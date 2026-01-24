@@ -13,7 +13,8 @@ use carina_core::resource::Value;
 /// Maps field name (CamelCase) to list of valid values (CamelCase)
 fn get_enum_values(field_name: &str) -> Option<&'static [&'static str]> {
     match field_name {
-        "Status" => Some(&["Enabled", "Suspended", "Disabled"]),
+        // VersioningConfiguration.Status
+        "Status" => Some(&["Enabled", "Suspended"]),
         "AccelerationStatus" => Some(&["Enabled", "Suspended"]),
         _ => None,
     }
