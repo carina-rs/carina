@@ -458,9 +458,9 @@ impl AwsProvider {
                 attributes.insert("cidr_block".to_string(), Value::String(cidr.to_string()));
             }
 
-            // Store VPC ID as internal attribute
+            // Store VPC ID as public attribute
             if let Some(vpc_id) = vpc.vpc_id() {
-                attributes.insert("_vpc_id".to_string(), Value::String(vpc_id.to_string()));
+                attributes.insert("id".to_string(), Value::String(vpc_id.to_string()));
             }
 
             // Get VPC attributes for DNS settings
@@ -719,51 +719,20 @@ impl AwsProvider {
                 );
             }
 
-            // Store subnet ID as internal attribute
+            // Store subnet ID
             if let Some(subnet_id) = subnet.subnet_id() {
-                attributes.insert(
-                    "_subnet_id".to_string(),
-                    Value::String(subnet_id.to_string()),
-                );
+                attributes.insert("id".to_string(), Value::String(subnet_id.to_string()));
             }
 
-            // Find VPC name from VPC ID
-            if let Some(vpc_id) = subnet.vpc_id()
-                && let Ok(vpc_name) = self.find_vpc_name_by_id(vpc_id).await
-            {
-                attributes.insert("vpc".to_string(), Value::String(vpc_name));
+            // Store VPC ID
+            if let Some(vpc_id) = subnet.vpc_id() {
+                attributes.insert("vpc_id".to_string(), Value::String(vpc_id.to_string()));
             }
 
             Ok(State::existing(id, attributes))
         } else {
             Ok(State::not_found(id))
         }
-    }
-
-    /// Find VPC name by VPC ID
-    async fn find_vpc_name_by_id(&self, vpc_id: &str) -> ProviderResult<String> {
-        let result = self
-            .ec2_client
-            .describe_vpcs()
-            .vpc_ids(vpc_id)
-            .send()
-            .await
-            .map_err(|e| ProviderError::new(format!("Failed to describe VPC: {:?}", e)))?;
-
-        if let Some(vpc) = result.vpcs().first() {
-            for tag in vpc.tags() {
-                if tag.key() == Some("Name")
-                    && let Some(name) = tag.value()
-                {
-                    return Ok(name.to_string());
-                }
-            }
-        }
-
-        Err(ProviderError::new(format!(
-            "VPC {} has no Name tag",
-            vpc_id
-        )))
     }
 
     /// Create an EC2 Subnet
@@ -786,19 +755,14 @@ impl AwsProvider {
             }
         };
 
-        let vpc_name = match resource.attributes.get("vpc") {
+        let vpc_id = match resource.attributes.get("vpc_id") {
             Some(Value::String(s)) => s.clone(),
             _ => {
                 return Err(
-                    ProviderError::new("VPC name is required").for_resource(resource.id.clone())
+                    ProviderError::new("VPC ID is required").for_resource(resource.id.clone())
                 );
             }
         };
-
-        let vpc_id = self.find_vpc_id_by_name(&vpc_name).await?.ok_or_else(|| {
-            ProviderError::new(format!("VPC '{}' not found", vpc_name))
-                .for_resource(resource.id.clone())
-        })?;
 
         let mut req = self
             .ec2_client
@@ -869,28 +833,6 @@ impl AwsProvider {
 
     // ========== EC2 Internet Gateway Operations ==========
 
-    /// Find Internet Gateway ID by Name tag
-    async fn find_igw_id_by_name(&self, name: &str) -> ProviderResult<Option<String>> {
-        use aws_sdk_ec2::types::Filter;
-
-        let filter = Filter::builder().name("tag:Name").values(name).build();
-
-        let result = self
-            .ec2_client
-            .describe_internet_gateways()
-            .filters(filter)
-            .send()
-            .await
-            .map_err(|e| {
-                ProviderError::new(format!("Failed to describe internet gateways: {:?}", e))
-            })?;
-
-        Ok(result
-            .internet_gateways()
-            .first()
-            .and_then(|igw| igw.internet_gateway_id().map(String::from)))
-    }
-
     /// Read an EC2 Internet Gateway
     async fn read_ec2_internet_gateway(&self, name: &str) -> ProviderResult<State> {
         use aws_sdk_ec2::types::Filter;
@@ -917,17 +859,16 @@ impl AwsProvider {
             let region_dsl = format!("aws.Region.{}", self.region.replace('-', "_"));
             attributes.insert("region".to_string(), Value::String(region_dsl));
 
-            // Store IGW ID as internal attribute
+            // Store IGW ID
             if let Some(igw_id) = igw.internet_gateway_id() {
-                attributes.insert("_igw_id".to_string(), Value::String(igw_id.to_string()));
+                attributes.insert("id".to_string(), Value::String(igw_id.to_string()));
             }
 
-            // Find attached VPC
+            // Store attached VPC ID
             if let Some(attachment) = igw.attachments().first()
                 && let Some(vpc_id) = attachment.vpc_id()
-                && let Ok(vpc_name) = self.find_vpc_name_by_id(vpc_id).await
             {
-                attributes.insert("vpc".to_string(), Value::String(vpc_name));
+                attributes.insert("vpc_id".to_string(), Value::String(vpc_id.to_string()));
             }
 
             Ok(State::existing(id, attributes))
@@ -983,16 +924,11 @@ impl AwsProvider {
             })?;
 
         // Attach to VPC if specified
-        if let Some(Value::String(vpc_name)) = resource.attributes.get("vpc") {
-            let vpc_id = self.find_vpc_id_by_name(vpc_name).await?.ok_or_else(|| {
-                ProviderError::new(format!("VPC '{}' not found", vpc_name))
-                    .for_resource(resource.id.clone())
-            })?;
-
+        if let Some(Value::String(vpc_id)) = resource.attributes.get("vpc_id") {
             self.ec2_client
                 .attach_internet_gateway()
                 .internet_gateway_id(igw_id)
-                .vpc_id(&vpc_id)
+                .vpc_id(vpc_id)
                 .send()
                 .await
                 .map_err(|e| {
@@ -1118,19 +1054,14 @@ impl AwsProvider {
             let region_dsl = format!("aws.Region.{}", self.region.replace('-', "_"));
             attributes.insert("region".to_string(), Value::String(region_dsl));
 
-            // Store route table ID as internal attribute
+            // Store route table ID
             if let Some(rt_id) = rt.route_table_id() {
-                attributes.insert(
-                    "_route_table_id".to_string(),
-                    Value::String(rt_id.to_string()),
-                );
+                attributes.insert("id".to_string(), Value::String(rt_id.to_string()));
             }
 
-            // Find VPC name
-            if let Some(vpc_id) = rt.vpc_id()
-                && let Ok(vpc_name) = self.find_vpc_name_by_id(vpc_id).await
-            {
-                attributes.insert("vpc".to_string(), Value::String(vpc_name));
+            // Store VPC ID
+            if let Some(vpc_id) = rt.vpc_id() {
+                attributes.insert("vpc_id".to_string(), Value::String(vpc_id.to_string()));
             }
 
             // Convert routes to list
@@ -1141,12 +1072,7 @@ impl AwsProvider {
                     route_map.insert("destination".to_string(), Value::String(dest.to_string()));
                 }
                 if let Some(gw) = route.gateway_id() {
-                    // Try to find gateway name by ID
-                    if let Ok(Some(gw_name)) = self.find_igw_name_by_id(gw).await {
-                        route_map.insert("gateway".to_string(), Value::String(gw_name));
-                    } else {
-                        route_map.insert("gateway".to_string(), Value::String(gw.to_string()));
-                    }
+                    route_map.insert("gateway_id".to_string(), Value::String(gw.to_string()));
                 }
                 if !route_map.is_empty() {
                     routes_list.push(Value::Map(route_map));
@@ -1162,29 +1088,6 @@ impl AwsProvider {
         }
     }
 
-    /// Find Internet Gateway name by ID
-    async fn find_igw_name_by_id(&self, igw_id: &str) -> ProviderResult<Option<String>> {
-        let result = self
-            .ec2_client
-            .describe_internet_gateways()
-            .internet_gateway_ids(igw_id)
-            .send()
-            .await
-            .map_err(|e| {
-                ProviderError::new(format!("Failed to describe internet gateway: {:?}", e))
-            })?;
-
-        if let Some(igw) = result.internet_gateways().first() {
-            for tag in igw.tags() {
-                if tag.key() == Some("Name") {
-                    return Ok(tag.value().map(String::from));
-                }
-            }
-        }
-
-        Ok(None)
-    }
-
     /// Create an EC2 Route Table
     async fn create_ec2_route_table(&self, resource: Resource) -> ProviderResult<State> {
         let name = match resource.attributes.get("name") {
@@ -1195,19 +1098,14 @@ impl AwsProvider {
             }
         };
 
-        let vpc_name = match resource.attributes.get("vpc") {
+        let vpc_id = match resource.attributes.get("vpc_id") {
             Some(Value::String(s)) => s.clone(),
             _ => {
                 return Err(
-                    ProviderError::new("VPC name is required").for_resource(resource.id.clone())
+                    ProviderError::new("VPC ID is required").for_resource(resource.id.clone())
                 );
             }
         };
-
-        let vpc_id = self.find_vpc_id_by_name(&vpc_name).await?.ok_or_else(|| {
-            ProviderError::new(format!("VPC '{}' not found", vpc_name))
-                .for_resource(resource.id.clone())
-        })?;
 
         // Create Route Table
         let result = self
@@ -1257,7 +1155,7 @@ impl AwsProvider {
                             None
                         }
                     });
-                    let gateway_name = route_map.get("gateway").and_then(|v| {
+                    let gateway_id = route_map.get("gateway_id").and_then(|v| {
                         if let Value::String(s) = v {
                             Some(s)
                         } else {
@@ -1265,18 +1163,12 @@ impl AwsProvider {
                         }
                     });
 
-                    if let (Some(dest), Some(gw_name)) = (destination, gateway_name) {
-                        let gateway_id =
-                            self.find_igw_id_by_name(gw_name).await?.ok_or_else(|| {
-                                ProviderError::new(format!("Gateway '{}' not found", gw_name))
-                                    .for_resource(resource.id.clone())
-                            })?;
-
+                    if let (Some(dest), Some(gw_id)) = (destination, gateway_id) {
                         self.ec2_client
                             .create_route()
                             .route_table_id(rt_id)
                             .destination_cidr_block(dest)
-                            .gateway_id(&gateway_id)
+                            .gateway_id(gw_id)
                             .send()
                             .await
                             .map_err(|e| {
@@ -1372,19 +1264,14 @@ impl AwsProvider {
                 attributes.insert("description".to_string(), Value::String(desc.to_string()));
             }
 
-            // Store security group ID as internal attribute
+            // Store security group ID
             if let Some(sg_id) = sg.group_id() {
-                attributes.insert(
-                    "_security_group_id".to_string(),
-                    Value::String(sg_id.to_string()),
-                );
+                attributes.insert("id".to_string(), Value::String(sg_id.to_string()));
             }
 
-            // Find VPC name
-            if let Some(vpc_id) = sg.vpc_id()
-                && let Ok(vpc_name) = self.find_vpc_name_by_id(vpc_id).await
-            {
-                attributes.insert("vpc".to_string(), Value::String(vpc_name));
+            // Store VPC ID
+            if let Some(vpc_id) = sg.vpc_id() {
+                attributes.insert("vpc_id".to_string(), Value::String(vpc_id.to_string()));
             }
 
             Ok(State::existing(id, attributes))
@@ -1403,11 +1290,11 @@ impl AwsProvider {
             }
         };
 
-        let vpc_name = match resource.attributes.get("vpc") {
+        let vpc_id = match resource.attributes.get("vpc_id") {
             Some(Value::String(s)) => s.clone(),
             _ => {
                 return Err(
-                    ProviderError::new("VPC name is required").for_resource(resource.id.clone())
+                    ProviderError::new("VPC ID is required").for_resource(resource.id.clone())
                 );
             }
         };
@@ -1416,11 +1303,6 @@ impl AwsProvider {
             Some(Value::String(s)) => s.clone(),
             _ => name.clone(), // Use name as description if not specified
         };
-
-        let vpc_id = self.find_vpc_id_by_name(&vpc_name).await?.ok_or_else(|| {
-            ProviderError::new(format!("VPC '{}' not found", vpc_name))
-                .for_resource(resource.id.clone())
-        })?;
 
         // Create Security Group
         let result = self
@@ -1550,16 +1432,17 @@ impl AwsProvider {
             let region_dsl = format!("aws.Region.{}", self.region.replace('-', "_"));
             attributes.insert("region".to_string(), Value::String(region_dsl));
 
-            // Store rule ID as internal attribute
+            // Store rule ID
             if let Some(rule_id) = rule.security_group_rule_id() {
-                attributes.insert("_rule_id".to_string(), Value::String(rule_id.to_string()));
+                attributes.insert("id".to_string(), Value::String(rule_id.to_string()));
             }
 
-            // Find security group name
-            if let Some(sg_id) = rule.group_id()
-                && let Ok(Some(sg_name)) = self.find_security_group_name_by_id(sg_id).await
-            {
-                attributes.insert("security_group".to_string(), Value::String(sg_name));
+            // Store security group ID
+            if let Some(sg_id) = rule.group_id() {
+                attributes.insert(
+                    "security_group_id".to_string(),
+                    Value::String(sg_id.to_string()),
+                );
             }
 
             if let Some(protocol) = rule.ip_protocol() {
@@ -1584,29 +1467,6 @@ impl AwsProvider {
         }
     }
 
-    /// Find Security Group name by ID
-    async fn find_security_group_name_by_id(&self, sg_id: &str) -> ProviderResult<Option<String>> {
-        let result = self
-            .ec2_client
-            .describe_security_groups()
-            .group_ids(sg_id)
-            .send()
-            .await
-            .map_err(|e| {
-                ProviderError::new(format!("Failed to describe security group: {:?}", e))
-            })?;
-
-        if let Some(sg) = result.security_groups().first() {
-            for tag in sg.tags() {
-                if tag.key() == Some("Name") {
-                    return Ok(tag.value().map(String::from));
-                }
-            }
-        }
-
-        Ok(None)
-    }
-
     /// Create an EC2 Security Group Rule
     async fn create_ec2_security_group_rule(
         &self,
@@ -1622,10 +1482,10 @@ impl AwsProvider {
             }
         };
 
-        let sg_name = match resource.attributes.get("security_group") {
+        let sg_id = match resource.attributes.get("security_group_id") {
             Some(Value::String(s)) => s.clone(),
             _ => {
-                return Err(ProviderError::new("Security Group name is required")
+                return Err(ProviderError::new("Security Group ID is required")
                     .for_resource(resource.id.clone()));
             }
         };
@@ -1649,14 +1509,6 @@ impl AwsProvider {
             Some(Value::String(s)) => s.clone(),
             _ => "0.0.0.0/0".to_string(),
         };
-
-        let sg_id = self
-            .find_security_group_id_by_name(&sg_name)
-            .await?
-            .ok_or_else(|| {
-                ProviderError::new(format!("Security Group '{}' not found", sg_name))
-                    .for_resource(resource.id.clone())
-            })?;
 
         let permission = aws_sdk_ec2::types::IpPermission::builder()
             .ip_protocol(&protocol)

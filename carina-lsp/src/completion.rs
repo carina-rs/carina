@@ -109,7 +109,7 @@ impl CompletionProvider {
             CompletionItem {
                 label: "aws.subnet".to_string(),
                 kind: Some(CompletionItemKind::CLASS),
-                insert_text: Some("aws.subnet {\n    name              = \"${1:subnet-name}\"\n    region            = aws.Region.${2:ap_northeast_1}\n    vpc               = ${3:vpc_name}\n    cidr_block        = \"${4:10.0.1.0/24}\"\n    availability_zone = \"${5:ap-northeast-1a}\"\n}".to_string()),
+                insert_text: Some("aws.subnet {\n    name              = \"${1:subnet-name}\"\n    region            = aws.Region.${2:ap_northeast_1}\n    vpc_id            = ${3:vpc.id}\n    cidr_block        = \"${4:10.0.1.0/24}\"\n    availability_zone = \"${5:ap-northeast-1a}\"\n}".to_string()),
                 insert_text_format: Some(InsertTextFormat::SNIPPET),
                 detail: Some("Subnet resource".to_string()),
                 ..Default::default()
@@ -117,7 +117,7 @@ impl CompletionProvider {
             CompletionItem {
                 label: "aws.internet_gateway".to_string(),
                 kind: Some(CompletionItemKind::CLASS),
-                insert_text: Some("aws.internet_gateway {\n    name   = \"${1:igw-name}\"\n    region = aws.Region.${2:ap_northeast_1}\n    vpc    = ${3:vpc_name}\n}".to_string()),
+                insert_text: Some("aws.internet_gateway {\n    name   = \"${1:igw-name}\"\n    region = aws.Region.${2:ap_northeast_1}\n    vpc_id = ${3:vpc.id}\n}".to_string()),
                 insert_text_format: Some(InsertTextFormat::SNIPPET),
                 detail: Some("Internet Gateway resource".to_string()),
                 ..Default::default()
@@ -125,7 +125,7 @@ impl CompletionProvider {
             CompletionItem {
                 label: "aws.route_table".to_string(),
                 kind: Some(CompletionItemKind::CLASS),
-                insert_text: Some("aws.route_table {\n    name   = \"${1:rt-name}\"\n    region = aws.Region.${2:ap_northeast_1}\n    vpc    = ${3:vpc_name}\n    routes = [\n        { destination = \"${4:0.0.0.0/0}\", gateway = ${5:igw_name} }\n    ]\n}".to_string()),
+                insert_text: Some("aws.route_table {\n    name   = \"${1:rt-name}\"\n    region = aws.Region.${2:ap_northeast_1}\n    vpc_id = ${3:vpc.id}\n    routes = [\n        { destination = \"${4:0.0.0.0/0}\", gateway_id = ${5:igw.id} }\n    ]\n}".to_string()),
                 insert_text_format: Some(InsertTextFormat::SNIPPET),
                 detail: Some("Route Table resource".to_string()),
                 ..Default::default()
@@ -133,7 +133,7 @@ impl CompletionProvider {
             CompletionItem {
                 label: "aws.security_group".to_string(),
                 kind: Some(CompletionItemKind::CLASS),
-                insert_text: Some("aws.security_group {\n    name        = \"${1:sg-name}\"\n    region      = aws.Region.${2:ap_northeast_1}\n    vpc         = ${3:vpc_name}\n    description = \"${4:Security group description}\"\n}".to_string()),
+                insert_text: Some("aws.security_group {\n    name        = \"${1:sg-name}\"\n    region      = aws.Region.${2:ap_northeast_1}\n    vpc_id      = ${3:vpc.id}\n    description = \"${4:Security group description}\"\n}".to_string()),
                 insert_text_format: Some(InsertTextFormat::SNIPPET),
                 detail: Some("Security Group resource".to_string()),
                 ..Default::default()
@@ -141,7 +141,7 @@ impl CompletionProvider {
             CompletionItem {
                 label: "aws.security_group.ingress_rule".to_string(),
                 kind: Some(CompletionItemKind::CLASS),
-                insert_text: Some("aws.security_group.ingress_rule {\n    name           = \"${1:rule-name}\"\n    region         = aws.Region.${2:ap_northeast_1}\n    security_group = ${3:sg_name}\n    protocol       = \"${4:tcp}\"\n    from_port      = ${5:80}\n    to_port        = ${6:80}\n    cidr           = \"${7:0.0.0.0/0}\"\n}".to_string()),
+                insert_text: Some("aws.security_group.ingress_rule {\n    name              = \"${1:rule-name}\"\n    region            = aws.Region.${2:ap_northeast_1}\n    security_group_id = ${3:sg.id}\n    protocol          = \"${4:tcp}\"\n    from_port         = ${5:80}\n    to_port           = ${6:80}\n    cidr              = \"${7:0.0.0.0/0}\"\n}".to_string()),
                 insert_text_format: Some(InsertTextFormat::SNIPPET),
                 detail: Some("Security Group Ingress Rule".to_string()),
                 ..Default::default()
@@ -149,7 +149,7 @@ impl CompletionProvider {
             CompletionItem {
                 label: "aws.security_group.egress_rule".to_string(),
                 kind: Some(CompletionItemKind::CLASS),
-                insert_text: Some("aws.security_group.egress_rule {\n    name           = \"${1:rule-name}\"\n    region         = aws.Region.${2:ap_northeast_1}\n    security_group = ${3:sg_name}\n    protocol       = \"${4:-1}\"\n    from_port      = ${5:0}\n    to_port        = ${6:0}\n    cidr           = \"${7:0.0.0.0/0}\"\n}".to_string()),
+                insert_text: Some("aws.security_group.egress_rule {\n    name              = \"${1:rule-name}\"\n    region            = aws.Region.${2:ap_northeast_1}\n    security_group_id = ${3:sg.id}\n    protocol          = \"${4:-1}\"\n    from_port         = ${5:0}\n    to_port           = ${6:0}\n    cidr              = \"${7:0.0.0.0/0}\"\n}".to_string()),
                 insert_text_format: Some(InsertTextFormat::SNIPPET),
                 detail: Some("Security Group Egress Rule".to_string()),
                 ..Default::default()

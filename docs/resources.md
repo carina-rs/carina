@@ -67,6 +67,7 @@ An AWS VPC (Virtual Private Cloud).
 
 | Attribute | Type | Required | Description |
 |-----------|------|----------|-------------|
+| `id` | String | No | VPC ID (read-only, set after creation) |
 | `name` | String | **Yes** | VPC name (Name tag) |
 | `region` | aws.Region | **Yes** | The AWS region for the VPC |
 | `cidr_block` | CidrBlock | **Yes** | The IPv4 CIDR block for the VPC (e.g., "10.0.0.0/16") |
@@ -88,6 +89,7 @@ let main_vpc = aws.vpc {
 #### Notes
 
 - `cidr_block` is immutable after creation
+- `id` is the VPC ID assigned by AWS after creation (e.g., "vpc-12345678")
 
 ---
 
@@ -99,9 +101,10 @@ An AWS VPC Subnet.
 
 | Attribute | Type | Required | Description |
 |-----------|------|----------|-------------|
+| `id` | String | No | Subnet ID (read-only, set after creation) |
 | `name` | String | **Yes** | Subnet name (Name tag) |
 | `region` | aws.Region | **Yes** | The AWS region for the subnet |
-| `vpc` | String | **Yes** | VPC name to create the subnet in |
+| `vpc_id` | String | **Yes** | VPC ID to create the subnet in |
 | `cidr_block` | CidrBlock | **Yes** | The IPv4 CIDR block for the subnet |
 | `availability_zone` | String | No | The availability zone (e.g., "ap-northeast-1a") |
 
@@ -111,7 +114,7 @@ An AWS VPC Subnet.
 let public_subnet_1a = aws.subnet {
     name              = "public-subnet-1a"
     region            = aws.Region.ap_northeast_1
-    vpc               = main_vpc.name
+    vpc_id            = main_vpc.id
     cidr_block        = "10.0.1.0/24"
     availability_zone = "ap-northeast-1a"
 }
@@ -119,7 +122,7 @@ let public_subnet_1a = aws.subnet {
 let public_subnet_1c = aws.subnet {
     name              = "public-subnet-1c"
     region            = aws.Region.ap_northeast_1
-    vpc               = main_vpc.name
+    vpc_id            = main_vpc.id
     cidr_block        = "10.0.2.0/24"
     availability_zone = "ap-northeast-1c"
 }
@@ -127,7 +130,7 @@ let public_subnet_1c = aws.subnet {
 
 #### Notes
 
-- `cidr_block`, `vpc`, and `availability_zone` are immutable after creation
+- `cidr_block`, `vpc_id`, and `availability_zone` are immutable after creation
 
 ---
 
@@ -139,9 +142,10 @@ An AWS Internet Gateway for VPC internet access.
 
 | Attribute | Type | Required | Description |
 |-----------|------|----------|-------------|
+| `id` | String | No | Internet Gateway ID (read-only, set after creation) |
 | `name` | String | **Yes** | Internet Gateway name (Name tag) |
 | `region` | aws.Region | **Yes** | The AWS region for the Internet Gateway |
-| `vpc` | String | No | VPC name to attach the Internet Gateway to |
+| `vpc_id` | String | No | VPC ID to attach the Internet Gateway to |
 
 #### Example
 
@@ -149,7 +153,7 @@ An AWS Internet Gateway for VPC internet access.
 let igw = aws.internet_gateway {
     name   = "main-igw"
     region = aws.Region.ap_northeast_1
-    vpc    = main_vpc.name
+    vpc_id = main_vpc.id
 }
 ```
 
@@ -163,9 +167,10 @@ An AWS VPC Route Table.
 
 | Attribute | Type | Required | Description |
 |-----------|------|----------|-------------|
+| `id` | String | No | Route Table ID (read-only, set after creation) |
 | `name` | String | **Yes** | Route Table name (Name tag) |
 | `region` | aws.Region | **Yes** | The AWS region for the Route Table |
-| `vpc` | String | **Yes** | VPC name for the Route Table |
+| `vpc_id` | String | **Yes** | VPC ID for the Route Table |
 | `routes` | List | No | List of routes |
 
 #### Route Object
@@ -173,7 +178,7 @@ An AWS VPC Route Table.
 | Field | Type | Description |
 |-------|------|-------------|
 | `destination` | String | Destination CIDR block (e.g., "0.0.0.0/0") |
-| `gateway` | String | Gateway name (Internet Gateway name) |
+| `gateway_id` | String | Internet Gateway ID |
 
 #### Example
 
@@ -181,9 +186,9 @@ An AWS VPC Route Table.
 let public_rt = aws.route_table {
     name   = "public-rt"
     region = aws.Region.ap_northeast_1
-    vpc    = main_vpc.name
+    vpc_id = main_vpc.id
     routes = [
-        { destination = "0.0.0.0/0", gateway = igw.name }
+        { destination = "0.0.0.0/0", gateway_id = igw.id }
     ]
 }
 ```
@@ -198,9 +203,10 @@ An AWS VPC Security Group.
 
 | Attribute | Type | Required | Description |
 |-----------|------|----------|-------------|
+| `id` | String | No | Security Group ID (read-only, set after creation) |
 | `name` | String | **Yes** | Security Group name (Name tag) |
 | `region` | aws.Region | **Yes** | The AWS region for the Security Group |
-| `vpc` | String | **Yes** | VPC name for the Security Group |
+| `vpc_id` | String | **Yes** | VPC ID for the Security Group |
 | `description` | String | No | Description of the Security Group |
 
 #### Example
@@ -209,7 +215,7 @@ An AWS VPC Security Group.
 let web_sg = aws.security_group {
     name        = "web-sg"
     region      = aws.Region.ap_northeast_1
-    vpc         = main_vpc.name
+    vpc_id      = main_vpc.id
     description = "Web server security group"
 }
 ```
@@ -228,9 +234,10 @@ An inbound rule for an AWS VPC Security Group.
 
 | Attribute | Type | Required | Description |
 |-----------|------|----------|-------------|
+| `id` | String | No | Security Group Rule ID (read-only, set after creation) |
 | `name` | String | **Yes** | Rule name (for identification) |
 | `region` | aws.Region | **Yes** | The AWS region |
-| `security_group` | String | **Yes** | Security Group name to add the rule to |
+| `security_group_id` | String | **Yes** | Security Group ID to add the rule to |
 | `protocol` | Enum | **Yes** | Protocol: "tcp", "udp", "icmp", or "-1" (all) |
 | `from_port` | Int | **Yes** | Start of port range (0-65535) |
 | `to_port` | Int | **Yes** | End of port range (0-65535) |
@@ -240,23 +247,23 @@ An inbound rule for an AWS VPC Security Group.
 
 ```crn
 aws.security_group.ingress_rule {
-    name           = "web-sg-http"
-    region         = aws.Region.ap_northeast_1
-    security_group = web_sg.name
-    protocol       = "tcp"
-    from_port      = 80
-    to_port        = 80
-    cidr           = "0.0.0.0/0"
+    name              = "web-sg-http"
+    region            = aws.Region.ap_northeast_1
+    security_group_id = web_sg.id
+    protocol          = "tcp"
+    from_port         = 80
+    to_port           = 80
+    cidr              = "0.0.0.0/0"
 }
 
 aws.security_group.ingress_rule {
-    name           = "web-sg-https"
-    region         = aws.Region.ap_northeast_1
-    security_group = web_sg.name
-    protocol       = "tcp"
-    from_port      = 443
-    to_port        = 443
-    cidr           = "0.0.0.0/0"
+    name              = "web-sg-https"
+    region            = aws.Region.ap_northeast_1
+    security_group_id = web_sg.id
+    protocol          = "tcp"
+    from_port         = 443
+    to_port           = 443
+    cidr              = "0.0.0.0/0"
 }
 ```
 
@@ -270,9 +277,10 @@ An outbound rule for an AWS VPC Security Group.
 
 | Attribute | Type | Required | Description |
 |-----------|------|----------|-------------|
+| `id` | String | No | Security Group Rule ID (read-only, set after creation) |
 | `name` | String | **Yes** | Rule name (for identification) |
 | `region` | aws.Region | **Yes** | The AWS region |
-| `security_group` | String | **Yes** | Security Group name to add the rule to |
+| `security_group_id` | String | **Yes** | Security Group ID to add the rule to |
 | `protocol` | Enum | **Yes** | Protocol: "tcp", "udp", "icmp", or "-1" (all) |
 | `from_port` | Int | **Yes** | Start of port range (0-65535) |
 | `to_port` | Int | **Yes** | End of port range (0-65535) |
@@ -282,13 +290,13 @@ An outbound rule for an AWS VPC Security Group.
 
 ```crn
 aws.security_group.egress_rule {
-    name           = "web-sg-all-outbound"
-    region         = aws.Region.ap_northeast_1
-    security_group = web_sg.name
-    protocol       = "-1"
-    from_port      = 0
-    to_port        = 0
-    cidr           = "0.0.0.0/0"
+    name              = "web-sg-all-outbound"
+    region            = aws.Region.ap_northeast_1
+    security_group_id = web_sg.id
+    protocol          = "-1"
+    from_port         = 0
+    to_port           = 0
+    cidr              = "0.0.0.0/0"
 }
 ```
 
@@ -336,7 +344,7 @@ let main_vpc = aws.vpc {
 let public_subnet_1a = aws.subnet {
     name              = "public-subnet-1a"
     region            = aws.Region.ap_northeast_1
-    vpc               = main_vpc.name
+    vpc_id            = main_vpc.id
     cidr_block        = "10.0.1.0/24"
     availability_zone = "ap-northeast-1a"
 }
@@ -344,7 +352,7 @@ let public_subnet_1a = aws.subnet {
 let public_subnet_1c = aws.subnet {
     name              = "public-subnet-1c"
     region            = aws.Region.ap_northeast_1
-    vpc               = main_vpc.name
+    vpc_id            = main_vpc.id
     cidr_block        = "10.0.2.0/24"
     availability_zone = "ap-northeast-1c"
 }
@@ -352,7 +360,7 @@ let public_subnet_1c = aws.subnet {
 let private_subnet_1a = aws.subnet {
     name              = "private-subnet-1a"
     region            = aws.Region.ap_northeast_1
-    vpc               = main_vpc.name
+    vpc_id            = main_vpc.id
     cidr_block        = "10.0.10.0/24"
     availability_zone = "ap-northeast-1a"
 }
@@ -361,16 +369,16 @@ let private_subnet_1a = aws.subnet {
 let igw = aws.internet_gateway {
     name   = "production-igw"
     region = aws.Region.ap_northeast_1
-    vpc    = main_vpc.name
+    vpc_id = main_vpc.id
 }
 
 // Route Table for public subnets
 let public_rt = aws.route_table {
     name   = "public-rt"
     region = aws.Region.ap_northeast_1
-    vpc    = main_vpc.name
+    vpc_id = main_vpc.id
     routes = [
-        { destination = "0.0.0.0/0", gateway = igw.name }
+        { destination = "0.0.0.0/0", gateway_id = igw.id }
     ]
 }
 
@@ -378,67 +386,67 @@ let public_rt = aws.route_table {
 let web_sg = aws.security_group {
     name        = "web-sg"
     region      = aws.Region.ap_northeast_1
-    vpc         = main_vpc.name
+    vpc_id      = main_vpc.id
     description = "Web server security group"
 }
 
 // Web Security Group Rules
 aws.security_group.ingress_rule {
-    name           = "web-sg-http"
-    region         = aws.Region.ap_northeast_1
-    security_group = web_sg.name
-    protocol       = "tcp"
-    from_port      = 80
-    to_port        = 80
-    cidr           = "0.0.0.0/0"
+    name              = "web-sg-http"
+    region            = aws.Region.ap_northeast_1
+    security_group_id = web_sg.id
+    protocol          = "tcp"
+    from_port         = 80
+    to_port           = 80
+    cidr              = "0.0.0.0/0"
 }
 
 aws.security_group.ingress_rule {
-    name           = "web-sg-https"
-    region         = aws.Region.ap_northeast_1
-    security_group = web_sg.name
-    protocol       = "tcp"
-    from_port      = 443
-    to_port        = 443
-    cidr           = "0.0.0.0/0"
+    name              = "web-sg-https"
+    region            = aws.Region.ap_northeast_1
+    security_group_id = web_sg.id
+    protocol          = "tcp"
+    from_port         = 443
+    to_port           = 443
+    cidr              = "0.0.0.0/0"
 }
 
 aws.security_group.egress_rule {
-    name           = "web-sg-all-outbound"
-    region         = aws.Region.ap_northeast_1
-    security_group = web_sg.name
-    protocol       = "-1"
-    from_port      = 0
-    to_port        = 0
-    cidr           = "0.0.0.0/0"
+    name              = "web-sg-all-outbound"
+    region            = aws.Region.ap_northeast_1
+    security_group_id = web_sg.id
+    protocol          = "-1"
+    from_port         = 0
+    to_port           = 0
+    cidr              = "0.0.0.0/0"
 }
 
 // Database Security Group
 let db_sg = aws.security_group {
     name        = "db-sg"
     region      = aws.Region.ap_northeast_1
-    vpc         = main_vpc.name
+    vpc_id      = main_vpc.id
     description = "Database security group"
 }
 
 aws.security_group.ingress_rule {
-    name           = "db-sg-mysql"
-    region         = aws.Region.ap_northeast_1
-    security_group = db_sg.name
-    protocol       = "tcp"
-    from_port      = 3306
-    to_port        = 3306
-    cidr           = "10.0.0.0/16"
+    name              = "db-sg-mysql"
+    region            = aws.Region.ap_northeast_1
+    security_group_id = db_sg.id
+    protocol          = "tcp"
+    from_port         = 3306
+    to_port           = 3306
+    cidr              = "10.0.0.0/16"
 }
 
 aws.security_group.egress_rule {
-    name           = "db-sg-all-outbound"
-    region         = aws.Region.ap_northeast_1
-    security_group = db_sg.name
-    protocol       = "-1"
-    from_port      = 0
-    to_port        = 0
-    cidr           = "0.0.0.0/0"
+    name              = "db-sg-all-outbound"
+    region            = aws.Region.ap_northeast_1
+    security_group_id = db_sg.id
+    protocol          = "-1"
+    from_port         = 0
+    to_port           = 0
+    cidr              = "0.0.0.0/0"
 }
 
 // S3 Bucket

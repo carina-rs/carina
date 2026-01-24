@@ -94,7 +94,14 @@ impl DiagnosticEngine {
                             continue;
                         }
 
-                        // Check for ResourceRef (e.g., vpc.name when misused)
+                        // Determine the suggested attribute based on the attribute name
+                        let suggested_attr = if attr_name.ends_with("_id") {
+                            "id"
+                        } else {
+                            "name"
+                        };
+
+                        // Check for ResourceRef (e.g., vpc.id when misused)
                         if let Value::ResourceRef(binding, _) = attr_value
                             && let Some((line, col)) =
                                 self.find_attribute_value_position(doc, attr_name, binding)
@@ -110,15 +117,15 @@ impl DiagnosticEngine {
                                 severity: Some(DiagnosticSeverity::WARNING),
                                 source: Some("carina".to_string()),
                                 message: format!(
-                                    "Expected string, got resource reference '{}'. Did you mean '{}.name'?",
-                                    binding, binding
+                                    "Expected string, got resource reference '{}'. Did you mean '{}.{}'?",
+                                    binding, binding, suggested_attr
                                 ),
                                 ..Default::default()
                             });
                         }
 
                         // Check for resource binding placeholder ${binding}
-                        // This happens when you write `vpc = vpc` instead of `vpc = vpc.name`
+                        // This happens when you write `vpc_id = vpc` instead of `vpc_id = vpc.id`
                         if let Value::String(s) = attr_value
                             && let Some(binding) =
                                 s.strip_prefix("${").and_then(|s| s.strip_suffix("}"))
@@ -136,8 +143,8 @@ impl DiagnosticEngine {
                                 severity: Some(DiagnosticSeverity::WARNING),
                                 source: Some("carina".to_string()),
                                 message: format!(
-                                    "Expected string, got resource reference '{}'. Did you mean '{}.name'?",
-                                    binding, binding
+                                    "Expected string, got resource reference '{}'. Did you mean '{}.{}'?",
+                                    binding, binding, suggested_attr
                                 ),
                                 ..Default::default()
                             });

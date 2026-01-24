@@ -72,6 +72,10 @@ pub fn vpc_schema() -> ResourceSchema {
     ResourceSchema::new("vpc")
         .with_description("An AWS VPC (Virtual Private Cloud)")
         .attribute(
+            AttributeSchema::new("id", AttributeType::String)
+                .with_description("VPC ID (read-only, set after creation)"),
+        )
+        .attribute(
             AttributeSchema::new("name", AttributeType::String)
                 .required()
                 .with_description("VPC name (Name tag)"),
@@ -101,6 +105,10 @@ pub fn subnet_schema() -> ResourceSchema {
     ResourceSchema::new("subnet")
         .with_description("An AWS VPC Subnet")
         .attribute(
+            AttributeSchema::new("id", AttributeType::String)
+                .with_description("Subnet ID (read-only, set after creation)"),
+        )
+        .attribute(
             AttributeSchema::new("name", AttributeType::String)
                 .required()
                 .with_description("Subnet name (Name tag)"),
@@ -111,9 +119,9 @@ pub fn subnet_schema() -> ResourceSchema {
                 .with_description("The AWS region for the subnet"),
         )
         .attribute(
-            AttributeSchema::new("vpc", AttributeType::String)
+            AttributeSchema::new("vpc_id", AttributeType::String)
                 .required()
-                .with_description("VPC name to create the subnet in"),
+                .with_description("VPC ID to create the subnet in"),
         )
         .attribute(
             AttributeSchema::new("cidr_block", cidr_block())
@@ -131,6 +139,10 @@ pub fn internet_gateway_schema() -> ResourceSchema {
     ResourceSchema::new("internet_gateway")
         .with_description("An AWS Internet Gateway")
         .attribute(
+            AttributeSchema::new("id", AttributeType::String)
+                .with_description("Internet Gateway ID (read-only, set after creation)"),
+        )
+        .attribute(
             AttributeSchema::new("name", AttributeType::String)
                 .required()
                 .with_description("Internet Gateway name (Name tag)"),
@@ -141,8 +153,8 @@ pub fn internet_gateway_schema() -> ResourceSchema {
                 .with_description("The AWS region for the Internet Gateway"),
         )
         .attribute(
-            AttributeSchema::new("vpc", AttributeType::String)
-                .with_description("VPC name to attach the Internet Gateway to"),
+            AttributeSchema::new("vpc_id", AttributeType::String)
+                .with_description("VPC ID to attach the Internet Gateway to"),
         )
 }
 
@@ -156,6 +168,10 @@ pub fn route_table_schema() -> ResourceSchema {
     ResourceSchema::new("route_table")
         .with_description("An AWS VPC Route Table")
         .attribute(
+            AttributeSchema::new("id", AttributeType::String)
+                .with_description("Route Table ID (read-only, set after creation)"),
+        )
+        .attribute(
             AttributeSchema::new("name", AttributeType::String)
                 .required()
                 .with_description("Route Table name (Name tag)"),
@@ -166,9 +182,9 @@ pub fn route_table_schema() -> ResourceSchema {
                 .with_description("The AWS region for the Route Table"),
         )
         .attribute(
-            AttributeSchema::new("vpc", AttributeType::String)
+            AttributeSchema::new("vpc_id", AttributeType::String)
                 .required()
-                .with_description("VPC name for the Route Table"),
+                .with_description("VPC ID for the Route Table"),
         )
         .attribute(
             AttributeSchema::new("routes", AttributeType::List(Box::new(route_schema())))
@@ -181,6 +197,10 @@ pub fn security_group_schema() -> ResourceSchema {
     ResourceSchema::new("security_group")
         .with_description("An AWS VPC Security Group")
         .attribute(
+            AttributeSchema::new("id", AttributeType::String)
+                .with_description("Security Group ID (read-only, set after creation)"),
+        )
+        .attribute(
             AttributeSchema::new("name", AttributeType::String)
                 .required()
                 .with_description("Security Group name (Name tag)"),
@@ -191,9 +211,9 @@ pub fn security_group_schema() -> ResourceSchema {
                 .with_description("The AWS region for the Security Group"),
         )
         .attribute(
-            AttributeSchema::new("vpc", AttributeType::String)
+            AttributeSchema::new("vpc_id", AttributeType::String)
                 .required()
-                .with_description("VPC name for the Security Group"),
+                .with_description("VPC ID for the Security Group"),
         )
         .attribute(
             AttributeSchema::new("description", AttributeType::String)
@@ -206,6 +226,10 @@ pub fn security_group_ingress_rule_schema() -> ResourceSchema {
     ResourceSchema::new("security_group.ingress_rule")
         .with_description("An inbound rule for an AWS VPC Security Group")
         .attribute(
+            AttributeSchema::new("id", AttributeType::String)
+                .with_description("Security Group Rule ID (read-only, set after creation)"),
+        )
+        .attribute(
             AttributeSchema::new("name", AttributeType::String)
                 .required()
                 .with_description("Rule name (for identification)"),
@@ -216,9 +240,9 @@ pub fn security_group_ingress_rule_schema() -> ResourceSchema {
                 .with_description("The AWS region"),
         )
         .attribute(
-            AttributeSchema::new("security_group", AttributeType::String)
+            AttributeSchema::new("security_group_id", AttributeType::String)
                 .required()
-                .with_description("Security Group name"),
+                .with_description("Security Group ID"),
         )
         .attribute(
             AttributeSchema::new("protocol", protocol())
@@ -245,6 +269,10 @@ pub fn security_group_egress_rule_schema() -> ResourceSchema {
     ResourceSchema::new("security_group.egress_rule")
         .with_description("An outbound rule for an AWS VPC Security Group")
         .attribute(
+            AttributeSchema::new("id", AttributeType::String)
+                .with_description("Security Group Rule ID (read-only, set after creation)"),
+        )
+        .attribute(
             AttributeSchema::new("name", AttributeType::String)
                 .required()
                 .with_description("Rule name (for identification)"),
@@ -255,9 +283,9 @@ pub fn security_group_egress_rule_schema() -> ResourceSchema {
                 .with_description("The AWS region"),
         )
         .attribute(
-            AttributeSchema::new("security_group", AttributeType::String)
+            AttributeSchema::new("security_group_id", AttributeType::String)
                 .required()
-                .with_description("Security Group name"),
+                .with_description("Security Group ID"),
         )
         .attribute(
             AttributeSchema::new("protocol", protocol())
@@ -361,7 +389,10 @@ mod tests {
             "region".to_string(),
             Value::String("Region.ap_northeast_1".to_string()),
         );
-        attrs.insert("vpc".to_string(), Value::String("my-vpc".to_string()));
+        attrs.insert(
+            "vpc_id".to_string(),
+            Value::String("vpc-12345678".to_string()),
+        );
         attrs.insert(
             "cidr_block".to_string(),
             Value::String("10.0.1.0/24".to_string()),
@@ -383,7 +414,10 @@ mod tests {
             "region".to_string(),
             Value::String("Region.ap_northeast_1".to_string()),
         );
-        attrs.insert("vpc".to_string(), Value::String("my-vpc".to_string()));
+        attrs.insert(
+            "vpc_id".to_string(),
+            Value::String("vpc-12345678".to_string()),
+        );
 
         assert!(schema.validate(&attrs).is_ok());
     }
@@ -397,7 +431,10 @@ mod tests {
             "region".to_string(),
             Value::String("Region.ap_northeast_1".to_string()),
         );
-        attrs.insert("vpc".to_string(), Value::String("my-vpc".to_string()));
+        attrs.insert(
+            "vpc_id".to_string(),
+            Value::String("vpc-12345678".to_string()),
+        );
 
         assert!(schema.validate(&attrs).is_ok());
     }
@@ -411,7 +448,10 @@ mod tests {
             "region".to_string(),
             Value::String("Region.ap_northeast_1".to_string()),
         );
-        attrs.insert("vpc".to_string(), Value::String("my-vpc".to_string()));
+        attrs.insert(
+            "vpc_id".to_string(),
+            Value::String("vpc-12345678".to_string()),
+        );
         attrs.insert(
             "description".to_string(),
             Value::String("My security group".to_string()),
