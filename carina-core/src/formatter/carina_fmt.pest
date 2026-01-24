@@ -1,0 +1,98 @@
+// Carina DSL Grammar for Formatting
+// Unlike the semantic parser, this grammar captures whitespace and comments
+
+// Entry point - captures everything including trivia
+file = { SOI ~ file_content* ~ EOI }
+file_content = _{ trivia | statement }
+
+// Trivia: whitespace and comments that we want to preserve
+trivia = { ws | comment | newline }
+ws = @{ (" " | "\t")+ }
+newline = @{ NEWLINE }
+comment = @{ "#" ~ (!NEWLINE ~ ANY)* }
+
+statement = { provider_block | let_binding | anonymous_resource }
+
+// Anonymous resource: aws.s3.bucket { ... }
+anonymous_resource = {
+    namespaced_id ~ trivia* ~ open_brace ~ block_content* ~ close_brace
+}
+
+// Provider block: provider aws { ... }
+provider_block = {
+    kw_provider ~ trivia+ ~ identifier ~ trivia* ~ open_brace ~ block_content* ~ close_brace
+}
+
+// Variable/resource definition: let name = value
+let_binding = {
+    kw_let ~ trivia+ ~ identifier ~ trivia* ~ equals ~ trivia* ~ expression
+}
+
+// Block content: attributes, trivia, or nested elements
+block_content = _{ trivia | attribute }
+
+// Attribute: key = value
+attribute = { identifier ~ trivia* ~ equals ~ trivia* ~ expression }
+
+identifier = @{ ASCII_ALPHA ~ (ASCII_ALPHANUMERIC | "_")* }
+
+// Namespaced identifier: aws.s3.bucket, aws.Region.ap_northeast_1
+namespaced_id = @{ identifier ~ ("." ~ identifier)+ }
+
+// Expression
+expression = { pipe_expr }
+
+// Pipe operator: value |> func |> func
+pipe_expr = { primary ~ (trivia* ~ pipe_op ~ trivia* ~ function_call)* }
+
+// Function call: func(args)
+function_call = {
+    identifier ~ open_paren ~ (trivia* ~ expression ~ (trivia* ~ comma ~ trivia* ~ expression)*)? ~ trivia* ~ close_paren
+}
+
+// Primary value
+primary = {
+    env_var
+  | resource_expr
+  | namespaced_id
+  | boolean
+  | number
+  | string
+  | variable_ref
+  | open_paren ~ trivia* ~ expression ~ trivia* ~ close_paren
+}
+
+// Environment variable: env("VAR_NAME")
+env_var = { kw_env ~ open_paren ~ trivia* ~ string ~ trivia* ~ close_paren }
+
+// Resource expression: aws.s3.bucket { ... }
+resource_expr = {
+    namespaced_id ~ trivia* ~ open_brace ~ block_content* ~ close_brace
+}
+
+// Variable reference (with optional member access: bucket.name)
+variable_ref = { identifier ~ ("." ~ identifier)? }
+
+// Literals
+boolean = { "true" | "false" }
+number = @{ "-"? ~ ASCII_DIGIT+ }
+string = ${ "\"" ~ inner_string ~ "\"" }
+inner_string = @{ char* }
+char = {
+    !("\"" | "\\") ~ ANY
+  | "\\" ~ ("\"" | "\\" | "n" | "r" | "t")
+}
+
+// Tokens (for easier identification in CST)
+open_brace = { "{" }
+close_brace = { "}" }
+open_paren = { "(" }
+close_paren = { ")" }
+equals = { "=" }
+comma = { "," }
+pipe_op = { "|>" }
+
+// Keywords
+kw_provider = { "provider" }
+kw_let = { "let" }
+kw_env = { "env" }

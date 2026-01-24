@@ -1,12 +1,14 @@
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
 use colored::Colorize;
+use similar::{ChangeTag, TextDiff};
 
 use carina_core::differ::create_plan;
 use carina_core::effect::Effect;
+use carina_core::formatter::{self, FormatConfig};
 use carina_core::interpreter::{EffectOutcome, Interpreter};
 use carina_core::parser::{self, ParsedFile};
 use carina_core::plan::Plan;
@@ -45,6 +47,24 @@ enum Commands {
         #[arg(default_value = "main.crn")]
         file: PathBuf,
     },
+    /// Format .crn files
+    Fmt {
+        /// Path to .crn file or directory
+        #[arg(default_value = ".")]
+        path: PathBuf,
+
+        /// Check if files are formatted (don't modify)
+        #[arg(long, short)]
+        check: bool,
+
+        /// Show diff of formatting changes
+        #[arg(long)]
+        diff: bool,
+
+        /// Recursively format all .crn files in directory
+        #[arg(long, short)]
+        recursive: bool,
+    },
 }
 
 #[tokio::main]
@@ -55,6 +75,12 @@ async fn main() {
         Commands::Validate { file } => run_validate(&file),
         Commands::Plan { file } => run_plan(&file).await,
         Commands::Apply { file } => run_apply(&file).await,
+        Commands::Fmt {
+            path,
+            check,
+            diff,
+            recursive,
+        } => run_fmt(&path, check, diff, recursive),
     };
 
     if let Err(e) = result {
@@ -516,5 +542,141 @@ impl Provider for FileProvider {
 
             Ok(())
         })
+    }
+}
+
+// Format command implementation
+fn run_fmt(path: &PathBuf, check: bool, show_diff: bool, recursive: bool) -> Result<(), String> {
+    let config = FormatConfig::default();
+
+    let files = if path.is_file() {
+        vec![path.clone()]
+    } else if recursive {
+        find_crn_files_recursive(path)?
+    } else {
+        find_crn_files_in_dir(path)?
+    };
+
+    if files.is_empty() {
+        println!("{}", "No .crn files found.".yellow());
+        return Ok(());
+    }
+
+    let mut needs_formatting = Vec::new();
+    let mut errors = Vec::new();
+
+    for file in &files {
+        let content = fs::read_to_string(file)
+            .map_err(|e| format!("Failed to read {}: {}", file.display(), e))?;
+
+        match formatter::format(&content, &config) {
+            Ok(formatted) => {
+                if content != formatted {
+                    needs_formatting.push((file.clone(), content.clone(), formatted.clone()));
+
+                    if show_diff {
+                        print_diff(file, &content, &formatted);
+                    }
+
+                    if !check {
+                        fs::write(file, &formatted)
+                            .map_err(|e| format!("Failed to write {}: {}", file.display(), e))?;
+                        println!("{} {}", "Formatted:".green(), file.display());
+                    }
+                }
+            }
+            Err(e) => {
+                errors.push((file.clone(), e.to_string()));
+            }
+        }
+    }
+
+    // Print summary
+    if check {
+        if needs_formatting.is_empty() && errors.is_empty() {
+            println!("{}", "All files are properly formatted.".green());
+            Ok(())
+        } else {
+            if !needs_formatting.is_empty() {
+                println!("{}", "The following files need formatting:".yellow());
+                for (file, _, _) in &needs_formatting {
+                    println!("  {}", file.display());
+                }
+            }
+            for (file, err) in &errors {
+                eprintln!("{} {}: {}", "Error:".red(), file.display(), err);
+            }
+            Err("Some files are not properly formatted".to_string())
+        }
+    } else if !errors.is_empty() {
+        for (file, err) in &errors {
+            eprintln!("{} {}: {}", "Error:".red(), file.display(), err);
+        }
+        Err("Some files had formatting errors".to_string())
+    } else {
+        let count = needs_formatting.len();
+        if count > 0 {
+            println!("{}", format!("Formatted {} file(s).", count).green().bold());
+        } else {
+            println!("{}", "All files are already properly formatted.".green());
+        }
+        Ok(())
+    }
+}
+
+fn find_crn_files_recursive(dir: &PathBuf) -> Result<Vec<PathBuf>, String> {
+    let mut files = Vec::new();
+    collect_crn_files_recursive(dir, &mut files)?;
+    Ok(files)
+}
+
+fn collect_crn_files_recursive(dir: &PathBuf, files: &mut Vec<PathBuf>) -> Result<(), String> {
+    let entries = fs::read_dir(dir)
+        .map_err(|e| format!("Failed to read directory {}: {}", dir.display(), e))?;
+
+    for entry in entries {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let path = entry.path();
+
+        if path.is_dir() {
+            // Skip hidden directories and common non-source directories
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            if !name.starts_with('.') && name != "target" && name != "node_modules" {
+                collect_crn_files_recursive(&path, files)?;
+            }
+        } else if path.extension().is_some_and(|ext| ext == "crn") {
+            files.push(path);
+        }
+    }
+
+    Ok(())
+}
+
+fn find_crn_files_in_dir(dir: &PathBuf) -> Result<Vec<PathBuf>, String> {
+    let entries = fs::read_dir(dir)
+        .map_err(|e| format!("Failed to read directory {}: {}", dir.display(), e))?;
+
+    let mut files = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let path = entry.path();
+        if path.extension().is_some_and(|ext| ext == "crn") {
+            files.push(path);
+        }
+    }
+    Ok(files)
+}
+
+fn print_diff(file: &Path, original: &str, formatted: &str) {
+    println!("\n{} {}:", "Diff for".cyan().bold(), file.display());
+
+    let diff = TextDiff::from_lines(original, formatted);
+    for change in diff.iter_all_changes() {
+        let sign = match change.tag() {
+            ChangeTag::Delete => "-".red(),
+            ChangeTag::Insert => "+".green(),
+            ChangeTag::Equal => " ".normal(),
+        };
+        print!("{}{}", sign, change);
     }
 }
