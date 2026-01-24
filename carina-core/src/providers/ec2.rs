@@ -176,11 +176,6 @@ pub fn route_table_schema() -> ResourceSchema {
         )
 }
 
-/// Security group rule schema
-fn security_group_rule_schema() -> AttributeType {
-    AttributeType::Map(Box::new(AttributeType::String))
-}
-
 /// Returns the schema for Security Group
 pub fn security_group_schema() -> ResourceSchema {
     ResourceSchema::new("security_group")
@@ -204,19 +199,83 @@ pub fn security_group_schema() -> ResourceSchema {
             AttributeSchema::new("description", AttributeType::String)
                 .with_description("Description of the Security Group"),
         )
+}
+
+/// Returns the schema for Security Group Ingress Rule
+pub fn security_group_ingress_rule_schema() -> ResourceSchema {
+    ResourceSchema::new("security_group_ingress_rule")
+        .with_description("An inbound rule for an AWS VPC Security Group")
         .attribute(
-            AttributeSchema::new(
-                "ingress",
-                AttributeType::List(Box::new(security_group_rule_schema())),
-            )
-            .with_description("Inbound rules"),
+            AttributeSchema::new("name", AttributeType::String)
+                .required()
+                .with_description("Rule name (for identification)"),
         )
         .attribute(
-            AttributeSchema::new(
-                "egress",
-                AttributeType::List(Box::new(security_group_rule_schema())),
-            )
-            .with_description("Outbound rules"),
+            AttributeSchema::new("region", types::aws_region())
+                .required()
+                .with_description("The AWS region"),
+        )
+        .attribute(
+            AttributeSchema::new("security_group", AttributeType::String)
+                .required()
+                .with_description("Security Group name"),
+        )
+        .attribute(
+            AttributeSchema::new("protocol", protocol())
+                .required()
+                .with_description("Protocol (tcp, udp, icmp, or -1 for all)"),
+        )
+        .attribute(
+            AttributeSchema::new("from_port", port_number())
+                .required()
+                .with_description("Start of port range"),
+        )
+        .attribute(
+            AttributeSchema::new("to_port", port_number())
+                .required()
+                .with_description("End of port range"),
+        )
+        .attribute(
+            AttributeSchema::new("cidr", cidr_block()).with_description("CIDR block to allow"),
+        )
+}
+
+/// Returns the schema for Security Group Egress Rule
+pub fn security_group_egress_rule_schema() -> ResourceSchema {
+    ResourceSchema::new("security_group_egress_rule")
+        .with_description("An outbound rule for an AWS VPC Security Group")
+        .attribute(
+            AttributeSchema::new("name", AttributeType::String)
+                .required()
+                .with_description("Rule name (for identification)"),
+        )
+        .attribute(
+            AttributeSchema::new("region", types::aws_region())
+                .required()
+                .with_description("The AWS region"),
+        )
+        .attribute(
+            AttributeSchema::new("security_group", AttributeType::String)
+                .required()
+                .with_description("Security Group name"),
+        )
+        .attribute(
+            AttributeSchema::new("protocol", protocol())
+                .required()
+                .with_description("Protocol (tcp, udp, icmp, or -1 for all)"),
+        )
+        .attribute(
+            AttributeSchema::new("from_port", port_number())
+                .required()
+                .with_description("Start of port range"),
+        )
+        .attribute(
+            AttributeSchema::new("to_port", port_number())
+                .required()
+                .with_description("End of port range"),
+        )
+        .attribute(
+            AttributeSchema::new("cidr", cidr_block()).with_description("CIDR block to allow"),
         )
 }
 
@@ -228,6 +287,8 @@ pub fn schemas() -> Vec<ResourceSchema> {
         internet_gateway_schema(),
         route_table_schema(),
         security_group_schema(),
+        security_group_ingress_rule_schema(),
+        security_group_egress_rule_schema(),
     ]
 }
 

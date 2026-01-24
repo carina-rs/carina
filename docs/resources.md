@@ -12,6 +12,8 @@ This document describes all supported resources and their attributes.
   - [aws.internet_gateway](#awsinternet_gateway)
   - [aws.route_table](#awsroute_table)
   - [aws.security_group](#awssecurity_group)
+  - [aws.security_group_ingress_rule](#awssecurity_group_ingress_rule)
+  - [aws.security_group_egress_rule](#awssecurity_group_egress_rule)
 
 ---
 
@@ -200,19 +202,8 @@ An AWS VPC Security Group.
 | `region` | aws.Region | **Yes** | The AWS region for the Security Group |
 | `vpc` | String | **Yes** | VPC name for the Security Group |
 | `description` | String | No | Description of the Security Group |
-| `ingress` | List | No | Inbound rules |
-| `egress` | List | No | Outbound rules |
 
-#### Ingress/Egress Rule Object
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `protocol` | String | Protocol: "tcp", "udp", "icmp", or "-1" (all) |
-| `from_port` | Int | Start of port range (0-65535) |
-| `to_port` | Int | End of port range (0-65535) |
-| `cidr` | String | CIDR block to allow (e.g., "0.0.0.0/0") |
-
-#### Example (Terraform-style blocks)
+#### Example
 
 ```crn
 let web_sg = aws.security_group {
@@ -220,52 +211,84 @@ let web_sg = aws.security_group {
     region      = aws.Region.ap_northeast_1
     vpc         = main_vpc.name
     description = "Web server security group"
-
-    ingress {
-        protocol  = "tcp"
-        from_port = 80
-        to_port   = 80
-        cidr      = "0.0.0.0/0"
-    }
-
-    ingress {
-        protocol  = "tcp"
-        from_port = 443
-        to_port   = 443
-        cidr      = "0.0.0.0/0"
-    }
-
-    ingress {
-        protocol  = "tcp"
-        from_port = 22
-        to_port   = 22
-        cidr      = "10.0.0.0/8"
-    }
-
-    egress {
-        protocol  = "-1"
-        from_port = 0
-        to_port   = 0
-        cidr      = "0.0.0.0/0"
-    }
 }
 ```
 
-#### Example (List syntax)
+#### Notes
+
+- Use `aws.security_group_ingress_rule` and `aws.security_group_egress_rule` to define rules
+
+---
+
+### aws.security_group_ingress_rule
+
+An inbound rule for an AWS VPC Security Group.
+
+#### Attributes
+
+| Attribute | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `name` | String | **Yes** | Rule name (for identification) |
+| `region` | aws.Region | **Yes** | The AWS region |
+| `security_group` | String | **Yes** | Security Group name to add the rule to |
+| `protocol` | Enum | **Yes** | Protocol: "tcp", "udp", "icmp", or "-1" (all) |
+| `from_port` | Int | **Yes** | Start of port range (0-65535) |
+| `to_port` | Int | **Yes** | End of port range (0-65535) |
+| `cidr` | CidrBlock | No | CIDR block to allow (e.g., "0.0.0.0/0") |
+
+#### Example
 
 ```crn
-let web_sg = aws.security_group {
-    name        = "web-sg"
-    region      = aws.Region.ap_northeast_1
-    vpc         = main_vpc.name
-    description = "Web server security group"
-    ingress = [
-        { protocol = "tcp", from_port = 80,  to_port = 80,  cidr = "0.0.0.0/0" },
-        { protocol = "tcp", from_port = 443, to_port = 443, cidr = "0.0.0.0/0" }
-    ]
-    egress = [
-        { protocol = "-1", from_port = 0, to_port = 0, cidr = "0.0.0.0/0" }
-    ]
+aws.security_group_ingress_rule {
+    name           = "web-sg-http"
+    region         = aws.Region.ap_northeast_1
+    security_group = web_sg.name
+    protocol       = "tcp"
+    from_port      = 80
+    to_port        = 80
+    cidr           = "0.0.0.0/0"
+}
+
+aws.security_group_ingress_rule {
+    name           = "web-sg-https"
+    region         = aws.Region.ap_northeast_1
+    security_group = web_sg.name
+    protocol       = "tcp"
+    from_port      = 443
+    to_port        = 443
+    cidr           = "0.0.0.0/0"
+}
+```
+
+---
+
+### aws.security_group_egress_rule
+
+An outbound rule for an AWS VPC Security Group.
+
+#### Attributes
+
+| Attribute | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `name` | String | **Yes** | Rule name (for identification) |
+| `region` | aws.Region | **Yes** | The AWS region |
+| `security_group` | String | **Yes** | Security Group name to add the rule to |
+| `protocol` | Enum | **Yes** | Protocol: "tcp", "udp", "icmp", or "-1" (all) |
+| `from_port` | Int | **Yes** | Start of port range (0-65535) |
+| `to_port` | Int | **Yes** | End of port range (0-65535) |
+| `cidr` | CidrBlock | No | CIDR block to allow (e.g., "0.0.0.0/0") |
+
+#### Example
+
+```crn
+aws.security_group_egress_rule {
+    name           = "web-sg-all-outbound"
+    region         = aws.Region.ap_northeast_1
+    security_group = web_sg.name
+    protocol       = "-1"
+    from_port      = 0
+    to_port        = 0
+    cidr           = "0.0.0.0/0"
 }
 ```
 
@@ -357,48 +380,65 @@ let web_sg = aws.security_group {
     region      = aws.Region.ap_northeast_1
     vpc         = main_vpc.name
     description = "Web server security group"
-
-    ingress {
-        protocol  = "tcp"
-        from_port = 80
-        to_port   = 80
-        cidr      = "0.0.0.0/0"
-    }
-
-    ingress {
-        protocol  = "tcp"
-        from_port = 443
-        to_port   = 443
-        cidr      = "0.0.0.0/0"
-    }
-
-    egress {
-        protocol  = "-1"
-        from_port = 0
-        to_port   = 0
-        cidr      = "0.0.0.0/0"
-    }
 }
 
+// Web Security Group Rules
+aws.security_group_ingress_rule {
+    name           = "web-sg-http"
+    region         = aws.Region.ap_northeast_1
+    security_group = web_sg.name
+    protocol       = "tcp"
+    from_port      = 80
+    to_port        = 80
+    cidr           = "0.0.0.0/0"
+}
+
+aws.security_group_ingress_rule {
+    name           = "web-sg-https"
+    region         = aws.Region.ap_northeast_1
+    security_group = web_sg.name
+    protocol       = "tcp"
+    from_port      = 443
+    to_port        = 443
+    cidr           = "0.0.0.0/0"
+}
+
+aws.security_group_egress_rule {
+    name           = "web-sg-all-outbound"
+    region         = aws.Region.ap_northeast_1
+    security_group = web_sg.name
+    protocol       = "-1"
+    from_port      = 0
+    to_port        = 0
+    cidr           = "0.0.0.0/0"
+}
+
+// Database Security Group
 let db_sg = aws.security_group {
     name        = "db-sg"
     region      = aws.Region.ap_northeast_1
     vpc         = main_vpc.name
     description = "Database security group"
+}
 
-    ingress {
-        protocol  = "tcp"
-        from_port = 3306
-        to_port   = 3306
-        cidr      = "10.0.0.0/16"
-    }
+aws.security_group_ingress_rule {
+    name           = "db-sg-mysql"
+    region         = aws.Region.ap_northeast_1
+    security_group = db_sg.name
+    protocol       = "tcp"
+    from_port      = 3306
+    to_port        = 3306
+    cidr           = "10.0.0.0/16"
+}
 
-    egress {
-        protocol  = "-1"
-        from_port = 0
-        to_port   = 0
-        cidr      = "0.0.0.0/0"
-    }
+aws.security_group_egress_rule {
+    name           = "db-sg-all-outbound"
+    region         = aws.Region.ap_northeast_1
+    security_group = db_sg.name
+    protocol       = "-1"
+    from_port      = 0
+    to_port        = 0
+    cidr           = "0.0.0.0/0"
 }
 
 // S3 Bucket
