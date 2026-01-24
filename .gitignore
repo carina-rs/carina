@@ -6,9 +6,14 @@
 
 # IDE
 .idea/
-.vscode/
+/.vscode/
 *.swp
 *.swo
+
+# VS Code extension
+editors/vscode/node_modules/
+editors/vscode/out/
+editors/vscode/*.vsix
 
 # OS files
 .DS_Store

@@ -2,6 +2,7 @@
 members = [
     "carina-cli",
     "carina-core",
+    "carina-lsp",
     "carina-provider-aws",
 ]
 resolver = "2"

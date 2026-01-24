@@ -1,0 +1,119 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "Carina",
+  "scopeName": "source.carina",
+  "fileTypes": ["crn"],
+  "patterns": [
+    { "include": "#comments" },
+    { "include": "#keywords" },
+    { "include": "#resource-types" },
+    { "include": "#regions" },
+    { "include": "#strings" },
+    { "include": "#numbers" },
+    { "include": "#booleans" },
+    { "include": "#operators" },
+    { "include": "#functions" },
+    { "include": "#properties" },
+    { "include": "#variables" }
+  ],
+  "repository": {
+    "comments": {
+      "patterns": [
+        {
+          "name": "comment.line.number-sign.carina",
+          "match": "#.*$"
+        }
+      ]
+    },
+    "keywords": {
+      "patterns": [
+        {
+          "name": "keyword.control.carina",
+          "match": "\\b(provider|let)\\b"
+        }
+      ]
+    },
+    "resource-types": {
+      "patterns": [
+        {
+          "name": "support.class.carina",
+          "match": "(aws|gcp|azure)\\.[a-z][a-z0-9_]*\\.[a-z][a-z0-9_]*"
+        }
+      ]
+    },
+    "regions": {
+      "patterns": [
+        {
+          "name": "constant.other.region.carina",
+          "match": "\\baws\\.Region\\.[a-z][a-z0-9_]*\\b"
+        }
+      ]
+    },
+    "strings": {
+      "patterns": [
+        {
+          "name": "string.quoted.double.carina",
+          "begin": "\"",
+          "end": "\"",
+          "patterns": [
+            {
+              "name": "constant.character.escape.carina",
+              "match": "\\\\."
+            }
+          ]
+        }
+      ]
+    },
+    "numbers": {
+      "patterns": [
+        {
+          "name": "constant.numeric.carina",
+          "match": "\\b[0-9]+\\b"
+        }
+      ]
+    },
+    "booleans": {
+      "patterns": [
+        {
+          "name": "constant.language.boolean.carina",
+          "match": "\\b(true|false)\\b"
+        }
+      ]
+    },
+    "operators": {
+      "patterns": [
+        {
+          "name": "keyword.operator.assignment.carina",
+          "match": "="
+        }
+      ]
+    },
+    "functions": {
+      "patterns": [
+        {
+          "name": "entity.name.function.carina",
+          "match": "\\b(env)\\s*(?=\\()"
+        }
+      ]
+    },
+    "properties": {
+      "patterns": [
+        {
+          "name": "variable.other.property.carina",
+          "match": "^\\s*([a-z][a-z0-9_]*)\\s*(?==)",
+          "captures": {
+            "1": { "name": "variable.other.property.carina" }
+          }
+        }
+      ]
+    },
+    "variables": {
+      "patterns": [
+        {
+          "name": "variable.other.carina",
+          "match": "(?<=let\\s)[a-z][a-z0-9_]*"
+        }
+      ]
+    }
+  }
+}
