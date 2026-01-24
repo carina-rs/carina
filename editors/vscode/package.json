@@ -1,0 +1,57 @@
+{
+  "name": "carina",
+  "displayName": "Carina",
+  "description": "Language support for Carina DSL",
+  "version": "0.1.0",
+  "publisher": "mizzy",
+  "engines": {
+    "vscode": "^1.75.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "activationEvents": [
+    "onLanguage:carina"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "languages": [
+      {
+        "id": "carina",
+        "aliases": ["Carina", "carina"],
+        "extensions": [".crn"],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "carina",
+        "scopeName": "source.carina",
+        "path": "./syntaxes/carina.tmLanguage.json"
+      }
+    ],
+    "configuration": {
+      "type": "object",
+      "title": "Carina",
+      "properties": {
+        "carina.server.path": {
+          "type": "string",
+          "default": "",
+          "description": "Path to carina-lsp executable. Leave empty to use 'carina-lsp' from PATH."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.75.0",
+    "@types/node": "^20.0.0",
+    "typescript": "^5.0.0"
+  }
+}
