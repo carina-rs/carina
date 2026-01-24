@@ -137,28 +137,8 @@ impl DiagnosticEngine {
                             "name"
                         };
 
-                        // Check for ResourceRef (e.g., vpc.id when misused)
-                        if let Value::ResourceRef(binding, _) = attr_value
-                            && let Some((line, col)) =
-                                self.find_attribute_value_position(doc, attr_name, binding)
-                        {
-                            diagnostics.push(Diagnostic {
-                                range: Range {
-                                    start: Position { line, character: col },
-                                    end: Position {
-                                        line,
-                                        character: col + binding.len() as u32,
-                                    },
-                                },
-                                severity: Some(DiagnosticSeverity::WARNING),
-                                source: Some("carina".to_string()),
-                                message: format!(
-                                    "Expected string, got resource reference '{}'. Did you mean '{}.{}'?",
-                                    binding, binding, suggested_attr
-                                ),
-                                ..Default::default()
-                            });
-                        }
+                        // Note: ResourceRef values (e.g., vpc.id) are valid - they resolve to strings
+                        // We only warn about bare resource bindings stored as ${binding}
 
                         // Check for resource binding placeholder ${binding}
                         // This happens when you write `vpc_id = vpc` instead of `vpc_id = vpc.id`
