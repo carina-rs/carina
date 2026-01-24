@@ -1,0 +1,71 @@
+// Carina DSL Grammar
+
+// エントリーポイント
+file = { SOI ~ statement* ~ EOI }
+
+statement = { provider_block | let_binding | anonymous_resource }
+
+// 匿名リソース: aws.s3.bucket { ... }（トップレベル）
+anonymous_resource = { namespaced_id ~ "{" ~ attribute* ~ "}" }
+
+// providerブロック: provider aws { ... }
+provider_block = {
+    "provider" ~ identifier ~ "{" ~ attribute* ~ "}"
+}
+
+// 変数/リソース定義: let name = value
+let_binding = { "let" ~ identifier ~ "=" ~ expression }
+
+// 属性: key = value
+attribute = { identifier ~ "=" ~ expression }
+
+identifier = @{ ASCII_ALPHA ~ (ASCII_ALPHANUMERIC | "_")* }
+
+// 名前空間付き識別子: aws.s3.bucket, aws.Region.ap_northeast_1
+namespaced_id = @{ identifier ~ ("." ~ identifier)+ }
+
+// 式
+expression = { pipe_expr }
+
+// パイプ演算子: value |> func |> func
+pipe_expr = { primary ~ ("|>" ~ function_call)* }
+
+// 関数呼び出し: func(args)
+function_call = { identifier ~ "(" ~ (expression ~ ("," ~ expression)*)? ~ ")" }
+
+// 基本値
+primary = {
+    env_var
+  | resource_expr
+  | namespaced_id
+  | boolean
+  | number
+  | string
+  | variable_ref
+  | "(" ~ expression ~ ")"
+}
+
+// 環境変数: env("VAR_NAME")
+env_var = { "env" ~ "(" ~ string ~ ")" }
+
+// リソース式: aws.s3.bucket { ... }
+resource_expr = { namespaced_id ~ "{" ~ attribute* ~ "}" }
+
+// 変数参照
+variable_ref = { identifier }
+
+// リテラル
+boolean = { "true" | "false" }
+number = @{ "-"? ~ ASCII_DIGIT+ }
+string = ${ "\"" ~ inner_string ~ "\"" }
+inner_string = @{ char* }
+char = {
+    !("\"" | "\\") ~ ANY
+  | "\\" ~ ("\"" | "\\" | "n" | "r" | "t")
+}
+
+// 空白（自動スキップ）
+WHITESPACE = _{ " " | "\t" | NEWLINE }
+
+// コメント（自動スキップ）
+COMMENT = _{ "#" ~ (!NEWLINE ~ ANY)* }

@@ -1,0 +1,13 @@
+[package]
+name = "carina-core"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[dependencies]
+pest = "2"
+pest_derive = "2"
+thiserror = "2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

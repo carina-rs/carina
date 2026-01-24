@@ -1,0 +1,25 @@
+# Carina example - Anonymous and named resources
+
+provider aws {
+    region = aws.Region.ap_northeast_1
+}
+
+# Anonymous resource (ID derived from name attribute)
+aws.s3.bucket {
+    name = "carina-test-logs-mizzy-2026"
+    region = aws.Region.ap_northeast_1
+    versioning = true
+    expiration_days = 90
+}
+
+aws.s3.bucket {
+    name = "carina-test-data-mizzy-2026"
+    region = aws.Region.ap_northeast_1
+    versioning = true
+}
+
+# Named resource (for referencing)
+let backup = aws.s3.bucket {
+    name = "carina-test-backup-mizzy-2026"
+    region = aws.Region.ap_northeast_1
+}

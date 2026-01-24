@@ -1,0 +1,7 @@
+[workspace]
+members = [
+    "carina-cli",
+    "carina-core",
+    "carina-provider-aws",
+]
+resolver = "2"

@@ -1,0 +1,12 @@
+[package]
+name = "carina-provider-aws"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[dependencies]
+carina-core = { path = "../carina-core" }
+aws-config = "1"
+aws-sdk-s3 = "1"
+tokio = { version = "1", features = ["full"] }
+thiserror = "2"
