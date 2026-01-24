@@ -1,0 +1,37 @@
+#!/bin/bash
+# Pre-commit hook for Carina
+# Install: ./scripts/setup-hooks.sh
+
+set -e
+
+echo "Running pre-commit checks..."
+
+# Check formatting
+echo "Checking formatting..."
+cargo fmt --all -- --check
+if [ $? -ne 0 ]; then
+    echo "Formatting check failed. Run 'cargo fmt --all' to fix."
+    exit 1
+fi
+echo "Formatting OK"
+
+# Run clippy
+echo "Running clippy..."
+cargo clippy --all-targets --all-features -- -D warnings
+if [ $? -ne 0 ]; then
+    echo "Clippy check failed. Fix the warnings above."
+    exit 1
+fi
+echo "Clippy OK"
+
+# Run tests
+echo "Running tests..."
+cargo test --quiet
+if [ $? -ne 0 ]; then
+    echo "Tests failed."
+    exit 1
+fi
+echo "Tests OK"
+
+echo ""
+echo "All pre-commit checks passed!"
