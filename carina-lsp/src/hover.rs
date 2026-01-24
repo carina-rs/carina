@@ -1,7 +1,8 @@
 use tower_lsp::lsp_types::{Hover, HoverContents, MarkupContent, MarkupKind, Position};
 
 use crate::document::Document;
-use carina_core::providers::s3;
+use carina_core::providers::{ec2, s3};
+use carina_core::schema::ResourceSchema;
 
 pub struct HoverProvider;
 
@@ -37,56 +38,112 @@ impl HoverProvider {
     }
 
     fn resource_type_hover(&self, word: &str) -> Option<Hover> {
+        // S3 resources
         if word == "aws.s3.bucket" || word.contains("s3.bucket") {
-            let schema = s3::bucket_schema();
-            let description = schema
-                .description
-                .as_deref()
-                .unwrap_or("S3 bucket resource");
-
-            let mut content = format!("## aws.s3.bucket\n\n{}\n\n### Attributes\n\n", description);
-
-            for attr in schema.attributes.values() {
-                let required = if attr.required { " **(required)**" } else { "" };
-                let desc = attr.description.as_deref().unwrap_or("");
-                content.push_str(&format!("- `{}`: {}{}\n", attr.name, desc, required));
-            }
-
-            return Some(Hover {
-                contents: HoverContents::Markup(MarkupContent {
-                    kind: MarkupKind::Markdown,
-                    value: content,
-                }),
-                range: None,
-            });
+            return self.schema_hover("aws.s3.bucket", &s3::bucket_schema());
         }
+
+        // EC2/VPC resources
+        if word == "aws.vpc" || word.contains(".vpc") && !word.contains("vpc_id") {
+            return self.schema_hover("aws.vpc", &ec2::vpc_schema());
+        }
+
+        if word == "aws.subnet" || word.contains(".subnet") && !word.contains("subnet_id") {
+            return self.schema_hover("aws.subnet", &ec2::subnet_schema());
+        }
+
+        if word == "aws.internet_gateway" || word.contains("internet_gateway") {
+            return self.schema_hover("aws.internet_gateway", &ec2::internet_gateway_schema());
+        }
+
+        if word == "aws.route_table" || word.contains("route_table") {
+            return self.schema_hover("aws.route_table", &ec2::route_table_schema());
+        }
+
+        if word == "aws.security_group_ingress_rule" || word.contains("security_group_ingress_rule")
+        {
+            return self.schema_hover(
+                "aws.security_group_ingress_rule",
+                &ec2::security_group_ingress_rule_schema(),
+            );
+        }
+
+        if word == "aws.security_group_egress_rule" || word.contains("security_group_egress_rule") {
+            return self.schema_hover(
+                "aws.security_group_egress_rule",
+                &ec2::security_group_egress_rule_schema(),
+            );
+        }
+
+        if word == "aws.security_group" || word.contains("security_group") {
+            return self.schema_hover("aws.security_group", &ec2::security_group_schema());
+        }
+
         None
     }
 
+    fn schema_hover(&self, resource_name: &str, schema: &ResourceSchema) -> Option<Hover> {
+        let description = schema
+            .description
+            .as_deref()
+            .unwrap_or("No description available");
+
+        let mut content = format!(
+            "## {}\n\n{}\n\n### Attributes\n\n",
+            resource_name, description
+        );
+
+        for attr in schema.attributes.values() {
+            let required = if attr.required { " **(required)**" } else { "" };
+            let desc = attr.description.as_deref().unwrap_or("");
+            content.push_str(&format!("- `{}`: {}{}\n", attr.name, desc, required));
+        }
+
+        Some(Hover {
+            contents: HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value: content,
+            }),
+            range: None,
+        })
+    }
+
     fn attribute_hover(&self, word: &str) -> Option<Hover> {
-        let schema = s3::bucket_schema();
+        // Check all schemas for the attribute
+        let schemas = vec![
+            s3::bucket_schema(),
+            ec2::vpc_schema(),
+            ec2::subnet_schema(),
+            ec2::internet_gateway_schema(),
+            ec2::route_table_schema(),
+            ec2::security_group_schema(),
+            ec2::security_group_ingress_rule_schema(),
+            ec2::security_group_egress_rule_schema(),
+        ];
 
-        if let Some(attr) = schema.attributes.get(word) {
-            let description = attr.description.as_deref().unwrap_or("No description");
-            let required = if attr.required {
-                "Required"
-            } else {
-                "Optional"
-            };
-            let type_name = format!("{}", attr.attr_type);
+        for schema in schemas {
+            if let Some(attr) = schema.attributes.get(word) {
+                let description = attr.description.as_deref().unwrap_or("No description");
+                let required = if attr.required {
+                    "Required"
+                } else {
+                    "Optional"
+                };
+                let type_name = format!("{}", attr.attr_type);
 
-            let content = format!(
-                "## {}\n\n{}\n\n- **Type**: {}\n- **Required**: {}",
-                attr.name, description, type_name, required
-            );
+                let content = format!(
+                    "## {}\n\n{}\n\n- **Type**: {}\n- **Required**: {}",
+                    attr.name, description, type_name, required
+                );
 
-            return Some(Hover {
-                contents: HoverContents::Markup(MarkupContent {
-                    kind: MarkupKind::Markdown,
-                    value: content,
-                }),
-                range: None,
-            });
+                return Some(Hover {
+                    contents: HoverContents::Markup(MarkupContent {
+                        kind: MarkupKind::Markdown,
+                        value: content,
+                    }),
+                    range: None,
+                });
+            }
         }
         None
     }
