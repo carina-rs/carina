@@ -90,10 +90,9 @@ impl Formatter {
             self.write_newline();
         }
 
-        // Ensure file ends with a newline
-        if !self.output.ends_with('\n') {
-            self.write_newline();
-        }
+        // Ensure file ends with exactly one newline (trim extra trailing newlines)
+        let trimmed = self.output.trim_end();
+        self.output = format!("{}\n", trimmed);
     }
 
     fn format_node(&mut self, node: &CstNode) {

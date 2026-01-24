@@ -158,9 +158,12 @@ impl LanguageServer for Backend {
                     }
 
                     // Calculate the range covering the entire document
-                    let lines: Vec<&str> = text.lines().collect();
-                    let last_line = lines.len().saturating_sub(1) as u32;
-                    let last_char = lines.last().map(|l| l.len() as u32).unwrap_or(0);
+                    // Note: lines() doesn't include trailing empty lines, so we count newlines manually
+                    let line_count = text.chars().filter(|&c| c == '\n').count();
+                    let last_line = line_count as u32;
+                    let last_char = text.lines().last().map(|l| l.len() as u32).unwrap_or(0);
+                    // If text ends with newline, last line is empty
+                    let last_char = if text.ends_with('\n') { 0 } else { last_char };
 
                     let edit = TextEdit {
                         range: Range {
