@@ -6,7 +6,7 @@ file = { SOI ~ statement* ~ EOI }
 statement = { provider_block | let_binding | anonymous_resource }
 
 // Anonymous resource: aws.s3.bucket { ... } (top-level)
-anonymous_resource = { namespaced_id ~ "{" ~ attribute* ~ "}" }
+anonymous_resource = { namespaced_id ~ "{" ~ block_content* ~ "}" }
 
 // Provider block: provider aws { ... }
 provider_block = {
@@ -16,8 +16,14 @@ provider_block = {
 // Variable/resource definition: let name = value
 let_binding = { "let" ~ identifier ~ "=" ~ expression }
 
+// Block content: either an attribute (key = value) or a nested block (key { ... })
+block_content = { attribute | nested_block }
+
 // Attribute: key = value
 attribute = { identifier ~ "=" ~ expression }
+
+// Nested block: key { ... } (like Terraform's ingress { ... })
+nested_block = { identifier ~ "{" ~ attribute* ~ "}" }
 
 identifier = @{ ASCII_ALPHA ~ (ASCII_ALPHANUMERIC | "_")* }
 
@@ -37,6 +43,8 @@ function_call = { identifier ~ "(" ~ (expression ~ ("," ~ expression)*)? ~ ")" }
 primary = {
     env_var
   | resource_expr
+  | list
+  | map
   | namespaced_id
   | boolean
   | number
@@ -45,11 +53,20 @@ primary = {
   | "(" ~ expression ~ ")"
 }
 
+// List: [item1, item2, ...]
+list = { "[" ~ (expression ~ ("," ~ expression)*)? ~ ","? ~ "]" }
+
+// Map: { key = value, ... }
+map = { "{" ~ (map_entry ~ ("," ~ map_entry)*)? ~ ","? ~ "}" }
+
+// Map entry: key = value
+map_entry = { identifier ~ "=" ~ expression }
+
 // Environment variable: env("VAR_NAME")
 env_var = { "env" ~ "(" ~ string ~ ")" }
 
 // Resource expression: aws.s3.bucket { ... }
-resource_expr = { namespaced_id ~ "{" ~ attribute* ~ "}" }
+resource_expr = { namespaced_id ~ "{" ~ block_content* ~ "}" }
 
 // Variable reference (with optional member access: bucket.name)
 variable_ref = { identifier ~ ("." ~ identifier)? }

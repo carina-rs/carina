@@ -12,7 +12,7 @@
 //! let config = FormatConfig::default();
 //! let formatted = format(source, &config).unwrap();
 //!
-//! assert!(formatted.contains("    region = aws.Region.ap_northeast_1"));
+//! assert!(formatted.contains("  region = aws.Region.ap_northeast_1"));
 //! ```
 
 mod config;

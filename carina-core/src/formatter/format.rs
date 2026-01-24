@@ -504,7 +504,7 @@ mod tests {
         let result = format(input, &config).unwrap();
 
         assert!(result.contains("provider aws {"));
-        assert!(result.contains("    region = aws.Region.ap_northeast_1"));
+        assert!(result.contains("  region = aws.Region.ap_northeast_1"));
     }
 
     #[test]
@@ -518,11 +518,11 @@ mod tests {
 
     #[test]
     fn test_format_normalizes_indentation() {
-        let input = "aws.s3.bucket {\n  name = \"test\"\n}";
+        let input = "aws.s3.bucket {\n    name = \"test\"\n}";
         let config = FormatConfig::default();
         let result = format(input, &config).unwrap();
 
-        assert!(result.contains("    name = \"test\""));
+        assert!(result.contains("  name = \"test\""));
     }
 
     #[test]
@@ -548,7 +548,7 @@ mod tests {
 
     #[test]
     fn test_format_idempotent() {
-        let input = "provider aws {\n    region = aws.Region.ap_northeast_1\n}\n";
+        let input = "provider aws {\n  region = aws.Region.ap_northeast_1\n}\n";
         let config = FormatConfig::default();
 
         let first = format(input, &config).unwrap();
@@ -570,7 +570,7 @@ mod tests {
     fn test_needs_format() {
         let config = FormatConfig::default();
 
-        let formatted = "provider aws {\n    region = aws.Region.ap_northeast_1\n}\n";
+        let formatted = "provider aws {\n  region = aws.Region.ap_northeast_1\n}\n";
         assert!(!needs_format(formatted, &config).unwrap());
 
         let unformatted = "provider aws {\nregion=aws.Region.ap_northeast_1\n}";

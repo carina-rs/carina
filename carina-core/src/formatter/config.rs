@@ -3,7 +3,7 @@
 /// Formatting options
 #[derive(Debug, Clone)]
 pub struct FormatConfig {
-    /// Number of spaces for indentation (default: 4)
+    /// Number of spaces for indentation (default: 2)
     pub indent_size: usize,
 
     /// Use tabs instead of spaces for indentation
@@ -19,7 +19,7 @@ pub struct FormatConfig {
 impl Default for FormatConfig {
     fn default() -> Self {
         Self {
-            indent_size: 4,
+            indent_size: 2,
             use_tabs: false,
             blank_lines_between_blocks: 1,
             align_attributes: true,
@@ -45,7 +45,7 @@ mod tests {
     #[test]
     fn test_default_config() {
         let config = FormatConfig::default();
-        assert_eq!(config.indent_size, 4);
+        assert_eq!(config.indent_size, 2);
         assert!(!config.use_tabs);
         assert_eq!(config.blank_lines_between_blocks, 1);
         assert!(config.align_attributes);
@@ -54,7 +54,7 @@ mod tests {
     #[test]
     fn test_indent_string_spaces() {
         let config = FormatConfig::default();
-        assert_eq!(config.indent_string(), "    ");
+        assert_eq!(config.indent_string(), "  ");
     }
 
     #[test]

@@ -4,6 +4,7 @@
 //! enabling type validation at parse time.
 
 use std::collections::HashMap;
+use std::fmt;
 
 use crate::resource::Value;
 
@@ -34,7 +35,8 @@ impl AttributeType {
     /// Check if a value conforms to this type
     pub fn validate(&self, value: &Value) -> Result<(), TypeError> {
         match (self, value) {
-            (AttributeType::String, Value::String(_)) => Ok(()),
+            // ResourceRef values resolve to strings at runtime, so they're valid for String types
+            (AttributeType::String, Value::String(_) | Value::ResourceRef(_, _)) => Ok(()),
             (AttributeType::Int, Value::Int(_)) => Ok(()),
             (AttributeType::Bool, Value::Bool(_)) => Ok(()),
 
@@ -92,6 +94,12 @@ impl AttributeType {
             AttributeType::List(inner) => format!("List<{}>", inner.type_name()),
             AttributeType::Map(inner) => format!("Map<{}>", inner.type_name()),
         }
+    }
+}
+
+impl fmt::Display for AttributeType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.type_name())
     }
 }
 

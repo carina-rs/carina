@@ -1,19 +1,19 @@
 //! S3 bucket schema definition
 
-use crate::schema::{AttributeSchema, AttributeType, ResourceSchema, types};
+use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, types};
 
 /// Returns the schema for S3 buckets
 pub fn bucket_schema() -> ResourceSchema {
-    ResourceSchema::new("s3_bucket")
+    ResourceSchema::new("s3.bucket")
         .with_description("An S3 bucket for object storage")
         .attribute(
             AttributeSchema::new("name", types::s3_bucket_name())
                 .with_description("Override bucket name (defaults to resource name)"),
         )
         .attribute(
-            AttributeSchema::new("region", types::aws_region())
-                .required()
-                .with_description("The AWS region for the bucket"),
+            AttributeSchema::new("region", types::aws_region()).with_description(
+                "The AWS region for the bucket (inherited from provider if not specified)",
+            ),
         )
         .attribute(
             AttributeSchema::new("acl", types::s3_acl())
@@ -37,7 +37,7 @@ pub fn schemas() -> Vec<ResourceSchema> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::resource::Value;
+    use carina_core::resource::Value;
     use std::collections::HashMap;
 
     #[test]
@@ -92,12 +92,13 @@ mod tests {
     }
 
     #[test]
-    fn missing_required_region() {
+    fn region_is_optional() {
         let schema = bucket_schema();
         let attrs = HashMap::new();
 
+        // Region is no longer required (inherited from provider)
         let result = schema.validate(&attrs);
-        assert!(result.is_err());
+        assert!(result.is_ok());
     }
 
     #[test]

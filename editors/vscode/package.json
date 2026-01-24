@@ -40,6 +40,11 @@
           "description": "Path to carina-lsp executable. Leave empty to use 'carina-lsp' from PATH."
         }
       }
+    },
+    "configurationDefaults": {
+      "[carina]": {
+        "editor.formatOnSave": true
+      }
     }
   },
   "scripts": {

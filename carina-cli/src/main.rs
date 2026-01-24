@@ -9,13 +9,13 @@ use similar::{ChangeTag, TextDiff};
 use carina_core::differ::create_plan;
 use carina_core::effect::Effect;
 use carina_core::formatter::{self, FormatConfig};
-use carina_core::interpreter::{EffectOutcome, Interpreter};
 use carina_core::parser::{self, ParsedFile};
 use carina_core::plan::Plan;
 use carina_core::provider::{BoxFuture, Provider, ProviderError, ProviderResult, ResourceType};
-use carina_core::providers::s3;
 use carina_core::resource::{Resource, ResourceId, State, Value};
 use carina_core::schema::ResourceSchema;
+use carina_provider_aws::schemas;
+use std::collections::HashSet;
 
 use carina_provider_aws::AwsProvider;
 
@@ -90,11 +90,11 @@ async fn main() {
 }
 
 fn get_schemas() -> HashMap<String, ResourceSchema> {
-    let mut schemas = HashMap::new();
-    for schema in s3::schemas() {
-        schemas.insert(schema.resource_type.clone(), schema);
+    let mut all_schemas = HashMap::new();
+    for schema in schemas::all_schemas() {
+        all_schemas.insert(schema.resource_type.clone(), schema);
     }
-    schemas
+    all_schemas
 }
 
 fn validate_resources(resources: &[Resource]) -> Result<(), String> {
@@ -125,7 +125,11 @@ fn run_validate(file: &PathBuf) -> Result<(), String> {
     let content = fs::read_to_string(file)
         .map_err(|e| format!("Failed to read {}: {}", file.display(), e))?;
 
-    let parsed = parser::parse_and_resolve(&content).map_err(|e| format!("Parse error: {}", e))?;
+    let mut parsed =
+        parser::parse_and_resolve(&content).map_err(|e| format!("Parse error: {}", e))?;
+
+    // Apply default region from provider
+    apply_default_region(&mut parsed);
 
     println!("{}", "Validating...".cyan());
 
@@ -152,7 +156,11 @@ async fn run_plan(file: &PathBuf) -> Result<(), String> {
     let content = fs::read_to_string(file)
         .map_err(|e| format!("Failed to read {}: {}", file.display(), e))?;
 
-    let parsed = parser::parse_and_resolve(&content).map_err(|e| format!("Parse error: {}", e))?;
+    let mut parsed =
+        parser::parse_and_resolve(&content).map_err(|e| format!("Parse error: {}", e))?;
+
+    // Apply default region from provider
+    apply_default_region(&mut parsed);
 
     validate_resources(&parsed.resources)?;
 
@@ -165,11 +173,105 @@ async fn run_apply(file: &PathBuf) -> Result<(), String> {
     let content = fs::read_to_string(file)
         .map_err(|e| format!("Failed to read {}: {}", file.display(), e))?;
 
-    let parsed = parser::parse_and_resolve(&content).map_err(|e| format!("Parse error: {}", e))?;
+    let mut parsed =
+        parser::parse_and_resolve(&content).map_err(|e| format!("Parse error: {}", e))?;
+
+    // Apply default region from provider
+    apply_default_region(&mut parsed);
 
     validate_resources(&parsed.resources)?;
 
-    let plan = create_plan_from_parsed(&parsed).await?;
+    // Sort resources by dependencies
+    let sorted_resources = sort_resources_by_dependencies(&parsed.resources);
+
+    // Select appropriate Provider based on configuration
+    let provider: Box<dyn Provider> = get_provider(&parsed).await;
+
+    // Get AWS provider for route-specific reads
+    let region = get_aws_region(&parsed);
+    let aws_provider = AwsProvider::new(&region).await;
+
+    // First pass: read states for non-route resources
+    let mut current_states: HashMap<ResourceId, State> = HashMap::new();
+    for resource in &sorted_resources {
+        if resource.id.resource_type != "route" {
+            let state = provider
+                .read(&resource.id)
+                .await
+                .map_err(|e| format!("Failed to read state: {}", e))?;
+            current_states.insert(resource.id.clone(), state);
+        }
+    }
+
+    // Build initial binding map for route reference resolution
+    let mut route_binding_map: HashMap<String, HashMap<String, Value>> = HashMap::new();
+    for resource in &sorted_resources {
+        if let Some(Value::String(binding_name)) = resource.attributes.get("_binding") {
+            let mut attrs = resource.attributes.clone();
+            if let Some(state) = current_states.get(&resource.id)
+                && state.exists
+            {
+                for (k, v) in &state.attributes {
+                    if !attrs.contains_key(k) {
+                        attrs.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+            route_binding_map.insert(binding_name.clone(), attrs);
+        }
+    }
+
+    // Second pass: read states for route resources (need resolved route_table_id)
+    for resource in &sorted_resources {
+        if resource.id.resource_type == "route" {
+            // Resolve route_table_id and destination_cidr_block
+            let route_table_id = match resource.attributes.get("route_table_id") {
+                Some(value) => {
+                    let resolved = resolve_ref_value(value, &route_binding_map);
+                    match resolved {
+                        Value::String(s) => s,
+                        _ => continue,
+                    }
+                }
+                None => continue,
+            };
+
+            let destination_cidr = match resource.attributes.get("destination_cidr_block") {
+                Some(Value::String(s)) => s.clone(),
+                _ => continue,
+            };
+
+            let state = aws_provider
+                .read_ec2_route_by_key(&resource.id.name, &route_table_id, &destination_cidr)
+                .await
+                .map_err(|e| format!("Failed to read route state: {}", e))?;
+            current_states.insert(resource.id.clone(), state);
+        }
+    }
+
+    // Build initial binding map for reference resolution
+    let mut binding_map: HashMap<String, HashMap<String, Value>> = HashMap::new();
+    for resource in &sorted_resources {
+        if let Some(Value::String(binding_name)) = resource.attributes.get("_binding") {
+            let mut attrs = resource.attributes.clone();
+            // Merge existing state if available
+            if let Some(state) = current_states.get(&resource.id)
+                && state.exists
+            {
+                for (k, v) in &state.attributes {
+                    if !attrs.contains_key(k) {
+                        attrs.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+            binding_map.insert(binding_name.clone(), attrs);
+        }
+    }
+
+    // Resolve references and create initial plan for display
+    let mut resources_for_plan = sorted_resources.clone();
+    resolve_refs_with_state(&mut resources_for_plan, &current_states);
+    let plan = create_plan(&resources_for_plan, &current_states);
 
     if plan.is_empty() {
         println!("{}", "No changes needed.".green());
@@ -179,42 +281,94 @@ async fn run_apply(file: &PathBuf) -> Result<(), String> {
     print_plan(&plan);
     println!();
 
-    // Select appropriate Provider based on configuration
-    let provider: Box<dyn Provider> = get_provider(&parsed).await;
-    let interpreter = Interpreter::new(provider);
-
     println!("{}", "Applying changes...".cyan().bold());
     println!();
 
-    let result = interpreter.apply(&plan).await;
+    let mut success_count = 0;
+    let mut failure_count = 0;
 
-    for (i, outcome) in result.outcomes.iter().enumerate() {
-        let effect = &plan.effects()[i];
-        match outcome {
-            Ok(EffectOutcome::Created { .. }) => {
-                println!("  {} {}", "✓".green(), format_effect(effect));
+    // Apply each effect in order, resolving references dynamically
+    for effect in plan.effects() {
+        match effect {
+            Effect::Create(resource) => {
+                // Re-resolve references with current binding_map
+                let mut resolved_resource = resource.clone();
+                for (key, value) in &resource.attributes {
+                    resolved_resource
+                        .attributes
+                        .insert(key.clone(), resolve_ref_value(value, &binding_map));
+                }
+
+                match provider.create(&resolved_resource).await {
+                    Ok(state) => {
+                        println!("  {} {}", "✓".green(), format_effect(effect));
+                        success_count += 1;
+
+                        // Update binding_map with the newly created resource's state (including id)
+                        if let Some(Value::String(binding_name)) =
+                            resource.attributes.get("_binding")
+                        {
+                            let mut attrs = resolved_resource.attributes.clone();
+                            for (k, v) in &state.attributes {
+                                attrs.insert(k.clone(), v.clone());
+                            }
+                            binding_map.insert(binding_name.clone(), attrs);
+                        }
+                    }
+                    Err(e) => {
+                        println!("  {} {} - {}", "✗".red(), format_effect(effect), e);
+                        failure_count += 1;
+                    }
+                }
             }
-            Ok(EffectOutcome::Updated { .. }) => {
-                println!("  {} {}", "✓".green(), format_effect(effect));
+            Effect::Update { id, from, to } => {
+                // Re-resolve references
+                let mut resolved_to = to.clone();
+                for (key, value) in &to.attributes {
+                    resolved_to
+                        .attributes
+                        .insert(key.clone(), resolve_ref_value(value, &binding_map));
+                }
+
+                match provider.update(id, from, &resolved_to).await {
+                    Ok(state) => {
+                        println!("  {} {}", "✓".green(), format_effect(effect));
+                        success_count += 1;
+
+                        // Update binding_map
+                        if let Some(Value::String(binding_name)) = to.attributes.get("_binding") {
+                            let mut attrs = resolved_to.attributes.clone();
+                            for (k, v) in &state.attributes {
+                                attrs.insert(k.clone(), v.clone());
+                            }
+                            binding_map.insert(binding_name.clone(), attrs);
+                        }
+                    }
+                    Err(e) => {
+                        println!("  {} {} - {}", "✗".red(), format_effect(effect), e);
+                        failure_count += 1;
+                    }
+                }
             }
-            Ok(EffectOutcome::Deleted) => {
-                println!("  {} {}", "✓".green(), format_effect(effect));
-            }
-            Ok(EffectOutcome::Skipped { reason }) => {
-                println!("  {} {} ({})", "⊘".yellow(), format_effect(effect), reason);
-            }
-            Ok(EffectOutcome::Read { .. }) => {}
-            Err(e) => {
-                println!("  {} {} - {}", "✗".red(), format_effect(effect), e);
-            }
+            Effect::Delete(id) => match provider.delete(id).await {
+                Ok(()) => {
+                    println!("  {} {}", "✓".green(), format_effect(effect));
+                    success_count += 1;
+                }
+                Err(e) => {
+                    println!("  {} {} - {}", "✗".red(), format_effect(effect), e);
+                    failure_count += 1;
+                }
+            },
+            Effect::Read(_) => {}
         }
     }
 
     println!();
-    if result.is_success() {
+    if failure_count == 0 {
         println!(
             "{}",
-            format!("Apply complete! {} changes applied.", result.success_count)
+            format!("Apply complete! {} changes applied.", success_count)
                 .green()
                 .bold()
         );
@@ -223,7 +377,7 @@ async fn run_apply(file: &PathBuf) -> Result<(), String> {
             "{}",
             format!(
                 "Apply failed. {} succeeded, {} failed.",
-                result.success_count, result.failure_count
+                success_count, failure_count
             )
             .red()
             .bold()
@@ -233,24 +387,45 @@ async fn run_apply(file: &PathBuf) -> Result<(), String> {
     Ok(())
 }
 
-/// Get region from provider configuration
-fn get_aws_region(parsed: &ParsedFile) -> String {
+/// Get region from provider configuration (DSL format: aws.Region.ap_northeast_1)
+fn get_aws_region_dsl(parsed: &ParsedFile) -> Option<String> {
     for provider in &parsed.providers {
         if provider.name == "aws"
             && let Some(Value::String(region)) = provider.attributes.get("region")
         {
-            // Convert from aws.Region.ap_northeast_1 format to ap-northeast-1 format
-            if region.starts_with("aws.Region.") {
-                return region
-                    .strip_prefix("aws.Region.")
-                    .unwrap_or(region)
-                    .replace('_', "-");
-            }
-            return region.clone();
+            return Some(region.clone());
         }
+    }
+    None
+}
+
+/// Get region from provider configuration (AWS format: ap-northeast-1)
+fn get_aws_region(parsed: &ParsedFile) -> String {
+    if let Some(region) = get_aws_region_dsl(parsed) {
+        // Convert from aws.Region.ap_northeast_1 format to ap-northeast-1 format
+        if region.starts_with("aws.Region.") {
+            return region
+                .strip_prefix("aws.Region.")
+                .unwrap_or(&region)
+                .replace('_', "-");
+        }
+        return region;
     }
     // Default region
     "ap-northeast-1".to_string()
+}
+
+/// Apply default region from provider to resources that don't have a region specified
+fn apply_default_region(parsed: &mut ParsedFile) {
+    if let Some(default_region) = get_aws_region_dsl(parsed) {
+        for resource in &mut parsed.resources {
+            if !resource.attributes.contains_key("region") {
+                resource
+                    .attributes
+                    .insert("region".to_string(), Value::String(default_region.clone()));
+            }
+        }
+    }
 }
 
 /// Determine and return the appropriate Provider
@@ -272,20 +447,239 @@ async fn get_provider(parsed: &ParsedFile) -> Box<dyn Provider> {
     Box::new(FileProvider::new())
 }
 
-async fn create_plan_from_parsed(parsed: &ParsedFile) -> Result<Plan, String> {
-    let provider: Box<dyn Provider> = get_provider(parsed).await;
+/// Resolve ResourceRef values using current AWS state
+fn resolve_refs_with_state(
+    resources: &mut [Resource],
+    current_states: &HashMap<ResourceId, State>,
+) {
+    // Build a map of binding_name -> attributes (merged from DSL and AWS state)
+    let mut binding_map: HashMap<String, HashMap<String, Value>> = HashMap::new();
 
-    // Get current state
-    let mut current_states = HashMap::new();
-    for resource in &parsed.resources {
-        let state = provider
-            .read(&resource.id)
-            .await
-            .map_err(|e| format!("Failed to read state: {}", e))?;
-        current_states.insert(resource.id.clone(), state);
+    for resource in resources.iter() {
+        if let Some(Value::String(binding_name)) = resource.attributes.get("_binding") {
+            let mut attrs = resource.attributes.clone();
+
+            // Merge AWS state attributes (like `id`) if available
+            if let Some(state) = current_states.get(&resource.id)
+                && state.exists
+            {
+                for (k, v) in &state.attributes {
+                    if !attrs.contains_key(k) {
+                        attrs.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+
+            binding_map.insert(binding_name.clone(), attrs);
+        }
     }
 
-    Ok(create_plan(&parsed.resources, &current_states))
+    // Resolve ResourceRef values in all resources
+    for resource in resources.iter_mut() {
+        let mut resolved_attrs = HashMap::new();
+        for (key, value) in &resource.attributes {
+            resolved_attrs.insert(key.clone(), resolve_ref_value(value, &binding_map));
+        }
+        resource.attributes = resolved_attrs;
+    }
+}
+
+fn resolve_ref_value(
+    value: &Value,
+    binding_map: &HashMap<String, HashMap<String, Value>>,
+) -> Value {
+    match value {
+        Value::ResourceRef(binding_name, attr_name) => {
+            if let Some(attrs) = binding_map.get(binding_name)
+                && let Some(attr_value) = attrs.get(attr_name)
+            {
+                // Recursively resolve
+                return resolve_ref_value(attr_value, binding_map);
+            }
+            // Keep as-is if not found
+            value.clone()
+        }
+        Value::List(items) => Value::List(
+            items
+                .iter()
+                .map(|v| resolve_ref_value(v, binding_map))
+                .collect(),
+        ),
+        Value::Map(map) => Value::Map(
+            map.iter()
+                .map(|(k, v)| (k.clone(), resolve_ref_value(v, binding_map)))
+                .collect(),
+        ),
+        _ => value.clone(),
+    }
+}
+
+/// Extract binding names that a resource depends on
+fn get_resource_dependencies(resource: &Resource) -> HashSet<String> {
+    let mut deps = HashSet::new();
+    for value in resource.attributes.values() {
+        collect_dependencies(value, &mut deps);
+    }
+    deps
+}
+
+fn collect_dependencies(value: &Value, deps: &mut HashSet<String>) {
+    match value {
+        Value::ResourceRef(binding_name, _) => {
+            deps.insert(binding_name.clone());
+        }
+        Value::List(items) => {
+            for item in items {
+                collect_dependencies(item, deps);
+            }
+        }
+        Value::Map(map) => {
+            for v in map.values() {
+                collect_dependencies(v, deps);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Sort resources topologically based on dependencies
+fn sort_resources_by_dependencies(resources: &[Resource]) -> Vec<Resource> {
+    // Build binding name to resource mapping
+    let mut binding_to_resource: HashMap<String, &Resource> = HashMap::new();
+    for resource in resources {
+        if let Some(Value::String(binding_name)) = resource.attributes.get("_binding") {
+            binding_to_resource.insert(binding_name.clone(), resource);
+        }
+    }
+
+    // Build dependency graph
+    let mut sorted = Vec::new();
+    let mut visited: HashSet<String> = HashSet::new();
+    let mut visiting: HashSet<String> = HashSet::new();
+
+    fn visit<'a>(
+        resource: &'a Resource,
+        binding_to_resource: &HashMap<String, &'a Resource>,
+        visited: &mut HashSet<String>,
+        visiting: &mut HashSet<String>,
+        sorted: &mut Vec<Resource>,
+    ) {
+        let binding_name = resource
+            .attributes
+            .get("_binding")
+            .and_then(|v| match v {
+                Value::String(s) => Some(s.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| format!("{}:{}", resource.id.resource_type, resource.id.name));
+
+        if visited.contains(&binding_name) {
+            return;
+        }
+        if visiting.contains(&binding_name) {
+            // Circular dependency - just continue
+            return;
+        }
+
+        visiting.insert(binding_name.clone());
+
+        // Visit dependencies first
+        let deps = get_resource_dependencies(resource);
+        for dep in deps {
+            if let Some(dep_resource) = binding_to_resource.get(&dep) {
+                visit(dep_resource, binding_to_resource, visited, visiting, sorted);
+            }
+        }
+
+        visiting.remove(&binding_name);
+        visited.insert(binding_name);
+        sorted.push(resource.clone());
+    }
+
+    for resource in resources {
+        visit(
+            resource,
+            &binding_to_resource,
+            &mut visited,
+            &mut visiting,
+            &mut sorted,
+        );
+    }
+
+    sorted
+}
+
+async fn create_plan_from_parsed(parsed: &ParsedFile) -> Result<Plan, String> {
+    // Sort resources by dependencies first
+    let sorted_resources = sort_resources_by_dependencies(&parsed.resources);
+
+    // Get AWS provider for route-specific reads
+    let region = get_aws_region(parsed);
+    let aws_provider = AwsProvider::new(&region).await;
+
+    // First pass: read states for non-route resources
+    let mut current_states: HashMap<ResourceId, State> = HashMap::new();
+    for resource in &sorted_resources {
+        if resource.id.resource_type != "route" {
+            let state = aws_provider
+                .read(&resource.id)
+                .await
+                .map_err(|e| format!("Failed to read state: {}", e))?;
+            current_states.insert(resource.id.clone(), state);
+        }
+    }
+
+    // Build binding map for reference resolution
+    let mut binding_map: HashMap<String, HashMap<String, Value>> = HashMap::new();
+    for resource in &sorted_resources {
+        if let Some(Value::String(binding_name)) = resource.attributes.get("_binding") {
+            let mut attrs = resource.attributes.clone();
+            if let Some(state) = current_states.get(&resource.id)
+                && state.exists
+            {
+                for (k, v) in &state.attributes {
+                    if !attrs.contains_key(k) {
+                        attrs.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+            binding_map.insert(binding_name.clone(), attrs);
+        }
+    }
+
+    // Second pass: read states for route resources (need resolved route_table_id)
+    for resource in &sorted_resources {
+        if resource.id.resource_type == "route" {
+            // Resolve route_table_id and destination_cidr_block
+            let route_table_id = match resource.attributes.get("route_table_id") {
+                Some(value) => {
+                    let resolved = resolve_ref_value(value, &binding_map);
+                    match resolved {
+                        Value::String(s) => s,
+                        _ => continue,
+                    }
+                }
+                None => continue,
+            };
+
+            let destination_cidr = match resource.attributes.get("destination_cidr_block") {
+                Some(Value::String(s)) => s.clone(),
+                _ => continue,
+            };
+
+            let state = aws_provider
+                .read_ec2_route_by_key(&resource.id.name, &route_table_id, &destination_cidr)
+                .await
+                .map_err(|e| format!("Failed to read route state: {}", e))?;
+            current_states.insert(resource.id.clone(), state);
+        }
+    }
+
+    // Resolve ResourceRef values using AWS state
+    let mut resources = sorted_resources;
+    resolve_refs_with_state(&mut resources, &current_states);
+
+    Ok(create_plan(&resources, &current_states))
 }
 
 fn print_plan(plan: &Plan) {
@@ -308,7 +702,11 @@ fn print_plan(plan: &Plan) {
                 );
                 for (key, value) in &r.attributes {
                     if !key.starts_with('_') {
-                        println!("      {}: {}", key, format_value(value).green());
+                        println!(
+                            "      {}: {}",
+                            key,
+                            format_value_with_key(value, Some(key)).green()
+                        );
                     }
                 }
             }
@@ -319,13 +717,13 @@ fn print_plan(plan: &Plan) {
                         let old_value = from.attributes.get(key);
                         if old_value != Some(new_value) {
                             let old_str = old_value
-                                .map(format_value)
+                                .map(|v| format_value_with_key(v, Some(key)))
                                 .unwrap_or_else(|| "(none)".to_string());
                             println!(
                                 "      {}: {} → {}",
                                 key,
                                 old_str.red(),
-                                format_value(new_value).green()
+                                format_value_with_key(new_value, Some(key)).green()
                             );
                         }
                     }
@@ -357,9 +755,57 @@ fn format_effect(effect: &Effect) -> String {
     }
 }
 
+/// Check if a string is in DSL enum format
+/// Patterns:
+/// - provider.TypeName.value (e.g., aws.Region.ap_northeast_1, gcp.Region.us_central1)
+/// - TypeName.value (e.g., Region.ap_northeast_1)
+fn is_dsl_enum_format(s: &str) -> bool {
+    let parts: Vec<&str> = s.split('.').collect();
+
+    match parts.len() {
+        // TypeName.value
+        2 => parts[0].chars().next().is_some_and(|c| c.is_uppercase()),
+        // provider.TypeName.value
+        3 => {
+            let provider = parts[0];
+            let type_name = parts[1];
+            // provider should be lowercase, TypeName should start with uppercase
+            provider.chars().all(|c| c.is_lowercase())
+                && type_name.chars().next().is_some_and(|c| c.is_uppercase())
+        }
+        _ => false,
+    }
+}
+
+/// Convert DSL enum format to display format (underscores to dashes, strip prefix)
+/// Handles patterns like:
+/// - provider.TypeName.value_name -> value-name (e.g., aws.Region.ap_northeast_1 -> ap-northeast-1)
+/// - TypeName.value_name -> value-name (e.g., Region.ap_northeast_1 -> ap-northeast-1)
+fn convert_enum_for_display(value: &str) -> String {
+    let parts: Vec<&str> = value.split('.').collect();
+
+    let raw_value = match parts.len() {
+        2 => parts[1], // TypeName.value -> value
+        3 => parts[2], // provider.TypeName.value -> value
+        _ => return value.to_string(),
+    };
+
+    raw_value.replace('_', "-")
+}
+
 fn format_value(value: &Value) -> String {
+    format_value_with_key(value, None)
+}
+
+fn format_value_with_key(value: &Value, _key: Option<&str>) -> String {
     match value {
-        Value::String(s) => format!("\"{}\"", s),
+        Value::String(s) => {
+            // Convert DSL enum format (aws.Type.value or Type.value) to AWS format
+            if is_dsl_enum_format(s) {
+                return format!("\"{}\"", convert_enum_for_display(s));
+            }
+            format!("\"{}\"", s)
+        }
         Value::Int(n) => n.to_string(),
         Value::Bool(b) => b.to_string(),
         Value::List(items) => {
