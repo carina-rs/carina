@@ -1,3 +1,4 @@
+use carina_core::formatter::{self, FormatConfig};
 use dashmap::DashMap;
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
@@ -67,6 +68,7 @@ impl LanguageServer for Backend {
                         },
                     ),
                 ),
+                document_formatting_provider: Some(OneOf::Left(true)),
                 ..Default::default()
             },
             ..Default::default()
@@ -137,6 +139,50 @@ impl LanguageServer for Backend {
                 result_id: None,
                 data: tokens,
             })));
+        }
+        Ok(None)
+    }
+
+    async fn formatting(&self, params: DocumentFormattingParams) -> Result<Option<Vec<TextEdit>>> {
+        let uri = &params.text_document.uri;
+
+        if let Some(doc) = self.documents.get(uri) {
+            let text = doc.text();
+            let config = FormatConfig::default();
+
+            match formatter::format(&text, &config) {
+                Ok(formatted) => {
+                    if formatted == text {
+                        // No changes needed
+                        return Ok(None);
+                    }
+
+                    // Calculate the range covering the entire document
+                    let lines: Vec<&str> = text.lines().collect();
+                    let last_line = lines.len().saturating_sub(1) as u32;
+                    let last_char = lines.last().map(|l| l.len() as u32).unwrap_or(0);
+
+                    let edit = TextEdit {
+                        range: Range {
+                            start: Position {
+                                line: 0,
+                                character: 0,
+                            },
+                            end: Position {
+                                line: last_line,
+                                character: last_char,
+                            },
+                        },
+                        new_text: formatted,
+                    };
+
+                    return Ok(Some(vec![edit]));
+                }
+                Err(_) => {
+                    // Formatting failed, return no edits
+                    return Ok(None);
+                }
+            }
         }
         Ok(None)
     }
