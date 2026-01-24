@@ -191,15 +191,36 @@ impl DiagnosticEngine {
         value: &str,
     ) -> Option<(u32, u32)> {
         let text = doc.text();
-        let pattern = format!("{} ", attr_name);
 
         for (line_idx, line) in text.lines().enumerate() {
-            if line.contains(&pattern) && line.contains('=') {
-                // Find the value after '='
-                if let Some(eq_pos) = line.find('=') {
-                    let after_eq = &line[eq_pos + 1..];
-                    if let Some(val_pos) = after_eq.find(value) {
-                        let col = eq_pos + 1 + val_pos;
+            let trimmed = line.trim_start();
+            // Must start with attr_name followed by whitespace or '='
+            // This ensures we match "vpc = ..." but not "let vpc = ..."
+            if !trimmed.starts_with(attr_name) {
+                continue;
+            }
+            let after_attr = &trimmed[attr_name.len()..];
+            // After attr_name, must have whitespace or '=' (not part of larger identifier)
+            if !after_attr.starts_with(' ') && !after_attr.starts_with('=') {
+                continue;
+            }
+
+            if let Some(eq_pos) = line.find('=') {
+                let after_eq = &line[eq_pos + 1..];
+                let after_eq_trimmed = after_eq.trim_start();
+                // Check if value appears at the start (not as substring of larger identifier)
+                if after_eq_trimmed.starts_with(value) {
+                    let next_char_idx = value.len();
+                    let is_end_of_value = after_eq_trimmed.len() == next_char_idx
+                        || !after_eq_trimmed[next_char_idx..]
+                            .chars()
+                            .next()
+                            .map(|c| c.is_alphanumeric() || c == '_')
+                            .unwrap_or(false);
+                    if is_end_of_value {
+                        // Calculate column: position where value starts
+                        let whitespace_len = after_eq.len() - after_eq_trimmed.len();
+                        let col = eq_pos + 1 + whitespace_len;
                         return Some((line_idx as u32, col as u32));
                     }
                 }
