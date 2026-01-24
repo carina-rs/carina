@@ -128,6 +128,7 @@ impl Value {
             Value::Bool(_) => "Bool".to_string(),
             Value::List(_) => "List".to_string(),
             Value::Map(_) => "Map".to_string(),
+            Value::ResourceRef(binding, attr) => format!("ResourceRef({}.{})", binding, attr),
         }
     }
 }

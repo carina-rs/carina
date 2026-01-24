@@ -62,3 +62,8 @@ The parser uses [pest](https://pest.rs/) grammar defined in `carina-core/src/par
 The DSL uses `aws.Region.ap_northeast_1` format, but AWS SDK uses `ap-northeast-1`. Conversion happens in:
 - `carina-provider-aws/src/lib.rs`: `convert_region_value()` for DSL→SDK
 - Provider read operations return DSL format for consistent state comparison
+
+## Code Style
+
+- **Commit messages**: Write in English
+- **Code comments**: Write in English

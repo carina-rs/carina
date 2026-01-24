@@ -50,12 +50,15 @@ pub struct ParsedFile {
 /// Parse context (variable scope)
 struct ParseContext {
     variables: HashMap<String, Value>,
+    /// Resource bindings (binding_name -> Resource)
+    resource_bindings: HashMap<String, Resource>,
 }
 
 impl ParseContext {
     fn new() -> Self {
         Self {
             variables: HashMap::new(),
+            resource_bindings: HashMap::new(),
         }
     }
 
@@ -65,6 +68,14 @@ impl ParseContext {
 
     fn get_variable(&self, name: &str) -> Option<&Value> {
         self.variables.get(name)
+    }
+
+    fn set_resource_binding(&mut self, name: String, resource: Resource) {
+        self.resource_bindings.insert(name, resource);
+    }
+
+    fn is_resource_binding(&self, name: &str) -> bool {
+        self.resource_bindings.contains_key(name)
     }
 }
 
@@ -91,6 +102,7 @@ pub fn parse(input: &str) -> Result<ParsedFile, ParseError> {
                                     parse_let_binding(stmt, &ctx)?;
                                 ctx.set_variable(name.clone(), value);
                                 if let Some(resource) = maybe_resource {
+                                    ctx.set_resource_binding(name.clone(), resource.clone());
                                     resources.push(resource);
                                 }
                             }
@@ -358,8 +370,36 @@ fn parse_primary_value(
             })
         }
         Rule::namespaced_id => {
-            // 名前空間付き識別子（aws.Region.ap_northeast_1 など）
-            Ok(Value::String(inner.as_str().to_string()))
+            // Namespaced identifier (e.g., aws.Region.ap_northeast_1)
+            // or resource reference (e.g., bucket.name)
+            let full_str = inner.as_str();
+            let parts: Vec<&str> = full_str.split('.').collect();
+
+            if parts.len() == 2 {
+                // Two-part identifier: could be resource reference or undefined variable
+                if ctx.is_resource_binding(parts[0]) {
+                    // This is a resource reference: resource.attribute
+                    Ok(Value::ResourceRef(
+                        parts[0].to_string(),
+                        parts[1].to_string(),
+                    ))
+                } else if ctx.get_variable(parts[0]).is_some() {
+                    // Variable exists but trying to access attribute on non-resource
+                    Err(ParseError::InvalidExpression {
+                        line: 0,
+                        message: format!(
+                            "'{}' is not a resource, cannot access attribute '{}'",
+                            parts[0], parts[1]
+                        ),
+                    })
+                } else {
+                    // Unknown identifier
+                    Err(ParseError::UndefinedVariable(full_str.to_string()))
+                }
+            } else {
+                // 3+ part identifier is a namespaced type (aws.Region.ap_northeast_1)
+                Ok(Value::String(full_str.to_string()))
+            }
         }
         Rule::boolean => {
             let b = inner.as_str() == "true";
@@ -374,11 +414,34 @@ fn parse_primary_value(
             Ok(Value::String(s))
         }
         Rule::variable_ref => {
-            // variable_ref contains identifier, which is atomic so get it directly with as_str
-            let name = inner.as_str();
-            match ctx.get_variable(name) {
-                Some(val) => Ok(val.clone()),
-                None => Err(ParseError::UndefinedVariable(name.to_string())),
+            // variable_ref can be "identifier" or "identifier.identifier" (member access)
+            let mut parts = inner.into_inner();
+            let first_ident = parts.next().unwrap().as_str();
+
+            if let Some(second_part) = parts.next() {
+                // Member access: resource.attribute
+                let attr_name = second_part.as_str();
+
+                // Check if it's a resource binding
+                if ctx.is_resource_binding(first_ident) {
+                    // Return a ResourceRef that will be resolved later
+                    Ok(Value::ResourceRef(
+                        first_ident.to_string(),
+                        attr_name.to_string(),
+                    ))
+                } else {
+                    // Not a resource binding, treat as undefined
+                    Err(ParseError::UndefinedVariable(format!(
+                        "{}.{}",
+                        first_ident, attr_name
+                    )))
+                }
+            } else {
+                // Simple variable reference
+                match ctx.get_variable(first_ident) {
+                    Some(val) => Ok(val.clone()),
+                    None => Err(ParseError::UndefinedVariable(first_ident.to_string())),
+                }
             }
         }
         Rule::expression => parse_expression(inner, ctx),
@@ -397,6 +460,82 @@ fn parse_string(pair: pest::iterators::Pair<Rule>) -> String {
         .replace("\\t", "\t")
         .replace("\\\"", "\"")
         .replace("\\\\", "\\")
+}
+
+/// Resolve resource references in a ParsedFile
+/// This replaces ResourceRef values with the actual attribute values from referenced resources
+pub fn resolve_resource_refs(parsed: &mut ParsedFile) -> Result<(), ParseError> {
+    // Build a map of binding_name -> attributes for quick lookup
+    let mut binding_map: HashMap<String, HashMap<String, Value>> = HashMap::new();
+    for resource in &parsed.resources {
+        if let Some(Value::String(binding_name)) = resource.attributes.get("_binding") {
+            binding_map.insert(binding_name.clone(), resource.attributes.clone());
+        }
+    }
+
+    // Resolve references in each resource
+    for resource in &mut parsed.resources {
+        let mut resolved_attrs: HashMap<String, Value> = HashMap::new();
+
+        for (key, value) in &resource.attributes {
+            let resolved = resolve_value(value, &binding_map)?;
+            resolved_attrs.insert(key.clone(), resolved);
+        }
+
+        resource.attributes = resolved_attrs;
+    }
+
+    Ok(())
+}
+
+fn resolve_value(
+    value: &Value,
+    binding_map: &HashMap<String, HashMap<String, Value>>,
+) -> Result<Value, ParseError> {
+    match value {
+        Value::ResourceRef(binding_name, attr_name) => {
+            match binding_map.get(binding_name) {
+                Some(attributes) => {
+                    match attributes.get(attr_name) {
+                        Some(attr_value) => {
+                            // Recursively resolve in case the attribute itself is a reference
+                            resolve_value(attr_value, binding_map)
+                        }
+                        None => {
+                            // Attribute not found, keep as reference (might be resolved at runtime)
+                            Ok(value.clone())
+                        }
+                    }
+                }
+                None => Err(ParseError::UndefinedVariable(format!(
+                    "{}.{}",
+                    binding_name, attr_name
+                ))),
+            }
+        }
+        Value::List(items) => {
+            let resolved: Result<Vec<Value>, ParseError> = items
+                .iter()
+                .map(|item| resolve_value(item, binding_map))
+                .collect();
+            Ok(Value::List(resolved?))
+        }
+        Value::Map(map) => {
+            let mut resolved = HashMap::new();
+            for (k, v) in map {
+                resolved.insert(k.clone(), resolve_value(v, binding_map)?);
+            }
+            Ok(Value::Map(resolved))
+        }
+        _ => Ok(value.clone()),
+    }
+}
+
+/// Parse a .crn file and resolve resource references
+pub fn parse_and_resolve(input: &str) -> Result<ParsedFile, ParseError> {
+    let mut parsed = parse(input)?;
+    resolve_resource_refs(&mut parsed)?;
+    Ok(parsed)
 }
 
 #[cfg(test)]
@@ -606,5 +745,99 @@ mod tests {
 
         let result = parse(input);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_resource_reference() {
+        let input = r#"
+            let bucket = aws.s3.bucket {
+                name = "my-bucket"
+                region = aws.Region.ap_northeast_1
+            }
+
+            let policy = aws.s3.bucket_policy {
+                name = "my-policy"
+                bucket = bucket.name
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+        assert_eq!(result.resources.len(), 2);
+
+        // Before resolution, the attribute should be a ResourceRef
+        let policy = &result.resources[1];
+        assert_eq!(
+            policy.attributes.get("bucket"),
+            Some(&Value::ResourceRef(
+                "bucket".to_string(),
+                "name".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn parse_and_resolve_resource_reference() {
+        let input = r#"
+            let bucket = aws.s3.bucket {
+                name = "my-bucket"
+                region = aws.Region.ap_northeast_1
+            }
+
+            let policy = aws.s3.bucket_policy {
+                name = "my-policy"
+                bucket = bucket.name
+                bucket_region = bucket.region
+            }
+        "#;
+
+        let result = parse_and_resolve(input).unwrap();
+        assert_eq!(result.resources.len(), 2);
+
+        // After resolution, the attribute should be the actual value
+        let policy = &result.resources[1];
+        assert_eq!(
+            policy.attributes.get("bucket"),
+            Some(&Value::String("my-bucket".to_string()))
+        );
+        assert_eq!(
+            policy.attributes.get("bucket_region"),
+            Some(&Value::String("aws.Region.ap_northeast_1".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_undefined_resource_reference_fails() {
+        let input = r#"
+            let policy = aws.s3.bucket_policy {
+                name = "my-policy"
+                bucket = nonexistent.name
+            }
+        "#;
+
+        let result = parse(input);
+        assert!(result.is_err());
+        match result {
+            Err(ParseError::UndefinedVariable(name)) => {
+                assert!(name.contains("nonexistent"));
+            }
+            _ => panic!("Expected UndefinedVariable error"),
+        }
+    }
+
+    #[test]
+    fn resource_reference_preserves_namespaced_id() {
+        // Ensure that aws.Region.ap_northeast_1 is NOT treated as a resource reference
+        let input = r#"
+            let bucket = aws.s3.bucket {
+                name = "my-bucket"
+                region = aws.Region.ap_northeast_1
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+        assert_eq!(
+            result.resources[0].attributes.get("region"),
+            Some(&Value::String("aws.Region.ap_northeast_1".to_string()))
+        );
     }
 }

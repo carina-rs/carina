@@ -28,6 +28,8 @@ pub enum Value {
     Bool(bool),
     List(Vec<Value>),
     Map(HashMap<String, Value>),
+    /// Reference to another resource's attribute (binding_name, attribute_name)
+    ResourceRef(String, String),
 }
 
 /// Desired state declared in DSL

@@ -99,7 +99,7 @@ fn run_validate(file: &PathBuf) -> Result<(), String> {
     let content = fs::read_to_string(file)
         .map_err(|e| format!("Failed to read {}: {}", file.display(), e))?;
 
-    let parsed = parser::parse(&content).map_err(|e| format!("Parse error: {}", e))?;
+    let parsed = parser::parse_and_resolve(&content).map_err(|e| format!("Parse error: {}", e))?;
 
     println!("{}", "Validating...".cyan());
 
@@ -126,7 +126,7 @@ async fn run_plan(file: &PathBuf) -> Result<(), String> {
     let content =
         fs::read_to_string(file).map_err(|e| format!("Failed to read {}: {}", file.display(), e))?;
 
-    let parsed = parser::parse(&content).map_err(|e| format!("Parse error: {}", e))?;
+    let parsed = parser::parse_and_resolve(&content).map_err(|e| format!("Parse error: {}", e))?;
 
     validate_resources(&parsed.resources)?;
 
@@ -139,7 +139,7 @@ async fn run_apply(file: &PathBuf) -> Result<(), String> {
     let content =
         fs::read_to_string(file).map_err(|e| format!("Failed to read {}: {}", file.display(), e))?;
 
-    let parsed = parser::parse(&content).map_err(|e| format!("Parse error: {}", e))?;
+    let parsed = parser::parse_and_resolve(&content).map_err(|e| format!("Parse error: {}", e))?;
 
     validate_resources(&parsed.resources)?;
 
@@ -347,6 +347,7 @@ fn format_value(value: &Value) -> String {
                 .collect();
             format!("{{{}}}", strs.join(", "))
         }
+        Value::ResourceRef(binding, attr) => format!("{}.{}", binding, attr),
     }
 }
 
@@ -399,6 +400,10 @@ impl FileProvider {
                     .map(|(k, v)| (k.clone(), Self::value_to_json(v)))
                     .collect();
                 serde_json::Value::Object(obj)
+            }
+            // ResourceRef should be resolved before reaching here, but handle it as a string
+            Value::ResourceRef(binding, attr) => {
+                serde_json::Value::String(format!("${{{}.{}}}", binding, attr))
             }
         }
     }
