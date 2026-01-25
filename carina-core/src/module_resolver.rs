@@ -65,7 +65,7 @@ impl ModuleResolver {
         }
     }
 
-    /// Load and cache a module from a file path
+    /// Load and cache a module from a file or directory path
     pub fn load_module(&mut self, path: &str) -> Result<ParsedFile, ModuleError> {
         let full_path = self.resolve_path(path);
 
@@ -82,9 +82,13 @@ impl ModuleResolver {
         // Mark as resolving
         self.resolving.insert(full_path.clone());
 
-        // Read and parse the file
-        let content = fs::read_to_string(&full_path)?;
-        let parsed = crate::parser::parse(&content)?;
+        // Load module: directory or single file
+        let parsed = if full_path.is_dir() {
+            self.load_directory_module(&full_path)?
+        } else {
+            let content = fs::read_to_string(&full_path)?;
+            crate::parser::parse(&content)?
+        };
 
         // Verify it's a module (has inputs or outputs)
         if parsed.inputs.is_empty() && parsed.outputs.is_empty() {
@@ -98,6 +102,45 @@ impl ModuleResolver {
         self.module_cache.insert(full_path, parsed.clone());
 
         Ok(parsed)
+    }
+
+    /// Load all .crn files from a directory and merge them into a single ParsedFile
+    fn load_directory_module(&self, dir_path: &Path) -> Result<ParsedFile, ModuleError> {
+        let mut merged = ParsedFile {
+            providers: vec![],
+            resources: vec![],
+            variables: HashMap::new(),
+            imports: vec![],
+            module_calls: vec![],
+            inputs: vec![],
+            outputs: vec![],
+        };
+
+        // Read all .crn files in the directory
+        let mut crn_files: Vec<_> = fs::read_dir(dir_path)?
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "crn"))
+            .collect();
+
+        // Sort for consistent ordering
+        crn_files.sort_by_key(|e| e.path());
+
+        for entry in crn_files {
+            let file_path = entry.path();
+            let content = fs::read_to_string(&file_path)?;
+            let parsed = crate::parser::parse(&content)?;
+
+            // Merge all fields
+            merged.providers.extend(parsed.providers);
+            merged.resources.extend(parsed.resources);
+            merged.variables.extend(parsed.variables);
+            merged.imports.extend(parsed.imports);
+            merged.module_calls.extend(parsed.module_calls);
+            merged.inputs.extend(parsed.inputs);
+            merged.outputs.extend(parsed.outputs);
+        }
+
+        Ok(merged)
     }
 
     /// Resolve a relative path to an absolute path

@@ -1040,22 +1040,142 @@ fn print_plan(plan: &Plan) {
         return;
     }
 
+    // Build dependency graph from effects
+    let mut binding_to_effect: HashMap<String, usize> = HashMap::new();
+    let mut effect_deps: HashMap<usize, HashSet<String>> = HashMap::new();
+    let mut effect_bindings: HashMap<usize, String> = HashMap::new();
+
+    for (idx, effect) in plan.effects().iter().enumerate() {
+        let (resource, deps) = match effect {
+            Effect::Create(r) => (Some(r), get_resource_dependencies(r)),
+            Effect::Update { to, .. } => (Some(to), get_resource_dependencies(to)),
+            Effect::Delete(_) | Effect::Read(_) => (None, HashSet::new()),
+        };
+
+        if let Some(r) = resource {
+            let binding = r
+                .attributes
+                .get("_binding")
+                .and_then(|v| match v {
+                    Value::String(s) => Some(s.clone()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| format!("{}.{}", r.id.resource_type, r.id.name));
+            binding_to_effect.insert(binding.clone(), idx);
+            effect_bindings.insert(idx, binding);
+        }
+        effect_deps.insert(idx, deps);
+    }
+
+    // Build reverse dependency map (who depends on this resource)
+    let mut dependents: HashMap<usize, Vec<usize>> = HashMap::new();
+    for idx in 0..plan.effects().len() {
+        dependents.insert(idx, Vec::new());
+    }
+
+    for (idx, deps) in &effect_deps {
+        for dep in deps {
+            if let Some(&dep_idx) = binding_to_effect.get(dep) {
+                dependents.get_mut(&dep_idx).unwrap().push(*idx);
+            }
+        }
+    }
+
+    // Find root resources (no dependencies within the plan)
+    let mut roots: Vec<usize> = Vec::new();
+    for (idx, deps) in &effect_deps {
+        let has_dep_in_plan = deps.iter().any(|d| binding_to_effect.contains_key(d));
+        if !has_dep_in_plan {
+            roots.push(*idx);
+        }
+    }
+    roots.sort();
+
     println!("{}", "Execution Plan:".cyan().bold());
     println!();
 
-    for effect in plan.effects() {
+    // Track printed effects to avoid duplicates
+    let mut printed: HashSet<usize> = HashSet::new();
+
+    fn print_effect_tree(
+        idx: usize,
+        plan: &Plan,
+        dependents: &HashMap<usize, Vec<usize>>,
+        printed: &mut HashSet<usize>,
+        indent: usize,
+        is_last: bool,
+        prefix: &str,
+    ) {
+        if printed.contains(&idx) {
+            return;
+        }
+        printed.insert(idx);
+
+        let effect = &plan.effects()[idx];
+        let colored_symbol = match effect {
+            Effect::Create(_) => "+".green().bold(),
+            Effect::Update { .. } => "~".yellow().bold(),
+            Effect::Delete(_) => "-".red().bold(),
+            Effect::Read(_) => "?".normal(),
+        };
+
+        // Build the tree connector (shown before child resources)
+        let connector = if indent == 0 {
+            "".to_string()
+        } else if is_last {
+            format!("{}└─ ", prefix)
+        } else {
+            format!("{}├─ ", prefix)
+        };
+
+        // Base indentation for this resource
+        let base_indent = "  ";
+        // Attribute indentation (4 spaces from resource line)
+        let attr_base = "    ";
+
         match effect {
             Effect::Create(r) => {
                 println!(
-                    "  {} {}.{}",
-                    "+".green().bold(),
-                    r.id.resource_type,
-                    r.id.name
+                    "{}{}{} {}",
+                    base_indent,
+                    connector,
+                    colored_symbol,
+                    r.id.resource_type.cyan().bold()
                 );
-                for (key, value) in &r.attributes {
-                    if !key.starts_with('_') {
+                // Attribute prefix aligns with the resource content
+                let attr_prefix = if indent == 0 {
+                    format!("{}{}", base_indent, attr_base)
+                } else {
+                    let continuation = if is_last {
+                        format!("{}   ", prefix)
+                    } else {
+                        format!("{}│  ", prefix)
+                    };
+                    format!("{}{}   ", base_indent, continuation)
+                };
+                let mut keys: Vec<_> = r
+                    .attributes
+                    .keys()
+                    .filter(|k| !k.starts_with('_'))
+                    .collect();
+                keys.sort_by(|a, b| match (a.as_str(), b.as_str()) {
+                    ("name", _) => std::cmp::Ordering::Less,
+                    (_, "name") => std::cmp::Ordering::Greater,
+                    _ => a.cmp(b),
+                });
+                for key in keys {
+                    let value = &r.attributes[key];
+                    if key == "name" {
                         println!(
-                            "      {}: {}",
+                            "{}{}: {}",
+                            attr_prefix,
+                            key.bold(),
+                            format_value_with_key(value, Some(key)).white().bold()
+                        );
+                    } else {
+                        println!(
+                            "{}{}: {}",
+                            attr_prefix,
                             key,
                             format_value_with_key(value, Some(key)).green()
                         );
@@ -1063,16 +1183,52 @@ fn print_plan(plan: &Plan) {
                 }
             }
             Effect::Update { id, from, to, .. } => {
-                println!("  {} {}.{}", "~".yellow().bold(), id.resource_type, id.name);
-                for (key, new_value) in &to.attributes {
-                    if !key.starts_with('_') {
-                        let old_value = from.attributes.get(key);
-                        if old_value != Some(new_value) {
-                            let old_str = old_value
-                                .map(|v| format_value_with_key(v, Some(key)))
-                                .unwrap_or_else(|| "(none)".to_string());
+                println!(
+                    "{}{}{} {}",
+                    base_indent,
+                    connector,
+                    colored_symbol,
+                    id.resource_type.cyan().bold()
+                );
+                let attr_prefix = if indent == 0 {
+                    format!("{}{}", base_indent, attr_base)
+                } else {
+                    let continuation = if is_last {
+                        format!("{}   ", prefix)
+                    } else {
+                        format!("{}│  ", prefix)
+                    };
+                    format!("{}{}   ", base_indent, continuation)
+                };
+                let mut keys: Vec<_> = to
+                    .attributes
+                    .keys()
+                    .filter(|k| !k.starts_with('_'))
+                    .collect();
+                keys.sort_by(|a, b| match (a.as_str(), b.as_str()) {
+                    ("name", _) => std::cmp::Ordering::Less,
+                    (_, "name") => std::cmp::Ordering::Greater,
+                    _ => a.cmp(b),
+                });
+                for key in keys {
+                    let new_value = &to.attributes[key];
+                    let old_value = from.attributes.get(key);
+                    if old_value != Some(new_value) {
+                        let old_str = old_value
+                            .map(|v| format_value_with_key(v, Some(key)))
+                            .unwrap_or_else(|| "(none)".to_string());
+                        if key == "name" {
                             println!(
-                                "      {}: {} → {}",
+                                "{}{}: {} → {}",
+                                attr_prefix,
+                                key.bold(),
+                                old_str.red(),
+                                format_value_with_key(new_value, Some(key)).white().bold()
+                            );
+                        } else {
+                            println!(
+                                "{}{}: {} → {}",
+                                attr_prefix,
                                 key,
                                 old_str.red(),
                                 format_value_with_key(new_value, Some(key)).green()
@@ -1082,10 +1238,82 @@ fn print_plan(plan: &Plan) {
                 }
             }
             Effect::Delete(id) => {
-                println!("  {} {}.{}", "-".red().bold(), id.resource_type, id.name);
+                println!(
+                    "{}{}{} {}",
+                    base_indent,
+                    connector,
+                    colored_symbol,
+                    id.resource_type.cyan().bold()
+                );
+                let attr_prefix = if indent == 0 {
+                    format!("{}{}", base_indent, attr_base)
+                } else {
+                    let continuation = if is_last {
+                        format!("{}   ", prefix)
+                    } else {
+                        format!("{}│  ", prefix)
+                    };
+                    format!("{}{}   ", base_indent, continuation)
+                };
+                println!("{}{}: {}", attr_prefix, "name".bold(), id.name.red().bold());
             }
             Effect::Read(_) => {}
         }
+
+        // Print children (dependents)
+        let children = dependents.get(&idx).cloned().unwrap_or_default();
+        let unprinted_children: Vec<_> = children
+            .iter()
+            .filter(|c| !printed.contains(c))
+            .cloned()
+            .collect();
+
+        // New prefix for children: align with attribute indentation
+        let new_prefix = if indent == 0 {
+            format!("{}  ", attr_base)
+        } else {
+            let continuation = if is_last {
+                format!("{}   ", prefix)
+            } else {
+                format!("{}│  ", prefix)
+            };
+            format!("{}   ", continuation)
+        };
+
+        for (i, child_idx) in unprinted_children.iter().enumerate() {
+            let child_is_last = i == unprinted_children.len() - 1;
+            print_effect_tree(
+                *child_idx,
+                plan,
+                dependents,
+                printed,
+                indent + 1,
+                child_is_last,
+                &new_prefix,
+            );
+        }
+    }
+
+    // Print from roots
+    for (i, root_idx) in roots.iter().enumerate() {
+        print_effect_tree(
+            *root_idx,
+            plan,
+            &dependents,
+            &mut printed,
+            0,
+            i == roots.len() - 1,
+            "",
+        );
+    }
+
+    // Print any remaining effects that weren't reachable from roots
+    // (e.g., circular dependencies or isolated resources)
+    let remaining: Vec<_> = (0..plan.effects().len())
+        .filter(|idx| !printed.contains(idx))
+        .collect();
+    for idx in remaining {
+        print_effect_tree(idx, plan, &dependents, &mut printed, 0, true, "");
     }
 
     println!();
