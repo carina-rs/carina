@@ -21,7 +21,7 @@ let web_sg = aws.security_group {
 }
 
 # HTTP ingress rule
-let http_rule = aws.security_group.ingress_rule {
+aws.security_group.ingress_rule {
     name              = "http"
     security_group_id = web_sg.id
     from_port         = 80
@@ -31,7 +31,7 @@ let http_rule = aws.security_group.ingress_rule {
 }
 
 # HTTPS ingress rule (if enabled)
-let https_rule = aws.security_group.ingress_rule {
+aws.security_group.ingress_rule {
     name              = "https"
     security_group_id = web_sg.id
     from_port         = 443
