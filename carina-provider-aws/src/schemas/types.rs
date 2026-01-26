@@ -66,3 +66,10 @@ fn normalize_region(s: &str) -> String {
     // Convert underscores to hyphens
     region_part.replace('_', "-")
 }
+
+/// S3 bucket versioning status
+/// - Enabled: Versioning is enabled
+/// - Suspended: Versioning is suspended (previously enabled)
+pub fn versioning_status() -> AttributeType {
+    AttributeType::Enum(vec!["Enabled".to_string(), "Suspended".to_string()])
+}

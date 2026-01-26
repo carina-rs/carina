@@ -1,6 +1,6 @@
 //! S3 bucket schema definition
 
-use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, types};
+use carina_core::schema::{AttributeSchema, ResourceSchema, types};
 
 use super::types as aws_types;
 
@@ -22,8 +22,8 @@ pub fn bucket_schema() -> ResourceSchema {
                 .with_description("The canned ACL for the bucket"),
         )
         .attribute(
-            AttributeSchema::new("versioning", AttributeType::Bool)
-                .with_description("Enable versioning for the bucket"),
+            AttributeSchema::new("versioning", aws_types::versioning_status())
+                .with_description("Versioning status for the bucket (Enabled or Suspended)"),
         )
         .attribute(
             AttributeSchema::new("expiration_days", types::positive_int())
@@ -50,7 +50,10 @@ mod tests {
             "region".to_string(),
             Value::String("Region.ap_northeast_1".to_string()),
         );
-        attrs.insert("versioning".to_string(), Value::Bool(true));
+        attrs.insert(
+            "versioning".to_string(),
+            Value::String("Enabled".to_string()),
+        );
 
         assert!(schema.validate(&attrs).is_ok());
     }
