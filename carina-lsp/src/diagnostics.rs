@@ -148,6 +148,11 @@ impl DiagnosticEngine {
                                         s
                                     ))
                                 }
+                                // CIDR type validation
+                                (
+                                    carina_core::schema::AttributeType::Custom { name, .. },
+                                    Value::String(s),
+                                ) if name == "Cidr" => validate_cidr(s).err(),
                                 // String type - check for bare resource binding
                                 (carina_core::schema::AttributeType::String, Value::String(s)) => {
                                     if let Some(binding) =

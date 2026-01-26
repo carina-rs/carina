@@ -3,41 +3,6 @@
 use carina_core::resource::Value;
 use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, types};
 
-/// CIDR block type (with validation)
-pub fn cidr_block() -> AttributeType {
-    AttributeType::Custom {
-        name: "CidrBlock".to_string(),
-        base: Box::new(AttributeType::String),
-        validate: |value| {
-            if let Value::String(s) = value {
-                // Basic CIDR format validation: x.x.x.x/n
-                let parts: Vec<&str> = s.split('/').collect();
-                if parts.len() != 2 {
-                    return Err("CIDR block must be in format x.x.x.x/n".to_string());
-                }
-                let ip_parts: Vec<&str> = parts[0].split('.').collect();
-                if ip_parts.len() != 4 {
-                    return Err("Invalid IP address in CIDR block".to_string());
-                }
-                for part in &ip_parts {
-                    if part.parse::<u8>().is_err() {
-                        return Err("Invalid IP address in CIDR block".to_string());
-                    }
-                }
-                let prefix: u8 = parts[1]
-                    .parse()
-                    .map_err(|_| "Invalid prefix length in CIDR block".to_string())?;
-                if prefix > 32 {
-                    return Err("Prefix length must be between 0 and 32".to_string());
-                }
-                Ok(())
-            } else {
-                Err("Expected string".to_string())
-            }
-        },
-    }
-}
-
 /// Port number type (with validation)
 pub fn port_number() -> AttributeType {
     AttributeType::Custom {
@@ -157,7 +122,7 @@ pub fn vpc_schema() -> ResourceSchema {
             ),
         )
         .attribute(
-            AttributeSchema::new("cidr_block", cidr_block())
+            AttributeSchema::new("cidr_block", types::cidr())
                 .required()
                 .with_description("The IPv4 CIDR block for the VPC"),
         )
@@ -195,7 +160,7 @@ pub fn subnet_schema() -> ResourceSchema {
                 .with_description("VPC ID to create the subnet in"),
         )
         .attribute(
-            AttributeSchema::new("cidr_block", cidr_block())
+            AttributeSchema::new("cidr_block", types::cidr())
                 .required()
                 .with_description("The IPv4 CIDR block for the subnet"),
         )
@@ -272,7 +237,7 @@ pub fn route_schema() -> ResourceSchema {
                 .with_description("Route Table ID"),
         )
         .attribute(
-            AttributeSchema::new("destination_cidr_block", cidr_block())
+            AttributeSchema::new("destination_cidr_block", types::cidr())
                 .required()
                 .with_description("Destination CIDR block"),
         )
@@ -422,7 +387,7 @@ mod tests {
 
     #[test]
     fn valid_cidr_block() {
-        let t = cidr_block();
+        let t = types::cidr();
         assert!(
             t.validate(&Value::String("10.0.0.0/16".to_string()))
                 .is_ok()
@@ -436,7 +401,7 @@ mod tests {
 
     #[test]
     fn invalid_cidr_block() {
-        let t = cidr_block();
+        let t = types::cidr();
         assert!(t.validate(&Value::String("10.0.0.0".to_string())).is_err()); // missing prefix
         assert!(t.validate(&Value::String("10.0.0/16".to_string())).is_err()); // invalid IP
         assert!(

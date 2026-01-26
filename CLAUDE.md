@@ -63,6 +63,12 @@ The DSL uses `aws.Region.ap_northeast_1` format, but AWS SDK uses `ap-northeast-
 - `carina-provider-aws/src/lib.rs`: `convert_region_value()` for DSL→SDK
 - Provider read operations return DSL format for consistent state comparison
 
+### LSP Integration
+
+When modifying resource schemas (`carina-provider-aws/src/schemas/`), also update the LSP:
+- **Completion** (`carina-lsp/src/completion.rs`): Add value completions for new types
+- **Diagnostics** (`carina-lsp/src/diagnostics.rs`): Add type validation for new types
+
 ## Code Style
 
 - **Commit messages**: Write in English

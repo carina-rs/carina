@@ -567,6 +567,7 @@ impl CompletionProvider {
             AttributeType::Int => {
                 vec![] // No specific completions for integers
             }
+            AttributeType::Custom { name, .. } if name == "Cidr" => self.cidr_completions(),
             AttributeType::String | AttributeType::Custom { .. } => {
                 vec![CompletionItem {
                     label: "env".to_string(),
@@ -663,6 +664,29 @@ impl CompletionProvider {
                 kind: Some(CompletionItemKind::ENUM_MEMBER),
                 detail: Some(description.to_string()),
                 insert_text: Some(format!("aws.Protocol.{}", code)),
+                ..Default::default()
+            })
+            .collect()
+    }
+
+    fn cidr_completions(&self) -> Vec<CompletionItem> {
+        let cidrs = vec![
+            ("10.0.0.0/16", "VPC CIDR (65,536 IPs)"),
+            ("10.0.0.0/24", "Subnet CIDR (256 IPs)"),
+            ("10.0.1.0/24", "Subnet CIDR (256 IPs)"),
+            ("10.0.2.0/24", "Subnet CIDR (256 IPs)"),
+            ("172.16.0.0/16", "VPC CIDR (65,536 IPs)"),
+            ("192.168.0.0/16", "VPC CIDR (65,536 IPs)"),
+            ("0.0.0.0/0", "All IPv4 addresses"),
+        ];
+
+        cidrs
+            .into_iter()
+            .map(|(cidr, description)| CompletionItem {
+                label: format!("\"{}\"", cidr),
+                kind: Some(CompletionItemKind::VALUE),
+                detail: Some(description.to_string()),
+                insert_text: Some(format!("\"{}\"", cidr)),
                 ..Default::default()
             })
             .collect()
