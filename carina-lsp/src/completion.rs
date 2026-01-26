@@ -156,32 +156,26 @@ impl CompletionProvider {
         let trimmed = line.trim();
 
         // Pattern: "aws.xxx.yyy {" or "let name = aws.xxx.yyy {"
-        for pattern in [
-            "aws.s3.bucket",
-            "aws.vpc",
-            "aws.subnet",
-            "aws.internet_gateway",
-            "aws.route_table",
-            "aws.route",
-            "aws.security_group.ingress_rule",
-            "aws.security_group.egress_rule",
-            "aws.security_group",
+        // Maps DSL format to schema resource_type
+        for (pattern, schema_type) in [
+            ("aws.s3.bucket", "s3.bucket"),
+            ("aws.vpc", "vpc"),
+            ("aws.subnet", "subnet"),
+            ("aws.internet_gateway", "internet_gateway"),
+            ("aws.route_table", "route_table"),
+            ("aws.route", "route"),
+            (
+                "aws.security_group.ingress_rule",
+                "security_group.ingress_rule",
+            ),
+            (
+                "aws.security_group.egress_rule",
+                "security_group.egress_rule",
+            ),
+            ("aws.security_group", "security_group"),
         ] {
             if trimmed.contains(pattern) {
-                // Convert DSL format to internal format
-                let internal_type = match pattern {
-                    "aws.s3.bucket" => "s3_bucket",
-                    "aws.vpc" => "vpc",
-                    "aws.subnet" => "subnet",
-                    "aws.internet_gateway" => "internet_gateway",
-                    "aws.route_table" => "route_table",
-                    "aws.route" => "route",
-                    "aws.security_group.ingress_rule" => "security_group.ingress_rule",
-                    "aws.security_group.egress_rule" => "security_group.egress_rule",
-                    "aws.security_group" => "security_group",
-                    _ => continue,
-                };
-                return Some(internal_type.to_string());
+                return Some(schema_type.to_string());
             }
         }
         None
