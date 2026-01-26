@@ -10,11 +10,12 @@ use carina_core::differ::create_plan;
 use carina_core::effect::Effect;
 use carina_core::formatter::{self, FormatConfig};
 use carina_core::module_resolver;
-use carina_core::parser::{self, ParsedFile};
+use carina_core::parser::{self, ParsedFile, TypeExpr};
 use carina_core::plan::Plan;
 use carina_core::provider::{BoxFuture, Provider, ProviderError, ProviderResult, ResourceType};
 use carina_core::resource::{Resource, ResourceId, State, Value};
 use carina_core::schema::ResourceSchema;
+use carina_core::schema::validate_cidr;
 use carina_provider_aws::schemas;
 use std::collections::HashSet;
 
@@ -264,6 +265,121 @@ fn validate_provider_region(parsed: &ParsedFile) -> Result<(), String> {
     Ok(())
 }
 
+/// Validate module call arguments against module input types
+fn validate_module_calls(parsed: &ParsedFile, base_dir: &Path) -> Result<(), String> {
+    let mut errors = Vec::new();
+
+    // Build a map of imported modules: alias -> inputs
+    let mut imported_modules = HashMap::new();
+    for import in &parsed.imports {
+        let module_path = base_dir.join(&import.path);
+        if let Some(module_parsed) = load_module(&module_path) {
+            imported_modules.insert(import.alias.clone(), module_parsed.inputs);
+        }
+    }
+
+    // Validate each module call
+    for call in &parsed.module_calls {
+        if let Some(module_inputs) = imported_modules.get(&call.module_name) {
+            for (arg_name, arg_value) in &call.arguments {
+                if let Some(input) = module_inputs.iter().find(|i| &i.name == arg_name)
+                    && let Some(error) = validate_module_arg_type(&input.type_expr, arg_value)
+                {
+                    errors.push(format!(
+                        "module {} argument '{}': {}",
+                        call.module_name, arg_name, error
+                    ));
+                }
+            }
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("\n"))
+    }
+}
+
+/// Load a module from a file or directory
+fn load_module(path: &Path) -> Option<ParsedFile> {
+    if path.is_dir() {
+        let main_path = path.join("main.crn");
+        if main_path.exists() {
+            let content = fs::read_to_string(&main_path).ok()?;
+            parser::parse(&content).ok()
+        } else {
+            load_directory_module(path)
+        }
+    } else {
+        let content = fs::read_to_string(path).ok()?;
+        parser::parse(&content).ok()
+    }
+}
+
+/// Load all .crn files from a directory and merge them
+fn load_directory_module(dir_path: &Path) -> Option<ParsedFile> {
+    let entries = fs::read_dir(dir_path).ok()?;
+    let mut merged = ParsedFile {
+        providers: vec![],
+        resources: vec![],
+        variables: HashMap::new(),
+        imports: vec![],
+        module_calls: vec![],
+        inputs: vec![],
+        outputs: vec![],
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_some_and(|ext| ext == "crn")
+            && let Ok(content) = fs::read_to_string(&path)
+            && let Ok(parsed) = parser::parse(&content)
+        {
+            merged.providers.extend(parsed.providers);
+            merged.resources.extend(parsed.resources);
+            merged.variables.extend(parsed.variables);
+            merged.imports.extend(parsed.imports);
+            merged.module_calls.extend(parsed.module_calls);
+            merged.inputs.extend(parsed.inputs);
+            merged.outputs.extend(parsed.outputs);
+        }
+    }
+
+    if merged.inputs.is_empty() && merged.outputs.is_empty() {
+        None
+    } else {
+        Some(merged)
+    }
+}
+
+/// Validate a module argument value against its expected type
+fn validate_module_arg_type(type_expr: &TypeExpr, value: &Value) -> Option<String> {
+    match (type_expr, value) {
+        (TypeExpr::Cidr, Value::String(s)) => validate_cidr(s).err(),
+        (TypeExpr::List(inner), Value::List(items)) => {
+            if let TypeExpr::Cidr = inner.as_ref() {
+                for (i, item) in items.iter().enumerate() {
+                    if let Value::String(s) = item {
+                        if let Err(e) = validate_cidr(s) {
+                            return Some(format!("element {}: {}", i, e));
+                        }
+                    } else {
+                        return Some(format!("element {}: expected string", i));
+                    }
+                }
+            }
+            None
+        }
+        (TypeExpr::Bool, Value::String(s)) => Some(format!(
+            "expected bool, got string \"{}\". Use true or false.",
+            s
+        )),
+        (TypeExpr::Int, Value::String(s)) => Some(format!("expected int, got string \"{}\".", s)),
+        _ => None,
+    }
+}
+
 fn run_validate(file: &PathBuf) -> Result<(), String> {
     let content = fs::read_to_string(file)
         .map_err(|e| format!("Failed to read {}: {}", file.display(), e))?;
@@ -271,13 +387,17 @@ fn run_validate(file: &PathBuf) -> Result<(), String> {
     let mut parsed =
         parser::parse_and_resolve(&content).map_err(|e| format!("Parse error: {}", e))?;
 
-    // Resolve module imports and expand module calls
     let base_dir = file.parent().unwrap_or(Path::new("."));
-    module_resolver::resolve_modules(&mut parsed, base_dir)
-        .map_err(|e| format!("Module resolution error: {}", e))?;
 
     // Validate provider region
     validate_provider_region(&parsed)?;
+
+    // Validate module call arguments before expansion
+    validate_module_calls(&parsed, base_dir)?;
+
+    // Resolve module imports and expand module calls
+    module_resolver::resolve_modules(&mut parsed, base_dir)
+        .map_err(|e| format!("Module resolution error: {}", e))?;
 
     // Apply default region from provider
     apply_default_region(&mut parsed);
