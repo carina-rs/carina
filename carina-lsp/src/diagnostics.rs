@@ -333,9 +333,7 @@ impl DiagnosticEngine {
 
         for import in &parsed.imports {
             let module_path = base_path.join(&import.path);
-            if let Ok(content) = std::fs::read_to_string(&module_path)
-                && let Ok(module_parsed) = carina_core::parser::parse(&content)
-            {
+            if let Some(module_parsed) = self.load_module(&module_path) {
                 imported_modules.insert(import.alias.clone(), module_parsed.inputs);
             }
         }
@@ -618,6 +616,62 @@ impl DiagnosticEngine {
         }
 
         diagnostics
+    }
+
+    /// Load a module from a file or directory
+    /// Handles both single-file modules and directory-based modules
+    fn load_module(&self, path: &Path) -> Option<ParsedFile> {
+        if path.is_dir() {
+            // Directory-based module: load main.crn or merge all .crn files
+            let main_path = path.join("main.crn");
+            if main_path.exists() {
+                let content = std::fs::read_to_string(&main_path).ok()?;
+                carina_core::parser::parse(&content).ok()
+            } else {
+                // Merge all .crn files in the directory
+                self.load_directory_module(path)
+            }
+        } else {
+            // Single file module
+            let content = std::fs::read_to_string(path).ok()?;
+            carina_core::parser::parse(&content).ok()
+        }
+    }
+
+    /// Load all .crn files from a directory and merge them
+    fn load_directory_module(&self, dir_path: &Path) -> Option<ParsedFile> {
+        let entries = std::fs::read_dir(dir_path).ok()?;
+        let mut merged = ParsedFile {
+            providers: vec![],
+            resources: vec![],
+            variables: HashMap::new(),
+            imports: vec![],
+            module_calls: vec![],
+            inputs: vec![],
+            outputs: vec![],
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().is_some_and(|ext| ext == "crn")
+                && let Ok(content) = std::fs::read_to_string(&path)
+                && let Ok(parsed) = carina_core::parser::parse(&content)
+            {
+                merged.providers.extend(parsed.providers);
+                merged.resources.extend(parsed.resources);
+                merged.variables.extend(parsed.variables);
+                merged.imports.extend(parsed.imports);
+                merged.module_calls.extend(parsed.module_calls);
+                merged.inputs.extend(parsed.inputs);
+                merged.outputs.extend(parsed.outputs);
+            }
+        }
+
+        if merged.inputs.is_empty() && merged.outputs.is_empty() {
+            None
+        } else {
+            Some(merged)
+        }
     }
 }
 
