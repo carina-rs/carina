@@ -954,3 +954,110 @@ enum CompletionContext {
     AfterInputDot,
     None,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::document::Document;
+
+    fn create_document(content: &str) -> Document {
+        Document::new(content.to_string())
+    }
+
+    #[test]
+    fn top_level_completion_replaces_prefix() {
+        let provider = CompletionProvider::new();
+        let doc = create_document("aws.s");
+        // Cursor at end of "aws.s" (line 0, col 5)
+        let position = Position {
+            line: 0,
+            character: 5,
+        };
+
+        let completions = provider.complete(&doc, position, None);
+
+        // Find the aws.s3.bucket completion
+        let s3_completion = completions
+            .iter()
+            .find(|c| c.label == "aws.s3.bucket")
+            .expect("Should have aws.s3.bucket completion");
+
+        // Verify it uses text_edit, not insert_text
+        assert!(
+            s3_completion.text_edit.is_some(),
+            "Should use text_edit for resource type completion"
+        );
+
+        // Verify the text_edit range starts at column 0 (beginning of "aws.s")
+        if let Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(edit)) = &s3_completion.text_edit
+        {
+            assert_eq!(
+                edit.range.start.character, 0,
+                "Should replace from start of prefix"
+            );
+            assert_eq!(edit.range.end.character, 5, "Should replace up to cursor");
+            assert!(
+                edit.new_text.starts_with("aws.s3.bucket"),
+                "new_text should start with aws.s3.bucket"
+            );
+        } else {
+            panic!("Expected CompletionTextEdit::Edit");
+        }
+    }
+
+    #[test]
+    fn top_level_completion_with_leading_whitespace() {
+        let provider = CompletionProvider::new();
+        let doc = create_document("    aws.v");
+        // Cursor at end of "    aws.v" (line 0, col 9)
+        let position = Position {
+            line: 0,
+            character: 9,
+        };
+
+        let completions = provider.complete(&doc, position, None);
+
+        // Find the aws.vpc completion
+        let vpc_completion = completions
+            .iter()
+            .find(|c| c.label == "aws.vpc")
+            .expect("Should have aws.vpc completion");
+
+        if let Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(edit)) =
+            &vpc_completion.text_edit
+        {
+            // Should replace from column 4 (after whitespace) to cursor at 9
+            assert_eq!(
+                edit.range.start.character, 4,
+                "Should replace from after whitespace"
+            );
+            assert_eq!(edit.range.end.character, 9, "Should replace up to cursor");
+        } else {
+            panic!("Expected CompletionTextEdit::Edit");
+        }
+    }
+
+    #[test]
+    fn top_level_completion_at_line_start() {
+        let provider = CompletionProvider::new();
+        let doc = create_document("a");
+        // Cursor at end of "a" (line 0, col 1)
+        let position = Position {
+            line: 0,
+            character: 1,
+        };
+
+        let completions = provider.complete(&doc, position, None);
+
+        // Find the aws.vpc completion (should still be offered)
+        let vpc_completion = completions.iter().find(|c| c.label == "aws.vpc");
+        assert!(vpc_completion.is_some(), "Should offer aws.vpc completion");
+
+        if let Some(c) = vpc_completion
+            && let Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(edit)) = &c.text_edit
+        {
+            assert_eq!(edit.range.start.character, 0, "Should replace from start");
+            assert_eq!(edit.range.end.character, 1, "Should replace up to cursor");
+        }
+    }
+}
