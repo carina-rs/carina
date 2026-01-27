@@ -793,9 +793,7 @@ impl CompletionProvider {
             && let Some(base) = base_path
         {
             let module_path = base.join(&import_path);
-            if let Ok(module_content) = std::fs::read_to_string(&module_path)
-                && let Ok(parsed) = parser::parse(&module_content)
-            {
+            if let Some(parsed) = self.load_module(&module_path) {
                 // Extract input parameters from the module
                 for input in &parsed.inputs {
                     let type_str = self.format_type_expr(&input.type_expr);
@@ -824,6 +822,57 @@ impl CompletionProvider {
         }
 
         completions
+    }
+
+    /// Load module from path, handling both file and directory-based modules
+    fn load_module(&self, path: &Path) -> Option<parser::ParsedFile> {
+        if path.is_dir() {
+            // Directory-based module: load main.crn
+            let main_path = path.join("main.crn");
+            if main_path.exists() {
+                let content = std::fs::read_to_string(&main_path).ok()?;
+                parser::parse(&content).ok()
+            } else {
+                // Fallback: merge all .crn files in the directory
+                self.load_directory_module(path)
+            }
+        } else {
+            // Single file module
+            let content = std::fs::read_to_string(path).ok()?;
+            parser::parse(&content).ok()
+        }
+    }
+
+    /// Load all .crn files from a directory and merge them
+    fn load_directory_module(&self, dir_path: &Path) -> Option<parser::ParsedFile> {
+        let entries = std::fs::read_dir(dir_path).ok()?;
+        let mut merged = parser::ParsedFile {
+            providers: vec![],
+            resources: vec![],
+            variables: HashMap::new(),
+            imports: vec![],
+            module_calls: vec![],
+            inputs: vec![],
+            outputs: vec![],
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().is_some_and(|ext| ext == "crn")
+                && let Ok(content) = std::fs::read_to_string(&path)
+                && let Ok(parsed) = parser::parse(&content)
+            {
+                merged.providers.extend(parsed.providers);
+                merged.resources.extend(parsed.resources);
+                merged.variables.extend(parsed.variables);
+                merged.imports.extend(parsed.imports);
+                merged.module_calls.extend(parsed.module_calls);
+                merged.inputs.extend(parsed.inputs);
+                merged.outputs.extend(parsed.outputs);
+            }
+        }
+
+        Some(merged)
     }
 
     /// Provide completions for input parameters in the current file (after "input.")
@@ -1059,5 +1108,141 @@ mod tests {
             assert_eq!(edit.range.start.character, 0, "Should replace from start");
             assert_eq!(edit.range.end.character, 1, "Should replace up to cursor");
         }
+    }
+
+    #[test]
+    fn module_parameter_completion_with_directory_module() {
+        use std::fs;
+        use tempfile::tempdir;
+
+        let provider = CompletionProvider::new();
+
+        // Create a temporary directory structure
+        let temp_dir = tempdir().expect("Failed to create temp dir");
+        let base_path = temp_dir.path();
+
+        // Create module directory
+        let module_dir = base_path.join("modules").join("web_tier");
+        fs::create_dir_all(&module_dir).expect("Failed to create module dir");
+
+        // Create main.crn with input parameters
+        let module_content = r#"
+input {
+    vpc: ref(aws.vpc)
+    cidr_blocks: list(cidr)
+    enable_https: bool = true
+}
+
+let web_sg = aws.security_group {
+    name = "web-sg"
+}
+"#;
+        fs::write(module_dir.join("main.crn"), module_content)
+            .expect("Failed to write module file");
+
+        // Create main file that imports the module
+        let main_content = r#"import "./modules/web_tier" as web_tier
+
+web_tier {
+
+}"#;
+        let doc = create_document(main_content);
+
+        // Cursor inside the module call block (line 3, after whitespace)
+        let position = Position {
+            line: 3,
+            character: 4,
+        };
+
+        let completions = provider.complete(&doc, position, Some(base_path));
+
+        // Should have module parameter completions
+        assert!(!completions.is_empty(), "Should have completions");
+
+        // Check for specific parameters
+        let vpc_completion = completions.iter().find(|c| c.label == "vpc");
+        assert!(
+            vpc_completion.is_some(),
+            "Should have vpc parameter completion"
+        );
+        if let Some(c) = vpc_completion {
+            assert!(
+                c.detail.as_ref().is_some_and(|d| d.contains("required")),
+                "vpc should be marked as required"
+            );
+        }
+
+        let cidr_completion = completions.iter().find(|c| c.label == "cidr_blocks");
+        assert!(
+            cidr_completion.is_some(),
+            "Should have cidr_blocks parameter completion"
+        );
+
+        let https_completion = completions.iter().find(|c| c.label == "enable_https");
+        assert!(
+            https_completion.is_some(),
+            "Should have enable_https parameter completion"
+        );
+        if let Some(c) = https_completion {
+            assert!(
+                !c.detail.as_ref().is_some_and(|d| d.contains("required")),
+                "enable_https should NOT be marked as required (has default)"
+            );
+        }
+    }
+
+    #[test]
+    fn module_parameter_completion_with_single_file_module() {
+        use std::fs;
+        use tempfile::tempdir;
+
+        let provider = CompletionProvider::new();
+
+        // Create a temporary directory structure
+        let temp_dir = tempdir().expect("Failed to create temp dir");
+        let base_path = temp_dir.path();
+
+        // Create module directory
+        let module_dir = base_path.join("modules");
+        fs::create_dir_all(&module_dir).expect("Failed to create module dir");
+
+        // Create single file module
+        let module_content = r#"
+input {
+    name: string
+    count: int = 1
+}
+"#;
+        fs::write(module_dir.join("simple.crn"), module_content)
+            .expect("Failed to write module file");
+
+        // Create main file that imports the module
+        let main_content = r#"import "./modules/simple.crn" as simple
+
+simple {
+    n
+}"#;
+        let doc = create_document(main_content);
+
+        // Cursor inside the module call block (line 3, after "n")
+        let position = Position {
+            line: 3,
+            character: 5,
+        };
+
+        let completions = provider.complete(&doc, position, Some(base_path));
+
+        // Should have module parameter completions
+        let name_completion = completions.iter().find(|c| c.label == "name");
+        assert!(
+            name_completion.is_some(),
+            "Should have name parameter completion"
+        );
+
+        let count_completion = completions.iter().find(|c| c.label == "count");
+        assert!(
+            count_completion.is_some(),
+            "Should have count parameter completion"
+        );
     }
 }
