@@ -1,6 +1,6 @@
 use std::path::Path;
 use tower_lsp::lsp_types::{
-    Command, CompletionItem, CompletionItemKind, InsertTextFormat, Position,
+    Command, CompletionItem, CompletionItemKind, InsertTextFormat, Position, Range, TextEdit,
 };
 
 use crate::document::Document;
@@ -34,7 +34,7 @@ impl CompletionProvider {
         let context = self.get_completion_context(&text, position);
 
         match context {
-            CompletionContext::TopLevel => self.top_level_completions(),
+            CompletionContext::TopLevel => self.top_level_completions(position, &text),
             CompletionContext::InsideResourceBlock { resource_type } => {
                 self.attribute_completions_for_type(&resource_type)
             }
@@ -187,7 +187,38 @@ impl CompletionProvider {
         before_eq.to_string()
     }
 
-    fn top_level_completions(&self) -> Vec<CompletionItem> {
+    fn top_level_completions(&self, position: Position, text: &str) -> Vec<CompletionItem> {
+        // Calculate the range for resource type replacements
+        // Find where the current word/prefix starts on this line
+        let lines: Vec<&str> = text.lines().collect();
+        let line_idx = position.line as usize;
+        let col = position.character as usize;
+
+        let prefix_start = if line_idx < lines.len() {
+            let line = lines[line_idx];
+            let before_cursor: String = line.chars().take(col).collect();
+            // Find where the identifier starts (going backwards from cursor)
+            // Stop at whitespace, but continue through dots
+            let mut start = col;
+            for (i, c) in before_cursor.chars().rev().enumerate() {
+                if c.is_whitespace() {
+                    break;
+                }
+                start = col - i - 1;
+            }
+            start as u32
+        } else {
+            position.character
+        };
+
+        let replacement_range = Range {
+            start: Position {
+                line: position.line,
+                character: prefix_start,
+            },
+            end: position,
+        };
+
         vec![
             CompletionItem {
                 label: "provider".to_string(),
@@ -241,7 +272,10 @@ impl CompletionProvider {
             CompletionItem {
                 label: "aws.s3.bucket".to_string(),
                 kind: Some(CompletionItemKind::CLASS),
-                insert_text: Some("aws.s3.bucket {\n    name = \"${1:bucket-name}\"\n}".to_string()),
+                text_edit: Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(TextEdit {
+                    range: replacement_range,
+                    new_text: "aws.s3.bucket {\n    name = \"${1:bucket-name}\"\n}".to_string(),
+                })),
                 insert_text_format: Some(InsertTextFormat::SNIPPET),
                 detail: Some("S3 bucket resource".to_string()),
                 ..Default::default()
@@ -250,7 +284,10 @@ impl CompletionProvider {
             CompletionItem {
                 label: "aws.vpc".to_string(),
                 kind: Some(CompletionItemKind::CLASS),
-                insert_text: Some("aws.vpc {\n    name       = \"${1:vpc-name}\"\n    cidr_block = \"${2:10.0.0.0/16}\"\n}".to_string()),
+                text_edit: Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(TextEdit {
+                    range: replacement_range,
+                    new_text: "aws.vpc {\n    name       = \"${1:vpc-name}\"\n    cidr_block = \"${2:10.0.0.0/16}\"\n}".to_string(),
+                })),
                 insert_text_format: Some(InsertTextFormat::SNIPPET),
                 detail: Some("VPC resource".to_string()),
                 ..Default::default()
@@ -258,7 +295,10 @@ impl CompletionProvider {
             CompletionItem {
                 label: "aws.subnet".to_string(),
                 kind: Some(CompletionItemKind::CLASS),
-                insert_text: Some("aws.subnet {\n    name              = \"${1:subnet-name}\"\n    vpc_id            = ${2:vpc.id}\n    cidr_block        = \"${3:10.0.1.0/24}\"\n    availability_zone = aws.AvailabilityZone.${4:ap_northeast_1a}\n}".to_string()),
+                text_edit: Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(TextEdit {
+                    range: replacement_range,
+                    new_text: "aws.subnet {\n    name              = \"${1:subnet-name}\"\n    vpc_id            = ${2:vpc.id}\n    cidr_block        = \"${3:10.0.1.0/24}\"\n    availability_zone = aws.AvailabilityZone.${4:ap_northeast_1a}\n}".to_string(),
+                })),
                 insert_text_format: Some(InsertTextFormat::SNIPPET),
                 detail: Some("Subnet resource".to_string()),
                 ..Default::default()
@@ -266,7 +306,10 @@ impl CompletionProvider {
             CompletionItem {
                 label: "aws.internet_gateway".to_string(),
                 kind: Some(CompletionItemKind::CLASS),
-                insert_text: Some("aws.internet_gateway {\n    name   = \"${1:igw-name}\"\n    vpc_id = ${2:vpc.id}\n}".to_string()),
+                text_edit: Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(TextEdit {
+                    range: replacement_range,
+                    new_text: "aws.internet_gateway {\n    name   = \"${1:igw-name}\"\n    vpc_id = ${2:vpc.id}\n}".to_string(),
+                })),
                 insert_text_format: Some(InsertTextFormat::SNIPPET),
                 detail: Some("Internet Gateway resource".to_string()),
                 ..Default::default()
@@ -274,7 +317,10 @@ impl CompletionProvider {
             CompletionItem {
                 label: "aws.route_table".to_string(),
                 kind: Some(CompletionItemKind::CLASS),
-                insert_text: Some("aws.route_table {\n    name   = \"${1:rt-name}\"\n    vpc_id = ${2:vpc.id}\n}".to_string()),
+                text_edit: Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(TextEdit {
+                    range: replacement_range,
+                    new_text: "aws.route_table {\n    name   = \"${1:rt-name}\"\n    vpc_id = ${2:vpc.id}\n}".to_string(),
+                })),
                 insert_text_format: Some(InsertTextFormat::SNIPPET),
                 detail: Some("Route Table resource".to_string()),
                 ..Default::default()
@@ -282,7 +328,10 @@ impl CompletionProvider {
             CompletionItem {
                 label: "aws.route".to_string(),
                 kind: Some(CompletionItemKind::CLASS),
-                insert_text: Some("aws.route {\n    name                   = \"${1:route-name}\"\n    route_table_id         = ${2:rt.id}\n    destination_cidr_block = \"${3:0.0.0.0/0}\"\n    gateway_id             = ${4:igw.id}\n}".to_string()),
+                text_edit: Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(TextEdit {
+                    range: replacement_range,
+                    new_text: "aws.route {\n    name                   = \"${1:route-name}\"\n    route_table_id         = ${2:rt.id}\n    destination_cidr_block = \"${3:0.0.0.0/0}\"\n    gateway_id             = ${4:igw.id}\n}".to_string(),
+                })),
                 insert_text_format: Some(InsertTextFormat::SNIPPET),
                 detail: Some("Route in a Route Table".to_string()),
                 ..Default::default()
@@ -290,7 +339,10 @@ impl CompletionProvider {
             CompletionItem {
                 label: "aws.security_group".to_string(),
                 kind: Some(CompletionItemKind::CLASS),
-                insert_text: Some("aws.security_group {\n    name        = \"${1:sg-name}\"\n    vpc_id      = ${2:vpc.id}\n    description = \"${3:Security group description}\"\n}".to_string()),
+                text_edit: Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(TextEdit {
+                    range: replacement_range,
+                    new_text: "aws.security_group {\n    name        = \"${1:sg-name}\"\n    vpc_id      = ${2:vpc.id}\n    description = \"${3:Security group description}\"\n}".to_string(),
+                })),
                 insert_text_format: Some(InsertTextFormat::SNIPPET),
                 detail: Some("Security Group resource".to_string()),
                 ..Default::default()
@@ -298,7 +350,10 @@ impl CompletionProvider {
             CompletionItem {
                 label: "aws.security_group.ingress_rule".to_string(),
                 kind: Some(CompletionItemKind::CLASS),
-                insert_text: Some("aws.security_group.ingress_rule {\n    name              = \"${1:rule-name}\"\n    security_group_id = ${2:sg.id}\n    protocol          = aws.Protocol.${3:tcp}\n    from_port         = ${4:80}\n    to_port           = ${5:80}\n    cidr              = \"${6:0.0.0.0/0}\"\n}".to_string()),
+                text_edit: Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(TextEdit {
+                    range: replacement_range,
+                    new_text: "aws.security_group.ingress_rule {\n    name              = \"${1:rule-name}\"\n    security_group_id = ${2:sg.id}\n    protocol          = aws.Protocol.${3:tcp}\n    from_port         = ${4:80}\n    to_port           = ${5:80}\n    cidr              = \"${6:0.0.0.0/0}\"\n}".to_string(),
+                })),
                 insert_text_format: Some(InsertTextFormat::SNIPPET),
                 detail: Some("Security Group Ingress Rule".to_string()),
                 ..Default::default()
@@ -306,7 +361,10 @@ impl CompletionProvider {
             CompletionItem {
                 label: "aws.security_group.egress_rule".to_string(),
                 kind: Some(CompletionItemKind::CLASS),
-                insert_text: Some("aws.security_group.egress_rule {\n    name              = \"${1:rule-name}\"\n    security_group_id = ${2:sg.id}\n    protocol          = aws.Protocol.${3:all}\n    from_port         = ${4:0}\n    to_port           = ${5:0}\n    cidr              = \"${6:0.0.0.0/0}\"\n}".to_string()),
+                text_edit: Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(TextEdit {
+                    range: replacement_range,
+                    new_text: "aws.security_group.egress_rule {\n    name              = \"${1:rule-name}\"\n    security_group_id = ${2:sg.id}\n    protocol          = aws.Protocol.${3:all}\n    from_port         = ${4:0}\n    to_port           = ${5:0}\n    cidr              = \"${6:0.0.0.0/0}\"\n}".to_string(),
+                })),
                 insert_text_format: Some(InsertTextFormat::SNIPPET),
                 detail: Some("Security Group Egress Rule".to_string()),
                 ..Default::default()
