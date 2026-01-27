@@ -92,6 +92,16 @@ Directory-based modules (e.g., `modules/web_tier/`) require special handling:
 - CLI: `load_module()` checks `is_dir()` and reads `main.crn` from directory
 - LSP: `load_directory_module()` in diagnostics.rs handles directory modules for proper validation
 
+## Git Workflow
+
+After merging a PR, clean up branches:
+```bash
+git checkout main
+git pull
+git branch -d <feature-branch>    # Delete local branch
+git remote prune origin           # Remove stale remote tracking branches
+```
+
 ## Code Style
 
 - **Commit messages**: Write in English
