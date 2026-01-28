@@ -33,27 +33,27 @@ struct Cli {
 enum Commands {
     /// Validate the configuration file
     Validate {
-        /// Path to .crn file
-        #[arg(default_value = "main.crn")]
-        file: PathBuf,
+        /// Path to .crn file or directory
+        #[arg(default_value = ".")]
+        path: PathBuf,
     },
     /// Show execution plan without applying changes
     Plan {
-        /// Path to .crn file
-        #[arg(default_value = "main.crn")]
-        file: PathBuf,
+        /// Path to .crn file or directory
+        #[arg(default_value = ".")]
+        path: PathBuf,
     },
     /// Apply changes to reach the desired state
     Apply {
-        /// Path to .crn file
-        #[arg(default_value = "main.crn")]
-        file: PathBuf,
+        /// Path to .crn file or directory
+        #[arg(default_value = ".")]
+        path: PathBuf,
     },
     /// Destroy all resources defined in the configuration file
     Destroy {
-        /// Path to .crn file
-        #[arg(default_value = "main.crn")]
-        file: PathBuf,
+        /// Path to .crn file or directory
+        #[arg(default_value = ".")]
+        path: PathBuf,
 
         /// Skip confirmation prompt (auto-approve)
         #[arg(long)]
@@ -98,10 +98,10 @@ async fn main() {
     let cli = Cli::parse();
 
     let result = match cli.command {
-        Commands::Validate { file } => run_validate(&file),
-        Commands::Plan { file } => run_plan(&file).await,
-        Commands::Apply { file } => run_apply(&file).await,
-        Commands::Destroy { file, auto_approve } => run_destroy(&file, auto_approve).await,
+        Commands::Validate { path } => run_validate(&path),
+        Commands::Plan { path } => run_plan(&path).await,
+        Commands::Apply { path } => run_apply(&path).await,
+        Commands::Destroy { path, auto_approve } => run_destroy(&path, auto_approve).await,
         Commands::Fmt {
             path,
             check,
@@ -361,6 +361,68 @@ fn load_directory_module(dir_path: &Path) -> Option<ParsedFile> {
     }
 }
 
+/// Load configuration from a file or directory
+fn load_configuration(path: &PathBuf) -> Result<ParsedFile, String> {
+    if path.is_file() {
+        // Single file mode (existing behavior)
+        let content = fs::read_to_string(path)
+            .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
+        parser::parse_and_resolve(&content).map_err(|e| format!("Parse error: {}", e))
+    } else if path.is_dir() {
+        // Directory mode
+        let files = find_crn_files_in_dir(path)?;
+        if files.is_empty() {
+            return Err(format!("No .crn files found in {}", path.display()));
+        }
+
+        let mut merged = ParsedFile {
+            providers: vec![],
+            resources: vec![],
+            variables: HashMap::new(),
+            imports: vec![],
+            module_calls: vec![],
+            inputs: vec![],
+            outputs: vec![],
+        };
+        let mut parse_errors = Vec::new();
+
+        for file in &files {
+            let content = fs::read_to_string(file)
+                .map_err(|e| format!("Failed to read {}: {}", file.display(), e))?;
+            match parser::parse_and_resolve(&content) {
+                Ok(parsed) => {
+                    merged.providers.extend(parsed.providers);
+                    merged.resources.extend(parsed.resources);
+                    merged.variables.extend(parsed.variables);
+                    merged.imports.extend(parsed.imports);
+                    merged.module_calls.extend(parsed.module_calls);
+                    merged.inputs.extend(parsed.inputs);
+                    merged.outputs.extend(parsed.outputs);
+                }
+                Err(e) => {
+                    parse_errors.push(format!("{}: {}", file.display(), e));
+                }
+            }
+        }
+
+        if !parse_errors.is_empty() {
+            return Err(parse_errors.join("\n"));
+        }
+        Ok(merged)
+    } else {
+        Err(format!("Path not found: {}", path.display()))
+    }
+}
+
+/// Get base directory for module resolution
+fn get_base_dir(path: &Path) -> &Path {
+    if path.is_file() {
+        path.parent().unwrap_or(Path::new("."))
+    } else {
+        path
+    }
+}
+
 /// Validate a module argument value against its expected type
 fn validate_module_arg_type(type_expr: &TypeExpr, value: &Value) -> Option<String> {
     match (type_expr, value) {
@@ -388,14 +450,10 @@ fn validate_module_arg_type(type_expr: &TypeExpr, value: &Value) -> Option<Strin
     }
 }
 
-fn run_validate(file: &PathBuf) -> Result<(), String> {
-    let content = fs::read_to_string(file)
-        .map_err(|e| format!("Failed to read {}: {}", file.display(), e))?;
+fn run_validate(path: &PathBuf) -> Result<(), String> {
+    let mut parsed = load_configuration(path)?;
 
-    let mut parsed =
-        parser::parse_and_resolve(&content).map_err(|e| format!("Parse error: {}", e))?;
-
-    let base_dir = file.parent().unwrap_or(Path::new("."));
+    let base_dir = get_base_dir(path);
 
     // Validate provider region
     validate_provider_region(&parsed)?;
@@ -431,15 +489,11 @@ fn run_validate(file: &PathBuf) -> Result<(), String> {
     Ok(())
 }
 
-async fn run_plan(file: &PathBuf) -> Result<(), String> {
-    let content = fs::read_to_string(file)
-        .map_err(|e| format!("Failed to read {}: {}", file.display(), e))?;
-
-    let mut parsed =
-        parser::parse_and_resolve(&content).map_err(|e| format!("Parse error: {}", e))?;
+async fn run_plan(path: &PathBuf) -> Result<(), String> {
+    let mut parsed = load_configuration(path)?;
 
     // Resolve module imports and expand module calls
-    let base_dir = file.parent().unwrap_or(Path::new("."));
+    let base_dir = get_base_dir(path);
     module_resolver::resolve_modules(&mut parsed, base_dir)
         .map_err(|e| format!("Module resolution error: {}", e))?;
 
@@ -456,15 +510,11 @@ async fn run_plan(file: &PathBuf) -> Result<(), String> {
     Ok(())
 }
 
-async fn run_apply(file: &PathBuf) -> Result<(), String> {
-    let content = fs::read_to_string(file)
-        .map_err(|e| format!("Failed to read {}: {}", file.display(), e))?;
-
-    let mut parsed =
-        parser::parse_and_resolve(&content).map_err(|e| format!("Parse error: {}", e))?;
+async fn run_apply(path: &PathBuf) -> Result<(), String> {
+    let mut parsed = load_configuration(path)?;
 
     // Resolve module imports and expand module calls
-    let base_dir = file.parent().unwrap_or(Path::new("."));
+    let base_dir = get_base_dir(path);
     module_resolver::resolve_modules(&mut parsed, base_dir)
         .map_err(|e| format!("Module resolution error: {}", e))?;
 
@@ -682,15 +732,11 @@ async fn run_apply(file: &PathBuf) -> Result<(), String> {
     Ok(())
 }
 
-async fn run_destroy(file: &PathBuf, auto_approve: bool) -> Result<(), String> {
-    let content = fs::read_to_string(file)
-        .map_err(|e| format!("Failed to read {}: {}", file.display(), e))?;
-
-    let mut parsed =
-        parser::parse_and_resolve(&content).map_err(|e| format!("Parse error: {}", e))?;
+async fn run_destroy(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
+    let mut parsed = load_configuration(path)?;
 
     // Resolve module imports and expand module calls
-    let base_dir = file.parent().unwrap_or(Path::new("."));
+    let base_dir = get_base_dir(path);
     module_resolver::resolve_modules(&mut parsed, base_dir)
         .map_err(|e| format!("Module resolution error: {}", e))?;
 
