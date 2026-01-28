@@ -55,8 +55,11 @@ impl Token {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NodeKind {
     File,
+    ImportStmt,
+    BackendBlock,
     ProviderBlock,
     LetBinding,
+    ModuleCall,
     AnonymousResource,
     ResourceExpr,
     Attribute,
@@ -70,15 +73,21 @@ pub enum NodeKind {
     String,
     Number,
     Boolean,
+    List,
     // Delimiters
     OpenBrace,
     CloseBrace,
+    OpenBracket,
+    CloseBracket,
     OpenParen,
     CloseParen,
     Equals,
     PipeOperator,
     Comma,
     // Keywords
+    KwImport,
+    KwAs,
+    KwBackend,
     KwProvider,
     KwLet,
     KwEnv,

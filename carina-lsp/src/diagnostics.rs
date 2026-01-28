@@ -645,6 +645,7 @@ impl DiagnosticEngine {
             module_calls: vec![],
             inputs: vec![],
             outputs: vec![],
+            backend: None,
         };
 
         for entry in entries.flatten() {

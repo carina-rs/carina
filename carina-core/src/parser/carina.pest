@@ -3,7 +3,7 @@
 // Entry point
 file = { SOI ~ statement* ~ EOI }
 
-statement = { import_stmt | provider_block | input_block | output_block | let_binding | module_call | anonymous_resource }
+statement = { import_stmt | backend_block | provider_block | input_block | output_block | let_binding | module_call | anonymous_resource }
 
 // Input block: input { vpc_id: string, ... }
 input_block = {
@@ -35,6 +35,11 @@ resource_type_path = @{ identifier ~ ("." ~ identifier)+ }
 // Import statement: import "./path/to/module.crn" as name
 import_stmt = {
     "import" ~ string ~ "as" ~ identifier
+}
+
+// Backend block: backend s3 { bucket = "...", key = "...", ... }
+backend_block = {
+    "backend" ~ identifier ~ "{" ~ attribute* ~ "}"
 }
 
 // Module call: module_name { key = value, ... }

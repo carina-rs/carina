@@ -10,13 +10,17 @@ use carina_core::differ::create_plan;
 use carina_core::effect::Effect;
 use carina_core::formatter::{self, FormatConfig};
 use carina_core::module_resolver;
-use carina_core::parser::{self, ParsedFile, TypeExpr};
+use carina_core::parser::{self, BackendConfig, ParsedFile, TypeExpr};
 use carina_core::plan::Plan;
 use carina_core::provider::{BoxFuture, Provider, ProviderError, ProviderResult, ResourceType};
 use carina_core::resource::{Resource, ResourceId, State, Value};
 use carina_core::schema::ResourceSchema;
 use carina_core::schema::validate_cidr;
 use carina_provider_aws::schemas;
+use carina_state::{
+    BackendConfig as StateBackendConfig, BackendError, LockInfo, ResourceState, StateBackend,
+    StateFile, create_backend,
+};
 use std::collections::HashSet;
 
 use carina_provider_aws::AwsProvider;
@@ -82,6 +86,20 @@ enum Commands {
         #[command(subcommand)]
         command: ModuleCommands,
     },
+    /// Force unlock a stuck state lock
+    ForceUnlock {
+        /// The lock ID to force unlock
+        lock_id: String,
+
+        /// Path to .crn file or directory containing backend configuration
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
+    /// State management commands
+    State {
+        #[command(subcommand)]
+        command: StateCommands,
+    },
 }
 
 #[derive(Subcommand)]
@@ -90,6 +108,23 @@ enum ModuleCommands {
     Info {
         /// Path to module .crn file
         file: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum StateCommands {
+    /// Delete state bucket (requires --force flag)
+    BucketDelete {
+        /// Name of the bucket to delete
+        bucket_name: String,
+
+        /// Force deletion without confirmation
+        #[arg(long)]
+        force: bool,
+
+        /// Path to .crn file or directory containing backend configuration
+        #[arg(default_value = ".")]
+        path: PathBuf,
     },
 }
 
@@ -109,6 +144,8 @@ async fn main() {
             recursive,
         } => run_fmt(&path, check, diff, recursive),
         Commands::Module { command } => run_module_command(command),
+        Commands::ForceUnlock { lock_id, path } => run_force_unlock(&lock_id, &path).await,
+        Commands::State { command } => run_state_command(command).await,
     };
 
     if let Err(e) = result {
@@ -197,6 +234,7 @@ fn load_module_from_directory(dir: &PathBuf) -> Result<ParsedFile, String> {
         module_calls: vec![],
         inputs: vec![],
         outputs: vec![],
+        backend: None,
     };
 
     for entry in entries {
@@ -336,6 +374,7 @@ fn load_directory_module(dir_path: &Path) -> Option<ParsedFile> {
         module_calls: vec![],
         inputs: vec![],
         outputs: vec![],
+        backend: None,
     };
 
     for entry in entries.flatten() {
@@ -361,13 +400,29 @@ fn load_directory_module(dir_path: &Path) -> Option<ParsedFile> {
     }
 }
 
+/// Result of loading configuration, includes the file path containing backend block
+struct LoadedConfig {
+    parsed: ParsedFile,
+    backend_file: Option<PathBuf>,
+}
+
 /// Load configuration from a file or directory
-fn load_configuration(path: &PathBuf) -> Result<ParsedFile, String> {
+fn load_configuration(path: &PathBuf) -> Result<LoadedConfig, String> {
     if path.is_file() {
         // Single file mode (existing behavior)
         let content = fs::read_to_string(path)
             .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
-        parser::parse_and_resolve(&content).map_err(|e| format!("Parse error: {}", e))
+        let parsed =
+            parser::parse_and_resolve(&content).map_err(|e| format!("Parse error: {}", e))?;
+        let backend_file = if parsed.backend.is_some() {
+            Some(path.clone())
+        } else {
+            None
+        };
+        Ok(LoadedConfig {
+            parsed,
+            backend_file,
+        })
     } else if path.is_dir() {
         // Directory mode
         let files = find_crn_files_in_dir(path)?;
@@ -383,8 +438,10 @@ fn load_configuration(path: &PathBuf) -> Result<ParsedFile, String> {
             module_calls: vec![],
             inputs: vec![],
             outputs: vec![],
+            backend: None,
         };
         let mut parse_errors = Vec::new();
+        let mut backend_file: Option<PathBuf> = None;
 
         for file in &files {
             let content = fs::read_to_string(file)
@@ -398,6 +455,18 @@ fn load_configuration(path: &PathBuf) -> Result<ParsedFile, String> {
                     merged.module_calls.extend(parsed.module_calls);
                     merged.inputs.extend(parsed.inputs);
                     merged.outputs.extend(parsed.outputs);
+                    // Merge backend (only one allowed)
+                    if let Some(backend) = parsed.backend {
+                        if merged.backend.is_some() {
+                            parse_errors.push(format!(
+                                "{}: multiple backend blocks defined",
+                                file.display()
+                            ));
+                        } else {
+                            merged.backend = Some(backend);
+                            backend_file = Some(file.clone());
+                        }
+                    }
                 }
                 Err(e) => {
                     parse_errors.push(format!("{}: {}", file.display(), e));
@@ -408,7 +477,10 @@ fn load_configuration(path: &PathBuf) -> Result<ParsedFile, String> {
         if !parse_errors.is_empty() {
             return Err(parse_errors.join("\n"));
         }
-        Ok(merged)
+        Ok(LoadedConfig {
+            parsed: merged,
+            backend_file,
+        })
     } else {
         Err(format!("Path not found: {}", path.display()))
     }
@@ -451,7 +523,7 @@ fn validate_module_arg_type(type_expr: &TypeExpr, value: &Value) -> Option<Strin
 }
 
 fn run_validate(path: &PathBuf) -> Result<(), String> {
-    let mut parsed = load_configuration(path)?;
+    let mut parsed = load_configuration(path)?.parsed;
 
     let base_dir = get_base_dir(path);
 
@@ -490,7 +562,7 @@ fn run_validate(path: &PathBuf) -> Result<(), String> {
 }
 
 async fn run_plan(path: &PathBuf) -> Result<(), String> {
-    let mut parsed = load_configuration(path)?;
+    let mut parsed = load_configuration(path)?.parsed;
 
     // Resolve module imports and expand module calls
     let base_dir = get_base_dir(path);
@@ -504,6 +576,77 @@ async fn run_plan(path: &PathBuf) -> Result<(), String> {
     apply_default_region(&mut parsed);
 
     validate_resources(&parsed.resources)?;
+
+    // Check for backend configuration and show bootstrap info
+    let mut will_create_state_bucket = false;
+    let mut state_bucket_name = String::new();
+
+    if let Some(config) = parsed.backend.as_ref() {
+        let state_config = convert_backend_config(config);
+        let backend = create_backend(&state_config)
+            .await
+            .map_err(|e| format!("Failed to create backend: {}", e))?;
+
+        let bucket_exists = backend
+            .bucket_exists()
+            .await
+            .map_err(|e| format!("Failed to check bucket: {}", e))?;
+
+        if !bucket_exists {
+            // Check if there's a matching s3.bucket resource defined
+            let bucket_name = config
+                .attributes
+                .get("bucket")
+                .and_then(|v| match v {
+                    Value::String(s) => Some(s.clone()),
+                    _ => None,
+                })
+                .ok_or("Backend bucket name not specified")?;
+
+            let has_bucket_resource = parsed.resources.iter().any(|r| {
+                r.id.resource_type == "s3.bucket"
+                    && r.attributes
+                        .get("name")
+                        .is_some_and(|v| matches!(v, Value::String(s) if s == &bucket_name))
+            });
+
+            if !has_bucket_resource {
+                let auto_create = config
+                    .attributes
+                    .get("auto_create")
+                    .and_then(|v| match v {
+                        Value::Bool(b) => Some(*b),
+                        _ => None,
+                    })
+                    .unwrap_or(true);
+
+                if auto_create {
+                    will_create_state_bucket = true;
+                    state_bucket_name = bucket_name;
+                } else {
+                    return Err(format!(
+                        "Backend bucket '{}' not found and auto_create is disabled",
+                        bucket_name
+                    ));
+                }
+            }
+        }
+    }
+
+    // Show bootstrap plan if needed
+    if will_create_state_bucket {
+        println!("{}", "Bootstrap Plan:".cyan().bold());
+        println!(
+            "  {} {} (state bucket with versioning enabled)",
+            "+".green(),
+            format!("aws.s3.bucket.{}", state_bucket_name).green()
+        );
+        println!(
+            "  {} Resource definition will be added to .crn file",
+            "→".cyan()
+        );
+        println!();
+    }
 
     let plan = create_plan_from_parsed(&parsed).await?;
     print_plan(&plan);
@@ -511,7 +654,9 @@ async fn run_plan(path: &PathBuf) -> Result<(), String> {
 }
 
 async fn run_apply(path: &PathBuf) -> Result<(), String> {
-    let mut parsed = load_configuration(path)?;
+    let loaded = load_configuration(path)?;
+    let mut parsed = loaded.parsed;
+    let backend_file = loaded.backend_file;
 
     // Resolve module imports and expand module calls
     let base_dir = get_base_dir(path);
@@ -525,6 +670,198 @@ async fn run_apply(path: &PathBuf) -> Result<(), String> {
     apply_default_region(&mut parsed);
 
     validate_resources(&parsed.resources)?;
+
+    // Check for backend configuration
+    let backend_config = parsed.backend.as_ref();
+    let backend: Option<Box<dyn StateBackend>> = if let Some(config) = backend_config {
+        let state_config = convert_backend_config(config);
+        Some(
+            create_backend(&state_config)
+                .await
+                .map_err(|e| format!("Failed to create backend: {}", e))?,
+        )
+    } else {
+        None
+    };
+
+    // Handle bootstrap if backend is configured
+    let mut lock: Option<LockInfo> = None;
+    let mut state_file: Option<StateFile> = None;
+
+    if let Some(ref backend) = backend {
+        let config = backend_config.unwrap();
+
+        // Check if bucket exists (bootstrap detection)
+        let bucket_exists = backend
+            .bucket_exists()
+            .await
+            .map_err(|e| format!("Failed to check bucket: {}", e))?;
+
+        if !bucket_exists {
+            println!(
+                "{}",
+                "State bucket not found. Running bootstrap..."
+                    .yellow()
+                    .bold()
+            );
+
+            // Get bucket name from config
+            let bucket_name = config
+                .attributes
+                .get("bucket")
+                .and_then(|v| match v {
+                    Value::String(s) => Some(s.clone()),
+                    _ => None,
+                })
+                .ok_or("Missing bucket name in backend configuration")?;
+
+            // Check if there's an s3.bucket resource defined with matching name
+            if let Some(bucket_resource) = find_state_bucket_resource(&parsed, &bucket_name) {
+                println!("Found state bucket resource in configuration.");
+                println!(
+                    "Creating bucket '{}' before other resources...",
+                    bucket_name.cyan()
+                );
+
+                // Create the bucket resource first
+                let region = get_aws_region(&parsed);
+                let aws_provider = AwsProvider::new(&region).await;
+
+                match aws_provider.create(bucket_resource).await {
+                    Ok(_) => {
+                        println!("  {} Created state bucket: {}", "✓".green(), bucket_name);
+                    }
+                    Err(e) => {
+                        return Err(format!("Failed to create state bucket: {}", e));
+                    }
+                }
+            } else {
+                // Auto-create the bucket if auto_create is enabled
+                let auto_create = config
+                    .attributes
+                    .get("auto_create")
+                    .and_then(|v| match v {
+                        Value::Bool(b) => Some(*b),
+                        _ => None,
+                    })
+                    .unwrap_or(true);
+
+                if auto_create {
+                    println!("Auto-creating state bucket: {}", bucket_name.cyan());
+                    backend
+                        .create_bucket()
+                        .await
+                        .map_err(|e| format!("Failed to create bucket: {}", e))?;
+                    println!("  {} Created state bucket", "✓".green());
+
+                    // Get region from backend config
+                    let region = config
+                        .attributes
+                        .get("region")
+                        .and_then(|v| match v {
+                            Value::String(s) => Some(convert_region_value(s)),
+                            _ => None,
+                        })
+                        .unwrap_or_else(|| "ap-northeast-1".to_string());
+
+                    // Append resource definition to backend file
+                    let target_file = backend_file.clone().unwrap_or_else(|| path.clone());
+
+                    let resource_code = format!(
+                        "\n# Auto-generated by carina (state bucket)\naws.s3.bucket {{\n    name       = \"{}\"\n    versioning = \"Enabled\"\n}}\n",
+                        bucket_name
+                    );
+
+                    // Read existing content if file exists, then append
+                    let mut content = if target_file.exists() {
+                        fs::read_to_string(&target_file).map_err(|e| {
+                            format!("Failed to read {}: {}", target_file.display(), e)
+                        })?
+                    } else {
+                        String::new()
+                    };
+                    content.push_str(&resource_code);
+
+                    fs::write(&target_file, &content)
+                        .map_err(|e| format!("Failed to write {}: {}", target_file.display(), e))?;
+                    println!(
+                        "  {} Added resource definition to {}",
+                        "✓".green(),
+                        target_file.display()
+                    );
+
+                    // Create a protected ResourceState for the auto-created bucket
+                    let bucket_state = ResourceState::new("s3.bucket", &bucket_name, "aws")
+                        .with_attribute("name".to_string(), serde_json::json!(bucket_name))
+                        .with_attribute("region".to_string(), serde_json::json!(region))
+                        .with_attribute("versioning".to_string(), serde_json::json!("Enabled"))
+                        .with_protected(true);
+
+                    // Initialize state with the protected bucket
+                    let mut initial_state = StateFile::new();
+                    initial_state.upsert_resource(bucket_state);
+                    backend
+                        .write_state(&initial_state)
+                        .await
+                        .map_err(|e| format!("Failed to write initial state: {}", e))?;
+                    println!(
+                        "  {} Registered state bucket as protected resource",
+                        "✓".green()
+                    );
+
+                    // Re-parse the updated configuration to include the new resource
+                    parsed = load_configuration(path)?.parsed;
+                    if let Err(e) =
+                        module_resolver::resolve_modules(&mut parsed, get_base_dir(path))
+                    {
+                        return Err(format!("Module resolution error: {}", e));
+                    }
+                } else {
+                    return Err(format!(
+                        "Backend bucket '{}' not found and auto_create is disabled",
+                        bucket_name
+                    ));
+                }
+            }
+
+            // Initialize state if not already done (when bucket existed or was created from resource)
+            if backend
+                .read_state()
+                .await
+                .map_err(|e| format!("Failed to read state: {}", e))?
+                .is_none()
+            {
+                backend
+                    .init()
+                    .await
+                    .map_err(|e| format!("Failed to initialize state: {}", e))?;
+            }
+        }
+
+        // Acquire lock
+        println!("{}", "Acquiring state lock...".cyan());
+        lock = Some(backend.acquire_lock("apply").await.map_err(|e| match e {
+            BackendError::Locked {
+                who,
+                lock_id,
+                operation,
+            } => {
+                format!(
+                    "State is locked by {} (lock ID: {}, operation: {})\n\
+                            If you believe this is stale, run: carina force-unlock {}",
+                    who, lock_id, operation, lock_id
+                )
+            }
+            _ => format!("Failed to acquire lock: {}", e),
+        })?);
+        println!("  {} Lock acquired", "✓".green());
+
+        // Read current state from backend
+        state_file = backend
+            .read_state()
+            .await
+            .map_err(|e| format!("Failed to read state: {}", e))?;
+    }
 
     // Sort resources by dependencies
     let sorted_resources = sort_resources_by_dependencies(&parsed.resources);
@@ -620,6 +957,15 @@ async fn run_apply(path: &PathBuf) -> Result<(), String> {
 
     if plan.is_empty() {
         println!("{}", "No changes needed.".green());
+
+        // Release lock if we have one
+        if let (Some(backend), Some(lock_info)) = (&backend, &lock) {
+            backend
+                .release_lock(lock_info)
+                .await
+                .map_err(|e| format!("Failed to release lock: {}", e))?;
+        }
+
         return Ok(());
     }
 
@@ -631,6 +977,7 @@ async fn run_apply(path: &PathBuf) -> Result<(), String> {
 
     let mut success_count = 0;
     let mut failure_count = 0;
+    let mut applied_states: HashMap<ResourceId, State> = HashMap::new();
 
     // Apply each effect in order, resolving references dynamically
     for effect in plan.effects() {
@@ -648,6 +995,9 @@ async fn run_apply(path: &PathBuf) -> Result<(), String> {
                     Ok(state) => {
                         println!("  {} {}", "✓".green(), format_effect(effect));
                         success_count += 1;
+
+                        // Track the applied state
+                        applied_states.insert(resource.id.clone(), state.clone());
 
                         // Update binding_map with the newly created resource's state (including id)
                         if let Some(Value::String(binding_name)) =
@@ -680,6 +1030,9 @@ async fn run_apply(path: &PathBuf) -> Result<(), String> {
                         println!("  {} {}", "✓".green(), format_effect(effect));
                         success_count += 1;
 
+                        // Track the applied state
+                        applied_states.insert(id.clone(), state.clone());
+
                         // Update binding_map
                         if let Some(Value::String(binding_name)) = to.attributes.get("_binding") {
                             let mut attrs = resolved_to.attributes.clone();
@@ -709,6 +1062,53 @@ async fn run_apply(path: &PathBuf) -> Result<(), String> {
         }
     }
 
+    // Save state if backend is configured
+    if let Some(ref backend) = backend {
+        println!();
+        println!("{}", "Saving state...".cyan());
+
+        // Get or create state file
+        let mut state = state_file.unwrap_or_default();
+
+        // Update state with current resources
+        for resource in &sorted_resources {
+            let existing = state.find_resource(&resource.id.resource_type, &resource.id.name);
+            if let Some(applied_state) = applied_states.get(&resource.id) {
+                let resource_state = resource_to_state(resource, applied_state, existing);
+                state.upsert_resource(resource_state);
+            } else if let Some(current_state) = current_states.get(&resource.id)
+                && current_state.exists
+            {
+                let resource_state = resource_to_state(resource, current_state, existing);
+                state.upsert_resource(resource_state);
+            }
+        }
+
+        // Remove deleted resources from state
+        for effect in plan.effects() {
+            if let Effect::Delete(id) = effect {
+                state.remove_resource(&id.resource_type, &id.name);
+            }
+        }
+
+        // Increment serial and save
+        state.increment_serial();
+        backend
+            .write_state(&state)
+            .await
+            .map_err(|e| format!("Failed to write state: {}", e))?;
+        println!("  {} State saved (serial: {})", "✓".green(), state.serial);
+
+        // Release lock
+        if let Some(ref lock_info) = lock {
+            backend
+                .release_lock(lock_info)
+                .await
+                .map_err(|e| format!("Failed to release lock: {}", e))?;
+            println!("  {} Lock released", "✓".green());
+        }
+    }
+
     println!();
     if failure_count == 0 {
         println!(
@@ -733,7 +1133,7 @@ async fn run_apply(path: &PathBuf) -> Result<(), String> {
 }
 
 async fn run_destroy(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
-    let mut parsed = load_configuration(path)?;
+    let mut parsed = load_configuration(path)?.parsed;
 
     // Resolve module imports and expand module calls
     let base_dir = get_base_dir(path);
@@ -749,6 +1149,58 @@ async fn run_destroy(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
     if parsed.resources.is_empty() {
         println!("{}", "No resources defined in configuration.".yellow());
         return Ok(());
+    }
+
+    // Check for backend configuration
+    let backend_config = parsed.backend.as_ref();
+    let backend: Option<Box<dyn StateBackend>> = if let Some(config) = backend_config {
+        let state_config = convert_backend_config(config);
+        Some(
+            create_backend(&state_config)
+                .await
+                .map_err(|e| format!("Failed to create backend: {}", e))?,
+        )
+    } else {
+        None
+    };
+
+    // Handle state locking if backend is configured
+    let mut lock: Option<LockInfo> = None;
+    let mut state_file: Option<StateFile> = None;
+    let mut protected_bucket: Option<String> = None;
+
+    if let Some(ref backend) = backend {
+        let config = backend_config.unwrap();
+
+        // Get the state bucket name for protection check
+        protected_bucket = config.attributes.get("bucket").and_then(|v| match v {
+            Value::String(s) => Some(s.clone()),
+            _ => None,
+        });
+
+        // Acquire lock
+        println!("{}", "Acquiring state lock...".cyan());
+        lock = Some(backend.acquire_lock("destroy").await.map_err(|e| match e {
+            BackendError::Locked {
+                who,
+                lock_id,
+                operation,
+            } => {
+                format!(
+                    "State is locked by {} (lock ID: {}, operation: {})\n\
+                            If you believe this is stale, run: carina force-unlock {}",
+                    who, lock_id, operation, lock_id
+                )
+            }
+            _ => format!("Failed to acquire lock: {}", e),
+        })?);
+        println!("  {} Lock acquired", "✓".green());
+
+        // Read current state from backend
+        state_file = backend
+            .read_state()
+            .await
+            .map_err(|e| format!("Failed to read state: {}", e))?;
     }
 
     // Sort resources by dependencies (for creation order)
@@ -822,13 +1274,40 @@ async fn run_destroy(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
     }
 
     // Collect resources that exist and will be destroyed
+    // Skip the state bucket if it matches the backend bucket
+    let mut protected_resources: Vec<&Resource> = Vec::new();
     let resources_to_destroy: Vec<&Resource> = destroy_order
         .iter()
-        .filter(|r| current_states.get(&r.id).map(|s| s.exists).unwrap_or(false))
+        .filter(|r| {
+            if !current_states.get(&r.id).map(|s| s.exists).unwrap_or(false) {
+                return false;
+            }
+
+            // Check if this is the protected state bucket
+            if r.id.resource_type == "s3.bucket"
+                && let Some(ref bucket_name) = protected_bucket
+                && let Some(Value::String(name)) = r.attributes.get("name")
+                && name == bucket_name
+            {
+                protected_resources.push(r);
+                return false;
+            }
+
+            true
+        })
         .collect();
 
-    if resources_to_destroy.is_empty() {
+    if resources_to_destroy.is_empty() && protected_resources.is_empty() {
         println!("{}", "No resources to destroy.".green());
+
+        // Release lock if we have one
+        if let (Some(backend), Some(lock_info)) = (&backend, &lock) {
+            backend
+                .release_lock(lock_info)
+                .await
+                .map_err(|e| format!("Failed to release lock: {}", e))?;
+        }
+
         return Ok(());
     }
 
@@ -845,12 +1324,46 @@ async fn run_destroy(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
         );
     }
 
+    // Show protected resources
+    for resource in &protected_resources {
+        println!(
+            "  {} {}.{} {}",
+            "⚠".yellow().bold(),
+            resource.id.resource_type,
+            resource.id.name,
+            "(protected - will be skipped)".yellow()
+        );
+    }
+
     println!();
-    println!(
-        "Plan: {} to destroy.",
-        resources_to_destroy.len().to_string().red()
-    );
+    let total_count = resources_to_destroy.len() + protected_resources.len();
+    if !protected_resources.is_empty() {
+        println!(
+            "Plan: {} to destroy, {} protected.",
+            resources_to_destroy.len().to_string().red(),
+            protected_resources.len().to_string().yellow()
+        );
+    } else {
+        println!("Plan: {} to destroy.", total_count.to_string().red());
+    }
     println!();
+
+    if resources_to_destroy.is_empty() {
+        println!(
+            "{}",
+            "All resources are protected. Nothing to destroy.".yellow()
+        );
+
+        // Release lock if we have one
+        if let (Some(backend), Some(lock_info)) = (&backend, &lock) {
+            backend
+                .release_lock(lock_info)
+                .await
+                .map_err(|e| format!("Failed to release lock: {}", e))?;
+        }
+
+        return Ok(());
+    }
 
     // Confirmation prompt
     if !auto_approve {
@@ -875,6 +1388,15 @@ async fn run_destroy(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
         if input.trim() != "yes" {
             println!();
             println!("{}", "Destroy cancelled.".yellow());
+
+            // Release lock if we have one
+            if let (Some(backend), Some(lock_info)) = (&backend, &lock) {
+                backend
+                    .release_lock(lock_info)
+                    .await
+                    .map_err(|e| format!("Failed to release lock: {}", e))?;
+            }
+
             return Ok(());
         }
         println!();
@@ -885,18 +1407,51 @@ async fn run_destroy(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
 
     let mut success_count = 0;
     let mut failure_count = 0;
+    let mut destroyed_ids: Vec<ResourceId> = Vec::new();
 
-    for resource in resources_to_destroy {
+    for resource in &resources_to_destroy {
         let effect = Effect::Delete(resource.id.clone());
         match provider.delete(&resource.id).await {
             Ok(()) => {
                 println!("  {} {}", "✓".green(), format_effect(&effect));
                 success_count += 1;
+                destroyed_ids.push(resource.id.clone());
             }
             Err(e) => {
                 println!("  {} {} - {}", "✗".red(), format_effect(&effect), e);
                 failure_count += 1;
             }
+        }
+    }
+
+    // Save state if backend is configured
+    if let Some(ref backend) = backend {
+        println!();
+        println!("{}", "Saving state...".cyan());
+
+        // Get or create state file
+        let mut state = state_file.unwrap_or_default();
+
+        // Remove destroyed resources from state
+        for id in &destroyed_ids {
+            state.remove_resource(&id.resource_type, &id.name);
+        }
+
+        // Increment serial and save
+        state.increment_serial();
+        backend
+            .write_state(&state)
+            .await
+            .map_err(|e| format!("Failed to write state: {}", e))?;
+        println!("  {} State saved (serial: {})", "✓".green(), state.serial);
+
+        // Release lock
+        if let Some(ref lock_info) = lock {
+            backend
+                .release_lock(lock_info)
+                .await
+                .map_err(|e| format!("Failed to release lock: {}", e))?;
+            println!("  {} Lock released", "✓".green());
         }
     }
 
@@ -1606,6 +2161,230 @@ fn format_value_with_key(value: &Value, _key: Option<&str>) -> String {
             attribute_name,
             ..
         } => format!("{}.{}", binding_name, attribute_name),
+    }
+}
+
+// =============================================================================
+// State Management Functions
+// =============================================================================
+
+/// Convert parser BackendConfig to state BackendConfig
+fn convert_backend_config(config: &BackendConfig) -> StateBackendConfig {
+    StateBackendConfig {
+        backend_type: config.backend_type.clone(),
+        attributes: config.attributes.clone(),
+    }
+}
+
+/// Find the state bucket resource in the parsed file
+fn find_state_bucket_resource<'a>(
+    parsed: &'a ParsedFile,
+    bucket_name: &str,
+) -> Option<&'a Resource> {
+    parsed.resources.iter().find(|r| {
+        r.id.resource_type == "s3.bucket"
+            && matches!(r.attributes.get("name"), Some(Value::String(name)) if name == bucket_name)
+    })
+}
+
+/// Convert a Resource to ResourceState for the state file
+fn resource_to_state(
+    resource: &Resource,
+    state: &State,
+    existing_state: Option<&ResourceState>,
+) -> ResourceState {
+    let provider = resource
+        .attributes
+        .get("_provider")
+        .and_then(|v| match v {
+            Value::String(s) => Some(s.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| "aws".to_string());
+
+    let mut resource_state =
+        ResourceState::new(&resource.id.resource_type, &resource.id.name, provider);
+
+    // Set attributes directly (not nested)
+    for (k, v) in &state.attributes {
+        resource_state
+            .attributes
+            .insert(k.clone(), value_to_json(v));
+    }
+
+    // Preserve protected flag from existing state
+    if let Some(existing) = existing_state {
+        resource_state.protected = existing.protected;
+    }
+
+    resource_state
+}
+
+/// Convert Value to serde_json::Value
+fn value_to_json(value: &Value) -> serde_json::Value {
+    match value {
+        Value::String(s) => serde_json::Value::String(s.clone()),
+        Value::Int(n) => serde_json::Value::Number((*n).into()),
+        Value::Bool(b) => serde_json::Value::Bool(*b),
+        Value::List(items) => serde_json::Value::Array(items.iter().map(value_to_json).collect()),
+        Value::Map(map) => {
+            let obj: serde_json::Map<_, _> = map
+                .iter()
+                .map(|(k, v)| (k.clone(), value_to_json(v)))
+                .collect();
+            serde_json::Value::Object(obj)
+        }
+        Value::ResourceRef(binding, attr) => {
+            serde_json::Value::String(format!("${{{}.{}}}", binding, attr))
+        }
+        Value::TypedResourceRef {
+            binding_name,
+            attribute_name,
+            ..
+        } => serde_json::Value::String(format!("${{{}.{}}}", binding_name, attribute_name)),
+    }
+}
+
+/// Run force-unlock command
+async fn run_force_unlock(lock_id: &str, path: &PathBuf) -> Result<(), String> {
+    let parsed = load_configuration(path)?.parsed;
+
+    let backend_config = parsed
+        .backend
+        .as_ref()
+        .ok_or("No backend configuration found. force-unlock requires a backend.")?;
+
+    let state_config = convert_backend_config(backend_config);
+    let backend = create_backend(&state_config)
+        .await
+        .map_err(|e| format!("Failed to create backend: {}", e))?;
+
+    println!("{}", "Force unlocking state...".yellow().bold());
+    println!("Lock ID: {}", lock_id);
+
+    match backend.force_unlock(lock_id).await {
+        Ok(()) => {
+            println!("{}", "State has been successfully unlocked.".green().bold());
+            Ok(())
+        }
+        Err(BackendError::LockNotFound(_)) => Err(format!("Lock with ID '{}' not found.", lock_id)),
+        Err(BackendError::LockMismatch { expected, actual }) => Err(format!(
+            "Lock ID mismatch. Expected '{}', found '{}'.",
+            expected, actual
+        )),
+        Err(e) => Err(format!("Failed to force unlock: {}", e)),
+    }
+}
+
+/// Run state subcommands
+async fn run_state_command(command: StateCommands) -> Result<(), String> {
+    match command {
+        StateCommands::BucketDelete {
+            bucket_name,
+            force,
+            path,
+        } => run_state_bucket_delete(&bucket_name, force, &path).await,
+    }
+}
+
+/// Run state bucket delete command
+async fn run_state_bucket_delete(
+    bucket_name: &str,
+    force: bool,
+    path: &PathBuf,
+) -> Result<(), String> {
+    let parsed = load_configuration(path)?.parsed;
+
+    let backend_config = parsed
+        .backend
+        .as_ref()
+        .ok_or("No backend configuration found.")?;
+
+    // Verify the bucket name matches the backend configuration
+    let config_bucket = backend_config
+        .attributes
+        .get("bucket")
+        .and_then(|v| match v {
+            Value::String(s) => Some(s.as_str()),
+            _ => None,
+        })
+        .ok_or("Backend configuration missing 'bucket' attribute")?;
+
+    if config_bucket != bucket_name {
+        return Err(format!(
+            "Bucket name '{}' does not match backend configuration bucket '{}'.",
+            bucket_name, config_bucket
+        ));
+    }
+
+    println!(
+        "{}",
+        "WARNING: This will delete the state bucket and all state history."
+            .red()
+            .bold()
+    );
+    println!("Bucket: {}", bucket_name.yellow());
+
+    if !force {
+        println!();
+        println!("{}", "Type the bucket name to confirm deletion:".yellow());
+        print!("  Enter bucket name: ");
+        std::io::Write::flush(&mut std::io::stdout()).map_err(|e| e.to_string())?;
+
+        let mut input = String::new();
+        std::io::stdin()
+            .read_line(&mut input)
+            .map_err(|e| e.to_string())?;
+
+        if input.trim() != bucket_name {
+            println!();
+            println!("{}", "Deletion cancelled.".yellow());
+            return Ok(());
+        }
+    }
+
+    // Get region from backend config
+    let region = backend_config
+        .attributes
+        .get("region")
+        .and_then(|v| match v {
+            Value::String(s) => Some(convert_region_value(s)),
+            _ => None,
+        })
+        .unwrap_or_else(|| "ap-northeast-1".to_string());
+
+    // Create AWS provider to delete the bucket
+    let aws_provider = AwsProvider::new(&region).await;
+
+    // First, try to empty the bucket (delete all objects and versions)
+    println!();
+    println!("{}", "Emptying bucket...".cyan());
+
+    // Delete the bucket resource
+    let bucket_id = ResourceId::new("s3.bucket", bucket_name);
+    match aws_provider.delete(&bucket_id).await {
+        Ok(()) => {
+            println!(
+                "{}",
+                format!("Deleted state bucket: {}", bucket_name)
+                    .green()
+                    .bold()
+            );
+            Ok(())
+        }
+        Err(e) => Err(format!("Failed to delete bucket: {}", e)),
+    }
+}
+
+/// Convert region value from DSL format to AWS format
+fn convert_region_value(value: &str) -> String {
+    if value.starts_with("aws.Region.") {
+        value
+            .strip_prefix("aws.Region.")
+            .unwrap_or(value)
+            .replace('_', "-")
+    } else {
+        value.to_string()
     }
 }
 

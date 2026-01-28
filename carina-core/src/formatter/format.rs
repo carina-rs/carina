@@ -97,8 +97,11 @@ impl Formatter {
 
     fn format_node(&mut self, node: &CstNode) {
         match node.kind {
+            NodeKind::ImportStmt => self.format_import_stmt(node),
+            NodeKind::BackendBlock => self.format_backend_block(node),
             NodeKind::ProviderBlock => self.format_provider_block(node),
             NodeKind::LetBinding => self.format_let_binding(node),
+            NodeKind::ModuleCall => self.format_module_call(node),
             NodeKind::AnonymousResource => self.format_anonymous_resource(node),
             NodeKind::ResourceExpr => self.format_resource_expr(node),
             NodeKind::Attribute => self.format_attribute(node, 0),
@@ -106,8 +109,93 @@ impl Formatter {
             NodeKind::FunctionCall => self.format_function_call(node),
             NodeKind::EnvVar => self.format_env_var(node),
             NodeKind::VariableRef => self.format_variable_ref(node),
+            NodeKind::List => self.format_list(node),
             _ => self.format_default(node),
         }
+    }
+
+    fn format_import_stmt(&mut self, node: &CstNode) {
+        self.write_indent();
+        self.write("import ");
+
+        let mut found_path = false;
+        let mut found_as = false;
+
+        for child in &node.children {
+            if let CstChild::Token(token) = child {
+                if token.text == "import" {
+                    continue;
+                }
+                if token.text.starts_with('"') && !found_path {
+                    self.write(&token.text);
+                    found_path = true;
+                    continue;
+                }
+                if token.text == "as" {
+                    self.write(" as ");
+                    found_as = true;
+                    continue;
+                }
+                if found_as && self.is_identifier(&token.text) {
+                    self.write(&token.text);
+                    break;
+                }
+            }
+        }
+
+        self.write_newline();
+    }
+
+    fn format_backend_block(&mut self, node: &CstNode) {
+        self.write_indent();
+        self.write("backend ");
+
+        // Find and write backend type (e.g., "s3")
+        for child in &node.children {
+            if let CstChild::Token(token) = child
+                && self.is_identifier(&token.text)
+                && token.text != "backend"
+            {
+                self.write(&token.text);
+                break;
+            }
+        }
+
+        self.write(" {");
+        self.write_newline();
+        self.current_indent += 1;
+
+        self.format_block_attributes(node);
+
+        self.current_indent -= 1;
+        self.write_indent();
+        self.write("}");
+        self.write_newline();
+    }
+
+    fn format_module_call(&mut self, node: &CstNode) {
+        self.write_indent();
+
+        // Find and write module name
+        for child in &node.children {
+            if let CstChild::Token(token) = child
+                && self.is_identifier(&token.text)
+            {
+                self.write(&token.text);
+                break;
+            }
+        }
+
+        self.write(" {");
+        self.write_newline();
+        self.current_indent += 1;
+
+        self.format_block_attributes(node);
+
+        self.current_indent -= 1;
+        self.write_indent();
+        self.write("}");
+        self.write_newline();
     }
 
     fn format_provider_block(&mut self, node: &CstNode) {
@@ -440,6 +528,40 @@ impl Formatter {
             }
         }
         self.write(&parts.join("."));
+    }
+
+    fn format_list(&mut self, node: &CstNode) {
+        self.write("[");
+        let mut first = true;
+
+        for child in &node.children {
+            match child {
+                CstChild::Token(token) => {
+                    if token.text == "[" || token.text == "]" {
+                        continue;
+                    }
+                    if token.text == "," {
+                        continue;
+                    }
+                    // String or other literal
+                    if !first {
+                        self.write(", ");
+                    }
+                    self.write(&token.text);
+                    first = false;
+                }
+                CstChild::Node(n) => {
+                    if !first {
+                        self.write(", ");
+                    }
+                    self.format_node(n);
+                    first = false;
+                }
+                CstChild::Trivia(_) => {}
+            }
+        }
+
+        self.write("]");
     }
 
     fn format_default(&mut self, node: &CstNode) {

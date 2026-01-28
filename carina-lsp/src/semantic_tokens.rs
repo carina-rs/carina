@@ -90,6 +90,18 @@ impl SemanticTokensProvider {
                     }
                 }
             }
+        } else if trimmed.starts_with("backend ") {
+            tokens.push((indent, 7, 0)); // KEYWORD: backend
+            // Backend type after "backend "
+            if let Some(name_start) = line.find("backend ") {
+                let after_backend = &line[name_start + 8..];
+                if let Some(name_end) = after_backend.find([' ', '{']) {
+                    let name = &after_backend[..name_end];
+                    if !name.is_empty() {
+                        tokens.push(((name_start + 8) as u32, name.len() as u32, 1)); // TYPE
+                    }
+                }
+            }
         } else if trimmed.starts_with("let ") {
             tokens.push((indent, 3, 0)); // KEYWORD: let
             // Variable name after "let "

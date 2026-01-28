@@ -141,6 +141,15 @@ pub struct ProviderConfig {
     pub attributes: HashMap<String, Value>,
 }
 
+/// Backend configuration for state storage
+#[derive(Debug, Clone)]
+pub struct BackendConfig {
+    /// Backend type (e.g., "s3", "gcs", "local")
+    pub backend_type: String,
+    /// Backend-specific attributes
+    pub attributes: HashMap<String, Value>,
+}
+
 /// Parse result
 #[derive(Debug, Clone)]
 pub struct ParsedFile {
@@ -155,6 +164,8 @@ pub struct ParsedFile {
     pub inputs: Vec<InputParameter>,
     /// Top-level output parameters (directory-based module style)
     pub outputs: Vec<OutputParameter>,
+    /// Backend configuration for state storage
+    pub backend: Option<BackendConfig>,
 }
 
 /// Parse context (variable scope)
@@ -209,6 +220,7 @@ pub fn parse(input: &str) -> Result<ParsedFile, ParseError> {
     let mut module_calls = Vec::new();
     let mut inputs = Vec::new();
     let mut outputs = Vec::new();
+    let mut backend = None;
 
     for pair in pairs {
         if pair.as_rule() == Rule::file {
@@ -221,6 +233,9 @@ pub fn parse(input: &str) -> Result<ParsedFile, ParseError> {
                                 ctx.imported_modules
                                     .insert(import.alias.clone(), import.path.clone());
                                 imports.push(import);
+                            }
+                            Rule::backend_block => {
+                                backend = Some(parse_backend_block(stmt, &ctx)?);
                             }
                             Rule::provider_block => {
                                 let provider = parse_provider_block(stmt, &ctx)?;
@@ -276,6 +291,7 @@ pub fn parse(input: &str) -> Result<ParsedFile, ParseError> {
         module_calls,
         inputs,
         outputs,
+        backend,
     })
 }
 
@@ -490,6 +506,29 @@ fn parse_provider_block(
     }
 
     Ok(ProviderConfig { name, attributes })
+}
+
+fn parse_backend_block(
+    pair: pest::iterators::Pair<Rule>,
+    ctx: &ParseContext,
+) -> Result<BackendConfig, ParseError> {
+    let mut inner = pair.into_inner();
+    let backend_type = inner.next().unwrap().as_str().to_string();
+
+    let mut attributes = HashMap::new();
+    for attr_pair in inner {
+        if attr_pair.as_rule() == Rule::attribute {
+            let mut attr_inner = attr_pair.into_inner();
+            let key = attr_inner.next().unwrap().as_str().to_string();
+            let value = parse_expression(attr_inner.next().unwrap(), ctx)?;
+            attributes.insert(key, value);
+        }
+    }
+
+    Ok(BackendConfig {
+        backend_type,
+        attributes,
+    })
 }
 
 fn parse_anonymous_resource(
@@ -1513,5 +1552,88 @@ mod tests {
             TypeExpr::Ref(ResourceTypePath::new("aws", "vpc")).to_string(),
             "ref(aws.vpc)"
         );
+    }
+
+    #[test]
+    fn parse_backend_block() {
+        let input = r#"
+            backend s3 {
+                bucket      = "my-carina-state"
+                key         = "infra/prod/carina.crnstate"
+                region      = aws.Region.ap_northeast_1
+                encrypt     = true
+                auto_create = true
+            }
+
+            provider aws {
+                region = aws.Region.ap_northeast_1
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+
+        // Check backend
+        assert!(result.backend.is_some());
+        let backend = result.backend.unwrap();
+        assert_eq!(backend.backend_type, "s3");
+        assert_eq!(
+            backend.attributes.get("bucket"),
+            Some(&Value::String("my-carina-state".to_string()))
+        );
+        assert_eq!(
+            backend.attributes.get("key"),
+            Some(&Value::String("infra/prod/carina.crnstate".to_string()))
+        );
+        assert_eq!(
+            backend.attributes.get("region"),
+            Some(&Value::String("aws.Region.ap_northeast_1".to_string()))
+        );
+        assert_eq!(backend.attributes.get("encrypt"), Some(&Value::Bool(true)));
+        assert_eq!(
+            backend.attributes.get("auto_create"),
+            Some(&Value::Bool(true))
+        );
+
+        // Check provider
+        assert_eq!(result.providers.len(), 1);
+        assert_eq!(result.providers[0].name, "aws");
+    }
+
+    #[test]
+    fn parse_backend_block_with_resources() {
+        let input = r#"
+            backend s3 {
+                bucket = "my-state"
+                key    = "prod/carina.state"
+                region = aws.Region.ap_northeast_1
+            }
+
+            provider aws {
+                region = aws.Region.ap_northeast_1
+            }
+
+            aws.s3.bucket {
+                name       = "my-state"
+                versioning = "Enabled"
+            }
+
+            aws.vpc.vpc {
+                name       = "main-vpc"
+                cidr_block = "10.0.0.0/16"
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+
+        assert!(result.backend.is_some());
+        let backend = result.backend.unwrap();
+        assert_eq!(backend.backend_type, "s3");
+        assert_eq!(
+            backend.attributes.get("bucket"),
+            Some(&Value::String("my-state".to_string()))
+        );
+
+        assert_eq!(result.providers.len(), 1);
+        assert_eq!(result.resources.len(), 2);
     }
 }

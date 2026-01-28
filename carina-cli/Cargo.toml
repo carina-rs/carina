@@ -11,6 +11,7 @@ path = "src/main.rs"
 [dependencies]
 carina-core = { path = "../carina-core" }
 carina-provider-aws = { path = "../carina-provider-aws" }
+carina-state = { path = "../carina-state" }
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 colored = "3"

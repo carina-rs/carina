@@ -182,11 +182,11 @@ impl AwsProvider {
                     .send()
                     .await
                 {
-                    let enabled = versioning
+                    let status = versioning
                         .status()
-                        .map(|s| s.as_str() == "Enabled")
-                        .unwrap_or(false);
-                    attributes.insert("versioning".to_string(), Value::Bool(enabled));
+                        .map(|s| s.as_str().to_string())
+                        .unwrap_or_else(|| "Suspended".to_string());
+                    attributes.insert("versioning".to_string(), Value::String(status));
                 }
 
                 // Get lifecycle configuration
@@ -278,10 +278,15 @@ impl AwsProvider {
         })?;
 
         // Configure versioning
-        if let Some(Value::Bool(true)) = resource.attributes.get("versioning") {
+        if let Some(Value::String(status)) = resource.attributes.get("versioning") {
             use aws_sdk_s3::types::{BucketVersioningStatus, VersioningConfiguration};
+            let versioning_status = if status == "Enabled" {
+                BucketVersioningStatus::Enabled
+            } else {
+                BucketVersioningStatus::Suspended
+            };
             let config = VersioningConfiguration::builder()
-                .status(BucketVersioningStatus::Enabled)
+                .status(versioning_status)
                 .build();
             self.s3_client
                 .put_bucket_versioning()
@@ -290,7 +295,7 @@ impl AwsProvider {
                 .send()
                 .await
                 .map_err(|e| {
-                    ProviderError::new(format!("Failed to enable versioning: {}", e))
+                    ProviderError::new(format!("Failed to configure versioning: {}", e))
                         .for_resource(resource.id.clone())
                 })?;
         }
@@ -343,14 +348,16 @@ impl AwsProvider {
         let bucket_name = id.name.clone();
 
         // Update versioning configuration
-        if let Some(Value::Bool(enabled)) = to.attributes.get("versioning") {
+        if let Some(Value::String(status)) = to.attributes.get("versioning") {
             use aws_sdk_s3::types::{BucketVersioningStatus, VersioningConfiguration};
-            let status = if *enabled {
+            let versioning_status = if status == "Enabled" {
                 BucketVersioningStatus::Enabled
             } else {
                 BucketVersioningStatus::Suspended
             };
-            let config = VersioningConfiguration::builder().status(status).build();
+            let config = VersioningConfiguration::builder()
+                .status(versioning_status)
+                .build();
             self.s3_client
                 .put_bucket_versioning()
                 .bucket(&bucket_name)

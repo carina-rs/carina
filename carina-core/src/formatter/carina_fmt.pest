@@ -11,11 +11,26 @@ ws = @{ (" " | "\t")+ }
 newline = @{ NEWLINE }
 comment = @{ "#" ~ (!NEWLINE ~ ANY)* }
 
-statement = { provider_block | let_binding | anonymous_resource }
+statement = { import_stmt | backend_block | provider_block | let_binding | module_call | anonymous_resource }
+
+// Import statement: import "./path/to/module.crn" as name
+import_stmt = {
+    kw_import ~ trivia+ ~ string ~ trivia+ ~ kw_as ~ trivia+ ~ identifier
+}
+
+// Backend block: backend s3 { ... }
+backend_block = {
+    kw_backend ~ trivia+ ~ identifier ~ trivia* ~ open_brace ~ block_content* ~ close_brace
+}
 
 // Anonymous resource: aws.s3.bucket { ... }
 anonymous_resource = {
     namespaced_id ~ trivia* ~ open_brace ~ block_content* ~ close_brace
+}
+
+// Module call: module_name { key = value, ... }
+module_call = {
+    identifier ~ trivia* ~ open_brace ~ block_content* ~ close_brace
 }
 
 // Provider block: provider aws { ... }
@@ -54,12 +69,18 @@ function_call = {
 primary = {
     env_var
   | resource_expr
+  | list
   | namespaced_id
   | boolean
   | number
   | string
   | variable_ref
   | open_paren ~ trivia* ~ expression ~ trivia* ~ close_paren
+}
+
+// List: [item1, item2, ...]
+list = {
+    open_bracket ~ trivia* ~ (expression ~ (trivia* ~ comma ~ trivia* ~ expression)*)? ~ trivia* ~ comma? ~ trivia* ~ close_bracket
 }
 
 // Environment variable: env("VAR_NAME")
@@ -86,6 +107,8 @@ char = {
 // Tokens (for easier identification in CST)
 open_brace = { "{" }
 close_brace = { "}" }
+open_bracket = { "[" }
+close_bracket = { "]" }
 open_paren = { "(" }
 close_paren = { ")" }
 equals = { "=" }
@@ -94,5 +117,8 @@ pipe_op = { "|>" }
 
 // Keywords
 kw_provider = { "provider" }
+kw_backend = { "backend" }
+kw_import = { "import" }
+kw_as = { "as" }
 kw_let = { "let" }
 kw_env = { "env" }

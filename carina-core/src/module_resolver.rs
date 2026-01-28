@@ -114,6 +114,7 @@ impl ModuleResolver {
             module_calls: vec![],
             inputs: vec![],
             outputs: vec![],
+            backend: None,
         };
 
         // Read all .crn files in the directory
@@ -333,6 +334,7 @@ mod tests {
                 },
             ],
             outputs: vec![],
+            backend: None,
         }
     }
 

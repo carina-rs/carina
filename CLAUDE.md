@@ -65,9 +65,20 @@ The DSL uses `aws.Region.ap_northeast_1` format, but AWS SDK uses `ap-northeast-
 
 ### LSP Integration
 
-When modifying resource schemas (`carina-provider-aws/src/schemas/`), also update the LSP:
-- **Completion** (`carina-lsp/src/completion.rs`): Add value completions for new types
-- **Diagnostics** (`carina-lsp/src/diagnostics.rs`): Add type validation for new types
+When modifying the DSL or resource schemas, also update the LSP:
+
+- **Completion** (`carina-lsp/src/completion.rs`):
+  - `top_level_completions()`: Add keywords (e.g., `backend`, `provider`, `let`)
+  - `attribute_completions_for_type()`: Add attribute completions for resource types
+  - `value_completions_for_attr()`: Add value completions for specific attributes
+
+- **Semantic Tokens** (`carina-lsp/src/semantic_tokens.rs`):
+  - `tokenize_line()`: Add keyword highlighting for new DSL constructs
+  - Keywords like `provider`, `backend`, `let` are highlighted at line start
+
+- **Diagnostics** (`carina-lsp/src/diagnostics.rs`):
+  - Add type validation for new types
+  - Parser errors are automatically detected via `carina-core::parser`
 
 **Testing**: When bugs are found or issues are pointed out, write test code to capture the fix. This ensures regressions are caught and documents expected behavior.
 

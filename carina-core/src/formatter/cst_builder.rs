@@ -63,10 +63,15 @@ impl<'a> CstBuilder<'a> {
                 let inner = pair.into_inner().next()?;
                 self.build_child(inner)
             }
+            Rule::import_stmt => Some(CstChild::Node(self.build_node(NodeKind::ImportStmt, pair))),
+            Rule::backend_block => Some(CstChild::Node(
+                self.build_node(NodeKind::BackendBlock, pair),
+            )),
             Rule::provider_block => Some(CstChild::Node(
                 self.build_node(NodeKind::ProviderBlock, pair),
             )),
             Rule::let_binding => Some(CstChild::Node(self.build_node(NodeKind::LetBinding, pair))),
+            Rule::module_call => Some(CstChild::Node(self.build_node(NodeKind::ModuleCall, pair))),
             Rule::anonymous_resource => Some(CstChild::Node(
                 self.build_node(NodeKind::AnonymousResource, pair),
             )),
@@ -89,6 +94,7 @@ impl<'a> CstBuilder<'a> {
                 self.build_child(inner)
             }
             Rule::env_var => Some(CstChild::Node(self.build_node(NodeKind::EnvVar, pair))),
+            Rule::list => Some(CstChild::Node(self.build_node(NodeKind::List, pair))),
             Rule::variable_ref => {
                 Some(CstChild::Node(self.build_node(NodeKind::VariableRef, pair)))
             }
@@ -106,6 +112,8 @@ impl<'a> CstBuilder<'a> {
             // Delimiters and operators
             Rule::open_brace => Some(CstChild::Token(Token::new("{".to_string(), span))),
             Rule::close_brace => Some(CstChild::Token(Token::new("}".to_string(), span))),
+            Rule::open_bracket => Some(CstChild::Token(Token::new("[".to_string(), span))),
+            Rule::close_bracket => Some(CstChild::Token(Token::new("]".to_string(), span))),
             Rule::open_paren => Some(CstChild::Token(Token::new("(".to_string(), span))),
             Rule::close_paren => Some(CstChild::Token(Token::new(")".to_string(), span))),
             Rule::equals => Some(CstChild::Token(Token::new("=".to_string(), span))),
@@ -113,6 +121,9 @@ impl<'a> CstBuilder<'a> {
             Rule::pipe_op => Some(CstChild::Token(Token::new("|>".to_string(), span))),
 
             // Keywords
+            Rule::kw_import => Some(CstChild::Token(Token::new("import".to_string(), span))),
+            Rule::kw_as => Some(CstChild::Token(Token::new("as".to_string(), span))),
+            Rule::kw_backend => Some(CstChild::Token(Token::new("backend".to_string(), span))),
             Rule::kw_provider => Some(CstChild::Token(Token::new("provider".to_string(), span))),
             Rule::kw_let => Some(CstChild::Token(Token::new("let".to_string(), span))),
             Rule::kw_env => Some(CstChild::Token(Token::new("env".to_string(), span))),

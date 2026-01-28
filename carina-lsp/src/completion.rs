@@ -261,6 +261,14 @@ impl CompletionProvider {
                 ..Default::default()
             },
             CompletionItem {
+                label: "backend".to_string(),
+                kind: Some(CompletionItemKind::KEYWORD),
+                insert_text: Some("backend s3 {\n    bucket = \"${1:my-carina-state}\"\n    key    = \"${2:prod/carina.crnstate}\"\n    region = aws.Region.${3:ap_northeast_1}\n}".to_string()),
+                insert_text_format: Some(InsertTextFormat::SNIPPET),
+                detail: Some("Configure state backend (S3)".to_string()),
+                ..Default::default()
+            },
+            CompletionItem {
                 label: "ref".to_string(),
                 kind: Some(CompletionItemKind::TYPE_PARAMETER),
                 insert_text: Some("ref(${1:aws.vpc})".to_string()),
@@ -854,6 +862,7 @@ impl CompletionProvider {
             module_calls: vec![],
             inputs: vec![],
             outputs: vec![],
+            backend: None,
         };
 
         for entry in entries.flatten() {
