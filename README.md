@@ -12,6 +12,8 @@ A functional infrastructure management tool written in Rust. Carina treats infra
 - **Strong Typing**: Catch configuration errors at parse time with schema validation
 - **Provider Architecture**: Extensible provider system for multi-cloud support
 - **Modules**: Reusable infrastructure components with typed inputs/outputs
+- **State Management**: Remote state storage with locking (S3 backend)
+- **LSP Support**: Editor integration with completion, diagnostics, and syntax highlighting
 - **Terraform-like Workflow**: Familiar `validate`, `plan`, `apply`, `destroy` commands
 
 ## Installation
@@ -28,30 +30,30 @@ The binary will be available at `target/release/carina`.
 
 Create a `.crn` file:
 
-```
+```hcl
 # main.crn
 
 provider aws {
-    region = aws.Region.ap_northeast_1
+  region = aws.Region.ap_northeast_1
 }
 
 let main_vpc = aws.vpc {
-    name       = "main-vpc"
-    cidr_block = "10.0.0.0/16"
+  name       = "main-vpc"
+  cidr_block = "10.0.0.0/16"
 }
 
 let web_sg = aws.security_group {
-    name   = "web-sg"
-    vpc_id = main_vpc.id
+  name   = "web-sg"
+  vpc_id = main_vpc.id
 }
 
 aws.security_group.ingress_rule {
-    name              = "http"
-    security_group_id = web_sg.id
-    from_port         = 80
-    to_port           = 80
-    protocol          = "tcp"
-    cidr_blocks       = ["0.0.0.0/0"]
+  name              = "http"
+  security_group_id = web_sg.id
+  from_port         = 80
+  to_port           = 80
+  protocol          = "tcp"
+  cidr_blocks       = ["0.0.0.0/0"]
 }
 ```
 
@@ -102,9 +104,9 @@ Apply complete! 3 changes applied.
 
 ### Provider Block
 
-```
+```hcl
 provider aws {
-    region = aws.Region.ap_northeast_1
+  region = aws.Region.ap_northeast_1
 }
 ```
 
@@ -112,22 +114,22 @@ provider aws {
 
 **Anonymous resources** - ID is derived from the `name` attribute:
 
-```
+```hcl
 aws.security_group.ingress_rule {
-    name              = "http"
-    security_group_id = web_sg.id
-    from_port         = 80
-    to_port           = 80
-    protocol          = "tcp"
+  name              = "http"
+  security_group_id = web_sg.id
+  from_port         = 80
+  to_port           = 80
+  protocol          = "tcp"
 }
 ```
 
 **Named resources** - Use `let` binding for referencing:
 
-```
+```hcl
 let web_sg = aws.security_group {
-    name   = "web-sg"
-    vpc_id = main_vpc.id
+  name   = "web-sg"
+  vpc_id = main_vpc.id
 }
 ```
 
@@ -137,37 +139,37 @@ Modules enable reusable infrastructure components with typed inputs and outputs.
 
 **Module definition** (`modules/web_tier/main.crn`):
 
-```
+```hcl
 input {
-    vpc: ref(aws.vpc)
-    cidr_blocks: list(cidr)
-    enable_https: bool = true
+  vpc: ref(aws.vpc)
+  cidr_blocks: list(cidr)
+  enable_https: bool = true
 }
 
 output {
-    security_group: ref(aws.security_group) = web_sg.id
+  security_group: ref(aws.security_group) = web_sg.id
 }
 
 let web_sg = aws.security_group {
-    name        = "web-sg"
-    vpc_id      = input.vpc
-    description = "Security group for web servers"
+  name        = "web-sg"
+  vpc_id      = input.vpc
+  description = "Security group for web servers"
 }
 ```
 
 **Using modules**:
 
-```
+```hcl
 import "./modules/web_tier" as web_tier
 
 let main_vpc = aws.vpc {
-    name       = "main-vpc"
-    cidr_block = "10.0.0.0/16"
+  name       = "main-vpc"
+  cidr_block = "10.0.0.0/16"
 }
 
 web_tier {
-    vpc         = main_vpc.id
-    cidr_blocks = ["10.0.1.0/24", "10.0.2.0/25"]
+  vpc         = main_vpc.id
+  cidr_blocks = ["10.0.1.0/24", "10.0.2.0/25"]
 }
 ```
 
@@ -243,7 +245,7 @@ DSL File (.crn)
 ```
 carina/
 ├── carina-cli/          # CLI application
-├── carina-core/         # Core library
+├── carina-core/         # Core library (provider-agnostic)
 │   ├── src/
 │   │   ├── effect.rs    # Effect type definitions
 │   │   ├── plan.rs      # Plan (collection of Effects)
@@ -252,10 +254,16 @@ carina/
 │   │   ├── interpreter.rs # Effect interpreter
 │   │   ├── differ.rs    # State comparison
 │   │   ├── parser/      # DSL parser (pest-based)
-│   │   ├── schema.rs    # Type validation
-│   │   └── providers/   # Built-in provider schemas
+│   │   ├── schema.rs    # Type validation (generic types only)
+│   │   ├── module.rs    # Module signature and dependency graph
+│   │   ├── module_resolver.rs # Module import and expansion
+│   │   └── formatter/   # Code formatter
 │   └── ...
-└── carina-provider-aws/ # AWS provider implementation
+├── carina-provider-aws/ # AWS provider implementation
+│   └── src/schemas/     # AWS-specific type definitions
+├── carina-state/        # State management
+│   └── src/backends/    # State backends (S3, etc.)
+└── carina-lsp/          # Language Server Protocol implementation
 ```
 
 ## AWS Provider
@@ -333,6 +341,37 @@ Inspect module structure and dependencies:
 $ carina module info modules/web_tier
 ```
 
+## State Management
+
+Carina supports remote state storage for tracking infrastructure state across team members and CI/CD pipelines.
+
+### S3 Backend
+
+Store state in an S3 bucket:
+
+```hcl
+backend s3 {
+  bucket      = "my-carina-state"
+  key         = "infra/prod/carina.crnstate"
+  region      = aws.Region.ap_northeast_1
+  encrypt     = true
+  auto_create = true  # Automatically create the bucket if it doesn't exist
+}
+
+provider aws {
+  region = aws.Region.ap_northeast_1
+}
+
+aws.s3.bucket {
+  name = "my-app-data"
+}
+```
+
+The state file tracks:
+- Resource states and attributes
+- Serial number for change detection
+- Locking to prevent concurrent modifications
+
 ## Development
 
 ### Run tests
@@ -356,7 +395,7 @@ MIT
 - [x] Resource dependencies and references
 - [x] Modules and reusability
 - [x] Destroy command
+- [x] State file management (S3 backend)
 - [ ] More AWS resources (EC2, IAM, Lambda, etc.)
 - [ ] GCP provider
-- [ ] State file management
 - [ ] Import existing resources
