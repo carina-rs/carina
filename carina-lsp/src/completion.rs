@@ -7,6 +7,7 @@ use crate::document::Document;
 use carina_core::parser;
 use carina_core::schema::{AttributeType, ResourceSchema};
 use carina_provider_aws::schemas;
+use carina_provider_awscc::schemas as awscc_schemas;
 use std::collections::HashMap;
 
 pub struct CompletionProvider {
@@ -17,6 +18,10 @@ impl CompletionProvider {
     pub fn new() -> Self {
         let mut schema_map = HashMap::new();
         for schema in schemas::all_schemas() {
+            schema_map.insert(schema.resource_type.clone(), schema);
+        }
+        // Add awscc schemas
+        for schema in awscc_schemas::all_schemas() {
             schema_map.insert(schema.resource_type.clone(), schema);
         }
         Self {
@@ -173,6 +178,8 @@ impl CompletionProvider {
                 "security_group.egress_rule",
             ),
             ("aws.security_group", "security_group"),
+            // awscc resources
+            ("awscc.vpc", "awscc.vpc"),
         ] {
             if trimmed.contains(pattern) {
                 return Some(schema_type.to_string());
@@ -377,6 +384,18 @@ impl CompletionProvider {
                 detail: Some("Security Group Egress Rule".to_string()),
                 ..Default::default()
             },
+            // AWS Cloud Control resources
+            CompletionItem {
+                label: "awscc.vpc".to_string(),
+                kind: Some(CompletionItemKind::CLASS),
+                text_edit: Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(TextEdit {
+                    range: replacement_range,
+                    new_text: "awscc.vpc {\n    name                 = \"${1:vpc-name}\"\n    cidr_block           = \"${2:10.0.0.0/16}\"\n    enable_dns_support   = true\n    enable_dns_hostnames = true\n}".to_string(),
+                })),
+                insert_text_format: Some(InsertTextFormat::SNIPPET),
+                detail: Some("VPC resource (Cloud Control API)".to_string()),
+                ..Default::default()
+            },
         ]
     }
 
@@ -488,7 +507,19 @@ impl CompletionProvider {
         if let Some(schema) = self.schemas.get(resource_type)
             && let Some(attr_schema) = schema.attributes.get(attr_name)
         {
-            completions.extend(self.completions_for_type(&attr_schema.attr_type));
+            // First check if schema defines completions for this attribute
+            if let Some(schema_completions) = &attr_schema.completions {
+                completions.extend(schema_completions.iter().map(|c| CompletionItem {
+                    label: c.value.clone(),
+                    kind: Some(CompletionItemKind::ENUM_MEMBER),
+                    detail: Some(c.description.clone()),
+                    insert_text: Some(c.value.clone()),
+                    ..Default::default()
+                }));
+                return completions;
+            }
+            // Fall back to type-based completions
+            completions.extend(self.completions_for_type(&attr_schema.attr_type, resource_type));
             return completions;
         }
 
@@ -571,7 +602,11 @@ impl CompletionProvider {
         bindings
     }
 
-    fn completions_for_type(&self, attr_type: &AttributeType) -> Vec<CompletionItem> {
+    fn completions_for_type(
+        &self,
+        attr_type: &AttributeType,
+        resource_type: &str,
+    ) -> Vec<CompletionItem> {
         match attr_type {
             AttributeType::Bool => {
                 vec![
@@ -614,12 +649,13 @@ impl CompletionProvider {
                 {
                     return self.protocol_completions();
                 }
-                // Generic enum completions
+                // Generic enum completions - wrap in quotes since they're string values
                 variants
                     .iter()
                     .map(|v| CompletionItem {
-                        label: v.clone(),
+                        label: format!("\"{}\"", v),
                         kind: Some(CompletionItemKind::ENUM_MEMBER),
+                        insert_text: Some(format!("\"{}\"", v)),
                         ..Default::default()
                     })
                     .collect()
@@ -628,6 +664,12 @@ impl CompletionProvider {
                 vec![] // No specific completions for integers
             }
             AttributeType::Custom { name, .. } if name == "Cidr" => self.cidr_completions(),
+            AttributeType::Custom { name, .. } if name == "VersioningStatus" => {
+                self.versioning_status_completions()
+            }
+            AttributeType::Custom { name, .. } if name == "InstanceTenancy" => {
+                self.instance_tenancy_completions(resource_type)
+            }
             AttributeType::String | AttributeType::Custom { .. } => {
                 vec![CompletionItem {
                     label: "env".to_string(),
@@ -752,6 +794,58 @@ impl CompletionProvider {
             .collect()
     }
 
+    fn versioning_status_completions(&self) -> Vec<CompletionItem> {
+        vec![
+            CompletionItem {
+                label: "aws.s3.VersioningStatus.Enabled".to_string(),
+                kind: Some(CompletionItemKind::ENUM_MEMBER),
+                detail: Some("Enable versioning".to_string()),
+                insert_text: Some("aws.s3.VersioningStatus.Enabled".to_string()),
+                ..Default::default()
+            },
+            CompletionItem {
+                label: "aws.s3.VersioningStatus.Suspended".to_string(),
+                kind: Some(CompletionItemKind::ENUM_MEMBER),
+                detail: Some("Suspend versioning".to_string()),
+                insert_text: Some("aws.s3.VersioningStatus.Suspended".to_string()),
+                ..Default::default()
+            },
+        ]
+    }
+
+    fn instance_tenancy_completions(&self, resource_type: &str) -> Vec<CompletionItem> {
+        // Determine prefix based on resource type
+        let prefix = if resource_type.starts_with("awscc") {
+            "awscc.vpc.InstanceTenancy"
+        } else {
+            "aws.vpc.InstanceTenancy"
+        };
+
+        vec![
+            CompletionItem {
+                label: format!("{}.default", prefix),
+                kind: Some(CompletionItemKind::ENUM_MEMBER),
+                detail: Some("Instances can have any tenancy".to_string()),
+                insert_text: Some(format!("{}.default", prefix)),
+                ..Default::default()
+            },
+            CompletionItem {
+                label: format!("{}.dedicated", prefix),
+                kind: Some(CompletionItemKind::ENUM_MEMBER),
+                detail: Some("Instances will be dedicated tenancy".to_string()),
+                insert_text: Some(format!("{}.dedicated", prefix)),
+                ..Default::default()
+            },
+            CompletionItem {
+                label: format!("{}.host", prefix),
+                kind: Some(CompletionItemKind::ENUM_MEMBER),
+                detail: Some("Instances will run on dedicated hosts".to_string()),
+                insert_text: Some(format!("{}.host", prefix)),
+                ..Default::default()
+            },
+        ]
+    }
+
     fn ref_type_completions(&self) -> Vec<CompletionItem> {
         // Provide completions for ref(aws.xxx) type syntax
         let resource_types = vec![
@@ -772,6 +866,8 @@ impl CompletionProvider {
                 "Security Group Egress Rule reference",
             ),
             ("aws.s3.bucket", "S3 Bucket resource reference"),
+            // awscc resources
+            ("awscc.vpc", "VPC resource reference (Cloud Control API)"),
         ];
 
         resource_types
@@ -1252,6 +1348,113 @@ simple {
         assert!(
             count_completion.is_some(),
             "Should have count parameter completion"
+        );
+    }
+
+    #[test]
+    fn instance_tenancy_completion_for_aws_vpc() {
+        let provider = CompletionProvider::new();
+        let doc = create_document(
+            r#"aws.vpc {
+    name = "my-vpc"
+    instance_tenancy =
+}"#,
+        );
+        // Cursor after "instance_tenancy = " (line 2, col 23)
+        let position = Position {
+            line: 2,
+            character: 23,
+        };
+
+        let completions = provider.complete(&doc, position, None);
+
+        // Should have aws.vpc.InstanceTenancy completions
+        let default_completion = completions
+            .iter()
+            .find(|c| c.label == "aws.vpc.InstanceTenancy.default");
+        assert!(
+            default_completion.is_some(),
+            "Should have aws.vpc.InstanceTenancy.default completion"
+        );
+
+        // Should NOT have awscc completions
+        let awscc_completion = completions
+            .iter()
+            .find(|c| c.label.contains("awscc.vpc.InstanceTenancy"));
+        assert!(
+            awscc_completion.is_none(),
+            "Should NOT have awscc.vpc.InstanceTenancy completion for aws.vpc resource"
+        );
+    }
+
+    #[test]
+    fn instance_tenancy_completion_for_awscc_vpc() {
+        let provider = CompletionProvider::new();
+        let doc = create_document(
+            r#"awscc.vpc {
+    name = "my-vpc"
+    instance_tenancy =
+}"#,
+        );
+        // Cursor after "instance_tenancy = " (line 2, col 23)
+        let position = Position {
+            line: 2,
+            character: 23,
+        };
+
+        let completions = provider.complete(&doc, position, None);
+
+        // Should have awscc.vpc.InstanceTenancy completions
+        let default_completion = completions
+            .iter()
+            .find(|c| c.label == "awscc.vpc.InstanceTenancy.default");
+        assert!(
+            default_completion.is_some(),
+            "Should have awscc.vpc.InstanceTenancy.default completion"
+        );
+
+        // Should NOT have aws completions
+        let aws_completion = completions
+            .iter()
+            .find(|c| c.label == "aws.vpc.InstanceTenancy.default");
+        assert!(
+            aws_completion.is_none(),
+            "Should NOT have aws.vpc.InstanceTenancy completion for awscc.vpc resource"
+        );
+    }
+
+    #[test]
+    fn versioning_completion_for_s3_bucket() {
+        let provider = CompletionProvider::new();
+        let doc = create_document(
+            r#"aws.s3.bucket {
+    name = "my-bucket"
+    versioning =
+}"#,
+        );
+        // Cursor after "versioning = " (line 2, col 17)
+        let position = Position {
+            line: 2,
+            character: 17,
+        };
+
+        let completions = provider.complete(&doc, position, None);
+
+        // Should have aws.s3.VersioningStatus completions
+        let enabled_completion = completions
+            .iter()
+            .find(|c| c.label == "aws.s3.VersioningStatus.Enabled");
+        assert!(
+            enabled_completion.is_some(),
+            "Should have aws.s3.VersioningStatus.Enabled completion"
+        );
+
+        let suspended_completion = completions
+            .iter()
+            .find(|c| c.label == "aws.s3.VersioningStatus.Suspended");
+        assert!(
+            suspended_completion.is_some(),
+            "Should have aws.s3.VersioningStatus.Suspended completion"
         );
     }
 }

@@ -101,11 +101,11 @@ primary = {
 // List: [item1, item2, ...]
 list = { "[" ~ (expression ~ ("," ~ expression)*)? ~ ","? ~ "]" }
 
-// Map: { key = value, ... }
-map = { "{" ~ (map_entry ~ ("," ~ map_entry)*)? ~ ","? ~ "}" }
+// Map: { key = value, ... } (commas are optional, newlines work too)
+map = { "{" ~ map_entry* ~ "}" }
 
-// Map entry: key = value
-map_entry = { identifier ~ "=" ~ expression }
+// Map entry: key = value (with optional trailing comma)
+map_entry = { identifier ~ "=" ~ expression ~ ","? }
 
 // Environment variable: env("VAR_NAME")
 env_var = { "env" ~ "(" ~ string ~ ")" }

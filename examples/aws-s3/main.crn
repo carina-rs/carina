@@ -1,0 +1,30 @@
+# S3 Bucket Example with State Backend
+#
+# This example demonstrates:
+# - S3 backend for state management
+# - Creating S3 buckets with versioning
+
+provider aws {
+  region = aws.Region.ap_northeast_1
+}
+
+backend s3 {
+  bucket      = "carina-state-example"
+  key         = "examples/s3/carina.crnstate"
+  region      = aws.Region.ap_northeast_1
+  encrypt     = true
+  auto_create = true
+}
+
+# Application bucket
+aws.s3.bucket {
+  name       = "my-app-bucket"
+  versioning = aws.s3.VersioningStatus.Enabled
+}
+
+# Log bucket with expiration
+aws.s3.bucket {
+  name            = "my-app-logs"
+  versioning      = aws.s3.VersioningStatus.Suspended
+  expiration_days = 90
+}

@@ -1,7 +1,7 @@
 //! VPC resource schema definitions
 
 use carina_core::resource::Value;
-use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, types};
+use carina_core::schema::{AttributeSchema, AttributeType, CompletionValue, ResourceSchema, types};
 
 use super::types as aws_types;
 
@@ -105,36 +105,139 @@ pub fn availability_zone() -> AttributeType {
     ])
 }
 
+/// Valid instance tenancy values
+const VALID_INSTANCE_TENANCY: &[&str] = &["default", "dedicated", "host"];
+
+/// Instance tenancy type for VPC
+/// Accepts:
+/// - DSL format: aws.vpc.InstanceTenancy.default
+/// - String format: "default"
+pub fn instance_tenancy() -> AttributeType {
+    AttributeType::Custom {
+        name: "InstanceTenancy".to_string(),
+        base: Box::new(AttributeType::String),
+        validate: |value| {
+            if let Value::String(s) = value {
+                // Check namespace format if it contains dots
+                if s.contains('.') {
+                    // Must be aws.vpc.InstanceTenancy.<value>
+                    let parts: Vec<&str> = s.split('.').collect();
+                    if parts.len() != 4
+                        || parts[0] != "aws"
+                        || parts[1] != "vpc"
+                        || parts[2] != "InstanceTenancy"
+                    {
+                        return Err(format!(
+                            "Invalid instance tenancy '{}', expected one of: aws.vpc.InstanceTenancy.default, aws.vpc.InstanceTenancy.dedicated, aws.vpc.InstanceTenancy.host",
+                            s
+                        ));
+                    }
+                }
+                let normalized = normalize_instance_tenancy(s);
+                if VALID_INSTANCE_TENANCY.contains(&normalized.as_str()) {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "Invalid instance tenancy '{}', expected one of: aws.vpc.InstanceTenancy.default, aws.vpc.InstanceTenancy.dedicated, aws.vpc.InstanceTenancy.host",
+                        s
+                    ))
+                }
+            } else {
+                Err("Expected string".to_string())
+            }
+        },
+    }
+}
+
+/// Normalize instance tenancy to API format
+/// - "aws.vpc.InstanceTenancy.default" -> "default"
+/// - "default" -> "default"
+pub fn normalize_instance_tenancy(s: &str) -> String {
+    if s.contains('.') {
+        s.split('.').next_back().unwrap_or(s).to_string()
+    } else {
+        s.to_string()
+    }
+}
+
+/// Tags type for AWS resources (Terraform-style map)
+/// Example: tags = { Environment = "production", Project = "myapp" }
+pub fn tags_type() -> AttributeType {
+    AttributeType::Map(Box::new(AttributeType::String))
+}
+
 /// Returns the schema for VPC
+///
+/// Based on CloudFormation AWS::EC2::VPC resource type.
+/// See: https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-ec2-vpc.html
 pub fn vpc_schema() -> ResourceSchema {
     ResourceSchema::new("vpc")
         .with_description("An AWS VPC (Virtual Private Cloud)")
-        .attribute(
-            AttributeSchema::new("id", AttributeType::String)
-                .with_description("VPC ID (read-only, set after creation)"),
-        )
+        // ========== Carina-specific attributes ==========
         .attribute(
             AttributeSchema::new("name", AttributeType::String)
                 .required()
-                .with_description("VPC name (Name tag)"),
+                .with_description("VPC name (Name tag) - Carina identifier"),
         )
         .attribute(
             AttributeSchema::new("region", aws_types::aws_region()).with_description(
                 "The AWS region for the VPC (inherited from provider if not specified)",
             ),
         )
+        // ========== CloudFormation input properties ==========
         .attribute(
             AttributeSchema::new("cidr_block", types::cidr())
-                .required()
-                .with_description("The IPv4 CIDR block for the VPC"),
-        )
-        .attribute(
-            AttributeSchema::new("enable_dns_support", AttributeType::Bool)
-                .with_description("Enable DNS resolution support"),
+                .with_description("The IPv4 network range for the VPC, in CIDR notation. Required if not using Ipv4IpamPoolId."),
         )
         .attribute(
             AttributeSchema::new("enable_dns_hostnames", AttributeType::Bool)
-                .with_description("Enable DNS hostnames"),
+                .with_description("Indicates whether instances launched in the VPC get DNS hostnames. Default: false"),
+        )
+        .attribute(
+            AttributeSchema::new("enable_dns_support", AttributeType::Bool)
+                .with_description("Indicates whether the DNS resolution is supported for the VPC. Default: true"),
+        )
+        .attribute(
+            AttributeSchema::new("instance_tenancy", instance_tenancy())
+                .with_description("The allowed tenancy of instances launched into the VPC. Values: default, dedicated, host")
+                .with_completions(vec![
+                    CompletionValue::new("aws.vpc.InstanceTenancy.default", "Instances can have any tenancy"),
+                    CompletionValue::new("aws.vpc.InstanceTenancy.dedicated", "Instances run on single-tenant hardware"),
+                    CompletionValue::new("aws.vpc.InstanceTenancy.host", "Instances run on dedicated host"),
+                ]),
+        )
+        .attribute(
+            AttributeSchema::new("ipv4_ipam_pool_id", AttributeType::String)
+                .with_description("The ID of an IPv4 IPAM pool to allocate the VPC CIDR from"),
+        )
+        .attribute(
+            AttributeSchema::new("ipv4_netmask_length", AttributeType::Int)
+                .with_description("The netmask length of the IPv4 CIDR to allocate from an IPAM pool"),
+        )
+        .attribute(
+            AttributeSchema::new("tags", tags_type())
+                .with_description("The tags for the VPC (Terraform-style map). Example: { Environment = \"production\" }"),
+        )
+        // ========== CloudFormation return values (read-only) ==========
+        .attribute(
+            AttributeSchema::new("vpc_id", AttributeType::String)
+                .with_description("The ID of the VPC (read-only)"),
+        )
+        .attribute(
+            AttributeSchema::new("cidr_block_associations", AttributeType::List(Box::new(AttributeType::String)))
+                .with_description("The association IDs of the IPv4 CIDR blocks for the VPC (read-only)"),
+        )
+        .attribute(
+            AttributeSchema::new("default_network_acl", AttributeType::String)
+                .with_description("The ID of the default network ACL for the VPC (read-only)"),
+        )
+        .attribute(
+            AttributeSchema::new("default_security_group", AttributeType::String)
+                .with_description("The ID of the default security group for the VPC (read-only)"),
+        )
+        .attribute(
+            AttributeSchema::new("ipv6_cidr_blocks", AttributeType::List(Box::new(AttributeType::String)))
+                .with_description("The IPv6 CIDR blocks associated with the VPC (read-only)"),
         )
 }
 
@@ -413,13 +516,26 @@ mod tests {
     }
 
     #[test]
-    fn valid_vpc() {
+    fn valid_vpc_minimal() {
+        let schema = vpc_schema();
+        let mut attrs = HashMap::new();
+        attrs.insert("name".to_string(), Value::String("my-vpc".to_string()));
+        attrs.insert(
+            "cidr_block".to_string(),
+            Value::String("10.0.0.0/16".to_string()),
+        );
+
+        assert!(schema.validate(&attrs).is_ok());
+    }
+
+    #[test]
+    fn valid_vpc_full() {
         let schema = vpc_schema();
         let mut attrs = HashMap::new();
         attrs.insert("name".to_string(), Value::String("my-vpc".to_string()));
         attrs.insert(
             "region".to_string(),
-            Value::String("Region.ap_northeast_1".to_string()),
+            Value::String("aws.Region.ap_northeast_1".to_string()),
         );
         attrs.insert(
             "cidr_block".to_string(),
@@ -427,19 +543,136 @@ mod tests {
         );
         attrs.insert("enable_dns_support".to_string(), Value::Bool(true));
         attrs.insert("enable_dns_hostnames".to_string(), Value::Bool(true));
+        attrs.insert(
+            "instance_tenancy".to_string(),
+            Value::String("aws.vpc.InstanceTenancy.default".to_string()),
+        );
 
         assert!(schema.validate(&attrs).is_ok());
     }
 
     #[test]
-    fn vpc_missing_required_cidr_block() {
+    fn valid_vpc_with_ipam() {
         let schema = vpc_schema();
         let mut attrs = HashMap::new();
         attrs.insert("name".to_string(), Value::String("my-vpc".to_string()));
-        // missing cidr_block (region is optional, inherited from provider)
+        attrs.insert(
+            "ipv4_ipam_pool_id".to_string(),
+            Value::String("ipam-pool-0123456789abcdef0".to_string()),
+        );
+        attrs.insert("ipv4_netmask_length".to_string(), Value::Int(16));
+
+        assert!(schema.validate(&attrs).is_ok());
+    }
+
+    #[test]
+    fn vpc_missing_name() {
+        let schema = vpc_schema();
+        let mut attrs = HashMap::new();
+        attrs.insert(
+            "cidr_block".to_string(),
+            Value::String("10.0.0.0/16".to_string()),
+        );
 
         let result = schema.validate(&attrs);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn valid_instance_tenancy_dsl_format() {
+        let tenancy = instance_tenancy();
+        assert!(
+            tenancy
+                .validate(&Value::String(
+                    "aws.vpc.InstanceTenancy.default".to_string()
+                ))
+                .is_ok()
+        );
+        assert!(
+            tenancy
+                .validate(&Value::String(
+                    "aws.vpc.InstanceTenancy.dedicated".to_string()
+                ))
+                .is_ok()
+        );
+        assert!(
+            tenancy
+                .validate(&Value::String("aws.vpc.InstanceTenancy.host".to_string()))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn valid_instance_tenancy_string_format() {
+        let tenancy = instance_tenancy();
+        assert!(
+            tenancy
+                .validate(&Value::String("default".to_string()))
+                .is_ok()
+        );
+        assert!(
+            tenancy
+                .validate(&Value::String("dedicated".to_string()))
+                .is_ok()
+        );
+        assert!(tenancy.validate(&Value::String("host".to_string())).is_ok());
+    }
+
+    #[test]
+    fn invalid_instance_tenancy() {
+        let tenancy = instance_tenancy();
+        assert!(
+            tenancy
+                .validate(&Value::String("shared".to_string()))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn invalid_instance_tenancy_wrong_namespace() {
+        let tenancy = instance_tenancy();
+        // Typo: aws.vp instead of aws.vpc
+        assert!(
+            tenancy
+                .validate(&Value::String("aws.vp.InstanceTenancy.default".to_string()))
+                .is_err()
+        );
+        // Wrong provider: awscc instead of aws
+        assert!(
+            tenancy
+                .validate(&Value::String(
+                    "awscc.vpc.InstanceTenancy.default".to_string()
+                ))
+                .is_err()
+        );
+        // Wrong type name
+        assert!(
+            tenancy
+                .validate(&Value::String("aws.vpc.Tenancy.default".to_string()))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn normalize_instance_tenancy_dsl_format() {
+        assert_eq!(
+            normalize_instance_tenancy("aws.vpc.InstanceTenancy.default"),
+            "default"
+        );
+        assert_eq!(
+            normalize_instance_tenancy("aws.vpc.InstanceTenancy.dedicated"),
+            "dedicated"
+        );
+        assert_eq!(
+            normalize_instance_tenancy("aws.vpc.InstanceTenancy.host"),
+            "host"
+        );
+    }
+
+    #[test]
+    fn normalize_instance_tenancy_string_format() {
+        assert_eq!(normalize_instance_tenancy("default"), "default");
+        assert_eq!(normalize_instance_tenancy("dedicated"), "dedicated");
     }
 
     #[test]

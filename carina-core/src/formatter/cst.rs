@@ -58,6 +58,11 @@ pub enum NodeKind {
     ImportStmt,
     BackendBlock,
     ProviderBlock,
+    InputBlock,
+    OutputBlock,
+    InputParam,
+    OutputParam,
+    TypeExpr,
     LetBinding,
     ModuleCall,
     AnonymousResource,
@@ -74,6 +79,8 @@ pub enum NodeKind {
     Number,
     Boolean,
     List,
+    Map,
+    MapEntry,
     // Delimiters
     OpenBrace,
     CloseBrace,
@@ -82,6 +89,7 @@ pub enum NodeKind {
     OpenParen,
     CloseParen,
     Equals,
+    Colon,
     PipeOperator,
     Comma,
     // Keywords
@@ -91,6 +99,8 @@ pub enum NodeKind {
     KwProvider,
     KwLet,
     KwEnv,
+    KwInput,
+    KwOutput,
 }
 
 /// CST node - preserves all source information

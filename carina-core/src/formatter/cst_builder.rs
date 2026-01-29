@@ -70,6 +70,21 @@ impl<'a> CstBuilder<'a> {
             Rule::provider_block => Some(CstChild::Node(
                 self.build_node(NodeKind::ProviderBlock, pair),
             )),
+            Rule::input_block => Some(CstChild::Node(self.build_node(NodeKind::InputBlock, pair))),
+            Rule::output_block => {
+                Some(CstChild::Node(self.build_node(NodeKind::OutputBlock, pair)))
+            }
+            Rule::input_param => Some(CstChild::Node(self.build_node(NodeKind::InputParam, pair))),
+            Rule::output_param => {
+                Some(CstChild::Node(self.build_node(NodeKind::OutputParam, pair)))
+            }
+            Rule::type_expr => Some(CstChild::Node(self.build_node(NodeKind::TypeExpr, pair))),
+            Rule::type_primitive => {
+                Some(CstChild::Token(Token::new(pair.as_str().to_string(), span)))
+            }
+            Rule::type_list => Some(CstChild::Node(self.build_node(NodeKind::TypeExpr, pair))),
+            Rule::type_map => Some(CstChild::Node(self.build_node(NodeKind::TypeExpr, pair))),
+            Rule::type_ref => Some(CstChild::Node(self.build_node(NodeKind::TypeExpr, pair))),
             Rule::let_binding => Some(CstChild::Node(self.build_node(NodeKind::LetBinding, pair))),
             Rule::module_call => Some(CstChild::Node(self.build_node(NodeKind::ModuleCall, pair))),
             Rule::anonymous_resource => Some(CstChild::Node(
@@ -95,6 +110,9 @@ impl<'a> CstBuilder<'a> {
             }
             Rule::env_var => Some(CstChild::Node(self.build_node(NodeKind::EnvVar, pair))),
             Rule::list => Some(CstChild::Node(self.build_node(NodeKind::List, pair))),
+            Rule::map => Some(CstChild::Node(self.build_node(NodeKind::Map, pair))),
+            Rule::map_content => None, // Silent rule
+            Rule::map_entry => Some(CstChild::Node(self.build_node(NodeKind::MapEntry, pair))),
             Rule::variable_ref => {
                 Some(CstChild::Node(self.build_node(NodeKind::VariableRef, pair)))
             }
@@ -117,6 +135,7 @@ impl<'a> CstBuilder<'a> {
             Rule::open_paren => Some(CstChild::Token(Token::new("(".to_string(), span))),
             Rule::close_paren => Some(CstChild::Token(Token::new(")".to_string(), span))),
             Rule::equals => Some(CstChild::Token(Token::new("=".to_string(), span))),
+            Rule::colon => Some(CstChild::Token(Token::new(":".to_string(), span))),
             Rule::comma => Some(CstChild::Token(Token::new(",".to_string(), span))),
             Rule::pipe_op => Some(CstChild::Token(Token::new("|>".to_string(), span))),
 
@@ -127,10 +146,17 @@ impl<'a> CstBuilder<'a> {
             Rule::kw_provider => Some(CstChild::Token(Token::new("provider".to_string(), span))),
             Rule::kw_let => Some(CstChild::Token(Token::new("let".to_string(), span))),
             Rule::kw_env => Some(CstChild::Token(Token::new("env".to_string(), span))),
+            Rule::kw_input => Some(CstChild::Token(Token::new("input".to_string(), span))),
+            Rule::kw_output => Some(CstChild::Token(Token::new("output".to_string(), span))),
+            Rule::kw_ref => Some(CstChild::Token(Token::new("ref".to_string(), span))),
+            Rule::kw_list => Some(CstChild::Token(Token::new("list".to_string(), span))),
+            Rule::kw_map => Some(CstChild::Token(Token::new("map".to_string(), span))),
 
             // Skip file_content (it's a silent rule wrapper)
             Rule::file_content => None,
             Rule::block_content => None,
+            Rule::input_block_content => None,
+            Rule::output_block_content => None,
 
             Rule::file => None,
         }

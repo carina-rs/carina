@@ -149,6 +149,24 @@ impl Value {
     }
 }
 
+/// Completion value for LSP completions
+#[derive(Debug, Clone)]
+pub struct CompletionValue {
+    /// The value to insert (e.g., "aws.vpc.InstanceTenancy.default")
+    pub value: String,
+    /// Description shown in completion popup
+    pub description: String,
+}
+
+impl CompletionValue {
+    pub fn new(value: impl Into<String>, description: impl Into<String>) -> Self {
+        Self {
+            value: value.into(),
+            description: description.into(),
+        }
+    }
+}
+
 /// Attribute schema
 #[derive(Debug, Clone)]
 pub struct AttributeSchema {
@@ -157,6 +175,8 @@ pub struct AttributeSchema {
     pub required: bool,
     pub default: Option<Value>,
     pub description: Option<String>,
+    /// Completion values for this attribute (used by LSP)
+    pub completions: Option<Vec<CompletionValue>>,
 }
 
 impl AttributeSchema {
@@ -167,6 +187,7 @@ impl AttributeSchema {
             required: false,
             default: None,
             description: None,
+            completions: None,
         }
     }
 
@@ -182,6 +203,11 @@ impl AttributeSchema {
 
     pub fn with_description(mut self, desc: impl Into<String>) -> Self {
         self.description = Some(desc.into());
+        self
+    }
+
+    pub fn with_completions(mut self, completions: Vec<CompletionValue>) -> Self {
+        self.completions = Some(completions);
         self
     }
 }

@@ -97,6 +97,29 @@ Resource types in schemas use dot notation (`s3.bucket`, `vpc.vpc`), not undersc
 - **Region**: Accepts both DSL format (`aws.Region.ap_northeast_1`) and AWS string format (`"ap-northeast-1"`). Validation normalizes both to AWS format for comparison.
 - **S3 Versioning**: Uses enum `Enabled`/`Suspended`, not boolean. AWS SDK returns these exact strings.
 
+### Namespaced Enum Identifiers
+
+Enum values use namespaced identifiers like `aws.s3.VersioningStatus.Enabled` or `awscc.vpc.InstanceTenancy.default`.
+
+**When adding new namespaced patterns:**
+
+1. **Pattern matching must handle digits** - Resource names like `s3` contain digits. Use `c.is_ascii_digit()` in addition to `c.is_lowercase()`:
+   ```rust
+   // Wrong: "s3" fails because '3'.is_lowercase() == false
+   resource.chars().all(|c| c.is_lowercase() || c == '_')
+
+   // Correct:
+   resource.chars().all(|c| c.is_lowercase() || c.is_ascii_digit() || c == '_')
+   ```
+
+2. **Update `is_dsl_enum_format()` in `carina-cli/src/main.rs`** for new patterns (e.g., 4-part identifiers like `provider.resource.TypeName.value`)
+
+3. **Plan display should not quote namespaced identifiers** - They are identifiers, not strings
+
+4. **LSP diagnostics must validate Custom types** - When adding `AttributeType::Custom` with a validate function, ensure `carina-lsp/src/diagnostics.rs` calls the validate function for editor warnings
+
+5. **Always test with actual values** - Don't assume pattern matching works; write a quick test to verify
+
 ### Module Loading
 
 Directory-based modules (e.g., `modules/web_tier/`) require special handling:

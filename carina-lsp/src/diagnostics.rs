@@ -7,6 +7,7 @@ use carina_core::parser::{InputParameter, ParseError, ParsedFile, TypeExpr};
 use carina_core::resource::Value;
 use carina_core::schema::validate_cidr;
 use carina_provider_aws::schemas::{s3, types as aws_types, vpc};
+use carina_provider_awscc::schemas::vpc as awscc_vpc;
 
 pub struct DiagnosticEngine {
     valid_resource_types: HashSet<String>,
@@ -28,6 +29,9 @@ impl DiagnosticEngine {
         valid_resource_types.insert("security_group".to_string());
         valid_resource_types.insert("security_group.ingress_rule".to_string());
         valid_resource_types.insert("security_group.egress_rule".to_string());
+
+        // AWS Cloud Control resources
+        valid_resource_types.insert("awscc.vpc".to_string());
 
         Self {
             valid_resource_types,
@@ -60,10 +64,19 @@ impl DiagnosticEngine {
             }
             // Check resource types
             for resource in &parsed.resources {
-                if !self
-                    .valid_resource_types
-                    .contains(&resource.id.resource_type)
-                {
+                // Detect the provider from the DSL (aws. or awscc.)
+                let provider = self.detect_resource_provider(
+                    doc,
+                    &resource.id.resource_type,
+                    &resource.id.name,
+                );
+                let full_resource_type = if provider == "awscc" {
+                    format!("awscc.{}", resource.id.resource_type)
+                } else {
+                    resource.id.resource_type.clone()
+                };
+
+                if !self.valid_resource_types.contains(&full_resource_type) {
                     // Find the line where this resource is defined
                     if let Some((line, col)) =
                         self.find_resource_position(doc, &resource.id.resource_type)
@@ -76,13 +89,17 @@ impl DiagnosticEngine {
                                 },
                                 end: Position {
                                     line,
-                                    character: col + resource.id.resource_type.len() as u32 + 4, // "aws." prefix
+                                    character: col
+                                        + resource.id.resource_type.len() as u32
+                                        + provider.len() as u32
+                                        + 1, // "provider." prefix
                                 },
                             },
                             severity: Some(DiagnosticSeverity::ERROR),
                             source: Some("carina".to_string()),
                             message: format!(
-                                "Unknown resource type: aws.{}",
+                                "Unknown resource type: {}.{}",
+                                provider,
                                 resource.id.resource_type.replace('_', ".")
                             ),
                             ..Default::default()
@@ -91,7 +108,7 @@ impl DiagnosticEngine {
                 }
 
                 // Semantic validation using schema
-                let schema = self.get_schema_for_type(&resource.id.resource_type);
+                let schema = self.get_schema_for_type(&full_resource_type);
                 if let Some(schema) = schema {
                     for (attr_name, attr_value) in &resource.attributes {
                         if attr_name.starts_with('_') {
@@ -151,11 +168,26 @@ impl DiagnosticEngine {
                                         s
                                     ))
                                 }
-                                // CIDR type validation
+                                // Custom type validation (VersioningStatus, InstanceTenancy, Cidr, Region, etc.)
                                 (
-                                    carina_core::schema::AttributeType::Custom { name, .. },
-                                    Value::String(s),
-                                ) if name == "Cidr" => validate_cidr(s).err(),
+                                    carina_core::schema::AttributeType::Custom {
+                                        name,
+                                        validate,
+                                        ..
+                                    },
+                                    value,
+                                ) => {
+                                    if name == "Cidr" {
+                                        if let Value::String(s) = value {
+                                            validate_cidr(s).err()
+                                        } else {
+                                            None
+                                        }
+                                    } else {
+                                        // Use schema's validate function for other Custom types
+                                        validate(value).err().map(|e| e.to_string())
+                                    }
+                                }
                                 // String type - check for bare resource binding
                                 (carina_core::schema::AttributeType::String, Value::String(s)) => {
                                     if let Some(binding) =
@@ -221,6 +253,8 @@ impl DiagnosticEngine {
             "security_group" => Some(vpc::security_group_schema()),
             "security_group.ingress_rule" => Some(vpc::security_group_ingress_rule_schema()),
             "security_group.egress_rule" => Some(vpc::security_group_egress_rule_schema()),
+            // AWS Cloud Control resources
+            "awscc.vpc" => Some(awscc_vpc::vpc_schema()),
             _ => None,
         }
     }
@@ -261,13 +295,14 @@ impl DiagnosticEngine {
     /// Check provider region attribute
     fn check_provider_region(&self, doc: &Document, parsed: &ParsedFile) -> Vec<Diagnostic> {
         let mut diagnostics = Vec::new();
-        let region_type = aws_types::aws_region();
+        let aws_region_type = aws_types::aws_region();
+        let awscc_region_type = awscc_vpc::aws_region();
 
         for provider in &parsed.providers {
             if provider.name == "aws"
                 && let Some(region_value) = provider.attributes.get("region")
-                && let Err(e) = region_type.validate(region_value)
-                && let Some((line, col)) = self.find_provider_region_position(doc)
+                && let Err(e) = aws_region_type.validate(region_value)
+                && let Some((line, col)) = self.find_provider_region_position(doc, "aws")
             {
                 diagnostics.push(Diagnostic {
                     range: Range {
@@ -286,29 +321,113 @@ impl DiagnosticEngine {
                     ..Default::default()
                 });
             }
+            if provider.name == "awscc"
+                && let Some(region_value) = provider.attributes.get("region")
+                && let Err(e) = awscc_region_type.validate(region_value)
+                && let Some((line, col)) = self.find_provider_region_position(doc, "awscc")
+            {
+                diagnostics.push(Diagnostic {
+                    range: Range {
+                        start: Position {
+                            line,
+                            character: col,
+                        },
+                        end: Position {
+                            line,
+                            character: col + 6, // "region"
+                        },
+                    },
+                    severity: Some(DiagnosticSeverity::WARNING),
+                    source: Some("carina".to_string()),
+                    message: format!("provider awscc: {}", e),
+                    ..Default::default()
+                });
+            }
         }
         diagnostics
     }
 
-    /// Find the position of the region attribute in a provider aws block
-    fn find_provider_region_position(&self, doc: &Document) -> Option<(u32, u32)> {
+    /// Detect the provider (aws or awscc) for a resource by looking at the DSL
+    fn detect_resource_provider(
+        &self,
+        doc: &Document,
+        resource_type: &str,
+        resource_name: &str,
+    ) -> String {
         let text = doc.text();
-        let mut in_provider_aws = false;
+        // Look for patterns like "awscc.vpc {" or "let x = awscc.vpc {"
+        let awscc_pattern = format!("awscc.{}", resource_type);
+
+        for line in text.lines() {
+            let trimmed = line.trim();
+            // Check if this line defines the resource with awscc provider
+            if trimmed.contains(&awscc_pattern) {
+                // Verify it's the right resource by checking the name attribute
+                // For now, just check if awscc pattern exists
+                return "awscc".to_string();
+            }
+        }
+
+        // Also check for the name attribute to be more precise
+        let mut in_awscc_block = false;
+        let mut brace_depth = 0;
+
+        for line in text.lines() {
+            let trimmed = line.trim();
+
+            if trimmed.contains(&awscc_pattern) && trimmed.contains('{') {
+                in_awscc_block = true;
+                brace_depth = 1;
+                continue;
+            }
+
+            if in_awscc_block {
+                for ch in trimmed.chars() {
+                    if ch == '{' {
+                        brace_depth += 1;
+                    } else if ch == '}' {
+                        brace_depth -= 1;
+                    }
+                }
+
+                // Check if this block has the matching name
+                if trimmed.starts_with("name") && trimmed.contains(resource_name) {
+                    return "awscc".to_string();
+                }
+
+                if brace_depth == 0 {
+                    in_awscc_block = false;
+                }
+            }
+        }
+
+        "aws".to_string()
+    }
+
+    /// Find the position of the region attribute in a provider block
+    fn find_provider_region_position(
+        &self,
+        doc: &Document,
+        provider_name: &str,
+    ) -> Option<(u32, u32)> {
+        let text = doc.text();
+        let mut in_provider = false;
+        let provider_pattern = format!("provider {}", provider_name);
 
         for (line_idx, line) in text.lines().enumerate() {
             let trimmed = line.trim();
-            if trimmed.starts_with("provider aws") {
-                in_provider_aws = true;
+            if trimmed.starts_with(&provider_pattern) {
+                in_provider = true;
             }
 
-            if in_provider_aws {
+            if in_provider {
                 if trimmed.starts_with("region") {
                     let leading_ws = line.len() - trimmed.len();
                     return Some((line_idx as u32, leading_ws as u32));
                 }
 
                 if trimmed == "}" {
-                    in_provider_aws = false;
+                    in_provider = false;
                 }
             }
         }

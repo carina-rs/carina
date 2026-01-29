@@ -200,6 +200,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "aws-sdk-cloudcontrol"
+version = "1.93.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4a6ce0c8d51f0f35893d4f8b73f87cd2077a6977ccab1b0b22facf26c4d8c7a8"
+dependencies = [
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http",
+ "aws-smithy-json",
+ "aws-smithy-observability",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-types",
+ "aws-types",
+ "bytes",
+ "fastrand",
+ "http 0.2.12",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
 name = "aws-sdk-ec2"
 version = "1.202.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -645,6 +668,7 @@ version = "0.1.0"
 dependencies = [
  "carina-core",
  "carina-provider-aws",
+ "carina-provider-awscc",
  "carina-state",
  "clap",
  "colored",
@@ -669,6 +693,7 @@ version = "0.1.0"
 dependencies = [
  "carina-core",
  "carina-provider-aws",
+ "carina-provider-awscc",
  "dashmap 6.1.0",
  "env_logger",
  "log",
@@ -687,6 +712,20 @@ dependencies = [
  "aws-sdk-ec2",
  "aws-sdk-s3",
  "carina-core",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
+name = "carina-provider-awscc"
+version = "0.1.0"
+dependencies = [
+ "aws-config",
+ "aws-sdk-cloudcontrol",
+ "aws-sdk-ec2",
+ "carina-core",
+ "serde",
+ "serde_json",
  "thiserror",
  "tokio",
 ]
