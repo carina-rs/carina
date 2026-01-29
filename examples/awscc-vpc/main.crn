@@ -1,0 +1,26 @@
+# VPC Example using AWS Cloud Control Provider
+#
+# This example demonstrates:
+# - Using the awscc provider (AWS Cloud Control API)
+# - VPC creation with full CloudFormation-compatible attributes
+#
+# The awscc provider uses AWS Cloud Control API which provides
+# a consistent interface for managing AWS resources.
+# Schema matches CloudFormation AWS::EC2::VPC resource type.
+
+provider awscc {
+  region = aws.Region.ap_northeast_1
+}
+
+awscc.vpc {
+  name                 = "cloudcontrol-vpc"
+  cidr_block           = "10.0.0.0/16"
+  enable_dns_support   = true
+  enable_dns_hostnames = true
+  instance_tenancy     = awscc.vpc.InstanceTenancy.dedicated
+
+  tags = {
+    Environment = "development"
+    Project     = "carina-example"
+  }
+}

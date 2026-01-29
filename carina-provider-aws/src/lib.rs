@@ -280,7 +280,8 @@ impl AwsProvider {
         // Configure versioning
         if let Some(Value::String(status)) = resource.attributes.get("versioning") {
             use aws_sdk_s3::types::{BucketVersioningStatus, VersioningConfiguration};
-            let versioning_status = if status == "Enabled" {
+            let normalized = schemas::types::normalize_versioning_status(status);
+            let versioning_status = if normalized == "Enabled" {
                 BucketVersioningStatus::Enabled
             } else {
                 BucketVersioningStatus::Suspended
@@ -350,7 +351,8 @@ impl AwsProvider {
         // Update versioning configuration
         if let Some(Value::String(status)) = to.attributes.get("versioning") {
             use aws_sdk_s3::types::{BucketVersioningStatus, VersioningConfiguration};
-            let versioning_status = if status == "Enabled" {
+            let normalized = schemas::types::normalize_versioning_status(status);
+            let versioning_status = if normalized == "Enabled" {
                 BucketVersioningStatus::Enabled
             } else {
                 BucketVersioningStatus::Suspended
@@ -485,6 +487,20 @@ impl AwsProvider {
                 attributes.insert("id".to_string(), Value::String(vpc_id.to_string()));
             }
 
+            // Instance tenancy - convert to DSL format
+            if let Some(tenancy) = vpc.instance_tenancy() {
+                let tenancy_str = match tenancy {
+                    aws_sdk_ec2::types::Tenancy::Default => "aws.vpc.InstanceTenancy.default",
+                    aws_sdk_ec2::types::Tenancy::Dedicated => "aws.vpc.InstanceTenancy.dedicated",
+                    aws_sdk_ec2::types::Tenancy::Host => "aws.vpc.InstanceTenancy.host",
+                    _ => "aws.vpc.InstanceTenancy.default",
+                };
+                attributes.insert(
+                    "instance_tenancy".to_string(),
+                    Value::String(tenancy_str.to_string()),
+                );
+            }
+
             // Get VPC attributes for DNS settings
             if let Some(vpc_id) = vpc.vpc_id() {
                 if let Ok(dns_support) = self
@@ -544,17 +560,30 @@ impl AwsProvider {
             }
         };
 
-        // Create VPC
-        let result = self
-            .ec2_client
-            .create_vpc()
-            .cidr_block(&cidr_block)
-            .send()
-            .await
-            .map_err(|e| {
-                ProviderError::new(format!("Failed to create VPC: {:?}", e))
-                    .for_resource(resource.id.clone())
-            })?;
+        // Create VPC with optional instance_tenancy
+        let mut create_vpc_builder = self.ec2_client.create_vpc().cidr_block(&cidr_block);
+
+        // Handle instance_tenancy if specified
+        if let Some(Value::String(tenancy)) = resource.attributes.get("instance_tenancy") {
+            // Convert DSL format (aws.vpc.InstanceTenancy.dedicated) to API value (dedicated)
+            let tenancy_value = if tenancy.contains('.') {
+                tenancy.split('.').next_back().unwrap_or(tenancy)
+            } else {
+                tenancy.as_str()
+            };
+
+            let tenancy_enum = match tenancy_value {
+                "dedicated" => aws_sdk_ec2::types::Tenancy::Dedicated,
+                "host" => aws_sdk_ec2::types::Tenancy::Host,
+                _ => aws_sdk_ec2::types::Tenancy::Default,
+            };
+            create_vpc_builder = create_vpc_builder.instance_tenancy(tenancy_enum);
+        }
+
+        let result = create_vpc_builder.send().await.map_err(|e| {
+            ProviderError::new(format!("Failed to create VPC: {:?}", e))
+                .for_resource(resource.id.clone())
+        })?;
 
         let vpc_id = result.vpc().and_then(|v| v.vpc_id()).ok_or_else(|| {
             ProviderError::new("VPC created but no ID returned").for_resource(resource.id.clone())

@@ -67,11 +67,59 @@ fn normalize_region(s: &str) -> String {
     region_part.replace('_', "-")
 }
 
+/// Valid versioning status values
+const VALID_VERSIONING_STATUS: &[&str] = &["Enabled", "Suspended"];
+
 /// S3 bucket versioning status
-/// - Enabled: Versioning is enabled
-/// - Suspended: Versioning is suspended (previously enabled)
+/// Accepts:
+/// - DSL format: aws.s3.VersioningStatus.Enabled
+/// - String format: "Enabled"
 pub fn versioning_status() -> AttributeType {
-    AttributeType::Enum(vec!["Enabled".to_string(), "Suspended".to_string()])
+    AttributeType::Custom {
+        name: "VersioningStatus".to_string(),
+        base: Box::new(AttributeType::String),
+        validate: |value| {
+            if let Value::String(s) = value {
+                // Check namespace format if it contains dots
+                if s.contains('.') {
+                    // Must be aws.s3.VersioningStatus.<value>
+                    let parts: Vec<&str> = s.split('.').collect();
+                    if parts.len() != 4
+                        || parts[0] != "aws"
+                        || parts[1] != "s3"
+                        || parts[2] != "VersioningStatus"
+                    {
+                        return Err(format!(
+                            "Invalid versioning status '{}', expected one of: aws.s3.VersioningStatus.Enabled, aws.s3.VersioningStatus.Suspended",
+                            s
+                        ));
+                    }
+                }
+                let normalized = normalize_versioning_status(s);
+                if VALID_VERSIONING_STATUS.contains(&normalized.as_str()) {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "Invalid versioning status '{}', expected one of: aws.s3.VersioningStatus.Enabled, aws.s3.VersioningStatus.Suspended",
+                        s
+                    ))
+                }
+            } else {
+                Err("Expected string".to_string())
+            }
+        },
+    }
+}
+
+/// Normalize versioning status to API format
+/// - "aws.s3.VersioningStatus.Enabled" -> "Enabled"
+/// - "Enabled" -> "Enabled"
+pub fn normalize_versioning_status(s: &str) -> String {
+    if s.contains('.') {
+        s.split('.').next_back().unwrap_or(s).to_string()
+    } else {
+        s.to_string()
+    }
 }
 
 /// S3 ACL enum type
@@ -186,7 +234,31 @@ mod tests {
     // Versioning status tests
 
     #[test]
-    fn versioning_accepts_enabled() {
+    fn versioning_accepts_dsl_format_enabled() {
+        let versioning = versioning_status();
+        assert!(
+            versioning
+                .validate(&Value::String(
+                    "aws.s3.VersioningStatus.Enabled".to_string()
+                ))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn versioning_accepts_dsl_format_suspended() {
+        let versioning = versioning_status();
+        assert!(
+            versioning
+                .validate(&Value::String(
+                    "aws.s3.VersioningStatus.Suspended".to_string()
+                ))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn versioning_accepts_string_enabled() {
         let versioning = versioning_status();
         assert!(
             versioning
@@ -196,7 +268,7 @@ mod tests {
     }
 
     #[test]
-    fn versioning_accepts_suspended() {
+    fn versioning_accepts_string_suspended() {
         let versioning = versioning_status();
         assert!(
             versioning
@@ -230,5 +302,48 @@ mod tests {
                 .validate(&Value::String("Disabled".to_string()))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn versioning_rejects_wrong_namespace() {
+        let versioning = versioning_status();
+        // Typo: aws.s.VersioningStatus instead of aws.s3.VersioningStatus
+        assert!(
+            versioning
+                .validate(&Value::String("aws.s.VersioningStatus.Enabled".to_string()))
+                .is_err()
+        );
+        // Wrong provider
+        assert!(
+            versioning
+                .validate(&Value::String(
+                    "awscc.s3.VersioningStatus.Enabled".to_string()
+                ))
+                .is_err()
+        );
+        // Wrong type name
+        assert!(
+            versioning
+                .validate(&Value::String("aws.s3.Versioning.Enabled".to_string()))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn normalize_versioning_status_dsl_format() {
+        assert_eq!(
+            normalize_versioning_status("aws.s3.VersioningStatus.Enabled"),
+            "Enabled"
+        );
+        assert_eq!(
+            normalize_versioning_status("aws.s3.VersioningStatus.Suspended"),
+            "Suspended"
+        );
+    }
+
+    #[test]
+    fn normalize_versioning_status_string_format() {
+        assert_eq!(normalize_versioning_status("Enabled"), "Enabled");
+        assert_eq!(normalize_versioning_status("Suspended"), "Suspended");
     }
 }

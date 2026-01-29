@@ -11,7 +11,7 @@ ws = @{ (" " | "\t")+ }
 newline = @{ NEWLINE }
 comment = @{ "#" ~ (!NEWLINE ~ ANY)* }
 
-statement = { import_stmt | backend_block | provider_block | let_binding | module_call | anonymous_resource }
+statement = { import_stmt | backend_block | provider_block | input_block | output_block | let_binding | module_call | anonymous_resource }
 
 // Import statement: import "./path/to/module.crn" as name
 import_stmt = {
@@ -37,6 +37,43 @@ module_call = {
 provider_block = {
     kw_provider ~ trivia+ ~ identifier ~ trivia* ~ open_brace ~ block_content* ~ close_brace
 }
+
+// Input block: input { name: type, name: type = default }
+input_block = {
+    kw_input ~ trivia* ~ open_brace ~ input_block_content* ~ close_brace
+}
+
+input_block_content = _{ trivia | input_param }
+
+// Input parameter: name: type or name: type = default
+input_param = {
+    identifier ~ trivia* ~ colon ~ trivia* ~ type_expr ~ (trivia* ~ equals ~ trivia* ~ expression)?
+}
+
+// Output block: output { name: type = value }
+output_block = {
+    kw_output ~ trivia* ~ open_brace ~ output_block_content* ~ close_brace
+}
+
+output_block_content = _{ trivia | output_param }
+
+// Output parameter: name: type = value
+output_param = {
+    identifier ~ trivia* ~ colon ~ trivia* ~ type_expr ~ trivia* ~ equals ~ trivia* ~ expression
+}
+
+// Type expression: string, bool, int, cidr, list(type), map(type), ref(aws.resource)
+type_expr = {
+    type_ref | type_list | type_map | type_primitive
+}
+
+type_primitive = @{ "string" | "bool" | "int" | "cidr" }
+
+type_list = { kw_list ~ trivia* ~ open_paren ~ trivia* ~ type_expr ~ trivia* ~ close_paren }
+
+type_map = { kw_map ~ trivia* ~ open_paren ~ trivia* ~ type_expr ~ trivia* ~ close_paren }
+
+type_ref = { kw_ref ~ trivia* ~ open_paren ~ trivia* ~ namespaced_id ~ trivia* ~ close_paren }
 
 // Variable/resource definition: let name = value
 let_binding = {
@@ -70,6 +107,7 @@ primary = {
     env_var
   | resource_expr
   | list
+  | map
   | namespaced_id
   | boolean
   | number
@@ -82,6 +120,16 @@ primary = {
 list = {
     open_bracket ~ trivia* ~ (expression ~ (trivia* ~ comma ~ trivia* ~ expression)*)? ~ trivia* ~ comma? ~ trivia* ~ close_bracket
 }
+
+// Map: { key = value, ... } (commas are optional)
+map = {
+    open_brace ~ map_content* ~ close_brace
+}
+
+map_content = _{ trivia | map_entry }
+
+// Map entry: key = value (with optional trailing comma)
+map_entry = { identifier ~ trivia* ~ equals ~ trivia* ~ expression ~ trivia* ~ comma? }
 
 // Environment variable: env("VAR_NAME")
 env_var = { kw_env ~ open_paren ~ trivia* ~ string ~ trivia* ~ close_paren }
@@ -112,6 +160,7 @@ close_bracket = { "]" }
 open_paren = { "(" }
 close_paren = { ")" }
 equals = { "=" }
+colon = { ":" }
 comma = { "," }
 pipe_op = { "|>" }
 
@@ -122,3 +171,8 @@ kw_import = { "import" }
 kw_as = { "as" }
 kw_let = { "let" }
 kw_env = { "env" }
+kw_input = { "input" }
+kw_output = { "output" }
+kw_ref = { "ref" }
+kw_list = { "list" }
+kw_map = { "map" }

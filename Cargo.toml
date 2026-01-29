@@ -4,6 +4,7 @@ members = [
     "carina-core",
     "carina-lsp",
     "carina-provider-aws",
+    "carina-provider-awscc",
     "carina-state",
 ]
 resolver = "2"

@@ -11,6 +11,7 @@ path = "src/main.rs"
 [dependencies]
 carina-core = { path = "../carina-core" }
 carina-provider-aws = { path = "../carina-provider-aws" }
+carina-provider-awscc = { path = "../carina-provider-awscc" }
 tower-lsp = "0.20"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std"] }
 dashmap = "6"

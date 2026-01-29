@@ -100,16 +100,23 @@ impl Formatter {
             NodeKind::ImportStmt => self.format_import_stmt(node),
             NodeKind::BackendBlock => self.format_backend_block(node),
             NodeKind::ProviderBlock => self.format_provider_block(node),
+            NodeKind::InputBlock => self.format_input_block(node),
+            NodeKind::OutputBlock => self.format_output_block(node),
             NodeKind::LetBinding => self.format_let_binding(node),
             NodeKind::ModuleCall => self.format_module_call(node),
             NodeKind::AnonymousResource => self.format_anonymous_resource(node),
             NodeKind::ResourceExpr => self.format_resource_expr(node),
             NodeKind::Attribute => self.format_attribute(node, 0),
+            NodeKind::InputParam => self.format_input_param(node, 0),
+            NodeKind::OutputParam => self.format_output_param(node, 0),
             NodeKind::PipeExpr => self.format_pipe_expr(node),
             NodeKind::FunctionCall => self.format_function_call(node),
             NodeKind::EnvVar => self.format_env_var(node),
             NodeKind::VariableRef => self.format_variable_ref(node),
             NodeKind::List => self.format_list(node),
+            NodeKind::Map => self.format_map(node),
+            NodeKind::MapEntry => self.format_map_entry(node),
+            NodeKind::TypeExpr => self.format_type_expr(node),
             _ => self.format_default(node),
         }
     }
@@ -225,6 +232,227 @@ impl Formatter {
         self.write_newline();
     }
 
+    fn format_input_block(&mut self, node: &CstNode) {
+        self.write_indent();
+        self.write("input {");
+        self.write_newline();
+        self.current_indent += 1;
+
+        self.format_input_params(node);
+
+        self.current_indent -= 1;
+        self.write_indent();
+        self.write("}");
+        self.write_newline();
+    }
+
+    fn format_output_block(&mut self, node: &CstNode) {
+        self.write_indent();
+        self.write("output {");
+        self.write_newline();
+        self.current_indent += 1;
+
+        self.format_output_params(node);
+
+        self.current_indent -= 1;
+        self.write_indent();
+        self.write("}");
+        self.write_newline();
+    }
+
+    fn format_input_params(&mut self, node: &CstNode) {
+        // Collect input params
+        let params: Vec<&CstNode> = node
+            .children
+            .iter()
+            .filter_map(|child| {
+                if let CstChild::Node(n) = child
+                    && n.kind == NodeKind::InputParam
+                {
+                    return Some(n);
+                }
+                None
+            })
+            .collect();
+
+        // Calculate max key length for alignment
+        let max_key_len = if self.config.align_attributes {
+            params
+                .iter()
+                .filter_map(|p| self.get_param_name(p))
+                .map(|k| k.len())
+                .max()
+                .unwrap_or(0)
+        } else {
+            0
+        };
+
+        for param in params {
+            self.format_input_param(param, max_key_len);
+        }
+    }
+
+    fn format_output_params(&mut self, node: &CstNode) {
+        // Collect output params
+        let params: Vec<&CstNode> = node
+            .children
+            .iter()
+            .filter_map(|child| {
+                if let CstChild::Node(n) = child
+                    && n.kind == NodeKind::OutputParam
+                {
+                    return Some(n);
+                }
+                None
+            })
+            .collect();
+
+        // Calculate max key length for alignment
+        let max_key_len = if self.config.align_attributes {
+            params
+                .iter()
+                .filter_map(|p| self.get_param_name(p))
+                .map(|k| k.len())
+                .max()
+                .unwrap_or(0)
+        } else {
+            0
+        };
+
+        for param in params {
+            self.format_output_param(param, max_key_len);
+        }
+    }
+
+    fn get_param_name(&self, node: &CstNode) -> Option<String> {
+        for child in &node.children {
+            if let CstChild::Token(token) = child
+                && self.is_identifier(&token.text)
+            {
+                return Some(token.text.clone());
+            }
+        }
+        None
+    }
+
+    fn format_input_param(&mut self, node: &CstNode, align_to: usize) {
+        self.write_indent();
+
+        let mut key_len: usize = 0;
+        let mut wrote_name = false;
+        let mut wrote_colon = false;
+        let mut wrote_equals = false;
+
+        for child in &node.children {
+            match child {
+                CstChild::Token(token) => {
+                    if !wrote_name && self.is_identifier(&token.text) && token.text != "input" {
+                        key_len = token.text.len();
+                        self.write(&token.text);
+                        wrote_name = true;
+                    } else if token.text == ":" && !wrote_colon {
+                        // Add padding for alignment before colon
+                        if align_to > 0 && key_len < align_to {
+                            let padding = align_to - key_len;
+                            self.write(&" ".repeat(padding));
+                        }
+                        self.write(": ");
+                        wrote_colon = true;
+                    } else if token.text == "=" && !wrote_equals {
+                        self.write(" = ");
+                        wrote_equals = true;
+                    } else if wrote_colon && !wrote_equals {
+                        // Type primitive
+                        self.write(&token.text);
+                    } else if wrote_equals {
+                        // Default value
+                        self.write(&token.text);
+                    }
+                }
+                CstChild::Node(n) => {
+                    if wrote_colon && !wrote_equals {
+                        self.format_type_expr(n);
+                    } else if wrote_equals {
+                        self.format_node(n);
+                    }
+                }
+                CstChild::Trivia(_) => {}
+            }
+        }
+
+        self.write_newline();
+    }
+
+    fn format_output_param(&mut self, node: &CstNode, align_to: usize) {
+        self.write_indent();
+
+        let mut key_len: usize = 0;
+        let mut wrote_name = false;
+        let mut wrote_colon = false;
+        let mut wrote_equals = false;
+
+        for child in &node.children {
+            match child {
+                CstChild::Token(token) => {
+                    if !wrote_name && self.is_identifier(&token.text) && token.text != "output" {
+                        key_len = token.text.len();
+                        self.write(&token.text);
+                        wrote_name = true;
+                    } else if token.text == ":" && !wrote_colon {
+                        // Add padding for alignment before colon
+                        if align_to > 0 && key_len < align_to {
+                            let padding = align_to - key_len;
+                            self.write(&" ".repeat(padding));
+                        }
+                        self.write(": ");
+                        wrote_colon = true;
+                    } else if token.text == "=" && !wrote_equals {
+                        self.write(" = ");
+                        wrote_equals = true;
+                    } else if wrote_colon && !wrote_equals {
+                        // Type primitive
+                        self.write(&token.text);
+                    } else if wrote_equals {
+                        // Value
+                        self.write(&token.text);
+                    }
+                }
+                CstChild::Node(n) => {
+                    if wrote_colon && !wrote_equals {
+                        self.format_type_expr(n);
+                    } else if wrote_equals {
+                        self.format_node(n);
+                    }
+                }
+                CstChild::Trivia(_) => {}
+            }
+        }
+
+        self.write_newline();
+    }
+
+    fn format_type_expr(&mut self, node: &CstNode) {
+        // Type expressions: ref(aws.vpc), list(cidr), map(string), string, bool, int, cidr
+        for child in &node.children {
+            match child {
+                CstChild::Token(token) => {
+                    if token.text == "(" {
+                        self.write("(");
+                    } else if token.text == ")" {
+                        self.write(")");
+                    } else {
+                        self.write(&token.text);
+                    }
+                }
+                CstChild::Node(n) => {
+                    // Recursively format nested type expressions
+                    self.format_type_expr(n);
+                }
+                CstChild::Trivia(_) => {}
+            }
+        }
+    }
+
     fn format_let_binding(&mut self, node: &CstNode) {
         self.write_indent();
         self.write("let ");
@@ -312,13 +540,15 @@ impl Formatter {
     }
 
     fn format_block_attributes(&mut self, node: &CstNode) {
-        // Collect attributes and comments
-        let mut attributes: Vec<&CstNode> = Vec::new();
+        // Collect attributes into groups separated by blank lines
+        let mut groups: Vec<Vec<&CstNode>> = Vec::new();
+        let mut current_group: Vec<&CstNode> = Vec::new();
         let mut inline_comments: std::collections::HashMap<usize, &Trivia> =
             std::collections::HashMap::new();
         let mut pending_comments: Vec<&Trivia> = Vec::new();
 
         let mut attr_index = 0;
+        let mut newline_count = 0;
         for child in &node.children {
             match child {
                 CstChild::Node(n) if n.kind == NodeKind::Attribute => {
@@ -328,13 +558,18 @@ impl Formatter {
                         self.write_trivia(comment);
                         self.write_newline();
                     }
-                    attributes.push(n);
+                    // Start a new group if there was a blank line
+                    if newline_count > 1 && !current_group.is_empty() {
+                        groups.push(std::mem::take(&mut current_group));
+                    }
+                    current_group.push(n);
                     attr_index += 1;
+                    newline_count = 0;
                 }
                 CstChild::Trivia(Trivia::LineComment(s)) => {
                     // Check if this is an inline comment (on same line as previous attribute)
                     // For simplicity, we treat comments after a newline as standalone
-                    if !attributes.is_empty() && !s.is_empty() {
+                    if attr_index > 0 && !s.is_empty() && newline_count == 0 {
                         // Store as potential inline comment for previous attribute
                         inline_comments.insert(
                             attr_index - 1,
@@ -349,30 +584,45 @@ impl Formatter {
                             _ => unreachable!(),
                         });
                     }
+                    newline_count = 0;
                 }
                 CstChild::Trivia(Trivia::Newline) => {
-                    // Newline means pending comments become standalone
+                    newline_count += 1;
                 }
                 _ => {}
             }
         }
+        // Don't forget the last group
+        if !current_group.is_empty() {
+            groups.push(current_group);
+        }
 
-        // Calculate max key length for alignment
-        let max_key_len = if self.config.align_attributes {
-            attributes
-                .iter()
-                .filter_map(|attr| self.get_attribute_key(attr))
-                .map(|k| k.len())
-                .max()
-                .unwrap_or(0)
-        } else {
-            0
-        };
+        // Format each group with its own alignment
+        let mut global_attr_index = 0;
+        for (group_index, group) in groups.iter().enumerate() {
+            // Add blank line between groups
+            if group_index > 0 {
+                self.write_newline();
+            }
 
-        // Format each attribute
-        for (i, attr) in attributes.iter().enumerate() {
-            let inline_comment = inline_comments.get(&i);
-            self.format_attribute_aligned(attr, max_key_len, inline_comment.copied());
+            // Calculate max key length for this group only
+            let max_key_len = if self.config.align_attributes {
+                group
+                    .iter()
+                    .filter_map(|attr| self.get_attribute_key(attr))
+                    .map(|k| k.len())
+                    .max()
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+
+            // Format each attribute in this group
+            for attr in group {
+                let inline_comment = inline_comments.get(&global_attr_index);
+                self.format_attribute_aligned(attr, max_key_len, inline_comment.copied());
+                global_attr_index += 1;
+            }
         }
 
         // Write any trailing standalone comments
@@ -564,6 +814,110 @@ impl Formatter {
         self.write("]");
     }
 
+    fn format_map(&mut self, node: &CstNode) {
+        self.write("{");
+
+        // Collect map entries
+        let entries: Vec<&CstNode> = node
+            .children
+            .iter()
+            .filter_map(|child| {
+                if let CstChild::Node(n) = child
+                    && n.kind == NodeKind::MapEntry
+                {
+                    return Some(n);
+                }
+                None
+            })
+            .collect();
+
+        if entries.is_empty() {
+            self.write("}");
+            return;
+        }
+
+        self.write_newline();
+        self.current_indent += 1;
+
+        // Calculate max key length for alignment
+        let max_key_len = if self.config.align_attributes {
+            entries
+                .iter()
+                .filter_map(|entry| self.get_map_entry_key(entry))
+                .map(|k| k.len())
+                .max()
+                .unwrap_or(0)
+        } else {
+            0
+        };
+
+        // Format each entry
+        for entry in entries {
+            self.format_map_entry_aligned(entry, max_key_len);
+        }
+
+        self.current_indent -= 1;
+        self.write_indent();
+        self.write("}");
+    }
+
+    fn get_map_entry_key(&self, node: &CstNode) -> Option<String> {
+        for child in &node.children {
+            if let CstChild::Token(token) = child
+                && self.is_identifier(&token.text)
+            {
+                return Some(token.text.clone());
+            }
+        }
+        None
+    }
+
+    fn format_map_entry(&mut self, node: &CstNode) {
+        self.format_map_entry_aligned(node, 0);
+    }
+
+    fn format_map_entry_aligned(&mut self, node: &CstNode, align_to: usize) {
+        self.write_indent();
+
+        let mut key_len: usize;
+        let mut wrote_key = false;
+        let mut wrote_equals = false;
+
+        for child in &node.children {
+            match child {
+                CstChild::Token(token) => {
+                    if !wrote_key && self.is_identifier(&token.text) {
+                        key_len = token.text.len();
+                        self.write(&token.text);
+                        wrote_key = true;
+
+                        // Add padding for alignment
+                        if align_to > 0 && key_len < align_to {
+                            let padding = align_to - key_len;
+                            self.write(&" ".repeat(padding));
+                        }
+                    } else if token.text == "=" && !wrote_equals {
+                        self.write(" = ");
+                        wrote_equals = true;
+                    } else if token.text == "," {
+                        // Skip trailing comma - we'll handle it consistently
+                        continue;
+                    } else if wrote_equals {
+                        self.write(&token.text);
+                    }
+                }
+                CstChild::Node(n) => {
+                    if wrote_equals {
+                        self.format_node(n);
+                    }
+                }
+                CstChild::Trivia(_) => {}
+            }
+        }
+
+        self.write_newline();
+    }
+
     fn format_default(&mut self, node: &CstNode) {
         for child in &node.children {
             match child {
@@ -696,5 +1050,147 @@ mod tests {
 
         let unformatted = "provider aws {\nregion=aws.Region.ap_northeast_1\n}";
         assert!(needs_format(unformatted, &config).unwrap());
+    }
+
+    #[test]
+    fn test_format_map() {
+        let input = "awscc.vpc {\ntags = {Environment=\"dev\"Project=\"test\"}\n}";
+        let config = FormatConfig::default();
+        let result = format(input, &config).unwrap();
+
+        // Map should be formatted with entries on separate lines
+        assert!(result.contains("tags = {"), "missing 'tags = {{'");
+        assert!(
+            result.contains("Environment = \"dev\""),
+            "missing Environment"
+        );
+        // With alignment, Project has extra spaces to align with Environment
+        assert!(
+            result.contains("Project") && result.contains("= \"test\""),
+            "missing Project"
+        );
+        // Map entries should be on separate lines (not all on one line)
+        let lines: Vec<&str> = result.lines().collect();
+        assert!(
+            lines.iter().any(|l| l.contains("Environment")),
+            "Environment should be on its own line"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("Project")),
+            "Project should be on its own line"
+        );
+    }
+
+    #[test]
+    fn test_format_map_aligns_entries() {
+        let input = "awscc.vpc {\ntags = {Environment=\"dev\"\nProject=\"test\"}\n}";
+        let config = FormatConfig {
+            align_attributes: true,
+            ..Default::default()
+        };
+        let result = format(input, &config).unwrap();
+
+        // Map entries should be aligned
+        let lines: Vec<&str> = result.lines().collect();
+        let env_eq_pos = lines
+            .iter()
+            .find(|l| l.contains("Environment"))
+            .unwrap()
+            .find('=');
+        let proj_eq_pos = lines
+            .iter()
+            .find(|l| l.contains("Project"))
+            .unwrap()
+            .find('=');
+
+        assert_eq!(env_eq_pos, proj_eq_pos);
+    }
+
+    #[test]
+    fn test_format_map_idempotent() {
+        let input =
+            "awscc.vpc {\n  tags = {\n    Environment = \"dev\"\n    Project = \"test\"\n  }\n}\n";
+        let config = FormatConfig::default();
+
+        let first = format(input, &config).unwrap();
+        let second = format(&first, &config).unwrap();
+
+        assert_eq!(first, second, "Map formatting should be idempotent");
+    }
+
+    #[test]
+    fn test_format_preserves_blank_lines_between_attributes() {
+        let input = "awscc.vpc {\n  name = \"test\"\n  cidr = \"10.0.0.0/16\"\n\n  tags = {\n    Env = \"dev\"\n  }\n}\n";
+        let config = FormatConfig::default();
+        let result = format(input, &config).unwrap();
+
+        // Should preserve blank line before tags
+        assert!(result.contains("cidr"), "should have cidr");
+        assert!(result.contains("tags"), "should have tags");
+
+        // Check that there's a blank line between cidr and tags
+        let lines: Vec<&str> = result.lines().collect();
+        let cidr_line = lines.iter().position(|l| l.contains("cidr")).unwrap();
+        let tags_line = lines.iter().position(|l| l.contains("tags")).unwrap();
+
+        // There should be an empty line between them (difference should be > 1)
+        assert!(
+            tags_line - cidr_line > 1,
+            "Expected blank line between cidr and tags, but cidr is at line {} and tags at line {}",
+            cidr_line,
+            tags_line
+        );
+    }
+
+    #[test]
+    fn test_format_blank_lines_idempotent() {
+        let input = "awscc.vpc {\n  name = \"test\"\n\n  tags = {\n    Env = \"dev\"\n  }\n}\n";
+        let config = FormatConfig::default();
+
+        let first = format(input, &config).unwrap();
+        let second = format(&first, &config).unwrap();
+
+        assert_eq!(first, second, "Blank line formatting should be idempotent");
+    }
+
+    #[test]
+    fn test_format_aligns_within_groups_separated_by_blank_lines() {
+        // Attributes before blank line should be aligned together
+        // Attributes after blank line should be aligned separately
+        let input = "awscc.vpc {\nenable_dns_hostnames = true\nname = \"test\"\n\ntags = {}\n}\n";
+        let config = FormatConfig {
+            align_attributes: true,
+            ..Default::default()
+        };
+        let result = format(input, &config).unwrap();
+
+        let lines: Vec<&str> = result.lines().collect();
+
+        // Find the = positions for each attribute
+        let dns_line = lines
+            .iter()
+            .find(|l| l.contains("enable_dns_hostnames"))
+            .unwrap();
+        let name_line = lines.iter().find(|l| l.contains("name")).unwrap();
+        let tags_line = lines.iter().find(|l| l.contains("tags")).unwrap();
+
+        let dns_eq_pos = dns_line.find('=').unwrap();
+        let name_eq_pos = name_line.find('=').unwrap();
+        let tags_eq_pos = tags_line.find('=').unwrap();
+
+        // dns and name should be aligned (same group)
+        assert_eq!(dns_eq_pos, name_eq_pos, "dns and name should be aligned");
+
+        // tags should NOT be aligned with dns/name (different group)
+        assert_ne!(
+            tags_eq_pos, dns_eq_pos,
+            "tags should not be aligned with dns/name"
+        );
+
+        // tags should have minimal padding (just "tags = ")
+        assert!(
+            tags_line.trim().starts_with("tags ="),
+            "tags should have minimal padding"
+        );
     }
 }
