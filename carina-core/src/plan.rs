@@ -255,7 +255,7 @@ fn format_effect_brief(effect: &Effect) -> String {
         Effect::Update { id, .. } => format!("~ {}.{}", id.resource_type, id.name),
         Effect::Delete(id) => format!("- {}.{}", id.resource_type, id.name),
         Effect::Read { resource } => format!(
-            "? {}.{} (data source)",
+            "<= {}.{} (data source)",
             resource.id.resource_type, resource.id.name
         ),
     }

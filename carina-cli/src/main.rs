@@ -1929,7 +1929,7 @@ fn print_plan(plan: &Plan) {
             Effect::Create(_) => "+".green().bold(),
             Effect::Update { .. } => "~".yellow().bold(),
             Effect::Delete(_) => "-".red().bold(),
-            Effect::Read { .. } => "?".cyan().bold(),
+            Effect::Read { .. } => "<=".cyan().bold(),
         };
 
         // Build the tree connector (shown before child resources)
