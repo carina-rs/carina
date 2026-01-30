@@ -87,6 +87,7 @@ function_call = { identifier ~ "(" ~ (expression ~ ("," ~ expression)*)? ~ ")" }
 // Primary value
 primary = {
     env_var
+  | read_resource_expr   // Must come before resource_expr for "read aws..." parsing
   | resource_expr
   | list
   | map
@@ -112,6 +113,9 @@ env_var = { "env" ~ "(" ~ string ~ ")" }
 
 // Resource expression: aws.s3.bucket { ... }
 resource_expr = { namespaced_id ~ "{" ~ block_content* ~ "}" }
+
+// Read resource expression (data source): read aws.s3.bucket { ... }
+read_resource_expr = { "read" ~ namespaced_id ~ "{" ~ block_content* ~ "}" }
 
 // Variable reference (with optional member access: bucket.name)
 variable_ref = { identifier ~ ("." ~ identifier)? }

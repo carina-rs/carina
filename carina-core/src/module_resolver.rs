@@ -317,6 +317,7 @@ mod tests {
                     );
                     attrs
                 },
+                read_only: false,
             }],
             variables: HashMap::new(),
             imports: vec![],

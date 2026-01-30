@@ -104,8 +104,8 @@ impl<P: Provider> Interpreter<P> {
         }
 
         match effect {
-            Effect::Read(id) => {
-                let state = self.provider.read(id).await?;
+            Effect::Read { resource } => {
+                let state = self.provider.read(&resource.id).await?;
                 Ok(EffectOutcome::Read { state })
             }
             Effect::Create(resource) => {

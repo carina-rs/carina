@@ -113,6 +113,11 @@ impl SemanticTokensProvider {
                         tokens.push(((let_start + 4) as u32, name.len() as u32, 2)); // VARIABLE
                     }
                 }
+                // Check for "read" keyword after "let name = read ..."
+                if let Some(read_pos) = after_let.find("= read ") {
+                    let read_start = let_start + 4 + read_pos + 2; // position of "read"
+                    tokens.push((read_start as u32, 4, 0)); // KEYWORD: read
+                }
             }
         }
 

@@ -42,7 +42,7 @@ impl Plan {
         let mut summary = PlanSummary::default();
         for effect in &self.effects {
             match effect {
-                Effect::Read(_) => summary.read += 1,
+                Effect::Read { .. } => summary.read += 1,
                 Effect::Create(_) => summary.create += 1,
                 Effect::Update { .. } => summary.update += 1,
                 Effect::Delete(_) => summary.delete += 1,
@@ -62,11 +62,19 @@ pub struct PlanSummary {
 
 impl std::fmt::Display for PlanSummary {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "Plan: {} to create, {} to update, {} to delete",
-            self.create, self.update, self.delete
-        )
+        if self.read > 0 {
+            write!(
+                f,
+                "Plan: {} to read, {} to create, {} to update, {} to delete",
+                self.read, self.create, self.update, self.delete
+            )
+        } else {
+            write!(
+                f,
+                "Plan: {} to create, {} to update, {} to delete",
+                self.create, self.update, self.delete
+            )
+        }
     }
 }
 
@@ -134,7 +142,8 @@ impl ModularPlan {
             let source = match effect {
                 Effect::Create(r) => Self::extract_source(&r.attributes),
                 Effect::Update { to, .. } => Self::extract_source(&to.attributes),
-                Effect::Delete(_) | Effect::Read(_) => ModuleSource::Root,
+                Effect::Read { resource } => Self::extract_source(&resource.attributes),
+                Effect::Delete(_) => ModuleSource::Root,
             };
             modular.effect_sources.insert(idx, source);
         }
@@ -245,7 +254,10 @@ fn format_effect_brief(effect: &Effect) -> String {
         Effect::Create(r) => format!("+ {}.{}", r.id.resource_type, r.id.name),
         Effect::Update { id, .. } => format!("~ {}.{}", id.resource_type, id.name),
         Effect::Delete(id) => format!("- {}.{}", id.resource_type, id.name),
-        Effect::Read(id) => format!("? {}.{}", id.resource_type, id.name),
+        Effect::Read { resource } => format!(
+            "? {}.{} (data source)",
+            resource.id.resource_type, resource.id.name
+        ),
     }
 }
 

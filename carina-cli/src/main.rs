@@ -1077,7 +1077,7 @@ async fn run_apply(path: &PathBuf) -> Result<(), String> {
                     failure_count += 1;
                 }
             },
-            Effect::Read(_) => {}
+            Effect::Read { .. } => {}
         }
     }
 
@@ -1861,7 +1861,8 @@ fn print_plan(plan: &Plan) {
         let (resource, deps) = match effect {
             Effect::Create(r) => (Some(r), get_resource_dependencies(r)),
             Effect::Update { to, .. } => (Some(to), get_resource_dependencies(to)),
-            Effect::Delete(_) | Effect::Read(_) => (None, HashSet::new()),
+            Effect::Read { resource } => (Some(resource), get_resource_dependencies(resource)),
+            Effect::Delete(_) => (None, HashSet::new()),
         };
 
         if let Some(r) = resource {
@@ -1928,7 +1929,7 @@ fn print_plan(plan: &Plan) {
             Effect::Create(_) => "+".green().bold(),
             Effect::Update { .. } => "~".yellow().bold(),
             Effect::Delete(_) => "-".red().bold(),
-            Effect::Read(_) => "?".normal(),
+            Effect::Read { .. } => "?".cyan().bold(),
         };
 
         // Build the tree connector (shown before child resources)
@@ -2069,7 +2070,32 @@ fn print_plan(plan: &Plan) {
                 };
                 println!("{}{}: {}", attr_prefix, "name".bold(), id.name.red().bold());
             }
-            Effect::Read(_) => {}
+            Effect::Read { resource } => {
+                println!(
+                    "{}{}{} {} {}",
+                    base_indent,
+                    connector,
+                    colored_symbol,
+                    resource.id.resource_type.cyan().bold(),
+                    "(data source)".dimmed()
+                );
+                let attr_prefix = if indent == 0 {
+                    format!("{}{}", base_indent, attr_base)
+                } else {
+                    let continuation = if is_last {
+                        format!("{}   ", prefix)
+                    } else {
+                        format!("{}│  ", prefix)
+                    };
+                    format!("{}{}   ", base_indent, continuation)
+                };
+                println!(
+                    "{}{}: {}",
+                    attr_prefix,
+                    "name".bold(),
+                    resource.id.name.cyan().bold()
+                );
+            }
         }
 
         // Print children (dependents)
@@ -2130,12 +2156,22 @@ fn print_plan(plan: &Plan) {
 
     println!();
     let summary = plan.summary();
-    println!(
-        "Plan: {} to add, {} to change, {} to destroy.",
-        summary.create.to_string().green(),
-        summary.update.to_string().yellow(),
-        summary.delete.to_string().red()
-    );
+    if summary.read > 0 {
+        println!(
+            "Plan: {} to read, {} to add, {} to change, {} to destroy.",
+            summary.read.to_string().cyan(),
+            summary.create.to_string().green(),
+            summary.update.to_string().yellow(),
+            summary.delete.to_string().red()
+        );
+    } else {
+        println!(
+            "Plan: {} to add, {} to change, {} to destroy.",
+            summary.create.to_string().green(),
+            summary.update.to_string().yellow(),
+            summary.delete.to_string().red()
+        );
+    }
 }
 
 fn format_effect(effect: &Effect) -> String {
@@ -2143,7 +2179,9 @@ fn format_effect(effect: &Effect) -> String {
         Effect::Create(r) => format!("Create {}.{}", r.id.resource_type, r.id.name),
         Effect::Update { id, .. } => format!("Update {}.{}", id.resource_type, id.name),
         Effect::Delete(id) => format!("Delete {}.{}", id.resource_type, id.name),
-        Effect::Read(id) => format!("Read {}.{}", id.resource_type, id.name),
+        Effect::Read { resource } => {
+            format!("Read {}.{}", resource.id.resource_type, resource.id.name)
+        }
     }
 }
 
