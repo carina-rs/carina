@@ -55,6 +55,8 @@ pub enum Value {
 pub struct Resource {
     pub id: ResourceId,
     pub attributes: HashMap<String, Value>,
+    /// If true, this is a data source (read-only) that won't be modified
+    pub read_only: bool,
 }
 
 impl Resource {
@@ -62,12 +64,23 @@ impl Resource {
         Self {
             id: ResourceId::new(resource_type, name),
             attributes: HashMap::new(),
+            read_only: false,
         }
     }
 
     pub fn with_attribute(mut self, key: impl Into<String>, value: Value) -> Self {
         self.attributes.insert(key.into(), value);
         self
+    }
+
+    pub fn with_read_only(mut self, read_only: bool) -> Self {
+        self.read_only = read_only;
+        self
+    }
+
+    /// Returns true if this resource is a data source (read-only)
+    pub fn is_data_source(&self) -> bool {
+        self.read_only
     }
 }
 

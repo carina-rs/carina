@@ -81,6 +81,14 @@ pub fn create_plan(desired: &[Resource], current_states: &HashMap<ResourceId, St
     let mut plan = Plan::new();
 
     for resource in desired {
+        // Data sources (read-only resources) only generate Read effects
+        if resource.read_only {
+            plan.add(Effect::Read {
+                resource: resource.clone(),
+            });
+            continue;
+        }
+
         let current = current_states
             .get(&resource.id)
             .cloned()
@@ -174,5 +182,50 @@ mod tests {
         assert_eq!(plan.effects().len(), 2);
         assert!(matches!(plan.effects()[0], Effect::Create(_)));
         assert!(matches!(plan.effects()[1], Effect::Update { .. }));
+    }
+
+    #[test]
+    fn create_plan_with_read_only_resource() {
+        let resources = vec![
+            Resource::new("bucket", "existing-bucket")
+                .with_attribute("name", Value::String("existing-bucket".to_string()))
+                .with_read_only(true),
+            Resource::new("bucket", "new-bucket"),
+        ];
+
+        let current_states = HashMap::new();
+        let plan = create_plan(&resources, &current_states);
+
+        // Should have 2 effects: Read for data source, Create for new bucket
+        assert_eq!(plan.effects().len(), 2);
+        assert!(matches!(plan.effects()[0], Effect::Read { .. }));
+        assert!(matches!(plan.effects()[1], Effect::Create(_)));
+    }
+
+    #[test]
+    fn read_only_resource_always_generates_read_effect() {
+        // Even if the resource "exists", read-only resources should only generate Read effect
+        let resources = vec![
+            Resource::new("bucket", "existing-bucket")
+                .with_attribute("name", Value::String("existing-bucket".to_string()))
+                .with_read_only(true),
+        ];
+
+        let mut current_states = HashMap::new();
+        let mut attrs = HashMap::new();
+        attrs.insert(
+            "name".to_string(),
+            Value::String("existing-bucket".to_string()),
+        );
+        current_states.insert(
+            ResourceId::new("bucket", "existing-bucket"),
+            State::existing(ResourceId::new("bucket", "existing-bucket"), attrs),
+        );
+
+        let plan = create_plan(&resources, &current_states);
+
+        // Should still have Read effect, not NoChange
+        assert_eq!(plan.effects().len(), 1);
+        assert!(matches!(plan.effects()[0], Effect::Read { .. }));
     }
 }

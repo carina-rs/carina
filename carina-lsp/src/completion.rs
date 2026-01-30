@@ -244,6 +244,14 @@ impl CompletionProvider {
                 ..Default::default()
             },
             CompletionItem {
+                label: "read".to_string(),
+                kind: Some(CompletionItemKind::KEYWORD),
+                insert_text: Some("let ${1:name} = read ${2:aws.s3.bucket} {\n    name = \"${3:existing-resource}\"\n}".to_string()),
+                insert_text_format: Some(InsertTextFormat::SNIPPET),
+                detail: Some("Read existing resource (data source)".to_string()),
+                ..Default::default()
+            },
+            CompletionItem {
                 label: "input".to_string(),
                 kind: Some(CompletionItemKind::KEYWORD),
                 insert_text: Some("input {\n    ${1:param}: ${2:type}\n}".to_string()),

@@ -8,8 +8,8 @@ use crate::resource::{Resource, ResourceId, State};
 /// Effect representing an operation on a resource
 #[derive(Debug, Clone, PartialEq)]
 pub enum Effect {
-    /// Read the current state of a resource
-    Read(ResourceId),
+    /// Read the current state of a resource (data source)
+    Read { resource: Resource },
 
     /// Create a new resource
     Create(Resource),
@@ -29,7 +29,7 @@ impl Effect {
     /// Returns the kind of Effect as a string (for display)
     pub fn kind(&self) -> &'static str {
         match self {
-            Effect::Read(_) => "read",
+            Effect::Read { .. } => "read",
             Effect::Create(_) => "create",
             Effect::Update { .. } => "update",
             Effect::Delete(_) => "delete",
@@ -38,7 +38,17 @@ impl Effect {
 
     /// Returns whether this Effect causes a mutation
     pub fn is_mutating(&self) -> bool {
-        !matches!(self, Effect::Read(_))
+        !matches!(self, Effect::Read { .. })
+    }
+
+    /// Returns the resource ID for this effect
+    pub fn resource_id(&self) -> &ResourceId {
+        match self {
+            Effect::Read { resource } => &resource.id,
+            Effect::Create(r) => &r.id,
+            Effect::Update { id, .. } => id,
+            Effect::Delete(id) => id,
+        }
     }
 }
 
@@ -48,7 +58,8 @@ mod tests {
 
     #[test]
     fn read_is_not_mutating() {
-        let effect = Effect::Read(ResourceId::new("test", "example"));
+        let resource = Resource::new("test", "example").with_read_only(true);
+        let effect = Effect::Read { resource };
         assert!(!effect.is_mutating());
     }
 
@@ -57,5 +68,14 @@ mod tests {
         let resource = Resource::new("s3_bucket", "my-bucket");
         let effect = Effect::Create(resource);
         assert!(effect.is_mutating());
+    }
+
+    #[test]
+    fn resource_id_returns_correct_id() {
+        let resource = Resource::new("s3_bucket", "my-bucket").with_read_only(true);
+        let effect = Effect::Read {
+            resource: resource.clone(),
+        };
+        assert_eq!(effect.resource_id(), &resource.id);
     }
 }

@@ -474,6 +474,11 @@ fn parse_primary_with_resource_or_module(
     let inner = pair.into_inner().next().unwrap();
 
     match inner.as_rule() {
+        Rule::read_resource_expr => {
+            let resource = parse_read_resource_expr(inner, ctx, binding_name)?;
+            let ref_value = Value::String(format!("${{{}}}", binding_name));
+            Ok((ref_value, Some(resource), None))
+        }
         Rule::resource_expr => {
             let resource = parse_resource_expr(inner, ctx, binding_name)?;
             let ref_value = Value::String(format!("${{{}}}", binding_name));
@@ -569,6 +574,7 @@ fn parse_anonymous_resource(
     Ok(Resource {
         id: ResourceId::new(resource_type, resource_name),
         attributes,
+        read_only: false,
     })
 }
 
@@ -681,6 +687,61 @@ fn parse_resource_expr(
     Ok(Resource {
         id: ResourceId::new(resource_type, resource_name),
         attributes,
+        read_only: false,
+    })
+}
+
+/// Parse a read resource expression (data source): read aws.s3.bucket { ... }
+fn parse_read_resource_expr(
+    pair: pest::iterators::Pair<Rule>,
+    ctx: &ParseContext,
+    binding_name: &str,
+) -> Result<Resource, ParseError> {
+    let mut inner = pair.into_inner();
+
+    let namespaced_type = inner.next().unwrap().as_str().to_string();
+
+    // Extract resource type from namespace (aws.s3.bucket -> s3.bucket)
+    let parts: Vec<&str> = namespaced_type.split('.').collect();
+    if parts.len() < 2 {
+        return Err(ParseError::InvalidResourceType(namespaced_type));
+    }
+
+    // First part is provider name, the rest is resource type
+    let provider = parts[0];
+    let resource_type = parts[1..].join(".");
+
+    let mut attributes = parse_block_contents(inner, ctx)?;
+
+    // Get resource name from name attribute (required for data sources)
+    let resource_name = match attributes.get("name") {
+        Some(Value::String(s)) => s.clone(),
+        _ => {
+            return Err(ParseError::InvalidExpression {
+                line: 0,
+                message: format!(
+                    "Data source '{}' must have a 'name' attribute to identify the existing resource",
+                    binding_name
+                ),
+            });
+        }
+    };
+
+    // Add provider information to attributes
+    attributes.insert("_provider".to_string(), Value::String(provider.to_string()));
+    attributes.insert("_type".to_string(), Value::String(namespaced_type.clone()));
+    // Save binding name (for reference)
+    attributes.insert(
+        "_binding".to_string(),
+        Value::String(binding_name.to_string()),
+    );
+    // Mark as data source
+    attributes.insert("_data_source".to_string(), Value::Bool(true));
+
+    Ok(Resource {
+        id: ResourceId::new(resource_type, resource_name),
+        attributes,
+        read_only: true,
     })
 }
 
@@ -1652,5 +1713,65 @@ mod tests {
 
         assert_eq!(result.providers.len(), 1);
         assert_eq!(result.resources.len(), 2);
+    }
+
+    #[test]
+    fn parse_read_resource_expr() {
+        let input = r#"
+            let existing = read aws.s3.bucket {
+                name = "my-existing-bucket"
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+        assert_eq!(result.resources.len(), 1);
+
+        let resource = &result.resources[0];
+        assert_eq!(resource.id.resource_type, "s3.bucket");
+        assert_eq!(resource.id.name, "my-existing-bucket");
+        assert!(resource.read_only);
+        assert!(resource.is_data_source());
+        assert_eq!(
+            resource.attributes.get("_data_source"),
+            Some(&Value::Bool(true))
+        );
+    }
+
+    #[test]
+    fn parse_read_resource_requires_name() {
+        let input = r#"
+            let existing = read aws.s3.bucket {
+                region = aws.Region.ap_northeast_1
+            }
+        "#;
+
+        let result = parse(input);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_read_with_regular_resources() {
+        let input = r#"
+            # Read existing bucket (data source)
+            let existing_bucket = read aws.s3.bucket {
+                name = "existing-bucket"
+            }
+
+            # Create new bucket that depends on reading the existing one
+            let new_bucket = aws.s3.bucket {
+                name = "new-bucket"
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+        assert_eq!(result.resources.len(), 2);
+
+        // First resource is read-only (data source)
+        assert!(result.resources[0].read_only);
+        assert_eq!(result.resources[0].id.name, "existing-bucket");
+
+        // Second resource is a regular resource
+        assert!(!result.resources[1].read_only);
+        assert_eq!(result.resources[1].id.name, "new-bucket");
     }
 }

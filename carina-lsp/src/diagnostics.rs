@@ -665,7 +665,7 @@ impl DiagnosticEngine {
         None
     }
 
-    /// Extract resource binding names from text (variables defined with `let binding_name = aws...`)
+    /// Extract resource binding names from text (variables defined with `let binding_name = aws...` or `let binding_name = read aws...`)
     fn extract_resource_bindings(&self, text: &str) -> HashSet<String> {
         let mut bindings = HashSet::new();
         for line in text.lines() {
