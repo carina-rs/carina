@@ -10,6 +10,7 @@ A functional infrastructure management tool written in Rust. Carina treats infra
 - **Custom DSL**: Simple, expressive syntax for defining infrastructure
 - **Effects as Values**: Side effects are represented as data structures, not immediately executed
 - **Strong Typing**: Catch configuration errors at parse time with schema validation
+- **Data Sources**: Reference existing infrastructure without managing its lifecycle
 - **Provider Architecture**: Extensible provider system for multi-cloud support
 - **Modules**: Reusable infrastructure components with typed inputs/outputs
 - **State Management**: Remote state storage with locking (S3 backend)
@@ -131,6 +132,43 @@ let web_sg = aws.security_group {
   name   = "web-sg"
   vpc_id = main_vpc.id
 }
+```
+
+### Data Sources
+
+Use the `read` keyword to reference existing infrastructure without managing its lifecycle. Data sources are read-only and cannot be created, modified, or deleted by Carina.
+
+```hcl
+# Read an existing VPC (data source)
+let existing_vpc = read aws.vpc {
+  name = "production-vpc"
+}
+
+# Create a new subnet that references the existing VPC
+let app_subnet = aws.subnet {
+  name              = "app-subnet"
+  vpc_id            = existing_vpc.id
+  cidr_block        = "10.0.100.0/24"
+  availability_zone = aws.AvailabilityZone.ap_northeast_1a
+}
+```
+
+In plan output, read effects are displayed with the `<=` symbol to distinguish them from mutations.
+
+### Enum Values
+
+Enum values support multiple formats. The shorthand forms are automatically resolved based on schema context:
+
+```hcl
+# Full namespace format
+versioning = aws.s3.VersioningStatus.Enabled
+
+# Type.value format
+versioning = VersioningStatus.Enabled
+
+# Value-only format (shortest, recommended)
+versioning = Enabled
+instance_tenancy = dedicated
 ```
 
 ### Modules
@@ -396,6 +434,7 @@ MIT
 - [x] Modules and reusability
 - [x] Destroy command
 - [x] State file management (S3 backend)
+- [x] Data sources (read existing infrastructure)
 - [ ] More AWS resources (EC2, IAM, Lambda, etc.)
 - [ ] GCP provider
 - [ ] Import existing resources
