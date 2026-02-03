@@ -179,7 +179,7 @@ impl CompletionProvider {
             ),
             ("aws.security_group", "security_group"),
             // awscc resources
-            ("awscc.vpc", "awscc.vpc"),
+            ("awscc.ec2_vpc", "awscc.ec2_vpc"),
         ] {
             if trimmed.contains(pattern) {
                 return Some(schema_type.to_string());
@@ -394,11 +394,11 @@ impl CompletionProvider {
             },
             // AWS Cloud Control resources
             CompletionItem {
-                label: "awscc.vpc".to_string(),
+                label: "awscc.ec2_vpc".to_string(),
                 kind: Some(CompletionItemKind::CLASS),
                 text_edit: Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(TextEdit {
                     range: replacement_range,
-                    new_text: "awscc.vpc {\n    name                 = \"${1:vpc-name}\"\n    cidr_block           = \"${2:10.0.0.0/16}\"\n    enable_dns_support   = true\n    enable_dns_hostnames = true\n}".to_string(),
+                    new_text: "awscc.ec2_vpc {\n    name                 = \"${1:vpc-name}\"\n    cidr_block           = \"${2:10.0.0.0/16}\"\n    enable_dns_support   = true\n    enable_dns_hostnames = true\n}".to_string(),
                 })),
                 insert_text_format: Some(InsertTextFormat::SNIPPET),
                 detail: Some("VPC resource (Cloud Control API)".to_string()),
@@ -824,7 +824,7 @@ impl CompletionProvider {
     fn instance_tenancy_completions(&self, resource_type: &str) -> Vec<CompletionItem> {
         // Determine prefix based on resource type
         let prefix = if resource_type.starts_with("awscc") {
-            "awscc.vpc.InstanceTenancy"
+            "awscc.ec2_vpc.InstanceTenancy"
         } else {
             "aws.vpc.InstanceTenancy"
         };
@@ -875,7 +875,10 @@ impl CompletionProvider {
             ),
             ("aws.s3.bucket", "S3 Bucket resource reference"),
             // awscc resources
-            ("awscc.vpc", "VPC resource reference (Cloud Control API)"),
+            (
+                "awscc.ec2_vpc",
+                "VPC resource reference (Cloud Control API)",
+            ),
         ];
 
         resource_types

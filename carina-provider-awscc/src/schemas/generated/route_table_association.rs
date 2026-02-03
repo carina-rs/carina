@@ -1,4 +1,4 @@
-//! subnet_route_table_association schema definition for AWS Cloud Control
+//! ec2_subnet_route_table_association schema definition for AWS Cloud Control
 //!
 //! Auto-generated from CloudFormation schema: AWS::EC2::SubnetRouteTableAssociation
 //!
@@ -6,9 +6,9 @@
 
 use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
-/// Returns the schema for subnet_route_table_association (AWS::EC2::SubnetRouteTableAssociation)
-pub fn subnet_route_table_association_schema() -> ResourceSchema {
-    ResourceSchema::new("awscc.route_table_association")
+/// Returns the schema for ec2_subnet_route_table_association (AWS::EC2::SubnetRouteTableAssociation)
+pub fn ec2_subnet_route_table_association_schema() -> ResourceSchema {
+    ResourceSchema::new("awscc.ec2_subnet_route_table_association")
         .with_description("Associates a subnet with a route table. The subnet and route table must be in the same VPC. This association causes traffic originating from the subnet to be routed according to the routes in the rout...")
         .attribute(
             AttributeSchema::new("route_table_id", AttributeType::String)

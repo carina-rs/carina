@@ -25,16 +25,16 @@ pub mod vpc_gateway_attachment;
 /// Returns all generated schemas
 pub fn schemas() -> Vec<ResourceSchema> {
     vec![
-        vpc::vpc_schema(),
-        subnet::subnet_schema(),
-        internet_gateway::internet_gateway_schema(),
-        route_table::route_table_schema(),
-        route::route_schema(),
-        route_table_association::subnet_route_table_association_schema(),
-        eip::eip_schema(),
-        nat_gateway::nat_gateway_schema(),
-        security_group::security_group_schema(),
-        vpc_endpoint::vpc_endpoint_schema(),
-        vpc_gateway_attachment::vpc_gateway_attachment_schema(),
+        vpc::ec2_vpc_schema(),
+        subnet::ec2_subnet_schema(),
+        internet_gateway::ec2_internet_gateway_schema(),
+        route_table::ec2_route_table_schema(),
+        route::ec2_route_schema(),
+        route_table_association::ec2_subnet_route_table_association_schema(),
+        eip::ec2_eip_schema(),
+        nat_gateway::ec2_nat_gateway_schema(),
+        security_group::ec2_security_group_schema(),
+        vpc_endpoint::ec2_vpc_endpoint_schema(),
+        vpc_gateway_attachment::ec2_vpc_gateway_attachment_schema(),
     ]
 }

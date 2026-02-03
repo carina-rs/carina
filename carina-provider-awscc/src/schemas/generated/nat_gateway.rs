@@ -1,4 +1,4 @@
-//! nat_gateway schema definition for AWS Cloud Control
+//! ec2_nat_gateway schema definition for AWS Cloud Control
 //!
 //! Auto-generated from CloudFormation schema: AWS::EC2::NatGateway
 //!
@@ -7,9 +7,9 @@
 use super::tags_type;
 use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
-/// Returns the schema for nat_gateway (AWS::EC2::NatGateway)
-pub fn nat_gateway_schema() -> ResourceSchema {
-    ResourceSchema::new("awscc.nat_gateway")
+/// Returns the schema for ec2_nat_gateway (AWS::EC2::NatGateway)
+pub fn ec2_nat_gateway_schema() -> ResourceSchema {
+    ResourceSchema::new("awscc.ec2_nat_gateway")
         .with_description("Specifies a network address translation (NAT) gateway in the specified subnet. You can create either a public NAT gateway or a private NAT gateway. The default is a public NAT gateway. If you create a...")
         .attribute(
             AttributeSchema::new("tags", tags_type())

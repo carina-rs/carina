@@ -1,19 +1,35 @@
-# VPC Example using AWS Cloud Control Provider
+# AWS VPC Module using awscc provider
 #
-# This example demonstrates creating resources equivalent to:
+# This module creates a complete VPC infrastructure equivalent to:
 # https://github.com/mizzy/terraform-modules/tree/main/aws/vpc
 #
-# Resources:
+# Creates:
 # - VPC with DNS support
-# - Public/Private/Database Subnets across 3 AZs
-# - Internet Gateway
-# - NAT Gateways (one per AZ)
-# - Route Tables with routes
-# - Security Group for VPC Endpoints
+# - Public subnets (3 AZs) with Internet Gateway
+# - Private subnets (3 AZs) with NAT Gateways
+# - Database subnets (3 AZs)
 # - VPC Endpoints (ECR, S3, CloudWatch Logs, SSM)
+#
+# Inputs:
+#   - name: Name prefix for all resources
+#   - cidr_block: VPC CIDR block (e.g., "10.0.0.0/16")
+#
+# Outputs:
+#   - vpc_id: The VPC ID
+#   - public_subnet_ids: List of public subnet IDs
+#   - private_subnet_ids: List of private subnet IDs
+#   - database_subnet_ids: List of database subnet IDs
 
-provider awscc {
-  region = aws.Region.ap_northeast_1
+input {
+  name       : string
+  cidr_block : cidr
+}
+
+output {
+  vpc_id              : string              = vpc.vpc_id
+  public_subnet_ids   : list(string)        = [public_subnet_1a.subnet_id, public_subnet_1c.subnet_id, public_subnet_1d.subnet_id]
+  private_subnet_ids  : list(string)        = [private_subnet_1a.subnet_id, private_subnet_1c.subnet_id, private_subnet_1d.subnet_id]
+  database_subnet_ids : list(string)        = [database_subnet_1a.subnet_id, database_subnet_1c.subnet_id, database_subnet_1d.subnet_id]
 }
 
 # ========================================
@@ -21,14 +37,14 @@ provider awscc {
 # ========================================
 
 let vpc = awscc.ec2_vpc {
-  name                 = "main"
-  cidr_block           = "10.0.0.0/16"
+  name                 = input.name
+  cidr_block           = input.cidr_block
   enable_dns_support   = true
   enable_dns_hostnames = true
-  instance_tenancy     = default
+  instance_tenancy     = "default"
 
   tags = {
-    Environment = "production"
+    Name = input.name
   }
 }
 
@@ -37,36 +53,48 @@ let vpc = awscc.ec2_vpc {
 # ========================================
 
 let igw = awscc.ec2_internet_gateway {
-  name   = "main"
+  name   = input.name
   vpc_id = vpc.vpc_id
 }
 
 # ========================================
-# Public Subnets (3 AZs: a, c, d)
+# Public Subnets
 # ========================================
 
 let public_subnet_1a = awscc.ec2_subnet {
-  name                    = "public-ap-northeast-1a"
+  name                    = "${input.name}-public-ap-northeast-1a"
   vpc_id                  = vpc.vpc_id
-  cidr_block              = "10.0.0.0/24"
+  cidr_block              = "10.0.0.0/24"  # TODO: Calculate from input.cidr_block
   availability_zone       = "ap_northeast_1a"
   map_public_ip_on_launch = true
+
+  tags = {
+    Name = "public-ap-northeast-1a"
+  }
 }
 
 let public_subnet_1c = awscc.ec2_subnet {
-  name                    = "public-ap-northeast-1c"
+  name                    = "${input.name}-public-ap-northeast-1c"
   vpc_id                  = vpc.vpc_id
   cidr_block              = "10.0.1.0/24"
   availability_zone       = "ap_northeast_1c"
   map_public_ip_on_launch = true
+
+  tags = {
+    Name = "public-ap-northeast-1c"
+  }
 }
 
 let public_subnet_1d = awscc.ec2_subnet {
-  name                    = "public-ap-northeast-1d"
+  name                    = "${input.name}-public-ap-northeast-1d"
   vpc_id                  = vpc.vpc_id
   cidr_block              = "10.0.2.0/24"
   availability_zone       = "ap_northeast_1d"
   map_public_ip_on_launch = true
+
+  tags = {
+    Name = "public-ap-northeast-1d"
+  }
 }
 
 # ========================================
@@ -74,31 +102,35 @@ let public_subnet_1d = awscc.ec2_subnet {
 # ========================================
 
 let public_rt = awscc.ec2_route_table {
-  name   = "public"
+  name   = "${input.name}-public"
   vpc_id = vpc.vpc_id
+
+  tags = {
+    Name = "public"
+  }
 }
 
 awscc.ec2_route {
-  name                   = "public-internet"
+  name                   = "${input.name}-public-internet"
   route_table_id         = public_rt.route_table_id
   destination_cidr_block = "0.0.0.0/0"
   gateway_id             = igw.internet_gateway_id
 }
 
 awscc.ec2_subnet_route_table_association {
-  name           = "public-1a"
+  name           = "${input.name}-public-1a"
   subnet_id      = public_subnet_1a.subnet_id
   route_table_id = public_rt.route_table_id
 }
 
 awscc.ec2_subnet_route_table_association {
-  name           = "public-1c"
+  name           = "${input.name}-public-1c"
   subnet_id      = public_subnet_1c.subnet_id
   route_table_id = public_rt.route_table_id
 }
 
 awscc.ec2_subnet_route_table_association {
-  name           = "public-1d"
+  name           = "${input.name}-public-1d"
   subnet_id      = public_subnet_1d.subnet_id
   route_table_id = public_rt.route_table_id
 }
@@ -108,103 +140,127 @@ awscc.ec2_subnet_route_table_association {
 # ========================================
 
 let eip_nat_1a = awscc.ec2_eip {
-  name   = "nat-gateway-1a"
+  name   = "${input.name}-nat-gateway-1a"
   domain = "vpc"
 }
 
 let eip_nat_1c = awscc.ec2_eip {
-  name   = "nat-gateway-1c"
+  name   = "${input.name}-nat-gateway-1c"
   domain = "vpc"
 }
 
 let eip_nat_1d = awscc.ec2_eip {
-  name   = "nat-gateway-1d"
+  name   = "${input.name}-nat-gateway-1d"
   domain = "vpc"
 }
 
 # ========================================
-# NAT Gateways (one per AZ)
+# NAT Gateways
 # ========================================
 
 let nat_gw_1a = awscc.ec2_nat_gateway {
-  name          = "nat-gateway-1a"
+  name          = "${input.name}-nat-gateway-1a"
   allocation_id = eip_nat_1a.allocation_id
   subnet_id     = public_subnet_1a.subnet_id
 }
 
 let nat_gw_1c = awscc.ec2_nat_gateway {
-  name          = "nat-gateway-1c"
+  name          = "${input.name}-nat-gateway-1c"
   allocation_id = eip_nat_1c.allocation_id
   subnet_id     = public_subnet_1c.subnet_id
 }
 
 let nat_gw_1d = awscc.ec2_nat_gateway {
-  name          = "nat-gateway-1d"
+  name          = "${input.name}-nat-gateway-1d"
   allocation_id = eip_nat_1d.allocation_id
   subnet_id     = public_subnet_1d.subnet_id
 }
 
 # ========================================
-# Private Subnets (3 AZs)
+# Private Subnets
 # ========================================
 
 let private_subnet_1a = awscc.ec2_subnet {
-  name              = "private-ap-northeast-1a"
+  name              = "${input.name}-private-ap-northeast-1a"
   vpc_id            = vpc.vpc_id
   cidr_block        = "10.0.100.0/24"
   availability_zone = "ap_northeast_1a"
+
+  tags = {
+    Name = "private-ap-northeast-1a"
+  }
 }
 
 let private_subnet_1c = awscc.ec2_subnet {
-  name              = "private-ap-northeast-1c"
+  name              = "${input.name}-private-ap-northeast-1c"
   vpc_id            = vpc.vpc_id
   cidr_block        = "10.0.101.0/24"
   availability_zone = "ap_northeast_1c"
+
+  tags = {
+    Name = "private-ap-northeast-1c"
+  }
 }
 
 let private_subnet_1d = awscc.ec2_subnet {
-  name              = "private-ap-northeast-1d"
+  name              = "${input.name}-private-ap-northeast-1d"
   vpc_id            = vpc.vpc_id
   cidr_block        = "10.0.102.0/24"
   availability_zone = "ap_northeast_1d"
+
+  tags = {
+    Name = "private-ap-northeast-1d"
+  }
 }
 
 # ========================================
-# Private Route Tables (one per AZ for NAT routing)
+# Private Route Tables
 # ========================================
 
 let private_rt_1a = awscc.ec2_route_table {
-  name   = "private-ap-northeast-1a"
+  name   = "${input.name}-private-ap-northeast-1a"
   vpc_id = vpc.vpc_id
+
+  tags = {
+    Name = "private-ap-northeast-1a"
+  }
 }
 
 let private_rt_1c = awscc.ec2_route_table {
-  name   = "private-ap-northeast-1c"
+  name   = "${input.name}-private-ap-northeast-1c"
   vpc_id = vpc.vpc_id
+
+  tags = {
+    Name = "private-ap-northeast-1c"
+  }
 }
 
 let private_rt_1d = awscc.ec2_route_table {
-  name   = "private-ap-northeast-1d"
+  name   = "${input.name}-private-ap-northeast-1d"
   vpc_id = vpc.vpc_id
+
+  tags = {
+    Name = "private-ap-northeast-1d"
+  }
 }
 
-# Private routes to NAT Gateways
+# Private routes via NAT Gateways
 awscc.ec2_route {
-  name                   = "private-nat-1a"
+  name                   = "${input.name}-private-nat-1a"
   route_table_id         = private_rt_1a.route_table_id
   destination_cidr_block = "0.0.0.0/0"
   nat_gateway_id         = nat_gw_1a.nat_gateway_id
 }
 
 awscc.ec2_route {
-  name                   = "private-nat-1c"
+  name                   = "${input.name}-private-nat-1c"
   route_table_id         = private_rt_1c.route_table_id
   destination_cidr_block = "0.0.0.0/0"
   nat_gateway_id         = nat_gw_1c.nat_gateway_id
 }
 
 awscc.ec2_route {
-  name                   = "private-nat-1d"
+  name                   = "${input.name}-private-nat-1d"
   route_table_id         = private_rt_1d.route_table_id
   destination_cidr_block = "0.0.0.0/0"
   nat_gateway_id         = nat_gw_1d.nat_gateway_id
@@ -212,46 +268,58 @@ awscc.ec2_route {
 
 # Private route table associations
 awscc.ec2_subnet_route_table_association {
-  name           = "private-1a"
+  name           = "${input.name}-private-1a"
   subnet_id      = private_subnet_1a.subnet_id
   route_table_id = private_rt_1a.route_table_id
 }
 
 awscc.ec2_subnet_route_table_association {
-  name           = "private-1c"
+  name           = "${input.name}-private-1c"
   subnet_id      = private_subnet_1c.subnet_id
   route_table_id = private_rt_1c.route_table_id
 }
 
 awscc.ec2_subnet_route_table_association {
-  name           = "private-1d"
+  name           = "${input.name}-private-1d"
   subnet_id      = private_subnet_1d.subnet_id
   route_table_id = private_rt_1d.route_table_id
 }
 
 # ========================================
-# Database Subnets (3 AZs)
+# Database Subnets
 # ========================================
 
 let database_subnet_1a = awscc.ec2_subnet {
-  name              = "database-ap-northeast-1a"
+  name              = "${input.name}-database-ap-northeast-1a"
   vpc_id            = vpc.vpc_id
   cidr_block        = "10.0.200.0/24"
   availability_zone = "ap_northeast_1a"
+
+  tags = {
+    Name = "database-ap-northeast-1a"
+  }
 }
 
 let database_subnet_1c = awscc.ec2_subnet {
-  name              = "database-ap-northeast-1c"
+  name              = "${input.name}-database-ap-northeast-1c"
   vpc_id            = vpc.vpc_id
   cidr_block        = "10.0.201.0/24"
   availability_zone = "ap_northeast_1c"
+
+  tags = {
+    Name = "database-ap-northeast-1c"
+  }
 }
 
 let database_subnet_1d = awscc.ec2_subnet {
-  name              = "database-ap-northeast-1d"
+  name              = "${input.name}-database-ap-northeast-1d"
   vpc_id            = vpc.vpc_id
   cidr_block        = "10.0.202.0/24"
   availability_zone = "ap_northeast_1d"
+
+  tags = {
+    Name = "database-ap-northeast-1d"
+  }
 }
 
 # ========================================
@@ -259,24 +327,28 @@ let database_subnet_1d = awscc.ec2_subnet {
 # ========================================
 
 let database_rt = awscc.ec2_route_table {
-  name   = "database"
+  name   = "${input.name}-database"
   vpc_id = vpc.vpc_id
+
+  tags = {
+    Name = "database"
+  }
 }
 
 awscc.ec2_subnet_route_table_association {
-  name           = "database-1a"
+  name           = "${input.name}-database-1a"
   subnet_id      = database_subnet_1a.subnet_id
   route_table_id = database_rt.route_table_id
 }
 
 awscc.ec2_subnet_route_table_association {
-  name           = "database-1c"
+  name           = "${input.name}-database-1c"
   subnet_id      = database_subnet_1c.subnet_id
   route_table_id = database_rt.route_table_id
 }
 
 awscc.ec2_subnet_route_table_association {
-  name           = "database-1d"
+  name           = "${input.name}-database-1d"
   subnet_id      = database_subnet_1d.subnet_id
   route_table_id = database_rt.route_table_id
 }
@@ -286,19 +358,23 @@ awscc.ec2_subnet_route_table_association {
 # ========================================
 
 let vpc_endpoint_sg = awscc.ec2_security_group {
-  name        = "vpc-endpoint"
+  name        = "${input.name}-vpc-endpoint"
   vpc_id      = vpc.vpc_id
   description = "SG for VPC Endpoint"
+
+  tags = {
+    Name = "vpc-endpoint"
+  }
 }
 
 awscc.ec2_security_group_ingress {
-  name              = "vpc-endpoint-https"
+  name              = "${input.name}-vpc-endpoint-https"
   security_group_id = vpc_endpoint_sg.group_id
   description       = "Allow access to 443 port"
   protocol          = "tcp"
   from_port         = 443
   to_port           = 443
-  cidr_blocks       = ["10.0.0.0/16"]
+  cidr_blocks       = [input.cidr_block]
 }
 
 # ========================================
@@ -307,7 +383,7 @@ awscc.ec2_security_group_ingress {
 
 # ECR Docker Registry
 awscc.ec2_vpc_endpoint {
-  name                = "ecr-dkr"
+  name                = "${input.name}-ecr-dkr"
   vpc_id              = vpc.vpc_id
   service_name        = "com.amazonaws.ap-northeast-1.ecr.dkr"
   vpc_endpoint_type   = "Interface"
@@ -318,7 +394,7 @@ awscc.ec2_vpc_endpoint {
 
 # ECR API
 awscc.ec2_vpc_endpoint {
-  name                = "ecr-api"
+  name                = "${input.name}-ecr-api"
   vpc_id              = vpc.vpc_id
   service_name        = "com.amazonaws.ap-northeast-1.ecr.api"
   vpc_endpoint_type   = "Interface"
@@ -329,7 +405,7 @@ awscc.ec2_vpc_endpoint {
 
 # S3 Gateway Endpoint
 awscc.ec2_vpc_endpoint {
-  name              = "s3"
+  name              = "${input.name}-s3"
   vpc_id            = vpc.vpc_id
   service_name      = "com.amazonaws.ap-northeast-1.s3"
   vpc_endpoint_type = "Gateway"
@@ -338,7 +414,7 @@ awscc.ec2_vpc_endpoint {
 
 # CloudWatch Logs
 awscc.ec2_vpc_endpoint {
-  name                = "logs"
+  name                = "${input.name}-logs"
   vpc_id              = vpc.vpc_id
   service_name        = "com.amazonaws.ap-northeast-1.logs"
   vpc_endpoint_type   = "Interface"
@@ -349,7 +425,7 @@ awscc.ec2_vpc_endpoint {
 
 # SSM
 awscc.ec2_vpc_endpoint {
-  name                = "ssm"
+  name                = "${input.name}-ssm"
   vpc_id              = vpc.vpc_id
   service_name        = "com.amazonaws.ap-northeast-1.ssm"
   vpc_endpoint_type   = "Interface"
@@ -360,7 +436,7 @@ awscc.ec2_vpc_endpoint {
 
 # SSM Messages
 awscc.ec2_vpc_endpoint {
-  name                = "ssmmessages"
+  name                = "${input.name}-ssmmessages"
   vpc_id              = vpc.vpc_id
   service_name        = "com.amazonaws.ap-northeast-1.ssmmessages"
   vpc_endpoint_type   = "Interface"

@@ -1,4 +1,4 @@
-//! security_group schema definition for AWS Cloud Control
+//! ec2_security_group schema definition for AWS Cloud Control
 //!
 //! Auto-generated from CloudFormation schema: AWS::EC2::SecurityGroup
 //!
@@ -7,9 +7,9 @@
 use super::tags_type;
 use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
-/// Returns the schema for security_group (AWS::EC2::SecurityGroup)
-pub fn security_group_schema() -> ResourceSchema {
-    ResourceSchema::new("awscc.security_group")
+/// Returns the schema for ec2_security_group (AWS::EC2::SecurityGroup)
+pub fn ec2_security_group_schema() -> ResourceSchema {
+    ResourceSchema::new("awscc.ec2_security_group")
         .with_description("Resource Type definition for AWS::EC2::SecurityGroup")
         .attribute(
             AttributeSchema::new("id", AttributeType::String)

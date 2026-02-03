@@ -99,7 +99,7 @@ Resource types in schemas use dot notation (`s3.bucket`, `vpc.vpc`), not undersc
 
 ### Namespaced Enum Identifiers
 
-Enum values use namespaced identifiers like `aws.s3.VersioningStatus.Enabled` or `awscc.vpc.InstanceTenancy.default`.
+Enum values use namespaced identifiers like `aws.s3.VersioningStatus.Enabled` or `awscc.ec2_vpc.InstanceTenancy.default`.
 
 **When adding new namespaced patterns:**
 

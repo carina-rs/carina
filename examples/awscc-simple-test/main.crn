@@ -5,7 +5,7 @@ provider awscc {
   region = aws.Region.ap_northeast_1
 }
 
-let vpc = awscc.vpc {
+let vpc = awscc.ec2_vpc {
   cidr_block           = "10.99.0.0/16"
   enable_dns_support   = true
   enable_dns_hostnames = true
@@ -18,7 +18,7 @@ let vpc = awscc.vpc {
   }
 }
 
-let igw = awscc.internet_gateway {
+let igw = awscc.ec2_internet_gateway {
   tags = {
     Name        = "carina-test"
     Environment = "test"
@@ -26,12 +26,12 @@ let igw = awscc.internet_gateway {
   }
 }
 
-let igw_attachment = awscc.vpc_gateway_attachment {
+let igw_attachment = awscc.ec2_vpc_gateway_attachment {
   vpc_id              = vpc.vpc_id
   internet_gateway_id = igw.internet_gateway_id
 }
 
-let public_subnet = awscc.subnet {
+let public_subnet = awscc.ec2_subnet {
   vpc_id                  = vpc.vpc_id
   cidr_block              = "10.99.0.0/24"
   availability_zone       = "ap-northeast-1a"
@@ -44,7 +44,7 @@ let public_subnet = awscc.subnet {
   }
 }
 
-let public_rt = awscc.route_table {
+let public_rt = awscc.ec2_route_table {
   vpc_id = vpc.vpc_id
 
   tags = {
@@ -54,14 +54,14 @@ let public_rt = awscc.route_table {
   }
 }
 
-let internet_route = awscc.route {
+let internet_route = awscc.ec2_route {
   route_table_id         = public_rt.route_table_id
   destination_cidr_block = "0.0.0.0/0"
   # Reference through igw_attachment to ensure IGW is attached before route creation
   gateway_id             = igw_attachment.internet_gateway_id
 }
 
-let public_rt_assoc = awscc.route_table_association {
+let public_rt_assoc = awscc.ec2_subnet_route_table_association {
   subnet_id      = public_subnet.subnet_id
   route_table_id = public_rt.route_table_id
 }

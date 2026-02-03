@@ -1,4 +1,4 @@
-//! vpc_endpoint schema definition for AWS Cloud Control
+//! ec2_vpc_endpoint schema definition for AWS Cloud Control
 //!
 //! Auto-generated from CloudFormation schema: AWS::EC2::VPCEndpoint
 //!
@@ -7,9 +7,9 @@
 use super::tags_type;
 use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
-/// Returns the schema for vpc_endpoint (AWS::EC2::VPCEndpoint)
-pub fn vpc_endpoint_schema() -> ResourceSchema {
-    ResourceSchema::new("awscc.vpc_endpoint")
+/// Returns the schema for ec2_vpc_endpoint (AWS::EC2::VPCEndpoint)
+pub fn ec2_vpc_endpoint_schema() -> ResourceSchema {
+    ResourceSchema::new("awscc.ec2_vpc_endpoint")
         .with_description("Specifies a VPC endpoint. A VPC endpoint provides a private connection between your VPC and an endpoint service. You can use an endpoint service provided by AWS, an MKT Partner, or another AWS account...")
         .attribute(
             AttributeSchema::new("dns_entries", AttributeType::List(Box::new(AttributeType::String)))

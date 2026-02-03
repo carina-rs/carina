@@ -174,7 +174,7 @@ fn validate_resources(resources: &[Resource]) -> Result<(), String> {
     for resource in resources {
         // Construct schema key based on provider
         // For aws provider, use just the resource_type (e.g., "vpc")
-        // For other providers, include the provider prefix (e.g., "awscc.vpc")
+        // For other providers, include the provider prefix (e.g., "awscc.ec2_vpc")
         let schema_key = match resource.attributes.get("_provider") {
             Some(Value::String(provider)) if provider != "aws" => {
                 format!("{}.{}", provider, resource.id.resource_type)
@@ -2093,7 +2093,7 @@ fn format_effect(effect: &Effect) -> String {
 /// Patterns:
 /// - provider.TypeName.value (e.g., aws.Region.ap_northeast_1, gcp.Region.us_central1)
 /// - TypeName.value (e.g., Region.ap_northeast_1)
-/// - provider.resource.TypeName.value (e.g., aws.s3.VersioningStatus.Enabled, awscc.vpc.InstanceTenancy.default)
+/// - provider.resource.TypeName.value (e.g., aws.s3.VersioningStatus.Enabled, awscc.ec2_vpc.InstanceTenancy.default)
 fn is_dsl_enum_format(s: &str) -> bool {
     let parts: Vec<&str> = s.split('.').collect();
 

@@ -1,4 +1,4 @@
-//! eip schema definition for AWS Cloud Control
+//! ec2_eip schema definition for AWS Cloud Control
 //!
 //! Auto-generated from CloudFormation schema: AWS::EC2::EIP
 //!
@@ -7,9 +7,9 @@
 use super::tags_type;
 use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
-/// Returns the schema for eip (AWS::EC2::EIP)
-pub fn eip_schema() -> ResourceSchema {
-    ResourceSchema::new("awscc.eip")
+/// Returns the schema for ec2_eip (AWS::EC2::EIP)
+pub fn ec2_eip_schema() -> ResourceSchema {
+    ResourceSchema::new("awscc.ec2_eip")
         .with_description("Specifies an Elastic IP (EIP) address and can, optionally, associate it with an Amazon EC2 instance.  You can allocate an Elastic IP address from an address pool owned by AWS or from an address pool c...")
         .attribute(
             AttributeSchema::new("public_ip", AttributeType::String)

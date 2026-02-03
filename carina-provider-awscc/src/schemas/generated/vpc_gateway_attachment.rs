@@ -1,4 +1,4 @@
-//! vpc_gateway_attachment schema definition for AWS Cloud Control
+//! ec2_vpc_gateway_attachment schema definition for AWS Cloud Control
 //!
 //! Auto-generated from CloudFormation schema: AWS::EC2::VPCGatewayAttachment
 //!
@@ -6,9 +6,9 @@
 
 use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
-/// Returns the schema for vpc_gateway_attachment (AWS::EC2::VPCGatewayAttachment)
-pub fn vpc_gateway_attachment_schema() -> ResourceSchema {
-    ResourceSchema::new("awscc.vpc_gateway_attachment")
+/// Returns the schema for ec2_vpc_gateway_attachment (AWS::EC2::VPCGatewayAttachment)
+pub fn ec2_vpc_gateway_attachment_schema() -> ResourceSchema {
+    ResourceSchema::new("awscc.ec2_vpc_gateway_attachment")
         .with_description("Attaches an internet gateway, or a virtual private gateway to a VPC, enabling connectivity between the internet and the VPC.")
         .attribute(
             AttributeSchema::new("vpc_id", AttributeType::String)
