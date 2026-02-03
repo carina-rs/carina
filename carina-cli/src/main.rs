@@ -53,6 +53,10 @@ enum Commands {
         /// Path to .crn file or directory
         #[arg(default_value = ".")]
         path: PathBuf,
+
+        /// Skip confirmation prompt (auto-approve)
+        #[arg(long)]
+        auto_approve: bool,
     },
     /// Destroy all resources defined in the configuration file
     Destroy {
@@ -136,7 +140,7 @@ async fn main() {
     let result = match cli.command {
         Commands::Validate { path } => run_validate(&path),
         Commands::Plan { path } => run_plan(&path).await,
-        Commands::Apply { path } => run_apply(&path).await,
+        Commands::Apply { path, auto_approve } => run_apply(&path, auto_approve).await,
         Commands::Destroy { path, auto_approve } => run_destroy(&path, auto_approve).await,
         Commands::Fmt {
             path,
@@ -683,7 +687,7 @@ async fn run_plan(path: &PathBuf) -> Result<(), String> {
     Ok(())
 }
 
-async fn run_apply(path: &PathBuf) -> Result<(), String> {
+async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
     let loaded = load_configuration(path)?;
     let mut parsed = loaded.parsed;
     let backend_file = loaded.backend_file;
@@ -972,7 +976,41 @@ async fn run_apply(path: &PathBuf) -> Result<(), String> {
     }
 
     print_plan(&plan);
-    println!();
+
+    // Confirmation prompt
+    if !auto_approve {
+        println!(
+            "{}",
+            "Do you want to perform these actions?".yellow().bold()
+        );
+        println!(
+            "  {}",
+            "Carina will perform the actions described above. Type 'yes' to confirm.".yellow()
+        );
+        print!("\n  Enter a value: ");
+        std::io::Write::flush(&mut std::io::stdout()).map_err(|e| e.to_string())?;
+
+        let mut input = String::new();
+        std::io::stdin()
+            .read_line(&mut input)
+            .map_err(|e| e.to_string())?;
+
+        if input.trim() != "yes" {
+            println!();
+            println!("{}", "Apply cancelled.".yellow());
+
+            // Release lock if we have one
+            if let Some(lock_info) = &lock {
+                backend
+                    .release_lock(lock_info)
+                    .await
+                    .map_err(|e| format!("Failed to release lock: {}", e))?;
+            }
+
+            return Ok(());
+        }
+        println!();
+    }
 
     println!("{}", "Applying changes...".cyan().bold());
     println!();
