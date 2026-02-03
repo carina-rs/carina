@@ -1054,7 +1054,7 @@ mod tests {
 
     #[test]
     fn test_format_map() {
-        let input = "awscc.vpc {\ntags = {Environment=\"dev\"Project=\"test\"}\n}";
+        let input = "awscc.ec2_vpc {\ntags = {Environment=\"dev\"Project=\"test\"}\n}";
         let config = FormatConfig::default();
         let result = format(input, &config).unwrap();
 
@@ -1083,7 +1083,7 @@ mod tests {
 
     #[test]
     fn test_format_map_aligns_entries() {
-        let input = "awscc.vpc {\ntags = {Environment=\"dev\"\nProject=\"test\"}\n}";
+        let input = "awscc.ec2_vpc {\ntags = {Environment=\"dev\"\nProject=\"test\"}\n}";
         let config = FormatConfig {
             align_attributes: true,
             ..Default::default()
@@ -1108,8 +1108,7 @@ mod tests {
 
     #[test]
     fn test_format_map_idempotent() {
-        let input =
-            "awscc.vpc {\n  tags = {\n    Environment = \"dev\"\n    Project = \"test\"\n  }\n}\n";
+        let input = "awscc.ec2_vpc {\n  tags = {\n    Environment = \"dev\"\n    Project = \"test\"\n  }\n}\n";
         let config = FormatConfig::default();
 
         let first = format(input, &config).unwrap();
@@ -1120,7 +1119,7 @@ mod tests {
 
     #[test]
     fn test_format_preserves_blank_lines_between_attributes() {
-        let input = "awscc.vpc {\n  name = \"test\"\n  cidr = \"10.0.0.0/16\"\n\n  tags = {\n    Env = \"dev\"\n  }\n}\n";
+        let input = "awscc.ec2_vpc {\n  name = \"test\"\n  cidr = \"10.0.0.0/16\"\n\n  tags = {\n    Env = \"dev\"\n  }\n}\n";
         let config = FormatConfig::default();
         let result = format(input, &config).unwrap();
 
@@ -1144,7 +1143,7 @@ mod tests {
 
     #[test]
     fn test_format_blank_lines_idempotent() {
-        let input = "awscc.vpc {\n  name = \"test\"\n\n  tags = {\n    Env = \"dev\"\n  }\n}\n";
+        let input = "awscc.ec2_vpc {\n  name = \"test\"\n\n  tags = {\n    Env = \"dev\"\n  }\n}\n";
         let config = FormatConfig::default();
 
         let first = format(input, &config).unwrap();
@@ -1157,7 +1156,8 @@ mod tests {
     fn test_format_aligns_within_groups_separated_by_blank_lines() {
         // Attributes before blank line should be aligned together
         // Attributes after blank line should be aligned separately
-        let input = "awscc.vpc {\nenable_dns_hostnames = true\nname = \"test\"\n\ntags = {}\n}\n";
+        let input =
+            "awscc.ec2_vpc {\nenable_dns_hostnames = true\nname = \"test\"\n\ntags = {}\n}\n";
         let config = FormatConfig {
             align_attributes: true,
             ..Default::default()

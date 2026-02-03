@@ -142,8 +142,10 @@ fn generate_schema_code(schema: &CfnSchema, type_name: &str) -> Result<String> {
     if parts.len() != 3 {
         anyhow::bail!("Invalid type name format: {}", type_name);
     }
-    let _service = parts[1].to_lowercase();
+    let service = parts[1].to_lowercase();
     let resource = parts[2].to_snake_case();
+    // Combined format: ec2_vpc (service + underscore + resource)
+    let full_resource = format!("{}_{}", service, resource);
 
     // Build read-only properties set
     let read_only: HashSet<String> = schema
@@ -187,16 +189,16 @@ use carina_core::schema::{{AttributeSchema, AttributeType, ResourceSchema{}}};
     code.push('\n');
 
     // Generate schema function
-    let fn_name = format!("{}_schema", resource);
-    // Use awscc.resource_name format (without service prefix like ec2)
-    let schema_name = format!("awscc.{}", resource);
+    let fn_name = format!("{}_schema", full_resource);
+    // Use awscc.service_resource format (e.g., awscc.ec2_vpc)
+    let schema_name = format!("awscc.{}", full_resource);
 
     code.push_str(&format!(
         r#"/// Returns the schema for {} ({})
 pub fn {}() -> ResourceSchema {{
     ResourceSchema::new("{}")
 "#,
-        resource, type_name, fn_name, schema_name
+        full_resource, type_name, fn_name, schema_name
     ));
 
     // Add description

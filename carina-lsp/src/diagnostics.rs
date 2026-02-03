@@ -31,7 +31,7 @@ impl DiagnosticEngine {
         valid_resource_types.insert("security_group.egress_rule".to_string());
 
         // AWS Cloud Control resources
-        valid_resource_types.insert("awscc.vpc".to_string());
+        valid_resource_types.insert("awscc.ec2_vpc".to_string());
 
         Self {
             valid_resource_types,
@@ -280,7 +280,7 @@ impl DiagnosticEngine {
             "security_group.ingress_rule" => Some(vpc::security_group_ingress_rule_schema()),
             "security_group.egress_rule" => Some(vpc::security_group_egress_rule_schema()),
             // AWS Cloud Control resources
-            "awscc.vpc" => Some(awscc_vpc::vpc_schema()),
+            "awscc.ec2_vpc" => Some(awscc_vpc::ec2_vpc_schema()),
             _ => None,
         }
     }
@@ -381,7 +381,7 @@ impl DiagnosticEngine {
         resource_name: &str,
     ) -> String {
         let text = doc.text();
-        // Look for patterns like "awscc.vpc {" or "let x = awscc.vpc {"
+        // Look for patterns like "awscc.ec2_vpc {" or "let x = awscc.ec2_vpc {"
         let awscc_pattern = format!("awscc.{}", resource_type);
 
         for line in text.lines() {

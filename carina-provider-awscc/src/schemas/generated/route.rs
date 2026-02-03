@@ -1,4 +1,4 @@
-//! route schema definition for AWS Cloud Control
+//! ec2_route schema definition for AWS Cloud Control
 //!
 //! Auto-generated from CloudFormation schema: AWS::EC2::Route
 //!
@@ -6,9 +6,9 @@
 
 use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, types};
 
-/// Returns the schema for route (AWS::EC2::Route)
-pub fn route_schema() -> ResourceSchema {
-    ResourceSchema::new("awscc.route")
+/// Returns the schema for ec2_route (AWS::EC2::Route)
+pub fn ec2_route_schema() -> ResourceSchema {
+    ResourceSchema::new("awscc.ec2_route")
         .with_description("Specifies a route in a route table. For more information, see [Routes](https://docs.aws.amazon.com/vpc/latest/userguide/VPC_Route_Tables.html#route-table-routes) in the *Amazon VPC User Guide*.  You m...")
         .attribute(
             AttributeSchema::new("local_gateway_id", AttributeType::String)

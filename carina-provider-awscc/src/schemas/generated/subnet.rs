@@ -1,4 +1,4 @@
-//! subnet schema definition for AWS Cloud Control
+//! ec2_subnet schema definition for AWS Cloud Control
 //!
 //! Auto-generated from CloudFormation schema: AWS::EC2::Subnet
 //!
@@ -7,9 +7,9 @@
 use super::tags_type;
 use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, types};
 
-/// Returns the schema for subnet (AWS::EC2::Subnet)
-pub fn subnet_schema() -> ResourceSchema {
-    ResourceSchema::new("awscc.subnet")
+/// Returns the schema for ec2_subnet (AWS::EC2::Subnet)
+pub fn ec2_subnet_schema() -> ResourceSchema {
+    ResourceSchema::new("awscc.ec2_subnet")
         .with_description("Specifies a subnet for the specified VPC.  For an IPv4 only subnet, specify an IPv4 CIDR block. If the VPC has an IPv6 CIDR block, you can create an IPv6 only subnet or a dual stack subnet instead. Fo...")
         .attribute(
             AttributeSchema::new("vpc_id", AttributeType::String)

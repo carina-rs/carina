@@ -1,4 +1,4 @@
-//! vpc schema definition for AWS Cloud Control
+//! ec2_vpc schema definition for AWS Cloud Control
 //!
 //! Auto-generated from CloudFormation schema: AWS::EC2::VPC
 //!
@@ -7,9 +7,9 @@
 use super::tags_type;
 use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, types};
 
-/// Returns the schema for vpc (AWS::EC2::VPC)
-pub fn vpc_schema() -> ResourceSchema {
-    ResourceSchema::new("awscc.vpc")
+/// Returns the schema for ec2_vpc (AWS::EC2::VPC)
+pub fn ec2_vpc_schema() -> ResourceSchema {
+    ResourceSchema::new("awscc.ec2_vpc")
         .with_description("Specifies a virtual private cloud (VPC).  To add an IPv6 CIDR block to the VPC, see [AWS::EC2::VPCCidrBlock](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-ec2-vpccidrbloc...")
         .attribute(
             AttributeSchema::new("enable_dns_support", AttributeType::Bool)

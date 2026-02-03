@@ -10,7 +10,7 @@ pub fn normalize_region(s: &str) -> String {
     region_part.replace('_', "-")
 }
 
-/// Normalize instance tenancy value (e.g., "awscc.vpc.InstanceTenancy.default" -> "default")
+/// Normalize instance tenancy value (e.g., "awscc.ec2_vpc.InstanceTenancy.default" -> "default")
 pub fn normalize_instance_tenancy(s: &str) -> String {
     if s.contains('.') {
         s.split('.').next_back().unwrap_or(s).to_string()
@@ -71,7 +71,7 @@ mod tests {
     fn test_normalize_instance_tenancy() {
         assert_eq!(normalize_instance_tenancy("default"), "default");
         assert_eq!(
-            normalize_instance_tenancy("awscc.vpc.InstanceTenancy.dedicated"),
+            normalize_instance_tenancy("awscc.ec2_vpc.InstanceTenancy.dedicated"),
             "dedicated"
         );
     }
