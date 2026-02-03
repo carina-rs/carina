@@ -1,4 +1,4 @@
-//! ec2_internet_gateway schema definition for AWS Cloud Control
+//! internet_gateway schema definition for AWS Cloud Control
 //!
 //! Auto-generated from CloudFormation schema: AWS::EC2::InternetGateway
 //!

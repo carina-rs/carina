@@ -70,11 +70,86 @@ cat > "$OUTPUT_DIR/mod.rs" << 'EOF'
 //! DO NOT EDIT MANUALLY - regenerate with:
 //!   aws-vault exec <profile> -- ./scripts/generate-awscc-schemas.sh
 
+use carina_core::resource::Value;
 use carina_core::schema::{AttributeType, ResourceSchema};
 
 /// Tags type for AWS resources (Terraform-style map)
 pub fn tags_type() -> AttributeType {
     AttributeType::Map(Box::new(AttributeType::String))
+}
+
+/// Normalize a namespaced enum value to its base value.
+/// Handles formats like:
+/// - "value" -> "value"
+/// - "TypeName.value" -> "value"
+/// - "awscc.resource.TypeName.value" -> "value"
+pub fn normalize_namespaced_enum(s: &str) -> String {
+    if s.contains('.') {
+        let parts: Vec<&str> = s.split('.').collect();
+        parts.last().map(|s| s.to_string()).unwrap_or_default()
+    } else {
+        s.to_string()
+    }
+}
+
+/// Validate a namespaced enum value.
+/// Returns Ok(()) if valid, Err with message if invalid.
+pub fn validate_namespaced_enum(
+    value: &Value,
+    type_name: &str,
+    namespace: &str,
+    valid_values: &[&str],
+) -> Result<(), String> {
+    if let Value::String(s) = value {
+        // Validate namespace format if it contains dots
+        if s.contains('.') {
+            let parts: Vec<&str> = s.split('.').collect();
+            match parts.len() {
+                // 2-part: TypeName.value
+                2 => {
+                    if parts[0] != type_name {
+                        return Err(format!(
+                            "Invalid format '{}', expected {}.value",
+                            s, type_name
+                        ));
+                    }
+                }
+                // 4-part: awscc.resource.TypeName.value
+                4 => {
+                    let expected_namespace: Vec<&str> = namespace.split('.').collect();
+                    if expected_namespace.len() != 2
+                        || parts[0] != expected_namespace[0]
+                        || parts[1] != expected_namespace[1]
+                        || parts[2] != type_name
+                    {
+                        return Err(format!(
+                            "Invalid format '{}', expected {}.{}.value",
+                            s, namespace, type_name
+                        ));
+                    }
+                }
+                _ => {
+                    return Err(format!(
+                        "Invalid format '{}', expected one of: value, {}.value, or {}.{}.value",
+                        s, type_name, namespace, type_name
+                    ));
+                }
+            }
+        }
+
+        let normalized = normalize_namespaced_enum(s);
+        if valid_values.contains(&normalized.as_str()) {
+            Ok(())
+        } else {
+            Err(format!(
+                "Invalid value '{}', expected one of: {}",
+                s,
+                valid_values.join(", ")
+            ))
+        }
+    } else {
+        Err("Expected string".to_string())
+    }
 }
 
 EOF
@@ -98,16 +173,40 @@ cat >> "$OUTPUT_DIR/mod.rs" << 'EOF'
 /// Returns all generated schemas
 pub fn schemas() -> Vec<ResourceSchema> {
     vec![
-        vpc::vpc_schema(),
-        subnet::subnet_schema(),
-        internet_gateway::internet_gateway_schema(),
-        route_table::route_table_schema(),
-        route::route_schema(),
-        route_table_association::subnet_route_table_association_schema(),
-        eip::eip_schema(),
-        nat_gateway::nat_gateway_schema(),
-        security_group::security_group_schema(),
-        vpc_endpoint::vpc_endpoint_schema(),
+EOF
+
+# Add schema function calls dynamically
+for TYPE_NAME in "${RESOURCE_TYPES[@]}"; do
+    # AWS::EC2::VPC -> ec2, vpc
+    SERVICE=$(echo "$TYPE_NAME" | sed 's/AWS::\([^:]*\)::.*/\1/' | tr '[:upper:]' '[:lower:]')
+    RESOURCE=$(echo "$TYPE_NAME" | sed 's/AWS::[^:]*:://' | tr '[:upper:]' '[:lower:]')
+
+    # Convert to snake_case
+    RESOURCE=$(echo "$RESOURCE" | sed 's/\([A-Z]\)/_\L\1/g' | sed 's/^_//')
+    # Handle special naming
+    RESOURCE=$(echo "$RESOURCE" | sed 's/subnetroutetableassociation/subnet_route_table_association/')
+    RESOURCE=$(echo "$RESOURCE" | sed 's/vpcendpoint/vpc_endpoint/')
+    RESOURCE=$(echo "$RESOURCE" | sed 's/natgateway/nat_gateway/')
+    RESOURCE=$(echo "$RESOURCE" | sed 's/internetgateway/internet_gateway/')
+    RESOURCE=$(echo "$RESOURCE" | sed 's/routetable/route_table/')
+    RESOURCE=$(echo "$RESOURCE" | sed 's/securitygroup/security_group/')
+
+    # Module name (same as MODNAME above)
+    MODNAME=$(echo "$TYPE_NAME" | sed 's/AWS::EC2:://' | tr '[:upper:]' '[:lower:]')
+    MODNAME=$(echo "$MODNAME" | sed 's/subnetroutetableassociation/route_table_association/')
+    MODNAME=$(echo "$MODNAME" | sed 's/vpcendpoint/vpc_endpoint/')
+    MODNAME=$(echo "$MODNAME" | sed 's/natgateway/nat_gateway/')
+    MODNAME=$(echo "$MODNAME" | sed 's/internetgateway/internet_gateway/')
+    MODNAME=$(echo "$MODNAME" | sed 's/routetable/route_table/')
+    MODNAME=$(echo "$MODNAME" | sed 's/securitygroup/security_group/')
+
+    # Function name: service_resource_schema (e.g., ec2_vpc_schema)
+    FUNC_NAME="${SERVICE}_${RESOURCE}_schema"
+
+    echo "        ${MODNAME}::${FUNC_NAME}()," >> "$OUTPUT_DIR/mod.rs"
+done
+
+cat >> "$OUTPUT_DIR/mod.rs" << 'EOF'
     ]
 }
 EOF
