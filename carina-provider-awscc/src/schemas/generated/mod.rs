@@ -20,6 +20,7 @@ pub mod security_group;
 pub mod subnet;
 pub mod vpc;
 pub mod vpc_endpoint;
+pub mod vpc_gateway_attachment;
 
 /// Returns all generated schemas
 pub fn schemas() -> Vec<ResourceSchema> {
@@ -34,5 +35,6 @@ pub fn schemas() -> Vec<ResourceSchema> {
         nat_gateway::nat_gateway_schema(),
         security_group::security_group_schema(),
         vpc_endpoint::vpc_endpoint_schema(),
+        vpc_gateway_attachment::vpc_gateway_attachment_schema(),
     ]
 }

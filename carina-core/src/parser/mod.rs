@@ -556,6 +556,7 @@ fn parse_anonymous_resource(
     let attributes = parse_block_contents(inner, ctx)?;
 
     // Get resource name from name attribute
+    // Anonymous resources (not bound with let) require a name attribute for identification
     // In module context, name can be input.param which is a ResourceRef
     let resource_name = match attributes.get("name") {
         Some(Value::String(s)) => s.clone(),
@@ -566,7 +567,7 @@ fn parse_anonymous_resource(
         _ => {
             return Err(ParseError::InvalidExpression {
                 line: 0,
-                message: "Anonymous resource must have a 'name' attribute".to_string(),
+                message: "Anonymous resource must have a 'name' attribute for identification. Use 'let' binding instead if you don't want to specify a name.".to_string(),
             });
         }
     };
@@ -668,6 +669,7 @@ fn parse_resource_expr(
 
     // Get resource name from name attribute (same as anonymous resources)
     // In module context, name can be input.param which is a ResourceRef
+    // If name attribute is not provided, use the binding name as the resource identifier
     let resource_name = match attributes.get("name") {
         Some(Value::String(s)) => s.clone(),
         Some(Value::ResourceRef(ref_name, ref_attr)) if ctx.in_module && ref_name == "input" => {
@@ -676,13 +678,8 @@ fn parse_resource_expr(
             format!("__input_ref__:{}", ref_attr)
         }
         _ => {
-            return Err(ParseError::InvalidExpression {
-                line: 0,
-                message: format!(
-                    "Resource bound to '{}' must have a 'name' attribute",
-                    binding_name
-                ),
-            });
+            // Use binding name as the resource identifier when name attribute is not provided
+            binding_name.to_string()
         }
     };
 

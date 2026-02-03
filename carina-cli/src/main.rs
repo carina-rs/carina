@@ -2204,6 +2204,9 @@ fn resource_to_state(
     let mut resource_state =
         ResourceState::new(&resource.id.resource_type, &resource.id.name, provider);
 
+    // Copy identifier from state
+    resource_state.identifier = state.identifier.clone();
+
     // Set attributes directly (not nested)
     for (k, v) in &state.attributes {
         resource_state

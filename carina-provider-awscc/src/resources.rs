@@ -27,6 +27,7 @@ macro_rules! define_resource_type {
 define_resource_type!(VpcType, "vpc");
 define_resource_type!(SubnetType, "subnet");
 define_resource_type!(InternetGatewayType, "internet_gateway");
+define_resource_type!(VpcGatewayAttachmentType, "vpc_gateway_attachment");
 define_resource_type!(RouteTableType, "route_table");
 define_resource_type!(RouteType, "route");
 define_resource_type!(RouteTableAssociationType, "route_table_association");
@@ -42,6 +43,7 @@ pub fn resource_types() -> Vec<Box<dyn ResourceType>> {
         Box::new(VpcType),
         Box::new(SubnetType),
         Box::new(InternetGatewayType),
+        Box::new(VpcGatewayAttachmentType),
         Box::new(RouteTableType),
         Box::new(RouteType),
         Box::new(RouteTableAssociationType),
@@ -77,6 +79,7 @@ pub struct ResourceConfig {
 pub const VPC_CONFIG: ResourceConfig = ResourceConfig {
     aws_type_name: "AWS::EC2::VPC",
     attributes: &[
+        ("vpc_id", "VpcId", false), // Read-only identifier
         ("cidr_block", "CidrBlock", true),
         ("enable_dns_hostnames", "EnableDnsHostnames", false),
         ("enable_dns_support", "EnableDnsSupport", false),
@@ -88,6 +91,7 @@ pub const VPC_CONFIG: ResourceConfig = ResourceConfig {
 pub const SUBNET_CONFIG: ResourceConfig = ResourceConfig {
     aws_type_name: "AWS::EC2::Subnet",
     attributes: &[
+        ("subnet_id", "SubnetId", false), // Read-only identifier
         ("vpc_id", "VpcId", true),
         ("cidr_block", "CidrBlock", true),
         ("availability_zone", "AvailabilityZone", false),
@@ -98,8 +102,20 @@ pub const SUBNET_CONFIG: ResourceConfig = ResourceConfig {
 
 pub const INTERNET_GATEWAY_CONFIG: ResourceConfig = ResourceConfig {
     aws_type_name: "AWS::EC2::InternetGateway",
-    attributes: &[],
+    attributes: &[
+        ("internet_gateway_id", "InternetGatewayId", false), // Read-only identifier
+    ],
     has_tags: true,
+};
+
+pub const VPC_GATEWAY_ATTACHMENT_CONFIG: ResourceConfig = ResourceConfig {
+    aws_type_name: "AWS::EC2::VPCGatewayAttachment",
+    attributes: &[
+        ("vpc_id", "VpcId", true),
+        ("internet_gateway_id", "InternetGatewayId", false),
+        ("vpn_gateway_id", "VpnGatewayId", false),
+    ],
+    has_tags: false,
 };
 
 // =============================================================================
@@ -108,7 +124,10 @@ pub const INTERNET_GATEWAY_CONFIG: ResourceConfig = ResourceConfig {
 
 pub const ROUTE_TABLE_CONFIG: ResourceConfig = ResourceConfig {
     aws_type_name: "AWS::EC2::RouteTable",
-    attributes: &[("vpc_id", "VpcId", true)],
+    attributes: &[
+        ("route_table_id", "RouteTableId", false), // Read-only identifier
+        ("vpc_id", "VpcId", true),
+    ],
     has_tags: true,
 };
 
@@ -126,6 +145,7 @@ pub const ROUTE_CONFIG: ResourceConfig = ResourceConfig {
 pub const ROUTE_TABLE_ASSOCIATION_CONFIG: ResourceConfig = ResourceConfig {
     aws_type_name: "AWS::EC2::SubnetRouteTableAssociation",
     attributes: &[
+        ("id", "Id", false), // Read-only identifier
         ("subnet_id", "SubnetId", true),
         ("route_table_id", "RouteTableId", true),
     ],
@@ -139,6 +159,7 @@ pub const ROUTE_TABLE_ASSOCIATION_CONFIG: ResourceConfig = ResourceConfig {
 pub const EIP_CONFIG: ResourceConfig = ResourceConfig {
     aws_type_name: "AWS::EC2::EIP",
     attributes: &[
+        ("allocation_id", "AllocationId", false), // Read-only identifier
         ("domain", "Domain", false),
         ("public_ip", "PublicIp", false),
     ],
@@ -148,6 +169,7 @@ pub const EIP_CONFIG: ResourceConfig = ResourceConfig {
 pub const NAT_GATEWAY_CONFIG: ResourceConfig = ResourceConfig {
     aws_type_name: "AWS::EC2::NatGateway",
     attributes: &[
+        ("nat_gateway_id", "NatGatewayId", false), // Read-only identifier
         ("subnet_id", "SubnetId", true),
         ("allocation_id", "AllocationId", false),
         ("connectivity_type", "ConnectivityType", false),
@@ -162,6 +184,7 @@ pub const NAT_GATEWAY_CONFIG: ResourceConfig = ResourceConfig {
 pub const SECURITY_GROUP_CONFIG: ResourceConfig = ResourceConfig {
     aws_type_name: "AWS::EC2::SecurityGroup",
     attributes: &[
+        ("group_id", "GroupId", false), // Read-only identifier (security group ID)
         ("vpc_id", "VpcId", true),
         ("description", "GroupDescription", false),
         ("group_name", "GroupName", false),
@@ -188,6 +211,7 @@ pub const SECURITY_GROUP_INGRESS_CONFIG: ResourceConfig = ResourceConfig {
 pub const VPC_ENDPOINT_CONFIG: ResourceConfig = ResourceConfig {
     aws_type_name: "AWS::EC2::VPCEndpoint",
     attributes: &[
+        ("vpc_endpoint_id", "Id", false), // Read-only identifier
         ("vpc_id", "VpcId", true),
         ("service_name", "ServiceName", true),
         ("vpc_endpoint_type", "VpcEndpointType", false),
@@ -205,6 +229,7 @@ pub fn get_resource_config(resource_type: &str) -> Option<&'static ResourceConfi
         "vpc" => Some(&VPC_CONFIG),
         "subnet" => Some(&SUBNET_CONFIG),
         "internet_gateway" => Some(&INTERNET_GATEWAY_CONFIG),
+        "vpc_gateway_attachment" => Some(&VPC_GATEWAY_ATTACHMENT_CONFIG),
         "route_table" => Some(&ROUTE_TABLE_CONFIG),
         "route" => Some(&ROUTE_CONFIG),
         "route_table_association" => Some(&ROUTE_TABLE_ASSOCIATION_CONFIG),
