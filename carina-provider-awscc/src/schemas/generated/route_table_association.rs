@@ -11,6 +11,7 @@ use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 pub fn ec2_subnet_route_table_association_config() -> AwsccSchemaConfig {
     AwsccSchemaConfig {
         aws_type_name: "AWS::EC2::SubnetRouteTableAssociation",
+        resource_type_name: "ec2_subnet_route_table_association",
         has_tags: false,
         schema: ResourceSchema::new("awscc.ec2_subnet_route_table_association")
         .with_description("Associates a subnet with a route table. The subnet and route table must be in the same VPC. This association causes traffic originating from the subnet to be routed according to the routes in the rout...")

@@ -12,6 +12,7 @@ use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 pub fn ec2_internet_gateway_config() -> AwsccSchemaConfig {
     AwsccSchemaConfig {
         aws_type_name: "AWS::EC2::InternetGateway",
+        resource_type_name: "ec2_internet_gateway",
         has_tags: true,
         schema: ResourceSchema::new("awscc.ec2_internet_gateway")
         .with_description("Allocates an internet gateway for use with a VPC. After creating the Internet gateway, you then attach it to a VPC.")

@@ -12,6 +12,7 @@ use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, types}
 pub fn ec2_subnet_config() -> AwsccSchemaConfig {
     AwsccSchemaConfig {
         aws_type_name: "AWS::EC2::Subnet",
+        resource_type_name: "ec2_subnet",
         has_tags: true,
         schema: ResourceSchema::new("awscc.ec2_subnet")
         .with_description("Specifies a subnet for the specified VPC.  For an IPv4 only subnet, specify an IPv4 CIDR block. If the VPC has an IPv6 CIDR block, you can create an IPv6 only subnet or a dual stack subnet instead. Fo...")

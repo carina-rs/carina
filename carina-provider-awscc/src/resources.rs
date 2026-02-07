@@ -1,59 +1,37 @@
 //! Resource type definitions for AWS Cloud Control API
 //!
-//! This module defines resource type definitions implementing the ResourceType trait.
+//! Resource types are automatically derived from generated schema configs.
 
 use carina_core::provider::{ResourceSchema, ResourceType};
 
-// =============================================================================
-// Resource Type Definitions
-// =============================================================================
+use crate::schemas::generated::configs;
 
-macro_rules! define_resource_type {
-    ($name:ident, $type_name:expr) => {
-        pub struct $name;
-        impl ResourceType for $name {
-            fn name(&self) -> &'static str {
-                $type_name
-            }
-            fn schema(&self) -> ResourceSchema {
-                ResourceSchema::default()
-            }
-        }
-    };
+/// A resource type backed by an AwsccSchemaConfig
+struct AwsccResourceType {
+    name: &'static str,
 }
 
-define_resource_type!(Ec2VpcType, "ec2_vpc");
-define_resource_type!(Ec2SubnetType, "ec2_subnet");
-define_resource_type!(Ec2InternetGatewayType, "ec2_internet_gateway");
-define_resource_type!(Ec2VpcGatewayAttachmentType, "ec2_vpc_gateway_attachment");
-define_resource_type!(Ec2RouteTableType, "ec2_route_table");
-define_resource_type!(Ec2RouteType, "ec2_route");
-define_resource_type!(
-    Ec2SubnetRouteTableAssociationType,
-    "ec2_subnet_route_table_association"
-);
-define_resource_type!(Ec2EipType, "ec2_eip");
-define_resource_type!(Ec2NatGatewayType, "ec2_nat_gateway");
-define_resource_type!(Ec2SecurityGroupType, "ec2_security_group");
-define_resource_type!(Ec2SecurityGroupIngressType, "ec2_security_group_ingress");
-define_resource_type!(Ec2VpcEndpointType, "ec2_vpc_endpoint");
+impl ResourceType for AwsccResourceType {
+    fn name(&self) -> &'static str {
+        self.name
+    }
 
-/// Returns all resource types supported by this provider
+    fn schema(&self) -> ResourceSchema {
+        ResourceSchema::default()
+    }
+}
+
+/// Returns all resource types supported by this provider.
+/// Automatically derived from generated schema configs.
 pub fn resource_types() -> Vec<Box<dyn ResourceType>> {
-    vec![
-        Box::new(Ec2VpcType),
-        Box::new(Ec2SubnetType),
-        Box::new(Ec2InternetGatewayType),
-        Box::new(Ec2VpcGatewayAttachmentType),
-        Box::new(Ec2RouteTableType),
-        Box::new(Ec2RouteType),
-        Box::new(Ec2SubnetRouteTableAssociationType),
-        Box::new(Ec2EipType),
-        Box::new(Ec2NatGatewayType),
-        Box::new(Ec2SecurityGroupType),
-        Box::new(Ec2SecurityGroupIngressType),
-        Box::new(Ec2VpcEndpointType),
-    ]
+    configs()
+        .into_iter()
+        .map(|c| {
+            Box::new(AwsccResourceType {
+                name: c.resource_type_name,
+            }) as Box<dyn ResourceType>
+        })
+        .collect()
 }
 
 #[cfg(test)]

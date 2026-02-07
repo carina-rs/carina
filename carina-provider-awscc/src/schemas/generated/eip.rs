@@ -12,6 +12,7 @@ use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 pub fn ec2_eip_config() -> AwsccSchemaConfig {
     AwsccSchemaConfig {
         aws_type_name: "AWS::EC2::EIP",
+        resource_type_name: "ec2_eip",
         has_tags: true,
         schema: ResourceSchema::new("awscc.ec2_eip")
         .with_description("Specifies an Elastic IP (EIP) address and can, optionally, associate it with an Amazon EC2 instance.  You can allocate an Elastic IP address from an address pool owned by AWS or from an address pool c...")
