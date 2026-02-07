@@ -360,7 +360,7 @@ awscc.ec2_subnet_route_table_association {
 let vpc_endpoint_sg = awscc.ec2_security_group {
   name        = "${input.name}-vpc-endpoint"
   vpc_id      = vpc.vpc_id
-  description = "SG for VPC Endpoint"
+  group_description = "SG for VPC Endpoint"
 
   tags = {
     Name = "vpc-endpoint"
@@ -371,10 +371,10 @@ awscc.ec2_security_group_ingress {
   name              = "${input.name}-vpc-endpoint-https"
   security_group_id = vpc_endpoint_sg.group_id
   description       = "Allow access to 443 port"
-  protocol          = "tcp"
+  ip_protocol       = "tcp"
   from_port         = 443
   to_port           = 443
-  cidr_blocks       = [input.cidr_block]
+  cidr_ip           = input.cidr_block
 }
 
 # ========================================

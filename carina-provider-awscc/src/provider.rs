@@ -13,8 +13,20 @@ use carina_core::provider::{ProviderError, ProviderResult};
 use carina_core::resource::{Resource, ResourceId, State, Value};
 use serde_json::json;
 
-use crate::resources::{ResourceConfig, get_resource_config};
+use crate::schemas::generated::AwsccSchemaConfig;
 use crate::utils::{normalize_availability_zone, normalize_instance_tenancy};
+
+/// Get the AwsccSchemaConfig for a resource type
+fn get_schema_config(resource_type: &str) -> Option<AwsccSchemaConfig> {
+    crate::schemas::generated::configs().into_iter().find(|c| {
+        // Match by schema resource_type: "awscc.ec2_vpc" -> "ec2_vpc"
+        c.schema
+            .resource_type
+            .strip_prefix("awscc.")
+            .map(|t| t == resource_type)
+            .unwrap_or(false)
+    })
+}
 
 /// AWS Cloud Control Provider
 pub struct AwsccProvider {
@@ -207,7 +219,7 @@ impl AwsccProvider {
     ) -> ProviderResult<State> {
         let id = ResourceId::new(resource_type, name);
 
-        let config = get_resource_config(resource_type).ok_or_else(|| {
+        let config = get_schema_config(resource_type).ok_or_else(|| {
             ProviderError::new(format!("Unknown resource type: {}", resource_type))
                 .for_resource(id.clone())
         })?;
@@ -233,9 +245,15 @@ impl AwsccProvider {
             attributes.insert("region".to_string(), Value::String(region_dsl));
         }
 
-        // Map AWS attributes to DSL attributes
-        for (dsl_name, aws_name, _) in config.attributes {
-            if let Some(value) = props.get(*aws_name) {
+        // Map AWS attributes to DSL attributes using provider_name
+        for (dsl_name, attr_schema) in &config.schema.attributes {
+            // Skip tags - handled separately below
+            if dsl_name == "tags" {
+                continue;
+            }
+            if let Some(aws_name) = &attr_schema.provider_name
+                && let Some(value) = props.get(aws_name.as_str())
+            {
                 let dsl_value = self.aws_value_to_dsl(dsl_name, value);
                 if let Some(v) = dsl_value {
                     attributes.insert(dsl_name.to_string(), v);
@@ -261,7 +279,7 @@ impl AwsccProvider {
 
     /// Create a resource using its configuration
     pub async fn create_resource(&self, resource: Resource) -> ProviderResult<State> {
-        let config = get_resource_config(&resource.id.resource_type).ok_or_else(|| {
+        let config = get_schema_config(&resource.id.resource_type).ok_or_else(|| {
             ProviderError::new(format!(
                 "Unknown resource type: {}",
                 resource.id.resource_type
@@ -271,9 +289,15 @@ impl AwsccProvider {
 
         let mut desired_state = serde_json::Map::new();
 
-        // Map DSL attributes to AWS attributes
-        for (dsl_name, aws_name, _required) in config.attributes {
-            if let Some(value) = resource.attributes.get(*dsl_name) {
+        // Map DSL attributes to AWS attributes using provider_name
+        for (dsl_name, attr_schema) in &config.schema.attributes {
+            // Skip tags - handled separately below
+            if dsl_name == "tags" {
+                continue;
+            }
+            if let Some(aws_name) = &attr_schema.provider_name
+                && let Some(value) = resource.attributes.get(dsl_name.as_str())
+            {
                 let aws_value = self.dsl_value_to_aws(dsl_name, value);
                 if let Some(v) = aws_value {
                     desired_state.insert(aws_name.to_string(), v);
@@ -318,7 +342,7 @@ impl AwsccProvider {
         identifier: &str,
         to: Resource,
     ) -> ProviderResult<State> {
-        let config = get_resource_config(&id.resource_type).ok_or_else(|| {
+        let config = get_schema_config(&id.resource_type).ok_or_else(|| {
             ProviderError::new(format!("Unknown resource type: {}", id.resource_type))
                 .for_resource(id.clone())
         })?;
@@ -334,9 +358,14 @@ impl AwsccProvider {
 
         let mut patch_ops = Vec::new();
 
-        // Build patch operations for changed attributes
-        for (dsl_name, aws_name, _) in config.attributes {
-            if let Some(value) = to.attributes.get(*dsl_name)
+        // Build patch operations for changed attributes using provider_name
+        for (dsl_name, attr_schema) in &config.schema.attributes {
+            // Skip tags - handled separately below
+            if dsl_name == "tags" {
+                continue;
+            }
+            if let Some(aws_name) = &attr_schema.provider_name
+                && let Some(value) = to.attributes.get(dsl_name.as_str())
                 && let Some(aws_value) = self.dsl_value_to_aws(dsl_name, value)
             {
                 patch_ops.push(json!({
@@ -372,13 +401,13 @@ impl AwsccProvider {
 
     /// Delete a resource
     pub async fn delete_resource(&self, id: &ResourceId, identifier: &str) -> ProviderResult<()> {
-        let config = get_resource_config(&id.resource_type).ok_or_else(|| {
+        let config = get_schema_config(&id.resource_type).ok_or_else(|| {
             ProviderError::new(format!("Unknown resource type: {}", id.resource_type))
                 .for_resource(id.clone())
         })?;
 
         // Handle special pre-delete operations
-        self.pre_delete_operations(id, config, identifier).await?;
+        self.pre_delete_operations(id, &config, identifier).await?;
 
         self.cc_delete_resource(config.aws_type_name, identifier)
             .await
@@ -499,30 +528,9 @@ impl AwsccProvider {
     /// Handle special attributes for create
     fn create_special_attributes(
         &self,
-        resource: &Resource,
-        desired_state: &mut serde_json::Map<String, serde_json::Value>,
+        _resource: &Resource,
+        _desired_state: &mut serde_json::Map<String, serde_json::Value>,
     ) {
-        match resource.id.resource_type.as_str() {
-            "ec2_security_group" => {
-                // Set default description if not provided
-                if !desired_state.contains_key("GroupDescription") {
-                    desired_state.insert(
-                        "GroupDescription".to_string(),
-                        json!(format!("Security group {}", resource.id.name)),
-                    );
-                }
-            }
-            "ec2_security_group_ingress" => {
-                // Handle cidr_blocks -> CidrIp
-                if !desired_state.contains_key("CidrIp")
-                    && let Some(Value::List(cidrs)) = resource.attributes.get("cidr_blocks")
-                    && let Some(Value::String(first_cidr)) = cidrs.first()
-                {
-                    desired_state.insert("CidrIp".to_string(), json!(first_cidr));
-                }
-            }
-            _ => {}
-        }
     }
 
     /// Set default values for create
@@ -540,7 +548,7 @@ impl AwsccProvider {
     async fn pre_delete_operations(
         &self,
         id: &ResourceId,
-        config: &ResourceConfig,
+        config: &AwsccSchemaConfig,
         identifier: &str,
     ) -> ProviderResult<()> {
         if id.resource_type == "ec2_internet_gateway" {

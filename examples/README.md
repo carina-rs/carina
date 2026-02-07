@@ -47,16 +47,31 @@ cargo run --bin carina -- plan examples/aws-module/
 
 ### awscc-vpc/
 
-VPC example using the AWS Cloud Control provider.
+Comprehensive VPC example using the AWS Cloud Control provider.
 
-- Using the `awscc` provider (AWS Cloud Control API)
-- VPC creation with DNS settings
-
-The awscc provider uses AWS Cloud Control API which provides a consistent interface for managing AWS resources.
+- VPC with DNS support
+- Public/Private/Database Subnets across 3 AZs
+- Internet Gateway
+- NAT Gateways (one per AZ)
+- Route Tables with routes
+- Security Group for VPC Endpoints
+- VPC Endpoints (ECR, S3, CloudWatch Logs, SSM)
 
 ```bash
 cargo run --bin carina -- validate examples/awscc-vpc/
 cargo run --bin carina -- plan examples/awscc-vpc/
+```
+
+### awscc-vpc-module-example/
+
+Module usage example with the AWS Cloud Control provider.
+
+- Importing and using a VPC module
+- Passing parameters to modules
+
+```bash
+cargo run --bin carina -- validate examples/awscc-vpc-module-example/
+cargo run --bin carina -- plan examples/awscc-vpc-module-example/
 ```
 
 ## Running Examples

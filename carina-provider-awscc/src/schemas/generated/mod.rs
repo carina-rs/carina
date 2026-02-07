@@ -6,6 +6,19 @@
 use carina_core::resource::Value;
 use carina_core::schema::{AttributeType, ResourceSchema};
 
+/// AWS Cloud Control schema configuration
+///
+/// Combines the generated ResourceSchema with AWS-specific metadata
+/// that was previously in ResourceConfig.
+pub struct AwsccSchemaConfig {
+    /// AWS CloudFormation type name (e.g., "AWS::EC2::VPC")
+    pub aws_type_name: &'static str,
+    /// Whether this resource type uses tags
+    pub has_tags: bool,
+    /// The resource schema with attribute definitions
+    pub schema: ResourceSchema,
+}
+
 /// Tags type for AWS resources (Terraform-style map)
 pub fn tags_type() -> AttributeType {
     AttributeType::Map(Box::new(AttributeType::String))
@@ -92,22 +105,31 @@ pub mod route;
 pub mod route_table;
 pub mod route_table_association;
 pub mod security_group;
+pub mod security_group_ingress;
 pub mod subnet;
 pub mod vpc;
 pub mod vpc_endpoint;
+pub mod vpc_gateway_attachment;
 
-/// Returns all generated schemas
-pub fn schemas() -> Vec<ResourceSchema> {
+/// Returns all generated schema configs
+pub fn configs() -> Vec<AwsccSchemaConfig> {
     vec![
-        vpc::ec2_vpc_schema(),
-        subnet::ec2_subnet_schema(),
-        internet_gateway::ec2_internet_gateway_schema(),
-        route_table::ec2_route_table_schema(),
-        route::ec2_route_schema(),
-        route_table_association::ec2_subnet_route_table_association_schema(),
-        eip::ec2_eip_schema(),
-        nat_gateway::ec2_nat_gateway_schema(),
-        security_group::ec2_security_group_schema(),
-        vpc_endpoint::ec2_vpc_endpoint_schema(),
+        vpc::ec2_vpc_config(),
+        subnet::ec2_subnet_config(),
+        internet_gateway::ec2_internet_gateway_config(),
+        route_table::ec2_route_table_config(),
+        route::ec2_route_config(),
+        route_table_association::ec2_subnet_route_table_association_config(),
+        eip::ec2_eip_config(),
+        nat_gateway::ec2_nat_gateway_config(),
+        security_group::ec2_security_group_config(),
+        security_group_ingress::ec2_security_group_ingress_config(),
+        vpc_endpoint::ec2_vpc_endpoint_config(),
+        vpc_gateway_attachment::ec2_vpc_gateway_attachment_config(),
     ]
+}
+
+/// Returns all generated schemas (for backward compatibility)
+pub fn schemas() -> Vec<ResourceSchema> {
+    configs().into_iter().map(|c| c.schema).collect()
 }

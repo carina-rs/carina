@@ -218,6 +218,8 @@ pub struct AttributeSchema {
     pub description: Option<String>,
     /// Completion values for this attribute (used by LSP)
     pub completions: Option<Vec<CompletionValue>>,
+    /// Provider-side property name (e.g., "VpcId" for AWS Cloud Control)
+    pub provider_name: Option<String>,
 }
 
 impl AttributeSchema {
@@ -229,6 +231,7 @@ impl AttributeSchema {
             default: None,
             description: None,
             completions: None,
+            provider_name: None,
         }
     }
 
@@ -249,6 +252,11 @@ impl AttributeSchema {
 
     pub fn with_completions(mut self, completions: Vec<CompletionValue>) -> Self {
         self.completions = Some(completions);
+        self
+    }
+
+    pub fn with_provider_name(mut self, name: impl Into<String>) -> Self {
+        self.provider_name = Some(name.into());
         self
     }
 }

@@ -3,6 +3,7 @@
 
 # Carina state files
 .carina/
+carina.state.json
 
 # IDE
 .idea/

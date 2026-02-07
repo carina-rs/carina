@@ -280,7 +280,7 @@ impl DiagnosticEngine {
             "security_group.ingress_rule" => Some(vpc::security_group_ingress_rule_schema()),
             "security_group.egress_rule" => Some(vpc::security_group_egress_rule_schema()),
             // AWS Cloud Control resources
-            "awscc.ec2_vpc" => Some(awscc_vpc::ec2_vpc_schema()),
+            "awscc.ec2_vpc" => Some(awscc_vpc::ec2_vpc_config().schema),
             _ => None,
         }
     }

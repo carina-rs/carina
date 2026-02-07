@@ -4,51 +4,66 @@
 //!
 //! DO NOT EDIT MANUALLY - regenerate with carina-codegen
 
+use super::AwsccSchemaConfig;
 use super::tags_type;
 use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
-/// Returns the schema for ec2_eip (AWS::EC2::EIP)
-pub fn ec2_eip_schema() -> ResourceSchema {
-    ResourceSchema::new("awscc.ec2_eip")
+/// Returns the schema config for ec2_eip (AWS::EC2::EIP)
+pub fn ec2_eip_config() -> AwsccSchemaConfig {
+    AwsccSchemaConfig {
+        aws_type_name: "AWS::EC2::EIP",
+        has_tags: true,
+        schema: ResourceSchema::new("awscc.ec2_eip")
         .with_description("Specifies an Elastic IP (EIP) address and can, optionally, associate it with an Amazon EC2 instance.  You can allocate an Elastic IP address from an address pool owned by AWS or from an address pool c...")
         .attribute(
-            AttributeSchema::new("transfer_address", AttributeType::String)
-                .with_description("The Elastic IP address you are accepting for transfer. You can only accept one transferred address. For more information on Elastic IP address transfe..."),
-        )
-        .attribute(
-            AttributeSchema::new("public_ipv4_pool", AttributeType::String)
-                .with_description("The ID of an address pool that you own. Use this parameter to let Amazon EC2 select an address from the address pool.  Updates to the ``PublicIpv4Pool..."),
-        )
-        .attribute(
-            AttributeSchema::new("domain", AttributeType::String)
-                .with_description("The network (``vpc``). If you define an Elastic IP address and associate it with a VPC that is defined in the same template, you must declare a depend..."),
+            AttributeSchema::new("allocation_id", AttributeType::String)
+                .with_description(" (read-only)")
+                .with_provider_name("AllocationId"),
         )
         .attribute(
             AttributeSchema::new("address", AttributeType::String)
-                .with_description(""),
-        )
-        .attribute(
-            AttributeSchema::new("tags", tags_type())
-                .with_description("Any tags assigned to the Elastic IP address.  Updates to the ``Tags`` property may require *some interruptions*. Updates on an EIP reassociates the ad..."),
-        )
-        .attribute(
-            AttributeSchema::new("public_ip", AttributeType::String)
-                .with_description(" (read-only)"),
-        )
-        .attribute(
-            AttributeSchema::new("allocation_id", AttributeType::String)
-                .with_description(" (read-only)"),
-        )
-        .attribute(
-            AttributeSchema::new("ipam_pool_id", AttributeType::String)
-                .with_description(""),
-        )
-        .attribute(
-            AttributeSchema::new("instance_id", AttributeType::String)
-                .with_description("The ID of the instance.  Updates to the ``InstanceId`` property may require *some interruptions*. Updates on an EIP reassociates the address on its as..."),
+                .with_description("")
+                .with_provider_name("Address"),
         )
         .attribute(
             AttributeSchema::new("network_border_group", AttributeType::String)
-                .with_description("A unique set of Availability Zones, Local Zones, or Wavelength Zones from which AWS advertises IP addresses. Use this parameter to limit the IP addres..."),
+                .with_description("A unique set of Availability Zones, Local Zones, or Wavelength Zones from which AWS advertises IP addresses. Use this parameter to limit the IP addres...")
+                .with_provider_name("NetworkBorderGroup"),
         )
+        .attribute(
+            AttributeSchema::new("public_ip", AttributeType::String)
+                .with_description(" (read-only)")
+                .with_provider_name("PublicIp"),
+        )
+        .attribute(
+            AttributeSchema::new("domain", AttributeType::String)
+                .with_description("The network (``vpc``). If you define an Elastic IP address and associate it with a VPC that is defined in the same template, you must declare a depend...")
+                .with_provider_name("Domain"),
+        )
+        .attribute(
+            AttributeSchema::new("ipam_pool_id", AttributeType::String)
+                .with_description("")
+                .with_provider_name("IpamPoolId"),
+        )
+        .attribute(
+            AttributeSchema::new("transfer_address", AttributeType::String)
+                .with_description("The Elastic IP address you are accepting for transfer. You can only accept one transferred address. For more information on Elastic IP address transfe...")
+                .with_provider_name("TransferAddress"),
+        )
+        .attribute(
+            AttributeSchema::new("instance_id", AttributeType::String)
+                .with_description("The ID of the instance.  Updates to the ``InstanceId`` property may require *some interruptions*. Updates on an EIP reassociates the address on its as...")
+                .with_provider_name("InstanceId"),
+        )
+        .attribute(
+            AttributeSchema::new("public_ipv4_pool", AttributeType::String)
+                .with_description("The ID of an address pool that you own. Use this parameter to let Amazon EC2 select an address from the address pool.  Updates to the ``PublicIpv4Pool...")
+                .with_provider_name("PublicIpv4Pool"),
+        )
+        .attribute(
+            AttributeSchema::new("tags", tags_type())
+                .with_description("Any tags assigned to the Elastic IP address.  Updates to the ``Tags`` property may require *some interruptions*. Updates on an EIP reassociates the ad...")
+                .with_provider_name("Tags"),
+        )
+    }
 }

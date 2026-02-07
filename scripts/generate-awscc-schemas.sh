@@ -22,7 +22,9 @@ RESOURCE_TYPES=(
     "AWS::EC2::EIP"
     "AWS::EC2::NatGateway"
     "AWS::EC2::SecurityGroup"
+    "AWS::EC2::SecurityGroupIngress"
     "AWS::EC2::VPCEndpoint"
+    "AWS::EC2::VPCGatewayAttachment"
 )
 
 echo "Generating awscc provider schemas..."
@@ -30,17 +32,32 @@ echo "Output directory: $OUTPUT_DIR"
 echo ""
 
 # Build codegen tool first
-cargo build -p carina-codegen --quiet
+# Use --quiet to suppress cargo output; build only the binary (not the lib)
+cargo build -p carina-provider-awscc --bin codegen --quiet 2>/dev/null || true
+
+# Find the built binary
+CODEGEN_BIN="target/debug/codegen"
+if [ ! -f "$CODEGEN_BIN" ]; then
+    echo "ERROR: codegen binary not found at $CODEGEN_BIN"
+    echo "Trying to build with cargo..."
+    cargo build -p carina-provider-awscc --bin codegen
+    if [ ! -f "$CODEGEN_BIN" ]; then
+        echo "ERROR: Could not build codegen binary"
+        exit 1
+    fi
+fi
 
 for TYPE_NAME in "${RESOURCE_TYPES[@]}"; do
     # Convert AWS::EC2::VPC -> vpc.rs
     FILENAME=$(echo "$TYPE_NAME" | sed 's/AWS::EC2:://' | tr '[:upper:]' '[:lower:]')
     # Handle special cases
     FILENAME=$(echo "$FILENAME" | sed 's/subnetroutetableassociation/route_table_association/')
+    FILENAME=$(echo "$FILENAME" | sed 's/vpcgatewayattachment/vpc_gateway_attachment/')
     FILENAME=$(echo "$FILENAME" | sed 's/vpcendpoint/vpc_endpoint/')
     FILENAME=$(echo "$FILENAME" | sed 's/natgateway/nat_gateway/')
     FILENAME=$(echo "$FILENAME" | sed 's/internetgateway/internet_gateway/')
     FILENAME=$(echo "$FILENAME" | sed 's/routetable/route_table/')
+    FILENAME=$(echo "$FILENAME" | sed 's/securitygroupingress/security_group_ingress/')
     FILENAME=$(echo "$FILENAME" | sed 's/securitygroup/security_group/')
 
     OUTPUT_FILE="$OUTPUT_DIR/${FILENAME}.rs"
@@ -52,7 +69,7 @@ for TYPE_NAME in "${RESOURCE_TYPES[@]}"; do
         --type-name "$TYPE_NAME" \
         --query 'Schema' \
         --output text 2>/dev/null | \
-    cargo run -p carina-codegen --quiet -- --type-name "$TYPE_NAME" > "$OUTPUT_FILE"
+    "$CODEGEN_BIN" --type-name "$TYPE_NAME" > "$OUTPUT_FILE"
 
     if [ $? -ne 0 ]; then
         echo "  ERROR: Failed to generate $TYPE_NAME"
@@ -72,6 +89,19 @@ cat > "$OUTPUT_DIR/mod.rs" << 'EOF'
 
 use carina_core::resource::Value;
 use carina_core::schema::{AttributeType, ResourceSchema};
+
+/// AWS Cloud Control schema configuration
+///
+/// Combines the generated ResourceSchema with AWS-specific metadata
+/// that was previously in ResourceConfig.
+pub struct AwsccSchemaConfig {
+    /// AWS CloudFormation type name (e.g., "AWS::EC2::VPC")
+    pub aws_type_name: &'static str,
+    /// Whether this resource type uses tags
+    pub has_tags: bool,
+    /// The resource schema with attribute definitions
+    pub schema: ResourceSchema,
+}
 
 /// Tags type for AWS resources (Terraform-style map)
 pub fn tags_type() -> AttributeType {
@@ -158,24 +188,26 @@ EOF
 for TYPE_NAME in "${RESOURCE_TYPES[@]}"; do
     MODNAME=$(echo "$TYPE_NAME" | sed 's/AWS::EC2:://' | tr '[:upper:]' '[:lower:]')
     MODNAME=$(echo "$MODNAME" | sed 's/subnetroutetableassociation/route_table_association/')
+    MODNAME=$(echo "$MODNAME" | sed 's/vpcgatewayattachment/vpc_gateway_attachment/')
     MODNAME=$(echo "$MODNAME" | sed 's/vpcendpoint/vpc_endpoint/')
     MODNAME=$(echo "$MODNAME" | sed 's/natgateway/nat_gateway/')
     MODNAME=$(echo "$MODNAME" | sed 's/internetgateway/internet_gateway/')
     MODNAME=$(echo "$MODNAME" | sed 's/routetable/route_table/')
+    MODNAME=$(echo "$MODNAME" | sed 's/securitygroupingress/security_group_ingress/')
     MODNAME=$(echo "$MODNAME" | sed 's/securitygroup/security_group/')
 
     echo "pub mod ${MODNAME};" >> "$OUTPUT_DIR/mod.rs"
 done
 
-# Add schemas() function
+# Add configs() function
 cat >> "$OUTPUT_DIR/mod.rs" << 'EOF'
 
-/// Returns all generated schemas
-pub fn schemas() -> Vec<ResourceSchema> {
+/// Returns all generated schema configs
+pub fn configs() -> Vec<AwsccSchemaConfig> {
     vec![
 EOF
 
-# Add schema function calls dynamically
+# Add config function calls dynamically
 for TYPE_NAME in "${RESOURCE_TYPES[@]}"; do
     # AWS::EC2::VPC -> ec2, vpc
     SERVICE=$(echo "$TYPE_NAME" | sed 's/AWS::\([^:]*\)::.*/\1/' | tr '[:upper:]' '[:lower:]')
@@ -185,29 +217,38 @@ for TYPE_NAME in "${RESOURCE_TYPES[@]}"; do
     RESOURCE=$(echo "$RESOURCE" | sed 's/\([A-Z]\)/_\L\1/g' | sed 's/^_//')
     # Handle special naming
     RESOURCE=$(echo "$RESOURCE" | sed 's/subnetroutetableassociation/subnet_route_table_association/')
+    RESOURCE=$(echo "$RESOURCE" | sed 's/vpcgatewayattachment/vpc_gateway_attachment/')
     RESOURCE=$(echo "$RESOURCE" | sed 's/vpcendpoint/vpc_endpoint/')
     RESOURCE=$(echo "$RESOURCE" | sed 's/natgateway/nat_gateway/')
     RESOURCE=$(echo "$RESOURCE" | sed 's/internetgateway/internet_gateway/')
     RESOURCE=$(echo "$RESOURCE" | sed 's/routetable/route_table/')
+    RESOURCE=$(echo "$RESOURCE" | sed 's/securitygroupingress/security_group_ingress/')
     RESOURCE=$(echo "$RESOURCE" | sed 's/securitygroup/security_group/')
 
     # Module name (same as MODNAME above)
     MODNAME=$(echo "$TYPE_NAME" | sed 's/AWS::EC2:://' | tr '[:upper:]' '[:lower:]')
     MODNAME=$(echo "$MODNAME" | sed 's/subnetroutetableassociation/route_table_association/')
+    MODNAME=$(echo "$MODNAME" | sed 's/vpcgatewayattachment/vpc_gateway_attachment/')
     MODNAME=$(echo "$MODNAME" | sed 's/vpcendpoint/vpc_endpoint/')
     MODNAME=$(echo "$MODNAME" | sed 's/natgateway/nat_gateway/')
     MODNAME=$(echo "$MODNAME" | sed 's/internetgateway/internet_gateway/')
     MODNAME=$(echo "$MODNAME" | sed 's/routetable/route_table/')
+    MODNAME=$(echo "$MODNAME" | sed 's/securitygroupingress/security_group_ingress/')
     MODNAME=$(echo "$MODNAME" | sed 's/securitygroup/security_group/')
 
-    # Function name: service_resource_schema (e.g., ec2_vpc_schema)
-    FUNC_NAME="${SERVICE}_${RESOURCE}_schema"
+    # Function name: service_resource_config (e.g., ec2_vpc_config)
+    FUNC_NAME="${SERVICE}_${RESOURCE}_config"
 
     echo "        ${MODNAME}::${FUNC_NAME}()," >> "$OUTPUT_DIR/mod.rs"
 done
 
 cat >> "$OUTPUT_DIR/mod.rs" << 'EOF'
     ]
+}
+
+/// Returns all generated schemas (for backward compatibility)
+pub fn schemas() -> Vec<ResourceSchema> {
+    configs().into_iter().map(|c| c.schema).collect()
 }
 EOF
 

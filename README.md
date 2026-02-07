@@ -282,26 +282,30 @@ DSL File (.crn)
 
 ```
 carina/
-├── carina-cli/          # CLI application
-├── carina-core/         # Core library (provider-agnostic)
+├── carina-cli/              # CLI application
+├── carina-core/             # Core library (provider-agnostic)
 │   ├── src/
-│   │   ├── effect.rs    # Effect type definitions
-│   │   ├── plan.rs      # Plan (collection of Effects)
-│   │   ├── resource.rs  # Resource and State types
-│   │   ├── provider.rs  # Provider trait
-│   │   ├── interpreter.rs # Effect interpreter
-│   │   ├── differ.rs    # State comparison
-│   │   ├── parser/      # DSL parser (pest-based)
-│   │   ├── schema.rs    # Type validation (generic types only)
-│   │   ├── module.rs    # Module signature and dependency graph
+│   │   ├── effect.rs        # Effect type definitions
+│   │   ├── plan.rs          # Plan (collection of Effects)
+│   │   ├── resource.rs      # Resource and State types
+│   │   ├── provider.rs      # Provider trait
+│   │   ├── interpreter.rs   # Effect interpreter
+│   │   ├── differ.rs        # State comparison
+│   │   ├── parser/          # DSL parser (pest-based)
+│   │   ├── schema.rs        # Type validation (generic types only)
+│   │   ├── module.rs        # Module signature and dependency graph
 │   │   ├── module_resolver.rs # Module import and expansion
-│   │   └── formatter/   # Code formatter
+│   │   └── formatter/       # Code formatter
 │   └── ...
-├── carina-provider-aws/ # AWS provider implementation
-│   └── src/schemas/     # AWS-specific type definitions
-├── carina-state/        # State management
-│   └── src/backends/    # State backends (S3, etc.)
-└── carina-lsp/          # Language Server Protocol implementation
+├── carina-provider-aws/     # AWS provider implementation
+│   └── src/schemas/         # AWS-specific type definitions
+├── carina-provider-awscc/   # AWS Cloud Control provider implementation
+│   └── src/
+│       ├── bin/codegen.rs   # Schema code generator from CloudFormation
+│       └── schemas/generated/ # Auto-generated schemas from CloudFormation
+├── carina-state/            # State management
+│   └── src/backends/        # State backends (S3, etc.)
+└── carina-lsp/              # Language Server Protocol implementation
 ```
 
 ## AWS Provider

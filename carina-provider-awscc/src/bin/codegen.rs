@@ -64,6 +64,16 @@ struct CfnSchema {
     write_only_properties: Vec<String>,
     primary_identifier: Option<Vec<String>>,
     definitions: Option<HashMap<String, CfnDefinition>>,
+    tagging: Option<CfnTagging>,
+}
+
+/// CloudFormation Tagging metadata
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
+struct CfnTagging {
+    #[serde(default)]
+    taggable: bool,
 }
 
 /// Type can be a string or an array of strings in JSON Schema
@@ -188,6 +198,9 @@ fn generate_schema_code(schema: &CfnSchema, type_name: &str) -> Result<String> {
 
     let has_enums = !enums.is_empty();
 
+    // Determine has_tags from tagging metadata
+    let has_tags = schema.tagging.as_ref().map(|t| t.taggable).unwrap_or(false);
+
     // Generate header with conditional imports
     let types_import = if needs_types { ", types" } else { "" };
     code.push_str(&format!(
@@ -198,6 +211,7 @@ fn generate_schema_code(schema: &CfnSchema, type_name: &str) -> Result<String> {
 //! DO NOT EDIT MANUALLY - regenerate with carina-codegen
 
 use carina_core::schema::{{AttributeSchema, AttributeType, ResourceSchema{}}};
+use super::AwsccSchemaConfig;
 "#,
         resource, type_name, types_import
     ));
@@ -241,17 +255,20 @@ use carina_core::schema::{{AttributeSchema, AttributeType, ResourceSchema{}}};
         ));
     }
 
-    // Generate schema function
-    let fn_name = format!("{}_schema", full_resource);
+    // Generate config function
+    let config_fn_name = format!("{}_config", full_resource);
     // Use awscc.service_resource format (e.g., awscc.ec2_vpc)
     let schema_name = format!("awscc.{}", full_resource);
 
     code.push_str(&format!(
-        r#"/// Returns the schema for {} ({})
-pub fn {}() -> ResourceSchema {{
-    ResourceSchema::new("{}")
+        r#"/// Returns the schema config for {} ({})
+pub fn {}() -> AwsccSchemaConfig {{
+    AwsccSchemaConfig {{
+        aws_type_name: "{}",
+        has_tags: {},
+        schema: ResourceSchema::new("{}")
 "#,
-        full_resource, type_name, fn_name, schema_name
+        full_resource, type_name, config_fn_name, type_name, has_tags, schema_name
     ));
 
     // Add description
@@ -316,11 +333,18 @@ pub fn {}() -> ResourceSchema {{
             attr_code.push_str("\n                .with_description(\"(read-only)\")");
         }
 
+        // Add provider_name mapping (AWS property name)
+        attr_code.push_str(&format!(
+            "\n                .with_provider_name(\"{}\")",
+            prop_name
+        ));
+
         attr_code.push_str(",\n        )\n");
         code.push_str(&attr_code);
     }
 
-    code.push_str("}\n");
+    // Close the schema (ResourceSchema) and the AwsccSchemaConfig struct
+    code.push_str("    }\n}\n");
 
     Ok(code)
 }
@@ -428,16 +452,16 @@ fn cfn_type_to_carina_type_with_enum(
             }
 
             // Try to extract enum values from description
-            if let Some(desc) = &prop.description {
-                if let Some(enum_values) = extract_enum_from_description(desc) {
-                    let type_name = prop_name.to_pascal_case();
-                    let enum_info = EnumInfo {
-                        type_name,
-                        values: enum_values,
-                    };
-                    // Return placeholder - actual type will be generated using enum_info
-                    return ("/* enum */".to_string(), Some(enum_info));
-                }
+            if let Some(desc) = &prop.description
+                && let Some(enum_values) = extract_enum_from_description(desc)
+            {
+                let type_name = prop_name.to_pascal_case();
+                let enum_info = EnumInfo {
+                    type_name,
+                    values: enum_values,
+                };
+                // Return placeholder - actual type will be generated using enum_info
+                return ("/* enum */".to_string(), Some(enum_info));
             }
 
             ("AttributeType::String".to_string(), None)

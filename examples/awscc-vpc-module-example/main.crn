@@ -1,0 +1,17 @@
+# Example: Using the awscc-vpc-module
+#
+# This shows how to use the VPC module to create a complete
+# VPC infrastructure in ap-northeast-1.
+
+provider awscc {
+  region = aws.Region.ap_northeast_1
+}
+
+# Import the VPC module
+import "../modules/awscc-vpc-module" as vpc_module
+
+# Create VPC using the module
+vpc_module {
+  name       = "production"
+  cidr_block = "10.0.0.0/16"
+}

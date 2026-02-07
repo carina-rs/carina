@@ -685,18 +685,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "carina-codegen"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "heck",
- "regex",
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "carina-core"
 version = "0.1.0"
 dependencies = [
@@ -739,9 +727,13 @@ dependencies = [
 name = "carina-provider-awscc"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "aws-config",
  "aws-sdk-cloudcontrol",
  "carina-core",
+ "clap",
+ "heck",
+ "regex",
  "serde",
  "serde_json",
  "thiserror",
