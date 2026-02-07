@@ -21,15 +21,15 @@ pub fn ec2_vpc_gateway_attachment_config() -> AwsccSchemaConfig {
                 .with_provider_name("AttachmentType"),
         )
         .attribute(
+            AttributeSchema::new("internet_gateway_id", AttributeType::String)
+                .with_description("The ID of the internet gateway. You must specify either InternetGatewayId or VpnGatewayId, but not both.")
+                .with_provider_name("InternetGatewayId"),
+        )
+        .attribute(
             AttributeSchema::new("vpc_id", AttributeType::String)
                 .required()
                 .with_description("The ID of the VPC.")
                 .with_provider_name("VpcId"),
-        )
-        .attribute(
-            AttributeSchema::new("internet_gateway_id", AttributeType::String)
-                .with_description("The ID of the internet gateway. You must specify either InternetGatewayId or VpnGatewayId, but not both.")
-                .with_provider_name("InternetGatewayId"),
         )
         .attribute(
             AttributeSchema::new("vpn_gateway_id", AttributeType::String)

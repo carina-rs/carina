@@ -16,15 +16,15 @@ pub fn ec2_subnet_route_table_association_config() -> AwsccSchemaConfig {
         schema: ResourceSchema::new("awscc.ec2_subnet_route_table_association")
         .with_description("Associates a subnet with a route table. The subnet and route table must be in the same VPC. This association causes traffic originating from the subnet to be routed according to the routes in the rout...")
         .attribute(
+            AttributeSchema::new("id", AttributeType::String)
+                .with_description(" (read-only)")
+                .with_provider_name("Id"),
+        )
+        .attribute(
             AttributeSchema::new("route_table_id", AttributeType::String)
                 .required()
                 .with_description("The ID of the route table. The physical ID changes when the route table ID is changed.")
                 .with_provider_name("RouteTableId"),
-        )
-        .attribute(
-            AttributeSchema::new("id", AttributeType::String)
-                .with_description(" (read-only)")
-                .with_provider_name("Id"),
         )
         .attribute(
             AttributeSchema::new("subnet_id", AttributeType::String)

@@ -17,7 +17,7 @@ use clap::Parser;
 use heck::{ToPascalCase, ToSnakeCase};
 use regex::Regex;
 use serde::Deserialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::io::{self, Read};
 
 /// Information about a detected enum type
@@ -53,7 +53,7 @@ struct Args {
 struct CfnSchema {
     type_name: String,
     description: Option<String>,
-    properties: HashMap<String, CfnProperty>,
+    properties: BTreeMap<String, CfnProperty>,
     #[serde(default)]
     required: Vec<String>,
     #[serde(default)]
@@ -63,7 +63,7 @@ struct CfnSchema {
     #[serde(default)]
     write_only_properties: Vec<String>,
     primary_identifier: Option<Vec<String>>,
-    definitions: Option<HashMap<String, CfnDefinition>>,
+    definitions: Option<BTreeMap<String, CfnDefinition>>,
     tagging: Option<CfnTagging>,
 }
 
@@ -115,7 +115,7 @@ struct CfnProperty {
 struct CfnDefinition {
     #[serde(rename = "type")]
     def_type: Option<String>,
-    properties: Option<HashMap<String, CfnProperty>>,
+    properties: Option<BTreeMap<String, CfnProperty>>,
     #[serde(default)]
     required: Vec<String>,
 }
@@ -181,7 +181,7 @@ fn generate_schema_code(schema: &CfnSchema, type_name: &str) -> Result<String> {
     // Pre-scan properties to determine which imports are needed and collect enum info
     let mut needs_types = false;
     let mut needs_tags_type = false;
-    let mut enums: HashMap<String, EnumInfo> = HashMap::new();
+    let mut enums: BTreeMap<String, EnumInfo> = BTreeMap::new();
 
     for (prop_name, prop) in &schema.properties {
         let (attr_type, enum_info) = cfn_type_to_carina_type_with_enum(prop, prop_name, schema);
