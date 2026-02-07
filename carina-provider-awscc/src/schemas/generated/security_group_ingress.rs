@@ -11,6 +11,7 @@ use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 pub fn ec2_security_group_ingress_config() -> AwsccSchemaConfig {
     AwsccSchemaConfig {
         aws_type_name: "AWS::EC2::SecurityGroupIngress",
+        resource_type_name: "ec2_security_group_ingress",
         has_tags: false,
         schema: ResourceSchema::new("awscc.ec2_security_group_ingress")
         .with_description("Resource Type definition for AWS::EC2::SecurityGroupIngress")

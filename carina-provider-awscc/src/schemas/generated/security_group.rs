@@ -12,6 +12,7 @@ use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 pub fn ec2_security_group_config() -> AwsccSchemaConfig {
     AwsccSchemaConfig {
         aws_type_name: "AWS::EC2::SecurityGroup",
+        resource_type_name: "ec2_security_group",
         has_tags: true,
         schema: ResourceSchema::new("awscc.ec2_security_group")
         .with_description("Resource Type definition for AWS::EC2::SecurityGroup")

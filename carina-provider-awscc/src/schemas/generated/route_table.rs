@@ -12,6 +12,7 @@ use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 pub fn ec2_route_table_config() -> AwsccSchemaConfig {
     AwsccSchemaConfig {
         aws_type_name: "AWS::EC2::RouteTable",
+        resource_type_name: "ec2_route_table",
         has_tags: true,
         schema: ResourceSchema::new("awscc.ec2_route_table")
         .with_description("Specifies a route table for the specified VPC. After you create a route table, you can add routes and associate the table with a subnet.  For more information, see [Route tables](https://docs.aws.amaz...")

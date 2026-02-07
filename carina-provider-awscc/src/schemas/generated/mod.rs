@@ -13,6 +13,8 @@ use carina_core::schema::{AttributeType, ResourceSchema};
 pub struct AwsccSchemaConfig {
     /// AWS CloudFormation type name (e.g., "AWS::EC2::VPC")
     pub aws_type_name: &'static str,
+    /// Resource type name used in DSL (e.g., "ec2_vpc")
+    pub resource_type_name: &'static str,
     /// Whether this resource type uses tags
     pub has_tags: bool,
     /// The resource schema with attribute definitions

@@ -265,10 +265,11 @@ use super::AwsccSchemaConfig;
 pub fn {}() -> AwsccSchemaConfig {{
     AwsccSchemaConfig {{
         aws_type_name: "{}",
+        resource_type_name: "{}",
         has_tags: {},
         schema: ResourceSchema::new("{}")
 "#,
-        full_resource, type_name, config_fn_name, type_name, has_tags, schema_name
+        full_resource, type_name, config_fn_name, type_name, full_resource, has_tags, schema_name
     ));
 
     // Add description

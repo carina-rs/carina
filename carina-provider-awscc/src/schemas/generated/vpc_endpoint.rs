@@ -42,6 +42,7 @@ fn validate_ip_address_type(value: &Value) -> Result<(), String> {
 pub fn ec2_vpc_endpoint_config() -> AwsccSchemaConfig {
     AwsccSchemaConfig {
         aws_type_name: "AWS::EC2::VPCEndpoint",
+        resource_type_name: "ec2_vpc_endpoint",
         has_tags: true,
         schema: ResourceSchema::new("awscc.ec2_vpc_endpoint")
         .with_description("Specifies a VPC endpoint. A VPC endpoint provides a private connection between your VPC and an endpoint service. You can use an endpoint service provided by AWS, an MKT Partner, or another AWS account...")

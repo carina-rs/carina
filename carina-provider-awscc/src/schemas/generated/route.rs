@@ -11,6 +11,7 @@ use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, types}
 pub fn ec2_route_config() -> AwsccSchemaConfig {
     AwsccSchemaConfig {
         aws_type_name: "AWS::EC2::Route",
+        resource_type_name: "ec2_route",
         has_tags: false,
         schema: ResourceSchema::new("awscc.ec2_route")
         .with_description("Specifies a route in a route table. For more information, see [Routes](https://docs.aws.amazon.com/vpc/latest/userguide/VPC_Route_Tables.html#route-table-routes) in the *Amazon VPC User Guide*.  You m...")

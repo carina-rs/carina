@@ -11,6 +11,7 @@ use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 pub fn ec2_vpc_gateway_attachment_config() -> AwsccSchemaConfig {
     AwsccSchemaConfig {
         aws_type_name: "AWS::EC2::VPCGatewayAttachment",
+        resource_type_name: "ec2_vpc_gateway_attachment",
         has_tags: false,
         schema: ResourceSchema::new("awscc.ec2_vpc_gateway_attachment")
         .with_description("Resource Type definition for AWS::EC2::VPCGatewayAttachment")
