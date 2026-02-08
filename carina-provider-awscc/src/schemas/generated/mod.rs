@@ -86,7 +86,12 @@ pub fn validate_namespaced_enum(
         }
 
         let normalized = normalize_namespaced_enum(s);
-        if valid_values.contains(&normalized.as_str()) {
+        // Accept both underscore (DSL identifier) and hyphen (AWS value) forms
+        // e.g., "cloud_watch_logs" matches "cloud-watch-logs"
+        let hyphenated = normalized.replace('_', "-");
+        if valid_values.contains(&normalized.as_str())
+            || valid_values.contains(&hyphenated.as_str())
+        {
             Ok(())
         } else {
             Err(format!(
@@ -101,6 +106,7 @@ pub fn validate_namespaced_enum(
 }
 
 pub mod eip;
+pub mod flow_log;
 pub mod internet_gateway;
 pub mod nat_gateway;
 pub mod route;
@@ -130,6 +136,7 @@ pub fn configs() -> Vec<AwsccSchemaConfig> {
         security_group_egress::ec2_security_group_egress_config(),
         vpc_endpoint::ec2_vpc_endpoint_config(),
         vpc_gateway_attachment::ec2_vpc_gateway_attachment_config(),
+        flow_log::ec2_flow_log_config(),
     ]
 }
 
