@@ -1,4 +1,11 @@
+<p align="center">
+  <img src="assets/header.png" alt="Carina" width="600">
+</p>
+
 # Carina
+
+**Carina** represents the keel of *Argo Navis*:
+the structural backbone that quietly supports everything above it.
 
 > [!CAUTION]
 > This is an experimental project. The DSL syntax, APIs, and features are subject to change without notice.
