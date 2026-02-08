@@ -1,0 +1,19 @@
+# EC2 VPC Example
+#
+# Creates a VPC with DNS support enabled.
+
+provider awscc {
+  region = aws.Region.ap_northeast_1
+}
+
+awscc.ec2_vpc {
+  name                 = "example-vpc"
+  cidr_block           = "10.0.0.0/16"
+  enable_dns_support   = true
+  enable_dns_hostnames = true
+  instance_tenancy     = default
+
+  tags = {
+    Environment = "example"
+  }
+}

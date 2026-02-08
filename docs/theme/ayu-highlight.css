@@ -1,0 +1,143 @@
+/* GitHub Light highlight.js theme for code blocks */
+.hljs {
+  color: #24292e;
+  background: #f6f8fa;
+}
+.hljs-keyword {
+  color: #d73a49;
+}
+.hljs-built_in {
+  color: #005cc5;
+}
+.hljs-type {
+  color: #005cc5;
+}
+.hljs-literal {
+  color: #005cc5;
+}
+.hljs-number {
+  color: #005cc5;
+}
+.hljs-operator {
+  color: #d73a49;
+}
+.hljs-punctuation {
+  color: #24292e;
+}
+.hljs-property {
+  color: #005cc5;
+}
+.hljs-regexp {
+  color: #032f62;
+}
+.hljs-string {
+  color: #032f62;
+}
+.hljs-char.escape_ {
+  color: #032f62;
+}
+.hljs-subst {
+  color: #24292e;
+}
+.hljs-symbol {
+  color: #e36209;
+}
+.hljs-variable {
+  color: #e36209;
+}
+.hljs-variable.language_ {
+  color: #005cc5;
+}
+.hljs-variable.constant_ {
+  color: #005cc5;
+}
+.hljs-title {
+  color: #6f42c1;
+}
+.hljs-title.class_ {
+  color: #6f42c1;
+}
+.hljs-title.function_ {
+  color: #6f42c1;
+}
+.hljs-params {
+  color: #24292e;
+}
+.hljs-comment {
+  color: #6a737d;
+}
+.hljs-doctag {
+  color: #d73a49;
+}
+.hljs-meta {
+  color: #005cc5;
+}
+.hljs-section {
+  color: #005cc5;
+}
+.hljs-tag {
+  color: #22863a;
+}
+.hljs-name {
+  color: #22863a;
+}
+.hljs-attr {
+  color: #005cc5;
+}
+.hljs-attribute {
+  color: #032f62;
+}
+.hljs-bullet {
+  color: #005cc5;
+}
+.hljs-code {
+  color: #032f62;
+}
+.hljs-emphasis {
+  color: #24292e;
+  font-style: italic;
+}
+.hljs-strong {
+  color: #24292e;
+  font-weight: bold;
+}
+.hljs-formula {
+  color: #005cc5;
+}
+.hljs-link {
+  color: #032f62;
+  font-style: italic;
+}
+.hljs-quote {
+  color: #22863a;
+  font-style: italic;
+}
+.hljs-selector-tag {
+  color: #22863a;
+}
+.hljs-selector-id {
+  color: #005cc5;
+}
+.hljs-selector-class {
+  color: #6f42c1;
+}
+.hljs-selector-attr {
+  color: #005cc5;
+}
+.hljs-selector-pseudo {
+  color: #005cc5;
+}
+.hljs-template-tag {
+  color: #005cc5;
+}
+.hljs-template-variable {
+  color: #e36209;
+}
+.hljs-addition {
+  color: #22863a;
+  background: rgba(34, 134, 58, 0.15);
+}
+.hljs-deletion {
+  color: #d73a49;
+  background: rgba(215, 58, 73, 0.15);
+}

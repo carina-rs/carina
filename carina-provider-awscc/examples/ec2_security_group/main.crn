@@ -1,0 +1,22 @@
+# EC2 Security Group Example
+#
+# Creates a VPC and a security group within it.
+
+provider awscc {
+  region = aws.Region.ap_northeast_1
+}
+
+let vpc = awscc.ec2_vpc {
+  name       = "example-vpc"
+  cidr_block = "10.0.0.0/16"
+}
+
+awscc.ec2_security_group {
+  name              = "example-sg"
+  vpc_id            = vpc.vpc_id
+  group_description = "Example security group"
+
+  tags = {
+    Environment = "example"
+  }
+}

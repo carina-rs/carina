@@ -1,0 +1,15 @@
+# EC2 Internet Gateway Example
+#
+# Creates a standalone Internet Gateway.
+
+provider awscc {
+  region = aws.Region.ap_northeast_1
+}
+
+awscc.ec2_internet_gateway {
+  name = "example-igw"
+
+  tags = {
+    Environment = "example"
+  }
+}

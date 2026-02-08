@@ -54,6 +54,10 @@ struct Args {
     /// e.g., AWS::EC2::SecurityGroupEgress -> ec2_security_group_egress
     #[arg(long)]
     print_full_resource_name: bool,
+
+    /// Output format: rust (default) or markdown (for documentation)
+    #[arg(long, default_value = "rust")]
+    format: String,
 }
 
 /// CloudFormation Resource Schema
@@ -181,19 +185,143 @@ fn main() -> Result<()> {
     let schema: CfnSchema =
         serde_json::from_str(&schema_json).context("Failed to parse CloudFormation schema")?;
 
-    // Generate code
-    let code = generate_schema_code(&schema, &args.type_name)?;
+    // Generate output based on format
+    let output = match args.format.as_str() {
+        "markdown" | "md" => generate_markdown(&schema, &args.type_name)?,
+        "rust" => generate_schema_code(&schema, &args.type_name)?,
+        other => anyhow::bail!("Unknown format: {}. Use 'rust' or 'markdown'.", other),
+    };
 
     // Output
     if let Some(output_path) = &args.output {
-        std::fs::write(output_path, &code)
+        std::fs::write(output_path, &output)
             .with_context(|| format!("Failed to write to: {}", output_path))?;
         eprintln!("Generated: {}", output_path);
     } else {
-        println!("{}", code);
+        println!("{}", output);
     }
 
     Ok(())
+}
+
+fn generate_markdown(schema: &CfnSchema, type_name: &str) -> Result<String> {
+    let mut md = String::new();
+
+    let full_resource = full_resource_name_from_type(type_name)?;
+    let namespace = format!("awscc.{}", full_resource);
+
+    // Build read-only properties set
+    let read_only: HashSet<String> = schema
+        .read_only_properties
+        .iter()
+        .map(|p| p.trim_start_matches("/properties/").to_string())
+        .collect();
+
+    let required: HashSet<String> = schema.required.iter().cloned().collect();
+
+    // Collect enum info
+    let mut enums: BTreeMap<String, EnumInfo> = BTreeMap::new();
+    for (prop_name, prop) in &schema.properties {
+        let (_, enum_info) = cfn_type_to_carina_type_with_enum(prop, prop_name, schema);
+        if let Some(info) = enum_info {
+            enums.insert(prop_name.clone(), info);
+        }
+    }
+
+    // Title
+    md.push_str(&format!("# awscc.{}\n\n", full_resource));
+    md.push_str(&format!("CloudFormation Type: `{}`\n\n", type_name));
+
+    // Description
+    if let Some(desc) = &schema.description {
+        md.push_str(&format!("{}\n\n", desc));
+    }
+
+    // Attributes table
+    md.push_str("## Attributes\n\n");
+    md.push_str("| Name | Type | Required | Description |\n");
+    md.push_str("|------|------|----------|-------------|\n");
+
+    for (prop_name, prop) in &schema.properties {
+        let attr_name = prop_name.to_snake_case();
+        let is_required = required.contains(prop_name) && !read_only.contains(prop_name);
+        let is_read_only = read_only.contains(prop_name);
+
+        // Determine type display string
+        let type_display = if enums.contains_key(prop_name) {
+            format!("Enum ({})", enums[prop_name].type_name)
+        } else if prop_name == "Tags" {
+            "Map".to_string()
+        } else if let Some(ref_path) = &prop.ref_path {
+            if ref_path.contains("/Tag") {
+                "Map".to_string()
+            } else {
+                "String".to_string()
+            }
+        } else {
+            match prop.prop_type.as_ref().and_then(|t| t.as_str()) {
+                Some("string") => {
+                    let prop_lower = prop_name.to_lowercase();
+                    if prop_lower.contains("cidrblock") || prop_lower == "cidr_block" {
+                        "CIDR".to_string()
+                    } else {
+                        "String".to_string()
+                    }
+                }
+                Some("boolean") => "Bool".to_string(),
+                Some("integer") | Some("number") => "Int".to_string(),
+                Some("array") => "List".to_string(),
+                Some("object") => "Map".to_string(),
+                _ => "String".to_string(),
+            }
+        };
+
+        let desc = if is_read_only {
+            "(read-only)".to_string()
+        } else if let Some(d) = &prop.description {
+            d.replace('\n', " ").replace("  ", " ").replace('|', "\\|")
+        } else {
+            String::new()
+        };
+
+        let req_str = if is_read_only {
+            ""
+        } else if is_required {
+            "Yes"
+        } else {
+            "No"
+        };
+
+        md.push_str(&format!(
+            "| `{}` | {} | {} | {} |\n",
+            attr_name, type_display, req_str, desc
+        ));
+    }
+    md.push('\n');
+
+    // Enum values section
+    if !enums.is_empty() {
+        md.push_str("## Enum Values\n\n");
+        for (prop_name, enum_info) in &enums {
+            let attr_name = prop_name.to_snake_case();
+            md.push_str(&format!("### {} ({})\n\n", attr_name, enum_info.type_name));
+            md.push_str("| Value | DSL Identifier |\n");
+            md.push_str("|-------|----------------|\n");
+            for value in &enum_info.values {
+                let dsl_id = format!("{}.{}.{}", namespace, enum_info.type_name, value);
+                md.push_str(&format!("| `{}` | `{}` |\n", value, dsl_id));
+            }
+            md.push('\n');
+            md.push_str(&format!(
+                "Shorthand formats: `{}` or `{}.{}`\n\n",
+                enum_info.values.first().unwrap_or(&String::new()),
+                enum_info.type_name,
+                enum_info.values.first().unwrap_or(&String::new()),
+            ));
+        }
+    }
+
+    Ok(md)
 }
 
 fn generate_schema_code(schema: &CfnSchema, type_name: &str) -> Result<String> {
