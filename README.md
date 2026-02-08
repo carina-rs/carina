@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/header.png" alt="Carina" width="600">
+  <img src="assets/header.png" alt="Carina">
 </p>
 
 # Carina
