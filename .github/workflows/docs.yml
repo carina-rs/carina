@@ -1,0 +1,34 @@
+name: Deploy Docs
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "docs/**"
+  workflow_dispatch:
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install mdbook
+        uses: taiki-e/install-action@v2
+        with:
+          tool: mdbook
+
+      - name: Build docs
+        run: mdbook build docs
+
+      - name: Deploy to carina-rs.github.io
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          external_repository: carina-rs/carina-rs.github.io
+          publish_branch: main
+          publish_dir: ./docs/book
+          personal_token: ${{ secrets.DOCS_DEPLOY_TOKEN }}
