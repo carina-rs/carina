@@ -1,0 +1,27 @@
+# EC2 Security Group Egress Rule Example
+#
+# Creates a VPC, a security group, and an outbound rule
+# allowing all traffic.
+
+provider awscc {
+  region = aws.Region.ap_northeast_1
+}
+
+let vpc = awscc.ec2_vpc {
+  name       = "example-vpc"
+  cidr_block = "10.0.0.0/16"
+}
+
+let sg = awscc.ec2_security_group {
+  name              = "example-sg"
+  vpc_id            = vpc.vpc_id
+  group_description = "Example security group"
+}
+
+awscc.ec2_security_group_egress {
+  name        = "example-all-outbound"
+  group_id    = sg.group_id
+  description = "Allow all outbound traffic"
+  ip_protocol = "-1"
+  cidr_ip     = "0.0.0.0/0"
+}

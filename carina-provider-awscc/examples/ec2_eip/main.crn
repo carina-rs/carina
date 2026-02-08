@@ -1,0 +1,16 @@
+# EC2 Elastic IP Example
+#
+# Creates a standalone Elastic IP address for use in a VPC.
+
+provider awscc {
+  region = aws.Region.ap_northeast_1
+}
+
+awscc.ec2_eip {
+  name   = "example-eip"
+  domain = "vpc"
+
+  tags = {
+    Environment = "example"
+  }
+}

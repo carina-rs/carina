@@ -1,0 +1,37 @@
+# EC2 NAT Gateway Example
+#
+# Creates a VPC, a public subnet, an Elastic IP, and a public NAT Gateway.
+
+provider awscc {
+  region = aws.Region.ap_northeast_1
+}
+
+let vpc = awscc.ec2_vpc {
+  name                 = "example-vpc"
+  cidr_block           = "10.0.0.0/16"
+  enable_dns_support   = true
+  enable_dns_hostnames = true
+}
+
+let public_subnet = awscc.ec2_subnet {
+  name                    = "example-public-subnet"
+  vpc_id                  = vpc.vpc_id
+  cidr_block              = "10.0.1.0/24"
+  availability_zone       = "ap-northeast-1a"
+  map_public_ip_on_launch = true
+}
+
+let eip = awscc.ec2_eip {
+  name   = "example-nat-eip"
+  domain = "vpc"
+}
+
+awscc.ec2_nat_gateway {
+  name          = "example-nat-gw"
+  allocation_id = eip.allocation_id
+  subnet_id     = public_subnet.subnet_id
+
+  tags = {
+    Environment = "example"
+  }
+}

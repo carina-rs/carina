@@ -1,0 +1,29 @@
+# EC2 Security Group Ingress Rule Example
+#
+# Creates a VPC, a security group, and an inbound rule
+# allowing HTTPS traffic from the VPC CIDR.
+
+provider awscc {
+  region = aws.Region.ap_northeast_1
+}
+
+let vpc = awscc.ec2_vpc {
+  name       = "example-vpc"
+  cidr_block = "10.0.0.0/16"
+}
+
+let sg = awscc.ec2_security_group {
+  name              = "example-sg"
+  vpc_id            = vpc.vpc_id
+  group_description = "Example security group"
+}
+
+awscc.ec2_security_group_ingress {
+  name        = "example-https-ingress"
+  group_id    = sg.group_id
+  description = "Allow HTTPS from VPC"
+  ip_protocol = "tcp"
+  from_port   = 443
+  to_port     = 443
+  cidr_ip     = "10.0.0.0/16"
+}

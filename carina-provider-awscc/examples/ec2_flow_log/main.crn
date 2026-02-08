@@ -1,0 +1,26 @@
+# EC2 Flow Log Example
+#
+# Creates a VPC and a flow log that sends traffic logs to S3.
+# Note: The S3 bucket must exist before applying this configuration.
+
+provider awscc {
+  region = aws.Region.ap_northeast_1
+}
+
+let vpc = awscc.ec2_vpc {
+  name       = "example-vpc"
+  cidr_block = "10.0.0.0/16"
+}
+
+awscc.ec2_flow_log {
+  name                 = "example-flow-log"
+  resource_id          = vpc.vpc_id
+  resource_type        = VPC
+  traffic_type         = ALL
+  log_destination_type = s3
+  log_destination      = "arn:aws:s3:::example-flow-logs-bucket"
+
+  tags = {
+    Environment = "example"
+  }
+}

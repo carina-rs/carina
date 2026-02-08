@@ -1,0 +1,13 @@
+[book]
+title = "Carina Documentation"
+authors = ["Gosuke Miyashita"]
+language = "en"
+src = "src"
+
+[build]
+build-dir = "book"
+
+[output.html]
+default-theme = "latte"
+preferred-dark-theme = "mocha"
+additional-css = ["./theme/catppuccin.css"]
