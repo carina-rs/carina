@@ -26,6 +26,7 @@ RESOURCE_TYPES=(
     "AWS::EC2::SecurityGroupEgress"
     "AWS::EC2::VPCEndpoint"
     "AWS::EC2::VPCGatewayAttachment"
+    "AWS::EC2::FlowLog"
 )
 
 echo "Generating awscc provider schemas..."
@@ -161,7 +162,12 @@ pub fn validate_namespaced_enum(
         }
 
         let normalized = normalize_namespaced_enum(s);
-        if valid_values.contains(&normalized.as_str()) {
+        // Accept both underscore (DSL identifier) and hyphen (AWS value) forms
+        // e.g., "cloud_watch_logs" matches "cloud-watch-logs"
+        let hyphenated = normalized.replace('_', "-");
+        if valid_values.contains(&normalized.as_str())
+            || valid_values.contains(&hyphenated.as_str())
+        {
             Ok(())
         } else {
             Err(format!(

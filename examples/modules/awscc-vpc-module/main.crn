@@ -53,8 +53,13 @@ let vpc = awscc.ec2_vpc {
 # ========================================
 
 let igw = awscc.ec2_internet_gateway {
-  name   = input.name
-  vpc_id = vpc.vpc_id
+  name = input.name
+}
+
+awscc.ec2_vpc_gateway_attachment {
+  name                = input.name
+  vpc_id              = vpc.vpc_id
+  internet_gateway_id = igw.internet_gateway_id
 }
 
 # ========================================
@@ -368,11 +373,11 @@ let vpc_endpoint_sg = awscc.ec2_security_group {
 }
 
 awscc.ec2_security_group_ingress {
-  name              = "${input.name}-vpc-endpoint-https"
-  security_group_id = vpc_endpoint_sg.group_id
-  description       = "Allow access to 443 port"
-  ip_protocol       = "tcp"
-  from_port         = 443
+  name        = "${input.name}-vpc-endpoint-https"
+  group_id    = vpc_endpoint_sg.group_id
+  description = "Allow access to 443 port"
+  ip_protocol = "tcp"
+  from_port   = 443
   to_port           = 443
   cidr_ip           = input.cidr_block
 }

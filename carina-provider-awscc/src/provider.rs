@@ -13,8 +13,10 @@ use carina_core::provider::{ProviderError, ProviderResult};
 use carina_core::resource::{Resource, ResourceId, State, Value};
 use serde_json::json;
 
+use carina_core::schema::AttributeType;
+
 use crate::schemas::generated::AwsccSchemaConfig;
-use crate::utils::{normalize_availability_zone, normalize_instance_tenancy};
+use crate::utils::{convert_enum_value, normalize_availability_zone, normalize_instance_tenancy};
 
 /// Get the AwsccSchemaConfig for a resource type
 fn get_schema_config(resource_type: &str) -> Option<AwsccSchemaConfig> {
@@ -298,7 +300,7 @@ impl AwsccProvider {
             if let Some(aws_name) = &attr_schema.provider_name
                 && let Some(value) = resource.attributes.get(dsl_name.as_str())
             {
-                let aws_value = self.dsl_value_to_aws(dsl_name, value);
+                let aws_value = self.dsl_value_to_aws(dsl_name, value, &attr_schema.attr_type);
                 if let Some(v) = aws_value {
                     desired_state.insert(aws_name.to_string(), v);
                 }
@@ -366,7 +368,8 @@ impl AwsccProvider {
             }
             if let Some(aws_name) = &attr_schema.provider_name
                 && let Some(value) = to.attributes.get(dsl_name.as_str())
-                && let Some(aws_value) = self.dsl_value_to_aws(dsl_name, value)
+                && let Some(aws_value) =
+                    self.dsl_value_to_aws(dsl_name, value, &attr_schema.attr_type)
             {
                 patch_ops.push(json!({
                     "op": "replace",
@@ -453,7 +456,12 @@ impl AwsccProvider {
     }
 
     /// Convert DSL value to AWS JSON value
-    fn dsl_value_to_aws(&self, dsl_name: &str, value: &Value) -> Option<serde_json::Value> {
+    fn dsl_value_to_aws(
+        &self,
+        dsl_name: &str,
+        value: &Value,
+        attr_type: &AttributeType,
+    ) -> Option<serde_json::Value> {
         match dsl_name {
             "availability_zone" => {
                 if let Value::String(s) = value {
@@ -469,7 +477,25 @@ impl AwsccProvider {
                     None
                 }
             }
-            _ => self.value_to_json(value),
+            _ => {
+                // For Custom (enum) types, convert enum values
+                if matches!(attr_type, AttributeType::Custom { .. }) {
+                    match value {
+                        Value::String(s) => Some(json!(convert_enum_value(s))),
+                        Value::UnresolvedIdent(ident, member) => {
+                            let raw = if let Some(m) = member {
+                                m.clone()
+                            } else {
+                                ident.clone()
+                            };
+                            Some(json!(raw.replace('_', "-")))
+                        }
+                        _ => self.value_to_json(value),
+                    }
+                } else {
+                    self.value_to_json(value)
+                }
+            }
         }
     }
 
