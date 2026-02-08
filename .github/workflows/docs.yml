@@ -7,10 +7,6 @@ on:
       - "docs/**"
   workflow_dispatch:
 
-permissions:
-  pages: write
-  id-token: write
-
 concurrency:
   group: pages
   cancel-in-progress: false
@@ -18,9 +14,6 @@ concurrency:
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - uses: actions/checkout@v4
 
@@ -32,11 +25,10 @@ jobs:
       - name: Build docs
         run: mdbook build docs
 
-      - name: Upload artifact
-        uses: actions/upload-pages-artifact@v3
+      - name: Deploy to carina-rs.github.io
+        uses: peaceiris/actions-gh-pages@v4
         with:
-          path: docs/book
-
-      - name: Deploy to GitHub Pages
-        id: deployment
-        uses: actions/deploy-pages@v4
+          external_repository: carina-rs/carina-rs.github.io
+          publish_branch: main
+          publish_dir: ./docs/book
+          personal_token: ${{ secrets.DOCS_DEPLOY_TOKEN }}
