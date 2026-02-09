@@ -8,6 +8,48 @@ use std::fmt;
 
 use crate::resource::Value;
 
+/// A field within a Struct type
+#[derive(Debug, Clone)]
+pub struct StructField {
+    /// Field name (snake_case, e.g., "ip_protocol")
+    pub name: String,
+    /// Field type
+    pub field_type: AttributeType,
+    /// Whether this field is required
+    pub required: bool,
+    /// Description of this field
+    pub description: Option<String>,
+    /// Provider-side property name (e.g., "IpProtocol")
+    pub provider_name: Option<String>,
+}
+
+impl StructField {
+    pub fn new(name: impl Into<String>, field_type: AttributeType) -> Self {
+        Self {
+            name: name.into(),
+            field_type,
+            required: false,
+            description: None,
+            provider_name: None,
+        }
+    }
+
+    pub fn required(mut self) -> Self {
+        self.required = true;
+        self
+    }
+
+    pub fn with_description(mut self, desc: impl Into<String>) -> Self {
+        self.description = Some(desc.into());
+        self
+    }
+
+    pub fn with_provider_name(mut self, name: impl Into<String>) -> Self {
+        self.provider_name = Some(name.into());
+        self
+    }
+}
+
 /// Attribute type
 #[derive(Debug, Clone)]
 pub enum AttributeType {
@@ -32,6 +74,11 @@ pub enum AttributeType {
     List(Box<AttributeType>),
     /// Map
     Map(Box<AttributeType>),
+    /// Struct (named object with typed fields)
+    Struct {
+        name: String,
+        fields: Vec<StructField>,
+    },
 }
 
 impl AttributeType {
@@ -114,6 +161,36 @@ impl AttributeType {
                 Ok(())
             }
 
+            (AttributeType::Struct { fields, .. }, Value::Map(map)) => {
+                // Check required fields
+                for field in fields {
+                    if field.required && !map.contains_key(&field.name) {
+                        return Err(TypeError::StructFieldError {
+                            field: field.name.clone(),
+                            inner: Box::new(TypeError::MissingRequired {
+                                name: field.name.clone(),
+                            }),
+                        });
+                    }
+                }
+                // Type-check each field value
+                let field_map: std::collections::HashMap<&str, &StructField> =
+                    fields.iter().map(|f| (f.name.as_str(), f)).collect();
+                for (k, v) in map {
+                    if let Some(field) = field_map.get(k.as_str()) {
+                        field
+                            .field_type
+                            .validate(v)
+                            .map_err(|e| TypeError::StructFieldError {
+                                field: k.clone(),
+                                inner: Box::new(e),
+                            })?;
+                    }
+                    // Unknown fields are allowed (for flexibility)
+                }
+                Ok(())
+            }
+
             _ => Err(TypeError::TypeMismatch {
                 expected: self.type_name(),
                 got: value.type_name(),
@@ -130,6 +207,7 @@ impl AttributeType {
             AttributeType::Custom { name, .. } => name.clone(),
             AttributeType::List(inner) => format!("List<{}>", inner.type_name()),
             AttributeType::Map(inner) => format!("Map<{}>", inner.type_name()),
+            AttributeType::Struct { name, .. } => format!("Struct({})", name),
         }
     }
 }
@@ -166,6 +244,12 @@ pub enum TypeError {
 
     #[error("Map value for key '{key}': {inner}")]
     MapValueError { key: String, inner: Box<TypeError> },
+
+    #[error("Struct field '{field}': {inner}")]
+    StructFieldError {
+        field: String,
+        inner: Box<TypeError>,
+    },
 }
 
 impl Value {
@@ -485,5 +569,60 @@ mod tests {
         assert!(t.validate(&Value::String("10.0.0/16".to_string())).is_err()); // only 3 octets
         assert!(t.validate(&Value::String("invalid".to_string())).is_err()); // not a CIDR
         assert!(t.validate(&Value::Int(42)).is_err()); // wrong type
+    }
+
+    #[test]
+    fn validate_struct_type() {
+        let t = AttributeType::Struct {
+            name: "Ingress".to_string(),
+            fields: vec![
+                StructField::new("ip_protocol", AttributeType::String).required(),
+                StructField::new("from_port", AttributeType::Int),
+                StructField::new("to_port", AttributeType::Int),
+            ],
+        };
+
+        // Valid: all required fields present
+        let mut map = HashMap::new();
+        map.insert("ip_protocol".to_string(), Value::String("tcp".to_string()));
+        map.insert("from_port".to_string(), Value::Int(80));
+        assert!(t.validate(&Value::Map(map)).is_ok());
+
+        // Invalid: missing required field
+        let empty_map = HashMap::new();
+        assert!(t.validate(&Value::Map(empty_map)).is_err());
+
+        // Invalid: wrong type for field
+        let mut bad_map = HashMap::new();
+        bad_map.insert("ip_protocol".to_string(), Value::String("tcp".to_string()));
+        bad_map.insert(
+            "from_port".to_string(),
+            Value::String("not_a_number".to_string()),
+        );
+        assert!(t.validate(&Value::Map(bad_map)).is_err());
+
+        // Invalid: not a Map
+        assert!(
+            t.validate(&Value::String("not a struct".to_string()))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn validate_list_of_struct() {
+        let struct_type = AttributeType::Struct {
+            name: "Ingress".to_string(),
+            fields: vec![StructField::new("ip_protocol", AttributeType::String).required()],
+        };
+        let list_type = AttributeType::List(Box::new(struct_type));
+
+        let mut item = HashMap::new();
+        item.insert("ip_protocol".to_string(), Value::String("tcp".to_string()));
+        let list = Value::List(vec![Value::Map(item)]);
+        assert!(list_type.validate(&list).is_ok());
+
+        // Invalid item in list
+        let bad_list = Value::List(vec![Value::Map(HashMap::new())]);
+        assert!(list_type.validate(&bad_list).is_err());
     }
 }

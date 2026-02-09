@@ -6,7 +6,7 @@
 
 use super::AwsccSchemaConfig;
 use super::tags_type;
-use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, types};
+use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField, types};
 
 /// Returns the schema config for ec2_subnet (AWS::EC2::Subnet)
 pub fn ec2_subnet_config() -> AwsccSchemaConfig {
@@ -32,7 +32,12 @@ pub fn ec2_subnet_config() -> AwsccSchemaConfig {
                 .with_provider_name("AvailabilityZoneId"),
         )
         .attribute(
-            AttributeSchema::new("block_public_access_states", AttributeType::Map(Box::new(AttributeType::String)))
+            AttributeSchema::new("block_public_access_states", AttributeType::Struct {
+                    name: "BlockPublicAccessStates".to_string(),
+                    fields: vec![
+                    StructField::new("internet_gateway_block_mode", AttributeType::String).with_description("The mode of VPC BPA. Options here are off, block-bidirectional, block-ingress ").with_provider_name("InternetGatewayBlockMode")
+                    ],
+                })
                 .with_description(" (read-only)")
                 .with_provider_name("BlockPublicAccessStates"),
         )
@@ -102,7 +107,14 @@ pub fn ec2_subnet_config() -> AwsccSchemaConfig {
                 .with_provider_name("OutpostArn"),
         )
         .attribute(
-            AttributeSchema::new("private_dns_name_options_on_launch", AttributeType::Map(Box::new(AttributeType::String)))
+            AttributeSchema::new("private_dns_name_options_on_launch", AttributeType::Struct {
+                    name: "PrivateDnsNameOptionsOnLaunch".to_string(),
+                    fields: vec![
+                    StructField::new("enable_resource_name_dns_aaaa_record", AttributeType::Bool).with_provider_name("EnableResourceNameDnsAAAARecord"),
+                    StructField::new("enable_resource_name_dns_a_record", AttributeType::Bool).with_provider_name("EnableResourceNameDnsARecord"),
+                    StructField::new("hostname_type", AttributeType::String).with_provider_name("HostnameType")
+                    ],
+                })
                 .with_description("The hostname type for EC2 instances launched into this subnet and how DNS A and AAAA record queries to the instances should be handled. For more infor...")
                 .with_provider_name("PrivateDnsNameOptionsOnLaunch"),
         )

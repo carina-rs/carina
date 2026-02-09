@@ -6,7 +6,7 @@
 
 use super::AwsccSchemaConfig;
 use super::tags_type;
-use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
 
 /// Returns the schema config for ec2_security_group (AWS::EC2::SecurityGroup)
 pub fn ec2_security_group_config() -> AwsccSchemaConfig {
@@ -38,12 +38,38 @@ pub fn ec2_security_group_config() -> AwsccSchemaConfig {
                 .with_provider_name("Id"),
         )
         .attribute(
-            AttributeSchema::new("security_group_egress", AttributeType::List(Box::new(AttributeType::String)))
+            AttributeSchema::new("security_group_egress", AttributeType::List(Box::new(AttributeType::Struct {
+                    name: "Egress".to_string(),
+                    fields: vec![
+                    StructField::new("cidr_ip", AttributeType::String).with_provider_name("CidrIp"),
+                    StructField::new("cidr_ipv6", AttributeType::String).with_provider_name("CidrIpv6"),
+                    StructField::new("description", AttributeType::String).with_provider_name("Description"),
+                    StructField::new("destination_prefix_list_id", AttributeType::String).with_provider_name("DestinationPrefixListId"),
+                    StructField::new("destination_security_group_id", AttributeType::String).with_provider_name("DestinationSecurityGroupId"),
+                    StructField::new("from_port", AttributeType::Int).with_provider_name("FromPort"),
+                    StructField::new("ip_protocol", AttributeType::String).required().with_provider_name("IpProtocol"),
+                    StructField::new("to_port", AttributeType::Int).with_provider_name("ToPort")
+                    ],
+                })))
                 .with_description("[VPC only] The outbound rules associated with the security group. There is a short interruption during which you cannot connect to the security group.")
                 .with_provider_name("SecurityGroupEgress"),
         )
         .attribute(
-            AttributeSchema::new("security_group_ingress", AttributeType::List(Box::new(AttributeType::String)))
+            AttributeSchema::new("security_group_ingress", AttributeType::List(Box::new(AttributeType::Struct {
+                    name: "Ingress".to_string(),
+                    fields: vec![
+                    StructField::new("cidr_ip", AttributeType::String).with_provider_name("CidrIp"),
+                    StructField::new("cidr_ipv6", AttributeType::String).with_provider_name("CidrIpv6"),
+                    StructField::new("description", AttributeType::String).with_provider_name("Description"),
+                    StructField::new("from_port", AttributeType::Int).with_provider_name("FromPort"),
+                    StructField::new("ip_protocol", AttributeType::String).required().with_provider_name("IpProtocol"),
+                    StructField::new("source_prefix_list_id", AttributeType::String).with_provider_name("SourcePrefixListId"),
+                    StructField::new("source_security_group_id", AttributeType::String).with_provider_name("SourceSecurityGroupId"),
+                    StructField::new("source_security_group_name", AttributeType::String).with_provider_name("SourceSecurityGroupName"),
+                    StructField::new("source_security_group_owner_id", AttributeType::String).with_provider_name("SourceSecurityGroupOwnerId"),
+                    StructField::new("to_port", AttributeType::Int).with_provider_name("ToPort")
+                    ],
+                })))
                 .with_description("The inbound rules associated with the security group. There is a short interruption during which you cannot connect to the security group.")
                 .with_provider_name("SecurityGroupIngress"),
         )

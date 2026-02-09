@@ -8,7 +8,7 @@ use super::AwsccSchemaConfig;
 use super::tags_type;
 use super::validate_namespaced_enum;
 use carina_core::resource::Value;
-use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
 
 const VALID_LOG_DESTINATION_TYPE: &[&str] = &["cloud-watch-logs", "s3", "kinesis-data-firehose"];
 
@@ -69,7 +69,14 @@ pub fn ec2_flow_log_config() -> AwsccSchemaConfig {
                 .with_provider_name("DeliverLogsPermissionArn"),
         )
         .attribute(
-            AttributeSchema::new("destination_options", AttributeType::Map(Box::new(AttributeType::String)))
+            AttributeSchema::new("destination_options", AttributeType::Struct {
+                    name: "DestinationOptions".to_string(),
+                    fields: vec![
+                    StructField::new("file_format", AttributeType::Enum(vec!["plain-text".to_string(), "parquet".to_string()])).required().with_provider_name("FileFormat"),
+                    StructField::new("hive_compatible_partitions", AttributeType::Bool).required().with_provider_name("HiveCompatiblePartitions"),
+                    StructField::new("per_hour_partition", AttributeType::Bool).required().with_provider_name("PerHourPartition")
+                    ],
+                })
                 .with_provider_name("DestinationOptions"),
         )
         .attribute(

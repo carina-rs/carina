@@ -21,7 +21,7 @@ Specifies a VPC endpoint. A VPC endpoint provides a private connection between y
 
 ### `dns_options`
 
-- **Type:** String
+- **Type:** Struct(DnsOptionsSpecification)
 - **Required:** No
 
 Describes the DNS options for an endpoint.
@@ -151,6 +151,17 @@ Shorthand formats: `ipv4` or `IpAddressType.ipv4`
 | `Resource` | `awscc.ec2_vpc_endpoint.VpcEndpointType.Resource` |
 
 Shorthand formats: `Interface` or `VpcEndpointType.Interface`
+
+## Struct Definitions
+
+### DnsOptionsSpecification
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `dns_record_ip_type` | String | No | The DNS records created for the endpoint. |
+| `private_dns_only_for_inbound_resolver_endpoint` | String | No | Indicates whether to enable private DNS only for inbound endpoints. This option is available only fo... |
+| `private_dns_preference` | String | No | The preference for which private domains have a private hosted zone created for and associated with ... |
+| `private_dns_specified_domains` | List | No | Indicates which of the private domains to create private hosted zones for and associate with the spe... |
 
 
 
