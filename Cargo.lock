@@ -706,6 +706,7 @@ dependencies = [
  "log",
  "pest",
  "ropey",
+ "serde_json",
  "tempfile",
  "tokio",
  "tower-lsp",

@@ -1,13 +1,6 @@
 use tower_lsp::{LspService, Server};
 
-mod backend;
-mod completion;
-mod diagnostics;
-mod document;
-mod hover;
-mod semantic_tokens;
-
-use backend::Backend;
+use carina_lsp::Backend;
 
 #[tokio::main]
 async fn main() {

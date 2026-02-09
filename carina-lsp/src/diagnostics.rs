@@ -7,10 +7,21 @@ use carina_core::parser::{InputParameter, ParseError, ParsedFile, TypeExpr};
 use carina_core::resource::Value;
 use carina_core::schema::validate_cidr;
 use carina_provider_aws::schemas::{s3, types as aws_types, vpc};
+use carina_provider_awscc::schemas::generated::flow_log as awscc_flow_log;
+use carina_provider_awscc::schemas::generated::nat_gateway as awscc_nat_gateway;
+use carina_provider_awscc::schemas::generated::security_group as awscc_security_group;
+use carina_provider_awscc::schemas::generated::subnet as awscc_subnet;
 use carina_provider_awscc::schemas::generated::vpc as awscc_vpc;
+use carina_provider_awscc::schemas::generated::vpc_endpoint as awscc_vpc_endpoint;
 
 pub struct DiagnosticEngine {
     valid_resource_types: HashSet<String>,
+}
+
+impl Default for DiagnosticEngine {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl DiagnosticEngine {
@@ -32,6 +43,11 @@ impl DiagnosticEngine {
 
         // AWS Cloud Control resources
         valid_resource_types.insert("awscc.ec2_vpc".to_string());
+        valid_resource_types.insert("awscc.ec2_security_group".to_string());
+        valid_resource_types.insert("awscc.ec2_flow_log".to_string());
+        valid_resource_types.insert("awscc.ec2_nat_gateway".to_string());
+        valid_resource_types.insert("awscc.ec2_vpc_endpoint".to_string());
+        valid_resource_types.insert("awscc.ec2_subnet".to_string());
 
         Self {
             valid_resource_types,
@@ -256,6 +272,29 @@ impl DiagnosticEngine {
                                     ..Default::default()
                                 });
                             }
+
+                            // Struct field validation
+                            let struct_fields = match &attr_schema.attr_type {
+                                carina_core::schema::AttributeType::Struct { fields, .. } => {
+                                    Some(fields)
+                                }
+                                carina_core::schema::AttributeType::List(inner) => {
+                                    match inner.as_ref() {
+                                        carina_core::schema::AttributeType::Struct {
+                                            fields,
+                                            ..
+                                        } => Some(fields),
+                                        _ => None,
+                                    }
+                                }
+                                _ => None,
+                            };
+
+                            if let Some(fields) = struct_fields {
+                                diagnostics.extend(
+                                    self.validate_struct_value(doc, attr_name, attr_value, fields),
+                                );
+                            }
                         }
                     }
                 }
@@ -281,6 +320,13 @@ impl DiagnosticEngine {
             "security_group.egress_rule" => Some(vpc::security_group_egress_rule_schema()),
             // AWS Cloud Control resources
             "awscc.ec2_vpc" => Some(awscc_vpc::ec2_vpc_config().schema),
+            "awscc.ec2_security_group" => {
+                Some(awscc_security_group::ec2_security_group_config().schema)
+            }
+            "awscc.ec2_flow_log" => Some(awscc_flow_log::ec2_flow_log_config().schema),
+            "awscc.ec2_nat_gateway" => Some(awscc_nat_gateway::ec2_nat_gateway_config().schema),
+            "awscc.ec2_vpc_endpoint" => Some(awscc_vpc_endpoint::ec2_vpc_endpoint_config().schema),
+            "awscc.ec2_subnet" => Some(awscc_subnet::ec2_subnet_config().schema),
             _ => None,
         }
     }
@@ -314,6 +360,151 @@ impl DiagnosticEngine {
             // Calculate column position (account for leading whitespace)
             let leading_ws = line.len() - trimmed.len();
             return Some((line_idx as u32, leading_ws as u32));
+        }
+        None
+    }
+
+    /// Validate struct values (fields inside nested blocks)
+    fn validate_struct_value(
+        &self,
+        doc: &Document,
+        attr_name: &str,
+        value: &Value,
+        fields: &[carina_core::schema::StructField],
+    ) -> Vec<Diagnostic> {
+        let mut diagnostics = Vec::new();
+
+        let maps: Vec<&std::collections::HashMap<String, Value>> = match value {
+            Value::Map(map) => vec![map],
+            Value::List(items) => items
+                .iter()
+                .filter_map(|item| {
+                    if let Value::Map(map) = item {
+                        Some(map)
+                    } else {
+                        None
+                    }
+                })
+                .collect(),
+            _ => return diagnostics,
+        };
+
+        let field_names: HashSet<&str> = fields.iter().map(|f| f.name.as_str()).collect();
+        let field_map: HashMap<&str, &carina_core::schema::StructField> =
+            fields.iter().map(|f| (f.name.as_str(), f)).collect();
+
+        for map in maps {
+            for (key, val) in map {
+                if let Some((line, col)) = self.find_nested_field_position(doc, attr_name, key) {
+                    // Check for unknown fields
+                    if !field_names.contains(key.as_str()) {
+                        diagnostics.push(Diagnostic {
+                            range: Range {
+                                start: Position {
+                                    line,
+                                    character: col,
+                                },
+                                end: Position {
+                                    line,
+                                    character: col + key.len() as u32,
+                                },
+                            },
+                            severity: Some(DiagnosticSeverity::WARNING),
+                            source: Some("carina".to_string()),
+                            message: format!("Unknown field '{}' in '{}'", key, attr_name),
+                            ..Default::default()
+                        });
+                        continue;
+                    }
+
+                    // Type validation for known fields
+                    if let Some(field) = field_map.get(key.as_str()) {
+                        let type_error = match (&field.field_type, val) {
+                            (carina_core::schema::AttributeType::Bool, Value::String(s)) => {
+                                Some(format!(
+                                    "Type mismatch: expected Bool, got String \"{}\". Use true or false.",
+                                    s
+                                ))
+                            }
+                            (carina_core::schema::AttributeType::Int, Value::String(s)) => Some(
+                                format!("Type mismatch: expected Int, got String \"{}\".", s),
+                            ),
+                            _ => None,
+                        };
+
+                        if let Some(message) = type_error {
+                            diagnostics.push(Diagnostic {
+                                range: Range {
+                                    start: Position {
+                                        line,
+                                        character: col,
+                                    },
+                                    end: Position {
+                                        line,
+                                        character: col + key.len() as u32,
+                                    },
+                                },
+                                severity: Some(DiagnosticSeverity::WARNING),
+                                source: Some("carina".to_string()),
+                                message,
+                                ..Default::default()
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        diagnostics
+    }
+
+    /// Find the position of a field inside a nested block (e.g., field inside `attr_name { ... }`)
+    fn find_nested_field_position(
+        &self,
+        doc: &Document,
+        block_name: &str,
+        field_name: &str,
+    ) -> Option<(u32, u32)> {
+        let text = doc.text();
+        let mut in_block = false;
+        let mut brace_depth = 0;
+
+        for (line_idx, line) in text.lines().enumerate() {
+            let trimmed = line.trim();
+
+            // Look for "block_name {" (without "=")
+            if !in_block && trimmed.starts_with(block_name) && !trimmed.contains('=') {
+                let after = trimmed[block_name.len()..].trim();
+                if after.starts_with('{') {
+                    in_block = true;
+                    brace_depth = 1;
+                    continue;
+                }
+            }
+
+            if in_block {
+                for ch in trimmed.chars() {
+                    if ch == '{' {
+                        brace_depth += 1;
+                    } else if ch == '}' {
+                        brace_depth -= 1;
+                        if brace_depth == 0 {
+                            in_block = false;
+                            break;
+                        }
+                    }
+                }
+
+                if in_block && brace_depth == 1 {
+                    // Check if this line starts with the field name
+                    if let Some(after) = trimmed.strip_prefix(field_name)
+                        && (after.starts_with(' ') || after.starts_with('='))
+                    {
+                        let leading_ws = line.len() - trimmed.len();
+                        return Some((line_idx as u32, leading_ws as u32));
+                    }
+                }
+            }
         }
         None
     }
@@ -893,5 +1084,75 @@ fn parse_error_to_diagnostic(error: &ParseError) -> Diagnostic {
             message: format!("Module not found: {}", name),
             ..Default::default()
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::document::Document;
+
+    fn create_document(content: &str) -> Document {
+        Document::new(content.to_string())
+    }
+
+    #[test]
+    fn unknown_field_in_struct_block() {
+        let engine = DiagnosticEngine::new();
+        let doc = create_document(
+            r#"provider awscc {
+    region = aws.Region.ap_northeast_1
+}
+
+awscc.ec2_security_group {
+    name = "test-sg"
+    group_description = "Test security group"
+    security_group_ingress {
+        ip_protocol = "tcp"
+        unknown_field = "bad"
+    }
+}"#,
+        );
+
+        let diagnostics = engine.analyze(&doc, None);
+
+        let unknown_field_diag = diagnostics
+            .iter()
+            .find(|d| d.message.contains("Unknown field 'unknown_field'"));
+        assert!(
+            unknown_field_diag.is_some(),
+            "Should warn about unknown field in struct block. Got diagnostics: {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn type_mismatch_in_struct_field() {
+        let engine = DiagnosticEngine::new();
+        let doc = create_document(
+            r#"provider awscc {
+    region = aws.Region.ap_northeast_1
+}
+
+awscc.ec2_security_group {
+    name = "test-sg"
+    group_description = "Test security group"
+    security_group_ingress {
+        ip_protocol = "tcp"
+        from_port = "not_a_number"
+    }
+}"#,
+        );
+
+        let diagnostics = engine.analyze(&doc, None);
+
+        let type_mismatch = diagnostics
+            .iter()
+            .find(|d| d.message.contains("Type mismatch") && d.message.contains("Int"));
+        assert!(
+            type_mismatch.is_some(),
+            "Should warn about type mismatch for Int field. Got diagnostics: {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
     }
 }

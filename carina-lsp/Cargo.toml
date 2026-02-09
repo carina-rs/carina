@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 
+[lib]
+name = "carina_lsp"
+path = "src/lib.rs"
+
 [[bin]]
 name = "carina-lsp"
 path = "src/main.rs"
@@ -13,7 +17,7 @@ carina-core = { path = "../carina-core" }
 carina-provider-aws = { path = "../carina-provider-aws" }
 carina-provider-awscc = { path = "../carina-provider-awscc" }
 tower-lsp = "0.20"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "io-util"] }
 dashmap = "6"
 ropey = "1"
 pest = "2"
@@ -22,3 +26,4 @@ env_logger = "0.11"
 
 [dev-dependencies]
 tempfile = "3"
+serde_json = "1"

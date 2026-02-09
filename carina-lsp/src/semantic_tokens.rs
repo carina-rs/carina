@@ -23,6 +23,12 @@ pub fn legend() -> SemanticTokensLegend {
 
 pub struct SemanticTokensProvider;
 
+impl Default for SemanticTokensProvider {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SemanticTokensProvider {
     pub fn new() -> Self {
         Self
