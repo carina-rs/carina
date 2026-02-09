@@ -286,8 +286,18 @@ fn generate_markdown(schema: &CfnSchema, type_name: &str) -> Result<String> {
             match prop.prop_type.as_ref().and_then(|t| t.as_str()) {
                 Some("string") => {
                     let prop_lower = prop_name.to_lowercase();
-                    if prop_lower.contains("cidrblock") || prop_lower == "cidr_block" {
-                        "CIDR".to_string()
+                    if prop_lower.contains("cidr") {
+                        if prop_lower.contains("ipv6") {
+                            "Ipv6Cidr".to_string()
+                        } else if prop_lower.contains("cidrblock")
+                            || prop_lower == "cidr_block"
+                            || prop_lower == "cidrip"
+                            || prop_lower == "destinationcidrblock"
+                        {
+                            "Ipv4Cidr".to_string()
+                        } else {
+                            "String".to_string()
+                        }
                     } else {
                         "String".to_string()
                     }
@@ -389,7 +399,20 @@ fn generate_markdown(schema: &CfnSchema, type_name: &str) -> Result<String> {
                 let is_req = required_set.contains(field_name.as_str());
                 let field_type_display =
                     match field_prop.prop_type.as_ref().and_then(|t| t.as_str()) {
-                        Some("string") => "String",
+                        Some("string") => {
+                            let fl = field_name.to_lowercase();
+                            if fl.contains("cidr") {
+                                if fl.contains("ipv6") {
+                                    "Ipv6Cidr"
+                                } else if fl == "cidrip" || fl.contains("cidrblock") {
+                                    "Ipv4Cidr"
+                                } else {
+                                    "String"
+                                }
+                            } else {
+                                "String"
+                            }
+                        }
                         Some("boolean") => "Bool",
                         Some("integer") | Some("number") => "Int",
                         Some("array") => "List",

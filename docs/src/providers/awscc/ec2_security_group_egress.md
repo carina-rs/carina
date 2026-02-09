@@ -12,14 +12,14 @@ Adds the specified outbound (egress) rule to a security group.
 
 ### `cidr_ip`
 
-- **Type:** String
+- **Type:** Ipv4Cidr
 - **Required:** No
 
 The IPv4 address range, in CIDR format. You must specify exactly one of the following: ``CidrIp``, ``CidrIpv6``, ``DestinationPrefixListId``, or ``DestinationSecurityGroupId``. For examples of rules that you can add to security groups for specific access scenarios, see [Security group rules for different use cases](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/security-group-rules-reference.html) in the *User Guide*.
 
 ### `cidr_ipv6`
 
-- **Type:** String
+- **Type:** Ipv6Cidr
 - **Required:** No
 
 The IPv6 address range, in CIDR format. You must specify exactly one of the following: ``CidrIp``, ``CidrIpv6``, ``DestinationPrefixListId``, or ``DestinationSecurityGroupId``. For examples of rules that you can add to security groups for specific access scenarios, see [Security group rules for different use cases](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/security-group-rules-reference.html) in the *User Guide*.
