@@ -70,7 +70,7 @@ The ID of the VPC for the security group.
 | `destination_prefix_list_id` | String | No |  |
 | `destination_security_group_id` | String | No |  |
 | `from_port` | Int | No |  |
-| `ip_protocol` | String | Yes |  |
+| `ip_protocol` | Enum | Yes |  |
 | `to_port` | Int | No |  |
 
 ### Ingress
@@ -81,7 +81,7 @@ The ID of the VPC for the security group.
 | `cidr_ipv6` | Ipv6Cidr | No |  |
 | `description` | String | No |  |
 | `from_port` | Int | No |  |
-| `ip_protocol` | String | Yes |  |
+| `ip_protocol` | Enum | Yes |  |
 | `source_prefix_list_id` | String | No |  |
 | `source_security_group_id` | String | No |  |
 | `source_security_group_name` | String | No |  |

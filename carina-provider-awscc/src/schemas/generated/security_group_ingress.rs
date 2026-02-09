@@ -5,7 +5,20 @@
 //! DO NOT EDIT MANUALLY - regenerate with carina-codegen
 
 use super::AwsccSchemaConfig;
+use super::validate_namespaced_enum;
+use carina_core::resource::Value;
 use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, types};
+
+const VALID_IP_PROTOCOL: &[&str] = &["tcp", "udp", "icmp", "icmpv6", "-1"];
+
+fn validate_ip_protocol(value: &Value) -> Result<(), String> {
+    validate_namespaced_enum(
+        value,
+        "IpProtocol",
+        "awscc.ec2_security_group_ingress",
+        VALID_IP_PROTOCOL,
+    )
+}
 
 /// Returns the schema config for ec2_security_group_ingress (AWS::EC2::SecurityGroupIngress)
 pub fn ec2_security_group_ingress_config() -> AwsccSchemaConfig {
@@ -16,7 +29,7 @@ pub fn ec2_security_group_ingress_config() -> AwsccSchemaConfig {
         schema: ResourceSchema::new("awscc.ec2_security_group_ingress")
         .with_description("Resource Type definition for AWS::EC2::SecurityGroupIngress")
         .attribute(
-            AttributeSchema::new("cidr_ip", types::ipv4_cidr())
+            AttributeSchema::new("cidr_ip", AttributeType::String)
                 .with_description("The IPv4 ranges")
                 .with_provider_name("CidrIp"),
         )
@@ -51,7 +64,12 @@ pub fn ec2_security_group_ingress_config() -> AwsccSchemaConfig {
                 .with_provider_name("Id"),
         )
         .attribute(
-            AttributeSchema::new("ip_protocol", AttributeType::String)
+            AttributeSchema::new("ip_protocol", AttributeType::Custom {
+                name: "IpProtocol".to_string(),
+                base: Box::new(AttributeType::String),
+                validate: validate_ip_protocol,
+                namespace: Some("awscc.ec2_security_group_ingress".to_string()),
+            })
                 .required()
                 .with_description("The IP protocol name (tcp, udp, icmp, icmpv6) or number (see Protocol Numbers). [VPC only] Use -1 to specify all protocols. When authorizing security ...")
                 .with_provider_name("IpProtocol"),

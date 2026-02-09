@@ -8,7 +8,7 @@ use super::AwsccSchemaConfig;
 use super::tags_type;
 use super::validate_namespaced_enum;
 use carina_core::resource::Value;
-use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
+use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField, types};
 
 const VALID_LOG_DESTINATION_TYPE: &[&str] = &["cloud-watch-logs", "s3", "kinesis-data-firehose"];
 
@@ -64,7 +64,7 @@ pub fn ec2_flow_log_config() -> AwsccSchemaConfig {
                 .with_provider_name("DeliverCrossAccountRole"),
         )
         .attribute(
-            AttributeSchema::new("deliver_logs_permission_arn", AttributeType::String)
+            AttributeSchema::new("deliver_logs_permission_arn", types::arn())
                 .with_description("The ARN for the IAM role that permits Amazon EC2 to publish flow logs to a CloudWatch Logs log group in your account. If you specify LogDestinationTyp...")
                 .with_provider_name("DeliverLogsPermissionArn"),
         )

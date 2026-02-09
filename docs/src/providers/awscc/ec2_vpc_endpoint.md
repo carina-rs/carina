@@ -59,7 +59,7 @@ Indicate whether to associate a private hosted zone with the specified VPC. The 
 
 ### `resource_configuration_arn`
 
-- **Type:** String
+- **Type:** Arn
 - **Required:** No
 
 The Amazon Resource Name (ARN) of the resource configuration.
@@ -87,7 +87,7 @@ The name of the endpoint service.
 
 ### `service_network_arn`
 
-- **Type:** String
+- **Type:** Arn
 - **Required:** No
 
 The Amazon Resource Name (ARN) of the service network.

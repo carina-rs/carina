@@ -112,6 +112,10 @@ impl AttributeType {
                 },
                 v,
             ) => {
+                // ResourceRef values resolve to strings at runtime, so they're valid for Custom types
+                if matches!(v, Value::ResourceRef(_, _) | Value::TypedResourceRef { .. }) {
+                    return Ok(());
+                }
                 // Handle UnresolvedIdent by expanding to full namespace format
                 let resolved_value = match v {
                     Value::UnresolvedIdent(ident, member) => {
@@ -457,6 +461,22 @@ pub mod types {
         }
     }
 
+    /// ARN type (e.g., "arn:aws:s3:::my-bucket")
+    pub fn arn() -> AttributeType {
+        AttributeType::Custom {
+            name: "Arn".to_string(),
+            base: Box::new(AttributeType::String),
+            validate: |value| {
+                if let Value::String(s) = value {
+                    validate_arn(s)
+                } else {
+                    Err("Expected string".to_string())
+                }
+            },
+            namespace: None,
+        }
+    }
+
     /// IPv6 CIDR block type (e.g., "2001:db8::/32", "::/0")
     pub fn ipv6_cidr() -> AttributeType {
         AttributeType::Custom {
@@ -519,6 +539,21 @@ pub fn validate_ipv4_cidr(cidr: &str) -> Result<(), String> {
 /// Backward-compatible alias for `validate_ipv4_cidr`
 pub fn validate_cidr(cidr: &str) -> Result<(), String> {
     validate_ipv4_cidr(cidr)
+}
+
+/// Validate ARN format (e.g., "arn:aws:s3:::my-bucket")
+pub fn validate_arn(arn: &str) -> Result<(), String> {
+    if !arn.starts_with("arn:") {
+        return Err(format!("Invalid ARN '{}': must start with 'arn:'", arn));
+    }
+    let parts: Vec<&str> = arn.splitn(6, ':').collect();
+    if parts.len() < 6 {
+        return Err(format!(
+            "Invalid ARN '{}': must have at least 6 colon-separated parts (arn:partition:service:region:account:resource)",
+            arn
+        ));
+    }
+    Ok(())
 }
 
 /// Validate IPv6 CIDR block format (e.g., "2001:db8::/32", "::/0")
@@ -849,5 +884,92 @@ mod tests {
         assert!(validate_ipv6_cidr("not-a-cidr").is_err());
         assert!(validate_ipv6_cidr("2001:db8::").is_err());
         assert!(validate_ipv6_cidr("/64").is_err());
+    }
+
+    #[test]
+    fn custom_type_accepts_resource_ref() {
+        // ResourceRef values resolve to strings at runtime, so Custom types should accept them
+        let ipv4 = types::ipv4_cidr();
+        assert!(
+            ipv4.validate(&Value::ResourceRef(
+                "vpc".to_string(),
+                "cidr_block".to_string()
+            ))
+            .is_ok()
+        );
+
+        let ipv6 = types::ipv6_cidr();
+        assert!(
+            ipv6.validate(&Value::ResourceRef(
+                "subnet".to_string(),
+                "ipv6_cidr".to_string()
+            ))
+            .is_ok()
+        );
+
+        let arn = types::arn();
+        assert!(
+            arn.validate(&Value::ResourceRef("role".to_string(), "arn".to_string()))
+                .is_ok()
+        );
+
+        // TypedResourceRef should also be accepted
+        assert!(
+            ipv4.validate(&Value::TypedResourceRef {
+                binding_name: "vpc".to_string(),
+                attribute_name: "cidr_block".to_string(),
+                resource_type: None,
+            })
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn validate_arn_type() {
+        let t = types::arn();
+
+        // Valid ARNs
+        assert!(
+            t.validate(&Value::String("arn:aws:s3:::my-bucket".to_string()))
+                .is_ok()
+        );
+        assert!(
+            t.validate(&Value::String(
+                "arn:aws:iam::123456789012:role/MyRole".to_string()
+            ))
+            .is_ok()
+        );
+        assert!(
+            t.validate(&Value::String(
+                "arn:aws:ec2:us-east-1:123456789012:vpc/vpc-1234".to_string()
+            ))
+            .is_ok()
+        );
+
+        // Invalid ARNs
+        assert!(
+            t.validate(&Value::String("not-an-arn".to_string()))
+                .is_err()
+        );
+        assert!(
+            t.validate(&Value::String("arn:aws:s3".to_string()))
+                .is_err()
+        ); // too few parts
+        assert!(t.validate(&Value::Int(42)).is_err()); // wrong type
+    }
+
+    #[test]
+    fn validate_arn_function_directly() {
+        // Valid
+        assert!(validate_arn("arn:aws:s3:::my-bucket").is_ok());
+        assert!(validate_arn("arn:aws:iam::123456789012:role/MyRole").is_ok());
+        assert!(validate_arn("arn:aws-cn:s3:::my-bucket").is_ok());
+        assert!(validate_arn("arn:aws:ec2:us-east-1:123456789012:vpc/vpc-1234").is_ok());
+
+        // Invalid
+        assert!(validate_arn("not-an-arn").is_err());
+        assert!(validate_arn("arn:aws:s3").is_err());
+        assert!(validate_arn("arn:aws").is_err());
+        assert!(validate_arn("").is_err());
     }
 }

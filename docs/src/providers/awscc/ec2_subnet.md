@@ -116,7 +116,7 @@ Indicates whether instances launched in this subnet receive a public IPv4 addres
 
 ### `outpost_arn`
 
-- **Type:** String
+- **Type:** Arn
 - **Required:** No
 
 The Amazon Resource Name (ARN) of the Outpost.

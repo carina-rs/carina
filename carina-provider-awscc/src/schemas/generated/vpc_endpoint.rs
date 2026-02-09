@@ -8,7 +8,7 @@ use super::AwsccSchemaConfig;
 use super::tags_type;
 use super::validate_namespaced_enum;
 use carina_core::resource::Value;
-use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
+use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField, types};
 
 const VALID_IP_ADDRESS_TYPE: &[&str] = &["ipv4", "ipv6", "dualstack", "not-specified"];
 
@@ -100,7 +100,7 @@ pub fn ec2_vpc_endpoint_config() -> AwsccSchemaConfig {
                 .with_provider_name("PrivateDnsEnabled"),
         )
         .attribute(
-            AttributeSchema::new("resource_configuration_arn", AttributeType::String)
+            AttributeSchema::new("resource_configuration_arn", types::arn())
                 .with_description("The Amazon Resource Name (ARN) of the resource configuration.")
                 .with_provider_name("ResourceConfigurationArn"),
         )
@@ -120,7 +120,7 @@ pub fn ec2_vpc_endpoint_config() -> AwsccSchemaConfig {
                 .with_provider_name("ServiceName"),
         )
         .attribute(
-            AttributeSchema::new("service_network_arn", AttributeType::String)
+            AttributeSchema::new("service_network_arn", types::arn())
                 .with_description("The Amazon Resource Name (ARN) of the service network.")
                 .with_provider_name("ServiceNetworkArn"),
         )

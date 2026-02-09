@@ -22,7 +22,7 @@ The ID of the carrier gateway. You can only use this option when the VPC contain
 
 ### `core_network_arn`
 
-- **Type:** String
+- **Type:** Arn
 - **Required:** No
 
 The Amazon Resource Name (ARN) of the core network.

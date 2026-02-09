@@ -15,7 +15,7 @@ The ARN of the IAM role that allows Amazon EC2 to publish flow logs across accou
 
 ### `deliver_logs_permission_arn`
 
-- **Type:** String
+- **Type:** Arn
 - **Required:** No
 
 The ARN for the IAM role that permits Amazon EC2 to publish flow logs to a CloudWatch Logs log group in your account. If you specify LogDestinationType as s3 or kinesis-data-firehose, do not specify DeliverLogsPermissionArn or LogGroupName.
