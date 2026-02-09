@@ -4,7 +4,7 @@ CloudFormation Type: `AWS::EC2::SecurityGroup`
 
 Resource Type definition for AWS::EC2::SecurityGroup
 
-## Attributes
+## Argument Reference
 
 ### `group_description`
 
@@ -13,22 +13,12 @@ Resource Type definition for AWS::EC2::SecurityGroup
 
 A description for the security group.
 
-### `group_id`
-
-- **Type:** String
-- **Read-only**
-
 ### `group_name`
 
 - **Type:** String
 - **Required:** No
 
 The name of the security group.
-
-### `id`
-
-- **Type:** String
-- **Read-only**
 
 ### `security_group_egress`
 
@@ -57,6 +47,16 @@ Any tags assigned to the security group.
 - **Required:** No
 
 The ID of the VPC for the security group.
+
+## Attribute Reference
+
+### `group_id`
+
+- **Type:** String
+
+### `id`
+
+- **Type:** String
 
 ## Struct Definitions
 

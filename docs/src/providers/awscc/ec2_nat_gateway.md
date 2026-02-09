@@ -7,7 +7,7 @@ Specifies a network address translation (NAT) gateway in the specified subnet. Y
  If you add a default route (``AWS::EC2::Route`` resource) that points to a NAT gateway, specify the NAT gateway ID for the route's ``NatGatewayId`` property.
   When you associate an Elastic IP address or secondary Elastic IP address with a public NAT gateway, the network border group of the Elastic IP address must match the network border group of the Availability Zone (AZ) that the public NAT gateway is in. Otherwise, the NAT gateway fails to launch. You can see the network border group for the AZ by viewing the details of the subnet. Similarly, you can view the network border group for the Elastic IP address by viewing its details. For more information, see [Allocate an Elastic IP address](https://docs.aws.amazon.com/vpc/latest/userguide/vpc-eips.html#allocate-eip) in the *Amazon VPC User Guide*.
 
-## Attributes
+## Argument Reference
 
 ### `allocation_id`
 
@@ -15,16 +15,6 @@ Specifies a network address translation (NAT) gateway in the specified subnet. Y
 - **Required:** No
 
 [Public NAT gateway only] The allocation ID of the Elastic IP address that's associated with the NAT gateway. This property is required for a public NAT gateway and cannot be specified with a private NAT gateway.
-
-### `auto_provision_zones`
-
-- **Type:** String
-- **Read-only**
-
-### `auto_scaling_ips`
-
-- **Type:** String
-- **Read-only**
 
 ### `availability_mode`
 
@@ -47,11 +37,6 @@ For regional NAT gateways only: Specifies which Availability Zones you want the 
 
 Indicates whether the NAT gateway supports public or private connectivity. The default is public connectivity.
 
-### `eni_id`
-
-- **Type:** String
-- **Read-only**
-
 ### `max_drain_duration_seconds`
 
 - **Type:** Int
@@ -59,22 +44,12 @@ Indicates whether the NAT gateway supports public or private connectivity. The d
 
 The maximum amount of time to wait (in seconds) before forcibly releasing the IP addresses if connections are still in progress. Default value is 350 seconds.
 
-### `nat_gateway_id`
-
-- **Type:** String
-- **Read-only**
-
 ### `private_ip_address`
 
 - **Type:** String
 - **Required:** No
 
 The private IPv4 address to assign to the NAT gateway. If you don't provide an address, a private IPv4 address will be automatically assigned.
-
-### `route_table_id`
-
-- **Type:** String
-- **Read-only**
 
 ### `secondary_allocation_ids`
 
@@ -117,6 +92,28 @@ The tags for the NAT gateway.
 - **Required:** No
 
 The ID of the VPC in which the NAT gateway is located.
+
+## Attribute Reference
+
+### `auto_provision_zones`
+
+- **Type:** String
+
+### `auto_scaling_ips`
+
+- **Type:** String
+
+### `eni_id`
+
+- **Type:** String
+
+### `nat_gateway_id`
+
+- **Type:** String
+
+### `route_table_id`
+
+- **Type:** String
 
 ## Enum Values
 

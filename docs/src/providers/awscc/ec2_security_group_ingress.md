@@ -4,7 +4,7 @@ CloudFormation Type: `AWS::EC2::SecurityGroupIngress`
 
 Resource Type definition for AWS::EC2::SecurityGroupIngress
 
-## Attributes
+## Argument Reference
 
 ### `cidr_ip`
 
@@ -48,11 +48,6 @@ The ID of the security group. You must specify either the security group ID or t
 
 The name of the security group.
 
-### `id`
-
-- **Type:** String
-- **Read-only**
-
 ### `ip_protocol`
 
 - **Type:** Enum (IpProtocol)
@@ -94,6 +89,12 @@ The ID of the security group. You must specify either the security group ID or t
 - **Required:** No
 
 The end of port range for the TCP and UDP protocols, or an ICMP/ICMPv6 code. A value of -1 indicates all ICMP/ICMPv6 codes for the specified ICMP type. If you specify all ICMP/ICMPv6 types, you must specify all codes. Use this for ICMP and any protocol that uses ports.
+
+## Attribute Reference
+
+### `id`
+
+- **Type:** String
 
 ## Enum Values
 

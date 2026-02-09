@@ -8,7 +8,7 @@ Adds the specified outbound (egress) rule to a security group.
  You must specify a protocol for each rule (for example, TCP). If the protocol is TCP or UDP, you must also specify a port or port range. If the protocol is ICMP or ICMPv6, you must also specify the ICMP/ICMPv6 type and code. To specify all types or all codes, use -1.
  Rule changes are propagated to instances associated with the security group as quickly as possible. However, a small delay might occur.
 
-## Attributes
+## Argument Reference
 
 ### `cidr_ip`
 
@@ -59,11 +59,6 @@ If the protocol is TCP or UDP, this is the start of the port range. If the proto
 
 The ID of the security group. You must specify either the security group ID or the security group name in the request. For security groups in a nondefault VPC, you must specify the security group ID.
 
-### `id`
-
-- **Type:** String
-- **Read-only**
-
 ### `ip_protocol`
 
 - **Type:** Enum (IpProtocol)
@@ -77,6 +72,12 @@ The IP protocol name (``tcp``, ``udp``, ``icmp``, ``icmpv6``) or number (see [Pr
 - **Required:** No
 
 If the protocol is TCP or UDP, this is the end of the port range. If the protocol is ICMP or ICMPv6, this is the ICMP code or -1 (all ICMP codes). If the start port is -1 (all ICMP types), then the end port must be -1 (all ICMP codes).
+
+## Attribute Reference
+
+### `id`
+
+- **Type:** String
 
 ## Enum Values
 

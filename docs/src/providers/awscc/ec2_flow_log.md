@@ -4,7 +4,7 @@ CloudFormation Type: `AWS::EC2::FlowLog`
 
 Specifies a VPC flow log, which enables you to capture IP traffic for a specific network interface, subnet, or VPC.
 
-## Attributes
+## Argument Reference
 
 ### `deliver_cross_account_role`
 
@@ -24,11 +24,6 @@ The ARN for the IAM role that permits Amazon EC2 to publish flow logs to a Cloud
 
 - **Type:** Struct(DestinationOptions)
 - **Required:** No
-
-### `id`
-
-- **Type:** String
-- **Read-only**
 
 ### `log_destination`
 
@@ -92,6 +87,12 @@ The tags to apply to the flow logs.
 - **Required:** No
 
 The type of traffic to log. You can log traffic that the resource accepts or rejects, or all traffic.
+
+## Attribute Reference
+
+### `id`
+
+- **Type:** String
 
 ## Enum Values
 

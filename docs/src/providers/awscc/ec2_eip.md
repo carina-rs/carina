@@ -6,7 +6,7 @@ Specifies an Elastic IP (EIP) address and can, optionally, associate it with an 
  You can allocate an Elastic IP address from an address pool owned by AWS or from an address pool created from a public IPv4 address range that you have brought to AWS for use with your AWS resources using bring your own IP addresses (BYOIP). For more information, see [Bring Your Own IP Addresses (BYOIP)](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ec2-byoip.html) in the *Amazon EC2 User Guide*.
  For more information, see [Elastic IP Addresses](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/elastic-ip-addresses-eip.html) in the *Amazon EC2 User Guide*.
 
-## Attributes
+## Argument Reference
 
 ### `address`
 
@@ -14,11 +14,6 @@ Specifies an Elastic IP (EIP) address and can, optionally, associate it with an 
 - **Required:** No
 
 
-
-### `allocation_id`
-
-- **Type:** String
-- **Read-only**
 
 ### `domain`
 
@@ -48,11 +43,6 @@ The ID of the instance.  Updates to the ``InstanceId`` property may require *som
 
 A unique set of Availability Zones, Local Zones, or Wavelength Zones from which AWS advertises IP addresses. Use this parameter to limit the IP address to this location. IP addresses cannot move between network border groups. Use [DescribeAvailabilityZones](https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_DescribeAvailabilityZones.html) to view the network border groups.
 
-### `public_ip`
-
-- **Type:** String
-- **Read-only**
-
 ### `public_ipv4_pool`
 
 - **Type:** String
@@ -73,6 +63,16 @@ Any tags assigned to the Elastic IP address.  Updates to the ``Tags`` property m
 - **Required:** No
 
 The Elastic IP address you are accepting for transfer. You can only accept one transferred address. For more information on Elastic IP address transfers, see [Transfer Elastic IP addresses](https://docs.aws.amazon.com/vpc/latest/userguide/vpc-eips.html#transfer-EIPs-intro) in the *Amazon Virtual Private Cloud User Guide*.
+
+## Attribute Reference
+
+### `allocation_id`
+
+- **Type:** String
+
+### `public_ip`
+
+- **Type:** String
 
 
 
