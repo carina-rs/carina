@@ -17,7 +17,7 @@ The ID of the carrier gateway. You can only use this option when the VPC contain
 
 ### `cidr_block`
 
-- **Type:** CIDR
+- **Type:** Ipv4Cidr
 - **Read-only**
 
 ### `core_network_arn`
@@ -29,14 +29,14 @@ The Amazon Resource Name (ARN) of the core network.
 
 ### `destination_cidr_block`
 
-- **Type:** CIDR
+- **Type:** Ipv4Cidr
 - **Required:** No
 
 The IPv4 CIDR address block used for the destination match. Routing decisions are based on the most specific match. We modify the specified CIDR block to its canonical form; for example, if you specify ``100.68.0.18/18``, we modify it to ``100.68.0.0/18``.
 
 ### `destination_ipv6_cidr_block`
 
-- **Type:** CIDR
+- **Type:** Ipv6Cidr
 - **Required:** No
 
 The IPv6 CIDR block used for the destination match. Routing decisions are based on the most specific match.
