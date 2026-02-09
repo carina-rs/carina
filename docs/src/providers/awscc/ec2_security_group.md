@@ -6,16 +6,57 @@ Resource Type definition for AWS::EC2::SecurityGroup
 
 ## Attributes
 
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `group_description` | String | Yes | A description for the security group. |
-| `group_id` | String |  | (read-only) |
-| `group_name` | String | No | The name of the security group. |
-| `id` | String |  | (read-only) |
-| `security_group_egress` | List | No | [VPC only] The outbound rules associated with the security group. There is a short interruption during which you cannot connect to the security group. |
-| `security_group_ingress` | List | No | The inbound rules associated with the security group. There is a short interruption during which you cannot connect to the security group. |
-| `tags` | Map | No | Any tags assigned to the security group. |
-| `vpc_id` | String | No | The ID of the VPC for the security group. |
+### `group_description`
+
+- **Type:** String
+- **Required:** Yes
+
+A description for the security group.
+
+### `group_id`
+
+- **Type:** String
+- **Read-only**
+
+### `group_name`
+
+- **Type:** String
+- **Required:** No
+
+The name of the security group.
+
+### `id`
+
+- **Type:** String
+- **Read-only**
+
+### `security_group_egress`
+
+- **Type:** List
+- **Required:** No
+
+[VPC only] The outbound rules associated with the security group. There is a short interruption during which you cannot connect to the security group.
+
+### `security_group_ingress`
+
+- **Type:** List
+- **Required:** No
+
+The inbound rules associated with the security group. There is a short interruption during which you cannot connect to the security group.
+
+### `tags`
+
+- **Type:** Map
+- **Required:** No
+
+Any tags assigned to the security group.
+
+### `vpc_id`
+
+- **Type:** String
+- **Required:** No
+
+The ID of the VPC for the security group.
 
 
 

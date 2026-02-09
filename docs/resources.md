@@ -26,13 +26,40 @@ An S3 bucket for object storage.
 
 #### Attributes
 
-| Attribute | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `name` | String | No | Override bucket name (defaults to resource name) |
-| `region` | aws.Region | **Yes** | The AWS region for the bucket |
-| `acl` | Enum | No | The canned ACL for the bucket |
-| `versioning` | Bool | No | Enable versioning for the bucket |
-| `expiration_days` | Int | No | Number of days before objects expire |
+##### `name`
+
+- **Type:** String
+- **Required:** No
+
+Override bucket name (defaults to resource name)
+
+##### `region`
+
+- **Type:** aws.Region
+- **Required:** Yes
+
+The AWS region for the bucket
+
+##### `acl`
+
+- **Type:** Enum
+- **Required:** No
+
+The canned ACL for the bucket
+
+##### `versioning`
+
+- **Type:** Bool
+- **Required:** No
+
+Enable versioning for the bucket
+
+##### `expiration_days`
+
+- **Type:** Int
+- **Required:** No
+
+Number of days before objects expire
 
 #### ACL Values
 
@@ -66,14 +93,47 @@ An AWS VPC (Virtual Private Cloud).
 
 #### Attributes
 
-| Attribute | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `id` | String | No | VPC ID (read-only, set after creation) |
-| `name` | String | **Yes** | VPC name (Name tag) |
-| `region` | aws.Region | **Yes** | The AWS region for the VPC |
-| `cidr_block` | CidrBlock | **Yes** | The IPv4 CIDR block for the VPC (e.g., "10.0.0.0/16") |
-| `enable_dns_support` | Bool | No | Enable DNS resolution support (default: true) |
-| `enable_dns_hostnames` | Bool | No | Enable DNS hostnames |
+##### `id`
+
+- **Type:** String
+- **Read-only**
+
+VPC ID (set after creation)
+
+##### `name`
+
+- **Type:** String
+- **Required:** Yes
+
+VPC name (Name tag)
+
+##### `region`
+
+- **Type:** aws.Region
+- **Required:** Yes
+
+The AWS region for the VPC
+
+##### `cidr_block`
+
+- **Type:** CidrBlock
+- **Required:** Yes
+
+The IPv4 CIDR block for the VPC (e.g., "10.0.0.0/16")
+
+##### `enable_dns_support`
+
+- **Type:** Bool
+- **Required:** No
+
+Enable DNS resolution support (default: true)
+
+##### `enable_dns_hostnames`
+
+- **Type:** Bool
+- **Required:** No
+
+Enable DNS hostnames
 
 #### Example
 
@@ -100,14 +160,47 @@ An AWS VPC Subnet.
 
 #### Attributes
 
-| Attribute | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `id` | String | No | Subnet ID (read-only, set after creation) |
-| `name` | String | **Yes** | Subnet name (Name tag) |
-| `region` | aws.Region | **Yes** | The AWS region for the subnet |
-| `vpc_id` | String | **Yes** | VPC ID to create the subnet in |
-| `cidr_block` | CidrBlock | **Yes** | The IPv4 CIDR block for the subnet |
-| `availability_zone` | aws.AvailabilityZone | No | The availability zone (e.g., aws.AvailabilityZone.ap_northeast_1a) |
+##### `id`
+
+- **Type:** String
+- **Read-only**
+
+Subnet ID (set after creation)
+
+##### `name`
+
+- **Type:** String
+- **Required:** Yes
+
+Subnet name (Name tag)
+
+##### `region`
+
+- **Type:** aws.Region
+- **Required:** Yes
+
+The AWS region for the subnet
+
+##### `vpc_id`
+
+- **Type:** String
+- **Required:** Yes
+
+VPC ID to create the subnet in
+
+##### `cidr_block`
+
+- **Type:** CidrBlock
+- **Required:** Yes
+
+The IPv4 CIDR block for the subnet
+
+##### `availability_zone`
+
+- **Type:** aws.AvailabilityZone
+- **Required:** No
+
+The availability zone (e.g., aws.AvailabilityZone.ap_northeast_1a)
 
 #### Example
 
@@ -141,12 +234,33 @@ An AWS Internet Gateway for VPC internet access.
 
 #### Attributes
 
-| Attribute | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `id` | String | No | Internet Gateway ID (read-only, set after creation) |
-| `name` | String | **Yes** | Internet Gateway name (Name tag) |
-| `region` | aws.Region | **Yes** | The AWS region for the Internet Gateway |
-| `vpc_id` | String | No | VPC ID to attach the Internet Gateway to |
+##### `id`
+
+- **Type:** String
+- **Read-only**
+
+Internet Gateway ID (set after creation)
+
+##### `name`
+
+- **Type:** String
+- **Required:** Yes
+
+Internet Gateway name (Name tag)
+
+##### `region`
+
+- **Type:** aws.Region
+- **Required:** Yes
+
+The AWS region for the Internet Gateway
+
+##### `vpc_id`
+
+- **Type:** String
+- **Required:** No
+
+VPC ID to attach the Internet Gateway to
 
 #### Example
 
@@ -166,12 +280,33 @@ An AWS VPC Route Table.
 
 #### Attributes
 
-| Attribute | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `id` | String | No | Route Table ID (read-only, set after creation) |
-| `name` | String | **Yes** | Route Table name (Name tag) |
-| `region` | aws.Region | **Yes** | The AWS region for the Route Table |
-| `vpc_id` | String | **Yes** | VPC ID for the Route Table |
+##### `id`
+
+- **Type:** String
+- **Read-only**
+
+Route Table ID (set after creation)
+
+##### `name`
+
+- **Type:** String
+- **Required:** Yes
+
+Route Table name (Name tag)
+
+##### `region`
+
+- **Type:** aws.Region
+- **Required:** Yes
+
+The AWS region for the Route Table
+
+##### `vpc_id`
+
+- **Type:** String
+- **Required:** Yes
+
+VPC ID for the Route Table
 
 #### Example
 
@@ -195,14 +330,47 @@ A route in an AWS VPC Route Table.
 
 #### Attributes
 
-| Attribute | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `name` | String | **Yes** | Route name (for identification) |
-| `region` | aws.Region | **Yes** | The AWS region |
-| `route_table_id` | String | **Yes** | Route Table ID to add the route to |
-| `destination_cidr_block` | CidrBlock | **Yes** | Destination CIDR block (e.g., "0.0.0.0/0") |
-| `gateway_id` | String | No | Internet Gateway ID (for internet-bound traffic) |
-| `nat_gateway_id` | String | No | NAT Gateway ID |
+##### `name`
+
+- **Type:** String
+- **Required:** Yes
+
+Route name (for identification)
+
+##### `region`
+
+- **Type:** aws.Region
+- **Required:** Yes
+
+The AWS region
+
+##### `route_table_id`
+
+- **Type:** String
+- **Required:** Yes
+
+Route Table ID to add the route to
+
+##### `destination_cidr_block`
+
+- **Type:** CidrBlock
+- **Required:** Yes
+
+Destination CIDR block (e.g., "0.0.0.0/0")
+
+##### `gateway_id`
+
+- **Type:** String
+- **Required:** No
+
+Internet Gateway ID (for internet-bound traffic)
+
+##### `nat_gateway_id`
+
+- **Type:** String
+- **Required:** No
+
+NAT Gateway ID
 
 #### Example
 
@@ -224,13 +392,40 @@ An AWS VPC Security Group.
 
 #### Attributes
 
-| Attribute | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `id` | String | No | Security Group ID (read-only, set after creation) |
-| `name` | String | **Yes** | Security Group name (Name tag) |
-| `region` | aws.Region | **Yes** | The AWS region for the Security Group |
-| `vpc_id` | String | **Yes** | VPC ID for the Security Group |
-| `description` | String | No | Description of the Security Group |
+##### `id`
+
+- **Type:** String
+- **Read-only**
+
+Security Group ID (set after creation)
+
+##### `name`
+
+- **Type:** String
+- **Required:** Yes
+
+Security Group name (Name tag)
+
+##### `region`
+
+- **Type:** aws.Region
+- **Required:** Yes
+
+The AWS region for the Security Group
+
+##### `vpc_id`
+
+- **Type:** String
+- **Required:** Yes
+
+VPC ID for the Security Group
+
+##### `description`
+
+- **Type:** String
+- **Required:** No
+
+Description of the Security Group
 
 #### Example
 
@@ -255,16 +450,61 @@ An inbound rule for an AWS VPC Security Group.
 
 #### Attributes
 
-| Attribute | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `id` | String | No | Security Group Rule ID (read-only, set after creation) |
-| `name` | String | **Yes** | Rule name (for identification) |
-| `region` | aws.Region | **Yes** | The AWS region |
-| `security_group_id` | String | **Yes** | Security Group ID to add the rule to |
-| `protocol` | aws.Protocol | **Yes** | Protocol (aws.Protocol.tcp, aws.Protocol.udp, aws.Protocol.icmp, aws.Protocol.all) |
-| `from_port` | Int | **Yes** | Start of port range (0-65535) |
-| `to_port` | Int | **Yes** | End of port range (0-65535) |
-| `cidr` | CidrBlock | No | CIDR block to allow (e.g., "0.0.0.0/0") |
+##### `id`
+
+- **Type:** String
+- **Read-only**
+
+Security Group Rule ID (set after creation)
+
+##### `name`
+
+- **Type:** String
+- **Required:** Yes
+
+Rule name (for identification)
+
+##### `region`
+
+- **Type:** aws.Region
+- **Required:** Yes
+
+The AWS region
+
+##### `security_group_id`
+
+- **Type:** String
+- **Required:** Yes
+
+Security Group ID to add the rule to
+
+##### `protocol`
+
+- **Type:** aws.Protocol
+- **Required:** Yes
+
+Protocol (aws.Protocol.tcp, aws.Protocol.udp, aws.Protocol.icmp, aws.Protocol.all)
+
+##### `from_port`
+
+- **Type:** Int
+- **Required:** Yes
+
+Start of port range (0-65535)
+
+##### `to_port`
+
+- **Type:** Int
+- **Required:** Yes
+
+End of port range (0-65535)
+
+##### `cidr`
+
+- **Type:** CidrBlock
+- **Required:** No
+
+CIDR block to allow (e.g., "0.0.0.0/0")
 
 #### Example
 
@@ -298,16 +538,61 @@ An outbound rule for an AWS VPC Security Group.
 
 #### Attributes
 
-| Attribute | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `id` | String | No | Security Group Rule ID (read-only, set after creation) |
-| `name` | String | **Yes** | Rule name (for identification) |
-| `region` | aws.Region | **Yes** | The AWS region |
-| `security_group_id` | String | **Yes** | Security Group ID to add the rule to |
-| `protocol` | aws.Protocol | **Yes** | Protocol (aws.Protocol.tcp, aws.Protocol.udp, aws.Protocol.icmp, aws.Protocol.all) |
-| `from_port` | Int | **Yes** | Start of port range (0-65535) |
-| `to_port` | Int | **Yes** | End of port range (0-65535) |
-| `cidr` | CidrBlock | No | CIDR block to allow (e.g., "0.0.0.0/0") |
+##### `id`
+
+- **Type:** String
+- **Read-only**
+
+Security Group Rule ID (set after creation)
+
+##### `name`
+
+- **Type:** String
+- **Required:** Yes
+
+Rule name (for identification)
+
+##### `region`
+
+- **Type:** aws.Region
+- **Required:** Yes
+
+The AWS region
+
+##### `security_group_id`
+
+- **Type:** String
+- **Required:** Yes
+
+Security Group ID to add the rule to
+
+##### `protocol`
+
+- **Type:** aws.Protocol
+- **Required:** Yes
+
+Protocol (aws.Protocol.tcp, aws.Protocol.udp, aws.Protocol.icmp, aws.Protocol.all)
+
+##### `from_port`
+
+- **Type:** Int
+- **Required:** Yes
+
+Start of port range (0-65535)
+
+##### `to_port`
+
+- **Type:** Int
+- **Required:** Yes
+
+End of port range (0-65535)
+
+##### `cidr`
+
+- **Type:** CidrBlock
+- **Required:** No
+
+CIDR block to allow (e.g., "0.0.0.0/0")
 
 #### Example
 

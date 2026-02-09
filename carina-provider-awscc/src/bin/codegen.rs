@@ -237,10 +237,8 @@ fn generate_markdown(schema: &CfnSchema, type_name: &str) -> Result<String> {
         md.push_str(&format!("{}\n\n", desc));
     }
 
-    // Attributes table
+    // Attributes
     md.push_str("## Attributes\n\n");
-    md.push_str("| Name | Type | Required | Description |\n");
-    md.push_str("|------|------|----------|-------------|\n");
 
     for (prop_name, prop) in &schema.properties {
         let attr_name = prop_name.to_snake_case();
@@ -276,28 +274,26 @@ fn generate_markdown(schema: &CfnSchema, type_name: &str) -> Result<String> {
             }
         };
 
-        let desc = if is_read_only {
-            "(read-only)".to_string()
-        } else if let Some(d) = &prop.description {
-            d.replace('\n', " ").replace("  ", " ").replace('|', "\\|")
-        } else {
-            String::new()
-        };
+        md.push_str(&format!("### `{}`\n\n", attr_name));
 
-        let req_str = if is_read_only {
-            ""
-        } else if is_required {
-            "Yes"
+        if is_read_only {
+            md.push_str(&format!("- **Type:** {}\n", type_display));
+            md.push_str("- **Read-only**\n\n");
         } else {
-            "No"
-        };
+            md.push_str(&format!("- **Type:** {}\n", type_display));
+            if is_required {
+                md.push_str("- **Required:** Yes\n");
+            } else {
+                md.push_str("- **Required:** No\n");
+            }
+            md.push('\n');
 
-        md.push_str(&format!(
-            "| `{}` | {} | {} | {} |\n",
-            attr_name, type_display, req_str, desc
-        ));
+            if let Some(d) = &prop.description {
+                let desc = d.replace('\n', " ").replace("  ", " ");
+                md.push_str(&format!("{}\n\n", desc));
+            }
+        }
     }
-    md.push('\n');
 
     // Enum values section
     if !enums.is_empty() {

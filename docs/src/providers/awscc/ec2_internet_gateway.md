@@ -6,10 +6,17 @@ Allocates an internet gateway for use with a VPC. After creating the Internet ga
 
 ## Attributes
 
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `internet_gateway_id` | String |  | (read-only) |
-| `tags` | Map | No | Any tags to assign to the internet gateway. |
+### `internet_gateway_id`
+
+- **Type:** String
+- **Read-only**
+
+### `tags`
+
+- **Type:** Map
+- **Required:** No
+
+Any tags to assign to the internet gateway.
 
 
 

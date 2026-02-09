@@ -6,12 +6,31 @@ Resource Type definition for AWS::EC2::VPCGatewayAttachment
 
 ## Attributes
 
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `attachment_type` | String |  | (read-only) |
-| `internet_gateway_id` | String | No | The ID of the internet gateway. You must specify either InternetGatewayId or VpnGatewayId, but not both. |
-| `vpc_id` | String | Yes | The ID of the VPC. |
-| `vpn_gateway_id` | String | No | The ID of the virtual private gateway. You must specify either InternetGatewayId or VpnGatewayId, but not both. |
+### `attachment_type`
+
+- **Type:** String
+- **Read-only**
+
+### `internet_gateway_id`
+
+- **Type:** String
+- **Required:** No
+
+The ID of the internet gateway. You must specify either InternetGatewayId or VpnGatewayId, but not both.
+
+### `vpc_id`
+
+- **Type:** String
+- **Required:** Yes
+
+The ID of the VPC.
+
+### `vpn_gateway_id`
+
+- **Type:** String
+- **Required:** No
+
+The ID of the virtual private gateway. You must specify either InternetGatewayId or VpnGatewayId, but not both.
 
 
 
