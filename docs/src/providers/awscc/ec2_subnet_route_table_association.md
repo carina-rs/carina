@@ -6,11 +6,24 @@ Associates a subnet with a route table. The subnet and route table must be in th
 
 ## Attributes
 
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `id` | String |  | (read-only) |
-| `route_table_id` | String | Yes | The ID of the route table. The physical ID changes when the route table ID is changed. |
-| `subnet_id` | String | Yes | The ID of the subnet. |
+### `id`
+
+- **Type:** String
+- **Read-only**
+
+### `route_table_id`
+
+- **Type:** String
+- **Required:** Yes
+
+The ID of the route table. The physical ID changes when the route table ID is changed.
+
+### `subnet_id`
+
+- **Type:** String
+- **Required:** Yes
+
+The ID of the subnet.
 
 
 

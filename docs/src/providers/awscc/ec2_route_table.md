@@ -7,11 +7,24 @@ Specifies a route table for the specified VPC. After you create a route table, y
 
 ## Attributes
 
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `route_table_id` | String |  | (read-only) |
-| `tags` | Map | No | Any tags assigned to the route table. |
-| `vpc_id` | String | Yes | The ID of the VPC. |
+### `route_table_id`
+
+- **Type:** String
+- **Read-only**
+
+### `tags`
+
+- **Type:** Map
+- **Required:** No
+
+Any tags assigned to the route table.
+
+### `vpc_id`
+
+- **Type:** String
+- **Required:** Yes
+
+The ID of the VPC.
 
 
 
