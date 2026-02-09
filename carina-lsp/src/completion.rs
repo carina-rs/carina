@@ -729,7 +729,12 @@ impl CompletionProvider {
             AttributeType::Int => {
                 vec![] // No specific completions for integers
             }
-            AttributeType::Custom { name, .. } if name == "Cidr" => self.cidr_completions(),
+            AttributeType::Custom { name, .. } if name == "Cidr" || name == "Ipv4Cidr" => {
+                self.cidr_completions()
+            }
+            AttributeType::Custom { name, .. } if name == "Ipv6Cidr" => {
+                self.ipv6_cidr_completions()
+            }
             AttributeType::Custom { name, .. } if name == "VersioningStatus" => {
                 self.versioning_status_completions()
             }
@@ -924,6 +929,27 @@ impl CompletionProvider {
             ("172.16.0.0/16", "VPC CIDR (65,536 IPs)"),
             ("192.168.0.0/16", "VPC CIDR (65,536 IPs)"),
             ("0.0.0.0/0", "All IPv4 addresses"),
+        ];
+
+        cidrs
+            .into_iter()
+            .map(|(cidr, description)| CompletionItem {
+                label: format!("\"{}\"", cidr),
+                kind: Some(CompletionItemKind::VALUE),
+                detail: Some(description.to_string()),
+                insert_text: Some(format!("\"{}\"", cidr)),
+                ..Default::default()
+            })
+            .collect()
+    }
+
+    fn ipv6_cidr_completions(&self) -> Vec<CompletionItem> {
+        let cidrs = vec![
+            ("::/0", "All IPv6 addresses"),
+            ("2001:db8::/32", "Documentation range"),
+            ("fe80::/10", "Link-local addresses"),
+            ("fc00::/7", "Unique local addresses"),
+            ("::1/128", "Loopback address"),
         ];
 
         cidrs

@@ -7,7 +7,7 @@
 use super::AwsccSchemaConfig;
 use super::validate_namespaced_enum;
 use carina_core::resource::Value;
-use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, types};
 
 const VALID_IP_PROTOCOL: &[&str] = &["tcp", "udp", "icmp", "icmpv6", "-1"];
 
@@ -29,12 +29,12 @@ pub fn ec2_security_group_egress_config() -> AwsccSchemaConfig {
         schema: ResourceSchema::new("awscc.ec2_security_group_egress")
         .with_description("Adds the specified outbound (egress) rule to a security group.  An outbound rule permits instances to send traffic to the specified IPv4 or IPv6 address range, the IP addresses that are specified by a...")
         .attribute(
-            AttributeSchema::new("cidr_ip", AttributeType::String)
+            AttributeSchema::new("cidr_ip", types::ipv4_cidr())
                 .with_description("The IPv4 address range, in CIDR format. You must specify exactly one of the following: ``CidrIp``, ``CidrIpv6``, ``DestinationPrefixListId``, or ``Des...")
                 .with_provider_name("CidrIp"),
         )
         .attribute(
-            AttributeSchema::new("cidr_ipv6", AttributeType::String)
+            AttributeSchema::new("cidr_ipv6", types::ipv6_cidr())
                 .with_description("The IPv6 address range, in CIDR format. You must specify exactly one of the following: ``CidrIp``, ``CidrIpv6``, ``DestinationPrefixListId``, or ``Des...")
                 .with_provider_name("CidrIpv6"),
         )

@@ -845,9 +845,18 @@ fn cfn_type_to_carina_type_with_enum(
             // Check property name for specific types
             let prop_lower = prop_name.to_lowercase();
 
-            // CIDR type - only for properties that are actually CIDRs
-            if prop_lower.contains("cidrblock") || prop_lower == "cidr_block" {
-                return ("types::cidr()".to_string(), None);
+            // CIDR types - differentiate IPv4 vs IPv6 based on property name
+            if prop_lower.contains("cidr") {
+                if prop_lower.contains("ipv6") {
+                    return ("types::ipv6_cidr()".to_string(), None);
+                }
+                if prop_lower.contains("cidrblock")
+                    || prop_lower == "cidr_block"
+                    || prop_lower == "cidr_ip"
+                    || prop_lower == "destination_cidr_block"
+                {
+                    return ("types::ipv4_cidr()".to_string(), None);
+                }
             }
 
             // IDs are always strings

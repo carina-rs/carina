@@ -5,7 +5,7 @@
 //! DO NOT EDIT MANUALLY - regenerate with carina-codegen
 
 use super::AwsccSchemaConfig;
-use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, types};
 
 /// Returns the schema config for ec2_security_group_ingress (AWS::EC2::SecurityGroupIngress)
 pub fn ec2_security_group_ingress_config() -> AwsccSchemaConfig {
@@ -16,12 +16,12 @@ pub fn ec2_security_group_ingress_config() -> AwsccSchemaConfig {
         schema: ResourceSchema::new("awscc.ec2_security_group_ingress")
         .with_description("Resource Type definition for AWS::EC2::SecurityGroupIngress")
         .attribute(
-            AttributeSchema::new("cidr_ip", AttributeType::String)
+            AttributeSchema::new("cidr_ip", types::ipv4_cidr())
                 .with_description("The IPv4 ranges")
                 .with_provider_name("CidrIp"),
         )
         .attribute(
-            AttributeSchema::new("cidr_ipv6", AttributeType::String)
+            AttributeSchema::new("cidr_ipv6", types::ipv6_cidr())
                 .with_description("[VPC only] The IPv6 ranges")
                 .with_provider_name("CidrIpv6"),
         )

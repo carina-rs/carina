@@ -425,14 +425,46 @@ pub mod types {
         }
     }
 
-    /// CIDR block type (e.g., "10.0.0.0/16")
+    /// IPv4 CIDR block type (e.g., "10.0.0.0/16")
+    pub fn ipv4_cidr() -> AttributeType {
+        AttributeType::Custom {
+            name: "Ipv4Cidr".to_string(),
+            base: Box::new(AttributeType::String),
+            validate: |value| {
+                if let Value::String(s) = value {
+                    validate_ipv4_cidr(s)
+                } else {
+                    Err("Expected string".to_string())
+                }
+            },
+            namespace: None,
+        }
+    }
+
+    /// CIDR block type — alias for `ipv4_cidr()` for backward compatibility
     pub fn cidr() -> AttributeType {
         AttributeType::Custom {
             name: "Cidr".to_string(),
             base: Box::new(AttributeType::String),
             validate: |value| {
                 if let Value::String(s) = value {
-                    validate_cidr(s)
+                    validate_ipv4_cidr(s)
+                } else {
+                    Err("Expected string".to_string())
+                }
+            },
+            namespace: None,
+        }
+    }
+
+    /// IPv6 CIDR block type (e.g., "2001:db8::/32", "::/0")
+    pub fn ipv6_cidr() -> AttributeType {
+        AttributeType::Custom {
+            name: "Ipv6Cidr".to_string(),
+            base: Box::new(AttributeType::String),
+            validate: |value| {
+                if let Value::String(s) = value {
+                    validate_ipv6_cidr(s)
                 } else {
                     Err("Expected string".to_string())
                 }
@@ -442,8 +474,8 @@ pub mod types {
     }
 }
 
-/// Validate CIDR block format (e.g., "10.0.0.0/16")
-pub fn validate_cidr(cidr: &str) -> Result<(), String> {
+/// Validate IPv4 CIDR block format (e.g., "10.0.0.0/16")
+pub fn validate_ipv4_cidr(cidr: &str) -> Result<(), String> {
     let parts: Vec<&str> = cidr.split('/').collect();
     if parts.len() != 2 {
         return Err(format!(
@@ -482,6 +514,115 @@ pub fn validate_cidr(cidr: &str) -> Result<(), String> {
             prefix
         )),
     }
+}
+
+/// Backward-compatible alias for `validate_ipv4_cidr`
+pub fn validate_cidr(cidr: &str) -> Result<(), String> {
+    validate_ipv4_cidr(cidr)
+}
+
+/// Validate IPv6 CIDR block format (e.g., "2001:db8::/32", "::/0")
+pub fn validate_ipv6_cidr(cidr: &str) -> Result<(), String> {
+    let parts: Vec<&str> = cidr.split('/').collect();
+    if parts.len() != 2 {
+        return Err(format!(
+            "Invalid IPv6 CIDR format '{}': expected address/prefix",
+            cidr
+        ));
+    }
+
+    let addr = parts[0];
+    let prefix = parts[1];
+
+    // Validate IPv6 address
+    validate_ipv6_address(addr)?;
+
+    // Validate prefix length (0-128)
+    match prefix.parse::<u8>() {
+        Ok(p) if p <= 128 => Ok(()),
+        Ok(p) => Err(format!("Invalid IPv6 prefix length '{}': must be 0-128", p)),
+        Err(_) => Err(format!(
+            "Invalid IPv6 prefix length '{}': must be a number",
+            prefix
+        )),
+    }
+}
+
+/// Validate an IPv6 address (supports `::` shorthand)
+fn validate_ipv6_address(addr: &str) -> Result<(), String> {
+    if addr.is_empty() {
+        return Err("Empty IPv6 address".to_string());
+    }
+
+    // Handle :: shorthand
+    if addr.contains("::") {
+        let halves: Vec<&str> = addr.splitn(2, "::").collect();
+        if halves.len() != 2 {
+            return Err(format!("Invalid IPv6 address '{}': malformed '::'", addr));
+        }
+
+        // Check for multiple ::
+        if halves[1].contains("::") {
+            return Err(format!(
+                "Invalid IPv6 address '{}': only one '::' allowed",
+                addr
+            ));
+        }
+
+        let left_groups: Vec<&str> = if halves[0].is_empty() {
+            vec![]
+        } else {
+            halves[0].split(':').collect()
+        };
+        let right_groups: Vec<&str> = if halves[1].is_empty() {
+            vec![]
+        } else {
+            halves[1].split(':').collect()
+        };
+
+        let total = left_groups.len() + right_groups.len();
+        if total > 7 {
+            return Err(format!(
+                "Invalid IPv6 address '{}': too many groups with '::'",
+                addr
+            ));
+        }
+
+        for group in left_groups.iter().chain(right_groups.iter()) {
+            validate_ipv6_group(group, addr)?;
+        }
+    } else {
+        let groups: Vec<&str> = addr.split(':').collect();
+        if groups.len() != 8 {
+            return Err(format!(
+                "Invalid IPv6 address '{}': expected 8 groups, got {}",
+                addr,
+                groups.len()
+            ));
+        }
+        for group in &groups {
+            validate_ipv6_group(group, addr)?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Validate a single IPv6 group (1-4 hex digits)
+fn validate_ipv6_group(group: &str, addr: &str) -> Result<(), String> {
+    if group.is_empty() || group.len() > 4 {
+        return Err(format!(
+            "Invalid IPv6 group '{}' in address '{}': must be 1-4 hex digits",
+            group, addr
+        ));
+    }
+    if !group.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(format!(
+            "Invalid IPv6 group '{}' in address '{}': must be hex digits",
+            group, addr
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -624,5 +765,89 @@ mod tests {
         // Invalid item in list
         let bad_list = Value::List(vec![Value::Map(HashMap::new())]);
         assert!(list_type.validate(&bad_list).is_err());
+    }
+
+    #[test]
+    fn validate_ipv4_cidr_type() {
+        let t = types::ipv4_cidr();
+
+        // Valid IPv4 CIDRs
+        assert!(
+            t.validate(&Value::String("10.0.0.0/16".to_string()))
+                .is_ok()
+        );
+        assert!(t.validate(&Value::String("0.0.0.0/0".to_string())).is_ok());
+        assert!(
+            t.validate(&Value::String("255.255.255.255/32".to_string()))
+                .is_ok()
+        );
+
+        // Invalid IPv4 CIDRs
+        assert!(
+            t.validate(&Value::String("10.0.0.0/33".to_string()))
+                .is_err()
+        );
+        assert!(t.validate(&Value::String("10.0.0.0".to_string())).is_err());
+        assert!(t.validate(&Value::Int(42)).is_err());
+    }
+
+    #[test]
+    fn validate_ipv6_cidr_type() {
+        let t = types::ipv6_cidr();
+
+        // Valid IPv6 CIDRs
+        assert!(t.validate(&Value::String("::/0".to_string())).is_ok());
+        assert!(
+            t.validate(&Value::String("2001:db8::/32".to_string()))
+                .is_ok()
+        );
+        assert!(t.validate(&Value::String("fe80::/10".to_string())).is_ok());
+        assert!(t.validate(&Value::String("::1/128".to_string())).is_ok());
+        assert!(
+            t.validate(&Value::String(
+                "2001:0db8:85a3:0000:0000:8a2e:0370:7334/64".to_string()
+            ))
+            .is_ok()
+        );
+        assert!(t.validate(&Value::String("ff00::/8".to_string())).is_ok());
+
+        // Invalid IPv6 CIDRs
+        assert!(
+            t.validate(&Value::String("2001:db8::/129".to_string()))
+                .is_err()
+        ); // prefix > 128
+        assert!(
+            t.validate(&Value::String("2001:db8::".to_string()))
+                .is_err()
+        ); // missing prefix
+        assert!(
+            t.validate(&Value::String("2001:gggg::/32".to_string()))
+                .is_err()
+        ); // invalid hex
+        assert!(
+            t.validate(&Value::String("2001:db8::1::2/64".to_string()))
+                .is_err()
+        ); // double ::
+        assert!(
+            t.validate(&Value::String("10.0.0.0/16".to_string()))
+                .is_err()
+        ); // IPv4, not IPv6
+        assert!(t.validate(&Value::Int(42)).is_err()); // wrong type
+    }
+
+    #[test]
+    fn validate_ipv6_cidr_function_directly() {
+        // Valid
+        assert!(validate_ipv6_cidr("::/0").is_ok());
+        assert!(validate_ipv6_cidr("2001:db8::/32").is_ok());
+        assert!(validate_ipv6_cidr("fe80::/10").is_ok());
+        assert!(validate_ipv6_cidr("::1/128").is_ok());
+        assert!(validate_ipv6_cidr("2001:0db8:85a3:0000:0000:8a2e:0370:7334/64").is_ok());
+
+        // Invalid
+        assert!(validate_ipv6_cidr("2001:db8::/129").is_err());
+        assert!(validate_ipv6_cidr("not-a-cidr").is_err());
+        assert!(validate_ipv6_cidr("2001:db8::").is_err());
+        assert!(validate_ipv6_cidr("/64").is_err());
     }
 }
