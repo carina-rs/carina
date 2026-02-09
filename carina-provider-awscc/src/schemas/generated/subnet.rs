@@ -42,7 +42,7 @@ pub fn ec2_subnet_config() -> AwsccSchemaConfig {
                 .with_provider_name("BlockPublicAccessStates"),
         )
         .attribute(
-            AttributeSchema::new("cidr_block", types::cidr())
+            AttributeSchema::new("cidr_block", types::ipv4_cidr())
                 .with_description("The IPv4 CIDR block assigned to the subnet. If you update this property, we create a new subnet, and then delete the existing one.")
                 .with_provider_name("CidrBlock"),
         )
@@ -67,12 +67,12 @@ pub fn ec2_subnet_config() -> AwsccSchemaConfig {
                 .with_provider_name("Ipv4NetmaskLength"),
         )
         .attribute(
-            AttributeSchema::new("ipv6_cidr_block", types::cidr())
+            AttributeSchema::new("ipv6_cidr_block", types::ipv6_cidr())
                 .with_description("The IPv6 CIDR block. If you specify ``AssignIpv6AddressOnCreation``, you must also specify an IPv6 CIDR block.")
                 .with_provider_name("Ipv6CidrBlock"),
         )
         .attribute(
-            AttributeSchema::new("ipv6_cidr_blocks", AttributeType::List(Box::new(types::cidr())))
+            AttributeSchema::new("ipv6_cidr_blocks", AttributeType::List(Box::new(types::ipv6_cidr())))
                 .with_description(" (read-only)")
                 .with_provider_name("Ipv6CidrBlocks"),
         )

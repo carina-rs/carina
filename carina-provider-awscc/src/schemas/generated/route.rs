@@ -21,7 +21,7 @@ pub fn ec2_route_config() -> AwsccSchemaConfig {
                 .with_provider_name("CarrierGatewayId"),
         )
         .attribute(
-            AttributeSchema::new("cidr_block", types::cidr())
+            AttributeSchema::new("cidr_block", types::ipv4_cidr())
                 .with_description(" (read-only)")
                 .with_provider_name("CidrBlock"),
         )
@@ -31,12 +31,12 @@ pub fn ec2_route_config() -> AwsccSchemaConfig {
                 .with_provider_name("CoreNetworkArn"),
         )
         .attribute(
-            AttributeSchema::new("destination_cidr_block", types::cidr())
+            AttributeSchema::new("destination_cidr_block", types::ipv4_cidr())
                 .with_description("The IPv4 CIDR address block used for the destination match. Routing decisions are based on the most specific match. We modify the specified CIDR block...")
                 .with_provider_name("DestinationCidrBlock"),
         )
         .attribute(
-            AttributeSchema::new("destination_ipv6_cidr_block", types::cidr())
+            AttributeSchema::new("destination_ipv6_cidr_block", types::ipv6_cidr())
                 .with_description("The IPv6 CIDR block used for the destination match. Routing decisions are based on the most specific match.")
                 .with_provider_name("DestinationIpv6CidrBlock"),
         )

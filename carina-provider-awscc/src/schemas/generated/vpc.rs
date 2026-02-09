@@ -30,12 +30,12 @@ pub fn ec2_vpc_config() -> AwsccSchemaConfig {
         schema: ResourceSchema::new("awscc.ec2_vpc")
         .with_description("Specifies a virtual private cloud (VPC).  To add an IPv6 CIDR block to the VPC, see [AWS::EC2::VPCCidrBlock](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-ec2-vpccidrbloc...")
         .attribute(
-            AttributeSchema::new("cidr_block", types::cidr())
+            AttributeSchema::new("cidr_block", types::ipv4_cidr())
                 .with_description("The IPv4 network range for the VPC, in CIDR notation. For example, ``10.0.0.0/16``. We modify the specified CIDR block to its canonical form; for exam...")
                 .with_provider_name("CidrBlock"),
         )
         .attribute(
-            AttributeSchema::new("cidr_block_associations", AttributeType::List(Box::new(types::cidr())))
+            AttributeSchema::new("cidr_block_associations", AttributeType::List(Box::new(types::ipv4_cidr())))
                 .with_description(" (read-only)")
                 .with_provider_name("CidrBlockAssociations"),
         )
@@ -80,7 +80,7 @@ pub fn ec2_vpc_config() -> AwsccSchemaConfig {
                 .with_provider_name("Ipv4NetmaskLength"),
         )
         .attribute(
-            AttributeSchema::new("ipv6_cidr_blocks", AttributeType::List(Box::new(types::cidr())))
+            AttributeSchema::new("ipv6_cidr_blocks", AttributeType::List(Box::new(types::ipv6_cidr())))
                 .with_description(" (read-only)")
                 .with_provider_name("Ipv6CidrBlocks"),
         )
