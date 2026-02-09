@@ -8,14 +8,14 @@ Resource Type definition for AWS::EC2::SecurityGroupIngress
 
 ### `cidr_ip`
 
-- **Type:** String
+- **Type:** Ipv4Cidr
 - **Required:** No
 
 The IPv4 ranges
 
 ### `cidr_ipv6`
 
-- **Type:** String
+- **Type:** Ipv6Cidr
 - **Required:** No
 
 [VPC only] The IPv6 ranges

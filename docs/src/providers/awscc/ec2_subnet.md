@@ -36,7 +36,7 @@ The AZ ID of the subnet.
 
 ### `cidr_block`
 
-- **Type:** CIDR
+- **Type:** Ipv4Cidr
 - **Required:** No
 
 The IPv4 CIDR block assigned to the subnet. If you update this property, we create a new subnet, and then delete the existing one.
@@ -71,7 +71,7 @@ An IPv4 netmask length for the subnet.
 
 ### `ipv6_cidr_block`
 
-- **Type:** CIDR
+- **Type:** Ipv6Cidr
 - **Required:** No
 
 The IPv6 CIDR block. If you specify ``AssignIpv6AddressOnCreation``, you must also specify an IPv6 CIDR block.

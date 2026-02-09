@@ -64,8 +64,8 @@ The ID of the VPC for the security group.
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `cidr_ip` | String | No |  |
-| `cidr_ipv6` | String | No |  |
+| `cidr_ip` | Ipv4Cidr | No |  |
+| `cidr_ipv6` | Ipv6Cidr | No |  |
 | `description` | String | No |  |
 | `destination_prefix_list_id` | String | No |  |
 | `destination_security_group_id` | String | No |  |
@@ -77,8 +77,8 @@ The ID of the VPC for the security group.
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `cidr_ip` | String | No |  |
-| `cidr_ipv6` | String | No |  |
+| `cidr_ip` | Ipv4Cidr | No |  |
+| `cidr_ipv6` | Ipv6Cidr | No |  |
 | `description` | String | No |  |
 | `from_port` | Int | No |  |
 | `ip_protocol` | String | Yes |  |

@@ -10,7 +10,7 @@ Specifies a virtual private cloud (VPC).
 
 ### `cidr_block`
 
-- **Type:** CIDR
+- **Type:** Ipv4Cidr
 - **Required:** No
 
 The IPv4 network range for the VPC, in CIDR notation. For example, ``10.0.0.0/16``. We modify the specified CIDR block to its canonical form; for example, if you specify ``100.68.0.18/18``, we modify it to ``100.68.0.0/18``. You must specify either``CidrBlock`` or ``Ipv4IpamPoolId``.
