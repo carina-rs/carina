@@ -6,7 +6,7 @@ Specifies a route in a route table. For more information, see [Routes](https://d
  You must specify either a destination CIDR block or prefix list ID. You must also specify exactly one of the resources as the target.
  If you create a route that references a transit gateway in the same template where you create the transit gateway, you must declare a dependency on the transit gateway attachment. The route table cannot use the transit gateway until it has successfully attached to the VPC. Add a [DependsOn Attribute](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-attribute-dependson.html) in the ``AWS::EC2::Route`` resource to explicitly declare a dependency on the ``AWS::EC2::TransitGatewayAttachment`` resource.
 
-## Attributes
+## Argument Reference
 
 ### `carrier_gateway_id`
 
@@ -14,11 +14,6 @@ Specifies a route in a route table. For more information, see [Routes](https://d
 - **Required:** No
 
 The ID of the carrier gateway. You can only use this option when the VPC contains a subnet which is associated with a Wavelength Zone.
-
-### `cidr_block`
-
-- **Type:** Ipv4Cidr
-- **Read-only**
 
 ### `core_network_arn`
 
@@ -117,6 +112,12 @@ The ID of a VPC endpoint. Supported for Gateway Load Balancer endpoints only.
 - **Required:** No
 
 The ID of a VPC peering connection.
+
+## Attribute Reference
+
+### `cidr_block`
+
+- **Type:** Ipv4Cidr
 
 
 

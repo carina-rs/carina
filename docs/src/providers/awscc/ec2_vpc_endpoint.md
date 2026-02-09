@@ -7,17 +7,7 @@ Specifies a VPC endpoint. A VPC endpoint provides a private connection between y
  An endpoint of type ``gateway`` serves as a target for a route in your route table for traffic destined for S3 or DDB. You can specify an endpoint policy for the endpoint, which controls access to the service from your VPC. You can also specify the VPC route tables that use the endpoint. For more information about connectivity to S3, see [Why can't I connect to an S3 bucket using a gateway VPC endpoint?](https://docs.aws.amazon.com/premiumsupport/knowledge-center/connect-s3-vpc-endpoint)
  An endpoint of type ``GatewayLoadBalancer`` provides private connectivity between your VPC and virtual appliances from a service provider.
 
-## Attributes
-
-### `creation_timestamp`
-
-- **Type:** String
-- **Read-only**
-
-### `dns_entries`
-
-- **Type:** List
-- **Read-only**
+## Argument Reference
 
 ### `dns_options`
 
@@ -26,22 +16,12 @@ Specifies a VPC endpoint. A VPC endpoint provides a private connection between y
 
 Describes the DNS options for an endpoint.
 
-### `id`
-
-- **Type:** String
-- **Read-only**
-
 ### `ip_address_type`
 
 - **Type:** Enum (IpAddressType)
 - **Required:** No
 
 The supported IP address types.
-
-### `network_interface_ids`
-
-- **Type:** List
-- **Read-only**
 
 ### `policy_document`
 
@@ -126,6 +106,24 @@ The type of endpoint. Default: Gateway
 - **Required:** Yes
 
 The ID of the VPC.
+
+## Attribute Reference
+
+### `creation_timestamp`
+
+- **Type:** String
+
+### `dns_entries`
+
+- **Type:** List
+
+### `id`
+
+- **Type:** String
+
+### `network_interface_ids`
+
+- **Type:** List
 
 ## Enum Values
 

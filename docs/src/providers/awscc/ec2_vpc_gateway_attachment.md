@@ -4,12 +4,7 @@ CloudFormation Type: `AWS::EC2::VPCGatewayAttachment`
 
 Resource Type definition for AWS::EC2::VPCGatewayAttachment
 
-## Attributes
-
-### `attachment_type`
-
-- **Type:** String
-- **Read-only**
+## Argument Reference
 
 ### `internet_gateway_id`
 
@@ -31,6 +26,12 @@ The ID of the VPC.
 - **Required:** No
 
 The ID of the virtual private gateway. You must specify either InternetGatewayId or VpnGatewayId, but not both.
+
+## Attribute Reference
+
+### `attachment_type`
+
+- **Type:** String
 
 
 

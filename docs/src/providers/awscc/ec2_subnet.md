@@ -6,7 +6,7 @@ Specifies a subnet for the specified VPC.
  For an IPv4 only subnet, specify an IPv4 CIDR block. If the VPC has an IPv6 CIDR block, you can create an IPv6 only subnet or a dual stack subnet instead. For an IPv6 only subnet, specify an IPv6 CIDR block. For a dual stack subnet, specify both an IPv4 CIDR block and an IPv6 CIDR block.
  For more information, see [Subnets for your VPC](https://docs.aws.amazon.com/vpc/latest/userguide/configure-subnets.html) in the *Amazon VPC User Guide*.
 
-## Attributes
+## Argument Reference
 
 ### `assign_ipv6_address_on_creation`
 
@@ -28,11 +28,6 @@ The Availability Zone of the subnet. If you update this property, you must also 
 - **Required:** No
 
 The AZ ID of the subnet.
-
-### `block_public_access_states`
-
-- **Type:** Struct(BlockPublicAccessStates)
-- **Read-only**
 
 ### `cidr_block`
 
@@ -76,11 +71,6 @@ An IPv4 netmask length for the subnet.
 
 The IPv6 CIDR block. If you specify ``AssignIpv6AddressOnCreation``, you must also specify an IPv6 CIDR block.
 
-### `ipv6_cidr_blocks`
-
-- **Type:** List
-- **Read-only**
-
 ### `ipv6_ipam_pool_id`
 
 - **Type:** String
@@ -109,11 +99,6 @@ An IPv6 netmask length for the subnet.
 
 Indicates whether instances launched in this subnet receive a public IPv4 address. The default value is ``false``. AWS charges for all public IPv4 addresses, including public IPv4 addresses associated with running instances and Elastic IP addresses. For more information, see the *Public IPv4 Address* tab on the [VPC pricing page](https://docs.aws.amazon.com/vpc/pricing/).
 
-### `network_acl_association_id`
-
-- **Type:** String
-- **Read-only**
-
 ### `outpost_arn`
 
 - **Type:** Arn
@@ -128,11 +113,6 @@ The Amazon Resource Name (ARN) of the Outpost.
 
 The hostname type for EC2 instances launched into this subnet and how DNS A and AAAA record queries to the instances should be handled. For more information, see [Amazon EC2 instance hostname types](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ec2-instance-naming.html) in the *User Guide*. Available options:  + EnableResourceNameDnsAAAARecord (true | false)  + EnableResourceNameDnsARecord (true | false)  + HostnameType (ip-name | resource-name)
 
-### `subnet_id`
-
-- **Type:** String
-- **Read-only**
-
 ### `tags`
 
 - **Type:** Map
@@ -146,6 +126,24 @@ Any tags assigned to the subnet.
 - **Required:** Yes
 
 The ID of the VPC the subnet is in. If you update this property, you must also update the ``CidrBlock`` property.
+
+## Attribute Reference
+
+### `block_public_access_states`
+
+- **Type:** Struct(BlockPublicAccessStates)
+
+### `ipv6_cidr_blocks`
+
+- **Type:** List
+
+### `network_acl_association_id`
+
+- **Type:** String
+
+### `subnet_id`
+
+- **Type:** String
 
 ## Struct Definitions
 

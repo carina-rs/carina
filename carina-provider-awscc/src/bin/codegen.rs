@@ -219,6 +219,92 @@ struct StructDefInfo {
     required: Vec<String>,
 }
 
+/// Determine the display string for a property's type in markdown docs
+fn type_display_string(
+    prop_name: &str,
+    prop: &CfnProperty,
+    schema: &CfnSchema,
+    enums: &BTreeMap<String, EnumInfo>,
+) -> String {
+    if enums.contains_key(prop_name) {
+        format!("Enum ({})", enums[prop_name].type_name)
+    } else if prop_name == "Tags" {
+        "Map".to_string()
+    } else if let Some(ref_path) = &prop.ref_path {
+        if ref_path.contains("/Tag") {
+            "Map".to_string()
+        } else if let Some(def_name) = ref_def_name(ref_path)
+            && resolve_ref(schema, ref_path)
+                .and_then(|d| d.properties.as_ref())
+                .map(|p| !p.is_empty())
+                .unwrap_or(false)
+        {
+            format!("Struct({})", def_name)
+        } else {
+            "String".to_string()
+        }
+    } else {
+        match prop.prop_type.as_ref().and_then(|t| t.as_str()) {
+            Some("string") => {
+                let prop_lower = prop_name.to_lowercase();
+                if prop_lower.contains("cidr") {
+                    if prop_lower.contains("ipv6") {
+                        "Ipv6Cidr".to_string()
+                    } else if prop_lower.contains("cidrblock")
+                        || prop_lower == "cidr_block"
+                        || prop_lower == "cidrip"
+                        || prop_lower == "destinationcidrblock"
+                    {
+                        "Ipv4Cidr".to_string()
+                    } else {
+                        "String".to_string()
+                    }
+                } else if prop_lower.ends_with("arn") || prop_lower.contains("_arn") {
+                    "Arn".to_string()
+                } else {
+                    "String".to_string()
+                }
+            }
+            Some("boolean") => "Bool".to_string(),
+            Some("integer") | Some("number") => "Int".to_string(),
+            Some("array") => {
+                if let Some(items) = &prop.items {
+                    if let Some(ref_path) = &items.ref_path {
+                        if !ref_path.contains("/Tag") {
+                            if let Some(def_name) = ref_def_name(ref_path)
+                                && resolve_ref(schema, ref_path)
+                                    .and_then(|d| d.properties.as_ref())
+                                    .map(|p| !p.is_empty())
+                                    .unwrap_or(false)
+                            {
+                                format!("List<{}>", def_name)
+                            } else {
+                                "List".to_string()
+                            }
+                        } else {
+                            "List".to_string()
+                        }
+                    } else {
+                        "List".to_string()
+                    }
+                } else {
+                    "List".to_string()
+                }
+            }
+            Some("object") => {
+                if let Some(props) = &prop.properties
+                    && !props.is_empty()
+                {
+                    format!("Struct({})", prop_name)
+                } else {
+                    "Map".to_string()
+                }
+            }
+            _ => "String".to_string(),
+        }
+    }
+}
+
 fn generate_markdown(schema: &CfnSchema, type_name: &str) -> Result<String> {
     let mut md = String::new();
 
@@ -256,112 +342,51 @@ fn generate_markdown(schema: &CfnSchema, type_name: &str) -> Result<String> {
         md.push_str(&format!("{}\n\n", desc));
     }
 
-    // Attributes
-    md.push_str("## Attributes\n\n");
+    // Argument Reference (writable attributes)
+    md.push_str("## Argument Reference\n\n");
 
     for (prop_name, prop) in &schema.properties {
-        let attr_name = prop_name.to_snake_case();
-        let is_required = required.contains(prop_name) && !read_only.contains(prop_name);
-        let is_read_only = read_only.contains(prop_name);
+        if read_only.contains(prop_name) {
+            continue;
+        }
 
-        // Determine type display string
-        let type_display = if enums.contains_key(prop_name) {
-            format!("Enum ({})", enums[prop_name].type_name)
-        } else if prop_name == "Tags" {
-            "Map".to_string()
-        } else if let Some(ref_path) = &prop.ref_path {
-            if ref_path.contains("/Tag") {
-                "Map".to_string()
-            } else if let Some(def_name) = ref_def_name(ref_path)
-                && resolve_ref(schema, ref_path)
-                    .and_then(|d| d.properties.as_ref())
-                    .map(|p| !p.is_empty())
-                    .unwrap_or(false)
-            {
-                format!("Struct({})", def_name)
-            } else {
-                "String".to_string()
-            }
-        } else {
-            match prop.prop_type.as_ref().and_then(|t| t.as_str()) {
-                Some("string") => {
-                    let prop_lower = prop_name.to_lowercase();
-                    if prop_lower.contains("cidr") {
-                        if prop_lower.contains("ipv6") {
-                            "Ipv6Cidr".to_string()
-                        } else if prop_lower.contains("cidrblock")
-                            || prop_lower == "cidr_block"
-                            || prop_lower == "cidrip"
-                            || prop_lower == "destinationcidrblock"
-                        {
-                            "Ipv4Cidr".to_string()
-                        } else {
-                            "String".to_string()
-                        }
-                    } else if prop_lower.ends_with("arn") || prop_lower.contains("_arn") {
-                        "Arn".to_string()
-                    } else {
-                        "String".to_string()
-                    }
-                }
-                Some("boolean") => "Bool".to_string(),
-                Some("integer") | Some("number") => "Int".to_string(),
-                Some("array") => {
-                    // Check if items has a $ref that resolves to a struct
-                    if let Some(items) = &prop.items {
-                        if let Some(ref_path) = &items.ref_path {
-                            if !ref_path.contains("/Tag") {
-                                if let Some(def_name) = ref_def_name(ref_path)
-                                    && resolve_ref(schema, ref_path)
-                                        .and_then(|d| d.properties.as_ref())
-                                        .map(|p| !p.is_empty())
-                                        .unwrap_or(false)
-                                {
-                                    format!("List<{}>", def_name)
-                                } else {
-                                    "List".to_string()
-                                }
-                            } else {
-                                "List".to_string()
-                            }
-                        } else {
-                            "List".to_string()
-                        }
-                    } else {
-                        "List".to_string()
-                    }
-                }
-                Some("object") => {
-                    if let Some(props) = &prop.properties
-                        && !props.is_empty()
-                    {
-                        format!("Struct({})", prop_name)
-                    } else {
-                        "Map".to_string()
-                    }
-                }
-                _ => "String".to_string(),
-            }
-        };
+        let attr_name = prop_name.to_snake_case();
+        let is_required = required.contains(prop_name);
+        let type_display = type_display_string(prop_name, prop, schema, &enums);
 
         md.push_str(&format!("### `{}`\n\n", attr_name));
-
-        if is_read_only {
-            md.push_str(&format!("- **Type:** {}\n", type_display));
-            md.push_str("- **Read-only**\n\n");
+        md.push_str(&format!("- **Type:** {}\n", type_display));
+        if is_required {
+            md.push_str("- **Required:** Yes\n");
         } else {
-            md.push_str(&format!("- **Type:** {}\n", type_display));
-            if is_required {
-                md.push_str("- **Required:** Yes\n");
-            } else {
-                md.push_str("- **Required:** No\n");
-            }
-            md.push('\n');
+            md.push_str("- **Required:** No\n");
+        }
+        md.push('\n');
 
-            if let Some(d) = &prop.description {
-                let desc = d.replace('\n', " ").replace("  ", " ");
-                md.push_str(&format!("{}\n\n", desc));
+        if let Some(d) = &prop.description {
+            let desc = d.replace('\n', " ").replace("  ", " ");
+            md.push_str(&format!("{}\n\n", desc));
+        }
+    }
+
+    // Attribute Reference (read-only attributes)
+    let has_read_only = schema
+        .properties
+        .keys()
+        .any(|name| read_only.contains(name));
+    if has_read_only {
+        md.push_str("## Attribute Reference\n\n");
+
+        for (prop_name, prop) in &schema.properties {
+            if !read_only.contains(prop_name) {
+                continue;
             }
+
+            let attr_name = prop_name.to_snake_case();
+            let type_display = type_display_string(prop_name, prop, schema, &enums);
+
+            md.push_str(&format!("### `{}`\n\n", attr_name));
+            md.push_str(&format!("- **Type:** {}\n\n", type_display));
         }
     }
 
