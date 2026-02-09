@@ -14,6 +14,12 @@ pub struct CompletionProvider {
     schemas: HashMap<String, ResourceSchema>,
 }
 
+impl Default for CompletionProvider {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CompletionProvider {
     pub fn new() -> Self {
         let mut schema_map = HashMap::new();

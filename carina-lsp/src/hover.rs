@@ -6,6 +6,12 @@ use carina_provider_aws::schemas::{s3, vpc};
 
 pub struct HoverProvider;
 
+impl Default for HoverProvider {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl HoverProvider {
     pub fn new() -> Self {
         Self

@@ -18,6 +18,12 @@ pub struct DiagnosticEngine {
     valid_resource_types: HashSet<String>,
 }
 
+impl Default for DiagnosticEngine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DiagnosticEngine {
     pub fn new() -> Self {
         let mut valid_resource_types = HashSet::new();
