@@ -5,7 +5,7 @@ use tower_lsp::lsp_types::{
 
 use crate::document::Document;
 use carina_core::parser;
-use carina_core::schema::{AttributeType, ResourceSchema};
+use carina_core::schema::{AttributeType, ResourceSchema, StructField};
 use carina_provider_aws::schemas;
 use carina_provider_awscc::schemas as awscc_schemas;
 use std::collections::HashMap;
@@ -50,6 +50,15 @@ impl CompletionProvider {
                 resource_type,
                 attr_name,
             } => self.value_completions_for_attr(&resource_type, &attr_name, &text),
+            CompletionContext::InsideStructBlock {
+                resource_type,
+                attr_name,
+            } => self.struct_field_completions(&resource_type, &attr_name),
+            CompletionContext::AfterEqualsInStruct {
+                resource_type,
+                attr_name,
+                field_name,
+            } => self.value_completions_for_struct_field(&resource_type, &attr_name, &field_name),
             CompletionContext::AfterAwsRegion => self.region_completions(),
             CompletionContext::AfterRefType => self.ref_type_completions(),
             CompletionContext::AfterInputDot => self.input_parameter_completions(&text),
@@ -88,6 +97,7 @@ impl CompletionProvider {
         let mut brace_depth = 0;
         let mut resource_type = String::new();
         let mut module_name: Option<String> = None;
+        let mut nested_block_name: Option<String> = None;
 
         for (i, line) in lines.iter().enumerate() {
             if i > line_idx {
@@ -118,6 +128,18 @@ impl CompletionProvider {
                 }
             }
 
+            // At brace_depth == 1, detect nested block: "identifier {" (without "=")
+            if brace_depth == 1
+                && trimmed.ends_with('{')
+                && !trimmed.contains('=')
+                && !resource_type.is_empty()
+            {
+                let name = trimmed.trim_end_matches('{').trim();
+                if !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                    nested_block_name = Some(name.to_string());
+                }
+            }
+
             for c in line.chars() {
                 if c == '{' {
                     brace_depth += 1;
@@ -126,9 +148,34 @@ impl CompletionProvider {
                     if brace_depth == 0 {
                         resource_type.clear();
                         module_name = None;
+                        nested_block_name = None;
+                    } else if brace_depth == 1 {
+                        nested_block_name = None;
                     }
                 }
             }
+        }
+
+        // Check if we're inside a nested struct block (brace_depth > 1)
+        if let Some(attr_name) = nested_block_name
+            && brace_depth > 1
+            && !resource_type.is_empty()
+        {
+            if prefix.contains('=') {
+                let after_eq = prefix.split('=').next_back().unwrap_or("").trim();
+                if !after_eq.starts_with('"') || after_eq == "\"" {
+                    let field_name = self.extract_attr_name(&prefix);
+                    return CompletionContext::AfterEqualsInStruct {
+                        resource_type: resource_type.clone(),
+                        attr_name,
+                        field_name,
+                    };
+                }
+            }
+            return CompletionContext::InsideStructBlock {
+                resource_type: resource_type.clone(),
+                attr_name,
+            };
         }
 
         // Check if we're after an equals sign (value position) inside a block
@@ -180,6 +227,11 @@ impl CompletionProvider {
             ("aws.security_group", "security_group"),
             // awscc resources
             ("awscc.ec2_vpc", "awscc.ec2_vpc"),
+            ("awscc.ec2_security_group", "awscc.ec2_security_group"),
+            ("awscc.ec2_flow_log", "awscc.ec2_flow_log"),
+            ("awscc.ec2_nat_gateway", "awscc.ec2_nat_gateway"),
+            ("awscc.ec2_vpc_endpoint", "awscc.ec2_vpc_endpoint"),
+            ("awscc.ec2_subnet", "awscc.ec2_subnet"),
         ] {
             if trimmed.contains(pattern) {
                 return Some(schema_type.to_string());
@@ -692,6 +744,84 @@ impl CompletionProvider {
         }
     }
 
+    /// Extract struct fields from an attribute type, unwrapping both Struct and List(Struct)
+    fn extract_struct_fields<'a>(
+        &self,
+        attr_type: &'a AttributeType,
+    ) -> Option<&'a Vec<StructField>> {
+        match attr_type {
+            AttributeType::Struct { fields, .. } => Some(fields),
+            AttributeType::List(inner) => match inner.as_ref() {
+                AttributeType::Struct { fields, .. } => Some(fields),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Provide completions for struct fields inside a nested block
+    fn struct_field_completions(
+        &self,
+        resource_type: &str,
+        attr_name: &str,
+    ) -> Vec<CompletionItem> {
+        let trigger_suggest = Command {
+            title: "Trigger Suggest".to_string(),
+            command: "editor.action.triggerSuggest".to_string(),
+            arguments: None,
+        };
+
+        if let Some(schema) = self.schemas.get(resource_type)
+            && let Some(attr_schema) = schema.attributes.get(attr_name)
+            && let Some(fields) = self.extract_struct_fields(&attr_schema.attr_type)
+        {
+            fields
+                .iter()
+                .map(|field| {
+                    let required_marker = if field.required { " (required)" } else { "" };
+                    CompletionItem {
+                        label: field.name.clone(),
+                        kind: Some(CompletionItemKind::FIELD),
+                        detail: field
+                            .description
+                            .as_ref()
+                            .map(|d| format!("{}{}", d, required_marker))
+                            .or_else(|| {
+                                if field.required {
+                                    Some("(required)".to_string())
+                                } else {
+                                    None
+                                }
+                            }),
+                        insert_text: Some(format!("{} = ", field.name)),
+                        command: Some(trigger_suggest.clone()),
+                        ..Default::default()
+                    }
+                })
+                .collect()
+        } else {
+            vec![]
+        }
+    }
+
+    /// Provide value completions for a specific struct field
+    fn value_completions_for_struct_field(
+        &self,
+        resource_type: &str,
+        attr_name: &str,
+        field_name: &str,
+    ) -> Vec<CompletionItem> {
+        if let Some(schema) = self.schemas.get(resource_type)
+            && let Some(attr_schema) = schema.attributes.get(attr_name)
+            && let Some(fields) = self.extract_struct_fields(&attr_schema.attr_type)
+            && let Some(field) = fields.iter().find(|f| f.name == field_name)
+        {
+            self.completions_for_type(&field.field_type, resource_type)
+        } else {
+            vec![]
+        }
+    }
+
     fn generic_value_completions(&self) -> Vec<CompletionItem> {
         let mut completions = vec![
             CompletionItem {
@@ -1114,6 +1244,15 @@ enum CompletionContext {
         resource_type: String,
         attr_name: String,
     },
+    InsideStructBlock {
+        resource_type: String,
+        attr_name: String,
+    },
+    AfterEqualsInStruct {
+        resource_type: String,
+        attr_name: String,
+        field_name: String,
+    },
     AfterAwsRegion,
     AfterRefType,
     AfterInputDot,
@@ -1425,6 +1564,120 @@ simple {
         assert!(
             suspended_completion.is_some(),
             "Should have 'Suspended' completion"
+        );
+    }
+
+    #[test]
+    fn struct_field_completion_inside_nested_block() {
+        let provider = CompletionProvider::new();
+        let doc = create_document(
+            r#"awscc.ec2_security_group {
+    group_description = "test"
+    security_group_ingress {
+
+    }
+}"#,
+        );
+        // Cursor inside the nested block (line 3)
+        let position = Position {
+            line: 3,
+            character: 8,
+        };
+
+        let completions = provider.complete(&doc, position, None);
+
+        // Should have struct field completions
+        let ip_protocol = completions.iter().find(|c| c.label == "ip_protocol");
+        assert!(
+            ip_protocol.is_some(),
+            "Should have ip_protocol field completion"
+        );
+
+        let from_port = completions.iter().find(|c| c.label == "from_port");
+        assert!(
+            from_port.is_some(),
+            "Should have from_port field completion"
+        );
+
+        let to_port = completions.iter().find(|c| c.label == "to_port");
+        assert!(to_port.is_some(), "Should have to_port field completion");
+
+        // ip_protocol should be marked as required
+        if let Some(c) = ip_protocol {
+            assert!(
+                c.detail.as_ref().is_some_and(|d| d.contains("required")),
+                "ip_protocol should be marked as required"
+            );
+        }
+
+        // Should NOT have top-level resource attributes like group_description
+        let group_desc = completions.iter().find(|c| c.label == "group_description");
+        assert!(
+            group_desc.is_none(),
+            "Should not have resource-level attributes inside struct block"
+        );
+    }
+
+    #[test]
+    fn struct_field_value_completion_for_bool() {
+        let provider = CompletionProvider::new();
+        // flow_log's destination_options has Bool fields
+        let doc = create_document(
+            r#"awscc.ec2_flow_log {
+    name = "test"
+    destination_options {
+        hive_compatible_partitions =
+    }
+}"#,
+        );
+        // Cursor after "hive_compatible_partitions = " (line 3)
+        let position = Position {
+            line: 3,
+            character: 37,
+        };
+
+        let completions = provider.complete(&doc, position, None);
+
+        let true_completion = completions.iter().find(|c| c.label == "true");
+        assert!(
+            true_completion.is_some(),
+            "Should have 'true' completion for Bool struct field"
+        );
+
+        let false_completion = completions.iter().find(|c| c.label == "false");
+        assert!(
+            false_completion.is_some(),
+            "Should have 'false' completion for Bool struct field"
+        );
+    }
+
+    #[test]
+    fn context_detection_returns_struct_context() {
+        let provider = CompletionProvider::new();
+        let text = r#"awscc.ec2_security_group {
+    group_description = "test"
+    security_group_ingress {
+
+    }
+}"#;
+        // Cursor inside nested block
+        let context = provider.get_completion_context(
+            text,
+            Position {
+                line: 3,
+                character: 8,
+            },
+        );
+        assert!(
+            matches!(
+                context,
+                CompletionContext::InsideStructBlock {
+                    ref resource_type,
+                    ref attr_name,
+                } if resource_type == "awscc.ec2_security_group" && attr_name == "security_group_ingress"
+            ),
+            "Should detect InsideStructBlock context, got: {:?}",
+            context
         );
     }
 }
