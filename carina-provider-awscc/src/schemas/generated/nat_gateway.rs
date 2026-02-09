@@ -6,7 +6,20 @@
 
 use super::AwsccSchemaConfig;
 use super::tags_type;
+use super::validate_namespaced_enum;
+use carina_core::resource::Value;
 use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
+
+const VALID_CONNECTIVITY_TYPE: &[&str] = &["public", "private"];
+
+fn validate_connectivity_type(value: &Value) -> Result<(), String> {
+    validate_namespaced_enum(
+        value,
+        "ConnectivityType",
+        "awscc.ec2_nat_gateway",
+        VALID_CONNECTIVITY_TYPE,
+    )
+}
 
 /// Returns the schema config for ec2_nat_gateway (AWS::EC2::NatGateway)
 pub fn ec2_nat_gateway_config() -> AwsccSchemaConfig {
@@ -49,7 +62,12 @@ pub fn ec2_nat_gateway_config() -> AwsccSchemaConfig {
                 .with_provider_name("AvailabilityZoneAddresses"),
         )
         .attribute(
-            AttributeSchema::new("connectivity_type", AttributeType::String)
+            AttributeSchema::new("connectivity_type", AttributeType::Custom {
+                name: "ConnectivityType".to_string(),
+                base: Box::new(AttributeType::String),
+                validate: validate_connectivity_type,
+                namespace: Some("awscc.ec2_nat_gateway".to_string()),
+            })
                 .with_description("Indicates whether the NAT gateway supports public or private connectivity. The default is public connectivity.")
                 .with_provider_name("ConnectivityType"),
         )

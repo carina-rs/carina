@@ -42,7 +42,7 @@ For regional NAT gateways only: Specifies which Availability Zones you want the 
 
 ### `connectivity_type`
 
-- **Type:** String
+- **Type:** Enum (ConnectivityType)
 - **Required:** No
 
 Indicates whether the NAT gateway supports public or private connectivity. The default is public connectivity.
@@ -117,6 +117,17 @@ The tags for the NAT gateway.
 - **Required:** No
 
 The ID of the VPC in which the NAT gateway is located.
+
+## Enum Values
+
+### connectivity_type (ConnectivityType)
+
+| Value | DSL Identifier |
+|-------|----------------|
+| `public` | `awscc.ec2_nat_gateway.ConnectivityType.public` |
+| `private` | `awscc.ec2_nat_gateway.ConnectivityType.private` |
+
+Shorthand formats: `public` or `ConnectivityType.public`
 
 ## Struct Definitions
 

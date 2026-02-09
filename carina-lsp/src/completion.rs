@@ -735,6 +735,7 @@ impl CompletionProvider {
             AttributeType::Custom { name, .. } if name == "Ipv6Cidr" => {
                 self.ipv6_cidr_completions()
             }
+            AttributeType::Custom { name, .. } if name == "Arn" => self.arn_completions(),
             AttributeType::Custom { name, .. } if name == "VersioningStatus" => {
                 self.versioning_status_completions()
             }
@@ -962,6 +963,19 @@ impl CompletionProvider {
                 ..Default::default()
             })
             .collect()
+    }
+
+    fn arn_completions(&self) -> Vec<CompletionItem> {
+        vec![CompletionItem {
+            label: "\"arn:aws:...\"".to_string(),
+            kind: Some(CompletionItemKind::VALUE),
+            insert_text: Some(
+                "\"arn:aws:${1:service}:${2:region}:${3:account}:${4:resource}\"".to_string(),
+            ),
+            insert_text_format: Some(InsertTextFormat::SNIPPET),
+            detail: Some("ARN format: arn:partition:service:region:account:resource".to_string()),
+            ..Default::default()
+        }]
     }
 
     fn versioning_status_completions(&self) -> Vec<CompletionItem> {

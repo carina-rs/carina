@@ -17,7 +17,7 @@ use clap::Parser;
 use heck::{ToPascalCase, ToSnakeCase};
 use regex::Regex;
 use serde::Deserialize;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{self, Read};
 
 /// Information about a detected enum type
@@ -298,6 +298,8 @@ fn generate_markdown(schema: &CfnSchema, type_name: &str) -> Result<String> {
                         } else {
                             "String".to_string()
                         }
+                    } else if prop_lower.ends_with("arn") || prop_lower.contains("_arn") {
+                        "Arn".to_string()
                     } else {
                         "String".to_string()
                     }
@@ -394,10 +396,13 @@ fn generate_markdown(schema: &CfnSchema, type_name: &str) -> Result<String> {
             md.push_str("|-------|------|----------|-------------|\n");
             let required_set: HashSet<&str> =
                 def_info.required.iter().map(|s| s.as_str()).collect();
+            let overrides = known_enum_overrides();
             for (field_name, field_prop) in &def_info.properties {
                 let snake_name = field_name.to_snake_case();
                 let is_req = required_set.contains(field_name.as_str());
-                let field_type_display =
+                let field_type_display = if overrides.contains_key(field_name.as_str()) {
+                    "Enum"
+                } else {
                     match field_prop.prop_type.as_ref().and_then(|t| t.as_str()) {
                         Some("string") => {
                             let fl = field_name.to_lowercase();
@@ -409,6 +414,8 @@ fn generate_markdown(schema: &CfnSchema, type_name: &str) -> Result<String> {
                                 } else {
                                     "String"
                                 }
+                            } else if fl.ends_with("arn") || fl.contains("_arn") {
+                                "Arn"
                             } else {
                                 "String"
                             }
@@ -418,7 +425,8 @@ fn generate_markdown(schema: &CfnSchema, type_name: &str) -> Result<String> {
                         Some("array") => "List",
                         Some("object") => "Map",
                         _ => "String",
-                    };
+                    }
+                };
                 let desc = field_prop
                     .description
                     .as_deref()
@@ -819,6 +827,15 @@ fn generate_struct_type(
     )
 }
 
+/// Known enum overrides for properties where `extract_enum_from_description()` fails
+/// due to inconsistent description formatting in CloudFormation schemas.
+fn known_enum_overrides() -> HashMap<&'static str, Vec<&'static str>> {
+    let mut m = HashMap::new();
+    m.insert("IpProtocol", vec!["tcp", "udp", "icmp", "icmpv6", "-1"]);
+    m.insert("ConnectivityType", vec!["public", "private"]);
+    m
+}
+
 /// Returns (type_string, Option<EnumInfo>)
 /// EnumInfo is Some if this property is an enum that should use AttributeType::Custom
 fn cfn_type_to_carina_type_with_enum(
@@ -862,6 +879,17 @@ fn cfn_type_to_carina_type_with_enum(
         return ("/* enum */".to_string(), Some(enum_info));
     }
 
+    // Check known enum overrides (for properties with inconsistent description formatting)
+    let overrides = known_enum_overrides();
+    if let Some(values) = overrides.get(prop_name) {
+        let type_name = prop_name.to_pascal_case();
+        let enum_info = EnumInfo {
+            type_name,
+            values: values.iter().map(|s| s.to_string()).collect(),
+        };
+        return ("/* enum */".to_string(), Some(enum_info));
+    }
+
     // Handle type
     match prop.prop_type.as_ref().and_then(|t| t.as_str()) {
         Some("string") => {
@@ -887,9 +915,9 @@ fn cfn_type_to_carina_type_with_enum(
                 return ("AttributeType::String".to_string(), None);
             }
 
-            // ARNs are always strings
+            // ARNs use validated Arn type
             if prop_lower.ends_with("arn") || prop_lower.contains("_arn") {
-                return ("AttributeType::String".to_string(), None);
+                return ("types::arn()".to_string(), None);
             }
 
             // Zone/Region are strings
@@ -1032,5 +1060,64 @@ mod tests {
         assert!(result.is_some());
         let values = result.unwrap();
         assert_eq!(values, vec!["enabled", "disabled"]);
+    }
+
+    #[test]
+    fn test_known_enum_overrides() {
+        let overrides = known_enum_overrides();
+
+        // IpProtocol should be overridden
+        let ip_protocol = overrides.get("IpProtocol");
+        assert!(ip_protocol.is_some(), "IpProtocol should be in overrides");
+        assert_eq!(
+            ip_protocol.unwrap(),
+            &vec!["tcp", "udp", "icmp", "icmpv6", "-1"]
+        );
+
+        // ConnectivityType should be overridden
+        let connectivity = overrides.get("ConnectivityType");
+        assert!(
+            connectivity.is_some(),
+            "ConnectivityType should be in overrides"
+        );
+        assert_eq!(connectivity.unwrap(), &vec!["public", "private"]);
+    }
+
+    #[test]
+    fn test_known_enum_override_used_in_codegen() {
+        // IpProtocol with plain description (no double backticks) should still
+        // produce an EnumInfo via known_enum_overrides
+        let prop = CfnProperty {
+            prop_type: Some(TypeValue::Single("string".to_string())),
+            description: Some(
+                "The IP protocol name (tcp, udp, icmp, icmpv6) or number.".to_string(),
+            ),
+            enum_values: None,
+            items: None,
+            ref_path: None,
+            insertion_order: None,
+            properties: None,
+            required: vec![],
+        };
+        let schema = CfnSchema {
+            type_name: "AWS::EC2::SecurityGroupIngress".to_string(),
+            description: None,
+            properties: BTreeMap::new(),
+            required: vec![],
+            read_only_properties: vec![],
+            create_only_properties: vec![],
+            write_only_properties: vec![],
+            primary_identifier: None,
+            definitions: None,
+            tagging: None,
+        };
+        let (_, enum_info) = cfn_type_to_carina_type_with_enum(&prop, "IpProtocol", &schema);
+        assert!(
+            enum_info.is_some(),
+            "IpProtocol should produce EnumInfo via overrides"
+        );
+        let info = enum_info.unwrap();
+        assert_eq!(info.type_name, "IpProtocol");
+        assert_eq!(info.values, vec!["tcp", "udp", "icmp", "icmpv6", "-1"]);
     }
 }

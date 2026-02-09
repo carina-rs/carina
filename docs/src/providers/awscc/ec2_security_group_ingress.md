@@ -55,7 +55,7 @@ The name of the security group.
 
 ### `ip_protocol`
 
-- **Type:** String
+- **Type:** Enum (IpProtocol)
 - **Required:** Yes
 
 The IP protocol name (tcp, udp, icmp, icmpv6) or number (see Protocol Numbers). [VPC only] Use -1 to specify all protocols. When authorizing security group rules, specifying -1 or a protocol number other than tcp, udp, icmp, or icmpv6 allows traffic on all ports, regardless of any port range you specify. For tcp, udp, and icmp, you must specify a port range. For icmpv6, the port range is optional; if you omit the port range, traffic for all types and codes is allowed.
@@ -94,6 +94,20 @@ The ID of the security group. You must specify either the security group ID or t
 - **Required:** No
 
 The end of port range for the TCP and UDP protocols, or an ICMP/ICMPv6 code. A value of -1 indicates all ICMP/ICMPv6 codes for the specified ICMP type. If you specify all ICMP/ICMPv6 types, you must specify all codes. Use this for ICMP and any protocol that uses ports.
+
+## Enum Values
+
+### ip_protocol (IpProtocol)
+
+| Value | DSL Identifier |
+|-------|----------------|
+| `tcp` | `awscc.ec2_security_group_ingress.IpProtocol.tcp` |
+| `udp` | `awscc.ec2_security_group_ingress.IpProtocol.udp` |
+| `icmp` | `awscc.ec2_security_group_ingress.IpProtocol.icmp` |
+| `icmpv6` | `awscc.ec2_security_group_ingress.IpProtocol.icmpv6` |
+| `-1` | `awscc.ec2_security_group_ingress.IpProtocol.-1` |
+
+Shorthand formats: `tcp` or `IpProtocol.tcp`
 
 
 

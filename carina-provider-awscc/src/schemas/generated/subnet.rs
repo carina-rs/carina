@@ -102,7 +102,7 @@ pub fn ec2_subnet_config() -> AwsccSchemaConfig {
                 .with_provider_name("NetworkAclAssociationId"),
         )
         .attribute(
-            AttributeSchema::new("outpost_arn", AttributeType::String)
+            AttributeSchema::new("outpost_arn", types::arn())
                 .with_description("The Amazon Resource Name (ARN) of the Outpost.")
                 .with_provider_name("OutpostArn"),
         )

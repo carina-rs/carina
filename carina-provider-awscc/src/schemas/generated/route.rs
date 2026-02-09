@@ -26,7 +26,7 @@ pub fn ec2_route_config() -> AwsccSchemaConfig {
                 .with_provider_name("CidrBlock"),
         )
         .attribute(
-            AttributeSchema::new("core_network_arn", AttributeType::String)
+            AttributeSchema::new("core_network_arn", types::arn())
                 .with_description("The Amazon Resource Name (ARN) of the core network.")
                 .with_provider_name("CoreNetworkArn"),
         )
