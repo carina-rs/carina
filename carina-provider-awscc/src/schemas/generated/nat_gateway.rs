@@ -6,7 +6,7 @@
 
 use super::AwsccSchemaConfig;
 use super::tags_type;
-use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
 
 /// Returns the schema config for ec2_nat_gateway (AWS::EC2::NatGateway)
 pub fn ec2_nat_gateway_config() -> AwsccSchemaConfig {
@@ -37,7 +37,14 @@ pub fn ec2_nat_gateway_config() -> AwsccSchemaConfig {
                 .with_provider_name("AvailabilityMode"),
         )
         .attribute(
-            AttributeSchema::new("availability_zone_addresses", AttributeType::List(Box::new(AttributeType::String)))
+            AttributeSchema::new("availability_zone_addresses", AttributeType::List(Box::new(AttributeType::Struct {
+                    name: "AvailabilityZoneAddress".to_string(),
+                    fields: vec![
+                    StructField::new("allocation_ids", AttributeType::List(Box::new(AttributeType::String))).required().with_description("The allocation IDs of the Elastic IP addresses (EIPs) to be used for handling outbound NAT traffic in this specific Availability Zone.").with_provider_name("AllocationIds"),
+                    StructField::new("availability_zone", AttributeType::String).with_description("For regional NAT gateways only: The Availability Zone where this specific NAT gateway configuration will be active. Each AZ in a regional NAT gateway ...").with_provider_name("AvailabilityZone"),
+                    StructField::new("availability_zone_id", AttributeType::String).with_description("For regional NAT gateways only: The ID of the Availability Zone where this specific NAT gateway configuration will be active. Each AZ in a regional NA...").with_provider_name("AvailabilityZoneId")
+                    ],
+                })))
                 .with_description("For regional NAT gateways only: Specifies which Availability Zones you want the NAT gateway to support and the Elastic IP addresses (EIPs) to use in e...")
                 .with_provider_name("AvailabilityZoneAddresses"),
         )

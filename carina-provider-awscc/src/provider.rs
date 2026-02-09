@@ -11,6 +11,7 @@ use aws_sdk_cloudcontrol::Client as CloudControlClient;
 use aws_sdk_cloudcontrol::types::OperationStatus;
 use carina_core::provider::{ProviderError, ProviderResult};
 use carina_core::resource::{Resource, ResourceId, State, Value};
+use heck::{ToPascalCase, ToSnakeCase};
 use serde_json::json;
 
 use carina_core::schema::AttributeType;
@@ -451,6 +452,13 @@ impl AwsccProvider {
                 let items: Vec<Value> = arr.iter().filter_map(|v| self.json_to_value(v)).collect();
                 Some(Value::List(items))
             }
+            serde_json::Value::Object(obj) => {
+                let map: HashMap<String, Value> = obj
+                    .iter()
+                    .filter_map(|(k, v)| self.json_to_value(v).map(|val| (k.to_snake_case(), val)))
+                    .collect();
+                Some(Value::Map(map))
+            }
             _ => None,
         }
     }
@@ -509,6 +517,13 @@ impl AwsccProvider {
                 let arr: Vec<serde_json::Value> =
                     items.iter().filter_map(|v| self.value_to_json(v)).collect();
                 Some(serde_json::Value::Array(arr))
+            }
+            Value::Map(map) => {
+                let obj: serde_json::Map<String, serde_json::Value> = map
+                    .iter()
+                    .filter_map(|(k, v)| self.value_to_json(v).map(|val| (k.to_pascal_case(), val)))
+                    .collect();
+                Some(serde_json::Value::Object(obj))
             }
             _ => None,
         }

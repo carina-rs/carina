@@ -91,7 +91,7 @@ struct CfnTagging {
 }
 
 /// Type can be a string or an array of strings in JSON Schema
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
 enum TypeValue {
     Single(String),
@@ -107,7 +107,7 @@ impl TypeValue {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[allow(dead_code)]
 struct CfnProperty {
@@ -121,9 +121,14 @@ struct CfnProperty {
     ref_path: Option<String>,
     #[serde(default)]
     insertion_order: Option<bool>,
+    /// Inline object properties (for nested objects)
+    properties: Option<BTreeMap<String, CfnProperty>>,
+    /// Required fields for inline objects
+    #[serde(default)]
+    required: Vec<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[allow(dead_code)]
 struct CfnDefinition {
@@ -204,6 +209,16 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// Information about a resolved struct definition for markdown docs
+struct StructDefInfo {
+    /// Definition name (e.g., "Ingress")
+    def_name: String,
+    /// Properties of the definition
+    properties: BTreeMap<String, CfnProperty>,
+    /// Required fields
+    required: Vec<String>,
+}
+
 fn generate_markdown(schema: &CfnSchema, type_name: &str) -> Result<String> {
     let mut md = String::new();
 
@@ -219,13 +234,17 @@ fn generate_markdown(schema: &CfnSchema, type_name: &str) -> Result<String> {
 
     let required: HashSet<String> = schema.required.iter().cloned().collect();
 
-    // Collect enum info
+    // Collect enum info and struct definitions
     let mut enums: BTreeMap<String, EnumInfo> = BTreeMap::new();
+    let mut struct_defs: BTreeMap<String, StructDefInfo> = BTreeMap::new();
+
     for (prop_name, prop) in &schema.properties {
         let (_, enum_info) = cfn_type_to_carina_type_with_enum(prop, prop_name, schema);
         if let Some(info) = enum_info {
             enums.insert(prop_name.clone(), info);
         }
+        // Collect struct definitions from $ref
+        collect_struct_defs(prop, prop_name, schema, &mut struct_defs);
     }
 
     // Title
@@ -253,6 +272,13 @@ fn generate_markdown(schema: &CfnSchema, type_name: &str) -> Result<String> {
         } else if let Some(ref_path) = &prop.ref_path {
             if ref_path.contains("/Tag") {
                 "Map".to_string()
+            } else if let Some(def_name) = ref_def_name(ref_path)
+                && resolve_ref(schema, ref_path)
+                    .and_then(|d| d.properties.as_ref())
+                    .map(|p| !p.is_empty())
+                    .unwrap_or(false)
+            {
+                format!("Struct({})", def_name)
             } else {
                 "String".to_string()
             }
@@ -268,8 +294,40 @@ fn generate_markdown(schema: &CfnSchema, type_name: &str) -> Result<String> {
                 }
                 Some("boolean") => "Bool".to_string(),
                 Some("integer") | Some("number") => "Int".to_string(),
-                Some("array") => "List".to_string(),
-                Some("object") => "Map".to_string(),
+                Some("array") => {
+                    // Check if items has a $ref that resolves to a struct
+                    if let Some(items) = &prop.items {
+                        if let Some(ref_path) = &items.ref_path {
+                            if !ref_path.contains("/Tag") {
+                                if let Some(def_name) = ref_def_name(ref_path)
+                                    && resolve_ref(schema, ref_path)
+                                        .and_then(|d| d.properties.as_ref())
+                                        .map(|p| !p.is_empty())
+                                        .unwrap_or(false)
+                                {
+                                    format!("List<{}>", def_name)
+                                } else {
+                                    "List".to_string()
+                                }
+                            } else {
+                                "List".to_string()
+                            }
+                        } else {
+                            "List".to_string()
+                        }
+                    } else {
+                        "List".to_string()
+                    }
+                }
+                Some("object") => {
+                    if let Some(props) = &prop.properties
+                        && !props.is_empty()
+                    {
+                        format!("Struct({})", prop_name)
+                    } else {
+                        "Map".to_string()
+                    }
+                }
                 _ => "String".to_string(),
             }
         };
@@ -317,7 +375,107 @@ fn generate_markdown(schema: &CfnSchema, type_name: &str) -> Result<String> {
         }
     }
 
+    // Struct Definitions section
+    if !struct_defs.is_empty() {
+        md.push_str("## Struct Definitions\n\n");
+        for def_info in struct_defs.values() {
+            md.push_str(&format!("### {}\n\n", def_info.def_name));
+            md.push_str("| Field | Type | Required | Description |\n");
+            md.push_str("|-------|------|----------|-------------|\n");
+            let required_set: HashSet<&str> =
+                def_info.required.iter().map(|s| s.as_str()).collect();
+            for (field_name, field_prop) in &def_info.properties {
+                let snake_name = field_name.to_snake_case();
+                let is_req = required_set.contains(field_name.as_str());
+                let field_type_display =
+                    match field_prop.prop_type.as_ref().and_then(|t| t.as_str()) {
+                        Some("string") => "String",
+                        Some("boolean") => "Bool",
+                        Some("integer") | Some("number") => "Int",
+                        Some("array") => "List",
+                        Some("object") => "Map",
+                        _ => "String",
+                    };
+                let desc = field_prop
+                    .description
+                    .as_deref()
+                    .unwrap_or("")
+                    .replace('\n', " ")
+                    .replace("  ", " ");
+                let truncated = if desc.len() > 100 {
+                    format!("{}...", &desc[..100])
+                } else {
+                    desc
+                };
+                md.push_str(&format!(
+                    "| `{}` | {} | {} | {} |\n",
+                    snake_name,
+                    field_type_display,
+                    if is_req { "Yes" } else { "No" },
+                    truncated
+                ));
+            }
+            md.push('\n');
+        }
+    }
+
     Ok(md)
+}
+
+/// Collect struct definitions from properties for markdown documentation
+fn collect_struct_defs(
+    prop: &CfnProperty,
+    prop_name: &str,
+    schema: &CfnSchema,
+    struct_defs: &mut BTreeMap<String, StructDefInfo>,
+) {
+    // Handle $ref
+    if let Some(ref_path) = &prop.ref_path
+        && !ref_path.contains("/Tag")
+        && let Some(def_name) = ref_def_name(ref_path)
+        && let Some(def) = resolve_ref(schema, ref_path)
+        && let Some(props) = &def.properties
+        && !props.is_empty()
+    {
+        struct_defs
+            .entry(def_name.to_string())
+            .or_insert_with(|| StructDefInfo {
+                def_name: def_name.to_string(),
+                properties: props.clone(),
+                required: def.required.clone(),
+            });
+    }
+    // Handle array items with $ref
+    if let Some(items) = &prop.items
+        && let Some(ref_path) = &items.ref_path
+        && !ref_path.contains("/Tag")
+        && let Some(def_name) = ref_def_name(ref_path)
+        && let Some(def) = resolve_ref(schema, ref_path)
+        && let Some(props) = &def.properties
+        && !props.is_empty()
+    {
+        struct_defs
+            .entry(def_name.to_string())
+            .or_insert_with(|| StructDefInfo {
+                def_name: def_name.to_string(),
+                properties: props.clone(),
+                required: def.required.clone(),
+            });
+    }
+    // Handle inline object with properties
+    if let Some(type_val) = &prop.prop_type
+        && type_val.as_str() == Some("object")
+        && let Some(props) = &prop.properties
+        && !props.is_empty()
+    {
+        struct_defs
+            .entry(prop_name.to_string())
+            .or_insert_with(|| StructDefInfo {
+                def_name: prop_name.to_string(),
+                properties: props.clone(),
+                required: prop.required.clone(),
+            });
+    }
 }
 
 fn generate_schema_code(schema: &CfnSchema, type_name: &str) -> Result<String> {
@@ -345,6 +503,7 @@ fn generate_schema_code(schema: &CfnSchema, type_name: &str) -> Result<String> {
     // Pre-scan properties to determine which imports are needed and collect enum info
     let mut needs_types = false;
     let mut needs_tags_type = false;
+    let mut needs_struct_field = false;
     let mut enums: BTreeMap<String, EnumInfo> = BTreeMap::new();
 
     for (prop_name, prop) in &schema.properties {
@@ -354,6 +513,9 @@ fn generate_schema_code(schema: &CfnSchema, type_name: &str) -> Result<String> {
         }
         if attr_type.contains("tags_type()") {
             needs_tags_type = true;
+        }
+        if attr_type.contains("StructField::") {
+            needs_struct_field = true;
         }
         if let Some(info) = enum_info {
             enums.insert(prop_name.clone(), info);
@@ -366,7 +528,13 @@ fn generate_schema_code(schema: &CfnSchema, type_name: &str) -> Result<String> {
     let has_tags = schema.tagging.as_ref().map(|t| t.taggable).unwrap_or(false);
 
     // Generate header with conditional imports
-    let types_import = if needs_types { ", types" } else { "" };
+    let mut extra_imports = String::new();
+    if needs_types {
+        extra_imports.push_str(", types");
+    }
+    if needs_struct_field {
+        extra_imports.push_str(", StructField");
+    }
     code.push_str(&format!(
         r#"//! {} schema definition for AWS Cloud Control
 //!
@@ -377,7 +545,7 @@ fn generate_schema_code(schema: &CfnSchema, type_name: &str) -> Result<String> {
 use carina_core::schema::{{AttributeSchema, AttributeType, ResourceSchema{}}};
 use super::AwsccSchemaConfig;
 "#,
-        resource, type_name, types_import
+        resource, type_name, extra_imports
     ));
 
     if has_enums {
@@ -558,12 +726,82 @@ fn extract_enum_from_description(description: &str) -> Option<Vec<String>> {
     None
 }
 
+/// Resolve a $ref path to a CfnDefinition
+/// e.g., "#/definitions/Ingress" -> Some(&CfnDefinition)
+fn resolve_ref<'a>(schema: &'a CfnSchema, ref_path: &str) -> Option<&'a CfnDefinition> {
+    let def_name = ref_path.strip_prefix("#/definitions/")?;
+    schema.definitions.as_ref()?.get(def_name)
+}
+
+/// Extract the definition name from a $ref path
+/// e.g., "#/definitions/Ingress" -> Some("Ingress")
+fn ref_def_name(ref_path: &str) -> Option<&str> {
+    ref_path.strip_prefix("#/definitions/")
+}
+
+/// Generate Rust code for an AttributeType::Struct from a set of properties
+fn generate_struct_type(
+    def_name: &str,
+    properties: &BTreeMap<String, CfnProperty>,
+    required: &[String],
+    schema: &CfnSchema,
+) -> String {
+    let required_set: HashSet<&str> = required.iter().map(|s| s.as_str()).collect();
+
+    let fields: Vec<String> = properties
+        .iter()
+        .map(|(field_name, field_prop)| {
+            let snake_name = field_name.to_snake_case();
+            let (field_type, enum_info) =
+                cfn_type_to_carina_type_with_enum(field_prop, field_name, schema);
+            // If enum detected in struct field, use Enum variant directly
+            let field_type = if let Some(info) = enum_info {
+                let values_str = info
+                    .values
+                    .iter()
+                    .map(|v| format!("\"{}\".to_string()", v))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("AttributeType::Enum(vec![{}])", values_str)
+            } else {
+                field_type
+            };
+            let is_required = required_set.contains(field_name.as_str());
+
+            let mut field_code = format!("StructField::new(\"{}\", {})", snake_name, field_type);
+            if is_required {
+                field_code.push_str(".required()");
+            }
+            if let Some(desc) = &field_prop.description {
+                let escaped = desc
+                    .replace('"', "\\\"")
+                    .replace('\n', " ")
+                    .replace("  ", " ");
+                let truncated = if escaped.len() > 150 {
+                    format!("{}...", &escaped[..150])
+                } else {
+                    escaped
+                };
+                field_code.push_str(&format!(".with_description(\"{}\")", truncated));
+            }
+            field_code.push_str(&format!(".with_provider_name(\"{}\")", field_name));
+            field_code
+        })
+        .collect();
+
+    let fields_str = fields.join(",\n                    ");
+    format!(
+        "AttributeType::Struct {{\n                    name: \"{}\".to_string(),\n                    fields: vec![\n                    {}\n                    ],\n                }}",
+        def_name, fields_str
+    )
+}
+
 /// Returns (type_string, Option<EnumInfo>)
 /// EnumInfo is Some if this property is an enum that should use AttributeType::Custom
 fn cfn_type_to_carina_type_with_enum(
     prop: &CfnProperty,
     prop_name: &str,
-    _schema: &CfnSchema,
+    schema: &CfnSchema,
 ) -> (String, Option<EnumInfo>) {
     // Tags property is special - it's a Map in Carina (Terraform-style)
     if prop_name == "Tags" {
@@ -574,6 +812,17 @@ fn cfn_type_to_carina_type_with_enum(
     if let Some(ref_path) = &prop.ref_path {
         if ref_path.contains("/Tag") {
             return ("tags_type()".to_string(), None);
+        }
+        // Try to resolve the $ref to a definition and generate Struct type
+        if let Some(def) = resolve_ref(schema, ref_path)
+            && let Some(props) = &def.properties
+            && !props.is_empty()
+        {
+            let def_name = ref_def_name(ref_path).unwrap_or(prop_name);
+            return (
+                generate_struct_type(def_name, props, &def.required, schema),
+                None,
+            );
         }
         // Default to String for unknown refs
         return ("AttributeType::String".to_string(), None);
@@ -636,7 +885,21 @@ fn cfn_type_to_carina_type_with_enum(
         Some("number") => ("AttributeType::Int".to_string(), None),
         Some("array") => {
             if let Some(items) = &prop.items {
-                let (item_type, _) = cfn_type_to_carina_type_with_enum(items, prop_name, _schema);
+                // Check if items has a $ref to a definition
+                if let Some(ref_path) = &items.ref_path
+                    && !ref_path.contains("/Tag")
+                    && let Some(def) = resolve_ref(schema, ref_path)
+                    && let Some(props) = &def.properties
+                    && !props.is_empty()
+                {
+                    let def_name = ref_def_name(ref_path).unwrap_or(prop_name);
+                    let struct_type = generate_struct_type(def_name, props, &def.required, schema);
+                    return (
+                        format!("AttributeType::List(Box::new({}))", struct_type),
+                        None,
+                    );
+                }
+                let (item_type, _) = cfn_type_to_carina_type_with_enum(items, prop_name, schema);
                 (
                     format!("AttributeType::List(Box::new({}))", item_type),
                     None,
@@ -648,10 +911,21 @@ fn cfn_type_to_carina_type_with_enum(
                 )
             }
         }
-        Some("object") => (
-            "AttributeType::Map(Box::new(AttributeType::String))".to_string(),
-            None,
-        ),
+        Some("object") => {
+            // Check if this object has inline properties -> Struct
+            if let Some(props) = &prop.properties
+                && !props.is_empty()
+            {
+                return (
+                    generate_struct_type(prop_name, props, &prop.required, schema),
+                    None,
+                );
+            }
+            (
+                "AttributeType::Map(Box::new(AttributeType::String))".to_string(),
+                None,
+            )
+        }
         _ => ("AttributeType::String".to_string(), None),
     }
 }

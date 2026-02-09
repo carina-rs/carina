@@ -35,7 +35,7 @@ Indicates whether this is a zonal (single-AZ) or regional (multi-AZ) NAT gateway
 
 ### `availability_zone_addresses`
 
-- **Type:** List
+- **Type:** List<AvailabilityZoneAddress>
 - **Required:** No
 
 For regional NAT gateways only: Specifies which Availability Zones you want the NAT gateway to support and the Elastic IP addresses (EIPs) to use in each AZ. The regional NAT gateway uses these EIPs to handle outbound NAT traffic from their respective AZs. If not specified, the NAT gateway will automatically expand to new AZs and associate EIPs upon detection of an elastic network interface. If you specify this parameter, auto-expansion is disabled and you must manually manage AZ coverage. A regional NAT gateway is a single NAT Gateway that works across multiple availability zones (AZs) in your VPC, providing redundancy, scalability and availability across all the AZs in a Region. For more information, see [Regional NAT gateways for automatic multi-AZ expansion](https://docs.aws.amazon.com/vpc/latest/userguide/nat-gateways-regional.html) in the *Amazon VPC User Guide*.
@@ -117,6 +117,16 @@ The tags for the NAT gateway.
 - **Required:** No
 
 The ID of the VPC in which the NAT gateway is located.
+
+## Struct Definitions
+
+### AvailabilityZoneAddress
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `allocation_ids` | List | Yes | The allocation IDs of the Elastic IP addresses (EIPs) to be used for handling outbound NAT traffic i... |
+| `availability_zone` | String | No | For regional NAT gateways only: The Availability Zone where this specific NAT gateway configuration ... |
+| `availability_zone_id` | String | No | For regional NAT gateways only: The ID of the Availability Zone where this specific NAT gateway conf... |
 
 
 

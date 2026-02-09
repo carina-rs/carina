@@ -22,7 +22,7 @@ The ARN for the IAM role that permits Amazon EC2 to publish flow logs to a Cloud
 
 ### `destination_options`
 
-- **Type:** Map
+- **Type:** Struct(DestinationOptions)
 - **Required:** No
 
 ### `id`
@@ -127,6 +127,16 @@ Shorthand formats: `NetworkInterface` or `ResourceType.NetworkInterface`
 | `REJECT` | `awscc.ec2_flow_log.TrafficType.REJECT` |
 
 Shorthand formats: `ACCEPT` or `TrafficType.ACCEPT`
+
+## Struct Definitions
+
+### DestinationOptions
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `file_format` | String | Yes |  |
+| `hive_compatible_partitions` | Bool | Yes |  |
+| `per_hour_partition` | Bool | Yes |  |
 
 
 

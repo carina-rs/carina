@@ -32,14 +32,14 @@ The name of the security group.
 
 ### `security_group_egress`
 
-- **Type:** List
+- **Type:** List<Egress>
 - **Required:** No
 
 [VPC only] The outbound rules associated with the security group. There is a short interruption during which you cannot connect to the security group.
 
 ### `security_group_ingress`
 
-- **Type:** List
+- **Type:** List<Ingress>
 - **Required:** No
 
 The inbound rules associated with the security group. There is a short interruption during which you cannot connect to the security group.
@@ -57,6 +57,36 @@ Any tags assigned to the security group.
 - **Required:** No
 
 The ID of the VPC for the security group.
+
+## Struct Definitions
+
+### Egress
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `cidr_ip` | String | No |  |
+| `cidr_ipv6` | String | No |  |
+| `description` | String | No |  |
+| `destination_prefix_list_id` | String | No |  |
+| `destination_security_group_id` | String | No |  |
+| `from_port` | Int | No |  |
+| `ip_protocol` | String | Yes |  |
+| `to_port` | Int | No |  |
+
+### Ingress
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `cidr_ip` | String | No |  |
+| `cidr_ipv6` | String | No |  |
+| `description` | String | No |  |
+| `from_port` | Int | No |  |
+| `ip_protocol` | String | Yes |  |
+| `source_prefix_list_id` | String | No |  |
+| `source_security_group_id` | String | No |  |
+| `source_security_group_name` | String | No |  |
+| `source_security_group_owner_id` | String | No |  |
+| `to_port` | Int | No |  |
 
 
 

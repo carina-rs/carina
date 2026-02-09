@@ -8,7 +8,7 @@ use super::AwsccSchemaConfig;
 use super::tags_type;
 use super::validate_namespaced_enum;
 use carina_core::resource::Value;
-use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
 
 const VALID_IP_ADDRESS_TYPE: &[&str] = &["ipv4", "ipv6", "dualstack", "not-specified"];
 
@@ -57,7 +57,15 @@ pub fn ec2_vpc_endpoint_config() -> AwsccSchemaConfig {
                 .with_provider_name("DnsEntries"),
         )
         .attribute(
-            AttributeSchema::new("dns_options", AttributeType::String)
+            AttributeSchema::new("dns_options", AttributeType::Struct {
+                    name: "DnsOptionsSpecification".to_string(),
+                    fields: vec![
+                    StructField::new("dns_record_ip_type", AttributeType::Enum(vec!["ipv4".to_string(), "ipv6".to_string(), "dualstack".to_string(), "service-defined".to_string(), "not-specified".to_string()])).with_description("The DNS records created for the endpoint.").with_provider_name("DnsRecordIpType"),
+                    StructField::new("private_dns_only_for_inbound_resolver_endpoint", AttributeType::Enum(vec!["OnlyInboundResolver".to_string(), "AllResolvers".to_string(), "NotSpecified".to_string()])).with_description("Indicates whether to enable private DNS only for inbound endpoints. This option is available only for services that support both gateway and interface...").with_provider_name("PrivateDnsOnlyForInboundResolverEndpoint"),
+                    StructField::new("private_dns_preference", AttributeType::Enum(vec!["VERIFIED_DOMAINS_ONLY".to_string(), "ALL_DOMAINS".to_string(), "VERIFIED_DOMAINS_AND_SPECIFIED_DOMAINS".to_string(), "SPECIFIED_DOMAINS_ONLY".to_string()])).with_description("The preference for which private domains have a private hosted zone created for and associated with the specified VPC. Only supported when private DNS...").with_provider_name("PrivateDnsPreference"),
+                    StructField::new("private_dns_specified_domains", AttributeType::List(Box::new(AttributeType::String))).with_description("Indicates which of the private domains to create private hosted zones for and associate with the specified VPC. Only supported when private DNS is ena...").with_provider_name("PrivateDnsSpecifiedDomains")
+                    ],
+                })
                 .with_description("Describes the DNS options for an endpoint.")
                 .with_provider_name("DnsOptions"),
         )

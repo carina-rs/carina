@@ -31,7 +31,7 @@ The AZ ID of the subnet.
 
 ### `block_public_access_states`
 
-- **Type:** Map
+- **Type:** Struct(BlockPublicAccessStates)
 - **Read-only**
 
 ### `cidr_block`
@@ -123,7 +123,7 @@ The Amazon Resource Name (ARN) of the Outpost.
 
 ### `private_dns_name_options_on_launch`
 
-- **Type:** Map
+- **Type:** Struct(PrivateDnsNameOptionsOnLaunch)
 - **Required:** No
 
 The hostname type for EC2 instances launched into this subnet and how DNS A and AAAA record queries to the instances should be handled. For more information, see [Amazon EC2 instance hostname types](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ec2-instance-naming.html) in the *User Guide*. Available options:  + EnableResourceNameDnsAAAARecord (true | false)  + EnableResourceNameDnsARecord (true | false)  + HostnameType (ip-name | resource-name)
@@ -146,6 +146,22 @@ Any tags assigned to the subnet.
 - **Required:** Yes
 
 The ID of the VPC the subnet is in. If you update this property, you must also update the ``CidrBlock`` property.
+
+## Struct Definitions
+
+### BlockPublicAccessStates
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `internet_gateway_block_mode` | String | No | The mode of VPC BPA. Options here are off, block-bidirectional, block-ingress  |
+
+### PrivateDnsNameOptionsOnLaunch
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `enable_resource_name_dns_aaaa_record` | Bool | No |  |
+| `enable_resource_name_dns_a_record` | Bool | No |  |
+| `hostname_type` | String | No |  |
 
 
 
