@@ -6,7 +6,7 @@
 
 use super::AwsccSchemaConfig;
 use super::tags_type;
-use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, types};
 
 /// Returns the schema config for ec2_eip (AWS::EC2::EIP)
 pub fn ec2_eip_config() -> AwsccSchemaConfig {
@@ -47,7 +47,7 @@ pub fn ec2_eip_config() -> AwsccSchemaConfig {
                 .with_provider_name("NetworkBorderGroup"),
         )
         .attribute(
-            AttributeSchema::new("public_ip", AttributeType::String)
+            AttributeSchema::new("public_ip", types::ipv4_address())
                 .with_description(" (read-only)")
                 .with_provider_name("PublicIp"),
         )

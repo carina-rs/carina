@@ -46,7 +46,7 @@ The maximum amount of time to wait (in seconds) before forcibly releasing the IP
 
 ### `private_ip_address`
 
-- **Type:** String
+- **Type:** Ipv4Address
 - **Required:** No
 
 The private IPv4 address to assign to the NAT gateway. If you don't provide an address, a private IPv4 address will be automatically assigned.
