@@ -133,7 +133,7 @@ Shorthand formats: `public` or `ConnectivityType.public`
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `allocation_ids` | List | Yes | The allocation IDs of the Elastic IP addresses (EIPs) to be used for handling outbound NAT traffic i... |
-| `availability_zone` | String | No | For regional NAT gateways only: The Availability Zone where this specific NAT gateway configuration ... |
+| `availability_zone` | AvailabilityZone | No | For regional NAT gateways only: The Availability Zone where this specific NAT gateway configuration ... |
 | `availability_zone_id` | String | No | For regional NAT gateways only: The ID of the Availability Zone where this specific NAT gateway conf... |
 
 
