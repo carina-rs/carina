@@ -29,7 +29,7 @@ pub fn ec2_security_group_egress_config() -> AwsccSchemaConfig {
         schema: ResourceSchema::new("awscc.ec2_security_group_egress")
         .with_description("Adds the specified outbound (egress) rule to a security group.  An outbound rule permits instances to send traffic to the specified IPv4 or IPv6 address range, the IP addresses that are specified by a...")
         .attribute(
-            AttributeSchema::new("cidr_ip", AttributeType::String)
+            AttributeSchema::new("cidr_ip", types::ipv4_cidr())
                 .with_description("The IPv4 address range, in CIDR format. You must specify exactly one of the following: ``CidrIp``, ``CidrIpv6``, ``DestinationPrefixListId``, or ``Des...")
                 .with_provider_name("CidrIp"),
         )

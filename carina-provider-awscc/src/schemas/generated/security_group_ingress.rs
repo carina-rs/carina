@@ -29,7 +29,7 @@ pub fn ec2_security_group_ingress_config() -> AwsccSchemaConfig {
         schema: ResourceSchema::new("awscc.ec2_security_group_ingress")
         .with_description("Resource Type definition for AWS::EC2::SecurityGroupIngress")
         .attribute(
-            AttributeSchema::new("cidr_ip", AttributeType::String)
+            AttributeSchema::new("cidr_ip", types::ipv4_cidr())
                 .with_description("The IPv4 ranges")
                 .with_provider_name("CidrIp"),
         )
