@@ -16,7 +16,7 @@ Any tags assigned to the route table.
 
 ### `vpc_id`
 
-- **Type:** String
+- **Type:** AwsResourceId
 - **Required:** Yes
 
 The ID of the VPC.
@@ -25,7 +25,7 @@ The ID of the VPC.
 
 ### `route_table_id`
 
-- **Type:** String
+- **Type:** AwsResourceId
 
 
 

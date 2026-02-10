@@ -22,7 +22,7 @@ pub fn ec2_eip_config() -> AwsccSchemaConfig {
                 .with_provider_name("Address"),
         )
         .attribute(
-            AttributeSchema::new("allocation_id", AttributeType::String)
+            AttributeSchema::new("allocation_id", types::aws_resource_id())
                 .with_description(" (read-only)")
                 .with_provider_name("AllocationId"),
         )
@@ -32,12 +32,12 @@ pub fn ec2_eip_config() -> AwsccSchemaConfig {
                 .with_provider_name("Domain"),
         )
         .attribute(
-            AttributeSchema::new("instance_id", AttributeType::String)
+            AttributeSchema::new("instance_id", types::aws_resource_id())
                 .with_description("The ID of the instance.  Updates to the ``InstanceId`` property may require *some interruptions*. Updates on an EIP reassociates the address on its as...")
                 .with_provider_name("InstanceId"),
         )
         .attribute(
-            AttributeSchema::new("ipam_pool_id", AttributeType::String)
+            AttributeSchema::new("ipam_pool_id", types::aws_resource_id())
                 .with_description("")
                 .with_provider_name("IpamPoolId"),
         )

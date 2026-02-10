@@ -17,7 +17,7 @@ Any tags to assign to the internet gateway.
 
 ### `internet_gateway_id`
 
-- **Type:** String
+- **Type:** AwsResourceId
 
 
 

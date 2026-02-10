@@ -269,6 +269,8 @@ fn type_display_string(
                     "AvailabilityZone".to_string()
                 } else if prop_lower.ends_with("arn") || prop_lower.contains("_arn") {
                     "Arn".to_string()
+                } else if is_aws_resource_id_property(prop_name) {
+                    "AwsResourceId".to_string()
                 } else {
                     "String".to_string()
                 }
@@ -461,6 +463,8 @@ fn generate_markdown(schema: &CfnSchema, type_name: &str) -> Result<String> {
                                 "AvailabilityZone"
                             } else if fl.ends_with("arn") || fl.contains("_arn") {
                                 "Arn"
+                            } else if is_aws_resource_id_property(field_name) {
+                                "AwsResourceId"
                             } else {
                                 "String"
                             }
@@ -578,6 +582,7 @@ fn generate_schema_code(schema: &CfnSchema, type_name: &str) -> Result<String> {
 
     // Pre-scan properties to determine which imports are needed and collect enum info
     let mut needs_types = false;
+    let mut needs_attribute_type = false;
     let mut needs_tags_type = false;
     let mut needs_struct_field = false;
     let mut enums: BTreeMap<String, EnumInfo> = BTreeMap::new();
@@ -586,6 +591,9 @@ fn generate_schema_code(schema: &CfnSchema, type_name: &str) -> Result<String> {
         let (attr_type, enum_info) = cfn_type_to_carina_type_with_enum(prop, prop_name, schema);
         if attr_type.contains("types::") {
             needs_types = true;
+        }
+        if attr_type.contains("AttributeType::") {
+            needs_attribute_type = true;
         }
         if attr_type.contains("tags_type()") {
             needs_tags_type = true;
@@ -600,17 +608,26 @@ fn generate_schema_code(schema: &CfnSchema, type_name: &str) -> Result<String> {
 
     let has_enums = !enums.is_empty();
 
+    // Enums use AttributeType::Custom with AttributeType::String base
+    if has_enums {
+        needs_attribute_type = true;
+    }
+
     // Determine has_tags from tagging metadata
     let has_tags = schema.tagging.as_ref().map(|t| t.taggable).unwrap_or(false);
 
     // Generate header with conditional imports
-    let mut extra_imports = String::new();
-    if needs_types {
-        extra_imports.push_str(", types");
+    let mut schema_imports = vec!["AttributeSchema", "ResourceSchema"];
+    if needs_attribute_type {
+        schema_imports.insert(1, "AttributeType");
     }
     if needs_struct_field {
-        extra_imports.push_str(", StructField");
+        schema_imports.push("StructField");
     }
+    if needs_types {
+        schema_imports.push("types");
+    }
+    let schema_imports_str = schema_imports.join(", ");
     code.push_str(&format!(
         r#"//! {} schema definition for AWS Cloud Control
 //!
@@ -618,10 +635,10 @@ fn generate_schema_code(schema: &CfnSchema, type_name: &str) -> Result<String> {
 //!
 //! DO NOT EDIT MANUALLY - regenerate with carina-codegen
 
-use carina_core::schema::{{AttributeSchema, AttributeType, ResourceSchema{}}};
+use carina_core::schema::{{{}}};
 use super::AwsccSchemaConfig;
 "#,
-        resource, type_name, extra_imports
+        resource, type_name, schema_imports_str
     ));
 
     if has_enums {
@@ -881,6 +898,35 @@ fn known_enum_overrides() -> HashMap<&'static str, Vec<&'static str>> {
     m
 }
 
+/// Check if a property name represents an AWS resource ID with the standard
+/// prefix-hex format (e.g., vpc-1a2b3c4d, subnet-0123456789abcdef0)
+fn is_aws_resource_id_property(prop_name: &str) -> bool {
+    let lower = prop_name.to_lowercase();
+    // Known resource ID suffixes that use prefix-hex format
+    let resource_id_suffixes = [
+        "vpcid",
+        "subnetid",
+        "groupid",
+        "gatewayid",
+        "routetableid",
+        "allocationid",
+        "networkinterfaceid",
+        "instanceid",
+        "endpointid",
+        "connectionid",
+        "prefixlistid",
+        "eniid",
+        "poolid",
+    ];
+    // Exclude properties that don't follow prefix-hex format
+    if lower.contains("owner") || lower.contains("availabilityzone") || lower == "resourceid" {
+        return false;
+    }
+    resource_id_suffixes
+        .iter()
+        .any(|suffix| lower.ends_with(suffix))
+}
+
 /// Returns (type_string, Option<EnumInfo>)
 /// EnumInfo is Some if this property is an enum that should use AttributeType::Custom
 fn cfn_type_to_carina_type_with_enum(
@@ -965,8 +1011,13 @@ fn cfn_type_to_carina_type_with_enum(
                 return ("types::ipv4_address()".to_string(), None);
             }
 
-            // IDs are always strings
-            if prop_lower.ends_with("id") || prop_lower.ends_with("_id") {
+            // AWS resource IDs with known prefix-hex format
+            if is_aws_resource_id_property(prop_name) {
+                return ("types::aws_resource_id()".to_string(), None);
+            }
+
+            // Other IDs are plain strings (AZ IDs, owner IDs, etc.)
+            if prop_lower.ends_with("id") {
                 return ("AttributeType::String".to_string(), None);
             }
 
@@ -1375,5 +1426,26 @@ mod tests {
         // AvailabilityZoneId should stay String
         let (type_str, _) = cfn_type_to_carina_type_with_enum(&prop, "AvailabilityZoneId", &schema);
         assert_eq!(type_str, "AttributeType::String");
+    }
+
+    #[test]
+    fn test_is_aws_resource_id_property() {
+        // Known resource ID properties
+        assert!(is_aws_resource_id_property("VpcId"));
+        assert!(is_aws_resource_id_property("SubnetId"));
+        assert!(is_aws_resource_id_property("GroupId"));
+        assert!(is_aws_resource_id_property("RouteTableId"));
+        assert!(is_aws_resource_id_property("InternetGatewayId"));
+        assert!(is_aws_resource_id_property("AllocationId"));
+        assert!(is_aws_resource_id_property("NetworkInterfaceId"));
+        assert!(is_aws_resource_id_property("InstanceId"));
+        assert!(is_aws_resource_id_property("DestinationSecurityGroupId"));
+        assert!(is_aws_resource_id_property("DestinationPrefixListId"));
+        assert!(is_aws_resource_id_property("VpcEndpointId"));
+
+        // Non-resource ID properties (should stay String)
+        assert!(!is_aws_resource_id_property("AvailabilityZoneId"));
+        assert!(!is_aws_resource_id_property("SourceSecurityGroupOwnerId"));
+        assert!(!is_aws_resource_id_property("ResourceId"));
     }
 }

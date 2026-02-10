@@ -11,7 +11,7 @@ Specifies a network address translation (NAT) gateway in the specified subnet. Y
 
 ### `allocation_id`
 
-- **Type:** String
+- **Type:** AwsResourceId
 - **Required:** No
 
 [Public NAT gateway only] The allocation ID of the Elastic IP address that's associated with the NAT gateway. This property is required for a public NAT gateway and cannot be specified with a private NAT gateway.
@@ -74,7 +74,7 @@ Secondary private IPv4 addresses. For more information about secondary addresses
 
 ### `subnet_id`
 
-- **Type:** String
+- **Type:** AwsResourceId
 - **Required:** No
 
 The ID of the subnet in which the NAT gateway is located.
@@ -88,7 +88,7 @@ The tags for the NAT gateway.
 
 ### `vpc_id`
 
-- **Type:** String
+- **Type:** AwsResourceId
 - **Required:** No
 
 The ID of the VPC in which the NAT gateway is located.
@@ -105,15 +105,15 @@ The ID of the VPC in which the NAT gateway is located.
 
 ### `eni_id`
 
-- **Type:** String
+- **Type:** AwsResourceId
 
 ### `nat_gateway_id`
 
-- **Type:** String
+- **Type:** AwsResourceId
 
 ### `route_table_id`
 
-- **Type:** String
+- **Type:** AwsResourceId
 
 ## Enum Values
 

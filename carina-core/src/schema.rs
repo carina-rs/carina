@@ -526,6 +526,23 @@ pub mod types {
         }
     }
 
+    /// AWS resource ID type (e.g., "vpc-1a2b3c4d", "subnet-0123456789abcdef0")
+    /// Validates format: {prefix}-{hex} where hex is 8+ hex digits
+    pub fn aws_resource_id() -> AttributeType {
+        AttributeType::Custom {
+            name: "AwsResourceId".to_string(),
+            base: Box::new(AttributeType::String),
+            validate: |value| {
+                if let Value::String(s) = value {
+                    validate_aws_resource_id(s)
+                } else {
+                    Err("Expected string".to_string())
+                }
+            },
+            namespace: None,
+        }
+    }
+
     /// IPv6 CIDR block type (e.g., "2001:db8::/32", "::/0")
     pub fn ipv6_cidr() -> AttributeType {
         AttributeType::Custom {
@@ -598,6 +615,47 @@ pub fn validate_cidr(cidr: &str) -> Result<(), String> {
 }
 
 /// Validate ARN format (e.g., "arn:aws:s3:::my-bucket")
+/// Validate AWS resource ID format (e.g., "vpc-1a2b3c4d", "subnet-0123456789abcdef0")
+/// Generic format: {prefix}-{hex} where prefix is lowercase/digits and hex is 8+ hex chars
+pub fn validate_aws_resource_id(id: &str) -> Result<(), String> {
+    let Some(dash_pos) = id.find('-') else {
+        return Err(format!(
+            "Invalid resource ID '{}': expected format 'prefix-hexdigits'",
+            id
+        ));
+    };
+
+    let prefix = &id[..dash_pos];
+    let hex_part = &id[dash_pos + 1..];
+
+    if prefix.is_empty()
+        || !prefix
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+    {
+        return Err(format!(
+            "Invalid resource ID '{}': prefix must be lowercase alphanumeric",
+            id
+        ));
+    }
+
+    if hex_part.len() < 8 {
+        return Err(format!(
+            "Invalid resource ID '{}': ID part must be at least 8 characters after prefix",
+            id
+        ));
+    }
+
+    if !hex_part.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(format!(
+            "Invalid resource ID '{}': ID part must contain only hex digits",
+            id
+        ));
+    }
+
+    Ok(())
+}
+
 pub fn validate_arn(arn: &str) -> Result<(), String> {
     if !arn.starts_with("arn:") {
         return Err(format!("Invalid ARN '{}': must start with 'arn:'", arn));
@@ -1171,5 +1229,62 @@ mod tests {
         assert!(validate_availability_zone("us-east").is_err()); // no number
         assert!(validate_availability_zone("1a").is_err()); // too short
         assert!(validate_availability_zone("").is_err()); // empty
+    }
+
+    #[test]
+    fn validate_aws_resource_id_type() {
+        let t = types::aws_resource_id();
+
+        // Valid resource IDs
+        assert!(
+            t.validate(&Value::String("vpc-1a2b3c4d".to_string()))
+                .is_ok()
+        );
+        assert!(
+            t.validate(&Value::String("subnet-0123456789abcdef0".to_string()))
+                .is_ok()
+        );
+        assert!(
+            t.validate(&Value::String("sg-12345678".to_string()))
+                .is_ok()
+        );
+        assert!(
+            t.validate(&Value::String("rtb-abcdef12".to_string()))
+                .is_ok()
+        );
+        assert!(
+            t.validate(&Value::String("eipalloc-0123456789abcdef0".to_string()))
+                .is_ok()
+        );
+        assert!(
+            t.validate(&Value::String("igw-12345678".to_string()))
+                .is_ok()
+        );
+
+        // Invalid resource IDs
+        assert!(
+            t.validate(&Value::String("not-a-valid-id".to_string()))
+                .is_err()
+        ); // hex part too short
+        assert!(t.validate(&Value::String("vpc".to_string())).is_err()); // no dash
+        assert!(t.validate(&Value::String("vpc-short".to_string())).is_err()); // hex part < 8
+        assert!(
+            t.validate(&Value::String("vpc-1234567".to_string()))
+                .is_err()
+        ); // only 7 chars
+        assert!(
+            t.validate(&Value::String("VPC-12345678".to_string()))
+                .is_err()
+        ); // uppercase prefix
+        assert!(t.validate(&Value::Int(42)).is_err()); // wrong type
+
+        // ResourceRef should be accepted
+        assert!(
+            t.validate(&Value::ResourceRef(
+                "my_vpc".to_string(),
+                "vpc_id".to_string()
+            ))
+            .is_ok()
+        );
     }
 }

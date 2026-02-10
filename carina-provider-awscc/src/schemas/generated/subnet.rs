@@ -57,7 +57,7 @@ pub fn ec2_subnet_config() -> AwsccSchemaConfig {
                 .with_provider_name("EnableLniAtDeviceIndex"),
         )
         .attribute(
-            AttributeSchema::new("ipv4_ipam_pool_id", AttributeType::String)
+            AttributeSchema::new("ipv4_ipam_pool_id", types::aws_resource_id())
                 .with_description("An IPv4 IPAM pool ID for the subnet.")
                 .with_provider_name("Ipv4IpamPoolId"),
         )
@@ -77,7 +77,7 @@ pub fn ec2_subnet_config() -> AwsccSchemaConfig {
                 .with_provider_name("Ipv6CidrBlocks"),
         )
         .attribute(
-            AttributeSchema::new("ipv6_ipam_pool_id", AttributeType::String)
+            AttributeSchema::new("ipv6_ipam_pool_id", types::aws_resource_id())
                 .with_description("An IPv6 IPAM pool ID for the subnet.")
                 .with_provider_name("Ipv6IpamPoolId"),
         )
@@ -119,7 +119,7 @@ pub fn ec2_subnet_config() -> AwsccSchemaConfig {
                 .with_provider_name("PrivateDnsNameOptionsOnLaunch"),
         )
         .attribute(
-            AttributeSchema::new("subnet_id", AttributeType::String)
+            AttributeSchema::new("subnet_id", types::aws_resource_id())
                 .with_description(" (read-only)")
                 .with_provider_name("SubnetId"),
         )
@@ -129,7 +129,7 @@ pub fn ec2_subnet_config() -> AwsccSchemaConfig {
                 .with_provider_name("Tags"),
         )
         .attribute(
-            AttributeSchema::new("vpc_id", AttributeType::String)
+            AttributeSchema::new("vpc_id", types::aws_resource_id())
                 .required()
                 .with_description("The ID of the VPC the subnet is in. If you update this property, you must also update the ``CidrBlock`` property.")
                 .with_provider_name("VpcId"),
