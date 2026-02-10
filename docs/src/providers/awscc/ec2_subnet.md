@@ -17,7 +17,7 @@ Indicates whether a network interface created in this subnet receives an IPv6 ad
 
 ### `availability_zone`
 
-- **Type:** String
+- **Type:** AvailabilityZone
 - **Required:** No
 
 The Availability Zone of the subnet. If you update this property, you must also update the ``CidrBlock`` property.

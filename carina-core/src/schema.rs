@@ -509,6 +509,23 @@ pub mod types {
         }
     }
 
+    /// Availability Zone type (e.g., "us-east-1a", "ap-northeast-1c")
+    /// Validates format: region + single letter zone identifier
+    pub fn availability_zone() -> AttributeType {
+        AttributeType::Custom {
+            name: "AvailabilityZone".to_string(),
+            base: Box::new(AttributeType::String),
+            validate: |value| {
+                if let Value::String(s) = value {
+                    validate_availability_zone(s)
+                } else {
+                    Err("Expected string".to_string())
+                }
+            },
+            namespace: None,
+        }
+    }
+
     /// IPv6 CIDR block type (e.g., "2001:db8::/32", "::/0")
     pub fn ipv6_cidr() -> AttributeType {
         AttributeType::Custom {
@@ -592,6 +609,54 @@ pub fn validate_arn(arn: &str) -> Result<(), String> {
             arn
         ));
     }
+    Ok(())
+}
+
+/// Validate Availability Zone format (e.g., "us-east-1a", "ap-northeast-1c")
+/// Format: {area}-{subarea}-{number}{zone_letter}
+/// where zone_letter is a single lowercase letter
+pub fn validate_availability_zone(az: &str) -> Result<(), String> {
+    // Must end with a single lowercase letter (zone identifier)
+    let zone_letter = az.chars().last();
+    if !zone_letter.is_some_and(|c| c.is_ascii_lowercase()) {
+        return Err(format!(
+            "Invalid availability zone '{}': must end with a zone letter (a-z)",
+            az
+        ));
+    }
+
+    // Region part is everything except the last character
+    let region = &az[..az.len() - 1];
+
+    // Region must match pattern: lowercase-lowercase-digit
+    // e.g., "us-east-1", "ap-northeast-1", "eu-west-2"
+    let parts: Vec<&str> = region.split('-').collect();
+    if parts.len() < 3 {
+        return Err(format!(
+            "Invalid availability zone '{}': expected format like 'us-east-1a'",
+            az
+        ));
+    }
+
+    // Last part of region must be a number
+    let last = parts.last().unwrap();
+    if last.parse::<u8>().is_err() {
+        return Err(format!(
+            "Invalid availability zone '{}': region must end with a number",
+            az
+        ));
+    }
+
+    // All other parts must be lowercase alphabetic
+    for part in &parts[..parts.len() - 1] {
+        if part.is_empty() || !part.chars().all(|c| c.is_ascii_lowercase()) {
+            return Err(format!(
+                "Invalid availability zone '{}': expected format like 'us-east-1a'",
+                az
+            ));
+        }
+    }
+
     Ok(())
 }
 
@@ -1065,5 +1130,46 @@ mod tests {
         assert!(validate_arn("arn:aws:s3").is_err());
         assert!(validate_arn("arn:aws").is_err());
         assert!(validate_arn("").is_err());
+    }
+
+    #[test]
+    fn validate_availability_zone_type() {
+        let t = types::availability_zone();
+
+        // Valid availability zones
+        assert!(t.validate(&Value::String("us-east-1a".to_string())).is_ok());
+        assert!(
+            t.validate(&Value::String("ap-northeast-1c".to_string()))
+                .is_ok()
+        );
+        assert!(t.validate(&Value::String("eu-west-2b".to_string())).is_ok());
+        assert!(
+            t.validate(&Value::String("ap-south-1a".to_string()))
+                .is_ok()
+        );
+        assert!(t.validate(&Value::String("us-west-2d".to_string())).is_ok());
+
+        // Invalid availability zones
+        assert!(t.validate(&Value::String("us-east-1".to_string())).is_err()); // missing zone letter
+        assert!(t.validate(&Value::String("invalid".to_string())).is_err());
+        assert!(t.validate(&Value::String("us-east-a".to_string())).is_err()); // no number
+        assert!(t.validate(&Value::String("".to_string())).is_err());
+        assert!(t.validate(&Value::Int(42)).is_err()); // wrong type
+    }
+
+    #[test]
+    fn validate_availability_zone_function_directly() {
+        // Valid
+        assert!(validate_availability_zone("us-east-1a").is_ok());
+        assert!(validate_availability_zone("ap-northeast-1c").is_ok());
+        assert!(validate_availability_zone("eu-central-1b").is_ok());
+        assert!(validate_availability_zone("me-south-1a").is_ok());
+
+        // Invalid
+        assert!(validate_availability_zone("us-east-1").is_err()); // no zone letter
+        assert!(validate_availability_zone("US-EAST-1A").is_err()); // uppercase
+        assert!(validate_availability_zone("us-east").is_err()); // no number
+        assert!(validate_availability_zone("1a").is_err()); // too short
+        assert!(validate_availability_zone("").is_err()); // empty
     }
 }

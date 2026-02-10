@@ -265,6 +265,8 @@ fn type_display_string(
                     } else {
                         "Ipv4Address".to_string()
                     }
+                } else if prop_lower == "availabilityzone" {
+                    "AvailabilityZone".to_string()
                 } else if prop_lower.ends_with("arn") || prop_lower.contains("_arn") {
                     "Arn".to_string()
                 } else {
@@ -455,6 +457,8 @@ fn generate_markdown(schema: &CfnSchema, type_name: &str) -> Result<String> {
                                 } else {
                                     "Ipv4Address"
                                 }
+                            } else if fl == "availabilityzone" {
+                                "AvailabilityZone"
                             } else if fl.ends_with("arn") || fl.contains("_arn") {
                                 "Arn"
                             } else {
@@ -971,7 +975,13 @@ fn cfn_type_to_carina_type_with_enum(
                 return ("types::arn()".to_string(), None);
             }
 
-            // Zone/Region are strings
+            // Availability zone uses format validation (e.g., "us-east-1a")
+            // but AvailabilityZoneId stays as String (e.g., "use1-az1")
+            if prop_lower == "availabilityzone" {
+                return ("types::availability_zone()".to_string(), None);
+            }
+
+            // Other zone/region fields are strings
             if prop_lower.contains("zone") || prop_lower.contains("region") {
                 return ("AttributeType::String".to_string(), None);
             }
@@ -1331,5 +1341,39 @@ mod tests {
             type_str, "AttributeType::Int",
             "SecondaryPrivateIpAddressCount should stay Int"
         );
+    }
+
+    #[test]
+    fn test_availability_zone_detected() {
+        let prop = CfnProperty {
+            prop_type: Some(TypeValue::Single("string".to_string())),
+            description: Some("The Availability Zone.".to_string()),
+            enum_values: None,
+            items: None,
+            ref_path: None,
+            insertion_order: None,
+            properties: None,
+            required: vec![],
+        };
+        let schema = CfnSchema {
+            type_name: "AWS::EC2::Subnet".to_string(),
+            description: None,
+            properties: BTreeMap::new(),
+            required: vec![],
+            read_only_properties: vec![],
+            create_only_properties: vec![],
+            write_only_properties: vec![],
+            primary_identifier: None,
+            definitions: None,
+            tagging: None,
+        };
+
+        // AvailabilityZone should use types::availability_zone()
+        let (type_str, _) = cfn_type_to_carina_type_with_enum(&prop, "AvailabilityZone", &schema);
+        assert_eq!(type_str, "types::availability_zone()");
+
+        // AvailabilityZoneId should stay String
+        let (type_str, _) = cfn_type_to_carina_type_with_enum(&prop, "AvailabilityZoneId", &schema);
+        assert_eq!(type_str, "AttributeType::String");
     }
 }

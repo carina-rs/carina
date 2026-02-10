@@ -22,7 +22,7 @@ pub fn ec2_subnet_config() -> AwsccSchemaConfig {
                 .with_provider_name("AssignIpv6AddressOnCreation"),
         )
         .attribute(
-            AttributeSchema::new("availability_zone", AttributeType::String)
+            AttributeSchema::new("availability_zone", types::availability_zone())
                 .with_description("The Availability Zone of the subnet. If you update this property, you must also update the ``CidrBlock`` property.")
                 .with_provider_name("AvailabilityZone"),
         )
