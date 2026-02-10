@@ -1,0 +1,21 @@
+# EC2 Route Table - Basic test
+#
+# Tests: vpc_id, tags
+
+provider awscc {
+  region = aws.Region.ap_northeast_1
+}
+
+let vpc = awscc.ec2_vpc {
+  name       = "acceptance-test-vpc-rt"
+  cidr_block = "10.0.0.0/16"
+}
+
+awscc.ec2_route_table {
+  name   = "acceptance-test-rt"
+  vpc_id = vpc.vpc_id
+
+  tags = {
+    Environment = "acceptance-test"
+  }
+}

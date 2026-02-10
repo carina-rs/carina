@@ -1,0 +1,34 @@
+# EC2 Security Group Ingress - Source security group test
+#
+# Tests: source_security_group_id
+
+provider awscc {
+  region = aws.Region.ap_northeast_1
+}
+
+let vpc = awscc.ec2_vpc {
+  name       = "acceptance-test-vpc-sgi-srcsg"
+  cidr_block = "10.0.0.0/16"
+}
+
+let source_sg = awscc.ec2_security_group {
+  name              = "acceptance-test-source-sg"
+  vpc_id            = vpc.vpc_id
+  group_description = "Source security group"
+}
+
+let dest_sg = awscc.ec2_security_group {
+  name              = "acceptance-test-dest-sg"
+  vpc_id            = vpc.vpc_id
+  group_description = "Destination security group"
+}
+
+awscc.ec2_security_group_ingress {
+  name                     = "acceptance-test-ingress-srcsg"
+  group_id                 = dest_sg.group_id
+  description              = "Allow HTTPS from source SG"
+  ip_protocol              = "tcp"
+  from_port                = 443
+  to_port                  = 443
+  source_security_group_id = source_sg.group_id
+}

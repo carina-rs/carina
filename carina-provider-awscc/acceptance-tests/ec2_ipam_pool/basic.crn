@@ -1,0 +1,37 @@
+# EC2 IPAM Pool - Basic test
+#
+# Tests: ipam_scope_id, address_family, locale, description,
+#        provisioned_cidrs (List<Struct>), tags
+
+provider awscc {
+  region = aws.Region.ap_northeast_1
+}
+
+let ipam = awscc.ec2_ipam {
+  name = "acceptance-test-ipam-pool-parent"
+  tier = advanced
+
+  operating_regions = [
+    {
+      region_name = "ap-northeast-1"
+    }
+  ]
+}
+
+awscc.ec2_ipam_pool {
+  name           = "acceptance-test-ipam-pool"
+  ipam_scope_id  = ipam.private_default_scope_id
+  address_family = "IPv4"
+  locale         = "ap-northeast-1"
+  description    = "Acceptance test IPv4 IPAM Pool"
+
+  provisioned_cidrs = [
+    {
+      cidr = "10.0.0.0/8"
+    }
+  ]
+
+  tags = {
+    Environment = "acceptance-test"
+  }
+}

@@ -1,0 +1,48 @@
+# EC2 VPC Endpoint - Interface type test
+#
+# Tests: vpc_endpoint_type=Interface, service_name, subnet_ids, security_group_ids,
+#        private_dns_enabled
+
+provider awscc {
+  region = aws.Region.ap_northeast_1
+}
+
+let vpc = awscc.ec2_vpc {
+  name                 = "acceptance-test-vpc-endpoint-iface"
+  cidr_block           = "10.0.0.0/16"
+  enable_dns_support   = true
+  enable_dns_hostnames = true
+}
+
+let subnet = awscc.ec2_subnet {
+  name              = "acceptance-test-subnet-endpoint-iface"
+  vpc_id            = vpc.vpc_id
+  cidr_block        = "10.0.100.0/24"
+  availability_zone = "ap-northeast-1a"
+}
+
+let sg = awscc.ec2_security_group {
+  name              = "acceptance-test-sg-endpoint-iface"
+  vpc_id            = vpc.vpc_id
+  group_description = "SG for VPC Endpoint"
+}
+
+awscc.ec2_security_group_ingress {
+  name        = "acceptance-test-endpoint-https"
+  group_id    = sg.group_id
+  description = "Allow HTTPS from VPC"
+  ip_protocol = "tcp"
+  from_port   = 443
+  to_port     = 443
+  cidr_ip     = "10.0.0.0/16"
+}
+
+awscc.ec2_vpc_endpoint {
+  name                = "acceptance-test-endpoint-iface"
+  vpc_id              = vpc.vpc_id
+  service_name        = "com.amazonaws.ap-northeast-1.ecr.dkr"
+  vpc_endpoint_type   = Interface
+  subnet_ids          = [subnet.subnet_id]
+  security_group_ids  = [sg.group_id]
+  private_dns_enabled = true
+}

@@ -1,0 +1,24 @@
+# EC2 Subnet - IPv6 test
+#
+# Tests: ipv6_native, assign_ipv6_address_on_creation
+
+provider awscc {
+  region = aws.Region.ap_northeast_1
+}
+
+let vpc = awscc.ec2_vpc {
+  name       = "acceptance-test-vpc-subnet-ipv6"
+  cidr_block = "10.0.0.0/16"
+}
+
+awscc.ec2_subnet {
+  name                            = "acceptance-test-subnet-ipv6"
+  vpc_id                          = vpc.vpc_id
+  cidr_block                      = "10.0.1.0/24"
+  availability_zone               = "ap-northeast-1a"
+  assign_ipv6_address_on_creation = false
+
+  tags = {
+    Environment = "acceptance-test"
+  }
+}

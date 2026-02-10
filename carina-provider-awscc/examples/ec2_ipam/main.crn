@@ -1,0 +1,23 @@
+# EC2 IPAM Example
+#
+# Creates an IP Address Manager (IPAM) instance.
+
+provider awscc {
+  region = aws.Region.ap_northeast_1
+}
+
+awscc.ec2_ipam {
+  name        = "example-ipam"
+  description = "Example IPAM"
+  tier        = free
+
+  operating_regions = [
+    {
+      region_name = "ap-northeast-1"
+    }
+  ]
+
+  tags = {
+    Environment = "example"
+  }
+}

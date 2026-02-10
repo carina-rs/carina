@@ -28,6 +28,12 @@ RESOURCE_TYPES=(
     "AWS::EC2::VPCEndpoint"
     "AWS::EC2::VPCGatewayAttachment"
     "AWS::EC2::FlowLog"
+    "AWS::EC2::IPAM"
+    "AWS::EC2::IPAMPool"
+    "AWS::EC2::VPNGateway"
+    "AWS::EC2::TransitGateway"
+    "AWS::EC2::VPCPeeringConnection"
+    "AWS::EC2::EgressOnlyInternetGateway"
 )
 
 echo "Generating awscc provider documentation..."

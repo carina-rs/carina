@@ -105,9 +105,12 @@ pub fn validate_namespaced_enum(
     }
 }
 
+pub mod egress_only_internet_gateway;
 pub mod eip;
 pub mod flow_log;
 pub mod internet_gateway;
+pub mod ipam;
+pub mod ipam_pool;
 pub mod nat_gateway;
 pub mod route;
 pub mod route_table;
@@ -116,9 +119,12 @@ pub mod security_group_egress;
 pub mod security_group_ingress;
 pub mod subnet;
 pub mod subnet_route_table_association;
+pub mod transit_gateway;
 pub mod vpc;
 pub mod vpc_endpoint;
 pub mod vpc_gateway_attachment;
+pub mod vpc_peering_connection;
+pub mod vpn_gateway;
 
 /// Returns all generated schema configs
 pub fn configs() -> Vec<AwsccSchemaConfig> {
@@ -137,6 +143,12 @@ pub fn configs() -> Vec<AwsccSchemaConfig> {
         vpc_endpoint::ec2_vpc_endpoint_config(),
         vpc_gateway_attachment::ec2_vpc_gateway_attachment_config(),
         flow_log::ec2_flow_log_config(),
+        ipam::ec2_ipam_config(),
+        ipam_pool::ec2_ipam_pool_config(),
+        vpn_gateway::ec2_vpn_gateway_config(),
+        transit_gateway::ec2_transit_gateway_config(),
+        vpc_peering_connection::ec2_vpc_peering_connection_config(),
+        egress_only_internet_gateway::ec2_egress_only_internet_gateway_config(),
     ]
 }
 

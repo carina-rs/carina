@@ -1,0 +1,55 @@
+# EC2 Route - NAT Gateway test
+#
+# Tests: nat_gateway_id, destination_cidr_block
+
+provider awscc {
+  region = aws.Region.ap_northeast_1
+}
+
+let vpc = awscc.ec2_vpc {
+  name                 = "acceptance-test-vpc-route-nat"
+  cidr_block           = "10.0.0.0/16"
+  enable_dns_support   = true
+  enable_dns_hostnames = true
+}
+
+let igw = awscc.ec2_internet_gateway {
+  name = "acceptance-test-igw-route-nat"
+}
+
+let igw_attach = awscc.ec2_vpc_gateway_attachment {
+  name                = "acceptance-test-igw-attach-route-nat"
+  vpc_id              = vpc.vpc_id
+  internet_gateway_id = igw.internet_gateway_id
+}
+
+let public_subnet = awscc.ec2_subnet {
+  name                    = "acceptance-test-public-subnet-nat"
+  vpc_id                  = vpc.vpc_id
+  cidr_block              = "10.0.1.0/24"
+  availability_zone       = "ap-northeast-1a"
+  map_public_ip_on_launch = true
+}
+
+let eip = awscc.ec2_eip {
+  name   = "acceptance-test-eip-nat-route"
+  domain = "vpc"
+}
+
+let nat_gw = awscc.ec2_nat_gateway {
+  name          = "acceptance-test-nat-gw-route"
+  allocation_id = eip.allocation_id
+  subnet_id     = public_subnet.subnet_id
+}
+
+let rt = awscc.ec2_route_table {
+  name   = "acceptance-test-rt-nat"
+  vpc_id = vpc.vpc_id
+}
+
+awscc.ec2_route {
+  name                   = "acceptance-test-route-nat"
+  route_table_id         = rt.route_table_id
+  destination_cidr_block = "0.0.0.0/0"
+  nat_gateway_id         = nat_gw.nat_gateway_id
+}

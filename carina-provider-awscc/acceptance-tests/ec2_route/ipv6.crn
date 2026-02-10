@@ -1,0 +1,30 @@
+# EC2 Route - IPv6 Egress Only Internet Gateway test
+#
+# Tests: destination_ipv6_cidr_block, egress_only_internet_gateway_id
+# Requires: Egress Only Internet Gateway
+
+provider awscc {
+  region = aws.Region.ap_northeast_1
+}
+
+let vpc = awscc.ec2_vpc {
+  name       = "acceptance-test-vpc-route-ipv6"
+  cidr_block = "10.0.0.0/16"
+}
+
+let eoigw = awscc.ec2_egress_only_internet_gateway {
+  name   = "acceptance-test-eoigw-route"
+  vpc_id = vpc.vpc_id
+}
+
+let rt = awscc.ec2_route_table {
+  name   = "acceptance-test-rt-ipv6"
+  vpc_id = vpc.vpc_id
+}
+
+awscc.ec2_route {
+  name                            = "acceptance-test-route-ipv6"
+  route_table_id                  = rt.route_table_id
+  destination_ipv6_cidr_block     = "::/0"
+  egress_only_internet_gateway_id = eoigw.id
+}

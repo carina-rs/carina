@@ -1,0 +1,17 @@
+# EC2 EIP - Network border group test
+#
+# Tests: network_border_group
+
+provider awscc {
+  region = aws.Region.ap_northeast_1
+}
+
+awscc.ec2_eip {
+  name                 = "acceptance-test-eip-border"
+  domain               = "vpc"
+  network_border_group = "ap-northeast-1"
+
+  tags = {
+    Environment = "acceptance-test"
+  }
+}

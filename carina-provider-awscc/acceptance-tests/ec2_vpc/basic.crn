@@ -1,0 +1,19 @@
+# EC2 VPC - Basic test
+#
+# Tests: cidr_block, enable_dns_support, enable_dns_hostnames, instance_tenancy, tags
+
+provider awscc {
+  region = aws.Region.ap_northeast_1
+}
+
+awscc.ec2_vpc {
+  name                 = "acceptance-test-vpc-basic"
+  cidr_block           = "10.0.0.0/16"
+  enable_dns_support   = true
+  enable_dns_hostnames = true
+  instance_tenancy     = default
+
+  tags = {
+    Environment = "acceptance-test"
+  }
+}

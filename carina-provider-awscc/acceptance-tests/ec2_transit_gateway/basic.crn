@@ -1,0 +1,16 @@
+# EC2 Transit Gateway - Basic test
+#
+# Tests: description, tags
+
+provider awscc {
+  region = aws.Region.ap_northeast_1
+}
+
+awscc.ec2_transit_gateway {
+  name        = "acceptance-test-tgw"
+  description = "Acceptance test Transit Gateway"
+
+  tags = {
+    Environment = "acceptance-test"
+  }
+}

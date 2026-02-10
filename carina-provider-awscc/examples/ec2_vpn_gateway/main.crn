@@ -1,0 +1,16 @@
+# EC2 VPN Gateway Example
+#
+# Creates a virtual private gateway.
+
+provider awscc {
+  region = aws.Region.ap_northeast_1
+}
+
+awscc.ec2_vpn_gateway {
+  name = "example-vpn-gw"
+  type = "ipsec.1"
+
+  tags = {
+    Environment = "example"
+  }
+}

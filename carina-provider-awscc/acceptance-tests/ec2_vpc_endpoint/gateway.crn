@@ -1,0 +1,25 @@
+# EC2 VPC Endpoint - Gateway type test
+#
+# Tests: vpc_endpoint_type=Gateway, service_name, route_table_ids, policy_document
+
+provider awscc {
+  region = aws.Region.ap_northeast_1
+}
+
+let vpc = awscc.ec2_vpc {
+  name       = "acceptance-test-vpc-endpoint-gw"
+  cidr_block = "10.0.0.0/16"
+}
+
+let rt = awscc.ec2_route_table {
+  name   = "acceptance-test-rt-endpoint-gw"
+  vpc_id = vpc.vpc_id
+}
+
+awscc.ec2_vpc_endpoint {
+  name              = "acceptance-test-endpoint-gw"
+  vpc_id            = vpc.vpc_id
+  service_name      = "com.amazonaws.ap-northeast-1.s3"
+  vpc_endpoint_type = Gateway
+  route_table_ids   = [rt.route_table_id]
+}

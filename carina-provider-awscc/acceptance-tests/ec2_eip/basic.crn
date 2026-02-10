@@ -1,0 +1,16 @@
+# EC2 EIP - Basic test
+#
+# Tests: domain, tags
+
+provider awscc {
+  region = aws.Region.ap_northeast_1
+}
+
+awscc.ec2_eip {
+  name   = "acceptance-test-eip"
+  domain = "vpc"
+
+  tags = {
+    Environment = "acceptance-test"
+  }
+}

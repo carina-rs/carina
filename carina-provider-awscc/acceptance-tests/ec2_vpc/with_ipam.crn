@@ -1,0 +1,48 @@
+# EC2 VPC - IPAM test
+#
+# Tests: ipv4_ipam_pool_id, ipv4_netmask_length
+# Requires: IPAM and IPAM Pool
+#
+# Known issue: IPAM Pool deletion times out via CloudControl API.
+# Apply succeeds but destroy may fail. Manual cleanup with
+# `aws ec2 delete-ipam --ipam-id <id> --cascade` may be needed.
+
+provider awscc {
+  region = aws.Region.ap_northeast_1
+}
+
+let ipam = awscc.ec2_ipam {
+  name = "acceptance-test-ipam-vpc"
+  tier = advanced
+
+  operating_regions = [
+    {
+      region_name = "ap-northeast-1"
+    }
+  ]
+}
+
+let ipam_pool = awscc.ec2_ipam_pool {
+  name           = "acceptance-test-ipam-pool-vpc"
+  ipam_scope_id  = ipam.private_default_scope_id
+  address_family = "IPv4"
+  locale         = "ap-northeast-1"
+
+  provisioned_cidrs = [
+    {
+      cidr = "10.0.0.0/8"
+    }
+  ]
+}
+
+awscc.ec2_vpc {
+  name                 = "acceptance-test-vpc-ipam"
+  ipv4_ipam_pool_id    = ipam_pool.ipam_pool_id
+  ipv4_netmask_length  = 16
+  enable_dns_support   = true
+  enable_dns_hostnames = true
+
+  tags = {
+    Environment = "acceptance-test"
+  }
+}
