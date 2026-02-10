@@ -24,14 +24,14 @@ The network (``vpc``). If you define an Elastic IP address and associate it with
 
 ### `instance_id`
 
-- **Type:** String
+- **Type:** AwsResourceId
 - **Required:** No
 
 The ID of the instance.  Updates to the ``InstanceId`` property may require *some interruptions*. Updates on an EIP reassociates the address on its associated resource.
 
 ### `ipam_pool_id`
 
-- **Type:** String
+- **Type:** AwsResourceId
 - **Required:** No
 
 
@@ -68,7 +68,7 @@ The Elastic IP address you are accepting for transfer. You can only accept one t
 
 ### `allocation_id`
 
-- **Type:** String
+- **Type:** AwsResourceId
 
 ### `public_ip`
 

@@ -10,7 +10,7 @@ Specifies a route in a route table. For more information, see [Routes](https://d
 
 ### `carrier_gateway_id`
 
-- **Type:** String
+- **Type:** AwsResourceId
 - **Required:** No
 
 The ID of the carrier gateway. You can only use this option when the VPC contains a subnet which is associated with a Wavelength Zone.
@@ -38,77 +38,77 @@ The IPv6 CIDR block used for the destination match. Routing decisions are based 
 
 ### `destination_prefix_list_id`
 
-- **Type:** String
+- **Type:** AwsResourceId
 - **Required:** No
 
 The ID of a prefix list used for the destination match.
 
 ### `egress_only_internet_gateway_id`
 
-- **Type:** String
+- **Type:** AwsResourceId
 - **Required:** No
 
 [IPv6 traffic only] The ID of an egress-only internet gateway.
 
 ### `gateway_id`
 
-- **Type:** String
+- **Type:** AwsResourceId
 - **Required:** No
 
 The ID of an internet gateway or virtual private gateway attached to your VPC.
 
 ### `instance_id`
 
-- **Type:** String
+- **Type:** AwsResourceId
 - **Required:** No
 
 The ID of a NAT instance in your VPC. The operation fails if you specify an instance ID unless exactly one network interface is attached.
 
 ### `local_gateway_id`
 
-- **Type:** String
+- **Type:** AwsResourceId
 - **Required:** No
 
 The ID of the local gateway.
 
 ### `nat_gateway_id`
 
-- **Type:** String
+- **Type:** AwsResourceId
 - **Required:** No
 
 [IPv4 traffic only] The ID of a NAT gateway.
 
 ### `network_interface_id`
 
-- **Type:** String
+- **Type:** AwsResourceId
 - **Required:** No
 
 The ID of a network interface.
 
 ### `route_table_id`
 
-- **Type:** String
+- **Type:** AwsResourceId
 - **Required:** Yes
 
 The ID of the route table for the route.
 
 ### `transit_gateway_id`
 
-- **Type:** String
+- **Type:** AwsResourceId
 - **Required:** No
 
 The ID of a transit gateway.
 
 ### `vpc_endpoint_id`
 
-- **Type:** String
+- **Type:** AwsResourceId
 - **Required:** No
 
 The ID of a VPC endpoint. Supported for Gateway Load Balancer endpoints only.
 
 ### `vpc_peering_connection_id`
 
-- **Type:** String
+- **Type:** AwsResourceId
 - **Required:** No
 
 The ID of a VPC peering connection.

@@ -36,7 +36,7 @@ The start of port range for the TCP and UDP protocols, or an ICMP/ICMPv6 type nu
 
 ### `group_id`
 
-- **Type:** String
+- **Type:** AwsResourceId
 - **Required:** No
 
 The ID of the security group. You must specify either the security group ID or the security group name in the request. For security groups in a nondefault VPC, you must specify the security group ID. You must specify the GroupName property or the GroupId property. For security groups that are in a VPC, you must use the GroupId property.
@@ -57,14 +57,14 @@ The IP protocol name (tcp, udp, icmp, icmpv6) or number (see Protocol Numbers). 
 
 ### `source_prefix_list_id`
 
-- **Type:** String
+- **Type:** AwsResourceId
 - **Required:** No
 
 [EC2-VPC only] The ID of a prefix list. 
 
 ### `source_security_group_id`
 
-- **Type:** String
+- **Type:** AwsResourceId
 - **Required:** No
 
 The ID of the security group. You must specify either the security group ID or the security group name. For security groups in a nondefault VPC, you must specify the security group ID.

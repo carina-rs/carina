@@ -33,14 +33,14 @@ The description of an egress (outbound) security group rule. Constraints: Up to 
 
 ### `destination_prefix_list_id`
 
-- **Type:** String
+- **Type:** AwsResourceId
 - **Required:** No
 
 The prefix list IDs for an AWS service. This is the AWS service to access through a VPC endpoint from instances associated with the security group. You must specify exactly one of the following: ``CidrIp``, ``CidrIpv6``, ``DestinationPrefixListId``, or ``DestinationSecurityGroupId``.
 
 ### `destination_security_group_id`
 
-- **Type:** String
+- **Type:** AwsResourceId
 - **Required:** No
 
 The ID of the security group. You must specify exactly one of the following: ``CidrIp``, ``CidrIpv6``, ``DestinationPrefixListId``, or ``DestinationSecurityGroupId``.
@@ -54,7 +54,7 @@ If the protocol is TCP or UDP, this is the start of the port range. If the proto
 
 ### `group_id`
 
-- **Type:** String
+- **Type:** AwsResourceId
 - **Required:** Yes
 
 The ID of the security group. You must specify either the security group ID or the security group name in the request. For security groups in a nondefault VPC, you must specify the security group ID.

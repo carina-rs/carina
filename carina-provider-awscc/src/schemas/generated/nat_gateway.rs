@@ -30,7 +30,7 @@ pub fn ec2_nat_gateway_config() -> AwsccSchemaConfig {
         schema: ResourceSchema::new("awscc.ec2_nat_gateway")
         .with_description("Specifies a network address translation (NAT) gateway in the specified subnet. You can create either a public NAT gateway or a private NAT gateway. The default is a public NAT gateway. If you create a...")
         .attribute(
-            AttributeSchema::new("allocation_id", AttributeType::String)
+            AttributeSchema::new("allocation_id", types::aws_resource_id())
                 .with_description("[Public NAT gateway only] The allocation ID of the Elastic IP address that's associated with the NAT gateway. This property is required for a public N...")
                 .with_provider_name("AllocationId"),
         )
@@ -72,7 +72,7 @@ pub fn ec2_nat_gateway_config() -> AwsccSchemaConfig {
                 .with_provider_name("ConnectivityType"),
         )
         .attribute(
-            AttributeSchema::new("eni_id", AttributeType::String)
+            AttributeSchema::new("eni_id", types::aws_resource_id())
                 .with_description(" (read-only)")
                 .with_provider_name("EniId"),
         )
@@ -82,7 +82,7 @@ pub fn ec2_nat_gateway_config() -> AwsccSchemaConfig {
                 .with_provider_name("MaxDrainDurationSeconds"),
         )
         .attribute(
-            AttributeSchema::new("nat_gateway_id", AttributeType::String)
+            AttributeSchema::new("nat_gateway_id", types::aws_resource_id())
                 .with_description(" (read-only)")
                 .with_provider_name("NatGatewayId"),
         )
@@ -92,7 +92,7 @@ pub fn ec2_nat_gateway_config() -> AwsccSchemaConfig {
                 .with_provider_name("PrivateIpAddress"),
         )
         .attribute(
-            AttributeSchema::new("route_table_id", AttributeType::String)
+            AttributeSchema::new("route_table_id", types::aws_resource_id())
                 .with_description(" (read-only)")
                 .with_provider_name("RouteTableId"),
         )
@@ -112,7 +112,7 @@ pub fn ec2_nat_gateway_config() -> AwsccSchemaConfig {
                 .with_provider_name("SecondaryPrivateIpAddresses"),
         )
         .attribute(
-            AttributeSchema::new("subnet_id", AttributeType::String)
+            AttributeSchema::new("subnet_id", types::aws_resource_id())
                 .with_description("The ID of the subnet in which the NAT gateway is located.")
                 .with_provider_name("SubnetId"),
         )
@@ -122,7 +122,7 @@ pub fn ec2_nat_gateway_config() -> AwsccSchemaConfig {
                 .with_provider_name("Tags"),
         )
         .attribute(
-            AttributeSchema::new("vpc_id", AttributeType::String)
+            AttributeSchema::new("vpc_id", types::aws_resource_id())
                 .with_description("The ID of the VPC in which the NAT gateway is located.")
                 .with_provider_name("VpcId"),
         )

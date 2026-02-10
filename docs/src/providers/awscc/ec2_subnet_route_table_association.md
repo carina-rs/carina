@@ -8,14 +8,14 @@ Associates a subnet with a route table. The subnet and route table must be in th
 
 ### `route_table_id`
 
-- **Type:** String
+- **Type:** AwsResourceId
 - **Required:** Yes
 
 The ID of the route table. The physical ID changes when the route table ID is changed.
 
 ### `subnet_id`
 
-- **Type:** String
+- **Type:** AwsResourceId
 - **Required:** Yes
 
 The ID of the subnet.

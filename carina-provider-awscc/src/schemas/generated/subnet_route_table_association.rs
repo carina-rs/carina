@@ -5,7 +5,7 @@
 //! DO NOT EDIT MANUALLY - regenerate with carina-codegen
 
 use super::AwsccSchemaConfig;
-use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, types};
 
 /// Returns the schema config for ec2_subnet_route_table_association (AWS::EC2::SubnetRouteTableAssociation)
 pub fn ec2_subnet_route_table_association_config() -> AwsccSchemaConfig {
@@ -21,13 +21,13 @@ pub fn ec2_subnet_route_table_association_config() -> AwsccSchemaConfig {
                 .with_provider_name("Id"),
         )
         .attribute(
-            AttributeSchema::new("route_table_id", AttributeType::String)
+            AttributeSchema::new("route_table_id", types::aws_resource_id())
                 .required()
                 .with_description("The ID of the route table. The physical ID changes when the route table ID is changed.")
                 .with_provider_name("RouteTableId"),
         )
         .attribute(
-            AttributeSchema::new("subnet_id", AttributeType::String)
+            AttributeSchema::new("subnet_id", types::aws_resource_id())
                 .required()
                 .with_description("The ID of the subnet.")
                 .with_provider_name("SubnetId"),

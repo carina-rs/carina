@@ -43,7 +43,7 @@ Any tags assigned to the security group.
 
 ### `vpc_id`
 
-- **Type:** String
+- **Type:** AwsResourceId
 - **Required:** No
 
 The ID of the VPC for the security group.
@@ -52,7 +52,7 @@ The ID of the VPC for the security group.
 
 ### `group_id`
 
-- **Type:** String
+- **Type:** AwsResourceId
 
 ### `id`
 
@@ -67,8 +67,8 @@ The ID of the VPC for the security group.
 | `cidr_ip` | Ipv4Cidr | No |  |
 | `cidr_ipv6` | Ipv6Cidr | No |  |
 | `description` | String | No |  |
-| `destination_prefix_list_id` | String | No |  |
-| `destination_security_group_id` | String | No |  |
+| `destination_prefix_list_id` | AwsResourceId | No |  |
+| `destination_security_group_id` | AwsResourceId | No |  |
 | `from_port` | Int | No |  |
 | `ip_protocol` | Enum | Yes |  |
 | `to_port` | Int | No |  |
@@ -82,8 +82,8 @@ The ID of the VPC for the security group.
 | `description` | String | No |  |
 | `from_port` | Int | No |  |
 | `ip_protocol` | Enum | Yes |  |
-| `source_prefix_list_id` | String | No |  |
-| `source_security_group_id` | String | No |  |
+| `source_prefix_list_id` | AwsResourceId | No |  |
+| `source_security_group_id` | AwsResourceId | No |  |
 | `source_security_group_name` | String | No |  |
 | `source_security_group_owner_id` | String | No |  |
 | `to_port` | Int | No |  |

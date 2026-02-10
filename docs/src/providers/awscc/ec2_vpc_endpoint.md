@@ -102,7 +102,7 @@ The type of endpoint. Default: Gateway
 
 ### `vpc_id`
 
-- **Type:** String
+- **Type:** AwsResourceId
 - **Required:** Yes
 
 The ID of the VPC.

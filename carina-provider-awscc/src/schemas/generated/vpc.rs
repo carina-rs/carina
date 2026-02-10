@@ -70,7 +70,7 @@ pub fn ec2_vpc_config() -> AwsccSchemaConfig {
                 .with_provider_name("InstanceTenancy"),
         )
         .attribute(
-            AttributeSchema::new("ipv4_ipam_pool_id", AttributeType::String)
+            AttributeSchema::new("ipv4_ipam_pool_id", types::aws_resource_id())
                 .with_description("The ID of an IPv4 IPAM pool you want to use for allocating this VPC's CIDR. For more information, see [What is IPAM?](https://docs.aws.amazon.com//vpc...")
                 .with_provider_name("Ipv4IpamPoolId"),
         )
@@ -90,7 +90,7 @@ pub fn ec2_vpc_config() -> AwsccSchemaConfig {
                 .with_provider_name("Tags"),
         )
         .attribute(
-            AttributeSchema::new("vpc_id", AttributeType::String)
+            AttributeSchema::new("vpc_id", types::aws_resource_id())
                 .with_description(" (read-only)")
                 .with_provider_name("VpcId"),
         )
