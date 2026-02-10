@@ -178,6 +178,33 @@ versioning = Enabled
 instance_tenancy = dedicated
 ```
 
+### Nested Objects (Struct Types)
+
+Some resources support nested objects for inline configuration:
+
+```hcl
+awscc.ec2_security_group {
+  name              = "web-sg"
+  vpc_id            = vpc.vpc_id
+  group_description = "Web server security group"
+
+  security_group_ingress = [
+    {
+      ip_protocol = "tcp"
+      from_port   = 80
+      to_port     = 80
+      cidr_ip     = "0.0.0.0/0"
+    },
+    {
+      ip_protocol = "tcp"
+      from_port   = 443
+      to_port     = 443
+      cidr_ip     = "0.0.0.0/0"
+    }
+  ]
+}
+```
+
 ### Modules
 
 Modules enable reusable infrastructure components with typed inputs and outputs.

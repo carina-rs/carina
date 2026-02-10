@@ -120,6 +120,20 @@ Enum values use namespaced identifiers like `aws.s3.VersioningStatus.Enabled` or
 
 5. **Always test with actual values** - Don't assume pattern matching works; write a quick test to verify
 
+### Struct Types
+
+`AttributeType::Struct` represents nested objects with typed fields.
+
+**Key points:**
+- Defined in `carina-core/src/schema.rs` as `Struct { name, fields: Vec<StructField> }`
+- Each `StructField` has: `name`, `field_type` (recursive AttributeType), `required`, `description`
+- AWSCC provider converts between DSL snake_case and CloudFormation PascalCase (see `carina-provider-awscc/src/provider.rs`)
+- Codegen resolves CloudFormation `$ref` and inline object definitions into Struct types
+
+**LSP integration:**
+- When adding Struct validation, update `carina-lsp/src/diagnostics.rs` to validate nested fields
+- Completion should work recursively for struct fields
+
 ### Module Loading
 
 Directory-based modules (e.g., `modules/web_tier/`) require special handling:
