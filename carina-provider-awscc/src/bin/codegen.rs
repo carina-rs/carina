@@ -253,6 +253,18 @@ fn type_display_string(
                     } else {
                         "Ipv4Cidr".to_string()
                     }
+                } else if (prop_lower.contains("ipaddress")
+                    || prop_lower.ends_with("ip")
+                    || prop_lower.contains("ipaddresses"))
+                    && !prop_lower.contains("cidr")
+                    && !prop_lower.contains("count")
+                    && !prop_lower.contains("type")
+                {
+                    if prop_lower.contains("ipv6") {
+                        "Ipv6Address".to_string()
+                    } else {
+                        "Ipv4Address".to_string()
+                    }
                 } else if prop_lower.ends_with("arn") || prop_lower.contains("_arn") {
                     "Arn".to_string()
                 } else {
@@ -430,6 +442,18 @@ fn generate_markdown(schema: &CfnSchema, type_name: &str) -> Result<String> {
                                     "Ipv6Cidr"
                                 } else {
                                     "Ipv4Cidr"
+                                }
+                            } else if (fl.contains("ipaddress")
+                                || fl.ends_with("ip")
+                                || fl.contains("ipaddresses"))
+                                && !fl.contains("cidr")
+                                && !fl.contains("count")
+                                && !fl.contains("type")
+                            {
+                                if fl.contains("ipv6") {
+                                    "Ipv6Address"
+                                } else {
+                                    "Ipv4Address"
                                 }
                             } else if fl.ends_with("arn") || fl.contains("_arn") {
                                 "Arn"
@@ -923,6 +947,20 @@ fn cfn_type_to_carina_type_with_enum(
                 return ("types::ipv4_cidr()".to_string(), None);
             }
 
+            // IP address types (not CIDR) - e.g., PrivateIpAddress, PublicIp
+            if (prop_lower.contains("ipaddress")
+                || prop_lower.ends_with("ip")
+                || prop_lower.contains("ipaddresses"))
+                && !prop_lower.contains("cidr")
+                && !prop_lower.contains("count")
+                && !prop_lower.contains("type")
+            {
+                if prop_lower.contains("ipv6") {
+                    return ("types::ipv6_address()".to_string(), None);
+                }
+                return ("types::ipv4_address()".to_string(), None);
+            }
+
             // IDs are always strings
             if prop_lower.ends_with("id") || prop_lower.ends_with("_id") {
                 return ("AttributeType::String".to_string(), None);
@@ -1195,6 +1233,103 @@ mod tests {
         assert_eq!(
             type_str, "types::ipv6_cidr()",
             "CidrIpv6 should produce types::ipv6_cidr()"
+        );
+    }
+
+    #[test]
+    fn test_ip_address_detected_as_ipv4_address() {
+        // PrivateIpAddress should be detected as IPv4 address
+        let prop = CfnProperty {
+            prop_type: Some(TypeValue::Single("string".to_string())),
+            description: Some("The private IPv4 address.".to_string()),
+            enum_values: None,
+            items: None,
+            ref_path: None,
+            insertion_order: None,
+            properties: None,
+            required: vec![],
+        };
+        let schema = CfnSchema {
+            type_name: "AWS::EC2::NatGateway".to_string(),
+            description: None,
+            properties: BTreeMap::new(),
+            required: vec![],
+            read_only_properties: vec![],
+            create_only_properties: vec![],
+            write_only_properties: vec![],
+            primary_identifier: None,
+            definitions: None,
+            tagging: None,
+        };
+        let (type_str, _) = cfn_type_to_carina_type_with_enum(&prop, "PrivateIpAddress", &schema);
+        assert_eq!(
+            type_str, "types::ipv4_address()",
+            "PrivateIpAddress should produce types::ipv4_address()"
+        );
+    }
+
+    #[test]
+    fn test_public_ip_detected_as_ipv4_address() {
+        // PublicIp should be detected as IPv4 address
+        let prop = CfnProperty {
+            prop_type: Some(TypeValue::Single("string".to_string())),
+            description: Some("The public IP address.".to_string()),
+            enum_values: None,
+            items: None,
+            ref_path: None,
+            insertion_order: None,
+            properties: None,
+            required: vec![],
+        };
+        let schema = CfnSchema {
+            type_name: "AWS::EC2::EIP".to_string(),
+            description: None,
+            properties: BTreeMap::new(),
+            required: vec![],
+            read_only_properties: vec![],
+            create_only_properties: vec![],
+            write_only_properties: vec![],
+            primary_identifier: None,
+            definitions: None,
+            tagging: None,
+        };
+        let (type_str, _) = cfn_type_to_carina_type_with_enum(&prop, "PublicIp", &schema);
+        assert_eq!(
+            type_str, "types::ipv4_address()",
+            "PublicIp should produce types::ipv4_address()"
+        );
+    }
+
+    #[test]
+    fn test_ip_address_count_stays_int() {
+        // SecondaryPrivateIpAddressCount should stay Int, not become IP address
+        let prop = CfnProperty {
+            prop_type: Some(TypeValue::Single("integer".to_string())),
+            description: Some("The number of secondary private IPv4 addresses.".to_string()),
+            enum_values: None,
+            items: None,
+            ref_path: None,
+            insertion_order: None,
+            properties: None,
+            required: vec![],
+        };
+        let schema = CfnSchema {
+            type_name: "AWS::EC2::NatGateway".to_string(),
+            description: None,
+            properties: BTreeMap::new(),
+            required: vec![],
+            read_only_properties: vec![],
+            create_only_properties: vec![],
+            write_only_properties: vec![],
+            primary_identifier: None,
+            definitions: None,
+            tagging: None,
+        };
+        let (type_str, _) =
+            cfn_type_to_carina_type_with_enum(&prop, "SecondaryPrivateIpAddressCount", &schema);
+        assert_eq!(
+            type_str, "AttributeType::Int",
+            "SecondaryPrivateIpAddressCount should stay Int"
         );
     }
 }

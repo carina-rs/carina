@@ -8,7 +8,7 @@ use super::AwsccSchemaConfig;
 use super::tags_type;
 use super::validate_namespaced_enum;
 use carina_core::resource::Value;
-use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
+use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField, types};
 
 const VALID_CONNECTIVITY_TYPE: &[&str] = &["public", "private"];
 
@@ -87,7 +87,7 @@ pub fn ec2_nat_gateway_config() -> AwsccSchemaConfig {
                 .with_provider_name("NatGatewayId"),
         )
         .attribute(
-            AttributeSchema::new("private_ip_address", AttributeType::String)
+            AttributeSchema::new("private_ip_address", types::ipv4_address())
                 .with_description("The private IPv4 address to assign to the NAT gateway. If you don't provide an address, a private IPv4 address will be automatically assigned.")
                 .with_provider_name("PrivateIpAddress"),
         )
@@ -107,7 +107,7 @@ pub fn ec2_nat_gateway_config() -> AwsccSchemaConfig {
                 .with_provider_name("SecondaryPrivateIpAddressCount"),
         )
         .attribute(
-            AttributeSchema::new("secondary_private_ip_addresses", AttributeType::List(Box::new(AttributeType::String)))
+            AttributeSchema::new("secondary_private_ip_addresses", AttributeType::List(Box::new(types::ipv4_address())))
                 .with_description("Secondary private IPv4 addresses. For more information about secondary addresses, see [Create a NAT gateway](https://docs.aws.amazon.com/vpc/latest/us...")
                 .with_provider_name("SecondaryPrivateIpAddresses"),
         )

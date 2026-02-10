@@ -72,7 +72,7 @@ The Elastic IP address you are accepting for transfer. You can only accept one t
 
 ### `public_ip`
 
-- **Type:** String
+- **Type:** Ipv4Address
 
 
 

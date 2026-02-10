@@ -477,6 +477,38 @@ pub mod types {
         }
     }
 
+    /// IPv4 address type (e.g., "10.0.1.5", "192.168.0.1")
+    pub fn ipv4_address() -> AttributeType {
+        AttributeType::Custom {
+            name: "Ipv4Address".to_string(),
+            base: Box::new(AttributeType::String),
+            validate: |value| {
+                if let Value::String(s) = value {
+                    validate_ipv4_address(s)
+                } else {
+                    Err("Expected string".to_string())
+                }
+            },
+            namespace: None,
+        }
+    }
+
+    /// IPv6 address type (e.g., "2001:db8::1", "::1")
+    pub fn ipv6_address() -> AttributeType {
+        AttributeType::Custom {
+            name: "Ipv6Address".to_string(),
+            base: Box::new(AttributeType::String),
+            validate: |value| {
+                if let Value::String(s) = value {
+                    validate_ipv6_address(s)
+                } else {
+                    Err("Expected string".to_string())
+                }
+            },
+            namespace: None,
+        }
+    }
+
     /// IPv6 CIDR block type (e.g., "2001:db8::/32", "::/0")
     pub fn ipv6_cidr() -> AttributeType {
         AttributeType::Custom {
@@ -494,6 +526,28 @@ pub mod types {
     }
 }
 
+/// Validate an IPv4 address (e.g., "10.0.1.5", "192.168.0.1")
+pub fn validate_ipv4_address(ip: &str) -> Result<(), String> {
+    let octets: Vec<&str> = ip.split('.').collect();
+    if octets.len() != 4 {
+        return Err(format!("Invalid IPv4 address '{}': expected 4 octets", ip));
+    }
+
+    for octet in &octets {
+        match octet.parse::<u8>() {
+            Ok(_) => {}
+            Err(_) => {
+                return Err(format!(
+                    "Invalid octet '{}' in IPv4 address: must be 0-255",
+                    octet
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Validate IPv4 CIDR block format (e.g., "10.0.0.0/16")
 pub fn validate_ipv4_cidr(cidr: &str) -> Result<(), String> {
     let parts: Vec<&str> = cidr.split('/').collect();
@@ -508,22 +562,7 @@ pub fn validate_ipv4_cidr(cidr: &str) -> Result<(), String> {
     let prefix = parts[1];
 
     // Validate IP address
-    let octets: Vec<&str> = ip.split('.').collect();
-    if octets.len() != 4 {
-        return Err(format!("Invalid IP address '{}': expected 4 octets", ip));
-    }
-
-    for octet in &octets {
-        match octet.parse::<u8>() {
-            Ok(_) => {}
-            Err(_) => {
-                return Err(format!(
-                    "Invalid octet '{}' in IP address: must be 0-255",
-                    octet
-                ));
-            }
-        }
-    }
+    validate_ipv4_address(ip)?;
 
     // Validate prefix length
     match prefix.parse::<u8>() {
@@ -584,7 +623,7 @@ pub fn validate_ipv6_cidr(cidr: &str) -> Result<(), String> {
 }
 
 /// Validate an IPv6 address (supports `::` shorthand)
-fn validate_ipv6_address(addr: &str) -> Result<(), String> {
+pub fn validate_ipv6_address(addr: &str) -> Result<(), String> {
     if addr.is_empty() {
         return Err("Empty IPv6 address".to_string());
     }
@@ -955,6 +994,61 @@ mod tests {
             t.validate(&Value::String("arn:aws:s3".to_string()))
                 .is_err()
         ); // too few parts
+        assert!(t.validate(&Value::Int(42)).is_err()); // wrong type
+    }
+
+    #[test]
+    fn validate_ipv4_address_type() {
+        let t = types::ipv4_address();
+
+        // Valid IPv4 addresses
+        assert!(t.validate(&Value::String("10.0.1.5".to_string())).is_ok());
+        assert!(
+            t.validate(&Value::String("192.168.0.1".to_string()))
+                .is_ok()
+        );
+        assert!(t.validate(&Value::String("0.0.0.0".to_string())).is_ok());
+        assert!(
+            t.validate(&Value::String("255.255.255.255".to_string()))
+                .is_ok()
+        );
+
+        // Invalid IPv4 addresses
+        assert!(
+            t.validate(&Value::String("10.0.0.0/16".to_string()))
+                .is_err()
+        ); // CIDR, not address
+        assert!(t.validate(&Value::String("256.0.0.1".to_string())).is_err()); // octet > 255
+        assert!(t.validate(&Value::String("10.0.1".to_string())).is_err()); // only 3 octets
+        assert!(t.validate(&Value::String("not-an-ip".to_string())).is_err());
+        assert!(t.validate(&Value::Int(42)).is_err()); // wrong type
+    }
+
+    #[test]
+    fn validate_ipv6_address_type() {
+        let t = types::ipv6_address();
+
+        // Valid IPv6 addresses
+        assert!(t.validate(&Value::String("::1".to_string())).is_ok());
+        assert!(
+            t.validate(&Value::String("2001:db8::1".to_string()))
+                .is_ok()
+        );
+        assert!(t.validate(&Value::String("fe80::1".to_string())).is_ok());
+        assert!(
+            t.validate(&Value::String(
+                "2001:0db8:85a3:0000:0000:8a2e:0370:7334".to_string()
+            ))
+            .is_ok()
+        );
+
+        // Invalid IPv6 addresses
+        assert!(
+            t.validate(&Value::String("2001:db8::/32".to_string()))
+                .is_err()
+        ); // CIDR, not address
+        assert!(t.validate(&Value::String("not-an-ip".to_string())).is_err());
+        assert!(t.validate(&Value::String("".to_string())).is_err());
         assert!(t.validate(&Value::Int(42)).is_err()); // wrong type
     }
 
