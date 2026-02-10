@@ -41,7 +41,7 @@ pub fn ec2_security_group_config() -> AwsccSchemaConfig {
             AttributeSchema::new("security_group_egress", AttributeType::List(Box::new(AttributeType::Struct {
                     name: "Egress".to_string(),
                     fields: vec![
-                    StructField::new("cidr_ip", AttributeType::String).with_provider_name("CidrIp"),
+                    StructField::new("cidr_ip", types::ipv4_cidr()).with_provider_name("CidrIp"),
                     StructField::new("cidr_ipv6", types::ipv6_cidr()).with_provider_name("CidrIpv6"),
                     StructField::new("description", AttributeType::String).with_provider_name("Description"),
                     StructField::new("destination_prefix_list_id", AttributeType::String).with_provider_name("DestinationPrefixListId"),
@@ -58,7 +58,7 @@ pub fn ec2_security_group_config() -> AwsccSchemaConfig {
             AttributeSchema::new("security_group_ingress", AttributeType::List(Box::new(AttributeType::Struct {
                     name: "Ingress".to_string(),
                     fields: vec![
-                    StructField::new("cidr_ip", AttributeType::String).with_provider_name("CidrIp"),
+                    StructField::new("cidr_ip", types::ipv4_cidr()).with_provider_name("CidrIp"),
                     StructField::new("cidr_ipv6", types::ipv6_cidr()).with_provider_name("CidrIpv6"),
                     StructField::new("description", AttributeType::String).with_provider_name("Description"),
                     StructField::new("from_port", AttributeType::Int).with_provider_name("FromPort"),

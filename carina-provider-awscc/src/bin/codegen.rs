@@ -250,14 +250,8 @@ fn type_display_string(
                 if prop_lower.contains("cidr") {
                     if prop_lower.contains("ipv6") {
                         "Ipv6Cidr".to_string()
-                    } else if prop_lower.contains("cidrblock")
-                        || prop_lower == "cidr_block"
-                        || prop_lower == "cidrip"
-                        || prop_lower == "destinationcidrblock"
-                    {
-                        "Ipv4Cidr".to_string()
                     } else {
-                        "String".to_string()
+                        "Ipv4Cidr".to_string()
                     }
                 } else if prop_lower.ends_with("arn") || prop_lower.contains("_arn") {
                     "Arn".to_string()
@@ -434,10 +428,8 @@ fn generate_markdown(schema: &CfnSchema, type_name: &str) -> Result<String> {
                             if fl.contains("cidr") {
                                 if fl.contains("ipv6") {
                                     "Ipv6Cidr"
-                                } else if fl == "cidrip" || fl.contains("cidrblock") {
-                                    "Ipv4Cidr"
                                 } else {
-                                    "String"
+                                    "Ipv4Cidr"
                                 }
                             } else if fl.ends_with("arn") || fl.contains("_arn") {
                                 "Arn"
@@ -922,17 +914,13 @@ fn cfn_type_to_carina_type_with_enum(
             let prop_lower = prop_name.to_lowercase();
 
             // CIDR types - differentiate IPv4 vs IPv6 based on property name
+            // Any property containing "cidr" is a CIDR field.
+            // If it also contains "ipv6", it's IPv6 CIDR; otherwise IPv4 CIDR.
             if prop_lower.contains("cidr") {
                 if prop_lower.contains("ipv6") {
                     return ("types::ipv6_cidr()".to_string(), None);
                 }
-                if prop_lower.contains("cidrblock")
-                    || prop_lower == "cidr_block"
-                    || prop_lower == "cidr_ip"
-                    || prop_lower == "destination_cidr_block"
-                {
-                    return ("types::ipv4_cidr()".to_string(), None);
-                }
+                return ("types::ipv4_cidr()".to_string(), None);
             }
 
             // IDs are always strings
@@ -1144,5 +1132,69 @@ mod tests {
         let info = enum_info.unwrap();
         assert_eq!(info.type_name, "IpProtocol");
         assert_eq!(info.values, vec!["tcp", "udp", "icmp", "icmpv6", "-1"]);
+    }
+
+    #[test]
+    fn test_cidr_ip_detected_as_ipv4_cidr() {
+        // CidrIp (PascalCase from CloudFormation) should be detected as IPv4 CIDR
+        let prop = CfnProperty {
+            prop_type: Some(TypeValue::Single("string".to_string())),
+            description: Some("The IPv4 address range, in CIDR format.".to_string()),
+            enum_values: None,
+            items: None,
+            ref_path: None,
+            insertion_order: None,
+            properties: None,
+            required: vec![],
+        };
+        let schema = CfnSchema {
+            type_name: "AWS::EC2::SecurityGroupIngress".to_string(),
+            description: None,
+            properties: BTreeMap::new(),
+            required: vec![],
+            read_only_properties: vec![],
+            create_only_properties: vec![],
+            write_only_properties: vec![],
+            primary_identifier: None,
+            definitions: None,
+            tagging: None,
+        };
+        let (type_str, _) = cfn_type_to_carina_type_with_enum(&prop, "CidrIp", &schema);
+        assert_eq!(
+            type_str, "types::ipv4_cidr()",
+            "CidrIp should produce types::ipv4_cidr()"
+        );
+    }
+
+    #[test]
+    fn test_cidr_ipv6_detected_as_ipv6_cidr() {
+        // CidrIpv6 (PascalCase from CloudFormation) should be detected as IPv6 CIDR
+        let prop = CfnProperty {
+            prop_type: Some(TypeValue::Single("string".to_string())),
+            description: Some("The IPv6 address range, in CIDR format.".to_string()),
+            enum_values: None,
+            items: None,
+            ref_path: None,
+            insertion_order: None,
+            properties: None,
+            required: vec![],
+        };
+        let schema = CfnSchema {
+            type_name: "AWS::EC2::SecurityGroupIngress".to_string(),
+            description: None,
+            properties: BTreeMap::new(),
+            required: vec![],
+            read_only_properties: vec![],
+            create_only_properties: vec![],
+            write_only_properties: vec![],
+            primary_identifier: None,
+            definitions: None,
+            tagging: None,
+        };
+        let (type_str, _) = cfn_type_to_carina_type_with_enum(&prop, "CidrIpv6", &schema);
+        assert_eq!(
+            type_str, "types::ipv6_cidr()",
+            "CidrIpv6 should produce types::ipv6_cidr()"
+        );
     }
 }
