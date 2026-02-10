@@ -1,0 +1,30 @@
+# EC2 Subnet - DNS options test
+#
+# Tests: private_dns_name_options_on_launch (Struct type)
+
+provider awscc {
+  region = aws.Region.ap_northeast_1
+}
+
+let vpc = awscc.ec2_vpc {
+  name                 = "acceptance-test-vpc-subnet-dns"
+  cidr_block           = "10.0.0.0/16"
+  enable_dns_support   = true
+  enable_dns_hostnames = true
+}
+
+awscc.ec2_subnet {
+  name              = "acceptance-test-subnet-dns"
+  vpc_id            = vpc.vpc_id
+  cidr_block        = "10.0.1.0/24"
+  availability_zone = "ap-northeast-1a"
+
+  private_dns_name_options_on_launch = {
+    enable_resource_name_dns_a_record = true
+    hostname_type                     = "ip-name"
+  }
+
+  tags = {
+    Environment = "acceptance-test"
+  }
+}

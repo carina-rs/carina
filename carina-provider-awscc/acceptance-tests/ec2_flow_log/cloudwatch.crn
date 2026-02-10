@@ -1,0 +1,30 @@
+# EC2 Flow Log - CloudWatch Logs destination test
+#
+# Tests: log_destination_type=cloud-watch-logs, log_group_name,
+#        deliver_logs_permission_arn
+#
+# validate-only: Requires IAM role and CloudWatch log group that cannot
+# be created with current awscc resource types.
+
+provider awscc {
+  region = aws.Region.ap_northeast_1
+}
+
+let vpc = awscc.ec2_vpc {
+  name       = "acceptance-test-vpc-flowlog-cw"
+  cidr_block = "10.0.0.0/16"
+}
+
+awscc.ec2_flow_log {
+  name                        = "acceptance-test-flowlog-cw"
+  resource_id                 = vpc.vpc_id
+  resource_type               = VPC
+  traffic_type                = ALL
+  log_destination_type        = cloud_watch_logs
+  log_group_name              = "/acceptance-test/vpc-flow-logs"
+  deliver_logs_permission_arn = "arn:aws:iam::123456789012:role/acceptance-test-flow-log-role"
+
+  tags = {
+    Environment = "acceptance-test"
+  }
+}

@@ -1,0 +1,37 @@
+# EC2 IPAM Pool Example
+#
+# Creates an IPAM and an IPv4 IPAM Pool within it.
+
+provider awscc {
+  region = aws.Region.ap_northeast_1
+}
+
+let ipam = awscc.ec2_ipam {
+  name        = "example-ipam"
+  description = "Example IPAM"
+  tier        = free
+
+  operating_regions = [
+    {
+      region_name = "ap-northeast-1"
+    }
+  ]
+}
+
+awscc.ec2_ipam_pool {
+  name           = "example-ipam-pool"
+  ipam_scope_id  = ipam.private_default_scope_id
+  address_family = "IPv4"
+  locale         = "ap-northeast-1"
+  description    = "Example IPv4 IPAM Pool"
+
+  provisioned_cidrs = [
+    {
+      cidr = "10.0.0.0/8"
+    }
+  ]
+
+  tags = {
+    Environment = "example"
+  }
+}

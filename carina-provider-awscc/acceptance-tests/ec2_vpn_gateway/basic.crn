@@ -1,0 +1,16 @@
+# EC2 VPN Gateway - Basic test
+#
+# Tests: type, tags
+
+provider awscc {
+  region = aws.Region.ap_northeast_1
+}
+
+awscc.ec2_vpn_gateway {
+  name = "acceptance-test-vpn-gw"
+  type = "ipsec.1"
+
+  tags = {
+    Environment = "acceptance-test"
+  }
+}

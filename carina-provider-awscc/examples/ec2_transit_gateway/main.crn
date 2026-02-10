@@ -1,0 +1,16 @@
+# EC2 Transit Gateway Example
+#
+# Creates a transit gateway.
+
+provider awscc {
+  region = aws.Region.ap_northeast_1
+}
+
+awscc.ec2_transit_gateway {
+  name        = "example-tgw"
+  description = "Example Transit Gateway"
+
+  tags = {
+    Environment = "example"
+  }
+}

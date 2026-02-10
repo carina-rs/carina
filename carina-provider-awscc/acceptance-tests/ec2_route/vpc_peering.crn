@@ -1,0 +1,36 @@
+# EC2 Route - VPC Peering Connection test
+#
+# Tests: vpc_peering_connection_id
+# Requires: VPC Peering Connection
+
+provider awscc {
+  region = aws.Region.ap_northeast_1
+}
+
+let vpc1 = awscc.ec2_vpc {
+  name       = "acceptance-test-vpc1-route-peer"
+  cidr_block = "10.0.0.0/16"
+}
+
+let vpc2 = awscc.ec2_vpc {
+  name       = "acceptance-test-vpc2-route-peer"
+  cidr_block = "10.1.0.0/16"
+}
+
+let peering = awscc.ec2_vpc_peering_connection {
+  name        = "acceptance-test-peering-route"
+  vpc_id      = vpc1.vpc_id
+  peer_vpc_id = vpc2.vpc_id
+}
+
+let rt = awscc.ec2_route_table {
+  name   = "acceptance-test-rt-peer"
+  vpc_id = vpc1.vpc_id
+}
+
+awscc.ec2_route {
+  name                       = "acceptance-test-route-peer"
+  route_table_id             = rt.route_table_id
+  destination_cidr_block     = "10.1.0.0/16"
+  vpc_peering_connection_id  = peering.id
+}

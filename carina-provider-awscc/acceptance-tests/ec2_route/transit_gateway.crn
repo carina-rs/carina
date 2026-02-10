@@ -1,0 +1,33 @@
+# EC2 Route - Transit Gateway test
+#
+# Tests: transit_gateway_id
+# Requires: Transit Gateway
+#
+# validate-only: Requires TransitGatewayAttachment to VPC before route
+# creation, which needs ec2_transit_gateway_attachment resource type.
+
+provider awscc {
+  region = aws.Region.ap_northeast_1
+}
+
+let vpc = awscc.ec2_vpc {
+  name       = "acceptance-test-vpc-route-tgw"
+  cidr_block = "10.0.0.0/16"
+}
+
+let tgw = awscc.ec2_transit_gateway {
+  name        = "acceptance-test-tgw-route"
+  description = "Transit Gateway for route test"
+}
+
+let rt = awscc.ec2_route_table {
+  name   = "acceptance-test-rt-tgw"
+  vpc_id = vpc.vpc_id
+}
+
+awscc.ec2_route {
+  name                   = "acceptance-test-route-tgw"
+  route_table_id         = rt.route_table_id
+  destination_cidr_block = "10.1.0.0/16"
+  transit_gateway_id     = tgw.id
+}

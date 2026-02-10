@@ -1,0 +1,40 @@
+# EC2 Security Group - IPv6 rules test
+#
+# Tests: security_group_ingress with cidr_ipv6, security_group_egress with cidr_ipv6
+
+provider awscc {
+  region = aws.Region.ap_northeast_1
+}
+
+let vpc = awscc.ec2_vpc {
+  name       = "acceptance-test-vpc-sg-ipv6"
+  cidr_block = "10.0.0.0/16"
+}
+
+awscc.ec2_security_group {
+  name              = "acceptance-test-sg-ipv6"
+  vpc_id            = vpc.vpc_id
+  group_description = "Acceptance test - IPv6 rules"
+
+  security_group_ingress = [
+    {
+      ip_protocol = "tcp"
+      from_port   = 443
+      to_port     = 443
+      cidr_ipv6   = "::/0"
+      description = "Allow HTTPS from IPv6"
+    }
+  ]
+
+  security_group_egress = [
+    {
+      ip_protocol = "-1"
+      cidr_ipv6   = "::/0"
+      description = "Allow all IPv6 outbound"
+    }
+  ]
+
+  tags = {
+    Environment = "acceptance-test"
+  }
+}

@@ -1,0 +1,23 @@
+# EC2 IPAM - Basic test
+#
+# Tests: description, tier, operating_regions (List<Struct>), tags
+
+provider awscc {
+  region = aws.Region.ap_northeast_1
+}
+
+awscc.ec2_ipam {
+  name        = "acceptance-test-ipam"
+  description = "Acceptance test IPAM"
+  tier        = free
+
+  operating_regions = [
+    {
+      region_name = "ap-northeast-1"
+    }
+  ]
+
+  tags = {
+    Environment = "acceptance-test"
+  }
+}

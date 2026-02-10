@@ -1,0 +1,26 @@
+# EC2 Security Group Egress - IPv6 test
+#
+# Tests: cidr_ipv6
+
+provider awscc {
+  region = aws.Region.ap_northeast_1
+}
+
+let vpc = awscc.ec2_vpc {
+  name       = "acceptance-test-vpc-sge-ipv6"
+  cidr_block = "10.0.0.0/16"
+}
+
+let sg = awscc.ec2_security_group {
+  name              = "acceptance-test-sg-for-egress-ipv6"
+  vpc_id            = vpc.vpc_id
+  group_description = "SG for IPv6 egress rule test"
+}
+
+awscc.ec2_security_group_egress {
+  name        = "acceptance-test-egress-ipv6"
+  group_id    = sg.group_id
+  description = "Allow all IPv6 outbound"
+  ip_protocol = "-1"
+  cidr_ipv6   = "::/0"
+}

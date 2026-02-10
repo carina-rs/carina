@@ -1,0 +1,30 @@
+# EC2 NAT Gateway - Private test
+#
+# Tests: connectivity_type=private, private_ip_address
+
+provider awscc {
+  region = aws.Region.ap_northeast_1
+}
+
+let vpc = awscc.ec2_vpc {
+  name       = "acceptance-test-vpc-natgw-private"
+  cidr_block = "10.0.0.0/16"
+}
+
+let private_subnet = awscc.ec2_subnet {
+  name              = "acceptance-test-subnet-natgw-private"
+  vpc_id            = vpc.vpc_id
+  cidr_block        = "10.0.1.0/24"
+  availability_zone = "ap-northeast-1a"
+}
+
+awscc.ec2_nat_gateway {
+  name               = "acceptance-test-natgw-private"
+  subnet_id          = private_subnet.subnet_id
+  connectivity_type  = private
+  private_ip_address = "10.0.1.100"
+
+  tags = {
+    Environment = "acceptance-test"
+  }
+}

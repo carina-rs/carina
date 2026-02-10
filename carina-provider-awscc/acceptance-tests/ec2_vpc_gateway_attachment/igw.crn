@@ -1,0 +1,22 @@
+# EC2 VPC Gateway Attachment - Internet Gateway test
+#
+# Tests: internet_gateway_id, vpc_id
+
+provider awscc {
+  region = aws.Region.ap_northeast_1
+}
+
+let vpc = awscc.ec2_vpc {
+  name       = "acceptance-test-vpc-gw-attach-igw"
+  cidr_block = "10.0.0.0/16"
+}
+
+let igw = awscc.ec2_internet_gateway {
+  name = "acceptance-test-igw-attach"
+}
+
+awscc.ec2_vpc_gateway_attachment {
+  name                = "acceptance-test-igw-attachment"
+  vpc_id              = vpc.vpc_id
+  internet_gateway_id = igw.internet_gateway_id
+}

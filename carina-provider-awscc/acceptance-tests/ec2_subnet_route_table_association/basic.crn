@@ -1,0 +1,30 @@
+# EC2 Subnet Route Table Association - Basic test
+#
+# Tests: subnet_id, route_table_id
+
+provider awscc {
+  region = aws.Region.ap_northeast_1
+}
+
+let vpc = awscc.ec2_vpc {
+  name       = "acceptance-test-vpc-rt-assoc"
+  cidr_block = "10.0.0.0/16"
+}
+
+let subnet = awscc.ec2_subnet {
+  name              = "acceptance-test-subnet-rt-assoc"
+  vpc_id            = vpc.vpc_id
+  cidr_block        = "10.0.1.0/24"
+  availability_zone = "ap-northeast-1a"
+}
+
+let rt = awscc.ec2_route_table {
+  name   = "acceptance-test-rt-assoc"
+  vpc_id = vpc.vpc_id
+}
+
+awscc.ec2_subnet_route_table_association {
+  name           = "acceptance-test-rt-association"
+  subnet_id      = subnet.subnet_id
+  route_table_id = rt.route_table_id
+}

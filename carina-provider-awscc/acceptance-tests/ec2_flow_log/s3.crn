@@ -1,0 +1,35 @@
+# EC2 Flow Log - S3 destination test
+#
+# Tests: log_destination_type=s3, traffic_type, resource_type, resource_id,
+#        log_destination, destination_options (Struct)
+#
+# validate-only: Requires S3 bucket that cannot be created with current
+# awscc resource types.
+
+provider awscc {
+  region = aws.Region.ap_northeast_1
+}
+
+let vpc = awscc.ec2_vpc {
+  name       = "acceptance-test-vpc-flowlog-s3"
+  cidr_block = "10.0.0.0/16"
+}
+
+awscc.ec2_flow_log {
+  name                 = "acceptance-test-flowlog-s3"
+  resource_id          = vpc.vpc_id
+  resource_type        = VPC
+  traffic_type         = ALL
+  log_destination_type = s3
+  log_destination      = "arn:aws:s3:::acceptance-test-flow-logs-bucket"
+
+  destination_options = {
+    file_format                = "plain-text"
+    hive_compatible_partitions = false
+    per_hour_partition         = false
+  }
+
+  tags = {
+    Environment = "acceptance-test"
+  }
+}

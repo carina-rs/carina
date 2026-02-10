@@ -1,0 +1,15 @@
+# EC2 Internet Gateway - Basic test
+#
+# Tests: tags
+
+provider awscc {
+  region = aws.Region.ap_northeast_1
+}
+
+awscc.ec2_internet_gateway {
+  name = "acceptance-test-igw"
+
+  tags = {
+    Environment = "acceptance-test"
+  }
+}
