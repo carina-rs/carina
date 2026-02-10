@@ -61,7 +61,7 @@ The tags for the VPC.
 
 ### `cidr_block_associations`
 
-- **Type:** List
+- **Type:** List<String>
 
 ### `default_network_acl`
 
@@ -73,7 +73,7 @@ The tags for the VPC.
 
 ### `ipv6_cidr_blocks`
 
-- **Type:** List
+- **Type:** List<String>
 
 ### `vpc_id`
 

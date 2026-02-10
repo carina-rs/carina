@@ -219,6 +219,16 @@ struct StructDefInfo {
     required: Vec<String>,
 }
 
+/// Display string for List element types based on items property type
+fn list_element_type_display(items: &CfnProperty) -> String {
+    match items.prop_type.as_ref().and_then(|t| t.as_str()) {
+        Some("string") => "List<String>".to_string(),
+        Some("integer") | Some("number") => "List<Int>".to_string(),
+        Some("boolean") => "List<Bool>".to_string(),
+        _ => "List".to_string(),
+    }
+}
+
 /// Determine the display string for a property's type in markdown docs
 fn type_display_string(
     prop_name: &str,
@@ -295,7 +305,7 @@ fn type_display_string(
                             "List".to_string()
                         }
                     } else {
-                        "List".to_string()
+                        list_element_type_display(items)
                     }
                 } else {
                     "List".to_string()
@@ -435,8 +445,8 @@ fn generate_markdown(schema: &CfnSchema, type_name: &str) -> Result<String> {
             for (field_name, field_prop) in &def_info.properties {
                 let snake_name = field_name.to_snake_case();
                 let is_req = required_set.contains(field_name.as_str());
-                let field_type_display = if overrides.contains_key(field_name.as_str()) {
-                    "Enum"
+                let field_type_display: String = if overrides.contains_key(field_name.as_str()) {
+                    "Enum".to_string()
                 } else {
                     match field_prop.prop_type.as_ref().and_then(|t| t.as_str()) {
                         Some("string") => {
@@ -469,11 +479,18 @@ fn generate_markdown(schema: &CfnSchema, type_name: &str) -> Result<String> {
                                 "String"
                             }
                         }
-                        Some("boolean") => "Bool",
-                        Some("integer") | Some("number") => "Int",
-                        Some("array") => "List",
-                        Some("object") => "Map",
-                        _ => "String",
+                        .to_string(),
+                        Some("boolean") => "Bool".to_string(),
+                        Some("integer") | Some("number") => "Int".to_string(),
+                        Some("array") => {
+                            if let Some(items) = &field_prop.items {
+                                list_element_type_display(items)
+                            } else {
+                                "List".to_string()
+                            }
+                        }
+                        Some("object") => "Map".to_string(),
+                        _ => "String".to_string(),
                     }
                 };
                 let desc = field_prop
@@ -1447,5 +1464,60 @@ mod tests {
         assert!(!is_aws_resource_id_property("AvailabilityZoneId"));
         assert!(!is_aws_resource_id_property("SourceSecurityGroupOwnerId"));
         assert!(!is_aws_resource_id_property("ResourceId"));
+    }
+
+    #[test]
+    fn test_list_element_type_display() {
+        // String items
+        let prop = CfnProperty {
+            prop_type: Some(TypeValue::Single("string".to_string())),
+            description: None,
+            enum_values: None,
+            items: None,
+            ref_path: None,
+            insertion_order: None,
+            properties: None,
+            required: vec![],
+        };
+        assert_eq!(list_element_type_display(&prop), "List<String>");
+
+        // Integer items
+        let prop = CfnProperty {
+            prop_type: Some(TypeValue::Single("integer".to_string())),
+            description: None,
+            enum_values: None,
+            items: None,
+            ref_path: None,
+            insertion_order: None,
+            properties: None,
+            required: vec![],
+        };
+        assert_eq!(list_element_type_display(&prop), "List<Int>");
+
+        // Boolean items
+        let prop = CfnProperty {
+            prop_type: Some(TypeValue::Single("boolean".to_string())),
+            description: None,
+            enum_values: None,
+            items: None,
+            ref_path: None,
+            insertion_order: None,
+            properties: None,
+            required: vec![],
+        };
+        assert_eq!(list_element_type_display(&prop), "List<Bool>");
+
+        // No type (fallback)
+        let prop = CfnProperty {
+            prop_type: None,
+            description: None,
+            enum_values: None,
+            items: None,
+            ref_path: None,
+            insertion_order: None,
+            properties: None,
+            required: vec![],
+        };
+        assert_eq!(list_element_type_display(&prop), "List");
     }
 }
