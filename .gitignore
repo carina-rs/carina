@@ -26,3 +26,6 @@ Thumbs.db
 
 # mdbook build output
 docs/book/
+
+# CloudFormation schema cache
+carina-provider-awscc/cfn-schema-cache/
