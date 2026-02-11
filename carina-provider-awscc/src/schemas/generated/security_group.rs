@@ -23,7 +23,7 @@ pub fn ec2_security_group_config() -> AwsccSchemaConfig {
                 .with_provider_name("GroupDescription"),
         )
         .attribute(
-            AttributeSchema::new("group_id", super::aws_resource_id())
+            AttributeSchema::new("group_id", super::security_group_id())
                 .with_description("The group ID of the specified security group. (read-only)")
                 .with_provider_name("GroupId"),
         )
@@ -45,7 +45,7 @@ pub fn ec2_security_group_config() -> AwsccSchemaConfig {
                     StructField::new("cidr_ipv6", types::ipv6_cidr()).with_provider_name("CidrIpv6"),
                     StructField::new("description", AttributeType::String).with_provider_name("Description"),
                     StructField::new("destination_prefix_list_id", super::aws_resource_id()).with_provider_name("DestinationPrefixListId"),
-                    StructField::new("destination_security_group_id", super::aws_resource_id()).with_provider_name("DestinationSecurityGroupId"),
+                    StructField::new("destination_security_group_id", super::security_group_id()).with_provider_name("DestinationSecurityGroupId"),
                     StructField::new("from_port", AttributeType::Int).with_provider_name("FromPort"),
                     StructField::new("ip_protocol", AttributeType::Enum(vec!["tcp".to_string(), "udp".to_string(), "icmp".to_string(), "icmpv6".to_string(), "-1".to_string()])).required().with_provider_name("IpProtocol"),
                     StructField::new("to_port", AttributeType::Int).with_provider_name("ToPort")
@@ -64,7 +64,7 @@ pub fn ec2_security_group_config() -> AwsccSchemaConfig {
                     StructField::new("from_port", AttributeType::Int).with_provider_name("FromPort"),
                     StructField::new("ip_protocol", AttributeType::Enum(vec!["tcp".to_string(), "udp".to_string(), "icmp".to_string(), "icmpv6".to_string(), "-1".to_string()])).required().with_provider_name("IpProtocol"),
                     StructField::new("source_prefix_list_id", super::aws_resource_id()).with_provider_name("SourcePrefixListId"),
-                    StructField::new("source_security_group_id", super::aws_resource_id()).with_provider_name("SourceSecurityGroupId"),
+                    StructField::new("source_security_group_id", super::security_group_id()).with_provider_name("SourceSecurityGroupId"),
                     StructField::new("source_security_group_name", AttributeType::String).with_provider_name("SourceSecurityGroupName"),
                     StructField::new("source_security_group_owner_id", AttributeType::String).with_provider_name("SourceSecurityGroupOwnerId"),
                     StructField::new("to_port", AttributeType::Int).with_provider_name("ToPort")
@@ -79,7 +79,7 @@ pub fn ec2_security_group_config() -> AwsccSchemaConfig {
                 .with_provider_name("Tags"),
         )
         .attribute(
-            AttributeSchema::new("vpc_id", super::aws_resource_id())
+            AttributeSchema::new("vpc_id", super::vpc_id())
                 .with_description("The ID of the VPC for the security group.")
                 .with_provider_name("VpcId"),
         )

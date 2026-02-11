@@ -119,7 +119,7 @@ pub fn ec2_subnet_config() -> AwsccSchemaConfig {
                 .with_provider_name("PrivateDnsNameOptionsOnLaunch"),
         )
         .attribute(
-            AttributeSchema::new("subnet_id", super::aws_resource_id())
+            AttributeSchema::new("subnet_id", super::subnet_id())
                 .with_description(" (read-only)")
                 .with_provider_name("SubnetId"),
         )
@@ -129,7 +129,7 @@ pub fn ec2_subnet_config() -> AwsccSchemaConfig {
                 .with_provider_name("Tags"),
         )
         .attribute(
-            AttributeSchema::new("vpc_id", super::aws_resource_id())
+            AttributeSchema::new("vpc_id", super::vpc_id())
                 .required()
                 .with_description("The ID of the VPC the subnet is in. If you update this property, you must also update the ``CidrBlock`` property.")
                 .with_provider_name("VpcId"),

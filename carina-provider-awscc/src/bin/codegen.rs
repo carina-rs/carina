@@ -287,7 +287,7 @@ fn type_display_string(
                 } else if is_ipam_pool_id_property(prop_name) {
                     "IpamPoolId".to_string()
                 } else if is_aws_resource_id_property(prop_name) {
-                    "AwsResourceId".to_string()
+                    get_resource_id_display_name(prop_name).to_string()
                 } else {
                     "String".to_string()
                 }
@@ -462,7 +462,7 @@ fn generate_markdown(schema: &CfnSchema, type_name: &str) -> Result<String> {
                             } else if is_ipam_pool_id_property(field_name) {
                                 "IpamPoolId"
                             } else if is_aws_resource_id_property(field_name) {
-                                "AwsResourceId"
+                                get_resource_id_display_name(field_name)
                             } else {
                                 "String"
                             }
@@ -1044,6 +1044,103 @@ fn is_aws_resource_id_property(prop_name: &str) -> bool {
         .any(|suffix| lower.ends_with(suffix) || singular.ends_with(suffix))
 }
 
+/// Get the specific resource ID type function for a property name
+/// Returns the function name (e.g., "super::vpc_id()") or generic aws_resource_id
+fn get_resource_id_type(prop_name: &str) -> &'static str {
+    let lower = prop_name.to_lowercase();
+
+    // Check for specific resource ID types
+    // VPC IDs
+    if lower.ends_with("vpcid") || lower == "vpcid" {
+        return "super::vpc_id()";
+    }
+    // Subnet IDs
+    if lower.ends_with("subnetid") || lower == "subnetid" {
+        return "super::subnet_id()";
+    }
+    // Security Group IDs (including DestinationSecurityGroupId, SourceSecurityGroupId, etc.)
+    if (lower.contains("securitygroup") || lower.contains("groupid")) && lower.ends_with("id") {
+        return "super::security_group_id()";
+    }
+    // Internet Gateway IDs
+    if lower.contains("internetgateway") && lower.ends_with("id") {
+        return "super::internet_gateway_id()";
+    }
+    // Egress Only Internet Gateway IDs
+    if lower.contains("egressonlyinternetgateway") && lower.ends_with("id") {
+        return "super::egress_only_internet_gateway_id()";
+    }
+    // Route Table IDs
+    if lower.contains("routetable") && lower.ends_with("id") {
+        return "super::route_table_id()";
+    }
+    // NAT Gateway IDs
+    if lower.contains("natgateway") && lower.ends_with("id") {
+        return "super::nat_gateway_id()";
+    }
+    // VPC Peering Connection IDs
+    if lower.contains("peeringconnection") && lower.ends_with("id") {
+        return "super::vpc_peering_connection_id()";
+    }
+    // Transit Gateway IDs
+    if lower.contains("transitgateway") && lower.ends_with("id") {
+        return "super::transit_gateway_id()";
+    }
+    // VPN Gateway IDs
+    if lower.contains("vpngateway") && lower.ends_with("id") {
+        return "super::vpn_gateway_id()";
+    }
+    // VPC Endpoint IDs
+    if lower.contains("vpcendpoint") && lower.ends_with("id") || lower.ends_with("endpointid") {
+        return "super::vpc_endpoint_id()";
+    }
+
+    // Fallback to generic aws_resource_id for other resource IDs
+    "super::aws_resource_id()"
+}
+
+/// Get the display name for a resource ID type (for markdown documentation)
+fn get_resource_id_display_name(prop_name: &str) -> &'static str {
+    let lower = prop_name.to_lowercase();
+
+    // Map property names to display type names
+    if lower.ends_with("vpcid") || lower == "vpcid" {
+        return "VpcId";
+    }
+    if lower.ends_with("subnetid") || lower == "subnetid" {
+        return "SubnetId";
+    }
+    if (lower.contains("securitygroup") || lower.contains("groupid")) && lower.ends_with("id") {
+        return "SecurityGroupId";
+    }
+    if lower.contains("internetgateway") && lower.ends_with("id") {
+        return "InternetGatewayId";
+    }
+    if lower.contains("egressonlyinternetgateway") && lower.ends_with("id") {
+        return "EgressOnlyInternetGatewayId";
+    }
+    if lower.contains("routetable") && lower.ends_with("id") {
+        return "RouteTableId";
+    }
+    if lower.contains("natgateway") && lower.ends_with("id") {
+        return "NatGatewayId";
+    }
+    if lower.contains("peeringconnection") && lower.ends_with("id") {
+        return "VpcPeeringConnectionId";
+    }
+    if lower.contains("transitgateway") && lower.ends_with("id") {
+        return "TransitGatewayId";
+    }
+    if lower.contains("vpngateway") && lower.ends_with("id") {
+        return "VpnGatewayId";
+    }
+    if lower.contains("vpcendpoint") && lower.ends_with("id") || lower.ends_with("endpointid") {
+        return "VpcEndpointId";
+    }
+
+    "AwsResourceId"
+}
+
 /// Check if a property name represents an IPAM Pool ID
 /// (e.g., IpamPoolId, Ipv4IpamPoolId, Ipv6IpamPoolId, SourceIpamPoolId)
 fn is_ipam_pool_id_property(prop_name: &str) -> bool {
@@ -1146,7 +1243,7 @@ fn cfn_type_to_carina_type_with_enum(
 
             // AWS resource IDs with known prefix-hex format
             if is_aws_resource_id_property(prop_name) {
-                return ("super::aws_resource_id()".to_string(), None);
+                return (get_resource_id_type(prop_name).to_string(), None);
             }
 
             // Other IDs are plain strings (AZ IDs, owner IDs, etc.)
