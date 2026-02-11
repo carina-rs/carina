@@ -90,12 +90,6 @@ The ID of the security group. You must specify either the security group ID or t
 
 The end of port range for the TCP and UDP protocols, or an ICMP/ICMPv6 code. A value of -1 indicates all ICMP/ICMPv6 codes for the specified ICMP type. If you specify all ICMP/ICMPv6 types, you must specify all codes. Use this for ICMP and any protocol that uses ports.
 
-## Attribute Reference
-
-### `id`
-
-- **Type:** String
-
 ## Enum Values
 
 ### ip_protocol (IpProtocol)
@@ -109,6 +103,12 @@ The end of port range for the TCP and UDP protocols, or an ICMP/ICMPv6 code. A v
 | `-1` | `awscc.ec2_security_group_ingress.IpProtocol.-1` |
 
 Shorthand formats: `tcp` or `IpProtocol.tcp`
+
+## Attribute Reference
+
+### `id`
+
+- **Type:** String
 
 
 

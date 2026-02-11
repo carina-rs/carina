@@ -127,6 +127,22 @@ Any tags assigned to the subnet.
 
 The ID of the VPC the subnet is in. If you update this property, you must also update the ``CidrBlock`` property.
 
+## Struct Definitions
+
+### BlockPublicAccessStates
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `internet_gateway_block_mode` | Enum | No | The mode of VPC BPA. Options here are off, block-bidirectional, block-ingress  |
+
+### PrivateDnsNameOptionsOnLaunch
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `enable_resource_name_dns_aaaa_record` | Bool | No |  |
+| `enable_resource_name_dns_a_record` | Bool | No |  |
+| `hostname_type` | Enum | No |  |
+
 ## Attribute Reference
 
 ### `block_public_access_states`
@@ -144,22 +160,6 @@ The ID of the VPC the subnet is in. If you update this property, you must also u
 ### `subnet_id`
 
 - **Type:** AwsResourceId
-
-## Struct Definitions
-
-### BlockPublicAccessStates
-
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `internet_gateway_block_mode` | Enum | No | The mode of VPC BPA. Options here are off, block-bidirectional, block-ingress  |
-
-### PrivateDnsNameOptionsOnLaunch
-
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `enable_resource_name_dns_aaaa_record` | Bool | No |  |
-| `enable_resource_name_dns_a_record` | Bool | No |  |
-| `hostname_type` | Enum | No |  |
 
 
 

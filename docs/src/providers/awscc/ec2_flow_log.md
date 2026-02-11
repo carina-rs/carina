@@ -88,12 +88,6 @@ The tags to apply to the flow logs.
 
 The type of traffic to log. You can log traffic that the resource accepts or rejects, or all traffic.
 
-## Attribute Reference
-
-### `id`
-
-- **Type:** String
-
 ## Enum Values
 
 ### log_destination_type (LogDestinationType)
@@ -138,6 +132,12 @@ Shorthand formats: `ACCEPT` or `TrafficType.ACCEPT`
 | `file_format` | String | Yes |  |
 | `hive_compatible_partitions` | Bool | Yes |  |
 | `per_hour_partition` | Bool | Yes |  |
+
+## Attribute Reference
+
+### `id`
+
+- **Type:** String
 
 
 

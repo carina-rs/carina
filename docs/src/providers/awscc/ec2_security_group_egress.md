@@ -73,12 +73,6 @@ The IP protocol name (``tcp``, ``udp``, ``icmp``, ``icmpv6``) or number (see [Pr
 
 If the protocol is TCP or UDP, this is the end of the port range. If the protocol is ICMP or ICMPv6, this is the ICMP code or -1 (all ICMP codes). If the start port is -1 (all ICMP types), then the end port must be -1 (all ICMP codes).
 
-## Attribute Reference
-
-### `id`
-
-- **Type:** String
-
 ## Enum Values
 
 ### ip_protocol (IpProtocol)
@@ -92,6 +86,12 @@ If the protocol is TCP or UDP, this is the end of the port range. If the protoco
 | `-1` | `awscc.ec2_security_group_egress.IpProtocol.-1` |
 
 Shorthand formats: `tcp` or `IpProtocol.tcp`
+
+## Attribute Reference
+
+### `id`
+
+- **Type:** String
 
 
 

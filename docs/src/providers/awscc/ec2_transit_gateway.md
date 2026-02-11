@@ -76,6 +76,17 @@ Resource Type definition for AWS::EC2::TransitGateway
 - **Type:** String
 - **Required:** No
 
+## Enum Values
+
+### encryption_support (EncryptionSupport)
+
+| Value | DSL Identifier |
+|-------|----------------|
+| `disable` | `awscc.ec2_transit_gateway.EncryptionSupport.disable` |
+| `enable` | `awscc.ec2_transit_gateway.EncryptionSupport.enable` |
+
+Shorthand formats: `disable` or `EncryptionSupport.disable`
+
 ## Attribute Reference
 
 ### `encryption_support_state`
@@ -89,17 +100,6 @@ Resource Type definition for AWS::EC2::TransitGateway
 ### `transit_gateway_arn`
 
 - **Type:** Arn
-
-## Enum Values
-
-### encryption_support (EncryptionSupport)
-
-| Value | DSL Identifier |
-|-------|----------------|
-| `disable` | `awscc.ec2_transit_gateway.EncryptionSupport.disable` |
-| `enable` | `awscc.ec2_transit_gateway.EncryptionSupport.enable` |
-
-Shorthand formats: `disable` or `EncryptionSupport.disable`
 
 
 

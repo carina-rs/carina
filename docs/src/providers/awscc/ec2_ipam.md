@@ -53,40 +53,6 @@ An array of key-value pairs to apply to this resource.
 
 The tier of the IPAM.
 
-## Attribute Reference
-
-### `arn`
-
-- **Type:** Arn
-
-### `default_resource_discovery_association_id`
-
-- **Type:** String
-
-### `default_resource_discovery_id`
-
-- **Type:** String
-
-### `ipam_id`
-
-- **Type:** String
-
-### `private_default_scope_id`
-
-- **Type:** String
-
-### `public_default_scope_id`
-
-- **Type:** String
-
-### `resource_discovery_association_count`
-
-- **Type:** Int
-
-### `scope_count`
-
-- **Type:** Int
-
 ## Enum Values
 
 ### metered_account (MeteredAccount)
@@ -120,6 +86,40 @@ Shorthand formats: `free` or `Tier.free`
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `organizations_entity_path` | String | Yes | An AWS Organizations entity path. Build the path for the OU(s) using AWS Organizations IDs separated... |
+
+## Attribute Reference
+
+### `arn`
+
+- **Type:** Arn
+
+### `default_resource_discovery_association_id`
+
+- **Type:** String
+
+### `default_resource_discovery_id`
+
+- **Type:** String
+
+### `ipam_id`
+
+- **Type:** String
+
+### `private_default_scope_id`
+
+- **Type:** String
+
+### `public_default_scope_id`
+
+- **Type:** String
+
+### `resource_discovery_association_count`
+
+- **Type:** Int
+
+### `scope_count`
+
+- **Type:** Int
 
 
 

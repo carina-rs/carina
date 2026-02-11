@@ -107,24 +107,6 @@ The type of endpoint. Default: Gateway
 
 The ID of the VPC.
 
-## Attribute Reference
-
-### `creation_timestamp`
-
-- **Type:** String
-
-### `dns_entries`
-
-- **Type:** List<String>
-
-### `id`
-
-- **Type:** String
-
-### `network_interface_ids`
-
-- **Type:** List<String>
-
 ## Enum Values
 
 ### ip_address_type (IpAddressType)
@@ -160,6 +142,24 @@ Shorthand formats: `Interface` or `VpcEndpointType.Interface`
 | `private_dns_only_for_inbound_resolver_endpoint` | String | No | Indicates whether to enable private DNS only for inbound endpoints. This option is available only fo... |
 | `private_dns_preference` | String | No | The preference for which private domains have a private hosted zone created for and associated with ... |
 | `private_dns_specified_domains` | List<String> | No | Indicates which of the private domains to create private hosted zones for and associate with the spe... |
+
+## Attribute Reference
+
+### `creation_timestamp`
+
+- **Type:** String
+
+### `dns_entries`
+
+- **Type:** List<String>
+
+### `id`
+
+- **Type:** String
+
+### `network_interface_ids`
+
+- **Type:** List<String>
 
 
 
