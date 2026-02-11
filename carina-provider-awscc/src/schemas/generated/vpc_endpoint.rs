@@ -90,7 +90,7 @@ pub fn ec2_vpc_endpoint_config() -> AwsccSchemaConfig {
                 .with_provider_name("NetworkInterfaceIds"),
         )
         .attribute(
-            AttributeSchema::new("policy_document", AttributeType::String)
+            AttributeSchema::new("policy_document", super::iam_policy_document())
                 .with_description("An endpoint policy, which controls access to the service from the VPC. The default endpoint policy allows full access to the service. Endpoint policie...")
                 .with_provider_name("PolicyDocument"),
         )

@@ -76,7 +76,7 @@ A list of tags that are attached to the role. For more information about tagging
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `policy_document` | String | Yes | The entire contents of the policy that defines permissions. For more information, see [Overview of J... |
+| `policy_document` | IamPolicyDocument | Yes | The entire contents of the policy that defines permissions. For more information, see [Overview of J... |
 | `policy_name` | String | Yes | The friendly name (not ARN) identifying the policy. |
 
 ## Attribute Reference

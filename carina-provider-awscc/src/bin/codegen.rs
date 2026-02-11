@@ -334,7 +334,13 @@ fn type_display_string(
         }
     } else {
         match prop.prop_type.as_ref().and_then(|t| t.as_str()) {
-            Some("string") => infer_string_type_display(prop_name),
+            Some("string") => {
+                if prop_name.ends_with("PolicyDocument") {
+                    "IamPolicyDocument".to_string()
+                } else {
+                    infer_string_type_display(prop_name)
+                }
+            }
             Some("boolean") => "Bool".to_string(),
             Some("integer") | Some("number") => {
                 if let (Some(min), Some(max)) = (prop.minimum, prop.maximum) {
@@ -486,7 +492,13 @@ fn generate_markdown(schema: &CfnSchema, type_name: &str) -> Result<String> {
                     "Enum".to_string()
                 } else {
                     match field_prop.prop_type.as_ref().and_then(|t| t.as_str()) {
-                        Some("string") => infer_string_type_display(field_name),
+                        Some("string") => {
+                            if field_name.ends_with("PolicyDocument") {
+                                "IamPolicyDocument".to_string()
+                            } else {
+                                infer_string_type_display(field_name)
+                            }
+                        }
                         Some("boolean") => "Bool".to_string(),
                         Some("integer") | Some("number") => {
                             if let (Some(min), Some(max)) = (field_prop.minimum, field_prop.maximum)
@@ -1301,6 +1313,11 @@ fn cfn_type_to_carina_type_with_enum(
     // Handle type
     match prop.prop_type.as_ref().and_then(|t| t.as_str()) {
         Some("string") => {
+            // Check if this is a policy document field (CFN sometimes types these as "string")
+            if prop_name.ends_with("PolicyDocument") {
+                return ("super::iam_policy_document()".to_string(), None);
+            }
+
             // Check property name for specific types
             let prop_lower = prop_name.to_lowercase();
 
