@@ -57,7 +57,7 @@ pub fn ec2_subnet_config() -> AwsccSchemaConfig {
                 .with_provider_name("EnableLniAtDeviceIndex"),
         )
         .attribute(
-            AttributeSchema::new("ipv4_ipam_pool_id", types::aws_resource_id())
+            AttributeSchema::new("ipv4_ipam_pool_id", super::ipam_pool_id())
                 .with_description("An IPv4 IPAM pool ID for the subnet.")
                 .with_provider_name("Ipv4IpamPoolId"),
         )
@@ -77,7 +77,7 @@ pub fn ec2_subnet_config() -> AwsccSchemaConfig {
                 .with_provider_name("Ipv6CidrBlocks"),
         )
         .attribute(
-            AttributeSchema::new("ipv6_ipam_pool_id", types::aws_resource_id())
+            AttributeSchema::new("ipv6_ipam_pool_id", super::ipam_pool_id())
                 .with_description("An IPv6 IPAM pool ID for the subnet.")
                 .with_provider_name("Ipv6IpamPoolId"),
         )

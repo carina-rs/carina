@@ -120,7 +120,7 @@ pub fn ec2_ipam_pool_config() -> AwsccSchemaConfig {
                 .with_provider_name("IpamArn"),
         )
         .attribute(
-            AttributeSchema::new("ipam_pool_id", types::aws_resource_id())
+            AttributeSchema::new("ipam_pool_id", super::ipam_pool_id())
                 .with_description("Id of the IPAM Pool. (read-only)")
                 .with_provider_name("IpamPoolId"),
         )
@@ -181,7 +181,7 @@ pub fn ec2_ipam_pool_config() -> AwsccSchemaConfig {
                 .with_provider_name("PubliclyAdvertisable"),
         )
         .attribute(
-            AttributeSchema::new("source_ipam_pool_id", types::aws_resource_id())
+            AttributeSchema::new("source_ipam_pool_id", super::ipam_pool_id())
                 .with_description("The Id of this pool's source. If set, all space provisioned in this pool must be free space provisioned in the parent pool.")
                 .with_provider_name("SourceIpamPoolId"),
         )

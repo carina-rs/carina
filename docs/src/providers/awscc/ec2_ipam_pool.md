@@ -97,7 +97,7 @@ Determines whether or not address space from this pool is publicly advertised. M
 
 ### `source_ipam_pool_id`
 
-- **Type:** AwsResourceId
+- **Type:** IpamPoolId
 - **Required:** No
 
 The Id of this pool's source. If set, all space provisioned in this pool must be free space provisioned in the parent pool.
@@ -126,7 +126,7 @@ An array of key-value pairs to apply to this resource.
 
 ### `ipam_pool_id`
 
-- **Type:** AwsResourceId
+- **Type:** IpamPoolId
 
 ### `ipam_scope_arn`
 

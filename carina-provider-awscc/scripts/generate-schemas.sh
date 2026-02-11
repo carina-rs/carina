@@ -187,6 +187,42 @@ pub fn validate_namespaced_enum(
     }
 }
 
+/// IPAM Pool ID type (e.g., "ipam-pool-0123456789abcdef0")
+/// Validates format: ipam-pool-{hex} where hex is 8+ hex digits
+pub fn ipam_pool_id() -> AttributeType {
+    AttributeType::Custom {
+        name: "IpamPoolId".to_string(),
+        base: Box::new(AttributeType::String),
+        validate: |value| {
+            if let Value::String(s) = value {
+                validate_ipam_pool_id(s)
+            } else {
+                Err("Expected string".to_string())
+            }
+        },
+        namespace: None,
+    }
+}
+
+pub fn validate_ipam_pool_id(id: &str) -> Result<(), String> {
+    let Some(hex_part) = id.strip_prefix("ipam-pool-") else {
+        return Err(format!(
+            "Invalid IPAM Pool ID '{}': expected format 'ipam-pool-{{hex}}'", id
+        ));
+    };
+    if hex_part.len() < 8 {
+        return Err(format!(
+            "Invalid IPAM Pool ID '{}': hex part must be at least 8 characters", id
+        ));
+    }
+    if !hex_part.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(format!(
+            "Invalid IPAM Pool ID '{}': hex part must contain only hex digits", id
+        ));
+    }
+    Ok(())
+}
+
 EOF
 
 # Add module declarations

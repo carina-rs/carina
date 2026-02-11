@@ -31,7 +31,7 @@ The ID of the instance.  Updates to the ``InstanceId`` property may require *som
 
 ### `ipam_pool_id`
 
-- **Type:** AwsResourceId
+- **Type:** IpamPoolId
 - **Required:** No
 
 

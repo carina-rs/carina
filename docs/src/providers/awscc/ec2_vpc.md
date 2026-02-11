@@ -38,7 +38,7 @@ The allowed tenancy of instances launched into the VPC.  + ``default``: An insta
 
 ### `ipv4_ipam_pool_id`
 
-- **Type:** AwsResourceId
+- **Type:** IpamPoolId
 - **Required:** No
 
 The ID of an IPv4 IPAM pool you want to use for allocating this VPC's CIDR. For more information, see [What is IPAM?](https://docs.aws.amazon.com//vpc/latest/ipam/what-is-it-ipam.html) in the *Amazon VPC IPAM User Guide*. You must specify either``CidrBlock`` or ``Ipv4IpamPoolId``.
