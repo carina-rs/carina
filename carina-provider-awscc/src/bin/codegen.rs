@@ -279,6 +279,8 @@ fn type_display_string(
                     "AvailabilityZone".to_string()
                 } else if prop_lower.ends_with("arn") || prop_lower.contains("_arn") {
                     "Arn".to_string()
+                } else if is_ipam_pool_id_property(prop_name) {
+                    "IpamPoolId".to_string()
                 } else if is_aws_resource_id_property(prop_name) {
                     "AwsResourceId".to_string()
                 } else {
@@ -473,6 +475,8 @@ fn generate_markdown(schema: &CfnSchema, type_name: &str) -> Result<String> {
                                 "AvailabilityZone"
                             } else if fl.ends_with("arn") || fl.contains("_arn") {
                                 "Arn"
+                            } else if is_ipam_pool_id_property(field_name) {
+                                "IpamPoolId"
                             } else if is_aws_resource_id_property(field_name) {
                                 "AwsResourceId"
                             } else {
@@ -933,7 +937,6 @@ fn is_aws_resource_id_property(prop_name: &str) -> bool {
         "connectionid",
         "prefixlistid",
         "eniid",
-        "poolid",
     ];
     // Exclude properties that don't follow prefix-hex format
     if lower.contains("owner") || lower.contains("availabilityzone") || lower == "resourceid" {
@@ -942,6 +945,17 @@ fn is_aws_resource_id_property(prop_name: &str) -> bool {
     resource_id_suffixes
         .iter()
         .any(|suffix| lower.ends_with(suffix))
+}
+
+/// Check if a property name represents an IPAM Pool ID
+/// (e.g., IpamPoolId, Ipv4IpamPoolId, Ipv6IpamPoolId, SourceIpamPoolId)
+fn is_ipam_pool_id_property(prop_name: &str) -> bool {
+    let lower = prop_name.to_lowercase();
+    // Exclude properties that don't follow prefix-hex format
+    if lower.contains("owner") || lower.contains("availabilityzone") || lower == "resourceid" {
+        return false;
+    }
+    lower.ends_with("poolid")
 }
 
 /// Returns (type_string, Option<EnumInfo>)
@@ -1026,6 +1040,11 @@ fn cfn_type_to_carina_type_with_enum(
                     return ("types::ipv6_address()".to_string(), None);
                 }
                 return ("types::ipv4_address()".to_string(), None);
+            }
+
+            // IPAM Pool IDs with ipam-pool-{hex} format
+            if is_ipam_pool_id_property(prop_name) {
+                return ("super::ipam_pool_id()".to_string(), None);
             }
 
             // AWS resource IDs with known prefix-hex format
@@ -1464,6 +1483,26 @@ mod tests {
         assert!(!is_aws_resource_id_property("AvailabilityZoneId"));
         assert!(!is_aws_resource_id_property("SourceSecurityGroupOwnerId"));
         assert!(!is_aws_resource_id_property("ResourceId"));
+
+        // IPAM Pool ID properties should NOT match AwsResourceId
+        assert!(!is_aws_resource_id_property("IpamPoolId"));
+        assert!(!is_aws_resource_id_property("Ipv4IpamPoolId"));
+        assert!(!is_aws_resource_id_property("Ipv6IpamPoolId"));
+        assert!(!is_aws_resource_id_property("SourceIpamPoolId"));
+    }
+
+    #[test]
+    fn test_is_ipam_pool_id_property() {
+        // Known IPAM Pool ID properties
+        assert!(is_ipam_pool_id_property("IpamPoolId"));
+        assert!(is_ipam_pool_id_property("Ipv4IpamPoolId"));
+        assert!(is_ipam_pool_id_property("Ipv6IpamPoolId"));
+        assert!(is_ipam_pool_id_property("SourceIpamPoolId"));
+
+        // Non-IPAM Pool ID properties
+        assert!(!is_ipam_pool_id_property("VpcId"));
+        assert!(!is_ipam_pool_id_property("SubnetId"));
+        assert!(!is_ipam_pool_id_property("AllocationId"));
     }
 
     #[test]

@@ -52,7 +52,7 @@ Indicates the device position for local network interfaces in this subnet. For e
 
 ### `ipv4_ipam_pool_id`
 
-- **Type:** AwsResourceId
+- **Type:** IpamPoolId
 - **Required:** No
 
 An IPv4 IPAM pool ID for the subnet.
@@ -73,7 +73,7 @@ The IPv6 CIDR block. If you specify ``AssignIpv6AddressOnCreation``, you must al
 
 ### `ipv6_ipam_pool_id`
 
-- **Type:** AwsResourceId
+- **Type:** IpamPoolId
 - **Required:** No
 
 An IPv6 IPAM pool ID for the subnet.

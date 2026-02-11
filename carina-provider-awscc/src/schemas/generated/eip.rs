@@ -37,7 +37,7 @@ pub fn ec2_eip_config() -> AwsccSchemaConfig {
                 .with_provider_name("InstanceId"),
         )
         .attribute(
-            AttributeSchema::new("ipam_pool_id", types::aws_resource_id())
+            AttributeSchema::new("ipam_pool_id", super::ipam_pool_id())
                 .with_description("")
                 .with_provider_name("IpamPoolId"),
         )
