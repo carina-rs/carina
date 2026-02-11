@@ -84,7 +84,7 @@ When modifying the DSL or resource schemas, also update the LSP:
 
 ### Provider-Specific Types
 
-AWS-specific type definitions (e.g., region validation, versioning status) belong in `carina-provider-aws/src/schemas/types.rs`, NOT in `carina-core`. Keep `carina-core` provider-agnostic.
+AWS-specific type definitions (e.g., region validation, versioning status) belong in `carina-provider-aws/src/schemas/types.rs` and `carina-provider-awscc/src/schemas/generated/mod.rs`, NOT in `carina-core`. Keep `carina-core` provider-agnostic.
 
 ### Resource Type Mapping
 

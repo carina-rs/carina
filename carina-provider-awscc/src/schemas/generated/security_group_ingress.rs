@@ -49,7 +49,7 @@ pub fn ec2_security_group_ingress_config() -> AwsccSchemaConfig {
                 .with_provider_name("FromPort"),
         )
         .attribute(
-            AttributeSchema::new("group_id", types::aws_resource_id())
+            AttributeSchema::new("group_id", super::aws_resource_id())
                 .with_description("The ID of the security group. You must specify either the security group ID or the security group name in the request. For security groups in a nondef...")
                 .with_provider_name("GroupId"),
         )
@@ -75,12 +75,12 @@ pub fn ec2_security_group_ingress_config() -> AwsccSchemaConfig {
                 .with_provider_name("IpProtocol"),
         )
         .attribute(
-            AttributeSchema::new("source_prefix_list_id", types::aws_resource_id())
+            AttributeSchema::new("source_prefix_list_id", super::aws_resource_id())
                 .with_description("[EC2-VPC only] The ID of a prefix list. ")
                 .with_provider_name("SourcePrefixListId"),
         )
         .attribute(
-            AttributeSchema::new("source_security_group_id", types::aws_resource_id())
+            AttributeSchema::new("source_security_group_id", super::aws_resource_id())
                 .with_description("The ID of the security group. You must specify either the security group ID or the security group name. For security groups in a nondefault VPC, you m...")
                 .with_provider_name("SourceSecurityGroupId"),
         )

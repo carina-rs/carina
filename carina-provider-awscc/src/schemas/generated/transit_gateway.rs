@@ -36,7 +36,7 @@ pub fn ec2_transit_gateway_config() -> AwsccSchemaConfig {
             .attribute(
                 AttributeSchema::new(
                     "association_default_route_table_id",
-                    types::aws_resource_id(),
+                    super::aws_resource_id(),
                 )
                 .with_provider_name("AssociationDefaultRouteTableId"),
             )
@@ -89,7 +89,7 @@ pub fn ec2_transit_gateway_config() -> AwsccSchemaConfig {
             .attribute(
                 AttributeSchema::new(
                     "propagation_default_route_table_id",
-                    types::aws_resource_id(),
+                    super::aws_resource_id(),
                 )
                 .with_provider_name("PropagationDefaultRouteTableId"),
             )
@@ -99,7 +99,7 @@ pub fn ec2_transit_gateway_config() -> AwsccSchemaConfig {
             )
             .attribute(AttributeSchema::new("tags", tags_type()).with_provider_name("Tags"))
             .attribute(
-                AttributeSchema::new("transit_gateway_arn", types::arn())
+                AttributeSchema::new("transit_gateway_arn", super::arn())
                     .with_description("(read-only)")
                     .with_provider_name("TransitGatewayArn"),
             )

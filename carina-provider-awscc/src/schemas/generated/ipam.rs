@@ -8,7 +8,7 @@ use super::AwsccSchemaConfig;
 use super::tags_type;
 use super::validate_namespaced_enum;
 use carina_core::resource::Value;
-use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField, types};
+use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
 
 const VALID_METERED_ACCOUNT: &[&str] = &["ipam-owner", "resource-owner"];
 
@@ -36,7 +36,7 @@ pub fn ec2_ipam_config() -> AwsccSchemaConfig {
         schema: ResourceSchema::new("awscc.ec2_ipam")
         .with_description("Resource Schema of AWS::EC2::IPAM Type")
         .attribute(
-            AttributeSchema::new("arn", types::arn())
+            AttributeSchema::new("arn", super::arn())
                 .with_description("The Amazon Resource Name (ARN) of the IPAM. (read-only)")
                 .with_provider_name("Arn"),
         )

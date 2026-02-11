@@ -405,7 +405,9 @@ impl ResourceSchema {
     }
 }
 
-/// Helper functions for common types
+/// Provider-agnostic types only. AWS-specific types (arn, aws_resource_id,
+/// availability_zone, etc.) belong in provider crates.
+/// See carina-provider-awscc/src/schemas/generated/mod.rs for AWS types.
 pub mod types {
     use super::*;
 
@@ -461,22 +463,6 @@ pub mod types {
         }
     }
 
-    /// ARN type (e.g., "arn:aws:s3:::my-bucket")
-    pub fn arn() -> AttributeType {
-        AttributeType::Custom {
-            name: "Arn".to_string(),
-            base: Box::new(AttributeType::String),
-            validate: |value| {
-                if let Value::String(s) = value {
-                    validate_arn(s)
-                } else {
-                    Err("Expected string".to_string())
-                }
-            },
-            namespace: None,
-        }
-    }
-
     /// IPv4 address type (e.g., "10.0.1.5", "192.168.0.1")
     pub fn ipv4_address() -> AttributeType {
         AttributeType::Custom {
@@ -501,40 +487,6 @@ pub mod types {
             validate: |value| {
                 if let Value::String(s) = value {
                     validate_ipv6_address(s)
-                } else {
-                    Err("Expected string".to_string())
-                }
-            },
-            namespace: None,
-        }
-    }
-
-    /// Availability Zone type (e.g., "us-east-1a", "ap-northeast-1c")
-    /// Validates format: region + single letter zone identifier
-    pub fn availability_zone() -> AttributeType {
-        AttributeType::Custom {
-            name: "AvailabilityZone".to_string(),
-            base: Box::new(AttributeType::String),
-            validate: |value| {
-                if let Value::String(s) = value {
-                    validate_availability_zone(s)
-                } else {
-                    Err("Expected string".to_string())
-                }
-            },
-            namespace: None,
-        }
-    }
-
-    /// AWS resource ID type (e.g., "vpc-1a2b3c4d", "subnet-0123456789abcdef0")
-    /// Validates format: {prefix}-{hex} where hex is 8+ hex digits
-    pub fn aws_resource_id() -> AttributeType {
-        AttributeType::Custom {
-            name: "AwsResourceId".to_string(),
-            base: Box::new(AttributeType::String),
-            validate: |value| {
-                if let Value::String(s) = value {
-                    validate_aws_resource_id(s)
                 } else {
                     Err("Expected string".to_string())
                 }
@@ -612,110 +564,6 @@ pub fn validate_ipv4_cidr(cidr: &str) -> Result<(), String> {
 /// Backward-compatible alias for `validate_ipv4_cidr`
 pub fn validate_cidr(cidr: &str) -> Result<(), String> {
     validate_ipv4_cidr(cidr)
-}
-
-/// Validate ARN format (e.g., "arn:aws:s3:::my-bucket")
-/// Validate AWS resource ID format (e.g., "vpc-1a2b3c4d", "subnet-0123456789abcdef0")
-/// Generic format: {prefix}-{hex} where prefix is lowercase/digits and hex is 8+ hex chars
-pub fn validate_aws_resource_id(id: &str) -> Result<(), String> {
-    let Some(dash_pos) = id.find('-') else {
-        return Err(format!(
-            "Invalid resource ID '{}': expected format 'prefix-hexdigits'",
-            id
-        ));
-    };
-
-    let prefix = &id[..dash_pos];
-    let hex_part = &id[dash_pos + 1..];
-
-    if prefix.is_empty()
-        || !prefix
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
-    {
-        return Err(format!(
-            "Invalid resource ID '{}': prefix must be lowercase alphanumeric",
-            id
-        ));
-    }
-
-    if hex_part.len() < 8 {
-        return Err(format!(
-            "Invalid resource ID '{}': ID part must be at least 8 characters after prefix",
-            id
-        ));
-    }
-
-    if !hex_part.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Err(format!(
-            "Invalid resource ID '{}': ID part must contain only hex digits",
-            id
-        ));
-    }
-
-    Ok(())
-}
-
-pub fn validate_arn(arn: &str) -> Result<(), String> {
-    if !arn.starts_with("arn:") {
-        return Err(format!("Invalid ARN '{}': must start with 'arn:'", arn));
-    }
-    let parts: Vec<&str> = arn.splitn(6, ':').collect();
-    if parts.len() < 6 {
-        return Err(format!(
-            "Invalid ARN '{}': must have at least 6 colon-separated parts (arn:partition:service:region:account:resource)",
-            arn
-        ));
-    }
-    Ok(())
-}
-
-/// Validate Availability Zone format (e.g., "us-east-1a", "ap-northeast-1c")
-/// Format: {area}-{subarea}-{number}{zone_letter}
-/// where zone_letter is a single lowercase letter
-pub fn validate_availability_zone(az: &str) -> Result<(), String> {
-    // Must end with a single lowercase letter (zone identifier)
-    let zone_letter = az.chars().last();
-    if !zone_letter.is_some_and(|c| c.is_ascii_lowercase()) {
-        return Err(format!(
-            "Invalid availability zone '{}': must end with a zone letter (a-z)",
-            az
-        ));
-    }
-
-    // Region part is everything except the last character
-    let region = &az[..az.len() - 1];
-
-    // Region must match pattern: lowercase-lowercase-digit
-    // e.g., "us-east-1", "ap-northeast-1", "eu-west-2"
-    let parts: Vec<&str> = region.split('-').collect();
-    if parts.len() < 3 {
-        return Err(format!(
-            "Invalid availability zone '{}': expected format like 'us-east-1a'",
-            az
-        ));
-    }
-
-    // Last part of region must be a number
-    let last = parts.last().unwrap();
-    if last.parse::<u8>().is_err() {
-        return Err(format!(
-            "Invalid availability zone '{}': region must end with a number",
-            az
-        ));
-    }
-
-    // All other parts must be lowercase alphabetic
-    for part in &parts[..parts.len() - 1] {
-        if part.is_empty() || !part.chars().all(|c| c.is_ascii_lowercase()) {
-            return Err(format!(
-                "Invalid availability zone '{}': expected format like 'us-east-1a'",
-                az
-            ));
-        }
-    }
-
-    Ok(())
 }
 
 /// Validate IPv6 CIDR block format (e.g., "2001:db8::/32", "::/0")
@@ -1069,12 +917,6 @@ mod tests {
             .is_ok()
         );
 
-        let arn = types::arn();
-        assert!(
-            arn.validate(&Value::ResourceRef("role".to_string(), "arn".to_string()))
-                .is_ok()
-        );
-
         // TypedResourceRef should also be accepted
         assert!(
             ipv4.validate(&Value::TypedResourceRef {
@@ -1084,40 +926,6 @@ mod tests {
             })
             .is_ok()
         );
-    }
-
-    #[test]
-    fn validate_arn_type() {
-        let t = types::arn();
-
-        // Valid ARNs
-        assert!(
-            t.validate(&Value::String("arn:aws:s3:::my-bucket".to_string()))
-                .is_ok()
-        );
-        assert!(
-            t.validate(&Value::String(
-                "arn:aws:iam::123456789012:role/MyRole".to_string()
-            ))
-            .is_ok()
-        );
-        assert!(
-            t.validate(&Value::String(
-                "arn:aws:ec2:us-east-1:123456789012:vpc/vpc-1234".to_string()
-            ))
-            .is_ok()
-        );
-
-        // Invalid ARNs
-        assert!(
-            t.validate(&Value::String("not-an-arn".to_string()))
-                .is_err()
-        );
-        assert!(
-            t.validate(&Value::String("arn:aws:s3".to_string()))
-                .is_err()
-        ); // too few parts
-        assert!(t.validate(&Value::Int(42)).is_err()); // wrong type
     }
 
     #[test]
@@ -1176,115 +984,29 @@ mod tests {
     }
 
     #[test]
-    fn validate_arn_function_directly() {
-        // Valid
-        assert!(validate_arn("arn:aws:s3:::my-bucket").is_ok());
-        assert!(validate_arn("arn:aws:iam::123456789012:role/MyRole").is_ok());
-        assert!(validate_arn("arn:aws-cn:s3:::my-bucket").is_ok());
-        assert!(validate_arn("arn:aws:ec2:us-east-1:123456789012:vpc/vpc-1234").is_ok());
-
-        // Invalid
-        assert!(validate_arn("not-an-arn").is_err());
-        assert!(validate_arn("arn:aws:s3").is_err());
-        assert!(validate_arn("arn:aws").is_err());
-        assert!(validate_arn("").is_err());
-    }
-
-    #[test]
-    fn validate_availability_zone_type() {
-        let t = types::availability_zone();
-
-        // Valid availability zones
-        assert!(t.validate(&Value::String("us-east-1a".to_string())).is_ok());
-        assert!(
-            t.validate(&Value::String("ap-northeast-1c".to_string()))
-                .is_ok()
-        );
-        assert!(t.validate(&Value::String("eu-west-2b".to_string())).is_ok());
-        assert!(
-            t.validate(&Value::String("ap-south-1a".to_string()))
-                .is_ok()
-        );
-        assert!(t.validate(&Value::String("us-west-2d".to_string())).is_ok());
-
-        // Invalid availability zones
-        assert!(t.validate(&Value::String("us-east-1".to_string())).is_err()); // missing zone letter
-        assert!(t.validate(&Value::String("invalid".to_string())).is_err());
-        assert!(t.validate(&Value::String("us-east-a".to_string())).is_err()); // no number
-        assert!(t.validate(&Value::String("".to_string())).is_err());
-        assert!(t.validate(&Value::Int(42)).is_err()); // wrong type
-    }
-
-    #[test]
-    fn validate_availability_zone_function_directly() {
-        // Valid
-        assert!(validate_availability_zone("us-east-1a").is_ok());
-        assert!(validate_availability_zone("ap-northeast-1c").is_ok());
-        assert!(validate_availability_zone("eu-central-1b").is_ok());
-        assert!(validate_availability_zone("me-south-1a").is_ok());
-
-        // Invalid
-        assert!(validate_availability_zone("us-east-1").is_err()); // no zone letter
-        assert!(validate_availability_zone("US-EAST-1A").is_err()); // uppercase
-        assert!(validate_availability_zone("us-east").is_err()); // no number
-        assert!(validate_availability_zone("1a").is_err()); // too short
-        assert!(validate_availability_zone("").is_err()); // empty
-    }
-
-    #[test]
-    fn validate_aws_resource_id_type() {
-        let t = types::aws_resource_id();
-
-        // Valid resource IDs
-        assert!(
-            t.validate(&Value::String("vpc-1a2b3c4d".to_string()))
-                .is_ok()
-        );
-        assert!(
-            t.validate(&Value::String("subnet-0123456789abcdef0".to_string()))
-                .is_ok()
-        );
-        assert!(
-            t.validate(&Value::String("sg-12345678".to_string()))
-                .is_ok()
-        );
-        assert!(
-            t.validate(&Value::String("rtb-abcdef12".to_string()))
-                .is_ok()
-        );
-        assert!(
-            t.validate(&Value::String("eipalloc-0123456789abcdef0".to_string()))
-                .is_ok()
-        );
-        assert!(
-            t.validate(&Value::String("igw-12345678".to_string()))
-                .is_ok()
-        );
-
-        // Invalid resource IDs
-        assert!(
-            t.validate(&Value::String("not-a-valid-id".to_string()))
-                .is_err()
-        ); // hex part too short
-        assert!(t.validate(&Value::String("vpc".to_string())).is_err()); // no dash
-        assert!(t.validate(&Value::String("vpc-short".to_string())).is_err()); // hex part < 8
-        assert!(
-            t.validate(&Value::String("vpc-1234567".to_string()))
-                .is_err()
-        ); // only 7 chars
-        assert!(
-            t.validate(&Value::String("VPC-12345678".to_string()))
-                .is_err()
-        ); // uppercase prefix
-        assert!(t.validate(&Value::Int(42)).is_err()); // wrong type
-
-        // ResourceRef should be accepted
-        assert!(
-            t.validate(&Value::ResourceRef(
-                "my_vpc".to_string(),
-                "vpc_id".to_string()
-            ))
-            .is_ok()
-        );
+    fn types_module_has_no_aws_specific_types() {
+        // Verify that AWS-specific types are not defined in carina-core.
+        // These belong in provider crates (e.g., carina-provider-awscc).
+        let source = include_str!("schema.rs");
+        let aws_keywords = [
+            "fn arn()",
+            "fn aws_resource_id()",
+            "fn availability_zone()",
+            "validate_arn",
+            "validate_aws_resource_id",
+            "validate_availability_zone",
+        ];
+        for keyword in &aws_keywords {
+            // Exclude this test function itself from the check
+            let occurrences: Vec<_> = source.match_indices(keyword).collect();
+            // Each keyword appears once in the aws_keywords array literal above
+            // If it appears more than once, it means it's also defined elsewhere
+            assert!(
+                occurrences.len() <= 1,
+                "Found AWS-specific type '{}' in carina-core/src/schema.rs. \
+                 AWS-specific types belong in provider crates.",
+                keyword
+            );
+        }
     }
 }

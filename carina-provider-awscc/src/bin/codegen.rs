@@ -1054,7 +1054,7 @@ fn cfn_type_to_carina_type_with_enum(
 
             // AWS resource IDs with known prefix-hex format
             if is_aws_resource_id_property(prop_name) {
-                return ("types::aws_resource_id()".to_string(), None);
+                return ("super::aws_resource_id()".to_string(), None);
             }
 
             // Other IDs are plain strings (AZ IDs, owner IDs, etc.)
@@ -1064,13 +1064,13 @@ fn cfn_type_to_carina_type_with_enum(
 
             // ARNs use validated Arn type
             if prop_lower.ends_with("arn") || prop_lower.contains("_arn") {
-                return ("types::arn()".to_string(), None);
+                return ("super::arn()".to_string(), None);
             }
 
             // Availability zone uses format validation (e.g., "us-east-1a")
             // but AvailabilityZoneId stays as String (e.g., "use1-az1")
             if prop_lower == "availabilityzone" {
-                return ("types::availability_zone()".to_string(), None);
+                return ("super::availability_zone()".to_string(), None);
             }
 
             // Other zone/region fields are strings
@@ -1460,9 +1460,9 @@ mod tests {
             tagging: None,
         };
 
-        // AvailabilityZone should use types::availability_zone()
+        // AvailabilityZone should use super::availability_zone()
         let (type_str, _) = cfn_type_to_carina_type_with_enum(&prop, "AvailabilityZone", &schema);
-        assert_eq!(type_str, "types::availability_zone()");
+        assert_eq!(type_str, "super::availability_zone()");
 
         // AvailabilityZoneId should stay String
         let (type_str, _) = cfn_type_to_carina_type_with_enum(&prop, "AvailabilityZoneId", &schema);
