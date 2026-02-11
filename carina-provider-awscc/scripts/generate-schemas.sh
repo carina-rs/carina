@@ -612,6 +612,85 @@ pub fn validate_iam_policy_document(value: &Value) -> Result<(), String> {
                     i, e
                 ));
             }
+
+            // Validate Sid if present (must be a string)
+            if let Some(sid) = stmt_map.get("sid")
+                && !matches!(sid, Value::String(_))
+            {
+                return Err(format!(
+                    "Statement[{}] 'sid' must be a string", i
+                ));
+            }
+
+            // Validate Action / NotAction if present (must be string or list of strings)
+            for key in &["action", "not_action"] {
+                if let Some(action) = stmt_map.get(*key) {
+                    match action {
+                        Value::String(_) => {}
+                        Value::List(items) => {
+                            for (j, item) in items.iter().enumerate() {
+                                if !matches!(item, Value::String(_)) {
+                                    return Err(format!(
+                                        "Statement[{}] '{}[{}]' must be a string", i, key, j
+                                    ));
+                                }
+                            }
+                        }
+                        _ => {
+                            return Err(format!(
+                                "Statement[{}] '{}' must be a string or list of strings", i, key
+                            ));
+                        }
+                    }
+                }
+            }
+
+            // Validate Resource / NotResource if present (must be string or list of strings)
+            for key in &["resource", "not_resource"] {
+                if let Some(resource) = stmt_map.get(*key) {
+                    match resource {
+                        Value::String(_) => {}
+                        Value::List(items) => {
+                            for (j, item) in items.iter().enumerate() {
+                                if !matches!(item, Value::String(_)) {
+                                    return Err(format!(
+                                        "Statement[{}] '{}[{}]' must be a string", i, key, j
+                                    ));
+                                }
+                            }
+                        }
+                        _ => {
+                            return Err(format!(
+                                "Statement[{}] '{}' must be a string or list of strings", i, key
+                            ));
+                        }
+                    }
+                }
+            }
+
+            // Validate Principal / NotPrincipal if present (must be string "*" or a map)
+            for key in &["principal", "not_principal"] {
+                if let Some(principal) = stmt_map.get(*key) {
+                    match principal {
+                        Value::String(_) => {}
+                        Value::Map(_) => {}
+                        _ => {
+                            return Err(format!(
+                                "Statement[{}] '{}' must be a string or a map", i, key
+                            ));
+                        }
+                    }
+                }
+            }
+
+            // Validate Condition if present (must be a map)
+            if let Some(condition) = stmt_map.get("condition")
+                && !matches!(condition, Value::Map(_))
+            {
+                return Err(format!(
+                    "Statement[{}] 'condition' must be a map", i
+                ));
+            }
         }
     }
 
@@ -972,6 +1051,99 @@ mod tests {
             t.validate(&Value::ResourceRef("role".to_string(), "policy".to_string()))
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn validate_iam_policy_document_valid_with_all_fields() {
+        let doc = Value::Map(
+            vec![
+                ("version".to_string(), Value::String("2012-10-17".to_string())),
+                ("statement".to_string(), Value::List(vec![
+                    Value::Map(
+                        vec![
+                            ("sid".to_string(), Value::String("AllowS3Access".to_string())),
+                            ("effect".to_string(), Value::String("Allow".to_string())),
+                            ("principal".to_string(), Value::Map(
+                                vec![("service".to_string(), Value::String("ec2.amazonaws.com".to_string()))]
+                                    .into_iter().collect()
+                            )),
+                            ("action".to_string(), Value::List(vec![
+                                Value::String("s3:GetObject".to_string()),
+                                Value::String("s3:PutObject".to_string()),
+                            ])),
+                            ("resource".to_string(), Value::String("*".to_string())),
+                            ("condition".to_string(), Value::Map(
+                                vec![("string_equals".to_string(), Value::Map(
+                                    vec![("aws:RequestedRegion".to_string(), Value::String("us-east-1".to_string()))]
+                                        .into_iter().collect()
+                                ))]
+                                    .into_iter().collect()
+                            )),
+                        ].into_iter().collect()
+                    ),
+                ])),
+            ].into_iter().collect()
+        );
+        assert!(validate_iam_policy_document(&doc).is_ok());
+    }
+
+    #[test]
+    fn validate_iam_policy_document_invalid_principal() {
+        let doc = Value::Map(
+            vec![
+                ("statement".to_string(), Value::List(vec![
+                    Value::Map(
+                        vec![
+                            ("effect".to_string(), Value::String("Allow".to_string())),
+                            ("principal".to_string(), Value::List(vec![
+                                Value::String("not-valid".to_string()),
+                            ])),
+                        ].into_iter().collect()
+                    ),
+                ])),
+            ].into_iter().collect()
+        );
+        let result = validate_iam_policy_document(&doc);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("principal"));
+    }
+
+    #[test]
+    fn validate_iam_policy_document_invalid_action() {
+        let doc = Value::Map(
+            vec![
+                ("statement".to_string(), Value::List(vec![
+                    Value::Map(
+                        vec![
+                            ("effect".to_string(), Value::String("Allow".to_string())),
+                            ("action".to_string(), Value::Int(42)),
+                        ].into_iter().collect()
+                    ),
+                ])),
+            ].into_iter().collect()
+        );
+        let result = validate_iam_policy_document(&doc);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("action"));
+    }
+
+    #[test]
+    fn validate_iam_policy_document_invalid_condition() {
+        let doc = Value::Map(
+            vec![
+                ("statement".to_string(), Value::List(vec![
+                    Value::Map(
+                        vec![
+                            ("effect".to_string(), Value::String("Allow".to_string())),
+                            ("condition".to_string(), Value::String("not-a-map".to_string())),
+                        ].into_iter().collect()
+                    ),
+                ])),
+            ].into_iter().collect()
+        );
+        let result = validate_iam_policy_document(&doc);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("condition"));
     }
 
     #[test]

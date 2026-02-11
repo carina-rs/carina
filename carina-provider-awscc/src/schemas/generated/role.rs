@@ -56,7 +56,7 @@ pub fn iam_role_config() -> AwsccSchemaConfig {
             AttributeSchema::new("policies", AttributeType::List(Box::new(AttributeType::Struct {
                     name: "Policy".to_string(),
                     fields: vec![
-                    StructField::new("policy_document", AttributeType::String).required().with_description("The entire contents of the policy that defines permissions. For more information, see [Overview of JSON policies](https://docs.aws.amazon.com/IAM/late...").with_provider_name("PolicyDocument"),
+                    StructField::new("policy_document", super::iam_policy_document()).required().with_description("The entire contents of the policy that defines permissions. For more information, see [Overview of JSON policies](https://docs.aws.amazon.com/IAM/late...").with_provider_name("PolicyDocument"),
                     StructField::new("policy_name", AttributeType::String).required().with_description("The friendly name (not ARN) identifying the policy.").with_provider_name("PolicyName")
                     ],
                 })))
