@@ -396,27 +396,6 @@ fn generate_markdown(schema: &CfnSchema, type_name: &str) -> Result<String> {
         }
     }
 
-    // Attribute Reference (read-only attributes)
-    let has_read_only = schema
-        .properties
-        .keys()
-        .any(|name| read_only.contains(name));
-    if has_read_only {
-        md.push_str("## Attribute Reference\n\n");
-
-        for (prop_name, prop) in &schema.properties {
-            if !read_only.contains(prop_name) {
-                continue;
-            }
-
-            let attr_name = prop_name.to_snake_case();
-            let type_display = type_display_string(prop_name, prop, schema, &enums);
-
-            md.push_str(&format!("### `{}`\n\n", attr_name));
-            md.push_str(&format!("- **Type:** {}\n\n", type_display));
-        }
-    }
-
     // Enum values section
     if !enums.is_empty() {
         md.push_str("## Enum Values\n\n");
@@ -522,6 +501,27 @@ fn generate_markdown(schema: &CfnSchema, type_name: &str) -> Result<String> {
                 ));
             }
             md.push('\n');
+        }
+    }
+
+    // Attribute Reference (read-only attributes)
+    let has_read_only = schema
+        .properties
+        .keys()
+        .any(|name| read_only.contains(name));
+    if has_read_only {
+        md.push_str("## Attribute Reference\n\n");
+
+        for (prop_name, prop) in &schema.properties {
+            if !read_only.contains(prop_name) {
+                continue;
+            }
+
+            let attr_name = prop_name.to_snake_case();
+            let type_display = type_display_string(prop_name, prop, schema, &enums);
+
+            md.push_str(&format!("### `{}`\n\n", attr_name));
+            md.push_str(&format!("- **Type:** {}\n\n", type_display));
         }
     }
 

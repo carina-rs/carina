@@ -57,6 +57,18 @@ The netmask length of the IPv4 CIDR you want to allocate to this VPC from an Ama
 
 The tags for the VPC.
 
+## Enum Values
+
+### instance_tenancy (InstanceTenancy)
+
+| Value | DSL Identifier |
+|-------|----------------|
+| `default` | `awscc.ec2_vpc.InstanceTenancy.default` |
+| `dedicated` | `awscc.ec2_vpc.InstanceTenancy.dedicated` |
+| `host` | `awscc.ec2_vpc.InstanceTenancy.host` |
+
+Shorthand formats: `default` or `InstanceTenancy.default`
+
 ## Attribute Reference
 
 ### `cidr_block_associations`
@@ -78,18 +90,6 @@ The tags for the VPC.
 ### `vpc_id`
 
 - **Type:** AwsResourceId
-
-## Enum Values
-
-### instance_tenancy (InstanceTenancy)
-
-| Value | DSL Identifier |
-|-------|----------------|
-| `default` | `awscc.ec2_vpc.InstanceTenancy.default` |
-| `dedicated` | `awscc.ec2_vpc.InstanceTenancy.dedicated` |
-| `host` | `awscc.ec2_vpc.InstanceTenancy.host` |
-
-Shorthand formats: `default` or `InstanceTenancy.default`
 
 
 

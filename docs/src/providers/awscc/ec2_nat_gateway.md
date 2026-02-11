@@ -93,28 +93,6 @@ The tags for the NAT gateway.
 
 The ID of the VPC in which the NAT gateway is located.
 
-## Attribute Reference
-
-### `auto_provision_zones`
-
-- **Type:** String
-
-### `auto_scaling_ips`
-
-- **Type:** String
-
-### `eni_id`
-
-- **Type:** AwsResourceId
-
-### `nat_gateway_id`
-
-- **Type:** AwsResourceId
-
-### `route_table_id`
-
-- **Type:** AwsResourceId
-
 ## Enum Values
 
 ### availability_mode (AvailabilityMode)
@@ -144,6 +122,28 @@ Shorthand formats: `public` or `ConnectivityType.public`
 | `allocation_ids` | List<String> | Yes | The allocation IDs of the Elastic IP addresses (EIPs) to be used for handling outbound NAT traffic i... |
 | `availability_zone` | AvailabilityZone | No | For regional NAT gateways only: The Availability Zone where this specific NAT gateway configuration ... |
 | `availability_zone_id` | String | No | For regional NAT gateways only: The ID of the Availability Zone where this specific NAT gateway conf... |
+
+## Attribute Reference
+
+### `auto_provision_zones`
+
+- **Type:** String
+
+### `auto_scaling_ips`
+
+- **Type:** String
+
+### `eni_id`
+
+- **Type:** AwsResourceId
+
+### `nat_gateway_id`
+
+- **Type:** AwsResourceId
+
+### `route_table_id`
+
+- **Type:** AwsResourceId
 
 
 

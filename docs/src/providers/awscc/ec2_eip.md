@@ -64,16 +64,6 @@ Any tags assigned to the Elastic IP address.  Updates to the ``Tags`` property m
 
 The Elastic IP address you are accepting for transfer. You can only accept one transferred address. For more information on Elastic IP address transfers, see [Transfer Elastic IP addresses](https://docs.aws.amazon.com/vpc/latest/userguide/vpc-eips.html#transfer-EIPs-intro) in the *Amazon Virtual Private Cloud User Guide*.
 
-## Attribute Reference
-
-### `allocation_id`
-
-- **Type:** AwsResourceId
-
-### `public_ip`
-
-- **Type:** Ipv4Address
-
 ## Enum Values
 
 ### domain (Domain)
@@ -84,6 +74,16 @@ The Elastic IP address you are accepting for transfer. You can only accept one t
 | `standard` | `awscc.ec2_eip.Domain.standard` |
 
 Shorthand formats: `vpc` or `Domain.vpc`
+
+## Attribute Reference
+
+### `allocation_id`
+
+- **Type:** AwsResourceId
+
+### `public_ip`
+
+- **Type:** Ipv4Address
 
 
 

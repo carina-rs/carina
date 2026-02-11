@@ -48,16 +48,6 @@ Any tags assigned to the security group.
 
 The ID of the VPC for the security group.
 
-## Attribute Reference
-
-### `group_id`
-
-- **Type:** AwsResourceId
-
-### `id`
-
-- **Type:** String
-
 ## Struct Definitions
 
 ### Egress
@@ -87,6 +77,16 @@ The ID of the VPC for the security group.
 | `source_security_group_name` | String | No |  |
 | `source_security_group_owner_id` | String | No |  |
 | `to_port` | Int | No |  |
+
+## Attribute Reference
+
+### `group_id`
+
+- **Type:** AwsResourceId
+
+### `id`
+
+- **Type:** String
 
 
 

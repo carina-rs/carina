@@ -114,40 +114,6 @@ The Id of this pool's source. If set, all space provisioned in this pool must be
 
 An array of key-value pairs to apply to this resource.
 
-## Attribute Reference
-
-### `arn`
-
-- **Type:** Arn
-
-### `ipam_arn`
-
-- **Type:** Arn
-
-### `ipam_pool_id`
-
-- **Type:** IpamPoolId
-
-### `ipam_scope_arn`
-
-- **Type:** Arn
-
-### `ipam_scope_type`
-
-- **Type:** [Enum (IpamScopeType)](#ipam_scope_type-ipamscopetype)
-
-### `pool_depth`
-
-- **Type:** Int
-
-### `state`
-
-- **Type:** [Enum (State)](#state-state)
-
-### `state_message`
-
-- **Type:** String
-
 ## Enum Values
 
 ### address_family (AddressFamily)
@@ -215,6 +181,40 @@ Shorthand formats: `create-in-progress` or `State.create-in-progress`
 | `resource_owner` | String | Yes |  |
 | `resource_region` | String | Yes |  |
 | `resource_type` | String | Yes |  |
+
+## Attribute Reference
+
+### `arn`
+
+- **Type:** Arn
+
+### `ipam_arn`
+
+- **Type:** Arn
+
+### `ipam_pool_id`
+
+- **Type:** IpamPoolId
+
+### `ipam_scope_arn`
+
+- **Type:** Arn
+
+### `ipam_scope_type`
+
+- **Type:** [Enum (IpamScopeType)](#ipam_scope_type-ipamscopetype)
+
+### `pool_depth`
+
+- **Type:** Int
+
+### `state`
+
+- **Type:** [Enum (State)](#state-state)
+
+### `state_message`
+
+- **Type:** String
 
 
 
