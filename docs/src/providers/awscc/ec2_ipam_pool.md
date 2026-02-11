@@ -76,7 +76,7 @@ The region of this pool. If not set, this will default to "None" which will disa
 
 ### `provisioned_cidrs`
 
-- **Type:** List<ProvisionedCidr>
+- **Type:** [List\<ProvisionedCidr\>](#provisionedcidr)
 - **Required:** No
 
 A list of cidrs representing the address space available for allocation in this pool.
@@ -104,7 +104,7 @@ The Id of this pool's source. If set, all space provisioned in this pool must be
 
 ### `source_resource`
 
-- **Type:** Struct(SourceResource)
+- **Type:** [Struct(SourceResource)](#sourceresource)
 - **Required:** No
 
 ### `tags`

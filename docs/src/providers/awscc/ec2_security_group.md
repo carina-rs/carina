@@ -22,14 +22,14 @@ The name of the security group.
 
 ### `security_group_egress`
 
-- **Type:** List<Egress>
+- **Type:** [List\<Egress\>](#egress)
 - **Required:** No
 
 [VPC only] The outbound rules associated with the security group. There is a short interruption during which you cannot connect to the security group.
 
 ### `security_group_ingress`
 
-- **Type:** List<Ingress>
+- **Type:** [List\<Ingress\>](#ingress)
 - **Required:** No
 
 The inbound rules associated with the security group. There is a short interruption during which you cannot connect to the security group.
