@@ -225,7 +225,7 @@ fn list_element_type_display(items: &CfnProperty) -> String {
         Some("string") => "List<String>".to_string(),
         Some("integer") | Some("number") => "List<Int>".to_string(),
         Some("boolean") => "List<Bool>".to_string(),
-        _ => "List".to_string(),
+        _ => "List<String>".to_string(),
     }
 }
 
@@ -306,16 +306,16 @@ fn type_display_string(
                             {
                                 format!("[List\\<{}\\>](#{})", def_name, def_name.to_lowercase())
                             } else {
-                                "List".to_string()
+                                "List<String>".to_string()
                             }
                         } else {
-                            "List".to_string()
+                            "List<Map>".to_string()
                         }
                     } else {
                         list_element_type_display(items)
                     }
                 } else {
-                    "List".to_string()
+                    "List<String>".to_string()
                 }
             }
             Some("object") => {
@@ -495,7 +495,7 @@ fn generate_markdown(schema: &CfnSchema, type_name: &str) -> Result<String> {
                             if let Some(items) = &field_prop.items {
                                 list_element_type_display(items)
                             } else {
-                                "List".to_string()
+                                "List<String>".to_string()
                             }
                         }
                         Some("object") => "Map".to_string(),
@@ -1562,6 +1562,268 @@ mod tests {
             properties: None,
             required: vec![],
         };
-        assert_eq!(list_element_type_display(&prop), "List");
+        assert_eq!(list_element_type_display(&prop), "List<String>");
+    }
+
+    #[test]
+    fn test_type_display_string_array_tag_ref() {
+        // Array with Tag $ref should display List<Map>
+        let prop = CfnProperty {
+            prop_type: Some(TypeValue::Single("array".to_string())),
+            description: None,
+            enum_values: None,
+            items: Some(Box::new(CfnProperty {
+                prop_type: None,
+                description: None,
+                enum_values: None,
+                items: None,
+                ref_path: Some("#/definitions/Tag".to_string()),
+                insertion_order: None,
+                properties: None,
+                required: vec![],
+            })),
+            ref_path: None,
+            insertion_order: None,
+            properties: None,
+            required: vec![],
+        };
+        let schema = CfnSchema {
+            type_name: "AWS::EC2::VPC".to_string(),
+            description: None,
+            properties: BTreeMap::new(),
+            required: vec![],
+            read_only_properties: vec![],
+            create_only_properties: vec![],
+            write_only_properties: vec![],
+            primary_identifier: None,
+            definitions: None,
+            tagging: None,
+        };
+        let enums = BTreeMap::new();
+        assert_eq!(
+            type_display_string("ResourceTags", &prop, &schema, &enums),
+            "List<Map>"
+        );
+    }
+
+    #[test]
+    fn test_type_display_string_array_unresolvable_ref() {
+        // Array with $ref that cannot be resolved should display List<String>
+        let prop = CfnProperty {
+            prop_type: Some(TypeValue::Single("array".to_string())),
+            description: None,
+            enum_values: None,
+            items: Some(Box::new(CfnProperty {
+                prop_type: None,
+                description: None,
+                enum_values: None,
+                items: None,
+                ref_path: Some("#/definitions/NonExistent".to_string()),
+                insertion_order: None,
+                properties: None,
+                required: vec![],
+            })),
+            ref_path: None,
+            insertion_order: None,
+            properties: None,
+            required: vec![],
+        };
+        let schema = CfnSchema {
+            type_name: "AWS::EC2::VPC".to_string(),
+            description: None,
+            properties: BTreeMap::new(),
+            required: vec![],
+            read_only_properties: vec![],
+            create_only_properties: vec![],
+            write_only_properties: vec![],
+            primary_identifier: None,
+            definitions: None,
+            tagging: None,
+        };
+        let enums = BTreeMap::new();
+        assert_eq!(
+            type_display_string("Items", &prop, &schema, &enums),
+            "List<String>"
+        );
+    }
+
+    #[test]
+    fn test_type_display_string_array_no_items() {
+        // Array with no items should display List<String>
+        let prop = CfnProperty {
+            prop_type: Some(TypeValue::Single("array".to_string())),
+            description: None,
+            enum_values: None,
+            items: None,
+            ref_path: None,
+            insertion_order: None,
+            properties: None,
+            required: vec![],
+        };
+        let schema = CfnSchema {
+            type_name: "AWS::EC2::VPC".to_string(),
+            description: None,
+            properties: BTreeMap::new(),
+            required: vec![],
+            read_only_properties: vec![],
+            create_only_properties: vec![],
+            write_only_properties: vec![],
+            primary_identifier: None,
+            definitions: None,
+            tagging: None,
+        };
+        let enums = BTreeMap::new();
+        assert_eq!(
+            type_display_string("SomeList", &prop, &schema, &enums),
+            "List<String>"
+        );
+    }
+
+    #[test]
+    fn test_list_element_type_display_always_includes_element_type() {
+        // Regression guard: list_element_type_display must always return "List<...>"
+        // with element type info, never bare "List".
+        let test_cases: Vec<Option<TypeValue>> = vec![
+            Some(TypeValue::Single("string".to_string())),
+            Some(TypeValue::Single("integer".to_string())),
+            Some(TypeValue::Single("number".to_string())),
+            Some(TypeValue::Single("boolean".to_string())),
+            Some(TypeValue::Single("object".to_string())),
+            Some(TypeValue::Single("unknown".to_string())),
+            None,
+        ];
+        for type_val in test_cases {
+            let prop = CfnProperty {
+                prop_type: type_val.clone(),
+                description: None,
+                enum_values: None,
+                items: None,
+                ref_path: None,
+                insertion_order: None,
+                properties: None,
+                required: vec![],
+            };
+            let result = list_element_type_display(&prop);
+            assert!(
+                result.contains('<') && result.contains('>'),
+                "list_element_type_display should include element type for {:?}, got: {}",
+                type_val,
+                result
+            );
+        }
+    }
+
+    #[test]
+    fn test_type_display_string_array_never_bare_list() {
+        // Regression guard: type_display_string for array types must never return
+        // bare "List" without element type information.
+        let schema = CfnSchema {
+            type_name: "AWS::EC2::VPC".to_string(),
+            description: None,
+            properties: BTreeMap::new(),
+            required: vec![],
+            read_only_properties: vec![],
+            create_only_properties: vec![],
+            write_only_properties: vec![],
+            primary_identifier: None,
+            definitions: None,
+            tagging: None,
+        };
+        let enums = BTreeMap::new();
+
+        // Case 1: array with no items
+        let prop = CfnProperty {
+            prop_type: Some(TypeValue::Single("array".to_string())),
+            description: None,
+            enum_values: None,
+            items: None,
+            ref_path: None,
+            insertion_order: None,
+            properties: None,
+            required: vec![],
+        };
+        let result = type_display_string("Prop1", &prop, &schema, &enums);
+        assert_ne!(
+            result, "List",
+            "array with no items should not return bare 'List'"
+        );
+
+        // Case 2: array with Tag ref items
+        let prop = CfnProperty {
+            prop_type: Some(TypeValue::Single("array".to_string())),
+            description: None,
+            enum_values: None,
+            items: Some(Box::new(CfnProperty {
+                prop_type: None,
+                description: None,
+                enum_values: None,
+                items: None,
+                ref_path: Some("#/definitions/Tag".to_string()),
+                insertion_order: None,
+                properties: None,
+                required: vec![],
+            })),
+            ref_path: None,
+            insertion_order: None,
+            properties: None,
+            required: vec![],
+        };
+        let result = type_display_string("Prop2", &prop, &schema, &enums);
+        assert_ne!(
+            result, "List",
+            "array with Tag ref should not return bare 'List'"
+        );
+
+        // Case 3: array with unresolvable ref items
+        let prop = CfnProperty {
+            prop_type: Some(TypeValue::Single("array".to_string())),
+            description: None,
+            enum_values: None,
+            items: Some(Box::new(CfnProperty {
+                prop_type: None,
+                description: None,
+                enum_values: None,
+                items: None,
+                ref_path: Some("#/definitions/Missing".to_string()),
+                insertion_order: None,
+                properties: None,
+                required: vec![],
+            })),
+            ref_path: None,
+            insertion_order: None,
+            properties: None,
+            required: vec![],
+        };
+        let result = type_display_string("Prop3", &prop, &schema, &enums);
+        assert_ne!(
+            result, "List",
+            "array with unresolvable ref should not return bare 'List'"
+        );
+
+        // Case 4: array with items that have no type
+        let prop = CfnProperty {
+            prop_type: Some(TypeValue::Single("array".to_string())),
+            description: None,
+            enum_values: None,
+            items: Some(Box::new(CfnProperty {
+                prop_type: None,
+                description: None,
+                enum_values: None,
+                items: None,
+                ref_path: None,
+                insertion_order: None,
+                properties: None,
+                required: vec![],
+            })),
+            ref_path: None,
+            insertion_order: None,
+            properties: None,
+            required: vec![],
+        };
+        let result = type_display_string("Prop4", &prop, &schema, &enums);
+        assert_ne!(
+            result, "List",
+            "array with typeless items should not return bare 'List'"
+        );
     }
 }
