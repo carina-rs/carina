@@ -578,7 +578,7 @@ fn parse_anonymous_resource(
     attributes.insert("_type".to_string(), Value::String(namespaced_type.clone()));
 
     Ok(Resource {
-        id: ResourceId::new(resource_type, resource_name),
+        id: ResourceId::with_provider(provider, resource_type, resource_name),
         attributes,
         read_only: false,
     })
@@ -693,7 +693,7 @@ fn parse_resource_expr(
     );
 
     Ok(Resource {
-        id: ResourceId::new(resource_type, resource_name),
+        id: ResourceId::with_provider(provider, resource_type, resource_name),
         attributes,
         read_only: false,
     })
@@ -752,7 +752,7 @@ fn parse_read_resource_expr(
     attributes.insert("_data_source".to_string(), Value::Bool(true));
 
     Ok(Resource {
-        id: ResourceId::new(resource_type, resource_name),
+        id: ResourceId::with_provider(provider, resource_type, resource_name),
         attributes,
         read_only: true,
     })

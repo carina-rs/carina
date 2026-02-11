@@ -251,13 +251,10 @@ impl ModularPlan {
 /// Format an effect briefly for display
 fn format_effect_brief(effect: &Effect) -> String {
     match effect {
-        Effect::Create(r) => format!("+ {}.{}", r.id.resource_type, r.id.name),
-        Effect::Update { id, .. } => format!("~ {}.{}", id.resource_type, id.name),
-        Effect::Delete(id) => format!("- {}.{}", id.resource_type, id.name),
-        Effect::Read { resource } => format!(
-            "<= {}.{} (data source)",
-            resource.id.resource_type, resource.id.name
-        ),
+        Effect::Create(r) => format!("+ {}", r.id),
+        Effect::Update { id, .. } => format!("~ {}", id),
+        Effect::Delete(id) => format!("- {}", id),
+        Effect::Read { resource } => format!("<= {} (data source)", resource.id),
     }
 }
 

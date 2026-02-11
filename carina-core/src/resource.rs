@@ -7,6 +7,8 @@ use crate::parser::ResourceTypePath;
 /// Unique identifier for a resource
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ResourceId {
+    /// Provider name (e.g., "aws", "awscc")
+    pub provider: String,
     /// Resource type (e.g., "s3_bucket", "ec2_instance")
     pub resource_type: String,
     /// Resource name (identifier specified in DSL)
@@ -16,8 +18,40 @@ pub struct ResourceId {
 impl ResourceId {
     pub fn new(resource_type: impl Into<String>, name: impl Into<String>) -> Self {
         Self {
+            provider: String::new(),
             resource_type: resource_type.into(),
             name: name.into(),
+        }
+    }
+
+    pub fn with_provider(
+        provider: impl Into<String>,
+        resource_type: impl Into<String>,
+        name: impl Into<String>,
+    ) -> Self {
+        Self {
+            provider: provider.into(),
+            resource_type: resource_type.into(),
+            name: name.into(),
+        }
+    }
+
+    /// Returns the display type including provider prefix if available
+    pub fn display_type(&self) -> String {
+        if self.provider.is_empty() {
+            self.resource_type.clone()
+        } else {
+            format!("{}.{}", self.provider, self.resource_type)
+        }
+    }
+}
+
+impl std::fmt::Display for ResourceId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.provider.is_empty() {
+            write!(f, "{}.{}", self.resource_type, self.name)
+        } else {
+            write!(f, "{}.{}.{}", self.provider, self.resource_type, self.name)
         }
     }
 }
@@ -63,6 +97,18 @@ impl Resource {
     pub fn new(resource_type: impl Into<String>, name: impl Into<String>) -> Self {
         Self {
             id: ResourceId::new(resource_type, name),
+            attributes: HashMap::new(),
+            read_only: false,
+        }
+    }
+
+    pub fn with_provider(
+        provider: impl Into<String>,
+        resource_type: impl Into<String>,
+        name: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: ResourceId::with_provider(provider, resource_type, name),
             attributes: HashMap::new(),
             read_only: false,
         }

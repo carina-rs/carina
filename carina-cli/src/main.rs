@@ -201,10 +201,7 @@ fn validate_resources(resources: &[Resource]) -> Result<(), String> {
             Some(schema) => {
                 if let Err(errors) = schema.validate(&resource.attributes) {
                     for error in errors {
-                        all_errors.push(format!(
-                            "{}.{}: {}",
-                            resource.id.resource_type, resource.id.name, error
-                        ));
+                        all_errors.push(format!("{}: {}", resource.id, error));
                     }
                 }
             }
@@ -299,14 +296,8 @@ fn validate_resource_ref_types(resources: &[Resource]) -> Result<(), String> {
             }
 
             all_errors.push(format!(
-                "{}.{}: type mismatch for '{}': expected {}, got {} (from {}.{})",
-                resource.id.resource_type,
-                resource.id.name,
-                attr_name,
-                expected_type_name,
-                ref_type_name,
-                ref_binding,
-                ref_attr,
+                "{}: type mismatch for '{}': expected {}, got {} (from {}.{})",
+                resource.id, attr_name, expected_type_name, ref_type_name, ref_binding, ref_attr,
             ));
         }
     }
@@ -681,7 +672,7 @@ fn run_validate(path: &PathBuf) -> Result<(), String> {
     );
 
     for resource in &parsed.resources {
-        println!("  • {}.{}", resource.id.resource_type, resource.id.name);
+        println!("  • {}", resource.id);
     }
 
     Ok(())
@@ -1416,21 +1407,15 @@ async fn run_destroy(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
     println!();
 
     for resource in &resources_to_destroy {
-        println!(
-            "  {} {}.{}",
-            "-".red().bold(),
-            resource.id.resource_type,
-            resource.id.name
-        );
+        println!("  {} {}", "-".red().bold(), resource.id);
     }
 
     // Show protected resources
     for resource in &protected_resources {
         println!(
-            "  {} {}.{} {}",
+            "  {} {} {}",
             "⚠".yellow().bold(),
-            resource.id.resource_type,
-            resource.id.name,
+            resource.id,
             "(protected - will be skipped)".yellow()
         );
     }
@@ -1564,10 +1549,9 @@ async fn run_destroy(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
             if let Some((dep_id, dep_identifier)) = timed_out_resources.remove(dep_binding.as_str())
             {
                 println!(
-                    "  {} Waiting for {}.{} to be deleted...",
+                    "  {} Waiting for {} to be deleted...",
                     "⏳".yellow(),
-                    dep_id.resource_type,
-                    dep_id.name
+                    dep_id
                 );
 
                 let mut completed = false;
@@ -1576,10 +1560,9 @@ async fn run_destroy(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
                     match provider.read(&dep_id, Some(&dep_identifier)).await {
                         Ok(state) if !state.exists => {
                             println!(
-                                "  {} Delete {}.{} (completed after extended wait)",
+                                "  {} Delete {} (completed after extended wait)",
                                 "✓".green(),
-                                dep_id.resource_type,
-                                dep_id.name
+                                dep_id
                             );
                             destroyed_ids.push(dep_id.clone());
                             success_count += 1;
@@ -1592,10 +1575,9 @@ async fn run_destroy(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
                         Err(_) => {
                             // Read error — resource may be gone, treat as completed
                             println!(
-                                "  {} Delete {}.{} (completed after extended wait)",
+                                "  {} Delete {} (completed after extended wait)",
                                 "✓".green(),
-                                dep_id.resource_type,
-                                dep_id.name
+                                dep_id
                             );
                             destroyed_ids.push(dep_id.clone());
                             success_count += 1;
@@ -1607,10 +1589,9 @@ async fn run_destroy(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
 
                 if !completed {
                     println!(
-                        "  {} {}.{} - still exists after extended wait",
+                        "  {} {} - still exists after extended wait",
                         "✗".red(),
-                        dep_id.resource_type,
-                        dep_id.name
+                        dep_id
                     );
                     failed_bindings.insert(dep_binding.clone());
                     failure_count += 1;
@@ -1657,10 +1638,9 @@ async fn run_destroy(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
     // Handle any remaining timed-out resources that no parent waited on
     for (dep_binding, (dep_id, dep_identifier)) in &timed_out_resources {
         println!(
-            "  {} Waiting for {}.{} to be deleted...",
+            "  {} Waiting for {} to be deleted...",
             "⏳".yellow(),
-            dep_id.resource_type,
-            dep_id.name
+            dep_id
         );
 
         let mut completed = false;
@@ -1669,10 +1649,9 @@ async fn run_destroy(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
             match provider.read(dep_id, Some(dep_identifier)).await {
                 Ok(state) if !state.exists => {
                     println!(
-                        "  {} Delete {}.{} (completed after extended wait)",
+                        "  {} Delete {} (completed after extended wait)",
                         "✓".green(),
-                        dep_id.resource_type,
-                        dep_id.name
+                        dep_id
                     );
                     destroyed_ids.push(dep_id.clone());
                     success_count += 1;
@@ -1682,10 +1661,9 @@ async fn run_destroy(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
                 Ok(_) => {}
                 Err(_) => {
                     println!(
-                        "  {} Delete {}.{} (completed after extended wait)",
+                        "  {} Delete {} (completed after extended wait)",
                         "✓".green(),
-                        dep_id.resource_type,
-                        dep_id.name
+                        dep_id
                     );
                     destroyed_ids.push(dep_id.clone());
                     success_count += 1;
@@ -1697,10 +1675,9 @@ async fn run_destroy(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
 
         if !completed {
             println!(
-                "  {} {}.{} - still exists after extended wait",
+                "  {} {} - still exists after extended wait",
                 "✗".red(),
-                dep_id.resource_type,
-                dep_id.name
+                dep_id
             );
             failed_bindings.insert(dep_binding.clone());
             failure_count += 1;
@@ -2088,7 +2065,7 @@ fn print_plan(plan: &Plan) {
                     Value::String(s) => Some(s.clone()),
                     _ => None,
                 })
-                .unwrap_or_else(|| format!("{}.{}", r.id.resource_type, r.id.name));
+                .unwrap_or_else(|| r.id.to_string());
             binding_to_effect.insert(binding.clone(), idx);
             effect_bindings.insert(idx, binding);
         }
@@ -2168,7 +2145,7 @@ fn print_plan(plan: &Plan) {
                     base_indent,
                     connector,
                     colored_symbol,
-                    r.id.resource_type.cyan().bold()
+                    r.id.display_type().cyan().bold()
                 );
                 // Attribute prefix aligns with the resource content
                 let attr_prefix = if indent == 0 {
@@ -2216,7 +2193,7 @@ fn print_plan(plan: &Plan) {
                     base_indent,
                     connector,
                     colored_symbol,
-                    id.resource_type.cyan().bold()
+                    id.display_type().cyan().bold()
                 );
                 let attr_prefix = if indent == 0 {
                     format!("{}{}", base_indent, attr_base)
@@ -2271,7 +2248,7 @@ fn print_plan(plan: &Plan) {
                     base_indent,
                     connector,
                     colored_symbol,
-                    id.resource_type.cyan().bold()
+                    id.display_type().cyan().bold()
                 );
                 let attr_prefix = if indent == 0 {
                     format!("{}{}", base_indent, attr_base)
@@ -2291,7 +2268,7 @@ fn print_plan(plan: &Plan) {
                     base_indent,
                     connector,
                     colored_symbol,
-                    resource.id.resource_type.cyan().bold(),
+                    resource.id.display_type().cyan().bold(),
                     "(data source)".dimmed()
                 );
                 let attr_prefix = if indent == 0 {
@@ -2391,11 +2368,11 @@ fn print_plan(plan: &Plan) {
 
 fn format_effect(effect: &Effect) -> String {
     match effect {
-        Effect::Create(r) => format!("Create {}.{}", r.id.resource_type, r.id.name),
-        Effect::Update { id, .. } => format!("Update {}.{}", id.resource_type, id.name),
-        Effect::Delete(id) => format!("Delete {}.{}", id.resource_type, id.name),
+        Effect::Create(r) => format!("Create {}", r.id),
+        Effect::Update { id, .. } => format!("Update {}", id),
+        Effect::Delete(id) => format!("Delete {}", id),
         Effect::Read { resource } => {
-            format!("Read {}.{}", resource.id.resource_type, resource.id.name)
+            format!("Read {}", resource.id)
         }
     }
 }
@@ -2678,7 +2655,7 @@ async fn run_state_bucket_delete(
     println!("{}", "Emptying bucket...".cyan());
 
     // Delete the bucket resource (for S3, identifier is the bucket name)
-    let bucket_id = ResourceId::new("s3.bucket", bucket_name);
+    let bucket_id = ResourceId::with_provider("aws", "s3.bucket", bucket_name);
     match aws_provider.delete(&bucket_id, bucket_name).await {
         Ok(()) => {
             println!(
