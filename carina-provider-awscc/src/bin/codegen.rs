@@ -143,6 +143,12 @@ struct CfnProperty {
     /// Required fields for inline objects
     #[serde(default)]
     required: Vec<String>,
+    /// Minimum value constraint (for integer/number types)
+    #[serde(default)]
+    minimum: Option<i64>,
+    /// Maximum value constraint (for integer/number types)
+    #[serde(default)]
+    maximum: Option<i64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -330,7 +336,13 @@ fn type_display_string(
         match prop.prop_type.as_ref().and_then(|t| t.as_str()) {
             Some("string") => infer_string_type_display(prop_name),
             Some("boolean") => "Bool".to_string(),
-            Some("integer") | Some("number") => "Int".to_string(),
+            Some("integer") | Some("number") => {
+                if let (Some(min), Some(max)) = (prop.minimum, prop.maximum) {
+                    format!("Int({}..={})", min, max)
+                } else {
+                    "Int".to_string()
+                }
+            }
             Some("array") => {
                 if let Some(items) = &prop.items {
                     if let Some(ref_path) = &items.ref_path {
@@ -476,7 +488,14 @@ fn generate_markdown(schema: &CfnSchema, type_name: &str) -> Result<String> {
                     match field_prop.prop_type.as_ref().and_then(|t| t.as_str()) {
                         Some("string") => infer_string_type_display(field_name),
                         Some("boolean") => "Bool".to_string(),
-                        Some("integer") | Some("number") => "Int".to_string(),
+                        Some("integer") | Some("number") => {
+                            if let (Some(min), Some(max)) = (field_prop.minimum, field_prop.maximum)
+                            {
+                                format!("Int({}..={})", min, max)
+                            } else {
+                                "Int".to_string()
+                            }
+                        }
                         Some("array") => {
                             if let Some(items) = &field_prop.items {
                                 list_element_type_display(items, field_name)
@@ -619,6 +638,7 @@ fn generate_schema_code(schema: &CfnSchema, type_name: &str) -> Result<String> {
     let mut needs_tags_type = false;
     let mut needs_struct_field = false;
     let mut enums: BTreeMap<String, EnumInfo> = BTreeMap::new();
+    let mut ranged_ints: BTreeMap<String, (i64, i64)> = BTreeMap::new();
 
     for (prop_name, prop) in &schema.properties {
         let (attr_type, enum_info) = cfn_type_to_carina_type_with_enum(prop, prop_name, schema);
@@ -637,12 +657,26 @@ fn generate_schema_code(schema: &CfnSchema, type_name: &str) -> Result<String> {
         if let Some(info) = enum_info {
             enums.insert(prop_name.clone(), info);
         }
+        // Collect ranged integer properties
+        if matches!(
+            prop.prop_type.as_ref().and_then(|t| t.as_str()),
+            Some("integer") | Some("number")
+        ) && let (Some(min), Some(max)) = (prop.minimum, prop.maximum)
+        {
+            ranged_ints.insert(prop_name.clone(), (min, max));
+        }
     }
 
     let has_enums = !enums.is_empty();
+    let has_ranged_ints = !ranged_ints.is_empty();
 
     // Enums use AttributeType::Custom with AttributeType::String base
     if has_enums {
+        needs_attribute_type = true;
+    }
+
+    // Ranged ints use AttributeType::Custom with AttributeType::Int base
+    if has_ranged_ints {
         needs_attribute_type = true;
     }
 
@@ -674,7 +708,7 @@ use super::AwsccSchemaConfig;
         resource, type_name, schema_imports_str
     ));
 
-    if has_enums {
+    if has_enums || has_ranged_ints {
         code.push_str("use carina_core::resource::Value;\n");
     }
     if needs_tags_type {
@@ -710,6 +744,27 @@ use super::AwsccSchemaConfig;
 
 "#,
             fn_name, enum_info.type_name, namespace, const_name
+        ));
+    }
+
+    // Generate range validation functions for integer properties
+    for (prop_name, (min, max)) in &ranged_ints {
+        let fn_name = format!("validate_{}_range", prop_name.to_snake_case());
+        code.push_str(&format!(
+            r#"fn {}(value: &Value) -> Result<(), String> {{
+    if let Value::Int(n) = value {{
+        if *n < {} || *n > {} {{
+            Err(format!("Value {{}} is out of range {}..={}", n))
+        }} else {{
+            Ok(())
+        }}
+    }} else {{
+        Err("Expected integer".to_string())
+    }}
+}}
+
+"#,
+            fn_name, min, max, min, max
         ));
     }
 
@@ -1320,8 +1375,26 @@ fn cfn_type_to_carina_type_with_enum(
             ("AttributeType::String".to_string(), None)
         }
         Some("boolean") => ("AttributeType::Bool".to_string(), None),
-        Some("integer") => ("AttributeType::Int".to_string(), None),
-        Some("number") => ("AttributeType::Int".to_string(), None),
+        Some("integer") | Some("number") => {
+            if let (Some(min), Some(max)) = (prop.minimum, prop.maximum) {
+                // Generate a ranged int type with validation
+                let validate_fn = format!("validate_{}_range", prop_name.to_snake_case());
+                (
+                    format!(
+                        r#"AttributeType::Custom {{
+                name: "Int({}..={})".to_string(),
+                base: Box::new(AttributeType::Int),
+                validate: {},
+                namespace: None,
+            }}"#,
+                        min, max, validate_fn
+                    ),
+                    None,
+                )
+            } else {
+                ("AttributeType::Int".to_string(), None)
+            }
+        }
         Some("array") => {
             if let Some(items) = &prop.items {
                 // Check if items has a $ref to a definition
@@ -1552,6 +1625,8 @@ mod tests {
             insertion_order: None,
             properties: None,
             required: vec![],
+            minimum: None,
+            maximum: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::SecurityGroupIngress".to_string(),
@@ -1587,6 +1662,8 @@ mod tests {
             insertion_order: None,
             properties: None,
             required: vec![],
+            minimum: None,
+            maximum: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::SecurityGroupIngress".to_string(),
@@ -1619,6 +1696,8 @@ mod tests {
             insertion_order: None,
             properties: None,
             required: vec![],
+            minimum: None,
+            maximum: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::SecurityGroupIngress".to_string(),
@@ -1651,6 +1730,8 @@ mod tests {
             insertion_order: None,
             properties: None,
             required: vec![],
+            minimum: None,
+            maximum: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::NatGateway".to_string(),
@@ -1683,6 +1764,8 @@ mod tests {
             insertion_order: None,
             properties: None,
             required: vec![],
+            minimum: None,
+            maximum: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::EIP".to_string(),
@@ -1715,6 +1798,8 @@ mod tests {
             insertion_order: None,
             properties: None,
             required: vec![],
+            minimum: None,
+            maximum: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::NatGateway".to_string(),
@@ -1747,6 +1832,8 @@ mod tests {
             insertion_order: None,
             properties: None,
             required: vec![],
+            minimum: None,
+            maximum: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::Subnet".to_string(),
@@ -1823,6 +1910,8 @@ mod tests {
             insertion_order: None,
             properties: None,
             required: vec![],
+            minimum: None,
+            maximum: None,
         };
         assert_eq!(
             list_element_type_display(&prop, "GenericProp"),
@@ -1839,6 +1928,8 @@ mod tests {
             insertion_order: None,
             properties: None,
             required: vec![],
+            minimum: None,
+            maximum: None,
         };
         assert_eq!(
             list_element_type_display(&prop, "GenericProp"),
@@ -1855,6 +1946,8 @@ mod tests {
             insertion_order: None,
             properties: None,
             required: vec![],
+            minimum: None,
+            maximum: None,
         };
         assert_eq!(
             list_element_type_display(&prop, "GenericProp"),
@@ -1871,6 +1964,8 @@ mod tests {
             insertion_order: None,
             properties: None,
             required: vec![],
+            minimum: None,
+            maximum: None,
         };
         assert_eq!(
             list_element_type_display(&prop, "GenericProp"),
@@ -1889,6 +1984,8 @@ mod tests {
             insertion_order: None,
             properties: None,
             required: vec![],
+            minimum: None,
+            maximum: None,
         };
         assert_eq!(
             list_element_type_display(&prop, "SubnetIds"),
@@ -1942,11 +2039,15 @@ mod tests {
                 insertion_order: None,
                 properties: None,
                 required: vec![],
+                minimum: None,
+                maximum: None,
             })),
             ref_path: None,
             insertion_order: None,
             properties: None,
             required: vec![],
+            minimum: None,
+            maximum: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::VPC".to_string(),
@@ -1983,11 +2084,15 @@ mod tests {
                 insertion_order: None,
                 properties: None,
                 required: vec![],
+                minimum: None,
+                maximum: None,
             })),
             ref_path: None,
             insertion_order: None,
             properties: None,
             required: vec![],
+            minimum: None,
+            maximum: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::VPC".to_string(),
@@ -2020,6 +2125,8 @@ mod tests {
             insertion_order: None,
             properties: None,
             required: vec![],
+            minimum: None,
+            maximum: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::VPC".to_string(),
@@ -2063,6 +2170,8 @@ mod tests {
                 insertion_order: None,
                 properties: None,
                 required: vec![],
+                minimum: None,
+                maximum: None,
             };
             let result = list_element_type_display(&prop, "GenericProp");
             assert!(
@@ -2102,6 +2211,8 @@ mod tests {
             insertion_order: None,
             properties: None,
             required: vec![],
+            minimum: None,
+            maximum: None,
         };
         let result = type_display_string("Prop1", &prop, &schema, &enums);
         assert_ne!(
@@ -2123,11 +2234,15 @@ mod tests {
                 insertion_order: None,
                 properties: None,
                 required: vec![],
+                minimum: None,
+                maximum: None,
             })),
             ref_path: None,
             insertion_order: None,
             properties: None,
             required: vec![],
+            minimum: None,
+            maximum: None,
         };
         let result = type_display_string("Prop2", &prop, &schema, &enums);
         assert_ne!(
@@ -2149,11 +2264,15 @@ mod tests {
                 insertion_order: None,
                 properties: None,
                 required: vec![],
+                minimum: None,
+                maximum: None,
             })),
             ref_path: None,
             insertion_order: None,
             properties: None,
             required: vec![],
+            minimum: None,
+            maximum: None,
         };
         let result = type_display_string("Prop3", &prop, &schema, &enums);
         assert_ne!(
@@ -2175,16 +2294,191 @@ mod tests {
                 insertion_order: None,
                 properties: None,
                 required: vec![],
+                minimum: None,
+                maximum: None,
             })),
             ref_path: None,
             insertion_order: None,
             properties: None,
             required: vec![],
+            minimum: None,
+            maximum: None,
         };
         let result = type_display_string("Prop4", &prop, &schema, &enums);
         assert_ne!(
             result, "List",
             "array with typeless items should not return bare 'List'"
+        );
+    }
+
+    #[test]
+    fn test_integer_with_range_produces_custom_type() {
+        let prop = CfnProperty {
+            prop_type: Some(TypeValue::Single("integer".to_string())),
+            description: Some("The netmask length.".to_string()),
+            enum_values: None,
+            items: None,
+            ref_path: None,
+            insertion_order: None,
+            properties: None,
+            required: vec![],
+            minimum: Some(0),
+            maximum: Some(32),
+        };
+        let schema = CfnSchema {
+            type_name: "AWS::EC2::VPC".to_string(),
+            description: None,
+            properties: BTreeMap::new(),
+            required: vec![],
+            read_only_properties: vec![],
+            create_only_properties: vec![],
+            write_only_properties: vec![],
+            primary_identifier: None,
+            definitions: None,
+            tagging: None,
+        };
+        let (type_str, _) = cfn_type_to_carina_type_with_enum(&prop, "Ipv4NetmaskLength", &schema);
+        assert!(
+            type_str.contains("AttributeType::Custom"),
+            "Integer with min/max should produce Custom type, got: {}",
+            type_str
+        );
+        assert!(
+            type_str.contains("Int(0..=32)"),
+            "Custom type name should include range, got: {}",
+            type_str
+        );
+        assert!(
+            type_str.contains("validate_ipv4_netmask_length_range"),
+            "Should reference range validation function, got: {}",
+            type_str
+        );
+    }
+
+    #[test]
+    fn test_integer_without_range_produces_plain_int() {
+        let prop = CfnProperty {
+            prop_type: Some(TypeValue::Single("integer".to_string())),
+            description: Some("Some integer value.".to_string()),
+            enum_values: None,
+            items: None,
+            ref_path: None,
+            insertion_order: None,
+            properties: None,
+            required: vec![],
+            minimum: None,
+            maximum: None,
+        };
+        let schema = CfnSchema {
+            type_name: "AWS::EC2::VPC".to_string(),
+            description: None,
+            properties: BTreeMap::new(),
+            required: vec![],
+            read_only_properties: vec![],
+            create_only_properties: vec![],
+            write_only_properties: vec![],
+            primary_identifier: None,
+            definitions: None,
+            tagging: None,
+        };
+        let (type_str, _) = cfn_type_to_carina_type_with_enum(&prop, "SomeCount", &schema);
+        assert_eq!(type_str, "AttributeType::Int");
+    }
+
+    #[test]
+    fn test_integer_with_only_minimum_produces_plain_int() {
+        // Only minimum set, no maximum - should remain plain Int
+        let prop = CfnProperty {
+            prop_type: Some(TypeValue::Single("integer".to_string())),
+            description: Some("Some integer value.".to_string()),
+            enum_values: None,
+            items: None,
+            ref_path: None,
+            insertion_order: None,
+            properties: None,
+            required: vec![],
+            minimum: Some(0),
+            maximum: None,
+        };
+        let schema = CfnSchema {
+            type_name: "AWS::EC2::VPC".to_string(),
+            description: None,
+            properties: BTreeMap::new(),
+            required: vec![],
+            read_only_properties: vec![],
+            create_only_properties: vec![],
+            write_only_properties: vec![],
+            primary_identifier: None,
+            definitions: None,
+            tagging: None,
+        };
+        let (type_str, _) = cfn_type_to_carina_type_with_enum(&prop, "SomeCount", &schema);
+        assert_eq!(type_str, "AttributeType::Int");
+    }
+
+    #[test]
+    fn test_type_display_string_ranged_int_markdown() {
+        let prop = CfnProperty {
+            prop_type: Some(TypeValue::Single("integer".to_string())),
+            description: Some("The netmask length.".to_string()),
+            enum_values: None,
+            items: None,
+            ref_path: None,
+            insertion_order: None,
+            properties: None,
+            required: vec![],
+            minimum: Some(0),
+            maximum: Some(32),
+        };
+        let schema = CfnSchema {
+            type_name: "AWS::EC2::VPC".to_string(),
+            description: None,
+            properties: BTreeMap::new(),
+            required: vec![],
+            read_only_properties: vec![],
+            create_only_properties: vec![],
+            write_only_properties: vec![],
+            primary_identifier: None,
+            definitions: None,
+            tagging: None,
+        };
+        let enums = BTreeMap::new();
+        let result = type_display_string("Ipv4NetmaskLength", &prop, &schema, &enums);
+        assert_eq!(result, "Int(0..=32)");
+    }
+
+    #[test]
+    fn test_number_with_range_produces_custom_type() {
+        // "number" type should also support range constraints
+        let prop = CfnProperty {
+            prop_type: Some(TypeValue::Single("number".to_string())),
+            description: Some("Port number.".to_string()),
+            enum_values: None,
+            items: None,
+            ref_path: None,
+            insertion_order: None,
+            properties: None,
+            required: vec![],
+            minimum: Some(0),
+            maximum: Some(65535),
+        };
+        let schema = CfnSchema {
+            type_name: "AWS::EC2::SecurityGroupIngress".to_string(),
+            description: None,
+            properties: BTreeMap::new(),
+            required: vec![],
+            read_only_properties: vec![],
+            create_only_properties: vec![],
+            write_only_properties: vec![],
+            primary_identifier: None,
+            definitions: None,
+            tagging: None,
+        };
+        let (type_str, _) = cfn_type_to_carina_type_with_enum(&prop, "FromPort", &schema);
+        assert!(
+            type_str.contains("Int(0..=65535)"),
+            "Number with range should include range in type name, got: {}",
+            type_str
         );
     }
 }
