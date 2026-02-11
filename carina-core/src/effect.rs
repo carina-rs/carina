@@ -17,7 +17,7 @@ pub enum Effect {
     /// Update an existing resource
     Update {
         id: ResourceId,
-        from: State,
+        from: Box<State>,
         to: Resource,
     },
 

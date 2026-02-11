@@ -220,7 +220,7 @@ impl AwsccProvider {
         name: &str,
         identifier: Option<&str>,
     ) -> ProviderResult<State> {
-        let id = ResourceId::new(resource_type, name);
+        let id = ResourceId::with_provider("awscc", resource_type, name);
 
         let config = get_schema_config(resource_type).ok_or_else(|| {
             ProviderError::new(format!("Unknown resource type: {}", resource_type))

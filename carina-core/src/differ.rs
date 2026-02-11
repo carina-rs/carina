@@ -17,7 +17,7 @@ pub enum Diff {
     /// Resource exists with differences -> needs update
     Update {
         id: ResourceId,
-        from: State,
+        from: Box<State>,
         to: Resource,
         changed_attributes: Vec<String>,
     },
@@ -47,7 +47,7 @@ pub fn diff(desired: &Resource, current: &State) -> Diff {
     } else {
         Diff::Update {
             id: desired.id.clone(),
-            from: current.clone(),
+            from: Box::new(current.clone()),
             to: desired.clone(),
             changed_attributes: changed,
         }

@@ -164,7 +164,7 @@ impl AwsProvider {
 
     /// Read an S3 bucket
     async fn read_s3_bucket(&self, name: &str) -> ProviderResult<State> {
-        let id = ResourceId::new("s3.bucket", name);
+        let id = ResourceId::with_provider("aws", "s3.bucket", name);
 
         match self.s3_client.head_bucket().bucket(name).send().await {
             Ok(_) => {
@@ -456,7 +456,7 @@ impl AwsProvider {
     async fn read_ec2_vpc(&self, name: &str) -> ProviderResult<State> {
         use aws_sdk_ec2::types::Filter;
 
-        let id = ResourceId::new("vpc", name);
+        let id = ResourceId::with_provider("aws", "vpc", name);
 
         let filter = Filter::builder().name("tag:Name").values(name).build();
 
@@ -744,7 +744,7 @@ impl AwsProvider {
     async fn read_ec2_subnet(&self, name: &str) -> ProviderResult<State> {
         use aws_sdk_ec2::types::Filter;
 
-        let id = ResourceId::new("subnet", name);
+        let id = ResourceId::with_provider("aws", "subnet", name);
 
         let filter = Filter::builder().name("tag:Name").values(name).build();
 
@@ -900,7 +900,7 @@ impl AwsProvider {
     async fn read_ec2_internet_gateway(&self, name: &str) -> ProviderResult<State> {
         use aws_sdk_ec2::types::Filter;
 
-        let id = ResourceId::new("internet_gateway", name);
+        let id = ResourceId::with_provider("aws", "internet_gateway", name);
 
         let filter = Filter::builder().name("tag:Name").values(name).build();
 
@@ -1101,7 +1101,7 @@ impl AwsProvider {
     async fn read_ec2_route_table(&self, name: &str) -> ProviderResult<State> {
         use aws_sdk_ec2::types::Filter;
 
-        let id = ResourceId::new("route_table", name);
+        let id = ResourceId::with_provider("aws", "route_table", name);
 
         let filter = Filter::builder().name("tag:Name").values(name).build();
 
@@ -1292,7 +1292,7 @@ impl AwsProvider {
         // Routes don't have a "name" in AWS - we use the name for identification
         // The actual route is identified by route_table_id + destination_cidr_block
         // For read, we return not_found since we can't look up by name alone
-        let id = ResourceId::new("route", name);
+        let id = ResourceId::with_provider("aws", "route", name);
         Ok(State::not_found(id))
     }
 
@@ -1303,7 +1303,7 @@ impl AwsProvider {
         route_table_id: &str,
         destination_cidr_block: &str,
     ) -> ProviderResult<State> {
-        let id = ResourceId::new("route", name);
+        let id = ResourceId::with_provider("aws", "route", name);
 
         // Describe the route table to get its routes
         let result = self
@@ -1485,7 +1485,7 @@ impl AwsProvider {
     async fn read_ec2_security_group(&self, name: &str) -> ProviderResult<State> {
         use aws_sdk_ec2::types::Filter;
 
-        let id = ResourceId::new("security_group", name);
+        let id = ResourceId::with_provider("aws", "security_group", name);
 
         let filter = Filter::builder().name("tag:Name").values(name).build();
 
@@ -1673,7 +1673,7 @@ impl AwsProvider {
         } else {
             "security_group.egress_rule"
         };
-        let id = ResourceId::new(resource_type, name);
+        let id = ResourceId::with_provider("aws", resource_type, name);
 
         let rules = self
             .find_security_group_rules_by_name(name, is_ingress)

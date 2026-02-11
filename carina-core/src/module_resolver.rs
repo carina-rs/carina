@@ -208,7 +208,11 @@ impl ModuleResolver {
 
             // Prefix the resource name with instance prefix
             let new_name = format!("{}_{}", instance_prefix, new_resource.id.name);
-            new_resource.id = ResourceId::new(&new_resource.id.resource_type, new_name.clone());
+            new_resource.id = ResourceId::with_provider(
+                &new_resource.id.provider,
+                &new_resource.id.resource_type,
+                new_name.clone(),
+            );
 
             // Update name attribute
             new_resource
