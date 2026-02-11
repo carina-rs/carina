@@ -8,6 +8,9 @@ use std::fmt;
 
 use crate::resource::Value;
 
+/// Type alias for resource validator functions
+pub type ResourceValidator = fn(&HashMap<String, Value>) -> Result<(), Vec<TypeError>>;
+
 /// A field within a Struct type
 #[derive(Debug, Clone)]
 pub struct StructField {
@@ -278,6 +281,51 @@ impl Value {
     }
 }
 
+/// Common validation patterns for resource schemas
+pub mod validators {
+    use super::*;
+
+    /// Helper function to validate that exactly one of the specified fields is present.
+    /// Returns `Ok(())` if exactly one field is present, `Err` otherwise.
+    ///
+    /// Use this in custom validator functions for mutually exclusive required fields.
+    ///
+    /// # Example
+    /// ```
+    /// use std::collections::HashMap;
+    /// use carina_core::resource::Value;
+    /// use carina_core::schema::{validators, TypeError};
+    ///
+    /// fn my_validator(attributes: &HashMap<String, Value>) -> Result<(), Vec<TypeError>> {
+    ///     validators::validate_exclusive_required(attributes, &["option_a", "option_b"])
+    /// }
+    /// ```
+    pub fn validate_exclusive_required(
+        attributes: &HashMap<String, Value>,
+        fields: &[&str],
+    ) -> Result<(), Vec<TypeError>> {
+        let present_fields: Vec<&str> = fields
+            .iter()
+            .filter(|&&name| attributes.contains_key(name))
+            .copied()
+            .collect();
+
+        match present_fields.len() {
+            0 => Err(vec![TypeError::ValidationFailed {
+                message: format!("Exactly one of [{}] must be specified", fields.join(", ")),
+            }]),
+            1 => Ok(()),
+            _ => Err(vec![TypeError::ValidationFailed {
+                message: format!(
+                    "Only one of [{}] can be specified, but found: {}",
+                    fields.join(", "),
+                    present_fields.join(", ")
+                ),
+            }]),
+        }
+    }
+}
+
 /// Completion value for LSP completions
 #[derive(Debug, Clone)]
 pub struct CompletionValue {
@@ -355,6 +403,9 @@ pub struct ResourceSchema {
     pub resource_type: String,
     pub attributes: HashMap<String, AttributeSchema>,
     pub description: Option<String>,
+    /// Optional validator function for cross-attribute validation
+    /// (e.g., mutually exclusive required fields)
+    pub validator: Option<ResourceValidator>,
 }
 
 impl ResourceSchema {
@@ -363,6 +414,7 @@ impl ResourceSchema {
             resource_type: resource_type.into(),
             attributes: HashMap::new(),
             description: None,
+            validator: None,
         }
     }
 
@@ -373,6 +425,11 @@ impl ResourceSchema {
 
     pub fn with_description(mut self, desc: impl Into<String>) -> Self {
         self.description = Some(desc.into());
+        self
+    }
+
+    pub fn with_validator(mut self, validator: ResourceValidator) -> Self {
+        self.validator = Some(validator);
         self
     }
 
@@ -395,6 +452,13 @@ impl ResourceSchema {
                 errors.push(e);
             }
             // Unknown attributes are allowed (for flexibility)
+        }
+
+        // Run custom validator if present
+        if let Some(validator) = self.validator
+            && let Err(mut validation_errors) = validator(attributes)
+        {
+            errors.append(&mut validation_errors);
         }
 
         if errors.is_empty() {
@@ -1008,5 +1072,133 @@ mod tests {
                 keyword
             );
         }
+    }
+
+    #[test]
+    fn resource_validator_called() {
+        fn my_validator(attributes: &HashMap<String, Value>) -> Result<(), Vec<TypeError>> {
+            if attributes.contains_key("forbidden") {
+                Err(vec![TypeError::ValidationFailed {
+                    message: "forbidden attribute not allowed".to_string(),
+                }])
+            } else {
+                Ok(())
+            }
+        }
+
+        let schema = ResourceSchema::new("test")
+            .attribute(AttributeSchema::new("name", AttributeType::String))
+            .attribute(AttributeSchema::new("forbidden", AttributeType::String))
+            .with_validator(my_validator);
+
+        // Valid: no forbidden attribute
+        let mut attrs = HashMap::new();
+        attrs.insert("name".to_string(), Value::String("test".to_string()));
+        assert!(schema.validate(&attrs).is_ok());
+
+        // Invalid: forbidden attribute present
+        let mut bad_attrs = HashMap::new();
+        bad_attrs.insert("forbidden".to_string(), Value::String("bad".to_string()));
+        let result = schema.validate(&bad_attrs);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().len(), 1);
+    }
+
+    #[test]
+    fn validate_exclusive_required_helper() {
+        use validators::validate_exclusive_required;
+
+        // Valid: exactly one field present
+        let mut attrs = HashMap::new();
+        attrs.insert("option_a".to_string(), Value::String("value".to_string()));
+        assert!(validate_exclusive_required(&attrs, &["option_a", "option_b"]).is_ok());
+
+        let mut attrs2 = HashMap::new();
+        attrs2.insert("option_b".to_string(), Value::String("value".to_string()));
+        assert!(validate_exclusive_required(&attrs2, &["option_a", "option_b"]).is_ok());
+
+        // Invalid: neither field present
+        let empty = HashMap::new();
+        let result = validate_exclusive_required(&empty, &["option_a", "option_b"]);
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert_eq!(errors.len(), 1);
+        assert!(
+            errors[0]
+                .to_string()
+                .contains("Exactly one of [option_a, option_b] must be specified")
+        );
+
+        // Invalid: both fields present
+        let mut both = HashMap::new();
+        both.insert("option_a".to_string(), Value::String("a".to_string()));
+        both.insert("option_b".to_string(), Value::String("b".to_string()));
+        let result = validate_exclusive_required(&both, &["option_a", "option_b"]);
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert_eq!(errors.len(), 1);
+        assert!(
+            errors[0]
+                .to_string()
+                .contains("Only one of [option_a, option_b] can be specified")
+        );
+        assert!(errors[0].to_string().contains("option_a, option_b"));
+    }
+
+    #[test]
+    fn exclusive_required_with_resource_schema() {
+        fn subnet_validator(attributes: &HashMap<String, Value>) -> Result<(), Vec<TypeError>> {
+            validators::validate_exclusive_required(
+                attributes,
+                &["cidr_block", "ipv4_ipam_pool_id"],
+            )
+        }
+
+        let schema = ResourceSchema::new("subnet")
+            .attribute(AttributeSchema::new("cidr_block", AttributeType::String))
+            .attribute(AttributeSchema::new(
+                "ipv4_ipam_pool_id",
+                AttributeType::String,
+            ))
+            .attribute(AttributeSchema::new("vpc_id", AttributeType::String).required())
+            .with_validator(subnet_validator);
+
+        // Valid: has cidr_block only
+        let mut attrs1 = HashMap::new();
+        attrs1.insert("vpc_id".to_string(), Value::String("vpc-123".to_string()));
+        attrs1.insert(
+            "cidr_block".to_string(),
+            Value::String("10.0.0.0/24".to_string()),
+        );
+        assert!(schema.validate(&attrs1).is_ok());
+
+        // Valid: has ipv4_ipam_pool_id only
+        let mut attrs2 = HashMap::new();
+        attrs2.insert("vpc_id".to_string(), Value::String("vpc-123".to_string()));
+        attrs2.insert(
+            "ipv4_ipam_pool_id".to_string(),
+            Value::String("ipam-pool-123".to_string()),
+        );
+        assert!(schema.validate(&attrs2).is_ok());
+
+        // Invalid: has neither
+        let mut attrs3 = HashMap::new();
+        attrs3.insert("vpc_id".to_string(), Value::String("vpc-123".to_string()));
+        let result = schema.validate(&attrs3);
+        assert!(result.is_err());
+
+        // Invalid: has both
+        let mut attrs4 = HashMap::new();
+        attrs4.insert("vpc_id".to_string(), Value::String("vpc-123".to_string()));
+        attrs4.insert(
+            "cidr_block".to_string(),
+            Value::String("10.0.0.0/24".to_string()),
+        );
+        attrs4.insert(
+            "ipv4_ipam_pool_id".to_string(),
+            Value::String("ipam-pool-123".to_string()),
+        );
+        let result = schema.validate(&attrs4);
+        assert!(result.is_err());
     }
 }

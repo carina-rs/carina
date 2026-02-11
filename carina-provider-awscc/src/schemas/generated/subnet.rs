@@ -6,7 +6,16 @@
 
 use super::AwsccSchemaConfig;
 use super::tags_type;
-use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField, types};
+use carina_core::resource::Value;
+use carina_core::schema::{
+    AttributeSchema, AttributeType, ResourceSchema, StructField, TypeError, types, validators,
+};
+use std::collections::HashMap;
+
+/// Validator for EC2 Subnet: requires exactly one of cidr_block or ipv4_ipam_pool_id
+fn validate_subnet(attributes: &HashMap<String, Value>) -> Result<(), Vec<TypeError>> {
+    validators::validate_exclusive_required(attributes, &["cidr_block", "ipv4_ipam_pool_id"])
+}
 
 /// Returns the schema config for ec2_subnet (AWS::EC2::Subnet)
 pub fn ec2_subnet_config() -> AwsccSchemaConfig {
@@ -134,5 +143,93 @@ pub fn ec2_subnet_config() -> AwsccSchemaConfig {
                 .with_description("The ID of the VPC the subnet is in. If you update this property, you must also update the ``CidrBlock`` property.")
                 .with_provider_name("VpcId"),
         )
+        .with_validator(validate_subnet)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_subnet_requires_cidr_or_ipam() {
+        let config = ec2_subnet_config();
+        let schema = config.schema;
+
+        // Valid: has cidr_block
+        let mut attrs1 = HashMap::new();
+        attrs1.insert(
+            "vpc_id".to_string(),
+            Value::String("vpc-12345678".to_string()),
+        );
+        attrs1.insert(
+            "cidr_block".to_string(),
+            Value::String("10.0.1.0/24".to_string()),
+        );
+        assert!(
+            schema.validate(&attrs1).is_ok(),
+            "Subnet with cidr_block should be valid"
+        );
+
+        // Valid: has ipv4_ipam_pool_id
+        let mut attrs2 = HashMap::new();
+        attrs2.insert(
+            "vpc_id".to_string(),
+            Value::String("vpc-12345678".to_string()),
+        );
+        attrs2.insert(
+            "ipv4_ipam_pool_id".to_string(),
+            Value::String("ipam-pool-0a1b2c3d4e5f6789a".to_string()),
+        );
+        assert!(
+            schema.validate(&attrs2).is_ok(),
+            "Subnet with ipv4_ipam_pool_id should be valid"
+        );
+
+        // Invalid: has neither cidr_block nor ipv4_ipam_pool_id
+        let mut attrs3 = HashMap::new();
+        attrs3.insert(
+            "vpc_id".to_string(),
+            Value::String("vpc-12345678".to_string()),
+        );
+        let result = schema.validate(&attrs3);
+        assert!(
+            result.is_err(),
+            "Subnet without cidr_block or ipv4_ipam_pool_id should be invalid"
+        );
+        let errors = result.unwrap_err();
+        assert_eq!(errors.len(), 1);
+        assert!(
+            errors[0]
+                .to_string()
+                .contains("Exactly one of [cidr_block, ipv4_ipam_pool_id] must be specified")
+        );
+
+        // Invalid: has both cidr_block and ipv4_ipam_pool_id
+        let mut attrs4 = HashMap::new();
+        attrs4.insert(
+            "vpc_id".to_string(),
+            Value::String("vpc-12345678".to_string()),
+        );
+        attrs4.insert(
+            "cidr_block".to_string(),
+            Value::String("10.0.1.0/24".to_string()),
+        );
+        attrs4.insert(
+            "ipv4_ipam_pool_id".to_string(),
+            Value::String("ipam-pool-0a1b2c3d4e5f6789a".to_string()),
+        );
+        let result = schema.validate(&attrs4);
+        assert!(
+            result.is_err(),
+            "Subnet with both cidr_block and ipv4_ipam_pool_id should be invalid"
+        );
+        let errors = result.unwrap_err();
+        assert_eq!(errors.len(), 1);
+        assert!(
+            errors[0]
+                .to_string()
+                .contains("Only one of [cidr_block, ipv4_ipam_pool_id] can be specified")
+        );
     }
 }
