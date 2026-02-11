@@ -94,7 +94,7 @@ for TYPE_NAME in "${RESOURCE_TYPES[@]}"; do
     fi
 done
 
-# Auto-generate SUMMARY.md
+# Auto-generate SUMMARY.md with service category grouping
 echo ""
 echo "Generating docs/src/SUMMARY.md"
 
@@ -108,9 +108,20 @@ cat > "docs/src/SUMMARY.md" << 'EOF'
 - [AWSCC Provider](providers/awscc/index.md)
 EOF
 
+# Group resources by service category
+PREV_SERVICE=""
 for TYPE_NAME in "${RESOURCE_TYPES[@]}"; do
+    # Extract service name (e.g., AWS::EC2::VPC -> EC2)
+    SERVICE=$(echo "$TYPE_NAME" | awk -F'::' '{print $2}')
     FULL_RESOURCE=$("$CODEGEN_BIN" --type-name "$TYPE_NAME" --print-full-resource-name)
-    echo "  - [awscc.${FULL_RESOURCE}](providers/awscc/${FULL_RESOURCE}.md)" >> "docs/src/SUMMARY.md"
+
+    # Write service category header when service changes
+    if [ "$SERVICE" != "$PREV_SERVICE" ]; then
+        echo "  - [${SERVICE}]()" >> "docs/src/SUMMARY.md"
+        PREV_SERVICE="$SERVICE"
+    fi
+
+    echo "    - [awscc.${FULL_RESOURCE}](providers/awscc/${FULL_RESOURCE}.md)" >> "docs/src/SUMMARY.md"
 done
 
 echo ""
