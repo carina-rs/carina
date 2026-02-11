@@ -144,6 +144,154 @@ pub fn validate_ipam_pool_id(id: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// ARN type (e.g., "arn:aws:s3:::my-bucket")
+pub fn arn() -> AttributeType {
+    AttributeType::Custom {
+        name: "Arn".to_string(),
+        base: Box::new(AttributeType::String),
+        validate: |value| {
+            if let Value::String(s) = value {
+                validate_arn(s)
+            } else {
+                Err("Expected string".to_string())
+            }
+        },
+        namespace: None,
+    }
+}
+
+pub fn validate_arn(arn: &str) -> Result<(), String> {
+    if !arn.starts_with("arn:") {
+        return Err(format!("Invalid ARN '{}': must start with 'arn:'", arn));
+    }
+    let parts: Vec<&str> = arn.splitn(6, ':').collect();
+    if parts.len() < 6 {
+        return Err(format!(
+            "Invalid ARN '{}': must have at least 6 colon-separated parts (arn:partition:service:region:account:resource)",
+            arn
+        ));
+    }
+    Ok(())
+}
+
+/// AWS resource ID type (e.g., "vpc-1a2b3c4d", "subnet-0123456789abcdef0")
+/// Validates format: {prefix}-{hex} where hex is 8+ hex digits
+pub fn aws_resource_id() -> AttributeType {
+    AttributeType::Custom {
+        name: "AwsResourceId".to_string(),
+        base: Box::new(AttributeType::String),
+        validate: |value| {
+            if let Value::String(s) = value {
+                validate_aws_resource_id(s)
+            } else {
+                Err("Expected string".to_string())
+            }
+        },
+        namespace: None,
+    }
+}
+
+pub fn validate_aws_resource_id(id: &str) -> Result<(), String> {
+    let Some(dash_pos) = id.find('-') else {
+        return Err(format!(
+            "Invalid resource ID '{}': expected format 'prefix-hexdigits'",
+            id
+        ));
+    };
+
+    let prefix = &id[..dash_pos];
+    let hex_part = &id[dash_pos + 1..];
+
+    if prefix.is_empty()
+        || !prefix
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+    {
+        return Err(format!(
+            "Invalid resource ID '{}': prefix must be lowercase alphanumeric",
+            id
+        ));
+    }
+
+    if hex_part.len() < 8 {
+        return Err(format!(
+            "Invalid resource ID '{}': ID part must be at least 8 characters after prefix",
+            id
+        ));
+    }
+
+    if !hex_part.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(format!(
+            "Invalid resource ID '{}': ID part must contain only hex digits",
+            id
+        ));
+    }
+
+    Ok(())
+}
+
+/// Availability Zone type (e.g., "us-east-1a", "ap-northeast-1c")
+/// Validates format: region + single letter zone identifier
+pub fn availability_zone() -> AttributeType {
+    AttributeType::Custom {
+        name: "AvailabilityZone".to_string(),
+        base: Box::new(AttributeType::String),
+        validate: |value| {
+            if let Value::String(s) = value {
+                validate_availability_zone(s)
+            } else {
+                Err("Expected string".to_string())
+            }
+        },
+        namespace: None,
+    }
+}
+
+pub fn validate_availability_zone(az: &str) -> Result<(), String> {
+    // Must end with a single lowercase letter (zone identifier)
+    let zone_letter = az.chars().last();
+    if !zone_letter.is_some_and(|c| c.is_ascii_lowercase()) {
+        return Err(format!(
+            "Invalid availability zone '{}': must end with a zone letter (a-z)",
+            az
+        ));
+    }
+
+    // Region part is everything except the last character
+    let region = &az[..az.len() - 1];
+
+    // Region must match pattern: lowercase-lowercase-digit
+    // e.g., "us-east-1", "ap-northeast-1", "eu-west-2"
+    let parts: Vec<&str> = region.split('-').collect();
+    if parts.len() < 3 {
+        return Err(format!(
+            "Invalid availability zone '{}': expected format like 'us-east-1a'",
+            az
+        ));
+    }
+
+    // Last part of region must be a number
+    let last = parts.last().unwrap();
+    if last.parse::<u8>().is_err() {
+        return Err(format!(
+            "Invalid availability zone '{}': region must end with a number",
+            az
+        ));
+    }
+
+    // All other parts must be lowercase alphabetic
+    for part in &parts[..parts.len() - 1] {
+        if part.is_empty() || !part.chars().all(|c| c.is_ascii_lowercase()) {
+            return Err(format!(
+                "Invalid availability zone '{}': expected format like 'us-east-1a'",
+                az
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 pub mod egress_only_internet_gateway;
 pub mod eip;
 pub mod flow_log;
@@ -194,4 +342,109 @@ pub fn configs() -> Vec<AwsccSchemaConfig> {
 /// Returns all generated schemas (for backward compatibility)
 pub fn schemas() -> Vec<ResourceSchema> {
     configs().into_iter().map(|c| c.schema).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_arn_valid() {
+        assert!(validate_arn("arn:aws:s3:::my-bucket").is_ok());
+        assert!(validate_arn("arn:aws:iam::123456789012:role/MyRole").is_ok());
+        assert!(validate_arn("arn:aws-cn:s3:::my-bucket").is_ok());
+        assert!(validate_arn("arn:aws:ec2:us-east-1:123456789012:vpc/vpc-1234").is_ok());
+    }
+
+    #[test]
+    fn validate_arn_invalid() {
+        assert!(validate_arn("not-an-arn").is_err());
+        assert!(validate_arn("arn:aws:s3").is_err());
+        assert!(validate_arn("arn:aws").is_err());
+        assert!(validate_arn("").is_err());
+    }
+
+    #[test]
+    fn validate_arn_type_with_value() {
+        let t = arn();
+        assert!(
+            t.validate(&Value::String("arn:aws:s3:::my-bucket".to_string()))
+                .is_ok()
+        );
+        assert!(
+            t.validate(&Value::String("not-an-arn".to_string()))
+                .is_err()
+        );
+        assert!(t.validate(&Value::Int(42)).is_err());
+        // ResourceRef should be accepted
+        assert!(
+            t.validate(&Value::ResourceRef("role".to_string(), "arn".to_string()))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn validate_aws_resource_id_valid() {
+        assert!(validate_aws_resource_id("vpc-1a2b3c4d").is_ok());
+        assert!(validate_aws_resource_id("subnet-0123456789abcdef0").is_ok());
+        assert!(validate_aws_resource_id("sg-12345678").is_ok());
+        assert!(validate_aws_resource_id("rtb-abcdef12").is_ok());
+        assert!(validate_aws_resource_id("eipalloc-0123456789abcdef0").is_ok());
+        assert!(validate_aws_resource_id("igw-12345678").is_ok());
+    }
+
+    #[test]
+    fn validate_aws_resource_id_invalid() {
+        assert!(validate_aws_resource_id("not-a-valid-id").is_err()); // hex part too short
+        assert!(validate_aws_resource_id("vpc").is_err()); // no dash
+        assert!(validate_aws_resource_id("vpc-short").is_err()); // hex part < 8
+        assert!(validate_aws_resource_id("vpc-1234567").is_err()); // only 7 chars
+        assert!(validate_aws_resource_id("VPC-12345678").is_err()); // uppercase prefix
+    }
+
+    #[test]
+    fn validate_aws_resource_id_type_with_value() {
+        let t = aws_resource_id();
+        assert!(
+            t.validate(&Value::String("vpc-1a2b3c4d".to_string()))
+                .is_ok()
+        );
+        assert!(t.validate(&Value::String("vpc".to_string())).is_err());
+        assert!(t.validate(&Value::Int(42)).is_err());
+        // ResourceRef should be accepted
+        assert!(
+            t.validate(&Value::ResourceRef(
+                "my_vpc".to_string(),
+                "vpc_id".to_string()
+            ))
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn validate_availability_zone_valid() {
+        assert!(validate_availability_zone("us-east-1a").is_ok());
+        assert!(validate_availability_zone("ap-northeast-1c").is_ok());
+        assert!(validate_availability_zone("eu-central-1b").is_ok());
+        assert!(validate_availability_zone("me-south-1a").is_ok());
+        assert!(validate_availability_zone("us-west-2d").is_ok());
+    }
+
+    #[test]
+    fn validate_availability_zone_invalid() {
+        assert!(validate_availability_zone("us-east-1").is_err()); // no zone letter
+        assert!(validate_availability_zone("US-EAST-1A").is_err()); // uppercase
+        assert!(validate_availability_zone("us-east").is_err()); // no number
+        assert!(validate_availability_zone("1a").is_err()); // too short
+        assert!(validate_availability_zone("").is_err()); // empty
+    }
+
+    #[test]
+    fn validate_availability_zone_type_with_value() {
+        let t = availability_zone();
+        assert!(t.validate(&Value::String("us-east-1a".to_string())).is_ok());
+        assert!(t.validate(&Value::String("us-east-1".to_string())).is_err());
+        assert!(t.validate(&Value::String("invalid".to_string())).is_err());
+        assert!(t.validate(&Value::Int(42)).is_err());
+    }
 }

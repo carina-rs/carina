@@ -90,7 +90,7 @@ pub fn ec2_vpc_config() -> AwsccSchemaConfig {
                 .with_provider_name("Tags"),
         )
         .attribute(
-            AttributeSchema::new("vpc_id", types::aws_resource_id())
+            AttributeSchema::new("vpc_id", super::aws_resource_id())
                 .with_description(" (read-only)")
                 .with_provider_name("VpcId"),
         )

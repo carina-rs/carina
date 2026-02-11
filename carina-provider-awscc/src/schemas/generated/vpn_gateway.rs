@@ -6,7 +6,7 @@
 
 use super::AwsccSchemaConfig;
 use super::tags_type;
-use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, types};
+use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
 /// Returns the schema config for ec2_vpn_gateway (AWS::EC2::VPNGateway)
 pub fn ec2_vpn_gateway_config() -> AwsccSchemaConfig {
@@ -33,7 +33,7 @@ pub fn ec2_vpn_gateway_config() -> AwsccSchemaConfig {
                 .with_provider_name("Type"),
         )
         .attribute(
-            AttributeSchema::new("vpn_gateway_id", types::aws_resource_id())
+            AttributeSchema::new("vpn_gateway_id", super::aws_resource_id())
                 .with_description(" (read-only)")
                 .with_provider_name("VPNGatewayId"),
         )

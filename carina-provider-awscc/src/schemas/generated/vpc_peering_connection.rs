@@ -6,7 +6,7 @@
 
 use super::AwsccSchemaConfig;
 use super::tags_type;
-use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, types};
+use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
 /// Returns the schema config for ec2_vpc_peering_connection (AWS::EC2::VPCPeeringConnection)
 pub fn ec2_vpc_peering_connection_config() -> AwsccSchemaConfig {
@@ -32,12 +32,12 @@ pub fn ec2_vpc_peering_connection_config() -> AwsccSchemaConfig {
                 .with_provider_name("PeerRegion"),
         )
         .attribute(
-            AttributeSchema::new("peer_role_arn", types::arn())
+            AttributeSchema::new("peer_role_arn", super::arn())
                 .with_description("The Amazon Resource Name (ARN) of the VPC peer role for the peering connection in another AWS account.")
                 .with_provider_name("PeerRoleArn"),
         )
         .attribute(
-            AttributeSchema::new("peer_vpc_id", types::aws_resource_id())
+            AttributeSchema::new("peer_vpc_id", super::aws_resource_id())
                 .required()
                 .with_description("The ID of the VPC with which you are creating the VPC peering connection. You must specify this parameter in the request.")
                 .with_provider_name("PeerVpcId"),
@@ -47,7 +47,7 @@ pub fn ec2_vpc_peering_connection_config() -> AwsccSchemaConfig {
                 .with_provider_name("Tags"),
         )
         .attribute(
-            AttributeSchema::new("vpc_id", types::aws_resource_id())
+            AttributeSchema::new("vpc_id", super::aws_resource_id())
                 .required()
                 .with_description("The ID of the VPC.")
                 .with_provider_name("VpcId"),

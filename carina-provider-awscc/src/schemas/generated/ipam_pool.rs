@@ -8,7 +8,7 @@ use super::AwsccSchemaConfig;
 use super::tags_type;
 use super::validate_namespaced_enum;
 use carina_core::resource::Value;
-use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField, types};
+use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
 
 const VALID_AWS_SERVICE: &[&str] = &["ec2", "global-services"];
 
@@ -91,7 +91,7 @@ pub fn ec2_ipam_pool_config() -> AwsccSchemaConfig {
                 .with_provider_name("AllocationResourceTags"),
         )
         .attribute(
-            AttributeSchema::new("arn", types::arn())
+            AttributeSchema::new("arn", super::arn())
                 .with_description("The Amazon Resource Name (ARN) of the IPAM Pool. (read-only)")
                 .with_provider_name("Arn"),
         )
@@ -115,7 +115,7 @@ pub fn ec2_ipam_pool_config() -> AwsccSchemaConfig {
                 .with_provider_name("Description"),
         )
         .attribute(
-            AttributeSchema::new("ipam_arn", types::arn())
+            AttributeSchema::new("ipam_arn", super::arn())
                 .with_description("The Amazon Resource Name (ARN) of the IPAM this pool is a part of. (read-only)")
                 .with_provider_name("IpamArn"),
         )
@@ -125,7 +125,7 @@ pub fn ec2_ipam_pool_config() -> AwsccSchemaConfig {
                 .with_provider_name("IpamPoolId"),
         )
         .attribute(
-            AttributeSchema::new("ipam_scope_arn", types::arn())
+            AttributeSchema::new("ipam_scope_arn", super::arn())
                 .with_description("The Amazon Resource Name (ARN) of the scope this pool is a part of. (read-only)")
                 .with_provider_name("IpamScopeArn"),
         )

@@ -22,7 +22,7 @@ pub fn ec2_subnet_config() -> AwsccSchemaConfig {
                 .with_provider_name("AssignIpv6AddressOnCreation"),
         )
         .attribute(
-            AttributeSchema::new("availability_zone", types::availability_zone())
+            AttributeSchema::new("availability_zone", super::availability_zone())
                 .with_description("The Availability Zone of the subnet. If you update this property, you must also update the ``CidrBlock`` property.")
                 .with_provider_name("AvailabilityZone"),
         )
@@ -102,7 +102,7 @@ pub fn ec2_subnet_config() -> AwsccSchemaConfig {
                 .with_provider_name("NetworkAclAssociationId"),
         )
         .attribute(
-            AttributeSchema::new("outpost_arn", types::arn())
+            AttributeSchema::new("outpost_arn", super::arn())
                 .with_description("The Amazon Resource Name (ARN) of the Outpost.")
                 .with_provider_name("OutpostArn"),
         )
@@ -119,7 +119,7 @@ pub fn ec2_subnet_config() -> AwsccSchemaConfig {
                 .with_provider_name("PrivateDnsNameOptionsOnLaunch"),
         )
         .attribute(
-            AttributeSchema::new("subnet_id", types::aws_resource_id())
+            AttributeSchema::new("subnet_id", super::aws_resource_id())
                 .with_description(" (read-only)")
                 .with_provider_name("SubnetId"),
         )
@@ -129,7 +129,7 @@ pub fn ec2_subnet_config() -> AwsccSchemaConfig {
                 .with_provider_name("Tags"),
         )
         .attribute(
-            AttributeSchema::new("vpc_id", types::aws_resource_id())
+            AttributeSchema::new("vpc_id", super::aws_resource_id())
                 .required()
                 .with_description("The ID of the VPC the subnet is in. If you update this property, you must also update the ``CidrBlock`` property.")
                 .with_provider_name("VpcId"),

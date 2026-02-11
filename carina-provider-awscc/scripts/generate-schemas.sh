@@ -223,6 +223,154 @@ pub fn validate_ipam_pool_id(id: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// ARN type (e.g., "arn:aws:s3:::my-bucket")
+pub fn arn() -> AttributeType {
+    AttributeType::Custom {
+        name: "Arn".to_string(),
+        base: Box::new(AttributeType::String),
+        validate: |value| {
+            if let Value::String(s) = value {
+                validate_arn(s)
+            } else {
+                Err("Expected string".to_string())
+            }
+        },
+        namespace: None,
+    }
+}
+
+pub fn validate_arn(arn: &str) -> Result<(), String> {
+    if !arn.starts_with("arn:") {
+        return Err(format!("Invalid ARN '{}': must start with 'arn:'", arn));
+    }
+    let parts: Vec<&str> = arn.splitn(6, ':').collect();
+    if parts.len() < 6 {
+        return Err(format!(
+            "Invalid ARN '{}': must have at least 6 colon-separated parts (arn:partition:service:region:account:resource)",
+            arn
+        ));
+    }
+    Ok(())
+}
+
+/// AWS resource ID type (e.g., "vpc-1a2b3c4d", "subnet-0123456789abcdef0")
+/// Validates format: {prefix}-{hex} where hex is 8+ hex digits
+pub fn aws_resource_id() -> AttributeType {
+    AttributeType::Custom {
+        name: "AwsResourceId".to_string(),
+        base: Box::new(AttributeType::String),
+        validate: |value| {
+            if let Value::String(s) = value {
+                validate_aws_resource_id(s)
+            } else {
+                Err("Expected string".to_string())
+            }
+        },
+        namespace: None,
+    }
+}
+
+pub fn validate_aws_resource_id(id: &str) -> Result<(), String> {
+    let Some(dash_pos) = id.find('-') else {
+        return Err(format!(
+            "Invalid resource ID '{}': expected format 'prefix-hexdigits'",
+            id
+        ));
+    };
+
+    let prefix = &id[..dash_pos];
+    let hex_part = &id[dash_pos + 1..];
+
+    if prefix.is_empty()
+        || !prefix
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+    {
+        return Err(format!(
+            "Invalid resource ID '{}': prefix must be lowercase alphanumeric",
+            id
+        ));
+    }
+
+    if hex_part.len() < 8 {
+        return Err(format!(
+            "Invalid resource ID '{}': ID part must be at least 8 characters after prefix",
+            id
+        ));
+    }
+
+    if !hex_part.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(format!(
+            "Invalid resource ID '{}': ID part must contain only hex digits",
+            id
+        ));
+    }
+
+    Ok(())
+}
+
+/// Availability Zone type (e.g., "us-east-1a", "ap-northeast-1c")
+/// Validates format: region + single letter zone identifier
+pub fn availability_zone() -> AttributeType {
+    AttributeType::Custom {
+        name: "AvailabilityZone".to_string(),
+        base: Box::new(AttributeType::String),
+        validate: |value| {
+            if let Value::String(s) = value {
+                validate_availability_zone(s)
+            } else {
+                Err("Expected string".to_string())
+            }
+        },
+        namespace: None,
+    }
+}
+
+pub fn validate_availability_zone(az: &str) -> Result<(), String> {
+    // Must end with a single lowercase letter (zone identifier)
+    let zone_letter = az.chars().last();
+    if !zone_letter.is_some_and(|c| c.is_ascii_lowercase()) {
+        return Err(format!(
+            "Invalid availability zone '{}': must end with a zone letter (a-z)",
+            az
+        ));
+    }
+
+    // Region part is everything except the last character
+    let region = &az[..az.len() - 1];
+
+    // Region must match pattern: lowercase-lowercase-digit
+    // e.g., "us-east-1", "ap-northeast-1", "eu-west-2"
+    let parts: Vec<&str> = region.split('-').collect();
+    if parts.len() < 3 {
+        return Err(format!(
+            "Invalid availability zone '{}': expected format like 'us-east-1a'",
+            az
+        ));
+    }
+
+    // Last part of region must be a number
+    let last = parts.last().unwrap();
+    if last.parse::<u8>().is_err() {
+        return Err(format!(
+            "Invalid availability zone '{}': region must end with a number",
+            az
+        ));
+    }
+
+    // All other parts must be lowercase alphabetic
+    for part in &parts[..parts.len() - 1] {
+        if part.is_empty() || !part.chars().all(|c| c.is_ascii_lowercase()) {
+            return Err(format!(
+                "Invalid availability zone '{}': expected format like 'us-east-1a'",
+                az
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 EOF
 
 # Add module declarations
