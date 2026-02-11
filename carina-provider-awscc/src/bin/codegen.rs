@@ -222,10 +222,10 @@ struct StructDefInfo {
 /// Display string for List element types based on items property type
 fn list_element_type_display(items: &CfnProperty) -> String {
     match items.prop_type.as_ref().and_then(|t| t.as_str()) {
-        Some("string") => "List<String>".to_string(),
-        Some("integer") | Some("number") => "List<Int>".to_string(),
-        Some("boolean") => "List<Bool>".to_string(),
-        _ => "List<String>".to_string(),
+        Some("string") => "`List<String>`".to_string(),
+        Some("integer") | Some("number") => "`List<Int>`".to_string(),
+        Some("boolean") => "`List<Bool>`".to_string(),
+        _ => "`List<String>`".to_string(),
     }
 }
 
@@ -306,16 +306,16 @@ fn type_display_string(
                             {
                                 format!("[List\\<{}\\>](#{})", def_name, def_name.to_lowercase())
                             } else {
-                                "List<String>".to_string()
+                                "`List<String>`".to_string()
                             }
                         } else {
-                            "List<Map>".to_string()
+                            "`List<Map>`".to_string()
                         }
                     } else {
                         list_element_type_display(items)
                     }
                 } else {
-                    "List<String>".to_string()
+                    "`List<String>`".to_string()
                 }
             }
             Some("object") => {
@@ -474,7 +474,7 @@ fn generate_markdown(schema: &CfnSchema, type_name: &str) -> Result<String> {
                             if let Some(items) = &field_prop.items {
                                 list_element_type_display(items)
                             } else {
-                                "List<String>".to_string()
+                                "`List<String>`".to_string()
                             }
                         }
                         Some("object") => "Map".to_string(),
@@ -1537,7 +1537,7 @@ mod tests {
             properties: None,
             required: vec![],
         };
-        assert_eq!(list_element_type_display(&prop), "List<String>");
+        assert_eq!(list_element_type_display(&prop), "`List<String>`");
 
         // Integer items
         let prop = CfnProperty {
@@ -1550,7 +1550,7 @@ mod tests {
             properties: None,
             required: vec![],
         };
-        assert_eq!(list_element_type_display(&prop), "List<Int>");
+        assert_eq!(list_element_type_display(&prop), "`List<Int>`");
 
         // Boolean items
         let prop = CfnProperty {
@@ -1563,7 +1563,7 @@ mod tests {
             properties: None,
             required: vec![],
         };
-        assert_eq!(list_element_type_display(&prop), "List<Bool>");
+        assert_eq!(list_element_type_display(&prop), "`List<Bool>`");
 
         // No type (fallback)
         let prop = CfnProperty {
@@ -1576,7 +1576,7 @@ mod tests {
             properties: None,
             required: vec![],
         };
-        assert_eq!(list_element_type_display(&prop), "List<String>");
+        assert_eq!(list_element_type_display(&prop), "`List<String>`");
     }
 
     #[test]
@@ -1616,7 +1616,7 @@ mod tests {
         let enums = BTreeMap::new();
         assert_eq!(
             type_display_string("ResourceTags", &prop, &schema, &enums),
-            "List<Map>"
+            "`List<Map>`"
         );
     }
 
@@ -1657,7 +1657,7 @@ mod tests {
         let enums = BTreeMap::new();
         assert_eq!(
             type_display_string("Items", &prop, &schema, &enums),
-            "List<String>"
+            "`List<String>`"
         );
     }
 
@@ -1689,7 +1689,7 @@ mod tests {
         let enums = BTreeMap::new();
         assert_eq!(
             type_display_string("SomeList", &prop, &schema, &enums),
-            "List<String>"
+            "`List<String>`"
         );
     }
 
