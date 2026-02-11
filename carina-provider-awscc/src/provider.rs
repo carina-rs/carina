@@ -206,7 +206,7 @@ impl AwsccProvider {
             }
         }
 
-        Err(ProviderError::new("Operation timed out"))
+        Err(ProviderError::new("Operation timed out").timeout())
     }
 
     // =========================================================================

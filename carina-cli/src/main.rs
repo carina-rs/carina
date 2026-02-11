@@ -1505,20 +1505,131 @@ async fn run_destroy(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
     println!("{}", "Destroying resources...".red().bold());
     println!();
 
+    // Build reverse dependency map for wait-for-completion logic
+    let dependents_map = build_dependents_map(&resources_to_destroy);
+
     let mut success_count = 0;
     let mut failure_count = 0;
+    let mut skip_count = 0;
     let mut destroyed_ids: Vec<ResourceId> = Vec::new();
+    let mut failed_bindings: HashSet<String> = HashSet::new();
+    // timed_out_resources: binding -> (ResourceId, identifier)
+    let mut timed_out_resources: HashMap<String, (ResourceId, String)> = HashMap::new();
 
     for resource in &resources_to_destroy {
         let effect = Effect::Delete(resource.id.clone());
+
+        let binding = resource
+            .attributes
+            .get("_binding")
+            .and_then(|v| match v {
+                Value::String(s) => Some(s.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| format!("{}:{}", resource.id.resource_type, resource.id.name));
 
         // Get identifier from current state
         let identifier = current_states
             .get(&resource.id)
             .and_then(|s| s.identifier.as_deref())
-            .unwrap_or("");
+            .unwrap_or("")
+            .to_string();
 
-        let delete_result = provider.delete(&resource.id, identifier).await;
+        // Check if any dependent has actually failed (non-timeout)
+        if let Some(failed_dep) = find_failed_dependent(&binding, &dependents_map, &failed_bindings)
+        {
+            println!(
+                "  {} {} - skipped (dependent {} failed)",
+                "⊘".yellow(),
+                format_effect(&effect),
+                failed_dep
+            );
+            skip_count += 1;
+            continue;
+        }
+
+        // Check if any dependent timed out — wait for it to complete
+        let timed_out_deps: Vec<String> = dependents_map
+            .get(&binding)
+            .map(|deps| {
+                deps.iter()
+                    .filter(|d| timed_out_resources.contains_key(d.as_str()))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let mut wait_failed = false;
+        for dep_binding in &timed_out_deps {
+            if let Some((dep_id, dep_identifier)) = timed_out_resources.remove(dep_binding.as_str())
+            {
+                println!(
+                    "  {} Waiting for {}.{} to be deleted...",
+                    "⏳".yellow(),
+                    dep_id.resource_type,
+                    dep_id.name
+                );
+
+                let mut completed = false;
+                for _ in 0..180 {
+                    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                    match provider.read(&dep_id, Some(&dep_identifier)).await {
+                        Ok(state) if !state.exists => {
+                            println!(
+                                "  {} Delete {}.{} (completed after extended wait)",
+                                "✓".green(),
+                                dep_id.resource_type,
+                                dep_id.name
+                            );
+                            destroyed_ids.push(dep_id.clone());
+                            success_count += 1;
+                            completed = true;
+                            break;
+                        }
+                        Ok(_) => {
+                            // Still exists, keep waiting
+                        }
+                        Err(_) => {
+                            // Read error — resource may be gone, treat as completed
+                            println!(
+                                "  {} Delete {}.{} (completed after extended wait)",
+                                "✓".green(),
+                                dep_id.resource_type,
+                                dep_id.name
+                            );
+                            destroyed_ids.push(dep_id.clone());
+                            success_count += 1;
+                            completed = true;
+                            break;
+                        }
+                    }
+                }
+
+                if !completed {
+                    println!(
+                        "  {} {}.{} - still exists after extended wait",
+                        "✗".red(),
+                        dep_id.resource_type,
+                        dep_id.name
+                    );
+                    failed_bindings.insert(dep_binding.clone());
+                    failure_count += 1;
+                    wait_failed = true;
+                }
+            }
+        }
+
+        if wait_failed {
+            println!(
+                "  {} {} - skipped (dependent deletion did not complete)",
+                "⊘".yellow(),
+                format_effect(&effect)
+            );
+            skip_count += 1;
+            continue;
+        }
+
+        let delete_result = provider.delete(&resource.id, &identifier).await;
 
         match delete_result {
             Ok(()) => {
@@ -1526,10 +1637,73 @@ async fn run_destroy(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
                 success_count += 1;
                 destroyed_ids.push(resource.id.clone());
             }
+            Err(e) if e.is_timeout => {
+                println!(
+                    "  {} {} - Operation timed out, waiting for completion...",
+                    "⏳".yellow(),
+                    format_effect(&effect)
+                );
+                timed_out_resources
+                    .insert(binding.clone(), (resource.id.clone(), identifier.clone()));
+            }
             Err(e) => {
                 println!("  {} {} - {}", "✗".red(), format_effect(&effect), e);
                 failure_count += 1;
+                failed_bindings.insert(binding.clone());
             }
+        }
+    }
+
+    // Handle any remaining timed-out resources that no parent waited on
+    for (dep_binding, (dep_id, dep_identifier)) in &timed_out_resources {
+        println!(
+            "  {} Waiting for {}.{} to be deleted...",
+            "⏳".yellow(),
+            dep_id.resource_type,
+            dep_id.name
+        );
+
+        let mut completed = false;
+        for _ in 0..180 {
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            match provider.read(dep_id, Some(dep_identifier)).await {
+                Ok(state) if !state.exists => {
+                    println!(
+                        "  {} Delete {}.{} (completed after extended wait)",
+                        "✓".green(),
+                        dep_id.resource_type,
+                        dep_id.name
+                    );
+                    destroyed_ids.push(dep_id.clone());
+                    success_count += 1;
+                    completed = true;
+                    break;
+                }
+                Ok(_) => {}
+                Err(_) => {
+                    println!(
+                        "  {} Delete {}.{} (completed after extended wait)",
+                        "✓".green(),
+                        dep_id.resource_type,
+                        dep_id.name
+                    );
+                    destroyed_ids.push(dep_id.clone());
+                    success_count += 1;
+                    completed = true;
+                    break;
+                }
+            }
+        }
+
+        if !completed {
+            println!(
+                "  {} {}.{} - still exists after extended wait",
+                "✗".red(),
+                dep_id.resource_type,
+                dep_id.name
+            );
+            failed_bindings.insert(dep_binding.clone());
+            failure_count += 1;
         }
     }
 
@@ -1563,7 +1737,7 @@ async fn run_destroy(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
     }
 
     println!();
-    if failure_count == 0 {
+    if failure_count == 0 && skip_count == 0 {
         println!(
             "{}",
             format!("Destroy complete! {} resources destroyed.", success_count)
@@ -1573,8 +1747,8 @@ async fn run_destroy(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
         Ok(())
     } else {
         Err(format!(
-            "Destroy failed. {} succeeded, {} failed.",
-            success_count, failure_count
+            "Destroy failed. {} succeeded, {} failed, {} skipped.",
+            success_count, failure_count, skip_count
         ))
     }
 }
@@ -2837,6 +3011,53 @@ fn find_crn_files_in_dir(dir: &PathBuf) -> Result<Vec<PathBuf>, String> {
     Ok(files)
 }
 
+/// Build a reverse dependency map: for each binding, which bindings depend on it.
+/// If resource A depends on resource B, then `dependents_map["b"]` contains "a".
+fn build_dependents_map(resources: &[&Resource]) -> HashMap<String, HashSet<String>> {
+    let mut dependents_map: HashMap<String, HashSet<String>> = HashMap::new();
+    for resource in resources {
+        let binding = resource
+            .attributes
+            .get("_binding")
+            .and_then(|v| match v {
+                Value::String(s) => Some(s.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| format!("{}:{}", resource.id.resource_type, resource.id.name));
+
+        let deps = get_resource_dependencies(resource);
+        for dep in deps {
+            dependents_map
+                .entry(dep)
+                .or_default()
+                .insert(binding.clone());
+        }
+    }
+    dependents_map
+}
+
+/// Check if any dependent of the given binding has failed (is in failed_bindings).
+/// Returns the first failed dependent found, if any.
+fn find_failed_dependent<'a>(
+    binding: &str,
+    dependents_map: &'a HashMap<String, HashSet<String>>,
+    failed_bindings: &'a HashSet<String>,
+) -> Option<&'a String> {
+    // Check direct dependents
+    if let Some(dependents) = dependents_map.get(binding) {
+        for dep in dependents {
+            if failed_bindings.contains(dep) {
+                return Some(dep);
+            }
+            // Check transitive: if a dependent of this binding has a dependent that failed
+            if let Some(failed) = find_failed_dependent(dep, dependents_map, failed_bindings) {
+                return Some(failed);
+            }
+        }
+    }
+    None
+}
+
 fn print_diff(file: &Path, original: &str, formatted: &str) {
     println!("\n{} {}:", "Diff for".cyan().bold(), file.display());
 
@@ -2848,5 +3069,95 @@ fn print_diff(file: &Path, original: &str, formatted: &str) {
             ChangeTag::Equal => " ".normal(),
         };
         print!("{}{}", sign, change);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_resource(binding: &str, deps: &[&str]) -> Resource {
+        let mut r = Resource::new("test", binding);
+        r.attributes
+            .insert("_binding".to_string(), Value::String(binding.to_string()));
+        for dep in deps {
+            r.attributes.insert(
+                format!("ref_{}", dep),
+                Value::ResourceRef(dep.to_string(), "id".to_string()),
+            );
+        }
+        r
+    }
+
+    #[test]
+    fn test_build_dependents_map() {
+        // A depends on B
+        let a = make_resource("a", &["b"]);
+        let b = make_resource("b", &[]);
+        let resources: Vec<&Resource> = vec![&a, &b];
+
+        let map = build_dependents_map(&resources);
+
+        // b's dependents should contain "a"
+        assert!(map.get("b").unwrap().contains("a"));
+        // a should have no dependents
+        assert!(!map.contains_key("a"));
+    }
+
+    #[test]
+    fn test_find_failed_dependent() {
+        let mut dependents_map: HashMap<String, HashSet<String>> = HashMap::new();
+        dependents_map
+            .entry("b".to_string())
+            .or_default()
+            .insert("a".to_string());
+
+        let mut failed_bindings = HashSet::new();
+        failed_bindings.insert("a".to_string());
+
+        // b has a dependent (a) that failed
+        let result = find_failed_dependent("b", &dependents_map, &failed_bindings);
+        assert_eq!(result, Some(&"a".to_string()));
+    }
+
+    #[test]
+    fn test_find_failed_dependent_none() {
+        let mut dependents_map: HashMap<String, HashSet<String>> = HashMap::new();
+        dependents_map
+            .entry("b".to_string())
+            .or_default()
+            .insert("a".to_string());
+
+        let failed_bindings: HashSet<String> = HashSet::new();
+
+        // No failed dependents
+        let result = find_failed_dependent("b", &dependents_map, &failed_bindings);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_transitive_chain() {
+        // A depends on B, B depends on C
+        // dependents_map: c -> {b}, b -> {a}
+        let mut dependents_map: HashMap<String, HashSet<String>> = HashMap::new();
+        dependents_map
+            .entry("c".to_string())
+            .or_default()
+            .insert("b".to_string());
+        dependents_map
+            .entry("b".to_string())
+            .or_default()
+            .insert("a".to_string());
+
+        let mut failed_bindings = HashSet::new();
+        failed_bindings.insert("a".to_string());
+
+        // a failed -> b is blocked (a is a direct dependent of b)
+        let result = find_failed_dependent("b", &dependents_map, &failed_bindings);
+        assert_eq!(result, Some(&"a".to_string()));
+
+        // a failed -> c is also blocked (transitively through b -> a)
+        let result = find_failed_dependent("c", &dependents_map, &failed_bindings);
+        assert_eq!(result, Some(&"a".to_string()));
     }
 }
