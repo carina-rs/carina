@@ -70,7 +70,7 @@ pub fn logs_log_group_config() -> AwsccSchemaConfig {
                 .with_provider_name("LogGroupName"),
         )
         .attribute(
-            AttributeSchema::new("resource_policy_document", AttributeType::Map(Box::new(AttributeType::String)))
+            AttributeSchema::new("resource_policy_document", super::iam_policy_document())
                 .with_description("Creates or updates a resource policy for the specified log group that allows other services to put log events to this account. A LogGroup can have 1 r...")
                 .with_provider_name("ResourcePolicyDocument"),
         )

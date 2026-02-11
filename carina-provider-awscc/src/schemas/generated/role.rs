@@ -22,7 +22,7 @@ pub fn iam_role_config() -> AwsccSchemaConfig {
                 .with_provider_name("Arn"),
         )
         .attribute(
-            AttributeSchema::new("assume_role_policy_document", AttributeType::Map(Box::new(AttributeType::String)))
+            AttributeSchema::new("assume_role_policy_document", super::iam_policy_document())
                 .required()
                 .with_description("The trust policy that is associated with this role. Trust policies define which entities can assume the role. You can associate only one trust policy ...")
                 .with_provider_name("AssumeRolePolicyDocument"),

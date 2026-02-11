@@ -54,7 +54,7 @@ The name of the log group. If you don't specify a name, CFNlong generates a uniq
 
 ### `resource_policy_document`
 
-- **Type:** Map
+- **Type:** IamPolicyDocument
 - **Required:** No
 
 Creates or updates a resource policy for the specified log group that allows other services to put log events to this account. A LogGroup can have 1 resource policy.

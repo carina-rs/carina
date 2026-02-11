@@ -1,10 +1,7 @@
 # EC2 Flow Log - CloudWatch Logs destination test
 #
 # Tests: log_destination_type=cloud-watch-logs, log_group_name,
-#        deliver_logs_permission_arn
-#
-# validate-only: Requires IAM role and CloudWatch log group that cannot
-# be created with current awscc resource types.
+#        deliver_logs_permission_arn, IAM role with nested policy document
 
 provider awscc {
   region = aws.Region.ap_northeast_1
@@ -15,14 +12,35 @@ let vpc = awscc.ec2_vpc {
   cidr_block = "10.0.0.0/16"
 }
 
+let log_group = awscc.logs_log_group {
+  name              = "acceptance-test-log-group-flowlog-cw"
+  log_group_name    = "/acceptance-test/vpc-flow-logs"
+  retention_in_days = 1
+}
+
+let flow_log_role = awscc.iam_role {
+  name      = "acceptance-test-flow-log-role"
+  role_name = "acceptance-test-flow-log-role"
+  assume_role_policy_document = {
+    version = "2012-10-17"
+    statement = [
+      {
+        effect    = "Allow"
+        principal = { service = "vpc-flow-logs.amazonaws.com" }
+        action    = "sts:AssumeRole"
+      }
+    ]
+  }
+}
+
 awscc.ec2_flow_log {
   name                        = "acceptance-test-flowlog-cw"
   resource_id                 = vpc.vpc_id
   resource_type               = VPC
   traffic_type                = ALL
   log_destination_type        = cloud_watch_logs
-  log_group_name              = "/acceptance-test/vpc-flow-logs"
-  deliver_logs_permission_arn = "arn:aws:iam::123456789012:role/acceptance-test-flow-log-role"
+  log_group_name              = log_group.log_group_name
+  deliver_logs_permission_arn = flow_log_role.arn
 
   tags = {
     Environment = "acceptance-test"

@@ -564,6 +564,60 @@ pub fn validate_availability_zone(az: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// IAM Policy Document type
+/// Validates the structure of IAM policy documents (trust policies, inline policies, etc.)
+pub fn iam_policy_document() -> AttributeType {
+    AttributeType::Custom {
+        name: "IamPolicyDocument".to_string(),
+        base: Box::new(AttributeType::Map(Box::new(AttributeType::String))),
+        validate: |value| validate_iam_policy_document(value),
+        namespace: None,
+    }
+}
+
+pub fn validate_iam_policy_document(value: &Value) -> Result<(), String> {
+    let Value::Map(map) = value else {
+        return Err("Expected a map for IAM policy document".to_string());
+    };
+
+    // Check Version if present
+    if let Some(Value::String(v)) = map.get("version")
+        && v != "2012-10-17"
+        && v != "2008-10-17"
+    {
+        return Err(format!(
+            "Invalid policy document Version '{}', expected '2012-10-17' or '2008-10-17'",
+            v
+        ));
+    }
+
+    // Check Statement if present
+    if let Some(statement) = map.get("statement") {
+        let Value::List(statements) = statement else {
+            return Err("Policy document 'statement' must be a list".to_string());
+        };
+
+        for (i, stmt) in statements.iter().enumerate() {
+            let Value::Map(stmt_map) = stmt else {
+                return Err(format!("Statement[{}] must be a map", i));
+            };
+
+            // Validate Effect if present
+            if let Some(Value::String(e)) = stmt_map.get("effect")
+                && e != "Allow"
+                && e != "Deny"
+            {
+                return Err(format!(
+                    "Statement[{}] has invalid Effect '{}', expected 'Allow' or 'Deny'",
+                    i, e
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
 EOF
 
 # Add module declarations
@@ -849,6 +903,75 @@ mod tests {
         assert!(t
             .validate(&Value::String("vpce-12345678".to_string()))
             .is_ok());
+    }
+
+    #[test]
+    fn validate_iam_policy_document_valid() {
+        let doc = Value::Map(
+            vec![
+                ("version".to_string(), Value::String("2012-10-17".to_string())),
+                ("statement".to_string(), Value::List(vec![
+                    Value::Map(
+                        vec![
+                            ("effect".to_string(), Value::String("Allow".to_string())),
+                            ("principal".to_string(), Value::Map(
+                                vec![("service".to_string(), Value::String("ec2.amazonaws.com".to_string()))]
+                                    .into_iter().collect()
+                            )),
+                            ("action".to_string(), Value::String("sts:AssumeRole".to_string())),
+                        ].into_iter().collect()
+                    ),
+                ])),
+            ].into_iter().collect()
+        );
+        assert!(validate_iam_policy_document(&doc).is_ok());
+    }
+
+    #[test]
+    fn validate_iam_policy_document_invalid_version() {
+        let doc = Value::Map(
+            vec![
+                ("version".to_string(), Value::String("2023-01-01".to_string())),
+            ].into_iter().collect()
+        );
+        let result = validate_iam_policy_document(&doc);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("2012-10-17"));
+    }
+
+    #[test]
+    fn validate_iam_policy_document_invalid_effect() {
+        let doc = Value::Map(
+            vec![
+                ("statement".to_string(), Value::List(vec![
+                    Value::Map(
+                        vec![
+                            ("effect".to_string(), Value::String("Maybe".to_string())),
+                        ].into_iter().collect()
+                    ),
+                ])),
+            ].into_iter().collect()
+        );
+        let result = validate_iam_policy_document(&doc);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Maybe"));
+    }
+
+    #[test]
+    fn validate_iam_policy_document_not_a_map() {
+        let result = validate_iam_policy_document(&Value::String("not a map".to_string()));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Expected a map"));
+    }
+
+    #[test]
+    fn validate_iam_policy_document_type_with_resource_ref() {
+        let t = iam_policy_document();
+        // ResourceRef should be accepted (via Custom type handling in schema.rs)
+        assert!(
+            t.validate(&Value::ResourceRef("role".to_string(), "policy".to_string()))
+                .is_ok()
+        );
     }
 
     #[test]

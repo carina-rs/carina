@@ -360,6 +360,8 @@ fn type_display_string(
                     && !props.is_empty()
                 {
                     format!("[Struct({})](#{})", prop_name, prop_name.to_lowercase())
+                } else if prop_name.ends_with("PolicyDocument") {
+                    "IamPolicyDocument".to_string()
                 } else {
                     "Map".to_string()
                 }
@@ -1365,6 +1367,10 @@ fn cfn_type_to_carina_type_with_enum(
                     generate_struct_type(prop_name, props, &prop.required, schema),
                     None,
                 );
+            }
+            // Check if this is an IAM policy document
+            if prop_name.ends_with("PolicyDocument") {
+                return ("super::iam_policy_document()".to_string(), None);
             }
             (
                 "AttributeType::Map(Box::new(AttributeType::String))".to_string(),
