@@ -73,7 +73,7 @@ Shorthand formats: `default` or `InstanceTenancy.default`
 
 ### `cidr_block_associations`
 
-- **Type:** `List<String>`
+- **Type:** `List<Ipv4Cidr>`
 
 ### `default_network_acl`
 
@@ -85,7 +85,7 @@ Shorthand formats: `default` or `InstanceTenancy.default`
 
 ### `ipv6_cidr_blocks`
 
-- **Type:** `List<String>`
+- **Type:** `List<Ipv6Cidr>`
 
 ### `vpc_id`
 

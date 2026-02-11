@@ -151,7 +151,7 @@ The ID of the VPC the subnet is in. If you update this property, you must also u
 
 ### `ipv6_cidr_blocks`
 
-- **Type:** `List<String>`
+- **Type:** `List<Ipv6Cidr>`
 
 ### `network_acl_association_id`
 

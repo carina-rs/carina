@@ -107,6 +107,23 @@ impl TypeValue {
     }
 }
 
+/// Enum value can be a string or an integer in JSON Schema
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum EnumValue {
+    Str(String),
+    Int(i64),
+}
+
+impl EnumValue {
+    fn to_string_value(&self) -> String {
+        match self {
+            EnumValue::Str(s) => s.clone(),
+            EnumValue::Int(i) => i.to_string(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[allow(dead_code)]
@@ -115,7 +132,7 @@ struct CfnProperty {
     prop_type: Option<TypeValue>,
     description: Option<String>,
     #[serde(rename = "enum")]
-    enum_values: Option<Vec<String>>,
+    enum_values: Option<Vec<EnumValue>>,
     items: Option<Box<CfnProperty>>,
     #[serde(rename = "$ref")]
     ref_path: Option<String>,
@@ -219,13 +236,64 @@ struct StructDefInfo {
     required: Vec<String>,
 }
 
-/// Display string for List element types based on items property type
-fn list_element_type_display(items: &CfnProperty) -> String {
+/// Display string for List element types based on items property type and property name.
+/// The `prop_name` is used for name-based type inference (e.g., SubnetIds -> `List<SubnetId>`).
+fn list_element_type_display(items: &CfnProperty, prop_name: &str) -> String {
     match items.prop_type.as_ref().and_then(|t| t.as_str()) {
-        Some("string") => "`List<String>`".to_string(),
+        Some("string") => {
+            let element_type = infer_string_type_display(prop_name);
+            format!("`List<{}>`", element_type)
+        }
         Some("integer") | Some("number") => "`List<Int>`".to_string(),
         Some("boolean") => "`List<Bool>`".to_string(),
         _ => "`List<String>`".to_string(),
+    }
+}
+
+/// Infer a display type name for a string property based on its name.
+/// Used by both scalar `type_display_string()` and `list_element_type_display()`.
+/// Handles both singular (e.g., "SubnetId") and plural (e.g., "SubnetIds") property names.
+fn infer_string_type_display(prop_name: &str) -> String {
+    // Normalize plural forms to singular for type inference
+    // e.g., "SubnetIds" -> "SubnetId", "CidrBlocks" -> "CidrBlock"
+    let singular_name = if prop_name.ends_with("Ids")
+        || prop_name.ends_with("ids")
+        || prop_name.ends_with("Arns")
+        || prop_name.ends_with("arns")
+    {
+        &prop_name[..prop_name.len() - 1]
+    } else {
+        prop_name
+    };
+    let prop_lower = singular_name.to_lowercase();
+    if prop_lower.contains("cidr") {
+        if prop_lower.contains("ipv6") {
+            "Ipv6Cidr".to_string()
+        } else {
+            "Ipv4Cidr".to_string()
+        }
+    } else if (prop_lower.contains("ipaddress")
+        || prop_lower.ends_with("ip")
+        || prop_lower.contains("ipaddresses"))
+        && !prop_lower.contains("cidr")
+        && !prop_lower.contains("count")
+        && !prop_lower.contains("type")
+    {
+        if prop_lower.contains("ipv6") {
+            "Ipv6Address".to_string()
+        } else {
+            "Ipv4Address".to_string()
+        }
+    } else if prop_lower == "availabilityzone" || prop_lower == "availabilityzones" {
+        "AvailabilityZone".to_string()
+    } else if prop_lower.ends_with("arn") || prop_lower.contains("_arn") {
+        "Arn".to_string()
+    } else if is_ipam_pool_id_property(singular_name) {
+        "IpamPoolId".to_string()
+    } else if is_aws_resource_id_property(singular_name) {
+        get_resource_id_display_name(singular_name).to_string()
+    } else {
+        "String".to_string()
     }
 }
 
@@ -260,38 +328,7 @@ fn type_display_string(
         }
     } else {
         match prop.prop_type.as_ref().and_then(|t| t.as_str()) {
-            Some("string") => {
-                let prop_lower = prop_name.to_lowercase();
-                if prop_lower.contains("cidr") {
-                    if prop_lower.contains("ipv6") {
-                        "Ipv6Cidr".to_string()
-                    } else {
-                        "Ipv4Cidr".to_string()
-                    }
-                } else if (prop_lower.contains("ipaddress")
-                    || prop_lower.ends_with("ip")
-                    || prop_lower.contains("ipaddresses"))
-                    && !prop_lower.contains("cidr")
-                    && !prop_lower.contains("count")
-                    && !prop_lower.contains("type")
-                {
-                    if prop_lower.contains("ipv6") {
-                        "Ipv6Address".to_string()
-                    } else {
-                        "Ipv4Address".to_string()
-                    }
-                } else if prop_lower == "availabilityzone" {
-                    "AvailabilityZone".to_string()
-                } else if prop_lower.ends_with("arn") || prop_lower.contains("_arn") {
-                    "Arn".to_string()
-                } else if is_ipam_pool_id_property(prop_name) {
-                    "IpamPoolId".to_string()
-                } else if is_aws_resource_id_property(prop_name) {
-                    get_resource_id_display_name(prop_name).to_string()
-                } else {
-                    "String".to_string()
-                }
-            }
+            Some("string") => infer_string_type_display(prop_name),
             Some("boolean") => "Bool".to_string(),
             Some("integer") | Some("number") => "Int".to_string(),
             Some("array") => {
@@ -312,7 +349,7 @@ fn type_display_string(
                             "`List<Map>`".to_string()
                         }
                     } else {
-                        list_element_type_display(items)
+                        list_element_type_display(items, prop_name)
                     }
                 } else {
                     "`List<String>`".to_string()
@@ -435,44 +472,12 @@ fn generate_markdown(schema: &CfnSchema, type_name: &str) -> Result<String> {
                     "Enum".to_string()
                 } else {
                     match field_prop.prop_type.as_ref().and_then(|t| t.as_str()) {
-                        Some("string") => {
-                            let fl = field_name.to_lowercase();
-                            if fl.contains("cidr") {
-                                if fl.contains("ipv6") {
-                                    "Ipv6Cidr"
-                                } else {
-                                    "Ipv4Cidr"
-                                }
-                            } else if (fl.contains("ipaddress")
-                                || fl.ends_with("ip")
-                                || fl.contains("ipaddresses"))
-                                && !fl.contains("cidr")
-                                && !fl.contains("count")
-                                && !fl.contains("type")
-                            {
-                                if fl.contains("ipv6") {
-                                    "Ipv6Address"
-                                } else {
-                                    "Ipv4Address"
-                                }
-                            } else if fl == "availabilityzone" {
-                                "AvailabilityZone"
-                            } else if fl.ends_with("arn") || fl.contains("_arn") {
-                                "Arn"
-                            } else if is_ipam_pool_id_property(field_name) {
-                                "IpamPoolId"
-                            } else if is_aws_resource_id_property(field_name) {
-                                get_resource_id_display_name(field_name)
-                            } else {
-                                "String"
-                            }
-                        }
-                        .to_string(),
+                        Some("string") => infer_string_type_display(field_name),
                         Some("boolean") => "Bool".to_string(),
                         Some("integer") | Some("number") => "Int".to_string(),
                         Some("array") => {
                             if let Some(items) = &field_prop.items {
-                                list_element_type_display(items)
+                                list_element_type_display(items, field_name)
                             } else {
                                 "`List<String>`".to_string()
                             }
@@ -818,6 +823,26 @@ fn looks_like_property_name(s: &str) -> bool {
     false
 }
 
+/// Check if a string looks like a valid enum value (not a code example, unicode escape, etc.)
+fn looks_like_enum_value(s: &str) -> bool {
+    if s.is_empty() {
+        return false;
+    }
+    if s.contains('{') || s.contains('}') {
+        return false;
+    }
+    if s.contains("\\u") {
+        return false;
+    }
+    if s.len() > 50 {
+        return false;
+    }
+    if s.contains(' ') {
+        return false;
+    }
+    true
+}
+
 /// Extract enum values from description text.
 /// Looks for patterns like ``value`` (double backticks) which CloudFormation uses
 /// to indicate allowed values in descriptions.
@@ -827,7 +852,7 @@ fn extract_enum_from_description(description: &str) -> Option<Vec<String>> {
     let mut values: Vec<String> = backtick_re
         .captures_iter(description)
         .map(|cap| cap[1].to_string())
-        .filter(|v| !looks_like_property_name(v))
+        .filter(|v| !looks_like_property_name(v) && looks_like_enum_value(v))
         .collect();
 
     // If we found enum values with backticks, use them
@@ -1186,10 +1211,20 @@ fn cfn_type_to_carina_type_with_enum(
 
     // Handle explicit enum
     if let Some(enum_values) = &prop.enum_values {
+        // If all enum values are integers, skip enum treatment and use the base type
+        let all_ints = enum_values.iter().all(|v| matches!(v, EnumValue::Int(_)));
+        if all_ints {
+            return match prop.prop_type.as_ref().and_then(|t| t.as_str()) {
+                Some("integer") | Some("number") => ("AttributeType::Int".to_string(), None),
+                _ => ("AttributeType::String".to_string(), None),
+            };
+        }
+
         let type_name = prop_name.to_pascal_case();
+        let string_values: Vec<String> = enum_values.iter().map(|v| v.to_string_value()).collect();
         let enum_info = EnumInfo {
             type_name,
-            values: enum_values.clone(),
+            values: string_values,
         };
         // Return placeholder - actual type will be generated using enum_info
         return ("/* enum */".to_string(), Some(enum_info));
@@ -1301,9 +1336,17 @@ fn cfn_type_to_carina_type_with_enum(
                         None,
                     );
                 }
-                let (item_type, _) = cfn_type_to_carina_type_with_enum(items, prop_name, schema);
+                let (item_type, item_enum) =
+                    cfn_type_to_carina_type_with_enum(items, prop_name, schema);
+                // If array items are enum values, use String as the item type
+                // (enum validation happens at the attribute level, not item level)
+                let effective_item_type = if item_enum.is_some() {
+                    "AttributeType::String".to_string()
+                } else {
+                    item_type
+                };
                 (
-                    format!("AttributeType::List(Box::new({}))", item_type),
+                    format!("AttributeType::List(Box::new({}))", effective_item_type),
                     None,
                 )
             } else {
@@ -1775,7 +1818,10 @@ mod tests {
             properties: None,
             required: vec![],
         };
-        assert_eq!(list_element_type_display(&prop), "`List<String>`");
+        assert_eq!(
+            list_element_type_display(&prop, "GenericProp"),
+            "`List<String>`"
+        );
 
         // Integer items
         let prop = CfnProperty {
@@ -1788,7 +1834,10 @@ mod tests {
             properties: None,
             required: vec![],
         };
-        assert_eq!(list_element_type_display(&prop), "`List<Int>`");
+        assert_eq!(
+            list_element_type_display(&prop, "GenericProp"),
+            "`List<Int>`"
+        );
 
         // Boolean items
         let prop = CfnProperty {
@@ -1801,7 +1850,10 @@ mod tests {
             properties: None,
             required: vec![],
         };
-        assert_eq!(list_element_type_display(&prop), "`List<Bool>`");
+        assert_eq!(
+            list_element_type_display(&prop, "GenericProp"),
+            "`List<Bool>`"
+        );
 
         // No type (fallback)
         let prop = CfnProperty {
@@ -1814,7 +1866,58 @@ mod tests {
             properties: None,
             required: vec![],
         };
-        assert_eq!(list_element_type_display(&prop), "`List<String>`");
+        assert_eq!(
+            list_element_type_display(&prop, "GenericProp"),
+            "`List<String>`"
+        );
+    }
+
+    #[test]
+    fn test_list_element_type_display_with_name_inference() {
+        let prop = CfnProperty {
+            prop_type: Some(TypeValue::Single("string".to_string())),
+            description: None,
+            enum_values: None,
+            items: None,
+            ref_path: None,
+            insertion_order: None,
+            properties: None,
+            required: vec![],
+        };
+        assert_eq!(
+            list_element_type_display(&prop, "SubnetIds"),
+            "`List<SubnetId>`"
+        );
+        assert_eq!(
+            list_element_type_display(&prop, "SecurityGroupIds"),
+            "`List<SecurityGroupId>`"
+        );
+        assert_eq!(
+            list_element_type_display(&prop, "RouteTableIds"),
+            "`List<RouteTableId>`"
+        );
+        assert_eq!(
+            list_element_type_display(&prop, "NetworkInterfaceIds"),
+            "`List<AwsResourceId>`"
+        );
+        assert_eq!(
+            list_element_type_display(&prop, "VpcEndpointIds"),
+            "`List<VpcEndpointId>`"
+        );
+        assert_eq!(list_element_type_display(&prop, "RoleArns"), "`List<Arn>`");
+        assert_eq!(
+            list_element_type_display(&prop, "CidrBlocks"),
+            "`List<Ipv4Cidr>`"
+        );
+        assert_eq!(
+            list_element_type_display(&prop, "Ipv6CidrBlocks"),
+            "`List<Ipv6Cidr>`"
+        );
+        assert_eq!(list_element_type_display(&prop, "Names"), "`List<String>`");
+        assert_eq!(
+            list_element_type_display(&prop, "SubnetId"),
+            "`List<SubnetId>`"
+        );
     }
 
     #[test]
@@ -1955,7 +2058,7 @@ mod tests {
                 properties: None,
                 required: vec![],
             };
-            let result = list_element_type_display(&prop);
+            let result = list_element_type_display(&prop, "GenericProp");
             assert!(
                 result.contains('<') && result.contains('>'),
                 "list_element_type_display should include element type for {:?}, got: {}",
