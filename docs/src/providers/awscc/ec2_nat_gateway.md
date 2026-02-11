@@ -53,7 +53,7 @@ The private IPv4 address to assign to the NAT gateway. If you don't provide an a
 
 ### `secondary_allocation_ids`
 
-- **Type:** `List<String>`
+- **Type:** `List<AwsResourceId>`
 - **Required:** No
 
 Secondary EIP allocation IDs. For more information, see [Create a NAT gateway](https://docs.aws.amazon.com/vpc/latest/userguide/nat-gateway-working-with.html) in the *Amazon VPC User Guide*.
@@ -67,7 +67,7 @@ Secondary EIP allocation IDs. For more information, see [Create a NAT gateway](h
 
 ### `secondary_private_ip_addresses`
 
-- **Type:** `List<String>`
+- **Type:** `List<Ipv4Address>`
 - **Required:** No
 
 Secondary private IPv4 addresses. For more information about secondary addresses, see [Create a NAT gateway](https://docs.aws.amazon.com/vpc/latest/userguide/vpc-nat-gateway.html#nat-gateway-creating) in the *Amazon Virtual Private Cloud User Guide*. ``SecondaryPrivateIpAddressCount`` and ``SecondaryPrivateIpAddresses`` cannot be set at the same time.
@@ -119,7 +119,7 @@ Shorthand formats: `public` or `ConnectivityType.public`
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `allocation_ids` | `List<String>` | Yes | The allocation IDs of the Elastic IP addresses (EIPs) to be used for handling outbound NAT traffic i... |
+| `allocation_ids` | `List<AwsResourceId>` | Yes | The allocation IDs of the Elastic IP addresses (EIPs) to be used for handling outbound NAT traffic i... |
 | `availability_zone` | AvailabilityZone | No | For regional NAT gateways only: The Availability Zone where this specific NAT gateway configuration ... |
 | `availability_zone_id` | String | No | For regional NAT gateways only: The ID of the Availability Zone where this specific NAT gateway conf... |
 
