@@ -822,27 +822,106 @@ fn looks_like_property_name(s: &str) -> bool {
 /// Looks for patterns like ``value`` (double backticks) which CloudFormation uses
 /// to indicate allowed values in descriptions.
 fn extract_enum_from_description(description: &str) -> Option<Vec<String>> {
-    let re = Regex::new(r"``([^`]+)``").ok()?;
-    let values: Vec<String> = re
+    // Strategy 1: Look for double-backtick values (existing behavior)
+    let backtick_re = Regex::new(r"``([^`]+)``").ok()?;
+    let mut values: Vec<String> = backtick_re
         .captures_iter(description)
         .map(|cap| cap[1].to_string())
-        // Filter out property names (CamelCase) as they're not enum values
         .filter(|v| !looks_like_property_name(v))
         .collect();
 
-    // Only return if we have at least 2 distinct values (indicating an enum)
+    // If we found enum values with backticks, use them
     if values.len() >= 2 {
-        // Deduplicate while preserving order
-        let mut seen = HashSet::new();
-        let unique: Vec<String> = values
+        return deduplicate_enum_values(values);
+    }
+
+    // Strategy 2: Look for "Valid values: X | Y | Z" or "Options: X | Y" patterns
+    if let Ok(pipe_re) = Regex::new(r"(?i)(?:valid values?|options?):\s*([^\n.]+)")
+        && let Some(cap) = pipe_re.captures(description)
+    {
+        let list = cap[1].trim();
+        // Split by pipe or comma
+        let candidates: Vec<String> = if list.contains('|') {
+            list.split('|').map(|s| s.trim().to_string()).collect()
+        } else if list.contains(',') {
+            list.split(',').map(|s| s.trim().to_string()).collect()
+        } else {
+            vec![]
+        };
+
+        values = candidates
             .into_iter()
-            .filter(|v| seen.insert(v.clone()))
+            .filter(|v| !v.is_empty() && !looks_like_property_name(v))
             .collect();
-        if unique.len() >= 2 {
-            return Some(unique);
+
+        if values.len() >= 2 {
+            return deduplicate_enum_values(values);
         }
     }
+
+    // Strategy 3: Look for "Options are X, Y, Z" or "Can be X, Y, or Z" patterns
+    if let Ok(list_re) = Regex::new(r"(?i)(?:options are|can be|either)\s+(.+?)(?:\.|\n|$)")
+        && let Some(cap) = list_re.captures(description)
+    {
+        let list = cap[1].trim();
+
+        // Extract the enum list part before any trailing explanatory text
+        // e.g., "default, dedicated, or host for instances" -> "default, dedicated, or host"
+        let enum_list = if let Some(idx) = list
+            .find(" for ")
+            .or_else(|| list.find(" when "))
+            .or_else(|| list.find(" where "))
+            .or_else(|| list.find(" by "))
+            .or_else(|| list.find(" with "))
+            .or_else(|| list.find(" that "))
+        {
+            &list[..idx]
+        } else {
+            list
+        };
+
+        // Split by comma and "or"
+        let mut candidates: Vec<String> = vec![];
+        for part in enum_list.split(',') {
+            let part = part.trim();
+            // Handle "or X" pattern
+            if let Some(stripped) = part.strip_prefix("or ") {
+                candidates.push(stripped.trim().to_string());
+            } else if part.contains(" or ") {
+                // Split on " or " within a part
+                for subpart in part.split(" or ") {
+                    candidates.push(subpart.trim().to_string());
+                }
+            } else {
+                candidates.push(part.to_string());
+            }
+        }
+
+        values = candidates
+            .into_iter()
+            .filter(|v| !v.is_empty() && !looks_like_property_name(v) && !v.contains(' '))
+            .collect();
+
+        if values.len() >= 2 {
+            return deduplicate_enum_values(values);
+        }
+    }
+
     None
+}
+
+/// Deduplicate enum values while preserving order
+fn deduplicate_enum_values(values: Vec<String>) -> Option<Vec<String>> {
+    let mut seen = HashSet::new();
+    let unique: Vec<String> = values
+        .into_iter()
+        .filter(|v| seen.insert(v.clone()))
+        .collect();
+    if unique.len() >= 2 {
+        Some(unique)
+    } else {
+        None
+    }
 }
 
 /// Resolve a $ref path to a CfnDefinition
@@ -1223,6 +1302,58 @@ mod tests {
         // Same value mentioned multiple times should be deduplicated
         let description =
             r#"Use ``enabled`` or ``disabled``. When ``enabled`` is set, the feature activates."#;
+        let result = extract_enum_from_description(description);
+        assert!(result.is_some());
+        let values = result.unwrap();
+        assert_eq!(values, vec!["enabled", "disabled"]);
+    }
+
+    #[test]
+    fn test_extract_enum_from_description_valid_values_pipe() {
+        // "Valid values: X | Y | Z" pattern
+        let description = "The connectivity type. Valid values: public | private";
+        let result = extract_enum_from_description(description);
+        assert!(result.is_some());
+        let values = result.unwrap();
+        assert_eq!(values, vec!["public", "private"]);
+    }
+
+    #[test]
+    fn test_extract_enum_from_description_options_colon() {
+        // "Options: X, Y, Z" pattern
+        let description =
+            "Block mode for internet gateway. Options: off, block-bidirectional, block-ingress";
+        let result = extract_enum_from_description(description);
+        assert!(result.is_some());
+        let values = result.unwrap();
+        assert_eq!(values, vec!["off", "block-bidirectional", "block-ingress"]);
+    }
+
+    #[test]
+    fn test_extract_enum_from_description_options_are() {
+        // "Options are X, Y, or Z" pattern
+        let description =
+            "The tenancy options. Options are default, dedicated, or host for instances.";
+        let result = extract_enum_from_description(description);
+        assert!(result.is_some());
+        let values = result.unwrap();
+        assert_eq!(values, vec!["default", "dedicated", "host"]);
+    }
+
+    #[test]
+    fn test_extract_enum_from_description_can_be() {
+        // "Can be X or Y" pattern
+        let description = "The allocation strategy can be zonal or regional";
+        let result = extract_enum_from_description(description);
+        assert!(result.is_some());
+        let values = result.unwrap();
+        assert_eq!(values, vec!["zonal", "regional"]);
+    }
+
+    #[test]
+    fn test_extract_enum_from_description_either() {
+        // "Either X or Y" pattern
+        let description = "Set the mode to either enabled or disabled";
         let result = extract_enum_from_description(description);
         assert!(result.is_some());
         let values = result.unwrap();
