@@ -122,7 +122,7 @@ Any tags assigned to the subnet.
 
 ### `vpc_id`
 
-- **Type:** AwsResourceId
+- **Type:** VpcId
 - **Required:** Yes
 
 The ID of the VPC the subnet is in. If you update this property, you must also update the ``CidrBlock`` property.
@@ -133,7 +133,7 @@ The ID of the VPC the subnet is in. If you update this property, you must also u
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `internet_gateway_block_mode` | Enum | No | The mode of VPC BPA. Options here are off, block-bidirectional, block-ingress  |
+| `internet_gateway_block_mode` | String | No | The mode of VPC BPA. Options here are off, block-bidirectional, block-ingress  |
 
 ### PrivateDnsNameOptionsOnLaunch
 
@@ -151,7 +151,7 @@ The ID of the VPC the subnet is in. If you update this property, you must also u
 
 ### `ipv6_cidr_blocks`
 
-- **Type:** List<String>
+- **Type:** `List<String>`
 
 ### `network_acl_association_id`
 
@@ -159,7 +159,7 @@ The ID of the VPC the subnet is in. If you update this property, you must also u
 
 ### `subnet_id`
 
-- **Type:** AwsResourceId
+- **Type:** SubnetId
 
 
 

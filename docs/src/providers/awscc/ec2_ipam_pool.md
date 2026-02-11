@@ -36,7 +36,7 @@ The minimum allowed netmask length for allocations made from this pool.
 
 ### `allocation_resource_tags`
 
-- **Type:** List<Map>
+- **Type:** `List<Map>`
 - **Required:** No
 
 When specified, an allocation will not be allowed unless a resource has a matching set of tags.
