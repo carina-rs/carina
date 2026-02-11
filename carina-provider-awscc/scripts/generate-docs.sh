@@ -111,11 +111,9 @@ EOF
 # Group resources by service category
 PREV_SERVICE=""
 for TYPE_NAME in "${RESOURCE_TYPES[@]}"; do
-    # Extract service name (e.g., AWS::EC2::VPC -> EC2)
     SERVICE=$(echo "$TYPE_NAME" | awk -F'::' '{print $2}')
     FULL_RESOURCE=$("$CODEGEN_BIN" --type-name "$TYPE_NAME" --print-full-resource-name)
 
-    # Write service category header when service changes
     if [ "$SERVICE" != "$PREV_SERVICE" ]; then
         echo "  - [${SERVICE}]()" >> "docs/src/SUMMARY.md"
         PREV_SERVICE="$SERVICE"
@@ -123,6 +121,56 @@ for TYPE_NAME in "${RESOURCE_TYPES[@]}"; do
 
     echo "    - [awscc.${FULL_RESOURCE}](providers/awscc/${FULL_RESOURCE}.md)" >> "docs/src/SUMMARY.md"
 done
+
+# Auto-generate index.md with categorized resource listing
+echo "Generating $DOCS_DIR/index.md"
+
+cat > "$DOCS_DIR/index.md" << 'EOF'
+# AWSCC Provider
+
+The `awscc` provider manages AWS resources through the [AWS Cloud Control API](https://docs.aws.amazon.com/cloudcontrolapi/latest/userguide/what-is-cloudcontrolapi.html).
+
+## Configuration
+
+```crn
+provider awscc {
+  region = aws.Region.ap_northeast_1
+}
+```
+
+## Usage
+
+Resources are defined using the `awscc.<resource_type>` syntax:
+
+```crn
+let vpc = awscc.ec2_vpc {
+  name       = "my-vpc"
+  cidr_block = "10.0.0.0/16"
+  tags = {
+    Environment = "production"
+  }
+}
+```
+
+Named resources (using `let`) can be referenced by other resources:
+
+```crn
+let subnet = awscc.ec2_subnet {
+  name              = "my-subnet"
+  vpc_id            = vpc.vpc_id
+  cidr_block        = "10.0.1.0/24"
+  availability_zone = "ap-northeast-1a"
+}
+```
+
+## Enum Values
+
+Some attributes accept enum values. These can be specified in three formats:
+
+- **Bare value**: `instance_tenancy = default`
+- **TypeName.value**: `instance_tenancy = InstanceTenancy.default`
+- **Full namespace**: `instance_tenancy = awscc.ec2_vpc.InstanceTenancy.default`
+EOF
 
 echo ""
 echo "Done! Generated documentation in $DOCS_DIR"
