@@ -1275,19 +1275,13 @@ async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
                 .green()
                 .bold()
         );
+        Ok(())
     } else {
-        println!(
-            "{}",
-            format!(
-                "Apply failed. {} succeeded, {} failed.",
-                success_count, failure_count
-            )
-            .red()
-            .bold()
-        );
+        Err(format!(
+            "Apply failed. {} succeeded, {} failed.",
+            success_count, failure_count
+        ))
     }
-
-    Ok(())
 }
 
 async fn run_destroy(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
@@ -1576,19 +1570,13 @@ async fn run_destroy(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
                 .green()
                 .bold()
         );
+        Ok(())
     } else {
-        println!(
-            "{}",
-            format!(
-                "Destroy failed. {} succeeded, {} failed.",
-                success_count, failure_count
-            )
-            .red()
-            .bold()
-        );
+        Err(format!(
+            "Destroy failed. {} succeeded, {} failed.",
+            success_count, failure_count
+        ))
     }
-
-    Ok(())
 }
 
 /// Get identifier from state file for a resource
