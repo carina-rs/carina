@@ -3,12 +3,29 @@
 #
 # Usage (from project root):
 #   aws-vault exec <profile> -- ./carina-provider-awscc/scripts/generate-schemas.sh
+#   aws-vault exec <profile> -- ./carina-provider-awscc/scripts/generate-schemas.sh --refresh-cache
+#
+# Options:
+#   --refresh-cache  Force re-download of all CloudFormation schemas
+#
+# Downloaded schemas are cached in carina-provider-awscc/cfn-schema-cache/.
+# Subsequent runs use cached schemas unless --refresh-cache is specified.
 #
 # This script generates Rust schema code from CloudFormation resource type schemas.
 
 set -e
 
+# Parse flags
+REFRESH_CACHE=false
+for arg in "$@"; do
+    case "$arg" in
+        --refresh-cache) REFRESH_CACHE=true ;;
+    esac
+done
+
+CACHE_DIR="carina-provider-awscc/cfn-schema-cache"
 OUTPUT_DIR="carina-provider-awscc/src/schemas/generated"
+mkdir -p "$CACHE_DIR"
 mkdir -p "$OUTPUT_DIR"
 
 # List of resource types to generate
@@ -66,12 +83,19 @@ for TYPE_NAME in "${RESOURCE_TYPES[@]}"; do
 
     echo "Generating $TYPE_NAME -> $OUTPUT_FILE"
 
-    aws cloudformation describe-type \
-        --type RESOURCE \
-        --type-name "$TYPE_NAME" \
-        --query 'Schema' \
-        --output text 2>/dev/null | \
-    "$CODEGEN_BIN" --type-name "$TYPE_NAME" > "$OUTPUT_FILE"
+    # Cache CloudFormation schema to avoid redundant API calls
+    CACHE_FILE="$CACHE_DIR/${TYPE_NAME//::/__}.json"
+    if [ "$REFRESH_CACHE" = true ] || [ ! -f "$CACHE_FILE" ]; then
+        aws cloudformation describe-type \
+            --type RESOURCE \
+            --type-name "$TYPE_NAME" \
+            --query 'Schema' \
+            --output text 2>/dev/null > "$CACHE_FILE"
+    else
+        echo "  Using cached schema"
+    fi
+
+    "$CODEGEN_BIN" --type-name "$TYPE_NAME" < "$CACHE_FILE" > "$OUTPUT_FILE"
 
     if [ $? -ne 0 ]; then
         echo "  ERROR: Failed to generate $TYPE_NAME"
