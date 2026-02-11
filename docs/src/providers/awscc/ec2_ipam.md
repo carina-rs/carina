@@ -27,7 +27,7 @@ Enable provisioning of GUA space in private pools.
 
 ### `metered_account`
 
-- **Type:** Enum (MeteredAccount)
+- **Type:** [Enum (MeteredAccount)](#metered_account-meteredaccount)
 - **Required:** No
 
 A metered account is an account that is charged for active IP addresses managed in IPAM
@@ -48,7 +48,7 @@ An array of key-value pairs to apply to this resource.
 
 ### `tier`
 
-- **Type:** Enum (Tier)
+- **Type:** [Enum (Tier)](#tier-tier)
 - **Required:** No
 
 The tier of the IPAM.

@@ -43,7 +43,7 @@ Resource Type definition for AWS::EC2::TransitGateway
 
 ### `encryption_support`
 
-- **Type:** Enum (EncryptionSupport)
+- **Type:** [Enum (EncryptionSupport)](#encryption_support-encryptionsupport)
 - **Required:** No
 
 ### `multicast_support`

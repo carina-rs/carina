@@ -32,7 +32,7 @@ For regional NAT gateways only: Specifies which Availability Zones you want the 
 
 ### `connectivity_type`
 
-- **Type:** Enum (ConnectivityType)
+- **Type:** [Enum (ConnectivityType)](#connectivity_type-connectivitytype)
 - **Required:** No
 
 Indicates whether the NAT gateway supports public or private connectivity. The default is public connectivity.

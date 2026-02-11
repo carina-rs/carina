@@ -34,7 +34,7 @@ Specifies the destination to which the flow log data is to be published. Flow lo
 
 ### `log_destination_type`
 
-- **Type:** Enum (LogDestinationType)
+- **Type:** [Enum (LogDestinationType)](#log_destination_type-logdestinationtype)
 - **Required:** No
 
 Specifies the type of destination to which the flow log data is to be published. Flow log data can be published to CloudWatch Logs or Amazon S3.
@@ -69,7 +69,7 @@ The ID of the subnet, network interface, or VPC for which you want to create a f
 
 ### `resource_type`
 
-- **Type:** Enum (ResourceType)
+- **Type:** [Enum (ResourceType)](#resource_type-resourcetype)
 - **Required:** Yes
 
 The type of resource for which to create the flow log. For example, if you specified a VPC ID for the ResourceId property, specify VPC for this property.
@@ -83,7 +83,7 @@ The tags to apply to the flow logs.
 
 ### `traffic_type`
 
-- **Type:** Enum (TrafficType)
+- **Type:** [Enum (TrafficType)](#traffic_type-traffictype)
 - **Required:** No
 
 The type of traffic to log. You can log traffic that the resource accepts or rejects, or all traffic.

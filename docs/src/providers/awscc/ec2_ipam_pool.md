@@ -50,7 +50,7 @@ Determines what to do if IPAM discovers resources that haven't been assigned an 
 
 ### `aws_service`
 
-- **Type:** Enum (AwsService)
+- **Type:** [Enum (AwsService)](#aws_service-awsservice)
 - **Required:** No
 
 Limits which service in Amazon Web Services that the pool can be used in.
@@ -83,7 +83,7 @@ A list of cidrs representing the address space available for allocation in this 
 
 ### `public_ip_source`
 
-- **Type:** Enum (PublicIpSource)
+- **Type:** [Enum (PublicIpSource)](#public_ip_source-publicipsource)
 - **Required:** No
 
 The IP address source for pools in the public scope. Only used for provisioning IP address CIDRs to pools in the public scope. Default is `byoip`.
@@ -134,7 +134,7 @@ An array of key-value pairs to apply to this resource.
 
 ### `ipam_scope_type`
 
-- **Type:** Enum (IpamScopeType)
+- **Type:** [Enum (IpamScopeType)](#ipam_scope_type-ipamscopetype)
 
 ### `pool_depth`
 
@@ -142,7 +142,7 @@ An array of key-value pairs to apply to this resource.
 
 ### `state`
 
-- **Type:** Enum (State)
+- **Type:** [Enum (State)](#state-state)
 
 ### `state_message`
 
