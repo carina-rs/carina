@@ -8,21 +8,21 @@ Resource Type definition for AWS::EC2::VPCGatewayAttachment
 
 ### `internet_gateway_id`
 
-- **Type:** AwsResourceId
+- **Type:** InternetGatewayId
 - **Required:** No
 
 The ID of the internet gateway. You must specify either InternetGatewayId or VpnGatewayId, but not both.
 
 ### `vpc_id`
 
-- **Type:** AwsResourceId
+- **Type:** VpcId
 - **Required:** Yes
 
 The ID of the VPC.
 
 ### `vpn_gateway_id`
 
-- **Type:** AwsResourceId
+- **Type:** VpnGatewayId
 - **Required:** No
 
 The ID of the virtual private gateway. You must specify either InternetGatewayId or VpnGatewayId, but not both.

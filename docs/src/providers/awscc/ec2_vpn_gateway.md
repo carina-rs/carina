@@ -32,7 +32,7 @@ The type of VPN connection the virtual private gateway supports.
 
 ### `vpn_gateway_id`
 
-- **Type:** AwsResourceId
+- **Type:** VpnGatewayId
 
 
 

@@ -15,7 +15,7 @@ Any tags assigned to the egress only internet gateway.
 
 ### `vpc_id`
 
-- **Type:** AwsResourceId
+- **Type:** VpcId
 - **Required:** Yes
 
 The ID of the VPC for which to create the egress-only internet gateway.

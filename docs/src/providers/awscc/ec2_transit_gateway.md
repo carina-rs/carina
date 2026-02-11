@@ -13,7 +13,7 @@ Resource Type definition for AWS::EC2::TransitGateway
 
 ### `association_default_route_table_id`
 
-- **Type:** AwsResourceId
+- **Type:** RouteTableId
 - **Required:** No
 
 ### `auto_accept_shared_attachments`
@@ -53,7 +53,7 @@ Resource Type definition for AWS::EC2::TransitGateway
 
 ### `propagation_default_route_table_id`
 
-- **Type:** AwsResourceId
+- **Type:** RouteTableId
 - **Required:** No
 
 ### `security_group_referencing_support`
@@ -68,7 +68,7 @@ Resource Type definition for AWS::EC2::TransitGateway
 
 ### `transit_gateway_cidr_blocks`
 
-- **Type:** List<String>
+- **Type:** `List<String>`
 - **Required:** No
 
 ### `vpn_ecmp_support`

@@ -29,7 +29,7 @@ The Amazon Resource Name (ARN) of the VPC peer role for the peering connection i
 
 ### `peer_vpc_id`
 
-- **Type:** AwsResourceId
+- **Type:** VpcId
 - **Required:** Yes
 
 The ID of the VPC with which you are creating the VPC peering connection. You must specify this parameter in the request.
@@ -41,7 +41,7 @@ The ID of the VPC with which you are creating the VPC peering connection. You mu
 
 ### `vpc_id`
 
-- **Type:** AwsResourceId
+- **Type:** VpcId
 - **Required:** Yes
 
 The ID of the VPC.

@@ -45,7 +45,7 @@ The ID of a prefix list used for the destination match.
 
 ### `egress_only_internet_gateway_id`
 
-- **Type:** AwsResourceId
+- **Type:** InternetGatewayId
 - **Required:** No
 
 [IPv6 traffic only] The ID of an egress-only internet gateway.
@@ -73,7 +73,7 @@ The ID of the local gateway.
 
 ### `nat_gateway_id`
 
-- **Type:** AwsResourceId
+- **Type:** NatGatewayId
 - **Required:** No
 
 [IPv4 traffic only] The ID of a NAT gateway.
@@ -87,28 +87,28 @@ The ID of a network interface.
 
 ### `route_table_id`
 
-- **Type:** AwsResourceId
+- **Type:** RouteTableId
 - **Required:** Yes
 
 The ID of the route table for the route.
 
 ### `transit_gateway_id`
 
-- **Type:** AwsResourceId
+- **Type:** TransitGatewayId
 - **Required:** No
 
 The ID of a transit gateway.
 
 ### `vpc_endpoint_id`
 
-- **Type:** AwsResourceId
+- **Type:** VpcEndpointId
 - **Required:** No
 
 The ID of a VPC endpoint. Supported for Gateway Load Balancer endpoints only.
 
 ### `vpc_peering_connection_id`
 
-- **Type:** AwsResourceId
+- **Type:** VpcPeeringConnectionId
 - **Required:** No
 
 The ID of a VPC peering connection.
