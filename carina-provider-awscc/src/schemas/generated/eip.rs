@@ -6,7 +6,15 @@
 
 use super::AwsccSchemaConfig;
 use super::tags_type;
+use super::validate_namespaced_enum;
+use carina_core::resource::Value;
 use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, types};
+
+const VALID_DOMAIN: &[&str] = &["vpc", "standard"];
+
+fn validate_domain(value: &Value) -> Result<(), String> {
+    validate_namespaced_enum(value, "Domain", "awscc.ec2_eip", VALID_DOMAIN)
+}
 
 /// Returns the schema config for ec2_eip (AWS::EC2::EIP)
 pub fn ec2_eip_config() -> AwsccSchemaConfig {
@@ -27,7 +35,12 @@ pub fn ec2_eip_config() -> AwsccSchemaConfig {
                 .with_provider_name("AllocationId"),
         )
         .attribute(
-            AttributeSchema::new("domain", AttributeType::String)
+            AttributeSchema::new("domain", AttributeType::Custom {
+                name: "Domain".to_string(),
+                base: Box::new(AttributeType::String),
+                validate: validate_domain,
+                namespace: Some("awscc.ec2_eip".to_string()),
+            })
                 .with_description("The network (``vpc``). If you define an Elastic IP address and associate it with a VPC that is defined in the same template, you must declare a depend...")
                 .with_provider_name("Domain"),
         )

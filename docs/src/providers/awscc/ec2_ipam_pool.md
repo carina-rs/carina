@@ -8,7 +8,7 @@ Resource Schema of AWS::EC2::IPAMPool Type
 
 ### `address_family`
 
-- **Type:** String
+- **Type:** [Enum (AddressFamily)](#address_family-addressfamily)
 - **Required:** Yes
 
 The address family of the address space in this pool. Either IPv4 or IPv6.
@@ -149,6 +149,15 @@ An array of key-value pairs to apply to this resource.
 - **Type:** String
 
 ## Enum Values
+
+### address_family (AddressFamily)
+
+| Value | DSL Identifier |
+|-------|----------------|
+| `IPv4` | `awscc.ec2_ipam_pool.AddressFamily.IPv4` |
+| `IPv6` | `awscc.ec2_ipam_pool.AddressFamily.IPv6` |
+
+Shorthand formats: `IPv4` or `AddressFamily.IPv4`
 
 ### aws_service (AwsService)
 

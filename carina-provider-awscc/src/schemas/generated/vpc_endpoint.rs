@@ -85,7 +85,7 @@ pub fn ec2_vpc_endpoint_config() -> AwsccSchemaConfig {
                 .with_provider_name("IpAddressType"),
         )
         .attribute(
-            AttributeSchema::new("network_interface_ids", AttributeType::List(Box::new(AttributeType::String)))
+            AttributeSchema::new("network_interface_ids", AttributeType::List(Box::new(super::aws_resource_id())))
                 .with_description(" (read-only)")
                 .with_provider_name("NetworkInterfaceIds"),
         )
@@ -105,12 +105,12 @@ pub fn ec2_vpc_endpoint_config() -> AwsccSchemaConfig {
                 .with_provider_name("ResourceConfigurationArn"),
         )
         .attribute(
-            AttributeSchema::new("route_table_ids", AttributeType::List(Box::new(AttributeType::String)))
+            AttributeSchema::new("route_table_ids", AttributeType::List(Box::new(super::aws_resource_id())))
                 .with_description("The IDs of the route tables. Routing is supported only for gateway endpoints.")
                 .with_provider_name("RouteTableIds"),
         )
         .attribute(
-            AttributeSchema::new("security_group_ids", AttributeType::List(Box::new(AttributeType::String)))
+            AttributeSchema::new("security_group_ids", AttributeType::List(Box::new(super::aws_resource_id())))
                 .with_description("The IDs of the security groups to associate with the endpoint network interfaces. If this parameter is not specified, we use the default security grou...")
                 .with_provider_name("SecurityGroupIds"),
         )
@@ -130,7 +130,7 @@ pub fn ec2_vpc_endpoint_config() -> AwsccSchemaConfig {
                 .with_provider_name("ServiceRegion"),
         )
         .attribute(
-            AttributeSchema::new("subnet_ids", AttributeType::List(Box::new(AttributeType::String)))
+            AttributeSchema::new("subnet_ids", AttributeType::List(Box::new(super::aws_resource_id())))
                 .with_description("The IDs of the subnets in which to create endpoint network interfaces. You must specify this property for an interface endpoint or a Gateway Load Bala...")
                 .with_provider_name("SubnetIds"),
         )

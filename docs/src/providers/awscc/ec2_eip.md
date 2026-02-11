@@ -17,7 +17,7 @@ Specifies an Elastic IP (EIP) address and can, optionally, associate it with an 
 
 ### `domain`
 
-- **Type:** String
+- **Type:** [Enum (Domain)](#domain-domain)
 - **Required:** No
 
 The network (``vpc``). If you define an Elastic IP address and associate it with a VPC that is defined in the same template, you must declare a dependency on the VPC-gateway attachment by using the [DependsOn Attribute](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-attribute-dependson.html) on this resource.
@@ -73,6 +73,17 @@ The Elastic IP address you are accepting for transfer. You can only accept one t
 ### `public_ip`
 
 - **Type:** Ipv4Address
+
+## Enum Values
+
+### domain (Domain)
+
+| Value | DSL Identifier |
+|-------|----------------|
+| `vpc` | `awscc.ec2_eip.Domain.vpc` |
+| `standard` | `awscc.ec2_eip.Domain.standard` |
+
+Shorthand formats: `vpc` or `Domain.vpc`
 
 
 
