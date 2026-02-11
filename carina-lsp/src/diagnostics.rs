@@ -375,6 +375,29 @@ impl DiagnosticEngine {
                             }
                         }
                     }
+
+                    // Run resource-level validator (e.g., mutually exclusive required fields)
+                    if let Err(errors) = schema.validate(&resource.attributes) {
+                        for error in errors {
+                            if let Some((line, _col)) =
+                                self.find_resource_position(doc, &resource.id.resource_type)
+                            {
+                                diagnostics.push(Diagnostic {
+                                    range: Range {
+                                        start: Position { line, character: 0 },
+                                        end: Position {
+                                            line: line + 1,
+                                            character: 0,
+                                        },
+                                    },
+                                    severity: Some(DiagnosticSeverity::ERROR),
+                                    source: Some("carina".to_string()),
+                                    message: error.to_string(),
+                                    ..Default::default()
+                                });
+                            }
+                        }
+                    }
                 }
             }
         }
