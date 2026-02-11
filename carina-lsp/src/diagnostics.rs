@@ -78,6 +78,24 @@ impl DiagnosticEngine {
             if let Some(base) = base_path {
                 diagnostics.extend(self.check_module_calls(doc, parsed, base));
             }
+            // Build binding_name -> (provider, resource_type) map for ResourceRef type checking
+            let mut binding_schema_map: HashMap<String, carina_core::schema::ResourceSchema> =
+                HashMap::new();
+            for res in &parsed.resources {
+                if let Some(Value::String(binding_name)) = res.attributes.get("_binding") {
+                    let provider =
+                        self.detect_resource_provider(doc, &res.id.resource_type, &res.id.name);
+                    let full_type = if provider == "awscc" {
+                        format!("awscc.{}", res.id.resource_type)
+                    } else {
+                        res.id.resource_type.clone()
+                    };
+                    if let Some(s) = self.get_schema_for_type(&full_type) {
+                        binding_schema_map.insert(binding_name.clone(), s);
+                    }
+                }
+            }
+
             // Check resource types
             for resource in &parsed.resources {
                 // Detect the provider from the DSL (aws. or awscc.)
@@ -183,6 +201,53 @@ impl DiagnosticEngine {
                                         "Type mismatch: expected Int, got String \"{}\".",
                                         s
                                     ))
+                                }
+                                // ResourceRef type check for Custom types
+                                (
+                                    carina_core::schema::AttributeType::Custom {
+                                        name: expected_name,
+                                        ..
+                                    },
+                                    Value::ResourceRef(ref_binding, ref_attr),
+                                )
+                                | (
+                                    carina_core::schema::AttributeType::Custom {
+                                        name: expected_name,
+                                        ..
+                                    },
+                                    Value::TypedResourceRef {
+                                        binding_name: ref_binding,
+                                        attribute_name: ref_attr,
+                                        ..
+                                    },
+                                ) => {
+                                    if let Some(ref_schema) =
+                                        binding_schema_map.get(ref_binding.as_str())
+                                    {
+                                        if let Some(ref_attr_schema) =
+                                            ref_schema.attributes.get(ref_attr.as_str())
+                                        {
+                                            let ref_type_name =
+                                                ref_attr_schema.attr_type.type_name();
+                                            if ref_type_name != *expected_name
+                                                && ref_type_name != "String"
+                                            {
+                                                Some(format!(
+                                                    "Type mismatch: expected {}, got {} (from {}.{})",
+                                                    expected_name,
+                                                    ref_type_name,
+                                                    ref_binding,
+                                                    ref_attr
+                                                ))
+                                            } else {
+                                                None
+                                            }
+                                        } else {
+                                            None
+                                        }
+                                    } else {
+                                        None
+                                    }
                                 }
                                 // Custom type validation (VersioningStatus, InstanceTenancy, Cidr, Region, etc.)
                                 (
@@ -1164,6 +1229,72 @@ awscc.ec2_security_group {
         assert!(
             type_mismatch.is_some(),
             "Should warn about type mismatch for Int field. Got diagnostics: {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn resource_ref_type_mismatch() {
+        let engine = DiagnosticEngine::new();
+        // vpc.vpc_id is AwsResourceId, but ipv4_ipam_pool_id expects IpamPoolId
+        let doc = create_document(
+            r#"provider awscc {
+    region = aws.Region.ap_northeast_1
+}
+
+let vpc = awscc.ec2_vpc {
+    name = "test-vpc"
+    cidr_block = "10.0.0.0/16"
+}
+
+awscc.ec2_vpc {
+    name = "test-vpc-2"
+    ipv4_ipam_pool_id = vpc.vpc_id
+}"#,
+        );
+
+        let diagnostics = engine.analyze(&doc, None);
+
+        let type_mismatch = diagnostics
+            .iter()
+            .find(|d| d.message.contains("Type mismatch") && d.message.contains("IpamPoolId"));
+        assert!(
+            type_mismatch.is_some(),
+            "Should warn about type mismatch for ResourceRef. Got diagnostics: {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn resource_ref_compatible_type() {
+        let engine = DiagnosticEngine::new();
+        // ipam_pool.ipam_pool_id is IpamPoolId, and ipv4_ipam_pool_id expects IpamPoolId -> OK
+        // Using vpc.vpc_id in a vpc_id field (same type) should not produce a warning
+        let doc = create_document(
+            r#"provider awscc {
+    region = aws.Region.ap_northeast_1
+}
+
+let vpc = awscc.ec2_vpc {
+    name = "test-vpc"
+    cidr_block = "10.0.0.0/16"
+}
+
+awscc.ec2_subnet {
+    name = "test-subnet"
+    vpc_id = vpc.vpc_id
+    cidr_block = "10.0.1.0/24"
+}"#,
+        );
+
+        let diagnostics = engine.analyze(&doc, None);
+
+        let type_mismatch = diagnostics
+            .iter()
+            .find(|d| d.message.contains("Type mismatch") && d.message.contains("AwsResourceId"));
+        assert!(
+            type_mismatch.is_none(),
+            "Should NOT warn about compatible ResourceRef types. Got diagnostics: {:?}",
             diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
     }

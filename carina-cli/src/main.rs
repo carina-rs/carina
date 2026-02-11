@@ -221,6 +221,103 @@ fn validate_resources(resources: &[Resource]) -> Result<(), String> {
     }
 }
 
+/// Validate that resource references have compatible types.
+/// For example, if `ipv4_ipam_pool_id` expects `IpamPoolId` type,
+/// a reference like `vpc.vpc_id` (which is `AwsResourceId`) should be an error.
+fn validate_resource_ref_types(resources: &[Resource]) -> Result<(), String> {
+    let schemas = get_schemas();
+    let mut all_errors = Vec::new();
+
+    // Build binding_name -> resource map
+    let mut binding_map: HashMap<String, &Resource> = HashMap::new();
+    for resource in resources {
+        if let Some(Value::String(binding_name)) = resource.attributes.get("_binding") {
+            binding_map.insert(binding_name.clone(), resource);
+        }
+    }
+
+    for resource in resources {
+        let schema_key = match resource.attributes.get("_provider") {
+            Some(Value::String(provider)) if provider != "aws" => {
+                format!("{}.{}", provider, resource.id.resource_type)
+            }
+            _ => resource.id.resource_type.clone(),
+        };
+
+        let Some(schema) = schemas.get(&schema_key) else {
+            continue;
+        };
+
+        for (attr_name, attr_value) in &resource.attributes {
+            if attr_name.starts_with('_') {
+                continue;
+            }
+
+            let (ref_binding, ref_attr) = match attr_value {
+                Value::ResourceRef(binding, attr) => (binding, attr),
+                Value::TypedResourceRef {
+                    binding_name,
+                    attribute_name,
+                    ..
+                } => (binding_name, attribute_name),
+                _ => continue,
+            };
+
+            // Get the expected type for this attribute
+            let Some(attr_schema) = schema.attributes.get(attr_name) else {
+                continue;
+            };
+            let expected_type_name = attr_schema.attr_type.type_name();
+
+            // Look up the referenced binding's schema to get the type of the referenced attribute
+            let Some(ref_resource) = binding_map.get(ref_binding.as_str()) else {
+                continue; // Unknown binding, skip
+            };
+            let ref_schema_key_str: String = match ref_resource.attributes.get("_provider") {
+                Some(Value::String(provider)) if provider != "aws" => {
+                    format!("{}.{}", provider, ref_resource.id.resource_type)
+                }
+                _ => ref_resource.id.resource_type.clone(),
+            };
+            let Some(ref_schema) = schemas.get(&ref_schema_key_str) else {
+                continue;
+            };
+            let Some(ref_attr_schema) = ref_schema.attributes.get(ref_attr.as_str()) else {
+                continue; // Unknown attribute on referenced resource, skip
+            };
+            let ref_type_name = ref_attr_schema.attr_type.type_name();
+
+            // Type compatibility check:
+            // - Same type -> OK
+            // - Either is "String" -> OK (String is the base type for Custom types)
+            // - Different Custom types -> Error
+            if expected_type_name == ref_type_name {
+                continue;
+            }
+            if expected_type_name == "String" || ref_type_name == "String" {
+                continue;
+            }
+
+            all_errors.push(format!(
+                "{}.{}: type mismatch for '{}': expected {}, got {} (from {}.{})",
+                resource.id.resource_type,
+                resource.id.name,
+                attr_name,
+                expected_type_name,
+                ref_type_name,
+                ref_binding,
+                ref_attr,
+            ));
+        }
+    }
+
+    if all_errors.is_empty() {
+        Ok(())
+    } else {
+        Err(all_errors.join("\n"))
+    }
+}
+
 fn run_module_command(command: ModuleCommands) -> Result<(), String> {
     match command {
         ModuleCommands::Info { file } => run_module_info(&file),
@@ -571,6 +668,7 @@ fn run_validate(path: &PathBuf) -> Result<(), String> {
     println!("{}", "Validating...".cyan());
 
     validate_resources(&parsed.resources)?;
+    validate_resource_ref_types(&parsed.resources)?;
 
     println!(
         "{}",
@@ -604,6 +702,7 @@ async fn run_plan(path: &PathBuf) -> Result<(), String> {
     apply_default_region(&mut parsed);
 
     validate_resources(&parsed.resources)?;
+    validate_resource_ref_types(&parsed.resources)?;
 
     // Check for backend configuration and load state
     // Use local backend by default if no backend is configured
@@ -715,6 +814,7 @@ async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
     apply_default_region(&mut parsed);
 
     validate_resources(&parsed.resources)?;
+    validate_resource_ref_types(&parsed.resources)?;
 
     // Check for backend configuration - use local backend by default
     let backend_config = parsed.backend.as_ref();
