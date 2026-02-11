@@ -42,3 +42,92 @@ td, th {
     word-wrap: break-word;
     overflow-wrap: break-word;
 }
+
+/* Hide sidebar content until JS has processed it (prevents flicker on navigation) */
+mdbook-sidebar-scrollbox {
+    visibility: hidden;
+}
+mdbook-sidebar-scrollbox.sidebar-ready {
+    visibility: visible;
+}
+
+/* Sidebar resize handle */
+.sidebar .sidebar-resize-handle {
+    width: 8px !important;
+    right: -8px !important;
+    cursor: col-resize;
+}
+
+/* Provider sidebar header (fixed above scrollbox) */
+.sidebar-header {
+    padding: 8px 12px;
+}
+
+/* Provider sidebar resource list (inside scrollbox) */
+.provider-resource-list {
+    padding: 0 12px 8px 12px;
+}
+
+.sidebar-provider-title {
+    font-size: 1.4em;
+    font-weight: bold;
+    color: var(--sidebar-fg);
+    padding: 4px 0 8px 0;
+}
+
+#sidebar-filter-input {
+    width: 100%;
+    padding: 6px 10px;
+    border: 1px solid var(--sidebar-fg);
+    border-radius: 4px;
+    background: color-mix(in srgb, var(--sidebar-fg) 15%, var(--sidebar-bg));
+    color: var(--sidebar-fg);
+    font-size: 0.85em;
+    outline: none;
+    box-sizing: border-box;
+    margin-bottom: 0;
+}
+
+#sidebar-filter-input:focus {
+    border-color: var(--sidebar-active);
+    box-shadow: 0 0 0 2px color-mix(in srgb, var(--sidebar-active) 30%, transparent);
+}
+
+#sidebar-filter-input::placeholder {
+    color: var(--sidebar-non-existant);
+}
+
+.provider-category-title {
+    font-weight: bold;
+    color: var(--sidebar-fg);
+    padding: 6px 0 2px 0;
+    font-size: 1.05em;
+}
+
+.provider-resource-list ul {
+    list-style: none;
+    padding: 0;
+    margin: 0 0 4px 0;
+}
+
+.provider-resource-item a {
+    display: block;
+    padding: 3px 0 3px 12px;
+    color: var(--sidebar-fg);
+    text-decoration: none;
+    font-size: 1em;
+}
+
+.provider-resource-item a:hover {
+    color: var(--sidebar-active);
+}
+
+.provider-resource-item a.active {
+    color: var(--sidebar-active);
+    font-weight: bold;
+}
+
+/* Hidden items during filtering */
+.sidebar-filter-hidden {
+    display: none !important;
+}
