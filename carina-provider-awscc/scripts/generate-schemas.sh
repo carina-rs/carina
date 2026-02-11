@@ -404,6 +404,111 @@ cat >> "$OUTPUT_DIR/mod.rs" << 'EOF'
 pub fn schemas() -> Vec<ResourceSchema> {
     configs().into_iter().map(|c| c.schema).collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_arn_valid() {
+        assert!(validate_arn("arn:aws:s3:::my-bucket").is_ok());
+        assert!(validate_arn("arn:aws:iam::123456789012:role/MyRole").is_ok());
+        assert!(validate_arn("arn:aws-cn:s3:::my-bucket").is_ok());
+        assert!(validate_arn("arn:aws:ec2:us-east-1:123456789012:vpc/vpc-1234").is_ok());
+    }
+
+    #[test]
+    fn validate_arn_invalid() {
+        assert!(validate_arn("not-an-arn").is_err());
+        assert!(validate_arn("arn:aws:s3").is_err());
+        assert!(validate_arn("arn:aws").is_err());
+        assert!(validate_arn("").is_err());
+    }
+
+    #[test]
+    fn validate_arn_type_with_value() {
+        let t = arn();
+        assert!(
+            t.validate(&Value::String("arn:aws:s3:::my-bucket".to_string()))
+                .is_ok()
+        );
+        assert!(
+            t.validate(&Value::String("not-an-arn".to_string()))
+                .is_err()
+        );
+        assert!(t.validate(&Value::Int(42)).is_err());
+        // ResourceRef should be accepted
+        assert!(
+            t.validate(&Value::ResourceRef("role".to_string(), "arn".to_string()))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn validate_aws_resource_id_valid() {
+        assert!(validate_aws_resource_id("vpc-1a2b3c4d").is_ok());
+        assert!(validate_aws_resource_id("subnet-0123456789abcdef0").is_ok());
+        assert!(validate_aws_resource_id("sg-12345678").is_ok());
+        assert!(validate_aws_resource_id("rtb-abcdef12").is_ok());
+        assert!(validate_aws_resource_id("eipalloc-0123456789abcdef0").is_ok());
+        assert!(validate_aws_resource_id("igw-12345678").is_ok());
+    }
+
+    #[test]
+    fn validate_aws_resource_id_invalid() {
+        assert!(validate_aws_resource_id("not-a-valid-id").is_err()); // hex part too short
+        assert!(validate_aws_resource_id("vpc").is_err()); // no dash
+        assert!(validate_aws_resource_id("vpc-short").is_err()); // hex part < 8
+        assert!(validate_aws_resource_id("vpc-1234567").is_err()); // only 7 chars
+        assert!(validate_aws_resource_id("VPC-12345678").is_err()); // uppercase prefix
+    }
+
+    #[test]
+    fn validate_aws_resource_id_type_with_value() {
+        let t = aws_resource_id();
+        assert!(
+            t.validate(&Value::String("vpc-1a2b3c4d".to_string()))
+                .is_ok()
+        );
+        assert!(t.validate(&Value::String("vpc".to_string())).is_err());
+        assert!(t.validate(&Value::Int(42)).is_err());
+        // ResourceRef should be accepted
+        assert!(
+            t.validate(&Value::ResourceRef(
+                "my_vpc".to_string(),
+                "vpc_id".to_string()
+            ))
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn validate_availability_zone_valid() {
+        assert!(validate_availability_zone("us-east-1a").is_ok());
+        assert!(validate_availability_zone("ap-northeast-1c").is_ok());
+        assert!(validate_availability_zone("eu-central-1b").is_ok());
+        assert!(validate_availability_zone("me-south-1a").is_ok());
+        assert!(validate_availability_zone("us-west-2d").is_ok());
+    }
+
+    #[test]
+    fn validate_availability_zone_invalid() {
+        assert!(validate_availability_zone("us-east-1").is_err()); // no zone letter
+        assert!(validate_availability_zone("US-EAST-1A").is_err()); // uppercase
+        assert!(validate_availability_zone("us-east").is_err()); // no number
+        assert!(validate_availability_zone("1a").is_err()); // too short
+        assert!(validate_availability_zone("").is_err()); // empty
+    }
+
+    #[test]
+    fn validate_availability_zone_type_with_value() {
+        let t = availability_zone();
+        assert!(t.validate(&Value::String("us-east-1a".to_string())).is_ok());
+        assert!(t.validate(&Value::String("us-east-1".to_string())).is_err());
+        assert!(t.validate(&Value::String("invalid".to_string())).is_err());
+        assert!(t.validate(&Value::Int(42)).is_err());
+    }
+}
 EOF
 
 echo ""

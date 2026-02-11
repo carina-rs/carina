@@ -35,7 +35,7 @@ pub fn ec2_subnet_config() -> AwsccSchemaConfig {
             AttributeSchema::new("block_public_access_states", AttributeType::Struct {
                     name: "BlockPublicAccessStates".to_string(),
                     fields: vec![
-                    StructField::new("internet_gateway_block_mode", AttributeType::String).with_description("The mode of VPC BPA. Options here are off, block-bidirectional, block-ingress ").with_provider_name("InternetGatewayBlockMode")
+                    StructField::new("internet_gateway_block_mode", AttributeType::Enum(vec!["off".to_string(), "block-bidirectional".to_string(), "block-ingress".to_string()])).with_description("The mode of VPC BPA. Options here are off, block-bidirectional, block-ingress ").with_provider_name("InternetGatewayBlockMode")
                     ],
                 })
                 .with_description(" (read-only)")
@@ -112,7 +112,7 @@ pub fn ec2_subnet_config() -> AwsccSchemaConfig {
                     fields: vec![
                     StructField::new("enable_resource_name_dns_aaaa_record", AttributeType::Bool).with_provider_name("EnableResourceNameDnsAAAARecord"),
                     StructField::new("enable_resource_name_dns_a_record", AttributeType::Bool).with_provider_name("EnableResourceNameDnsARecord"),
-                    StructField::new("hostname_type", AttributeType::String).with_provider_name("HostnameType")
+                    StructField::new("hostname_type", AttributeType::Enum(vec!["ip-name".to_string(), "resource-name".to_string()])).with_provider_name("HostnameType")
                     ],
                 })
                 .with_description("The hostname type for EC2 instances launched into this subnet and how DNS A and AAAA record queries to the instances should be handled. For more infor...")

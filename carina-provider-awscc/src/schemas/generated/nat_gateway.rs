@@ -10,6 +10,17 @@ use super::validate_namespaced_enum;
 use carina_core::resource::Value;
 use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField, types};
 
+const VALID_AVAILABILITY_MODE: &[&str] = &["zonal", "regional"];
+
+fn validate_availability_mode(value: &Value) -> Result<(), String> {
+    validate_namespaced_enum(
+        value,
+        "AvailabilityMode",
+        "awscc.ec2_nat_gateway",
+        VALID_AVAILABILITY_MODE,
+    )
+}
+
 const VALID_CONNECTIVITY_TYPE: &[&str] = &["public", "private"];
 
 fn validate_connectivity_type(value: &Value) -> Result<(), String> {
@@ -45,7 +56,12 @@ pub fn ec2_nat_gateway_config() -> AwsccSchemaConfig {
                 .with_provider_name("AutoScalingIps"),
         )
         .attribute(
-            AttributeSchema::new("availability_mode", AttributeType::String)
+            AttributeSchema::new("availability_mode", AttributeType::Custom {
+                name: "AvailabilityMode".to_string(),
+                base: Box::new(AttributeType::String),
+                validate: validate_availability_mode,
+                namespace: Some("awscc.ec2_nat_gateway".to_string()),
+            })
                 .with_description("Indicates whether this is a zonal (single-AZ) or regional (multi-AZ) NAT gateway. A zonal NAT gateway is a NAT Gateway that provides redundancy and sc...")
                 .with_provider_name("AvailabilityMode"),
         )
@@ -53,7 +69,7 @@ pub fn ec2_nat_gateway_config() -> AwsccSchemaConfig {
             AttributeSchema::new("availability_zone_addresses", AttributeType::List(Box::new(AttributeType::Struct {
                     name: "AvailabilityZoneAddress".to_string(),
                     fields: vec![
-                    StructField::new("allocation_ids", AttributeType::List(Box::new(AttributeType::String))).required().with_description("The allocation IDs of the Elastic IP addresses (EIPs) to be used for handling outbound NAT traffic in this specific Availability Zone.").with_provider_name("AllocationIds"),
+                    StructField::new("allocation_ids", AttributeType::List(Box::new(super::aws_resource_id()))).required().with_description("The allocation IDs of the Elastic IP addresses (EIPs) to be used for handling outbound NAT traffic in this specific Availability Zone.").with_provider_name("AllocationIds"),
                     StructField::new("availability_zone", super::availability_zone()).with_description("For regional NAT gateways only: The Availability Zone where this specific NAT gateway configuration will be active. Each AZ in a regional NAT gateway ...").with_provider_name("AvailabilityZone"),
                     StructField::new("availability_zone_id", AttributeType::String).with_description("For regional NAT gateways only: The ID of the Availability Zone where this specific NAT gateway configuration will be active. Each AZ in a regional NA...").with_provider_name("AvailabilityZoneId")
                     ],
@@ -97,7 +113,7 @@ pub fn ec2_nat_gateway_config() -> AwsccSchemaConfig {
                 .with_provider_name("RouteTableId"),
         )
         .attribute(
-            AttributeSchema::new("secondary_allocation_ids", AttributeType::List(Box::new(AttributeType::String)))
+            AttributeSchema::new("secondary_allocation_ids", AttributeType::List(Box::new(super::aws_resource_id())))
                 .with_description("Secondary EIP allocation IDs. For more information, see [Create a NAT gateway](https://docs.aws.amazon.com/vpc/latest/userguide/nat-gateway-working-wi...")
                 .with_provider_name("SecondaryAllocationIds"),
         )

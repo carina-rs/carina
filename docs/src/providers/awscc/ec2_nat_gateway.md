@@ -18,7 +18,7 @@ Specifies a network address translation (NAT) gateway in the specified subnet. Y
 
 ### `availability_mode`
 
-- **Type:** String
+- **Type:** [Enum (AvailabilityMode)](#availability_mode-availabilitymode)
 - **Required:** No
 
 Indicates whether this is a zonal (single-AZ) or regional (multi-AZ) NAT gateway. A zonal NAT gateway is a NAT Gateway that provides redundancy and scalability within a single availability zone. A regional NAT gateway is a single NAT Gateway that works across multiple availability zones (AZs) in your VPC, providing redundancy, scalability and availability across all the AZs in a Region. For more information, see [Regional NAT gateways for automatic multi-AZ expansion](https://docs.aws.amazon.com/vpc/latest/userguide/nat-gateways-regional.html) in the *Amazon VPC User Guide*.
@@ -116,6 +116,15 @@ The ID of the VPC in which the NAT gateway is located.
 - **Type:** AwsResourceId
 
 ## Enum Values
+
+### availability_mode (AvailabilityMode)
+
+| Value | DSL Identifier |
+|-------|----------------|
+| `zonal` | `awscc.ec2_nat_gateway.AvailabilityMode.zonal` |
+| `regional` | `awscc.ec2_nat_gateway.AvailabilityMode.regional` |
+
+Shorthand formats: `zonal` or `AvailabilityMode.zonal`
 
 ### connectivity_type (ConnectivityType)
 

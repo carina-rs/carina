@@ -151,7 +151,7 @@ The ID of the VPC the subnet is in. If you update this property, you must also u
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `internet_gateway_block_mode` | String | No | The mode of VPC BPA. Options here are off, block-bidirectional, block-ingress  |
+| `internet_gateway_block_mode` | Enum | No | The mode of VPC BPA. Options here are off, block-bidirectional, block-ingress  |
 
 ### PrivateDnsNameOptionsOnLaunch
 
@@ -159,7 +159,7 @@ The ID of the VPC the subnet is in. If you update this property, you must also u
 |-------|------|----------|-------------|
 | `enable_resource_name_dns_aaaa_record` | Bool | No |  |
 | `enable_resource_name_dns_a_record` | Bool | No |  |
-| `hostname_type` | String | No |  |
+| `hostname_type` | Enum | No |  |
 
 
 

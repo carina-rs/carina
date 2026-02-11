@@ -921,6 +921,14 @@ fn known_enum_overrides() -> HashMap<&'static str, Vec<&'static str>> {
     let mut m = HashMap::new();
     m.insert("IpProtocol", vec!["tcp", "udp", "icmp", "icmpv6", "-1"]);
     m.insert("ConnectivityType", vec!["public", "private"]);
+    m.insert("AvailabilityMode", vec!["zonal", "regional"]);
+    m.insert("AddressFamily", vec!["IPv4", "IPv6"]);
+    m.insert("Domain", vec!["vpc", "standard"]);
+    m.insert(
+        "InternetGatewayBlockMode",
+        vec!["off", "block-bidirectional", "block-ingress"],
+    );
+    m.insert("HostnameType", vec!["ip-name", "resource-name"]);
     m
 }
 
@@ -947,9 +955,15 @@ fn is_aws_resource_id_property(prop_name: &str) -> bool {
     if lower.contains("owner") || lower.contains("availabilityzone") || lower == "resourceid" {
         return false;
     }
+    // Strip trailing "s" for plural forms (e.g., "RouteTableIds" -> "routetableid")
+    let singular = if lower.ends_with("ids") {
+        &lower[..lower.len() - 1]
+    } else {
+        &lower
+    };
     resource_id_suffixes
         .iter()
-        .any(|suffix| lower.ends_with(suffix))
+        .any(|suffix| lower.ends_with(suffix) || singular.ends_with(suffix))
 }
 
 /// Check if a property name represents an IPAM Pool ID

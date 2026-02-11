@@ -10,6 +10,17 @@ use super::validate_namespaced_enum;
 use carina_core::resource::Value;
 use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
 
+const VALID_ADDRESS_FAMILY: &[&str] = &["IPv4", "IPv6"];
+
+fn validate_address_family(value: &Value) -> Result<(), String> {
+    validate_namespaced_enum(
+        value,
+        "AddressFamily",
+        "awscc.ec2_ipam_pool",
+        VALID_ADDRESS_FAMILY,
+    )
+}
+
 const VALID_AWS_SERVICE: &[&str] = &["ec2", "global-services"];
 
 fn validate_aws_service(value: &Value) -> Result<(), String> {
@@ -65,7 +76,12 @@ pub fn ec2_ipam_pool_config() -> AwsccSchemaConfig {
         schema: ResourceSchema::new("awscc.ec2_ipam_pool")
         .with_description("Resource Schema of AWS::EC2::IPAMPool Type")
         .attribute(
-            AttributeSchema::new("address_family", AttributeType::String)
+            AttributeSchema::new("address_family", AttributeType::Custom {
+                name: "AddressFamily".to_string(),
+                base: Box::new(AttributeType::String),
+                validate: validate_address_family,
+                namespace: Some("awscc.ec2_ipam_pool".to_string()),
+            })
                 .required()
                 .with_description("The address family of the address space in this pool. Either IPv4 or IPv6.")
                 .with_provider_name("AddressFamily"),
