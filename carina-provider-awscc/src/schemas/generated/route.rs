@@ -46,7 +46,7 @@ pub fn ec2_route_config() -> AwsccSchemaConfig {
                 .with_provider_name("DestinationPrefixListId"),
         )
         .attribute(
-            AttributeSchema::new("egress_only_internet_gateway_id", super::aws_resource_id())
+            AttributeSchema::new("egress_only_internet_gateway_id", super::internet_gateway_id())
                 .with_description("[IPv6 traffic only] The ID of an egress-only internet gateway.")
                 .with_provider_name("EgressOnlyInternetGatewayId"),
         )
@@ -66,7 +66,7 @@ pub fn ec2_route_config() -> AwsccSchemaConfig {
                 .with_provider_name("LocalGatewayId"),
         )
         .attribute(
-            AttributeSchema::new("nat_gateway_id", super::aws_resource_id())
+            AttributeSchema::new("nat_gateway_id", super::nat_gateway_id())
                 .with_description("[IPv4 traffic only] The ID of a NAT gateway.")
                 .with_provider_name("NatGatewayId"),
         )
@@ -76,23 +76,23 @@ pub fn ec2_route_config() -> AwsccSchemaConfig {
                 .with_provider_name("NetworkInterfaceId"),
         )
         .attribute(
-            AttributeSchema::new("route_table_id", super::aws_resource_id())
+            AttributeSchema::new("route_table_id", super::route_table_id())
                 .required()
                 .with_description("The ID of the route table for the route.")
                 .with_provider_name("RouteTableId"),
         )
         .attribute(
-            AttributeSchema::new("transit_gateway_id", super::aws_resource_id())
+            AttributeSchema::new("transit_gateway_id", super::transit_gateway_id())
                 .with_description("The ID of a transit gateway.")
                 .with_provider_name("TransitGatewayId"),
         )
         .attribute(
-            AttributeSchema::new("vpc_endpoint_id", super::aws_resource_id())
+            AttributeSchema::new("vpc_endpoint_id", super::vpc_endpoint_id())
                 .with_description("The ID of a VPC endpoint. Supported for Gateway Load Balancer endpoints only.")
                 .with_provider_name("VpcEndpointId"),
         )
         .attribute(
-            AttributeSchema::new("vpc_peering_connection_id", super::aws_resource_id())
+            AttributeSchema::new("vpc_peering_connection_id", super::vpc_peering_connection_id())
                 .with_description("The ID of a VPC peering connection.")
                 .with_provider_name("VpcPeeringConnectionId"),
         )

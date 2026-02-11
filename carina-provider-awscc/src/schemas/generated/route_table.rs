@@ -17,7 +17,7 @@ pub fn ec2_route_table_config() -> AwsccSchemaConfig {
         schema: ResourceSchema::new("awscc.ec2_route_table")
         .with_description("Specifies a route table for the specified VPC. After you create a route table, you can add routes and associate the table with a subnet.  For more information, see [Route tables](https://docs.aws.amaz...")
         .attribute(
-            AttributeSchema::new("route_table_id", super::aws_resource_id())
+            AttributeSchema::new("route_table_id", super::route_table_id())
                 .with_description(" (read-only)")
                 .with_provider_name("RouteTableId"),
         )
@@ -27,7 +27,7 @@ pub fn ec2_route_table_config() -> AwsccSchemaConfig {
                 .with_provider_name("Tags"),
         )
         .attribute(
-            AttributeSchema::new("vpc_id", super::aws_resource_id())
+            AttributeSchema::new("vpc_id", super::vpc_id())
                 .required()
                 .with_description("The ID of the VPC.")
                 .with_provider_name("VpcId"),

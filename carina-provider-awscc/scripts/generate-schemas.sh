@@ -309,6 +309,195 @@ pub fn validate_aws_resource_id(id: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Validate a resource ID with a specific prefix
+fn validate_prefixed_resource_id(id: &str, expected_prefix: &str) -> Result<(), String> {
+    let expected_format = format!("{}-xxxxxxxx", expected_prefix);
+    if !id.starts_with(&format!("{}-", expected_prefix)) {
+        return Err(format!(
+            "Invalid resource ID '{}': expected format '{}'",
+            id, expected_format
+        ));
+    }
+    // Reuse existing validation for the rest
+    validate_aws_resource_id(id)
+}
+
+/// VPC ID type (e.g., "vpc-1a2b3c4d")
+pub fn vpc_id() -> AttributeType {
+    AttributeType::Custom {
+        name: "VpcId".to_string(),
+        base: Box::new(AttributeType::String),
+        validate: |value| {
+            if let Value::String(s) = value {
+                validate_prefixed_resource_id(s, "vpc")
+            } else {
+                Err("Expected string".to_string())
+            }
+        },
+        namespace: None,
+    }
+}
+
+/// Subnet ID type (e.g., "subnet-0123456789abcdef0")
+pub fn subnet_id() -> AttributeType {
+    AttributeType::Custom {
+        name: "SubnetId".to_string(),
+        base: Box::new(AttributeType::String),
+        validate: |value| {
+            if let Value::String(s) = value {
+                validate_prefixed_resource_id(s, "subnet")
+            } else {
+                Err("Expected string".to_string())
+            }
+        },
+        namespace: None,
+    }
+}
+
+/// Security Group ID type (e.g., "sg-12345678")
+pub fn security_group_id() -> AttributeType {
+    AttributeType::Custom {
+        name: "SecurityGroupId".to_string(),
+        base: Box::new(AttributeType::String),
+        validate: |value| {
+            if let Value::String(s) = value {
+                validate_prefixed_resource_id(s, "sg")
+            } else {
+                Err("Expected string".to_string())
+            }
+        },
+        namespace: None,
+    }
+}
+
+/// Internet Gateway ID type (e.g., "igw-12345678")
+pub fn internet_gateway_id() -> AttributeType {
+    AttributeType::Custom {
+        name: "InternetGatewayId".to_string(),
+        base: Box::new(AttributeType::String),
+        validate: |value| {
+            if let Value::String(s) = value {
+                validate_prefixed_resource_id(s, "igw")
+            } else {
+                Err("Expected string".to_string())
+            }
+        },
+        namespace: None,
+    }
+}
+
+/// Route Table ID type (e.g., "rtb-abcdef12")
+pub fn route_table_id() -> AttributeType {
+    AttributeType::Custom {
+        name: "RouteTableId".to_string(),
+        base: Box::new(AttributeType::String),
+        validate: |value| {
+            if let Value::String(s) = value {
+                validate_prefixed_resource_id(s, "rtb")
+            } else {
+                Err("Expected string".to_string())
+            }
+        },
+        namespace: None,
+    }
+}
+
+/// NAT Gateway ID type (e.g., "nat-0123456789abcdef0")
+pub fn nat_gateway_id() -> AttributeType {
+    AttributeType::Custom {
+        name: "NatGatewayId".to_string(),
+        base: Box::new(AttributeType::String),
+        validate: |value| {
+            if let Value::String(s) = value {
+                validate_prefixed_resource_id(s, "nat")
+            } else {
+                Err("Expected string".to_string())
+            }
+        },
+        namespace: None,
+    }
+}
+
+/// VPC Peering Connection ID type (e.g., "pcx-12345678")
+pub fn vpc_peering_connection_id() -> AttributeType {
+    AttributeType::Custom {
+        name: "VpcPeeringConnectionId".to_string(),
+        base: Box::new(AttributeType::String),
+        validate: |value| {
+            if let Value::String(s) = value {
+                validate_prefixed_resource_id(s, "pcx")
+            } else {
+                Err("Expected string".to_string())
+            }
+        },
+        namespace: None,
+    }
+}
+
+/// Transit Gateway ID type (e.g., "tgw-0123456789abcdef0")
+pub fn transit_gateway_id() -> AttributeType {
+    AttributeType::Custom {
+        name: "TransitGatewayId".to_string(),
+        base: Box::new(AttributeType::String),
+        validate: |value| {
+            if let Value::String(s) = value {
+                validate_prefixed_resource_id(s, "tgw")
+            } else {
+                Err("Expected string".to_string())
+            }
+        },
+        namespace: None,
+    }
+}
+
+/// VPN Gateway ID type (e.g., "vgw-12345678")
+pub fn vpn_gateway_id() -> AttributeType {
+    AttributeType::Custom {
+        name: "VpnGatewayId".to_string(),
+        base: Box::new(AttributeType::String),
+        validate: |value| {
+            if let Value::String(s) = value {
+                validate_prefixed_resource_id(s, "vgw")
+            } else {
+                Err("Expected string".to_string())
+            }
+        },
+        namespace: None,
+    }
+}
+
+/// Egress Only Internet Gateway ID type (e.g., "eigw-12345678")
+pub fn egress_only_internet_gateway_id() -> AttributeType {
+    AttributeType::Custom {
+        name: "EgressOnlyInternetGatewayId".to_string(),
+        base: Box::new(AttributeType::String),
+        validate: |value| {
+            if let Value::String(s) = value {
+                validate_prefixed_resource_id(s, "eigw")
+            } else {
+                Err("Expected string".to_string())
+            }
+        },
+        namespace: None,
+    }
+}
+
+/// VPC Endpoint ID type (e.g., "vpce-0123456789abcdef0")
+pub fn vpc_endpoint_id() -> AttributeType {
+    AttributeType::Custom {
+        name: "VpcEndpointId".to_string(),
+        base: Box::new(AttributeType::String),
+        validate: |value| {
+            if let Value::String(s) = value {
+                validate_prefixed_resource_id(s, "vpce")
+            } else {
+                Err("Expected string".to_string())
+            }
+        },
+        namespace: None,
+    }
+}
+
 /// Availability Zone type (e.g., "us-east-1a", "ap-northeast-1c")
 /// Validates format: region + single letter zone identifier
 pub fn availability_zone() -> AttributeType {
@@ -507,6 +696,166 @@ mod tests {
         assert!(t.validate(&Value::String("us-east-1".to_string())).is_err());
         assert!(t.validate(&Value::String("invalid".to_string())).is_err());
         assert!(t.validate(&Value::Int(42)).is_err());
+    }
+
+    #[test]
+    fn validate_vpc_id_valid() {
+        let t = vpc_id();
+        assert!(t.validate(&Value::String("vpc-1a2b3c4d".to_string())).is_ok());
+        assert!(t
+            .validate(&Value::String("vpc-0123456789abcdef0".to_string()))
+            .is_ok());
+    }
+
+    #[test]
+    fn validate_vpc_id_invalid() {
+        let t = vpc_id();
+        assert!(t
+            .validate(&Value::String("subnet-12345678".to_string()))
+            .is_err());
+        assert!(t.validate(&Value::String("vpc-short".to_string())).is_err());
+        assert!(t.validate(&Value::String("vpc".to_string())).is_err());
+    }
+
+    #[test]
+    fn validate_subnet_id_valid() {
+        let t = subnet_id();
+        assert!(t
+            .validate(&Value::String("subnet-0123456789abcdef0".to_string()))
+            .is_ok());
+        assert!(t
+            .validate(&Value::String("subnet-12345678".to_string()))
+            .is_ok());
+    }
+
+    #[test]
+    fn validate_subnet_id_invalid() {
+        let t = subnet_id();
+        assert!(t
+            .validate(&Value::String("vpc-12345678".to_string()))
+            .is_err());
+        assert!(t
+            .validate(&Value::String("subnet-short".to_string()))
+            .is_err());
+    }
+
+    #[test]
+    fn validate_security_group_id_valid() {
+        let t = security_group_id();
+        assert!(t
+            .validate(&Value::String("sg-12345678".to_string()))
+            .is_ok());
+        assert!(t
+            .validate(&Value::String("sg-0123456789abcdef0".to_string()))
+            .is_ok());
+    }
+
+    #[test]
+    fn validate_security_group_id_invalid() {
+        let t = security_group_id();
+        assert!(t
+            .validate(&Value::String("vpc-12345678".to_string()))
+            .is_err());
+        assert!(t.validate(&Value::String("sg-short".to_string())).is_err());
+    }
+
+    #[test]
+    fn validate_internet_gateway_id_valid() {
+        let t = internet_gateway_id();
+        assert!(t
+            .validate(&Value::String("igw-12345678".to_string()))
+            .is_ok());
+        assert!(t
+            .validate(&Value::String("igw-0123456789abcdef0".to_string()))
+            .is_ok());
+    }
+
+    #[test]
+    fn validate_route_table_id_valid() {
+        let t = route_table_id();
+        assert!(t
+            .validate(&Value::String("rtb-abcdef12".to_string()))
+            .is_ok());
+        assert!(t
+            .validate(&Value::String("rtb-0123456789abcdef0".to_string()))
+            .is_ok());
+    }
+
+    #[test]
+    fn validate_nat_gateway_id_valid() {
+        let t = nat_gateway_id();
+        assert!(t
+            .validate(&Value::String("nat-0123456789abcdef0".to_string()))
+            .is_ok());
+        assert!(t
+            .validate(&Value::String("nat-12345678".to_string()))
+            .is_ok());
+    }
+
+    #[test]
+    fn validate_vpc_peering_connection_id_valid() {
+        let t = vpc_peering_connection_id();
+        assert!(t
+            .validate(&Value::String("pcx-12345678".to_string()))
+            .is_ok());
+        assert!(t
+            .validate(&Value::String("pcx-0123456789abcdef0".to_string()))
+            .is_ok());
+    }
+
+    #[test]
+    fn validate_transit_gateway_id_valid() {
+        let t = transit_gateway_id();
+        assert!(t
+            .validate(&Value::String("tgw-0123456789abcdef0".to_string()))
+            .is_ok());
+        assert!(t
+            .validate(&Value::String("tgw-12345678".to_string()))
+            .is_ok());
+    }
+
+    #[test]
+    fn validate_vpn_gateway_id_valid() {
+        let t = vpn_gateway_id();
+        assert!(t
+            .validate(&Value::String("vgw-12345678".to_string()))
+            .is_ok());
+        assert!(t
+            .validate(&Value::String("vgw-0123456789abcdef0".to_string()))
+            .is_ok());
+    }
+
+    #[test]
+    fn validate_egress_only_internet_gateway_id_valid() {
+        let t = egress_only_internet_gateway_id();
+        assert!(t
+            .validate(&Value::String("eigw-12345678".to_string()))
+            .is_ok());
+        assert!(t
+            .validate(&Value::String("eigw-0123456789abcdef0".to_string()))
+            .is_ok());
+    }
+
+    #[test]
+    fn validate_vpc_endpoint_id_valid() {
+        let t = vpc_endpoint_id();
+        assert!(t
+            .validate(&Value::String("vpce-0123456789abcdef0".to_string()))
+            .is_ok());
+        assert!(t
+            .validate(&Value::String("vpce-12345678".to_string()))
+            .is_ok());
+    }
+
+    #[test]
+    fn validate_prefix_mismatch_error_messages() {
+        let t = vpc_id();
+        let result = t.validate(&Value::String("subnet-12345678".to_string()));
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        let err_msg = err.to_string();
+        assert!(err_msg.contains("vpc-xxxxxxxx"));
+        assert!(err_msg.contains("subnet-12345678"));
     }
 }
 EOF

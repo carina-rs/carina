@@ -150,7 +150,7 @@ pub fn ec2_vpc_endpoint_config() -> AwsccSchemaConfig {
                 .with_provider_name("VpcEndpointType"),
         )
         .attribute(
-            AttributeSchema::new("vpc_id", super::aws_resource_id())
+            AttributeSchema::new("vpc_id", super::vpc_id())
                 .required()
                 .with_description("The ID of the VPC.")
                 .with_provider_name("VpcId"),

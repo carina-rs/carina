@@ -33,7 +33,7 @@ pub fn ec2_vpn_gateway_config() -> AwsccSchemaConfig {
                 .with_provider_name("Type"),
         )
         .attribute(
-            AttributeSchema::new("vpn_gateway_id", super::aws_resource_id())
+            AttributeSchema::new("vpn_gateway_id", super::vpn_gateway_id())
                 .with_description(" (read-only)")
                 .with_provider_name("VPNGatewayId"),
         )

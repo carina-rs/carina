@@ -49,7 +49,7 @@ pub fn ec2_security_group_egress_config() -> AwsccSchemaConfig {
                 .with_provider_name("DestinationPrefixListId"),
         )
         .attribute(
-            AttributeSchema::new("destination_security_group_id", super::aws_resource_id())
+            AttributeSchema::new("destination_security_group_id", super::security_group_id())
                 .with_description("The ID of the security group. You must specify exactly one of the following: ``CidrIp``, ``CidrIpv6``, ``DestinationPrefixListId``, or ``DestinationSe...")
                 .with_provider_name("DestinationSecurityGroupId"),
         )
@@ -59,7 +59,7 @@ pub fn ec2_security_group_egress_config() -> AwsccSchemaConfig {
                 .with_provider_name("FromPort"),
         )
         .attribute(
-            AttributeSchema::new("group_id", super::aws_resource_id())
+            AttributeSchema::new("group_id", super::security_group_id())
                 .required()
                 .with_description("The ID of the security group. You must specify either the security group ID or the security group name in the request. For security groups in a nondef...")
                 .with_provider_name("GroupId"),

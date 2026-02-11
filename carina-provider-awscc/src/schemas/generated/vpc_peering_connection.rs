@@ -37,7 +37,7 @@ pub fn ec2_vpc_peering_connection_config() -> AwsccSchemaConfig {
                 .with_provider_name("PeerRoleArn"),
         )
         .attribute(
-            AttributeSchema::new("peer_vpc_id", super::aws_resource_id())
+            AttributeSchema::new("peer_vpc_id", super::vpc_id())
                 .required()
                 .with_description("The ID of the VPC with which you are creating the VPC peering connection. You must specify this parameter in the request.")
                 .with_provider_name("PeerVpcId"),
@@ -47,7 +47,7 @@ pub fn ec2_vpc_peering_connection_config() -> AwsccSchemaConfig {
                 .with_provider_name("Tags"),
         )
         .attribute(
-            AttributeSchema::new("vpc_id", super::aws_resource_id())
+            AttributeSchema::new("vpc_id", super::vpc_id())
                 .required()
                 .with_description("The ID of the VPC.")
                 .with_provider_name("VpcId"),

@@ -98,7 +98,7 @@ pub fn ec2_nat_gateway_config() -> AwsccSchemaConfig {
                 .with_provider_name("MaxDrainDurationSeconds"),
         )
         .attribute(
-            AttributeSchema::new("nat_gateway_id", super::aws_resource_id())
+            AttributeSchema::new("nat_gateway_id", super::nat_gateway_id())
                 .with_description(" (read-only)")
                 .with_provider_name("NatGatewayId"),
         )
@@ -108,7 +108,7 @@ pub fn ec2_nat_gateway_config() -> AwsccSchemaConfig {
                 .with_provider_name("PrivateIpAddress"),
         )
         .attribute(
-            AttributeSchema::new("route_table_id", super::aws_resource_id())
+            AttributeSchema::new("route_table_id", super::route_table_id())
                 .with_description(" (read-only)")
                 .with_provider_name("RouteTableId"),
         )
@@ -128,7 +128,7 @@ pub fn ec2_nat_gateway_config() -> AwsccSchemaConfig {
                 .with_provider_name("SecondaryPrivateIpAddresses"),
         )
         .attribute(
-            AttributeSchema::new("subnet_id", super::aws_resource_id())
+            AttributeSchema::new("subnet_id", super::subnet_id())
                 .with_description("The ID of the subnet in which the NAT gateway is located.")
                 .with_provider_name("SubnetId"),
         )
@@ -138,7 +138,7 @@ pub fn ec2_nat_gateway_config() -> AwsccSchemaConfig {
                 .with_provider_name("Tags"),
         )
         .attribute(
-            AttributeSchema::new("vpc_id", super::aws_resource_id())
+            AttributeSchema::new("vpc_id", super::vpc_id())
                 .with_description("The ID of the VPC in which the NAT gateway is located.")
                 .with_provider_name("VpcId"),
         )

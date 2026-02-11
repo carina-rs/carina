@@ -17,7 +17,7 @@ pub fn ec2_internet_gateway_config() -> AwsccSchemaConfig {
         schema: ResourceSchema::new("awscc.ec2_internet_gateway")
         .with_description("Allocates an internet gateway for use with a VPC. After creating the Internet gateway, you then attach it to a VPC.")
         .attribute(
-            AttributeSchema::new("internet_gateway_id", super::aws_resource_id())
+            AttributeSchema::new("internet_gateway_id", super::internet_gateway_id())
                 .with_description(" (read-only)")
                 .with_provider_name("InternetGatewayId"),
         )
