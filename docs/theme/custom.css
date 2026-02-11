@@ -1,0 +1,44 @@
+/* Standardize table column widths for documentation */
+
+/* All tables: consistent base styling */
+table {
+    table-layout: fixed;
+    width: 100%;
+}
+
+/* Enum values tables (2 columns: Value | DSL Identifier) */
+table:has(th:first-child:last-child + th) {
+    table-layout: fixed;
+}
+table:has(th:first-child:last-child + th) th:first-child,
+table:has(th:first-child:last-child + th) td:first-child {
+    width: 30%;
+}
+table:has(th:first-child:last-child + th) th:last-child,
+table:has(th:first-child:last-child + th) td:last-child {
+    width: 70%;
+}
+
+/* Struct field tables (4 columns: Field | Type | Required | Description) */
+table:has(th:nth-child(4):last-child) th:nth-child(1),
+table:has(th:nth-child(4):last-child) td:nth-child(1) {
+    width: 25%;
+}
+table:has(th:nth-child(4):last-child) th:nth-child(2),
+table:has(th:nth-child(4):last-child) td:nth-child(2) {
+    width: 20%;
+}
+table:has(th:nth-child(4):last-child) th:nth-child(3),
+table:has(th:nth-child(4):last-child) td:nth-child(3) {
+    width: 10%;
+}
+table:has(th:nth-child(4):last-child) th:nth-child(4),
+table:has(th:nth-child(4):last-child) td:nth-child(4) {
+    width: 45%;
+}
+
+/* Ensure cell content wraps properly with fixed layout */
+td, th {
+    word-wrap: break-word;
+    overflow-wrap: break-word;
+}
