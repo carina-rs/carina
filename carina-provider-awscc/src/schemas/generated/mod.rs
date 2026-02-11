@@ -481,13 +481,16 @@ pub fn validate_availability_zone(az: &str) -> Result<(), String> {
     Ok(())
 }
 
+pub mod bucket;
 pub mod egress_only_internet_gateway;
 pub mod eip;
 pub mod flow_log;
 pub mod internet_gateway;
 pub mod ipam;
 pub mod ipam_pool;
+pub mod log_group;
 pub mod nat_gateway;
+pub mod role;
 pub mod route;
 pub mod route_table;
 pub mod security_group;
@@ -496,6 +499,7 @@ pub mod security_group_ingress;
 pub mod subnet;
 pub mod subnet_route_table_association;
 pub mod transit_gateway;
+pub mod transit_gateway_attachment;
 pub mod vpc;
 pub mod vpc_endpoint;
 pub mod vpc_gateway_attachment;
@@ -525,6 +529,10 @@ pub fn configs() -> Vec<AwsccSchemaConfig> {
         transit_gateway::ec2_transit_gateway_config(),
         vpc_peering_connection::ec2_vpc_peering_connection_config(),
         egress_only_internet_gateway::ec2_egress_only_internet_gateway_config(),
+        transit_gateway_attachment::ec2_transit_gateway_attachment_config(),
+        bucket::s3_bucket_config(),
+        role::iam_role_config(),
+        log_group::logs_log_group_config(),
     ]
 }
 
