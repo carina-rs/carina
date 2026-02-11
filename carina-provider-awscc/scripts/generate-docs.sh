@@ -34,6 +34,10 @@ RESOURCE_TYPES=(
     "AWS::EC2::TransitGateway"
     "AWS::EC2::VPCPeeringConnection"
     "AWS::EC2::EgressOnlyInternetGateway"
+    "AWS::EC2::TransitGatewayAttachment"
+    "AWS::S3::Bucket"
+    "AWS::IAM::Role"
+    "AWS::Logs::LogGroup"
 )
 
 echo "Generating awscc provider documentation..."

@@ -25,3 +25,7 @@
   - [awscc.ec2_transit_gateway](providers/awscc/ec2_transit_gateway.md)
   - [awscc.ec2_vpc_peering_connection](providers/awscc/ec2_vpc_peering_connection.md)
   - [awscc.ec2_egress_only_internet_gateway](providers/awscc/ec2_egress_only_internet_gateway.md)
+  - [awscc.ec2_transit_gateway_attachment](providers/awscc/ec2_transit_gateway_attachment.md)
+  - [awscc.s3_bucket](providers/awscc/s3_bucket.md)
+  - [awscc.iam_role](providers/awscc/iam_role.md)
+  - [awscc.logs_log_group](providers/awscc/logs_log_group.md)
