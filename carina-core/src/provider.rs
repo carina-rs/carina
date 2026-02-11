@@ -14,6 +14,7 @@ pub struct ProviderError {
     pub message: String,
     pub resource_id: Option<ResourceId>,
     pub cause: Option<Box<dyn std::error::Error + Send + Sync>>,
+    pub is_timeout: bool,
 }
 
 impl std::fmt::Display for ProviderError {
@@ -40,6 +41,7 @@ impl ProviderError {
             message: message.into(),
             resource_id: None,
             cause: None,
+            is_timeout: false,
         }
     }
 
@@ -50,6 +52,11 @@ impl ProviderError {
 
     pub fn with_cause(mut self, cause: impl std::error::Error + Send + Sync + 'static) -> Self {
         self.cause = Some(Box::new(cause));
+        self
+    }
+
+    pub fn timeout(mut self) -> Self {
+        self.is_timeout = true;
         self
     }
 }
