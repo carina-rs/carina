@@ -31,7 +31,7 @@ Indicates whether the DNS resolution is supported for the VPC. If enabled, queri
 
 ### `instance_tenancy`
 
-- **Type:** Enum (InstanceTenancy)
+- **Type:** [Enum (InstanceTenancy)](#instance_tenancy-instancetenancy)
 - **Required:** No
 
 The allowed tenancy of instances launched into the VPC.  + ``default``: An instance launched into the VPC runs on shared hardware by default, unless you explicitly specify a different tenancy during instance launch.  + ``dedicated``: An instance launched into the VPC runs on dedicated hardware by default, unless you explicitly specify a tenancy of ``host`` during instance launch. You cannot specify a tenancy of ``default`` during instance launch.   Updating ``InstanceTenancy`` requires no replacement only if you are updating its value from ``dedicated`` to ``default``. Updating ``InstanceTenancy`` from ``default`` to ``dedicated`` requires replacement.

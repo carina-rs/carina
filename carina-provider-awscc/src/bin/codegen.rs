@@ -237,7 +237,12 @@ fn type_display_string(
     enums: &BTreeMap<String, EnumInfo>,
 ) -> String {
     if enums.contains_key(prop_name) {
-        format!("Enum ({})", enums[prop_name].type_name)
+        format!(
+            "[Enum ({})](#{}-{})",
+            enums[prop_name].type_name,
+            prop_name.to_snake_case(),
+            enums[prop_name].type_name.to_lowercase()
+        )
     } else if prop_name == "Tags" {
         "Map".to_string()
     } else if let Some(ref_path) = &prop.ref_path {

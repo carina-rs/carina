@@ -18,7 +18,7 @@ Describes the DNS options for an endpoint.
 
 ### `ip_address_type`
 
-- **Type:** Enum (IpAddressType)
+- **Type:** [Enum (IpAddressType)](#ip_address_type-ipaddresstype)
 - **Required:** No
 
 The supported IP address types.
@@ -95,7 +95,7 @@ The tags to associate with the endpoint.
 
 ### `vpc_endpoint_type`
 
-- **Type:** Enum (VpcEndpointType)
+- **Type:** [Enum (VpcEndpointType)](#vpc_endpoint_type-vpcendpointtype)
 - **Required:** No
 
 The type of endpoint. Default: Gateway
