@@ -860,7 +860,8 @@ fn extract_enum_from_description(description: &str) -> Option<Vec<String>> {
     }
 
     // Strategy 3: Look for "Options are X, Y, Z" or "Can be X, Y, or Z" patterns
-    if let Ok(list_re) = Regex::new(r"(?i)(?:options are|can be|either)\s+(.+?)(?:\.|\n|$)")
+    if let Ok(list_re) =
+        Regex::new(r"(?i)(?:options (?:here )?are|can be|either)\s+(.+?)(?:\.|\n|$)")
         && let Some(cap) = list_re.captures(description)
     {
         let list = cap[1].trim();
@@ -1003,11 +1004,9 @@ fn known_enum_overrides() -> HashMap<&'static str, Vec<&'static str>> {
     m.insert("AvailabilityMode", vec!["zonal", "regional"]);
     m.insert("AddressFamily", vec!["IPv4", "IPv6"]);
     m.insert("Domain", vec!["vpc", "standard"]);
-    m.insert(
-        "InternetGatewayBlockMode",
-        vec!["off", "block-bidirectional", "block-ingress"],
-    );
+    // HostnameType enum values are in parent struct description, not field description
     m.insert("HostnameType", vec!["ip-name", "resource-name"]);
+    // InternetGatewayBlockMode removed - now auto-detected via "Options here are" pattern
     m
 }
 
@@ -1323,6 +1322,17 @@ mod tests {
         // "Options: X, Y, Z" pattern
         let description =
             "Block mode for internet gateway. Options: off, block-bidirectional, block-ingress";
+        let result = extract_enum_from_description(description);
+        assert!(result.is_some());
+        let values = result.unwrap();
+        assert_eq!(values, vec!["off", "block-bidirectional", "block-ingress"]);
+    }
+
+    #[test]
+    fn test_extract_enum_from_description_options_here_are() {
+        // "Options here are X, Y, Z" pattern (real CloudFormation format)
+        let description =
+            "The mode of VPC BPA. Options here are off, block-bidirectional, block-ingress";
         let result = extract_enum_from_description(description);
         assert!(result.is_some());
         let values = result.unwrap();
