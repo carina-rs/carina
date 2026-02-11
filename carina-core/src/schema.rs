@@ -202,7 +202,7 @@ impl AttributeType {
         }
     }
 
-    fn type_name(&self) -> String {
+    pub fn type_name(&self) -> String {
         match self {
             AttributeType::String => "String".to_string(),
             AttributeType::Int => "Int".to_string(),
