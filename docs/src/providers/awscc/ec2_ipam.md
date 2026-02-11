@@ -8,7 +8,7 @@ Resource Schema of AWS::EC2::IPAM Type
 
 ### `default_resource_discovery_organizational_unit_exclusions`
 
-- **Type:** List<IpamOrganizationalUnitExclusion>
+- **Type:** [List\<IpamOrganizationalUnitExclusion\>](#ipamorganizationalunitexclusion)
 - **Required:** No
 
 A set of organizational unit (OU) exclusions for the default resource discovery, created with this IPAM.
@@ -34,7 +34,7 @@ A metered account is an account that is charged for active IP addresses managed 
 
 ### `operating_regions`
 
-- **Type:** List<IpamOperatingRegion>
+- **Type:** [List\<IpamOperatingRegion\>](#ipamoperatingregion)
 - **Required:** No
 
 The regions IPAM is enabled for. Allows pools to be created in these regions, as well as enabling monitoring

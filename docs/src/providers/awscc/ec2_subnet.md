@@ -108,7 +108,7 @@ The Amazon Resource Name (ARN) of the Outpost.
 
 ### `private_dns_name_options_on_launch`
 
-- **Type:** Struct(PrivateDnsNameOptionsOnLaunch)
+- **Type:** [Struct(PrivateDnsNameOptionsOnLaunch)](#privatednsnameoptionsonlaunch)
 - **Required:** No
 
 The hostname type for EC2 instances launched into this subnet and how DNS A and AAAA record queries to the instances should be handled. For more information, see [Amazon EC2 instance hostname types](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ec2-instance-naming.html) in the *User Guide*. Available options:  + EnableResourceNameDnsAAAARecord (true | false)  + EnableResourceNameDnsARecord (true | false)  + HostnameType (ip-name | resource-name)
@@ -131,7 +131,7 @@ The ID of the VPC the subnet is in. If you update this property, you must also u
 
 ### `block_public_access_states`
 
-- **Type:** Struct(BlockPublicAccessStates)
+- **Type:** [Struct(BlockPublicAccessStates)](#blockpublicaccessstates)
 
 ### `ipv6_cidr_blocks`
 

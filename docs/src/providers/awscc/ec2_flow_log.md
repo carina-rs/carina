@@ -22,7 +22,7 @@ The ARN for the IAM role that permits Amazon EC2 to publish flow logs to a Cloud
 
 ### `destination_options`
 
-- **Type:** Struct(DestinationOptions)
+- **Type:** [Struct(DestinationOptions)](#destinationoptions)
 - **Required:** No
 
 ### `log_destination`

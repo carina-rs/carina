@@ -254,7 +254,7 @@ fn type_display_string(
                 .map(|p| !p.is_empty())
                 .unwrap_or(false)
         {
-            format!("Struct({})", def_name)
+            format!("[Struct({})](#{})", def_name, def_name.to_lowercase())
         } else {
             "String".to_string()
         }
@@ -304,7 +304,7 @@ fn type_display_string(
                                     .map(|p| !p.is_empty())
                                     .unwrap_or(false)
                             {
-                                format!("List<{}>", def_name)
+                                format!("[List\\<{}\\>](#{})", def_name, def_name.to_lowercase())
                             } else {
                                 "List".to_string()
                             }
@@ -322,7 +322,7 @@ fn type_display_string(
                 if let Some(props) = &prop.properties
                     && !props.is_empty()
                 {
-                    format!("Struct({})", prop_name)
+                    format!("[Struct({})](#{})", prop_name, prop_name.to_lowercase())
                 } else {
                     "Map".to_string()
                 }

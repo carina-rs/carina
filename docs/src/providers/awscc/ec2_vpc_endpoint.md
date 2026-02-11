@@ -11,7 +11,7 @@ Specifies a VPC endpoint. A VPC endpoint provides a private connection between y
 
 ### `dns_options`
 
-- **Type:** Struct(DnsOptionsSpecification)
+- **Type:** [Struct(DnsOptionsSpecification)](#dnsoptionsspecification)
 - **Required:** No
 
 Describes the DNS options for an endpoint.
