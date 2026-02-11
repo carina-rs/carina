@@ -31,6 +31,15 @@ fn get_schema_config(resource_type: &str) -> Option<AwsccSchemaConfig> {
     })
 }
 
+/// Maximum number of retry attempts for retryable create errors
+const CREATE_RETRY_MAX_ATTEMPTS: u32 = 12;
+
+/// Initial delay in seconds before retrying a failed create operation
+const CREATE_RETRY_INITIAL_DELAY_SECS: u64 = 10;
+
+/// Maximum delay in seconds between create retry attempts
+const CREATE_RETRY_MAX_DELAY_SECS: u64 = 120;
+
 /// AWS Cloud Control Provider
 pub struct AwsccProvider {
     cloudcontrol_client: CloudControlClient,
@@ -95,27 +104,84 @@ impl AwsccProvider {
         }
     }
 
-    /// Create a resource using Cloud Control API
+    /// Create a resource using Cloud Control API, with retry logic for retryable errors.
+    ///
+    /// Some operations fail transiently due to eventual consistency in AWS
+    /// (e.g., IPAM Pool CIDR propagation delays cause "missing a source resource"
+    /// errors when creating subnets). This method retries with exponential backoff
+    /// for such errors.
     pub async fn cc_create_resource(
         &self,
         type_name: &str,
         desired_state: serde_json::Value,
     ) -> ProviderResult<String> {
-        let result = self
-            .cloudcontrol_client
-            .create_resource()
-            .type_name(type_name)
-            .desired_state(desired_state.to_string())
-            .send()
-            .await
-            .map_err(|e| ProviderError::new(format!("Failed to create resource: {:?}", e)))?;
+        let mut delay_secs = CREATE_RETRY_INITIAL_DELAY_SECS;
 
-        let request_token = result
-            .progress_event()
-            .and_then(|p| p.request_token())
-            .ok_or_else(|| ProviderError::new("No request token returned"))?;
+        for attempt in 0..=CREATE_RETRY_MAX_ATTEMPTS {
+            let result = self
+                .cloudcontrol_client
+                .create_resource()
+                .type_name(type_name)
+                .desired_state(desired_state.to_string())
+                .send()
+                .await;
 
-        self.wait_for_operation(request_token).await
+            match result {
+                Ok(response) => {
+                    let request_token =
+                        response
+                            .progress_event()
+                            .and_then(|p| p.request_token())
+                            .ok_or_else(|| ProviderError::new("No request token returned"))?;
+
+                    match self.wait_for_operation(request_token).await {
+                        Ok(identifier) => return Ok(identifier),
+                        Err(e)
+                            if Self::is_retryable_error(&e.message)
+                                && attempt < CREATE_RETRY_MAX_ATTEMPTS =>
+                        {
+                            eprintln!(
+                                "  Retryable error creating {} (attempt {}/{}): {}. Retrying in {}s...",
+                                type_name,
+                                attempt + 1,
+                                CREATE_RETRY_MAX_ATTEMPTS,
+                                e.message,
+                                delay_secs,
+                            );
+                            tokio::time::sleep(Duration::from_secs(delay_secs)).await;
+                            delay_secs = (delay_secs * 2).min(CREATE_RETRY_MAX_DELAY_SECS);
+                            continue;
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+                Err(e) => {
+                    let err_str = format!("{:?}", e);
+                    if Self::is_retryable_error(&err_str) && attempt < CREATE_RETRY_MAX_ATTEMPTS {
+                        eprintln!(
+                            "  Retryable error creating {} (attempt {}/{}): {}. Retrying in {}s...",
+                            type_name,
+                            attempt + 1,
+                            CREATE_RETRY_MAX_ATTEMPTS,
+                            err_str,
+                            delay_secs,
+                        );
+                        tokio::time::sleep(Duration::from_secs(delay_secs)).await;
+                        delay_secs = (delay_secs * 2).min(CREATE_RETRY_MAX_DELAY_SECS);
+                        continue;
+                    }
+                    return Err(ProviderError::new(format!(
+                        "Failed to create resource: {:?}",
+                        e
+                    )));
+                }
+            }
+        }
+
+        Err(ProviderError::new(format!(
+            "Failed to create resource {} after {} retry attempts",
+            type_name, CREATE_RETRY_MAX_ATTEMPTS
+        )))
     }
 
     /// Update a resource using Cloud Control API
@@ -149,7 +215,11 @@ impl AwsccProvider {
         Ok(())
     }
 
-    /// Delete a resource using Cloud Control API
+    /// Delete a resource using Cloud Control API.
+    ///
+    /// Uses resource-type-specific polling timeouts. IPAM-related resources
+    /// get a longer timeout since their deletion via CloudControl API can
+    /// take 15-30 minutes.
     pub async fn cc_delete_resource(
         &self,
         type_name: &str,
@@ -165,15 +235,56 @@ impl AwsccProvider {
             .map_err(|e| ProviderError::new(format!("Failed to delete resource: {:?}", e)))?;
 
         if let Some(request_token) = result.progress_event().and_then(|p| p.request_token()) {
-            self.wait_for_operation(request_token).await?;
+            let max_attempts = Self::max_polling_attempts(type_name, "delete");
+            self.wait_for_operation_with_attempts(request_token, max_attempts)
+                .await?;
         }
 
         Ok(())
     }
 
+    /// Returns the max polling attempts for a given resource type and operation.
+    ///
+    /// Some resource types (e.g., IPAM Pool) take significantly longer to delete
+    /// via the CloudControl API than the default timeout allows.
+    fn max_polling_attempts(type_name: &str, operation: &str) -> u32 {
+        // IPAM Pool deletions can take 15-30 minutes via CloudControl API
+        if operation == "delete" && (type_name.contains("IPAMPool") || type_name.contains("IPAM")) {
+            return 360; // 30 minutes (360 * 5s)
+        }
+        120 // Default: 10 minutes (120 * 5s)
+    }
+
+    /// Returns true if the error message indicates a retryable condition.
+    ///
+    /// Some operations fail transiently, e.g., IPAM Pool CIDR propagation
+    /// delays cause "missing a source resource" errors for subnet creation.
+    fn is_retryable_error(error_message: &str) -> bool {
+        let retryable_patterns = [
+            "missing a source resource",
+            "Throttling",
+            "Rate exceeded",
+            "RequestLimitExceeded",
+            "ServiceUnavailable",
+            "InternalError",
+        ];
+        retryable_patterns
+            .iter()
+            .any(|pattern| error_message.contains(pattern))
+    }
+
     /// Wait for a Cloud Control operation to complete
     async fn wait_for_operation(&self, request_token: &str) -> ProviderResult<String> {
-        let max_attempts = 120;
+        self.wait_for_operation_with_attempts(request_token, 120)
+            .await
+    }
+
+    /// Wait for a Cloud Control operation to complete with a configurable number of attempts
+    async fn wait_for_operation_with_attempts(
+        &self,
+        request_token: &str,
+        max_attempts: u32,
+    ) -> ProviderResult<String> {
         let delay = Duration::from_secs(5);
 
         for _ in 0..max_attempts {
@@ -638,5 +749,91 @@ impl AwsccProvider {
             }
         }
         tags_map
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_retryable_error_ipam_source_resource() {
+        assert!(AwsccProvider::is_retryable_error(
+            "Operation failed: IpamPool 'ipam-pool-xxx' is missing a source resource"
+        ));
+    }
+
+    #[test]
+    fn test_is_retryable_error_throttling() {
+        assert!(AwsccProvider::is_retryable_error(
+            "Throttling: Rate exceeded"
+        ));
+    }
+
+    #[test]
+    fn test_is_retryable_error_request_limit() {
+        assert!(AwsccProvider::is_retryable_error(
+            "RequestLimitExceeded: too many requests"
+        ));
+    }
+
+    #[test]
+    fn test_is_retryable_error_service_unavailable() {
+        assert!(AwsccProvider::is_retryable_error(
+            "ServiceUnavailable: try again later"
+        ));
+    }
+
+    #[test]
+    fn test_is_retryable_error_internal_error() {
+        assert!(AwsccProvider::is_retryable_error(
+            "InternalError: something went wrong"
+        ));
+    }
+
+    #[test]
+    fn test_is_not_retryable_error() {
+        assert!(!AwsccProvider::is_retryable_error(
+            "InvalidParameterValue: invalid CIDR"
+        ));
+        assert!(!AwsccProvider::is_retryable_error(
+            "ResourceNotFoundException: not found"
+        ));
+        assert!(!AwsccProvider::is_retryable_error(
+            "AccessDeniedException: not authorized"
+        ));
+    }
+
+    #[test]
+    fn test_max_polling_attempts_ipam_pool_delete() {
+        assert_eq!(
+            AwsccProvider::max_polling_attempts("AWS::EC2::IPAMPool", "delete"),
+            360
+        );
+    }
+
+    #[test]
+    fn test_max_polling_attempts_ipam_delete() {
+        assert_eq!(
+            AwsccProvider::max_polling_attempts("AWS::EC2::IPAM", "delete"),
+            360
+        );
+    }
+
+    #[test]
+    fn test_max_polling_attempts_default_delete() {
+        assert_eq!(
+            AwsccProvider::max_polling_attempts("AWS::EC2::VPC", "delete"),
+            120
+        );
+    }
+
+    #[test]
+    fn test_max_polling_attempts_ipam_create() {
+        // IPAM create should use default timeout
+        assert_eq!(
+            AwsccProvider::max_polling_attempts("AWS::EC2::IPAMPool", "create"),
+            120
+        );
     }
 }
