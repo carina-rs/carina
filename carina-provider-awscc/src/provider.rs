@@ -712,9 +712,15 @@ impl AwsccProvider {
                 && !attachments.is_empty()
             {
                 let patch_ops = vec![json!({"op": "remove", "path": "/Attachments"})];
-                let _ = self
-                    .cc_update_resource(config.aws_type_name, identifier, patch_ops)
-                    .await;
+                self.cc_update_resource(config.aws_type_name, identifier, patch_ops)
+                    .await
+                    .map_err(|e| {
+                        ProviderError::new(format!(
+                            "Failed to detach Internet Gateway from VPC before deletion: {}",
+                            e
+                        ))
+                        .for_resource(id.clone())
+                    })?;
             }
         }
         Ok(())
