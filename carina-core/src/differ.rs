@@ -80,6 +80,9 @@ fn find_changed_attributes(
 pub fn create_plan(desired: &[Resource], current_states: &HashMap<ResourceId, State>) -> Plan {
     let mut plan = Plan::new();
 
+    let desired_ids: std::collections::HashSet<&ResourceId> =
+        desired.iter().map(|r| &r.id).collect();
+
     for resource in desired {
         // Data sources (read-only resources) only generate Read effects
         if resource.read_only {
@@ -103,6 +106,13 @@ pub fn create_plan(desired: &[Resource], current_states: &HashMap<ResourceId, St
             }
             Diff::NoChange(_) => {}
             Diff::Delete(id) => plan.add(Effect::Delete(id)),
+        }
+    }
+
+    // Detect orphaned resources: exist in current_states but not in desired
+    for (id, state) in current_states {
+        if state.exists && !desired_ids.contains(id) {
+            plan.add(Effect::Delete(id.clone()));
         }
     }
 
@@ -241,6 +251,47 @@ mod tests {
             }
             _ => panic!("Expected Update when list-of-maps changed"),
         }
+    }
+
+    #[test]
+    fn create_plan_detects_orphaned_resources_for_deletion() {
+        // A resource exists in current_states but NOT in desired list
+        // create_plan() should generate a Delete effect for it
+        let desired = vec![Resource::new("bucket", "keep-this")];
+
+        let mut current_states = HashMap::new();
+        // "keep-this" exists and matches
+        current_states.insert(
+            ResourceId::new("bucket", "keep-this"),
+            State::existing(ResourceId::new("bucket", "keep-this"), HashMap::new()),
+        );
+        // "orphaned-bucket" exists in state but not in desired
+        let mut orphan_attrs = HashMap::new();
+        orphan_attrs.insert(
+            "name".to_string(),
+            Value::String("orphaned-bucket".to_string()),
+        );
+        current_states.insert(
+            ResourceId::new("bucket", "orphaned-bucket"),
+            State::existing(ResourceId::new("bucket", "orphaned-bucket"), orphan_attrs),
+        );
+
+        let plan = create_plan(&desired, &current_states);
+
+        // Should have 1 effect: Delete for orphaned-bucket
+        // (keep-this has NoChange, so no effect)
+        let delete_effects: Vec<_> = plan
+            .effects()
+            .iter()
+            .filter(|e| matches!(e, Effect::Delete(_)))
+            .collect();
+        assert_eq!(
+            delete_effects.len(),
+            1,
+            "Expected 1 Delete effect for orphaned resource, got {}. Effects: {:?}",
+            delete_effects.len(),
+            plan.effects()
+        );
     }
 
     #[test]
