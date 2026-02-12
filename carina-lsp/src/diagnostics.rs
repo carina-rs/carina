@@ -494,9 +494,11 @@ impl DiagnosticEngine {
         let field_map: HashMap<&str, &carina_core::schema::StructField> =
             fields.iter().map(|f| (f.name.as_str(), f)).collect();
 
-        for map in maps {
-            for (key, val) in map {
-                if let Some((line, col)) = self.find_nested_field_position(doc, attr_name, key) {
+        for (map_index, map) in maps.iter().enumerate() {
+            for (key, val) in *map {
+                let all_positions = self.find_all_nested_field_positions(doc, attr_name, key);
+                if let Some(Some((line, col))) = all_positions.get(map_index) {
+                    let (line, col) = (*line, *col);
                     // Check for unknown fields
                     if !field_names.contains(key.as_str()) {
                         diagnostics.push(Diagnostic {
@@ -559,16 +561,20 @@ impl DiagnosticEngine {
         diagnostics
     }
 
-    /// Find the position of a field inside a nested block (e.g., field inside `attr_name { ... }`)
-    fn find_nested_field_position(
+    /// Find the positions of a field inside ALL matching nested blocks
+    /// Returns a Vec with one entry per block occurrence. Each entry is `Some((line, col))`
+    /// if the field was found in that block, or `None` if not.
+    fn find_all_nested_field_positions(
         &self,
         doc: &Document,
         block_name: &str,
         field_name: &str,
-    ) -> Option<(u32, u32)> {
+    ) -> Vec<Option<(u32, u32)>> {
         let text = doc.text();
+        let mut positions = Vec::new();
         let mut in_block = false;
         let mut brace_depth = 0;
+        let mut found_in_current_block: Option<(u32, u32)> = None;
 
         for (line_idx, line) in text.lines().enumerate() {
             let trimmed = line.trim();
@@ -579,6 +585,7 @@ impl DiagnosticEngine {
                 if after.starts_with('{') {
                     in_block = true;
                     brace_depth = 1;
+                    found_in_current_block = None;
                     continue;
                 }
             }
@@ -591,6 +598,8 @@ impl DiagnosticEngine {
                         brace_depth -= 1;
                         if brace_depth == 0 {
                             in_block = false;
+                            positions.push(found_in_current_block);
+                            found_in_current_block = None;
                             break;
                         }
                     }
@@ -602,12 +611,18 @@ impl DiagnosticEngine {
                         && (after.starts_with(' ') || after.starts_with('='))
                     {
                         let leading_ws = line.len() - trimmed.len();
-                        return Some((line_idx as u32, leading_ws as u32));
+                        found_in_current_block = Some((line_idx as u32, leading_ws as u32));
                     }
                 }
             }
         }
-        None
+
+        // Handle case where file ends while still in a block
+        if in_block {
+            positions.push(found_in_current_block);
+        }
+
+        positions
     }
 
     /// Check provider region attribute
@@ -1320,6 +1335,54 @@ awscc.ec2_subnet {
             type_mismatch.is_none(),
             "Should NOT warn about compatible ResourceRef types. Got diagnostics: {:?}",
             diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn unknown_field_in_second_repeated_block() {
+        let engine = DiagnosticEngine::new();
+        let doc = create_document(
+            r#"provider awscc {
+    region = aws.Region.ap_northeast_1
+}
+
+awscc.ec2_security_group {
+    name = "test-sg"
+    group_description = "Test security group"
+    security_group_ingress {
+        ip_protocol = "tcp"
+        from_port = 80
+        to_port = 80
+        cidr_ip = "0.0.0.0/0"
+    }
+    security_group_ingress {
+        ip_protocol = "tcp"
+        from_port = 443
+        to_port = 443
+        cidr_ip = "0.0.0.0/0"
+        bad_field = "oops"
+    }
+}"#,
+        );
+
+        let diagnostics = engine.analyze(&doc, None);
+
+        let bad_field_diag = diagnostics
+            .iter()
+            .find(|d| d.message.contains("Unknown field 'bad_field'"));
+        assert!(
+            bad_field_diag.is_some(),
+            "Should warn about unknown field in second repeated block. Got diagnostics: {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+
+        // The diagnostic should point to the second block, not the first.
+        // LSP uses 0-indexed lines, so line 18 = line 19 in 1-indexed.
+        let diag = bad_field_diag.unwrap();
+        assert_eq!(
+            diag.range.start.line, 18,
+            "Diagnostic should point to line 18 (0-indexed, in second block), got line {}",
+            diag.range.start.line
         );
     }
 }

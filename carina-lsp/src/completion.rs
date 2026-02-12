@@ -1698,6 +1698,45 @@ simple {
     }
 
     #[test]
+    fn struct_field_completion_inside_second_repeated_block() {
+        let provider = CompletionProvider::new();
+        let doc = create_document(
+            r#"awscc.ec2_security_group {
+    group_description = "test"
+    security_group_ingress {
+        ip_protocol = "tcp"
+        from_port = 80
+        to_port = 80
+        cidr_ip = "0.0.0.0/0"
+    }
+    security_group_ingress {
+
+    }
+}"#,
+        );
+        // Cursor inside the second nested block (line 9)
+        let position = Position {
+            line: 9,
+            character: 8,
+        };
+
+        let completions = provider.complete(&doc, position, None);
+
+        // Should have struct field completions in the second block too
+        let ip_protocol = completions.iter().find(|c| c.label == "ip_protocol");
+        assert!(
+            ip_protocol.is_some(),
+            "Should have ip_protocol field completion in second repeated block"
+        );
+
+        let from_port = completions.iter().find(|c| c.label == "from_port");
+        assert!(
+            from_port.is_some(),
+            "Should have from_port field completion in second repeated block"
+        );
+    }
+
+    #[test]
     fn context_detection_returns_struct_context() {
         let provider = CompletionProvider::new();
         let text = r#"awscc.ec2_security_group {
