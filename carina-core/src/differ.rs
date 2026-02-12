@@ -105,14 +105,24 @@ pub fn create_plan(desired: &[Resource], current_states: &HashMap<ResourceId, St
                 plan.add(Effect::Update { id, from, to });
             }
             Diff::NoChange(_) => {}
-            Diff::Delete(id) => plan.add(Effect::Delete(id)),
+            Diff::Delete(id) => {
+                let identifier = current_states
+                    .get(&id)
+                    .and_then(|s| s.identifier.clone())
+                    .unwrap_or_default();
+                plan.add(Effect::Delete { id, identifier });
+            }
         }
     }
 
     // Detect orphaned resources: exist in current_states but not in desired
     for (id, state) in current_states {
         if state.exists && !desired_ids.contains(id) {
-            plan.add(Effect::Delete(id.clone()));
+            let identifier = state.identifier.clone().unwrap_or_default();
+            plan.add(Effect::Delete {
+                id: id.clone(),
+                identifier,
+            });
         }
     }
 
@@ -283,7 +293,7 @@ mod tests {
         let delete_effects: Vec<_> = plan
             .effects()
             .iter()
-            .filter(|e| matches!(e, Effect::Delete(_)))
+            .filter(|e| matches!(e, Effect::Delete { .. }))
             .collect();
         assert_eq!(
             delete_effects.len(),

@@ -45,7 +45,7 @@ impl Plan {
                 Effect::Read { .. } => summary.read += 1,
                 Effect::Create(_) => summary.create += 1,
                 Effect::Update { .. } => summary.update += 1,
-                Effect::Delete(_) => summary.delete += 1,
+                Effect::Delete { .. } => summary.delete += 1,
             }
         }
         summary
@@ -143,7 +143,7 @@ impl ModularPlan {
                 Effect::Create(r) => Self::extract_source(&r.attributes),
                 Effect::Update { to, .. } => Self::extract_source(&to.attributes),
                 Effect::Read { resource } => Self::extract_source(&resource.attributes),
-                Effect::Delete(_) => ModuleSource::Root,
+                Effect::Delete { .. } => ModuleSource::Root,
             };
             modular.effect_sources.insert(idx, source);
         }
@@ -253,7 +253,7 @@ fn format_effect_brief(effect: &Effect) -> String {
     match effect {
         Effect::Create(r) => format!("+ {}", r.id),
         Effect::Update { id, .. } => format!("~ {}", id),
-        Effect::Delete(id) => format!("- {}", id),
+        Effect::Delete { id, .. } => format!("- {}", id),
         Effect::Read { resource } => format!("<= {} (data source)", resource.id),
     }
 }
@@ -275,10 +275,10 @@ mod tests {
         let mut plan = Plan::new();
         plan.add(Effect::Create(Resource::new("s3_bucket", "a")));
         plan.add(Effect::Create(Resource::new("s3_bucket", "b")));
-        plan.add(Effect::Delete(crate::resource::ResourceId::new(
-            "s3_bucket",
-            "c",
-        )));
+        plan.add(Effect::Delete {
+            id: crate::resource::ResourceId::new("s3_bucket", "c"),
+            identifier: String::new(),
+        });
 
         let summary = plan.summary();
         assert_eq!(summary.create, 2);
