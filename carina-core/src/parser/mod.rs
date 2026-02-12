@@ -555,29 +555,9 @@ fn parse_anonymous_resource(
 
     let attributes = parse_block_contents(inner, ctx)?;
 
-    // For non-aws providers, name is NOT used as resource identifier.
     // Anonymous resources get an empty name that will be replaced by a hash-based
     // identifier computed from create-only properties after parsing.
-    // For aws provider, keep current behavior (require name attribute).
-    let resource_name = if provider == "aws" {
-        match attributes.get("name") {
-            Some(Value::String(s)) => s.clone(),
-            Some(Value::ResourceRef(ref_name, ref_attr))
-                if ctx.in_module && ref_name == "input" =>
-            {
-                format!("__input_ref__:{}", ref_attr)
-            }
-            _ => {
-                return Err(ParseError::InvalidExpression {
-                    line: 0,
-                    message: "Anonymous resource must have a 'name' attribute for identification. Use 'let' binding instead if you don't want to specify a name.".to_string(),
-                });
-            }
-        }
-    } else {
-        // Non-aws: empty name, will be computed later from create-only properties
-        String::new()
-    };
+    let resource_name = String::new();
 
     // Add provider information to attributes
     let mut attributes = attributes;
@@ -678,23 +658,13 @@ fn parse_resource_expr(
 
     let mut attributes = parse_block_contents(inner, ctx)?;
 
-    // For non-aws providers, always use binding name as identifier.
-    // For aws provider, use name attribute or fall back to binding name.
-    let resource_name = if provider == "aws" {
-        match attributes.get("name") {
-            Some(Value::String(s)) => s.clone(),
-            Some(Value::ResourceRef(ref_name, ref_attr))
-                if ctx.in_module && ref_name == "input" =>
-            {
-                format!("__input_ref__:{}", ref_attr)
-            }
-            _ => binding_name.to_string(),
-        }
-    } else {
-        // Non-aws: always use binding name, strip name from attributes
+    // All providers: use binding name as identifier.
+    // Strip name from attributes for non-aws providers (name is not a resource property).
+    // For aws, keep name in attributes (it's a real property: bucket name, Name tag, etc.)
+    if provider != "aws" {
         attributes.remove("name");
-        binding_name.to_string()
-    };
+    }
+    let resource_name = binding_name.to_string();
 
     // Add provider information to attributes
     attributes.insert("_provider".to_string(), Value::String(provider.to_string()));
@@ -734,31 +704,12 @@ fn parse_read_resource_expr(
 
     let mut attributes = parse_block_contents(inner, ctx)?;
 
-    // For non-aws providers, use binding name as identifier.
-    // For aws provider, require name attribute for data sources.
-    let resource_name = if provider == "aws" {
-        match attributes.get("name") {
-            Some(Value::String(s)) => s.clone(),
-            Some(Value::ResourceRef(ref_name, ref_attr))
-                if ctx.in_module && ref_name == "input" =>
-            {
-                format!("__input_ref__:{}", ref_attr)
-            }
-            _ => {
-                return Err(ParseError::InvalidExpression {
-                    line: 0,
-                    message: format!(
-                        "Data source '{}' must have a 'name' attribute to identify the existing resource",
-                        binding_name
-                    ),
-                });
-            }
-        }
-    } else {
-        // Non-aws: use binding name, strip name from attributes
+    // All providers: use binding name as identifier.
+    // Strip name from attributes for non-aws providers.
+    if provider != "aws" {
         attributes.remove("name");
-        binding_name.to_string()
-    };
+    }
+    let resource_name = binding_name.to_string();
 
     // Add provider information to attributes
     attributes.insert("_provider".to_string(), Value::String(provider.to_string()));
@@ -1086,7 +1037,7 @@ mod tests {
 
         let resource = &result.resources[0];
         assert_eq!(resource.id.resource_type, "s3.bucket");
-        assert_eq!(resource.id.name, "my-bucket"); // name attribute value becomes the resource ID
+        assert_eq!(resource.id.name, "my_bucket"); // binding name becomes the resource ID
         assert_eq!(
             resource.attributes.get("name"),
             Some(&Value::String("my-bucket".to_string()))
@@ -1111,8 +1062,8 @@ mod tests {
 
         let result = parse(input).unwrap();
         assert_eq!(result.resources.len(), 2);
-        assert_eq!(result.resources[0].id.name, "app-logs"); // name attribute value becomes the resource ID
-        assert_eq!(result.resources[1].id.name, "app-data");
+        assert_eq!(result.resources[0].id.name, "logs"); // binding name becomes the resource ID
+        assert_eq!(result.resources[1].id.name, "data");
     }
 
     #[test]
@@ -1229,7 +1180,7 @@ mod tests {
 
         let resource = &result.resources[0];
         assert_eq!(resource.id.resource_type, "s3.bucket");
-        assert_eq!(resource.id.name, "my-anonymous-bucket");
+        assert_eq!(resource.id.name, ""); // anonymous resources get empty name (computed later)
     }
 
     #[test]
@@ -1248,12 +1199,12 @@ mod tests {
 
         let result = parse(input).unwrap();
         assert_eq!(result.resources.len(), 2);
-        assert_eq!(result.resources[0].id.name, "anonymous-bucket");
-        assert_eq!(result.resources[1].id.name, "named-bucket"); // name attribute value becomes the resource ID
+        assert_eq!(result.resources[0].id.name, ""); // anonymous gets empty name
+        assert_eq!(result.resources[1].id.name, "named"); // binding name becomes the resource ID
     }
 
     #[test]
-    fn parse_anonymous_resource_without_name_fails() {
+    fn parse_anonymous_resource_without_name_succeeds() {
         let input = r#"
             aws.s3.bucket {
                 region = aws.Region.ap_northeast_1
@@ -1261,7 +1212,9 @@ mod tests {
         "#;
 
         let result = parse(input);
-        assert!(result.is_err());
+        assert!(result.is_ok());
+        let parsed = result.unwrap();
+        assert_eq!(parsed.resources[0].id.name, ""); // empty name, computed later
     }
 
     #[test]
@@ -1761,7 +1714,7 @@ mod tests {
 
         let resource = &result.resources[0];
         assert_eq!(resource.id.resource_type, "s3.bucket");
-        assert_eq!(resource.id.name, "my-existing-bucket");
+        assert_eq!(resource.id.name, "existing"); // binding name becomes the resource ID
         assert!(resource.read_only);
         assert!(resource.is_data_source());
         assert_eq!(
@@ -1771,7 +1724,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_read_resource_requires_name() {
+    fn parse_read_resource_without_name_uses_binding() {
         let input = r#"
             let existing = read aws.s3.bucket {
                 region = aws.Region.ap_northeast_1
@@ -1779,7 +1732,9 @@ mod tests {
         "#;
 
         let result = parse(input);
-        assert!(result.is_err());
+        assert!(result.is_ok());
+        let parsed = result.unwrap();
+        assert_eq!(parsed.resources[0].id.name, "existing"); // binding name
     }
 
     #[test]
@@ -1801,10 +1756,10 @@ mod tests {
 
         // First resource is read-only (data source)
         assert!(result.resources[0].read_only);
-        assert_eq!(result.resources[0].id.name, "existing-bucket");
+        assert_eq!(result.resources[0].id.name, "existing_bucket"); // binding name
 
         // Second resource is a regular resource
         assert!(!result.resources[1].read_only);
-        assert_eq!(result.resources[1].id.name, "new-bucket");
+        assert_eq!(result.resources[1].id.name, "new_bucket"); // binding name
     }
 }

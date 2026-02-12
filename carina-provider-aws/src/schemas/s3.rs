@@ -10,6 +10,7 @@ pub fn bucket_schema() -> ResourceSchema {
         .with_description("An S3 bucket for object storage")
         .attribute(
             AttributeSchema::new("name", aws_types::s3_bucket_name())
+                .create_only()
                 .with_description("Override bucket name (defaults to resource name)"),
         )
         .attribute(

@@ -374,10 +374,15 @@ fn compute_anonymous_identifiers(resources: &mut [Resource]) -> Result<(), Strin
             continue;
         }
 
-        // Only non-aws providers can have empty names
+        // Look up schema for this resource's provider
         let schema_key = match resource.attributes.get("_provider") {
-            Some(Value::String(provider)) if provider != "aws" => {
-                format!("{}.{}", provider, resource.id.resource_type)
+            Some(Value::String(provider)) => {
+                if provider == "aws" {
+                    // AWS provider schemas use resource_type directly (e.g., "s3.bucket")
+                    resource.id.resource_type.clone()
+                } else {
+                    format!("{}.{}", provider, resource.id.resource_type)
+                }
             }
             _ => continue,
         };
@@ -2373,11 +2378,16 @@ fn get_identifier_from_state(
     state_file: &Option<StateFile>,
     resource: &Resource,
 ) -> Option<String> {
+    // First: try stored state
     if let Some(state) = state_file
         && let Some(resource_state) =
             state.find_resource(&resource.id.resource_type, &resource.id.name)
     {
         return resource_state.identifier.clone();
+    }
+    // Fallback: use name attribute for initial lookup (aws provider)
+    if let Some(Value::String(name)) = resource.attributes.get("name") {
+        return Some(name.clone());
     }
     None
 }
