@@ -168,7 +168,7 @@ impl AttributeType {
                 Ok(())
             }
 
-            (AttributeType::Struct { fields, .. }, Value::Map(map)) => {
+            (AttributeType::Struct { name, fields }, Value::Map(map)) => {
                 // Check required fields
                 for field in fields {
                     if field.required && !map.contains_key(&field.name) {
@@ -183,6 +183,7 @@ impl AttributeType {
                 // Type-check each field value
                 let field_map: std::collections::HashMap<&str, &StructField> =
                     fields.iter().map(|f| (f.name.as_str(), f)).collect();
+                let field_names: Vec<&str> = field_map.keys().copied().collect();
                 for (k, v) in map {
                     if let Some(field) = field_map.get(k.as_str()) {
                         field
@@ -192,8 +193,14 @@ impl AttributeType {
                                 field: k.clone(),
                                 inner: Box::new(e),
                             })?;
+                    } else {
+                        let suggestion = suggest_similar_name(k, &field_names);
+                        return Err(TypeError::UnknownStructField {
+                            struct_name: name.clone(),
+                            field: k.clone(),
+                            suggestion,
+                        });
                     }
-                    // Unknown fields are allowed (for flexibility)
                 }
                 Ok(())
             }
@@ -245,6 +252,13 @@ pub enum TypeError {
 
     #[error("Unknown attribute '{name}'")]
     UnknownAttribute { name: String },
+
+    #[error("Unknown field '{field}' in {struct_name}{}", suggestion.as_ref().map(|s| format!(", did you mean '{}'?", s)).unwrap_or_default())]
+    UnknownStructField {
+        struct_name: String,
+        field: String,
+        suggestion: Option<String>,
+    },
 
     #[error("List item at index {index}: {inner}")]
     ListItemError { index: usize, inner: Box<TypeError> },
@@ -717,6 +731,49 @@ pub fn validate_ipv6_address(addr: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Compute Levenshtein edit distance between two strings
+fn levenshtein_distance(a: &str, b: &str) -> usize {
+    let a_len = a.len();
+    let b_len = b.len();
+
+    if a_len == 0 {
+        return b_len;
+    }
+    if b_len == 0 {
+        return a_len;
+    }
+
+    let mut prev: Vec<usize> = (0..=b_len).collect();
+    let mut curr = vec![0; b_len + 1];
+
+    for (i, ca) in a.chars().enumerate() {
+        curr[0] = i + 1;
+        for (j, cb) in b.chars().enumerate() {
+            let cost = if ca == cb { 0 } else { 1 };
+            curr[j + 1] = (prev[j] + cost).min(prev[j + 1] + 1).min(curr[j] + 1);
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+
+    prev[b_len]
+}
+
+/// Suggest the most similar field name, if one is close enough
+fn suggest_similar_name(unknown: &str, known: &[&str]) -> Option<String> {
+    let max_distance = match unknown.len() {
+        0..=2 => 1,
+        3..=5 => 2,
+        _ => 3,
+    };
+
+    known
+        .iter()
+        .map(|name| (*name, levenshtein_distance(unknown, name)))
+        .filter(|(_, dist)| *dist <= max_distance)
+        .min_by_key(|(_, dist)| *dist)
+        .map(|(name, _)| name.to_string())
+}
+
 /// Validate a single IPv6 group (1-4 hex digits)
 fn validate_ipv6_group(group: &str, addr: &str) -> Result<(), String> {
     if group.is_empty() || group.len() > 4 {
@@ -856,6 +913,159 @@ mod tests {
             t.validate(&Value::String("not a struct".to_string()))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn struct_rejects_unknown_field() {
+        let t = AttributeType::Struct {
+            name: "Ingress".to_string(),
+            fields: vec![
+                StructField::new("ip_protocol", AttributeType::String).required(),
+                StructField::new("from_port", AttributeType::Int),
+                StructField::new("to_port", AttributeType::Int),
+                StructField::new("cidr_ip", AttributeType::String),
+            ],
+        };
+
+        // Unknown field should be rejected
+        let mut map = HashMap::new();
+        map.insert("ip_protocol".to_string(), Value::String("tcp".to_string()));
+        map.insert(
+            "unknown_field".to_string(),
+            Value::String("value".to_string()),
+        );
+        let result = t.validate(&Value::Map(map));
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        match &err {
+            TypeError::UnknownStructField {
+                struct_name,
+                field,
+                suggestion,
+            } => {
+                assert_eq!(struct_name, "Ingress");
+                assert_eq!(field, "unknown_field");
+                assert!(suggestion.is_none());
+            }
+            other => panic!("Expected UnknownStructField, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn struct_suggests_similar_field() {
+        let t = AttributeType::Struct {
+            name: "Ingress".to_string(),
+            fields: vec![
+                StructField::new("ip_protocol", AttributeType::String),
+                StructField::new("from_port", AttributeType::Int),
+                StructField::new("to_port", AttributeType::Int),
+                StructField::new("cidr_ip", AttributeType::String),
+            ],
+        };
+
+        // Typo: "ip_protcol" -> should suggest "ip_protocol"
+        let mut map = HashMap::new();
+        map.insert("ip_protcol".to_string(), Value::String("tcp".to_string()));
+        let result = t.validate(&Value::Map(map));
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        match &err {
+            TypeError::UnknownStructField {
+                struct_name,
+                field,
+                suggestion,
+            } => {
+                assert_eq!(struct_name, "Ingress");
+                assert_eq!(field, "ip_protcol");
+                assert_eq!(suggestion.as_deref(), Some("ip_protocol"));
+            }
+            other => panic!("Expected UnknownStructField, got: {:?}", other),
+        }
+
+        // Typo: "cidr_iip" -> should suggest "cidr_ip"
+        let mut map2 = HashMap::new();
+        map2.insert("ip_protocol".to_string(), Value::String("tcp".to_string()));
+        map2.insert(
+            "cidr_iip".to_string(),
+            Value::String("10.0.0.0/8".to_string()),
+        );
+        let result2 = t.validate(&Value::Map(map2));
+        assert!(result2.is_err());
+        let err2 = result2.unwrap_err();
+        match &err2 {
+            TypeError::UnknownStructField {
+                suggestion, field, ..
+            } => {
+                assert_eq!(field, "cidr_iip");
+                assert_eq!(suggestion.as_deref(), Some("cidr_ip"));
+            }
+            other => panic!("Expected UnknownStructField, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn struct_error_message_format() {
+        let t = AttributeType::Struct {
+            name: "SecurityGroupIngress".to_string(),
+            fields: vec![
+                StructField::new("vpc_id", AttributeType::String),
+                StructField::new("cidr_ip", AttributeType::String),
+            ],
+        };
+
+        // With suggestion
+        let mut map = HashMap::new();
+        map.insert("vpc_idd".to_string(), Value::String("vpc-123".to_string()));
+        let err = t.validate(&Value::Map(map)).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Unknown field 'vpc_idd' in SecurityGroupIngress, did you mean 'vpc_id'?"
+        );
+
+        // Without suggestion (completely different name)
+        let mut map2 = HashMap::new();
+        map2.insert(
+            "completely_different".to_string(),
+            Value::String("x".to_string()),
+        );
+        let err2 = t.validate(&Value::Map(map2)).unwrap_err();
+        assert_eq!(
+            err2.to_string(),
+            "Unknown field 'completely_different' in SecurityGroupIngress"
+        );
+    }
+
+    #[test]
+    fn test_levenshtein_distance() {
+        assert_eq!(levenshtein_distance("", ""), 0);
+        assert_eq!(levenshtein_distance("abc", "abc"), 0);
+        assert_eq!(levenshtein_distance("abc", ""), 3);
+        assert_eq!(levenshtein_distance("", "abc"), 3);
+        assert_eq!(levenshtein_distance("kitten", "sitting"), 3);
+        assert_eq!(levenshtein_distance("vpc_id", "vpc_idd"), 1);
+        assert_eq!(levenshtein_distance("ip_protocol", "ip_protcol"), 1);
+    }
+
+    #[test]
+    fn test_suggest_similar_name() {
+        let fields = vec!["ip_protocol", "from_port", "to_port", "cidr_ip"];
+
+        // Close match
+        assert_eq!(
+            suggest_similar_name("ip_protcol", &fields),
+            Some("ip_protocol".to_string())
+        );
+        assert_eq!(
+            suggest_similar_name("cidr_iip", &fields),
+            Some("cidr_ip".to_string())
+        );
+        assert_eq!(
+            suggest_similar_name("from_prot", &fields),
+            Some("from_port".to_string())
+        );
+
+        // No match (too far)
+        assert_eq!(suggest_similar_name("completely_unrelated", &fields), None);
     }
 
     #[test]
