@@ -561,10 +561,6 @@ fn parse_anonymous_resource(
 
     // Add provider information to attributes
     let mut attributes = attributes;
-    // Strip name from attributes for non-aws providers (name is not a resource property)
-    if provider != "aws" {
-        attributes.remove("name");
-    }
     attributes.insert("_provider".to_string(), Value::String(provider.to_string()));
     attributes.insert("_type".to_string(), Value::String(namespaced_type.clone()));
 
@@ -659,11 +655,6 @@ fn parse_resource_expr(
     let mut attributes = parse_block_contents(inner, ctx)?;
 
     // All providers: use binding name as identifier.
-    // Strip name from attributes for non-aws providers (name is not a resource property).
-    // For aws, keep name in attributes (it's a real property: bucket name, Name tag, etc.)
-    if provider != "aws" {
-        attributes.remove("name");
-    }
     let resource_name = binding_name.to_string();
 
     // Add provider information to attributes
@@ -705,10 +696,6 @@ fn parse_read_resource_expr(
     let mut attributes = parse_block_contents(inner, ctx)?;
 
     // All providers: use binding name as identifier.
-    // Strip name from attributes for non-aws providers.
-    if provider != "aws" {
-        attributes.remove("name");
-    }
     let resource_name = binding_name.to_string();
 
     // Add provider information to attributes
