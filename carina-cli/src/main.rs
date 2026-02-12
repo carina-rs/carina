@@ -1192,23 +1192,16 @@ async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
                     }
                 }
             }
-            Effect::Delete(id) => {
-                // Get identifier from current state
-                let identifier = current_states
-                    .get(id)
-                    .and_then(|s| s.identifier.as_deref())
-                    .unwrap_or("");
-                match provider.delete(id, identifier).await {
-                    Ok(()) => {
-                        println!("  {} {}", "✓".green(), format_effect(effect));
-                        success_count += 1;
-                    }
-                    Err(e) => {
-                        println!("  {} {} - {}", "✗".red(), format_effect(effect), e);
-                        failure_count += 1;
-                    }
+            Effect::Delete { id, identifier } => match provider.delete(id, identifier).await {
+                Ok(()) => {
+                    println!("  {} {}", "✓".green(), format_effect(effect));
+                    success_count += 1;
                 }
-            }
+                Err(e) => {
+                    println!("  {} {} - {}", "✗".red(), format_effect(effect), e);
+                    failure_count += 1;
+                }
+            },
             Effect::Read { .. } => {}
         }
     }
@@ -1236,7 +1229,7 @@ async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
 
     // Remove deleted resources from state
     for effect in plan.effects() {
-        if let Effect::Delete(id) = effect {
+        if let Effect::Delete { id, .. } = effect {
             state.remove_resource(&id.resource_type, &id.name);
         }
     }
@@ -1502,7 +1495,14 @@ async fn run_destroy(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
     let mut timed_out_resources: HashMap<String, (ResourceId, String)> = HashMap::new();
 
     for resource in &resources_to_destroy {
-        let effect = Effect::Delete(resource.id.clone());
+        let identifier = current_states
+            .get(&resource.id)
+            .and_then(|s| s.identifier.clone())
+            .unwrap_or_default();
+        let effect = Effect::Delete {
+            id: resource.id.clone(),
+            identifier: identifier.clone(),
+        };
 
         let binding = resource
             .attributes
@@ -1512,13 +1512,6 @@ async fn run_destroy(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
                 _ => None,
             })
             .unwrap_or_else(|| format!("{}:{}", resource.id.resource_type, resource.id.name));
-
-        // Get identifier from current state
-        let identifier = current_states
-            .get(&resource.id)
-            .and_then(|s| s.identifier.as_deref())
-            .unwrap_or("")
-            .to_string();
 
         // Check if any dependent has actually failed (non-timeout)
         if let Some(failed_dep) = find_failed_dependent(&binding, &dependents_map, &failed_bindings)
@@ -2054,7 +2047,7 @@ fn print_plan(plan: &Plan) {
             Effect::Create(r) => (Some(r), get_resource_dependencies(r)),
             Effect::Update { to, .. } => (Some(to), get_resource_dependencies(to)),
             Effect::Read { resource } => (Some(resource), get_resource_dependencies(resource)),
-            Effect::Delete(_) => (None, HashSet::new()),
+            Effect::Delete { .. } => (None, HashSet::new()),
         };
 
         if let Some(r) = resource {
@@ -2120,7 +2113,7 @@ fn print_plan(plan: &Plan) {
         let colored_symbol = match effect {
             Effect::Create(_) => "+".green().bold(),
             Effect::Update { .. } => "~".yellow().bold(),
-            Effect::Delete(_) => "-".red().bold(),
+            Effect::Delete { .. } => "-".red().bold(),
             Effect::Read { .. } => "<=".cyan().bold(),
         };
 
@@ -2250,7 +2243,7 @@ fn print_plan(plan: &Plan) {
                     }
                 }
             }
-            Effect::Delete(id) => {
+            Effect::Delete { id, .. } => {
                 println!(
                     "{}{}{} {}",
                     base_indent,
@@ -2378,7 +2371,7 @@ fn format_effect(effect: &Effect) -> String {
     match effect {
         Effect::Create(r) => format!("Create {}", r.id),
         Effect::Update { id, .. } => format!("Update {}", id),
-        Effect::Delete(id) => format!("Delete {}", id),
+        Effect::Delete { id, .. } => format!("Delete {}", id),
         Effect::Read { resource } => {
             format!("Read {}", resource.id)
         }

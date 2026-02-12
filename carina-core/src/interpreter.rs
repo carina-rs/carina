@@ -119,10 +119,8 @@ impl<P: Provider> Interpreter<P> {
                 let state = self.provider.update(id, identifier, from, to).await?;
                 Ok(EffectOutcome::Updated { state })
             }
-            Effect::Delete(id) => {
-                // Delete without identifier - this won't work for identifier-based providers
-                // CLI handles identifier extraction from state directly
-                self.provider.delete(id, "").await?;
+            Effect::Delete { id, identifier } => {
+                self.provider.delete(id, identifier).await?;
                 Ok(EffectOutcome::Deleted)
             }
         }

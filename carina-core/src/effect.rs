@@ -22,7 +22,7 @@ pub enum Effect {
     },
 
     /// Delete a resource
-    Delete(ResourceId),
+    Delete { id: ResourceId, identifier: String },
 }
 
 impl Effect {
@@ -32,7 +32,7 @@ impl Effect {
             Effect::Read { .. } => "read",
             Effect::Create(_) => "create",
             Effect::Update { .. } => "update",
-            Effect::Delete(_) => "delete",
+            Effect::Delete { .. } => "delete",
         }
     }
 
@@ -47,7 +47,7 @@ impl Effect {
             Effect::Read { resource } => &resource.id,
             Effect::Create(r) => &r.id,
             Effect::Update { id, .. } => id,
-            Effect::Delete(id) => id,
+            Effect::Delete { id, .. } => id,
         }
     }
 }
