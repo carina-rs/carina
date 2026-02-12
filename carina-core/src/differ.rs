@@ -203,6 +203,47 @@ mod tests {
     }
 
     #[test]
+    fn diff_update_when_list_of_maps_changed() {
+        let mut ingress1 = HashMap::new();
+        ingress1.insert("ip_protocol".to_string(), Value::String("tcp".to_string()));
+        ingress1.insert("from_port".to_string(), Value::Int(80));
+        ingress1.insert("to_port".to_string(), Value::Int(80));
+
+        let mut ingress2 = HashMap::new();
+        ingress2.insert("ip_protocol".to_string(), Value::String("tcp".to_string()));
+        ingress2.insert("from_port".to_string(), Value::Int(443));
+        ingress2.insert("to_port".to_string(), Value::Int(443));
+
+        let desired = Resource::new("ec2_security_group", "test-sg").with_attribute(
+            "security_group_ingress",
+            Value::List(vec![Value::Map(ingress1.clone()), Value::Map(ingress2)]),
+        );
+
+        let mut current_attrs = HashMap::new();
+        current_attrs.insert(
+            "security_group_ingress".to_string(),
+            Value::List(vec![Value::Map(ingress1)]),
+        );
+        let current = State::existing(
+            ResourceId::new("ec2_security_group", "test-sg"),
+            current_attrs,
+        );
+
+        let result = diff(&desired, &current);
+        match result {
+            Diff::Update {
+                changed_attributes, ..
+            } => {
+                assert!(
+                    changed_attributes.contains(&"security_group_ingress".to_string()),
+                    "Should detect security_group_ingress as changed"
+                );
+            }
+            _ => panic!("Expected Update when list-of-maps changed"),
+        }
+    }
+
+    #[test]
     fn read_only_resource_always_generates_read_effect() {
         // Even if the resource "exists", read-only resources should only generate Read effect
         let resources = vec![

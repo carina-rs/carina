@@ -2177,6 +2177,9 @@ fn print_plan(plan: &Plan) {
                             key.bold(),
                             format_value_with_key(value, Some(key)).white().bold()
                         );
+                    } else if is_list_of_maps(value) {
+                        println!("{}{}:", attr_prefix, key);
+                        println!("{}", format_list_of_maps(value, &attr_prefix));
                     } else {
                         println!(
                             "{}{}: {}",
@@ -2219,25 +2222,30 @@ fn print_plan(plan: &Plan) {
                     let new_value = &to.attributes[key];
                     let old_value = from.attributes.get(key);
                     if old_value != Some(new_value) {
-                        let old_str = old_value
-                            .map(|v| format_value_with_key(v, Some(key)))
-                            .unwrap_or_else(|| "(none)".to_string());
-                        if key == "name" {
-                            println!(
-                                "{}{}: {} → {}",
-                                attr_prefix,
-                                key.bold(),
-                                old_str.red(),
-                                format_value_with_key(new_value, Some(key)).white().bold()
-                            );
+                        if is_list_of_maps(new_value) {
+                            println!("{}{}:", attr_prefix, key);
+                            println!("{}", format_list_diff(old_value, new_value, &attr_prefix));
                         } else {
-                            println!(
-                                "{}{}: {} → {}",
-                                attr_prefix,
-                                key,
-                                old_str.red(),
-                                format_value_with_key(new_value, Some(key)).green()
-                            );
+                            let old_str = old_value
+                                .map(|v| format_value_with_key(v, Some(key)))
+                                .unwrap_or_else(|| "(none)".to_string());
+                            if key == "name" {
+                                println!(
+                                    "{}{}: {} → {}",
+                                    attr_prefix,
+                                    key.bold(),
+                                    old_str.red(),
+                                    format_value_with_key(new_value, Some(key)).white().bold()
+                                );
+                            } else {
+                                println!(
+                                    "{}{}: {} → {}",
+                                    attr_prefix,
+                                    key,
+                                    old_str.red(),
+                                    format_value_with_key(new_value, Some(key)).green()
+                                );
+                            }
                         }
                     }
                 }
@@ -2410,6 +2418,135 @@ fn is_dsl_enum_format(s: &str) -> bool {
         }
         _ => false,
     }
+}
+
+/// Check if a value is a list of maps (list-of-struct)
+fn is_list_of_maps(value: &Value) -> bool {
+    if let Value::List(items) = value {
+        !items.is_empty() && items.iter().all(|item| matches!(item, Value::Map(_)))
+    } else {
+        false
+    }
+}
+
+/// Format a list-of-maps for Create effect display (multi-line with + prefix)
+fn format_list_of_maps(value: &Value, attr_prefix: &str) -> String {
+    let items = match value {
+        Value::List(items) => items,
+        _ => return format_value(value),
+    };
+    let mut lines = Vec::new();
+    for item in items {
+        if let Value::Map(map) = item {
+            let mut keys: Vec<_> = map.keys().collect();
+            keys.sort();
+            let fields: Vec<String> = keys
+                .iter()
+                .map(|k| format!("{}: {}", k, format_value(&map[*k])))
+                .collect();
+            lines.push(format!(
+                "{}  {} {{{}}}",
+                attr_prefix,
+                "+".green().bold(),
+                fields.join(", ")
+            ));
+        }
+    }
+    lines.join("\n")
+}
+
+/// Format a list-of-maps diff for Update effect display
+/// Uses index-based comparison: + for added, - for removed, ~ for modified items
+fn format_list_diff(old_value: Option<&Value>, new_value: &Value, attr_prefix: &str) -> String {
+    let new_items = match new_value {
+        Value::List(items) => items,
+        _ => return format_value(new_value),
+    };
+    let old_items = match old_value {
+        Some(Value::List(items)) => items.clone(),
+        _ => vec![],
+    };
+
+    let mut lines = Vec::new();
+    let max_len = std::cmp::max(old_items.len(), new_items.len());
+
+    for i in 0..max_len {
+        let old = old_items.get(i);
+        let new = new_items.get(i);
+        match (old, new) {
+            (None, Some(Value::Map(map))) => {
+                // Added item
+                let mut keys: Vec<_> = map.keys().collect();
+                keys.sort();
+                let fields: Vec<String> = keys
+                    .iter()
+                    .map(|k| format!("{}: {}", k, format_value(&map[*k])))
+                    .collect();
+                lines.push(format!(
+                    "{}  {} {{{}}}",
+                    attr_prefix,
+                    "+".green().bold(),
+                    fields.join(", ")
+                ));
+            }
+            (Some(Value::Map(map)), None) => {
+                // Removed item
+                let mut keys: Vec<_> = map.keys().collect();
+                keys.sort();
+                let fields: Vec<String> = keys
+                    .iter()
+                    .map(|k| format!("{}: {}", k, format_value(&map[*k])))
+                    .collect();
+                lines.push(format!(
+                    "{}  {} {{{}}}",
+                    attr_prefix,
+                    "-".red().bold(),
+                    fields.join(", ")
+                ));
+            }
+            (Some(old_item), Some(new_item)) if old_item != new_item => {
+                // Modified item
+                if let (Value::Map(old_map), Value::Map(new_map)) = (old_item, new_item) {
+                    let mut keys: Vec<_> = new_map.keys().collect();
+                    keys.sort();
+                    let fields: Vec<String> = keys
+                        .iter()
+                        .map(|k| {
+                            let new_v = format_value(&new_map[*k]);
+                            if old_map.get(*k) != Some(&new_map[*k]) {
+                                let old_v = old_map
+                                    .get(*k)
+                                    .map(format_value)
+                                    .unwrap_or_else(|| "(none)".to_string());
+                                format!("{}: {} → {}", k, old_v.red(), new_v.green())
+                            } else {
+                                format!("{}: {}", k, new_v)
+                            }
+                        })
+                        .collect();
+                    lines.push(format!(
+                        "{}  {} {{{}}}",
+                        attr_prefix,
+                        "~".yellow().bold(),
+                        fields.join(", ")
+                    ));
+                }
+            }
+            _ => {
+                // Unchanged item (same in both)
+                if let Some(Value::Map(map)) = new {
+                    let mut keys: Vec<_> = map.keys().collect();
+                    keys.sort();
+                    let fields: Vec<String> = keys
+                        .iter()
+                        .map(|k| format!("{}: {}", k, format_value(&map[*k])))
+                        .collect();
+                    lines.push(format!("{}    {{{}}}", attr_prefix, fields.join(", ")));
+                }
+            }
+        }
+    }
+    lines.join("\n")
 }
 
 fn format_value(value: &Value) -> String {

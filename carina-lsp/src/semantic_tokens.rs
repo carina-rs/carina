@@ -127,6 +127,21 @@ impl SemanticTokensProvider {
             }
         }
 
+        // Nested block names: "identifier {" without "=" (e.g., "security_group_ingress {")
+        // Highlight as PROPERTY since these are attribute names in block form
+        if !trimmed.starts_with("provider ")
+            && !trimmed.starts_with("backend ")
+            && !trimmed.starts_with("let ")
+            && !trimmed.contains('=')
+            && !trimmed.contains('.')
+            && trimmed.ends_with('{')
+        {
+            let name = trimmed.trim_end_matches('{').trim();
+            if !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                tokens.push((indent, name.len() as u32, 3)); // PROPERTY
+            }
+        }
+
         // Resource type: aws.<service>.<resource> pattern
         self.find_resource_types(line, &mut tokens);
 
@@ -370,6 +385,37 @@ mod tests {
             has_resource_type,
             "Should have aws.s3.bucket as TYPE at position 0. Got: {:?}",
             line_tokens
+        );
+    }
+
+    #[test]
+    fn test_nested_block_name_highlighted_as_property() {
+        let provider = SemanticTokensProvider::new();
+        let tokens = provider.tokenize_line("    security_group_ingress {", 0);
+
+        // Should have PROPERTY token for security_group_ingress
+        let property_token = tokens.iter().find(|(_, _, typ)| *typ == 3);
+        assert!(
+            property_token.is_some(),
+            "Should highlight nested block name as PROPERTY. Got: {:?}",
+            tokens
+        );
+        let (start, len, _) = property_token.unwrap();
+        assert_eq!(*start, 4, "Should start at column 4 (after indent)");
+        assert_eq!(*len, 22, "Should span 'security_group_ingress'");
+    }
+
+    #[test]
+    fn test_nested_block_name_not_highlighted_for_keywords() {
+        let provider = SemanticTokensProvider::new();
+
+        // "provider aws {" should NOT get PROPERTY for "provider"
+        let tokens = provider.tokenize_line("provider aws {", 0);
+        let prop_at_0 = tokens.iter().find(|(s, _, typ)| *s == 0 && *typ == 3);
+        assert!(
+            prop_at_0.is_none(),
+            "Keywords should not be highlighted as PROPERTY. Got: {:?}",
+            tokens
         );
     }
 

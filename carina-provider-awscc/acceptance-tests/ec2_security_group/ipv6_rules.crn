@@ -16,23 +16,19 @@ awscc.ec2_security_group {
   vpc_id            = vpc.vpc_id
   group_description = "Acceptance test - IPv6 rules"
 
-  security_group_ingress = [
-    {
-      ip_protocol = "tcp"
-      from_port   = 443
-      to_port     = 443
-      cidr_ipv6   = "::/0"
-      description = "Allow HTTPS from IPv6"
-    }
-  ]
+  security_group_ingress {
+    ip_protocol = "tcp"
+    from_port   = 443
+    to_port     = 443
+    cidr_ipv6   = "::/0"
+    description = "Allow HTTPS from IPv6"
+  }
 
-  security_group_egress = [
-    {
-      ip_protocol = "-1"
-      cidr_ipv6   = "::/0"
-      description = "Allow all IPv6 outbound"
-    }
-  ]
+  security_group_egress {
+    ip_protocol = "-1"
+    cidr_ipv6   = "::/0"
+    description = "Allow all IPv6 outbound"
+  }
 
   tags = {
     Environment = "acceptance-test"
