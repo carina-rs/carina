@@ -8,36 +8,30 @@ provider awscc {
 }
 
 let vpc = awscc.ec2_vpc {
-  name       = "acceptance-test-vpc-route-tgw"
   cidr_block = "10.0.0.0/16"
 }
 
 let subnet = awscc.ec2_subnet {
-  name              = "acceptance-test-subnet-route-tgw"
   vpc_id            = vpc.vpc_id
   cidr_block        = "10.0.1.0/24"
   availability_zone = "ap-northeast-1a"
 }
 
 let tgw = awscc.ec2_transit_gateway {
-  name        = "acceptance-test-tgw-route"
   description = "Transit Gateway for route test"
 }
 
 let tgw_attach = awscc.ec2_transit_gateway_attachment {
-  name               = "acceptance-test-tgw-attach-route"
   transit_gateway_id = tgw.id
   vpc_id             = vpc.vpc_id
   subnet_ids         = [subnet.subnet_id]
 }
 
 let rt = awscc.ec2_route_table {
-  name   = "acceptance-test-rt-tgw"
   vpc_id = vpc.vpc_id
 }
 
-awscc.ec2_route {
-  name                   = "acceptance-test-route-tgw"
+let route = awscc.ec2_route {
   route_table_id         = rt.route_table_id
   destination_cidr_block = "10.1.0.0/16"
   transit_gateway_id     = tgw_attach.transit_gateway_id

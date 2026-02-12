@@ -361,6 +361,79 @@ fn validate_resource_ref_types(resources: &[Resource]) -> Result<(), String> {
     }
 }
 
+/// Compute stable identifiers for anonymous resources (those with empty ResourceId.name).
+/// Uses create-only properties from the schema to generate a deterministic hash.
+fn compute_anonymous_identifiers(resources: &mut [Resource]) -> Result<(), String> {
+    use std::collections::BTreeMap;
+    use std::hash::{Hash, Hasher};
+
+    let schemas = get_schemas();
+
+    for resource in resources.iter_mut() {
+        if !resource.id.name.is_empty() {
+            continue;
+        }
+
+        // Only non-aws providers can have empty names
+        let schema_key = match resource.attributes.get("_provider") {
+            Some(Value::String(provider)) if provider != "aws" => {
+                format!("{}.{}", provider, resource.id.resource_type)
+            }
+            _ => continue,
+        };
+
+        let Some(schema) = schemas.get(&schema_key) else {
+            continue;
+        };
+
+        let create_only_attrs = schema.create_only_attributes();
+        if create_only_attrs.is_empty() {
+            return Err(format!(
+                "Anonymous resource '{}' has no create-only properties. Use `let` binding for identification.",
+                resource.id.display_type()
+            ));
+        }
+
+        // Collect create-only values in sorted order for deterministic hashing
+        let mut create_only_values: BTreeMap<&str, String> = BTreeMap::new();
+        for attr_name in &create_only_attrs {
+            if let Some(value) = resource.attributes.get(*attr_name) {
+                create_only_values.insert(attr_name, format!("{:?}", value));
+            }
+        }
+
+        if create_only_values.is_empty() {
+            return Err(format!(
+                "Anonymous resource '{}' has no create-only property values set. Use `let` binding for identification.",
+                resource.id.display_type()
+            ));
+        }
+
+        // Compute deterministic hash
+        let mut hasher = std::hash::DefaultHasher::new();
+        for (k, v) in &create_only_values {
+            k.hash(&mut hasher);
+            v.hash(&mut hasher);
+        }
+        let hash = hasher.finish();
+        let hash_str = format!("{:08x}", hash & 0xFFFFFFFF); // 8 hex chars
+
+        // Build identifier: resource_type_hash (e.g., ec2_vpc_a3f2b1c8)
+        let identifier = format!(
+            "{}_{}",
+            resource.id.resource_type.replace('.', "_"),
+            hash_str
+        );
+        resource.id = ResourceId::with_provider(
+            &resource.id.provider,
+            &resource.id.resource_type,
+            identifier,
+        );
+    }
+
+    Ok(())
+}
+
 fn run_module_command(command: ModuleCommands) -> Result<(), String> {
     match command {
         ModuleCommands::Info { file } => run_module_info(&file),
@@ -712,6 +785,7 @@ fn run_validate(path: &PathBuf) -> Result<(), String> {
 
     validate_resources(&parsed.resources)?;
     validate_resource_ref_types(&parsed.resources)?;
+    compute_anonymous_identifiers(&mut parsed.resources)?;
 
     println!(
         "{}",
@@ -746,6 +820,7 @@ async fn run_plan(path: &PathBuf, out: Option<&PathBuf>) -> Result<(), String> {
 
     validate_resources(&parsed.resources)?;
     validate_resource_ref_types(&parsed.resources)?;
+    compute_anonymous_identifiers(&mut parsed.resources)?;
 
     // Check for backend configuration and load state
     // Use local backend by default if no backend is configured
@@ -909,6 +984,7 @@ async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
 
     validate_resources(&parsed.resources)?;
     validate_resource_ref_types(&parsed.resources)?;
+    compute_anonymous_identifiers(&mut parsed.resources)?;
 
     // Check for backend configuration - use local backend by default
     let backend_config = parsed.backend.as_ref();
@@ -1849,6 +1925,8 @@ async fn run_destroy(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
     // Apply default region from provider
     apply_default_region(&mut parsed);
 
+    compute_anonymous_identifiers(&mut parsed.resources)?;
+
     if parsed.resources.is_empty() {
         println!("{}", "No resources defined in configuration.".yellow());
         return Ok(());
@@ -2706,11 +2784,12 @@ fn print_plan(plan: &Plan) {
         match effect {
             Effect::Create(r) => {
                 println!(
-                    "{}{}{} {}",
+                    "{}{}{} {} \"{}\"",
                     base_indent,
                     connector,
                     colored_symbol,
-                    r.id.display_type().cyan().bold()
+                    r.id.display_type().cyan().bold(),
+                    r.id.name.white().bold()
                 );
                 // Attribute prefix aligns with the resource content
                 let attr_prefix = if indent == 0 {
@@ -2728,21 +2807,10 @@ fn print_plan(plan: &Plan) {
                     .keys()
                     .filter(|k| !k.starts_with('_'))
                     .collect();
-                keys.sort_by(|a, b| match (a.as_str(), b.as_str()) {
-                    ("name", _) => std::cmp::Ordering::Less,
-                    (_, "name") => std::cmp::Ordering::Greater,
-                    _ => a.cmp(b),
-                });
+                keys.sort();
                 for key in keys {
                     let value = &r.attributes[key];
-                    if key == "name" {
-                        println!(
-                            "{}{}: {}",
-                            attr_prefix,
-                            key.bold(),
-                            format_value_with_key(value, Some(key)).white().bold()
-                        );
-                    } else if is_list_of_maps(value) {
+                    if is_list_of_maps(value) {
                         println!("{}{}:", attr_prefix, key);
                         println!("{}", format_list_of_maps(value, &attr_prefix));
                     } else {
@@ -2757,11 +2825,12 @@ fn print_plan(plan: &Plan) {
             }
             Effect::Update { id, from, to, .. } => {
                 println!(
-                    "{}{}{} {}",
+                    "{}{}{} {} \"{}\"",
                     base_indent,
                     connector,
                     colored_symbol,
-                    id.display_type().cyan().bold()
+                    id.display_type().cyan().bold(),
+                    id.name.yellow().bold()
                 );
                 let attr_prefix = if indent == 0 {
                     format!("{}{}", base_indent, attr_base)
@@ -2778,11 +2847,7 @@ fn print_plan(plan: &Plan) {
                     .keys()
                     .filter(|k| !k.starts_with('_'))
                     .collect();
-                keys.sort_by(|a, b| match (a.as_str(), b.as_str()) {
-                    ("name", _) => std::cmp::Ordering::Less,
-                    (_, "name") => std::cmp::Ordering::Greater,
-                    _ => a.cmp(b),
-                });
+                keys.sort();
                 for key in keys {
                     let new_value = &to.attributes[key];
                     let old_value = from.attributes.get(key);
@@ -2794,71 +2859,36 @@ fn print_plan(plan: &Plan) {
                             let old_str = old_value
                                 .map(|v| format_value_with_key(v, Some(key)))
                                 .unwrap_or_else(|| "(none)".to_string());
-                            if key == "name" {
-                                println!(
-                                    "{}{}: {} → {}",
-                                    attr_prefix,
-                                    key.bold(),
-                                    old_str.red(),
-                                    format_value_with_key(new_value, Some(key)).white().bold()
-                                );
-                            } else {
-                                println!(
-                                    "{}{}: {} → {}",
-                                    attr_prefix,
-                                    key,
-                                    old_str.red(),
-                                    format_value_with_key(new_value, Some(key)).green()
-                                );
-                            }
+                            println!(
+                                "{}{}: {} → {}",
+                                attr_prefix,
+                                key,
+                                old_str.red(),
+                                format_value_with_key(new_value, Some(key)).green()
+                            );
                         }
                     }
                 }
             }
             Effect::Delete { id, .. } => {
                 println!(
-                    "{}{}{} {}",
+                    "{}{}{} {} \"{}\"",
                     base_indent,
                     connector,
                     colored_symbol,
-                    id.display_type().cyan().bold()
+                    id.display_type().cyan().bold(),
+                    id.name.red().bold()
                 );
-                let attr_prefix = if indent == 0 {
-                    format!("{}{}", base_indent, attr_base)
-                } else {
-                    let continuation = if is_last {
-                        format!("{}   ", prefix)
-                    } else {
-                        format!("{}│  ", prefix)
-                    };
-                    format!("{}{}   ", base_indent, continuation)
-                };
-                println!("{}{}: {}", attr_prefix, "name".bold(), id.name.red().bold());
             }
             Effect::Read { resource } => {
                 println!(
-                    "{}{}{} {} {}",
+                    "{}{}{} {} \"{}\" {}",
                     base_indent,
                     connector,
                     colored_symbol,
                     resource.id.display_type().cyan().bold(),
+                    resource.id.name.cyan().bold(),
                     "(data source)".dimmed()
-                );
-                let attr_prefix = if indent == 0 {
-                    format!("{}{}", base_indent, attr_base)
-                } else {
-                    let continuation = if is_last {
-                        format!("{}   ", prefix)
-                    } else {
-                        format!("{}│  ", prefix)
-                    };
-                    format!("{}{}   ", base_indent, continuation)
-                };
-                println!(
-                    "{}{}: {}",
-                    attr_prefix,
-                    "name".bold(),
-                    resource.id.name.cyan().bold()
                 );
             }
         }

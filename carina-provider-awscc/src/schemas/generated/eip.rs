@@ -26,6 +26,7 @@ pub fn ec2_eip_config() -> AwsccSchemaConfig {
         .with_description("Specifies an Elastic IP (EIP) address and can, optionally, associate it with an Amazon EC2 instance.  You can allocate an Elastic IP address from an address pool owned by AWS or from an address pool c...")
         .attribute(
             AttributeSchema::new("address", AttributeType::String)
+                .create_only()
                 .with_description("")
                 .with_provider_name("Address"),
         )
@@ -51,11 +52,13 @@ pub fn ec2_eip_config() -> AwsccSchemaConfig {
         )
         .attribute(
             AttributeSchema::new("ipam_pool_id", super::ipam_pool_id())
+                .create_only()
                 .with_description("")
                 .with_provider_name("IpamPoolId"),
         )
         .attribute(
             AttributeSchema::new("network_border_group", AttributeType::String)
+                .create_only()
                 .with_description("A unique set of Availability Zones, Local Zones, or Wavelength Zones from which AWS advertises IP addresses. Use this parameter to limit the IP addres...")
                 .with_provider_name("NetworkBorderGroup"),
         )
@@ -76,6 +79,7 @@ pub fn ec2_eip_config() -> AwsccSchemaConfig {
         )
         .attribute(
             AttributeSchema::new("transfer_address", AttributeType::String)
+                .create_only()
                 .with_description("The Elastic IP address you are accepting for transfer. You can only accept one transferred address. For more information on Elastic IP address transfe...")
                 .with_provider_name("TransferAddress"),
         )

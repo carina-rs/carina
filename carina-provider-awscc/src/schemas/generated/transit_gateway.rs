@@ -31,6 +31,7 @@ pub fn ec2_transit_gateway_config() -> AwsccSchemaConfig {
             .with_description("Resource Type definition for AWS::EC2::TransitGateway")
             .attribute(
                 AttributeSchema::new("amazon_side_asn", AttributeType::Int)
+                    .create_only()
                     .with_provider_name("AmazonSideAsn"),
             )
             .attribute(
@@ -84,6 +85,7 @@ pub fn ec2_transit_gateway_config() -> AwsccSchemaConfig {
             )
             .attribute(
                 AttributeSchema::new("multicast_support", AttributeType::String)
+                    .create_only()
                     .with_provider_name("MulticastSupport"),
             )
             .attribute(

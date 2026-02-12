@@ -642,6 +642,13 @@ fn generate_schema_code(schema: &CfnSchema, type_name: &str) -> Result<String> {
         .map(|p| p.trim_start_matches("/properties/").to_string())
         .collect();
 
+    // Build create-only properties set
+    let create_only: HashSet<String> = schema
+        .create_only_properties
+        .iter()
+        .map(|p| p.trim_start_matches("/properties/").to_string())
+        .collect();
+
     let required: HashSet<String> = schema.required.iter().cloned().collect();
 
     // Pre-scan properties to determine which imports are needed and collect enum info
@@ -813,6 +820,7 @@ pub fn {}() -> AwsccSchemaConfig {{
         let attr_name = prop_name.to_snake_case();
         let is_required = required.contains(prop_name) && !read_only.contains(prop_name);
         let is_read_only = read_only.contains(prop_name);
+        let is_create_only = create_only.contains(prop_name);
 
         let attr_type = if let Some(enum_info) = enums.get(prop_name) {
             // Use AttributeType::Custom for enums
@@ -838,6 +846,10 @@ pub fn {}() -> AwsccSchemaConfig {{
 
         if is_required {
             attr_code.push_str("\n                .required()");
+        }
+
+        if is_create_only {
+            attr_code.push_str("\n                .create_only()");
         }
 
         if let Some(desc) = &prop.description {

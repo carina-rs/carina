@@ -44,6 +44,7 @@ pub fn iam_role_config() -> AwsccSchemaConfig {
         )
         .attribute(
             AttributeSchema::new("path", AttributeType::String)
+                .create_only()
                 .with_description("The path to the role. For more information about paths, see [IAM Identifiers](https://docs.aws.amazon.com/IAM/latest/UserGuide/Using_Identifiers.html)...")
                 .with_provider_name("Path"),
         )
@@ -70,6 +71,7 @@ pub fn iam_role_config() -> AwsccSchemaConfig {
         )
         .attribute(
             AttributeSchema::new("role_name", AttributeType::String)
+                .create_only()
                 .with_description("A name for the IAM role, up to 64 characters in length. For valid values, see the ``RoleName`` parameter for the [CreateRole](https://docs.aws.amazon....")
                 .with_provider_name("RoleName"),
         )

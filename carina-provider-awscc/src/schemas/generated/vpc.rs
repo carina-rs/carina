@@ -31,6 +31,7 @@ pub fn ec2_vpc_config() -> AwsccSchemaConfig {
         .with_description("Specifies a virtual private cloud (VPC).  To add an IPv6 CIDR block to the VPC, see [AWS::EC2::VPCCidrBlock](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-ec2-vpccidrbloc...")
         .attribute(
             AttributeSchema::new("cidr_block", types::ipv4_cidr())
+                .create_only()
                 .with_description("The IPv4 network range for the VPC, in CIDR notation. For example, ``10.0.0.0/16``. We modify the specified CIDR block to its canonical form; for exam...")
                 .with_provider_name("CidrBlock"),
         )
@@ -71,11 +72,13 @@ pub fn ec2_vpc_config() -> AwsccSchemaConfig {
         )
         .attribute(
             AttributeSchema::new("ipv4_ipam_pool_id", super::ipam_pool_id())
+                .create_only()
                 .with_description("The ID of an IPv4 IPAM pool you want to use for allocating this VPC's CIDR. For more information, see [What is IPAM?](https://docs.aws.amazon.com//vpc...")
                 .with_provider_name("Ipv4IpamPoolId"),
         )
         .attribute(
             AttributeSchema::new("ipv4_netmask_length", AttributeType::Int)
+                .create_only()
                 .with_description("The netmask length of the IPv4 CIDR you want to allocate to this VPC from an Amazon VPC IP Address Manager (IPAM) pool. For more information about IPA...")
                 .with_provider_name("Ipv4NetmaskLength"),
         )

@@ -19,6 +19,7 @@ pub fn ec2_security_group_config() -> AwsccSchemaConfig {
         .attribute(
             AttributeSchema::new("group_description", AttributeType::String)
                 .required()
+                .create_only()
                 .with_description("A description for the security group.")
                 .with_provider_name("GroupDescription"),
         )
@@ -29,6 +30,7 @@ pub fn ec2_security_group_config() -> AwsccSchemaConfig {
         )
         .attribute(
             AttributeSchema::new("group_name", AttributeType::String)
+                .create_only()
                 .with_description("The name of the security group.")
                 .with_provider_name("GroupName"),
         )
@@ -80,6 +82,7 @@ pub fn ec2_security_group_config() -> AwsccSchemaConfig {
         )
         .attribute(
             AttributeSchema::new("vpc_id", super::vpc_id())
+                .create_only()
                 .with_description("The ID of the VPC for the security group.")
                 .with_provider_name("VpcId"),
         )

@@ -6,8 +6,7 @@ provider awscc {
   region = aws.Region.ap_northeast_1
 }
 
-awscc.ec2_vpc {
-  name                 = "acceptance-test-vpc-basic"
+let vpc = awscc.ec2_vpc {
   cidr_block           = "10.0.0.0/16"
   enable_dns_support   = true
   enable_dns_hostnames = true

@@ -7,24 +7,20 @@ provider awscc {
 }
 
 let vpc = awscc.ec2_vpc {
-  name                 = "acceptance-test-vpc-natgw-public"
   cidr_block           = "10.0.0.0/16"
   enable_dns_support   = true
   enable_dns_hostnames = true
 }
 
 let igw = awscc.ec2_internet_gateway {
-  name = "acceptance-test-igw-natgw-public"
 }
 
 let igw_attach = awscc.ec2_vpc_gateway_attachment {
-  name                = "acceptance-test-igw-attach-natgw-public"
   vpc_id              = vpc.vpc_id
   internet_gateway_id = igw.internet_gateway_id
 }
 
 let public_subnet = awscc.ec2_subnet {
-  name                    = "acceptance-test-subnet-natgw-public"
   vpc_id                  = vpc.vpc_id
   cidr_block              = "10.0.1.0/24"
   availability_zone       = "ap-northeast-1a"
@@ -32,12 +28,10 @@ let public_subnet = awscc.ec2_subnet {
 }
 
 let eip = awscc.ec2_eip {
-  name   = "acceptance-test-eip-natgw-public"
   domain = "vpc"
 }
 
-awscc.ec2_nat_gateway {
-  name          = "acceptance-test-natgw-public"
+let nat_gw = awscc.ec2_nat_gateway {
   allocation_id = eip.allocation_id
   subnet_id     = public_subnet.subnet_id
 

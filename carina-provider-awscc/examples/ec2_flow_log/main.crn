@@ -8,12 +8,10 @@ provider awscc {
 }
 
 let vpc = awscc.ec2_vpc {
-  name       = "example-vpc"
   cidr_block = "10.0.0.0/16"
 }
 
-awscc.ec2_flow_log {
-  name                 = "example-flow-log"
+let flow_log = awscc.ec2_flow_log {
   resource_id          = vpc.vpc_id
   resource_type        = VPC
   traffic_type         = ALL

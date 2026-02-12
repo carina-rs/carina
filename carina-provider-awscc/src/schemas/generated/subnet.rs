@@ -23,11 +23,13 @@ pub fn ec2_subnet_config() -> AwsccSchemaConfig {
         )
         .attribute(
             AttributeSchema::new("availability_zone", super::availability_zone())
+                .create_only()
                 .with_description("The Availability Zone of the subnet. If you update this property, you must also update the ``CidrBlock`` property.")
                 .with_provider_name("AvailabilityZone"),
         )
         .attribute(
             AttributeSchema::new("availability_zone_id", AttributeType::String)
+                .create_only()
                 .with_description("The AZ ID of the subnet.")
                 .with_provider_name("AvailabilityZoneId"),
         )
@@ -43,6 +45,7 @@ pub fn ec2_subnet_config() -> AwsccSchemaConfig {
         )
         .attribute(
             AttributeSchema::new("cidr_block", types::ipv4_cidr())
+                .create_only()
                 .with_description("The IPv4 CIDR block assigned to the subnet. If you update this property, we create a new subnet, and then delete the existing one.")
                 .with_provider_name("CidrBlock"),
         )
@@ -58,11 +61,13 @@ pub fn ec2_subnet_config() -> AwsccSchemaConfig {
         )
         .attribute(
             AttributeSchema::new("ipv4_ipam_pool_id", super::ipam_pool_id())
+                .create_only()
                 .with_description("An IPv4 IPAM pool ID for the subnet.")
                 .with_provider_name("Ipv4IpamPoolId"),
         )
         .attribute(
             AttributeSchema::new("ipv4_netmask_length", AttributeType::Int)
+                .create_only()
                 .with_description("An IPv4 netmask length for the subnet.")
                 .with_provider_name("Ipv4NetmaskLength"),
         )
@@ -78,16 +83,19 @@ pub fn ec2_subnet_config() -> AwsccSchemaConfig {
         )
         .attribute(
             AttributeSchema::new("ipv6_ipam_pool_id", super::ipam_pool_id())
+                .create_only()
                 .with_description("An IPv6 IPAM pool ID for the subnet.")
                 .with_provider_name("Ipv6IpamPoolId"),
         )
         .attribute(
             AttributeSchema::new("ipv6_native", AttributeType::Bool)
+                .create_only()
                 .with_description("Indicates whether this is an IPv6 only subnet. For more information, see [Subnet basics](https://docs.aws.amazon.com/vpc/latest/userguide/VPC_Subnets....")
                 .with_provider_name("Ipv6Native"),
         )
         .attribute(
             AttributeSchema::new("ipv6_netmask_length", AttributeType::Int)
+                .create_only()
                 .with_description("An IPv6 netmask length for the subnet.")
                 .with_provider_name("Ipv6NetmaskLength"),
         )
@@ -103,6 +111,7 @@ pub fn ec2_subnet_config() -> AwsccSchemaConfig {
         )
         .attribute(
             AttributeSchema::new("outpost_arn", super::arn())
+                .create_only()
                 .with_description("The Amazon Resource Name (ARN) of the Outpost.")
                 .with_provider_name("OutpostArn"),
         )
@@ -131,6 +140,7 @@ pub fn ec2_subnet_config() -> AwsccSchemaConfig {
         .attribute(
             AttributeSchema::new("vpc_id", super::vpc_id())
                 .required()
+                .create_only()
                 .with_description("The ID of the VPC the subnet is in. If you update this property, you must also update the ``CidrBlock`` property.")
                 .with_provider_name("VpcId"),
         )

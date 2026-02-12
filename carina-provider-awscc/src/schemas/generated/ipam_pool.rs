@@ -83,6 +83,7 @@ pub fn ec2_ipam_pool_config() -> AwsccSchemaConfig {
                 namespace: Some("awscc.ec2_ipam_pool".to_string()),
             })
                 .required()
+                .create_only()
                 .with_description("The address family of the address space in this pool. Either IPv4 or IPv6.")
                 .with_provider_name("AddressFamily"),
         )
@@ -123,6 +124,7 @@ pub fn ec2_ipam_pool_config() -> AwsccSchemaConfig {
                 validate: validate_aws_service,
                 namespace: Some("awscc.ec2_ipam_pool".to_string()),
             })
+                .create_only()
                 .with_description("Limits which service in Amazon Web Services that the pool can be used in.")
                 .with_provider_name("AwsService"),
         )
@@ -148,6 +150,7 @@ pub fn ec2_ipam_pool_config() -> AwsccSchemaConfig {
         .attribute(
             AttributeSchema::new("ipam_scope_id", AttributeType::String)
                 .required()
+                .create_only()
                 .with_description("The Id of the scope this pool is a part of.")
                 .with_provider_name("IpamScopeId"),
         )
@@ -163,6 +166,7 @@ pub fn ec2_ipam_pool_config() -> AwsccSchemaConfig {
         )
         .attribute(
             AttributeSchema::new("locale", AttributeType::String)
+                .create_only()
                 .with_description("The region of this pool. If not set, this will default to \"None\" which will disable non-custom allocations. If the locale has been specified for the...")
                 .with_provider_name("Locale"),
         )
@@ -188,16 +192,19 @@ pub fn ec2_ipam_pool_config() -> AwsccSchemaConfig {
                 validate: validate_public_ip_source,
                 namespace: Some("awscc.ec2_ipam_pool".to_string()),
             })
+                .create_only()
                 .with_description("The IP address source for pools in the public scope. Only used for provisioning IP address CIDRs to pools in the public scope. Default is `byoip`.")
                 .with_provider_name("PublicIpSource"),
         )
         .attribute(
             AttributeSchema::new("publicly_advertisable", AttributeType::Bool)
+                .create_only()
                 .with_description("Determines whether or not address space from this pool is publicly advertised. Must be set if and only if the pool is IPv6.")
                 .with_provider_name("PubliclyAdvertisable"),
         )
         .attribute(
             AttributeSchema::new("source_ipam_pool_id", super::ipam_pool_id())
+                .create_only()
                 .with_description("The Id of this pool's source. If set, all space provisioned in this pool must be free space provisioned in the parent pool.")
                 .with_provider_name("SourceIpamPoolId"),
         )
@@ -211,6 +218,7 @@ pub fn ec2_ipam_pool_config() -> AwsccSchemaConfig {
                     StructField::new("resource_type", AttributeType::String).required().with_provider_name("ResourceType")
                     ],
                 })
+                .create_only()
                 .with_provider_name("SourceResource"),
         )
         .attribute(

@@ -8,18 +8,15 @@ provider awscc {
 }
 
 let vpc = awscc.ec2_vpc {
-  name       = "example-vpc"
   cidr_block = "10.0.0.0/16"
 }
 
 let sg = awscc.ec2_security_group {
-  name              = "example-sg"
   vpc_id            = vpc.vpc_id
   group_description = "Example security group"
 }
 
-awscc.ec2_security_group_ingress {
-  name        = "example-https-ingress"
+let ingress = awscc.ec2_security_group_ingress {
   group_id    = sg.group_id
   description = "Allow HTTPS from VPC"
   ip_protocol = "tcp"

@@ -7,17 +7,14 @@ provider awscc {
 }
 
 let vpc1 = awscc.ec2_vpc {
-  name       = "acceptance-test-vpc-peer1"
   cidr_block = "10.0.0.0/16"
 }
 
 let vpc2 = awscc.ec2_vpc {
-  name       = "acceptance-test-vpc-peer2"
   cidr_block = "10.1.0.0/16"
 }
 
-awscc.ec2_vpc_peering_connection {
-  name        = "acceptance-test-peering"
+let peering = awscc.ec2_vpc_peering_connection {
   vpc_id      = vpc1.vpc_id
   peer_vpc_id = vpc2.vpc_id
 

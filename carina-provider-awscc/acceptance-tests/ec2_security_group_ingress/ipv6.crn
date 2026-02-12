@@ -7,18 +7,15 @@ provider awscc {
 }
 
 let vpc = awscc.ec2_vpc {
-  name       = "acceptance-test-vpc-sgi-ipv6"
   cidr_block = "10.0.0.0/16"
 }
 
 let sg = awscc.ec2_security_group {
-  name              = "acceptance-test-sg-for-ingress-ipv6"
   vpc_id            = vpc.vpc_id
   group_description = "SG for IPv6 ingress rule test"
 }
 
-awscc.ec2_security_group_ingress {
-  name        = "acceptance-test-ingress-ipv6"
+let ingress = awscc.ec2_security_group_ingress {
   group_id    = sg.group_id
   description = "Allow HTTPS from IPv6"
   ip_protocol = "tcp"

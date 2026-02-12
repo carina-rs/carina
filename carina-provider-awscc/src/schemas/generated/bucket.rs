@@ -141,6 +141,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
         )
         .attribute(
             AttributeSchema::new("bucket_name", AttributeType::String)
+                .create_only()
                 .with_description("A name for the bucket. If you don't specify a name, AWS CloudFormation generates a unique ID and uses that ID for the bucket name. The bucket name mus...")
                 .with_provider_name("BucketName"),
         )

@@ -42,6 +42,7 @@ pub fn ec2_nat_gateway_config() -> AwsccSchemaConfig {
         .with_description("Specifies a network address translation (NAT) gateway in the specified subnet. You can create either a public NAT gateway or a private NAT gateway. The default is a public NAT gateway. If you create a...")
         .attribute(
             AttributeSchema::new("allocation_id", super::aws_resource_id())
+                .create_only()
                 .with_description("[Public NAT gateway only] The allocation ID of the Elastic IP address that's associated with the NAT gateway. This property is required for a public N...")
                 .with_provider_name("AllocationId"),
         )
@@ -62,6 +63,7 @@ pub fn ec2_nat_gateway_config() -> AwsccSchemaConfig {
                 validate: validate_availability_mode,
                 namespace: Some("awscc.ec2_nat_gateway".to_string()),
             })
+                .create_only()
                 .with_description("Indicates whether this is a zonal (single-AZ) or regional (multi-AZ) NAT gateway. A zonal NAT gateway is a NAT Gateway that provides redundancy and sc...")
                 .with_provider_name("AvailabilityMode"),
         )
@@ -84,6 +86,7 @@ pub fn ec2_nat_gateway_config() -> AwsccSchemaConfig {
                 validate: validate_connectivity_type,
                 namespace: Some("awscc.ec2_nat_gateway".to_string()),
             })
+                .create_only()
                 .with_description("Indicates whether the NAT gateway supports public or private connectivity. The default is public connectivity.")
                 .with_provider_name("ConnectivityType"),
         )
@@ -104,6 +107,7 @@ pub fn ec2_nat_gateway_config() -> AwsccSchemaConfig {
         )
         .attribute(
             AttributeSchema::new("private_ip_address", types::ipv4_address())
+                .create_only()
                 .with_description("The private IPv4 address to assign to the NAT gateway. If you don't provide an address, a private IPv4 address will be automatically assigned.")
                 .with_provider_name("PrivateIpAddress"),
         )
@@ -129,6 +133,7 @@ pub fn ec2_nat_gateway_config() -> AwsccSchemaConfig {
         )
         .attribute(
             AttributeSchema::new("subnet_id", super::subnet_id())
+                .create_only()
                 .with_description("The ID of the subnet in which the NAT gateway is located.")
                 .with_provider_name("SubnetId"),
         )
@@ -139,6 +144,7 @@ pub fn ec2_nat_gateway_config() -> AwsccSchemaConfig {
         )
         .attribute(
             AttributeSchema::new("vpc_id", super::vpc_id())
+                .create_only()
                 .with_description("The ID of the VPC in which the NAT gateway is located.")
                 .with_provider_name("VpcId"),
         )

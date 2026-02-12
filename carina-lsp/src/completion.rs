@@ -456,7 +456,7 @@ impl CompletionProvider {
                 kind: Some(CompletionItemKind::CLASS),
                 text_edit: Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(TextEdit {
                     range: replacement_range,
-                    new_text: "awscc.ec2_vpc {\n    name                 = \"${1:vpc-name}\"\n    cidr_block           = \"${2:10.0.0.0/16}\"\n    enable_dns_support   = true\n    enable_dns_hostnames = true\n}".to_string(),
+                    new_text: "let ${1:vpc} = awscc.ec2_vpc {\n    cidr_block           = \"${2:10.0.0.0/16}\"\n    enable_dns_support   = true\n    enable_dns_hostnames = true\n}".to_string(),
                 })),
                 insert_text_format: Some(InsertTextFormat::SNIPPET),
                 detail: Some("VPC resource (Cloud Control API)".to_string()),
@@ -1669,16 +1669,15 @@ simple {
         let provider = CompletionProvider::new();
         // flow_log's destination_options has Bool fields
         let doc = create_document(
-            r#"awscc.ec2_flow_log {
-    name = "test"
+            r#"let flow_log = awscc.ec2_flow_log {
     destination_options {
         hive_compatible_partitions =
     }
 }"#,
         );
-        // Cursor after "hive_compatible_partitions = " (line 3)
+        // Cursor after "hive_compatible_partitions = " (line 2)
         let position = Position {
-            line: 3,
+            line: 2,
             character: 37,
         };
 

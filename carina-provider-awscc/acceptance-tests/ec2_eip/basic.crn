@@ -6,8 +6,7 @@ provider awscc {
   region = aws.Region.ap_northeast_1
 }
 
-awscc.ec2_eip {
-  name   = "acceptance-test-eip"
+let eip = awscc.ec2_eip {
   domain = "vpc"
 
   tags = {

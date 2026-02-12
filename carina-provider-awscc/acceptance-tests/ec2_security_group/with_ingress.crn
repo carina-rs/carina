@@ -7,12 +7,10 @@ provider awscc {
 }
 
 let vpc = awscc.ec2_vpc {
-  name       = "acceptance-test-vpc-sg-ingress"
   cidr_block = "10.0.0.0/16"
 }
 
-awscc.ec2_security_group {
-  name              = "acceptance-test-sg-ingress"
+let sg = awscc.ec2_security_group {
   vpc_id            = vpc.vpc_id
   group_description = "Acceptance test - ingress rules"
 

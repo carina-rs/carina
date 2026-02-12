@@ -60,11 +60,13 @@ pub fn ec2_flow_log_config() -> AwsccSchemaConfig {
         .with_description("Specifies a VPC flow log, which enables you to capture IP traffic for a specific network interface, subnet, or VPC.")
         .attribute(
             AttributeSchema::new("deliver_cross_account_role", AttributeType::String)
+                .create_only()
                 .with_description("The ARN of the IAM role that allows Amazon EC2 to publish flow logs across accounts.")
                 .with_provider_name("DeliverCrossAccountRole"),
         )
         .attribute(
             AttributeSchema::new("deliver_logs_permission_arn", super::arn())
+                .create_only()
                 .with_description("The ARN for the IAM role that permits Amazon EC2 to publish flow logs to a CloudWatch Logs log group in your account. If you specify LogDestinationTyp...")
                 .with_provider_name("DeliverLogsPermissionArn"),
         )
@@ -77,6 +79,7 @@ pub fn ec2_flow_log_config() -> AwsccSchemaConfig {
                     StructField::new("per_hour_partition", AttributeType::Bool).required().with_provider_name("PerHourPartition")
                     ],
                 })
+                .create_only()
                 .with_provider_name("DestinationOptions"),
         )
         .attribute(
@@ -86,6 +89,7 @@ pub fn ec2_flow_log_config() -> AwsccSchemaConfig {
         )
         .attribute(
             AttributeSchema::new("log_destination", AttributeType::String)
+                .create_only()
                 .with_description("Specifies the destination to which the flow log data is to be published. Flow log data can be published to a CloudWatch Logs log group, an Amazon S3 b...")
                 .with_provider_name("LogDestination"),
         )
@@ -96,27 +100,32 @@ pub fn ec2_flow_log_config() -> AwsccSchemaConfig {
                 validate: validate_log_destination_type,
                 namespace: Some("awscc.ec2_flow_log".to_string()),
             })
+                .create_only()
                 .with_description("Specifies the type of destination to which the flow log data is to be published. Flow log data can be published to CloudWatch Logs or Amazon S3.")
                 .with_provider_name("LogDestinationType"),
         )
         .attribute(
             AttributeSchema::new("log_format", AttributeType::String)
+                .create_only()
                 .with_description("The fields to include in the flow log record, in the order in which they should appear.")
                 .with_provider_name("LogFormat"),
         )
         .attribute(
             AttributeSchema::new("log_group_name", AttributeType::String)
+                .create_only()
                 .with_description("The name of a new or existing CloudWatch Logs log group where Amazon EC2 publishes your flow logs. If you specify LogDestinationType as s3 or kinesis-...")
                 .with_provider_name("LogGroupName"),
         )
         .attribute(
             AttributeSchema::new("max_aggregation_interval", AttributeType::Int)
+                .create_only()
                 .with_description("The maximum interval of time during which a flow of packets is captured and aggregated into a flow log record. You can specify 60 seconds (1 minute) o...")
                 .with_provider_name("MaxAggregationInterval"),
         )
         .attribute(
             AttributeSchema::new("resource_id", AttributeType::String)
                 .required()
+                .create_only()
                 .with_description("The ID of the subnet, network interface, or VPC for which you want to create a flow log.")
                 .with_provider_name("ResourceId"),
         )
@@ -128,6 +137,7 @@ pub fn ec2_flow_log_config() -> AwsccSchemaConfig {
                 namespace: Some("awscc.ec2_flow_log".to_string()),
             })
                 .required()
+                .create_only()
                 .with_description("The type of resource for which to create the flow log. For example, if you specified a VPC ID for the ResourceId property, specify VPC for this proper...")
                 .with_provider_name("ResourceType"),
         )
@@ -143,6 +153,7 @@ pub fn ec2_flow_log_config() -> AwsccSchemaConfig {
                 validate: validate_traffic_type,
                 namespace: Some("awscc.ec2_flow_log".to_string()),
             })
+                .create_only()
                 .with_description("The type of traffic to log. You can log traffic that the resource accepts or rejects, or all traffic.")
                 .with_provider_name("TrafficType"),
         )

@@ -31,6 +31,7 @@ pub fn ec2_egress_only_internet_gateway_config() -> AwsccSchemaConfig {
             .attribute(
                 AttributeSchema::new("vpc_id", super::vpc_id())
                     .required()
+                    .create_only()
                     .with_description(
                         "The ID of the VPC for which to create the egress-only internet gateway.",
                     )

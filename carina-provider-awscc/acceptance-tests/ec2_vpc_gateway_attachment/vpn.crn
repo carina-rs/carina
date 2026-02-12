@@ -8,17 +8,14 @@ provider awscc {
 }
 
 let vpc = awscc.ec2_vpc {
-  name       = "acceptance-test-vpc-gw-attach-vpn"
   cidr_block = "10.0.0.0/16"
 }
 
 let vpn_gw = awscc.ec2_vpn_gateway {
-  name = "acceptance-test-vpn-gw"
   type = "ipsec.1"
 }
 
-awscc.ec2_vpc_gateway_attachment {
-  name           = "acceptance-test-vpn-attachment"
+let vpn_attachment = awscc.ec2_vpc_gateway_attachment {
   vpc_id         = vpc.vpc_id
   vpn_gateway_id = vpn_gw.vpn_gateway_id
 }

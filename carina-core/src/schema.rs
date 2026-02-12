@@ -370,6 +370,8 @@ pub struct AttributeSchema {
     pub completions: Option<Vec<CompletionValue>>,
     /// Provider-side property name (e.g., "VpcId" for AWS Cloud Control)
     pub provider_name: Option<String>,
+    /// Whether this attribute is create-only (immutable after creation)
+    pub create_only: bool,
 }
 
 impl AttributeSchema {
@@ -382,11 +384,17 @@ impl AttributeSchema {
             description: None,
             completions: None,
             provider_name: None,
+            create_only: false,
         }
     }
 
     pub fn required(mut self) -> Self {
         self.required = true;
+        self
+    }
+
+    pub fn create_only(mut self) -> Self {
+        self.create_only = true;
         self
     }
 
@@ -445,6 +453,15 @@ impl ResourceSchema {
     pub fn with_validator(mut self, validator: ResourceValidator) -> Self {
         self.validator = Some(validator);
         self
+    }
+
+    /// Returns the names of create-only (immutable) attributes
+    pub fn create_only_attributes(&self) -> Vec<&str> {
+        self.attributes
+            .iter()
+            .filter(|(_, schema)| schema.create_only)
+            .map(|(name, _)| name.as_str())
+            .collect()
     }
 
     /// Validate resource attributes
