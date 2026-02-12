@@ -676,9 +676,11 @@ dependencies = [
  "carina-provider-aws",
  "carina-provider-awscc",
  "carina-state",
+ "chrono",
  "clap",
  "clap_complete",
  "colored",
+ "serde",
  "serde_json",
  "similar",
  "tokio",
@@ -690,6 +692,8 @@ version = "0.1.0"
 dependencies = [
  "pest",
  "pest_derive",
+ "serde",
+ "serde_json",
  "thiserror",
  "tokio",
 ]

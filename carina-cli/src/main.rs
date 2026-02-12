@@ -5,13 +5,14 @@ use std::path::{Path, PathBuf};
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::{Shell, generate};
 use colored::Colorize;
+use serde::{Deserialize, Serialize};
 use similar::{ChangeTag, TextDiff};
 
 use carina_core::differ::create_plan;
 use carina_core::effect::Effect;
 use carina_core::formatter::{self, FormatConfig};
 use carina_core::module_resolver;
-use carina_core::parser::{self, BackendConfig, ParsedFile, TypeExpr};
+use carina_core::parser::{self, BackendConfig, ParsedFile, ProviderConfig, TypeExpr};
 use carina_core::plan::Plan;
 use carina_core::provider::{BoxFuture, Provider, ProviderError, ProviderResult, ResourceType};
 use carina_core::resource::{Resource, ResourceId, State, Value};
@@ -48,6 +49,10 @@ enum Commands {
         /// Path to .crn file or directory
         #[arg(default_value = ".")]
         path: PathBuf,
+
+        /// Save plan to a file for later apply
+        #[arg(long = "out")]
+        out: Option<PathBuf>,
     },
     /// Apply changes to reach the desired state
     Apply {
@@ -140,14 +145,61 @@ enum StateCommands {
     },
 }
 
+/// Saved plan file for `plan --out` / `apply plan.json`
+#[derive(Debug, Serialize, Deserialize)]
+struct PlanFile {
+    /// Plan file format version
+    version: u32,
+    /// Carina version that created this plan
+    carina_version: String,
+    /// ISO 8601 timestamp
+    timestamp: String,
+    /// Original .crn path (informational)
+    source_path: String,
+    /// State lineage for drift detection
+    state_lineage: Option<String>,
+    /// State serial for drift detection
+    state_serial: Option<u64>,
+    /// Provider configuration
+    provider_config: ProviderConfig,
+    /// Backend configuration
+    backend_config: Option<BackendConfig>,
+    /// The plan (effects)
+    plan: Plan,
+    /// Resources sorted by dependencies (for post-apply state saving)
+    sorted_resources: Vec<Resource>,
+    /// Current states (for binding_map + state saving)
+    current_states: Vec<CurrentStateEntry>,
+}
+
+/// Entry for serializing current resource states
+#[derive(Debug, Serialize, Deserialize)]
+struct CurrentStateEntry {
+    id: ResourceId,
+    state: State,
+}
+
+/// Result of creating a plan, with context needed for saving
+struct PlanContext {
+    plan: Plan,
+    sorted_resources: Vec<Resource>,
+    current_states: HashMap<ResourceId, State>,
+}
+
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
 
     let result = match cli.command {
         Commands::Validate { path } => run_validate(&path),
-        Commands::Plan { path } => run_plan(&path).await,
-        Commands::Apply { path, auto_approve } => run_apply(&path, auto_approve).await,
+        Commands::Plan { path, out } => run_plan(&path, out.as_ref()).await,
+        Commands::Apply { path, auto_approve } => {
+            if path.extension().is_some_and(|ext| ext == "json") {
+                run_apply_from_plan(&path, auto_approve).await
+            } else {
+                run_apply(&path, auto_approve).await
+            }
+        }
         Commands::Destroy { path, auto_approve } => run_destroy(&path, auto_approve).await,
         Commands::Fmt {
             path,
@@ -678,7 +730,7 @@ fn run_validate(path: &PathBuf) -> Result<(), String> {
     Ok(())
 }
 
-async fn run_plan(path: &PathBuf) -> Result<(), String> {
+async fn run_plan(path: &PathBuf, out: Option<&PathBuf>) -> Result<(), String> {
     let mut parsed = load_configuration(path)?.parsed;
 
     // Resolve module imports and expand module calls
@@ -783,8 +835,59 @@ async fn run_plan(path: &PathBuf) -> Result<(), String> {
         println!();
     }
 
-    let plan = create_plan_from_parsed(&parsed, &state_file).await?;
-    print_plan(&plan);
+    let ctx = create_plan_from_parsed(&parsed, &state_file).await?;
+    print_plan(&ctx.plan);
+
+    // Save plan to file if --out was specified
+    if let Some(out_path) = out {
+        let provider_config = parsed
+            .providers
+            .first()
+            .cloned()
+            .unwrap_or_else(|| ProviderConfig {
+                name: "unknown".to_string(),
+                attributes: HashMap::new(),
+            });
+
+        let plan_file = PlanFile {
+            version: 1,
+            carina_version: env!("CARGO_PKG_VERSION").to_string(),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            source_path: path.display().to_string(),
+            state_lineage: state_file.as_ref().map(|s| s.lineage.clone()),
+            state_serial: state_file.as_ref().map(|s| s.serial),
+            provider_config,
+            backend_config: parsed.backend.clone(),
+            plan: ctx.plan,
+            sorted_resources: ctx.sorted_resources,
+            current_states: ctx
+                .current_states
+                .into_iter()
+                .map(|(id, state)| CurrentStateEntry { id, state })
+                .collect(),
+        };
+
+        let json = serde_json::to_string_pretty(&plan_file)
+            .map_err(|e| format!("Failed to serialize plan: {}", e))?;
+        fs::write(out_path, json).map_err(|e| format!("Failed to write plan file: {}", e))?;
+
+        println!();
+        println!(
+            "{}",
+            format!("Plan saved to {}", out_path.display())
+                .green()
+                .bold()
+        );
+        println!(
+            "{}",
+            format!(
+                "To apply this plan, run: carina apply {}",
+                out_path.display()
+            )
+            .cyan()
+        );
+    }
+
     Ok(())
 }
 
@@ -1265,6 +1368,360 @@ async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
             "Apply failed. {} succeeded, {} failed.",
             success_count, failure_count
         ))
+    }
+}
+
+async fn run_apply_from_plan(plan_path: &PathBuf, auto_approve: bool) -> Result<(), String> {
+    // Read and deserialize the plan file
+    let content =
+        fs::read_to_string(plan_path).map_err(|e| format!("Failed to read plan file: {}", e))?;
+    let plan_file: PlanFile =
+        serde_json::from_str(&content).map_err(|e| format!("Failed to parse plan file: {}", e))?;
+
+    // Validate version compatibility
+    if plan_file.version != 1 {
+        return Err(format!(
+            "Unsupported plan file version: {} (expected 1)",
+            plan_file.version
+        ));
+    }
+
+    let current_version = env!("CARGO_PKG_VERSION");
+    if plan_file.carina_version != current_version {
+        println!(
+            "{}",
+            format!(
+                "Warning: plan was created with carina {} but current version is {}",
+                plan_file.carina_version, current_version
+            )
+            .yellow()
+        );
+    }
+
+    println!(
+        "{}",
+        format!(
+            "Using saved plan from {} (created {})",
+            plan_file.source_path, plan_file.timestamp
+        )
+        .cyan()
+    );
+
+    // Set up backend
+    let backend: Box<dyn StateBackend> = if let Some(config) = plan_file.backend_config.as_ref() {
+        let state_config = convert_backend_config(config);
+        create_backend(&state_config)
+            .await
+            .map_err(|e| format!("Failed to create backend: {}", e))?
+    } else {
+        create_local_backend()
+    };
+
+    // Acquire lock
+    println!("{}", "Acquiring state lock...".cyan());
+    let lock = backend.acquire_lock("apply").await.map_err(|e| match e {
+        BackendError::Locked {
+            who,
+            lock_id,
+            operation,
+        } => {
+            format!(
+                "State is locked by {} (lock ID: {}, operation: {})\n\
+                        If you believe this is stale, run: carina force-unlock {}",
+                who, lock_id, operation, lock_id
+            )
+        }
+        _ => format!("Failed to acquire lock: {}", e),
+    })?;
+    println!("  {} Lock acquired", "✓".green());
+
+    // Read current state and validate lineage
+    let state_file = backend
+        .read_state()
+        .await
+        .map_err(|e| format!("Failed to read state: {}", e))?;
+
+    if let Some(ref state) = state_file {
+        // Validate state lineage
+        if let Some(ref plan_lineage) = plan_file.state_lineage
+            && &state.lineage != plan_lineage
+        {
+            backend
+                .release_lock(&lock)
+                .await
+                .map_err(|e| format!("Failed to release lock: {}", e))?;
+            return Err(format!(
+                "State lineage mismatch: plan was created for lineage '{}' but current state has '{}'",
+                plan_lineage, state.lineage
+            ));
+        }
+
+        // Warn on serial mismatch (state may have drifted)
+        if let Some(plan_serial) = plan_file.state_serial
+            && state.serial != plan_serial
+        {
+            println!(
+                "{}",
+                format!(
+                    "Warning: state serial has changed since plan was created ({} → {}). \
+                     The infrastructure may have drifted.",
+                    plan_serial, state.serial
+                )
+                .yellow()
+            );
+        }
+    }
+
+    let plan = &plan_file.plan;
+    let sorted_resources = &plan_file.sorted_resources;
+
+    // Rebuild current_states HashMap from plan file
+    let current_states: HashMap<ResourceId, State> = plan_file
+        .current_states
+        .into_iter()
+        .map(|entry| (entry.id, entry.state))
+        .collect();
+
+    if plan.is_empty() {
+        println!("{}", "No changes needed.".green());
+        backend
+            .release_lock(&lock)
+            .await
+            .map_err(|e| format!("Failed to release lock: {}", e))?;
+        return Ok(());
+    }
+
+    print_plan(plan);
+
+    // Confirmation prompt
+    if !auto_approve {
+        println!(
+            "{}",
+            "Do you want to perform these actions?".yellow().bold()
+        );
+        println!(
+            "  {}",
+            "Carina will perform the actions described above. Type 'yes' to confirm.".yellow()
+        );
+        print!("\n  Enter a value: ");
+        std::io::Write::flush(&mut std::io::stdout()).map_err(|e| e.to_string())?;
+
+        let mut input = String::new();
+        std::io::stdin()
+            .read_line(&mut input)
+            .map_err(|e| e.to_string())?;
+
+        if input.trim() != "yes" {
+            println!();
+            println!("{}", "Apply cancelled.".yellow());
+            backend
+                .release_lock(&lock)
+                .await
+                .map_err(|e| format!("Failed to release lock: {}", e))?;
+            return Ok(());
+        }
+        println!();
+    }
+
+    // Create provider from plan file config
+    let provider: Box<dyn Provider> = create_provider_from_config(&plan_file.provider_config).await;
+
+    // Build initial binding map for reference resolution
+    let mut binding_map: HashMap<String, HashMap<String, Value>> = HashMap::new();
+    for resource in sorted_resources {
+        if let Some(Value::String(binding_name)) = resource.attributes.get("_binding") {
+            let mut attrs = resource.attributes.clone();
+            if let Some(state) = current_states.get(&resource.id)
+                && state.exists
+            {
+                for (k, v) in &state.attributes {
+                    if !attrs.contains_key(k) {
+                        attrs.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+            binding_map.insert(binding_name.clone(), attrs);
+        }
+    }
+
+    println!("{}", "Applying changes...".cyan().bold());
+    println!();
+
+    let mut success_count = 0;
+    let mut failure_count = 0;
+    let mut applied_states: HashMap<ResourceId, State> = HashMap::new();
+
+    // Apply each effect in order, resolving references dynamically
+    for effect in plan.effects() {
+        match effect {
+            Effect::Create(resource) => {
+                let mut resolved_resource = resource.clone();
+                for (key, value) in &resource.attributes {
+                    resolved_resource
+                        .attributes
+                        .insert(key.clone(), resolve_ref_value(value, &binding_map));
+                }
+
+                match provider.create(&resolved_resource).await {
+                    Ok(state) => {
+                        println!("  {} {}", "✓".green(), format_effect(effect));
+                        success_count += 1;
+                        applied_states.insert(resource.id.clone(), state.clone());
+
+                        if let Some(Value::String(binding_name)) =
+                            resource.attributes.get("_binding")
+                        {
+                            let mut attrs = resolved_resource.attributes.clone();
+                            for (k, v) in &state.attributes {
+                                attrs.insert(k.clone(), v.clone());
+                            }
+                            binding_map.insert(binding_name.clone(), attrs);
+                        }
+                    }
+                    Err(e) => {
+                        println!("  {} {} - {}", "✗".red(), format_effect(effect), e);
+                        failure_count += 1;
+                    }
+                }
+            }
+            Effect::Update { id, from, to } => {
+                let mut resolved_to = to.clone();
+                for (key, value) in &to.attributes {
+                    resolved_to
+                        .attributes
+                        .insert(key.clone(), resolve_ref_value(value, &binding_map));
+                }
+
+                let identifier = from.identifier.as_deref().unwrap_or("");
+                match provider.update(id, identifier, from, &resolved_to).await {
+                    Ok(state) => {
+                        println!("  {} {}", "✓".green(), format_effect(effect));
+                        success_count += 1;
+                        applied_states.insert(id.clone(), state.clone());
+
+                        if let Some(Value::String(binding_name)) = to.attributes.get("_binding") {
+                            let mut attrs = resolved_to.attributes.clone();
+                            for (k, v) in &state.attributes {
+                                attrs.insert(k.clone(), v.clone());
+                            }
+                            binding_map.insert(binding_name.clone(), attrs);
+                        }
+                    }
+                    Err(e) => {
+                        println!("  {} {} - {}", "✗".red(), format_effect(effect), e);
+                        failure_count += 1;
+                    }
+                }
+            }
+            Effect::Delete { id, identifier } => match provider.delete(id, identifier).await {
+                Ok(()) => {
+                    println!("  {} {}", "✓".green(), format_effect(effect));
+                    success_count += 1;
+                }
+                Err(e) => {
+                    println!("  {} {} - {}", "✗".red(), format_effect(effect), e);
+                    failure_count += 1;
+                }
+            },
+            Effect::Read { .. } => {}
+        }
+    }
+
+    // Save state
+    println!();
+    println!("{}", "Saving state...".cyan());
+
+    let mut state = state_file.unwrap_or_default();
+
+    for resource in sorted_resources {
+        let existing = state.find_resource(&resource.id.resource_type, &resource.id.name);
+        if let Some(applied_state) = applied_states.get(&resource.id) {
+            let resource_state = resource_to_state(resource, applied_state, existing);
+            state.upsert_resource(resource_state);
+        } else if let Some(current_state) = current_states.get(&resource.id)
+            && current_state.exists
+        {
+            let resource_state = resource_to_state(resource, current_state, existing);
+            state.upsert_resource(resource_state);
+        }
+    }
+
+    // Remove deleted resources from state
+    for effect in plan.effects() {
+        if let Effect::Delete { id, .. } = effect {
+            state.remove_resource(&id.resource_type, &id.name);
+        }
+    }
+
+    // Increment serial and save
+    state.increment_serial();
+    backend
+        .write_state(&state)
+        .await
+        .map_err(|e| format!("Failed to write state: {}", e))?;
+    println!("  {} State saved (serial: {})", "✓".green(), state.serial);
+
+    // Release lock
+    backend
+        .release_lock(&lock)
+        .await
+        .map_err(|e| format!("Failed to release lock: {}", e))?;
+    println!("  {} Lock released", "✓".green());
+
+    println!();
+    if failure_count == 0 {
+        println!(
+            "{}",
+            format!("Apply complete! {} changes applied.", success_count)
+                .green()
+                .bold()
+        );
+        Ok(())
+    } else {
+        Err(format!(
+            "Apply failed. {} succeeded, {} failed.",
+            success_count, failure_count
+        ))
+    }
+}
+
+/// Create a provider from a saved ProviderConfig
+async fn create_provider_from_config(config: &ProviderConfig) -> Box<dyn Provider> {
+    match config.name.as_str() {
+        "aws" => {
+            let region = config
+                .attributes
+                .get("region")
+                .and_then(|v| match v {
+                    Value::String(s) => Some(convert_region_value(s)),
+                    _ => None,
+                })
+                .unwrap_or_else(|| "ap-northeast-1".to_string());
+            println!(
+                "{}",
+                format!("Using AWS provider (region: {})", region).cyan()
+            );
+            Box::new(AwsProvider::new(&region).await)
+        }
+        "awscc" => {
+            let region = config
+                .attributes
+                .get("region")
+                .and_then(|v| match v {
+                    Value::String(s) => Some(convert_region_value(s)),
+                    _ => None,
+                })
+                .unwrap_or_else(|| "ap-northeast-1".to_string());
+            println!(
+                "{}",
+                format!("Using AWS Cloud Control provider (region: {})", region).cyan()
+            );
+            Box::new(AwsccProvider::new(&region).await)
+        }
+        _ => {
+            println!("{}", "Using file-based mock provider".cyan());
+            Box::new(FileProvider::new())
+        }
     }
 }
 
@@ -2006,7 +2463,7 @@ fn sort_resources_by_dependencies(resources: &[Resource]) -> Vec<Resource> {
 async fn create_plan_from_parsed(
     parsed: &ParsedFile,
     state_file: &Option<StateFile>,
-) -> Result<Plan, String> {
+) -> Result<PlanContext, String> {
     let sorted_resources = sort_resources_by_dependencies(&parsed.resources);
 
     // Select appropriate Provider based on configuration
@@ -2025,10 +2482,15 @@ async fn create_plan_from_parsed(
     }
 
     // Resolve ResourceRef values using AWS state
-    let mut resources = sorted_resources;
+    let mut resources = sorted_resources.clone();
     resolve_refs_with_state(&mut resources, &current_states);
 
-    Ok(create_plan(&resources, &current_states))
+    let plan = create_plan(&resources, &current_states);
+    Ok(PlanContext {
+        plan,
+        sorted_resources,
+        current_states,
+    })
 }
 
 fn print_plan(plan: &Plan) {
@@ -3266,5 +3728,73 @@ mod tests {
         // a failed -> c is also blocked (transitively through b -> a)
         let result = find_failed_dependent("c", &dependents_map, &failed_bindings);
         assert_eq!(result, Some(&"a".to_string()));
+    }
+
+    #[test]
+    fn plan_file_serde_round_trip() {
+        use carina_core::plan::Plan;
+
+        let mut plan = Plan::new();
+        plan.add(Effect::Create(
+            Resource::with_provider("aws", "s3.bucket", "my-bucket")
+                .with_attribute("name", Value::String("my-bucket".to_string())),
+        ));
+        plan.add(Effect::Delete {
+            id: ResourceId::with_provider("aws", "s3.bucket", "old-bucket"),
+            identifier: "old-bucket".to_string(),
+        });
+
+        let sorted_resources = vec![
+            Resource::with_provider("aws", "s3.bucket", "my-bucket")
+                .with_attribute("name", Value::String("my-bucket".to_string())),
+        ];
+
+        let current_states = vec![CurrentStateEntry {
+            id: ResourceId::with_provider("aws", "s3.bucket", "my-bucket"),
+            state: State::not_found(ResourceId::with_provider("aws", "s3.bucket", "my-bucket")),
+        }];
+
+        let plan_file = PlanFile {
+            version: 1,
+            carina_version: "0.1.0".to_string(),
+            timestamp: "2025-01-01T00:00:00Z".to_string(),
+            source_path: "example.crn".to_string(),
+            state_lineage: Some("test-lineage".to_string()),
+            state_serial: Some(1),
+            provider_config: ProviderConfig {
+                name: "aws".to_string(),
+                attributes: HashMap::from([(
+                    "region".to_string(),
+                    Value::String("aws.Region.ap_northeast_1".to_string()),
+                )]),
+            },
+            backend_config: Some(BackendConfig {
+                backend_type: "s3".to_string(),
+                attributes: HashMap::from([
+                    ("bucket".to_string(), Value::String("my-state".to_string())),
+                    (
+                        "key".to_string(),
+                        Value::String("prod/carina.state".to_string()),
+                    ),
+                ]),
+            }),
+            plan,
+            sorted_resources,
+            current_states,
+        };
+
+        let json = serde_json::to_string_pretty(&plan_file).unwrap();
+        let deserialized: PlanFile = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized.version, 1);
+        assert_eq!(deserialized.carina_version, "0.1.0");
+        assert_eq!(deserialized.source_path, "example.crn");
+        assert_eq!(deserialized.state_lineage, Some("test-lineage".to_string()));
+        assert_eq!(deserialized.state_serial, Some(1));
+        assert_eq!(deserialized.provider_config.name, "aws");
+        assert!(deserialized.backend_config.is_some());
+        assert_eq!(deserialized.plan.effects().len(), 2);
+        assert_eq!(deserialized.sorted_resources.len(), 1);
+        assert_eq!(deserialized.current_states.len(), 1);
     }
 }

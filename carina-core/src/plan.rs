@@ -5,12 +5,14 @@
 
 use std::collections::HashMap;
 
+use serde::{Deserialize, Serialize};
+
 use crate::effect::Effect;
 use crate::module::DependencyGraph;
 use crate::resource::Value;
 
 /// Plan containing Effects to be executed
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Plan {
     effects: Vec<Effect>,
 }
@@ -345,5 +347,22 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn plan_serde_round_trip() {
+        use crate::resource::ResourceId;
+
+        let mut plan = Plan::new();
+        plan.add(Effect::Create(Resource::new("s3_bucket", "a")));
+        plan.add(Effect::Delete {
+            id: ResourceId::new("s3_bucket", "b"),
+            identifier: "b-id".to_string(),
+        });
+
+        let json = serde_json::to_string(&plan).unwrap();
+        let deserialized: Plan = serde_json::from_str(&json).unwrap();
+        assert_eq!(plan.effects().len(), deserialized.effects().len());
+        assert_eq!(plan.effects(), deserialized.effects());
     }
 }

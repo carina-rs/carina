@@ -39,7 +39,7 @@ pub enum ParseError {
 }
 
 /// Resource type path for typed references (e.g., aws.vpc, aws.security_group)
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ResourceTypePath {
     /// Provider name (e.g., "aws")
     pub provider: String,
@@ -135,14 +135,14 @@ pub struct ModuleCall {
 }
 
 /// Provider configuration
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ProviderConfig {
     pub name: String,
     pub attributes: HashMap<String, Value>,
 }
 
 /// Backend configuration for state storage
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BackendConfig {
     /// Backend type (e.g., "s3", "gcs", "local")
     pub backend_type: String,
