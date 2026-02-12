@@ -2,10 +2,12 @@
 
 use std::collections::HashMap;
 
+use serde::{Deserialize, Serialize};
+
 use crate::parser::ResourceTypePath;
 
 /// Unique identifier for a resource
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ResourceId {
     /// Provider name (e.g., "aws", "awscc")
     pub provider: String,
@@ -57,7 +59,7 @@ impl std::fmt::Display for ResourceId {
 }
 
 /// Attribute value of a resource
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Value {
     String(String),
     Int(i64),
@@ -85,7 +87,7 @@ pub enum Value {
 }
 
 /// Desired state declared in DSL
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Resource {
     pub id: ResourceId,
     pub attributes: HashMap<String, Value>,
@@ -131,7 +133,7 @@ impl Resource {
 }
 
 /// Current state fetched from actual infrastructure
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct State {
     pub id: ResourceId,
     /// AWS internal identifier (e.g., vpc-xxx, subnet-xxx)
@@ -163,5 +165,69 @@ impl State {
     pub fn with_identifier(mut self, identifier: impl Into<String>) -> Self {
         self.identifier = Some(identifier.into());
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parser::ResourceTypePath;
+
+    #[test]
+    fn value_serde_round_trip() {
+        let values = vec![
+            Value::String("hello".to_string()),
+            Value::Int(42),
+            Value::Bool(true),
+            Value::List(vec![Value::String("a".to_string()), Value::Int(1)]),
+            Value::Map(HashMap::from([
+                ("key".to_string(), Value::String("val".to_string())),
+                ("num".to_string(), Value::Int(10)),
+            ])),
+            Value::ResourceRef("vpc".to_string(), "id".to_string()),
+            Value::TypedResourceRef {
+                binding_name: "web_sg".to_string(),
+                attribute_name: "id".to_string(),
+                resource_type: Some(ResourceTypePath::new("aws", "security_group")),
+            },
+            Value::TypedResourceRef {
+                binding_name: "bucket".to_string(),
+                attribute_name: "arn".to_string(),
+                resource_type: None,
+            },
+            Value::UnresolvedIdent("dedicated".to_string(), None),
+            Value::UnresolvedIdent("InstanceTenancy".to_string(), Some("dedicated".to_string())),
+        ];
+
+        for value in values {
+            let json = serde_json::to_string(&value).unwrap();
+            let deserialized: Value = serde_json::from_str(&json).unwrap();
+            assert_eq!(value, deserialized, "Round-trip failed for {:?}", value);
+        }
+    }
+
+    #[test]
+    fn resource_id_serde_round_trip() {
+        let id = ResourceId::with_provider("awscc", "ec2.vpc", "main-vpc");
+        let json = serde_json::to_string(&id).unwrap();
+        let deserialized: ResourceId = serde_json::from_str(&json).unwrap();
+        assert_eq!(id, deserialized);
+    }
+
+    #[test]
+    fn state_serde_round_trip() {
+        let mut attrs = HashMap::new();
+        attrs.insert("name".to_string(), Value::String("my-bucket".to_string()));
+        attrs.insert("versioning".to_string(), Value::Bool(true));
+
+        let state = State::existing(
+            ResourceId::with_provider("aws", "s3.bucket", "my-bucket"),
+            attrs,
+        )
+        .with_identifier("my-bucket");
+
+        let json = serde_json::to_string(&state).unwrap();
+        let deserialized: State = serde_json::from_str(&json).unwrap();
+        assert_eq!(state, deserialized);
     }
 }

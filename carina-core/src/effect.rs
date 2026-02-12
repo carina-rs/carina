@@ -3,10 +3,12 @@
 //! An Effect describes "what to do" without actually performing the side effect.
 //! Side effects only occur when the Interpreter executes the Effect.
 
+use serde::{Deserialize, Serialize};
+
 use crate::resource::{Resource, ResourceId, State};
 
 /// Effect representing an operation on a resource
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Effect {
     /// Read the current state of a resource (data source)
     Read { resource: Resource },
@@ -77,5 +79,40 @@ mod tests {
             resource: resource.clone(),
         };
         assert_eq!(effect.resource_id(), &resource.id);
+    }
+
+    #[test]
+    fn effect_serde_round_trip() {
+        use crate::resource::Value;
+        use std::collections::HashMap;
+
+        let effects = vec![
+            Effect::Create(Resource::new("s3_bucket", "my-bucket")),
+            Effect::Read {
+                resource: Resource::new("s3_bucket", "existing").with_read_only(true),
+            },
+            Effect::Update {
+                id: ResourceId::new("s3_bucket", "my-bucket"),
+                from: Box::new(State::existing(
+                    ResourceId::new("s3_bucket", "my-bucket"),
+                    HashMap::from([(
+                        "versioning".to_string(),
+                        Value::String("Disabled".to_string()),
+                    )]),
+                )),
+                to: Resource::new("s3_bucket", "my-bucket")
+                    .with_attribute("versioning", Value::String("Enabled".to_string())),
+            },
+            Effect::Delete {
+                id: ResourceId::new("s3_bucket", "old-bucket"),
+                identifier: "old-bucket".to_string(),
+            },
+        ];
+
+        for effect in effects {
+            let json = serde_json::to_string(&effect).unwrap();
+            let deserialized: Effect = serde_json::from_str(&json).unwrap();
+            assert_eq!(effect, deserialized, "Round-trip failed for {:?}", effect);
+        }
     }
 }
