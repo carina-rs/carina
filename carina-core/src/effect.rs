@@ -5,7 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::resource::{Resource, ResourceId, State};
+use crate::resource::{LifecycleConfig, Resource, ResourceId, State};
 
 /// Effect representing an operation on a resource
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -24,7 +24,12 @@ pub enum Effect {
     },
 
     /// Delete a resource
-    Delete { id: ResourceId, identifier: String },
+    Delete {
+        id: ResourceId,
+        identifier: String,
+        #[serde(default)]
+        lifecycle: LifecycleConfig,
+    },
 }
 
 impl Effect {
@@ -106,6 +111,7 @@ mod tests {
             Effect::Delete {
                 id: ResourceId::new("s3_bucket", "old-bucket"),
                 identifier: "old-bucket".to_string(),
+                lifecycle: LifecycleConfig::default(),
             },
         ];
 

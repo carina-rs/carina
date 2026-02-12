@@ -7,7 +7,7 @@ use pest_derive::Parser;
 use std::collections::HashMap;
 use std::env;
 
-use crate::resource::{Resource, ResourceId, Value};
+use crate::resource::{LifecycleConfig, Resource, ResourceId, Value};
 
 #[derive(Parser)]
 #[grammar = "parser/carina.pest"]
@@ -564,10 +564,14 @@ fn parse_anonymous_resource(
     attributes.insert("_provider".to_string(), Value::String(provider.to_string()));
     attributes.insert("_type".to_string(), Value::String(namespaced_type.clone()));
 
+    // Extract lifecycle block from attributes (it's a meta-argument, not a real attribute)
+    let lifecycle = extract_lifecycle_config(&mut attributes);
+
     Ok(Resource {
         id: ResourceId::with_provider(provider, resource_type, resource_name),
         attributes,
         read_only: false,
+        lifecycle,
     })
 }
 
@@ -633,6 +637,20 @@ fn parse_block_contents(
     Ok(attributes)
 }
 
+/// Extract lifecycle configuration from attributes.
+/// The parser parses `lifecycle { ... }` as a nested block, which becomes
+/// a List of Maps in attributes. We extract it and convert to LifecycleConfig.
+fn extract_lifecycle_config(attributes: &mut HashMap<String, Value>) -> LifecycleConfig {
+    if let Some(Value::List(blocks)) = attributes.remove("lifecycle") {
+        // Take the first lifecycle block (there should only be one)
+        if let Some(Value::Map(map)) = blocks.into_iter().next() {
+            let force_delete = matches!(map.get("force_delete"), Some(Value::Bool(true)));
+            return LifecycleConfig { force_delete };
+        }
+    }
+    LifecycleConfig::default()
+}
+
 fn parse_resource_expr(
     pair: pest::iterators::Pair<Rule>,
     ctx: &ParseContext,
@@ -657,6 +675,9 @@ fn parse_resource_expr(
     // All providers: use binding name as identifier.
     let resource_name = binding_name.to_string();
 
+    // Extract lifecycle block from attributes (it's a meta-argument, not a real attribute)
+    let lifecycle = extract_lifecycle_config(&mut attributes);
+
     // Add provider information to attributes
     attributes.insert("_provider".to_string(), Value::String(provider.to_string()));
     attributes.insert("_type".to_string(), Value::String(namespaced_type.clone()));
@@ -670,6 +691,7 @@ fn parse_resource_expr(
         id: ResourceId::with_provider(provider, resource_type, resource_name),
         attributes,
         read_only: false,
+        lifecycle,
     })
 }
 
@@ -698,6 +720,9 @@ fn parse_read_resource_expr(
     // All providers: use binding name as identifier.
     let resource_name = binding_name.to_string();
 
+    // Extract lifecycle block from attributes (it's a meta-argument, not a real attribute)
+    let lifecycle = extract_lifecycle_config(&mut attributes);
+
     // Add provider information to attributes
     attributes.insert("_provider".to_string(), Value::String(provider.to_string()));
     attributes.insert("_type".to_string(), Value::String(namespaced_type.clone()));
@@ -713,6 +738,7 @@ fn parse_read_resource_expr(
         id: ResourceId::with_provider(provider, resource_type, resource_name),
         attributes,
         read_only: true,
+        lifecycle,
     })
 }
 
@@ -1748,5 +1774,56 @@ mod tests {
         // Second resource is a regular resource
         assert!(!result.resources[1].read_only);
         assert_eq!(result.resources[1].id.name, "new_bucket"); // binding name
+    }
+
+    #[test]
+    fn parse_lifecycle_force_delete() {
+        let input = r#"
+            let bucket = awscc.s3_bucket {
+                bucket_name = "my-bucket"
+                lifecycle {
+                    force_delete = true
+                }
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+        assert_eq!(result.resources.len(), 1);
+
+        let resource = &result.resources[0];
+        assert_eq!(resource.id.resource_type, "s3_bucket");
+        assert!(resource.lifecycle.force_delete);
+        // lifecycle should NOT appear in attributes
+        assert!(!resource.attributes.contains_key("lifecycle"));
+    }
+
+    #[test]
+    fn parse_lifecycle_default_when_absent() {
+        let input = r#"
+            let bucket = awscc.s3_bucket {
+                bucket_name = "my-bucket"
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+        assert_eq!(result.resources.len(), 1);
+        assert!(!result.resources[0].lifecycle.force_delete);
+    }
+
+    #[test]
+    fn parse_lifecycle_anonymous_resource() {
+        let input = r#"
+            awscc.s3_bucket {
+                bucket_name = "my-bucket"
+                lifecycle {
+                    force_delete = true
+                }
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+        assert_eq!(result.resources.len(), 1);
+        assert!(result.resources[0].lifecycle.force_delete);
+        assert!(!result.resources[0].attributes.contains_key("lifecycle"));
     }
 }

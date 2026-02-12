@@ -6,7 +6,7 @@
 use std::future::Future;
 use std::pin::Pin;
 
-use crate::resource::{Resource, ResourceId, State};
+use crate::resource::{LifecycleConfig, Resource, ResourceId, State};
 
 /// Error type for Provider operations
 #[derive(Debug)]
@@ -124,7 +124,12 @@ pub trait Provider: Send + Sync {
     /// Delete a resource
     ///
     /// The identifier is the AWS internal ID (e.g., vpc-xxx)
-    fn delete(&self, id: &ResourceId, identifier: &str) -> BoxFuture<'_, ProviderResult<()>>;
+    fn delete(
+        &self,
+        id: &ResourceId,
+        identifier: &str,
+        lifecycle: &LifecycleConfig,
+    ) -> BoxFuture<'_, ProviderResult<()>>;
 }
 
 /// Provider implementation for Box<dyn Provider>
@@ -160,8 +165,13 @@ impl Provider for Box<dyn Provider> {
         (**self).update(id, identifier, from, to)
     }
 
-    fn delete(&self, id: &ResourceId, identifier: &str) -> BoxFuture<'_, ProviderResult<()>> {
-        (**self).delete(id, identifier)
+    fn delete(
+        &self,
+        id: &ResourceId,
+        identifier: &str,
+        lifecycle: &LifecycleConfig,
+    ) -> BoxFuture<'_, ProviderResult<()>> {
+        (**self).delete(id, identifier, lifecycle)
     }
 }
 
@@ -208,7 +218,12 @@ mod tests {
             Box::pin(async move { Ok(State::existing(id, attrs)) })
         }
 
-        fn delete(&self, _id: &ResourceId, _identifier: &str) -> BoxFuture<'_, ProviderResult<()>> {
+        fn delete(
+            &self,
+            _id: &ResourceId,
+            _identifier: &str,
+            _lifecycle: &LifecycleConfig,
+        ) -> BoxFuture<'_, ProviderResult<()>> {
             Box::pin(async { Ok(()) })
         }
     }

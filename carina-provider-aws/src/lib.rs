@@ -12,7 +12,7 @@ use aws_sdk_s3::Client as S3Client;
 use carina_core::provider::{
     BoxFuture, Provider, ProviderError, ProviderResult, ResourceSchema, ResourceType,
 };
-use carina_core::resource::{Resource, ResourceId, State, Value};
+use carina_core::resource::{LifecycleConfig, Resource, ResourceId, State, Value};
 
 /// S3 Bucket resource type
 pub struct S3BucketType;
@@ -2160,7 +2160,12 @@ impl Provider for AwsProvider {
         })
     }
 
-    fn delete(&self, id: &ResourceId, identifier: &str) -> BoxFuture<'_, ProviderResult<()>> {
+    fn delete(
+        &self,
+        id: &ResourceId,
+        identifier: &str,
+        _lifecycle: &LifecycleConfig,
+    ) -> BoxFuture<'_, ProviderResult<()>> {
         let id = id.clone();
         let identifier = identifier.to_string();
         Box::pin(async move {
