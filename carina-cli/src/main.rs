@@ -2776,13 +2776,9 @@ fn print_plan(plan: &Plan) {
                 let mut keys: Vec<_> = to
                     .attributes
                     .keys()
-                    .filter(|k| !k.starts_with('_'))
+                    .filter(|k| !k.starts_with('_') && k.as_str() != "name")
                     .collect();
-                keys.sort_by(|a, b| match (a.as_str(), b.as_str()) {
-                    ("name", _) => std::cmp::Ordering::Less,
-                    (_, "name") => std::cmp::Ordering::Greater,
-                    _ => a.cmp(b),
-                });
+                keys.sort();
                 for key in keys {
                     let new_value = &to.attributes[key];
                     let old_value = from.attributes.get(key);
@@ -2794,23 +2790,13 @@ fn print_plan(plan: &Plan) {
                             let old_str = old_value
                                 .map(|v| format_value_with_key(v, Some(key)))
                                 .unwrap_or_else(|| "(none)".to_string());
-                            if key == "name" {
-                                println!(
-                                    "{}{}: {} → {}",
-                                    attr_prefix,
-                                    key.bold(),
-                                    old_str.red(),
-                                    format_value_with_key(new_value, Some(key)).white().bold()
-                                );
-                            } else {
-                                println!(
-                                    "{}{}: {} → {}",
-                                    attr_prefix,
-                                    key,
-                                    old_str.red(),
-                                    format_value_with_key(new_value, Some(key)).green()
-                                );
-                            }
+                            println!(
+                                "{}{}: {} → {}",
+                                attr_prefix,
+                                key,
+                                old_str.red(),
+                                format_value_with_key(new_value, Some(key)).green()
+                            );
                         }
                     }
                 }

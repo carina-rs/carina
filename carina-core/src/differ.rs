@@ -67,6 +67,13 @@ fn find_changed_attributes(
             continue;
         }
 
+        // Skip "name" attribute - it's a DSL-level resource identifier,
+        // not an infrastructure property. Providers don't return it in
+        // read state, causing false diffs.
+        if key == "name" {
+            continue;
+        }
+
         match current.get(key) {
             Some(current_value) if current_value == desired_value => {}
             _ => changed.push(key.clone()),
@@ -301,6 +308,30 @@ mod tests {
             "Expected 1 Delete effect for orphaned resource, got {}. Effects: {:?}",
             delete_effects.len(),
             plan.effects()
+        );
+    }
+
+    #[test]
+    fn name_attribute_excluded_from_diff() {
+        // "name" is a DSL identifier, not an infrastructure property.
+        // Providers don't return it, so it should be skipped to avoid false diffs.
+        let desired = Resource::new("ec2_vpc", "my-vpc")
+            .with_attribute("name", Value::String("my-vpc".to_string()))
+            .with_attribute("cidr_block", Value::String("10.0.0.0/16".to_string()));
+
+        let mut attrs = HashMap::new();
+        // Provider read state has cidr_block but NOT name
+        attrs.insert(
+            "cidr_block".to_string(),
+            Value::String("10.0.0.0/16".to_string()),
+        );
+        let current = State::existing(ResourceId::new("ec2_vpc", "my-vpc"), attrs);
+
+        let result = diff(&desired, &current);
+        assert!(
+            matches!(result, Diff::NoChange(_)),
+            "Expected NoChange but got {:?}",
+            result
         );
     }
 
