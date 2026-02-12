@@ -1475,12 +1475,125 @@ async fn run_apply_from_plan(plan_path: &PathBuf, auto_approve: bool) -> Result<
     let plan = &plan_file.plan;
     let sorted_resources = &plan_file.sorted_resources;
 
-    // Rebuild current_states HashMap from plan file
-    let current_states: HashMap<ResourceId, State> = plan_file
+    // Rebuild planned current_states HashMap from plan file
+    let planned_states: HashMap<ResourceId, State> = plan_file
         .current_states
         .into_iter()
         .map(|entry| (entry.id, entry.state))
         .collect();
+
+    // Create provider early for drift detection
+    let provider: Box<dyn Provider> = create_provider_from_config(&plan_file.provider_config).await;
+
+    // Drift detection: re-read actual infrastructure state and compare against planned states
+    println!("{}", "Checking for infrastructure drift...".cyan());
+    let mut drift_detected = false;
+    let mut drift_messages: Vec<String> = Vec::new();
+
+    for resource in sorted_resources {
+        let planned_state = planned_states.get(&resource.id);
+        let identifier = planned_state.and_then(|s| s.identifier.as_deref());
+
+        let actual_state = provider
+            .read(&resource.id, identifier)
+            .await
+            .map_err(|e| format!("Failed to read current state of {}: {}", resource.id, e))?;
+
+        if let Some(planned) = planned_state {
+            if planned.exists != actual_state.exists {
+                drift_detected = true;
+                if planned.exists {
+                    drift_messages.push(format!(
+                        "  {} {}: resource existed at plan time but no longer exists",
+                        "~".yellow(),
+                        resource.id
+                    ));
+                } else {
+                    drift_messages.push(format!(
+                        "  {} {}: resource did not exist at plan time but now exists",
+                        "~".yellow(),
+                        resource.id
+                    ));
+                }
+            } else if planned.exists && actual_state.exists {
+                // Compare attributes for existing resources
+                let mut attr_diffs: Vec<String> = Vec::new();
+                for (key, planned_val) in &planned.attributes {
+                    if key.starts_with('_') {
+                        continue;
+                    }
+                    match actual_state.attributes.get(key) {
+                        Some(actual_val) if actual_val != planned_val => {
+                            attr_diffs.push(format!(
+                                "      {}: {} → {}",
+                                key,
+                                format_value(planned_val),
+                                format_value(actual_val)
+                            ));
+                        }
+                        None => {
+                            attr_diffs.push(format!(
+                                "      {}: {} → (removed)",
+                                key,
+                                format_value(planned_val)
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
+                for (key, actual_val) in &actual_state.attributes {
+                    if key.starts_with('_') {
+                        continue;
+                    }
+                    if !planned.attributes.contains_key(key) {
+                        attr_diffs.push(format!(
+                            "      {}: (none) → {}",
+                            key,
+                            format_value(actual_val)
+                        ));
+                    }
+                }
+                if !attr_diffs.is_empty() {
+                    drift_detected = true;
+                    drift_messages.push(format!(
+                        "  {} {}: attributes have changed since plan was created:",
+                        "~".yellow(),
+                        resource.id
+                    ));
+                    drift_messages.extend(attr_diffs);
+                }
+            }
+        }
+    }
+
+    if drift_detected {
+        println!();
+        println!("{}", "Error: Infrastructure drift detected!".red().bold());
+        println!(
+            "{}",
+            "The following resources have changed since the plan was created:".red()
+        );
+        println!();
+        for msg in &drift_messages {
+            println!("{}", msg);
+        }
+        println!();
+        println!(
+            "{}",
+            "Please re-run 'carina plan' to create a new plan that reflects the current state."
+                .yellow()
+        );
+        backend
+            .release_lock(&lock)
+            .await
+            .map_err(|e| format!("Failed to release lock: {}", e))?;
+        return Err("Apply aborted due to infrastructure drift.".to_string());
+    }
+
+    println!("  {} No drift detected.", "✓".green());
+
+    // Use the actual states (freshly read) as current_states for apply
+    let current_states = planned_states;
 
     if plan.is_empty() {
         println!("{}", "No changes needed.".green());
@@ -1522,9 +1635,6 @@ async fn run_apply_from_plan(plan_path: &PathBuf, auto_approve: bool) -> Result<
         }
         println!();
     }
-
-    // Create provider from plan file config
-    let provider: Box<dyn Provider> = create_provider_from_config(&plan_file.provider_config).await;
 
     // Build initial binding map for reference resolution
     let mut binding_map: HashMap<String, HashMap<String, Value>> = HashMap::new();
