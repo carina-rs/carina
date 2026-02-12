@@ -163,8 +163,14 @@ impl AwsProvider {
     }
 
     /// Read an S3 bucket
-    async fn read_s3_bucket(&self, name: &str) -> ProviderResult<State> {
-        let id = ResourceId::with_provider("aws", "s3.bucket", name);
+    async fn read_s3_bucket(
+        &self,
+        id: &ResourceId,
+        identifier: Option<&str>,
+    ) -> ProviderResult<State> {
+        let Some(name) = identifier else {
+            return Ok(State::not_found(id.clone()));
+        };
 
         match self.s3_client.head_bucket().bucket(name).send().await {
             Ok(_) => {
@@ -209,7 +215,7 @@ impl AwsProvider {
                 }
 
                 // S3 bucket identifier is the bucket name
-                Ok(State::existing(id, attributes).with_identifier(name))
+                Ok(State::existing(id.clone(), attributes).with_identifier(name))
             }
             Err(err) => {
                 // Handle bucket not found
@@ -229,11 +235,11 @@ impl AwsProvider {
                 };
 
                 if is_not_found {
-                    Ok(State::not_found(id))
+                    Ok(State::not_found(id.clone()))
                 } else {
                     Err(
                         ProviderError::new(format!("Failed to read bucket: {:?}", err))
-                            .for_resource(id),
+                            .for_resource(id.clone()),
                     )
                 }
             }
@@ -342,12 +348,17 @@ impl AwsProvider {
         }
 
         // Return state after creation
-        self.read_s3_bucket(&bucket_name).await
+        self.read_s3_bucket(&resource.id, Some(&bucket_name)).await
     }
 
     /// Update an S3 bucket
-    async fn update_s3_bucket(&self, id: ResourceId, to: Resource) -> ProviderResult<State> {
-        let bucket_name = id.name.clone();
+    async fn update_s3_bucket(
+        &self,
+        id: ResourceId,
+        identifier: &str,
+        to: Resource,
+    ) -> ProviderResult<State> {
+        let bucket_name = identifier.to_string();
 
         // Update versioning configuration
         if let Some(Value::String(status)) = to.attributes.get("versioning") {
@@ -412,14 +423,14 @@ impl AwsProvider {
                 })?;
         }
 
-        self.read_s3_bucket(&bucket_name).await
+        self.read_s3_bucket(&id, Some(&bucket_name)).await
     }
 
     /// Delete an S3 bucket
-    async fn delete_s3_bucket(&self, id: ResourceId) -> ProviderResult<()> {
+    async fn delete_s3_bucket(&self, id: ResourceId, identifier: &str) -> ProviderResult<()> {
         self.s3_client
             .delete_bucket()
-            .bucket(&id.name)
+            .bucket(identifier)
             .send()
             .await
             .map_err(|e| {
@@ -433,32 +444,27 @@ impl AwsProvider {
     // ========== EC2 VPC Operations ==========
 
     /// Find VPC ID by Name tag
-    async fn find_vpc_id_by_name(&self, name: &str) -> ProviderResult<Option<String>> {
-        use aws_sdk_ec2::types::Filter;
-
-        let filter = Filter::builder().name("tag:Name").values(name).build();
-
-        let result = self
-            .ec2_client
-            .describe_vpcs()
-            .filters(filter)
-            .send()
-            .await
-            .map_err(|e| ProviderError::new(format!("Failed to describe VPCs: {:?}", e)))?;
-
-        Ok(result
-            .vpcs()
-            .first()
-            .and_then(|vpc| vpc.vpc_id().map(String::from)))
-    }
-
     /// Read an EC2 VPC
-    async fn read_ec2_vpc(&self, name: &str) -> ProviderResult<State> {
+    async fn read_ec2_vpc(
+        &self,
+        id: &ResourceId,
+        identifier: Option<&str>,
+    ) -> ProviderResult<State> {
         use aws_sdk_ec2::types::Filter;
 
-        let id = ResourceId::with_provider("aws", "vpc", name);
+        let Some(identifier) = identifier else {
+            return Ok(State::not_found(id.clone()));
+        };
 
-        let filter = Filter::builder().name("tag:Name").values(name).build();
+        // If identifier starts with vpc-, look up by VPC ID; otherwise by Name tag
+        let filter = if identifier.starts_with("vpc-") {
+            Filter::builder().name("vpc-id").values(identifier).build()
+        } else {
+            Filter::builder()
+                .name("tag:Name")
+                .values(identifier)
+                .build()
+        };
 
         let result = self
             .ec2_client
@@ -473,7 +479,16 @@ impl AwsProvider {
 
         if let Some(vpc) = result.vpcs().first() {
             let mut attributes = HashMap::new();
-            attributes.insert("name".to_string(), Value::String(name.to_string()));
+
+            // Extract Name tag from VPC
+            if let Some(name_tag) = vpc
+                .tags()
+                .iter()
+                .find(|t| t.key() == Some("Name"))
+                .and_then(|t| t.value())
+            {
+                attributes.insert("name".to_string(), Value::String(name_tag.to_string()));
+            }
 
             // Return region in DSL format
             let region_dsl = format!("aws.Region.{}", self.region.replace('-', "_"));
@@ -536,27 +551,23 @@ impl AwsProvider {
                 }
             }
 
-            let state = State::existing(id, attributes);
+            let state = State::existing(id.clone(), attributes);
             Ok(if let Some(vpc_id) = vpc_id_str {
                 state.with_identifier(vpc_id)
             } else {
                 state
             })
         } else {
-            Ok(State::not_found(id))
+            Ok(State::not_found(id.clone()))
         }
     }
 
     /// Create an EC2 VPC
     async fn create_ec2_vpc(&self, resource: Resource) -> ProviderResult<State> {
-        let name = match resource.attributes.get("name") {
-            Some(Value::String(s)) => s.clone(),
-            _ => {
-                return Err(
-                    ProviderError::new("VPC name is required").for_resource(resource.id.clone())
-                );
-            }
-        };
+        let name = resource.attributes.get("name").and_then(|v| match v {
+            Value::String(s) => Some(s.clone()),
+            _ => None,
+        });
 
         let cidr_block = match resource.attributes.get("cidr_block") {
             Some(Value::String(s)) => s.clone(),
@@ -596,22 +607,24 @@ impl AwsProvider {
             ProviderError::new("VPC created but no ID returned").for_resource(resource.id.clone())
         })?;
 
-        // Tag with Name
-        self.ec2_client
-            .create_tags()
-            .resources(vpc_id)
-            .tags(
-                aws_sdk_ec2::types::Tag::builder()
-                    .key("Name")
-                    .value(&name)
-                    .build(),
-            )
-            .send()
-            .await
-            .map_err(|e| {
-                ProviderError::new(format!("Failed to tag VPC: {:?}", e))
-                    .for_resource(resource.id.clone())
-            })?;
+        // Tag with Name (if provided)
+        if let Some(ref name) = name {
+            self.ec2_client
+                .create_tags()
+                .resources(vpc_id)
+                .tags(
+                    aws_sdk_ec2::types::Tag::builder()
+                        .key("Name")
+                        .value(name)
+                        .build(),
+                )
+                .send()
+                .await
+                .map_err(|e| {
+                    ProviderError::new(format!("Failed to tag VPC: {:?}", e))
+                        .for_resource(resource.id.clone())
+                })?;
+        }
 
         // Configure DNS support
         if let Some(Value::Bool(enabled)) = resource.attributes.get("enable_dns_support") {
@@ -649,15 +662,19 @@ impl AwsProvider {
                 })?;
         }
 
-        self.read_ec2_vpc(&name).await
+        // Read back using VPC ID (reliable identifier)
+        self.read_ec2_vpc(&resource.id, Some(vpc_id)).await
     }
 
     /// Update an EC2 VPC
-    async fn update_ec2_vpc(&self, id: ResourceId, to: Resource) -> ProviderResult<State> {
-        let vpc_id = self
-            .find_vpc_id_by_name(&id.name)
-            .await?
-            .ok_or_else(|| ProviderError::new("VPC not found").for_resource(id.clone()))?;
+    async fn update_ec2_vpc(
+        &self,
+        id: ResourceId,
+        identifier: &str,
+        to: Resource,
+    ) -> ProviderResult<State> {
+        // identifier is the VPC ID (e.g., vpc-12345678)
+        let vpc_id = identifier.to_string();
 
         // Update DNS support
         if let Some(Value::Bool(enabled)) = to.attributes.get("enable_dns_support") {
@@ -695,19 +712,15 @@ impl AwsProvider {
                 })?;
         }
 
-        self.read_ec2_vpc(&id.name).await
+        self.read_ec2_vpc(&id, Some(identifier)).await
     }
 
     /// Delete an EC2 VPC
-    async fn delete_ec2_vpc(&self, id: ResourceId) -> ProviderResult<()> {
-        let vpc_id = self
-            .find_vpc_id_by_name(&id.name)
-            .await?
-            .ok_or_else(|| ProviderError::new("VPC not found").for_resource(id.clone()))?;
-
+    async fn delete_ec2_vpc(&self, id: ResourceId, identifier: &str) -> ProviderResult<()> {
+        // identifier is the VPC ID
         self.ec2_client
             .delete_vpc()
-            .vpc_id(&vpc_id)
+            .vpc_id(identifier)
             .send()
             .await
             .map_err(|e| {
@@ -720,33 +733,30 @@ impl AwsProvider {
 
     // ========== EC2 Subnet Operations ==========
 
-    /// Find Subnet ID by Name tag
-    async fn find_subnet_id_by_name(&self, name: &str) -> ProviderResult<Option<String>> {
-        use aws_sdk_ec2::types::Filter;
-
-        let filter = Filter::builder().name("tag:Name").values(name).build();
-
-        let result = self
-            .ec2_client
-            .describe_subnets()
-            .filters(filter)
-            .send()
-            .await
-            .map_err(|e| ProviderError::new(format!("Failed to describe subnets: {:?}", e)))?;
-
-        Ok(result
-            .subnets()
-            .first()
-            .and_then(|s| s.subnet_id().map(String::from)))
-    }
-
     /// Read an EC2 Subnet
-    async fn read_ec2_subnet(&self, name: &str) -> ProviderResult<State> {
+    async fn read_ec2_subnet(
+        &self,
+        id: &ResourceId,
+        identifier: Option<&str>,
+    ) -> ProviderResult<State> {
         use aws_sdk_ec2::types::Filter;
 
-        let id = ResourceId::with_provider("aws", "subnet", name);
+        let Some(identifier) = identifier else {
+            return Ok(State::not_found(id.clone()));
+        };
 
-        let filter = Filter::builder().name("tag:Name").values(name).build();
+        // If identifier starts with subnet-, look up by subnet ID; otherwise by Name tag
+        let filter = if identifier.starts_with("subnet-") {
+            Filter::builder()
+                .name("subnet-id")
+                .values(identifier)
+                .build()
+        } else {
+            Filter::builder()
+                .name("tag:Name")
+                .values(identifier)
+                .build()
+        };
 
         let result = self
             .ec2_client
@@ -761,7 +771,16 @@ impl AwsProvider {
 
         if let Some(subnet) = result.subnets().first() {
             let mut attributes = HashMap::new();
-            attributes.insert("name".to_string(), Value::String(name.to_string()));
+
+            // Extract Name tag from subnet
+            if let Some(name_tag) = subnet
+                .tags()
+                .iter()
+                .find(|t| t.key() == Some("Name"))
+                .and_then(|t| t.value())
+            {
+                attributes.insert("name".to_string(), Value::String(name_tag.to_string()));
+            }
 
             let region_dsl = format!("aws.Region.{}", self.region.replace('-', "_"));
             attributes.insert("region".to_string(), Value::String(region_dsl));
@@ -787,27 +806,23 @@ impl AwsProvider {
                 attributes.insert("vpc_id".to_string(), Value::String(vpc_id.to_string()));
             }
 
-            let state = State::existing(id, attributes);
+            let state = State::existing(id.clone(), attributes);
             Ok(if let Some(subnet_id) = subnet_id_str {
                 state.with_identifier(subnet_id)
             } else {
                 state
             })
         } else {
-            Ok(State::not_found(id))
+            Ok(State::not_found(id.clone()))
         }
     }
 
     /// Create an EC2 Subnet
     async fn create_ec2_subnet(&self, resource: Resource) -> ProviderResult<State> {
-        let name = match resource.attributes.get("name") {
-            Some(Value::String(s)) => s.clone(),
-            _ => {
-                return Err(
-                    ProviderError::new("Subnet name is required").for_resource(resource.id.clone())
-                );
-            }
-        };
+        let name = resource.attributes.get("name").and_then(|v| match v {
+            Value::String(s) => Some(s.clone()),
+            _ => None,
+        });
 
         let cidr_block = match resource.attributes.get("cidr_block") {
             Some(Value::String(s)) => s.clone(),
@@ -847,43 +862,46 @@ impl AwsProvider {
                 .for_resource(resource.id.clone())
         })?;
 
-        // Tag with Name
-        self.ec2_client
-            .create_tags()
-            .resources(subnet_id)
-            .tags(
-                aws_sdk_ec2::types::Tag::builder()
-                    .key("Name")
-                    .value(&name)
-                    .build(),
-            )
-            .send()
-            .await
-            .map_err(|e| {
-                ProviderError::new(format!("Failed to tag subnet: {:?}", e))
-                    .for_resource(resource.id.clone())
-            })?;
+        // Tag with Name (if provided)
+        if let Some(ref name) = name {
+            self.ec2_client
+                .create_tags()
+                .resources(subnet_id)
+                .tags(
+                    aws_sdk_ec2::types::Tag::builder()
+                        .key("Name")
+                        .value(name)
+                        .build(),
+                )
+                .send()
+                .await
+                .map_err(|e| {
+                    ProviderError::new(format!("Failed to tag subnet: {:?}", e))
+                        .for_resource(resource.id.clone())
+                })?;
+        }
 
-        self.read_ec2_subnet(&name).await
+        // Read back using subnet ID (reliable identifier)
+        self.read_ec2_subnet(&resource.id, Some(subnet_id)).await
     }
 
     /// Update an EC2 Subnet (limited - most attributes are immutable)
-    async fn update_ec2_subnet(&self, id: ResourceId, _to: Resource) -> ProviderResult<State> {
+    async fn update_ec2_subnet(
+        &self,
+        id: ResourceId,
+        identifier: &str,
+        _to: Resource,
+    ) -> ProviderResult<State> {
         // Subnet attributes (cidr_block, vpc, availability_zone) are immutable
         // Only tags can be updated
-        self.read_ec2_subnet(&id.name).await
+        self.read_ec2_subnet(&id, Some(identifier)).await
     }
 
     /// Delete an EC2 Subnet
-    async fn delete_ec2_subnet(&self, id: ResourceId) -> ProviderResult<()> {
-        let subnet_id = self
-            .find_subnet_id_by_name(&id.name)
-            .await?
-            .ok_or_else(|| ProviderError::new("Subnet not found").for_resource(id.clone()))?;
-
+    async fn delete_ec2_subnet(&self, id: ResourceId, identifier: &str) -> ProviderResult<()> {
         self.ec2_client
             .delete_subnet()
-            .subnet_id(&subnet_id)
+            .subnet_id(identifier)
             .send()
             .await
             .map_err(|e| {
@@ -897,12 +915,29 @@ impl AwsProvider {
     // ========== EC2 Internet Gateway Operations ==========
 
     /// Read an EC2 Internet Gateway
-    async fn read_ec2_internet_gateway(&self, name: &str) -> ProviderResult<State> {
+    async fn read_ec2_internet_gateway(
+        &self,
+        id: &ResourceId,
+        identifier: Option<&str>,
+    ) -> ProviderResult<State> {
         use aws_sdk_ec2::types::Filter;
 
-        let id = ResourceId::with_provider("aws", "internet_gateway", name);
+        let Some(identifier) = identifier else {
+            return Ok(State::not_found(id.clone()));
+        };
 
-        let filter = Filter::builder().name("tag:Name").values(name).build();
+        // If identifier starts with igw-, look up by IGW ID; otherwise by Name tag
+        let filter = if identifier.starts_with("igw-") {
+            Filter::builder()
+                .name("internet-gateway-id")
+                .values(identifier)
+                .build()
+        } else {
+            Filter::builder()
+                .name("tag:Name")
+                .values(identifier)
+                .build()
+        };
 
         let result = self
             .ec2_client
@@ -917,7 +952,16 @@ impl AwsProvider {
 
         if let Some(igw) = result.internet_gateways().first() {
             let mut attributes = HashMap::new();
-            attributes.insert("name".to_string(), Value::String(name.to_string()));
+
+            // Extract Name tag from IGW
+            if let Some(name_tag) = igw
+                .tags()
+                .iter()
+                .find(|t| t.key() == Some("Name"))
+                .and_then(|t| t.value())
+            {
+                attributes.insert("name".to_string(), Value::String(name_tag.to_string()));
+            }
 
             let region_dsl = format!("aws.Region.{}", self.region.replace('-', "_"));
             attributes.insert("region".to_string(), Value::String(region_dsl));
@@ -935,26 +979,23 @@ impl AwsProvider {
                 attributes.insert("vpc_id".to_string(), Value::String(vpc_id.to_string()));
             }
 
-            let state = State::existing(id, attributes);
+            let state = State::existing(id.clone(), attributes);
             Ok(if let Some(igw_id) = igw_id_str {
                 state.with_identifier(igw_id)
             } else {
                 state
             })
         } else {
-            Ok(State::not_found(id))
+            Ok(State::not_found(id.clone()))
         }
     }
 
     /// Create an EC2 Internet Gateway
     async fn create_ec2_internet_gateway(&self, resource: Resource) -> ProviderResult<State> {
-        let name = match resource.attributes.get("name") {
-            Some(Value::String(s)) => s.clone(),
-            _ => {
-                return Err(ProviderError::new("Internet Gateway name is required")
-                    .for_resource(resource.id.clone()));
-            }
-        };
+        let name = resource.attributes.get("name").and_then(|v| match v {
+            Value::String(s) => Some(s.clone()),
+            _ => None,
+        });
 
         // Create Internet Gateway
         let result = self
@@ -975,22 +1016,24 @@ impl AwsProvider {
                     .for_resource(resource.id.clone())
             })?;
 
-        // Tag with Name
-        self.ec2_client
-            .create_tags()
-            .resources(igw_id)
-            .tags(
-                aws_sdk_ec2::types::Tag::builder()
-                    .key("Name")
-                    .value(&name)
-                    .build(),
-            )
-            .send()
-            .await
-            .map_err(|e| {
-                ProviderError::new(format!("Failed to tag internet gateway: {:?}", e))
-                    .for_resource(resource.id.clone())
-            })?;
+        // Tag with Name (if provided)
+        if let Some(ref name) = name {
+            self.ec2_client
+                .create_tags()
+                .resources(igw_id)
+                .tags(
+                    aws_sdk_ec2::types::Tag::builder()
+                        .key("Name")
+                        .value(name)
+                        .build(),
+                )
+                .send()
+                .await
+                .map_err(|e| {
+                    ProviderError::new(format!("Failed to tag internet gateway: {:?}", e))
+                        .for_resource(resource.id.clone())
+                })?;
+        }
 
         // Attach to VPC if specified
         if let Some(Value::String(vpc_id)) = resource.attributes.get("vpc_id") {
@@ -1006,30 +1049,34 @@ impl AwsProvider {
                 })?;
         }
 
-        self.read_ec2_internet_gateway(&name).await
+        // Read back using IGW ID (reliable identifier)
+        self.read_ec2_internet_gateway(&resource.id, Some(igw_id))
+            .await
     }
 
     /// Update an EC2 Internet Gateway
     async fn update_ec2_internet_gateway(
         &self,
         id: ResourceId,
+        identifier: &str,
         _to: Resource,
     ) -> ProviderResult<State> {
         // Internet Gateway attributes are mostly immutable
         // VPC attachment changes would require detach/attach
-        self.read_ec2_internet_gateway(&id.name).await
+        self.read_ec2_internet_gateway(&id, Some(identifier)).await
     }
 
     /// Delete an EC2 Internet Gateway
-    async fn delete_ec2_internet_gateway(&self, id: ResourceId) -> ProviderResult<()> {
-        use aws_sdk_ec2::types::Filter;
-
-        let filter = Filter::builder().name("tag:Name").values(&id.name).build();
-
+    async fn delete_ec2_internet_gateway(
+        &self,
+        id: ResourceId,
+        identifier: &str,
+    ) -> ProviderResult<()> {
+        // Look up the IGW to check for VPC attachments before deleting
         let result = self
             .ec2_client
             .describe_internet_gateways()
-            .filters(filter)
+            .internet_gateway_ids(identifier)
             .send()
             .await
             .map_err(|e| {
@@ -1037,34 +1084,28 @@ impl AwsProvider {
                     .for_resource(id.clone())
             })?;
 
-        let igw = result.internet_gateways().first().ok_or_else(|| {
-            ProviderError::new("Internet Gateway not found").for_resource(id.clone())
-        })?;
-
-        let igw_id = igw
-            .internet_gateway_id()
-            .ok_or_else(|| ProviderError::new("No IGW ID").for_resource(id.clone()))?;
-
-        // Detach from VPC first
-        if let Some(attachment) = igw.attachments().first()
-            && let Some(vpc_id) = attachment.vpc_id()
-        {
-            self.ec2_client
-                .detach_internet_gateway()
-                .internet_gateway_id(igw_id)
-                .vpc_id(vpc_id)
-                .send()
-                .await
-                .map_err(|e| {
-                    ProviderError::new(format!("Failed to detach internet gateway: {:?}", e))
-                        .for_resource(id.clone())
-                })?;
+        if let Some(igw) = result.internet_gateways().first() {
+            // Detach from VPC first
+            if let Some(attachment) = igw.attachments().first()
+                && let Some(vpc_id) = attachment.vpc_id()
+            {
+                self.ec2_client
+                    .detach_internet_gateway()
+                    .internet_gateway_id(identifier)
+                    .vpc_id(vpc_id)
+                    .send()
+                    .await
+                    .map_err(|e| {
+                        ProviderError::new(format!("Failed to detach internet gateway: {:?}", e))
+                            .for_resource(id.clone())
+                    })?;
+            }
         }
 
         // Delete Internet Gateway
         self.ec2_client
             .delete_internet_gateway()
-            .internet_gateway_id(igw_id)
+            .internet_gateway_id(identifier)
             .send()
             .await
             .map_err(|e| {
@@ -1077,33 +1118,30 @@ impl AwsProvider {
 
     // ========== EC2 Route Table Operations ==========
 
-    /// Find Route Table ID by Name tag
-    async fn find_route_table_id_by_name(&self, name: &str) -> ProviderResult<Option<String>> {
-        use aws_sdk_ec2::types::Filter;
-
-        let filter = Filter::builder().name("tag:Name").values(name).build();
-
-        let result = self
-            .ec2_client
-            .describe_route_tables()
-            .filters(filter)
-            .send()
-            .await
-            .map_err(|e| ProviderError::new(format!("Failed to describe route tables: {:?}", e)))?;
-
-        Ok(result
-            .route_tables()
-            .first()
-            .and_then(|rt| rt.route_table_id().map(String::from)))
-    }
-
     /// Read an EC2 Route Table
-    async fn read_ec2_route_table(&self, name: &str) -> ProviderResult<State> {
+    async fn read_ec2_route_table(
+        &self,
+        id: &ResourceId,
+        identifier: Option<&str>,
+    ) -> ProviderResult<State> {
         use aws_sdk_ec2::types::Filter;
 
-        let id = ResourceId::with_provider("aws", "route_table", name);
+        let Some(identifier) = identifier else {
+            return Ok(State::not_found(id.clone()));
+        };
 
-        let filter = Filter::builder().name("tag:Name").values(name).build();
+        // If identifier starts with rtb-, look up by route table ID; otherwise by Name tag
+        let filter = if identifier.starts_with("rtb-") {
+            Filter::builder()
+                .name("route-table-id")
+                .values(identifier)
+                .build()
+        } else {
+            Filter::builder()
+                .name("tag:Name")
+                .values(identifier)
+                .build()
+        };
 
         let result = self
             .ec2_client
@@ -1118,7 +1156,16 @@ impl AwsProvider {
 
         if let Some(rt) = result.route_tables().first() {
             let mut attributes = HashMap::new();
-            attributes.insert("name".to_string(), Value::String(name.to_string()));
+
+            // Extract Name tag from route table
+            if let Some(name_tag) = rt
+                .tags()
+                .iter()
+                .find(|t| t.key() == Some("Name"))
+                .and_then(|t| t.value())
+            {
+                attributes.insert("name".to_string(), Value::String(name_tag.to_string()));
+            }
 
             let region_dsl = format!("aws.Region.{}", self.region.replace('-', "_"));
             attributes.insert("region".to_string(), Value::String(region_dsl));
@@ -1152,26 +1199,23 @@ impl AwsProvider {
                 attributes.insert("routes".to_string(), Value::List(routes_list));
             }
 
-            let state = State::existing(id, attributes);
+            let state = State::existing(id.clone(), attributes);
             Ok(if let Some(rt_id) = rt_id_str {
                 state.with_identifier(rt_id)
             } else {
                 state
             })
         } else {
-            Ok(State::not_found(id))
+            Ok(State::not_found(id.clone()))
         }
     }
 
     /// Create an EC2 Route Table
     async fn create_ec2_route_table(&self, resource: Resource) -> ProviderResult<State> {
-        let name = match resource.attributes.get("name") {
-            Some(Value::String(s)) => s.clone(),
-            _ => {
-                return Err(ProviderError::new("Route Table name is required")
-                    .for_resource(resource.id.clone()));
-            }
-        };
+        let name = resource.attributes.get("name").and_then(|v| match v {
+            Value::String(s) => Some(s.clone()),
+            _ => None,
+        });
 
         let vpc_id = match resource.attributes.get("vpc_id") {
             Some(Value::String(s)) => s.clone(),
@@ -1202,22 +1246,24 @@ impl AwsProvider {
                     .for_resource(resource.id.clone())
             })?;
 
-        // Tag with Name
-        self.ec2_client
-            .create_tags()
-            .resources(rt_id)
-            .tags(
-                aws_sdk_ec2::types::Tag::builder()
-                    .key("Name")
-                    .value(&name)
-                    .build(),
-            )
-            .send()
-            .await
-            .map_err(|e| {
-                ProviderError::new(format!("Failed to tag route table: {:?}", e))
-                    .for_resource(resource.id.clone())
-            })?;
+        // Tag with Name (if provided)
+        if let Some(ref name) = name {
+            self.ec2_client
+                .create_tags()
+                .resources(rt_id)
+                .tags(
+                    aws_sdk_ec2::types::Tag::builder()
+                        .key("Name")
+                        .value(name)
+                        .build(),
+                )
+                .send()
+                .await
+                .map_err(|e| {
+                    ProviderError::new(format!("Failed to tag route table: {:?}", e))
+                        .for_resource(resource.id.clone())
+                })?;
+        }
 
         // Add routes
         if let Some(Value::List(routes)) = resource.attributes.get("routes") {
@@ -1255,26 +1301,27 @@ impl AwsProvider {
             }
         }
 
-        self.read_ec2_route_table(&name).await
+        // Read back using route table ID (reliable identifier)
+        self.read_ec2_route_table(&resource.id, Some(rt_id)).await
     }
 
     /// Update an EC2 Route Table
-    async fn update_ec2_route_table(&self, id: ResourceId, _to: Resource) -> ProviderResult<State> {
+    async fn update_ec2_route_table(
+        &self,
+        id: ResourceId,
+        identifier: &str,
+        _to: Resource,
+    ) -> ProviderResult<State> {
         // Route updates would require deleting and recreating routes
         // For now, just return current state
-        self.read_ec2_route_table(&id.name).await
+        self.read_ec2_route_table(&id, Some(identifier)).await
     }
 
     /// Delete an EC2 Route Table
-    async fn delete_ec2_route_table(&self, id: ResourceId) -> ProviderResult<()> {
-        let rt_id = self
-            .find_route_table_id_by_name(&id.name)
-            .await?
-            .ok_or_else(|| ProviderError::new("Route Table not found").for_resource(id.clone()))?;
-
+    async fn delete_ec2_route_table(&self, id: ResourceId, identifier: &str) -> ProviderResult<()> {
         self.ec2_client
             .delete_route_table()
-            .route_table_id(&rt_id)
+            .route_table_id(identifier)
             .send()
             .await
             .map_err(|e| {
@@ -1288,12 +1335,15 @@ impl AwsProvider {
     // ========== EC2 Route Operations ==========
 
     /// Read an EC2 Route (routes are identified by route_table_id + destination)
-    async fn read_ec2_route(&self, name: &str) -> ProviderResult<State> {
+    async fn read_ec2_route(
+        &self,
+        id: &ResourceId,
+        _identifier: Option<&str>,
+    ) -> ProviderResult<State> {
         // Routes don't have a "name" in AWS - we use the name for identification
         // The actual route is identified by route_table_id + destination_cidr_block
         // For read, we return not_found since we can't look up by name alone
-        let id = ResourceId::with_provider("aws", "route", name);
-        Ok(State::not_found(id))
+        Ok(State::not_found(id.clone()))
     }
 
     /// Read an EC2 Route by route_table_id and destination_cidr_block
@@ -1414,7 +1464,12 @@ impl AwsProvider {
     }
 
     /// Update an EC2 Route (replace the route)
-    async fn update_ec2_route(&self, id: ResourceId, to: Resource) -> ProviderResult<State> {
+    async fn update_ec2_route(
+        &self,
+        id: ResourceId,
+        _identifier: &str,
+        to: Resource,
+    ) -> ProviderResult<State> {
         let route_table_id = match to.attributes.get("route_table_id") {
             Some(Value::String(s)) => s.clone(),
             _ => {
@@ -1459,35 +1514,30 @@ impl AwsProvider {
 
     // ========== EC2 Security Group Operations ==========
 
-    /// Find Security Group ID by Name tag (not group-name)
-    async fn find_security_group_id_by_name(&self, name: &str) -> ProviderResult<Option<String>> {
-        use aws_sdk_ec2::types::Filter;
-
-        let filter = Filter::builder().name("tag:Name").values(name).build();
-
-        let result = self
-            .ec2_client
-            .describe_security_groups()
-            .filters(filter)
-            .send()
-            .await
-            .map_err(|e| {
-                ProviderError::new(format!("Failed to describe security groups: {:?}", e))
-            })?;
-
-        Ok(result
-            .security_groups()
-            .first()
-            .and_then(|sg| sg.group_id().map(String::from)))
-    }
-
     /// Read an EC2 Security Group
-    async fn read_ec2_security_group(&self, name: &str) -> ProviderResult<State> {
+    async fn read_ec2_security_group(
+        &self,
+        id: &ResourceId,
+        identifier: Option<&str>,
+    ) -> ProviderResult<State> {
         use aws_sdk_ec2::types::Filter;
 
-        let id = ResourceId::with_provider("aws", "security_group", name);
+        let Some(identifier) = identifier else {
+            return Ok(State::not_found(id.clone()));
+        };
 
-        let filter = Filter::builder().name("tag:Name").values(name).build();
+        // If identifier starts with sg-, look up by security group ID; otherwise by Name tag
+        let filter = if identifier.starts_with("sg-") {
+            Filter::builder()
+                .name("group-id")
+                .values(identifier)
+                .build()
+        } else {
+            Filter::builder()
+                .name("tag:Name")
+                .values(identifier)
+                .build()
+        };
 
         let result = self
             .ec2_client
@@ -1502,7 +1552,16 @@ impl AwsProvider {
 
         if let Some(sg) = result.security_groups().first() {
             let mut attributes = HashMap::new();
-            attributes.insert("name".to_string(), Value::String(name.to_string()));
+
+            // Extract Name tag from security group
+            if let Some(name_tag) = sg
+                .tags()
+                .iter()
+                .find(|t| t.key() == Some("Name"))
+                .and_then(|t| t.value())
+            {
+                attributes.insert("name".to_string(), Value::String(name_tag.to_string()));
+            }
 
             let region_dsl = format!("aws.Region.{}", self.region.replace('-', "_"));
             attributes.insert("region".to_string(), Value::String(region_dsl));
@@ -1522,26 +1581,23 @@ impl AwsProvider {
                 attributes.insert("vpc_id".to_string(), Value::String(vpc_id.to_string()));
             }
 
-            let state = State::existing(id, attributes);
+            let state = State::existing(id.clone(), attributes);
             Ok(if let Some(sg_id) = sg_id_str {
                 state.with_identifier(sg_id)
             } else {
                 state
             })
         } else {
-            Ok(State::not_found(id))
+            Ok(State::not_found(id.clone()))
         }
     }
 
     /// Create an EC2 Security Group
     async fn create_ec2_security_group(&self, resource: Resource) -> ProviderResult<State> {
-        let name = match resource.attributes.get("name") {
-            Some(Value::String(s)) => s.clone(),
-            _ => {
-                return Err(ProviderError::new("Security Group name is required")
-                    .for_resource(resource.id.clone()));
-            }
-        };
+        let name = resource.attributes.get("name").and_then(|v| match v {
+            Value::String(s) => Some(s.clone()),
+            _ => None,
+        });
 
         let vpc_id = match resource.attributes.get("vpc_id") {
             Some(Value::String(s)) => s.clone(),
@@ -1554,14 +1610,17 @@ impl AwsProvider {
 
         let description = match resource.attributes.get("description") {
             Some(Value::String(s)) => s.clone(),
-            _ => name.clone(), // Use name as description if not specified
+            _ => name.clone().unwrap_or_default(), // Use name as description if not specified
         };
+
+        // group_name is required for CreateSecurityGroup API
+        let group_name = name.clone().unwrap_or_else(|| resource.id.name.clone());
 
         // Create Security Group
         let result = self
             .ec2_client
             .create_security_group()
-            .group_name(&name)
+            .group_name(&group_name)
             .description(&description)
             .vpc_id(&vpc_id)
             .send()
@@ -1576,49 +1635,51 @@ impl AwsProvider {
                 .for_resource(resource.id.clone())
         })?;
 
-        // Tag with Name
-        self.ec2_client
-            .create_tags()
-            .resources(sg_id)
-            .tags(
-                aws_sdk_ec2::types::Tag::builder()
-                    .key("Name")
-                    .value(&name)
-                    .build(),
-            )
-            .send()
-            .await
-            .map_err(|e| {
-                ProviderError::new(format!("Failed to tag security group: {:?}", e))
-                    .for_resource(resource.id.clone())
-            })?;
+        // Tag with Name (if provided)
+        if let Some(ref name) = name {
+            self.ec2_client
+                .create_tags()
+                .resources(sg_id)
+                .tags(
+                    aws_sdk_ec2::types::Tag::builder()
+                        .key("Name")
+                        .value(name)
+                        .build(),
+                )
+                .send()
+                .await
+                .map_err(|e| {
+                    ProviderError::new(format!("Failed to tag security group: {:?}", e))
+                        .for_resource(resource.id.clone())
+                })?;
+        }
 
-        self.read_ec2_security_group(&name).await
+        // Read back using security group ID (reliable identifier)
+        self.read_ec2_security_group(&resource.id, Some(sg_id))
+            .await
     }
 
     /// Update an EC2 Security Group
     async fn update_ec2_security_group(
         &self,
         id: ResourceId,
+        identifier: &str,
         _to: Resource,
     ) -> ProviderResult<State> {
         // Security group rule updates would require revoking and re-adding rules
         // For now, just return current state
-        self.read_ec2_security_group(&id.name).await
+        self.read_ec2_security_group(&id, Some(identifier)).await
     }
 
     /// Delete an EC2 Security Group
-    async fn delete_ec2_security_group(&self, id: ResourceId) -> ProviderResult<()> {
-        let sg_id = self
-            .find_security_group_id_by_name(&id.name)
-            .await?
-            .ok_or_else(|| {
-                ProviderError::new("Security Group not found").for_resource(id.clone())
-            })?;
-
+    async fn delete_ec2_security_group(
+        &self,
+        id: ResourceId,
+        identifier: &str,
+    ) -> ProviderResult<()> {
         self.ec2_client
             .delete_security_group()
-            .group_id(&sg_id)
+            .group_id(identifier)
             .send()
             .await
             .map_err(|e| {
@@ -1665,28 +1726,54 @@ impl AwsProvider {
     /// Read an EC2 Security Group Rule
     async fn read_ec2_security_group_rule(
         &self,
-        name: &str,
+        id: &ResourceId,
+        identifier: Option<&str>,
         is_ingress: bool,
     ) -> ProviderResult<State> {
-        let resource_type = if is_ingress {
-            "security_group.ingress_rule"
-        } else {
-            "security_group.egress_rule"
+        let Some(identifier) = identifier else {
+            return Ok(State::not_found(id.clone()));
         };
-        let id = ResourceId::with_provider("aws", resource_type, name);
 
-        let rules = self
-            .find_security_group_rules_by_name(name, is_ingress)
-            .await?;
+        // If identifier starts with sgr-, look up by rule ID; otherwise by Name tag
+        let rules = if identifier.starts_with("sgr-") {
+            // Look up by rule IDs (may be comma-separated)
+            let rule_ids: Vec<&str> = identifier.split(',').collect();
+            let mut req = self.ec2_client.describe_security_group_rules();
+            for rule_id in &rule_ids {
+                req = req.security_group_rule_ids(*rule_id);
+            }
+            let result = req.send().await.map_err(|e| {
+                ProviderError::new(format!("Failed to describe security group rules: {:?}", e))
+                    .for_resource(id.clone())
+            })?;
+            result
+                .security_group_rules()
+                .iter()
+                .filter(|rule| rule.is_egress() == Some(!is_ingress))
+                .cloned()
+                .collect::<Vec<_>>()
+        } else {
+            self.find_security_group_rules_by_name(identifier, is_ingress)
+                .await?
+        };
 
         if rules.is_empty() {
-            return Ok(State::not_found(id));
+            return Ok(State::not_found(id.clone()));
         }
 
         // Use the first rule for common attributes
         let first_rule = &rules[0];
         let mut attributes = HashMap::new();
-        attributes.insert("name".to_string(), Value::String(name.to_string()));
+
+        // Extract Name tag from rules
+        if let Some(name_tag) = first_rule
+            .tags()
+            .iter()
+            .find(|t| t.key() == Some("Name"))
+            .and_then(|t| t.value())
+        {
+            attributes.insert("name".to_string(), Value::String(name_tag.to_string()));
+        }
 
         let region_dsl = format!("aws.Region.{}", self.region.replace('-', "_"));
         attributes.insert("region".to_string(), Value::String(region_dsl));
@@ -1696,7 +1783,7 @@ impl AwsProvider {
             .iter()
             .filter_map(|r| r.security_group_rule_id().map(String::from))
             .collect();
-        let identifier = if !rule_ids.is_empty() {
+        let rule_identifier = if !rule_ids.is_empty() {
             attributes.insert("id".to_string(), Value::String(rule_ids.join(",")));
             Some(rule_ids.join(","))
         } else {
@@ -1733,8 +1820,8 @@ impl AwsProvider {
             attributes.insert("cidr_blocks".to_string(), Value::List(cidr_blocks));
         }
 
-        let state = State::existing(id, attributes);
-        Ok(if let Some(id_str) = identifier {
+        let state = State::existing(id.clone(), attributes);
+        Ok(if let Some(id_str) = rule_identifier {
             state.with_identifier(id_str)
         } else {
             state
@@ -1747,14 +1834,10 @@ impl AwsProvider {
         resource: Resource,
         is_ingress: bool,
     ) -> ProviderResult<State> {
-        let name = match resource.attributes.get("name") {
-            Some(Value::String(s)) => s.clone(),
-            _ => {
-                return Err(
-                    ProviderError::new("Rule name is required").for_resource(resource.id.clone())
-                );
-            }
-        };
+        let name = resource.attributes.get("name").and_then(|v| match v {
+            Value::String(s) => Some(s.clone()),
+            _ => None,
+        });
 
         let sg_id = match resource.attributes.get("security_group_id") {
             Some(Value::String(s)) => s.clone(),
@@ -1844,8 +1927,10 @@ impl AwsProvider {
                 .collect()
         };
 
-        // Tag ALL rules with the same Name
-        if !rule_ids.is_empty() {
+        // Tag ALL rules with the same Name (if name provided)
+        if let Some(ref name) = name
+            && !rule_ids.is_empty()
+        {
             let mut tag_request = self.ec2_client.create_tags();
             for rule_id in &rule_ids {
                 tag_request = tag_request.resources(rule_id);
@@ -1854,7 +1939,7 @@ impl AwsProvider {
                 .tags(
                     aws_sdk_ec2::types::Tag::builder()
                         .key("Name")
-                        .value(&name)
+                        .value(name)
                         .build(),
                 )
                 .send()
@@ -1865,43 +1950,60 @@ impl AwsProvider {
                 })?;
         }
 
-        self.read_ec2_security_group_rule(&name, is_ingress).await
+        // Read back using rule IDs (reliable identifier)
+        let identifier = rule_ids.join(",");
+        self.read_ec2_security_group_rule(
+            &resource.id,
+            if identifier.is_empty() {
+                None
+            } else {
+                Some(&identifier)
+            },
+            is_ingress,
+        )
+        .await
     }
 
     /// Update an EC2 Security Group Rule (rules are immutable, so recreate)
     async fn update_ec2_security_group_rule(
         &self,
         id: ResourceId,
+        identifier: &str,
         to: Resource,
         is_ingress: bool,
     ) -> ProviderResult<State> {
         // Security group rules are immutable - delete and recreate
-        self.delete_ec2_security_group_rule(id.clone(), is_ingress)
+        self.delete_ec2_security_group_rule(id.clone(), identifier, is_ingress)
             .await?;
         self.create_ec2_security_group_rule(to, is_ingress).await
     }
 
-    /// Delete an EC2 Security Group Rule (deletes all rules with the same name tag)
+    /// Delete an EC2 Security Group Rule (deletes all rules by identifier)
     async fn delete_ec2_security_group_rule(
         &self,
         id: ResourceId,
+        identifier: &str,
         is_ingress: bool,
     ) -> ProviderResult<()> {
-        let rules = self
-            .find_security_group_rules_by_name(&id.name, is_ingress)
-            .await?;
+        // identifier is comma-separated rule IDs (e.g., "sgr-123,sgr-456")
+        let rule_ids: Vec<&str> = identifier.split(',').collect();
 
+        // Look up the rules to get the security group ID
+        let mut req = self.ec2_client.describe_security_group_rules();
+        for rule_id in &rule_ids {
+            req = req.security_group_rule_ids(*rule_id);
+        }
+        let result = req.send().await.map_err(|e| {
+            ProviderError::new(format!("Failed to describe security group rules: {:?}", e))
+                .for_resource(id.clone())
+        })?;
+
+        let rules = result.security_group_rules();
         if rules.is_empty() {
             return Err(
                 ProviderError::new("Security Group Rule not found").for_resource(id.clone())
             );
         }
-
-        // Collect all rule IDs and the security group ID
-        let rule_ids: Vec<String> = rules
-            .iter()
-            .filter_map(|r| r.security_group_rule_id().map(String::from))
-            .collect();
 
         let sg_id = rules[0].group_id().ok_or_else(|| {
             ProviderError::new("Rule has no security group ID").for_resource(id.clone())
@@ -1914,7 +2016,7 @@ impl AwsProvider {
                 .revoke_security_group_ingress()
                 .group_id(sg_id);
             for rule_id in &rule_ids {
-                request = request.security_group_rule_ids(rule_id);
+                request = request.security_group_rule_ids(*rule_id);
             }
             request.send().await.map_err(|e| {
                 ProviderError::new(format!("Failed to delete ingress rules: {:?}", e))
@@ -1926,7 +2028,7 @@ impl AwsProvider {
                 .revoke_security_group_egress()
                 .group_id(sg_id);
             for rule_id in &rule_ids {
-                request = request.security_group_rule_ids(rule_id);
+                request = request.security_group_rule_ids(*rule_id);
             }
             request.send().await.map_err(|e| {
                 ProviderError::new(format!("Failed to delete egress rules: {:?}", e))
@@ -1960,25 +2062,32 @@ impl Provider for AwsProvider {
     fn read(
         &self,
         id: &ResourceId,
-        _identifier: Option<&str>,
+        identifier: Option<&str>,
     ) -> BoxFuture<'_, ProviderResult<State>> {
-        // Note: For AWS provider, we currently use name-based lookup.
-        // The identifier parameter is available for future optimization.
         let id = id.clone();
+        let identifier = identifier.map(String::from);
         Box::pin(async move {
             match id.resource_type.as_str() {
-                "s3.bucket" => self.read_s3_bucket(&id.name).await,
-                "vpc" => self.read_ec2_vpc(&id.name).await,
-                "subnet" => self.read_ec2_subnet(&id.name).await,
-                "internet_gateway" => self.read_ec2_internet_gateway(&id.name).await,
-                "route_table" => self.read_ec2_route_table(&id.name).await,
-                "route" => self.read_ec2_route(&id.name).await,
-                "security_group" => self.read_ec2_security_group(&id.name).await,
+                "s3.bucket" => self.read_s3_bucket(&id, identifier.as_deref()).await,
+                "vpc" => self.read_ec2_vpc(&id, identifier.as_deref()).await,
+                "subnet" => self.read_ec2_subnet(&id, identifier.as_deref()).await,
+                "internet_gateway" => {
+                    self.read_ec2_internet_gateway(&id, identifier.as_deref())
+                        .await
+                }
+                "route_table" => self.read_ec2_route_table(&id, identifier.as_deref()).await,
+                "route" => self.read_ec2_route(&id, identifier.as_deref()).await,
+                "security_group" => {
+                    self.read_ec2_security_group(&id, identifier.as_deref())
+                        .await
+                }
                 "security_group.ingress_rule" => {
-                    self.read_ec2_security_group_rule(&id.name, true).await
+                    self.read_ec2_security_group_rule(&id, identifier.as_deref(), true)
+                        .await
                 }
                 "security_group.egress_rule" => {
-                    self.read_ec2_security_group_rule(&id.name, false).await
+                    self.read_ec2_security_group_rule(&id, identifier.as_deref(), false)
+                        .await
                 }
                 _ => Err(ProviderError::new(format!(
                     "Unknown resource type: {}",
@@ -2018,28 +2127,29 @@ impl Provider for AwsProvider {
     fn update(
         &self,
         id: &ResourceId,
-        _identifier: &str,
+        identifier: &str,
         _from: &State,
         to: &Resource,
     ) -> BoxFuture<'_, ProviderResult<State>> {
-        // Note: For AWS provider, we currently use name-based lookup.
-        // The identifier parameter is available for future optimization.
         let id = id.clone();
+        let identifier = identifier.to_string();
         let to = to.clone();
         Box::pin(async move {
             match id.resource_type.as_str() {
-                "s3.bucket" => self.update_s3_bucket(id, to).await,
-                "vpc" => self.update_ec2_vpc(id, to).await,
-                "subnet" => self.update_ec2_subnet(id, to).await,
-                "internet_gateway" => self.update_ec2_internet_gateway(id, to).await,
-                "route_table" => self.update_ec2_route_table(id, to).await,
-                "route" => self.update_ec2_route(id, to).await,
-                "security_group" => self.update_ec2_security_group(id, to).await,
+                "s3.bucket" => self.update_s3_bucket(id, &identifier, to).await,
+                "vpc" => self.update_ec2_vpc(id, &identifier, to).await,
+                "subnet" => self.update_ec2_subnet(id, &identifier, to).await,
+                "internet_gateway" => self.update_ec2_internet_gateway(id, &identifier, to).await,
+                "route_table" => self.update_ec2_route_table(id, &identifier, to).await,
+                "route" => self.update_ec2_route(id, &identifier, to).await,
+                "security_group" => self.update_ec2_security_group(id, &identifier, to).await,
                 "security_group.ingress_rule" => {
-                    self.update_ec2_security_group_rule(id, to, true).await
+                    self.update_ec2_security_group_rule(id, &identifier, to, true)
+                        .await
                 }
                 "security_group.egress_rule" => {
-                    self.update_ec2_security_group_rule(id, to, false).await
+                    self.update_ec2_security_group_rule(id, &identifier, to, false)
+                        .await
                 }
                 _ => Err(ProviderError::new(format!(
                     "Unknown resource type: {}",
@@ -2050,29 +2160,30 @@ impl Provider for AwsProvider {
         })
     }
 
-    fn delete(&self, id: &ResourceId, _identifier: &str) -> BoxFuture<'_, ProviderResult<()>> {
-        // Note: For AWS provider, we currently use name-based lookup.
-        // The identifier parameter is available for future optimization.
+    fn delete(&self, id: &ResourceId, identifier: &str) -> BoxFuture<'_, ProviderResult<()>> {
         let id = id.clone();
+        let identifier = identifier.to_string();
         Box::pin(async move {
             match id.resource_type.as_str() {
-                "s3.bucket" => self.delete_s3_bucket(id).await,
-                "vpc" => self.delete_ec2_vpc(id).await,
-                "subnet" => self.delete_ec2_subnet(id).await,
-                "internet_gateway" => self.delete_ec2_internet_gateway(id).await,
-                "route_table" => self.delete_ec2_route_table(id).await,
+                "s3.bucket" => self.delete_s3_bucket(id, &identifier).await,
+                "vpc" => self.delete_ec2_vpc(id, &identifier).await,
+                "subnet" => self.delete_ec2_subnet(id, &identifier).await,
+                "internet_gateway" => self.delete_ec2_internet_gateway(id, &identifier).await,
+                "route_table" => self.delete_ec2_route_table(id, &identifier).await,
                 "route" => {
                     // Route deletion requires route_table_id and destination_cidr_block
                     // which are not available from ResourceId alone.
                     // Routes are typically deleted when the route table is deleted.
                     Ok(())
                 }
-                "security_group" => self.delete_ec2_security_group(id).await,
+                "security_group" => self.delete_ec2_security_group(id, &identifier).await,
                 "security_group.ingress_rule" => {
-                    self.delete_ec2_security_group_rule(id, true).await
+                    self.delete_ec2_security_group_rule(id, &identifier, true)
+                        .await
                 }
                 "security_group.egress_rule" => {
-                    self.delete_ec2_security_group_rule(id, false).await
+                    self.delete_ec2_security_group_rule(id, &identifier, false)
+                        .await
                 }
                 _ => Err(ProviderError::new(format!(
                     "Unknown resource type: {}",

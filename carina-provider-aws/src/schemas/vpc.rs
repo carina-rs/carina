@@ -197,8 +197,7 @@ pub fn vpc_schema() -> ResourceSchema {
         // ========== Carina-specific attributes ==========
         .attribute(
             AttributeSchema::new("name", AttributeType::String)
-                .required()
-                .with_description("VPC name (Name tag) - Carina identifier"),
+                .with_description("VPC name (Name tag)"),
         )
         .attribute(
             AttributeSchema::new("region", aws_types::aws_region()).with_description(
@@ -208,6 +207,7 @@ pub fn vpc_schema() -> ResourceSchema {
         // ========== CloudFormation input properties ==========
         .attribute(
             AttributeSchema::new("cidr_block", types::cidr())
+                .create_only()
                 .with_description("The IPv4 network range for the VPC, in CIDR notation. Required if not using Ipv4IpamPoolId."),
         )
         .attribute(
@@ -220,6 +220,7 @@ pub fn vpc_schema() -> ResourceSchema {
         )
         .attribute(
             AttributeSchema::new("instance_tenancy", instance_tenancy())
+                .create_only()
                 .with_description("The allowed tenancy of instances launched into the VPC. Values: default, dedicated, host")
                 .with_completions(vec![
                     CompletionValue::new("default", "Instances can have any tenancy"),
@@ -272,7 +273,6 @@ pub fn subnet_schema() -> ResourceSchema {
         )
         .attribute(
             AttributeSchema::new("name", AttributeType::String)
-                .required()
                 .with_description("Subnet name (Name tag)"),
         )
         .attribute(
@@ -283,15 +283,18 @@ pub fn subnet_schema() -> ResourceSchema {
         .attribute(
             AttributeSchema::new("vpc_id", AttributeType::String)
                 .required()
+                .create_only()
                 .with_description("VPC ID to create the subnet in"),
         )
         .attribute(
             AttributeSchema::new("cidr_block", types::cidr())
                 .required()
+                .create_only()
                 .with_description("The IPv4 CIDR block for the subnet"),
         )
         .attribute(
             AttributeSchema::new("availability_zone", availability_zone())
+                .create_only()
                 .with_description("The availability zone for the subnet"),
         )
 }
@@ -306,7 +309,6 @@ pub fn internet_gateway_schema() -> ResourceSchema {
         )
         .attribute(
             AttributeSchema::new("name", AttributeType::String)
-                .required()
                 .with_description("Internet Gateway name (Name tag)"),
         )
         .attribute(
@@ -329,7 +331,6 @@ pub fn route_table_schema() -> ResourceSchema {
         )
         .attribute(
             AttributeSchema::new("name", AttributeType::String)
-                .required()
                 .with_description("Route Table name (Name tag)"),
         )
         .attribute(
@@ -340,6 +341,7 @@ pub fn route_table_schema() -> ResourceSchema {
         .attribute(
             AttributeSchema::new("vpc_id", AttributeType::String)
                 .required()
+                .create_only()
                 .with_description("VPC ID for the Route Table"),
         )
 }
@@ -350,7 +352,6 @@ pub fn route_schema() -> ResourceSchema {
         .with_description("A route in an AWS VPC Route Table")
         .attribute(
             AttributeSchema::new("name", AttributeType::String)
-                .required()
                 .with_description("Route name (for identification)"),
         )
         .attribute(
@@ -360,11 +361,13 @@ pub fn route_schema() -> ResourceSchema {
         .attribute(
             AttributeSchema::new("route_table_id", AttributeType::String)
                 .required()
+                .create_only()
                 .with_description("Route Table ID"),
         )
         .attribute(
             AttributeSchema::new("destination_cidr_block", types::cidr())
                 .required()
+                .create_only()
                 .with_description("Destination CIDR block"),
         )
         .attribute(
@@ -387,7 +390,6 @@ pub fn security_group_schema() -> ResourceSchema {
         )
         .attribute(
             AttributeSchema::new("name", AttributeType::String)
-                .required()
                 .with_description("Security Group name (Name tag)"),
         )
         .attribute(
@@ -398,6 +400,7 @@ pub fn security_group_schema() -> ResourceSchema {
         .attribute(
             AttributeSchema::new("vpc_id", AttributeType::String)
                 .required()
+                .create_only()
                 .with_description("VPC ID for the Security Group"),
         )
         .attribute(
@@ -416,7 +419,6 @@ pub fn security_group_ingress_rule_schema() -> ResourceSchema {
         )
         .attribute(
             AttributeSchema::new("name", AttributeType::String)
-                .required()
                 .with_description("Rule name (for identification)"),
         )
         .attribute(
@@ -426,21 +428,25 @@ pub fn security_group_ingress_rule_schema() -> ResourceSchema {
         .attribute(
             AttributeSchema::new("security_group_id", AttributeType::String)
                 .required()
+                .create_only()
                 .with_description("Security Group ID"),
         )
         .attribute(
             AttributeSchema::new("protocol", protocol())
                 .required()
+                .create_only()
                 .with_description("Protocol (tcp, udp, icmp, or -1 for all)"),
         )
         .attribute(
             AttributeSchema::new("from_port", port_number())
                 .required()
+                .create_only()
                 .with_description("Start of port range"),
         )
         .attribute(
             AttributeSchema::new("to_port", port_number())
                 .required()
+                .create_only()
                 .with_description("End of port range"),
         )
         .attribute(
@@ -459,7 +465,6 @@ pub fn security_group_egress_rule_schema() -> ResourceSchema {
         )
         .attribute(
             AttributeSchema::new("name", AttributeType::String)
-                .required()
                 .with_description("Rule name (for identification)"),
         )
         .attribute(
@@ -469,21 +474,25 @@ pub fn security_group_egress_rule_schema() -> ResourceSchema {
         .attribute(
             AttributeSchema::new("security_group_id", AttributeType::String)
                 .required()
+                .create_only()
                 .with_description("Security Group ID"),
         )
         .attribute(
             AttributeSchema::new("protocol", protocol())
                 .required()
+                .create_only()
                 .with_description("Protocol (tcp, udp, icmp, or -1 for all)"),
         )
         .attribute(
             AttributeSchema::new("from_port", port_number())
                 .required()
+                .create_only()
                 .with_description("Start of port range"),
         )
         .attribute(
             AttributeSchema::new("to_port", port_number())
                 .required()
+                .create_only()
                 .with_description("End of port range"),
         )
         .attribute(
@@ -588,6 +597,7 @@ mod tests {
 
     #[test]
     fn vpc_missing_name() {
+        // name is optional (not required) - VPC can be identified by vpc-id
         let schema = vpc_schema();
         let mut attrs = HashMap::new();
         attrs.insert(
@@ -596,7 +606,7 @@ mod tests {
         );
 
         let result = schema.validate(&attrs);
-        assert!(result.is_err());
+        assert!(result.is_ok());
     }
 
     #[test]

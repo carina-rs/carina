@@ -367,7 +367,7 @@ impl CompletionProvider {
                 kind: Some(CompletionItemKind::CLASS),
                 text_edit: Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(TextEdit {
                     range: replacement_range,
-                    new_text: "aws.vpc {\n    name       = \"${1:vpc-name}\"\n    cidr_block = \"${2:10.0.0.0/16}\"\n}".to_string(),
+                    new_text: "aws.vpc {\n    cidr_block = \"${1:10.0.0.0/16}\"\n}".to_string(),
                 })),
                 insert_text_format: Some(InsertTextFormat::SNIPPET),
                 detail: Some("VPC resource".to_string()),
@@ -378,7 +378,7 @@ impl CompletionProvider {
                 kind: Some(CompletionItemKind::CLASS),
                 text_edit: Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(TextEdit {
                     range: replacement_range,
-                    new_text: "aws.subnet {\n    name              = \"${1:subnet-name}\"\n    vpc_id            = ${2:vpc.id}\n    cidr_block        = \"${3:10.0.1.0/24}\"\n    availability_zone = aws.AvailabilityZone.${4:ap_northeast_1a}\n}".to_string(),
+                    new_text: "aws.subnet {\n    vpc_id            = ${1:vpc.id}\n    cidr_block        = \"${2:10.0.1.0/24}\"\n    availability_zone = aws.AvailabilityZone.${3:ap_northeast_1a}\n}".to_string(),
                 })),
                 insert_text_format: Some(InsertTextFormat::SNIPPET),
                 detail: Some("Subnet resource".to_string()),
@@ -389,7 +389,7 @@ impl CompletionProvider {
                 kind: Some(CompletionItemKind::CLASS),
                 text_edit: Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(TextEdit {
                     range: replacement_range,
-                    new_text: "aws.internet_gateway {\n    name   = \"${1:igw-name}\"\n    vpc_id = ${2:vpc.id}\n}".to_string(),
+                    new_text: "aws.internet_gateway {\n    vpc_id = ${1:vpc.id}\n}".to_string(),
                 })),
                 insert_text_format: Some(InsertTextFormat::SNIPPET),
                 detail: Some("Internet Gateway resource".to_string()),
@@ -400,7 +400,7 @@ impl CompletionProvider {
                 kind: Some(CompletionItemKind::CLASS),
                 text_edit: Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(TextEdit {
                     range: replacement_range,
-                    new_text: "aws.route_table {\n    name   = \"${1:rt-name}\"\n    vpc_id = ${2:vpc.id}\n}".to_string(),
+                    new_text: "aws.route_table {\n    vpc_id = ${1:vpc.id}\n}".to_string(),
                 })),
                 insert_text_format: Some(InsertTextFormat::SNIPPET),
                 detail: Some("Route Table resource".to_string()),
@@ -411,7 +411,7 @@ impl CompletionProvider {
                 kind: Some(CompletionItemKind::CLASS),
                 text_edit: Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(TextEdit {
                     range: replacement_range,
-                    new_text: "aws.route {\n    name                   = \"${1:route-name}\"\n    route_table_id         = ${2:rt.id}\n    destination_cidr_block = \"${3:0.0.0.0/0}\"\n    gateway_id             = ${4:igw.id}\n}".to_string(),
+                    new_text: "aws.route {\n    route_table_id         = ${1:rt.id}\n    destination_cidr_block = \"${2:0.0.0.0/0}\"\n    gateway_id             = ${3:igw.id}\n}".to_string(),
                 })),
                 insert_text_format: Some(InsertTextFormat::SNIPPET),
                 detail: Some("Route in a Route Table".to_string()),
@@ -422,7 +422,7 @@ impl CompletionProvider {
                 kind: Some(CompletionItemKind::CLASS),
                 text_edit: Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(TextEdit {
                     range: replacement_range,
-                    new_text: "aws.security_group {\n    name        = \"${1:sg-name}\"\n    vpc_id      = ${2:vpc.id}\n    description = \"${3:Security group description}\"\n}".to_string(),
+                    new_text: "aws.security_group {\n    vpc_id      = ${1:vpc.id}\n    description = \"${2:Security group description}\"\n}".to_string(),
                 })),
                 insert_text_format: Some(InsertTextFormat::SNIPPET),
                 detail: Some("Security Group resource".to_string()),
@@ -433,7 +433,7 @@ impl CompletionProvider {
                 kind: Some(CompletionItemKind::CLASS),
                 text_edit: Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(TextEdit {
                     range: replacement_range,
-                    new_text: "aws.security_group.ingress_rule {\n    name              = \"${1:rule-name}\"\n    security_group_id = ${2:sg.id}\n    protocol          = aws.Protocol.${3:tcp}\n    from_port         = ${4:80}\n    to_port           = ${5:80}\n    cidr              = \"${6:0.0.0.0/0}\"\n}".to_string(),
+                    new_text: "aws.security_group.ingress_rule {\n    security_group_id = ${1:sg.id}\n    protocol          = aws.Protocol.${2:tcp}\n    from_port         = ${3:80}\n    to_port           = ${4:80}\n    cidr              = \"${5:0.0.0.0/0}\"\n}".to_string(),
                 })),
                 insert_text_format: Some(InsertTextFormat::SNIPPET),
                 detail: Some("Security Group Ingress Rule".to_string()),
@@ -444,7 +444,7 @@ impl CompletionProvider {
                 kind: Some(CompletionItemKind::CLASS),
                 text_edit: Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(TextEdit {
                     range: replacement_range,
-                    new_text: "aws.security_group.egress_rule {\n    name              = \"${1:rule-name}\"\n    security_group_id = ${2:sg.id}\n    protocol          = aws.Protocol.${3:all}\n    from_port         = ${4:0}\n    to_port           = ${5:0}\n    cidr              = \"${6:0.0.0.0/0}\"\n}".to_string(),
+                    new_text: "aws.security_group.egress_rule {\n    security_group_id = ${1:sg.id}\n    protocol          = aws.Protocol.${2:all}\n    from_port         = ${3:0}\n    to_port           = ${4:0}\n    cidr              = \"${5:0.0.0.0/0}\"\n}".to_string(),
                 })),
                 insert_text_format: Some(InsertTextFormat::SNIPPET),
                 detail: Some("Security Group Egress Rule".to_string()),
