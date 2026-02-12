@@ -6,9 +6,7 @@ provider awscc {
   region = aws.Region.ap_northeast_1
 }
 
-awscc.ec2_internet_gateway {
-  name = "acceptance-test-igw"
-
+let igw = awscc.ec2_internet_gateway {
   tags = {
     Environment = "acceptance-test"
   }

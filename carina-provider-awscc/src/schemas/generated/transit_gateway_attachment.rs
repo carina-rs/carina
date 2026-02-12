@@ -46,11 +46,13 @@ pub fn ec2_transit_gateway_attachment_config() -> AwsccSchemaConfig {
         .attribute(
             AttributeSchema::new("transit_gateway_id", super::transit_gateway_id())
                 .required()
+                .create_only()
                 .with_provider_name("TransitGatewayId"),
         )
         .attribute(
             AttributeSchema::new("vpc_id", super::vpc_id())
                 .required()
+                .create_only()
                 .with_provider_name("VpcId"),
         )
     }

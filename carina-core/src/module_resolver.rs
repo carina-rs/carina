@@ -214,10 +214,17 @@ impl ModuleResolver {
                 new_name.clone(),
             );
 
-            // Update name attribute
-            new_resource
+            // Update name attribute for aws provider only
+            // Non-aws providers don't use name as a resource property
+            let is_aws_provider = new_resource
                 .attributes
-                .insert("name".to_string(), Value::String(new_name));
+                .get("_provider")
+                .is_some_and(|v| matches!(v, Value::String(s) if s == "aws"));
+            if is_aws_provider {
+                new_resource
+                    .attributes
+                    .insert("name".to_string(), Value::String(new_name));
+            }
 
             // Add module source info
             new_resource.attributes.insert(

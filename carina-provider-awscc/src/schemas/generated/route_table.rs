@@ -29,6 +29,7 @@ pub fn ec2_route_table_config() -> AwsccSchemaConfig {
         .attribute(
             AttributeSchema::new("vpc_id", super::vpc_id())
                 .required()
+                .create_only()
                 .with_description("The ID of the VPC.")
                 .with_provider_name("VpcId"),
         )

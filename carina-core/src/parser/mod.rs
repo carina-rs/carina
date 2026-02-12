@@ -555,25 +555,36 @@ fn parse_anonymous_resource(
 
     let attributes = parse_block_contents(inner, ctx)?;
 
-    // Get resource name from name attribute
-    // Anonymous resources (not bound with let) require a name attribute for identification
-    // In module context, name can be input.param which is a ResourceRef
-    let resource_name = match attributes.get("name") {
-        Some(Value::String(s)) => s.clone(),
-        Some(Value::ResourceRef(ref_name, ref_attr)) if ctx.in_module && ref_name == "input" => {
-            // In module context, use a placeholder that will be resolved at instantiation
-            format!("__input_ref__:{}", ref_attr)
+    // For non-aws providers, name is NOT used as resource identifier.
+    // Anonymous resources get an empty name that will be replaced by a hash-based
+    // identifier computed from create-only properties after parsing.
+    // For aws provider, keep current behavior (require name attribute).
+    let resource_name = if provider == "aws" {
+        match attributes.get("name") {
+            Some(Value::String(s)) => s.clone(),
+            Some(Value::ResourceRef(ref_name, ref_attr))
+                if ctx.in_module && ref_name == "input" =>
+            {
+                format!("__input_ref__:{}", ref_attr)
+            }
+            _ => {
+                return Err(ParseError::InvalidExpression {
+                    line: 0,
+                    message: "Anonymous resource must have a 'name' attribute for identification. Use 'let' binding instead if you don't want to specify a name.".to_string(),
+                });
+            }
         }
-        _ => {
-            return Err(ParseError::InvalidExpression {
-                line: 0,
-                message: "Anonymous resource must have a 'name' attribute for identification. Use 'let' binding instead if you don't want to specify a name.".to_string(),
-            });
-        }
+    } else {
+        // Non-aws: empty name, will be computed later from create-only properties
+        String::new()
     };
 
     // Add provider information to attributes
     let mut attributes = attributes;
+    // Strip name from attributes for non-aws providers (name is not a resource property)
+    if provider != "aws" {
+        attributes.remove("name");
+    }
     attributes.insert("_provider".to_string(), Value::String(provider.to_string()));
     attributes.insert("_type".to_string(), Value::String(namespaced_type.clone()));
 
@@ -667,20 +678,22 @@ fn parse_resource_expr(
 
     let mut attributes = parse_block_contents(inner, ctx)?;
 
-    // Get resource name from name attribute (same as anonymous resources)
-    // In module context, name can be input.param which is a ResourceRef
-    // If name attribute is not provided, use the binding name as the resource identifier
-    let resource_name = match attributes.get("name") {
-        Some(Value::String(s)) => s.clone(),
-        Some(Value::ResourceRef(ref_name, ref_attr)) if ctx.in_module && ref_name == "input" => {
-            // In module context, use a placeholder that will be resolved at instantiation
-            // The actual name will be substituted when the module is used
-            format!("__input_ref__:{}", ref_attr)
+    // For non-aws providers, always use binding name as identifier.
+    // For aws provider, use name attribute or fall back to binding name.
+    let resource_name = if provider == "aws" {
+        match attributes.get("name") {
+            Some(Value::String(s)) => s.clone(),
+            Some(Value::ResourceRef(ref_name, ref_attr))
+                if ctx.in_module && ref_name == "input" =>
+            {
+                format!("__input_ref__:{}", ref_attr)
+            }
+            _ => binding_name.to_string(),
         }
-        _ => {
-            // Use binding name as the resource identifier when name attribute is not provided
-            binding_name.to_string()
-        }
+    } else {
+        // Non-aws: always use binding name, strip name from attributes
+        attributes.remove("name");
+        binding_name.to_string()
     };
 
     // Add provider information to attributes
@@ -721,23 +734,30 @@ fn parse_read_resource_expr(
 
     let mut attributes = parse_block_contents(inner, ctx)?;
 
-    // Get resource name from name attribute (required for data sources)
-    // In module context, name can be input.param which is a ResourceRef
-    let resource_name = match attributes.get("name") {
-        Some(Value::String(s)) => s.clone(),
-        Some(Value::ResourceRef(ref_name, ref_attr)) if ctx.in_module && ref_name == "input" => {
-            // In module context, use a placeholder that will be resolved at instantiation
-            format!("__input_ref__:{}", ref_attr)
+    // For non-aws providers, use binding name as identifier.
+    // For aws provider, require name attribute for data sources.
+    let resource_name = if provider == "aws" {
+        match attributes.get("name") {
+            Some(Value::String(s)) => s.clone(),
+            Some(Value::ResourceRef(ref_name, ref_attr))
+                if ctx.in_module && ref_name == "input" =>
+            {
+                format!("__input_ref__:{}", ref_attr)
+            }
+            _ => {
+                return Err(ParseError::InvalidExpression {
+                    line: 0,
+                    message: format!(
+                        "Data source '{}' must have a 'name' attribute to identify the existing resource",
+                        binding_name
+                    ),
+                });
+            }
         }
-        _ => {
-            return Err(ParseError::InvalidExpression {
-                line: 0,
-                message: format!(
-                    "Data source '{}' must have a 'name' attribute to identify the existing resource",
-                    binding_name
-                ),
-            });
-        }
+    } else {
+        // Non-aws: use binding name, strip name from attributes
+        attributes.remove("name");
+        binding_name.to_string()
     };
 
     // Add provider information to attributes

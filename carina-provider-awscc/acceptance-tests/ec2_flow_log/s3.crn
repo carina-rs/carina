@@ -8,16 +8,13 @@ provider awscc {
 }
 
 let vpc = awscc.ec2_vpc {
-  name       = "acceptance-test-vpc-flowlog-s3"
   cidr_block = "10.0.0.0/16"
 }
 
 let bucket = awscc.s3_bucket {
-  name = "acceptance-test-flowlog-s3-bucket"
 }
 
-awscc.ec2_flow_log {
-  name                 = "acceptance-test-flowlog-s3"
+let flow_log = awscc.ec2_flow_log {
   resource_id          = vpc.vpc_id
   resource_type        = VPC
   traffic_type         = ALL

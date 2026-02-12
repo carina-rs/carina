@@ -1220,8 +1220,7 @@ mod tests {
     region = aws.Region.ap_northeast_1
 }
 
-awscc.ec2_security_group {
-    name = "test-sg"
+let sg = awscc.ec2_security_group {
     group_description = "Test security group"
     security_group_ingress {
         ip_protocol = "tcp"
@@ -1250,8 +1249,7 @@ awscc.ec2_security_group {
     region = aws.Region.ap_northeast_1
 }
 
-awscc.ec2_security_group {
-    name = "test-sg"
+let sg = awscc.ec2_security_group {
     group_description = "Test security group"
     security_group_ingress {
         ip_protocol = "tcp"
@@ -1282,12 +1280,10 @@ awscc.ec2_security_group {
 }
 
 let vpc = awscc.ec2_vpc {
-    name = "test-vpc"
     cidr_block = "10.0.0.0/16"
 }
 
-awscc.ec2_vpc {
-    name = "test-vpc-2"
+let vpc2 = awscc.ec2_vpc {
     ipv4_ipam_pool_id = vpc.vpc_id
 }"#,
         );
@@ -1315,12 +1311,10 @@ awscc.ec2_vpc {
 }
 
 let vpc = awscc.ec2_vpc {
-    name = "test-vpc"
     cidr_block = "10.0.0.0/16"
 }
 
-awscc.ec2_subnet {
-    name = "test-subnet"
+let subnet = awscc.ec2_subnet {
     vpc_id = vpc.vpc_id
     cidr_block = "10.0.1.0/24"
 }"#,
@@ -1346,8 +1340,7 @@ awscc.ec2_subnet {
     region = aws.Region.ap_northeast_1
 }
 
-awscc.ec2_security_group {
-    name = "test-sg"
+let sg = awscc.ec2_security_group {
     group_description = "Test security group"
     security_group_ingress {
         ip_protocol = "tcp"
@@ -1377,11 +1370,11 @@ awscc.ec2_security_group {
         );
 
         // The diagnostic should point to the second block, not the first.
-        // LSP uses 0-indexed lines, so line 18 = line 19 in 1-indexed.
+        // LSP uses 0-indexed lines, so line 17 = line 18 in 1-indexed.
         let diag = bad_field_diag.unwrap();
         assert_eq!(
-            diag.range.start.line, 18,
-            "Diagnostic should point to line 18 (0-indexed, in second block), got line {}",
+            diag.range.start.line, 17,
+            "Diagnostic should point to line 17 (0-indexed, in second block), got line {}",
             diag.range.start.line
         );
     }

@@ -66,6 +66,7 @@ pub fn logs_log_group_config() -> AwsccSchemaConfig {
         )
         .attribute(
             AttributeSchema::new("log_group_name", AttributeType::String)
+                .create_only()
                 .with_description("The name of the log group. If you don't specify a name, CFNlong generates a unique ID for the log group.")
                 .with_provider_name("LogGroupName"),
         )

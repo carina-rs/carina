@@ -23,12 +23,14 @@ pub fn ec2_subnet_route_table_association_config() -> AwsccSchemaConfig {
         .attribute(
             AttributeSchema::new("route_table_id", super::route_table_id())
                 .required()
+                .create_only()
                 .with_description("The ID of the route table. The physical ID changes when the route table ID is changed.")
                 .with_provider_name("RouteTableId"),
         )
         .attribute(
             AttributeSchema::new("subnet_id", super::subnet_id())
                 .required()
+                .create_only()
                 .with_description("The ID of the subnet.")
                 .with_provider_name("SubnetId"),
         )

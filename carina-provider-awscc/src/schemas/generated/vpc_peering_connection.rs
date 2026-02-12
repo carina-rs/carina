@@ -23,22 +23,26 @@ pub fn ec2_vpc_peering_connection_config() -> AwsccSchemaConfig {
         )
         .attribute(
             AttributeSchema::new("peer_owner_id", AttributeType::String)
+                .create_only()
                 .with_description("The AWS account ID of the owner of the accepter VPC.")
                 .with_provider_name("PeerOwnerId"),
         )
         .attribute(
             AttributeSchema::new("peer_region", AttributeType::String)
+                .create_only()
                 .with_description("The Region code for the accepter VPC, if the accepter VPC is located in a Region other than the Region in which you make the request.")
                 .with_provider_name("PeerRegion"),
         )
         .attribute(
             AttributeSchema::new("peer_role_arn", super::arn())
+                .create_only()
                 .with_description("The Amazon Resource Name (ARN) of the VPC peer role for the peering connection in another AWS account.")
                 .with_provider_name("PeerRoleArn"),
         )
         .attribute(
             AttributeSchema::new("peer_vpc_id", super::vpc_id())
                 .required()
+                .create_only()
                 .with_description("The ID of the VPC with which you are creating the VPC peering connection. You must specify this parameter in the request.")
                 .with_provider_name("PeerVpcId"),
         )
@@ -49,6 +53,7 @@ pub fn ec2_vpc_peering_connection_config() -> AwsccSchemaConfig {
         .attribute(
             AttributeSchema::new("vpc_id", super::vpc_id())
                 .required()
+                .create_only()
                 .with_description("The ID of the VPC.")
                 .with_provider_name("VpcId"),
         )

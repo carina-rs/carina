@@ -7,27 +7,22 @@ provider awscc {
 }
 
 let vpc = awscc.ec2_vpc {
-  name       = "acceptance-test-vpc-route-igw"
   cidr_block = "10.0.0.0/16"
 }
 
 let igw = awscc.ec2_internet_gateway {
-  name = "acceptance-test-igw-route"
 }
 
 let igw_attachment = awscc.ec2_vpc_gateway_attachment {
-  name                = "acceptance-test-igw-attach-route"
   vpc_id              = vpc.vpc_id
   internet_gateway_id = igw.internet_gateway_id
 }
 
 let rt = awscc.ec2_route_table {
-  name   = "acceptance-test-rt-igw"
   vpc_id = vpc.vpc_id
 }
 
-awscc.ec2_route {
-  name                   = "acceptance-test-route-igw"
+let route = awscc.ec2_route {
   route_table_id         = rt.route_table_id
   destination_cidr_block = "0.0.0.0/0"
   gateway_id             = igw_attachment.internet_gateway_id

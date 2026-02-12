@@ -8,7 +8,6 @@ provider awscc {
 }
 
 let ipam = awscc.ec2_ipam {
-  name = "acceptance-test-ipam-pool-parent"
   tier = advanced
 
   operating_regions = [
@@ -18,8 +17,7 @@ let ipam = awscc.ec2_ipam {
   ]
 }
 
-awscc.ec2_ipam_pool {
-  name           = "acceptance-test-ipam-pool"
+let ipam_pool = awscc.ec2_ipam_pool {
   ipam_scope_id  = ipam.private_default_scope_id
   address_family = "IPv4"
   locale         = "ap-northeast-1"

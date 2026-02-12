@@ -7,12 +7,10 @@ provider awscc {
 }
 
 let vpc = awscc.ec2_vpc {
-  name       = "acceptance-test-vpc-subnet-ipv6"
   cidr_block = "10.0.0.0/16"
 }
 
-awscc.ec2_subnet {
-  name                            = "acceptance-test-subnet-ipv6"
+let subnet = awscc.ec2_subnet {
   vpc_id                          = vpc.vpc_id
   cidr_block                      = "10.0.1.0/24"
   availability_zone               = "ap-northeast-1a"

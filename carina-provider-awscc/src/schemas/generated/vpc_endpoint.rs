@@ -101,6 +101,7 @@ pub fn ec2_vpc_endpoint_config() -> AwsccSchemaConfig {
         )
         .attribute(
             AttributeSchema::new("resource_configuration_arn", super::arn())
+                .create_only()
                 .with_description("The Amazon Resource Name (ARN) of the resource configuration.")
                 .with_provider_name("ResourceConfigurationArn"),
         )
@@ -116,16 +117,19 @@ pub fn ec2_vpc_endpoint_config() -> AwsccSchemaConfig {
         )
         .attribute(
             AttributeSchema::new("service_name", AttributeType::String)
+                .create_only()
                 .with_description("The name of the endpoint service.")
                 .with_provider_name("ServiceName"),
         )
         .attribute(
             AttributeSchema::new("service_network_arn", super::arn())
+                .create_only()
                 .with_description("The Amazon Resource Name (ARN) of the service network.")
                 .with_provider_name("ServiceNetworkArn"),
         )
         .attribute(
             AttributeSchema::new("service_region", AttributeType::String)
+                .create_only()
                 .with_description("Describes a Region.")
                 .with_provider_name("ServiceRegion"),
         )
@@ -146,12 +150,14 @@ pub fn ec2_vpc_endpoint_config() -> AwsccSchemaConfig {
                 validate: validate_vpc_endpoint_type,
                 namespace: Some("awscc.ec2_vpc_endpoint".to_string()),
             })
+                .create_only()
                 .with_description("The type of endpoint. Default: Gateway")
                 .with_provider_name("VpcEndpointType"),
         )
         .attribute(
             AttributeSchema::new("vpc_id", super::vpc_id())
                 .required()
+                .create_only()
                 .with_description("The ID of the VPC.")
                 .with_provider_name("VpcId"),
         )

@@ -7,18 +7,15 @@ provider awscc {
 }
 
 let vpc = awscc.ec2_vpc {
-  name       = "acceptance-test-vpc-sge-basic"
   cidr_block = "10.0.0.0/16"
 }
 
 let sg = awscc.ec2_security_group {
-  name              = "acceptance-test-sg-for-egress"
   vpc_id            = vpc.vpc_id
   group_description = "SG for egress rule test"
 }
 
-awscc.ec2_security_group_egress {
-  name        = "acceptance-test-egress-basic"
+let egress = awscc.ec2_security_group_egress {
   group_id    = sg.group_id
   description = "Allow all outbound"
   ip_protocol = "-1"

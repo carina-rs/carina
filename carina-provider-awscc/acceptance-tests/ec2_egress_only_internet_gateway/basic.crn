@@ -7,12 +7,10 @@ provider awscc {
 }
 
 let vpc = awscc.ec2_vpc {
-  name       = "acceptance-test-vpc-eoigw"
   cidr_block = "10.0.0.0/16"
 }
 
-awscc.ec2_egress_only_internet_gateway {
-  name   = "acceptance-test-eoigw"
+let eoigw = awscc.ec2_egress_only_internet_gateway {
   vpc_id = vpc.vpc_id
 
   tags = {

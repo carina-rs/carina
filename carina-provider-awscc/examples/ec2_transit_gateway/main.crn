@@ -6,8 +6,7 @@ provider awscc {
   region = aws.Region.ap_northeast_1
 }
 
-awscc.ec2_transit_gateway {
-  name        = "example-tgw"
+let tgw = awscc.ec2_transit_gateway {
   description = "Example Transit Gateway"
 
   tags = {
