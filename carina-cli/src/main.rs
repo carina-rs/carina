@@ -53,6 +53,10 @@ enum Commands {
         /// Save plan to a file for later apply
         #[arg(long = "out")]
         out: Option<PathBuf>,
+
+        /// Return exit code 2 when changes are present
+        #[arg(long = "detailed-exitcode")]
+        detailed_exitcode: bool,
     },
     /// Apply changes to reach the desired state
     Apply {
@@ -190,9 +194,30 @@ struct PlanContext {
 async fn main() {
     let cli = Cli::parse();
 
+    // Handle Plan separately since it returns Result<bool, String>
+    if let Commands::Plan {
+        path,
+        out,
+        detailed_exitcode,
+    } = cli.command
+    {
+        match run_plan(&path, out.as_ref()).await {
+            Ok(has_changes) => {
+                if detailed_exitcode && has_changes {
+                    std::process::exit(2);
+                }
+            }
+            Err(e) => {
+                eprintln!("{} {}", "Error:".red().bold(), e);
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
     let result = match cli.command {
         Commands::Validate { path } => run_validate(&path),
-        Commands::Plan { path, out } => run_plan(&path, out.as_ref()).await,
+        Commands::Plan { .. } => unreachable!(),
         Commands::Apply { path, auto_approve } => {
             if path.extension().is_some_and(|ext| ext == "json") {
                 run_apply_from_plan(&path, auto_approve).await
@@ -952,7 +977,7 @@ fn run_validate(path: &PathBuf) -> Result<(), String> {
     Ok(())
 }
 
-async fn run_plan(path: &PathBuf, out: Option<&PathBuf>) -> Result<(), String> {
+async fn run_plan(path: &PathBuf, out: Option<&PathBuf>) -> Result<bool, String> {
     let mut parsed = load_configuration(path)?.parsed;
 
     // Resolve module imports and expand module calls
@@ -1062,6 +1087,7 @@ async fn run_plan(path: &PathBuf, out: Option<&PathBuf>) -> Result<(), String> {
     reconcile_prefixed_names(&mut parsed.resources, &state_file);
 
     let ctx = create_plan_from_parsed(&parsed, &state_file).await?;
+    let has_changes = !ctx.plan.is_empty();
     print_plan(&ctx.plan);
 
     // Save plan to file if --out was specified
@@ -1114,7 +1140,7 @@ async fn run_plan(path: &PathBuf, out: Option<&PathBuf>) -> Result<(), String> {
         );
     }
 
-    Ok(())
+    Ok(has_changes)
 }
 
 async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
@@ -4327,5 +4353,22 @@ mod tests {
         let suffix = generate_random_suffix();
         assert_eq!(suffix.len(), 8);
         assert!(suffix.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn test_detailed_exitcode_no_changes() {
+        // An empty plan means no changes — has_changes should be false
+        let plan = Plan::new();
+        let has_changes = !plan.is_empty();
+        assert!(!has_changes);
+    }
+
+    #[test]
+    fn test_detailed_exitcode_with_changes() {
+        // A plan with effects means changes — has_changes should be true
+        let mut plan = Plan::new();
+        plan.add(Effect::Create(Resource::new("s3.bucket", "test")));
+        let has_changes = !plan.is_empty();
+        assert!(has_changes);
     }
 }
