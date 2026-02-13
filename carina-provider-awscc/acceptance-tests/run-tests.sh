@@ -9,7 +9,7 @@
 #   plan       - Run plan on .crn files (single account, needs aws-vault)
 #   apply      - Apply .crn files (single account, needs aws-vault)
 #   destroy    - Destroy resources created by .crn files (single account)
-#   full       - Run apply+destroy per test, 10 accounts in parallel
+#   full       - Run apply+plan-verify+destroy per test, 10 accounts in parallel
 #
 # For validate, no AWS credentials are needed.
 # For plan/apply/destroy, wrap with: aws-vault exec <profile> -- ./run-tests.sh ...
@@ -21,8 +21,8 @@
 # Examples:
 #   ./run-tests.sh validate                          # validate all
 #   ./run-tests.sh validate ec2_vpc/basic            # validate specific test
-#   ./run-tests.sh full                              # apply+destroy, 10 parallel accounts
-#   ./run-tests.sh full ec2_vpc                      # apply+destroy VPC tests only
+#   ./run-tests.sh full                              # apply+plan-verify+destroy, 10 parallel accounts
+#   ./run-tests.sh full ec2_vpc                      # apply+plan-verify+destroy VPC tests only
 
 set -e
 
@@ -86,7 +86,7 @@ fi
 # ── full: 10-account parallel execution ──────────────────────────────
 if [ "$COMMAND" = "full" ]; then
     TOTAL=${#TESTS[@]}
-    echo "Running full cycle (apply -> destroy) on $TOTAL test(s) across $NUM_ACCOUNTS accounts"
+    echo "Running full cycle (apply -> plan-verify -> destroy) on $TOTAL test(s) across $NUM_ACCOUNTS accounts"
     echo ""
 
     WORK_DIR=$(mktemp -d)
@@ -126,6 +126,25 @@ if [ "$COMMAND" = "full" ]; then
                     echo "  ERROR: $APPLY_OUTPUT"
                     FAILED=$((FAILED + 1))
                     # Try to destroy whatever was partially created
+                    cd "$STATE_DIR" && aws-vault exec "$ACCOUNT" -- "$CARINA_BIN" destroy --auto-approve "$TEST_FILE" 2>&1 || true
+                    continue
+                fi
+
+                # Post-apply plan verification (idempotency check)
+                PLAN_OUTPUT=$(cd "$STATE_DIR" && aws-vault exec "$ACCOUNT" -- "$CARINA_BIN" plan --detailed-exitcode "$TEST_FILE" 2>&1)
+                PLAN_RC=$?
+                if [ $PLAN_RC -eq 2 ]; then
+                    echo "FAIL (plan-verify) $REL_PATH"
+                    echo "  ERROR: Post-apply plan detected changes (not idempotent):"
+                    echo "  $PLAN_OUTPUT"
+                    FAILED=$((FAILED + 1))
+                    # Still destroy to clean up
+                    cd "$STATE_DIR" && aws-vault exec "$ACCOUNT" -- "$CARINA_BIN" destroy --auto-approve "$TEST_FILE" 2>&1 || true
+                    continue
+                elif [ $PLAN_RC -ne 0 ]; then
+                    echo "FAIL (plan-verify) $REL_PATH"
+                    echo "  ERROR: $PLAN_OUTPUT"
+                    FAILED=$((FAILED + 1))
                     cd "$STATE_DIR" && aws-vault exec "$ACCOUNT" -- "$CARINA_BIN" destroy --auto-approve "$TEST_FILE" 2>&1 || true
                     continue
                 fi
@@ -219,6 +238,22 @@ for TEST_FILE in "${TESTS[@]}"; do
         AUTO_APPROVE="--auto-approve"
     fi
     if OUTPUT=$("$CARINA_BIN" "$COMMAND" $AUTO_APPROVE "$TEST_FILE" 2>&1); then
+        if [ "$COMMAND" = "apply" ]; then
+            # Post-apply plan verification (idempotency check)
+            PLAN_OUTPUT=$("$CARINA_BIN" plan --detailed-exitcode "$TEST_FILE" 2>&1)
+            PLAN_RC=$?
+            if [ $PLAN_RC -eq 2 ]; then
+                echo "FAIL (plan-verify)"
+                ERRORS+=("$REL_PATH: Post-apply plan detected changes (not idempotent): $PLAN_OUTPUT")
+                FAILED=$((FAILED + 1))
+                continue
+            elif [ $PLAN_RC -ne 0 ]; then
+                echo "FAIL (plan-verify)"
+                ERRORS+=("$REL_PATH: $PLAN_OUTPUT")
+                FAILED=$((FAILED + 1))
+                continue
+            fi
+        fi
         echo "OK"
         PASSED=$((PASSED + 1))
     else
