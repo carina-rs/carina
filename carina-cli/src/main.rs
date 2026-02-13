@@ -361,6 +361,148 @@ fn validate_resource_ref_types(resources: &[Resource]) -> Result<(), String> {
     }
 }
 
+/// Check if an AttributeType is string-compatible (can accept a string value).
+fn is_string_compatible_type(attr_type: &carina_core::schema::AttributeType) -> bool {
+    use carina_core::schema::AttributeType;
+    matches!(
+        attr_type,
+        AttributeType::String | AttributeType::Custom { .. } | AttributeType::Enum(_)
+    )
+}
+
+/// Generate a random 8-character lowercase hex suffix using UUID v4.
+fn generate_random_suffix() -> String {
+    let uuid = uuid::Uuid::new_v4();
+    let hex = uuid.as_simple().to_string();
+    hex[..8].to_string()
+}
+
+/// Resolve `<attr>_prefix` meta-attributes in resources.
+///
+/// For each resource attribute ending in `_prefix`, checks if the base attribute
+/// (without `_prefix`) exists in the schema as a string-compatible type. If so:
+/// - Removes the `_prefix` attribute
+/// - Stores the prefix in `resource.prefixes`
+/// - Generates a temporary name: `prefix + random_suffix`
+///
+/// Errors if both `<attr>_prefix` and `<attr>` are specified, or if prefix is empty.
+fn resolve_attr_prefixes(resources: &mut [Resource]) -> Result<(), String> {
+    let schemas = get_schemas();
+    let mut all_errors = Vec::new();
+
+    for resource in resources.iter_mut() {
+        let schema_key = match resource.attributes.get("_provider") {
+            Some(Value::String(provider)) if provider != "aws" => {
+                format!("{}.{}", provider, resource.id.resource_type)
+            }
+            _ => resource.id.resource_type.clone(),
+        };
+
+        let schema = match schemas.get(&schema_key) {
+            Some(s) => s,
+            None => continue, // Unknown resource type; validate_resources will catch this
+        };
+
+        // Collect prefix attributes to process
+        let prefix_attrs: Vec<(String, String)> = resource
+            .attributes
+            .iter()
+            .filter_map(|(key, value)| {
+                if let Some(base_attr) = key.strip_suffix("_prefix")
+                    && let Value::String(prefix_value) = value
+                    && let Some(attr_schema) = schema.attributes.get(base_attr)
+                    && is_string_compatible_type(&attr_schema.attr_type)
+                {
+                    return Some((base_attr.to_string(), prefix_value.clone()));
+                }
+                None
+            })
+            .collect();
+
+        for (base_attr, prefix_value) in prefix_attrs {
+            let prefix_key = format!("{}_prefix", base_attr);
+
+            // Error if prefix is empty
+            if prefix_value.is_empty() {
+                all_errors.push(format!("{}: '{}' cannot be empty", resource.id, prefix_key));
+                continue;
+            }
+
+            // Error if both prefix and base attribute are specified
+            if resource.attributes.contains_key(&base_attr) {
+                all_errors.push(format!(
+                    "{}: cannot specify both '{}' and '{}'",
+                    resource.id, prefix_key, base_attr
+                ));
+                continue;
+            }
+
+            // Remove the _prefix attribute
+            resource.attributes.remove(&prefix_key);
+
+            // Store prefix
+            resource
+                .prefixes
+                .insert(base_attr.clone(), prefix_value.clone());
+
+            // Generate temporary name
+            let generated_name = format!("{}{}", prefix_value, generate_random_suffix());
+            resource
+                .attributes
+                .insert(base_attr, Value::String(generated_name));
+        }
+    }
+
+    if all_errors.is_empty() {
+        Ok(())
+    } else {
+        Err(all_errors.join("\n"))
+    }
+}
+
+/// Reconcile prefixed names with existing state.
+///
+/// For resources that have prefixes and a matching entry in state (same prefix),
+/// reuses the existing name from state instead of the temporarily generated one.
+/// If the prefix has changed or there's no state match, keeps the new generated name.
+fn reconcile_prefixed_names(resources: &mut [Resource], state_file: &Option<StateFile>) {
+    let state_file = match state_file {
+        Some(sf) => sf,
+        None => return,
+    };
+
+    for resource in resources.iter_mut() {
+        if resource.prefixes.is_empty() {
+            continue;
+        }
+
+        // Find matching resource in state
+        let state_resource =
+            state_file.find_resource(&resource.id.resource_type, &resource.id.name);
+        let state_resource = match state_resource {
+            Some(sr) => sr,
+            None => continue,
+        };
+
+        for (attr_name, prefix) in &resource.prefixes {
+            // Check if state has the same prefix for this attribute
+            if let Some(state_prefix) = state_resource.prefixes.get(attr_name)
+                && state_prefix == prefix
+            {
+                // Same prefix: reuse the existing name from state
+                if let Some(state_value) = state_resource.attributes.get(attr_name)
+                    && let Some(name_str) = state_value.as_str()
+                {
+                    resource
+                        .attributes
+                        .insert(attr_name.clone(), Value::String(name_str.to_string()));
+                }
+            }
+            // If prefix changed or no state prefix exists, keep the newly generated name
+        }
+    }
+}
+
 /// Compute stable identifiers for anonymous resources (those with empty ResourceId.name).
 /// Uses create-only properties from the schema to generate a deterministic hash.
 fn compute_anonymous_identifiers(resources: &mut [Resource]) -> Result<(), String> {
@@ -788,6 +930,7 @@ fn run_validate(path: &PathBuf) -> Result<(), String> {
 
     println!("{}", "Validating...".cyan());
 
+    resolve_attr_prefixes(&mut parsed.resources)?;
     validate_resources(&parsed.resources)?;
     validate_resource_ref_types(&parsed.resources)?;
     compute_anonymous_identifiers(&mut parsed.resources)?;
@@ -823,6 +966,7 @@ async fn run_plan(path: &PathBuf, out: Option<&PathBuf>) -> Result<(), String> {
     // Apply default region from provider
     apply_default_region(&mut parsed);
 
+    resolve_attr_prefixes(&mut parsed.resources)?;
     validate_resources(&parsed.resources)?;
     validate_resource_ref_types(&parsed.resources)?;
     compute_anonymous_identifiers(&mut parsed.resources)?;
@@ -915,6 +1059,8 @@ async fn run_plan(path: &PathBuf, out: Option<&PathBuf>) -> Result<(), String> {
         println!();
     }
 
+    reconcile_prefixed_names(&mut parsed.resources, &state_file);
+
     let ctx = create_plan_from_parsed(&parsed, &state_file).await?;
     print_plan(&ctx.plan);
 
@@ -987,6 +1133,7 @@ async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
     // Apply default region from provider
     apply_default_region(&mut parsed);
 
+    resolve_attr_prefixes(&mut parsed.resources)?;
     validate_resources(&parsed.resources)?;
     validate_resource_ref_types(&parsed.resources)?;
     compute_anonymous_identifiers(&mut parsed.resources)?;
@@ -1134,6 +1281,7 @@ async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
                     {
                         return Err(format!("Module resolution error: {}", e));
                     }
+                    resolve_attr_prefixes(&mut parsed.resources)?;
                 } else {
                     return Err(format!(
                         "Backend bucket '{}' not found and auto_create is disabled",
@@ -1204,6 +1352,8 @@ async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
             .await
             .map_err(|e| format!("Failed to read state: {}", e))?;
     }
+
+    reconcile_prefixed_names(&mut parsed.resources, &state_file);
 
     // Sort resources by dependencies
     let sorted_resources = sort_resources_by_dependencies(&parsed.resources);
@@ -1939,6 +2089,7 @@ async fn run_destroy(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
     // Apply default region from provider
     apply_default_region(&mut parsed);
 
+    resolve_attr_prefixes(&mut parsed.resources)?;
     compute_anonymous_identifiers(&mut parsed.resources)?;
 
     if parsed.resources.is_empty() {
@@ -1995,6 +2146,8 @@ async fn run_destroy(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
         .read_state()
         .await
         .map_err(|e| format!("Failed to read state: {}", e))?;
+
+    reconcile_prefixed_names(&mut parsed.resources, &state_file);
 
     // Sort resources by dependencies (for creation order)
     let sorted_resources = sort_resources_by_dependencies(&parsed.resources);
@@ -3267,6 +3420,9 @@ fn resource_to_state(
     // Copy lifecycle configuration from resource
     resource_state.lifecycle = resource.lifecycle.clone();
 
+    // Copy attribute prefixes from resource
+    resource_state.prefixes = resource.prefixes.clone();
+
     resource_state
 }
 
@@ -3987,5 +4143,189 @@ mod tests {
         assert_eq!(deserialized.plan.effects().len(), 2);
         assert_eq!(deserialized.sorted_resources.len(), 1);
         assert_eq!(deserialized.current_states.len(), 1);
+    }
+
+    #[test]
+    fn test_resolve_attr_prefixes_extracts_prefix_and_generates_name() {
+        let mut resource = Resource::with_provider("awscc", "s3_bucket", "test-bucket");
+        resource
+            .attributes
+            .insert("_provider".to_string(), Value::String("awscc".to_string()));
+        resource.attributes.insert(
+            "bucket_name_prefix".to_string(),
+            Value::String("my-app-".to_string()),
+        );
+
+        let mut resources = vec![resource];
+        resolve_attr_prefixes(&mut resources).unwrap();
+
+        // bucket_name_prefix should be removed
+        assert!(!resources[0].attributes.contains_key("bucket_name_prefix"));
+
+        // bucket_name should be generated with the prefix
+        let bucket_name = match resources[0].attributes.get("bucket_name").unwrap() {
+            Value::String(s) => s.clone(),
+            _ => panic!("expected String"),
+        };
+        assert!(bucket_name.starts_with("my-app-"));
+        assert_eq!(bucket_name.len(), "my-app-".len() + 8); // prefix + 8 hex chars
+
+        // prefixes map should have the entry
+        assert_eq!(
+            resources[0].prefixes.get("bucket_name"),
+            Some(&"my-app-".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_attr_prefixes_leaves_non_matching_prefix_alone() {
+        // If base attr doesn't exist in schema, leave _prefix as-is
+        let mut resource = Resource::with_provider("awscc", "s3_bucket", "test-bucket");
+        resource
+            .attributes
+            .insert("_provider".to_string(), Value::String("awscc".to_string()));
+        resource.attributes.insert(
+            "nonexistent_attr_prefix".to_string(),
+            Value::String("some-value".to_string()),
+        );
+
+        let mut resources = vec![resource];
+        resolve_attr_prefixes(&mut resources).unwrap();
+
+        // nonexistent_attr_prefix should remain untouched
+        assert!(
+            resources[0]
+                .attributes
+                .contains_key("nonexistent_attr_prefix")
+        );
+        assert!(resources[0].prefixes.is_empty());
+    }
+
+    #[test]
+    fn test_resolve_attr_prefixes_errors_when_both_prefix_and_attr_specified() {
+        let mut resource = Resource::with_provider("awscc", "s3_bucket", "test-bucket");
+        resource
+            .attributes
+            .insert("_provider".to_string(), Value::String("awscc".to_string()));
+        resource.attributes.insert(
+            "bucket_name_prefix".to_string(),
+            Value::String("my-app-".to_string()),
+        );
+        resource.attributes.insert(
+            "bucket_name".to_string(),
+            Value::String("my-actual-bucket".to_string()),
+        );
+
+        let mut resources = vec![resource];
+        let result = resolve_attr_prefixes(&mut resources);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("cannot specify both"));
+    }
+
+    #[test]
+    fn test_resolve_attr_prefixes_errors_on_empty_prefix() {
+        let mut resource = Resource::with_provider("awscc", "s3_bucket", "test-bucket");
+        resource
+            .attributes
+            .insert("_provider".to_string(), Value::String("awscc".to_string()));
+        resource.attributes.insert(
+            "bucket_name_prefix".to_string(),
+            Value::String("".to_string()),
+        );
+
+        let mut resources = vec![resource];
+        let result = resolve_attr_prefixes(&mut resources);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("cannot be empty"));
+    }
+
+    #[test]
+    fn test_reconcile_prefixed_names_reuses_state_name_when_prefix_matches() {
+        let mut resource = Resource::with_provider("awscc", "s3_bucket", "test-bucket");
+        resource
+            .prefixes
+            .insert("bucket_name".to_string(), "my-app-".to_string());
+        resource.attributes.insert(
+            "bucket_name".to_string(),
+            Value::String("my-app-temporary".to_string()),
+        );
+
+        let mut state_file = StateFile::new();
+        let mut rs = ResourceState::new("s3_bucket", "test-bucket", "awscc");
+        rs.attributes.insert(
+            "bucket_name".to_string(),
+            serde_json::json!("my-app-existing1"),
+        );
+        rs.prefixes
+            .insert("bucket_name".to_string(), "my-app-".to_string());
+        state_file.upsert_resource(rs);
+
+        let mut resources = vec![resource];
+        reconcile_prefixed_names(&mut resources, &Some(state_file));
+
+        // Should reuse the state name, not the temporary one
+        assert_eq!(
+            resources[0].attributes.get("bucket_name"),
+            Some(&Value::String("my-app-existing1".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_reconcile_prefixed_names_generates_new_name_when_prefix_changes() {
+        let mut resource = Resource::with_provider("awscc", "s3_bucket", "test-bucket");
+        resource
+            .prefixes
+            .insert("bucket_name".to_string(), "new-prefix-".to_string());
+        resource.attributes.insert(
+            "bucket_name".to_string(),
+            Value::String("new-prefix-abcd1234".to_string()),
+        );
+
+        let mut state_file = StateFile::new();
+        let mut rs = ResourceState::new("s3_bucket", "test-bucket", "awscc");
+        rs.attributes.insert(
+            "bucket_name".to_string(),
+            serde_json::json!("old-prefix-existing1"),
+        );
+        rs.prefixes
+            .insert("bucket_name".to_string(), "old-prefix-".to_string());
+        state_file.upsert_resource(rs);
+
+        let mut resources = vec![resource];
+        reconcile_prefixed_names(&mut resources, &Some(state_file));
+
+        // Should keep the newly generated name since prefix changed
+        assert_eq!(
+            resources[0].attributes.get("bucket_name"),
+            Some(&Value::String("new-prefix-abcd1234".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_reconcile_prefixed_names_keeps_generated_name_when_no_state() {
+        let mut resource = Resource::with_provider("awscc", "s3_bucket", "test-bucket");
+        resource
+            .prefixes
+            .insert("bucket_name".to_string(), "my-app-".to_string());
+        resource.attributes.insert(
+            "bucket_name".to_string(),
+            Value::String("my-app-abcd1234".to_string()),
+        );
+
+        let mut resources = vec![resource];
+        reconcile_prefixed_names(&mut resources, &None);
+
+        // No state, so keep the generated name
+        assert_eq!(
+            resources[0].attributes.get("bucket_name"),
+            Some(&Value::String("my-app-abcd1234".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_generate_random_suffix_format() {
+        let suffix = generate_random_suffix();
+        assert_eq!(suffix.len(), 8);
+        assert!(suffix.chars().all(|c| c.is_ascii_hexdigit()));
     }
 }
