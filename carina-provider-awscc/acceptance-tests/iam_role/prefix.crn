@@ -1,0 +1,24 @@
+# IAM Role - role_name_prefix test
+#
+# Tests: role_name_prefix generates a unique name with prefix + random suffix,
+#        plan-verify confirms state reconciliation preserves the generated name,
+#        destroy cleans up the prefixed resource.
+
+provider awscc {
+  region = aws.Region.ap_northeast_1
+}
+
+let role = awscc.iam_role {
+  role_name_prefix = "carina-acc-test-"
+
+  assume_role_policy_document = {
+    version = "2012-10-17"
+    statement = [
+      {
+        effect    = "Allow"
+        principal = { service = "lambda.amazonaws.com" }
+        action    = "sts:AssumeRole"
+      }
+    ]
+  }
+}
