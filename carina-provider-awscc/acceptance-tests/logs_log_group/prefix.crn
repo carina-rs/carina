@@ -1,0 +1,14 @@
+# CloudWatch Logs Log Group - log_group_name_prefix test
+#
+# Tests: log_group_name_prefix generates a unique name with prefix + random suffix,
+#        plan-verify confirms state reconciliation preserves the generated name,
+#        destroy cleans up the prefixed resource.
+
+provider awscc {
+  region = aws.Region.ap_northeast_1
+}
+
+let log_group = awscc.logs_log_group {
+  log_group_name_prefix = "/carina/acc-test-"
+  retention_in_days     = 1
+}

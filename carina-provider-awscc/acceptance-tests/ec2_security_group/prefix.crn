@@ -1,0 +1,19 @@
+# EC2 Security Group - group_name_prefix test
+#
+# Tests: group_name_prefix generates a unique name with prefix + random suffix,
+#        plan-verify confirms state reconciliation preserves the generated name,
+#        destroy cleans up the prefixed resource.
+
+provider awscc {
+  region = aws.Region.ap_northeast_1
+}
+
+let vpc = awscc.ec2_vpc {
+  cidr_block = "10.0.0.0/16"
+}
+
+let sg = awscc.ec2_security_group {
+  vpc_id             = vpc.vpc_id
+  group_description  = "Acceptance test - group_name_prefix"
+  group_name_prefix  = "carina-acc-test-"
+}
