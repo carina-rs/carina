@@ -572,6 +572,7 @@ fn parse_anonymous_resource(
         attributes,
         read_only: false,
         lifecycle,
+        prefixes: HashMap::new(),
     })
 }
 
@@ -692,6 +693,7 @@ fn parse_resource_expr(
         attributes,
         read_only: false,
         lifecycle,
+        prefixes: HashMap::new(),
     })
 }
 
@@ -739,6 +741,7 @@ fn parse_read_resource_expr(
         attributes,
         read_only: true,
         lifecycle,
+        prefixes: HashMap::new(),
     })
 }
 

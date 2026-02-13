@@ -319,6 +319,7 @@ mod tests {
                 },
                 read_only: false,
                 lifecycle: LifecycleConfig::default(),
+                prefixes: HashMap::new(),
             }],
             variables: HashMap::new(),
             imports: vec![],

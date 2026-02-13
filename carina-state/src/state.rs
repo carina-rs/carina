@@ -120,6 +120,9 @@ pub struct ResourceState {
     /// Lifecycle configuration persisted from DSL
     #[serde(default)]
     pub lifecycle: LifecycleConfig,
+    /// Attribute prefixes used to generate names (e.g., {"bucket_name": "my-app-"})
+    #[serde(default)]
+    pub prefixes: HashMap<String, String>,
 }
 
 impl ResourceState {
@@ -137,6 +140,7 @@ impl ResourceState {
             attributes: HashMap::new(),
             protected: false,
             lifecycle: LifecycleConfig::default(),
+            prefixes: HashMap::new(),
         }
     }
 
@@ -243,5 +247,39 @@ mod tests {
         assert_eq!(deserialized.serial, state.serial);
         assert_eq!(deserialized.lineage, state.lineage);
         assert_eq!(deserialized.resources.len(), 1);
+    }
+
+    #[test]
+    fn test_resource_state_prefixes_serialization() {
+        let mut resource = ResourceState::new("s3_bucket", "test-bucket", "awscc").with_attribute(
+            "bucket_name".to_string(),
+            serde_json::json!("my-app-abcd1234"),
+        );
+        resource
+            .prefixes
+            .insert("bucket_name".to_string(), "my-app-".to_string());
+
+        let json = serde_json::to_string_pretty(&resource).unwrap();
+        let deserialized: ResourceState = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(
+            deserialized.prefixes.get("bucket_name"),
+            Some(&"my-app-".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resource_state_backward_compatibility_without_prefixes() {
+        // Simulate an old state file without the prefixes field
+        let json = r#"{
+            "resource_type": "s3.bucket",
+            "name": "my-bucket",
+            "provider": "aws",
+            "attributes": {"region": "ap-northeast-1"},
+            "protected": false
+        }"#;
+
+        let deserialized: ResourceState = serde_json::from_str(json).unwrap();
+        assert!(deserialized.prefixes.is_empty());
     }
 }

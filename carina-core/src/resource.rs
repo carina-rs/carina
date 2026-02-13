@@ -105,6 +105,10 @@ pub struct Resource {
     /// Lifecycle meta-argument configuration
     #[serde(default)]
     pub lifecycle: LifecycleConfig,
+    /// Attribute prefixes: maps attribute name -> prefix string
+    /// e.g., {"bucket_name": "my-app-"} from `bucket_name_prefix = "my-app-"`
+    #[serde(default)]
+    pub prefixes: HashMap<String, String>,
 }
 
 impl Resource {
@@ -114,6 +118,7 @@ impl Resource {
             attributes: HashMap::new(),
             read_only: false,
             lifecycle: LifecycleConfig::default(),
+            prefixes: HashMap::new(),
         }
     }
 
@@ -127,6 +132,7 @@ impl Resource {
             attributes: HashMap::new(),
             read_only: false,
             lifecycle: LifecycleConfig::default(),
+            prefixes: HashMap::new(),
         }
     }
 
