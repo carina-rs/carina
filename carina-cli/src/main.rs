@@ -15,7 +15,7 @@ use carina_core::module_resolver;
 use carina_core::parser::{self, BackendConfig, ParsedFile, ProviderConfig, TypeExpr};
 use carina_core::plan::Plan;
 use carina_core::provider::{BoxFuture, Provider, ProviderError, ProviderResult, ResourceType};
-use carina_core::resource::{Resource, ResourceId, State, Value};
+use carina_core::resource::{LifecycleConfig, Resource, ResourceId, State, Value};
 use carina_core::schema::ResourceSchema;
 use carina_core::schema::validate_cidr;
 use carina_provider_aws::schemas;
@@ -1245,7 +1245,8 @@ async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
     // Resolve references and create initial plan for display
     let mut resources_for_plan = sorted_resources.clone();
     resolve_refs_with_state(&mut resources_for_plan, &current_states);
-    let plan = create_plan(&resources_for_plan, &current_states);
+    let lifecycles = build_lifecycles_from_state(&state_file);
+    let plan = create_plan(&resources_for_plan, &current_states, &lifecycles);
 
     if plan.is_empty() {
         println!("{}", "No changes needed.".green());
@@ -1376,7 +1377,11 @@ async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
                     }
                 }
             }
-            Effect::Delete { id, identifier } => match provider.delete(id, identifier).await {
+            Effect::Delete {
+                id,
+                identifier,
+                lifecycle,
+            } => match provider.delete(id, identifier, lifecycle).await {
                 Ok(()) => {
                     println!("  {} {}", "✓".green(), format_effect(effect));
                     success_count += 1;
@@ -1804,7 +1809,11 @@ async fn run_apply_from_plan(plan_path: &PathBuf, auto_approve: bool) -> Result<
                     }
                 }
             }
-            Effect::Delete { id, identifier } => match provider.delete(id, identifier).await {
+            Effect::Delete {
+                id,
+                identifier,
+                lifecycle,
+            } => match provider.delete(id, identifier, lifecycle).await {
                 Ok(()) => {
                     println!("  {} {}", "✓".green(), format_effect(effect));
                     success_count += 1;
@@ -2152,6 +2161,7 @@ async fn run_destroy(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
         let effect = Effect::Delete {
             id: resource.id.clone(),
             identifier: identifier.clone(),
+            lifecycle: resource.lifecycle.clone(),
         };
 
         let binding = resource
@@ -2253,7 +2263,9 @@ async fn run_destroy(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
             continue;
         }
 
-        let delete_result = provider.delete(&resource.id, &identifier).await;
+        let delete_result = provider
+            .delete(&resource.id, &identifier, &resource.lifecycle)
+            .await;
 
         match delete_result {
             Ok(()) => {
@@ -2683,7 +2695,10 @@ async fn create_plan_from_parsed(
     let mut resources = sorted_resources.clone();
     resolve_refs_with_state(&mut resources, &current_states);
 
-    let plan = create_plan(&resources, &current_states);
+    // Build lifecycles map from state file for orphaned resource deletion
+    let lifecycles = build_lifecycles_from_state(state_file);
+
+    let plan = create_plan(&resources, &current_states, &lifecycles);
     Ok(PlanContext {
         plan,
         sorted_resources,
@@ -3249,7 +3264,24 @@ fn resource_to_state(
         resource_state.protected = existing.protected;
     }
 
+    // Copy lifecycle configuration from resource
+    resource_state.lifecycle = resource.lifecycle.clone();
+
     resource_state
+}
+
+/// Build a map of ResourceId -> LifecycleConfig from the state file
+fn build_lifecycles_from_state(
+    state_file: &Option<StateFile>,
+) -> HashMap<ResourceId, LifecycleConfig> {
+    let mut lifecycles = HashMap::new();
+    if let Some(sf) = state_file {
+        for rs in &sf.resources {
+            let id = ResourceId::with_provider(&rs.provider, &rs.resource_type, &rs.name);
+            lifecycles.insert(id, rs.lifecycle.clone());
+        }
+    }
+    lifecycles
 }
 
 /// Convert Value to serde_json::Value
@@ -3398,7 +3430,10 @@ async fn run_state_bucket_delete(
 
     // Delete the bucket resource (for S3, identifier is the bucket name)
     let bucket_id = ResourceId::with_provider("aws", "s3.bucket", bucket_name);
-    match aws_provider.delete(&bucket_id, bucket_name).await {
+    match aws_provider
+        .delete(&bucket_id, bucket_name, &LifecycleConfig::default())
+        .await
+    {
         Ok(()) => {
             println!(
                 "{}",
@@ -3593,7 +3628,12 @@ impl Provider for FileProvider {
         })
     }
 
-    fn delete(&self, id: &ResourceId, _identifier: &str) -> BoxFuture<'_, ProviderResult<()>> {
+    fn delete(
+        &self,
+        id: &ResourceId,
+        _identifier: &str,
+        _lifecycle: &LifecycleConfig,
+    ) -> BoxFuture<'_, ProviderResult<()>> {
         let id = id.clone();
         Box::pin(async move {
             let mut states = self.load_states();
@@ -3892,6 +3932,7 @@ mod tests {
         plan.add(Effect::Delete {
             id: ResourceId::with_provider("aws", "s3.bucket", "old-bucket"),
             identifier: "old-bucket".to_string(),
+            lifecycle: LifecycleConfig::default(),
         });
 
         let sorted_resources = vec![

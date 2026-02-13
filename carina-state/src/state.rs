@@ -1,5 +1,6 @@
 //! State file structures for persisting infrastructure state
 
+use carina_core::resource::LifecycleConfig;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -116,6 +117,9 @@ pub struct ResourceState {
     /// Whether this resource is protected from deletion (e.g., state bucket)
     #[serde(default)]
     pub protected: bool,
+    /// Lifecycle configuration persisted from DSL
+    #[serde(default)]
+    pub lifecycle: LifecycleConfig,
 }
 
 impl ResourceState {
@@ -132,6 +136,7 @@ impl ResourceState {
             identifier: None,
             attributes: HashMap::new(),
             protected: false,
+            lifecycle: LifecycleConfig::default(),
         }
     }
 

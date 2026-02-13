@@ -119,8 +119,12 @@ impl<P: Provider> Interpreter<P> {
                 let state = self.provider.update(id, identifier, from, to).await?;
                 Ok(EffectOutcome::Updated { state })
             }
-            Effect::Delete { id, identifier } => {
-                self.provider.delete(id, identifier).await?;
+            Effect::Delete {
+                id,
+                identifier,
+                lifecycle,
+            } => {
+                self.provider.delete(id, identifier, lifecycle).await?;
                 Ok(EffectOutcome::Deleted)
             }
         }
@@ -131,7 +135,7 @@ impl<P: Provider> Interpreter<P> {
 mod tests {
     use super::*;
     use crate::provider::BoxFuture;
-    use crate::resource::{Resource, ResourceId};
+    use crate::resource::{LifecycleConfig, Resource, ResourceId};
 
     struct TestProvider;
 
@@ -170,7 +174,12 @@ mod tests {
             Box::pin(async move { Ok(state) })
         }
 
-        fn delete(&self, _id: &ResourceId, _identifier: &str) -> BoxFuture<'_, ProviderResult<()>> {
+        fn delete(
+            &self,
+            _id: &ResourceId,
+            _identifier: &str,
+            _lifecycle: &LifecycleConfig,
+        ) -> BoxFuture<'_, ProviderResult<()>> {
             Box::pin(async { Ok(()) })
         }
     }

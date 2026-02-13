@@ -297,6 +297,7 @@ pub fn get_parsed_file(path: &Path) -> Result<ParsedFile, ModuleError> {
 mod tests {
     use super::*;
     use crate::parser::{InputParameter, TypeExpr};
+    use crate::resource::LifecycleConfig;
 
     fn create_test_module() -> ParsedFile {
         ParsedFile {
@@ -317,6 +318,7 @@ mod tests {
                     attrs
                 },
                 read_only: false,
+                lifecycle: LifecycleConfig::default(),
             }],
             variables: HashMap::new(),
             imports: vec![],

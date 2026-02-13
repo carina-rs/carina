@@ -280,6 +280,7 @@ mod tests {
         plan.add(Effect::Delete {
             id: crate::resource::ResourceId::new("s3_bucket", "c"),
             identifier: String::new(),
+            lifecycle: crate::resource::LifecycleConfig::default(),
         });
 
         let summary = plan.summary();
@@ -358,6 +359,7 @@ mod tests {
         plan.add(Effect::Delete {
             id: ResourceId::new("s3_bucket", "b"),
             identifier: "b-id".to_string(),
+            lifecycle: crate::resource::LifecycleConfig::default(),
         });
 
         let json = serde_json::to_string(&plan).unwrap();

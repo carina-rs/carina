@@ -86,6 +86,15 @@ pub enum Value {
     UnresolvedIdent(String, Option<String>),
 }
 
+/// Lifecycle configuration for a resource
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct LifecycleConfig {
+    /// If true, force-delete the resource (e.g., empty S3 bucket before deletion)
+    #[serde(default)]
+    pub force_delete: bool,
+    // Future: create_before_destroy, prevent_destroy (issue #150)
+}
+
 /// Desired state declared in DSL
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Resource {
@@ -93,6 +102,9 @@ pub struct Resource {
     pub attributes: HashMap<String, Value>,
     /// If true, this is a data source (read-only) that won't be modified
     pub read_only: bool,
+    /// Lifecycle meta-argument configuration
+    #[serde(default)]
+    pub lifecycle: LifecycleConfig,
 }
 
 impl Resource {
@@ -101,6 +113,7 @@ impl Resource {
             id: ResourceId::new(resource_type, name),
             attributes: HashMap::new(),
             read_only: false,
+            lifecycle: LifecycleConfig::default(),
         }
     }
 
@@ -113,6 +126,7 @@ impl Resource {
             id: ResourceId::with_provider(provider, resource_type, name),
             attributes: HashMap::new(),
             read_only: false,
+            lifecycle: LifecycleConfig::default(),
         }
     }
 

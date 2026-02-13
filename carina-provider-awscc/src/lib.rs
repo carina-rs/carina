@@ -21,7 +21,7 @@ pub use utils::{
 };
 
 use carina_core::provider::{BoxFuture, Provider, ProviderResult};
-use carina_core::resource::{Resource, ResourceId, State};
+use carina_core::resource::{LifecycleConfig, Resource, ResourceId, State};
 
 use resources::resource_types;
 
@@ -69,9 +69,15 @@ impl Provider for AwsccProvider {
         Box::pin(async move { self.update_resource(id, &identifier, to).await })
     }
 
-    fn delete(&self, id: &ResourceId, identifier: &str) -> BoxFuture<'_, ProviderResult<()>> {
+    fn delete(
+        &self,
+        id: &ResourceId,
+        identifier: &str,
+        lifecycle: &LifecycleConfig,
+    ) -> BoxFuture<'_, ProviderResult<()>> {
         let id = id.clone();
         let identifier = identifier.to_string();
-        Box::pin(async move { self.delete_resource(&id, &identifier).await })
+        let lifecycle = lifecycle.clone();
+        Box::pin(async move { self.delete_resource(&id, &identifier, &lifecycle).await })
     }
 }

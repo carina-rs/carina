@@ -7,7 +7,7 @@ use std::collections::HashMap;
 
 use crate::effect::Effect;
 use crate::plan::Plan;
-use crate::resource::{Resource, ResourceId, State, Value};
+use crate::resource::{LifecycleConfig, Resource, ResourceId, State, Value};
 
 /// Result of a diff operation
 #[derive(Debug, Clone, PartialEq)]
@@ -77,7 +77,15 @@ fn find_changed_attributes(
 }
 
 /// Compute Diff for multiple resources and generate a Plan
-pub fn create_plan(desired: &[Resource], current_states: &HashMap<ResourceId, State>) -> Plan {
+///
+/// The `lifecycles` map provides lifecycle configuration for orphaned resources
+/// (resources in state but not in desired). For desired resources, the lifecycle
+/// is read directly from the Resource struct.
+pub fn create_plan(
+    desired: &[Resource],
+    current_states: &HashMap<ResourceId, State>,
+    lifecycles: &HashMap<ResourceId, LifecycleConfig>,
+) -> Plan {
     let mut plan = Plan::new();
 
     let desired_ids: std::collections::HashSet<&ResourceId> =
@@ -110,7 +118,12 @@ pub fn create_plan(desired: &[Resource], current_states: &HashMap<ResourceId, St
                     .get(&id)
                     .and_then(|s| s.identifier.clone())
                     .unwrap_or_default();
-                plan.add(Effect::Delete { id, identifier });
+                let lifecycle = resource.lifecycle.clone();
+                plan.add(Effect::Delete {
+                    id,
+                    identifier,
+                    lifecycle,
+                });
             }
         }
     }
@@ -119,9 +132,11 @@ pub fn create_plan(desired: &[Resource], current_states: &HashMap<ResourceId, St
     for (id, state) in current_states {
         if state.exists && !desired_ids.contains(id) {
             let identifier = state.identifier.clone().unwrap_or_default();
+            let lifecycle = lifecycles.get(id).cloned().unwrap_or_default();
             plan.add(Effect::Delete {
                 id: id.clone(),
                 identifier,
+                lifecycle,
             });
         }
     }
@@ -197,7 +212,7 @@ mod tests {
             State::existing(ResourceId::new("bucket", "existing-bucket"), attrs),
         );
 
-        let plan = create_plan(&resources, &current_states);
+        let plan = create_plan(&resources, &current_states, &HashMap::new());
 
         assert_eq!(plan.effects().len(), 2);
         assert!(matches!(plan.effects()[0], Effect::Create(_)));
@@ -214,7 +229,7 @@ mod tests {
         ];
 
         let current_states = HashMap::new();
-        let plan = create_plan(&resources, &current_states);
+        let plan = create_plan(&resources, &current_states, &HashMap::new());
 
         // Should have 2 effects: Read for data source, Create for new bucket
         assert_eq!(plan.effects().len(), 2);
@@ -286,7 +301,7 @@ mod tests {
             State::existing(ResourceId::new("bucket", "orphaned-bucket"), orphan_attrs),
         );
 
-        let plan = create_plan(&desired, &current_states);
+        let plan = create_plan(&desired, &current_states, &HashMap::new());
 
         // Should have 1 effect: Delete for orphaned-bucket
         // (keep-this has NoChange, so no effect)
@@ -324,7 +339,7 @@ mod tests {
             State::existing(ResourceId::new("bucket", "existing-bucket"), attrs),
         );
 
-        let plan = create_plan(&resources, &current_states);
+        let plan = create_plan(&resources, &current_states, &HashMap::new());
 
         // Should still have Read effect, not NoChange
         assert_eq!(plan.effects().len(), 1);

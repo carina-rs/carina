@@ -10,7 +10,7 @@ use aws_config::Region;
 use aws_sdk_cloudcontrol::Client as CloudControlClient;
 use aws_sdk_cloudcontrol::types::OperationStatus;
 use carina_core::provider::{ProviderError, ProviderResult};
-use carina_core::resource::{Resource, ResourceId, State, Value};
+use carina_core::resource::{LifecycleConfig, Resource, ResourceId, State, Value};
 use heck::{ToPascalCase, ToSnakeCase};
 use serde_json::json;
 
@@ -43,6 +43,7 @@ const CREATE_RETRY_MAX_DELAY_SECS: u64 = 120;
 /// AWS Cloud Control Provider
 pub struct AwsccProvider {
     cloudcontrol_client: CloudControlClient,
+    aws_config: aws_config::SdkConfig,
     region: String,
 }
 
@@ -56,8 +57,88 @@ impl AwsccProvider {
 
         Self {
             cloudcontrol_client: CloudControlClient::new(&config),
+            aws_config: config,
             region: region.to_string(),
         }
+    }
+
+    /// Create an S3 client from the stored config
+    fn s3_client(&self) -> aws_sdk_s3::Client {
+        aws_sdk_s3::Client::new(&self.aws_config)
+    }
+
+    /// Empty an S3 bucket by deleting all objects and versions
+    async fn empty_s3_bucket(&self, bucket_name: &str) -> ProviderResult<()> {
+        let s3 = self.s3_client();
+
+        // Delete all object versions (handles versioned and non-versioned buckets)
+        let mut key_marker: Option<String> = None;
+        let mut version_id_marker: Option<String> = None;
+
+        loop {
+            let mut req = s3.list_object_versions().bucket(bucket_name).max_keys(1000);
+            if let Some(ref km) = key_marker {
+                req = req.key_marker(km);
+            }
+            if let Some(ref vim) = version_id_marker {
+                req = req.version_id_marker(vim);
+            }
+
+            let response = req.send().await.map_err(|e| {
+                ProviderError::new(format!("Failed to list object versions: {:?}", e))
+            })?;
+
+            let mut objects_to_delete = Vec::new();
+
+            // Collect versions
+            for version in response.versions() {
+                if let Some(key) = version.key() {
+                    let mut id = aws_sdk_s3::types::ObjectIdentifier::builder().key(key);
+                    if let Some(vid) = version.version_id() {
+                        id = id.version_id(vid);
+                    }
+                    objects_to_delete.push(id.build().unwrap());
+                }
+            }
+
+            // Collect delete markers
+            for marker in response.delete_markers() {
+                if let Some(key) = marker.key() {
+                    let mut id = aws_sdk_s3::types::ObjectIdentifier::builder().key(key);
+                    if let Some(vid) = marker.version_id() {
+                        id = id.version_id(vid);
+                    }
+                    objects_to_delete.push(id.build().unwrap());
+                }
+            }
+
+            // Batch delete (max 1000 per request)
+            if !objects_to_delete.is_empty() {
+                let delete = aws_sdk_s3::types::Delete::builder()
+                    .set_objects(Some(objects_to_delete))
+                    .quiet(true)
+                    .build()
+                    .unwrap();
+
+                s3.delete_objects()
+                    .bucket(bucket_name)
+                    .delete(delete)
+                    .send()
+                    .await
+                    .map_err(|e| {
+                        ProviderError::new(format!("Failed to delete objects: {:?}", e))
+                    })?;
+            }
+
+            if response.is_truncated() == Some(true) {
+                key_marker = response.next_key_marker().map(|s| s.to_string());
+                version_id_marker = response.next_version_id_marker().map(|s| s.to_string());
+            } else {
+                break;
+            }
+        }
+
+        Ok(())
     }
 
     // =========================================================================
@@ -515,7 +596,12 @@ impl AwsccProvider {
     }
 
     /// Delete a resource
-    pub async fn delete_resource(&self, id: &ResourceId, identifier: &str) -> ProviderResult<()> {
+    pub async fn delete_resource(
+        &self,
+        id: &ResourceId,
+        identifier: &str,
+        lifecycle: &LifecycleConfig,
+    ) -> ProviderResult<()> {
         let config = get_schema_config(&id.resource_type).ok_or_else(|| {
             ProviderError::new(format!("Unknown resource type: {}", id.resource_type))
                 .for_resource(id.clone())
@@ -523,6 +609,14 @@ impl AwsccProvider {
 
         // Handle special pre-delete operations
         self.pre_delete_operations(id, &config, identifier).await?;
+
+        // Handle force_delete for S3 buckets: empty the bucket before deletion
+        if lifecycle.force_delete && id.resource_type == "s3_bucket" {
+            self.empty_s3_bucket(identifier).await.map_err(|e| {
+                ProviderError::new(format!("Failed to empty S3 bucket before deletion: {}", e))
+                    .for_resource(id.clone())
+            })?;
+        }
 
         self.cc_delete_resource(config.aws_type_name, identifier)
             .await

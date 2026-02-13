@@ -12,6 +12,9 @@ let vpc = awscc.ec2_vpc {
 }
 
 let bucket = awscc.s3_bucket {
+  lifecycle {
+    force_delete = true
+  }
 }
 
 let flow_log = awscc.ec2_flow_log {
