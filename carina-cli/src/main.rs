@@ -1400,6 +1400,9 @@ async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
         current_states.insert(resource.id.clone(), state);
     }
 
+    // Restore create-only attributes from state file (CloudControl doesn't return them)
+    restore_create_only_attrs_from_state(&mut current_states, &state_file);
+
     // Build initial binding map for reference resolution
     let mut binding_map: HashMap<String, HashMap<String, Value>> = HashMap::new();
     for resource in &sorted_resources {
@@ -2939,6 +2942,9 @@ async fn create_plan_from_parsed(
         current_states.insert(resource.id.clone(), state);
     }
 
+    // Restore create-only attributes from state file (CloudControl doesn't return them)
+    restore_create_only_attrs_from_state(&mut current_states, state_file);
+
     // Resolve ResourceRef values and enum identifiers using AWS state
     let mut resources = sorted_resources.clone();
     resolve_refs_with_state(&mut resources, &current_states);
@@ -3562,6 +3568,67 @@ fn value_to_json(value: &Value) -> serde_json::Value {
             Some(m) => serde_json::Value::String(format!("{}.{}", name, m)),
             None => serde_json::Value::String(name.clone()),
         },
+    }
+}
+
+/// Convert serde_json::Value to DSL Value
+fn json_to_dsl_value(json: &serde_json::Value) -> Value {
+    match json {
+        serde_json::Value::String(s) => Value::String(s.clone()),
+        serde_json::Value::Number(n) => Value::Int(n.as_i64().unwrap_or(0)),
+        serde_json::Value::Bool(b) => Value::Bool(*b),
+        serde_json::Value::Array(items) => {
+            Value::List(items.iter().map(json_to_dsl_value).collect())
+        }
+        serde_json::Value::Object(map) => {
+            let m: HashMap<_, _> = map
+                .iter()
+                .map(|(k, v)| (k.clone(), json_to_dsl_value(v)))
+                .collect();
+            Value::Map(m)
+        }
+        serde_json::Value::Null => Value::String("null".to_string()),
+    }
+}
+
+/// Restore create-only attributes from the state file into read states.
+/// CloudControl API doesn't return create-only properties in GetResource responses,
+/// so we need to carry them forward from the saved state.
+fn restore_create_only_attrs_from_state(
+    current_states: &mut HashMap<ResourceId, State>,
+    state_file: &Option<StateFile>,
+) {
+    let state_file = match state_file {
+        Some(sf) => sf,
+        None => return,
+    };
+    let awscc_configs = carina_provider_awscc::schemas::generated::configs();
+
+    for (resource_id, state) in current_states.iter_mut() {
+        if !state.exists || resource_id.provider != "awscc" {
+            continue;
+        }
+        let config = awscc_configs
+            .iter()
+            .find(|c| c.resource_type_name == resource_id.resource_type);
+        let config = match config {
+            Some(c) => c,
+            None => continue,
+        };
+        let saved = match state_file.find_resource(&resource_id.resource_type, &resource_id.name) {
+            Some(rs) => rs,
+            None => continue,
+        };
+        for (dsl_name, attr_schema) in &config.schema.attributes {
+            if attr_schema.create_only
+                && !state.attributes.contains_key(dsl_name)
+                && let Some(json_val) = saved.attributes.get(dsl_name)
+            {
+                state
+                    .attributes
+                    .insert(dsl_name.clone(), json_to_dsl_value(json_val));
+            }
+        }
     }
 }
 
