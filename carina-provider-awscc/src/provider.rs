@@ -16,7 +16,9 @@ use serde_json::json;
 
 use carina_core::schema::AttributeType;
 
-use crate::schemas::generated::AwsccSchemaConfig;
+use crate::schemas::generated::{
+    AwsccSchemaConfig, canonicalize_enum_value, get_enum_valid_values,
+};
 use crate::utils::{convert_enum_value, normalize_availability_zone, normalize_instance_tenancy};
 
 /// Get the AwsccSchemaConfig for a resource type
@@ -449,7 +451,8 @@ impl AwsccProvider {
             if let Some(aws_name) = &attr_schema.provider_name
                 && let Some(value) = props.get(aws_name.as_str())
             {
-                let dsl_value = self.aws_value_to_dsl(dsl_name, value);
+                let dsl_value =
+                    self.aws_value_to_dsl(dsl_name, value, &attr_schema.attr_type, resource_type);
                 if let Some(v) = dsl_value {
                     attributes.insert(dsl_name.to_string(), v);
                 }
@@ -522,12 +525,27 @@ impl AwsccProvider {
             .await
             .map_err(|e| e.for_resource(resource.id.clone()))?;
 
-        self.read_resource(
-            &resource.id.resource_type,
-            &resource.id.name,
-            Some(&identifier),
-        )
-        .await
+        let mut state = self
+            .read_resource(
+                &resource.id.resource_type,
+                &resource.id.name,
+                Some(&identifier),
+            )
+            .await?;
+
+        // Preserve create-only attributes from the desired resource.
+        // CloudControl API doesn't return create-only properties in GetResource responses,
+        // so we need to carry them forward from the desired state.
+        for (dsl_name, attr_schema) in &config.schema.attributes {
+            if attr_schema.create_only
+                && !state.attributes.contains_key(dsl_name)
+                && let Some(value) = resource.attributes.get(dsl_name.as_str())
+            {
+                state.attributes.insert(dsl_name.to_string(), value.clone());
+            }
+        }
+
+        Ok(state)
     }
 
     /// Update a resource
@@ -628,7 +646,13 @@ impl AwsccProvider {
     // =========================================================================
 
     /// Convert AWS value to DSL value
-    fn aws_value_to_dsl(&self, dsl_name: &str, value: &serde_json::Value) -> Option<Value> {
+    fn aws_value_to_dsl(
+        &self,
+        dsl_name: &str,
+        value: &serde_json::Value,
+        attr_type: &AttributeType,
+        resource_type: &str,
+    ) -> Option<Value> {
         match dsl_name {
             "availability_zone" => {
                 // Convert ap-northeast-1a to aws.AvailabilityZone.ap_northeast_1a
@@ -637,7 +661,28 @@ impl AwsccProvider {
                     Value::String(az_dsl)
                 })
             }
-            _ => self.json_to_value(value),
+            _ => {
+                // For Custom enum types with namespace, convert to DSL namespaced format
+                if let AttributeType::Custom {
+                    name: type_name,
+                    namespace: Some(ns),
+                    ..
+                } = attr_type
+                    && let Some(s) = value.as_str()
+                {
+                    // Canonicalize case using valid values registry
+                    let canonical = if let Some(valid_values) =
+                        get_enum_valid_values(resource_type, dsl_name)
+                    {
+                        canonicalize_enum_value(s, valid_values)
+                    } else {
+                        s.to_string()
+                    };
+                    let namespaced = format!("{}.{}.{}", ns, type_name, canonical);
+                    return Some(Value::String(namespaced));
+                }
+                self.json_to_value(value)
+            }
         }
     }
 

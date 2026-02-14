@@ -40,6 +40,108 @@ pub fn normalize_namespaced_enum(s: &str) -> String {
     }
 }
 
+/// Find the canonical enum value by case-insensitive matching.
+/// Returns the canonical value from valid_values, or the raw value if no match found.
+pub fn canonicalize_enum_value(raw: &str, valid_values: &[&str]) -> String {
+    // Exact match first
+    if valid_values.contains(&raw) {
+        return raw.to_string();
+    }
+    // Case-insensitive match
+    for &valid in valid_values {
+        if valid.eq_ignore_ascii_case(raw) {
+            return valid.to_string();
+        }
+    }
+    // Underscore-to-hyphen match (case-insensitive)
+    let hyphenated = raw.replace('_', "-");
+    for &valid in valid_values {
+        if valid.eq_ignore_ascii_case(&hyphenated) {
+            return valid.to_string();
+        }
+    }
+    // No match - return as-is
+    raw.to_string()
+}
+
+/// Get valid enum values for a given resource type and attribute name.
+/// Used during read-back to normalize AWS-returned values to canonical DSL form.
+pub fn get_enum_valid_values(
+    resource_type: &str,
+    attr_name: &str,
+) -> Option<&'static [&'static str]> {
+    match (resource_type, attr_name) {
+        // ec2_vpc
+        ("ec2_vpc", "instance_tenancy") => Some(&["default", "dedicated", "host"]),
+        // ec2_ipam
+        ("ec2_ipam", "tier") => Some(&["free", "advanced"]),
+        ("ec2_ipam", "metered_account") => Some(&["ipam-owner", "resource-owner"]),
+        // ec2_ipam_pool
+        ("ec2_ipam_pool", "address_family") => Some(&["IPv4", "IPv6"]),
+        ("ec2_ipam_pool", "aws_service") => Some(&["ec2", "global-services"]),
+        ("ec2_ipam_pool", "ipam_scope_type") => Some(&["public", "private"]),
+        ("ec2_ipam_pool", "public_ip_source") => Some(&["byoip", "amazon"]),
+        ("ec2_ipam_pool", "state") => Some(&[
+            "create-in-progress",
+            "create-complete",
+            "modify-in-progress",
+            "modify-complete",
+            "delete-in-progress",
+            "delete-complete",
+        ]),
+        // ec2_nat_gateway
+        ("ec2_nat_gateway", "availability_mode") => Some(&["zonal", "regional"]),
+        ("ec2_nat_gateway", "connectivity_type") => Some(&["public", "private"]),
+        // ec2_eip
+        ("ec2_eip", "domain") => Some(&["vpc", "standard"]),
+        // ec2_vpc_endpoint
+        ("ec2_vpc_endpoint", "ip_address_type") => {
+            Some(&["ipv4", "ipv6", "dualstack", "not-specified"])
+        }
+        ("ec2_vpc_endpoint", "vpc_endpoint_type") => {
+            Some(&["Interface", "Gateway", "GatewayLoadBalancer"])
+        }
+        // ec2_flow_log
+        ("ec2_flow_log", "log_destination_type") => {
+            Some(&["cloud-watch-logs", "s3", "kinesis-data-firehose"])
+        }
+        ("ec2_flow_log", "resource_type") => Some(&[
+            "NetworkInterface",
+            "Subnet",
+            "VPC",
+            "TransitGateway",
+            "TransitGatewayAttachment",
+        ]),
+        ("ec2_flow_log", "traffic_type") => Some(&["ACCEPT", "ALL", "REJECT"]),
+        // ec2_transit_gateway
+        ("ec2_transit_gateway", "encryption_support") => Some(&["disable", "enable"]),
+        // ec2_security_group_ingress / egress
+        ("ec2_security_group_ingress", "ip_protocol") => {
+            Some(&["tcp", "udp", "icmp", "icmpv6", "-1"])
+        }
+        ("ec2_security_group_egress", "ip_protocol") => {
+            Some(&["tcp", "udp", "icmp", "icmpv6", "-1"])
+        }
+        // s3_bucket
+        ("s3_bucket", "abac_status") => Some(&["Enabled", "Disabled"]),
+        ("s3_bucket", "access_control") => Some(&[
+            "AuthenticatedRead",
+            "AwsExecRead",
+            "BucketOwnerFullControl",
+            "BucketOwnerRead",
+            "LogDeliveryWrite",
+            "Private",
+            "PublicRead",
+            "PublicReadWrite",
+        ]),
+        // logs_log_group
+        ("logs_log_group", "log_group_class") => {
+            Some(&["STANDARD", "INFREQUENT_ACCESS", "DELIVERY"])
+        }
+        _ => None,
+    }
+}
+
 /// Validate a namespaced enum value.
 /// Returns Ok(()) if valid, Err with message if invalid.
 pub fn validate_namespaced_enum(
@@ -1197,5 +1299,62 @@ mod tests {
         let err_msg = err.to_string();
         assert!(err_msg.contains("vpc-xxxxxxxx"));
         assert!(err_msg.contains("subnet-12345678"));
+    }
+
+    #[test]
+    fn canonicalize_enum_value_exact_match() {
+        assert_eq!(canonicalize_enum_value("IPv4", &["IPv4", "IPv6"]), "IPv4");
+        assert_eq!(
+            canonicalize_enum_value("advanced", &["free", "advanced"]),
+            "advanced"
+        );
+    }
+
+    #[test]
+    fn canonicalize_enum_value_case_insensitive() {
+        // AWS returns lowercase "ipv4" but schema expects "IPv4"
+        assert_eq!(canonicalize_enum_value("ipv4", &["IPv4", "IPv6"]), "IPv4");
+        assert_eq!(canonicalize_enum_value("ipv6", &["IPv4", "IPv6"]), "IPv6");
+        // All-caps should also match
+        assert_eq!(canonicalize_enum_value("IPV4", &["IPv4", "IPv6"]), "IPv4");
+    }
+
+    #[test]
+    fn canonicalize_enum_value_no_match() {
+        // Unknown value returned as-is
+        assert_eq!(
+            canonicalize_enum_value("unknown", &["IPv4", "IPv6"]),
+            "unknown"
+        );
+    }
+
+    #[test]
+    fn canonicalize_enum_value_underscore_to_hyphen() {
+        assert_eq!(
+            canonicalize_enum_value("cloud_watch_logs", &["cloud-watch-logs", "s3"]),
+            "cloud-watch-logs"
+        );
+    }
+
+    #[test]
+    fn get_enum_valid_values_known() {
+        assert_eq!(
+            get_enum_valid_values("ec2_ipam", "tier"),
+            Some(["free", "advanced"].as_slice())
+        );
+        assert_eq!(
+            get_enum_valid_values("ec2_ipam_pool", "address_family"),
+            Some(["IPv4", "IPv6"].as_slice())
+        );
+        assert_eq!(
+            get_enum_valid_values("ec2_vpc", "instance_tenancy"),
+            Some(["default", "dedicated", "host"].as_slice())
+        );
+    }
+
+    #[test]
+    fn get_enum_valid_values_unknown() {
+        assert_eq!(get_enum_valid_values("ec2_vpc", "cidr_block"), None);
+        assert_eq!(get_enum_valid_values("unknown", "unknown"), None);
     }
 }

@@ -31,6 +31,7 @@ pub fn normalize_availability_zone(s: &str) -> String {
 
 /// Convert DSL enum value to AWS SDK format
 /// e.g., "aws.Region.ap_northeast_1" -> "ap-northeast-1"
+/// e.g., "awscc.ec2_ipam.Tier.advanced" -> "advanced"
 pub fn convert_enum_value(value: &str) -> String {
     let parts: Vec<&str> = value.split('.').collect();
     let raw_value = match parts.len() {
@@ -48,6 +49,19 @@ pub fn convert_enum_value(value: &str) -> String {
                 && type_name.chars().next().is_some_and(|c| c.is_uppercase())
             {
                 parts[2]
+            } else {
+                return value.to_string();
+            }
+        }
+        // 4-part: provider.resource.TypeName.value
+        // e.g., "awscc.ec2_ipam.Tier.advanced" -> "advanced"
+        4 => {
+            let provider = parts[0];
+            let type_name = parts[2];
+            if provider.chars().all(|c| c.is_lowercase())
+                && type_name.chars().next().is_some_and(|c| c.is_uppercase())
+            {
+                parts[3]
             } else {
                 return value.to_string();
             }
@@ -99,5 +113,18 @@ mod tests {
             "ap-northeast-1"
         );
         assert_eq!(convert_enum_value("eu-west-1"), "eu-west-1");
+        // 4-part: provider.resource.TypeName.value
+        assert_eq!(
+            convert_enum_value("awscc.ec2_ipam.Tier.advanced"),
+            "advanced"
+        );
+        assert_eq!(
+            convert_enum_value("awscc.ec2_ipam_pool.AddressFamily.IPv4"),
+            "IPv4"
+        );
+        assert_eq!(
+            convert_enum_value("awscc.ec2_vpc.InstanceTenancy.default"),
+            "default"
+        );
     }
 }
