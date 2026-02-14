@@ -112,6 +112,7 @@ if [ "$COMMAND" = "full" ]; then
         mkdir -p "$STATE_DIR"
 
         (
+            set +e
             PASSED=0
             FAILED=0
 
