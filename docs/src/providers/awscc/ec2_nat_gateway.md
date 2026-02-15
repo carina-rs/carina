@@ -151,14 +151,12 @@ Shorthand formats: `public` or `ConnectivityType.public`
 
 ```crn
 let vpc = awscc.ec2_vpc {
-  name                 = "example-vpc"
   cidr_block           = "10.0.0.0/16"
   enable_dns_support   = true
   enable_dns_hostnames = true
 }
 
 let public_subnet = awscc.ec2_subnet {
-  name                    = "example-public-subnet"
   vpc_id                  = vpc.vpc_id
   cidr_block              = "10.0.1.0/24"
   availability_zone       = "ap-northeast-1a"
@@ -166,12 +164,10 @@ let public_subnet = awscc.ec2_subnet {
 }
 
 let eip = awscc.ec2_eip {
-  name   = "example-nat-eip"
   domain = "vpc"
 }
 
-awscc.ec2_nat_gateway {
-  name          = "example-nat-gw"
+let nat_gw = awscc.ec2_nat_gateway {
   allocation_id = eip.allocation_id
   subnet_id     = public_subnet.subnet_id
 

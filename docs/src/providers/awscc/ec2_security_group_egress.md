@@ -47,7 +47,7 @@ The ID of the security group. You must specify exactly one of the following: ``C
 
 ### `from_port`
 
-- **Type:** Int
+- **Type:** Int(-1..=65535)
 - **Required:** No
 
 If the protocol is TCP or UDP, this is the start of the port range. If the protocol is ICMP or ICMPv6, this is the ICMP type or -1 (all ICMP types).
@@ -68,7 +68,7 @@ The IP protocol name (``tcp``, ``udp``, ``icmp``, ``icmpv6``) or number (see [Pr
 
 ### `to_port`
 
-- **Type:** Int
+- **Type:** Int(-1..=65535)
 - **Required:** No
 
 If the protocol is TCP or UDP, this is the end of the port range. If the protocol is ICMP or ICMPv6, this is the ICMP code or -1 (all ICMP codes). If the start port is -1 (all ICMP types), then the end port must be -1 (all ICMP codes).
@@ -99,18 +99,15 @@ Shorthand formats: `tcp` or `IpProtocol.tcp`
 
 ```crn
 let vpc = awscc.ec2_vpc {
-  name       = "example-vpc"
   cidr_block = "10.0.0.0/16"
 }
 
 let sg = awscc.ec2_security_group {
-  name              = "example-sg"
   vpc_id            = vpc.vpc_id
   group_description = "Example security group"
 }
 
-awscc.ec2_security_group_egress {
-  name        = "example-all-outbound"
+let egress = awscc.ec2_security_group_egress {
   group_id    = sg.group_id
   description = "Allow all outbound traffic"
   ip_protocol = "-1"

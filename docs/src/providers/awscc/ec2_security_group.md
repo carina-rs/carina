@@ -59,9 +59,9 @@ The ID of the VPC for the security group.
 | `description` | String | No |  |
 | `destination_prefix_list_id` | AwsResourceId | No |  |
 | `destination_security_group_id` | SecurityGroupId | No |  |
-| `from_port` | Int | No |  |
+| `from_port` | Int(-1..=65535) | No |  |
 | `ip_protocol` | Enum | Yes |  |
-| `to_port` | Int | No |  |
+| `to_port` | Int(-1..=65535) | No |  |
 
 ### Ingress
 
@@ -70,13 +70,13 @@ The ID of the VPC for the security group.
 | `cidr_ip` | Ipv4Cidr | No |  |
 | `cidr_ipv6` | Ipv6Cidr | No |  |
 | `description` | String | No |  |
-| `from_port` | Int | No |  |
+| `from_port` | Int(-1..=65535) | No |  |
 | `ip_protocol` | Enum | Yes |  |
 | `source_prefix_list_id` | AwsResourceId | No |  |
 | `source_security_group_id` | SecurityGroupId | No |  |
 | `source_security_group_name` | String | No |  |
 | `source_security_group_owner_id` | String | No |  |
-| `to_port` | Int | No |  |
+| `to_port` | Int(-1..=65535) | No |  |
 
 ## Attribute Reference
 
@@ -94,12 +94,10 @@ The ID of the VPC for the security group.
 
 ```crn
 let vpc = awscc.ec2_vpc {
-  name       = "example-vpc"
   cidr_block = "10.0.0.0/16"
 }
 
-awscc.ec2_security_group {
-  name              = "example-sg"
+let sg = awscc.ec2_security_group {
   vpc_id            = vpc.vpc_id
   group_description = "Example security group"
 

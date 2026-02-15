@@ -39,18 +39,15 @@ The ID of the virtual private gateway. You must specify either InternetGatewayId
 
 ```crn
 let vpc = awscc.ec2_vpc {
-  name                 = "example-vpc"
   cidr_block           = "10.0.0.0/16"
   enable_dns_support   = true
   enable_dns_hostnames = true
 }
 
 let igw = awscc.ec2_internet_gateway {
-  name = "example-igw"
 }
 
-awscc.ec2_vpc_gateway_attachment {
-  name                = "example-igw-attachment"
+let igw_attachment = awscc.ec2_vpc_gateway_attachment {
   vpc_id              = vpc.vpc_id
   internet_gateway_id = igw.internet_gateway_id
 }

@@ -34,7 +34,7 @@ pub fn ec2_vpc_peering_connection_config() -> AwsccSchemaConfig {
                 .with_provider_name("PeerRegion"),
         )
         .attribute(
-            AttributeSchema::new("peer_role_arn", super::arn())
+            AttributeSchema::new("peer_role_arn", super::iam_role_arn())
                 .create_only()
                 .with_description("The Amazon Resource Name (ARN) of the VPC peer role for the peering connection in another AWS account.")
                 .with_provider_name("PeerRoleArn"),
