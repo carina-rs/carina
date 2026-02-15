@@ -1510,22 +1510,10 @@ fn cfn_type_to_carina_type_with_enum(
                 return ("super::ipam_pool_id()".to_string(), None);
             }
 
-            // AWS resource IDs with known prefix-hex format
-            if is_aws_resource_id_property(prop_name) {
-                return (get_resource_id_type(prop_name).to_string(), None);
-            }
-
             // Other IDs are plain strings (AZ IDs, owner IDs, etc.)
+            // Note: resource IDs and ARNs are already handled by infer_string_type() above
             if prop_lower.ends_with("id") {
                 return ("AttributeType::String".to_string(), None);
-            }
-
-            // ARNs use validated Arn type
-            if prop_lower.ends_with("arn")
-                || prop_lower.ends_with("arns")
-                || prop_lower.contains("_arn")
-            {
-                return ("super::arn()".to_string(), None);
             }
 
             // Availability zone uses format validation (e.g., "us-east-1a")
