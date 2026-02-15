@@ -2789,9 +2789,19 @@ fn resolve_enum_identifiers(resources: &mut [Resource]) {
             None => continue,
         };
 
-        // Resolve enum attributes
+        // Resolve enum attributes and availability_zone
         let mut resolved_attrs = HashMap::new();
         for (key, value) in &resource.attributes {
+            // Resolve availability_zone: "ap-northeast-1a" → "aws.AvailabilityZone.ap_northeast_1a"
+            if key == "availability_zone"
+                && let Value::String(s) = value
+                && !s.contains('.')
+            {
+                let az_dsl = format!("aws.AvailabilityZone.{}", s.replace('-', "_"));
+                resolved_attrs.insert(key.clone(), Value::String(az_dsl));
+                continue;
+            }
+
             if let Some(attr_schema) = config.schema.attributes.get(key.as_str())
                 && let AttributeType::Custom {
                     name: type_name,
