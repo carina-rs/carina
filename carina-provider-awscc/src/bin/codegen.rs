@@ -19,6 +19,7 @@ use regex::Regex;
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{self, Read};
+use std::sync::LazyLock;
 
 /// Information about a detected enum type
 #[derive(Debug, Clone)]
@@ -1175,55 +1176,84 @@ fn generate_struct_type(
 
 /// Known enum overrides for properties where `extract_enum_from_description()` fails
 /// due to inconsistent description formatting in CloudFormation schemas.
-fn known_enum_overrides() -> HashMap<&'static str, Vec<&'static str>> {
-    let mut m = HashMap::new();
-    m.insert("IpProtocol", vec!["tcp", "udp", "icmp", "icmpv6", "-1"]);
-    m.insert("ConnectivityType", vec!["public", "private"]);
-    m.insert("AvailabilityMode", vec!["zonal", "regional"]);
-    m.insert("AddressFamily", vec!["IPv4", "IPv6"]);
-    m.insert("Domain", vec!["vpc", "standard"]);
-    // HostnameType enum values are in parent struct description, not field description
-    m.insert("HostnameType", vec!["ip-name", "resource-name"]);
-    // InternetGatewayBlockMode removed - now auto-detected via "Options here are" pattern
-    // Transit gateway enable/disable properties
-    m.insert("AutoAcceptSharedAttachments", vec!["enable", "disable"]);
-    m.insert("DefaultRouteTableAssociation", vec!["enable", "disable"]);
-    m.insert("DefaultRouteTablePropagation", vec!["enable", "disable"]);
-    m.insert("DnsSupport", vec!["enable", "disable"]);
-    m.insert("MulticastSupport", vec!["enable", "disable"]);
-    m.insert("SecurityGroupReferencingSupport", vec!["enable", "disable"]);
-    m.insert("VpnEcmpSupport", vec!["enable", "disable"]);
-    m
+fn known_enum_overrides() -> &'static HashMap<&'static str, Vec<&'static str>> {
+    static OVERRIDES: LazyLock<HashMap<&'static str, Vec<&'static str>>> = LazyLock::new(|| {
+        let mut m = HashMap::new();
+        m.insert("IpProtocol", vec!["tcp", "udp", "icmp", "icmpv6", "-1"]);
+        m.insert("ConnectivityType", vec!["public", "private"]);
+        m.insert("AvailabilityMode", vec!["zonal", "regional"]);
+        m.insert("AddressFamily", vec!["IPv4", "IPv6"]);
+        m.insert("Domain", vec!["vpc", "standard"]);
+        // HostnameType enum values are in parent struct description, not field description
+        m.insert("HostnameType", vec!["ip-name", "resource-name"]);
+        // InternetGatewayBlockMode removed - now auto-detected via "Options here are" pattern
+        // Transit gateway enable/disable properties
+        m.insert("AutoAcceptSharedAttachments", vec!["enable", "disable"]);
+        m.insert("DefaultRouteTableAssociation", vec!["enable", "disable"]);
+        m.insert("DefaultRouteTablePropagation", vec!["enable", "disable"]);
+        m.insert("DnsSupport", vec!["enable", "disable"]);
+        m.insert("MulticastSupport", vec!["enable", "disable"]);
+        m.insert("SecurityGroupReferencingSupport", vec!["enable", "disable"]);
+        m.insert("VpnEcmpSupport", vec!["enable", "disable"]);
+        m
+    });
+    &OVERRIDES
 }
 
 /// Known integer range overrides for properties where CloudFormation schemas
 /// don't include min/max constraints but the ranges are well-known.
-fn known_int_range_overrides() -> HashMap<&'static str, (i64, i64)> {
-    let mut m = HashMap::new();
-    m.insert("Ipv4NetmaskLength", (0, 32));
-    m.insert("Ipv6NetmaskLength", (0, 128));
-    m.insert("FromPort", (-1, 65535));
-    m.insert("ToPort", (-1, 65535));
-    m.insert("MaxSessionDuration", (3600, 43200));
-    m
+fn known_int_range_overrides() -> &'static HashMap<&'static str, (i64, i64)> {
+    static OVERRIDES: LazyLock<HashMap<&'static str, (i64, i64)>> = LazyLock::new(|| {
+        let mut m = HashMap::new();
+        m.insert("Ipv4NetmaskLength", (0, 32));
+        m.insert("Ipv6NetmaskLength", (0, 128));
+        m.insert("FromPort", (-1, 65535));
+        m.insert("ToPort", (-1, 65535));
+        m.insert("MaxSessionDuration", (3600, 43200));
+        m
+    });
+    &OVERRIDES
 }
 
 /// Known string type overrides for properties where the CloudFormation type is
 /// plain "string" but should use a more specific type.
-fn known_string_type_overrides() -> HashMap<&'static str, &'static str> {
-    let mut m = HashMap::new();
-    m.insert("DefaultSecurityGroup", "super::security_group_id()");
-    m.insert("DefaultNetworkAcl", "super::aws_resource_id()");
-    m.insert("DeliverCrossAccountRole", "super::iam_role_arn()");
-    m.insert("DeliverLogsPermissionArn", "super::iam_role_arn()");
-    m.insert("PeerRoleArn", "super::iam_role_arn()");
-    m.insert("PermissionsBoundary", "super::iam_policy_arn()");
-    m.insert("ManagedPolicyArns", "super::iam_policy_arn()");
-    m.insert("KmsKeyId", "super::kms_key_arn()");
-    m.insert("KMSMasterKeyID", "super::kms_key_arn()");
-    m.insert("ReplicaKmsKeyID", "super::kms_key_arn()");
-    m.insert("KmsKeyArn", "super::kms_key_arn()");
-    m
+fn known_string_type_overrides() -> &'static HashMap<&'static str, &'static str> {
+    static OVERRIDES: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| {
+        let mut m = HashMap::new();
+        m.insert("DefaultSecurityGroup", "super::security_group_id()");
+        m.insert("DefaultNetworkAcl", "super::aws_resource_id()");
+        m.insert("DeliverCrossAccountRole", "super::iam_role_arn()");
+        m.insert("DeliverLogsPermissionArn", "super::iam_role_arn()");
+        m.insert("PeerRoleArn", "super::iam_role_arn()");
+        m.insert("PermissionsBoundary", "super::iam_policy_arn()");
+        m.insert("ManagedPolicyArns", "super::iam_policy_arn()");
+        m.insert("KmsKeyId", "super::kms_key_arn()");
+        m.insert("KMSMasterKeyID", "super::kms_key_arn()");
+        m.insert("ReplicaKmsKeyID", "super::kms_key_arn()");
+        m.insert("KmsKeyArn", "super::kms_key_arn()");
+        m
+    });
+    &OVERRIDES
+}
+
+/// Infer the Carina type string for a property based on its name.
+/// Checks known string type overrides, ARN patterns, and resource ID patterns.
+/// Returns None if no heuristic matches (caller should default to String).
+fn infer_string_type(prop_name: &str) -> Option<String> {
+    // Check known string type overrides
+    if let Some(&override_type) = known_string_type_overrides().get(prop_name) {
+        return Some(override_type.to_string());
+    }
+    // Check ARN pattern
+    let prop_lower = prop_name.to_lowercase();
+    if prop_lower.ends_with("arn") || prop_lower.ends_with("arns") || prop_lower.contains("_arn") {
+        return Some("super::arn()".to_string());
+    }
+    // Check resource ID pattern
+    if is_aws_resource_id_property(prop_name) {
+        return Some(get_resource_id_type(prop_name).to_string());
+    }
+    None
 }
 
 /// Check if a property name represents an AWS resource ID with the standard
@@ -1397,21 +1427,8 @@ fn cfn_type_to_carina_type_with_enum(
             );
         }
         // Apply name-based heuristics for unresolvable $ref
-        // Check known string type overrides
-        if let Some(&override_type) = known_string_type_overrides().get(prop_name) {
-            return (override_type.to_string(), None);
-        }
-        // Check ARN pattern
-        let prop_lower = prop_name.to_lowercase();
-        if prop_lower.ends_with("arn")
-            || prop_lower.ends_with("arns")
-            || prop_lower.contains("_arn")
-        {
-            return ("super::arn()".to_string(), None);
-        }
-        // Check resource ID pattern
-        if is_aws_resource_id_property(prop_name) {
-            return (get_resource_id_type(prop_name).to_string(), None);
+        if let Some(inferred) = infer_string_type(prop_name) {
+            return (inferred, None);
         }
         return ("AttributeType::String".to_string(), None);
     }
@@ -1452,8 +1469,8 @@ fn cfn_type_to_carina_type_with_enum(
     match prop.prop_type.as_ref().and_then(|t| t.as_str()) {
         Some("string") => {
             // Check known string type overrides first
-            if let Some(&override_type) = known_string_type_overrides().get(prop_name) {
-                return (override_type.to_string(), None);
+            if let Some(inferred) = infer_string_type(prop_name) {
+                return (inferred, None);
             }
 
             // Check if this is a policy document field (CFN sometimes types these as "string")
@@ -1620,24 +1637,12 @@ fn cfn_type_to_carina_type_with_enum(
             )
         }
         _ => {
-            // Fallback: apply name-based heuristics for $ref properties with no explicit type
-            // Check known string type overrides
-            if let Some(&override_type) = known_string_type_overrides().get(prop_name) {
-                return (override_type.to_string(), None);
+            // Fallback: apply name-based heuristics for properties with no explicit type
+            if let Some(inferred) = infer_string_type(prop_name) {
+                (inferred, None)
+            } else {
+                ("AttributeType::String".to_string(), None)
             }
-            // Check ARN pattern
-            let prop_lower = prop_name.to_lowercase();
-            if prop_lower.ends_with("arn")
-                || prop_lower.ends_with("arns")
-                || prop_lower.contains("_arn")
-            {
-                return ("super::arn()".to_string(), None);
-            }
-            // Check resource ID pattern
-            if is_aws_resource_id_property(prop_name) {
-                return (get_resource_id_type(prop_name).to_string(), None);
-            }
-            ("AttributeType::String".to_string(), None)
         }
     }
 }
