@@ -39,8 +39,7 @@ The type of VPN connection the virtual private gateway supports.
 ## Example
 
 ```crn
-awscc.ec2_vpn_gateway {
-  name = "example-vpn-gw"
+let vpn_gw = awscc.ec2_vpn_gateway {
   type = "ipsec.1"
 
   tags = {

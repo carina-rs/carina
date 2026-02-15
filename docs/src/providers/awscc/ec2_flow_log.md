@@ -8,14 +8,14 @@ Specifies a VPC flow log, which enables you to capture IP traffic for a specific
 
 ### `deliver_cross_account_role`
 
-- **Type:** String
+- **Type:** IamRoleArn
 - **Required:** No
 
 The ARN of the IAM role that allows Amazon EC2 to publish flow logs across accounts.
 
 ### `deliver_logs_permission_arn`
 
-- **Type:** Arn
+- **Type:** IamRoleArn
 - **Required:** No
 
 The ARN for the IAM role that permits Amazon EC2 to publish flow logs to a CloudWatch Logs log group in your account. If you specify LogDestinationType as s3 or kinesis-data-firehose, do not specify DeliverLogsPermissionArn or LogGroupName.
@@ -145,12 +145,10 @@ Shorthand formats: `ACCEPT` or `TrafficType.ACCEPT`
 
 ```crn
 let vpc = awscc.ec2_vpc {
-  name       = "example-vpc"
   cidr_block = "10.0.0.0/16"
 }
 
-awscc.ec2_flow_log {
-  name                 = "example-flow-log"
+let flow_log = awscc.ec2_flow_log {
   resource_id          = vpc.vpc_id
   resource_type        = VPC
   traffic_type         = ALL

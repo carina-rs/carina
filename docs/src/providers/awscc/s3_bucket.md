@@ -341,7 +341,7 @@ Shorthand formats: `AuthenticatedRead` or `AccessControl.AuthenticatedRead`
 
 ### `arn`
 
-- **Type:** String
+- **Type:** Arn
 
 ### `domain_name`
 

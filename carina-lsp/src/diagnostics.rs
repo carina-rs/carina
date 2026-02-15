@@ -532,6 +532,13 @@ impl DiagnosticEngine {
                             (carina_core::schema::AttributeType::Int, Value::String(s)) => Some(
                                 format!("Type mismatch: expected Int, got String \"{}\".", s),
                             ),
+                            // Custom types with Int base (e.g., ranged integers)
+                            (
+                                carina_core::schema::AttributeType::Custom { base, .. },
+                                Value::String(s),
+                            ) if matches!(**base, carina_core::schema::AttributeType::Int) => Some(
+                                format!("Type mismatch: expected Int, got String \"{}\".", s),
+                            ),
                             _ => None,
                         };
 

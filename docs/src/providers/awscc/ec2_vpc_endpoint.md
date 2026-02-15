@@ -167,27 +167,23 @@ Shorthand formats: `Interface` or `VpcEndpointType.Interface`
 
 ```crn
 let vpc = awscc.ec2_vpc {
-  name                 = "example-vpc"
   cidr_block           = "10.0.0.0/16"
   enable_dns_support   = true
   enable_dns_hostnames = true
 }
 
 let subnet = awscc.ec2_subnet {
-  name              = "example-private-subnet"
   vpc_id            = vpc.vpc_id
   cidr_block        = "10.0.100.0/24"
   availability_zone = "ap-northeast-1a"
 }
 
 let sg = awscc.ec2_security_group {
-  name              = "example-endpoint-sg"
   vpc_id            = vpc.vpc_id
   group_description = "SG for VPC Endpoint"
 }
 
-awscc.ec2_security_group_ingress {
-  name        = "example-endpoint-https"
+let ingress = awscc.ec2_security_group_ingress {
   group_id    = sg.group_id
   description = "Allow HTTPS from VPC"
   ip_protocol = "tcp"
@@ -196,8 +192,7 @@ awscc.ec2_security_group_ingress {
   cidr_ip     = "10.0.0.0/16"
 }
 
-awscc.ec2_vpc_endpoint {
-  name                = "example-ecr-dkr"
+let vpc_endpoint = awscc.ec2_vpc_endpoint {
   vpc_id              = vpc.vpc_id
   service_name        = "com.amazonaws.ap-northeast-1.ecr.dkr"
   vpc_endpoint_type   = "Interface"

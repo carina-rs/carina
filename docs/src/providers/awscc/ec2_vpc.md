@@ -45,7 +45,7 @@ The ID of an IPv4 IPAM pool you want to use for allocating this VPC's CIDR. For 
 
 ### `ipv4_netmask_length`
 
-- **Type:** Int
+- **Type:** Int(0..=32)
 - **Required:** No
 
 The netmask length of the IPv4 CIDR you want to allocate to this VPC from an Amazon VPC IP Address Manager (IPAM) pool. For more information about IPAM, see [What is IPAM?](https://docs.aws.amazon.com//vpc/latest/ipam/what-is-it-ipam.html) in the *Amazon VPC IPAM User Guide*.
@@ -77,11 +77,11 @@ Shorthand formats: `default` or `InstanceTenancy.default`
 
 ### `default_network_acl`
 
-- **Type:** String
+- **Type:** AwsResourceId
 
 ### `default_security_group`
 
-- **Type:** String
+- **Type:** SecurityGroupId
 
 ### `ipv6_cidr_blocks`
 
@@ -96,8 +96,7 @@ Shorthand formats: `default` or `InstanceTenancy.default`
 ## Example
 
 ```crn
-awscc.ec2_vpc {
-  name                 = "example-vpc"
+let vpc = awscc.ec2_vpc {
   cidr_block           = "10.0.0.0/16"
   enable_dns_support   = true
   enable_dns_hostnames = true

@@ -6,7 +6,20 @@
 
 use super::AwsccSchemaConfig;
 use super::tags_type;
+use carina_core::resource::Value;
 use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
+
+fn validate_max_session_duration_range(value: &Value) -> Result<(), String> {
+    if let Value::Int(n) = value {
+        if *n < 3600 || *n > 43200 {
+            Err(format!("Value {} is out of range 3600..=43200", n))
+        } else {
+            Ok(())
+        }
+    } else {
+        Err("Expected integer".to_string())
+    }
+}
 
 /// Returns the schema config for iam_role (AWS::IAM::Role)
 pub fn iam_role_config() -> AwsccSchemaConfig {
@@ -33,12 +46,17 @@ pub fn iam_role_config() -> AwsccSchemaConfig {
                 .with_provider_name("Description"),
         )
         .attribute(
-            AttributeSchema::new("managed_policy_arns", AttributeType::List(Box::new(AttributeType::String)))
+            AttributeSchema::new("managed_policy_arns", AttributeType::List(Box::new(super::iam_policy_arn())))
                 .with_description("A list of Amazon Resource Names (ARNs) of the IAM managed policies that you want to attach to the role. For more information about ARNs, see [Amazon R...")
                 .with_provider_name("ManagedPolicyArns"),
         )
         .attribute(
-            AttributeSchema::new("max_session_duration", AttributeType::Int)
+            AttributeSchema::new("max_session_duration", AttributeType::Custom {
+                name: "Int(3600..=43200)".to_string(),
+                base: Box::new(AttributeType::Int),
+                validate: validate_max_session_duration_range,
+                namespace: None,
+            })
                 .with_description("The maximum session duration (in seconds) that you want to set for the specified role. If you do not specify a value for this setting, the default val...")
                 .with_provider_name("MaxSessionDuration"),
         )
@@ -49,7 +67,7 @@ pub fn iam_role_config() -> AwsccSchemaConfig {
                 .with_provider_name("Path"),
         )
         .attribute(
-            AttributeSchema::new("permissions_boundary", AttributeType::String)
+            AttributeSchema::new("permissions_boundary", super::iam_policy_arn())
                 .with_description("The ARN of the policy used to set the permissions boundary for the role. For more information about permissions boundaries, see [Permissions boundarie...")
                 .with_provider_name("PermissionsBoundary"),
         )

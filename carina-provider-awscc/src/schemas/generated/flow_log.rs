@@ -59,13 +59,13 @@ pub fn ec2_flow_log_config() -> AwsccSchemaConfig {
         schema: ResourceSchema::new("awscc.ec2_flow_log")
         .with_description("Specifies a VPC flow log, which enables you to capture IP traffic for a specific network interface, subnet, or VPC.")
         .attribute(
-            AttributeSchema::new("deliver_cross_account_role", AttributeType::String)
+            AttributeSchema::new("deliver_cross_account_role", super::iam_role_arn())
                 .create_only()
                 .with_description("The ARN of the IAM role that allows Amazon EC2 to publish flow logs across accounts.")
                 .with_provider_name("DeliverCrossAccountRole"),
         )
         .attribute(
-            AttributeSchema::new("deliver_logs_permission_arn", super::arn())
+            AttributeSchema::new("deliver_logs_permission_arn", super::iam_role_arn())
                 .create_only()
                 .with_description("The ARN for the IAM role that permits Amazon EC2 to publish flow logs to a CloudWatch Logs log group in your account. If you specify LogDestinationTyp...")
                 .with_provider_name("DeliverLogsPermissionArn"),

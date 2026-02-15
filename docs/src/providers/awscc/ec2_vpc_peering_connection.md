@@ -22,7 +22,7 @@ The Region code for the accepter VPC, if the accepter VPC is located in a Region
 
 ### `peer_role_arn`
 
-- **Type:** Arn
+- **Type:** IamRoleArn
 - **Required:** No
 
 The Amazon Resource Name (ARN) of the VPC peer role for the peering connection in another AWS account.
@@ -58,17 +58,14 @@ The ID of the VPC.
 
 ```crn
 let vpc1 = awscc.ec2_vpc {
-  name       = "example-vpc-peer-1"
   cidr_block = "10.0.0.0/16"
 }
 
 let vpc2 = awscc.ec2_vpc {
-  name       = "example-vpc-peer-2"
   cidr_block = "10.1.0.0/16"
 }
 
-awscc.ec2_vpc_peering_connection {
-  name        = "example-vpc-peering"
+let peering = awscc.ec2_vpc_peering_connection {
   vpc_id      = vpc1.vpc_id
   peer_vpc_id = vpc2.vpc_id
 

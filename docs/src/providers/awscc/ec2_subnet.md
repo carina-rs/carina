@@ -59,7 +59,7 @@ An IPv4 IPAM pool ID for the subnet.
 
 ### `ipv4_netmask_length`
 
-- **Type:** Int
+- **Type:** Int(0..=32)
 - **Required:** No
 
 An IPv4 netmask length for the subnet.
@@ -87,7 +87,7 @@ Indicates whether this is an IPv6 only subnet. For more information, see [Subnet
 
 ### `ipv6_netmask_length`
 
-- **Type:** Int
+- **Type:** Int(0..=128)
 - **Required:** No
 
 An IPv6 netmask length for the subnet.
@@ -167,14 +167,12 @@ The ID of the VPC the subnet is in. If you update this property, you must also u
 
 ```crn
 let vpc = awscc.ec2_vpc {
-  name                 = "example-vpc"
   cidr_block           = "10.0.0.0/16"
   enable_dns_support   = true
   enable_dns_hostnames = true
 }
 
-awscc.ec2_subnet {
-  name                    = "example-public-subnet"
+let subnet = awscc.ec2_subnet {
   vpc_id                  = vpc.vpc_id
   cidr_block              = "10.0.1.0/24"
   availability_zone       = "ap-northeast-1a"

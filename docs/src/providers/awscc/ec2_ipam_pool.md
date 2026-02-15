@@ -171,7 +171,7 @@ Shorthand formats: `create-in-progress` or `State.create-in-progress`
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `cidr` | String | Yes |  |
+| `cidr` | Ipv4Cidr | Yes |  |
 
 ### SourceResource
 
@@ -222,7 +222,6 @@ Shorthand formats: `create-in-progress` or `State.create-in-progress`
 
 ```crn
 let ipam = awscc.ec2_ipam {
-  name        = "example-ipam"
   description = "Example IPAM"
   tier        = free
 
@@ -233,8 +232,7 @@ let ipam = awscc.ec2_ipam {
   ]
 }
 
-awscc.ec2_ipam_pool {
-  name           = "example-ipam-pool"
+let ipam_pool = awscc.ec2_ipam_pool {
   ipam_scope_id  = ipam.private_default_scope_id
   address_family = "IPv4"
   locale         = "ap-northeast-1"

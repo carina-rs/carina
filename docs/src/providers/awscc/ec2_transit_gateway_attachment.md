@@ -40,9 +40,9 @@ The options for the transit gateway vpc attachment.
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `appliance_mode_support` | String | No | Indicates whether to enable Ipv6 Support for Vpc Attachment. Valid Values: enable | disable |
-| `dns_support` | String | No | Indicates whether to enable DNS Support for Vpc Attachment. Valid Values: enable | disable |
+| `dns_support` | Enum | No | Indicates whether to enable DNS Support for Vpc Attachment. Valid Values: enable | disable |
 | `ipv6_support` | String | No | Indicates whether to enable Ipv6 Support for Vpc Attachment. Valid Values: enable | disable |
-| `security_group_referencing_support` | String | No | Indicates whether to enable Security Group referencing support for Vpc Attachment. Valid Values: ena... |
+| `security_group_referencing_support` | Enum | No | Indicates whether to enable Security Group referencing support for Vpc Attachment. Valid Values: ena... |
 
 ## Attribute Reference
 
