@@ -2,7 +2,7 @@
 
 use carina_core::resource::Value;
 use carina_core::schema::AttributeType;
-use carina_core::utils::extract_enum_value;
+use carina_core::utils::{extract_enum_value, validate_enum_namespace};
 
 /// Valid AWS regions (in AWS format with hyphens)
 const VALID_REGIONS: &[&str] = &[
@@ -36,37 +36,7 @@ pub fn aws_region() -> AttributeType {
         base: Box::new(AttributeType::String),
         validate: |value| {
             if let Value::String(s) = value {
-                // Check namespace format if it contains dots
-                if s.contains('.') {
-                    let parts: Vec<&str> = s.split('.').collect();
-                    match parts.len() {
-                        // 2-part: Region.value
-                        2 => {
-                            if parts[0] != "Region" {
-                                return Err(format!(
-                                    "Invalid region '{}', expected format: Region.ap_northeast_1 or aws.Region.ap_northeast_1",
-                                    s
-                                ));
-                            }
-                        }
-                        // 3-part: aws.Region.value
-                        3 => {
-                            if parts[0] != "aws" || parts[1] != "Region" {
-                                return Err(format!(
-                                    "Invalid region '{}', expected format: aws.Region.ap_northeast_1",
-                                    s
-                                ));
-                            }
-                        }
-                        _ => {
-                            return Err(format!(
-                                "Invalid region '{}', expected one of: {}, Region.ap_northeast_1, or aws.Region.ap_northeast_1",
-                                s,
-                                VALID_REGIONS.join(", ")
-                            ));
-                        }
-                    }
-                }
+                validate_enum_namespace(s, "Region", "aws")?;
                 // Normalize the input to AWS format (hyphens)
                 let normalized = extract_enum_value(s).replace('_', "-");
                 if VALID_REGIONS.contains(&normalized.as_str()) {
@@ -101,39 +71,7 @@ pub fn versioning_status() -> AttributeType {
         base: Box::new(AttributeType::String),
         validate: |value| {
             if let Value::String(s) = value {
-                // Check namespace format if it contains dots
-                if s.contains('.') {
-                    let parts: Vec<&str> = s.split('.').collect();
-                    match parts.len() {
-                        // 2-part: VersioningStatus.value
-                        2 => {
-                            if parts[0] != "VersioningStatus" {
-                                return Err(format!(
-                                    "Invalid versioning status '{}', expected format: VersioningStatus.Enabled or VersioningStatus.Suspended",
-                                    s
-                                ));
-                            }
-                        }
-                        // 4-part: aws.s3.VersioningStatus.value
-                        4 => {
-                            if parts[0] != "aws"
-                                || parts[1] != "s3"
-                                || parts[2] != "VersioningStatus"
-                            {
-                                return Err(format!(
-                                    "Invalid versioning status '{}', expected format: aws.s3.VersioningStatus.Enabled or aws.s3.VersioningStatus.Suspended",
-                                    s
-                                ));
-                            }
-                        }
-                        _ => {
-                            return Err(format!(
-                                "Invalid versioning status '{}', expected one of: Enabled, Suspended, VersioningStatus.Enabled, or aws.s3.VersioningStatus.Enabled",
-                                s
-                            ));
-                        }
-                    }
-                }
+                validate_enum_namespace(s, "VersioningStatus", "aws.s3")?;
                 let normalized = extract_enum_value(s);
                 if VALID_VERSIONING_STATUS.contains(&normalized) {
                     Ok(())
