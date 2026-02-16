@@ -19,7 +19,7 @@ use carina_core::schema::AttributeType;
 use crate::schemas::generated::{
     AwsccSchemaConfig, canonicalize_enum_value, get_enum_valid_values,
 };
-use crate::utils::{convert_enum_value, normalize_instance_tenancy};
+use crate::utils::convert_enum_value;
 
 /// Get the AwsccSchemaConfig for a resource type
 fn get_schema_config(resource_type: &str) -> Option<AwsccSchemaConfig> {
@@ -496,7 +496,7 @@ impl AwsccProvider {
             if let Some(aws_name) = &attr_schema.provider_name
                 && let Some(value) = resource.attributes.get(dsl_name.as_str())
             {
-                let aws_value = self.dsl_value_to_aws(dsl_name, value, &attr_schema.attr_type);
+                let aws_value = self.dsl_value_to_aws(value, &attr_schema.attr_type);
                 if let Some(v) = aws_value {
                     desired_state.insert(aws_name.to_string(), v);
                 }
@@ -579,8 +579,7 @@ impl AwsccProvider {
             }
             if let Some(aws_name) = &attr_schema.provider_name
                 && let Some(value) = to.attributes.get(dsl_name.as_str())
-                && let Some(aws_value) =
-                    self.dsl_value_to_aws(dsl_name, value, &attr_schema.attr_type)
+                && let Some(aws_value) = self.dsl_value_to_aws(value, &attr_schema.attr_type)
             {
                 patch_ops.push(json!({
                     "op": "replace",
@@ -707,37 +706,25 @@ impl AwsccProvider {
     /// Convert DSL value to AWS JSON value
     fn dsl_value_to_aws(
         &self,
-        dsl_name: &str,
         value: &Value,
         attr_type: &AttributeType,
     ) -> Option<serde_json::Value> {
-        match dsl_name {
-            "instance_tenancy" => {
-                if let Value::String(s) = value {
-                    Some(json!(normalize_instance_tenancy(s)))
-                } else {
-                    None
+        // For Custom (enum) types, convert enum values
+        if matches!(attr_type, AttributeType::Custom { .. }) {
+            match value {
+                Value::String(s) => Some(json!(convert_enum_value(s))),
+                Value::UnresolvedIdent(ident, member) => {
+                    let raw = if let Some(m) = member {
+                        m.clone()
+                    } else {
+                        ident.clone()
+                    };
+                    Some(json!(raw.replace('_', "-")))
                 }
+                _ => self.value_to_json(value),
             }
-            _ => {
-                // For Custom (enum) types, convert enum values
-                if matches!(attr_type, AttributeType::Custom { .. }) {
-                    match value {
-                        Value::String(s) => Some(json!(convert_enum_value(s))),
-                        Value::UnresolvedIdent(ident, member) => {
-                            let raw = if let Some(m) = member {
-                                m.clone()
-                            } else {
-                                ident.clone()
-                            };
-                            Some(json!(raw.replace('_', "-")))
-                        }
-                        _ => self.value_to_json(value),
-                    }
-                } else {
-                    self.value_to_json(value)
-                }
-            }
+        } else {
+            self.value_to_json(value)
         }
     }
 
