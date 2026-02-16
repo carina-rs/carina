@@ -154,8 +154,8 @@ pub fn instance_tenancy() -> AttributeType {
                         }
                     }
                 }
-                let normalized = normalize_instance_tenancy(s);
-                if VALID_INSTANCE_TENANCY.contains(&normalized.as_str()) {
+                let normalized = aws_types::extract_enum_value(s);
+                if VALID_INSTANCE_TENANCY.contains(&normalized) {
                     Ok(())
                 } else {
                     Err(format!(
@@ -169,17 +169,6 @@ pub fn instance_tenancy() -> AttributeType {
         },
         namespace: Some("aws.vpc".to_string()),
         to_dsl: None,
-    }
-}
-
-/// Normalize instance tenancy to API format
-/// - "aws.vpc.InstanceTenancy.default" -> "default"
-/// - "default" -> "default"
-pub fn normalize_instance_tenancy(s: &str) -> String {
-    if s.contains('.') {
-        s.split('.').next_back().unwrap_or(s).to_string()
-    } else {
-        s.to_string()
     }
 }
 
@@ -717,28 +706,6 @@ mod tests {
                 .validate(&Value::String("vpc.InstanceTenancy.default".to_string()))
                 .is_err()
         );
-    }
-
-    #[test]
-    fn normalize_instance_tenancy_dsl_format() {
-        assert_eq!(
-            normalize_instance_tenancy("aws.vpc.InstanceTenancy.default"),
-            "default"
-        );
-        assert_eq!(
-            normalize_instance_tenancy("aws.vpc.InstanceTenancy.dedicated"),
-            "dedicated"
-        );
-        assert_eq!(
-            normalize_instance_tenancy("aws.vpc.InstanceTenancy.host"),
-            "host"
-        );
-    }
-
-    #[test]
-    fn normalize_instance_tenancy_string_format() {
-        assert_eq!(normalize_instance_tenancy("default"), "default");
-        assert_eq!(normalize_instance_tenancy("dedicated"), "dedicated");
     }
 
     #[test]

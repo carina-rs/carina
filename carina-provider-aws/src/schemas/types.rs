@@ -36,7 +36,7 @@ pub fn aws_region() -> AttributeType {
         validate: |value| {
             if let Value::String(s) = value {
                 // Normalize the input to AWS format (hyphens)
-                let normalized = normalize_region(s);
+                let normalized = extract_enum_value(s).replace('_', "-");
                 if VALID_REGIONS.contains(&normalized.as_str()) {
                     Ok(())
                 } else {
@@ -55,19 +55,18 @@ pub fn aws_region() -> AttributeType {
     }
 }
 
-/// Normalize region string to AWS format (hyphens)
-/// - "aws.Region.ap_northeast_1" -> "ap-northeast-1"
-/// - "ap_northeast_1" -> "ap-northeast-1"
-/// - "ap-northeast-1" -> "ap-northeast-1"
-fn normalize_region(s: &str) -> String {
-    // Extract region part from DSL format (aws.Region.xxx)
-    let region_part = if s.contains('.') {
+/// Extract the last dot-separated part from a namespaced identifier.
+/// Returns the original string if no dots are present.
+///
+/// - "aws.Region.ap_northeast_1" -> "ap_northeast_1"
+/// - "aws.s3.VersioningStatus.Enabled" -> "Enabled"
+/// - "Enabled" -> "Enabled"
+pub fn extract_enum_value(s: &str) -> &str {
+    if s.contains('.') {
         s.split('.').next_back().unwrap_or(s)
     } else {
         s
-    };
-    // Convert underscores to hyphens
-    region_part.replace('_', "-")
+    }
 }
 
 /// Valid versioning status values
@@ -117,8 +116,8 @@ pub fn versioning_status() -> AttributeType {
                         }
                     }
                 }
-                let normalized = normalize_versioning_status(s);
-                if VALID_VERSIONING_STATUS.contains(&normalized.as_str()) {
+                let normalized = extract_enum_value(s);
+                if VALID_VERSIONING_STATUS.contains(&normalized) {
                     Ok(())
                 } else {
                     Err(format!(
@@ -132,17 +131,6 @@ pub fn versioning_status() -> AttributeType {
         },
         namespace: Some("aws.s3".to_string()),
         to_dsl: None,
-    }
-}
-
-/// Normalize versioning status to API format
-/// - "aws.s3.VersioningStatus.Enabled" -> "Enabled"
-/// - "Enabled" -> "Enabled"
-pub fn normalize_versioning_status(s: &str) -> String {
-    if s.contains('.') {
-        s.split('.').next_back().unwrap_or(s).to_string()
-    } else {
-        s.to_string()
     }
 }
 
@@ -355,21 +343,29 @@ mod tests {
         );
     }
 
+    // extract_enum_value tests
+
     #[test]
-    fn normalize_versioning_status_dsl_format() {
+    fn extract_enum_value_with_dots() {
         assert_eq!(
-            normalize_versioning_status("aws.s3.VersioningStatus.Enabled"),
+            extract_enum_value("aws.Region.ap_northeast_1"),
+            "ap_northeast_1"
+        );
+        assert_eq!(
+            extract_enum_value("aws.s3.VersioningStatus.Enabled"),
             "Enabled"
         );
         assert_eq!(
-            normalize_versioning_status("aws.s3.VersioningStatus.Suspended"),
-            "Suspended"
+            extract_enum_value("aws.vpc.InstanceTenancy.default"),
+            "default"
         );
+        assert_eq!(extract_enum_value("InstanceTenancy.dedicated"), "dedicated");
     }
 
     #[test]
-    fn normalize_versioning_status_string_format() {
-        assert_eq!(normalize_versioning_status("Enabled"), "Enabled");
-        assert_eq!(normalize_versioning_status("Suspended"), "Suspended");
+    fn extract_enum_value_without_dots() {
+        assert_eq!(extract_enum_value("Enabled"), "Enabled");
+        assert_eq!(extract_enum_value("default"), "default");
+        assert_eq!(extract_enum_value("ap-northeast-1"), "ap-northeast-1");
     }
 }
