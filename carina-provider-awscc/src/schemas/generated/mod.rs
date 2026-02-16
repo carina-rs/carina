@@ -147,8 +147,8 @@ pub fn get_enum_valid_values(
         ("logs_log_group", "log_group_class") => {
             Some(&["STANDARD", "INFREQUENT_ACCESS", "DELIVERY"])
         }
-        // iam_role
-        ("iam_role", "hostname_type") => Some(&["ip-name", "resource-name"]),
+        // ec2_subnet (PrivateDnsNameOptionsOnLaunch struct field)
+        ("ec2_subnet", "hostname_type") => Some(&["ip-name", "resource-name"]),
         _ => None,
     }
 }
