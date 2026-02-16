@@ -689,6 +689,17 @@ pub fn kms_key_id() -> AttributeType {
     }
 }
 
+/// Check if a string is a valid UUID (8-4-4-4-12 hex digits)
+fn is_uuid(s: &str) -> bool {
+    let expected_lens = [8, 4, 4, 4, 12];
+    let parts: Vec<&str> = s.split('-').collect();
+    parts.len() == 5
+        && parts
+            .iter()
+            .zip(expected_lens.iter())
+            .all(|(part, &len)| part.len() == len && part.chars().all(|c| c.is_ascii_hexdigit()))
+}
+
 fn validate_kms_key_id(value: &str) -> Result<(), String> {
     // Accept KMS ARNs (both key/ and alias/ resource prefixes)
     if value.starts_with("arn:") {
@@ -702,11 +713,7 @@ fn validate_kms_key_id(value: &str) -> Result<(), String> {
         return Ok(());
     }
     // Accept bare key ID (UUID format: 8-4-4-4-12 hex digits)
-    let uuid_re = regex::Regex::new(
-        r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
-    )
-    .unwrap();
-    if uuid_re.is_match(value) {
+    if is_uuid(value) {
         return Ok(());
     }
     Err(format!(
