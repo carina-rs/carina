@@ -40,8 +40,8 @@ pub fn normalize_namespaced_enum(s: &str) -> String {
     }
 }
 
-/// Find the canonical enum value by case-insensitive matching.
-/// Returns the canonical value from valid_values, or the raw value if no match found.
+/// Canonicalize an enum value by matching against valid values.
+/// Handles exact match, case-insensitive match, and underscore-to-hyphen conversion.
 pub fn canonicalize_enum_value(raw: &str, valid_values: &[&str]) -> String {
     // Exact match first
     if valid_values.contains(&raw) {
@@ -114,7 +114,16 @@ pub fn get_enum_valid_values(
         ]),
         ("ec2_flow_log", "traffic_type") => Some(&["ACCEPT", "ALL", "REJECT"]),
         // ec2_transit_gateway
+        ("ec2_transit_gateway", "auto_accept_shared_attachments") => Some(&["enable", "disable"]),
+        ("ec2_transit_gateway", "default_route_table_association") => Some(&["enable", "disable"]),
+        ("ec2_transit_gateway", "default_route_table_propagation") => Some(&["enable", "disable"]),
+        ("ec2_transit_gateway", "dns_support") => Some(&["enable", "disable"]),
         ("ec2_transit_gateway", "encryption_support") => Some(&["disable", "enable"]),
+        ("ec2_transit_gateway", "multicast_support") => Some(&["enable", "disable"]),
+        ("ec2_transit_gateway", "security_group_referencing_support") => {
+            Some(&["enable", "disable"])
+        }
+        ("ec2_transit_gateway", "vpn_ecmp_support") => Some(&["enable", "disable"]),
         // ec2_security_group_ingress / egress
         ("ec2_security_group_ingress", "ip_protocol") => {
             Some(&["tcp", "udp", "icmp", "icmpv6", "-1"])
@@ -138,6 +147,8 @@ pub fn get_enum_valid_values(
         ("logs_log_group", "log_group_class") => {
             Some(&["STANDARD", "INFREQUENT_ACCESS", "DELIVERY"])
         }
+        // ec2_subnet (PrivateDnsNameOptionsOnLaunch struct field)
+        ("ec2_subnet", "hostname_type") => Some(&["ip-name", "resource-name"]),
         _ => None,
     }
 }
@@ -581,6 +592,79 @@ pub fn validate_availability_zone(az: &str) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+/// Validate an ARN for a specific AWS service and optional resource prefix
+fn validate_service_arn(
+    arn: &str,
+    expected_service: &str,
+    resource_prefix: Option<&str>,
+) -> Result<(), String> {
+    validate_arn(arn)?;
+    let parts: Vec<&str> = arn.splitn(6, ':').collect();
+    if parts[2] != expected_service {
+        return Err(format!(
+            "Expected {} ARN, got service '{}'",
+            expected_service, parts[2]
+        ));
+    }
+    if let Some(prefix) = resource_prefix
+        && !parts[5].starts_with(prefix)
+    {
+        return Err(format!(
+            "Expected resource starting with '{}', got '{}'",
+            prefix, parts[5]
+        ));
+    }
+    Ok(())
+}
+
+/// IAM Role ARN type (e.g., "arn:aws:iam::123456789012:role/MyRole")
+pub fn iam_role_arn() -> AttributeType {
+    AttributeType::Custom {
+        name: "IamRoleArn".to_string(),
+        base: Box::new(AttributeType::String),
+        validate: |value| {
+            if let Value::String(s) = value {
+                validate_service_arn(s, "iam", Some("role/"))
+            } else {
+                Err("Expected string".to_string())
+            }
+        },
+        namespace: None,
+    }
+}
+
+/// IAM Policy ARN type (e.g., "arn:aws:iam::123456789012:policy/MyPolicy")
+pub fn iam_policy_arn() -> AttributeType {
+    AttributeType::Custom {
+        name: "IamPolicyArn".to_string(),
+        base: Box::new(AttributeType::String),
+        validate: |value| {
+            if let Value::String(s) = value {
+                validate_service_arn(s, "iam", Some("policy/"))
+            } else {
+                Err("Expected string".to_string())
+            }
+        },
+        namespace: None,
+    }
+}
+
+/// KMS Key ARN type (e.g., "arn:aws:kms:us-east-1:123456789012:key/1234abcd-12ab-34cd-56ef-1234567890ab")
+pub fn kms_key_arn() -> AttributeType {
+    AttributeType::Custom {
+        name: "KmsKeyArn".to_string(),
+        base: Box::new(AttributeType::String),
+        validate: |value| {
+            if let Value::String(s) = value {
+                validate_service_arn(s, "kms", Some("key/"))
+            } else {
+                Err("Expected string".to_string())
+            }
+        },
+        namespace: None,
+    }
 }
 
 /// IAM Policy Document type
@@ -1291,6 +1375,125 @@ mod tests {
     }
 
     #[test]
+    fn validate_iam_role_arn_valid() {
+        let t = iam_role_arn();
+        assert!(
+            t.validate(&Value::String(
+                "arn:aws:iam::123456789012:role/MyRole".to_string()
+            ))
+            .is_ok()
+        );
+        assert!(
+            t.validate(&Value::String(
+                "arn:aws:iam::123456789012:role/path/to/MyRole".to_string()
+            ))
+            .is_ok()
+        );
+        // ResourceRef should be accepted
+        assert!(
+            t.validate(&Value::ResourceRef("role".to_string(), "arn".to_string()))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn validate_iam_role_arn_invalid() {
+        let t = iam_role_arn();
+        // Wrong service
+        assert!(
+            t.validate(&Value::String("arn:aws:s3:::my-bucket".to_string()))
+                .is_err()
+        );
+        // Wrong resource prefix
+        assert!(
+            t.validate(&Value::String(
+                "arn:aws:iam::123456789012:policy/MyPolicy".to_string()
+            ))
+            .is_err()
+        );
+        // Not an ARN at all
+        assert!(
+            t.validate(&Value::String("not-an-arn".to_string()))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn validate_iam_policy_arn_valid() {
+        let t = iam_policy_arn();
+        assert!(
+            t.validate(&Value::String(
+                "arn:aws:iam::123456789012:policy/MyPolicy".to_string()
+            ))
+            .is_ok()
+        );
+        assert!(
+            t.validate(&Value::String(
+                "arn:aws:iam::aws:policy/AdministratorAccess".to_string()
+            ))
+            .is_ok()
+        );
+        // ResourceRef should be accepted
+        assert!(
+            t.validate(&Value::ResourceRef("policy".to_string(), "arn".to_string()))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn validate_iam_policy_arn_invalid() {
+        let t = iam_policy_arn();
+        // Wrong resource prefix
+        assert!(
+            t.validate(&Value::String(
+                "arn:aws:iam::123456789012:role/MyRole".to_string()
+            ))
+            .is_err()
+        );
+        // Wrong service
+        assert!(
+            t.validate(&Value::String("arn:aws:s3:::my-bucket".to_string()))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn validate_kms_key_arn_valid() {
+        let t = kms_key_arn();
+        assert!(
+            t.validate(&Value::String(
+                "arn:aws:kms:us-east-1:123456789012:key/1234abcd-12ab-34cd-56ef-1234567890ab"
+                    .to_string()
+            ))
+            .is_ok()
+        );
+        // ResourceRef should be accepted
+        assert!(
+            t.validate(&Value::ResourceRef("key".to_string(), "arn".to_string()))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn validate_kms_key_arn_invalid() {
+        let t = kms_key_arn();
+        // Wrong service
+        assert!(
+            t.validate(&Value::String(
+                "arn:aws:iam::123456789012:role/MyRole".to_string()
+            ))
+            .is_err()
+        );
+        // Wrong resource prefix
+        assert!(
+            t.validate(&Value::String(
+                "arn:aws:kms:us-east-1:123456789012:alias/my-key".to_string()
+            ))
+            .is_err()
+        );
+    }
+
+    #[test]
     fn validate_prefix_mismatch_error_messages() {
         let t = vpc_id();
         let result = t.validate(&Value::String("subnet-12345678".to_string()));
@@ -1349,6 +1552,22 @@ mod tests {
         assert_eq!(
             get_enum_valid_values("ec2_vpc", "instance_tenancy"),
             Some(["default", "dedicated", "host"].as_slice())
+        );
+    }
+
+    #[test]
+    fn get_enum_valid_values_transit_gateway() {
+        assert_eq!(
+            get_enum_valid_values("ec2_transit_gateway", "auto_accept_shared_attachments"),
+            Some(["enable", "disable"].as_slice())
+        );
+        assert_eq!(
+            get_enum_valid_values("ec2_transit_gateway", "dns_support"),
+            Some(["enable", "disable"].as_slice())
+        );
+        assert_eq!(
+            get_enum_valid_values("ec2_transit_gateway", "vpn_ecmp_support"),
+            Some(["enable", "disable"].as_slice())
         );
     }
 

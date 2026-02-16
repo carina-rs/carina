@@ -20,6 +20,30 @@ fn validate_ip_protocol(value: &Value) -> Result<(), String> {
     )
 }
 
+fn validate_from_port_range(value: &Value) -> Result<(), String> {
+    if let Value::Int(n) = value {
+        if *n < -1 || *n > 65535 {
+            Err(format!("Value {} is out of range -1..=65535", n))
+        } else {
+            Ok(())
+        }
+    } else {
+        Err("Expected integer".to_string())
+    }
+}
+
+fn validate_to_port_range(value: &Value) -> Result<(), String> {
+    if let Value::Int(n) = value {
+        if *n < -1 || *n > 65535 {
+            Err(format!("Value {} is out of range -1..=65535", n))
+        } else {
+            Ok(())
+        }
+    } else {
+        Err("Expected integer".to_string())
+    }
+}
+
 /// Returns the schema config for ec2_security_group_ingress (AWS::EC2::SecurityGroupIngress)
 pub fn ec2_security_group_ingress_config() -> AwsccSchemaConfig {
     AwsccSchemaConfig {
@@ -46,7 +70,12 @@ pub fn ec2_security_group_ingress_config() -> AwsccSchemaConfig {
                 .with_provider_name("Description"),
         )
         .attribute(
-            AttributeSchema::new("from_port", AttributeType::Int)
+            AttributeSchema::new("from_port", AttributeType::Custom {
+                name: "Int(-1..=65535)".to_string(),
+                base: Box::new(AttributeType::Int),
+                validate: validate_from_port_range,
+                namespace: None,
+            })
                 .create_only()
                 .with_description("The start of port range for the TCP and UDP protocols, or an ICMP/ICMPv6 type number. A value of -1 indicates all ICMP/ICMPv6 types. If you specify al...")
                 .with_provider_name("FromPort"),
@@ -105,7 +134,12 @@ pub fn ec2_security_group_ingress_config() -> AwsccSchemaConfig {
                 .with_provider_name("SourceSecurityGroupOwnerId"),
         )
         .attribute(
-            AttributeSchema::new("to_port", AttributeType::Int)
+            AttributeSchema::new("to_port", AttributeType::Custom {
+                name: "Int(-1..=65535)".to_string(),
+                base: Box::new(AttributeType::Int),
+                validate: validate_to_port_range,
+                namespace: None,
+            })
                 .create_only()
                 .with_description("The end of port range for the TCP and UDP protocols, or an ICMP/ICMPv6 code. A value of -1 indicates all ICMP/ICMPv6 codes for the specified ICMP type...")
                 .with_provider_name("ToPort"),

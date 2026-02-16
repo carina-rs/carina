@@ -32,12 +32,10 @@ The ID of the VPC for which to create the egress-only internet gateway.
 
 ```crn
 let vpc = awscc.ec2_vpc {
-  name       = "example-vpc-eoigw"
   cidr_block = "10.0.0.0/16"
 }
 
-awscc.ec2_egress_only_internet_gateway {
-  name   = "example-eoigw"
+let eoigw = awscc.ec2_egress_only_internet_gateway {
   vpc_id = vpc.vpc_id
 
   tags = {

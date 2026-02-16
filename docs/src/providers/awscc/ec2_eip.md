@@ -90,8 +90,7 @@ Shorthand formats: `vpc` or `Domain.vpc`
 ## Example
 
 ```crn
-awscc.ec2_eip {
-  name   = "example-eip"
+let eip = awscc.ec2_eip {
   domain = "vpc"
 
   tags = {

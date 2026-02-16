@@ -19,6 +19,7 @@ use regex::Regex;
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{self, Read};
+use std::sync::LazyLock;
 
 /// Information about a detected enum type
 #[derive(Debug, Clone)]
@@ -260,6 +261,15 @@ fn list_element_type_display(items: &CfnProperty, prop_name: &str) -> String {
 /// Used by both scalar `type_display_string()` and `list_element_type_display()`.
 /// Handles both singular (e.g., "SubnetId") and plural (e.g., "SubnetIds") property names.
 fn infer_string_type_display(prop_name: &str) -> String {
+    // Check known string type overrides first
+    let string_overrides = known_string_type_overrides();
+    if let Some(&override_type) = string_overrides.get(prop_name) {
+        // Extract display name from override type string
+        // e.g., "super::security_group_id()" -> "SecurityGroupId"
+        //       "super::iam_role_arn()" -> "IamRoleArn"
+        return override_type_to_display_name(override_type).to_string();
+    }
+
     // Normalize plural forms to singular for type inference
     // e.g., "SubnetIds" -> "SubnetId", "CidrBlocks" -> "CidrBlock"
     let singular_name = if prop_name.ends_with("Ids")
@@ -271,6 +281,12 @@ fn infer_string_type_display(prop_name: &str) -> String {
     } else {
         prop_name
     };
+
+    // Check overrides for singular form too (e.g., list items)
+    if let Some(&override_type) = string_overrides.get(singular_name) {
+        return override_type_to_display_name(override_type).to_string();
+    }
+
     let prop_lower = singular_name.to_lowercase();
     if prop_lower.contains("cidr") {
         if prop_lower.contains("ipv6") {
@@ -292,7 +308,10 @@ fn infer_string_type_display(prop_name: &str) -> String {
         }
     } else if prop_lower == "availabilityzone" || prop_lower == "availabilityzones" {
         "AvailabilityZone".to_string()
-    } else if prop_lower.ends_with("arn") || prop_lower.contains("_arn") {
+    } else if prop_lower.ends_with("arn")
+        || prop_lower.ends_with("arns")
+        || prop_lower.contains("_arn")
+    {
         "Arn".to_string()
     } else if is_ipam_pool_id_property(singular_name) {
         "IpamPoolId".to_string()
@@ -300,6 +319,19 @@ fn infer_string_type_display(prop_name: &str) -> String {
         get_resource_id_display_name(singular_name).to_string()
     } else {
         "String".to_string()
+    }
+}
+
+/// Convert an override type string to a display name
+/// e.g., "super::security_group_id()" -> "SecurityGroupId"
+fn override_type_to_display_name(override_type: &str) -> &str {
+    match override_type {
+        "super::security_group_id()" => "SecurityGroupId",
+        "super::aws_resource_id()" => "AwsResourceId",
+        "super::iam_role_arn()" => "IamRoleArn",
+        "super::iam_policy_arn()" => "IamPolicyArn",
+        "super::kms_key_arn()" => "KmsKeyArn",
+        _ => "String",
     }
 }
 
@@ -330,7 +362,8 @@ fn type_display_string(
         {
             format!("[Struct({})](#{})", def_name, def_name.to_lowercase())
         } else {
-            "String".to_string()
+            // Apply name-based heuristics for unresolvable $ref
+            infer_string_type_display(prop_name)
         }
     } else {
         match prop.prop_type.as_ref().and_then(|t| t.as_str()) {
@@ -343,7 +376,12 @@ fn type_display_string(
             }
             Some("boolean") => "Bool".to_string(),
             Some("integer") | Some("number") => {
-                if let (Some(min), Some(max)) = (prop.minimum, prop.maximum) {
+                let range = if let (Some(min), Some(max)) = (prop.minimum, prop.maximum) {
+                    Some((min, max))
+                } else {
+                    known_int_range_overrides().get(prop_name).copied()
+                };
+                if let Some((min, max)) = range {
                     format!("Int({}..={})", min, max)
                 } else {
                     "Int".to_string()
@@ -501,8 +539,16 @@ fn generate_markdown(schema: &CfnSchema, type_name: &str) -> Result<String> {
                         }
                         Some("boolean") => "Bool".to_string(),
                         Some("integer") | Some("number") => {
-                            if let (Some(min), Some(max)) = (field_prop.minimum, field_prop.maximum)
+                            let range = if let (Some(min), Some(max)) =
+                                (field_prop.minimum, field_prop.maximum)
                             {
+                                Some((min, max))
+                            } else {
+                                known_int_range_overrides()
+                                    .get(field_name.as_str())
+                                    .copied()
+                            };
+                            if let Some((min, max)) = range {
                                 format!("Int({}..={})", min, max)
                             } else {
                                 "Int".to_string()
@@ -516,7 +562,7 @@ fn generate_markdown(schema: &CfnSchema, type_name: &str) -> Result<String> {
                             }
                         }
                         Some("object") => "Map".to_string(),
-                        _ => "String".to_string(),
+                        _ => infer_string_type_display(field_name),
                     }
                 };
                 let desc = field_prop
@@ -680,9 +726,36 @@ fn generate_schema_code(schema: &CfnSchema, type_name: &str) -> Result<String> {
         if matches!(
             prop.prop_type.as_ref().and_then(|t| t.as_str()),
             Some("integer") | Some("number")
-        ) && let (Some(min), Some(max)) = (prop.minimum, prop.maximum)
-        {
-            ranged_ints.insert(prop_name.clone(), (min, max));
+        ) {
+            if let (Some(min), Some(max)) = (prop.minimum, prop.maximum) {
+                ranged_ints.insert(prop_name.clone(), (min, max));
+            } else if let Some(&(min, max)) = known_int_range_overrides().get(prop_name.as_str()) {
+                ranged_ints.insert(prop_name.clone(), (min, max));
+            }
+        }
+    }
+
+    // Also scan definitions for struct field integer properties matching overrides
+    let int_overrides = known_int_range_overrides();
+    if let Some(definitions) = &schema.definitions {
+        for def in definitions.values() {
+            if let Some(props) = &def.properties {
+                for (field_name, field_prop) in props {
+                    if matches!(
+                        field_prop.prop_type.as_ref().and_then(|t| t.as_str()),
+                        Some("integer") | Some("number")
+                    ) && field_prop.minimum.is_none()
+                        && field_prop.maximum.is_none()
+                        && int_overrides.contains_key(field_name.as_str())
+                    {
+                        // Mark that we need ranged ints (for imports)
+                        if !ranged_ints.contains_key(field_name) {
+                            let (min, max) = int_overrides[field_name.as_str()];
+                            ranged_ints.insert(field_name.clone(), (min, max));
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -1103,17 +1176,84 @@ fn generate_struct_type(
 
 /// Known enum overrides for properties where `extract_enum_from_description()` fails
 /// due to inconsistent description formatting in CloudFormation schemas.
-fn known_enum_overrides() -> HashMap<&'static str, Vec<&'static str>> {
-    let mut m = HashMap::new();
-    m.insert("IpProtocol", vec!["tcp", "udp", "icmp", "icmpv6", "-1"]);
-    m.insert("ConnectivityType", vec!["public", "private"]);
-    m.insert("AvailabilityMode", vec!["zonal", "regional"]);
-    m.insert("AddressFamily", vec!["IPv4", "IPv6"]);
-    m.insert("Domain", vec!["vpc", "standard"]);
-    // HostnameType enum values are in parent struct description, not field description
-    m.insert("HostnameType", vec!["ip-name", "resource-name"]);
-    // InternetGatewayBlockMode removed - now auto-detected via "Options here are" pattern
-    m
+fn known_enum_overrides() -> &'static HashMap<&'static str, Vec<&'static str>> {
+    static OVERRIDES: LazyLock<HashMap<&'static str, Vec<&'static str>>> = LazyLock::new(|| {
+        let mut m = HashMap::new();
+        m.insert("IpProtocol", vec!["tcp", "udp", "icmp", "icmpv6", "-1"]);
+        m.insert("ConnectivityType", vec!["public", "private"]);
+        m.insert("AvailabilityMode", vec!["zonal", "regional"]);
+        m.insert("AddressFamily", vec!["IPv4", "IPv6"]);
+        m.insert("Domain", vec!["vpc", "standard"]);
+        // HostnameType enum values are in parent struct description, not field description
+        m.insert("HostnameType", vec!["ip-name", "resource-name"]);
+        // InternetGatewayBlockMode removed - now auto-detected via "Options here are" pattern
+        // Transit gateway enable/disable properties
+        m.insert("AutoAcceptSharedAttachments", vec!["enable", "disable"]);
+        m.insert("DefaultRouteTableAssociation", vec!["enable", "disable"]);
+        m.insert("DefaultRouteTablePropagation", vec!["enable", "disable"]);
+        m.insert("DnsSupport", vec!["enable", "disable"]);
+        m.insert("MulticastSupport", vec!["enable", "disable"]);
+        m.insert("SecurityGroupReferencingSupport", vec!["enable", "disable"]);
+        m.insert("VpnEcmpSupport", vec!["enable", "disable"]);
+        m
+    });
+    &OVERRIDES
+}
+
+/// Known integer range overrides for properties where CloudFormation schemas
+/// don't include min/max constraints but the ranges are well-known.
+fn known_int_range_overrides() -> &'static HashMap<&'static str, (i64, i64)> {
+    static OVERRIDES: LazyLock<HashMap<&'static str, (i64, i64)>> = LazyLock::new(|| {
+        let mut m = HashMap::new();
+        m.insert("Ipv4NetmaskLength", (0, 32));
+        m.insert("Ipv6NetmaskLength", (0, 128));
+        m.insert("FromPort", (-1, 65535));
+        m.insert("ToPort", (-1, 65535));
+        m.insert("MaxSessionDuration", (3600, 43200));
+        m
+    });
+    &OVERRIDES
+}
+
+/// Known string type overrides for properties where the CloudFormation type is
+/// plain "string" but should use a more specific type.
+fn known_string_type_overrides() -> &'static HashMap<&'static str, &'static str> {
+    static OVERRIDES: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| {
+        let mut m = HashMap::new();
+        m.insert("DefaultSecurityGroup", "super::security_group_id()");
+        m.insert("DefaultNetworkAcl", "super::aws_resource_id()");
+        m.insert("DeliverCrossAccountRole", "super::iam_role_arn()");
+        m.insert("DeliverLogsPermissionArn", "super::iam_role_arn()");
+        m.insert("PeerRoleArn", "super::iam_role_arn()");
+        m.insert("PermissionsBoundary", "super::iam_policy_arn()");
+        m.insert("ManagedPolicyArns", "super::iam_policy_arn()");
+        m.insert("KmsKeyId", "super::kms_key_arn()");
+        m.insert("KMSMasterKeyID", "super::kms_key_arn()");
+        m.insert("ReplicaKmsKeyID", "super::kms_key_arn()");
+        m.insert("KmsKeyArn", "super::kms_key_arn()");
+        m
+    });
+    &OVERRIDES
+}
+
+/// Infer the Carina type string for a property based on its name.
+/// Checks known string type overrides, ARN patterns, and resource ID patterns.
+/// Returns None if no heuristic matches (caller should default to String).
+fn infer_string_type(prop_name: &str) -> Option<String> {
+    // Check known string type overrides
+    if let Some(&override_type) = known_string_type_overrides().get(prop_name) {
+        return Some(override_type.to_string());
+    }
+    // Check ARN pattern
+    let prop_lower = prop_name.to_lowercase();
+    if prop_lower.ends_with("arn") || prop_lower.ends_with("arns") || prop_lower.contains("_arn") {
+        return Some("super::arn()".to_string());
+    }
+    // Check resource ID pattern
+    if is_aws_resource_id_property(prop_name) {
+        return Some(get_resource_id_type(prop_name).to_string());
+    }
+    None
 }
 
 /// Check if a property name represents an AWS resource ID with the standard
@@ -1286,7 +1426,10 @@ fn cfn_type_to_carina_type_with_enum(
                 None,
             );
         }
-        // Default to String for unknown refs
+        // Apply name-based heuristics for unresolvable $ref
+        if let Some(inferred) = infer_string_type(prop_name) {
+            return (inferred, None);
+        }
         return ("AttributeType::String".to_string(), None);
     }
 
@@ -1325,6 +1468,11 @@ fn cfn_type_to_carina_type_with_enum(
     // Handle type
     match prop.prop_type.as_ref().and_then(|t| t.as_str()) {
         Some("string") => {
+            // Check known string type overrides first
+            if let Some(inferred) = infer_string_type(prop_name) {
+                return (inferred, None);
+            }
+
             // Check if this is a policy document field (CFN sometimes types these as "string")
             if prop_name.ends_with("PolicyDocument") {
                 return ("super::iam_policy_document()".to_string(), None);
@@ -1362,19 +1510,10 @@ fn cfn_type_to_carina_type_with_enum(
                 return ("super::ipam_pool_id()".to_string(), None);
             }
 
-            // AWS resource IDs with known prefix-hex format
-            if is_aws_resource_id_property(prop_name) {
-                return (get_resource_id_type(prop_name).to_string(), None);
-            }
-
             // Other IDs are plain strings (AZ IDs, owner IDs, etc.)
+            // Note: resource IDs and ARNs are already handled by infer_string_type() above
             if prop_lower.ends_with("id") {
                 return ("AttributeType::String".to_string(), None);
-            }
-
-            // ARNs use validated Arn type
-            if prop_lower.ends_with("arn") || prop_lower.contains("_arn") {
-                return ("super::arn()".to_string(), None);
             }
 
             // Availability zone uses format validation (e.g., "us-east-1a")
@@ -1405,7 +1544,13 @@ fn cfn_type_to_carina_type_with_enum(
         }
         Some("boolean") => ("AttributeType::Bool".to_string(), None),
         Some("integer") | Some("number") => {
-            if let (Some(min), Some(max)) = (prop.minimum, prop.maximum) {
+            // Use CF min/max if available, otherwise check known overrides
+            let range = if let (Some(min), Some(max)) = (prop.minimum, prop.maximum) {
+                Some((min, max))
+            } else {
+                known_int_range_overrides().get(prop_name).copied()
+            };
+            if let Some((min, max)) = range {
                 // Generate a ranged int type with validation
                 let validate_fn = format!("validate_{}_range", prop_name.to_snake_case());
                 (
@@ -1479,7 +1624,14 @@ fn cfn_type_to_carina_type_with_enum(
                 None,
             )
         }
-        _ => ("AttributeType::String".to_string(), None),
+        _ => {
+            // Fallback: apply name-based heuristics for properties with no explicit type
+            if let Some(inferred) = infer_string_type(prop_name) {
+                (inferred, None)
+            } else {
+                ("AttributeType::String".to_string(), None)
+            }
+        }
     }
 }
 
@@ -2474,6 +2626,149 @@ mod tests {
         let enums = BTreeMap::new();
         let result = type_display_string("Ipv4NetmaskLength", &prop, &schema, &enums);
         assert_eq!(result, "Int(0..=32)");
+    }
+
+    #[test]
+    fn test_known_int_range_overrides() {
+        let overrides = known_int_range_overrides();
+        assert_eq!(overrides.get("Ipv4NetmaskLength"), Some(&(0, 32)));
+        assert_eq!(overrides.get("Ipv6NetmaskLength"), Some(&(0, 128)));
+        assert_eq!(overrides.get("FromPort"), Some(&(-1, 65535)));
+        assert_eq!(overrides.get("ToPort"), Some(&(-1, 65535)));
+        assert_eq!(overrides.get("MaxSessionDuration"), Some(&(3600, 43200)));
+    }
+
+    #[test]
+    fn test_known_string_type_overrides() {
+        let overrides = known_string_type_overrides();
+        assert_eq!(
+            overrides.get("DefaultSecurityGroup"),
+            Some(&"super::security_group_id()")
+        );
+        assert_eq!(
+            overrides.get("DeliverLogsPermissionArn"),
+            Some(&"super::iam_role_arn()")
+        );
+        assert_eq!(overrides.get("KmsKeyId"), Some(&"super::kms_key_arn()"));
+        assert_eq!(
+            overrides.get("PermissionsBoundary"),
+            Some(&"super::iam_policy_arn()")
+        );
+    }
+
+    #[test]
+    fn test_string_type_override_applied() {
+        // DefaultSecurityGroup should use security_group_id() via override
+        let prop = CfnProperty {
+            prop_type: Some(TypeValue::Single("string".to_string())),
+            description: Some("The ID of the default security group.".to_string()),
+            enum_values: None,
+            items: None,
+            ref_path: None,
+            insertion_order: None,
+            properties: None,
+            required: vec![],
+            minimum: None,
+            maximum: None,
+        };
+        let schema = CfnSchema {
+            type_name: "AWS::EC2::VPC".to_string(),
+            description: None,
+            properties: BTreeMap::new(),
+            required: vec![],
+            read_only_properties: vec![],
+            create_only_properties: vec![],
+            write_only_properties: vec![],
+            primary_identifier: None,
+            definitions: None,
+            tagging: None,
+        };
+        let (type_str, _) =
+            cfn_type_to_carina_type_with_enum(&prop, "DefaultSecurityGroup", &schema);
+        assert_eq!(type_str, "super::security_group_id()");
+    }
+
+    #[test]
+    fn test_int_range_override_applied() {
+        // FromPort without CF min/max should use override (-1..=65535)
+        let prop = CfnProperty {
+            prop_type: Some(TypeValue::Single("integer".to_string())),
+            description: Some("The start of port range.".to_string()),
+            enum_values: None,
+            items: None,
+            ref_path: None,
+            insertion_order: None,
+            properties: None,
+            required: vec![],
+            minimum: None,
+            maximum: None,
+        };
+        let schema = CfnSchema {
+            type_name: "AWS::EC2::SecurityGroupIngress".to_string(),
+            description: None,
+            properties: BTreeMap::new(),
+            required: vec![],
+            read_only_properties: vec![],
+            create_only_properties: vec![],
+            write_only_properties: vec![],
+            primary_identifier: None,
+            definitions: None,
+            tagging: None,
+        };
+        let (type_str, _) = cfn_type_to_carina_type_with_enum(&prop, "FromPort", &schema);
+        assert!(
+            type_str.contains("Int(-1..=65535)"),
+            "FromPort should use override range, got: {}",
+            type_str
+        );
+    }
+
+    #[test]
+    fn test_ref_fallback_arn_heuristic() {
+        // A $ref property named "Arn" with no resolvable definition should use arn()
+        let prop = CfnProperty {
+            prop_type: None,
+            description: None,
+            enum_values: None,
+            items: None,
+            ref_path: Some("#/definitions/Arn".to_string()),
+            insertion_order: None,
+            properties: None,
+            required: vec![],
+            minimum: None,
+            maximum: None,
+        };
+        let schema = CfnSchema {
+            type_name: "AWS::S3::Bucket".to_string(),
+            description: None,
+            properties: BTreeMap::new(),
+            required: vec![],
+            read_only_properties: vec![],
+            create_only_properties: vec![],
+            write_only_properties: vec![],
+            primary_identifier: None,
+            definitions: None,
+            tagging: None,
+        };
+        let (type_str, _) = cfn_type_to_carina_type_with_enum(&prop, "Arn", &schema);
+        assert_eq!(type_str, "super::arn()");
+    }
+
+    #[test]
+    fn test_transit_gateway_enum_overrides() {
+        let overrides = known_enum_overrides();
+        assert_eq!(
+            overrides.get("AutoAcceptSharedAttachments"),
+            Some(&vec!["enable", "disable"])
+        );
+        assert_eq!(
+            overrides.get("DnsSupport"),
+            Some(&vec!["enable", "disable"])
+        );
+        assert_eq!(
+            overrides.get("VpnEcmpSupport"),
+            Some(&vec!["enable", "disable"])
+        );
     }
 
     #[test]

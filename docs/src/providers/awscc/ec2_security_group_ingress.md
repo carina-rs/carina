@@ -29,7 +29,7 @@ Updates the description of an ingress (inbound) security group rule. You can rep
 
 ### `from_port`
 
-- **Type:** Int
+- **Type:** Int(-1..=65535)
 - **Required:** No
 
 The start of port range for the TCP and UDP protocols, or an ICMP/ICMPv6 type number. A value of -1 indicates all ICMP/ICMPv6 types. If you specify all ICMP/ICMPv6 types, you must specify all codes. Use this for ICMP and any protocol that uses ports.
@@ -85,7 +85,7 @@ The ID of the security group. You must specify either the security group ID or t
 
 ### `to_port`
 
-- **Type:** Int
+- **Type:** Int(-1..=65535)
 - **Required:** No
 
 The end of port range for the TCP and UDP protocols, or an ICMP/ICMPv6 code. A value of -1 indicates all ICMP/ICMPv6 codes for the specified ICMP type. If you specify all ICMP/ICMPv6 types, you must specify all codes. Use this for ICMP and any protocol that uses ports.
@@ -116,18 +116,15 @@ Shorthand formats: `tcp` or `IpProtocol.tcp`
 
 ```crn
 let vpc = awscc.ec2_vpc {
-  name       = "example-vpc"
   cidr_block = "10.0.0.0/16"
 }
 
 let sg = awscc.ec2_security_group {
-  name              = "example-sg"
   vpc_id            = vpc.vpc_id
   group_description = "Example security group"
 }
 
-awscc.ec2_security_group_ingress {
-  name        = "example-https-ingress"
+let ingress = awscc.ec2_security_group_ingress {
   group_id    = sg.group_id
   description = "Allow HTTPS from VPC"
   ip_protocol = "tcp"

@@ -10,6 +10,50 @@ use super::validate_namespaced_enum;
 use carina_core::resource::Value;
 use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, types};
 
+const VALID_AUTO_ACCEPT_SHARED_ATTACHMENTS: &[&str] = &["enable", "disable"];
+
+fn validate_auto_accept_shared_attachments(value: &Value) -> Result<(), String> {
+    validate_namespaced_enum(
+        value,
+        "AutoAcceptSharedAttachments",
+        "awscc.ec2_transit_gateway",
+        VALID_AUTO_ACCEPT_SHARED_ATTACHMENTS,
+    )
+}
+
+const VALID_DEFAULT_ROUTE_TABLE_ASSOCIATION: &[&str] = &["enable", "disable"];
+
+fn validate_default_route_table_association(value: &Value) -> Result<(), String> {
+    validate_namespaced_enum(
+        value,
+        "DefaultRouteTableAssociation",
+        "awscc.ec2_transit_gateway",
+        VALID_DEFAULT_ROUTE_TABLE_ASSOCIATION,
+    )
+}
+
+const VALID_DEFAULT_ROUTE_TABLE_PROPAGATION: &[&str] = &["enable", "disable"];
+
+fn validate_default_route_table_propagation(value: &Value) -> Result<(), String> {
+    validate_namespaced_enum(
+        value,
+        "DefaultRouteTablePropagation",
+        "awscc.ec2_transit_gateway",
+        VALID_DEFAULT_ROUTE_TABLE_PROPAGATION,
+    )
+}
+
+const VALID_DNS_SUPPORT: &[&str] = &["enable", "disable"];
+
+fn validate_dns_support(value: &Value) -> Result<(), String> {
+    validate_namespaced_enum(
+        value,
+        "DnsSupport",
+        "awscc.ec2_transit_gateway",
+        VALID_DNS_SUPPORT,
+    )
+}
+
 const VALID_ENCRYPTION_SUPPORT: &[&str] = &["disable", "enable"];
 
 fn validate_encryption_support(value: &Value) -> Result<(), String> {
@@ -18,6 +62,39 @@ fn validate_encryption_support(value: &Value) -> Result<(), String> {
         "EncryptionSupport",
         "awscc.ec2_transit_gateway",
         VALID_ENCRYPTION_SUPPORT,
+    )
+}
+
+const VALID_MULTICAST_SUPPORT: &[&str] = &["enable", "disable"];
+
+fn validate_multicast_support(value: &Value) -> Result<(), String> {
+    validate_namespaced_enum(
+        value,
+        "MulticastSupport",
+        "awscc.ec2_transit_gateway",
+        VALID_MULTICAST_SUPPORT,
+    )
+}
+
+const VALID_SECURITY_GROUP_REFERENCING_SUPPORT: &[&str] = &["enable", "disable"];
+
+fn validate_security_group_referencing_support(value: &Value) -> Result<(), String> {
+    validate_namespaced_enum(
+        value,
+        "SecurityGroupReferencingSupport",
+        "awscc.ec2_transit_gateway",
+        VALID_SECURITY_GROUP_REFERENCING_SUPPORT,
+    )
+}
+
+const VALID_VPN_ECMP_SUPPORT: &[&str] = &["enable", "disable"];
+
+fn validate_vpn_ecmp_support(value: &Value) -> Result<(), String> {
+    validate_namespaced_enum(
+        value,
+        "VpnEcmpSupport",
+        "awscc.ec2_transit_gateway",
+        VALID_VPN_ECMP_SUPPORT,
     )
 }
 
@@ -42,24 +119,56 @@ pub fn ec2_transit_gateway_config() -> AwsccSchemaConfig {
                 .with_provider_name("AssociationDefaultRouteTableId"),
             )
             .attribute(
-                AttributeSchema::new("auto_accept_shared_attachments", AttributeType::String)
-                    .with_provider_name("AutoAcceptSharedAttachments"),
+                AttributeSchema::new(
+                    "auto_accept_shared_attachments",
+                    AttributeType::Custom {
+                        name: "AutoAcceptSharedAttachments".to_string(),
+                        base: Box::new(AttributeType::String),
+                        validate: validate_auto_accept_shared_attachments,
+                        namespace: Some("awscc.ec2_transit_gateway".to_string()),
+                    },
+                )
+                .with_provider_name("AutoAcceptSharedAttachments"),
             )
             .attribute(
-                AttributeSchema::new("default_route_table_association", AttributeType::String)
-                    .with_provider_name("DefaultRouteTableAssociation"),
+                AttributeSchema::new(
+                    "default_route_table_association",
+                    AttributeType::Custom {
+                        name: "DefaultRouteTableAssociation".to_string(),
+                        base: Box::new(AttributeType::String),
+                        validate: validate_default_route_table_association,
+                        namespace: Some("awscc.ec2_transit_gateway".to_string()),
+                    },
+                )
+                .with_provider_name("DefaultRouteTableAssociation"),
             )
             .attribute(
-                AttributeSchema::new("default_route_table_propagation", AttributeType::String)
-                    .with_provider_name("DefaultRouteTablePropagation"),
+                AttributeSchema::new(
+                    "default_route_table_propagation",
+                    AttributeType::Custom {
+                        name: "DefaultRouteTablePropagation".to_string(),
+                        base: Box::new(AttributeType::String),
+                        validate: validate_default_route_table_propagation,
+                        namespace: Some("awscc.ec2_transit_gateway".to_string()),
+                    },
+                )
+                .with_provider_name("DefaultRouteTablePropagation"),
             )
             .attribute(
                 AttributeSchema::new("description", AttributeType::String)
                     .with_provider_name("Description"),
             )
             .attribute(
-                AttributeSchema::new("dns_support", AttributeType::String)
-                    .with_provider_name("DnsSupport"),
+                AttributeSchema::new(
+                    "dns_support",
+                    AttributeType::Custom {
+                        name: "DnsSupport".to_string(),
+                        base: Box::new(AttributeType::String),
+                        validate: validate_dns_support,
+                        namespace: Some("awscc.ec2_transit_gateway".to_string()),
+                    },
+                )
+                .with_provider_name("DnsSupport"),
             )
             .attribute(
                 AttributeSchema::new(
@@ -84,9 +193,17 @@ pub fn ec2_transit_gateway_config() -> AwsccSchemaConfig {
                     .with_provider_name("Id"),
             )
             .attribute(
-                AttributeSchema::new("multicast_support", AttributeType::String)
-                    .create_only()
-                    .with_provider_name("MulticastSupport"),
+                AttributeSchema::new(
+                    "multicast_support",
+                    AttributeType::Custom {
+                        name: "MulticastSupport".to_string(),
+                        base: Box::new(AttributeType::String),
+                        validate: validate_multicast_support,
+                        namespace: Some("awscc.ec2_transit_gateway".to_string()),
+                    },
+                )
+                .create_only()
+                .with_provider_name("MulticastSupport"),
             )
             .attribute(
                 AttributeSchema::new(
@@ -96,8 +213,16 @@ pub fn ec2_transit_gateway_config() -> AwsccSchemaConfig {
                 .with_provider_name("PropagationDefaultRouteTableId"),
             )
             .attribute(
-                AttributeSchema::new("security_group_referencing_support", AttributeType::String)
-                    .with_provider_name("SecurityGroupReferencingSupport"),
+                AttributeSchema::new(
+                    "security_group_referencing_support",
+                    AttributeType::Custom {
+                        name: "SecurityGroupReferencingSupport".to_string(),
+                        base: Box::new(AttributeType::String),
+                        validate: validate_security_group_referencing_support,
+                        namespace: Some("awscc.ec2_transit_gateway".to_string()),
+                    },
+                )
+                .with_provider_name("SecurityGroupReferencingSupport"),
             )
             .attribute(AttributeSchema::new("tags", tags_type()).with_provider_name("Tags"))
             .attribute(
@@ -113,8 +238,16 @@ pub fn ec2_transit_gateway_config() -> AwsccSchemaConfig {
                 .with_provider_name("TransitGatewayCidrBlocks"),
             )
             .attribute(
-                AttributeSchema::new("vpn_ecmp_support", AttributeType::String)
-                    .with_provider_name("VpnEcmpSupport"),
+                AttributeSchema::new(
+                    "vpn_ecmp_support",
+                    AttributeType::Custom {
+                        name: "VpnEcmpSupport".to_string(),
+                        base: Box::new(AttributeType::String),
+                        validate: validate_vpn_ecmp_support,
+                        namespace: Some("awscc.ec2_transit_gateway".to_string()),
+                    },
+                )
+                .with_provider_name("VpnEcmpSupport"),
             ),
     }
 }

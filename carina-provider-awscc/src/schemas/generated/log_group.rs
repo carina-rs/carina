@@ -50,7 +50,7 @@ pub fn logs_log_group_config() -> AwsccSchemaConfig {
                 .with_provider_name("FieldIndexPolicies"),
         )
         .attribute(
-            AttributeSchema::new("kms_key_id", AttributeType::String)
+            AttributeSchema::new("kms_key_id", super::kms_key_arn())
                 .with_description("The Amazon Resource Name (ARN) of the KMS key to use when encrypting log data. To associate an KMS key with the log group, specify the ARN of that KMS...")
                 .with_provider_name("KmsKeyId"),
         )

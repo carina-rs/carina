@@ -21,6 +21,18 @@ fn validate_instance_tenancy(value: &Value) -> Result<(), String> {
     )
 }
 
+fn validate_ipv4_netmask_length_range(value: &Value) -> Result<(), String> {
+    if let Value::Int(n) = value {
+        if *n < 0 || *n > 32 {
+            Err(format!("Value {} is out of range 0..=32", n))
+        } else {
+            Ok(())
+        }
+    } else {
+        Err("Expected integer".to_string())
+    }
+}
+
 /// Returns the schema config for ec2_vpc (AWS::EC2::VPC)
 pub fn ec2_vpc_config() -> AwsccSchemaConfig {
     AwsccSchemaConfig {
@@ -41,12 +53,12 @@ pub fn ec2_vpc_config() -> AwsccSchemaConfig {
                 .with_provider_name("CidrBlockAssociations"),
         )
         .attribute(
-            AttributeSchema::new("default_network_acl", AttributeType::String)
+            AttributeSchema::new("default_network_acl", super::aws_resource_id())
                 .with_description(" (read-only)")
                 .with_provider_name("DefaultNetworkAcl"),
         )
         .attribute(
-            AttributeSchema::new("default_security_group", AttributeType::String)
+            AttributeSchema::new("default_security_group", super::security_group_id())
                 .with_description(" (read-only)")
                 .with_provider_name("DefaultSecurityGroup"),
         )
@@ -77,7 +89,12 @@ pub fn ec2_vpc_config() -> AwsccSchemaConfig {
                 .with_provider_name("Ipv4IpamPoolId"),
         )
         .attribute(
-            AttributeSchema::new("ipv4_netmask_length", AttributeType::Int)
+            AttributeSchema::new("ipv4_netmask_length", AttributeType::Custom {
+                name: "Int(0..=32)".to_string(),
+                base: Box::new(AttributeType::Int),
+                validate: validate_ipv4_netmask_length_range,
+                namespace: None,
+            })
                 .create_only()
                 .with_description("The netmask length of the IPv4 CIDR you want to allocate to this VPC from an Amazon VPC IP Address Manager (IPAM) pool. For more information about IPA...")
                 .with_provider_name("Ipv4NetmaskLength"),
