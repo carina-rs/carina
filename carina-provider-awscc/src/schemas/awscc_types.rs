@@ -7,7 +7,7 @@
 
 use carina_core::resource::Value;
 use carina_core::schema::{AttributeType, ResourceSchema};
-use carina_core::utils::validate_enum_namespace;
+use carina_core::utils::{extract_enum_value, validate_enum_namespace};
 
 /// AWS Cloud Control schema configuration
 ///
@@ -27,20 +27,6 @@ pub struct AwsccSchemaConfig {
 /// Tags type for AWS resources (Terraform-style map)
 pub fn tags_type() -> AttributeType {
     AttributeType::Map(Box::new(AttributeType::String))
-}
-
-/// Normalize a namespaced enum value to its base value.
-/// Handles formats like:
-/// - "value" -> "value"
-/// - "TypeName.value" -> "value"
-/// - "awscc.resource.TypeName.value" -> "value"
-pub fn normalize_namespaced_enum(s: &str) -> String {
-    if s.contains('.') {
-        let parts: Vec<&str> = s.split('.').collect();
-        parts.last().map(|s| s.to_string()).unwrap_or_default()
-    } else {
-        s.to_string()
-    }
 }
 
 /// Canonicalize an enum value by matching against valid values.
@@ -167,13 +153,11 @@ pub fn validate_namespaced_enum(
     if let Value::String(s) = value {
         validate_enum_namespace(s, type_name, namespace)?;
 
-        let normalized = normalize_namespaced_enum(s);
+        let normalized = extract_enum_value(s);
         // Accept both underscore (DSL identifier) and hyphen (AWS value) forms
         // e.g., "cloud_watch_logs" matches "cloud-watch-logs"
         let hyphenated = normalized.replace('_', "-");
-        if valid_values.contains(&normalized.as_str())
-            || valid_values.contains(&hyphenated.as_str())
-        {
+        if valid_values.contains(&normalized) || valid_values.contains(&hyphenated.as_str()) {
             Ok(())
         } else {
             Err(format!(
