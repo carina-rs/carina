@@ -96,6 +96,7 @@ pub fn ec2_subnet_config() -> AwsccSchemaConfig {
                 base: Box::new(AttributeType::Int),
                 validate: validate_ipv4_netmask_length_range,
                 namespace: None,
+                to_dsl: None,
             })
                 .create_only()
                 .with_description("An IPv4 netmask length for the subnet.")
@@ -129,6 +130,7 @@ pub fn ec2_subnet_config() -> AwsccSchemaConfig {
                 base: Box::new(AttributeType::Int),
                 validate: validate_ipv6_netmask_length_range,
                 namespace: None,
+                to_dsl: None,
             })
                 .create_only()
                 .with_description("An IPv6 netmask length for the subnet.")

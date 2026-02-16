@@ -60,6 +60,7 @@ pub fn logs_log_group_config() -> AwsccSchemaConfig {
                 base: Box::new(AttributeType::String),
                 validate: validate_log_group_class,
                 namespace: Some("awscc.logs_log_group".to_string()),
+                to_dsl: None,
             })
                 .with_description("Specifies the log group class for this log group. There are two classes:  + The ``Standard`` log class supports all CWL features.  + The ``Infrequent ...")
                 .with_provider_name("LogGroupClass"),

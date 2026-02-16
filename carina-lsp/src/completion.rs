@@ -378,7 +378,7 @@ impl CompletionProvider {
                 kind: Some(CompletionItemKind::CLASS),
                 text_edit: Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(TextEdit {
                     range: replacement_range,
-                    new_text: "aws.subnet {\n    vpc_id            = ${1:vpc.id}\n    cidr_block        = \"${2:10.0.1.0/24}\"\n    availability_zone = aws.AvailabilityZone.${3:ap_northeast_1a}\n}".to_string(),
+                    new_text: "aws.subnet {\n    vpc_id            = ${1:vpc.id}\n    cidr_block        = \"${2:10.0.1.0/24}\"\n    availability_zone = awscc.AvailabilityZone.${3:ap_northeast_1a}\n}".to_string(),
                 })),
                 insert_text_format: Some(InsertTextFormat::SNIPPET),
                 detail: Some("Subnet resource".to_string()),
@@ -1265,10 +1265,10 @@ impl CompletionProvider {
                 };
 
                 CompletionItem {
-                    label: format!("aws.AvailabilityZone.{}", az),
+                    label: format!("awscc.AvailabilityZone.{}", az),
                     kind: Some(CompletionItemKind::ENUM_MEMBER),
                     detail: Some(detail),
-                    insert_text: Some(format!("aws.AvailabilityZone.{}", az)),
+                    insert_text: Some(format!("awscc.AvailabilityZone.{}", az)),
                     ..Default::default()
                 }
             })

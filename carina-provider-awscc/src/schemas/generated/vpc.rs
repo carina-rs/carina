@@ -78,6 +78,7 @@ pub fn ec2_vpc_config() -> AwsccSchemaConfig {
                 base: Box::new(AttributeType::String),
                 validate: validate_instance_tenancy,
                 namespace: Some("awscc.ec2_vpc".to_string()),
+                to_dsl: None,
             })
                 .with_description("The allowed tenancy of instances launched into the VPC.  + ``default``: An instance launched into the VPC runs on shared hardware by default, unless y...")
                 .with_provider_name("InstanceTenancy"),
@@ -94,6 +95,7 @@ pub fn ec2_vpc_config() -> AwsccSchemaConfig {
                 base: Box::new(AttributeType::Int),
                 validate: validate_ipv4_netmask_length_range,
                 namespace: None,
+                to_dsl: None,
             })
                 .create_only()
                 .with_description("The netmask length of the IPv4 CIDR you want to allocate to this VPC from an Amazon VPC IP Address Manager (IPAM) pool. For more information about IPA...")

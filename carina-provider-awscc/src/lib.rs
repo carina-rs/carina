@@ -16,9 +16,7 @@ pub mod utils;
 
 // Re-export main types
 pub use provider::AwsccProvider;
-pub use utils::{
-    convert_enum_value, normalize_availability_zone, normalize_instance_tenancy, normalize_region,
-};
+pub use utils::{convert_enum_value, normalize_instance_tenancy, normalize_region};
 
 use carina_core::provider::{BoxFuture, Provider, ProviderResult};
 use carina_core::resource::{LifecycleConfig, Resource, ResourceId, State};

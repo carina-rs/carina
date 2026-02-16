@@ -2789,38 +2789,32 @@ fn resolve_enum_identifiers(resources: &mut [Resource]) {
             None => continue,
         };
 
-        // Resolve enum attributes and availability_zone
+        // Resolve enum attributes
         let mut resolved_attrs = HashMap::new();
         for (key, value) in &resource.attributes {
-            // Resolve availability_zone: "ap-northeast-1a" → "aws.AvailabilityZone.ap_northeast_1a"
-            if key == "availability_zone"
-                && let Value::String(s) = value
-                && !s.contains('.')
-            {
-                let az_dsl = format!("aws.AvailabilityZone.{}", s.replace('-', "_"));
-                resolved_attrs.insert(key.clone(), Value::String(az_dsl));
-                continue;
-            }
-
             if let Some(attr_schema) = config.schema.attributes.get(key.as_str())
                 && let AttributeType::Custom {
                     name: type_name,
                     namespace: Some(ns),
+                    to_dsl,
                     ..
                 } = &attr_schema.attr_type
             {
                 let resolved = match value {
                     Value::UnresolvedIdent(ident, None) => {
                         // bare identifier: advanced → awscc.ec2_ipam.Tier.advanced
-                        Value::String(format!("{}.{}.{}", ns, type_name, ident))
+                        let dsl_val = to_dsl.map_or_else(|| ident.clone(), |f| f(ident));
+                        Value::String(format!("{}.{}.{}", ns, type_name, dsl_val))
                     }
                     Value::UnresolvedIdent(ident, Some(member)) if ident == type_name => {
                         // TypeName.value: Tier.advanced → awscc.ec2_ipam.Tier.advanced
-                        Value::String(format!("{}.{}.{}", ns, type_name, member))
+                        let dsl_val = to_dsl.map_or_else(|| member.clone(), |f| f(member));
+                        Value::String(format!("{}.{}.{}", ns, type_name, dsl_val))
                     }
                     Value::String(s) if !s.contains('.') => {
-                        // plain string: "IPv4" → awscc.ec2_ipam_pool.AddressFamily.IPv4
-                        Value::String(format!("{}.{}.{}", ns, type_name, s))
+                        // plain string: "ap-northeast-1a" → awscc.AvailabilityZone.ap_northeast_1a
+                        let dsl_val = to_dsl.map_or_else(|| s.clone(), |f| f(s));
+                        Value::String(format!("{}.{}.{}", ns, type_name, dsl_val))
                     }
                     _ => value.clone(),
                 };

@@ -126,6 +126,7 @@ pub fn ec2_transit_gateway_config() -> AwsccSchemaConfig {
                         base: Box::new(AttributeType::String),
                         validate: validate_auto_accept_shared_attachments,
                         namespace: Some("awscc.ec2_transit_gateway".to_string()),
+                        to_dsl: None,
                     },
                 )
                 .with_provider_name("AutoAcceptSharedAttachments"),
@@ -138,6 +139,7 @@ pub fn ec2_transit_gateway_config() -> AwsccSchemaConfig {
                         base: Box::new(AttributeType::String),
                         validate: validate_default_route_table_association,
                         namespace: Some("awscc.ec2_transit_gateway".to_string()),
+                        to_dsl: None,
                     },
                 )
                 .with_provider_name("DefaultRouteTableAssociation"),
@@ -150,6 +152,7 @@ pub fn ec2_transit_gateway_config() -> AwsccSchemaConfig {
                         base: Box::new(AttributeType::String),
                         validate: validate_default_route_table_propagation,
                         namespace: Some("awscc.ec2_transit_gateway".to_string()),
+                        to_dsl: None,
                     },
                 )
                 .with_provider_name("DefaultRouteTablePropagation"),
@@ -166,6 +169,7 @@ pub fn ec2_transit_gateway_config() -> AwsccSchemaConfig {
                         base: Box::new(AttributeType::String),
                         validate: validate_dns_support,
                         namespace: Some("awscc.ec2_transit_gateway".to_string()),
+                        to_dsl: None,
                     },
                 )
                 .with_provider_name("DnsSupport"),
@@ -178,6 +182,7 @@ pub fn ec2_transit_gateway_config() -> AwsccSchemaConfig {
                         base: Box::new(AttributeType::String),
                         validate: validate_encryption_support,
                         namespace: Some("awscc.ec2_transit_gateway".to_string()),
+                        to_dsl: None,
                     },
                 )
                 .with_provider_name("EncryptionSupport"),
@@ -200,6 +205,7 @@ pub fn ec2_transit_gateway_config() -> AwsccSchemaConfig {
                         base: Box::new(AttributeType::String),
                         validate: validate_multicast_support,
                         namespace: Some("awscc.ec2_transit_gateway".to_string()),
+                        to_dsl: None,
                     },
                 )
                 .create_only()
@@ -220,6 +226,7 @@ pub fn ec2_transit_gateway_config() -> AwsccSchemaConfig {
                         base: Box::new(AttributeType::String),
                         validate: validate_security_group_referencing_support,
                         namespace: Some("awscc.ec2_transit_gateway".to_string()),
+                        to_dsl: None,
                     },
                 )
                 .with_provider_name("SecurityGroupReferencingSupport"),
@@ -245,6 +252,7 @@ pub fn ec2_transit_gateway_config() -> AwsccSchemaConfig {
                         base: Box::new(AttributeType::String),
                         validate: validate_vpn_ecmp_support,
                         namespace: Some("awscc.ec2_transit_gateway".to_string()),
+                        to_dsl: None,
                     },
                 )
                 .with_provider_name("VpnEcmpSupport"),

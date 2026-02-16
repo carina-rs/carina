@@ -234,6 +234,7 @@ pub fn ipam_pool_id() -> AttributeType {
             }
         },
         namespace: None,
+        to_dsl: None,
     }
 }
 
@@ -272,6 +273,7 @@ pub fn arn() -> AttributeType {
             }
         },
         namespace: None,
+        to_dsl: None,
     }
 }
 
@@ -303,6 +305,7 @@ pub fn aws_resource_id() -> AttributeType {
             }
         },
         namespace: None,
+        to_dsl: None,
     }
 }
 
@@ -371,6 +374,7 @@ pub fn vpc_id() -> AttributeType {
             }
         },
         namespace: None,
+        to_dsl: None,
     }
 }
 
@@ -387,6 +391,7 @@ pub fn subnet_id() -> AttributeType {
             }
         },
         namespace: None,
+        to_dsl: None,
     }
 }
 
@@ -403,6 +408,7 @@ pub fn security_group_id() -> AttributeType {
             }
         },
         namespace: None,
+        to_dsl: None,
     }
 }
 
@@ -419,6 +425,7 @@ pub fn internet_gateway_id() -> AttributeType {
             }
         },
         namespace: None,
+        to_dsl: None,
     }
 }
 
@@ -435,6 +442,7 @@ pub fn route_table_id() -> AttributeType {
             }
         },
         namespace: None,
+        to_dsl: None,
     }
 }
 
@@ -451,6 +459,7 @@ pub fn nat_gateway_id() -> AttributeType {
             }
         },
         namespace: None,
+        to_dsl: None,
     }
 }
 
@@ -467,6 +476,7 @@ pub fn vpc_peering_connection_id() -> AttributeType {
             }
         },
         namespace: None,
+        to_dsl: None,
     }
 }
 
@@ -483,6 +493,7 @@ pub fn transit_gateway_id() -> AttributeType {
             }
         },
         namespace: None,
+        to_dsl: None,
     }
 }
 
@@ -499,6 +510,7 @@ pub fn vpn_gateway_id() -> AttributeType {
             }
         },
         namespace: None,
+        to_dsl: None,
     }
 }
 
@@ -515,6 +527,7 @@ pub fn egress_only_internet_gateway_id() -> AttributeType {
             }
         },
         namespace: None,
+        to_dsl: None,
     }
 }
 
@@ -531,6 +544,7 @@ pub fn vpc_endpoint_id() -> AttributeType {
             }
         },
         namespace: None,
+        to_dsl: None,
     }
 }
 
@@ -547,7 +561,8 @@ pub fn availability_zone() -> AttributeType {
                 Err("Expected string".to_string())
             }
         },
-        namespace: None,
+        namespace: Some("awscc".to_string()),
+        to_dsl: Some(|s: &str| s.replace('-', "_")),
     }
 }
 
@@ -634,6 +649,7 @@ pub fn iam_role_arn() -> AttributeType {
             }
         },
         namespace: None,
+        to_dsl: None,
     }
 }
 
@@ -650,6 +666,7 @@ pub fn iam_policy_arn() -> AttributeType {
             }
         },
         namespace: None,
+        to_dsl: None,
     }
 }
 
@@ -666,6 +683,7 @@ pub fn kms_key_arn() -> AttributeType {
             }
         },
         namespace: None,
+        to_dsl: None,
     }
 }
 
@@ -686,6 +704,7 @@ pub fn kms_key_id() -> AttributeType {
             }
         },
         namespace: None,
+        to_dsl: None,
     }
 }
 
@@ -739,6 +758,7 @@ pub fn iam_policy_document() -> AttributeType {
         base: Box::new(AttributeType::Map(Box::new(AttributeType::String))),
         validate: |value| validate_iam_policy_document(value),
         namespace: None,
+        to_dsl: None,
     }
 }
 

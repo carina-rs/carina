@@ -22,6 +22,7 @@ pub fn port_number() -> AttributeType {
             }
         },
         namespace: None,
+        to_dsl: None,
     }
 }
 
@@ -167,6 +168,7 @@ pub fn instance_tenancy() -> AttributeType {
             }
         },
         namespace: Some("aws.vpc".to_string()),
+        to_dsl: None,
     }
 }
 

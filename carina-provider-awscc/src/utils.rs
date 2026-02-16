@@ -19,16 +19,6 @@ pub fn normalize_instance_tenancy(s: &str) -> String {
     }
 }
 
-/// Normalize availability zone value (e.g., "ap_northeast_1a" -> "ap-northeast-1a")
-pub fn normalize_availability_zone(s: &str) -> String {
-    let az_part = if s.contains('.') {
-        s.split('.').next_back().unwrap_or(s)
-    } else {
-        s
-    };
-    az_part.replace('_', "-")
-}
-
 /// Convert DSL enum value to AWS SDK format
 /// e.g., "aws.Region.ap_northeast_1" -> "ap-northeast-1"
 /// e.g., "awscc.ec2_ipam.Tier.advanced" -> "advanced"
@@ -87,18 +77,6 @@ mod tests {
         assert_eq!(
             normalize_instance_tenancy("awscc.ec2_vpc.InstanceTenancy.dedicated"),
             "dedicated"
-        );
-    }
-
-    #[test]
-    fn test_normalize_availability_zone() {
-        assert_eq!(
-            normalize_availability_zone("ap_northeast_1a"),
-            "ap-northeast-1a"
-        );
-        assert_eq!(
-            normalize_availability_zone("aws.AvailabilityZone.us_east_1b"),
-            "us-east-1b"
         );
     }
 

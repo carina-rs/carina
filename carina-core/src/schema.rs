@@ -72,6 +72,10 @@ pub enum AttributeType {
         /// Namespace for resolving shorthand enum values (e.g., "aws.vpc")
         /// When set, allows `dedicated` to be resolved to `aws.vpc.InstanceTenancy.dedicated`
         namespace: Option<String>,
+        /// Optional callback to normalize AWS values to DSL format.
+        /// For example, availability_zone uses `|s| s.replace('-', "_")` to convert
+        /// "ap-northeast-1a" to "ap_northeast_1a" for DSL identifier form.
+        to_dsl: Option<fn(&str) -> String>,
     },
     /// List
     List(Box<AttributeType>),
@@ -523,6 +527,7 @@ pub mod types {
                 }
             },
             namespace: None,
+            to_dsl: None,
         }
     }
 
@@ -539,6 +544,7 @@ pub mod types {
                 }
             },
             namespace: None,
+            to_dsl: None,
         }
     }
 
@@ -555,6 +561,7 @@ pub mod types {
                 }
             },
             namespace: None,
+            to_dsl: None,
         }
     }
 
@@ -571,6 +578,7 @@ pub mod types {
                 }
             },
             namespace: None,
+            to_dsl: None,
         }
     }
 
@@ -587,6 +595,7 @@ pub mod types {
                 }
             },
             namespace: None,
+            to_dsl: None,
         }
     }
 
@@ -603,6 +612,7 @@ pub mod types {
                 }
             },
             namespace: None,
+            to_dsl: None,
         }
     }
 }

@@ -19,7 +19,7 @@ use carina_core::schema::AttributeType;
 use crate::schemas::generated::{
     AwsccSchemaConfig, canonicalize_enum_value, get_enum_valid_values,
 };
-use crate::utils::{convert_enum_value, normalize_availability_zone, normalize_instance_tenancy};
+use crate::utils::{convert_enum_value, normalize_instance_tenancy};
 
 /// Get the AwsccSchemaConfig for a resource type
 fn get_schema_config(resource_type: &str) -> Option<AwsccSchemaConfig> {
@@ -653,37 +653,28 @@ impl AwsccProvider {
         attr_type: &AttributeType,
         resource_type: &str,
     ) -> Option<Value> {
-        match dsl_name {
-            "availability_zone" => {
-                // Convert ap-northeast-1a to aws.AvailabilityZone.ap_northeast_1a
-                value.as_str().map(|s| {
-                    let az_dsl = format!("aws.AvailabilityZone.{}", s.replace('-', "_"));
-                    Value::String(az_dsl)
-                })
-            }
-            _ => {
-                // For Custom enum types with namespace, convert to DSL namespaced format
-                if let AttributeType::Custom {
-                    name: type_name,
-                    namespace: Some(ns),
-                    ..
-                } = attr_type
-                    && let Some(s) = value.as_str()
-                {
-                    // Canonicalize case using valid values registry
-                    let canonical = if let Some(valid_values) =
-                        get_enum_valid_values(resource_type, dsl_name)
-                    {
-                        canonicalize_enum_value(s, valid_values)
-                    } else {
-                        s.to_string()
-                    };
-                    let namespaced = format!("{}.{}.{}", ns, type_name, canonical);
-                    return Some(Value::String(namespaced));
-                }
-                self.json_to_value(value)
-            }
+        // For Custom enum types with namespace, convert to DSL namespaced format
+        if let AttributeType::Custom {
+            name: type_name,
+            namespace: Some(ns),
+            to_dsl,
+            ..
+        } = attr_type
+            && let Some(s) = value.as_str()
+        {
+            // Canonicalize case using valid values registry
+            let canonical =
+                if let Some(valid_values) = get_enum_valid_values(resource_type, dsl_name) {
+                    canonicalize_enum_value(s, valid_values)
+                } else {
+                    s.to_string()
+                };
+            // Apply to_dsl transformation if present (e.g., hyphens → underscores for AZs)
+            let dsl_val = to_dsl.map_or(canonical.clone(), |f| f(&canonical));
+            let namespaced = format!("{}.{}.{}", ns, type_name, dsl_val);
+            return Some(Value::String(namespaced));
         }
+        self.json_to_value(value)
     }
 
     /// Convert JSON value to DSL Value
@@ -721,13 +712,6 @@ impl AwsccProvider {
         attr_type: &AttributeType,
     ) -> Option<serde_json::Value> {
         match dsl_name {
-            "availability_zone" => {
-                if let Value::String(s) = value {
-                    Some(json!(normalize_availability_zone(s)))
-                } else {
-                    None
-                }
-            }
             "instance_tenancy" => {
                 if let Value::String(s) = value {
                     Some(json!(normalize_instance_tenancy(s)))

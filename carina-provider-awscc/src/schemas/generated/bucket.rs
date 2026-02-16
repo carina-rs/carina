@@ -50,6 +50,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                 base: Box::new(AttributeType::String),
                 validate: validate_abac_status,
                 namespace: Some("awscc.s3_bucket".to_string()),
+                to_dsl: None,
             })
                 .with_description("The ABAC status of the general purpose bucket. When ABAC is enabled for the general purpose bucket, you can use tags to manage access to the general p...")
                 .with_provider_name("AbacStatus"),
@@ -70,6 +71,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                 base: Box::new(AttributeType::String),
                 validate: validate_access_control,
                 namespace: Some("awscc.s3_bucket".to_string()),
+                to_dsl: None,
             })
                 .with_description("This is a legacy property, and it is not recommended for most use cases. A majority of modern use cases in Amazon S3 no longer require the use of ACLs...")
                 .with_provider_name("AccessControl"),
