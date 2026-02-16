@@ -1614,4 +1614,83 @@ mod tests {
         assert_eq!(get_enum_valid_values("ec2_vpc", "cidr_block"), None);
         assert_eq!(get_enum_valid_values("unknown", "unknown"), None);
     }
+
+    #[test]
+    fn validate_namespaced_enum_plain_value() {
+        let result = validate_namespaced_enum(
+            &Value::String("default".to_string()),
+            "InstanceTenancy",
+            "awscc.ec2_vpc",
+            &["default", "dedicated", "host"],
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_namespaced_enum_2part_namespaced() {
+        let result = validate_namespaced_enum(
+            &Value::String("InstanceTenancy.default".to_string()),
+            "InstanceTenancy",
+            "awscc.ec2_vpc",
+            &["default", "dedicated", "host"],
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_namespaced_enum_full_namespaced() {
+        let result = validate_namespaced_enum(
+            &Value::String("awscc.ec2_vpc.InstanceTenancy.default".to_string()),
+            "InstanceTenancy",
+            "awscc.ec2_vpc",
+            &["default", "dedicated", "host"],
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_namespaced_enum_invalid_value() {
+        let result = validate_namespaced_enum(
+            &Value::String("invalid".to_string()),
+            "InstanceTenancy",
+            "awscc.ec2_vpc",
+            &["default", "dedicated", "host"],
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Invalid value"));
+    }
+
+    #[test]
+    fn validate_namespaced_enum_underscore_to_hyphen() {
+        let result = validate_namespaced_enum(
+            &Value::String("cloud_watch_logs".to_string()),
+            "LogDestinationType",
+            "awscc.ec2_flow_log",
+            &["cloud-watch-logs", "s3", "kinesis-data-firehose"],
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_namespaced_enum_invalid_namespace() {
+        let result = validate_namespaced_enum(
+            &Value::String("wrong.ec2_vpc.InstanceTenancy.default".to_string()),
+            "InstanceTenancy",
+            "awscc.ec2_vpc",
+            &["default", "dedicated", "host"],
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn validate_namespaced_enum_non_string() {
+        let result = validate_namespaced_enum(
+            &Value::Int(42),
+            "InstanceTenancy",
+            "awscc.ec2_vpc",
+            &["default", "dedicated", "host"],
+        );
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), "Expected string");
+    }
 }
