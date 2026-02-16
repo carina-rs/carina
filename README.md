@@ -156,7 +156,7 @@ let app_subnet = aws.subnet {
   name              = "app-subnet"
   vpc_id            = existing_vpc.id
   cidr_block        = "10.0.100.0/24"
-  availability_zone = aws.AvailabilityZone.ap_northeast_1a
+  availability_zone = awscc.AvailabilityZone.ap_northeast_1a
 }
 ```
 

@@ -197,10 +197,10 @@ The IPv4 CIDR block for the subnet
 
 ##### `availability_zone`
 
-- **Type:** aws.AvailabilityZone
+- **Type:** awscc.AvailabilityZone
 - **Required:** No
 
-The availability zone (e.g., aws.AvailabilityZone.ap_northeast_1a)
+The availability zone (e.g., awscc.AvailabilityZone.ap_northeast_1a)
 
 #### Example
 
@@ -210,7 +210,7 @@ let public_subnet_1a = aws.subnet {
     region            = aws.Region.ap_northeast_1
     vpc_id            = main_vpc.id
     cidr_block        = "10.0.1.0/24"
-    availability_zone = aws.AvailabilityZone.ap_northeast_1a
+    availability_zone = awscc.AvailabilityZone.ap_northeast_1a
 }
 
 let public_subnet_1c = aws.subnet {
@@ -218,7 +218,7 @@ let public_subnet_1c = aws.subnet {
     region            = aws.Region.ap_northeast_1
     vpc_id            = main_vpc.id
     cidr_block        = "10.0.2.0/24"
-    availability_zone = aws.AvailabilityZone.ap_northeast_1c
+    availability_zone = awscc.AvailabilityZone.ap_northeast_1c
 }
 ```
 
@@ -667,7 +667,7 @@ let public_subnet_1a = aws.subnet {
     region            = aws.Region.ap_northeast_1
     vpc_id            = main_vpc.id
     cidr_block        = "10.0.1.0/24"
-    availability_zone = aws.AvailabilityZone.ap_northeast_1a
+    availability_zone = awscc.AvailabilityZone.ap_northeast_1a
 }
 
 let public_subnet_1c = aws.subnet {
@@ -675,7 +675,7 @@ let public_subnet_1c = aws.subnet {
     region            = aws.Region.ap_northeast_1
     vpc_id            = main_vpc.id
     cidr_block        = "10.0.2.0/24"
-    availability_zone = aws.AvailabilityZone.ap_northeast_1c
+    availability_zone = awscc.AvailabilityZone.ap_northeast_1c
 }
 
 let private_subnet_1a = aws.subnet {
@@ -683,7 +683,7 @@ let private_subnet_1a = aws.subnet {
     region            = aws.Region.ap_northeast_1
     vpc_id            = main_vpc.id
     cidr_block        = "10.0.10.0/24"
-    availability_zone = aws.AvailabilityZone.ap_northeast_1a
+    availability_zone = awscc.AvailabilityZone.ap_northeast_1a
 }
 
 // Internet Gateway
