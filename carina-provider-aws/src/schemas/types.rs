@@ -2,6 +2,7 @@
 
 use carina_core::resource::Value;
 use carina_core::schema::AttributeType;
+use carina_core::utils::extract_enum_value;
 
 /// Valid AWS regions (in AWS format with hyphens)
 const VALID_REGIONS: &[&str] = &[
@@ -52,20 +53,6 @@ pub fn aws_region() -> AttributeType {
         },
         namespace: Some("aws".to_string()),
         to_dsl: None,
-    }
-}
-
-/// Extract the last dot-separated part from a namespaced identifier.
-/// Returns the original string if no dots are present.
-///
-/// - "aws.Region.ap_northeast_1" -> "ap_northeast_1"
-/// - "aws.s3.VersioningStatus.Enabled" -> "Enabled"
-/// - "Enabled" -> "Enabled"
-pub fn extract_enum_value(s: &str) -> &str {
-    if s.contains('.') {
-        s.split('.').next_back().unwrap_or(s)
-    } else {
-        s
     }
 }
 
@@ -341,31 +328,5 @@ mod tests {
                 .validate(&Value::String("aws.s3.Versioning.Enabled".to_string()))
                 .is_err()
         );
-    }
-
-    // extract_enum_value tests
-
-    #[test]
-    fn extract_enum_value_with_dots() {
-        assert_eq!(
-            extract_enum_value("aws.Region.ap_northeast_1"),
-            "ap_northeast_1"
-        );
-        assert_eq!(
-            extract_enum_value("aws.s3.VersioningStatus.Enabled"),
-            "Enabled"
-        );
-        assert_eq!(
-            extract_enum_value("aws.vpc.InstanceTenancy.default"),
-            "default"
-        );
-        assert_eq!(extract_enum_value("InstanceTenancy.dedicated"), "dedicated");
-    }
-
-    #[test]
-    fn extract_enum_value_without_dots() {
-        assert_eq!(extract_enum_value("Enabled"), "Enabled");
-        assert_eq!(extract_enum_value("default"), "default");
-        assert_eq!(extract_enum_value("ap-northeast-1"), "ap-northeast-1");
     }
 }

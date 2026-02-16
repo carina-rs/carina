@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::fmt;
 
 use crate::resource::Value;
+use crate::utils::extract_enum_value;
 
 /// Type alias for resource validator functions
 pub type ResourceValidator = fn(&HashMap<String, Value>) -> Result<(), Vec<TypeError>>;
@@ -98,8 +99,7 @@ impl AttributeType {
             (AttributeType::Bool, Value::Bool(_)) => Ok(()),
 
             (AttributeType::Enum(variants), Value::String(s)) => {
-                // Extract variant from "Type.variant" format
-                let variant = s.split('.').next_back().unwrap_or(s);
+                let variant = extract_enum_value(s);
                 if variants.iter().any(|v| v == variant || s == v) {
                     Ok(())
                 } else {

@@ -1,5 +1,25 @@
 //! Shared utility functions for value normalization and conversion
 
+/// Extract the last dot-separated part from a namespaced identifier.
+/// Returns the original string if no dots are present.
+///
+/// # Examples
+///
+/// ```
+/// use carina_core::utils::extract_enum_value;
+///
+/// assert_eq!(extract_enum_value("aws.Region.ap_northeast_1"), "ap_northeast_1");
+/// assert_eq!(extract_enum_value("aws.s3.VersioningStatus.Enabled"), "Enabled");
+/// assert_eq!(extract_enum_value("Enabled"), "Enabled");
+/// ```
+pub fn extract_enum_value(s: &str) -> &str {
+    if s.contains('.') {
+        s.split('.').next_back().unwrap_or(s)
+    } else {
+        s
+    }
+}
+
 /// Convert DSL enum value to provider SDK format.
 ///
 /// Handles the following patterns:
@@ -65,6 +85,30 @@ pub fn convert_enum_value(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_extract_enum_value_with_dots() {
+        assert_eq!(
+            extract_enum_value("aws.Region.ap_northeast_1"),
+            "ap_northeast_1"
+        );
+        assert_eq!(
+            extract_enum_value("aws.s3.VersioningStatus.Enabled"),
+            "Enabled"
+        );
+        assert_eq!(
+            extract_enum_value("aws.vpc.InstanceTenancy.default"),
+            "default"
+        );
+        assert_eq!(extract_enum_value("InstanceTenancy.dedicated"), "dedicated");
+    }
+
+    #[test]
+    fn test_extract_enum_value_without_dots() {
+        assert_eq!(extract_enum_value("Enabled"), "Enabled");
+        assert_eq!(extract_enum_value("default"), "default");
+        assert_eq!(extract_enum_value("ap-northeast-1"), "ap-northeast-1");
+    }
 
     #[test]
     fn test_convert_enum_value_2_part() {

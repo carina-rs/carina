@@ -13,7 +13,7 @@ use carina_core::provider::{
     BoxFuture, Provider, ProviderError, ProviderResult, ResourceSchema, ResourceType,
 };
 use carina_core::resource::{LifecycleConfig, Resource, ResourceId, State, Value};
-use carina_core::utils::convert_enum_value;
+use carina_core::utils::{convert_enum_value, extract_enum_value};
 
 /// S3 Bucket resource type
 pub struct S3BucketType;
@@ -288,7 +288,7 @@ impl AwsProvider {
         // Configure versioning
         if let Some(Value::String(status)) = resource.attributes.get("versioning") {
             use aws_sdk_s3::types::{BucketVersioningStatus, VersioningConfiguration};
-            let normalized = schemas::types::extract_enum_value(status);
+            let normalized = extract_enum_value(status);
             let versioning_status = if normalized == "Enabled" {
                 BucketVersioningStatus::Enabled
             } else {
@@ -364,7 +364,7 @@ impl AwsProvider {
         // Update versioning configuration
         if let Some(Value::String(status)) = to.attributes.get("versioning") {
             use aws_sdk_s3::types::{BucketVersioningStatus, VersioningConfiguration};
-            let normalized = schemas::types::extract_enum_value(status);
+            let normalized = extract_enum_value(status);
             let versioning_status = if normalized == "Enabled" {
                 BucketVersioningStatus::Enabled
             } else {
@@ -585,7 +585,7 @@ impl AwsProvider {
         // Handle instance_tenancy if specified
         if let Some(Value::String(tenancy)) = resource.attributes.get("instance_tenancy") {
             // Convert DSL format (aws.vpc.InstanceTenancy.dedicated) to API value (dedicated)
-            let tenancy_value = schemas::types::extract_enum_value(tenancy);
+            let tenancy_value = extract_enum_value(tenancy);
 
             let tenancy_enum = match tenancy_value {
                 "dedicated" => aws_sdk_ec2::types::Tenancy::Dedicated,
