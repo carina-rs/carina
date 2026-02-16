@@ -36,7 +36,7 @@ pub fn aws_region() -> AttributeType {
         validate: |value| {
             if let Value::String(s) = value {
                 // Normalize the input to AWS format (hyphens)
-                let normalized = normalize_region(s);
+                let normalized = extract_enum_value(s).replace('_', "-");
                 if VALID_REGIONS.contains(&normalized.as_str()) {
                     Ok(())
                 } else {
@@ -67,14 +67,6 @@ pub fn extract_enum_value(s: &str) -> &str {
     } else {
         s
     }
-}
-
-/// Normalize region string to AWS format (hyphens)
-/// - "aws.Region.ap_northeast_1" -> "ap-northeast-1"
-/// - "ap_northeast_1" -> "ap-northeast-1"
-/// - "ap-northeast-1" -> "ap-northeast-1"
-fn normalize_region(s: &str) -> String {
-    extract_enum_value(s).replace('_', "-")
 }
 
 /// Valid versioning status values
@@ -124,8 +116,8 @@ pub fn versioning_status() -> AttributeType {
                         }
                     }
                 }
-                let normalized = normalize_versioning_status(s);
-                if VALID_VERSIONING_STATUS.contains(&normalized.as_str()) {
+                let normalized = extract_enum_value(s);
+                if VALID_VERSIONING_STATUS.contains(&normalized) {
                     Ok(())
                 } else {
                     Err(format!(
@@ -140,13 +132,6 @@ pub fn versioning_status() -> AttributeType {
         namespace: Some("aws.s3".to_string()),
         to_dsl: None,
     }
-}
-
-/// Normalize versioning status to API format
-/// - "aws.s3.VersioningStatus.Enabled" -> "Enabled"
-/// - "Enabled" -> "Enabled"
-pub fn normalize_versioning_status(s: &str) -> String {
-    extract_enum_value(s).to_string()
 }
 
 /// S3 ACL enum type
@@ -356,24 +341,6 @@ mod tests {
                 .validate(&Value::String("aws.s3.Versioning.Enabled".to_string()))
                 .is_err()
         );
-    }
-
-    #[test]
-    fn normalize_versioning_status_dsl_format() {
-        assert_eq!(
-            normalize_versioning_status("aws.s3.VersioningStatus.Enabled"),
-            "Enabled"
-        );
-        assert_eq!(
-            normalize_versioning_status("aws.s3.VersioningStatus.Suspended"),
-            "Suspended"
-        );
-    }
-
-    #[test]
-    fn normalize_versioning_status_string_format() {
-        assert_eq!(normalize_versioning_status("Enabled"), "Enabled");
-        assert_eq!(normalize_versioning_status("Suspended"), "Suspended");
     }
 
     // extract_enum_value tests

@@ -287,7 +287,7 @@ impl AwsProvider {
         // Configure versioning
         if let Some(Value::String(status)) = resource.attributes.get("versioning") {
             use aws_sdk_s3::types::{BucketVersioningStatus, VersioningConfiguration};
-            let normalized = schemas::types::normalize_versioning_status(status);
+            let normalized = schemas::types::extract_enum_value(status);
             let versioning_status = if normalized == "Enabled" {
                 BucketVersioningStatus::Enabled
             } else {
@@ -363,7 +363,7 @@ impl AwsProvider {
         // Update versioning configuration
         if let Some(Value::String(status)) = to.attributes.get("versioning") {
             use aws_sdk_s3::types::{BucketVersioningStatus, VersioningConfiguration};
-            let normalized = schemas::types::normalize_versioning_status(status);
+            let normalized = schemas::types::extract_enum_value(status);
             let versioning_status = if normalized == "Enabled" {
                 BucketVersioningStatus::Enabled
             } else {
