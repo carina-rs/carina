@@ -1,5 +1,6 @@
 //! AWS Cloud Control resource schema definitions
 
+pub mod awscc_types;
 pub mod generated;
 
 use carina_core::schema::ResourceSchema;
