@@ -13,7 +13,6 @@ pub mod resources;
 pub mod schemas;
 
 // Re-export main types
-pub use carina_core::utils::convert_enum_value;
 pub use provider::AwsccProvider;
 
 use carina_core::provider::{BoxFuture, Provider, ProviderResult};
