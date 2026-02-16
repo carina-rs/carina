@@ -2651,6 +2651,15 @@ mod tests {
             Some(&"super::iam_role_arn()")
         );
         assert_eq!(overrides.get("KmsKeyId"), Some(&"super::kms_key_arn()"));
+        assert_eq!(overrides.get("KmsKeyArn"), Some(&"super::kms_key_arn()"));
+        assert_eq!(
+            overrides.get("KMSMasterKeyID"),
+            Some(&"super::kms_key_id()")
+        );
+        assert_eq!(
+            overrides.get("ReplicaKmsKeyID"),
+            Some(&"super::kms_key_id()")
+        );
         assert_eq!(
             overrides.get("PermissionsBoundary"),
             Some(&"super::iam_policy_arn()")
