@@ -2,6 +2,7 @@
 
 use carina_core::resource::Value;
 use carina_core::schema::{AttributeSchema, AttributeType, CompletionValue, ResourceSchema, types};
+use carina_core::utils::extract_enum_value;
 
 use super::types as aws_types;
 
@@ -154,7 +155,7 @@ pub fn instance_tenancy() -> AttributeType {
                         }
                     }
                 }
-                let normalized = aws_types::extract_enum_value(s);
+                let normalized = extract_enum_value(s);
                 if VALID_INSTANCE_TENANCY.contains(&normalized) {
                     Ok(())
                 } else {
