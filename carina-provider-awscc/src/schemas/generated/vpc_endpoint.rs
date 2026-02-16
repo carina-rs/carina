@@ -80,6 +80,7 @@ pub fn ec2_vpc_endpoint_config() -> AwsccSchemaConfig {
                 base: Box::new(AttributeType::String),
                 validate: validate_ip_address_type,
                 namespace: Some("awscc.ec2_vpc_endpoint".to_string()),
+                to_dsl: None,
             })
                 .with_description("The supported IP address types.")
                 .with_provider_name("IpAddressType"),
@@ -149,6 +150,7 @@ pub fn ec2_vpc_endpoint_config() -> AwsccSchemaConfig {
                 base: Box::new(AttributeType::String),
                 validate: validate_vpc_endpoint_type,
                 namespace: Some("awscc.ec2_vpc_endpoint".to_string()),
+                to_dsl: None,
             })
                 .create_only()
                 .with_description("The type of endpoint. Default: Gateway")

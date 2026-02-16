@@ -78,6 +78,7 @@ pub fn ec2_security_group_config() -> AwsccSchemaConfig {
                 base: Box::new(AttributeType::Int),
                 validate: validate_from_port_range,
                 namespace: None,
+                to_dsl: None,
             }).with_provider_name("FromPort"),
                     StructField::new("ip_protocol", AttributeType::Enum(vec!["tcp".to_string(), "udp".to_string(), "icmp".to_string(), "icmpv6".to_string(), "-1".to_string()])).required().with_provider_name("IpProtocol"),
                     StructField::new("to_port", AttributeType::Custom {
@@ -85,6 +86,7 @@ pub fn ec2_security_group_config() -> AwsccSchemaConfig {
                 base: Box::new(AttributeType::Int),
                 validate: validate_to_port_range,
                 namespace: None,
+                to_dsl: None,
             }).with_provider_name("ToPort")
                     ],
                 })))
@@ -103,6 +105,7 @@ pub fn ec2_security_group_config() -> AwsccSchemaConfig {
                 base: Box::new(AttributeType::Int),
                 validate: validate_from_port_range,
                 namespace: None,
+                to_dsl: None,
             }).with_provider_name("FromPort"),
                     StructField::new("ip_protocol", AttributeType::Enum(vec!["tcp".to_string(), "udp".to_string(), "icmp".to_string(), "icmpv6".to_string(), "-1".to_string()])).required().with_provider_name("IpProtocol"),
                     StructField::new("source_prefix_list_id", super::aws_resource_id()).with_provider_name("SourcePrefixListId"),
@@ -114,6 +117,7 @@ pub fn ec2_security_group_config() -> AwsccSchemaConfig {
                 base: Box::new(AttributeType::Int),
                 validate: validate_to_port_range,
                 namespace: None,
+                to_dsl: None,
             }).with_provider_name("ToPort")
                     ],
                 })))

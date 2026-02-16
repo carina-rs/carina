@@ -62,6 +62,7 @@ pub fn ec2_nat_gateway_config() -> AwsccSchemaConfig {
                 base: Box::new(AttributeType::String),
                 validate: validate_availability_mode,
                 namespace: Some("awscc.ec2_nat_gateway".to_string()),
+                to_dsl: None,
             })
                 .create_only()
                 .with_description("Indicates whether this is a zonal (single-AZ) or regional (multi-AZ) NAT gateway. A zonal NAT gateway is a NAT Gateway that provides redundancy and sc...")
@@ -85,6 +86,7 @@ pub fn ec2_nat_gateway_config() -> AwsccSchemaConfig {
                 base: Box::new(AttributeType::String),
                 validate: validate_connectivity_type,
                 namespace: Some("awscc.ec2_nat_gateway".to_string()),
+                to_dsl: None,
             })
                 .create_only()
                 .with_description("Indicates whether the NAT gateway supports public or private connectivity. The default is public connectivity.")

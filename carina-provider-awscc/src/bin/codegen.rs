@@ -905,6 +905,7 @@ pub fn {}() -> AwsccSchemaConfig {{
                 base: Box::new(AttributeType::String),
                 validate: {},
                 namespace: Some("{}".to_string()),
+                to_dsl: None,
             }}"#,
                 enum_info.type_name, validate_fn, namespace
             )
@@ -1561,6 +1562,7 @@ fn cfn_type_to_carina_type_with_enum(
                 base: Box::new(AttributeType::Int),
                 validate: {},
                 namespace: None,
+                to_dsl: None,
             }}"#,
                         min, max, validate_fn
                     ),

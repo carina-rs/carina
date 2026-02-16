@@ -99,6 +99,7 @@ pub fn ec2_flow_log_config() -> AwsccSchemaConfig {
                 base: Box::new(AttributeType::String),
                 validate: validate_log_destination_type,
                 namespace: Some("awscc.ec2_flow_log".to_string()),
+                to_dsl: None,
             })
                 .create_only()
                 .with_description("Specifies the type of destination to which the flow log data is to be published. Flow log data can be published to CloudWatch Logs or Amazon S3.")
@@ -135,6 +136,7 @@ pub fn ec2_flow_log_config() -> AwsccSchemaConfig {
                 base: Box::new(AttributeType::String),
                 validate: validate_resource_type,
                 namespace: Some("awscc.ec2_flow_log".to_string()),
+                to_dsl: None,
             })
                 .required()
                 .create_only()
@@ -152,6 +154,7 @@ pub fn ec2_flow_log_config() -> AwsccSchemaConfig {
                 base: Box::new(AttributeType::String),
                 validate: validate_traffic_type,
                 namespace: Some("awscc.ec2_flow_log".to_string()),
+                to_dsl: None,
             })
                 .create_only()
                 .with_description("The type of traffic to log. You can log traffic that the resource accepts or rejects, or all traffic.")

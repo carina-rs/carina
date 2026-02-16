@@ -87,6 +87,7 @@ pub fn ec2_security_group_egress_config() -> AwsccSchemaConfig {
                 base: Box::new(AttributeType::Int),
                 validate: validate_from_port_range,
                 namespace: None,
+                to_dsl: None,
             })
                 .create_only()
                 .with_description("If the protocol is TCP or UDP, this is the start of the port range. If the protocol is ICMP or ICMPv6, this is the ICMP type or -1 (all ICMP types).")
@@ -110,6 +111,7 @@ pub fn ec2_security_group_egress_config() -> AwsccSchemaConfig {
                 base: Box::new(AttributeType::String),
                 validate: validate_ip_protocol,
                 namespace: Some("awscc.ec2_security_group_egress".to_string()),
+                to_dsl: None,
             })
                 .required()
                 .create_only()
@@ -122,6 +124,7 @@ pub fn ec2_security_group_egress_config() -> AwsccSchemaConfig {
                 base: Box::new(AttributeType::Int),
                 validate: validate_to_port_range,
                 namespace: None,
+                to_dsl: None,
             })
                 .create_only()
                 .with_description("If the protocol is TCP or UDP, this is the end of the port range. If the protocol is ICMP or ICMPv6, this is the ICMP code or -1 (all ICMP codes). If ...")

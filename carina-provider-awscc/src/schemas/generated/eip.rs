@@ -41,6 +41,7 @@ pub fn ec2_eip_config() -> AwsccSchemaConfig {
                 base: Box::new(AttributeType::String),
                 validate: validate_domain,
                 namespace: Some("awscc.ec2_eip".to_string()),
+                to_dsl: None,
             })
                 .with_description("The network (``vpc``). If you define an Elastic IP address and associate it with a VPC that is defined in the same template, you must declare a depend...")
                 .with_provider_name("Domain"),

@@ -51,6 +51,7 @@ pub fn aws_region() -> AttributeType {
             }
         },
         namespace: Some("aws".to_string()),
+        to_dsl: None,
     }
 }
 
@@ -130,6 +131,7 @@ pub fn versioning_status() -> AttributeType {
             }
         },
         namespace: Some("aws.s3".to_string()),
+        to_dsl: None,
     }
 }
 
@@ -180,6 +182,7 @@ pub fn s3_bucket_name() -> AttributeType {
             }
         },
         namespace: None,
+        to_dsl: None,
     }
 }
 
