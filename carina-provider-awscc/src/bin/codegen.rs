@@ -331,6 +331,7 @@ fn override_type_to_display_name(override_type: &str) -> &str {
         "super::iam_role_arn()" => "IamRoleArn",
         "super::iam_policy_arn()" => "IamPolicyArn",
         "super::kms_key_arn()" => "KmsKeyArn",
+        "super::kms_key_id()" => "KmsKeyId",
         _ => "String",
     }
 }
@@ -1228,8 +1229,8 @@ fn known_string_type_overrides() -> &'static HashMap<&'static str, &'static str>
         m.insert("PermissionsBoundary", "super::iam_policy_arn()");
         m.insert("ManagedPolicyArns", "super::iam_policy_arn()");
         m.insert("KmsKeyId", "super::kms_key_arn()");
-        m.insert("KMSMasterKeyID", "super::kms_key_arn()");
-        m.insert("ReplicaKmsKeyID", "super::kms_key_arn()");
+        m.insert("KMSMasterKeyID", "super::kms_key_id()");
+        m.insert("ReplicaKmsKeyID", "super::kms_key_id()");
         m.insert("KmsKeyArn", "super::kms_key_arn()");
         m
     });

@@ -669,6 +669,52 @@ pub fn kms_key_arn() -> AttributeType {
     }
 }
 
+/// KMS Key ID type - accepts multiple formats:
+/// - Key ARN: "arn:aws:kms:us-east-1:123456789012:key/1234abcd-..."
+/// - Key alias ARN: "arn:aws:kms:us-east-1:123456789012:alias/my-key"
+/// - Key alias: "alias/my-key"
+/// - Key ID: "1234abcd-12ab-34cd-56ef-1234567890ab"
+pub fn kms_key_id() -> AttributeType {
+    AttributeType::Custom {
+        name: "KmsKeyId".to_string(),
+        base: Box::new(AttributeType::String),
+        validate: |value| {
+            if let Value::String(s) = value {
+                validate_kms_key_id(s)
+            } else {
+                Err("Expected string".to_string())
+            }
+        },
+        namespace: None,
+    }
+}
+
+fn validate_kms_key_id(value: &str) -> Result<(), String> {
+    // Accept KMS ARNs (both key/ and alias/ resource prefixes)
+    if value.starts_with("arn:") {
+        return validate_service_arn(value, "kms", None);
+    }
+    // Accept alias format: alias/<name>
+    if value.starts_with("alias/") {
+        if value.len() <= "alias/".len() {
+            return Err("Invalid KMS alias: missing alias name after 'alias/'".to_string());
+        }
+        return Ok(());
+    }
+    // Accept bare key ID (UUID format: 8-4-4-4-12 hex digits)
+    let uuid_re = regex::Regex::new(
+        r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+    )
+    .unwrap();
+    if uuid_re.is_match(value) {
+        return Ok(());
+    }
+    Err(format!(
+        "Invalid KMS key identifier '{}': expected a key ARN, alias ARN, alias name (alias/...), or key ID (UUID format)",
+        value
+    ))
+}
+
 /// IAM Policy Document type
 /// Validates the structure of IAM policy documents (trust policies, inline policies, etc.)
 pub fn iam_policy_document() -> AttributeType {
@@ -1433,6 +1479,62 @@ mod tests {
             ))
             .is_err()
         );
+    }
+
+    #[test]
+    fn validate_kms_key_id_valid() {
+        let t = kms_key_id();
+        // Key ARN
+        assert!(
+            t.validate(&Value::String(
+                "arn:aws:kms:us-east-1:123456789012:key/1234abcd-12ab-34cd-56ef-1234567890ab"
+                    .to_string()
+            ))
+            .is_ok()
+        );
+        // Key alias ARN
+        assert!(
+            t.validate(&Value::String(
+                "arn:aws:kms:us-east-1:123456789012:alias/my-key".to_string()
+            ))
+            .is_ok()
+        );
+        // Alias name
+        assert!(
+            t.validate(&Value::String("alias/my-key".to_string()))
+                .is_ok()
+        );
+        // Bare key ID (UUID)
+        assert!(
+            t.validate(&Value::String(
+                "1234abcd-12ab-34cd-56ef-1234567890ab".to_string()
+            ))
+            .is_ok()
+        );
+        // ResourceRef should be accepted
+        assert!(
+            t.validate(&Value::ResourceRef("key".to_string(), "arn".to_string()))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn validate_kms_key_id_invalid() {
+        let t = kms_key_id();
+        // Wrong service ARN
+        assert!(
+            t.validate(&Value::String(
+                "arn:aws:iam::123456789012:role/MyRole".to_string()
+            ))
+            .is_err()
+        );
+        // Not a valid format at all
+        assert!(
+            t.validate(&Value::String("not-a-valid-key".to_string()))
+                .is_err()
+        );
+        // Empty alias name
+        assert!(t.validate(&Value::String("alias/".to_string())).is_err());
     }
 
     #[test]
