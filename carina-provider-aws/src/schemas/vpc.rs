@@ -2,7 +2,7 @@
 
 use carina_core::resource::Value;
 use carina_core::schema::{AttributeSchema, AttributeType, CompletionValue, ResourceSchema, types};
-use carina_core::utils::extract_enum_value;
+use carina_core::utils::{extract_enum_value, validate_enum_namespace};
 
 use super::types as aws_types;
 
@@ -122,39 +122,7 @@ pub fn instance_tenancy() -> AttributeType {
         base: Box::new(AttributeType::String),
         validate: |value| {
             if let Value::String(s) = value {
-                // Check namespace format if it contains dots
-                if s.contains('.') {
-                    let parts: Vec<&str> = s.split('.').collect();
-                    match parts.len() {
-                        // 2-part: InstanceTenancy.value
-                        2 => {
-                            if parts[0] != "InstanceTenancy" {
-                                return Err(format!(
-                                    "Invalid instance tenancy '{}', expected format: InstanceTenancy.default, InstanceTenancy.dedicated, or InstanceTenancy.host",
-                                    s
-                                ));
-                            }
-                        }
-                        // 4-part: aws.vpc.InstanceTenancy.value
-                        4 => {
-                            if parts[0] != "aws"
-                                || parts[1] != "vpc"
-                                || parts[2] != "InstanceTenancy"
-                            {
-                                return Err(format!(
-                                    "Invalid instance tenancy '{}', expected format: aws.vpc.InstanceTenancy.default, aws.vpc.InstanceTenancy.dedicated, or aws.vpc.InstanceTenancy.host",
-                                    s
-                                ));
-                            }
-                        }
-                        _ => {
-                            return Err(format!(
-                                "Invalid instance tenancy '{}', expected one of: default, dedicated, host, InstanceTenancy.default, or aws.vpc.InstanceTenancy.default",
-                                s
-                            ));
-                        }
-                    }
-                }
+                validate_enum_namespace(s, "InstanceTenancy", "aws.vpc")?;
                 let normalized = extract_enum_value(s);
                 if VALID_INSTANCE_TENANCY.contains(&normalized) {
                     Ok(())

@@ -7,6 +7,7 @@
 
 use carina_core::resource::Value;
 use carina_core::schema::{AttributeType, ResourceSchema};
+use carina_core::utils::validate_enum_namespace;
 
 /// AWS Cloud Control schema configuration
 ///
@@ -164,41 +165,7 @@ pub fn validate_namespaced_enum(
     valid_values: &[&str],
 ) -> Result<(), String> {
     if let Value::String(s) = value {
-        // Validate namespace format if it contains dots
-        if s.contains('.') {
-            let parts: Vec<&str> = s.split('.').collect();
-            match parts.len() {
-                // 2-part: TypeName.value
-                2 => {
-                    if parts[0] != type_name {
-                        return Err(format!(
-                            "Invalid format '{}', expected {}.value",
-                            s, type_name
-                        ));
-                    }
-                }
-                // 4-part: awscc.resource.TypeName.value
-                4 => {
-                    let expected_namespace: Vec<&str> = namespace.split('.').collect();
-                    if expected_namespace.len() != 2
-                        || parts[0] != expected_namespace[0]
-                        || parts[1] != expected_namespace[1]
-                        || parts[2] != type_name
-                    {
-                        return Err(format!(
-                            "Invalid format '{}', expected {}.{}.value",
-                            s, namespace, type_name
-                        ));
-                    }
-                }
-                _ => {
-                    return Err(format!(
-                        "Invalid format '{}', expected one of: value, {}.value, or {}.{}.value",
-                        s, type_name, namespace, type_name
-                    ));
-                }
-            }
-        }
+        validate_enum_namespace(s, type_name, namespace)?;
 
         let normalized = normalize_namespaced_enum(s);
         // Accept both underscore (DSL identifier) and hyphen (AWS value) forms
