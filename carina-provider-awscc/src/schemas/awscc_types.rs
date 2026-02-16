@@ -29,28 +29,38 @@ pub fn tags_type() -> AttributeType {
     AttributeType::Map(Box::new(AttributeType::String))
 }
 
+/// Check if `input` matches any of `valid_values` using enum matching rules:
+/// exact match, case-insensitive, or underscore-to-hyphen (case-insensitive).
+/// Returns the matched valid value if found.
+fn find_matching_enum_value<'a>(input: &str, valid_values: &[&'a str]) -> Option<&'a str> {
+    // Exact match
+    if let Some(&v) = valid_values.iter().find(|&&v| v == input) {
+        return Some(v);
+    }
+    // Case-insensitive match
+    if let Some(&v) = valid_values
+        .iter()
+        .find(|&&v| v.eq_ignore_ascii_case(input))
+    {
+        return Some(v);
+    }
+    // Underscore-to-hyphen match (case-insensitive)
+    let hyphenated = input.replace('_', "-");
+    if let Some(&v) = valid_values
+        .iter()
+        .find(|&&v| v.eq_ignore_ascii_case(&hyphenated))
+    {
+        return Some(v);
+    }
+    None
+}
+
 /// Canonicalize an enum value by matching against valid values.
 /// Handles exact match, case-insensitive match, and underscore-to-hyphen conversion.
 pub fn canonicalize_enum_value(raw: &str, valid_values: &[&str]) -> String {
-    // Exact match first
-    if valid_values.contains(&raw) {
-        return raw.to_string();
-    }
-    // Case-insensitive match
-    for &valid in valid_values {
-        if valid.eq_ignore_ascii_case(raw) {
-            return valid.to_string();
-        }
-    }
-    // Underscore-to-hyphen match (case-insensitive)
-    let hyphenated = raw.replace('_', "-");
-    for &valid in valid_values {
-        if valid.eq_ignore_ascii_case(&hyphenated) {
-            return valid.to_string();
-        }
-    }
-    // No match - return as-is
-    raw.to_string()
+    find_matching_enum_value(raw, valid_values)
+        .unwrap_or(raw)
+        .to_string()
 }
 
 /// Get valid enum values for a given resource type and attribute name.
@@ -154,18 +164,7 @@ pub fn validate_namespaced_enum(
         validate_enum_namespace(s, type_name, namespace)?;
 
         let normalized = extract_enum_value(s);
-        // Accept both underscore (DSL identifier) and hyphen (AWS value) forms
-        // e.g., "cloud_watch_logs" matches "cloud-watch-logs"
-        let hyphenated = normalized.replace('_', "-");
-        if valid_values.contains(&normalized)
-            || valid_values.contains(&hyphenated.as_str())
-            || valid_values
-                .iter()
-                .any(|v| v.eq_ignore_ascii_case(normalized))
-            || valid_values
-                .iter()
-                .any(|v| v.eq_ignore_ascii_case(&hyphenated))
-        {
+        if find_matching_enum_value(normalized, valid_values).is_some() {
             Ok(())
         } else {
             Err(format!(
@@ -1548,6 +1547,35 @@ mod tests {
         let err_msg = err.to_string();
         assert!(err_msg.contains("vpc-xxxxxxxx"));
         assert!(err_msg.contains("subnet-12345678"));
+    }
+
+    #[test]
+    fn find_matching_enum_value_exact_match() {
+        assert_eq!(
+            find_matching_enum_value("IPv4", &["IPv4", "IPv6"]),
+            Some("IPv4")
+        );
+    }
+
+    #[test]
+    fn find_matching_enum_value_case_insensitive() {
+        assert_eq!(
+            find_matching_enum_value("ipv4", &["IPv4", "IPv6"]),
+            Some("IPv4")
+        );
+    }
+
+    #[test]
+    fn find_matching_enum_value_underscore_to_hyphen() {
+        assert_eq!(
+            find_matching_enum_value("cloud_watch_logs", &["cloud-watch-logs", "s3"]),
+            Some("cloud-watch-logs")
+        );
+    }
+
+    #[test]
+    fn find_matching_enum_value_no_match() {
+        assert_eq!(find_matching_enum_value("unknown", &["IPv4", "IPv6"]), None);
     }
 
     #[test]
