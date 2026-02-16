@@ -584,11 +584,7 @@ impl AwsProvider {
         // Handle instance_tenancy if specified
         if let Some(Value::String(tenancy)) = resource.attributes.get("instance_tenancy") {
             // Convert DSL format (aws.vpc.InstanceTenancy.dedicated) to API value (dedicated)
-            let tenancy_value = if tenancy.contains('.') {
-                tenancy.split('.').next_back().unwrap_or(tenancy)
-            } else {
-                tenancy.as_str()
-            };
+            let tenancy_value = schemas::types::extract_enum_value(tenancy);
 
             let tenancy_enum = match tenancy_value {
                 "dedicated" => aws_sdk_ec2::types::Tenancy::Dedicated,
