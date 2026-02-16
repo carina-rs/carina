@@ -157,7 +157,15 @@ pub fn validate_namespaced_enum(
         // Accept both underscore (DSL identifier) and hyphen (AWS value) forms
         // e.g., "cloud_watch_logs" matches "cloud-watch-logs"
         let hyphenated = normalized.replace('_', "-");
-        if valid_values.contains(&normalized) || valid_values.contains(&hyphenated.as_str()) {
+        if valid_values.contains(&normalized)
+            || valid_values.contains(&hyphenated.as_str())
+            || valid_values
+                .iter()
+                .any(|v| v.eq_ignore_ascii_case(normalized))
+            || valid_values
+                .iter()
+                .any(|v| v.eq_ignore_ascii_case(&hyphenated))
+        {
             Ok(())
         } else {
             Err(format!(
@@ -1664,6 +1672,42 @@ mod tests {
     fn validate_namespaced_enum_underscore_to_hyphen() {
         let result = validate_namespaced_enum(
             &Value::String("cloud_watch_logs".to_string()),
+            "LogDestinationType",
+            "awscc.ec2_flow_log",
+            &["cloud-watch-logs", "s3", "kinesis-data-firehose"],
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_namespaced_enum_case_insensitive() {
+        // "ipv4" should match "IPv4" case-insensitively
+        let result = validate_namespaced_enum(
+            &Value::String("ipv4".to_string()),
+            "AddressFamily",
+            "awscc.ec2_ipam_pool",
+            &["IPv4", "IPv6"],
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_namespaced_enum_case_insensitive_with_namespace() {
+        // Namespaced form with case-insensitive value
+        let result = validate_namespaced_enum(
+            &Value::String("awscc.ec2_ipam_pool.AddressFamily.ipv4".to_string()),
+            "AddressFamily",
+            "awscc.ec2_ipam_pool",
+            &["IPv4", "IPv6"],
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_namespaced_enum_case_insensitive_underscore_to_hyphen() {
+        // "Cloud_Watch_Logs" -> hyphenated "Cloud-Watch-Logs" matches "cloud-watch-logs" case-insensitively
+        let result = validate_namespaced_enum(
+            &Value::String("Cloud_Watch_Logs".to_string()),
             "LogDestinationType",
             "awscc.ec2_flow_log",
             &["cloud-watch-logs", "s3", "kinesis-data-firehose"],
