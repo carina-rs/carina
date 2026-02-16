@@ -13,6 +13,7 @@ use carina_core::provider::{
     BoxFuture, Provider, ProviderError, ProviderResult, ResourceSchema, ResourceType,
 };
 use carina_core::resource::{LifecycleConfig, Resource, ResourceId, State, Value};
+use carina_core::utils::convert_enum_value;
 
 /// S3 Bucket resource type
 pub struct S3BucketType;
@@ -2196,41 +2197,6 @@ impl Provider for AwsProvider {
     }
 }
 
-/// Convert DSL enum value (provider.TypeName.value_name) to AWS SDK format (value-name)
-/// Handles patterns like:
-/// - aws.Region.ap_northeast_1 -> ap-northeast-1
-/// - aws.AvailabilityZone.ap_northeast_1a -> ap-northeast-1a
-/// - Region.ap_northeast_1 -> ap-northeast-1
-fn convert_enum_value(value: &str) -> String {
-    let parts: Vec<&str> = value.split('.').collect();
-
-    let raw_value = match parts.len() {
-        2 => {
-            // TypeName.value pattern
-            if parts[0].chars().next().is_some_and(|c| c.is_uppercase()) {
-                parts[1]
-            } else {
-                return value.to_string();
-            }
-        }
-        3 => {
-            // provider.TypeName.value pattern
-            let provider = parts[0];
-            let type_name = parts[1];
-            if provider.chars().all(|c| c.is_lowercase())
-                && type_name.chars().next().is_some_and(|c| c.is_uppercase())
-            {
-                parts[2]
-            } else {
-                return value.to_string();
-            }
-        }
-        _ => return value.to_string(),
-    };
-
-    raw_value.replace('_', "-")
-}
-
 /// Convert protocol value from DSL format to AWS format
 /// - aws.Protocol.tcp / Protocol.tcp / tcp -> tcp
 /// - aws.Protocol.all / Protocol.all / all / -1 -> -1
@@ -2245,33 +2211,6 @@ fn convert_protocol_value(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_convert_enum_value() {
-        // Region
-        assert_eq!(
-            convert_enum_value("aws.Region.ap_northeast_1"),
-            "ap-northeast-1"
-        );
-        assert_eq!(convert_enum_value("aws.Region.us_east_1"), "us-east-1");
-        // AvailabilityZone
-        assert_eq!(
-            convert_enum_value("aws.AvailabilityZone.ap_northeast_1a"),
-            "ap-northeast-1a"
-        );
-        assert_eq!(
-            convert_enum_value("aws.AvailabilityZone.us_east_1b"),
-            "us-east-1b"
-        );
-        // TypeName.value pattern
-        assert_eq!(
-            convert_enum_value("Region.ap_northeast_1"),
-            "ap-northeast-1"
-        );
-        // Already in AWS format (no conversion needed)
-        assert_eq!(convert_enum_value("eu-west-1"), "eu-west-1");
-        assert_eq!(convert_enum_value("ap-northeast-1a"), "ap-northeast-1a");
-    }
 
     #[test]
     fn test_s3_bucket_type_name() {

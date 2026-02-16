@@ -19,7 +19,7 @@ use carina_core::schema::AttributeType;
 use crate::schemas::generated::{
     AwsccSchemaConfig, canonicalize_enum_value, get_enum_valid_values,
 };
-use crate::utils::convert_enum_value;
+use carina_core::utils::convert_enum_value;
 
 /// Get the AwsccSchemaConfig for a resource type
 fn get_schema_config(resource_type: &str) -> Option<AwsccSchemaConfig> {

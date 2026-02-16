@@ -7,16 +7,14 @@
 //! - `resources` - Resource type definitions and configurations
 //! - `provider` - AwsccProvider implementation
 //! - `schemas` - Auto-generated resource schemas
-//! - `utils` - Helper functions for value normalization
 
 pub mod provider;
 pub mod resources;
 pub mod schemas;
-pub mod utils;
 
 // Re-export main types
+pub use carina_core::utils::convert_enum_value;
 pub use provider::AwsccProvider;
-pub use utils::convert_enum_value;
 
 use carina_core::provider::{BoxFuture, Provider, ProviderResult};
 use carina_core::resource::{LifecycleConfig, Resource, ResourceId, State};
