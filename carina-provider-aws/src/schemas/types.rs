@@ -55,19 +55,26 @@ pub fn aws_region() -> AttributeType {
     }
 }
 
+/// Extract the last dot-separated part from a namespaced identifier.
+/// Returns the original string if no dots are present.
+///
+/// - "aws.Region.ap_northeast_1" -> "ap_northeast_1"
+/// - "aws.s3.VersioningStatus.Enabled" -> "Enabled"
+/// - "Enabled" -> "Enabled"
+pub fn extract_enum_value(s: &str) -> &str {
+    if s.contains('.') {
+        s.split('.').next_back().unwrap_or(s)
+    } else {
+        s
+    }
+}
+
 /// Normalize region string to AWS format (hyphens)
 /// - "aws.Region.ap_northeast_1" -> "ap-northeast-1"
 /// - "ap_northeast_1" -> "ap-northeast-1"
 /// - "ap-northeast-1" -> "ap-northeast-1"
 fn normalize_region(s: &str) -> String {
-    // Extract region part from DSL format (aws.Region.xxx)
-    let region_part = if s.contains('.') {
-        s.split('.').next_back().unwrap_or(s)
-    } else {
-        s
-    };
-    // Convert underscores to hyphens
-    region_part.replace('_', "-")
+    extract_enum_value(s).replace('_', "-")
 }
 
 /// Valid versioning status values
@@ -139,11 +146,7 @@ pub fn versioning_status() -> AttributeType {
 /// - "aws.s3.VersioningStatus.Enabled" -> "Enabled"
 /// - "Enabled" -> "Enabled"
 pub fn normalize_versioning_status(s: &str) -> String {
-    if s.contains('.') {
-        s.split('.').next_back().unwrap_or(s).to_string()
-    } else {
-        s.to_string()
-    }
+    extract_enum_value(s).to_string()
 }
 
 /// S3 ACL enum type
@@ -371,5 +374,31 @@ mod tests {
     fn normalize_versioning_status_string_format() {
         assert_eq!(normalize_versioning_status("Enabled"), "Enabled");
         assert_eq!(normalize_versioning_status("Suspended"), "Suspended");
+    }
+
+    // extract_enum_value tests
+
+    #[test]
+    fn extract_enum_value_with_dots() {
+        assert_eq!(
+            extract_enum_value("aws.Region.ap_northeast_1"),
+            "ap_northeast_1"
+        );
+        assert_eq!(
+            extract_enum_value("aws.s3.VersioningStatus.Enabled"),
+            "Enabled"
+        );
+        assert_eq!(
+            extract_enum_value("aws.vpc.InstanceTenancy.default"),
+            "default"
+        );
+        assert_eq!(extract_enum_value("InstanceTenancy.dedicated"), "dedicated");
+    }
+
+    #[test]
+    fn extract_enum_value_without_dots() {
+        assert_eq!(extract_enum_value("Enabled"), "Enabled");
+        assert_eq!(extract_enum_value("default"), "default");
+        assert_eq!(extract_enum_value("ap-northeast-1"), "ap-northeast-1");
     }
 }

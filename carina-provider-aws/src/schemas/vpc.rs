@@ -176,11 +176,7 @@ pub fn instance_tenancy() -> AttributeType {
 /// - "aws.vpc.InstanceTenancy.default" -> "default"
 /// - "default" -> "default"
 pub fn normalize_instance_tenancy(s: &str) -> String {
-    if s.contains('.') {
-        s.split('.').next_back().unwrap_or(s).to_string()
-    } else {
-        s.to_string()
-    }
+    aws_types::extract_enum_value(s).to_string()
 }
 
 /// Tags type for AWS resources (Terraform-style map)
