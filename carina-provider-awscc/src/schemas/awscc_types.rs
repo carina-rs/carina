@@ -701,9 +701,18 @@ fn is_uuid(s: &str) -> bool {
 }
 
 fn validate_kms_key_id(value: &str) -> Result<(), String> {
-    // Accept KMS ARNs (both key/ and alias/ resource prefixes)
+    // Accept KMS ARNs with key/ or alias/ resource prefix
     if value.starts_with("arn:") {
-        return validate_service_arn(value, "kms", None);
+        validate_service_arn(value, "kms", None)?;
+        let parts: Vec<&str> = value.splitn(6, ':').collect();
+        let resource = parts[5];
+        if !resource.starts_with("key/") && !resource.starts_with("alias/") {
+            return Err(format!(
+                "Invalid KMS ARN resource '{}': expected 'key/...' or 'alias/...'",
+                resource
+            ));
+        }
+        return Ok(());
     }
     // Accept alias format: alias/<name>
     if value.starts_with("alias/") {
@@ -1542,6 +1551,13 @@ mod tests {
         );
         // Empty alias name
         assert!(t.validate(&Value::String("alias/".to_string())).is_err());
+        // KMS ARN with invalid resource prefix
+        assert!(
+            t.validate(&Value::String(
+                "arn:aws:kms:us-east-1:123456789012:something/invalid".to_string()
+            ))
+            .is_err()
+        );
     }
 
     #[test]
