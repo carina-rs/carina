@@ -128,7 +128,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                     StructField::new("server_side_encryption_by_default", AttributeType::Struct {
                     name: "ServerSideEncryptionByDefault".to_string(),
                     fields: vec![
-                    StructField::new("kms_master_key_id", super::kms_key_arn()).with_description("AWS Key Management Service (KMS) customer managed key ID to use for the default encryption.   + *General purpose buckets* - This parameter is allowed ...").with_provider_name("KMSMasterKeyID"),
+                    StructField::new("kms_master_key_id", super::kms_key_id()).with_description("AWS Key Management Service (KMS) customer managed key ID to use for the default encryption.   + *General purpose buckets* - This parameter is allowed ...").with_provider_name("KMSMasterKeyID"),
                     StructField::new("sse_algorithm", AttributeType::Enum(vec!["aws:kms".to_string(), "AES256".to_string(), "aws:kms:dsse".to_string()])).required().with_description("Server-side encryption algorithm to use for the default encryption.  For directory buckets, there are only two supported values for server-side encryp...").with_provider_name("SSEAlgorithm")
                     ],
                 }).with_description("Specifies the default server-side encryption to apply to new objects in the bucket. If a PUT Object request doesn't specify any server-side encryption...").with_provider_name("ServerSideEncryptionByDefault")
@@ -561,7 +561,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                     StructField::new("encryption_configuration", AttributeType::Struct {
                     name: "EncryptionConfiguration".to_string(),
                     fields: vec![
-                    StructField::new("replica_kms_key_id", super::kms_key_arn()).required().with_description("Specifies the ID (Key ARN or Alias ARN) of the customer managed AWS KMS key stored in AWS Key Management Service (KMS) for the destination bucket. Ama...").with_provider_name("ReplicaKmsKeyID")
+                    StructField::new("replica_kms_key_id", super::kms_key_id()).required().with_description("Specifies the ID (Key ARN or Alias ARN) of the customer managed AWS KMS key stored in AWS Key Management Service (KMS) for the destination bucket. Ama...").with_provider_name("ReplicaKmsKeyID")
                     ],
                 }).with_description("Specifies encryption-related information.").with_provider_name("EncryptionConfiguration"),
                     StructField::new("metrics", AttributeType::Struct {
