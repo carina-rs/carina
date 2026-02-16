@@ -36,6 +36,37 @@ pub fn aws_region() -> AttributeType {
         base: Box::new(AttributeType::String),
         validate: |value| {
             if let Value::String(s) = value {
+                // Check namespace format if it contains dots
+                if s.contains('.') {
+                    let parts: Vec<&str> = s.split('.').collect();
+                    match parts.len() {
+                        // 2-part: Region.value
+                        2 => {
+                            if parts[0] != "Region" {
+                                return Err(format!(
+                                    "Invalid region '{}', expected format: Region.ap_northeast_1 or aws.Region.ap_northeast_1",
+                                    s
+                                ));
+                            }
+                        }
+                        // 3-part: aws.Region.value
+                        3 => {
+                            if parts[0] != "aws" || parts[1] != "Region" {
+                                return Err(format!(
+                                    "Invalid region '{}', expected format: aws.Region.ap_northeast_1",
+                                    s
+                                ));
+                            }
+                        }
+                        _ => {
+                            return Err(format!(
+                                "Invalid region '{}', expected one of: {}, Region.ap_northeast_1, or aws.Region.ap_northeast_1",
+                                s,
+                                VALID_REGIONS.join(", ")
+                            ));
+                        }
+                    }
+                }
                 // Normalize the input to AWS format (hyphens)
                 let normalized = extract_enum_value(s).replace('_', "-");
                 if VALID_REGIONS.contains(&normalized.as_str()) {
@@ -230,6 +261,35 @@ mod tests {
                 region
             );
         }
+    }
+
+    #[test]
+    fn region_rejects_wrong_namespace() {
+        let region_type = aws_region();
+        // Wrong provider prefix
+        assert!(
+            region_type
+                .validate(&Value::String("gcp.Region.ap_northeast_1".to_string()))
+                .is_err()
+        );
+        // Wrong type name
+        assert!(
+            region_type
+                .validate(&Value::String("aws.Location.ap_northeast_1".to_string()))
+                .is_err()
+        );
+        // Too many parts
+        assert!(
+            region_type
+                .validate(&Value::String("foo.bar.baz.ap_northeast_1".to_string()))
+                .is_err()
+        );
+        // 2-part with wrong type name
+        assert!(
+            region_type
+                .validate(&Value::String("Location.ap_northeast_1".to_string()))
+                .is_err()
+        );
     }
 
     // Versioning status tests
