@@ -670,7 +670,7 @@ impl AwsccProvider {
                     s.to_string()
                 };
             // Apply to_dsl transformation if present (e.g., hyphens → underscores for AZs)
-            let dsl_val = to_dsl.map_or(canonical.clone(), |f| f(&canonical));
+            let dsl_val = to_dsl.map_or_else(|| canonical.clone(), |f| f(&canonical));
             let namespaced = format!("{}.{}.{}", ns, type_name, dsl_val);
             return Some(Value::String(namespaced));
         }
