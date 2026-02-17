@@ -25,7 +25,7 @@ pub struct AwsccSchemaConfig {
 }
 
 /// Tags type for AWS resources (Terraform-style map)
-pub fn tags_type() -> AttributeType {
+pub(crate) fn tags_type() -> AttributeType {
     AttributeType::Map(Box::new(AttributeType::String))
 }
 
@@ -91,7 +91,7 @@ pub(crate) fn validate_namespaced_enum(
 
 /// IPAM Pool ID type (e.g., "ipam-pool-0123456789abcdef0")
 /// Validates format: ipam-pool-{hex} where hex is 8+ hex digits
-pub fn ipam_pool_id() -> AttributeType {
+pub(crate) fn ipam_pool_id() -> AttributeType {
     AttributeType::Custom {
         name: "IpamPoolId".to_string(),
         base: Box::new(AttributeType::String),
@@ -122,7 +122,7 @@ fn validate_ipam_pool_id(id: &str) -> Result<(), String> {
 }
 
 /// ARN type (e.g., "arn:aws:s3:::my-bucket")
-pub fn arn() -> AttributeType {
+pub(crate) fn arn() -> AttributeType {
     AttributeType::Custom {
         name: "Arn".to_string(),
         base: Box::new(AttributeType::String),
@@ -153,7 +153,7 @@ pub fn validate_arn(arn: &str) -> Result<(), String> {
 
 /// AWS resource ID type (e.g., "vpc-1a2b3c4d", "subnet-0123456789abcdef0")
 /// Validates format: {prefix}-{hex} where hex is 8+ hex digits
-pub fn aws_resource_id() -> AttributeType {
+pub(crate) fn aws_resource_id() -> AttributeType {
     AttributeType::Custom {
         name: "AwsResourceId".to_string(),
         base: Box::new(AttributeType::String),
@@ -208,7 +208,7 @@ fn validate_prefixed_resource_id(id: &str, expected_prefix: &str) -> Result<(), 
 }
 
 /// VPC ID type (e.g., "vpc-1a2b3c4d")
-pub fn vpc_id() -> AttributeType {
+pub(crate) fn vpc_id() -> AttributeType {
     AttributeType::Custom {
         name: "VpcId".to_string(),
         base: Box::new(AttributeType::String),
@@ -226,7 +226,7 @@ pub fn vpc_id() -> AttributeType {
 }
 
 /// Subnet ID type (e.g., "subnet-0123456789abcdef0")
-pub fn subnet_id() -> AttributeType {
+pub(crate) fn subnet_id() -> AttributeType {
     AttributeType::Custom {
         name: "SubnetId".to_string(),
         base: Box::new(AttributeType::String),
@@ -244,7 +244,7 @@ pub fn subnet_id() -> AttributeType {
 }
 
 /// Security Group ID type (e.g., "sg-12345678")
-pub fn security_group_id() -> AttributeType {
+pub(crate) fn security_group_id() -> AttributeType {
     AttributeType::Custom {
         name: "SecurityGroupId".to_string(),
         base: Box::new(AttributeType::String),
@@ -262,7 +262,7 @@ pub fn security_group_id() -> AttributeType {
 }
 
 /// Internet Gateway ID type (e.g., "igw-12345678")
-pub fn internet_gateway_id() -> AttributeType {
+pub(crate) fn internet_gateway_id() -> AttributeType {
     AttributeType::Custom {
         name: "InternetGatewayId".to_string(),
         base: Box::new(AttributeType::String),
@@ -280,7 +280,7 @@ pub fn internet_gateway_id() -> AttributeType {
 }
 
 /// Route Table ID type (e.g., "rtb-abcdef12")
-pub fn route_table_id() -> AttributeType {
+pub(crate) fn route_table_id() -> AttributeType {
     AttributeType::Custom {
         name: "RouteTableId".to_string(),
         base: Box::new(AttributeType::String),
@@ -298,7 +298,7 @@ pub fn route_table_id() -> AttributeType {
 }
 
 /// NAT Gateway ID type (e.g., "nat-0123456789abcdef0")
-pub fn nat_gateway_id() -> AttributeType {
+pub(crate) fn nat_gateway_id() -> AttributeType {
     AttributeType::Custom {
         name: "NatGatewayId".to_string(),
         base: Box::new(AttributeType::String),
@@ -316,7 +316,7 @@ pub fn nat_gateway_id() -> AttributeType {
 }
 
 /// VPC Peering Connection ID type (e.g., "pcx-12345678")
-pub fn vpc_peering_connection_id() -> AttributeType {
+pub(crate) fn vpc_peering_connection_id() -> AttributeType {
     AttributeType::Custom {
         name: "VpcPeeringConnectionId".to_string(),
         base: Box::new(AttributeType::String),
@@ -335,7 +335,7 @@ pub fn vpc_peering_connection_id() -> AttributeType {
 }
 
 /// Transit Gateway ID type (e.g., "tgw-0123456789abcdef0")
-pub fn transit_gateway_id() -> AttributeType {
+pub(crate) fn transit_gateway_id() -> AttributeType {
     AttributeType::Custom {
         name: "TransitGatewayId".to_string(),
         base: Box::new(AttributeType::String),
@@ -353,7 +353,7 @@ pub fn transit_gateway_id() -> AttributeType {
 }
 
 /// VPN Gateway ID type (e.g., "vgw-12345678")
-pub fn vpn_gateway_id() -> AttributeType {
+pub(crate) fn vpn_gateway_id() -> AttributeType {
     AttributeType::Custom {
         name: "VpnGatewayId".to_string(),
         base: Box::new(AttributeType::String),
@@ -371,7 +371,8 @@ pub fn vpn_gateway_id() -> AttributeType {
 }
 
 /// Egress Only Internet Gateway ID type (e.g., "eigw-12345678")
-pub fn egress_only_internet_gateway_id() -> AttributeType {
+#[allow(dead_code)] // TODO: codegen should use this instead of internet_gateway_id() for eigw attributes
+pub(crate) fn egress_only_internet_gateway_id() -> AttributeType {
     AttributeType::Custom {
         name: "EgressOnlyInternetGatewayId".to_string(),
         base: Box::new(AttributeType::String),
@@ -393,7 +394,7 @@ pub fn egress_only_internet_gateway_id() -> AttributeType {
 }
 
 /// VPC Endpoint ID type (e.g., "vpce-0123456789abcdef0")
-pub fn vpc_endpoint_id() -> AttributeType {
+pub(crate) fn vpc_endpoint_id() -> AttributeType {
     AttributeType::Custom {
         name: "VpcEndpointId".to_string(),
         base: Box::new(AttributeType::String),
@@ -412,7 +413,7 @@ pub fn vpc_endpoint_id() -> AttributeType {
 
 /// Availability Zone type (e.g., "us-east-1a", "ap-northeast-1c")
 /// Validates format: region + single letter zone identifier
-pub fn availability_zone() -> AttributeType {
+pub(crate) fn availability_zone() -> AttributeType {
     AttributeType::Custom {
         name: "AvailabilityZone".to_string(),
         base: Box::new(AttributeType::String),
@@ -494,7 +495,7 @@ fn validate_service_arn(
 }
 
 /// IAM Role ARN type (e.g., "arn:aws:iam::123456789012:role/MyRole")
-pub fn iam_role_arn() -> AttributeType {
+pub(crate) fn iam_role_arn() -> AttributeType {
     AttributeType::Custom {
         name: "IamRoleArn".to_string(),
         base: Box::new(AttributeType::String),
@@ -512,7 +513,7 @@ pub fn iam_role_arn() -> AttributeType {
 }
 
 /// IAM Policy ARN type (e.g., "arn:aws:iam::123456789012:policy/MyPolicy")
-pub fn iam_policy_arn() -> AttributeType {
+pub(crate) fn iam_policy_arn() -> AttributeType {
     AttributeType::Custom {
         name: "IamPolicyArn".to_string(),
         base: Box::new(AttributeType::String),
@@ -530,7 +531,7 @@ pub fn iam_policy_arn() -> AttributeType {
 }
 
 /// KMS Key ARN type (e.g., "arn:aws:kms:us-east-1:123456789012:key/1234abcd-12ab-34cd-56ef-1234567890ab")
-pub fn kms_key_arn() -> AttributeType {
+pub(crate) fn kms_key_arn() -> AttributeType {
     AttributeType::Custom {
         name: "KmsKeyArn".to_string(),
         base: Box::new(AttributeType::String),
@@ -552,7 +553,7 @@ pub fn kms_key_arn() -> AttributeType {
 /// - Key alias ARN: "arn:aws:kms:us-east-1:123456789012:alias/my-key"
 /// - Key alias: "alias/my-key"
 /// - Key ID: "1234abcd-12ab-34cd-56ef-1234567890ab"
-pub fn kms_key_id() -> AttributeType {
+pub(crate) fn kms_key_id() -> AttributeType {
     AttributeType::Custom {
         name: "KmsKeyId".to_string(),
         base: Box::new(AttributeType::String),
@@ -613,7 +614,7 @@ fn validate_kms_key_id(value: &str) -> Result<(), String> {
 
 /// IAM Policy Document type
 /// Validates the structure of IAM policy documents (trust policies, inline policies, etc.)
-pub fn iam_policy_document() -> AttributeType {
+pub(crate) fn iam_policy_document() -> AttributeType {
     AttributeType::Custom {
         name: "IamPolicyDocument".to_string(),
         base: Box::new(AttributeType::Map(Box::new(AttributeType::String))),
