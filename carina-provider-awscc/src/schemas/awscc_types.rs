@@ -429,6 +429,7 @@ pub fn availability_zone() -> AttributeType {
                 let extracted = extract_enum_value(s);
                 let normalized = extracted.replace('_', "-");
                 validate_availability_zone(&normalized)
+                    .map_err(|reason| format!("Invalid availability zone '{}': {}", s, reason))
             } else {
                 Err("Expected string".to_string())
             }
@@ -438,14 +439,14 @@ pub fn availability_zone() -> AttributeType {
     }
 }
 
+/// Validate availability zone format.
+/// Returns the reason for failure (e.g., "must end with a zone letter (a-z)"),
+/// without embedding the input value. Callers add context as needed.
 pub fn validate_availability_zone(az: &str) -> Result<(), String> {
     // Must end with a single lowercase letter (zone identifier)
     let zone_letter = az.chars().last();
     if !zone_letter.is_some_and(|c| c.is_ascii_lowercase()) {
-        return Err(format!(
-            "Invalid availability zone '{}': must end with a zone letter (a-z)",
-            az
-        ));
+        return Err("must end with a zone letter (a-z)".to_string());
     }
 
     // Region part is everything except the last character
@@ -455,28 +456,19 @@ pub fn validate_availability_zone(az: &str) -> Result<(), String> {
     // e.g., "us-east-1", "ap-northeast-1", "eu-west-2"
     let parts: Vec<&str> = region.split('-').collect();
     if parts.len() < 3 {
-        return Err(format!(
-            "Invalid availability zone '{}': expected format like 'us-east-1a'",
-            az
-        ));
+        return Err("expected format like 'us-east-1a'".to_string());
     }
 
     // Last part of region must be a number
     let last = parts.last().unwrap();
     if last.parse::<u8>().is_err() {
-        return Err(format!(
-            "Invalid availability zone '{}': region must end with a number",
-            az
-        ));
+        return Err("region must end with a number".to_string());
     }
 
     // All other parts must be lowercase alphabetic
     for part in &parts[..parts.len() - 1] {
         if part.is_empty() || !part.chars().all(|c| c.is_ascii_lowercase()) {
-            return Err(format!(
-                "Invalid availability zone '{}': expected format like 'us-east-1a'",
-                az
-            ));
+            return Err("expected format like 'us-east-1a'".to_string());
         }
     }
 
@@ -886,6 +878,27 @@ mod tests {
                 "wrong.AvailabilityZone.us_east_1a".to_string()
             ))
             .is_err()
+        );
+    }
+
+    #[test]
+    fn validate_availability_zone_namespace_expanded_error_shows_original_input() {
+        let t = availability_zone();
+        // No zone letter - error should show original input, not normalized form
+        let result = t.validate(&Value::String(
+            "awscc.AvailabilityZone.us_east_1".to_string(),
+        ));
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("awscc.AvailabilityZone.us_east_1"),
+            "Error should show original input, got: {}",
+            err_msg
+        );
+        assert!(
+            !err_msg.contains("'us-east-1'"),
+            "Error should not show normalized form, got: {}",
+            err_msg
         );
     }
 
