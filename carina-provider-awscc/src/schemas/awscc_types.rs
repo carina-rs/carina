@@ -903,6 +903,25 @@ mod tests {
     }
 
     #[test]
+    fn validate_availability_zone_underscored_error_shows_original_input() {
+        let t = availability_zone();
+        // Underscored form without namespace - error should show original, not normalized
+        let result = t.validate(&Value::String("us_east_1".to_string()));
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("us_east_1"),
+            "Error should show original input, got: {}",
+            err_msg
+        );
+        assert!(
+            !err_msg.contains("'us-east-1'"),
+            "Error should not show normalized form, got: {}",
+            err_msg
+        );
+    }
+
+    #[test]
     fn validate_availability_zone_invalid() {
         assert!(validate_availability_zone("us-east-1").is_err()); // no zone letter
         assert!(validate_availability_zone("US-EAST-1A").is_err()); // uppercase
