@@ -1386,11 +1386,12 @@ fn get_resource_id_display_name(prop_name: &str) -> &'static str {
     if (lower.contains("securitygroup") || lower.contains("groupid")) && lower.ends_with("id") {
         return "SecurityGroupId";
     }
-    if lower.contains("internetgateway") && lower.ends_with("id") {
-        return "InternetGatewayId";
-    }
+    // Egress Only Internet Gateway IDs (must be checked before Internet Gateway IDs)
     if lower.contains("egressonlyinternetgateway") && lower.ends_with("id") {
         return "EgressOnlyInternetGatewayId";
+    }
+    if lower.contains("internetgateway") && lower.ends_with("id") {
+        return "InternetGatewayId";
     }
     if lower.contains("routetable") && lower.ends_with("id") {
         return "RouteTableId";
@@ -2840,6 +2841,194 @@ mod tests {
             type_str.contains("Int(0..=65535)"),
             "Number with range should include range in type name, got: {}",
             type_str
+        );
+    }
+
+    #[test]
+    fn test_get_resource_id_type_vpc_id() {
+        assert_eq!(get_resource_id_type("VpcId"), "super::vpc_id()");
+    }
+
+    #[test]
+    fn test_get_resource_id_type_subnet_id() {
+        assert_eq!(get_resource_id_type("SubnetId"), "super::subnet_id()");
+    }
+
+    #[test]
+    fn test_get_resource_id_type_security_group_id() {
+        assert_eq!(
+            get_resource_id_type("SecurityGroupId"),
+            "super::security_group_id()"
+        );
+        assert_eq!(
+            get_resource_id_type("DestinationSecurityGroupId"),
+            "super::security_group_id()"
+        );
+        assert_eq!(
+            get_resource_id_type("SourceSecurityGroupId"),
+            "super::security_group_id()"
+        );
+        assert_eq!(
+            get_resource_id_type("GroupId"),
+            "super::security_group_id()"
+        );
+    }
+
+    #[test]
+    fn test_get_resource_id_type_egress_only_internet_gateway_id() {
+        assert_eq!(
+            get_resource_id_type("EgressOnlyInternetGatewayId"),
+            "super::egress_only_internet_gateway_id()"
+        );
+    }
+
+    #[test]
+    fn test_get_resource_id_type_internet_gateway_id() {
+        assert_eq!(
+            get_resource_id_type("InternetGatewayId"),
+            "super::internet_gateway_id()"
+        );
+    }
+
+    #[test]
+    fn test_get_resource_id_type_route_table_id() {
+        assert_eq!(
+            get_resource_id_type("RouteTableId"),
+            "super::route_table_id()"
+        );
+    }
+
+    #[test]
+    fn test_get_resource_id_type_nat_gateway_id() {
+        assert_eq!(
+            get_resource_id_type("NatGatewayId"),
+            "super::nat_gateway_id()"
+        );
+    }
+
+    #[test]
+    fn test_get_resource_id_type_vpc_peering_connection_id() {
+        assert_eq!(
+            get_resource_id_type("VpcPeeringConnectionId"),
+            "super::vpc_peering_connection_id()"
+        );
+    }
+
+    #[test]
+    fn test_get_resource_id_type_transit_gateway_id() {
+        assert_eq!(
+            get_resource_id_type("TransitGatewayId"),
+            "super::transit_gateway_id()"
+        );
+    }
+
+    #[test]
+    fn test_get_resource_id_type_vpn_gateway_id() {
+        assert_eq!(
+            get_resource_id_type("VpnGatewayId"),
+            "super::vpn_gateway_id()"
+        );
+    }
+
+    #[test]
+    fn test_get_resource_id_type_vpc_endpoint_id() {
+        assert_eq!(
+            get_resource_id_type("VpcEndpointId"),
+            "super::vpc_endpoint_id()"
+        );
+    }
+
+    #[test]
+    fn test_get_resource_id_type_fallback() {
+        assert_eq!(
+            get_resource_id_type("SomeUnknownId"),
+            "super::aws_resource_id()"
+        );
+    }
+
+    #[test]
+    fn test_get_resource_id_display_name_vpc_id() {
+        assert_eq!(get_resource_id_display_name("VpcId"), "VpcId");
+    }
+
+    #[test]
+    fn test_get_resource_id_display_name_subnet_id() {
+        assert_eq!(get_resource_id_display_name("SubnetId"), "SubnetId");
+    }
+
+    #[test]
+    fn test_get_resource_id_display_name_security_group_id() {
+        assert_eq!(
+            get_resource_id_display_name("SecurityGroupId"),
+            "SecurityGroupId"
+        );
+        assert_eq!(
+            get_resource_id_display_name("DestinationSecurityGroupId"),
+            "SecurityGroupId"
+        );
+        assert_eq!(get_resource_id_display_name("GroupId"), "SecurityGroupId");
+    }
+
+    #[test]
+    fn test_get_resource_id_display_name_egress_only_internet_gateway_id() {
+        assert_eq!(
+            get_resource_id_display_name("EgressOnlyInternetGatewayId"),
+            "EgressOnlyInternetGatewayId"
+        );
+    }
+
+    #[test]
+    fn test_get_resource_id_display_name_internet_gateway_id() {
+        assert_eq!(
+            get_resource_id_display_name("InternetGatewayId"),
+            "InternetGatewayId"
+        );
+    }
+
+    #[test]
+    fn test_get_resource_id_display_name_route_table_id() {
+        assert_eq!(get_resource_id_display_name("RouteTableId"), "RouteTableId");
+    }
+
+    #[test]
+    fn test_get_resource_id_display_name_nat_gateway_id() {
+        assert_eq!(get_resource_id_display_name("NatGatewayId"), "NatGatewayId");
+    }
+
+    #[test]
+    fn test_get_resource_id_display_name_vpc_peering_connection_id() {
+        assert_eq!(
+            get_resource_id_display_name("VpcPeeringConnectionId"),
+            "VpcPeeringConnectionId"
+        );
+    }
+
+    #[test]
+    fn test_get_resource_id_display_name_transit_gateway_id() {
+        assert_eq!(
+            get_resource_id_display_name("TransitGatewayId"),
+            "TransitGatewayId"
+        );
+    }
+
+    #[test]
+    fn test_get_resource_id_display_name_vpn_gateway_id() {
+        assert_eq!(get_resource_id_display_name("VpnGatewayId"), "VpnGatewayId");
+    }
+
+    #[test]
+    fn test_get_resource_id_display_name_vpc_endpoint_id() {
+        assert_eq!(
+            get_resource_id_display_name("VpcEndpointId"),
+            "VpcEndpointId"
+        );
+    }
+
+    #[test]
+    fn test_get_resource_id_display_name_fallback() {
+        assert_eq!(
+            get_resource_id_display_name("SomeUnknownId"),
+            "AwsResourceId"
         );
     }
 }
