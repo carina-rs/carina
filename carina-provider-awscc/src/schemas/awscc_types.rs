@@ -623,7 +623,7 @@ pub fn iam_policy_document() -> AttributeType {
     }
 }
 
-pub fn validate_iam_policy_document(value: &Value) -> Result<(), String> {
+fn validate_iam_policy_document(value: &Value) -> Result<(), String> {
     let Value::Map(map) = value else {
         return Err("Expected a map for IAM policy document".to_string());
     };
