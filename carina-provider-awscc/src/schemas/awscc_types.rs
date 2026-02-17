@@ -908,6 +908,12 @@ mod tests {
             ))
             .is_ok()
         );
+        // Underscored form without namespace (consistent with other enum types
+        // accepting underscore-to-hyphen conversion via find_matching_enum_value)
+        assert!(
+            t.validate(&Value::String("ap_northeast_1a".to_string()))
+                .is_ok()
+        );
         assert!(t.validate(&Value::String("us-east-1".to_string())).is_err());
         assert!(t.validate(&Value::String("invalid".to_string())).is_err());
         assert!(t.validate(&Value::Int(42)).is_err());
