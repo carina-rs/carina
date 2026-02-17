@@ -425,7 +425,10 @@ pub fn availability_zone() -> AttributeType {
         base: Box::new(AttributeType::String),
         validate: |value| {
             if let Value::String(s) = value {
-                validate_availability_zone(s)
+                validate_enum_namespace(s, "AvailabilityZone", "awscc")?;
+                let extracted = extract_enum_value(s);
+                let normalized = extracted.replace('_', "-");
+                validate_availability_zone(&normalized)
             } else {
                 Err("Expected string".to_string())
             }
@@ -841,6 +844,52 @@ mod tests {
     }
 
     #[test]
+    fn validate_availability_zone_namespace_expanded() {
+        let t = availability_zone();
+        assert!(
+            t.validate(&Value::String(
+                "awscc.AvailabilityZone.ap_northeast_1a".to_string()
+            ))
+            .is_ok()
+        );
+        assert!(
+            t.validate(&Value::String(
+                "awscc.AvailabilityZone.us_east_1a".to_string()
+            ))
+            .is_ok()
+        );
+        assert!(
+            t.validate(&Value::String(
+                "awscc.AvailabilityZone.eu_central_1b".to_string()
+            ))
+            .is_ok()
+        );
+        assert!(
+            t.validate(&Value::String("AvailabilityZone.us_west_2d".to_string()))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn validate_availability_zone_namespace_expanded_invalid() {
+        let t = availability_zone();
+        // No zone letter
+        assert!(
+            t.validate(&Value::String(
+                "awscc.AvailabilityZone.us_east_1".to_string()
+            ))
+            .is_err()
+        );
+        // Wrong namespace prefix
+        assert!(
+            t.validate(&Value::String(
+                "wrong.AvailabilityZone.us_east_1a".to_string()
+            ))
+            .is_err()
+        );
+    }
+
+    #[test]
     fn validate_availability_zone_invalid() {
         assert!(validate_availability_zone("us-east-1").is_err()); // no zone letter
         assert!(validate_availability_zone("US-EAST-1A").is_err()); // uppercase
@@ -853,6 +902,12 @@ mod tests {
     fn validate_availability_zone_type_with_value() {
         let t = availability_zone();
         assert!(t.validate(&Value::String("us-east-1a".to_string())).is_ok());
+        assert!(
+            t.validate(&Value::String(
+                "awscc.AvailabilityZone.us_east_1a".to_string()
+            ))
+            .is_ok()
+        );
         assert!(t.validate(&Value::String("us-east-1".to_string())).is_err());
         assert!(t.validate(&Value::String("invalid".to_string())).is_err());
         assert!(t.validate(&Value::Int(42)).is_err());
