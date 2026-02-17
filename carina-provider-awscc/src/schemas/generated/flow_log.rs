@@ -162,3 +162,18 @@ pub fn ec2_flow_log_config() -> AwsccSchemaConfig {
         )
     }
 }
+
+/// Returns the resource type name and all enum valid values for this module
+pub fn enum_valid_values() -> (
+    &'static str,
+    &'static [(&'static str, &'static [&'static str])],
+) {
+    (
+        "ec2_flow_log",
+        &[
+            ("log_destination_type", VALID_LOG_DESTINATION_TYPE),
+            ("resource_type", VALID_RESOURCE_TYPE),
+            ("traffic_type", VALID_TRAFFIC_TYPE),
+        ],
+    )
+}

@@ -59,3 +59,11 @@ pub fn ec2_vpc_peering_connection_config() -> AwsccSchemaConfig {
         )
     }
 }
+
+/// Returns the resource type name and all enum valid values for this module
+pub fn enum_valid_values() -> (
+    &'static str,
+    &'static [(&'static str, &'static [&'static str])],
+) {
+    ("ec2_vpc_peering_connection", &[])
+}

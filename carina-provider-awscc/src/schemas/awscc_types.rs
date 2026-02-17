@@ -63,95 +63,6 @@ pub fn canonicalize_enum_value(raw: &str, valid_values: &[&str]) -> String {
         .to_string()
 }
 
-/// Get valid enum values for a given resource type and attribute name.
-/// Used during read-back to normalize AWS-returned values to canonical DSL form.
-pub fn get_enum_valid_values(
-    resource_type: &str,
-    attr_name: &str,
-) -> Option<&'static [&'static str]> {
-    match (resource_type, attr_name) {
-        // ec2_vpc
-        ("ec2_vpc", "instance_tenancy") => Some(&["default", "dedicated", "host"]),
-        // ec2_ipam
-        ("ec2_ipam", "tier") => Some(&["free", "advanced"]),
-        ("ec2_ipam", "metered_account") => Some(&["ipam-owner", "resource-owner"]),
-        // ec2_ipam_pool
-        ("ec2_ipam_pool", "address_family") => Some(&["IPv4", "IPv6"]),
-        ("ec2_ipam_pool", "aws_service") => Some(&["ec2", "global-services"]),
-        ("ec2_ipam_pool", "ipam_scope_type") => Some(&["public", "private"]),
-        ("ec2_ipam_pool", "public_ip_source") => Some(&["byoip", "amazon"]),
-        ("ec2_ipam_pool", "state") => Some(&[
-            "create-in-progress",
-            "create-complete",
-            "modify-in-progress",
-            "modify-complete",
-            "delete-in-progress",
-            "delete-complete",
-        ]),
-        // ec2_nat_gateway
-        ("ec2_nat_gateway", "availability_mode") => Some(&["zonal", "regional"]),
-        ("ec2_nat_gateway", "connectivity_type") => Some(&["public", "private"]),
-        // ec2_eip
-        ("ec2_eip", "domain") => Some(&["vpc", "standard"]),
-        // ec2_vpc_endpoint
-        ("ec2_vpc_endpoint", "ip_address_type") => {
-            Some(&["ipv4", "ipv6", "dualstack", "not-specified"])
-        }
-        ("ec2_vpc_endpoint", "vpc_endpoint_type") => {
-            Some(&["Interface", "Gateway", "GatewayLoadBalancer"])
-        }
-        // ec2_flow_log
-        ("ec2_flow_log", "log_destination_type") => {
-            Some(&["cloud-watch-logs", "s3", "kinesis-data-firehose"])
-        }
-        ("ec2_flow_log", "resource_type") => Some(&[
-            "NetworkInterface",
-            "Subnet",
-            "VPC",
-            "TransitGateway",
-            "TransitGatewayAttachment",
-        ]),
-        ("ec2_flow_log", "traffic_type") => Some(&["ACCEPT", "ALL", "REJECT"]),
-        // ec2_transit_gateway
-        ("ec2_transit_gateway", "auto_accept_shared_attachments") => Some(&["enable", "disable"]),
-        ("ec2_transit_gateway", "default_route_table_association") => Some(&["enable", "disable"]),
-        ("ec2_transit_gateway", "default_route_table_propagation") => Some(&["enable", "disable"]),
-        ("ec2_transit_gateway", "dns_support") => Some(&["enable", "disable"]),
-        ("ec2_transit_gateway", "encryption_support") => Some(&["disable", "enable"]),
-        ("ec2_transit_gateway", "multicast_support") => Some(&["enable", "disable"]),
-        ("ec2_transit_gateway", "security_group_referencing_support") => {
-            Some(&["enable", "disable"])
-        }
-        ("ec2_transit_gateway", "vpn_ecmp_support") => Some(&["enable", "disable"]),
-        // ec2_security_group_ingress / egress
-        ("ec2_security_group_ingress", "ip_protocol") => {
-            Some(&["tcp", "udp", "icmp", "icmpv6", "-1"])
-        }
-        ("ec2_security_group_egress", "ip_protocol") => {
-            Some(&["tcp", "udp", "icmp", "icmpv6", "-1"])
-        }
-        // s3_bucket
-        ("s3_bucket", "abac_status") => Some(&["Enabled", "Disabled"]),
-        ("s3_bucket", "access_control") => Some(&[
-            "AuthenticatedRead",
-            "AwsExecRead",
-            "BucketOwnerFullControl",
-            "BucketOwnerRead",
-            "LogDeliveryWrite",
-            "Private",
-            "PublicRead",
-            "PublicReadWrite",
-        ]),
-        // logs_log_group
-        ("logs_log_group", "log_group_class") => {
-            Some(&["STANDARD", "INFREQUENT_ACCESS", "DELIVERY"])
-        }
-        // ec2_subnet (PrivateDnsNameOptionsOnLaunch struct field)
-        ("ec2_subnet", "hostname_type") => Some(&["ip-name", "resource-name"]),
-        _ => None,
-    }
-}
-
 /// Validate a namespaced enum value.
 /// Returns Ok(()) if valid, Err with message if invalid.
 pub fn validate_namespaced_enum(
@@ -1614,7 +1525,8 @@ mod tests {
     }
 
     #[test]
-    fn get_enum_valid_values_known() {
+    fn auto_generated_get_enum_valid_values_known() {
+        use crate::schemas::generated::get_enum_valid_values;
         assert_eq!(
             get_enum_valid_values("ec2_ipam", "tier"),
             Some(["free", "advanced"].as_slice())
@@ -1630,7 +1542,8 @@ mod tests {
     }
 
     #[test]
-    fn get_enum_valid_values_transit_gateway() {
+    fn auto_generated_get_enum_valid_values_transit_gateway() {
+        use crate::schemas::generated::get_enum_valid_values;
         assert_eq!(
             get_enum_valid_values("ec2_transit_gateway", "auto_accept_shared_attachments"),
             Some(["enable", "disable"].as_slice())
@@ -1646,7 +1559,8 @@ mod tests {
     }
 
     #[test]
-    fn get_enum_valid_values_unknown() {
+    fn auto_generated_get_enum_valid_values_unknown() {
+        use crate::schemas::generated::get_enum_valid_values;
         assert_eq!(get_enum_valid_values("ec2_vpc", "cidr_block"), None);
         assert_eq!(get_enum_valid_values("unknown", "unknown"), None);
     }

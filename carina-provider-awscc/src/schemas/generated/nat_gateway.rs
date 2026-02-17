@@ -152,3 +152,17 @@ pub fn ec2_nat_gateway_config() -> AwsccSchemaConfig {
         )
     }
 }
+
+/// Returns the resource type name and all enum valid values for this module
+pub fn enum_valid_values() -> (
+    &'static str,
+    &'static [(&'static str, &'static [&'static str])],
+) {
+    (
+        "ec2_nat_gateway",
+        &[
+            ("availability_mode", VALID_AVAILABILITY_MODE),
+            ("connectivity_type", VALID_CONNECTIVITY_TYPE),
+        ],
+    )
+}

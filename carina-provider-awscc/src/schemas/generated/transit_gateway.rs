@@ -259,3 +259,35 @@ pub fn ec2_transit_gateway_config() -> AwsccSchemaConfig {
             ),
     }
 }
+
+/// Returns the resource type name and all enum valid values for this module
+pub fn enum_valid_values() -> (
+    &'static str,
+    &'static [(&'static str, &'static [&'static str])],
+) {
+    (
+        "ec2_transit_gateway",
+        &[
+            (
+                "auto_accept_shared_attachments",
+                VALID_AUTO_ACCEPT_SHARED_ATTACHMENTS,
+            ),
+            (
+                "default_route_table_association",
+                VALID_DEFAULT_ROUTE_TABLE_ASSOCIATION,
+            ),
+            (
+                "default_route_table_propagation",
+                VALID_DEFAULT_ROUTE_TABLE_PROPAGATION,
+            ),
+            ("dns_support", VALID_DNS_SUPPORT),
+            ("encryption_support", VALID_ENCRYPTION_SUPPORT),
+            ("multicast_support", VALID_MULTICAST_SUPPORT),
+            (
+                "security_group_referencing_support",
+                VALID_SECURITY_GROUP_REFERENCING_SUPPORT,
+            ),
+            ("vpn_ecmp_support", VALID_VPN_ECMP_SUPPORT),
+        ],
+    )
+}

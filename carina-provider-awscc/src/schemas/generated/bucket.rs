@@ -697,3 +697,17 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
         )
     }
 }
+
+/// Returns the resource type name and all enum valid values for this module
+pub fn enum_valid_values() -> (
+    &'static str,
+    &'static [(&'static str, &'static [&'static str])],
+) {
+    (
+        "s3_bucket",
+        &[
+            ("abac_status", VALID_ABAC_STATUS),
+            ("access_control", VALID_ACCESS_CONTROL),
+        ],
+    )
+}

@@ -88,3 +88,14 @@ pub fn logs_log_group_config() -> AwsccSchemaConfig {
         )
     }
 }
+
+/// Returns the resource type name and all enum valid values for this module
+pub fn enum_valid_values() -> (
+    &'static str,
+    &'static [(&'static str, &'static [&'static str])],
+) {
+    (
+        "logs_log_group",
+        &[("log_group_class", VALID_LOG_GROUP_CLASS)],
+    )
+}

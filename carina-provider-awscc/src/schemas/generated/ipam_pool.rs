@@ -248,3 +248,20 @@ pub fn ec2_ipam_pool_config() -> AwsccSchemaConfig {
         )
     }
 }
+
+/// Returns the resource type name and all enum valid values for this module
+pub fn enum_valid_values() -> (
+    &'static str,
+    &'static [(&'static str, &'static [&'static str])],
+) {
+    (
+        "ec2_ipam_pool",
+        &[
+            ("address_family", VALID_ADDRESS_FAMILY),
+            ("aws_service", VALID_AWS_SERVICE),
+            ("ipam_scope_type", VALID_IPAM_SCOPE_TYPE),
+            ("public_ip_source", VALID_PUBLIC_IP_SOURCE),
+            ("state", VALID_STATE),
+        ],
+    )
+}

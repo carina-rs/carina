@@ -165,3 +165,17 @@ pub fn ec2_vpc_endpoint_config() -> AwsccSchemaConfig {
         )
     }
 }
+
+/// Returns the resource type name and all enum valid values for this module
+pub fn enum_valid_values() -> (
+    &'static str,
+    &'static [(&'static str, &'static [&'static str])],
+) {
+    (
+        "ec2_vpc_endpoint",
+        &[
+            ("ip_address_type", VALID_IP_ADDRESS_TYPE),
+            ("vpc_endpoint_type", VALID_VPC_ENDPOINT_TYPE),
+        ],
+    )
+}
