@@ -49,7 +49,7 @@ pub fn ec2_route_config() -> AwsccSchemaConfig {
                 .with_provider_name("DestinationPrefixListId"),
         )
         .attribute(
-            AttributeSchema::new("egress_only_internet_gateway_id", super::internet_gateway_id())
+            AttributeSchema::new("egress_only_internet_gateway_id", super::egress_only_internet_gateway_id())
                 .with_description("[IPv6 traffic only] The ID of an egress-only internet gateway.")
                 .with_provider_name("EgressOnlyInternetGatewayId"),
         )

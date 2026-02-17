@@ -1335,13 +1335,13 @@ fn get_resource_id_type(prop_name: &str) -> &'static str {
     if (lower.contains("securitygroup") || lower.contains("groupid")) && lower.ends_with("id") {
         return "super::security_group_id()";
     }
+    // Egress Only Internet Gateway IDs (must be checked before Internet Gateway IDs)
+    if lower.contains("egressonlyinternetgateway") && lower.ends_with("id") {
+        return "super::egress_only_internet_gateway_id()";
+    }
     // Internet Gateway IDs
     if lower.contains("internetgateway") && lower.ends_with("id") {
         return "super::internet_gateway_id()";
-    }
-    // Egress Only Internet Gateway IDs
-    if lower.contains("egressonlyinternetgateway") && lower.ends_with("id") {
-        return "super::egress_only_internet_gateway_id()";
     }
     // Route Table IDs
     if lower.contains("routetable") && lower.ends_with("id") {
