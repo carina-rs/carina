@@ -299,7 +299,11 @@ impl DiagnosticEngine {
                                         }
                                     } else if name == "Arn" {
                                         if let Value::String(s) = &resolved_value {
-                                            validate_arn(s).err()
+                                            validate_arn(s)
+                                                .map_err(|reason| {
+                                                    format!("Invalid ARN '{}': {}", s, reason)
+                                                })
+                                                .err()
                                         } else {
                                             None
                                         }

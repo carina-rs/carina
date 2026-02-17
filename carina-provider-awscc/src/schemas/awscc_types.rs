@@ -98,6 +98,7 @@ pub fn ipam_pool_id() -> AttributeType {
         validate: |value| {
             if let Value::String(s) = value {
                 validate_ipam_pool_id(s)
+                    .map_err(|reason| format!("Invalid IPAM Pool ID '{}': {}", s, reason))
             } else {
                 Err("Expected string".to_string())
             }
@@ -107,24 +108,15 @@ pub fn ipam_pool_id() -> AttributeType {
     }
 }
 
-pub fn validate_ipam_pool_id(id: &str) -> Result<(), String> {
+fn validate_ipam_pool_id(id: &str) -> Result<(), String> {
     let Some(hex_part) = id.strip_prefix("ipam-pool-") else {
-        return Err(format!(
-            "Invalid IPAM Pool ID '{}': expected format 'ipam-pool-{{hex}}'",
-            id
-        ));
+        return Err("expected format 'ipam-pool-{hex}'".to_string());
     };
     if hex_part.len() < 8 {
-        return Err(format!(
-            "Invalid IPAM Pool ID '{}': hex part must be at least 8 characters",
-            id
-        ));
+        return Err("hex part must be at least 8 characters".to_string());
     }
     if !hex_part.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Err(format!(
-            "Invalid IPAM Pool ID '{}': hex part must contain only hex digits",
-            id
-        ));
+        return Err("hex part must contain only hex digits".to_string());
     }
     Ok(())
 }
@@ -136,7 +128,7 @@ pub fn arn() -> AttributeType {
         base: Box::new(AttributeType::String),
         validate: |value| {
             if let Value::String(s) = value {
-                validate_arn(s)
+                validate_arn(s).map_err(|reason| format!("Invalid ARN '{}': {}", s, reason))
             } else {
                 Err("Expected string".to_string())
             }
@@ -148,14 +140,13 @@ pub fn arn() -> AttributeType {
 
 pub fn validate_arn(arn: &str) -> Result<(), String> {
     if !arn.starts_with("arn:") {
-        return Err(format!("Invalid ARN '{}': must start with 'arn:'", arn));
+        return Err("must start with 'arn:'".to_string());
     }
     let parts: Vec<&str> = arn.splitn(6, ':').collect();
     if parts.len() < 6 {
-        return Err(format!(
-            "Invalid ARN '{}': must have at least 6 colon-separated parts (arn:partition:service:region:account:resource)",
-            arn
-        ));
+        return Err(
+            "must have at least 6 colon-separated parts (arn:partition:service:region:account:resource)".to_string()
+        );
     }
     Ok(())
 }
@@ -169,6 +160,7 @@ pub fn aws_resource_id() -> AttributeType {
         validate: |value| {
             if let Value::String(s) = value {
                 validate_aws_resource_id(s)
+                    .map_err(|reason| format!("Invalid resource ID '{}': {}", s, reason))
             } else {
                 Err("Expected string".to_string())
             }
@@ -178,12 +170,9 @@ pub fn aws_resource_id() -> AttributeType {
     }
 }
 
-pub fn validate_aws_resource_id(id: &str) -> Result<(), String> {
+fn validate_aws_resource_id(id: &str) -> Result<(), String> {
     let Some(dash_pos) = id.find('-') else {
-        return Err(format!(
-            "Invalid resource ID '{}': expected format 'prefix-hexdigits'",
-            id
-        ));
+        return Err("expected format 'prefix-hexdigits'".to_string());
     };
 
     let prefix = &id[..dash_pos];
@@ -194,24 +183,15 @@ pub fn validate_aws_resource_id(id: &str) -> Result<(), String> {
             .chars()
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
     {
-        return Err(format!(
-            "Invalid resource ID '{}': prefix must be lowercase alphanumeric",
-            id
-        ));
+        return Err("prefix must be lowercase alphanumeric".to_string());
     }
 
     if hex_part.len() < 8 {
-        return Err(format!(
-            "Invalid resource ID '{}': ID part must be at least 8 characters after prefix",
-            id
-        ));
+        return Err("ID part must be at least 8 characters after prefix".to_string());
     }
 
     if !hex_part.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Err(format!(
-            "Invalid resource ID '{}': ID part must contain only hex digits",
-            id
-        ));
+        return Err("ID part must contain only hex digits".to_string());
     }
 
     Ok(())
@@ -221,10 +201,7 @@ pub fn validate_aws_resource_id(id: &str) -> Result<(), String> {
 fn validate_prefixed_resource_id(id: &str, expected_prefix: &str) -> Result<(), String> {
     let expected_format = format!("{}-xxxxxxxx", expected_prefix);
     if !id.starts_with(&format!("{}-", expected_prefix)) {
-        return Err(format!(
-            "Invalid resource ID '{}': expected format '{}'",
-            id, expected_format
-        ));
+        return Err(format!("expected format '{}'", expected_format));
     }
     // Reuse existing validation for the rest
     validate_aws_resource_id(id)
@@ -238,6 +215,7 @@ pub fn vpc_id() -> AttributeType {
         validate: |value| {
             if let Value::String(s) = value {
                 validate_prefixed_resource_id(s, "vpc")
+                    .map_err(|reason| format!("Invalid VPC ID '{}': {}", s, reason))
             } else {
                 Err("Expected string".to_string())
             }
@@ -255,6 +233,7 @@ pub fn subnet_id() -> AttributeType {
         validate: |value| {
             if let Value::String(s) = value {
                 validate_prefixed_resource_id(s, "subnet")
+                    .map_err(|reason| format!("Invalid Subnet ID '{}': {}", s, reason))
             } else {
                 Err("Expected string".to_string())
             }
@@ -272,6 +251,7 @@ pub fn security_group_id() -> AttributeType {
         validate: |value| {
             if let Value::String(s) = value {
                 validate_prefixed_resource_id(s, "sg")
+                    .map_err(|reason| format!("Invalid Security Group ID '{}': {}", s, reason))
             } else {
                 Err("Expected string".to_string())
             }
@@ -289,6 +269,7 @@ pub fn internet_gateway_id() -> AttributeType {
         validate: |value| {
             if let Value::String(s) = value {
                 validate_prefixed_resource_id(s, "igw")
+                    .map_err(|reason| format!("Invalid Internet Gateway ID '{}': {}", s, reason))
             } else {
                 Err("Expected string".to_string())
             }
@@ -306,6 +287,7 @@ pub fn route_table_id() -> AttributeType {
         validate: |value| {
             if let Value::String(s) = value {
                 validate_prefixed_resource_id(s, "rtb")
+                    .map_err(|reason| format!("Invalid Route Table ID '{}': {}", s, reason))
             } else {
                 Err("Expected string".to_string())
             }
@@ -323,6 +305,7 @@ pub fn nat_gateway_id() -> AttributeType {
         validate: |value| {
             if let Value::String(s) = value {
                 validate_prefixed_resource_id(s, "nat")
+                    .map_err(|reason| format!("Invalid NAT Gateway ID '{}': {}", s, reason))
             } else {
                 Err("Expected string".to_string())
             }
@@ -339,7 +322,9 @@ pub fn vpc_peering_connection_id() -> AttributeType {
         base: Box::new(AttributeType::String),
         validate: |value| {
             if let Value::String(s) = value {
-                validate_prefixed_resource_id(s, "pcx")
+                validate_prefixed_resource_id(s, "pcx").map_err(|reason| {
+                    format!("Invalid VPC Peering Connection ID '{}': {}", s, reason)
+                })
             } else {
                 Err("Expected string".to_string())
             }
@@ -357,6 +342,7 @@ pub fn transit_gateway_id() -> AttributeType {
         validate: |value| {
             if let Value::String(s) = value {
                 validate_prefixed_resource_id(s, "tgw")
+                    .map_err(|reason| format!("Invalid Transit Gateway ID '{}': {}", s, reason))
             } else {
                 Err("Expected string".to_string())
             }
@@ -374,6 +360,7 @@ pub fn vpn_gateway_id() -> AttributeType {
         validate: |value| {
             if let Value::String(s) = value {
                 validate_prefixed_resource_id(s, "vgw")
+                    .map_err(|reason| format!("Invalid VPN Gateway ID '{}': {}", s, reason))
             } else {
                 Err("Expected string".to_string())
             }
@@ -390,7 +377,12 @@ pub fn egress_only_internet_gateway_id() -> AttributeType {
         base: Box::new(AttributeType::String),
         validate: |value| {
             if let Value::String(s) = value {
-                validate_prefixed_resource_id(s, "eigw")
+                validate_prefixed_resource_id(s, "eigw").map_err(|reason| {
+                    format!(
+                        "Invalid Egress Only Internet Gateway ID '{}': {}",
+                        s, reason
+                    )
+                })
             } else {
                 Err("Expected string".to_string())
             }
@@ -408,6 +400,7 @@ pub fn vpc_endpoint_id() -> AttributeType {
         validate: |value| {
             if let Value::String(s) = value {
                 validate_prefixed_resource_id(s, "vpce")
+                    .map_err(|reason| format!("Invalid VPC Endpoint ID '{}': {}", s, reason))
             } else {
                 Err("Expected string".to_string())
             }
@@ -442,7 +435,7 @@ pub fn availability_zone() -> AttributeType {
 /// Validate availability zone format.
 /// Returns the reason for failure (e.g., "must end with a zone letter (a-z)"),
 /// without embedding the input value. Callers add context as needed.
-pub fn validate_availability_zone(az: &str) -> Result<(), String> {
+fn validate_availability_zone(az: &str) -> Result<(), String> {
     // Must end with a single lowercase letter (zone identifier)
     let zone_letter = az.chars().last();
     if !zone_letter.is_some_and(|c| c.is_ascii_lowercase()) {
@@ -485,7 +478,7 @@ fn validate_service_arn(
     let parts: Vec<&str> = arn.splitn(6, ':').collect();
     if parts[2] != expected_service {
         return Err(format!(
-            "Expected {} ARN, got service '{}'",
+            "expected {} service, got '{}'",
             expected_service, parts[2]
         ));
     }
@@ -493,7 +486,7 @@ fn validate_service_arn(
         && !parts[5].starts_with(prefix)
     {
         return Err(format!(
-            "Expected resource starting with '{}', got '{}'",
+            "expected resource starting with '{}', got '{}'",
             prefix, parts[5]
         ));
     }
@@ -508,6 +501,7 @@ pub fn iam_role_arn() -> AttributeType {
         validate: |value| {
             if let Value::String(s) = value {
                 validate_service_arn(s, "iam", Some("role/"))
+                    .map_err(|reason| format!("Invalid IAM Role ARN '{}': {}", s, reason))
             } else {
                 Err("Expected string".to_string())
             }
@@ -525,6 +519,7 @@ pub fn iam_policy_arn() -> AttributeType {
         validate: |value| {
             if let Value::String(s) = value {
                 validate_service_arn(s, "iam", Some("policy/"))
+                    .map_err(|reason| format!("Invalid IAM Policy ARN '{}': {}", s, reason))
             } else {
                 Err("Expected string".to_string())
             }
@@ -542,6 +537,7 @@ pub fn kms_key_arn() -> AttributeType {
         validate: |value| {
             if let Value::String(s) = value {
                 validate_service_arn(s, "kms", Some("key/"))
+                    .map_err(|reason| format!("Invalid KMS Key ARN '{}': {}", s, reason))
             } else {
                 Err("Expected string".to_string())
             }
@@ -563,6 +559,7 @@ pub fn kms_key_id() -> AttributeType {
         validate: |value| {
             if let Value::String(s) = value {
                 validate_kms_key_id(s)
+                    .map_err(|reason| format!("Invalid KMS key identifier '{}': {}", s, reason))
             } else {
                 Err("Expected string".to_string())
             }
@@ -591,7 +588,7 @@ fn validate_kms_key_id(value: &str) -> Result<(), String> {
         let resource = parts[5];
         if !resource.starts_with("key/") && !resource.starts_with("alias/") {
             return Err(format!(
-                "Invalid KMS ARN resource '{}': expected 'key/...' or 'alias/...'",
+                "KMS ARN resource '{}' must start with 'key/' or 'alias/'",
                 resource
             ));
         }
@@ -600,7 +597,7 @@ fn validate_kms_key_id(value: &str) -> Result<(), String> {
     // Accept alias format: alias/<name>
     if value.starts_with("alias/") {
         if value.len() <= "alias/".len() {
-            return Err("Invalid KMS alias: missing alias name after 'alias/'".to_string());
+            return Err("missing alias name after 'alias/'".to_string());
         }
         return Ok(());
     }
@@ -608,10 +605,10 @@ fn validate_kms_key_id(value: &str) -> Result<(), String> {
     if is_uuid(value) {
         return Ok(());
     }
-    Err(format!(
-        "Invalid KMS key identifier '{}': expected a key ARN, alias ARN, alias name (alias/...), or key ID (UUID format)",
-        value
-    ))
+    Err(
+        "expected a key ARN, alias ARN, alias name (alias/...), or key ID (UUID format)"
+            .to_string(),
+    )
 }
 
 /// IAM Policy Document type
