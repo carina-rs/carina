@@ -959,6 +959,31 @@ pub fn {}() -> AwsccSchemaConfig {{
     // Close the schema (ResourceSchema) and the AwsccSchemaConfig struct
     code.push_str("    }\n}\n");
 
+    // Generate enum_valid_values() function that exposes VALID_* constants
+    code.push_str(&format!(
+        "\n/// Returns the resource type name and all enum valid values for this module\n\
+         pub fn enum_valid_values() -> (&'static str, &'static [(&'static str, &'static [&'static str])]) {{\n\
+         {}\
+         }}\n",
+        if enums.is_empty() {
+            format!("    (\"{}\", &[])\n", full_resource)
+        } else {
+            let entries: Vec<String> = enums
+                .keys()
+                .map(|prop_name| {
+                    let attr_name = prop_name.to_snake_case();
+                    let const_name = format!("VALID_{}", attr_name.to_uppercase());
+                    format!("        (\"{}\", {}),", attr_name, const_name)
+                })
+                .collect();
+            format!(
+                "    (\"{}\", &[\n{}\n    ])\n",
+                full_resource,
+                entries.join("\n")
+            )
+        }
+    ));
+
     Ok(code)
 }
 

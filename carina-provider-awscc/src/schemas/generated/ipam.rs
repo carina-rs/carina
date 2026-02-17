@@ -133,3 +133,17 @@ pub fn ec2_ipam_config() -> AwsccSchemaConfig {
         )
     }
 }
+
+/// Returns the resource type name and all enum valid values for this module
+pub fn enum_valid_values() -> (
+    &'static str,
+    &'static [(&'static str, &'static [&'static str])],
+) {
+    (
+        "ec2_ipam",
+        &[
+            ("metered_account", VALID_METERED_ACCOUNT),
+            ("tier", VALID_TIER),
+        ],
+    )
+}

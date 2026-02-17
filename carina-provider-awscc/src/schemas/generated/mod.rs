@@ -68,3 +68,51 @@ pub fn configs() -> Vec<AwsccSchemaConfig> {
 pub fn schemas() -> Vec<ResourceSchema> {
     configs().into_iter().map(|c| c.schema).collect()
 }
+
+/// Get valid enum values for a given resource type and attribute name.
+/// Used during read-back to normalize AWS-returned values to canonical DSL form.
+///
+/// Auto-generated from schema enum constants.
+#[allow(clippy::type_complexity)]
+pub fn get_enum_valid_values(
+    resource_type: &str,
+    attr_name: &str,
+) -> Option<&'static [&'static str]> {
+    let modules: &[(&str, &[(&str, &[&str])])] = &[
+        vpc::enum_valid_values(),
+        subnet::enum_valid_values(),
+        internet_gateway::enum_valid_values(),
+        route_table::enum_valid_values(),
+        route::enum_valid_values(),
+        subnet_route_table_association::enum_valid_values(),
+        eip::enum_valid_values(),
+        nat_gateway::enum_valid_values(),
+        security_group::enum_valid_values(),
+        security_group_ingress::enum_valid_values(),
+        security_group_egress::enum_valid_values(),
+        vpc_endpoint::enum_valid_values(),
+        vpc_gateway_attachment::enum_valid_values(),
+        flow_log::enum_valid_values(),
+        ipam::enum_valid_values(),
+        ipam_pool::enum_valid_values(),
+        vpn_gateway::enum_valid_values(),
+        transit_gateway::enum_valid_values(),
+        vpc_peering_connection::enum_valid_values(),
+        egress_only_internet_gateway::enum_valid_values(),
+        transit_gateway_attachment::enum_valid_values(),
+        bucket::enum_valid_values(),
+        role::enum_valid_values(),
+        log_group::enum_valid_values(),
+    ];
+    for (rt, attrs) in modules {
+        if *rt == resource_type {
+            for (attr, values) in *attrs {
+                if *attr == attr_name {
+                    return Some(values);
+                }
+            }
+            return None;
+        }
+    }
+    None
+}

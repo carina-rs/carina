@@ -152,6 +152,36 @@ cat >> "$OUTPUT_DIR/mod.rs" << 'EOF'
 pub fn schemas() -> Vec<ResourceSchema> {
     configs().into_iter().map(|c| c.schema).collect()
 }
+
+/// Get valid enum values for a given resource type and attribute name.
+/// Used during read-back to normalize AWS-returned values to canonical DSL form.
+///
+/// Auto-generated from schema enum constants.
+#[allow(clippy::type_complexity)]
+pub fn get_enum_valid_values(resource_type: &str, attr_name: &str) -> Option<&'static [&'static str]> {
+    let modules: &[(&str, &[(&str, &[&str])])] = &[
+EOF
+
+# Add enum_valid_values() calls dynamically
+for TYPE_NAME in "${RESOURCE_TYPES[@]}"; do
+    MODNAME=$("$CODEGEN_BIN" --type-name "$TYPE_NAME" --print-module-name)
+    echo "        ${MODNAME}::enum_valid_values()," >> "$OUTPUT_DIR/mod.rs"
+done
+
+cat >> "$OUTPUT_DIR/mod.rs" << 'EOF'
+    ];
+    for (rt, attrs) in modules {
+        if *rt == resource_type {
+            for (attr, values) in *attrs {
+                if *attr == attr_name {
+                    return Some(values);
+                }
+            }
+            return None;
+        }
+    }
+    None
+}
 EOF
 
 echo ""
