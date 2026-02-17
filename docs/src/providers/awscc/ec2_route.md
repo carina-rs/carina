@@ -45,7 +45,7 @@ The ID of a prefix list used for the destination match.
 
 ### `egress_only_internet_gateway_id`
 
-- **Type:** InternetGatewayId
+- **Type:** EgressOnlyInternetGatewayId
 - **Required:** No
 
 [IPv6 traffic only] The ID of an egress-only internet gateway.
