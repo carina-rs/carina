@@ -65,7 +65,7 @@ pub fn canonicalize_enum_value(raw: &str, valid_values: &[&str]) -> String {
 
 /// Validate a namespaced enum value.
 /// Returns Ok(()) if valid, Err with message if invalid.
-pub fn validate_namespaced_enum(
+pub(crate) fn validate_namespaced_enum(
     value: &Value,
     type_name: &str,
     namespace: &str,
