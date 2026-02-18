@@ -709,12 +709,17 @@ fn derive_module_name(path: &Path) -> String {
 
 /// Validate provider region attribute
 fn validate_provider_region(parsed: &ParsedFile) -> Result<(), String> {
-    // Use the same region type for both aws and awscc providers
-    let region_type = carina_provider_aws::schemas::types::aws_region();
+    let aws_region_type = carina_provider_aws::schemas::types::aws_region();
+    let awscc_region_type = carina_provider_awscc::schemas::awscc_types::awscc_region();
 
     for provider in &parsed.providers {
-        if (provider.name == "aws" || provider.name == "awscc")
-            && let Some(region_value) = provider.attributes.get("region")
+        let region_type = match provider.name.as_str() {
+            "aws" => &aws_region_type,
+            "awscc" => &awscc_region_type,
+            _ => continue,
+        };
+
+        if let Some(region_value) = provider.attributes.get("region")
             && let Err(e) = region_type.validate(region_value)
         {
             return Err(format!("provider {}: {}", provider.name, e));
