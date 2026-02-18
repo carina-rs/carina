@@ -1317,102 +1317,114 @@ fn is_aws_resource_id_property(prop_name: &str) -> bool {
         .any(|suffix| lower.ends_with(suffix) || singular.ends_with(suffix))
 }
 
-/// Get the specific resource ID type function for a property name
-/// Returns the function name (e.g., "super::vpc_id()") or generic aws_resource_id
-fn get_resource_id_type(prop_name: &str) -> &'static str {
+/// Classification of AWS resource ID types.
+/// Used to derive both the type function name and display name from a single
+/// matching logic, avoiding duplication (see #243).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResourceIdKind {
+    VpcId,
+    SubnetId,
+    SecurityGroupId,
+    EgressOnlyInternetGatewayId,
+    InternetGatewayId,
+    RouteTableId,
+    NatGatewayId,
+    VpcPeeringConnectionId,
+    TransitGatewayId,
+    VpnGatewayId,
+    VpcEndpointId,
+    Generic,
+}
+
+/// Classify a property name into a specific resource ID kind.
+/// The matching order matters: more specific patterns (e.g., EgressOnlyInternetGateway)
+/// must be checked before more general ones (e.g., InternetGateway).
+fn classify_resource_id(prop_name: &str) -> ResourceIdKind {
     let lower = prop_name.to_lowercase();
 
-    // Check for specific resource ID types
     // VPC IDs
     if lower.ends_with("vpcid") || lower == "vpcid" {
-        return "super::vpc_id()";
+        return ResourceIdKind::VpcId;
     }
     // Subnet IDs
     if lower.ends_with("subnetid") || lower == "subnetid" {
-        return "super::subnet_id()";
+        return ResourceIdKind::SubnetId;
     }
     // Security Group IDs (including DestinationSecurityGroupId, SourceSecurityGroupId, etc.)
     if (lower.contains("securitygroup") || lower.contains("groupid")) && lower.ends_with("id") {
-        return "super::security_group_id()";
+        return ResourceIdKind::SecurityGroupId;
     }
     // Egress Only Internet Gateway IDs (must be checked before Internet Gateway IDs)
     if lower.contains("egressonlyinternetgateway") && lower.ends_with("id") {
-        return "super::egress_only_internet_gateway_id()";
+        return ResourceIdKind::EgressOnlyInternetGatewayId;
     }
     // Internet Gateway IDs
     if lower.contains("internetgateway") && lower.ends_with("id") {
-        return "super::internet_gateway_id()";
+        return ResourceIdKind::InternetGatewayId;
     }
     // Route Table IDs
     if lower.contains("routetable") && lower.ends_with("id") {
-        return "super::route_table_id()";
+        return ResourceIdKind::RouteTableId;
     }
     // NAT Gateway IDs
     if lower.contains("natgateway") && lower.ends_with("id") {
-        return "super::nat_gateway_id()";
+        return ResourceIdKind::NatGatewayId;
     }
     // VPC Peering Connection IDs
     if lower.contains("peeringconnection") && lower.ends_with("id") {
-        return "super::vpc_peering_connection_id()";
+        return ResourceIdKind::VpcPeeringConnectionId;
     }
     // Transit Gateway IDs
     if lower.contains("transitgateway") && lower.ends_with("id") {
-        return "super::transit_gateway_id()";
+        return ResourceIdKind::TransitGatewayId;
     }
     // VPN Gateway IDs
     if lower.contains("vpngateway") && lower.ends_with("id") {
-        return "super::vpn_gateway_id()";
+        return ResourceIdKind::VpnGatewayId;
     }
     // VPC Endpoint IDs
     if lower.contains("vpcendpoint") && lower.ends_with("id") {
-        return "super::vpc_endpoint_id()";
+        return ResourceIdKind::VpcEndpointId;
     }
 
-    // Fallback to generic aws_resource_id for other resource IDs
-    "super::aws_resource_id()"
+    ResourceIdKind::Generic
 }
 
-/// Get the display name for a resource ID type (for markdown documentation)
+/// Get the specific resource ID type function for a property name.
+/// Returns the function name (e.g., "super::vpc_id()") or generic aws_resource_id.
+fn get_resource_id_type(prop_name: &str) -> &'static str {
+    match classify_resource_id(prop_name) {
+        ResourceIdKind::VpcId => "super::vpc_id()",
+        ResourceIdKind::SubnetId => "super::subnet_id()",
+        ResourceIdKind::SecurityGroupId => "super::security_group_id()",
+        ResourceIdKind::EgressOnlyInternetGatewayId => "super::egress_only_internet_gateway_id()",
+        ResourceIdKind::InternetGatewayId => "super::internet_gateway_id()",
+        ResourceIdKind::RouteTableId => "super::route_table_id()",
+        ResourceIdKind::NatGatewayId => "super::nat_gateway_id()",
+        ResourceIdKind::VpcPeeringConnectionId => "super::vpc_peering_connection_id()",
+        ResourceIdKind::TransitGatewayId => "super::transit_gateway_id()",
+        ResourceIdKind::VpnGatewayId => "super::vpn_gateway_id()",
+        ResourceIdKind::VpcEndpointId => "super::vpc_endpoint_id()",
+        ResourceIdKind::Generic => "super::aws_resource_id()",
+    }
+}
+
+/// Get the display name for a resource ID type (for markdown documentation).
 fn get_resource_id_display_name(prop_name: &str) -> &'static str {
-    let lower = prop_name.to_lowercase();
-
-    // Map property names to display type names
-    if lower.ends_with("vpcid") || lower == "vpcid" {
-        return "VpcId";
+    match classify_resource_id(prop_name) {
+        ResourceIdKind::VpcId => "VpcId",
+        ResourceIdKind::SubnetId => "SubnetId",
+        ResourceIdKind::SecurityGroupId => "SecurityGroupId",
+        ResourceIdKind::EgressOnlyInternetGatewayId => "EgressOnlyInternetGatewayId",
+        ResourceIdKind::InternetGatewayId => "InternetGatewayId",
+        ResourceIdKind::RouteTableId => "RouteTableId",
+        ResourceIdKind::NatGatewayId => "NatGatewayId",
+        ResourceIdKind::VpcPeeringConnectionId => "VpcPeeringConnectionId",
+        ResourceIdKind::TransitGatewayId => "TransitGatewayId",
+        ResourceIdKind::VpnGatewayId => "VpnGatewayId",
+        ResourceIdKind::VpcEndpointId => "VpcEndpointId",
+        ResourceIdKind::Generic => "AwsResourceId",
     }
-    if lower.ends_with("subnetid") || lower == "subnetid" {
-        return "SubnetId";
-    }
-    if (lower.contains("securitygroup") || lower.contains("groupid")) && lower.ends_with("id") {
-        return "SecurityGroupId";
-    }
-    // Egress Only Internet Gateway IDs (must be checked before Internet Gateway IDs)
-    if lower.contains("egressonlyinternetgateway") && lower.ends_with("id") {
-        return "EgressOnlyInternetGatewayId";
-    }
-    if lower.contains("internetgateway") && lower.ends_with("id") {
-        return "InternetGatewayId";
-    }
-    if lower.contains("routetable") && lower.ends_with("id") {
-        return "RouteTableId";
-    }
-    if lower.contains("natgateway") && lower.ends_with("id") {
-        return "NatGatewayId";
-    }
-    if lower.contains("peeringconnection") && lower.ends_with("id") {
-        return "VpcPeeringConnectionId";
-    }
-    if lower.contains("transitgateway") && lower.ends_with("id") {
-        return "TransitGatewayId";
-    }
-    if lower.contains("vpngateway") && lower.ends_with("id") {
-        return "VpnGatewayId";
-    }
-    if lower.contains("vpcendpoint") && lower.ends_with("id") {
-        return "VpcEndpointId";
-    }
-
-    "AwsResourceId"
 }
 
 /// Check if a property name represents an IPAM Pool ID
@@ -3049,5 +3061,98 @@ mod tests {
             get_resource_id_display_name("SomeUnknownId"),
             "AwsResourceId"
         );
+    }
+
+    #[test]
+    fn test_classify_resource_id() {
+        assert_eq!(classify_resource_id("VpcId"), ResourceIdKind::VpcId);
+        assert_eq!(classify_resource_id("SubnetId"), ResourceIdKind::SubnetId);
+        assert_eq!(
+            classify_resource_id("SecurityGroupId"),
+            ResourceIdKind::SecurityGroupId
+        );
+        assert_eq!(
+            classify_resource_id("GroupId"),
+            ResourceIdKind::SecurityGroupId
+        );
+        assert_eq!(
+            classify_resource_id("EgressOnlyInternetGatewayId"),
+            ResourceIdKind::EgressOnlyInternetGatewayId
+        );
+        assert_eq!(
+            classify_resource_id("InternetGatewayId"),
+            ResourceIdKind::InternetGatewayId
+        );
+        assert_eq!(
+            classify_resource_id("RouteTableId"),
+            ResourceIdKind::RouteTableId
+        );
+        assert_eq!(
+            classify_resource_id("NatGatewayId"),
+            ResourceIdKind::NatGatewayId
+        );
+        assert_eq!(
+            classify_resource_id("VpcPeeringConnectionId"),
+            ResourceIdKind::VpcPeeringConnectionId
+        );
+        assert_eq!(
+            classify_resource_id("TransitGatewayId"),
+            ResourceIdKind::TransitGatewayId
+        );
+        assert_eq!(
+            classify_resource_id("VpnGatewayId"),
+            ResourceIdKind::VpnGatewayId
+        );
+        assert_eq!(
+            classify_resource_id("VpcEndpointId"),
+            ResourceIdKind::VpcEndpointId
+        );
+        assert_eq!(
+            classify_resource_id("SomeUnknownId"),
+            ResourceIdKind::Generic
+        );
+        // Regression: ServiceEndpointId should NOT match VpcEndpointId
+        assert_eq!(
+            classify_resource_id("ServiceEndpointId"),
+            ResourceIdKind::Generic
+        );
+    }
+
+    #[test]
+    fn test_classify_resource_id_type_and_display_name_consistency() {
+        // Verify that get_resource_id_type and get_resource_id_display_name
+        // agree on classification for all test inputs
+        let test_inputs = [
+            "VpcId",
+            "SubnetId",
+            "SecurityGroupId",
+            "DestinationSecurityGroupId",
+            "GroupId",
+            "EgressOnlyInternetGatewayId",
+            "InternetGatewayId",
+            "RouteTableId",
+            "NatGatewayId",
+            "VpcPeeringConnectionId",
+            "TransitGatewayId",
+            "VpnGatewayId",
+            "VpcEndpointId",
+            "ServiceEndpointId",
+            "SomeUnknownId",
+        ];
+
+        for input in &test_inputs {
+            let kind = classify_resource_id(input);
+            let is_generic = kind == ResourceIdKind::Generic;
+            let type_is_generic = get_resource_id_type(input) == "super::aws_resource_id()";
+            let display_is_generic = get_resource_id_display_name(input) == "AwsResourceId";
+            assert_eq!(
+                is_generic, type_is_generic,
+                "Mismatch for {input}: classify says generic={is_generic}, type says generic={type_is_generic}"
+            );
+            assert_eq!(
+                is_generic, display_is_generic,
+                "Mismatch for {input}: classify says generic={is_generic}, display says generic={display_is_generic}"
+            );
+        }
     }
 }
