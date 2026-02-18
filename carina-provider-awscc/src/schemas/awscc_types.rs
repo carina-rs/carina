@@ -57,7 +57,7 @@ fn find_matching_enum_value<'a>(input: &str, valid_values: &[&'a str]) -> Option
 
 /// Canonicalize an enum value by matching against valid values.
 /// Handles exact match, case-insensitive match, and underscore-to-hyphen conversion.
-pub fn canonicalize_enum_value(raw: &str, valid_values: &[&str]) -> String {
+pub(crate) fn canonicalize_enum_value(raw: &str, valid_values: &[&str]) -> String {
     find_matching_enum_value(raw, valid_values)
         .unwrap_or(raw)
         .to_string()
