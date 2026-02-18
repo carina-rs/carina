@@ -66,10 +66,8 @@ pub enum Value {
     Bool(bool),
     List(Vec<Value>),
     Map(HashMap<String, Value>),
-    /// Reference to another resource's attribute (binding_name, attribute_name)
-    ResourceRef(String, String),
-    /// Typed reference to another resource's attribute with optional type information
-    TypedResourceRef {
+    /// Reference to another resource's attribute with optional type information
+    ResourceRef {
         /// Binding name of the referenced resource (e.g., "vpc", "web_sg")
         binding_name: String,
         /// Attribute name being referenced (e.g., "id", "name")
@@ -204,13 +202,17 @@ mod tests {
                 ("key".to_string(), Value::String("val".to_string())),
                 ("num".to_string(), Value::Int(10)),
             ])),
-            Value::ResourceRef("vpc".to_string(), "id".to_string()),
-            Value::TypedResourceRef {
+            Value::ResourceRef {
+                binding_name: "vpc".to_string(),
+                attribute_name: "id".to_string(),
+                resource_type: None,
+            },
+            Value::ResourceRef {
                 binding_name: "web_sg".to_string(),
                 attribute_name: "id".to_string(),
                 resource_type: Some(ResourceTypePath::new("aws", "security_group")),
             },
-            Value::TypedResourceRef {
+            Value::ResourceRef {
                 binding_name: "bucket".to_string(),
                 attribute_name: "arn".to_string(),
                 resource_type: None,

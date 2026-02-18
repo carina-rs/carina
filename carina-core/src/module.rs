@@ -144,8 +144,7 @@ fn format_value(value: &Value) -> String {
                 format!("{{...{} keys}}", map.len())
             }
         }
-        Value::ResourceRef(binding, attr) => format!("{}.{}", binding, attr),
-        Value::TypedResourceRef {
+        Value::ResourceRef {
             binding_name,
             attribute_name,
             ..
@@ -412,19 +411,7 @@ impl RootConfigSignature {
         binding_types: &HashMap<String, ResourceTypePath>,
     ) {
         match value {
-            Value::ResourceRef(target, attribute) => {
-                let target_type = binding_types.get(target).cloned();
-                graph.add_edge(
-                    from.to_string(),
-                    TypedDependency {
-                        target: target.clone(),
-                        target_type,
-                        attribute: attribute.clone(),
-                        used_in: attr_key.to_string(),
-                    },
-                );
-            }
-            Value::TypedResourceRef {
+            Value::ResourceRef {
                 binding_name,
                 attribute_name,
                 resource_type,
@@ -809,8 +796,7 @@ impl ModuleSignature {
             .iter()
             .map(|output| {
                 let source_binding = output.value.as_ref().and_then(|v| match v {
-                    Value::ResourceRef(binding, _) => Some(binding.clone()),
-                    Value::TypedResourceRef { binding_name, .. } => Some(binding_name.clone()),
+                    Value::ResourceRef { binding_name, .. } => Some(binding_name.clone()),
                     _ => None,
                 });
 
@@ -840,31 +826,7 @@ impl ModuleSignature {
         input_types: &HashMap<String, TypeExpr>,
     ) {
         match value {
-            Value::ResourceRef(target, attribute) => {
-                let target_type = if target == "input" {
-                    // For input references, try to get the type from input_types
-                    input_types.get(attribute).and_then(|t| {
-                        if let TypeExpr::Ref(path) = t {
-                            Some(path.clone())
-                        } else {
-                            None
-                        }
-                    })
-                } else {
-                    binding_types.get(target).cloned()
-                };
-
-                graph.add_edge(
-                    from.to_string(),
-                    TypedDependency {
-                        target: target.clone(),
-                        target_type,
-                        attribute: attribute.clone(),
-                        used_in: attr_key.to_string(),
-                    },
-                );
-            }
-            Value::TypedResourceRef {
+            Value::ResourceRef {
                 binding_name,
                 attribute_name,
                 resource_type,

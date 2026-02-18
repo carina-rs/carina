@@ -827,10 +827,11 @@ fn parse_primary_value(
                 if parts[0] == "input" && ctx.in_module {
                     // Input reference in module context (input.vpc_id)
                     // Treat as a special ResourceRef with "input" as the binding name
-                    Ok(Value::ResourceRef(
-                        "input".to_string(),
-                        parts[1].to_string(),
-                    ))
+                    Ok(Value::ResourceRef {
+                        binding_name: "input".to_string(),
+                        attribute_name: parts[1].to_string(),
+                        resource_type: None,
+                    })
                 } else if ctx.get_variable(parts[0]).is_some() && !ctx.is_resource_binding(parts[0])
                 {
                     // Variable exists but trying to access attribute on non-resource
@@ -843,10 +844,11 @@ fn parse_primary_value(
                     })
                 } else if ctx.is_resource_binding(parts[0]) {
                     // Known resource binding: treat as resource reference
-                    Ok(Value::ResourceRef(
-                        parts[0].to_string(),
-                        parts[1].to_string(),
-                    ))
+                    Ok(Value::ResourceRef {
+                        binding_name: parts[0].to_string(),
+                        attribute_name: parts[1].to_string(),
+                        resource_type: None,
+                    })
                 } else {
                     // Unknown 2-part identifier: could be TypeName.value enum shorthand
                     // Will be resolved during schema validation
@@ -883,17 +885,19 @@ fn parse_primary_value(
 
                 // Handle input reference in module context
                 if first_ident == "input" && ctx.in_module {
-                    return Ok(Value::ResourceRef(
-                        "input".to_string(),
-                        attr_name.to_string(),
-                    ));
+                    return Ok(Value::ResourceRef {
+                        binding_name: "input".to_string(),
+                        attribute_name: attr_name.to_string(),
+                        resource_type: None,
+                    });
                 }
 
                 // Return a ResourceRef that will be resolved/validated later
-                Ok(Value::ResourceRef(
-                    first_ident.to_string(),
-                    attr_name.to_string(),
-                ))
+                Ok(Value::ResourceRef {
+                    binding_name: first_ident.to_string(),
+                    attribute_name: attr_name.to_string(),
+                    resource_type: None,
+                })
             } else {
                 // Simple variable reference
                 match ctx.get_variable(first_ident) {
@@ -955,27 +959,7 @@ fn resolve_value(
     binding_map: &HashMap<String, HashMap<String, Value>>,
 ) -> Result<Value, ParseError> {
     match value {
-        Value::ResourceRef(binding_name, attr_name) => {
-            match binding_map.get(binding_name) {
-                Some(attributes) => {
-                    match attributes.get(attr_name) {
-                        Some(attr_value) => {
-                            // Recursively resolve in case the attribute itself is a reference
-                            resolve_value(attr_value, binding_map)
-                        }
-                        None => {
-                            // Attribute not found, keep as reference (might be resolved at runtime)
-                            Ok(value.clone())
-                        }
-                    }
-                }
-                None => Err(ParseError::UndefinedVariable(format!(
-                    "{}.{}",
-                    binding_name, attr_name
-                ))),
-            }
-        }
-        Value::TypedResourceRef {
+        Value::ResourceRef {
             binding_name,
             attribute_name,
             ..
@@ -1254,10 +1238,11 @@ mod tests {
         let policy = &result.resources[1];
         assert_eq!(
             policy.attributes.get("bucket"),
-            Some(&Value::ResourceRef(
-                "bucket".to_string(),
-                "name".to_string()
-            ))
+            Some(&Value::ResourceRef {
+                binding_name: "bucket".to_string(),
+                attribute_name: "name".to_string(),
+                resource_type: None,
+            })
         );
     }
 
@@ -1477,10 +1462,11 @@ mod tests {
         let sg = &result.resources[0];
         assert_eq!(
             sg.attributes.get("vpc_id"),
-            Some(&Value::ResourceRef(
-                "input".to_string(),
-                "vpc_id".to_string()
-            ))
+            Some(&Value::ResourceRef {
+                binding_name: "input".to_string(),
+                attribute_name: "vpc_id".to_string(),
+                resource_type: None,
+            })
         );
     }
 

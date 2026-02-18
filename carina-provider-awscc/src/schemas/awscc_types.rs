@@ -779,8 +779,12 @@ mod tests {
         assert!(t.validate(&Value::Int(42)).is_err());
         // ResourceRef should be accepted
         assert!(
-            t.validate(&Value::ResourceRef("role".to_string(), "arn".to_string()))
-                .is_ok()
+            t.validate(&Value::ResourceRef {
+                binding_name: "role".to_string(),
+                attribute_name: "arn".to_string(),
+                resource_type: None,
+            })
+            .is_ok()
         );
     }
 
@@ -814,10 +818,11 @@ mod tests {
         assert!(t.validate(&Value::Int(42)).is_err());
         // ResourceRef should be accepted
         assert!(
-            t.validate(&Value::ResourceRef(
-                "my_vpc".to_string(),
-                "vpc_id".to_string()
-            ))
+            t.validate(&Value::ResourceRef {
+                binding_name: "my_vpc".to_string(),
+                attribute_name: "vpc_id".to_string(),
+                resource_type: None,
+            })
             .is_ok()
         );
     }
@@ -1210,10 +1215,11 @@ mod tests {
         let t = iam_policy_document();
         // ResourceRef should be accepted (via Custom type handling in schema.rs)
         assert!(
-            t.validate(&Value::ResourceRef(
-                "role".to_string(),
-                "policy".to_string()
-            ))
+            t.validate(&Value::ResourceRef {
+                binding_name: "role".to_string(),
+                attribute_name: "policy".to_string(),
+                resource_type: None,
+            })
             .is_ok()
         );
     }
@@ -1373,8 +1379,12 @@ mod tests {
         );
         // ResourceRef should be accepted
         assert!(
-            t.validate(&Value::ResourceRef("role".to_string(), "arn".to_string()))
-                .is_ok()
+            t.validate(&Value::ResourceRef {
+                binding_name: "role".to_string(),
+                attribute_name: "arn".to_string(),
+                resource_type: None,
+            })
+            .is_ok()
         );
     }
 
@@ -1417,8 +1427,12 @@ mod tests {
         );
         // ResourceRef should be accepted
         assert!(
-            t.validate(&Value::ResourceRef("policy".to_string(), "arn".to_string()))
-                .is_ok()
+            t.validate(&Value::ResourceRef {
+                binding_name: "policy".to_string(),
+                attribute_name: "arn".to_string(),
+                resource_type: None,
+            })
+            .is_ok()
         );
     }
 
@@ -1451,8 +1465,12 @@ mod tests {
         );
         // ResourceRef should be accepted
         assert!(
-            t.validate(&Value::ResourceRef("key".to_string(), "arn".to_string()))
-                .is_ok()
+            t.validate(&Value::ResourceRef {
+                binding_name: "key".to_string(),
+                attribute_name: "arn".to_string(),
+                resource_type: None,
+            })
+            .is_ok()
         );
     }
 
@@ -1507,8 +1525,12 @@ mod tests {
         );
         // ResourceRef should be accepted
         assert!(
-            t.validate(&Value::ResourceRef("key".to_string(), "arn".to_string()))
-                .is_ok()
+            t.validate(&Value::ResourceRef {
+                binding_name: "key".to_string(),
+                attribute_name: "arn".to_string(),
+                resource_type: None,
+            })
+            .is_ok()
         );
     }
 

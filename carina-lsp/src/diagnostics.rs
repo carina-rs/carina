@@ -209,14 +209,7 @@ impl DiagnosticEngine {
                                         name: expected_name,
                                         ..
                                     },
-                                    Value::ResourceRef(ref_binding, ref_attr),
-                                )
-                                | (
-                                    carina_core::schema::AttributeType::Custom {
-                                        name: expected_name,
-                                        ..
-                                    },
-                                    Value::TypedResourceRef {
+                                    Value::ResourceRef {
                                         binding_name: ref_binding,
                                         attribute_name: ref_attr,
                                         ..
