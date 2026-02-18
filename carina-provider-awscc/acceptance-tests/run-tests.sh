@@ -10,6 +10,7 @@
 #   apply      - Apply .crn files (single account, needs aws-vault)
 #   destroy    - Destroy resources created by .crn files (single account)
 #   full       - Run apply+plan-verify+destroy per test, 10 accounts in parallel
+#   cleanup    - Run destroy across all 10 accounts in parallel (recover from stuck state)
 #
 # For validate, no AWS credentials are needed.
 # For plan/apply/destroy, wrap with: aws-vault exec <profile> -- ./run-tests.sh ...
@@ -23,6 +24,8 @@
 #   ./run-tests.sh validate ec2_vpc/basic            # validate specific test
 #   ./run-tests.sh full                              # apply+plan-verify+destroy, 10 parallel accounts
 #   ./run-tests.sh full ec2_vpc                      # apply+plan-verify+destroy VPC tests only
+#   ./run-tests.sh cleanup                           # destroy all matching tests across 10 accounts
+#   ./run-tests.sh cleanup ec2_vpc                   # destroy VPC tests only across 10 accounts
 
 set -e
 
@@ -48,11 +51,11 @@ NUM_ACCOUNTS=${#ACCOUNTS[@]}
 
 # Validate command
 case "$COMMAND" in
-    validate|plan|apply|destroy|full)
+    validate|plan|apply|destroy|full|cleanup)
         ;;
     *)
         echo "ERROR: Unknown command '$COMMAND'"
-        echo "Usage: $0 [validate|plan|apply|destroy|full] [filter]"
+        echo "Usage: $0 [validate|plan|apply|destroy|full|cleanup] [filter]"
         exit 1
         ;;
 esac
@@ -83,6 +86,95 @@ if [ ${#TESTS[@]} -eq 0 ]; then
     exit 0
 fi
 
+# ── cleanup: destroy across all 10 accounts in parallel ───────────────
+if [ "$COMMAND" = "cleanup" ]; then
+    TOTAL=${#TESTS[@]}
+    echo "Running cleanup (destroy) on $TOTAL test(s) across $NUM_ACCOUNTS accounts"
+    echo ""
+
+    WORK_DIR=$(mktemp -d)
+    trap "rm -rf $WORK_DIR" EXIT
+
+    # Pre-authenticate all accounts
+    echo "Pre-authenticating AWS accounts..."
+    for SLOT in $(seq 0 $((NUM_ACCOUNTS - 1))); do
+        ACCOUNT="${ACCOUNTS[$SLOT]}"
+        echo "  Authenticating $ACCOUNT..."
+        if ! aws-vault exec "$ACCOUNT" -- true 2>&1; then
+            echo "  WARNING: Failed to pre-authenticate $ACCOUNT"
+        fi
+    done
+    echo "Pre-authentication complete."
+    echo ""
+
+    # Each account tries to destroy all tests (we don't know which account
+    # created which resources, so every account attempts every test)
+    PIDS=()
+    for SLOT in $(seq 0 $((NUM_ACCOUNTS - 1))); do
+        ACCOUNT="${ACCOUNTS[$SLOT]}"
+        LOG_FILE="$WORK_DIR/slot_${SLOT}.log"
+        STATE_DIR="$WORK_DIR/state_${SLOT}"
+        mkdir -p "$STATE_DIR"
+
+        (
+            set +e
+            DESTROYED=0
+            SKIPPED=0
+
+            for TEST_FILE in "${TESTS[@]}"; do
+                REL_PATH="${TEST_FILE#$SCRIPT_DIR/}"
+                DESTROY_OUTPUT=$(cd "$STATE_DIR" && aws-vault exec "$ACCOUNT" -- "$CARINA_BIN" destroy --auto-approve "$TEST_FILE" 2>&1)
+                DESTROY_RC=$?
+                if [ $DESTROY_RC -eq 0 ]; then
+                    if echo "$DESTROY_OUTPUT" | grep -q "No resources to destroy"; then
+                        SKIPPED=$((SKIPPED + 1))
+                    else
+                        echo "DESTROYED $REL_PATH"
+                        DESTROYED=$((DESTROYED + 1))
+                    fi
+                else
+                    echo "FAIL (destroy) $REL_PATH"
+                    echo "  ERROR: $DESTROY_OUTPUT"
+                fi
+            done
+
+            echo "---"
+            echo "SUMMARY $ACCOUNT: $DESTROYED destroyed, $SKIPPED already clean"
+        ) > "$LOG_FILE" 2>&1 &
+
+        PIDS+=($!)
+        echo "  [$ACCOUNT] started (PID $!)"
+    done
+
+    echo ""
+    echo "Waiting for all accounts to finish cleanup..."
+    echo ""
+
+    # Wait for all workers
+    OVERALL_EXIT=0
+    for PID in "${PIDS[@]}"; do
+        wait "$PID" || OVERALL_EXIT=1
+    done
+
+    # Print results per account
+    for SLOT in $(seq 0 $((NUM_ACCOUNTS - 1))); do
+        LOG_FILE="$WORK_DIR/slot_${SLOT}.log"
+        if [ ! -f "$LOG_FILE" ]; then
+            continue
+        fi
+        ACCOUNT="${ACCOUNTS[$SLOT]}"
+        echo "── $ACCOUNT ──"
+        cat "$LOG_FILE"
+        echo ""
+    done
+
+    echo "════════════════════════════════════════"
+    echo "Cleanup complete."
+    echo "════════════════════════════════════════"
+
+    exit $OVERALL_EXIT
+fi
+
 # ── full: 10-account parallel execution ──────────────────────────────
 if [ "$COMMAND" = "full" ]; then
     TOTAL=${#TESTS[@]}
@@ -90,6 +182,26 @@ if [ "$COMMAND" = "full" ]; then
     echo ""
 
     WORK_DIR=$(mktemp -d)
+
+    # Signal handling for the main process: forward signals to workers
+    PIDS=()
+    cleanup_main() {
+        echo ""
+        echo "Interrupted! Signaling workers to clean up..."
+        for PID in "${PIDS[@]}"; do
+            kill -TERM "$PID" 2>/dev/null || true
+        done
+        echo "Waiting for workers to finish cleanup..."
+        for PID in "${PIDS[@]}"; do
+            wait "$PID" 2>/dev/null || true
+        done
+        echo "All workers finished."
+        rm -rf "$WORK_DIR"
+        exit 1
+    }
+    trap cleanup_main INT TERM
+
+    # Clean up temp dir on normal exit
     trap "rm -rf $WORK_DIR" EXIT
 
     # Pre-authenticate all accounts sequentially to avoid opening
@@ -112,7 +224,6 @@ if [ "$COMMAND" = "full" ]; then
     done
 
     # Launch one worker per account
-    PIDS=()
     for SLOT in $(seq 0 $((NUM_ACCOUNTS - 1))); do
         LIST_FILE="$WORK_DIR/slot_${SLOT}.list"
         if [ ! -f "$LIST_FILE" ]; then
@@ -128,25 +239,50 @@ if [ "$COMMAND" = "full" ]; then
             set +e
             PASSED=0
             FAILED=0
+            CURRENT_TEST_FILE=""
+            INTERRUPTED=0
+
+            # Worker trap: attempt destroy for the current test on interruption
+            worker_cleanup() {
+                INTERRUPTED=1
+                if [ -n "$CURRENT_TEST_FILE" ]; then
+                    REL_PATH="${CURRENT_TEST_FILE#$SCRIPT_DIR/}"
+                    echo "INTERRUPTED - destroying resources for $REL_PATH"
+                    cd "$STATE_DIR" && aws-vault exec "$ACCOUNT" -- "$CARINA_BIN" destroy --auto-approve "$CURRENT_TEST_FILE" 2>&1 || true
+                fi
+            }
+            trap worker_cleanup INT TERM
 
             while IFS= read -r TEST_FILE; do
+                if [ $INTERRUPTED -eq 1 ]; then
+                    break
+                fi
+
                 REL_PATH="${TEST_FILE#$SCRIPT_DIR/}"
+                CURRENT_TEST_FILE="$TEST_FILE"
 
                 # Apply (run from STATE_DIR so each account has its own state file)
                 APPLY_OUTPUT=$(cd "$STATE_DIR" && aws-vault exec "$ACCOUNT" -- "$CARINA_BIN" apply --auto-approve "$TEST_FILE" 2>&1)
                 APPLY_RC=$?
+                if [ $INTERRUPTED -eq 1 ]; then
+                    break
+                fi
                 if [ $APPLY_RC -ne 0 ] || echo "$APPLY_OUTPUT" | grep -q "failed"; then
                     echo "FAIL (apply) $REL_PATH"
                     echo "  ERROR: $APPLY_OUTPUT"
                     FAILED=$((FAILED + 1))
                     # Try to destroy whatever was partially created
                     cd "$STATE_DIR" && aws-vault exec "$ACCOUNT" -- "$CARINA_BIN" destroy --auto-approve "$TEST_FILE" 2>&1 || true
+                    CURRENT_TEST_FILE=""
                     continue
                 fi
 
                 # Post-apply plan verification (idempotency check)
                 PLAN_OUTPUT=$(cd "$STATE_DIR" && aws-vault exec "$ACCOUNT" -- "$CARINA_BIN" plan --detailed-exitcode "$TEST_FILE" 2>&1)
                 PLAN_RC=$?
+                if [ $INTERRUPTED -eq 1 ]; then
+                    break
+                fi
                 if [ $PLAN_RC -eq 2 ]; then
                     echo "FAIL (plan-verify) $REL_PATH"
                     echo "  ERROR: Post-apply plan detected changes (not idempotent):"
@@ -154,12 +290,14 @@ if [ "$COMMAND" = "full" ]; then
                     FAILED=$((FAILED + 1))
                     # Still destroy to clean up
                     cd "$STATE_DIR" && aws-vault exec "$ACCOUNT" -- "$CARINA_BIN" destroy --auto-approve "$TEST_FILE" 2>&1 || true
+                    CURRENT_TEST_FILE=""
                     continue
                 elif [ $PLAN_RC -ne 0 ]; then
                     echo "FAIL (plan-verify) $REL_PATH"
                     echo "  ERROR: $PLAN_OUTPUT"
                     FAILED=$((FAILED + 1))
                     cd "$STATE_DIR" && aws-vault exec "$ACCOUNT" -- "$CARINA_BIN" destroy --auto-approve "$TEST_FILE" 2>&1 || true
+                    CURRENT_TEST_FILE=""
                     continue
                 fi
 
@@ -170,11 +308,13 @@ if [ "$COMMAND" = "full" ]; then
                     echo "FAIL (destroy) $REL_PATH"
                     echo "  ERROR: $DESTROY_OUTPUT"
                     FAILED=$((FAILED + 1))
+                    CURRENT_TEST_FILE=""
                     continue
                 fi
 
                 echo "OK   $REL_PATH"
                 PASSED=$((PASSED + 1))
+                CURRENT_TEST_FILE=""
             done < "$LIST_FILE"
 
             echo "---"
