@@ -19,6 +19,13 @@ fn validate_ip_address_type(value: &Value) -> Result<(), String> {
         "awscc.ec2_vpc_endpoint",
         VALID_IP_ADDRESS_TYPE,
     )
+    .map_err(|reason| {
+        if let Value::String(s) = value {
+            format!("Invalid IpAddressType '{}': {}", s, reason)
+        } else {
+            reason
+        }
+    })
 }
 
 const VALID_VPC_ENDPOINT_TYPE: &[&str] = &[
@@ -36,6 +43,13 @@ fn validate_vpc_endpoint_type(value: &Value) -> Result<(), String> {
         "awscc.ec2_vpc_endpoint",
         VALID_VPC_ENDPOINT_TYPE,
     )
+    .map_err(|reason| {
+        if let Value::String(s) = value {
+            format!("Invalid VpcEndpointType '{}': {}", s, reason)
+        } else {
+            reason
+        }
+    })
 }
 
 /// Returns the schema config for ec2_vpc_endpoint (AWS::EC2::VPCEndpoint)

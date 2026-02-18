@@ -19,6 +19,13 @@ fn validate_address_family(value: &Value) -> Result<(), String> {
         "awscc.ec2_ipam_pool",
         VALID_ADDRESS_FAMILY,
     )
+    .map_err(|reason| {
+        if let Value::String(s) = value {
+            format!("Invalid AddressFamily '{}': {}", s, reason)
+        } else {
+            reason
+        }
+    })
 }
 
 const VALID_AWS_SERVICE: &[&str] = &["ec2", "global-services"];
@@ -30,6 +37,13 @@ fn validate_aws_service(value: &Value) -> Result<(), String> {
         "awscc.ec2_ipam_pool",
         VALID_AWS_SERVICE,
     )
+    .map_err(|reason| {
+        if let Value::String(s) = value {
+            format!("Invalid AwsService '{}': {}", s, reason)
+        } else {
+            reason
+        }
+    })
 }
 
 const VALID_IPAM_SCOPE_TYPE: &[&str] = &["public", "private"];
@@ -41,6 +55,13 @@ fn validate_ipam_scope_type(value: &Value) -> Result<(), String> {
         "awscc.ec2_ipam_pool",
         VALID_IPAM_SCOPE_TYPE,
     )
+    .map_err(|reason| {
+        if let Value::String(s) = value {
+            format!("Invalid IpamScopeType '{}': {}", s, reason)
+        } else {
+            reason
+        }
+    })
 }
 
 const VALID_PUBLIC_IP_SOURCE: &[&str] = &["byoip", "amazon"];
@@ -52,6 +73,13 @@ fn validate_public_ip_source(value: &Value) -> Result<(), String> {
         "awscc.ec2_ipam_pool",
         VALID_PUBLIC_IP_SOURCE,
     )
+    .map_err(|reason| {
+        if let Value::String(s) = value {
+            format!("Invalid PublicIpSource '{}': {}", s, reason)
+        } else {
+            reason
+        }
+    })
 }
 
 const VALID_STATE: &[&str] = &[
@@ -64,7 +92,13 @@ const VALID_STATE: &[&str] = &[
 ];
 
 fn validate_state(value: &Value) -> Result<(), String> {
-    validate_namespaced_enum(value, "State", "awscc.ec2_ipam_pool", VALID_STATE)
+    validate_namespaced_enum(value, "State", "awscc.ec2_ipam_pool", VALID_STATE).map_err(|reason| {
+        if let Value::String(s) = value {
+            format!("Invalid State '{}': {}", s, reason)
+        } else {
+            reason
+        }
+    })
 }
 
 /// Returns the schema config for ec2_ipam_pool (AWS::EC2::IPAMPool)

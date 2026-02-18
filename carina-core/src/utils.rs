@@ -100,7 +100,7 @@ pub fn convert_enum_value(value: &str) -> String {
 ///
 /// # Returns
 /// * `Ok(())` if namespace is valid or string has no dots
-/// * `Err(String)` with descriptive message if namespace is invalid
+/// * `Err(String)` with bare reason string (without the input value) if namespace is invalid
 ///
 /// # Examples
 ///
@@ -132,8 +132,8 @@ pub fn validate_enum_namespace(s: &str, type_name: &str, namespace: &str) -> Res
         2 => {
             if parts[0] != type_name {
                 return Err(format!(
-                    "Invalid format '{}', expected {}.value or {}.{}.value",
-                    s, type_name, namespace, type_name
+                    "expected format {}.value or {}.{}.value",
+                    type_name, namespace, type_name
                 ));
             }
         }
@@ -141,23 +141,17 @@ pub fn validate_enum_namespace(s: &str, type_name: &str, namespace: &str) -> Res
             // Full namespaced form: namespace.TypeName.value
             for (i, &expected) in ns_parts.iter().enumerate() {
                 if parts[i] != expected {
-                    return Err(format!(
-                        "Invalid format '{}', expected {}.{}.value",
-                        s, namespace, type_name
-                    ));
+                    return Err(format!("expected format {}.{}.value", namespace, type_name));
                 }
             }
             if parts[ns_parts.len()] != type_name {
-                return Err(format!(
-                    "Invalid format '{}', expected {}.{}.value",
-                    s, namespace, type_name
-                ));
+                return Err(format!("expected format {}.{}.value", namespace, type_name));
             }
         }
         _ => {
             return Err(format!(
-                "Invalid format '{}', expected one of: value, {}.value, or {}.{}.value",
-                s, type_name, namespace, type_name
+                "expected format: value, {}.value, or {}.{}.value",
+                type_name, namespace, type_name
             ));
         }
     }

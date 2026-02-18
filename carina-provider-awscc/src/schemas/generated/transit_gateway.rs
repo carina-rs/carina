@@ -19,6 +19,13 @@ fn validate_auto_accept_shared_attachments(value: &Value) -> Result<(), String> 
         "awscc.ec2_transit_gateway",
         VALID_AUTO_ACCEPT_SHARED_ATTACHMENTS,
     )
+    .map_err(|reason| {
+        if let Value::String(s) = value {
+            format!("Invalid AutoAcceptSharedAttachments '{}': {}", s, reason)
+        } else {
+            reason
+        }
+    })
 }
 
 const VALID_DEFAULT_ROUTE_TABLE_ASSOCIATION: &[&str] = &["enable", "disable"];
@@ -30,6 +37,13 @@ fn validate_default_route_table_association(value: &Value) -> Result<(), String>
         "awscc.ec2_transit_gateway",
         VALID_DEFAULT_ROUTE_TABLE_ASSOCIATION,
     )
+    .map_err(|reason| {
+        if let Value::String(s) = value {
+            format!("Invalid DefaultRouteTableAssociation '{}': {}", s, reason)
+        } else {
+            reason
+        }
+    })
 }
 
 const VALID_DEFAULT_ROUTE_TABLE_PROPAGATION: &[&str] = &["enable", "disable"];
@@ -41,6 +55,13 @@ fn validate_default_route_table_propagation(value: &Value) -> Result<(), String>
         "awscc.ec2_transit_gateway",
         VALID_DEFAULT_ROUTE_TABLE_PROPAGATION,
     )
+    .map_err(|reason| {
+        if let Value::String(s) = value {
+            format!("Invalid DefaultRouteTablePropagation '{}': {}", s, reason)
+        } else {
+            reason
+        }
+    })
 }
 
 const VALID_DNS_SUPPORT: &[&str] = &["enable", "disable"];
@@ -52,6 +73,13 @@ fn validate_dns_support(value: &Value) -> Result<(), String> {
         "awscc.ec2_transit_gateway",
         VALID_DNS_SUPPORT,
     )
+    .map_err(|reason| {
+        if let Value::String(s) = value {
+            format!("Invalid DnsSupport '{}': {}", s, reason)
+        } else {
+            reason
+        }
+    })
 }
 
 const VALID_ENCRYPTION_SUPPORT: &[&str] = &["disable", "enable"];
@@ -63,6 +91,13 @@ fn validate_encryption_support(value: &Value) -> Result<(), String> {
         "awscc.ec2_transit_gateway",
         VALID_ENCRYPTION_SUPPORT,
     )
+    .map_err(|reason| {
+        if let Value::String(s) = value {
+            format!("Invalid EncryptionSupport '{}': {}", s, reason)
+        } else {
+            reason
+        }
+    })
 }
 
 const VALID_MULTICAST_SUPPORT: &[&str] = &["enable", "disable"];
@@ -74,6 +109,13 @@ fn validate_multicast_support(value: &Value) -> Result<(), String> {
         "awscc.ec2_transit_gateway",
         VALID_MULTICAST_SUPPORT,
     )
+    .map_err(|reason| {
+        if let Value::String(s) = value {
+            format!("Invalid MulticastSupport '{}': {}", s, reason)
+        } else {
+            reason
+        }
+    })
 }
 
 const VALID_SECURITY_GROUP_REFERENCING_SUPPORT: &[&str] = &["enable", "disable"];
@@ -85,6 +127,16 @@ fn validate_security_group_referencing_support(value: &Value) -> Result<(), Stri
         "awscc.ec2_transit_gateway",
         VALID_SECURITY_GROUP_REFERENCING_SUPPORT,
     )
+    .map_err(|reason| {
+        if let Value::String(s) = value {
+            format!(
+                "Invalid SecurityGroupReferencingSupport '{}': {}",
+                s, reason
+            )
+        } else {
+            reason
+        }
+    })
 }
 
 const VALID_VPN_ECMP_SUPPORT: &[&str] = &["enable", "disable"];
@@ -96,6 +148,13 @@ fn validate_vpn_ecmp_support(value: &Value) -> Result<(), String> {
         "awscc.ec2_transit_gateway",
         VALID_VPN_ECMP_SUPPORT,
     )
+    .map_err(|reason| {
+        if let Value::String(s) = value {
+            format!("Invalid VpnEcmpSupport '{}': {}", s, reason)
+        } else {
+            reason
+        }
+    })
 }
 
 /// Returns the schema config for ec2_transit_gateway (AWS::EC2::TransitGateway)

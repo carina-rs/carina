@@ -13,7 +13,15 @@ use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, Struct
 const VALID_ABAC_STATUS: &[&str] = &["Enabled", "Disabled"];
 
 fn validate_abac_status(value: &Value) -> Result<(), String> {
-    validate_namespaced_enum(value, "AbacStatus", "awscc.s3_bucket", VALID_ABAC_STATUS)
+    validate_namespaced_enum(value, "AbacStatus", "awscc.s3_bucket", VALID_ABAC_STATUS).map_err(
+        |reason| {
+            if let Value::String(s) = value {
+                format!("Invalid AbacStatus '{}': {}", s, reason)
+            } else {
+                reason
+            }
+        },
+    )
 }
 
 const VALID_ACCESS_CONTROL: &[&str] = &[
@@ -34,6 +42,13 @@ fn validate_access_control(value: &Value) -> Result<(), String> {
         "awscc.s3_bucket",
         VALID_ACCESS_CONTROL,
     )
+    .map_err(|reason| {
+        if let Value::String(s) = value {
+            format!("Invalid AccessControl '{}': {}", s, reason)
+        } else {
+            reason
+        }
+    })
 }
 
 /// Returns the schema config for s3_bucket (AWS::S3::Bucket)

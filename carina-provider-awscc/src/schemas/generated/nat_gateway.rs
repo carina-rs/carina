@@ -19,6 +19,13 @@ fn validate_availability_mode(value: &Value) -> Result<(), String> {
         "awscc.ec2_nat_gateway",
         VALID_AVAILABILITY_MODE,
     )
+    .map_err(|reason| {
+        if let Value::String(s) = value {
+            format!("Invalid AvailabilityMode '{}': {}", s, reason)
+        } else {
+            reason
+        }
+    })
 }
 
 const VALID_CONNECTIVITY_TYPE: &[&str] = &["public", "private"];
@@ -30,6 +37,13 @@ fn validate_connectivity_type(value: &Value) -> Result<(), String> {
         "awscc.ec2_nat_gateway",
         VALID_CONNECTIVITY_TYPE,
     )
+    .map_err(|reason| {
+        if let Value::String(s) = value {
+            format!("Invalid ConnectivityType '{}': {}", s, reason)
+        } else {
+            reason
+        }
+    })
 }
 
 /// Returns the schema config for ec2_nat_gateway (AWS::EC2::NatGateway)

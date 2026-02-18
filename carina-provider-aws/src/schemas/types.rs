@@ -36,7 +36,8 @@ pub fn aws_region() -> AttributeType {
         base: Box::new(AttributeType::String),
         validate: |value| {
             if let Value::String(s) = value {
-                validate_enum_namespace(s, "Region", "aws")?;
+                validate_enum_namespace(s, "Region", "aws")
+                    .map_err(|reason| format!("Invalid region '{}': {}", s, reason))?;
                 // Normalize the input to AWS format (hyphens)
                 let normalized = extract_enum_value(s).replace('_', "-");
                 if VALID_REGIONS.contains(&normalized.as_str()) {
@@ -71,7 +72,8 @@ pub fn versioning_status() -> AttributeType {
         base: Box::new(AttributeType::String),
         validate: |value| {
             if let Value::String(s) = value {
-                validate_enum_namespace(s, "VersioningStatus", "aws.s3")?;
+                validate_enum_namespace(s, "VersioningStatus", "aws.s3")
+                    .map_err(|reason| format!("Invalid versioning status '{}': {}", s, reason))?;
                 let normalized = extract_enum_value(s);
                 if VALID_VERSIONING_STATUS.contains(&normalized) {
                     Ok(())

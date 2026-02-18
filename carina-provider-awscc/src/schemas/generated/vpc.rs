@@ -19,6 +19,13 @@ fn validate_instance_tenancy(value: &Value) -> Result<(), String> {
         "awscc.ec2_vpc",
         VALID_INSTANCE_TENANCY,
     )
+    .map_err(|reason| {
+        if let Value::String(s) = value {
+            format!("Invalid InstanceTenancy '{}': {}", s, reason)
+        } else {
+            reason
+        }
+    })
 }
 
 fn validate_ipv4_netmask_length_range(value: &Value) -> Result<(), String> {
