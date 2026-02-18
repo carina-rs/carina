@@ -36,16 +36,14 @@ pub fn aws_region() -> AttributeType {
         base: Box::new(AttributeType::String),
         validate: |value| {
             if let Value::String(s) = value {
-                validate_enum_namespace(s, "Region", "aws")
-                    .map_err(|reason| format!("Invalid region '{}': {}", s, reason))?;
+                validate_enum_namespace(s, "Region", "aws")?;
                 // Normalize the input to AWS format (hyphens)
                 let normalized = extract_enum_value(s).replace('_', "-");
                 if VALID_REGIONS.contains(&normalized.as_str()) {
                     Ok(())
                 } else {
                     Err(format!(
-                        "Invalid region '{}', expected one of: {} or DSL format like aws.Region.ap_northeast_1",
-                        s,
+                        "expected one of: {} or DSL format like aws.Region.ap_northeast_1",
                         VALID_REGIONS.join(", ")
                     ))
                 }
@@ -72,16 +70,12 @@ pub fn versioning_status() -> AttributeType {
         base: Box::new(AttributeType::String),
         validate: |value| {
             if let Value::String(s) = value {
-                validate_enum_namespace(s, "VersioningStatus", "aws.s3")
-                    .map_err(|reason| format!("Invalid versioning status '{}': {}", s, reason))?;
+                validate_enum_namespace(s, "VersioningStatus", "aws.s3")?;
                 let normalized = extract_enum_value(s);
                 if VALID_VERSIONING_STATUS.contains(&normalized) {
                     Ok(())
                 } else {
-                    Err(format!(
-                        "Invalid versioning status '{}', expected one of: Enabled, Suspended",
-                        s
-                    ))
+                    Err("expected one of: Enabled, Suspended".to_string())
                 }
             } else {
                 Err("Expected string".to_string())
@@ -174,7 +168,7 @@ mod tests {
         let result = region_type.validate(&Value::String("invalid-region".to_string()));
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("Invalid region"));
+        assert!(err.contains("expected one of:"));
         assert!(err.contains("ap-northeast-1")); // Should suggest valid regions
     }
 
