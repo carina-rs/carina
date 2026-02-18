@@ -414,11 +414,8 @@ impl RootConfigSignature {
             Value::ResourceRef {
                 binding_name,
                 attribute_name,
-                resource_type,
             } => {
-                let target_type = resource_type
-                    .clone()
-                    .or_else(|| binding_types.get(binding_name).cloned());
+                let target_type = binding_types.get(binding_name).cloned();
                 graph.add_edge(
                     from.to_string(),
                     TypedDependency {
@@ -829,21 +826,18 @@ impl ModuleSignature {
             Value::ResourceRef {
                 binding_name,
                 attribute_name,
-                resource_type,
             } => {
-                let target_type = resource_type.clone().or_else(|| {
-                    if binding_name == "input" {
-                        input_types.get(attribute_name).and_then(|t| {
-                            if let TypeExpr::Ref(path) = t {
-                                Some(path.clone())
-                            } else {
-                                None
-                            }
-                        })
-                    } else {
-                        binding_types.get(binding_name).cloned()
-                    }
-                });
+                let target_type = if binding_name == "input" {
+                    input_types.get(attribute_name).and_then(|t| {
+                        if let TypeExpr::Ref(path) = t {
+                            Some(path.clone())
+                        } else {
+                            None
+                        }
+                    })
+                } else {
+                    binding_types.get(binding_name).cloned()
+                };
 
                 graph.add_edge(
                     from.to_string(),

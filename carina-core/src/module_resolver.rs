@@ -309,7 +309,6 @@ mod tests {
                         Value::ResourceRef {
                             binding_name: "input".to_string(),
                             attribute_name: "vpc_id".to_string(),
-                            resource_type: None,
                         },
                     );
                     attrs.insert(
@@ -350,7 +349,6 @@ mod tests {
         let value = Value::ResourceRef {
             binding_name: "input".to_string(),
             attribute_name: "vpc_id".to_string(),
-            resource_type: None,
         };
         let result = substitute_inputs(&value, &inputs);
 
@@ -366,7 +364,6 @@ mod tests {
             Value::ResourceRef {
                 binding_name: "input".to_string(),
                 attribute_name: "port".to_string(),
-                resource_type: None,
             },
             Value::Int(443),
         ]);

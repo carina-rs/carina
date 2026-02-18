@@ -4,8 +4,6 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::parser::ResourceTypePath;
-
 /// Unique identifier for a resource
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ResourceId {
@@ -66,14 +64,12 @@ pub enum Value {
     Bool(bool),
     List(Vec<Value>),
     Map(HashMap<String, Value>),
-    /// Reference to another resource's attribute with optional type information
+    /// Reference to another resource's attribute
     ResourceRef {
         /// Binding name of the referenced resource (e.g., "vpc", "web_sg")
         binding_name: String,
         /// Attribute name being referenced (e.g., "id", "name")
         attribute_name: String,
-        /// Optional resource type for type checking (e.g., aws.vpc)
-        resource_type: Option<ResourceTypePath>,
     },
     /// Unresolved identifier that will be resolved during schema validation
     /// This allows shorthand enum values like `dedicated` to be resolved to
@@ -189,7 +185,6 @@ impl State {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parser::ResourceTypePath;
 
     #[test]
     fn value_serde_round_trip() {
@@ -205,17 +200,14 @@ mod tests {
             Value::ResourceRef {
                 binding_name: "vpc".to_string(),
                 attribute_name: "id".to_string(),
-                resource_type: None,
             },
             Value::ResourceRef {
                 binding_name: "web_sg".to_string(),
                 attribute_name: "id".to_string(),
-                resource_type: Some(ResourceTypePath::new("aws", "security_group")),
             },
             Value::ResourceRef {
                 binding_name: "bucket".to_string(),
                 attribute_name: "arn".to_string(),
-                resource_type: None,
             },
             Value::UnresolvedIdent("dedicated".to_string(), None),
             Value::UnresolvedIdent("InstanceTenancy".to_string(), Some("dedicated".to_string())),

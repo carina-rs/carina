@@ -830,7 +830,6 @@ fn parse_primary_value(
                     Ok(Value::ResourceRef {
                         binding_name: "input".to_string(),
                         attribute_name: parts[1].to_string(),
-                        resource_type: None,
                     })
                 } else if ctx.get_variable(parts[0]).is_some() && !ctx.is_resource_binding(parts[0])
                 {
@@ -847,7 +846,6 @@ fn parse_primary_value(
                     Ok(Value::ResourceRef {
                         binding_name: parts[0].to_string(),
                         attribute_name: parts[1].to_string(),
-                        resource_type: None,
                     })
                 } else {
                     // Unknown 2-part identifier: could be TypeName.value enum shorthand
@@ -888,7 +886,6 @@ fn parse_primary_value(
                     return Ok(Value::ResourceRef {
                         binding_name: "input".to_string(),
                         attribute_name: attr_name.to_string(),
-                        resource_type: None,
                     });
                 }
 
@@ -896,7 +893,6 @@ fn parse_primary_value(
                 Ok(Value::ResourceRef {
                     binding_name: first_ident.to_string(),
                     attribute_name: attr_name.to_string(),
-                    resource_type: None,
                 })
             } else {
                 // Simple variable reference
@@ -1241,7 +1237,6 @@ mod tests {
             Some(&Value::ResourceRef {
                 binding_name: "bucket".to_string(),
                 attribute_name: "name".to_string(),
-                resource_type: None,
             })
         );
     }
@@ -1465,7 +1460,6 @@ mod tests {
             Some(&Value::ResourceRef {
                 binding_name: "input".to_string(),
                 attribute_name: "vpc_id".to_string(),
-                resource_type: None,
             })
         );
     }

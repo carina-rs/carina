@@ -4146,7 +4146,6 @@ mod tests {
                 Value::ResourceRef {
                     binding_name: dep.to_string(),
                     attribute_name: "id".to_string(),
-                    resource_type: None,
                 },
             );
         }
