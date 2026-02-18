@@ -893,16 +893,19 @@ impl CompletionProvider {
             ("us_west_2", "Oregon"),
         ];
 
-        regions
-            .into_iter()
-            .map(|(code, name)| CompletionItem {
-                label: format!("aws.Region.{}", code),
-                kind: Some(CompletionItemKind::ENUM_MEMBER),
-                detail: Some(name.to_string()),
-                insert_text: Some(format!("aws.Region.{}", code)),
-                ..Default::default()
-            })
-            .collect()
+        let mut completions = Vec::new();
+        for prefix in &["aws", "awscc"] {
+            for (code, name) in &regions {
+                completions.push(CompletionItem {
+                    label: format!("{}.Region.{}", prefix, code),
+                    kind: Some(CompletionItemKind::ENUM_MEMBER),
+                    detail: Some(name.to_string()),
+                    insert_text: Some(format!("{}.Region.{}", prefix, code)),
+                    ..Default::default()
+                });
+            }
+        }
+        completions
     }
 
     fn protocol_completions(&self) -> Vec<CompletionItem> {
