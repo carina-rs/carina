@@ -3,7 +3,7 @@
 # Tests: cidr_block, availability_zone, map_public_ip_on_launch, tags
 
 provider awscc {
-  region = aws.Region.ap_northeast_1
+  region = awscc.Region.ap_northeast_1
 }
 
 let vpc = awscc.ec2_vpc {

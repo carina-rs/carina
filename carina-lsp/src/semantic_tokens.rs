@@ -145,27 +145,30 @@ impl SemanticTokensProvider {
         // Resource type: aws.<service>.<resource> pattern
         self.find_resource_types(line, &mut tokens);
 
-        // Region patterns: aws.Region.*
-        for region in &[
-            "aws.Region.ap_northeast_1",
-            "aws.Region.ap_northeast_2",
-            "aws.Region.ap_northeast_3",
-            "aws.Region.ap_south_1",
-            "aws.Region.ap_southeast_1",
-            "aws.Region.ap_southeast_2",
-            "aws.Region.ca_central_1",
-            "aws.Region.eu_central_1",
-            "aws.Region.eu_west_1",
-            "aws.Region.eu_west_2",
-            "aws.Region.eu_west_3",
-            "aws.Region.eu_north_1",
-            "aws.Region.sa_east_1",
-            "aws.Region.us_east_1",
-            "aws.Region.us_east_2",
-            "aws.Region.us_west_1",
-            "aws.Region.us_west_2",
-        ] {
-            self.find_and_add_pattern(line, region, 1, &mut tokens);
+        // Region patterns: aws.Region.* and awscc.Region.*
+        for prefix in &["aws", "awscc"] {
+            for region_code in &[
+                "ap_northeast_1",
+                "ap_northeast_2",
+                "ap_northeast_3",
+                "ap_south_1",
+                "ap_southeast_1",
+                "ap_southeast_2",
+                "ca_central_1",
+                "eu_central_1",
+                "eu_west_1",
+                "eu_west_2",
+                "eu_west_3",
+                "eu_north_1",
+                "sa_east_1",
+                "us_east_1",
+                "us_east_2",
+                "us_west_1",
+                "us_west_2",
+            ] {
+                let region = format!("{}.Region.{}", prefix, region_code);
+                self.find_and_add_pattern(line, &region, 1, &mut tokens);
+            }
         }
 
         // env() function

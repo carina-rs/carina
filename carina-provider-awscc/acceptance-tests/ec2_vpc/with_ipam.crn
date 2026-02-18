@@ -8,7 +8,7 @@
 # `aws ec2 delete-ipam --ipam-id <id> --cascade` may be needed.
 
 provider awscc {
-  region = aws.Region.ap_northeast_1
+  region = awscc.Region.ap_northeast_1
 }
 
 let ipam = awscc.ec2_ipam {

@@ -3,7 +3,7 @@
 # Tests: network_border_group
 
 provider awscc {
-  region = aws.Region.ap_northeast_1
+  region = awscc.Region.ap_northeast_1
 }
 
 let eip = awscc.ec2_eip {

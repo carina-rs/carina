@@ -3,7 +3,7 @@
 # Tests: ipv6_native, assign_ipv6_address_on_creation
 
 provider awscc {
-  region = aws.Region.ap_northeast_1
+  region = awscc.Region.ap_northeast_1
 }
 
 let vpc = awscc.ec2_vpc {

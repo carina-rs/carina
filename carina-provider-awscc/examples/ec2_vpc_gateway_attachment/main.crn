@@ -3,7 +3,7 @@
 # Creates a VPC, an Internet Gateway, and attaches the gateway to the VPC.
 
 provider awscc {
-  region = aws.Region.ap_northeast_1
+  region = awscc.Region.ap_northeast_1
 }
 
 let vpc = awscc.ec2_vpc {

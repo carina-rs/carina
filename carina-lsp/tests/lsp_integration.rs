@@ -310,7 +310,7 @@ async fn test_diagnostics_for_unknown_struct_field() {
 
     let uri = "file:///tmp/test_diag.crn";
     let text = r#"provider awscc {
-    region = aws.Region.ap_northeast_1
+    region = awscc.Region.ap_northeast_1
 }
 
 awscc.ec2_security_group {

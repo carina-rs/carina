@@ -6,7 +6,7 @@ The `awscc` provider manages AWS resources through the [AWS Cloud Control API](h
 
 ```crn
 provider awscc {
-  region = aws.Region.ap_northeast_1
+  region = awscc.Region.ap_northeast_1
 }
 ```
 
