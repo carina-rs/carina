@@ -254,8 +254,8 @@ impl HoverProvider {
         for (code, name, aws_code) in regions {
             if word.contains(code) {
                 let content = format!(
-                    "## AWS Region\n\n**{}**\n\n- DSL format: `aws.Region.{}`\n- AWS format: `{}`",
-                    name, code, aws_code
+                    "## AWS Region\n\n**{}**\n\n- DSL format: `aws.Region.{}` / `awscc.Region.{}`\n- AWS format: `{}`",
+                    name, code, code, aws_code
                 );
 
                 return Some(Hover {
