@@ -92,6 +92,19 @@ if [ "$COMMAND" = "full" ]; then
     WORK_DIR=$(mktemp -d)
     trap "rm -rf $WORK_DIR" EXIT
 
+    # Pre-authenticate all accounts sequentially to avoid opening
+    # multiple SSO browser tabs simultaneously
+    echo "Pre-authenticating AWS accounts..."
+    for SLOT in $(seq 0 $((NUM_ACCOUNTS - 1))); do
+        ACCOUNT="${ACCOUNTS[$SLOT]}"
+        echo "  Authenticating $ACCOUNT..."
+        if ! aws-vault exec "$ACCOUNT" -- true 2>&1; then
+            echo "  WARNING: Failed to pre-authenticate $ACCOUNT"
+        fi
+    done
+    echo "Pre-authentication complete."
+    echo ""
+
     # Distribute tests round-robin across accounts
     for i in "${!TESTS[@]}"; do
         SLOT=$((i % NUM_ACCOUNTS))
