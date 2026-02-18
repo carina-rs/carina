@@ -3,10 +3,11 @@
 //! A Provider defines operations for a specific infrastructure (AWS, GCP, etc.).
 //! It is responsible for converting Effects into actual API calls.
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 
-use crate::resource::{LifecycleConfig, Resource, ResourceId, State};
+use crate::resource::{LifecycleConfig, Resource, ResourceId, State, Value};
 
 /// Error type for Provider operations
 #[derive(Debug)]
@@ -130,6 +131,25 @@ pub trait Provider: Send + Sync {
         identifier: &str,
         lifecycle: &LifecycleConfig,
     ) -> BoxFuture<'_, ProviderResult<()>>;
+
+    /// Resolve enum identifiers in resources to their fully-qualified DSL format.
+    ///
+    /// For example, resolves bare `advanced` or `Tier.advanced` into
+    /// `awscc.ec2_ipam.Tier.advanced` based on schema definitions.
+    /// Default implementation is a no-op for providers without enum types.
+    fn resolve_enum_identifiers(&self, _resources: &mut [Resource]) {}
+
+    /// Restore create-only attributes from saved state into current read states.
+    ///
+    /// Some APIs (e.g., CloudControl) don't return create-only properties in read responses.
+    /// This method carries them forward from previously saved attribute values.
+    /// Default implementation is a no-op.
+    fn restore_create_only_attrs(
+        &self,
+        _current_states: &mut HashMap<ResourceId, State>,
+        _saved_attrs: &HashMap<ResourceId, HashMap<String, Value>>,
+    ) {
+    }
 }
 
 /// Provider implementation for Box<dyn Provider>
@@ -172,6 +192,18 @@ impl Provider for Box<dyn Provider> {
         lifecycle: &LifecycleConfig,
     ) -> BoxFuture<'_, ProviderResult<()>> {
         (**self).delete(id, identifier, lifecycle)
+    }
+
+    fn resolve_enum_identifiers(&self, resources: &mut [Resource]) {
+        (**self).resolve_enum_identifiers(resources)
+    }
+
+    fn restore_create_only_attrs(
+        &self,
+        current_states: &mut HashMap<ResourceId, State>,
+        saved_attrs: &HashMap<ResourceId, HashMap<String, Value>>,
+    ) {
+        (**self).restore_create_only_attrs(current_states, saved_attrs)
     }
 }
 

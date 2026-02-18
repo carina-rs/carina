@@ -16,7 +16,6 @@ use carina_core::parser::{self, BackendConfig, ParsedFile, ProviderConfig, TypeE
 use carina_core::plan::Plan;
 use carina_core::provider::{BoxFuture, Provider, ProviderError, ProviderResult, ResourceType};
 use carina_core::resource::{LifecycleConfig, Resource, ResourceId, State, Value};
-use carina_core::schema::AttributeType;
 use carina_core::schema::ResourceSchema;
 use carina_core::schema::validate_cidr;
 use carina_provider_aws::schemas;
@@ -1400,7 +1399,8 @@ async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
     }
 
     // Restore create-only attributes from state file (CloudControl doesn't return them)
-    restore_create_only_attrs_from_state(&mut current_states, &state_file);
+    let saved_attrs = build_saved_attrs_from_state(&state_file);
+    provider.restore_create_only_attrs(&mut current_states, &saved_attrs);
 
     // Build initial binding map for reference resolution
     let mut binding_map: HashMap<String, HashMap<String, Value>> = HashMap::new();
@@ -1424,7 +1424,7 @@ async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
     // Resolve references and enum identifiers, then create initial plan for display
     let mut resources_for_plan = sorted_resources.clone();
     resolve_refs_with_state(&mut resources_for_plan, &current_states);
-    resolve_enum_identifiers(&mut resources_for_plan);
+    provider.resolve_enum_identifiers(&mut resources_for_plan);
     let lifecycles = build_lifecycles_from_state(&state_file);
     let plan = create_plan(&resources_for_plan, &current_states, &lifecycles);
 
@@ -2738,77 +2738,6 @@ fn resolve_ref_value(
     }
 }
 
-/// Resolve enum identifiers in resources to their full namespaced string format.
-///
-/// For awscc resources with Custom enum attributes, converts:
-/// - UnresolvedIdent("advanced", None) → String("awscc.ec2_ipam.Tier.advanced")
-/// - String("IPv4") → String("awscc.ec2_ipam_pool.AddressFamily.IPv4")
-///
-/// This ensures desired values match the format produced by the provider's read-back.
-fn resolve_enum_identifiers(resources: &mut [Resource]) {
-    let awscc_configs = carina_provider_awscc::schemas::generated::configs();
-
-    for resource in resources.iter_mut() {
-        // Only handle awscc resources
-        let is_awscc = matches!(
-            resource.attributes.get("_provider"),
-            Some(Value::String(p)) if p == "awscc"
-        );
-        if !is_awscc {
-            continue;
-        }
-
-        // Find the matching schema config
-        let config = awscc_configs.iter().find(|c| {
-            c.schema
-                .resource_type
-                .strip_prefix("awscc.")
-                .map(|t| t == resource.id.resource_type)
-                .unwrap_or(false)
-        });
-        let config = match config {
-            Some(c) => c,
-            None => continue,
-        };
-
-        // Resolve enum attributes
-        let mut resolved_attrs = HashMap::new();
-        for (key, value) in &resource.attributes {
-            if let Some(attr_schema) = config.schema.attributes.get(key.as_str())
-                && let AttributeType::Custom {
-                    name: type_name,
-                    namespace: Some(ns),
-                    to_dsl,
-                    ..
-                } = &attr_schema.attr_type
-            {
-                let resolved = match value {
-                    Value::UnresolvedIdent(ident, None) => {
-                        // bare identifier: advanced → awscc.ec2_ipam.Tier.advanced
-                        let dsl_val = to_dsl.map_or_else(|| ident.clone(), |f| f(ident));
-                        Value::String(format!("{}.{}.{}", ns, type_name, dsl_val))
-                    }
-                    Value::UnresolvedIdent(ident, Some(member)) if ident == type_name => {
-                        // TypeName.value: Tier.advanced → awscc.ec2_ipam.Tier.advanced
-                        let dsl_val = to_dsl.map_or_else(|| member.clone(), |f| f(member));
-                        Value::String(format!("{}.{}.{}", ns, type_name, dsl_val))
-                    }
-                    Value::String(s) if !s.contains('.') => {
-                        // plain string: "ap-northeast-1a" → awscc.AvailabilityZone.ap_northeast_1a
-                        let dsl_val = to_dsl.map_or_else(|| s.clone(), |f| f(s));
-                        Value::String(format!("{}.{}.{}", ns, type_name, dsl_val))
-                    }
-                    _ => value.clone(),
-                };
-                resolved_attrs.insert(key.clone(), resolved);
-                continue;
-            }
-            resolved_attrs.insert(key.clone(), value.clone());
-        }
-        resource.attributes = resolved_attrs;
-    }
-}
-
 /// Extract binding names that a resource depends on
 fn get_resource_dependencies(resource: &Resource) -> HashSet<String> {
     let mut deps = HashSet::new();
@@ -2926,12 +2855,13 @@ async fn create_plan_from_parsed(
     }
 
     // Restore create-only attributes from state file (CloudControl doesn't return them)
-    restore_create_only_attrs_from_state(&mut current_states, state_file);
+    let saved_attrs = build_saved_attrs_from_state(state_file);
+    provider.restore_create_only_attrs(&mut current_states, &saved_attrs);
 
     // Resolve ResourceRef values and enum identifiers using AWS state
     let mut resources = sorted_resources.clone();
     resolve_refs_with_state(&mut resources, &current_states);
-    resolve_enum_identifiers(&mut resources);
+    provider.resolve_enum_identifiers(&mut resources);
 
     // Build lifecycles map from state file for orphaned resource deletion
     let lifecycles = build_lifecycles_from_state(state_file);
@@ -3570,45 +3500,27 @@ fn json_to_dsl_value(json: &serde_json::Value) -> Value {
     }
 }
 
-/// Restore create-only attributes from the state file into read states.
-/// CloudControl API doesn't return create-only properties in GetResource responses,
-/// so we need to carry them forward from the saved state.
-fn restore_create_only_attrs_from_state(
-    current_states: &mut HashMap<ResourceId, State>,
+/// Build a map of saved attributes from a state file, converting JSON values to DSL values.
+///
+/// This is used to pass saved attribute data to the provider's `restore_create_only_attrs` method.
+fn build_saved_attrs_from_state(
     state_file: &Option<StateFile>,
-) {
+) -> HashMap<ResourceId, HashMap<String, Value>> {
+    let mut result = HashMap::new();
     let state_file = match state_file {
         Some(sf) => sf,
-        None => return,
+        None => return result,
     };
-    let awscc_configs = carina_provider_awscc::schemas::generated::configs();
-
-    for (resource_id, state) in current_states.iter_mut() {
-        if !state.exists || resource_id.provider != "awscc" {
-            continue;
-        }
-        let config = awscc_configs
+    for rs in &state_file.resources {
+        let id = ResourceId::with_provider(&rs.provider, &rs.resource_type, &rs.name);
+        let attrs: HashMap<String, Value> = rs
+            .attributes
             .iter()
-            .find(|c| c.resource_type_name == resource_id.resource_type);
-        let config = match config {
-            Some(c) => c,
-            None => continue,
-        };
-        let saved = match state_file.find_resource(&resource_id.resource_type, &resource_id.name) {
-            Some(rs) => rs,
-            None => continue,
-        };
-        for (dsl_name, attr_schema) in &config.schema.attributes {
-            if attr_schema.create_only
-                && !state.attributes.contains_key(dsl_name)
-                && let Some(json_val) = saved.attributes.get(dsl_name)
-            {
-                state
-                    .attributes
-                    .insert(dsl_name.clone(), json_to_dsl_value(json_val));
-            }
-        }
+            .map(|(k, v)| (k.clone(), json_to_dsl_value(v)))
+            .collect();
+        result.insert(id, attrs);
     }
+    result
 }
 
 /// Run force-unlock command

@@ -15,8 +15,10 @@ pub mod schemas;
 // Re-export main types
 pub use provider::AwsccProvider;
 
+use std::collections::HashMap;
+
 use carina_core::provider::{BoxFuture, Provider, ProviderResult};
-use carina_core::resource::{LifecycleConfig, Resource, ResourceId, State};
+use carina_core::resource::{LifecycleConfig, Resource, ResourceId, State, Value};
 
 use resources::resource_types;
 
@@ -74,5 +76,17 @@ impl Provider for AwsccProvider {
         let identifier = identifier.to_string();
         let lifecycle = lifecycle.clone();
         Box::pin(async move { self.delete_resource(&id, &identifier, &lifecycle).await })
+    }
+
+    fn resolve_enum_identifiers(&self, resources: &mut [Resource]) {
+        crate::provider::resolve_enum_identifiers_impl(resources);
+    }
+
+    fn restore_create_only_attrs(
+        &self,
+        current_states: &mut HashMap<ResourceId, State>,
+        saved_attrs: &HashMap<ResourceId, HashMap<String, Value>>,
+    ) {
+        crate::provider::restore_create_only_attrs_impl(current_states, saved_attrs);
     }
 }

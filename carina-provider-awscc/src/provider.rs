@@ -868,6 +868,115 @@ impl AwsccProvider {
     }
 }
 
+// =============================================================================
+// Standalone functions for Provider trait methods
+// =============================================================================
+
+/// Resolve enum identifiers in resources to their fully-qualified DSL format.
+///
+/// For each awscc resource, looks up the schema and resolves bare identifiers
+/// (e.g., `advanced`) or TypeName.value identifiers (e.g., `Tier.advanced`)
+/// into fully-qualified namespaced strings (e.g., `awscc.ec2_ipam.Tier.advanced`).
+pub fn resolve_enum_identifiers_impl(resources: &mut [Resource]) {
+    let awscc_configs = crate::schemas::generated::configs();
+
+    for resource in resources.iter_mut() {
+        // Only handle awscc resources
+        let is_awscc = matches!(
+            resource.attributes.get("_provider"),
+            Some(Value::String(p)) if p == "awscc"
+        );
+        if !is_awscc {
+            continue;
+        }
+
+        // Find the matching schema config
+        let config = awscc_configs.iter().find(|c| {
+            c.schema
+                .resource_type
+                .strip_prefix("awscc.")
+                .map(|t| t == resource.id.resource_type)
+                .unwrap_or(false)
+        });
+        let config = match config {
+            Some(c) => c,
+            None => continue,
+        };
+
+        // Resolve enum attributes
+        let mut resolved_attrs = HashMap::new();
+        for (key, value) in &resource.attributes {
+            if let Some(attr_schema) = config.schema.attributes.get(key.as_str())
+                && let AttributeType::Custom {
+                    name: type_name,
+                    namespace: Some(ns),
+                    to_dsl,
+                    ..
+                } = &attr_schema.attr_type
+            {
+                let resolved = match value {
+                    Value::UnresolvedIdent(ident, None) => {
+                        // bare identifier: advanced → awscc.ec2_ipam.Tier.advanced
+                        let dsl_val = to_dsl.map_or_else(|| ident.clone(), |f| f(ident));
+                        Value::String(format!("{}.{}.{}", ns, type_name, dsl_val))
+                    }
+                    Value::UnresolvedIdent(ident, Some(member)) if ident == type_name => {
+                        // TypeName.value: Tier.advanced → awscc.ec2_ipam.Tier.advanced
+                        let dsl_val = to_dsl.map_or_else(|| member.clone(), |f| f(member));
+                        Value::String(format!("{}.{}.{}", ns, type_name, dsl_val))
+                    }
+                    Value::String(s) if !s.contains('.') => {
+                        // plain string: "ap-northeast-1a" → awscc.AvailabilityZone.ap_northeast_1a
+                        let dsl_val = to_dsl.map_or_else(|| s.clone(), |f| f(s));
+                        Value::String(format!("{}.{}.{}", ns, type_name, dsl_val))
+                    }
+                    _ => value.clone(),
+                };
+                resolved_attrs.insert(key.clone(), resolved);
+                continue;
+            }
+            resolved_attrs.insert(key.clone(), value.clone());
+        }
+        resource.attributes = resolved_attrs;
+    }
+}
+
+/// Restore create-only attributes from saved state into current read states.
+///
+/// CloudControl API doesn't return create-only properties in GetResource responses,
+/// so we carry them forward from the previously saved attribute values.
+pub fn restore_create_only_attrs_impl(
+    current_states: &mut HashMap<ResourceId, State>,
+    saved_attrs: &HashMap<ResourceId, HashMap<String, Value>>,
+) {
+    let awscc_configs = crate::schemas::generated::configs();
+
+    for (resource_id, state) in current_states.iter_mut() {
+        if !state.exists || resource_id.provider != "awscc" {
+            continue;
+        }
+        let config = awscc_configs
+            .iter()
+            .find(|c| c.resource_type_name == resource_id.resource_type);
+        let config = match config {
+            Some(c) => c,
+            None => continue,
+        };
+        let saved = match saved_attrs.get(resource_id) {
+            Some(attrs) => attrs,
+            None => continue,
+        };
+        for (dsl_name, attr_schema) in &config.schema.attributes {
+            if attr_schema.create_only
+                && !state.attributes.contains_key(dsl_name)
+                && let Some(value) = saved.get(dsl_name)
+            {
+                state.attributes.insert(dsl_name.clone(), value.clone());
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -950,6 +1059,153 @@ mod tests {
         assert_eq!(
             AwsccProvider::max_polling_attempts("AWS::EC2::IPAMPool", "create"),
             120
+        );
+    }
+
+    #[test]
+    fn test_resolve_enum_identifiers_bare_ident() {
+        let mut resource = Resource::new("ec2_vpc", "test");
+        resource
+            .attributes
+            .insert("_provider".to_string(), Value::String("awscc".to_string()));
+        resource.attributes.insert(
+            "instance_tenancy".to_string(),
+            Value::UnresolvedIdent("dedicated".to_string(), None),
+        );
+
+        // After resolution, the bare ident should be fully qualified
+        let mut resources = vec![resource];
+        resolve_enum_identifiers_impl(&mut resources);
+        match &resources[0].attributes["instance_tenancy"] {
+            Value::String(s) => assert!(
+                s.contains("InstanceTenancy") && s.contains("dedicated"),
+                "Expected namespaced enum, got: {}",
+                s
+            ),
+            other => panic!("Expected String, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_resolve_enum_identifiers_typename_value() {
+        let mut resource = Resource::new("ec2_vpc", "test");
+        resource
+            .attributes
+            .insert("_provider".to_string(), Value::String("awscc".to_string()));
+        resource.attributes.insert(
+            "instance_tenancy".to_string(),
+            Value::UnresolvedIdent("InstanceTenancy".to_string(), Some("dedicated".to_string())),
+        );
+
+        let mut resources = vec![resource];
+        resolve_enum_identifiers_impl(&mut resources);
+        match &resources[0].attributes["instance_tenancy"] {
+            Value::String(s) => assert!(
+                s.contains("InstanceTenancy") && s.contains("dedicated"),
+                "Expected namespaced enum, got: {}",
+                s
+            ),
+            other => panic!("Expected String, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_resolve_enum_identifiers_skips_non_awscc() {
+        let mut resource = Resource::new("s3_bucket", "test");
+        resource
+            .attributes
+            .insert("_provider".to_string(), Value::String("aws".to_string()));
+        resource.attributes.insert(
+            "instance_tenancy".to_string(),
+            Value::UnresolvedIdent("dedicated".to_string(), None),
+        );
+
+        let mut resources = vec![resource];
+        resolve_enum_identifiers_impl(&mut resources);
+        // Should remain unchanged
+        assert!(matches!(
+            &resources[0].attributes["instance_tenancy"],
+            Value::UnresolvedIdent(_, _)
+        ));
+    }
+
+    #[test]
+    fn test_restore_create_only_attrs_impl_basic() {
+        // Create a state that's missing a create-only attribute
+        let id = ResourceId::with_provider("awscc", "ec2_nat_gateway", "test");
+        let mut state = State::existing(id.clone(), HashMap::new());
+        state.attributes.insert(
+            "nat_gateway_id".to_string(),
+            Value::String("nat-123".to_string()),
+        );
+
+        let mut current_states = HashMap::new();
+        current_states.insert(id.clone(), state);
+
+        // Build saved attrs with a create-only attribute (subnet_id is create-only for nat_gateway)
+        let mut saved = HashMap::new();
+        saved.insert(
+            "subnet_id".to_string(),
+            Value::String("subnet-abc".to_string()),
+        );
+        let mut saved_attrs = HashMap::new();
+        saved_attrs.insert(id.clone(), saved);
+
+        restore_create_only_attrs_impl(&mut current_states, &saved_attrs);
+
+        // subnet_id is create-only on nat_gateway, so it should be restored
+        assert_eq!(
+            current_states[&id].attributes.get("subnet_id"),
+            Some(&Value::String("subnet-abc".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_restore_create_only_attrs_skips_non_awscc() {
+        let id = ResourceId::with_provider("aws", "s3_bucket", "test");
+        let state = State::existing(id.clone(), HashMap::new());
+
+        let mut current_states = HashMap::new();
+        current_states.insert(id.clone(), state);
+
+        let mut saved = HashMap::new();
+        saved.insert("some_attr".to_string(), Value::String("value".to_string()));
+        let mut saved_attrs = HashMap::new();
+        saved_attrs.insert(id.clone(), saved);
+
+        restore_create_only_attrs_impl(&mut current_states, &saved_attrs);
+
+        // Should not have added anything since provider is "aws"
+        assert!(!current_states[&id].attributes.contains_key("some_attr"));
+    }
+
+    #[test]
+    fn test_restore_create_only_attrs_skips_already_present() {
+        let id = ResourceId::with_provider("awscc", "ec2_nat_gateway", "test");
+        let mut attrs = HashMap::new();
+        attrs.insert(
+            "subnet_id".to_string(),
+            Value::String("subnet-current".to_string()),
+        );
+        let state = State::existing(id.clone(), attrs);
+
+        let mut current_states = HashMap::new();
+        current_states.insert(id.clone(), state);
+
+        let mut saved = HashMap::new();
+        saved.insert(
+            "subnet_id".to_string(),
+            Value::String("subnet-saved".to_string()),
+        );
+        let mut saved_attrs = HashMap::new();
+        saved_attrs.insert(id.clone(), saved);
+
+        restore_create_only_attrs_impl(&mut current_states, &saved_attrs);
+
+        // Should keep the current value, not overwrite with saved
+        assert_eq!(
+            current_states[&id].attributes.get("subnet_id"),
+            Some(&Value::String("subnet-current".to_string()))
         );
     }
 }
