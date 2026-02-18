@@ -1204,7 +1204,6 @@ mod tests {
             ipv4.validate(&Value::ResourceRef {
                 binding_name: "vpc".to_string(),
                 attribute_name: "cidr_block".to_string(),
-                resource_type: None,
             })
             .is_ok()
         );
@@ -1214,17 +1213,6 @@ mod tests {
             ipv6.validate(&Value::ResourceRef {
                 binding_name: "subnet".to_string(),
                 attribute_name: "ipv6_cidr".to_string(),
-                resource_type: None,
-            })
-            .is_ok()
-        );
-
-        // ResourceRef with type info should also be accepted
-        assert!(
-            ipv4.validate(&Value::ResourceRef {
-                binding_name: "vpc".to_string(),
-                attribute_name: "cidr_block".to_string(),
-                resource_type: Some(crate::parser::ResourceTypePath::new("aws", "vpc")),
             })
             .is_ok()
         );
