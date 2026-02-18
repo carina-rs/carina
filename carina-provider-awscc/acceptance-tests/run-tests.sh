@@ -126,7 +126,7 @@ if [ "$COMMAND" = "cleanup" ]; then
                 DESTROY_OUTPUT=$(cd "$STATE_DIR" && aws-vault exec "$ACCOUNT" -- "$CARINA_BIN" destroy --auto-approve "$TEST_FILE" 2>&1)
                 DESTROY_RC=$?
                 if [ $DESTROY_RC -eq 0 ]; then
-                    if echo "$DESTROY_OUTPUT" | grep -q "No changes"; then
+                    if echo "$DESTROY_OUTPUT" | grep -q "No resources to destroy"; then
                         SKIPPED=$((SKIPPED + 1))
                     else
                         echo "DESTROYED $REL_PATH"
