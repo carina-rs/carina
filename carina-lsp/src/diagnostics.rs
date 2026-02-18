@@ -7,6 +7,7 @@ use carina_core::parser::{InputParameter, ParseError, ParsedFile, TypeExpr};
 use carina_core::resource::Value;
 use carina_core::schema::{validate_cidr, validate_ipv6_cidr};
 use carina_provider_aws::schemas::{s3, types as aws_types, vpc};
+use carina_provider_awscc::schemas::awscc_types;
 use carina_provider_awscc::schemas::generated::flow_log as awscc_flow_log;
 use carina_provider_awscc::schemas::generated::nat_gateway as awscc_nat_gateway;
 use carina_provider_awscc::schemas::generated::security_group as awscc_security_group;
@@ -632,13 +633,13 @@ impl DiagnosticEngine {
     /// Check provider region attribute
     fn check_provider_region(&self, doc: &Document, parsed: &ParsedFile) -> Vec<Diagnostic> {
         let mut diagnostics = Vec::new();
-        // Use the same region type for both aws and awscc providers
-        let region_type = aws_types::aws_region();
+        let aws_region_type = aws_types::aws_region();
+        let awscc_region_type = awscc_types::awscc_region();
 
         for provider in &parsed.providers {
             if provider.name == "aws"
                 && let Some(region_value) = provider.attributes.get("region")
-                && let Err(e) = region_type.validate(region_value)
+                && let Err(e) = aws_region_type.validate(region_value)
                 && let Some((line, col)) = self.find_provider_region_position(doc, "aws")
             {
                 diagnostics.push(Diagnostic {
@@ -660,7 +661,7 @@ impl DiagnosticEngine {
             }
             if provider.name == "awscc"
                 && let Some(region_value) = provider.attributes.get("region")
-                && let Err(e) = region_type.validate(region_value)
+                && let Err(e) = awscc_region_type.validate(region_value)
                 && let Some((line, col)) = self.find_provider_region_position(doc, "awscc")
             {
                 diagnostics.push(Diagnostic {
@@ -1017,8 +1018,8 @@ impl DiagnosticEngine {
                     continue;
                 }
 
-                // Skip if it starts with "aws." (enum values like aws.Region.xxx)
-                if after_eq_trimmed.starts_with("aws.") {
+                // Skip if it starts with "aws." or "awscc." (enum values like aws.Region.xxx)
+                if after_eq_trimmed.starts_with("aws.") || after_eq_trimmed.starts_with("awscc.") {
                     continue;
                 }
 
@@ -1221,7 +1222,7 @@ mod tests {
         let engine = DiagnosticEngine::new();
         let doc = create_document(
             r#"provider awscc {
-    region = aws.Region.ap_northeast_1
+    region = awscc.Region.ap_northeast_1
 }
 
 let sg = awscc.ec2_security_group {
@@ -1250,7 +1251,7 @@ let sg = awscc.ec2_security_group {
         let engine = DiagnosticEngine::new();
         let doc = create_document(
             r#"provider awscc {
-    region = aws.Region.ap_northeast_1
+    region = awscc.Region.ap_northeast_1
 }
 
 let sg = awscc.ec2_security_group {
@@ -1280,7 +1281,7 @@ let sg = awscc.ec2_security_group {
         // vpc.vpc_id is AwsResourceId, but ipv4_ipam_pool_id expects IpamPoolId
         let doc = create_document(
             r#"provider awscc {
-    region = aws.Region.ap_northeast_1
+    region = awscc.Region.ap_northeast_1
 }
 
 let vpc = awscc.ec2_vpc {
@@ -1311,7 +1312,7 @@ let vpc2 = awscc.ec2_vpc {
         // Using vpc.vpc_id in a vpc_id field (same type) should not produce a warning
         let doc = create_document(
             r#"provider awscc {
-    region = aws.Region.ap_northeast_1
+    region = awscc.Region.ap_northeast_1
 }
 
 let vpc = awscc.ec2_vpc {
@@ -1341,7 +1342,7 @@ let subnet = awscc.ec2_subnet {
         let engine = DiagnosticEngine::new();
         let doc = create_document(
             r#"provider awscc {
-    region = aws.Region.ap_northeast_1
+    region = awscc.Region.ap_northeast_1
 }
 
 let sg = awscc.ec2_security_group {

@@ -89,8 +89,12 @@ impl CompletionProvider {
             return CompletionContext::AfterInputDot;
         }
 
-        // Check if we're typing after "aws.Region."
-        if prefix.contains("aws.Region.") || prefix.ends_with("aws.Region") {
+        // Check if we're typing after "aws.Region." or "awscc.Region."
+        if prefix.contains("aws.Region.")
+            || prefix.ends_with("aws.Region")
+            || prefix.contains("awscc.Region.")
+            || prefix.ends_with("awscc.Region")
+        {
             return CompletionContext::AfterAwsRegion;
         }
 
