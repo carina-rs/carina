@@ -1364,7 +1364,7 @@ fn get_resource_id_type(prop_name: &str) -> &'static str {
         return "super::vpn_gateway_id()";
     }
     // VPC Endpoint IDs
-    if lower.contains("vpcendpoint") && lower.ends_with("id") || lower.ends_with("endpointid") {
+    if lower.contains("vpcendpoint") && lower.ends_with("id") {
         return "super::vpc_endpoint_id()";
     }
 
@@ -1408,7 +1408,7 @@ fn get_resource_id_display_name(prop_name: &str) -> &'static str {
     if lower.contains("vpngateway") && lower.ends_with("id") {
         return "VpnGatewayId";
     }
-    if lower.contains("vpcendpoint") && lower.ends_with("id") || lower.ends_with("endpointid") {
+    if lower.contains("vpcendpoint") && lower.ends_with("id") {
         return "VpcEndpointId";
     }
 
@@ -2939,6 +2939,16 @@ mod tests {
     }
 
     #[test]
+    fn test_get_resource_id_type_non_vpc_endpoint_id() {
+        // Regression test for #244: ServiceEndpointId should NOT match VPC Endpoint ID
+        // Previously, due to operator precedence, anything ending with "endpointid" matched
+        assert_eq!(
+            get_resource_id_type("ServiceEndpointId"),
+            "super::aws_resource_id()"
+        );
+    }
+
+    #[test]
     fn test_get_resource_id_type_fallback() {
         assert_eq!(
             get_resource_id_type("SomeUnknownId"),
@@ -3021,6 +3031,15 @@ mod tests {
         assert_eq!(
             get_resource_id_display_name("VpcEndpointId"),
             "VpcEndpointId"
+        );
+    }
+
+    #[test]
+    fn test_get_resource_id_display_name_non_vpc_endpoint_id() {
+        // Regression test for #244: ServiceEndpointId should NOT match VPC Endpoint ID
+        assert_eq!(
+            get_resource_id_display_name("ServiceEndpointId"),
+            "AwsResourceId"
         );
     }
 
