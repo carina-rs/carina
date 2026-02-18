@@ -374,12 +374,12 @@ impl StateBackend for S3Backend {
 
 /// Convert region value from DSL format to AWS format
 /// e.g., "aws.Region.ap_northeast_1" -> "ap-northeast-1"
+///       "awscc.Region.ap_northeast_1" -> "ap-northeast-1"
 fn convert_region_value(value: &str) -> String {
-    if value.starts_with("aws.Region.") {
-        value
-            .strip_prefix("aws.Region.")
-            .unwrap_or(value)
-            .replace('_', "-")
+    if let Some(rest) = value.strip_prefix("aws.Region.") {
+        rest.replace('_', "-")
+    } else if let Some(rest) = value.strip_prefix("awscc.Region.") {
+        rest.replace('_', "-")
     } else {
         value.to_string()
     }
@@ -405,6 +405,11 @@ mod tests {
             "ap-northeast-1"
         );
         assert_eq!(convert_region_value("aws.Region.us_west_2"), "us-west-2");
+        assert_eq!(
+            convert_region_value("awscc.Region.ap_northeast_1"),
+            "ap-northeast-1"
+        );
+        assert_eq!(convert_region_value("awscc.Region.us_west_2"), "us-west-2");
         assert_eq!(convert_region_value("us-east-1"), "us-east-1");
         assert_eq!(convert_region_value("eu-west-1"), "eu-west-1");
     }

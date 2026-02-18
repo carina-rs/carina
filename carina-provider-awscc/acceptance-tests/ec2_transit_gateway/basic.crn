@@ -3,7 +3,7 @@
 # Tests: description, tags
 
 provider awscc {
-  region = aws.Region.ap_northeast_1
+  region = awscc.Region.ap_northeast_1
 }
 
 let tgw = awscc.ec2_transit_gateway {

@@ -3,7 +3,7 @@
 # Tests: cidr_block, enable_dns_support, enable_dns_hostnames, instance_tenancy, tags
 
 provider awscc {
-  region = aws.Region.ap_northeast_1
+  region = awscc.Region.ap_northeast_1
 }
 
 let vpc = awscc.ec2_vpc {

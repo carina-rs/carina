@@ -3,7 +3,7 @@
 # Tests: vpc_id, peer_vpc_id, tags
 
 provider awscc {
-  region = aws.Region.ap_northeast_1
+  region = awscc.Region.ap_northeast_1
 }
 
 let vpc1 = awscc.ec2_vpc {

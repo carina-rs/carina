@@ -3,7 +3,7 @@
 # Tests: cidr_ip, from_port, to_port, ip_protocol, description
 
 provider awscc {
-  region = aws.Region.ap_northeast_1
+  region = awscc.Region.ap_northeast_1
 }
 
 let vpc = awscc.ec2_vpc {

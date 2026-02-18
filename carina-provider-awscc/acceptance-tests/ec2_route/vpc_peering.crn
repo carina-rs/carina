@@ -4,7 +4,7 @@
 # Requires: VPC Peering Connection
 
 provider awscc {
-  region = aws.Region.ap_northeast_1
+  region = awscc.Region.ap_northeast_1
 }
 
 let vpc1 = awscc.ec2_vpc {

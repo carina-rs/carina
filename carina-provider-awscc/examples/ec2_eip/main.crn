@@ -3,7 +3,7 @@
 # Creates a standalone Elastic IP address for use in a VPC.
 
 provider awscc {
-  region = aws.Region.ap_northeast_1
+  region = awscc.Region.ap_northeast_1
 }
 
 let eip = awscc.ec2_eip {

@@ -2620,14 +2620,7 @@ fn get_awscc_region(parsed: &ParsedFile) -> String {
         if provider.name == "awscc"
             && let Some(Value::String(region)) = provider.attributes.get("region")
         {
-            // Convert from aws.Region.ap_northeast_1 format to ap-northeast-1 format
-            if region.starts_with("aws.Region.") {
-                return region
-                    .strip_prefix("aws.Region.")
-                    .unwrap_or(region)
-                    .replace('_', "-");
-            }
-            return region.clone();
+            return convert_region_value(region);
         }
     }
     // Default region
@@ -3754,11 +3747,10 @@ async fn run_state_bucket_delete(
 
 /// Convert region value from DSL format to AWS format
 fn convert_region_value(value: &str) -> String {
-    if value.starts_with("aws.Region.") {
-        value
-            .strip_prefix("aws.Region.")
-            .unwrap_or(value)
-            .replace('_', "-")
+    if let Some(rest) = value.strip_prefix("aws.Region.") {
+        rest.replace('_', "-")
+    } else if let Some(rest) = value.strip_prefix("awscc.Region.") {
+        rest.replace('_', "-")
     } else {
         value.to_string()
     }

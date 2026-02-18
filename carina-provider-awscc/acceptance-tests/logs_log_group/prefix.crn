@@ -5,7 +5,7 @@
 #        destroy cleans up the prefixed resource.
 
 provider awscc {
-  region = aws.Region.ap_northeast_1
+  region = awscc.Region.ap_northeast_1
 }
 
 let log_group = awscc.logs_log_group {

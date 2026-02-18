@@ -3,7 +3,7 @@
 # Tests: private_dns_name_options_on_launch (Struct type)
 
 provider awscc {
-  region = aws.Region.ap_northeast_1
+  region = awscc.Region.ap_northeast_1
 }
 
 let vpc = awscc.ec2_vpc {

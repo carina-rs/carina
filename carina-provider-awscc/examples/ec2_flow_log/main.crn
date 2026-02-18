@@ -4,7 +4,7 @@
 # Note: The S3 bucket must exist before applying this configuration.
 
 provider awscc {
-  region = aws.Region.ap_northeast_1
+  region = awscc.Region.ap_northeast_1
 }
 
 let vpc = awscc.ec2_vpc {

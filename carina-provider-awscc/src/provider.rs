@@ -438,7 +438,7 @@ impl AwsccProvider {
 
         // Add region for VPC
         if resource_type == "ec2_vpc" {
-            let region_dsl = format!("aws.Region.{}", self.region.replace('-', "_"));
+            let region_dsl = format!("awscc.Region.{}", self.region.replace('-', "_"));
             attributes.insert("region".to_string(), Value::String(region_dsl));
         }
 

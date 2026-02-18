@@ -3,7 +3,7 @@
 # Tests: security_group_ingress (List<Struct>) with IPv4 cidr_ip
 
 provider awscc {
-  region = aws.Region.ap_northeast_1
+  region = awscc.Region.ap_northeast_1
 }
 
 let vpc = awscc.ec2_vpc {

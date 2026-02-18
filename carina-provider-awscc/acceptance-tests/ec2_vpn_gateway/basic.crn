@@ -3,7 +3,7 @@
 # Tests: type, tags
 
 provider awscc {
-  region = aws.Region.ap_northeast_1
+  region = awscc.Region.ap_northeast_1
 }
 
 let vpn_gw = awscc.ec2_vpn_gateway {
