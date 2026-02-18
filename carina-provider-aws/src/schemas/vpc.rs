@@ -122,13 +122,16 @@ pub fn instance_tenancy() -> AttributeType {
         base: Box::new(AttributeType::String),
         validate: |value| {
             if let Value::String(s) = value {
-                validate_enum_namespace(s, "InstanceTenancy", "aws.vpc")?;
-                let normalized = extract_enum_value(s);
-                if VALID_INSTANCE_TENANCY.contains(&normalized) {
-                    Ok(())
-                } else {
-                    Err("expected one of: default, dedicated, host".to_string())
-                }
+                (|| {
+                    validate_enum_namespace(s, "InstanceTenancy", "aws.vpc")?;
+                    let normalized = extract_enum_value(s);
+                    if VALID_INSTANCE_TENANCY.contains(&normalized) {
+                        Ok(())
+                    } else {
+                        Err("expected one of: default, dedicated, host".to_string())
+                    }
+                })()
+                .map_err(|reason| format!("Invalid instance tenancy '{}': {}", s, reason))
             } else {
                 Err("Expected string".to_string())
             }

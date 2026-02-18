@@ -36,17 +36,20 @@ pub fn aws_region() -> AttributeType {
         base: Box::new(AttributeType::String),
         validate: |value| {
             if let Value::String(s) = value {
-                validate_enum_namespace(s, "Region", "aws")?;
-                // Normalize the input to AWS format (hyphens)
-                let normalized = extract_enum_value(s).replace('_', "-");
-                if VALID_REGIONS.contains(&normalized.as_str()) {
-                    Ok(())
-                } else {
-                    Err(format!(
-                        "expected one of: {} or DSL format like aws.Region.ap_northeast_1",
-                        VALID_REGIONS.join(", ")
-                    ))
-                }
+                (|| {
+                    validate_enum_namespace(s, "Region", "aws")?;
+                    // Normalize the input to AWS format (hyphens)
+                    let normalized = extract_enum_value(s).replace('_', "-");
+                    if VALID_REGIONS.contains(&normalized.as_str()) {
+                        Ok(())
+                    } else {
+                        Err(format!(
+                            "expected one of: {} or DSL format like aws.Region.ap_northeast_1",
+                            VALID_REGIONS.join(", ")
+                        ))
+                    }
+                })()
+                .map_err(|reason| format!("Invalid region '{}': {}", s, reason))
             } else {
                 Err("Expected string".to_string())
             }
@@ -70,13 +73,16 @@ pub fn versioning_status() -> AttributeType {
         base: Box::new(AttributeType::String),
         validate: |value| {
             if let Value::String(s) = value {
-                validate_enum_namespace(s, "VersioningStatus", "aws.s3")?;
-                let normalized = extract_enum_value(s);
-                if VALID_VERSIONING_STATUS.contains(&normalized) {
-                    Ok(())
-                } else {
-                    Err("expected one of: Enabled, Suspended".to_string())
-                }
+                (|| {
+                    validate_enum_namespace(s, "VersioningStatus", "aws.s3")?;
+                    let normalized = extract_enum_value(s);
+                    if VALID_VERSIONING_STATUS.contains(&normalized) {
+                        Ok(())
+                    } else {
+                        Err("expected one of: Enabled, Suspended".to_string())
+                    }
+                })()
+                .map_err(|reason| format!("Invalid versioning status '{}': {}", s, reason))
             } else {
                 Err("Expected string".to_string())
             }
@@ -168,6 +174,7 @@ mod tests {
         let result = region_type.validate(&Value::String("invalid-region".to_string()));
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
+        assert!(err.contains("Invalid region 'invalid-region':"));
         assert!(err.contains("expected one of:"));
         assert!(err.contains("ap-northeast-1")); // Should suggest valid regions
     }
