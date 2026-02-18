@@ -94,7 +94,7 @@ impl AttributeType {
     pub fn validate(&self, value: &Value) -> Result<(), TypeError> {
         match (self, value) {
             // ResourceRef values resolve to strings at runtime, so they're valid for String types
-            (AttributeType::String, Value::String(_) | Value::ResourceRef(_, _)) => Ok(()),
+            (AttributeType::String, Value::String(_) | Value::ResourceRef { .. }) => Ok(()),
             (AttributeType::Int, Value::Int(_)) => Ok(()),
             (AttributeType::Bool, Value::Bool(_)) => Ok(()),
 
@@ -120,7 +120,7 @@ impl AttributeType {
                 v,
             ) => {
                 // ResourceRef values resolve to strings at runtime, so they're valid for Custom types
-                if matches!(v, Value::ResourceRef(_, _) | Value::TypedResourceRef { .. }) {
+                if matches!(v, Value::ResourceRef { .. }) {
                     return Ok(());
                 }
                 // Handle UnresolvedIdent by expanding to full namespace format
@@ -285,12 +285,11 @@ impl Value {
             Value::Bool(_) => "Bool".to_string(),
             Value::List(_) => "List".to_string(),
             Value::Map(_) => "Map".to_string(),
-            Value::ResourceRef(binding, attr) => format!("ResourceRef({}.{})", binding, attr),
-            Value::TypedResourceRef {
+            Value::ResourceRef {
                 binding_name,
                 attribute_name,
                 ..
-            } => format!("TypedResourceRef({}.{})", binding_name, attribute_name),
+            } => format!("ResourceRef({}.{})", binding_name, attribute_name),
             Value::UnresolvedIdent(name, member) => match member {
                 Some(m) => format!("UnresolvedIdent({}.{})", name, m),
                 None => format!("UnresolvedIdent({})", name),
@@ -1202,28 +1201,30 @@ mod tests {
         // ResourceRef values resolve to strings at runtime, so Custom types should accept them
         let ipv4 = types::ipv4_cidr();
         assert!(
-            ipv4.validate(&Value::ResourceRef(
-                "vpc".to_string(),
-                "cidr_block".to_string()
-            ))
+            ipv4.validate(&Value::ResourceRef {
+                binding_name: "vpc".to_string(),
+                attribute_name: "cidr_block".to_string(),
+                resource_type: None,
+            })
             .is_ok()
         );
 
         let ipv6 = types::ipv6_cidr();
         assert!(
-            ipv6.validate(&Value::ResourceRef(
-                "subnet".to_string(),
-                "ipv6_cidr".to_string()
-            ))
+            ipv6.validate(&Value::ResourceRef {
+                binding_name: "subnet".to_string(),
+                attribute_name: "ipv6_cidr".to_string(),
+                resource_type: None,
+            })
             .is_ok()
         );
 
-        // TypedResourceRef should also be accepted
+        // ResourceRef with type info should also be accepted
         assert!(
-            ipv4.validate(&Value::TypedResourceRef {
+            ipv4.validate(&Value::ResourceRef {
                 binding_name: "vpc".to_string(),
                 attribute_name: "cidr_block".to_string(),
-                resource_type: None,
+                resource_type: Some(crate::parser::ResourceTypePath::new("aws", "vpc")),
             })
             .is_ok()
         );

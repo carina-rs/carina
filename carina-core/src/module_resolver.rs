@@ -241,10 +241,7 @@ impl ModuleResolver {
 /// Substitute input references with actual values
 fn substitute_inputs(value: &Value, inputs: &HashMap<String, Value>) -> Value {
     match value {
-        Value::ResourceRef(binding, attr) if binding == "input" => {
-            inputs.get(attr).cloned().unwrap_or_else(|| value.clone())
-        }
-        Value::TypedResourceRef {
+        Value::ResourceRef {
             binding_name,
             attribute_name,
             ..
@@ -309,7 +306,11 @@ mod tests {
                     attrs.insert("name".to_string(), Value::String("sg".to_string()));
                     attrs.insert(
                         "vpc_id".to_string(),
-                        Value::ResourceRef("input".to_string(), "vpc_id".to_string()),
+                        Value::ResourceRef {
+                            binding_name: "input".to_string(),
+                            attribute_name: "vpc_id".to_string(),
+                            resource_type: None,
+                        },
                     );
                     attrs.insert(
                         "_type".to_string(),
@@ -346,7 +347,11 @@ mod tests {
         let mut inputs = HashMap::new();
         inputs.insert("vpc_id".to_string(), Value::String("vpc-123".to_string()));
 
-        let value = Value::ResourceRef("input".to_string(), "vpc_id".to_string());
+        let value = Value::ResourceRef {
+            binding_name: "input".to_string(),
+            attribute_name: "vpc_id".to_string(),
+            resource_type: None,
+        };
         let result = substitute_inputs(&value, &inputs);
 
         assert_eq!(result, Value::String("vpc-123".to_string()));
@@ -358,7 +363,11 @@ mod tests {
         inputs.insert("port".to_string(), Value::Int(8080));
 
         let value = Value::List(vec![
-            Value::ResourceRef("input".to_string(), "port".to_string()),
+            Value::ResourceRef {
+                binding_name: "input".to_string(),
+                attribute_name: "port".to_string(),
+                resource_type: None,
+            },
             Value::Int(443),
         ]);
         let result = substitute_inputs(&value, &inputs);

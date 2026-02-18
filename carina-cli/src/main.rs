@@ -329,8 +329,7 @@ fn validate_resource_ref_types(resources: &[Resource]) -> Result<(), String> {
             }
 
             let (ref_binding, ref_attr) = match attr_value {
-                Value::ResourceRef(binding, attr) => (binding, attr),
-                Value::TypedResourceRef {
+                Value::ResourceRef {
                     binding_name,
                     attribute_name,
                     ..
@@ -2717,17 +2716,7 @@ fn resolve_ref_value(
     binding_map: &HashMap<String, HashMap<String, Value>>,
 ) -> Value {
     match value {
-        Value::ResourceRef(binding_name, attr_name) => {
-            if let Some(attrs) = binding_map.get(binding_name)
-                && let Some(attr_value) = attrs.get(attr_name)
-            {
-                // Recursively resolve
-                return resolve_ref_value(attr_value, binding_map);
-            }
-            // Keep as-is if not found
-            value.clone()
-        }
-        Value::TypedResourceRef {
+        Value::ResourceRef {
             binding_name,
             attribute_name,
             ..
@@ -2838,10 +2827,7 @@ fn get_resource_dependencies(resource: &Resource) -> HashSet<String> {
 
 fn collect_dependencies(value: &Value, deps: &mut HashSet<String>) {
     match value {
-        Value::ResourceRef(binding_name, _) => {
-            deps.insert(binding_name.clone());
-        }
-        Value::TypedResourceRef { binding_name, .. } => {
+        Value::ResourceRef { binding_name, .. } => {
             deps.insert(binding_name.clone());
         }
         Value::List(items) => {
@@ -3454,8 +3440,7 @@ fn format_value_with_key(value: &Value, _key: Option<&str>) -> String {
                 .collect();
             format!("{{{}}}", strs.join(", "))
         }
-        Value::ResourceRef(binding, attr) => format!("{}.{}", binding, attr),
-        Value::TypedResourceRef {
+        Value::ResourceRef {
             binding_name,
             attribute_name,
             ..
@@ -3560,10 +3545,7 @@ fn value_to_json(value: &Value) -> serde_json::Value {
                 .collect();
             serde_json::Value::Object(obj)
         }
-        Value::ResourceRef(binding, attr) => {
-            serde_json::Value::String(format!("${{{}.{}}}", binding, attr))
-        }
-        Value::TypedResourceRef {
+        Value::ResourceRef {
             binding_name,
             attribute_name,
             ..
@@ -3833,11 +3815,7 @@ impl FileProvider {
                 serde_json::Value::Object(obj)
             }
             // ResourceRef should be resolved before reaching here, but handle it as a string
-            Value::ResourceRef(binding, attr) => {
-                serde_json::Value::String(format!("${{{}.{}}}", binding, attr))
-            }
-            // TypedResourceRef should be resolved before reaching here, but handle it as a string
-            Value::TypedResourceRef {
+            Value::ResourceRef {
                 binding_name,
                 attribute_name,
                 ..
@@ -4165,7 +4143,11 @@ mod tests {
         for dep in deps {
             r.attributes.insert(
                 format!("ref_{}", dep),
-                Value::ResourceRef(dep.to_string(), "id".to_string()),
+                Value::ResourceRef {
+                    binding_name: dep.to_string(),
+                    attribute_name: "id".to_string(),
+                    resource_type: None,
+                },
             );
         }
         r
