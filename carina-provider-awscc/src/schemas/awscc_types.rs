@@ -64,7 +64,8 @@ pub(crate) fn canonicalize_enum_value(raw: &str, valid_values: &[&str]) -> Strin
 }
 
 /// Validate a namespaced enum value.
-/// Returns Ok(()) if valid, Err with message if invalid.
+/// Returns Ok(()) if valid, Err with bare reason string if invalid.
+/// Callers are responsible for adding context (e.g., what value was provided).
 pub(crate) fn validate_namespaced_enum(
     value: &Value,
     type_name: &str,
@@ -78,11 +79,7 @@ pub(crate) fn validate_namespaced_enum(
         if find_matching_enum_value(normalized, valid_values).is_some() {
             Ok(())
         } else {
-            Err(format!(
-                "Invalid value '{}', expected one of: {}",
-                s,
-                valid_values.join(", ")
-            ))
+            Err(format!("expected one of: {}", valid_values.join(", ")))
         }
     } else {
         Err("Expected string".to_string())
@@ -419,7 +416,8 @@ pub(crate) fn availability_zone() -> AttributeType {
         base: Box::new(AttributeType::String),
         validate: |value| {
             if let Value::String(s) = value {
-                validate_enum_namespace(s, "AvailabilityZone", "awscc")?;
+                validate_enum_namespace(s, "AvailabilityZone", "awscc")
+                    .map_err(|reason| format!("Invalid availability zone '{}': {}", s, reason))?;
                 let extracted = extract_enum_value(s);
                 let normalized = extracted.replace('_', "-");
                 validate_availability_zone(&normalized)
@@ -1698,7 +1696,7 @@ mod tests {
             &["default", "dedicated", "host"],
         );
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("Invalid value"));
+        assert!(result.unwrap_err().contains("expected one of:"));
     }
 
     #[test]

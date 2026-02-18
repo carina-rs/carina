@@ -19,12 +19,25 @@ fn validate_metered_account(value: &Value) -> Result<(), String> {
         "awscc.ec2_ipam",
         VALID_METERED_ACCOUNT,
     )
+    .map_err(|reason| {
+        if let Value::String(s) = value {
+            format!("Invalid MeteredAccount '{}': {}", s, reason)
+        } else {
+            reason
+        }
+    })
 }
 
 const VALID_TIER: &[&str] = &["free", "advanced"];
 
 fn validate_tier(value: &Value) -> Result<(), String> {
-    validate_namespaced_enum(value, "Tier", "awscc.ec2_ipam", VALID_TIER)
+    validate_namespaced_enum(value, "Tier", "awscc.ec2_ipam", VALID_TIER).map_err(|reason| {
+        if let Value::String(s) = value {
+            format!("Invalid Tier '{}': {}", s, reason)
+        } else {
+            reason
+        }
+    })
 }
 
 /// Returns the schema config for ec2_ipam (AWS::EC2::IPAM)

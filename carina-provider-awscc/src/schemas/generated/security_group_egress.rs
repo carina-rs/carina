@@ -18,6 +18,13 @@ fn validate_ip_protocol(value: &Value) -> Result<(), String> {
         "awscc.ec2_security_group_egress",
         VALID_IP_PROTOCOL,
     )
+    .map_err(|reason| {
+        if let Value::String(s) = value {
+            format!("Invalid IpProtocol '{}': {}", s, reason)
+        } else {
+            reason
+        }
+    })
 }
 
 fn validate_from_port_range(value: &Value) -> Result<(), String> {

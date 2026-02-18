@@ -19,6 +19,13 @@ fn validate_log_group_class(value: &Value) -> Result<(), String> {
         "awscc.logs_log_group",
         VALID_LOG_GROUP_CLASS,
     )
+    .map_err(|reason| {
+        if let Value::String(s) = value {
+            format!("Invalid LogGroupClass '{}': {}", s, reason)
+        } else {
+            reason
+        }
+    })
 }
 
 /// Returns the schema config for logs_log_group (AWS::Logs::LogGroup)

@@ -19,6 +19,13 @@ fn validate_log_destination_type(value: &Value) -> Result<(), String> {
         "awscc.ec2_flow_log",
         VALID_LOG_DESTINATION_TYPE,
     )
+    .map_err(|reason| {
+        if let Value::String(s) = value {
+            format!("Invalid LogDestinationType '{}': {}", s, reason)
+        } else {
+            reason
+        }
+    })
 }
 
 const VALID_RESOURCE_TYPE: &[&str] = &[
@@ -37,6 +44,13 @@ fn validate_resource_type(value: &Value) -> Result<(), String> {
         "awscc.ec2_flow_log",
         VALID_RESOURCE_TYPE,
     )
+    .map_err(|reason| {
+        if let Value::String(s) = value {
+            format!("Invalid ResourceType '{}': {}", s, reason)
+        } else {
+            reason
+        }
+    })
 }
 
 const VALID_TRAFFIC_TYPE: &[&str] = &["ACCEPT", "ALL", "REJECT"];
@@ -48,6 +62,13 @@ fn validate_traffic_type(value: &Value) -> Result<(), String> {
         "awscc.ec2_flow_log",
         VALID_TRAFFIC_TYPE,
     )
+    .map_err(|reason| {
+        if let Value::String(s) = value {
+            format!("Invalid TrafficType '{}': {}", s, reason)
+        } else {
+            reason
+        }
+    })
 }
 
 /// Returns the schema config for ec2_flow_log (AWS::EC2::FlowLog)

@@ -833,10 +833,17 @@ use super::AwsccSchemaConfig;
         code.push_str(&format!(
             r#"fn {}(value: &Value) -> Result<(), String> {{
     validate_namespaced_enum(value, "{}", "{}", {})
+        .map_err(|reason| {{
+            if let Value::String(s) = value {{
+                format!("Invalid {} '{{}}': {{}}", s, reason)
+            }} else {{
+                reason
+            }}
+        }})
 }}
 
 "#,
-            fn_name, enum_info.type_name, namespace, const_name
+            fn_name, enum_info.type_name, namespace, const_name, enum_info.type_name
         ));
     }
 
