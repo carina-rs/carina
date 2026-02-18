@@ -756,4 +756,32 @@ mod tests {
 
         assert!(schema.validate(&attrs).is_ok());
     }
+
+    #[test]
+    fn instance_tenancy_error_format_consistent_for_namespace_and_value() {
+        let tenancy = instance_tenancy();
+        // Namespace error: wrong provider
+        let ns_err = tenancy
+            .validate(&Value::String(
+                "awscc.vpc.InstanceTenancy.default".to_string(),
+            ))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            ns_err.contains("Invalid instance tenancy 'awscc.vpc.InstanceTenancy.default':"),
+            "Namespace error should use consistent format, got: {}",
+            ns_err
+        );
+
+        // Value error: invalid value
+        let val_err = tenancy
+            .validate(&Value::String("shared".to_string()))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            val_err.contains("Invalid instance tenancy 'shared':"),
+            "Value error should use consistent format, got: {}",
+            val_err
+        );
+    }
 }

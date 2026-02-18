@@ -330,4 +330,60 @@ mod tests {
                 .is_err()
         );
     }
+
+    // Error message format consistency tests
+
+    #[test]
+    fn region_error_format_consistent_for_namespace_and_value() {
+        let region_type = aws_region();
+        // Namespace error: wrong provider prefix
+        let ns_err = region_type
+            .validate(&Value::String("gcp.Region.ap_northeast_1".to_string()))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            ns_err.contains("Invalid region 'gcp.Region.ap_northeast_1':"),
+            "Namespace error should use 'Invalid region '<value>':' format, got: {}",
+            ns_err
+        );
+
+        // Value error: invalid region value
+        let val_err = region_type
+            .validate(&Value::String("invalid-region".to_string()))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            val_err.contains("Invalid region 'invalid-region':"),
+            "Value error should use 'Invalid region '<value>':' format, got: {}",
+            val_err
+        );
+    }
+
+    #[test]
+    fn versioning_error_format_consistent_for_namespace_and_value() {
+        let versioning = versioning_status();
+        // Namespace error: wrong provider
+        let ns_err = versioning
+            .validate(&Value::String(
+                "awscc.s3.VersioningStatus.Enabled".to_string(),
+            ))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            ns_err.contains("Invalid versioning status 'awscc.s3.VersioningStatus.Enabled':"),
+            "Namespace error should use consistent format, got: {}",
+            ns_err
+        );
+
+        // Value error: invalid value
+        let val_err = versioning
+            .validate(&Value::String("Disabled".to_string()))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            val_err.contains("Invalid versioning status 'Disabled':"),
+            "Value error should use consistent format, got: {}",
+            val_err
+        );
+    }
 }
