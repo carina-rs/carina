@@ -454,7 +454,8 @@ fn generate_markdown(schema: &CfnSchema, type_name: &str) -> Result<String> {
     let mut struct_defs: BTreeMap<String, StructDefInfo> = BTreeMap::new();
 
     for (prop_name, prop) in &schema.properties {
-        let (_, enum_info) = cfn_type_to_carina_type_with_enum(prop, prop_name, schema);
+        let (_, enum_info) =
+            cfn_type_to_carina_type_with_enum(prop, prop_name, schema, &namespace, &enums);
         if let Some(info) = enum_info {
             enums.insert(prop_name.clone(), info);
         }
@@ -743,7 +744,8 @@ fn generate_schema_code(schema: &CfnSchema, type_name: &str) -> Result<String> {
     let mut ranged_ints: BTreeMap<String, (i64, i64)> = BTreeMap::new();
 
     for (prop_name, prop) in &schema.properties {
-        let (attr_type, enum_info) = cfn_type_to_carina_type_with_enum(prop, prop_name, schema);
+        let (attr_type, enum_info) =
+            cfn_type_to_carina_type_with_enum(prop, prop_name, schema, &namespace, &enums);
         if attr_type.contains("types::") {
             needs_types = true;
         }
@@ -790,6 +792,31 @@ fn generate_schema_code(schema: &CfnSchema, type_name: &str) -> Result<String> {
                             let (min, max) = int_overrides[field_name.as_str()];
                             ranged_ints.insert(field_name.clone(), (min, max));
                         }
+                    }
+                }
+            }
+        }
+    }
+
+    // Also scan definitions for struct field enum properties
+    if let Some(definitions) = &schema.definitions {
+        // Build set of existing snake_case names to avoid duplicates
+        // (e.g., "SSEAlgorithm" and "SseAlgorithm" both become "sse_algorithm")
+        let existing_snake: HashSet<String> = enums.keys().map(|k| k.to_snake_case()).collect();
+        let mut seen_snake: HashSet<String> = existing_snake;
+        for def in definitions.values() {
+            if let Some(props) = &def.properties {
+                for (field_name, field_prop) in props {
+                    let snake = field_name.to_snake_case();
+                    if seen_snake.contains(&snake) {
+                        continue;
+                    }
+                    let (_, field_enum_info) = cfn_type_to_carina_type_with_enum(
+                        field_prop, field_name, schema, &namespace, &enums,
+                    );
+                    if let Some(info) = field_enum_info {
+                        seen_snake.insert(snake);
+                        enums.insert(field_name.clone(), info);
                     }
                 }
             }
@@ -867,13 +894,14 @@ use super::AwsccSchemaConfig;
         }
         let values_str = all_values.join(", ");
         code.push_str(&format!(
-            "const {}: &[&str] = &[{}];\n\n",
+            "#[allow(dead_code)]\nconst {}: &[&str] = &[{}];\n\n",
             const_name, values_str
         ));
 
         // Generate validation function
         code.push_str(&format!(
-            r#"fn {}(value: &Value) -> Result<(), String> {{
+            r#"#[allow(dead_code)]
+fn {}(value: &Value) -> Result<(), String> {{
     validate_namespaced_enum(value, "{}", "{}", {})
         .map_err(|reason| {{
             if let Value::String(s) = value {{
@@ -983,7 +1011,8 @@ pub fn {}() -> AwsccSchemaConfig {{
                 enum_info.type_name, validate_fn, namespace, to_dsl_code
             )
         } else {
-            let (attr_type, _) = cfn_type_to_carina_type_with_enum(prop, prop_name, schema);
+            let (attr_type, _) =
+                cfn_type_to_carina_type_with_enum(prop, prop_name, schema, &namespace, &enums);
             attr_type
         };
 
@@ -1254,24 +1283,64 @@ fn generate_struct_type(
     properties: &BTreeMap<String, CfnProperty>,
     required: &[String],
     schema: &CfnSchema,
+    namespace: &str,
+    enums: &BTreeMap<String, EnumInfo>,
 ) -> String {
     let required_set: HashSet<&str> = required.iter().map(|s| s.as_str()).collect();
+    let aliases = known_enum_aliases();
 
     let fields: Vec<String> = properties
         .iter()
         .map(|(field_name, field_prop)| {
             let snake_name = field_name.to_snake_case();
             let (field_type, enum_info) =
-                cfn_type_to_carina_type_with_enum(field_prop, field_name, schema);
-            // If enum detected in struct field, use Enum variant directly
-            let field_type = if let Some(info) = enum_info {
-                let values_str = info
-                    .values
-                    .iter()
-                    .map(|v| format!("\"{}\".to_string()", v))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                format!("AttributeType::Enum(vec![{}])", values_str)
+                cfn_type_to_carina_type_with_enum(field_prop, field_name, schema, namespace, enums);
+            // If enum detected in struct field and it's in the enums map, use Custom type
+            let field_type = if let Some(local_enum_info) = enum_info {
+                if let Some(enum_info) = enums.get(field_name) {
+                    // Generate Custom type (same as top-level enum handling)
+                    let validate_fn = format!("validate_{}", field_name.to_snake_case());
+                    let prop_aliases = aliases.get(field_name.as_str());
+                    let has_hyphens = enum_info.values.iter().any(|v| v.contains('-'));
+                    let to_dsl_code = if let Some(alias_list) = prop_aliases {
+                        let mut match_arms: Vec<String> = alias_list
+                            .iter()
+                            .map(|(canonical, alias)| {
+                                format!("\"{}\" => \"{}\".to_string()", canonical, alias)
+                            })
+                            .collect();
+                        let fallback = if has_hyphens {
+                            "_ => s.replace('-', \"_\")"
+                        } else {
+                            "_ => s.to_string()"
+                        };
+                        match_arms.push(fallback.to_string());
+                        format!("Some(|s: &str| match s {{ {} }})", match_arms.join(", "))
+                    } else if has_hyphens {
+                        "Some(|s: &str| s.replace('-', \"_\"))".to_string()
+                    } else {
+                        "None".to_string()
+                    };
+                    format!(
+                        r#"AttributeType::Custom {{
+                name: "{}".to_string(),
+                base: Box::new(AttributeType::String),
+                validate: {},
+                namespace: Some("{}".to_string()),
+                to_dsl: {},
+            }}"#,
+                        enum_info.type_name, validate_fn, namespace, to_dsl_code
+                    )
+                } else {
+                    // Fallback: use Enum variant directly
+                    let values_str = local_enum_info
+                        .values
+                        .iter()
+                        .map(|v| format!("\"{}\".to_string()", v))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!("AttributeType::Enum(vec![{}])", values_str)
+                }
             } else {
                 field_type
             };
@@ -1583,6 +1652,8 @@ fn cfn_type_to_carina_type_with_enum(
     prop: &CfnProperty,
     prop_name: &str,
     schema: &CfnSchema,
+    namespace: &str,
+    enums: &BTreeMap<String, EnumInfo>,
 ) -> (String, Option<EnumInfo>) {
     // Tags property is special - it's a Map in Carina (Terraform-style)
     if prop_name == "Tags" {
@@ -1601,7 +1672,7 @@ fn cfn_type_to_carina_type_with_enum(
         {
             let def_name = ref_def_name(ref_path).unwrap_or(prop_name);
             return (
-                generate_struct_type(def_name, props, &def.required, schema),
+                generate_struct_type(def_name, props, &def.required, schema, namespace, enums),
                 None,
             );
         }
@@ -1759,14 +1830,21 @@ fn cfn_type_to_carina_type_with_enum(
                     && !props.is_empty()
                 {
                     let def_name = ref_def_name(ref_path).unwrap_or(prop_name);
-                    let struct_type = generate_struct_type(def_name, props, &def.required, schema);
+                    let struct_type = generate_struct_type(
+                        def_name,
+                        props,
+                        &def.required,
+                        schema,
+                        namespace,
+                        enums,
+                    );
                     return (
                         format!("AttributeType::List(Box::new({}))", struct_type),
                         None,
                     );
                 }
                 let (item_type, item_enum) =
-                    cfn_type_to_carina_type_with_enum(items, prop_name, schema);
+                    cfn_type_to_carina_type_with_enum(items, prop_name, schema, namespace, enums);
                 // If array items are enum values, use String as the item type
                 // (enum validation happens at the attribute level, not item level)
                 let effective_item_type = if item_enum.is_some() {
@@ -1791,7 +1869,14 @@ fn cfn_type_to_carina_type_with_enum(
                 && !props.is_empty()
             {
                 return (
-                    generate_struct_type(prop_name, props, &prop.required, schema),
+                    generate_struct_type(
+                        prop_name,
+                        props,
+                        &prop.required,
+                        schema,
+                        namespace,
+                        enums,
+                    ),
                     None,
                 );
             }
@@ -2001,7 +2086,8 @@ mod tests {
             definitions: None,
             tagging: None,
         };
-        let (_, enum_info) = cfn_type_to_carina_type_with_enum(&prop, "IpProtocol", &schema);
+        let (_, enum_info) =
+            cfn_type_to_carina_type_with_enum(&prop, "IpProtocol", &schema, "", &BTreeMap::new());
         assert!(
             enum_info.is_some(),
             "IpProtocol should produce EnumInfo via overrides"
@@ -2068,7 +2154,8 @@ mod tests {
             definitions: None,
             tagging: None,
         };
-        let (type_str, _) = cfn_type_to_carina_type_with_enum(&prop, "CidrIp", &schema);
+        let (type_str, _) =
+            cfn_type_to_carina_type_with_enum(&prop, "CidrIp", &schema, "", &BTreeMap::new());
         assert_eq!(
             type_str, "types::ipv4_cidr()",
             "CidrIp should produce types::ipv4_cidr()"
@@ -2102,7 +2189,8 @@ mod tests {
             definitions: None,
             tagging: None,
         };
-        let (type_str, _) = cfn_type_to_carina_type_with_enum(&prop, "CidrIpv6", &schema);
+        let (type_str, _) =
+            cfn_type_to_carina_type_with_enum(&prop, "CidrIpv6", &schema, "", &BTreeMap::new());
         assert_eq!(
             type_str, "types::ipv6_cidr()",
             "CidrIpv6 should produce types::ipv6_cidr()"
@@ -2136,7 +2224,13 @@ mod tests {
             definitions: None,
             tagging: None,
         };
-        let (type_str, _) = cfn_type_to_carina_type_with_enum(&prop, "PrivateIpAddress", &schema);
+        let (type_str, _) = cfn_type_to_carina_type_with_enum(
+            &prop,
+            "PrivateIpAddress",
+            &schema,
+            "",
+            &BTreeMap::new(),
+        );
         assert_eq!(
             type_str, "types::ipv4_address()",
             "PrivateIpAddress should produce types::ipv4_address()"
@@ -2170,7 +2264,8 @@ mod tests {
             definitions: None,
             tagging: None,
         };
-        let (type_str, _) = cfn_type_to_carina_type_with_enum(&prop, "PublicIp", &schema);
+        let (type_str, _) =
+            cfn_type_to_carina_type_with_enum(&prop, "PublicIp", &schema, "", &BTreeMap::new());
         assert_eq!(
             type_str, "types::ipv4_address()",
             "PublicIp should produce types::ipv4_address()"
@@ -2204,8 +2299,13 @@ mod tests {
             definitions: None,
             tagging: None,
         };
-        let (type_str, _) =
-            cfn_type_to_carina_type_with_enum(&prop, "SecondaryPrivateIpAddressCount", &schema);
+        let (type_str, _) = cfn_type_to_carina_type_with_enum(
+            &prop,
+            "SecondaryPrivateIpAddressCount",
+            &schema,
+            "",
+            &BTreeMap::new(),
+        );
         assert_eq!(
             type_str, "AttributeType::Int",
             "SecondaryPrivateIpAddressCount should stay Int"
@@ -2240,11 +2340,23 @@ mod tests {
         };
 
         // AvailabilityZone should use super::availability_zone()
-        let (type_str, _) = cfn_type_to_carina_type_with_enum(&prop, "AvailabilityZone", &schema);
+        let (type_str, _) = cfn_type_to_carina_type_with_enum(
+            &prop,
+            "AvailabilityZone",
+            &schema,
+            "",
+            &BTreeMap::new(),
+        );
         assert_eq!(type_str, "super::availability_zone()");
 
         // AvailabilityZoneId should stay String
-        let (type_str, _) = cfn_type_to_carina_type_with_enum(&prop, "AvailabilityZoneId", &schema);
+        let (type_str, _) = cfn_type_to_carina_type_with_enum(
+            &prop,
+            "AvailabilityZoneId",
+            &schema,
+            "",
+            &BTreeMap::new(),
+        );
         assert_eq!(type_str, "AttributeType::String");
     }
 
@@ -2734,7 +2846,13 @@ mod tests {
             definitions: None,
             tagging: None,
         };
-        let (type_str, _) = cfn_type_to_carina_type_with_enum(&prop, "Ipv4NetmaskLength", &schema);
+        let (type_str, _) = cfn_type_to_carina_type_with_enum(
+            &prop,
+            "Ipv4NetmaskLength",
+            &schema,
+            "",
+            &BTreeMap::new(),
+        );
         assert!(
             type_str.contains("AttributeType::Custom"),
             "Integer with min/max should produce Custom type, got: {}",
@@ -2778,7 +2896,8 @@ mod tests {
             definitions: None,
             tagging: None,
         };
-        let (type_str, _) = cfn_type_to_carina_type_with_enum(&prop, "SomeCount", &schema);
+        let (type_str, _) =
+            cfn_type_to_carina_type_with_enum(&prop, "SomeCount", &schema, "", &BTreeMap::new());
         assert_eq!(type_str, "AttributeType::Int");
     }
 
@@ -2809,7 +2928,8 @@ mod tests {
             definitions: None,
             tagging: None,
         };
-        let (type_str, _) = cfn_type_to_carina_type_with_enum(&prop, "SomeCount", &schema);
+        let (type_str, _) =
+            cfn_type_to_carina_type_with_enum(&prop, "SomeCount", &schema, "", &BTreeMap::new());
         assert_eq!(type_str, "AttributeType::Int");
     }
 
@@ -2908,8 +3028,13 @@ mod tests {
             definitions: None,
             tagging: None,
         };
-        let (type_str, _) =
-            cfn_type_to_carina_type_with_enum(&prop, "DefaultSecurityGroup", &schema);
+        let (type_str, _) = cfn_type_to_carina_type_with_enum(
+            &prop,
+            "DefaultSecurityGroup",
+            &schema,
+            "",
+            &BTreeMap::new(),
+        );
         assert_eq!(type_str, "super::security_group_id()");
     }
 
@@ -2940,7 +3065,8 @@ mod tests {
             definitions: None,
             tagging: None,
         };
-        let (type_str, _) = cfn_type_to_carina_type_with_enum(&prop, "FromPort", &schema);
+        let (type_str, _) =
+            cfn_type_to_carina_type_with_enum(&prop, "FromPort", &schema, "", &BTreeMap::new());
         assert!(
             type_str.contains("Int(-1..=65535)"),
             "FromPort should use override range, got: {}",
@@ -2975,7 +3101,8 @@ mod tests {
             definitions: None,
             tagging: None,
         };
-        let (type_str, _) = cfn_type_to_carina_type_with_enum(&prop, "Arn", &schema);
+        let (type_str, _) =
+            cfn_type_to_carina_type_with_enum(&prop, "Arn", &schema, "", &BTreeMap::new());
         assert_eq!(type_str, "super::arn()");
     }
 
@@ -3023,7 +3150,8 @@ mod tests {
             definitions: None,
             tagging: None,
         };
-        let (type_str, _) = cfn_type_to_carina_type_with_enum(&prop, "FromPort", &schema);
+        let (type_str, _) =
+            cfn_type_to_carina_type_with_enum(&prop, "FromPort", &schema, "", &BTreeMap::new());
         assert!(
             type_str.contains("Int(0..=65535)"),
             "Number with range should include range in type name, got: {}",

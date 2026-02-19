@@ -6,8 +6,29 @@
 
 use super::AwsccSchemaConfig;
 use super::tags_type;
+use super::validate_namespaced_enum;
 use carina_core::resource::Value;
 use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField, types};
+
+#[allow(dead_code)]
+const VALID_IP_PROTOCOL: &[&str] = &["tcp", "udp", "icmp", "icmpv6", "-1", "all"];
+
+#[allow(dead_code)]
+fn validate_ip_protocol(value: &Value) -> Result<(), String> {
+    validate_namespaced_enum(
+        value,
+        "IpProtocol",
+        "awscc.ec2_security_group",
+        VALID_IP_PROTOCOL,
+    )
+    .map_err(|reason| {
+        if let Value::String(s) = value {
+            format!("Invalid IpProtocol '{}': {}", s, reason)
+        } else {
+            reason
+        }
+    })
+}
 
 fn validate_from_port_range(value: &Value) -> Result<(), String> {
     if let Value::Int(n) = value {
@@ -80,7 +101,13 @@ pub fn ec2_security_group_config() -> AwsccSchemaConfig {
                 namespace: None,
                 to_dsl: None,
             }).with_provider_name("FromPort"),
-                    StructField::new("ip_protocol", AttributeType::Enum(vec!["tcp".to_string(), "udp".to_string(), "icmp".to_string(), "icmpv6".to_string(), "-1".to_string()])).required().with_provider_name("IpProtocol"),
+                    StructField::new("ip_protocol", AttributeType::Custom {
+                name: "IpProtocol".to_string(),
+                base: Box::new(AttributeType::String),
+                validate: validate_ip_protocol,
+                namespace: Some("awscc.ec2_security_group".to_string()),
+                to_dsl: Some(|s: &str| match s { "-1" => "all".to_string(), _ => s.replace('-', "_") }),
+            }).required().with_provider_name("IpProtocol"),
                     StructField::new("to_port", AttributeType::Custom {
                 name: "Int(-1..=65535)".to_string(),
                 base: Box::new(AttributeType::Int),
@@ -107,7 +134,13 @@ pub fn ec2_security_group_config() -> AwsccSchemaConfig {
                 namespace: None,
                 to_dsl: None,
             }).with_provider_name("FromPort"),
-                    StructField::new("ip_protocol", AttributeType::Enum(vec!["tcp".to_string(), "udp".to_string(), "icmp".to_string(), "icmpv6".to_string(), "-1".to_string()])).required().with_provider_name("IpProtocol"),
+                    StructField::new("ip_protocol", AttributeType::Custom {
+                name: "IpProtocol".to_string(),
+                base: Box::new(AttributeType::String),
+                validate: validate_ip_protocol,
+                namespace: Some("awscc.ec2_security_group".to_string()),
+                to_dsl: Some(|s: &str| match s { "-1" => "all".to_string(), _ => s.replace('-', "_") }),
+            }).required().with_provider_name("IpProtocol"),
                     StructField::new("source_prefix_list_id", super::aws_resource_id()).with_provider_name("SourcePrefixListId"),
                     StructField::new("source_security_group_id", super::security_group_id()).with_provider_name("SourceSecurityGroupId"),
                     StructField::new("source_security_group_name", AttributeType::String).with_provider_name("SourceSecurityGroupName"),
@@ -143,12 +176,14 @@ pub fn enum_valid_values() -> (
     &'static str,
     &'static [(&'static str, &'static [&'static str])],
 ) {
-    ("ec2_security_group", &[])
+    ("ec2_security_group", &[("ip_protocol", VALID_IP_PROTOCOL)])
 }
 
 /// Maps DSL alias values back to canonical AWS values for this module.
 /// e.g., ("ip_protocol", "all") -> Some("-1")
 pub fn enum_alias_reverse(attr_name: &str, value: &str) -> Option<&'static str> {
-    let _ = (attr_name, value);
-    None
+    match (attr_name, value) {
+        ("ip_protocol", "all") => Some("-1"),
+        _ => None,
+    }
 }

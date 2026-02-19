@@ -110,7 +110,7 @@ let sg = awscc.ec2_security_group {
 let egress = awscc.ec2_security_group_egress {
   group_id    = sg.group_id
   description = "Allow all outbound traffic"
-  ip_protocol = "-1"
+  ip_protocol = all
   cidr_ip     = "0.0.0.0/0"
 }
 ```

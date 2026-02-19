@@ -10,8 +10,36 @@ use super::validate_namespaced_enum;
 use carina_core::resource::Value;
 use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
 
+#[allow(dead_code)]
+const VALID_DNS_RECORD_IP_TYPE: &[&str] = &[
+    "ipv4",
+    "ipv6",
+    "dualstack",
+    "service-defined",
+    "not-specified",
+];
+
+#[allow(dead_code)]
+fn validate_dns_record_ip_type(value: &Value) -> Result<(), String> {
+    validate_namespaced_enum(
+        value,
+        "DnsRecordIpType",
+        "awscc.ec2_vpc_endpoint",
+        VALID_DNS_RECORD_IP_TYPE,
+    )
+    .map_err(|reason| {
+        if let Value::String(s) = value {
+            format!("Invalid DnsRecordIpType '{}': {}", s, reason)
+        } else {
+            reason
+        }
+    })
+}
+
+#[allow(dead_code)]
 const VALID_IP_ADDRESS_TYPE: &[&str] = &["ipv4", "ipv6", "dualstack", "not-specified"];
 
+#[allow(dead_code)]
 fn validate_ip_address_type(value: &Value) -> Result<(), String> {
     validate_namespaced_enum(
         value,
@@ -28,6 +56,56 @@ fn validate_ip_address_type(value: &Value) -> Result<(), String> {
     })
 }
 
+#[allow(dead_code)]
+const VALID_PRIVATE_DNS_ONLY_FOR_INBOUND_RESOLVER_ENDPOINT: &[&str] =
+    &["OnlyInboundResolver", "AllResolvers", "NotSpecified"];
+
+#[allow(dead_code)]
+fn validate_private_dns_only_for_inbound_resolver_endpoint(value: &Value) -> Result<(), String> {
+    validate_namespaced_enum(
+        value,
+        "PrivateDnsOnlyForInboundResolverEndpoint",
+        "awscc.ec2_vpc_endpoint",
+        VALID_PRIVATE_DNS_ONLY_FOR_INBOUND_RESOLVER_ENDPOINT,
+    )
+    .map_err(|reason| {
+        if let Value::String(s) = value {
+            format!(
+                "Invalid PrivateDnsOnlyForInboundResolverEndpoint '{}': {}",
+                s, reason
+            )
+        } else {
+            reason
+        }
+    })
+}
+
+#[allow(dead_code)]
+const VALID_PRIVATE_DNS_PREFERENCE: &[&str] = &[
+    "VERIFIED_DOMAINS_ONLY",
+    "ALL_DOMAINS",
+    "VERIFIED_DOMAINS_AND_SPECIFIED_DOMAINS",
+    "SPECIFIED_DOMAINS_ONLY",
+];
+
+#[allow(dead_code)]
+fn validate_private_dns_preference(value: &Value) -> Result<(), String> {
+    validate_namespaced_enum(
+        value,
+        "PrivateDnsPreference",
+        "awscc.ec2_vpc_endpoint",
+        VALID_PRIVATE_DNS_PREFERENCE,
+    )
+    .map_err(|reason| {
+        if let Value::String(s) = value {
+            format!("Invalid PrivateDnsPreference '{}': {}", s, reason)
+        } else {
+            reason
+        }
+    })
+}
+
+#[allow(dead_code)]
 const VALID_VPC_ENDPOINT_TYPE: &[&str] = &[
     "Interface",
     "Gateway",
@@ -36,6 +114,7 @@ const VALID_VPC_ENDPOINT_TYPE: &[&str] = &[
     "Resource",
 ];
 
+#[allow(dead_code)]
 fn validate_vpc_endpoint_type(value: &Value) -> Result<(), String> {
     validate_namespaced_enum(
         value,
@@ -74,9 +153,27 @@ pub fn ec2_vpc_endpoint_config() -> AwsccSchemaConfig {
             AttributeSchema::new("dns_options", AttributeType::Struct {
                     name: "DnsOptionsSpecification".to_string(),
                     fields: vec![
-                    StructField::new("dns_record_ip_type", AttributeType::Enum(vec!["ipv4".to_string(), "ipv6".to_string(), "dualstack".to_string(), "service-defined".to_string(), "not-specified".to_string()])).with_description("The DNS records created for the endpoint.").with_provider_name("DnsRecordIpType"),
-                    StructField::new("private_dns_only_for_inbound_resolver_endpoint", AttributeType::Enum(vec!["OnlyInboundResolver".to_string(), "AllResolvers".to_string(), "NotSpecified".to_string()])).with_description("Indicates whether to enable private DNS only for inbound endpoints. This option is available only for services that support both gateway and interface...").with_provider_name("PrivateDnsOnlyForInboundResolverEndpoint"),
-                    StructField::new("private_dns_preference", AttributeType::Enum(vec!["VERIFIED_DOMAINS_ONLY".to_string(), "ALL_DOMAINS".to_string(), "VERIFIED_DOMAINS_AND_SPECIFIED_DOMAINS".to_string(), "SPECIFIED_DOMAINS_ONLY".to_string()])).with_description("The preference for which private domains have a private hosted zone created for and associated with the specified VPC. Only supported when private DNS...").with_provider_name("PrivateDnsPreference"),
+                    StructField::new("dns_record_ip_type", AttributeType::Custom {
+                name: "DnsRecordIpType".to_string(),
+                base: Box::new(AttributeType::String),
+                validate: validate_dns_record_ip_type,
+                namespace: Some("awscc.ec2_vpc_endpoint".to_string()),
+                to_dsl: Some(|s: &str| s.replace('-', "_")),
+            }).with_description("The DNS records created for the endpoint.").with_provider_name("DnsRecordIpType"),
+                    StructField::new("private_dns_only_for_inbound_resolver_endpoint", AttributeType::Custom {
+                name: "PrivateDnsOnlyForInboundResolverEndpoint".to_string(),
+                base: Box::new(AttributeType::String),
+                validate: validate_private_dns_only_for_inbound_resolver_endpoint,
+                namespace: Some("awscc.ec2_vpc_endpoint".to_string()),
+                to_dsl: None,
+            }).with_description("Indicates whether to enable private DNS only for inbound endpoints. This option is available only for services that support both gateway and interface...").with_provider_name("PrivateDnsOnlyForInboundResolverEndpoint"),
+                    StructField::new("private_dns_preference", AttributeType::Custom {
+                name: "PrivateDnsPreference".to_string(),
+                base: Box::new(AttributeType::String),
+                validate: validate_private_dns_preference,
+                namespace: Some("awscc.ec2_vpc_endpoint".to_string()),
+                to_dsl: None,
+            }).with_description("The preference for which private domains have a private hosted zone created for and associated with the specified VPC. Only supported when private DNS...").with_provider_name("PrivateDnsPreference"),
                     StructField::new("private_dns_specified_domains", AttributeType::List(Box::new(AttributeType::String))).with_description("Indicates which of the private domains to create private hosted zones for and associate with the specified VPC. Only supported when private DNS is ena...").with_provider_name("PrivateDnsSpecifiedDomains")
                     ],
                 })
@@ -188,7 +285,13 @@ pub fn enum_valid_values() -> (
     (
         "ec2_vpc_endpoint",
         &[
+            ("dns_record_ip_type", VALID_DNS_RECORD_IP_TYPE),
             ("ip_address_type", VALID_IP_ADDRESS_TYPE),
+            (
+                "private_dns_only_for_inbound_resolver_endpoint",
+                VALID_PRIVATE_DNS_ONLY_FOR_INBOUND_RESOLVER_ENDPOINT,
+            ),
+            ("private_dns_preference", VALID_PRIVATE_DNS_PREFERENCE),
             ("vpc_endpoint_type", VALID_VPC_ENDPOINT_TYPE),
         ],
     )
