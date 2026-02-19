@@ -503,19 +503,31 @@ fn generate_markdown(schema: &CfnSchema, type_name: &str) -> Result<String> {
         md.push_str("## Enum Values\n\n");
         for (prop_name, enum_info) in &enums {
             let attr_name = prop_name.to_snake_case();
+            let has_hyphens = enum_info.values.iter().any(|v| v.contains('-'));
             md.push_str(&format!("### {} ({})\n\n", attr_name, enum_info.type_name));
             md.push_str("| Value | DSL Identifier |\n");
             md.push_str("|-------|----------------|\n");
             for value in &enum_info.values {
-                let dsl_id = format!("{}.{}.{}", namespace, enum_info.type_name, value);
+                // Convert hyphens to underscores in DSL identifier to match to_dsl behavior
+                let dsl_value = if has_hyphens {
+                    value.replace('-', "_")
+                } else {
+                    value.clone()
+                };
+                let dsl_id = format!("{}.{}.{}", namespace, enum_info.type_name, dsl_value);
                 md.push_str(&format!("| `{}` | `{}` |\n", value, dsl_id));
             }
             md.push('\n');
+            let empty = String::new();
+            let first_value = enum_info.values.first().unwrap_or(&empty);
+            let first_dsl = if has_hyphens {
+                first_value.replace('-', "_")
+            } else {
+                first_value.clone()
+            };
             md.push_str(&format!(
                 "Shorthand formats: `{}` or `{}.{}`\n\n",
-                enum_info.values.first().unwrap_or(&String::new()),
-                enum_info.type_name,
-                enum_info.values.first().unwrap_or(&String::new()),
+                first_dsl, enum_info.type_name, first_dsl,
             ));
         }
     }

@@ -100,7 +100,7 @@ The end of port range for the TCP and UDP protocols, or an ICMP/ICMPv6 code. A v
 | `udp` | `awscc.ec2_security_group_ingress.IpProtocol.udp` |
 | `icmp` | `awscc.ec2_security_group_ingress.IpProtocol.icmp` |
 | `icmpv6` | `awscc.ec2_security_group_ingress.IpProtocol.icmpv6` |
-| `-1` | `awscc.ec2_security_group_ingress.IpProtocol.-1` |
+| `-1` | `awscc.ec2_security_group_ingress.IpProtocol._1` |
 
 Shorthand formats: `tcp` or `IpProtocol.tcp`
 
