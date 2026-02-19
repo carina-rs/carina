@@ -83,7 +83,7 @@ A list of tags that are attached to the role. For more information about tagging
 
 ### `arn`
 
-- **Type:** Arn
+- **Type:** IamRoleArn
 
 ### `role_id`
 
