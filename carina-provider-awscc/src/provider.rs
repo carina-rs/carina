@@ -1130,6 +1130,58 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_enum_identifiers_hyphen_to_underscore() {
+        // Test that flow log's log_destination_type with hyphens gets converted to underscores
+        let mut resource = Resource::new("ec2_flow_log", "test");
+        resource
+            .attributes
+            .insert("_provider".to_string(), Value::String("awscc".to_string()));
+        resource.attributes.insert(
+            "log_destination_type".to_string(),
+            Value::UnresolvedIdent("cloud_watch_logs".to_string(), None),
+        );
+
+        let mut resources = vec![resource];
+        resolve_enum_identifiers_impl(&mut resources);
+        match &resources[0].attributes["log_destination_type"] {
+            Value::String(s) => {
+                assert_eq!(
+                    s, "awscc.ec2_flow_log.LogDestinationType.cloud_watch_logs",
+                    "Expected underscored namespaced enum, got: {}",
+                    s
+                );
+            }
+            other => panic!("Expected String, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_resolve_enum_identifiers_hyphen_string_to_underscore() {
+        // Test that a plain string with hyphens is converted to underscores via to_dsl
+        let mut resource = Resource::new("ec2_flow_log", "test");
+        resource
+            .attributes
+            .insert("_provider".to_string(), Value::String("awscc".to_string()));
+        resource.attributes.insert(
+            "log_destination_type".to_string(),
+            Value::String("cloud-watch-logs".to_string()),
+        );
+
+        let mut resources = vec![resource];
+        resolve_enum_identifiers_impl(&mut resources);
+        match &resources[0].attributes["log_destination_type"] {
+            Value::String(s) => {
+                assert_eq!(
+                    s, "awscc.ec2_flow_log.LogDestinationType.cloud_watch_logs",
+                    "Hyphenated string should be converted to underscore form, got: {}",
+                    s
+                );
+            }
+            other => panic!("Expected String, got: {:?}", other),
+        }
+    }
+
+    #[test]
     fn test_restore_create_only_attrs_impl_basic() {
         // Create a state that's missing a create-only attribute
         let id = ResourceId::with_provider("awscc", "ec2_nat_gateway", "test");

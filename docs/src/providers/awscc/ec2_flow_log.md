@@ -94,11 +94,11 @@ The type of traffic to log. You can log traffic that the resource accepts or rej
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `cloud-watch-logs` | `awscc.ec2_flow_log.LogDestinationType.cloud-watch-logs` |
+| `cloud-watch-logs` | `awscc.ec2_flow_log.LogDestinationType.cloud_watch_logs` |
 | `s3` | `awscc.ec2_flow_log.LogDestinationType.s3` |
-| `kinesis-data-firehose` | `awscc.ec2_flow_log.LogDestinationType.kinesis-data-firehose` |
+| `kinesis-data-firehose` | `awscc.ec2_flow_log.LogDestinationType.kinesis_data_firehose` |
 
-Shorthand formats: `cloud-watch-logs` or `LogDestinationType.cloud-watch-logs`
+Shorthand formats: `cloud_watch_logs` or `LogDestinationType.cloud_watch_logs`
 
 ### resource_type (ResourceType)
 

@@ -116,7 +116,7 @@ The ID of the VPC.
 | `ipv4` | `awscc.ec2_vpc_endpoint.IpAddressType.ipv4` |
 | `ipv6` | `awscc.ec2_vpc_endpoint.IpAddressType.ipv6` |
 | `dualstack` | `awscc.ec2_vpc_endpoint.IpAddressType.dualstack` |
-| `not-specified` | `awscc.ec2_vpc_endpoint.IpAddressType.not-specified` |
+| `not-specified` | `awscc.ec2_vpc_endpoint.IpAddressType.not_specified` |
 
 Shorthand formats: `ipv4` or `IpAddressType.ipv4`
 

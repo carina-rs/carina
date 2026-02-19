@@ -120,7 +120,7 @@ pub fn ec2_flow_log_config() -> AwsccSchemaConfig {
                 base: Box::new(AttributeType::String),
                 validate: validate_log_destination_type,
                 namespace: Some("awscc.ec2_flow_log".to_string()),
-                to_dsl: None,
+                to_dsl: Some(|s: &str| s.replace('-', "_")),
             })
                 .create_only()
                 .with_description("Specifies the type of destination to which the flow log data is to be published. Flow log data can be published to CloudWatch Logs or Amazon S3.")

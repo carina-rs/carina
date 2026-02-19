@@ -59,10 +59,10 @@ The tier of the IPAM.
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `ipam-owner` | `awscc.ec2_ipam.MeteredAccount.ipam-owner` |
-| `resource-owner` | `awscc.ec2_ipam.MeteredAccount.resource-owner` |
+| `ipam-owner` | `awscc.ec2_ipam.MeteredAccount.ipam_owner` |
+| `resource-owner` | `awscc.ec2_ipam.MeteredAccount.resource_owner` |
 
-Shorthand formats: `ipam-owner` or `MeteredAccount.ipam-owner`
+Shorthand formats: `ipam_owner` or `MeteredAccount.ipam_owner`
 
 ### tier (Tier)
 

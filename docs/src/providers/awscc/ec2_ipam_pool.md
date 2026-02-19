@@ -130,7 +130,7 @@ Shorthand formats: `IPv4` or `AddressFamily.IPv4`
 | Value | DSL Identifier |
 |-------|----------------|
 | `ec2` | `awscc.ec2_ipam_pool.AwsService.ec2` |
-| `global-services` | `awscc.ec2_ipam_pool.AwsService.global-services` |
+| `global-services` | `awscc.ec2_ipam_pool.AwsService.global_services` |
 
 Shorthand formats: `ec2` or `AwsService.ec2`
 
@@ -156,14 +156,14 @@ Shorthand formats: `byoip` or `PublicIpSource.byoip`
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `create-in-progress` | `awscc.ec2_ipam_pool.State.create-in-progress` |
-| `create-complete` | `awscc.ec2_ipam_pool.State.create-complete` |
-| `modify-in-progress` | `awscc.ec2_ipam_pool.State.modify-in-progress` |
-| `modify-complete` | `awscc.ec2_ipam_pool.State.modify-complete` |
-| `delete-in-progress` | `awscc.ec2_ipam_pool.State.delete-in-progress` |
-| `delete-complete` | `awscc.ec2_ipam_pool.State.delete-complete` |
+| `create-in-progress` | `awscc.ec2_ipam_pool.State.create_in_progress` |
+| `create-complete` | `awscc.ec2_ipam_pool.State.create_complete` |
+| `modify-in-progress` | `awscc.ec2_ipam_pool.State.modify_in_progress` |
+| `modify-complete` | `awscc.ec2_ipam_pool.State.modify_complete` |
+| `delete-in-progress` | `awscc.ec2_ipam_pool.State.delete_in_progress` |
+| `delete-complete` | `awscc.ec2_ipam_pool.State.delete_complete` |
 
-Shorthand formats: `create-in-progress` or `State.create-in-progress`
+Shorthand formats: `create_in_progress` or `State.create_in_progress`
 
 ## Struct Definitions
 
