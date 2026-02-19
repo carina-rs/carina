@@ -7,7 +7,7 @@ use carina_core::parser::{InputParameter, ParseError, ParsedFile, TypeExpr};
 use carina_core::resource::Value;
 use carina_core::schema::{validate_cidr, validate_ipv6_cidr};
 use carina_provider_aws::schemas::{s3, types as aws_types, vpc};
-use carina_provider_awscc::schemas::awscc_types;
+use carina_provider_awscc::schemas::awscc_types::{self, are_custom_types_compatible};
 use carina_provider_awscc::schemas::generated::flow_log as awscc_flow_log;
 use carina_provider_awscc::schemas::generated::nat_gateway as awscc_nat_gateway;
 use carina_provider_awscc::schemas::generated::security_group as awscc_security_group;
@@ -226,6 +226,10 @@ impl DiagnosticEngine {
                                                 ref_attr_schema.attr_type.type_name();
                                             if ref_type_name != *expected_name
                                                 && ref_type_name != "String"
+                                                && !are_custom_types_compatible(
+                                                    expected_name,
+                                                    &ref_type_name,
+                                                )
                                             {
                                                 Some(format!(
                                                     "Type mismatch: expected {}, got {} (from {}.{})",

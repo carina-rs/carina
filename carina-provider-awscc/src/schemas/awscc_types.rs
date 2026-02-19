@@ -798,6 +798,41 @@ fn validate_iam_policy_document(value: &Value) -> Result<(), String> {
     Ok(())
 }
 
+/// Check if two Custom type names are compatible for resource reference type checking.
+///
+/// Types in the same "family" are compatible. For example:
+/// - ARN types: Arn, IamRoleArn, IamPolicyArn, KmsKeyArn
+/// - Resource ID types: AwsResourceId, VpcId, SubnetId, SecurityGroupId, etc.
+///
+/// This allows resource references like `iam_role.arn` (type Arn) to be accepted
+/// where `IamRoleArn` is expected, because at runtime the value from an IAM role's
+/// ARN attribute is always a valid IAM Role ARN.
+pub fn are_custom_types_compatible(expected: &str, actual: &str) -> bool {
+    const ARN_TYPES: &[&str] = &["Arn", "IamRoleArn", "IamPolicyArn", "KmsKeyArn"];
+    const RESOURCE_ID_TYPES: &[&str] = &[
+        "AwsResourceId",
+        "VpcId",
+        "SubnetId",
+        "SecurityGroupId",
+        "InternetGatewayId",
+        "RouteTableId",
+        "NatGatewayId",
+        "VpcPeeringConnectionId",
+        "TransitGatewayId",
+        "VpnGatewayId",
+        "EgressOnlyInternetGatewayId",
+        "VpcEndpointId",
+    ];
+
+    if ARN_TYPES.contains(&expected) && ARN_TYPES.contains(&actual) {
+        return true;
+    }
+    if RESOURCE_ID_TYPES.contains(&expected) && RESOURCE_ID_TYPES.contains(&actual) {
+        return true;
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1835,5 +1870,51 @@ mod tests {
         );
         assert!(result.is_err());
         assert_eq!(result.unwrap_err(), "Expected string");
+    }
+
+    #[test]
+    fn compatible_types_same_arn_family() {
+        assert!(are_custom_types_compatible("Arn", "IamRoleArn"));
+        assert!(are_custom_types_compatible("IamRoleArn", "Arn"));
+        assert!(are_custom_types_compatible("Arn", "IamPolicyArn"));
+        assert!(are_custom_types_compatible("Arn", "KmsKeyArn"));
+        assert!(are_custom_types_compatible("IamRoleArn", "IamPolicyArn"));
+    }
+
+    #[test]
+    fn compatible_types_same_resource_id_family() {
+        assert!(are_custom_types_compatible(
+            "AwsResourceId",
+            "InternetGatewayId"
+        ));
+        assert!(are_custom_types_compatible(
+            "InternetGatewayId",
+            "AwsResourceId"
+        ));
+        assert!(are_custom_types_compatible("AwsResourceId", "VpcId"));
+        assert!(are_custom_types_compatible("AwsResourceId", "SubnetId"));
+        assert!(are_custom_types_compatible("VpcId", "SubnetId"));
+    }
+
+    #[test]
+    fn incompatible_types_across_families() {
+        assert!(!are_custom_types_compatible("Arn", "AwsResourceId"));
+        assert!(!are_custom_types_compatible("IamRoleArn", "VpcId"));
+        assert!(!are_custom_types_compatible("Arn", "VpcId"));
+    }
+
+    #[test]
+    fn incompatible_types_ipam_pool_id() {
+        // IpamPoolId has a distinct format (ipam-pool-{hex}) and should NOT be
+        // compatible with generic AwsResourceId or other resource ID types
+        assert!(!are_custom_types_compatible("AwsResourceId", "IpamPoolId"));
+        assert!(!are_custom_types_compatible("IpamPoolId", "VpcId"));
+    }
+
+    #[test]
+    fn incompatible_types_unknown() {
+        assert!(!are_custom_types_compatible("Arn", "Unknown"));
+        assert!(!are_custom_types_compatible("Unknown", "Arn"));
+        assert!(!are_custom_types_compatible("Foo", "Bar"));
     }
 }

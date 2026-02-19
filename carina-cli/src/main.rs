@@ -20,6 +20,7 @@ use carina_core::schema::ResourceSchema;
 use carina_core::schema::validate_cidr;
 use carina_provider_aws::schemas;
 use carina_provider_awscc::AwsccProvider;
+use carina_provider_awscc::schemas::awscc_types::are_custom_types_compatible;
 use carina_state::{
     BackendConfig as StateBackendConfig, BackendError, LockInfo, ResourceState, StateBackend,
     StateFile, create_backend, create_local_backend,
@@ -363,11 +364,15 @@ fn validate_resource_ref_types(resources: &[Resource]) -> Result<(), String> {
             // Type compatibility check:
             // - Same type -> OK
             // - Either is "String" -> OK (String is the base type for Custom types)
+            // - Types in the same family -> OK (e.g., Arn and IamRoleArn)
             // - Different Custom types -> Error
             if expected_type_name == ref_type_name {
                 continue;
             }
             if expected_type_name == "String" || ref_type_name == "String" {
+                continue;
+            }
+            if are_custom_types_compatible(&expected_type_name, &ref_type_name) {
                 continue;
             }
 
