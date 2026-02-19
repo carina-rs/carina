@@ -67,6 +67,10 @@ impl ProviderFactory for AwsProviderFactory {
     fn schemas(&self) -> Vec<carina_core::schema::ResourceSchema> {
         schemas::all_schemas()
     }
+
+    fn format_schema_key(&self, resource_type: &str) -> String {
+        resource_type.to_string()
+    }
 }
 
 /// S3 Bucket resource type

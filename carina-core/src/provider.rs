@@ -184,6 +184,12 @@ pub trait ProviderFactory: Send + Sync {
 
     /// Get all resource schemas for this provider.
     fn schemas(&self) -> Vec<crate::schema::ResourceSchema>;
+
+    /// Format a schema lookup key from a resource type.
+    /// Default: prepends provider name (e.g., "awscc" + "ec2_vpc" → "awscc.ec2_vpc").
+    fn format_schema_key(&self, resource_type: &str) -> String {
+        format!("{}.{}", self.name(), resource_type)
+    }
 }
 
 /// Provider implementation for Box<dyn Provider>
