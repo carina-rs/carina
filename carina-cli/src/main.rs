@@ -1257,8 +1257,9 @@ async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
                         .map_err(|e| format!("Failed to create bucket: {}", e))?;
                     println!("  {} Created state bucket", "✓".green());
 
-                    // Get region from backend config
-                    let region = get_region_for_provider(&parsed, "aws");
+                    // Get region from backend config using AWS factory
+                    let aws_factory = AwsProviderFactory;
+                    let region = aws_factory.extract_region(&config.attributes);
 
                     // Append resource definition to backend file
                     let target_file = backend_file.clone().unwrap_or_else(|| path.clone());
