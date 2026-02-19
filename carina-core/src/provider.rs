@@ -152,6 +152,40 @@ pub trait Provider: Send + Sync {
     }
 }
 
+/// Factory for creating and configuring a Provider.
+///
+/// Each provider crate implements this trait to encapsulate provider-specific
+/// logic (region validation, region extraction, provider instantiation, schemas).
+/// The CLI uses factories instead of hardcoded provider name matching.
+pub trait ProviderFactory: Send + Sync {
+    /// Provider name (e.g., "aws", "awscc")
+    fn name(&self) -> &str;
+
+    /// Display name for user-facing messages (e.g., "AWS provider", "AWS Cloud Control provider")
+    fn display_name(&self) -> &str;
+
+    /// Validate provider configuration (e.g., region).
+    /// Called before provider instantiation.
+    fn validate_config(&self, attributes: &HashMap<String, Value>) -> Result<(), String>;
+
+    /// Extract region from config in SDK format (e.g., "ap-northeast-1").
+    /// Returns a default region if none is configured.
+    fn extract_region(&self, attributes: &HashMap<String, Value>) -> String;
+
+    /// Extract raw region from config in DSL format (e.g., "aws.Region.ap_northeast_1").
+    /// Returns None if no region is configured.
+    fn extract_region_dsl(&self, attributes: &HashMap<String, Value>) -> Option<String>;
+
+    /// Create a provider instance from configuration attributes.
+    fn create_provider(
+        &self,
+        attributes: &HashMap<String, Value>,
+    ) -> BoxFuture<'_, Box<dyn Provider>>;
+
+    /// Get all resource schemas for this provider.
+    fn schemas(&self) -> Vec<crate::schema::ResourceSchema>;
+}
+
 /// Provider implementation for Box<dyn Provider>
 /// This enables dynamic dispatch for Providers
 impl Provider for Box<dyn Provider> {
