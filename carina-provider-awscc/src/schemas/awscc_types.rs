@@ -1836,4 +1836,89 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(result.unwrap_err(), "Expected string");
     }
+
+    #[test]
+    fn validate_ip_protocol_alias_all() {
+        // "all" should be accepted as a valid IpProtocol value (alias for "-1")
+        let valid_values = &["tcp", "udp", "icmp", "icmpv6", "-1", "all"];
+        let result = validate_namespaced_enum(
+            &Value::String("all".to_string()),
+            "IpProtocol",
+            "awscc.ec2_security_group_egress",
+            valid_values,
+        );
+        assert!(result.is_ok(), "all should be accepted: {:?}", result);
+    }
+
+    #[test]
+    fn validate_ip_protocol_canonical_minus_one() {
+        // "-1" should still be accepted
+        let valid_values = &["tcp", "udp", "icmp", "icmpv6", "-1", "all"];
+        let result = validate_namespaced_enum(
+            &Value::String("-1".to_string()),
+            "IpProtocol",
+            "awscc.ec2_security_group_egress",
+            valid_values,
+        );
+        assert!(result.is_ok(), "-1 should still be accepted: {:?}", result);
+    }
+
+    #[test]
+    fn validate_ip_protocol_namespaced_all() {
+        // Full namespaced form: awscc.ec2_security_group_egress.IpProtocol.all
+        let valid_values = &["tcp", "udp", "icmp", "icmpv6", "-1", "all"];
+        let result = validate_namespaced_enum(
+            &Value::String("awscc.ec2_security_group_egress.IpProtocol.all".to_string()),
+            "IpProtocol",
+            "awscc.ec2_security_group_egress",
+            valid_values,
+        );
+        assert!(
+            result.is_ok(),
+            "Namespaced all should be accepted: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn auto_generated_get_enum_alias_reverse() {
+        use crate::schemas::generated::get_enum_alias_reverse;
+        // "all" maps to "-1" for ip_protocol on security_group_egress
+        assert_eq!(
+            get_enum_alias_reverse("ec2_security_group_egress", "ip_protocol", "all"),
+            Some("-1")
+        );
+        // "all" maps to "-1" for ip_protocol on security_group_ingress
+        assert_eq!(
+            get_enum_alias_reverse("ec2_security_group_ingress", "ip_protocol", "all"),
+            Some("-1")
+        );
+        // "tcp" has no alias mapping
+        assert_eq!(
+            get_enum_alias_reverse("ec2_security_group_egress", "ip_protocol", "tcp"),
+            None
+        );
+        // Unknown resource has no alias mapping
+        assert_eq!(
+            get_enum_alias_reverse("ec2_vpc", "instance_tenancy", "default"),
+            None
+        );
+    }
+
+    #[test]
+    fn auto_generated_ip_protocol_valid_values_include_all() {
+        use crate::schemas::generated::get_enum_valid_values;
+        // VALID_IP_PROTOCOL should include "all" as an alias
+        let values = get_enum_valid_values("ec2_security_group_egress", "ip_protocol").unwrap();
+        assert!(
+            values.contains(&"all"),
+            "VALID_IP_PROTOCOL should include 'all', got: {:?}",
+            values
+        );
+        assert!(
+            values.contains(&"-1"),
+            "VALID_IP_PROTOCOL should still include '-1', got: {:?}",
+            values
+        );
+    }
 }

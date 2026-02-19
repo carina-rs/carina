@@ -9,7 +9,7 @@ use super::validate_namespaced_enum;
 use carina_core::resource::Value;
 use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, types};
 
-const VALID_IP_PROTOCOL: &[&str] = &["tcp", "udp", "icmp", "icmpv6", "-1"];
+const VALID_IP_PROTOCOL: &[&str] = &["tcp", "udp", "icmp", "icmpv6", "-1", "all"];
 
 fn validate_ip_protocol(value: &Value) -> Result<(), String> {
     validate_namespaced_enum(
@@ -111,7 +111,7 @@ pub fn ec2_security_group_ingress_config() -> AwsccSchemaConfig {
                 base: Box::new(AttributeType::String),
                 validate: validate_ip_protocol,
                 namespace: Some("awscc.ec2_security_group_ingress".to_string()),
-                to_dsl: Some(|s: &str| s.replace('-', "_")),
+                to_dsl: Some(|s: &str| match s { "-1" => "all".to_string(), _ => s.replace('-', "_") }),
             })
                 .required()
                 .create_only()
@@ -166,4 +166,13 @@ pub fn enum_valid_values() -> (
         "ec2_security_group_ingress",
         &[("ip_protocol", VALID_IP_PROTOCOL)],
     )
+}
+
+/// Maps DSL alias values back to canonical AWS values for this module.
+/// e.g., ("ip_protocol", "all") -> Some("-1")
+pub fn enum_alias_reverse(attr_name: &str, value: &str) -> Option<&'static str> {
+    match (attr_name, value) {
+        ("ip_protocol", "all") => Some("-1"),
+        _ => None,
+    }
 }

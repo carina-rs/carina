@@ -17,7 +17,7 @@ use serde_json::json;
 use carina_core::schema::AttributeType;
 
 use crate::schemas::generated::{
-    AwsccSchemaConfig, canonicalize_enum_value, get_enum_valid_values,
+    AwsccSchemaConfig, canonicalize_enum_value, get_enum_alias_reverse, get_enum_valid_values,
 };
 use carina_core::utils::convert_enum_value;
 
@@ -496,7 +496,12 @@ impl AwsccProvider {
             if let Some(aws_name) = &attr_schema.provider_name
                 && let Some(value) = resource.attributes.get(dsl_name.as_str())
             {
-                let aws_value = self.dsl_value_to_aws(value, &attr_schema.attr_type);
+                let aws_value = self.dsl_value_to_aws(
+                    value,
+                    &attr_schema.attr_type,
+                    &resource.id.resource_type,
+                    dsl_name,
+                );
                 if let Some(v) = aws_value {
                     desired_state.insert(aws_name.to_string(), v);
                 }
@@ -579,7 +584,12 @@ impl AwsccProvider {
             }
             if let Some(aws_name) = &attr_schema.provider_name
                 && let Some(value) = to.attributes.get(dsl_name.as_str())
-                && let Some(aws_value) = self.dsl_value_to_aws(value, &attr_schema.attr_type)
+                && let Some(aws_value) = self.dsl_value_to_aws(
+                    value,
+                    &attr_schema.attr_type,
+                    &id.resource_type,
+                    dsl_name,
+                )
             {
                 patch_ops.push(json!({
                     "op": "replace",
@@ -708,18 +718,35 @@ impl AwsccProvider {
         &self,
         value: &Value,
         attr_type: &AttributeType,
+        resource_type: &str,
+        attr_name: &str,
     ) -> Option<serde_json::Value> {
         // For Custom (enum) types, convert enum values
         if matches!(attr_type, AttributeType::Custom { .. }) {
             match value {
-                Value::String(s) => Some(json!(convert_enum_value(s))),
+                Value::String(s) => {
+                    let raw = convert_enum_value(s);
+                    // Apply alias reverse mapping (e.g., "all" -> "-1")
+                    let resolved = match get_enum_alias_reverse(resource_type, attr_name, &raw) {
+                        Some(canonical) => canonical.to_string(),
+                        None => raw,
+                    };
+                    Some(json!(resolved))
+                }
                 Value::UnresolvedIdent(ident, member) => {
                     let raw = if let Some(m) = member {
                         m.clone()
                     } else {
                         ident.clone()
                     };
-                    Some(json!(raw.replace('_', "-")))
+                    let converted = raw.replace('_', "-");
+                    // Apply alias reverse mapping (e.g., "all" -> "-1")
+                    let resolved =
+                        match get_enum_alias_reverse(resource_type, attr_name, &converted) {
+                            Some(canonical) => canonical.to_string(),
+                            None => converted,
+                        };
+                    Some(json!(resolved))
                 }
                 _ => self.value_to_json(value),
             }
@@ -1259,5 +1286,57 @@ mod tests {
             current_states[&id].attributes.get("subnet_id"),
             Some(&Value::String("subnet-current".to_string()))
         );
+    }
+
+    #[test]
+    fn test_resolve_enum_identifiers_ip_protocol_all_alias() {
+        // Test that bare "all" identifier resolves to namespaced form for IpProtocol
+        let mut resource = Resource::new("ec2_security_group_egress", "test");
+        resource
+            .attributes
+            .insert("_provider".to_string(), Value::String("awscc".to_string()));
+        resource.attributes.insert(
+            "ip_protocol".to_string(),
+            Value::UnresolvedIdent("all".to_string(), None),
+        );
+
+        let mut resources = vec![resource];
+        resolve_enum_identifiers_impl(&mut resources);
+        match &resources[0].attributes["ip_protocol"] {
+            Value::String(s) => {
+                assert_eq!(
+                    s, "awscc.ec2_security_group_egress.IpProtocol.all",
+                    "Expected namespaced IpProtocol.all, got: {}",
+                    s
+                );
+            }
+            other => panic!("Expected String, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_resolve_enum_identifiers_ip_protocol_tcp() {
+        // Test that bare "tcp" identifier resolves correctly
+        let mut resource = Resource::new("ec2_security_group_egress", "test");
+        resource
+            .attributes
+            .insert("_provider".to_string(), Value::String("awscc".to_string()));
+        resource.attributes.insert(
+            "ip_protocol".to_string(),
+            Value::UnresolvedIdent("tcp".to_string(), None),
+        );
+
+        let mut resources = vec![resource];
+        resolve_enum_identifiers_impl(&mut resources);
+        match &resources[0].attributes["ip_protocol"] {
+            Value::String(s) => {
+                assert_eq!(
+                    s, "awscc.ec2_security_group_egress.IpProtocol.tcp",
+                    "Expected namespaced IpProtocol.tcp, got: {}",
+                    s
+                );
+            }
+            other => panic!("Expected String, got: {:?}", other),
+        }
     }
 }

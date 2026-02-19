@@ -182,6 +182,26 @@ cat >> "$OUTPUT_DIR/mod.rs" << 'EOF'
     }
     None
 }
+
+/// Maps DSL alias values back to canonical AWS values.
+/// Dispatches to per-module enum_alias_reverse() functions.
+pub fn get_enum_alias_reverse(resource_type: &str, attr_name: &str, value: &str) -> Option<&'static str> {
+EOF
+
+# Add enum_alias_reverse() dispatches dynamically
+for TYPE_NAME in "${RESOURCE_TYPES[@]}"; do
+    MODNAME=$("$CODEGEN_BIN" --type-name "$TYPE_NAME" --print-module-name)
+    FULL_RESOURCE=$("$CODEGEN_BIN" --type-name "$TYPE_NAME" --print-full-resource-name)
+    cat >> "$OUTPUT_DIR/mod.rs" << INNEREOF
+    if resource_type == "${FULL_RESOURCE}" {
+        return ${MODNAME}::enum_alias_reverse(attr_name, value);
+    }
+INNEREOF
+done
+
+cat >> "$OUTPUT_DIR/mod.rs" << 'EOF'
+    None
+}
 EOF
 
 echo ""

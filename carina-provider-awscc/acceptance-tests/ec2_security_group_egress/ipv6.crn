@@ -18,6 +18,6 @@ let sg = awscc.ec2_security_group {
 let egress = awscc.ec2_security_group_egress {
   group_id    = sg.group_id
   description = "Allow all IPv6 outbound"
-  ip_protocol = "-1"
+  ip_protocol = all
   cidr_ipv6   = "::/0"
 }

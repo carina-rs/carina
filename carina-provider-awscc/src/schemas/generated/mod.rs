@@ -116,3 +116,85 @@ pub fn get_enum_valid_values(
     }
     None
 }
+
+/// Maps DSL alias values back to canonical AWS values.
+/// Dispatches to per-module enum_alias_reverse() functions.
+pub fn get_enum_alias_reverse(
+    resource_type: &str,
+    attr_name: &str,
+    value: &str,
+) -> Option<&'static str> {
+    if resource_type == "ec2_vpc" {
+        return vpc::enum_alias_reverse(attr_name, value);
+    }
+    if resource_type == "ec2_subnet" {
+        return subnet::enum_alias_reverse(attr_name, value);
+    }
+    if resource_type == "ec2_internet_gateway" {
+        return internet_gateway::enum_alias_reverse(attr_name, value);
+    }
+    if resource_type == "ec2_route_table" {
+        return route_table::enum_alias_reverse(attr_name, value);
+    }
+    if resource_type == "ec2_route" {
+        return route::enum_alias_reverse(attr_name, value);
+    }
+    if resource_type == "ec2_subnet_route_table_association" {
+        return subnet_route_table_association::enum_alias_reverse(attr_name, value);
+    }
+    if resource_type == "ec2_eip" {
+        return eip::enum_alias_reverse(attr_name, value);
+    }
+    if resource_type == "ec2_nat_gateway" {
+        return nat_gateway::enum_alias_reverse(attr_name, value);
+    }
+    if resource_type == "ec2_security_group" {
+        return security_group::enum_alias_reverse(attr_name, value);
+    }
+    if resource_type == "ec2_security_group_ingress" {
+        return security_group_ingress::enum_alias_reverse(attr_name, value);
+    }
+    if resource_type == "ec2_security_group_egress" {
+        return security_group_egress::enum_alias_reverse(attr_name, value);
+    }
+    if resource_type == "ec2_vpc_endpoint" {
+        return vpc_endpoint::enum_alias_reverse(attr_name, value);
+    }
+    if resource_type == "ec2_vpc_gateway_attachment" {
+        return vpc_gateway_attachment::enum_alias_reverse(attr_name, value);
+    }
+    if resource_type == "ec2_flow_log" {
+        return flow_log::enum_alias_reverse(attr_name, value);
+    }
+    if resource_type == "ec2_ipam" {
+        return ipam::enum_alias_reverse(attr_name, value);
+    }
+    if resource_type == "ec2_ipam_pool" {
+        return ipam_pool::enum_alias_reverse(attr_name, value);
+    }
+    if resource_type == "ec2_vpn_gateway" {
+        return vpn_gateway::enum_alias_reverse(attr_name, value);
+    }
+    if resource_type == "ec2_transit_gateway" {
+        return transit_gateway::enum_alias_reverse(attr_name, value);
+    }
+    if resource_type == "ec2_vpc_peering_connection" {
+        return vpc_peering_connection::enum_alias_reverse(attr_name, value);
+    }
+    if resource_type == "ec2_egress_only_internet_gateway" {
+        return egress_only_internet_gateway::enum_alias_reverse(attr_name, value);
+    }
+    if resource_type == "ec2_transit_gateway_attachment" {
+        return transit_gateway_attachment::enum_alias_reverse(attr_name, value);
+    }
+    if resource_type == "s3_bucket" {
+        return bucket::enum_alias_reverse(attr_name, value);
+    }
+    if resource_type == "iam_role" {
+        return role::enum_alias_reverse(attr_name, value);
+    }
+    if resource_type == "logs_log_group" {
+        return log_group::enum_alias_reverse(attr_name, value);
+    }
+    None
+}
