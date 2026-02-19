@@ -158,7 +158,7 @@ pub fn ec2_ipam_pool_config() -> AwsccSchemaConfig {
                 base: Box::new(AttributeType::String),
                 validate: validate_aws_service,
                 namespace: Some("awscc.ec2_ipam_pool".to_string()),
-                to_dsl: None,
+                to_dsl: Some(|s: &str| s.replace('-', "_")),
             })
                 .create_only()
                 .with_description("Limits which service in Amazon Web Services that the pool can be used in.")
@@ -265,7 +265,7 @@ pub fn ec2_ipam_pool_config() -> AwsccSchemaConfig {
                 base: Box::new(AttributeType::String),
                 validate: validate_state,
                 namespace: Some("awscc.ec2_ipam_pool".to_string()),
-                to_dsl: None,
+                to_dsl: Some(|s: &str| s.replace('-', "_")),
             })
                 .with_description("The state of this pool. This can be one of the following values: \"create-in-progress\", \"create-complete\", \"modify-in-progress\", \"modify-complet... (read-only)")
                 .with_provider_name("State"),

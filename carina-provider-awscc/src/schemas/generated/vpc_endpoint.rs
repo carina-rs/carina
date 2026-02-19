@@ -94,7 +94,7 @@ pub fn ec2_vpc_endpoint_config() -> AwsccSchemaConfig {
                 base: Box::new(AttributeType::String),
                 validate: validate_ip_address_type,
                 namespace: Some("awscc.ec2_vpc_endpoint".to_string()),
-                to_dsl: None,
+                to_dsl: Some(|s: &str| s.replace('-', "_")),
             })
                 .with_description("The supported IP address types.")
                 .with_provider_name("IpAddressType"),

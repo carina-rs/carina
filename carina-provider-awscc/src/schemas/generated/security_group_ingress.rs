@@ -111,7 +111,7 @@ pub fn ec2_security_group_ingress_config() -> AwsccSchemaConfig {
                 base: Box::new(AttributeType::String),
                 validate: validate_ip_protocol,
                 namespace: Some("awscc.ec2_security_group_ingress".to_string()),
-                to_dsl: None,
+                to_dsl: Some(|s: &str| s.replace('-', "_")),
             })
                 .required()
                 .create_only()

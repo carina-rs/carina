@@ -93,7 +93,7 @@ pub fn ec2_ipam_config() -> AwsccSchemaConfig {
                 base: Box::new(AttributeType::String),
                 validate: validate_metered_account,
                 namespace: Some("awscc.ec2_ipam".to_string()),
-                to_dsl: None,
+                to_dsl: Some(|s: &str| s.replace('-', "_")),
             })
                 .with_description("A metered account is an account that is charged for active IP addresses managed in IPAM")
                 .with_provider_name("MeteredAccount"),

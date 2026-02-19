@@ -912,15 +912,22 @@ pub fn {}() -> AwsccSchemaConfig {{
         let attr_type = if let Some(enum_info) = enums.get(prop_name) {
             // Use AttributeType::Custom for enums
             let validate_fn = format!("validate_{}", prop_name.to_snake_case());
+            // If any enum value contains hyphens, generate to_dsl to convert hyphens to underscores
+            let has_hyphens = enum_info.values.iter().any(|v| v.contains('-'));
+            let to_dsl_code = if has_hyphens {
+                "Some(|s: &str| s.replace('-', \"_\"))"
+            } else {
+                "None"
+            };
             format!(
                 r#"AttributeType::Custom {{
                 name: "{}".to_string(),
                 base: Box::new(AttributeType::String),
                 validate: {},
                 namespace: Some("{}".to_string()),
-                to_dsl: None,
+                to_dsl: {},
             }}"#,
-                enum_info.type_name, validate_fn, namespace
+                enum_info.type_name, validate_fn, namespace, to_dsl_code
             )
         } else {
             let (attr_type, _) = cfn_type_to_carina_type_with_enum(prop, prop_name, schema);
@@ -1905,6 +1912,36 @@ mod tests {
         let info = enum_info.unwrap();
         assert_eq!(info.type_name, "IpProtocol");
         assert_eq!(info.values, vec!["tcp", "udp", "icmp", "icmpv6", "-1"]);
+    }
+
+    #[test]
+    fn test_to_dsl_generated_for_hyphenated_enum_values() {
+        // EnumInfo with hyphenated values should trigger to_dsl generation
+        let with_hyphens = EnumInfo {
+            type_name: "LogDestinationType".to_string(),
+            values: vec![
+                "cloud-watch-logs".to_string(),
+                "s3".to_string(),
+                "kinesis-data-firehose".to_string(),
+            ],
+        };
+        assert!(
+            with_hyphens.values.iter().any(|v| v.contains('-')),
+            "Enum with hyphenated values should be detected"
+        );
+
+        let without_hyphens = EnumInfo {
+            type_name: "InstanceTenancy".to_string(),
+            values: vec![
+                "default".to_string(),
+                "dedicated".to_string(),
+                "host".to_string(),
+            ],
+        };
+        assert!(
+            !without_hyphens.values.iter().any(|v| v.contains('-')),
+            "Enum without hyphenated values should not be detected"
+        );
     }
 
     #[test]
