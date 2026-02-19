@@ -1270,10 +1270,32 @@ fn known_string_type_overrides() -> &'static HashMap<&'static str, &'static str>
     &OVERRIDES
 }
 
+/// Resource-specific property type overrides.
+/// Maps (CloudFormation type name, property name) to a specific type.
+/// Use this when the same property name should have different types on different resources.
+fn resource_specific_type_overrides() -> &'static HashMap<(&'static str, &'static str), &'static str>
+{
+    static OVERRIDES: LazyLock<HashMap<(&'static str, &'static str), &'static str>> =
+        LazyLock::new(|| {
+            let mut m = HashMap::new();
+            // IAM Role's Arn is always an IAM Role ARN
+            m.insert(("AWS::IAM::Role", "Arn"), "super::iam_role_arn()");
+            m
+        });
+    &OVERRIDES
+}
+
 /// Infer the Carina type string for a property based on its name.
-/// Checks known string type overrides, ARN patterns, and resource ID patterns.
+/// Checks resource-specific overrides, known string type overrides, ARN patterns,
+/// and resource ID patterns.
 /// Returns None if no heuristic matches (caller should default to String).
-fn infer_string_type(prop_name: &str) -> Option<String> {
+fn infer_string_type(prop_name: &str, resource_type: &str) -> Option<String> {
+    // Check resource-specific overrides first
+    if let Some(&override_type) =
+        resource_specific_type_overrides().get(&(resource_type, prop_name))
+    {
+        return Some(override_type.to_string());
+    }
     // Check known string type overrides
     if let Some(&override_type) = known_string_type_overrides().get(prop_name) {
         return Some(override_type.to_string());
@@ -1474,7 +1496,7 @@ fn cfn_type_to_carina_type_with_enum(
             );
         }
         // Apply name-based heuristics for unresolvable $ref
-        if let Some(inferred) = infer_string_type(prop_name) {
+        if let Some(inferred) = infer_string_type(prop_name, &schema.type_name) {
             return (inferred, None);
         }
         return ("AttributeType::String".to_string(), None);
@@ -1516,7 +1538,7 @@ fn cfn_type_to_carina_type_with_enum(
     match prop.prop_type.as_ref().and_then(|t| t.as_str()) {
         Some("string") => {
             // Check known string type overrides first
-            if let Some(inferred) = infer_string_type(prop_name) {
+            if let Some(inferred) = infer_string_type(prop_name, &schema.type_name) {
                 return (inferred, None);
             }
 
@@ -1674,7 +1696,7 @@ fn cfn_type_to_carina_type_with_enum(
         }
         _ => {
             // Fallback: apply name-based heuristics for properties with no explicit type
-            if let Some(inferred) = infer_string_type(prop_name) {
+            if let Some(inferred) = infer_string_type(prop_name, &schema.type_name) {
                 (inferred, None)
             } else {
                 ("AttributeType::String".to_string(), None)
