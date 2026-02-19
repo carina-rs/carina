@@ -10,10 +10,64 @@ use aws_config::Region;
 use aws_sdk_ec2::Client as Ec2Client;
 use aws_sdk_s3::Client as S3Client;
 use carina_core::provider::{
-    BoxFuture, Provider, ProviderError, ProviderResult, ResourceSchema, ResourceType,
+    BoxFuture, Provider, ProviderError, ProviderFactory, ProviderResult, ResourceSchema,
+    ResourceType,
 };
 use carina_core::resource::{LifecycleConfig, Resource, ResourceId, State, Value};
 use carina_core::utils::{convert_enum_value, extract_enum_value};
+
+/// Factory for creating and configuring the AWS Provider
+pub struct AwsProviderFactory;
+
+impl ProviderFactory for AwsProviderFactory {
+    fn name(&self) -> &str {
+        "aws"
+    }
+
+    fn display_name(&self) -> &str {
+        "AWS provider"
+    }
+
+    fn validate_config(&self, attributes: &HashMap<String, Value>) -> Result<(), String> {
+        let region_type = schemas::types::aws_region();
+        if let Some(region_value) = attributes.get("region") {
+            region_type
+                .validate(region_value)
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+
+    fn extract_region(&self, attributes: &HashMap<String, Value>) -> String {
+        if let Some(Value::String(region)) = attributes.get("region") {
+            if let Some(rest) = region.strip_prefix("aws.Region.") {
+                return rest.replace('_', "-");
+            }
+            return region.clone();
+        }
+        "ap-northeast-1".to_string()
+    }
+
+    fn extract_region_dsl(&self, attributes: &HashMap<String, Value>) -> Option<String> {
+        if let Some(Value::String(region)) = attributes.get("region") {
+            Some(region.clone())
+        } else {
+            None
+        }
+    }
+
+    fn create_provider(
+        &self,
+        attributes: &HashMap<String, Value>,
+    ) -> BoxFuture<'_, Box<dyn Provider>> {
+        let region = self.extract_region(attributes);
+        Box::pin(async move { Box::new(AwsProvider::new(&region).await) as Box<dyn Provider> })
+    }
+
+    fn schemas(&self) -> Vec<carina_core::schema::ResourceSchema> {
+        schemas::all_schemas()
+    }
+}
 
 /// S3 Bucket resource type
 pub struct S3BucketType;

@@ -17,10 +17,66 @@ pub use provider::AwsccProvider;
 
 use std::collections::HashMap;
 
-use carina_core::provider::{BoxFuture, Provider, ProviderResult};
+use carina_core::provider::{BoxFuture, Provider, ProviderFactory, ProviderResult};
 use carina_core::resource::{LifecycleConfig, Resource, ResourceId, State, Value};
 
 use resources::resource_types;
+
+/// Factory for creating and configuring the AWSCC Provider
+pub struct AwsccProviderFactory;
+
+impl ProviderFactory for AwsccProviderFactory {
+    fn name(&self) -> &str {
+        "awscc"
+    }
+
+    fn display_name(&self) -> &str {
+        "AWS Cloud Control provider"
+    }
+
+    fn validate_config(&self, attributes: &HashMap<String, Value>) -> Result<(), String> {
+        let region_type = schemas::awscc_types::awscc_region();
+        if let Some(region_value) = attributes.get("region") {
+            region_type
+                .validate(region_value)
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+
+    fn extract_region(&self, attributes: &HashMap<String, Value>) -> String {
+        if let Some(Value::String(region)) = attributes.get("region") {
+            if let Some(rest) = region.strip_prefix("awscc.Region.") {
+                return rest.replace('_', "-");
+            }
+            if let Some(rest) = region.strip_prefix("aws.Region.") {
+                return rest.replace('_', "-");
+            }
+            return region.clone();
+        }
+        "ap-northeast-1".to_string()
+    }
+
+    fn extract_region_dsl(&self, attributes: &HashMap<String, Value>) -> Option<String> {
+        if let Some(Value::String(region)) = attributes.get("region") {
+            Some(region.clone())
+        } else {
+            None
+        }
+    }
+
+    fn create_provider(
+        &self,
+        attributes: &HashMap<String, Value>,
+    ) -> BoxFuture<'_, Box<dyn Provider>> {
+        let region = self.extract_region(attributes);
+        Box::pin(async move { Box::new(AwsccProvider::new(&region).await) as Box<dyn Provider> })
+    }
+
+    fn schemas(&self) -> Vec<carina_core::schema::ResourceSchema> {
+        schemas::all_schemas()
+    }
+}
 
 // =============================================================================
 // Provider Trait Implementation

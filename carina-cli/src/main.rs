@@ -14,12 +14,14 @@ use carina_core::formatter::{self, FormatConfig};
 use carina_core::module_resolver;
 use carina_core::parser::{self, BackendConfig, ParsedFile, ProviderConfig, TypeExpr};
 use carina_core::plan::Plan;
-use carina_core::provider::{BoxFuture, Provider, ProviderError, ProviderResult, ResourceType};
+use carina_core::provider::{
+    BoxFuture, Provider, ProviderError, ProviderFactory, ProviderResult, ResourceType,
+};
 use carina_core::resource::{LifecycleConfig, Resource, ResourceId, State, Value};
 use carina_core::schema::ResourceSchema;
 use carina_core::schema::validate_cidr;
-use carina_provider_aws::schemas;
-use carina_provider_awscc::AwsccProvider;
+use carina_provider_aws::AwsProviderFactory;
+use carina_provider_awscc::AwsccProviderFactory;
 use carina_state::{
     BackendConfig as StateBackendConfig, BackendError, LockInfo, ResourceState, StateBackend,
     StateFile, create_backend, create_local_backend,
@@ -247,14 +249,27 @@ async fn main() {
     }
 }
 
+fn provider_factories() -> Vec<Box<dyn ProviderFactory>> {
+    vec![Box::new(AwsProviderFactory), Box::new(AwsccProviderFactory)]
+}
+
+fn find_factory<'a>(
+    factories: &'a [Box<dyn ProviderFactory>],
+    name: &str,
+) -> Option<&'a dyn ProviderFactory> {
+    factories
+        .iter()
+        .find(|f| f.name() == name)
+        .map(|f| f.as_ref())
+}
+
 fn get_schemas() -> HashMap<String, ResourceSchema> {
+    let factories = provider_factories();
     let mut all_schemas = HashMap::new();
-    for schema in schemas::all_schemas() {
-        all_schemas.insert(schema.resource_type.clone(), schema);
-    }
-    // Add awscc schemas
-    for schema in carina_provider_awscc::schemas::all_schemas() {
-        all_schemas.insert(schema.resource_type.clone(), schema);
+    for factory in &factories {
+        for schema in factory.schemas() {
+            all_schemas.insert(schema.resource_type.clone(), schema);
+        }
     }
     all_schemas
 }
@@ -709,20 +724,13 @@ fn derive_module_name(path: &Path) -> String {
 
 /// Validate provider region attribute
 fn validate_provider_region(parsed: &ParsedFile) -> Result<(), String> {
-    let aws_region_type = carina_provider_aws::schemas::types::aws_region();
-    let awscc_region_type = carina_provider_awscc::schemas::awscc_types::awscc_region();
+    let factories = provider_factories();
 
     for provider in &parsed.providers {
-        let region_type = match provider.name.as_str() {
-            "aws" => &aws_region_type,
-            "awscc" => &awscc_region_type,
-            _ => continue,
-        };
-
-        if let Some(region_value) = provider.attributes.get("region")
-            && let Err(e) = region_type.validate(region_value)
-        {
-            return Err(format!("provider {}: {}", provider.name, e));
+        if let Some(factory) = find_factory(&factories, &provider.name) {
+            factory
+                .validate_config(&provider.attributes)
+                .map_err(|e| format!("provider {}: {}", provider.name, e))?;
         }
     }
     Ok(())
@@ -1219,7 +1227,7 @@ async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
                 );
 
                 // Create the bucket resource first
-                let region = get_aws_region(&parsed);
+                let region = get_region_for_provider(&parsed, "aws");
                 let aws_provider = AwsProvider::new(&region).await;
 
                 match aws_provider.create(bucket_resource).await {
@@ -1250,14 +1258,7 @@ async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
                     println!("  {} Created state bucket", "✓".green());
 
                     // Get region from backend config
-                    let region = config
-                        .attributes
-                        .get("region")
-                        .and_then(|v| match v {
-                            Value::String(s) => Some(convert_region_value(s)),
-                            _ => None,
-                        })
-                        .unwrap_or_else(|| "ap-northeast-1".to_string());
+                    let region = get_region_for_provider(&parsed, "aws");
 
                     // Append resource definition to backend file
                     let target_file = backend_file.clone().unwrap_or_else(|| path.clone());
@@ -2072,42 +2073,18 @@ async fn run_apply_from_plan(plan_path: &PathBuf, auto_approve: bool) -> Result<
 
 /// Create a provider from a saved ProviderConfig
 async fn create_provider_from_config(config: &ProviderConfig) -> Box<dyn Provider> {
-    match config.name.as_str() {
-        "aws" => {
-            let region = config
-                .attributes
-                .get("region")
-                .and_then(|v| match v {
-                    Value::String(s) => Some(convert_region_value(s)),
-                    _ => None,
-                })
-                .unwrap_or_else(|| "ap-northeast-1".to_string());
-            println!(
-                "{}",
-                format!("Using AWS provider (region: {})", region).cyan()
-            );
-            Box::new(AwsProvider::new(&region).await)
-        }
-        "awscc" => {
-            let region = config
-                .attributes
-                .get("region")
-                .and_then(|v| match v {
-                    Value::String(s) => Some(convert_region_value(s)),
-                    _ => None,
-                })
-                .unwrap_or_else(|| "ap-northeast-1".to_string());
-            println!(
-                "{}",
-                format!("Using AWS Cloud Control provider (region: {})", region).cyan()
-            );
-            Box::new(AwsccProvider::new(&region).await)
-        }
-        _ => {
-            println!("{}", "Using file-based mock provider".cyan());
-            Box::new(FileProvider::new())
-        }
+    let factories = provider_factories();
+    if let Some(factory) = find_factory(&factories, &config.name) {
+        let region = factory.extract_region(&config.attributes);
+        println!(
+            "{}",
+            format!("Using {} (region: {})", factory.display_name(), region).cyan()
+        );
+        return factory.create_provider(&config.attributes).await;
     }
+
+    println!("{}", "Using file-based mock provider".cyan());
+    Box::new(FileProvider::new())
 }
 
 async fn run_destroy(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
@@ -2592,78 +2569,49 @@ fn get_identifier_from_state(
     None
 }
 
-fn get_aws_region_dsl(parsed: &ParsedFile) -> Option<String> {
-    for provider in &parsed.providers {
-        if provider.name == "aws"
-            && let Some(Value::String(region)) = provider.attributes.get("region")
-        {
-            return Some(region.clone());
-        }
-    }
-    None
-}
-
-/// Get region from provider configuration (AWS format: ap-northeast-1)
-fn get_aws_region(parsed: &ParsedFile) -> String {
-    if let Some(region) = get_aws_region_dsl(parsed) {
-        // Convert from aws.Region.ap_northeast_1 format to ap-northeast-1 format
-        if region.starts_with("aws.Region.") {
-            return region
-                .strip_prefix("aws.Region.")
-                .unwrap_or(&region)
-                .replace('_', "-");
-        }
-        return region;
-    }
-    // Default region
-    "ap-northeast-1".to_string()
-}
-
-/// Get region from awscc provider configuration (AWS format: ap-northeast-1)
-fn get_awscc_region(parsed: &ParsedFile) -> String {
-    for provider in &parsed.providers {
-        if provider.name == "awscc"
-            && let Some(Value::String(region)) = provider.attributes.get("region")
-        {
-            return convert_region_value(region);
-        }
-    }
-    // Default region
-    "ap-northeast-1".to_string()
-}
-
 /// Apply default region from provider to resources that don't have a region specified
 fn apply_default_region(parsed: &mut ParsedFile) {
-    if let Some(default_region) = get_aws_region_dsl(parsed) {
-        for resource in &mut parsed.resources {
-            if !resource.attributes.contains_key("region") {
-                resource
-                    .attributes
-                    .insert("region".to_string(), Value::String(default_region.clone()));
+    let factories = provider_factories();
+    for provider_config in &parsed.providers {
+        if let Some(factory) = find_factory(&factories, &provider_config.name)
+            && let Some(default_region) = factory.extract_region_dsl(&provider_config.attributes)
+        {
+            for resource in &mut parsed.resources {
+                if !resource.attributes.contains_key("region") {
+                    resource
+                        .attributes
+                        .insert("region".to_string(), Value::String(default_region.clone()));
+                }
             }
+            return;
         }
     }
+}
+
+/// Extract region in SDK format from the first matching provider config
+fn get_region_for_provider(parsed: &ParsedFile, provider_name: &str) -> String {
+    let factories = provider_factories();
+    for provider_config in &parsed.providers {
+        if provider_config.name == provider_name
+            && let Some(factory) = find_factory(&factories, &provider_config.name)
+        {
+            return factory.extract_region(&provider_config.attributes);
+        }
+    }
+    "ap-northeast-1".to_string()
 }
 
 /// Determine and return the appropriate Provider
 async fn get_provider(parsed: &ParsedFile) -> Box<dyn Provider> {
-    // Use AwsProvider if AWS provider is configured
-    for provider in &parsed.providers {
-        if provider.name == "aws" {
-            let region = get_aws_region(parsed);
+    let factories = provider_factories();
+    for provider_config in &parsed.providers {
+        if let Some(factory) = find_factory(&factories, &provider_config.name) {
+            let region = factory.extract_region(&provider_config.attributes);
             println!(
                 "{}",
-                format!("Using AWS provider (region: {})", region).cyan()
+                format!("Using {} (region: {})", factory.display_name(), region).cyan()
             );
-            return Box::new(AwsProvider::new(&region).await);
-        }
-        if provider.name == "awscc" {
-            let region = get_awscc_region(parsed);
-            println!(
-                "{}",
-                format!("Using AWS Cloud Control provider (region: {})", region).cyan()
-            );
-            return Box::new(AwsccProvider::new(&region).await);
+            return factory.create_provider(&provider_config.attributes).await;
         }
     }
 
@@ -3626,15 +3574,9 @@ async fn run_state_bucket_delete(
         }
     }
 
-    // Get region from backend config
-    let region = backend_config
-        .attributes
-        .get("region")
-        .and_then(|v| match v {
-            Value::String(s) => Some(convert_region_value(s)),
-            _ => None,
-        })
-        .unwrap_or_else(|| "ap-northeast-1".to_string());
+    // Get region from backend config using AWS factory
+    let aws_factory = AwsProviderFactory;
+    let region = aws_factory.extract_region(&backend_config.attributes);
 
     // Create AWS provider to delete the bucket
     let aws_provider = AwsProvider::new(&region).await;
@@ -3659,17 +3601,6 @@ async fn run_state_bucket_delete(
             Ok(())
         }
         Err(e) => Err(format!("Failed to delete bucket: {}", e)),
-    }
-}
-
-/// Convert region value from DSL format to AWS format
-fn convert_region_value(value: &str) -> String {
-    if let Some(rest) = value.strip_prefix("aws.Region.") {
-        rest.replace('_', "-")
-    } else if let Some(rest) = value.strip_prefix("awscc.Region.") {
-        rest.replace('_', "-")
-    } else {
-        value.to_string()
     }
 }
 
