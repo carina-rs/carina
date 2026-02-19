@@ -14,7 +14,7 @@ use carina_core::resource::{LifecycleConfig, Resource, ResourceId, State, Value}
 use heck::{ToPascalCase, ToSnakeCase};
 use serde_json::json;
 
-use carina_core::schema::AttributeType;
+use carina_core::schema::{AttributeType, StructField};
 
 use crate::schemas::generated::{
     AwsccSchemaConfig, canonicalize_enum_value, get_enum_alias_reverse, get_enum_valid_values,
@@ -683,6 +683,67 @@ impl AwsccProvider {
             let namespaced = format!("{}.{}.{}", ns, type_name, dsl_val);
             return Some(Value::String(namespaced));
         }
+
+        // For List(Struct{fields}), recurse into struct fields for type-aware conversion
+        if let AttributeType::List(inner) = attr_type
+            && let AttributeType::Struct { fields, .. } = inner.as_ref()
+            && let Some(arr) = value.as_array()
+        {
+            let items: Vec<Value> = arr
+                .iter()
+                .filter_map(|item| {
+                    if let Some(obj) = item.as_object() {
+                        let map: HashMap<String, Value> = fields
+                            .iter()
+                            .filter_map(|field| {
+                                let provider_key =
+                                    field.provider_name.as_deref().unwrap_or(&field.name);
+                                let json_val = obj.get(provider_key)?;
+                                let dsl_val = self.aws_value_to_dsl(
+                                    &field.name,
+                                    json_val,
+                                    &field.field_type,
+                                    resource_type,
+                                );
+                                dsl_val.map(|v| (field.name.clone(), v))
+                            })
+                            .collect();
+                        if map.is_empty() {
+                            None
+                        } else {
+                            Some(Value::Map(map))
+                        }
+                    } else {
+                        self.json_to_value(item)
+                    }
+                })
+                .collect();
+            return Some(Value::List(items));
+        }
+
+        // For bare Struct{fields}, recurse into fields
+        if let AttributeType::Struct { fields, .. } = attr_type
+            && let Some(obj) = value.as_object()
+        {
+            let map: HashMap<String, Value> = fields
+                .iter()
+                .filter_map(|field| {
+                    let provider_key = field.provider_name.as_deref().unwrap_or(&field.name);
+                    let json_val = obj.get(provider_key)?;
+                    let dsl_val = self.aws_value_to_dsl(
+                        &field.name,
+                        json_val,
+                        &field.field_type,
+                        resource_type,
+                    );
+                    dsl_val.map(|v| (field.name.clone(), v))
+                })
+                .collect();
+            if !map.is_empty() {
+                return Some(Value::Map(map));
+            }
+        }
+
         self.json_to_value(value)
     }
 
@@ -750,6 +811,63 @@ impl AwsccProvider {
                 }
                 _ => self.value_to_json(value),
             }
+        } else if let AttributeType::List(inner) = attr_type
+            && let AttributeType::Struct { fields, .. } = inner.as_ref()
+            && let Value::List(items) = value
+        {
+            // Recurse into struct fields for type-aware conversion
+            let arr: Vec<serde_json::Value> = items
+                .iter()
+                .filter_map(|item| {
+                    if let Value::Map(map) = item {
+                        let obj: serde_json::Map<String, serde_json::Value> = fields
+                            .iter()
+                            .filter_map(|field| {
+                                let dsl_val = map.get(&field.name)?;
+                                let provider_key = field
+                                    .provider_name
+                                    .as_deref()
+                                    .unwrap_or(&field.name)
+                                    .to_string();
+                                let json_val = self.dsl_value_to_aws(
+                                    dsl_val,
+                                    &field.field_type,
+                                    resource_type,
+                                    &field.name,
+                                );
+                                json_val.map(|v| (provider_key, v))
+                            })
+                            .collect();
+                        Some(serde_json::Value::Object(obj))
+                    } else {
+                        self.value_to_json(item)
+                    }
+                })
+                .collect();
+            Some(serde_json::Value::Array(arr))
+        } else if let AttributeType::Struct { fields, .. } = attr_type
+            && let Value::Map(map) = value
+        {
+            // Recurse into bare struct fields for type-aware conversion
+            let obj: serde_json::Map<String, serde_json::Value> = fields
+                .iter()
+                .filter_map(|field| {
+                    let dsl_val = map.get(&field.name)?;
+                    let provider_key = field
+                        .provider_name
+                        .as_deref()
+                        .unwrap_or(&field.name)
+                        .to_string();
+                    let json_val = self.dsl_value_to_aws(
+                        dsl_val,
+                        &field.field_type,
+                        resource_type,
+                        &field.name,
+                    );
+                    json_val.map(|v| (provider_key, v))
+                })
+                .collect();
+            Some(serde_json::Value::Object(obj))
         } else {
             self.value_to_json(value)
         }
@@ -962,9 +1080,80 @@ pub fn resolve_enum_identifiers_impl(resources: &mut [Resource]) {
                 resolved_attrs.insert(key.clone(), resolved);
                 continue;
             }
+
+            // Handle struct fields containing Custom enum types
+            if let Some(attr_schema) = config.schema.attributes.get(key.as_str()) {
+                let struct_fields = match &attr_schema.attr_type {
+                    AttributeType::List(inner) => {
+                        if let AttributeType::Struct { fields, .. } = inner.as_ref() {
+                            Some(fields)
+                        } else {
+                            None
+                        }
+                    }
+                    AttributeType::Struct { fields, .. } => Some(fields),
+                    _ => None,
+                };
+
+                if let Some(fields) = struct_fields {
+                    let resolved = resolve_struct_enum_values(value, fields);
+                    resolved_attrs.insert(key.clone(), resolved);
+                    continue;
+                }
+            }
+
             resolved_attrs.insert(key.clone(), value.clone());
         }
         resource.attributes = resolved_attrs;
+    }
+}
+
+/// Resolve enum identifiers within struct field values.
+/// Recurses into List and Map values, resolving UnresolvedIdent values
+/// for struct fields that have Custom type with namespace.
+fn resolve_struct_enum_values(value: &Value, fields: &[StructField]) -> Value {
+    match value {
+        Value::List(items) => {
+            let resolved_items: Vec<Value> = items
+                .iter()
+                .map(|item| resolve_struct_enum_values(item, fields))
+                .collect();
+            Value::List(resolved_items)
+        }
+        Value::Map(map) => {
+            let mut resolved_map = HashMap::new();
+            for (field_key, field_value) in map {
+                if let Some(field) = fields.iter().find(|f| f.name == *field_key)
+                    && let AttributeType::Custom {
+                        name: type_name,
+                        namespace: Some(ns),
+                        to_dsl,
+                        ..
+                    } = &field.field_type
+                {
+                    let resolved = match field_value {
+                        Value::UnresolvedIdent(ident, None) => {
+                            let dsl_val = to_dsl.map_or_else(|| ident.clone(), |f| f(ident));
+                            Value::String(format!("{}.{}.{}", ns, type_name, dsl_val))
+                        }
+                        Value::UnresolvedIdent(ident, Some(member)) if ident == type_name => {
+                            let dsl_val = to_dsl.map_or_else(|| member.clone(), |f| f(member));
+                            Value::String(format!("{}.{}.{}", ns, type_name, dsl_val))
+                        }
+                        Value::String(s) if !s.contains('.') => {
+                            let dsl_val = to_dsl.map_or_else(|| s.clone(), |f| f(s));
+                            Value::String(format!("{}.{}.{}", ns, type_name, dsl_val))
+                        }
+                        _ => field_value.clone(),
+                    };
+                    resolved_map.insert(field_key.clone(), resolved);
+                    continue;
+                }
+                resolved_map.insert(field_key.clone(), field_value.clone());
+            }
+            Value::Map(resolved_map)
+        }
+        _ => value.clone(),
     }
 }
 
@@ -1337,6 +1526,168 @@ mod tests {
                 );
             }
             other => panic!("Expected String, got: {:?}", other),
+        }
+    }
+
+    /// Helper to create struct fields with a Custom enum type for testing
+    fn test_ip_protocol_fields() -> Vec<StructField> {
+        vec![
+            StructField::new(
+                "ip_protocol",
+                AttributeType::Custom {
+                    name: "IpProtocol".to_string(),
+                    base: Box::new(AttributeType::String),
+                    validate: |_| Ok(()),
+                    namespace: Some("awscc.ec2_security_group".to_string()),
+                    to_dsl: Some(|s: &str| match s {
+                        "-1" => "all".to_string(),
+                        _ => s.to_string(),
+                    }),
+                },
+            )
+            .with_provider_name("IpProtocol"),
+            StructField::new("from_port", AttributeType::Int).with_provider_name("FromPort"),
+            StructField::new("cidr_ip", AttributeType::String).with_provider_name("CidrIp"),
+        ]
+    }
+
+    #[test]
+    fn test_resolve_struct_enum_values_bare_ident() {
+        let fields = test_ip_protocol_fields();
+        let mut map = HashMap::new();
+        map.insert(
+            "ip_protocol".to_string(),
+            Value::UnresolvedIdent("all".to_string(), None),
+        );
+        map.insert("from_port".to_string(), Value::Int(443));
+        let value = Value::List(vec![Value::Map(map)]);
+
+        let resolved = resolve_struct_enum_values(&value, &fields);
+        if let Value::List(items) = resolved {
+            if let Value::Map(m) = &items[0] {
+                match &m["ip_protocol"] {
+                    Value::String(s) => {
+                        assert_eq!(s, "awscc.ec2_security_group.IpProtocol.all");
+                    }
+                    other => panic!("Expected String, got: {:?}", other),
+                }
+                // Non-enum field should be unchanged
+                assert_eq!(m["from_port"], Value::Int(443));
+            } else {
+                panic!("Expected Map");
+            }
+        } else {
+            panic!("Expected List");
+        }
+    }
+
+    #[test]
+    fn test_resolve_struct_enum_values_typename_dot_value() {
+        let fields = test_ip_protocol_fields();
+        let mut map = HashMap::new();
+        map.insert(
+            "ip_protocol".to_string(),
+            Value::UnresolvedIdent("IpProtocol".to_string(), Some("tcp".to_string())),
+        );
+        let value = Value::List(vec![Value::Map(map)]);
+
+        let resolved = resolve_struct_enum_values(&value, &fields);
+        if let Value::List(items) = resolved {
+            if let Value::Map(m) = &items[0] {
+                match &m["ip_protocol"] {
+                    Value::String(s) => {
+                        assert_eq!(s, "awscc.ec2_security_group.IpProtocol.tcp");
+                    }
+                    other => panic!("Expected String, got: {:?}", other),
+                }
+            } else {
+                panic!("Expected Map");
+            }
+        } else {
+            panic!("Expected List");
+        }
+    }
+
+    #[test]
+    fn test_resolve_struct_enum_values_string_passthrough() {
+        let fields = test_ip_protocol_fields();
+        let mut map = HashMap::new();
+        // Already-resolved string with dots should pass through unchanged
+        map.insert(
+            "ip_protocol".to_string(),
+            Value::String("awscc.ec2_security_group.IpProtocol.tcp".to_string()),
+        );
+        let value = Value::List(vec![Value::Map(map)]);
+
+        let resolved = resolve_struct_enum_values(&value, &fields);
+        if let Value::List(items) = resolved {
+            if let Value::Map(m) = &items[0] {
+                match &m["ip_protocol"] {
+                    Value::String(s) => {
+                        assert_eq!(s, "awscc.ec2_security_group.IpProtocol.tcp");
+                    }
+                    other => panic!("Expected String, got: {:?}", other),
+                }
+            } else {
+                panic!("Expected Map");
+            }
+        } else {
+            panic!("Expected List");
+        }
+    }
+
+    #[test]
+    fn test_resolve_enum_identifiers_impl_struct_field() {
+        // Test that resolve_enum_identifiers_impl handles struct field enums
+        // in ec2_security_group
+        let mut resource = Resource::new("ec2_security_group", "test-sg");
+        resource
+            .attributes
+            .insert("_provider".to_string(), Value::String("awscc".to_string()));
+        resource.attributes.insert(
+            "group_description".to_string(),
+            Value::String("test".to_string()),
+        );
+        let mut egress_map = HashMap::new();
+        egress_map.insert(
+            "ip_protocol".to_string(),
+            Value::UnresolvedIdent("all".to_string(), None),
+        );
+        egress_map.insert(
+            "cidr_ip".to_string(),
+            Value::String("0.0.0.0/0".to_string()),
+        );
+        resource.attributes.insert(
+            "security_group_egress".to_string(),
+            Value::List(vec![Value::Map(egress_map)]),
+        );
+
+        let mut resources = vec![resource];
+        resolve_enum_identifiers_impl(&mut resources);
+
+        // Check that the struct field enum was resolved
+        if let Value::List(items) = &resources[0].attributes["security_group_egress"] {
+            if let Value::Map(m) = &items[0] {
+                match &m["ip_protocol"] {
+                    Value::String(s) => {
+                        assert_eq!(
+                            s, "awscc.ec2_security_group.IpProtocol.all",
+                            "Expected namespaced IpProtocol.all in struct field, got: {}",
+                            s
+                        );
+                    }
+                    other => panic!("Expected String for ip_protocol, got: {:?}", other),
+                }
+                // Non-enum field should be unchanged
+                match &m["cidr_ip"] {
+                    Value::String(s) => assert_eq!(s, "0.0.0.0/0"),
+                    other => panic!("Expected String for cidr_ip, got: {:?}", other),
+                }
+            } else {
+                panic!("Expected Map in egress list");
+            }
+        } else {
+            panic!("Expected List for security_group_egress");
         }
     }
 }

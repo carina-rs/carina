@@ -15,7 +15,7 @@ let sg = awscc.ec2_security_group {
   group_description = "Acceptance test - egress rules"
 
   security_group_egress {
-    ip_protocol = "tcp"
+    ip_protocol = tcp
     from_port   = 443
     to_port     = 443
     cidr_ip     = "0.0.0.0/0"
@@ -23,7 +23,7 @@ let sg = awscc.ec2_security_group {
   }
 
   security_group_egress {
-    ip_protocol = "-1"
+    ip_protocol = all
     cidr_ip     = "10.0.0.0/8"
     description = "Allow all to private ranges"
   }

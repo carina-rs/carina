@@ -10,8 +10,10 @@ use super::validate_namespaced_enum;
 use carina_core::resource::Value;
 use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, types};
 
+#[allow(dead_code)]
 const VALID_INSTANCE_TENANCY: &[&str] = &["default", "dedicated", "host"];
 
+#[allow(dead_code)]
 fn validate_instance_tenancy(value: &Value) -> Result<(), String> {
     validate_namespaced_enum(
         value,
