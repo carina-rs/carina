@@ -30,7 +30,7 @@ pub fn iam_role_config() -> AwsccSchemaConfig {
         schema: ResourceSchema::new("awscc.iam_role")
         .with_description("Creates a new role for your AWS-account.   For more information about roles, see [IAM roles](https://docs.aws.amazon.com/IAM/latest/UserGuide/id_roles.html) in the *IAM User Guide*. For information ab...")
         .attribute(
-            AttributeSchema::new("arn", super::arn())
+            AttributeSchema::new("arn", super::iam_role_arn())
                 .with_description(" (read-only)")
                 .with_provider_name("Arn"),
         )

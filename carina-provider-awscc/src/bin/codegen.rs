@@ -245,10 +245,10 @@ struct StructDefInfo {
 
 /// Display string for List element types based on items property type and property name.
 /// The `prop_name` is used for name-based type inference (e.g., SubnetIds -> `List<SubnetId>`).
-fn list_element_type_display(items: &CfnProperty, prop_name: &str) -> String {
+fn list_element_type_display(items: &CfnProperty, prop_name: &str, resource_type: &str) -> String {
     match items.prop_type.as_ref().and_then(|t| t.as_str()) {
         Some("string") => {
-            let element_type = infer_string_type_display(prop_name);
+            let element_type = infer_string_type_display(prop_name, resource_type);
             format!("`List<{}>`", element_type)
         }
         Some("integer") | Some("number") => "`List<Int>`".to_string(),
@@ -260,8 +260,14 @@ fn list_element_type_display(items: &CfnProperty, prop_name: &str) -> String {
 /// Infer a display type name for a string property based on its name.
 /// Used by both scalar `type_display_string()` and `list_element_type_display()`.
 /// Handles both singular (e.g., "SubnetId") and plural (e.g., "SubnetIds") property names.
-fn infer_string_type_display(prop_name: &str) -> String {
-    // Check known string type overrides first
+fn infer_string_type_display(prop_name: &str, resource_type: &str) -> String {
+    // Check resource-specific overrides first
+    if let Some(&override_type) =
+        resource_specific_type_overrides().get(&(resource_type, prop_name))
+    {
+        return override_type_to_display_name(override_type).to_string();
+    }
+    // Check known string type overrides
     let string_overrides = known_string_type_overrides();
     if let Some(&override_type) = string_overrides.get(prop_name) {
         // Extract display name from override type string
@@ -364,7 +370,7 @@ fn type_display_string(
             format!("[Struct({})](#{})", def_name, def_name.to_lowercase())
         } else {
             // Apply name-based heuristics for unresolvable $ref
-            infer_string_type_display(prop_name)
+            infer_string_type_display(prop_name, &schema.type_name)
         }
     } else {
         match prop.prop_type.as_ref().and_then(|t| t.as_str()) {
@@ -372,7 +378,7 @@ fn type_display_string(
                 if prop_name.ends_with("PolicyDocument") {
                     "IamPolicyDocument".to_string()
                 } else {
-                    infer_string_type_display(prop_name)
+                    infer_string_type_display(prop_name, &schema.type_name)
                 }
             }
             Some("boolean") => "Bool".to_string(),
@@ -406,7 +412,7 @@ fn type_display_string(
                             "`List<Map>`".to_string()
                         }
                     } else {
-                        list_element_type_display(items, prop_name)
+                        list_element_type_display(items, prop_name, &schema.type_name)
                     }
                 } else {
                     "`List<String>`".to_string()
@@ -535,7 +541,7 @@ fn generate_markdown(schema: &CfnSchema, type_name: &str) -> Result<String> {
                             if field_name.ends_with("PolicyDocument") {
                                 "IamPolicyDocument".to_string()
                             } else {
-                                infer_string_type_display(field_name)
+                                infer_string_type_display(field_name, &schema.type_name)
                             }
                         }
                         Some("boolean") => "Bool".to_string(),
@@ -557,13 +563,13 @@ fn generate_markdown(schema: &CfnSchema, type_name: &str) -> Result<String> {
                         }
                         Some("array") => {
                             if let Some(items) = &field_prop.items {
-                                list_element_type_display(items, field_name)
+                                list_element_type_display(items, field_name, &schema.type_name)
                             } else {
                                 "`List<String>`".to_string()
                             }
                         }
                         Some("object") => "Map".to_string(),
-                        _ => infer_string_type_display(field_name),
+                        _ => infer_string_type_display(field_name, &schema.type_name),
                     }
                 };
                 let desc = field_prop
@@ -1270,10 +1276,32 @@ fn known_string_type_overrides() -> &'static HashMap<&'static str, &'static str>
     &OVERRIDES
 }
 
+/// Resource-specific property type overrides.
+/// Maps (CloudFormation type name, property name) to a specific type.
+/// Use this when the same property name should have different types on different resources.
+fn resource_specific_type_overrides() -> &'static HashMap<(&'static str, &'static str), &'static str>
+{
+    static OVERRIDES: LazyLock<HashMap<(&'static str, &'static str), &'static str>> =
+        LazyLock::new(|| {
+            let mut m = HashMap::new();
+            // IAM Role's Arn is always an IAM Role ARN
+            m.insert(("AWS::IAM::Role", "Arn"), "super::iam_role_arn()");
+            m
+        });
+    &OVERRIDES
+}
+
 /// Infer the Carina type string for a property based on its name.
-/// Checks known string type overrides, ARN patterns, and resource ID patterns.
+/// Checks resource-specific overrides, known string type overrides, ARN patterns,
+/// and resource ID patterns.
 /// Returns None if no heuristic matches (caller should default to String).
-fn infer_string_type(prop_name: &str) -> Option<String> {
+fn infer_string_type(prop_name: &str, resource_type: &str) -> Option<String> {
+    // Check resource-specific overrides first
+    if let Some(&override_type) =
+        resource_specific_type_overrides().get(&(resource_type, prop_name))
+    {
+        return Some(override_type.to_string());
+    }
     // Check known string type overrides
     if let Some(&override_type) = known_string_type_overrides().get(prop_name) {
         return Some(override_type.to_string());
@@ -1474,7 +1502,7 @@ fn cfn_type_to_carina_type_with_enum(
             );
         }
         // Apply name-based heuristics for unresolvable $ref
-        if let Some(inferred) = infer_string_type(prop_name) {
+        if let Some(inferred) = infer_string_type(prop_name, &schema.type_name) {
             return (inferred, None);
         }
         return ("AttributeType::String".to_string(), None);
@@ -1516,7 +1544,7 @@ fn cfn_type_to_carina_type_with_enum(
     match prop.prop_type.as_ref().and_then(|t| t.as_str()) {
         Some("string") => {
             // Check known string type overrides first
-            if let Some(inferred) = infer_string_type(prop_name) {
+            if let Some(inferred) = infer_string_type(prop_name, &schema.type_name) {
                 return (inferred, None);
             }
 
@@ -1674,7 +1702,7 @@ fn cfn_type_to_carina_type_with_enum(
         }
         _ => {
             // Fallback: apply name-based heuristics for properties with no explicit type
-            if let Some(inferred) = infer_string_type(prop_name) {
+            if let Some(inferred) = infer_string_type(prop_name, &schema.type_name) {
                 (inferred, None)
             } else {
                 ("AttributeType::String".to_string(), None)
@@ -2143,7 +2171,7 @@ mod tests {
             maximum: None,
         };
         assert_eq!(
-            list_element_type_display(&prop, "GenericProp"),
+            list_element_type_display(&prop, "GenericProp", ""),
             "`List<String>`"
         );
 
@@ -2161,7 +2189,7 @@ mod tests {
             maximum: None,
         };
         assert_eq!(
-            list_element_type_display(&prop, "GenericProp"),
+            list_element_type_display(&prop, "GenericProp", ""),
             "`List<Int>`"
         );
 
@@ -2179,7 +2207,7 @@ mod tests {
             maximum: None,
         };
         assert_eq!(
-            list_element_type_display(&prop, "GenericProp"),
+            list_element_type_display(&prop, "GenericProp", ""),
             "`List<Bool>`"
         );
 
@@ -2197,7 +2225,7 @@ mod tests {
             maximum: None,
         };
         assert_eq!(
-            list_element_type_display(&prop, "GenericProp"),
+            list_element_type_display(&prop, "GenericProp", ""),
             "`List<String>`"
         );
     }
@@ -2217,37 +2245,43 @@ mod tests {
             maximum: None,
         };
         assert_eq!(
-            list_element_type_display(&prop, "SubnetIds"),
+            list_element_type_display(&prop, "SubnetIds", ""),
             "`List<SubnetId>`"
         );
         assert_eq!(
-            list_element_type_display(&prop, "SecurityGroupIds"),
+            list_element_type_display(&prop, "SecurityGroupIds", ""),
             "`List<SecurityGroupId>`"
         );
         assert_eq!(
-            list_element_type_display(&prop, "RouteTableIds"),
+            list_element_type_display(&prop, "RouteTableIds", ""),
             "`List<RouteTableId>`"
         );
         assert_eq!(
-            list_element_type_display(&prop, "NetworkInterfaceIds"),
+            list_element_type_display(&prop, "NetworkInterfaceIds", ""),
             "`List<AwsResourceId>`"
         );
         assert_eq!(
-            list_element_type_display(&prop, "VpcEndpointIds"),
+            list_element_type_display(&prop, "VpcEndpointIds", ""),
             "`List<VpcEndpointId>`"
         );
-        assert_eq!(list_element_type_display(&prop, "RoleArns"), "`List<Arn>`");
         assert_eq!(
-            list_element_type_display(&prop, "CidrBlocks"),
+            list_element_type_display(&prop, "RoleArns", ""),
+            "`List<Arn>`"
+        );
+        assert_eq!(
+            list_element_type_display(&prop, "CidrBlocks", ""),
             "`List<Ipv4Cidr>`"
         );
         assert_eq!(
-            list_element_type_display(&prop, "Ipv6CidrBlocks"),
+            list_element_type_display(&prop, "Ipv6CidrBlocks", ""),
             "`List<Ipv6Cidr>`"
         );
-        assert_eq!(list_element_type_display(&prop, "Names"), "`List<String>`");
         assert_eq!(
-            list_element_type_display(&prop, "SubnetId"),
+            list_element_type_display(&prop, "Names", ""),
+            "`List<String>`"
+        );
+        assert_eq!(
+            list_element_type_display(&prop, "SubnetId", ""),
             "`List<SubnetId>`"
         );
     }
@@ -2402,7 +2436,7 @@ mod tests {
                 minimum: None,
                 maximum: None,
             };
-            let result = list_element_type_display(&prop, "GenericProp");
+            let result = list_element_type_display(&prop, "GenericProp", "");
             assert!(
                 result.contains('<') && result.contains('>'),
                 "list_element_type_display should include element type for {:?}, got: {}",
@@ -3161,5 +3195,35 @@ mod tests {
                 "Mismatch for {input}: classify says generic={is_generic}, display says generic={display_is_generic}"
             );
         }
+    }
+
+    #[test]
+    fn test_resource_specific_type_overrides() {
+        // IAM Role's Arn should use iam_role_arn, not generic arn
+        assert_eq!(
+            infer_string_type("Arn", "AWS::IAM::Role"),
+            Some("super::iam_role_arn()".to_string())
+        );
+        // Other resources' Arn should use generic arn
+        assert_eq!(
+            infer_string_type("Arn", "AWS::S3::Bucket"),
+            Some("super::arn()".to_string())
+        );
+        // Non-overridden properties are unaffected
+        assert_eq!(
+            infer_string_type("VpcId", "AWS::IAM::Role"),
+            Some("super::vpc_id()".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resource_specific_type_overrides_display() {
+        // IAM Role's Arn should display as IamRoleArn
+        assert_eq!(
+            infer_string_type_display("Arn", "AWS::IAM::Role"),
+            "IamRoleArn"
+        );
+        // Other resources' Arn should display as generic Arn
+        assert_eq!(infer_string_type_display("Arn", "AWS::S3::Bucket"), "Arn");
     }
 }
