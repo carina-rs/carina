@@ -3196,4 +3196,34 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn test_resource_specific_type_overrides() {
+        // IAM Role's Arn should use iam_role_arn, not generic arn
+        assert_eq!(
+            infer_string_type("Arn", "AWS::IAM::Role"),
+            Some("super::iam_role_arn()".to_string())
+        );
+        // Other resources' Arn should use generic arn
+        assert_eq!(
+            infer_string_type("Arn", "AWS::S3::Bucket"),
+            Some("super::arn()".to_string())
+        );
+        // Non-overridden properties are unaffected
+        assert_eq!(
+            infer_string_type("VpcId", "AWS::IAM::Role"),
+            Some("super::vpc_id()".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resource_specific_type_overrides_display() {
+        // IAM Role's Arn should display as IamRoleArn
+        assert_eq!(
+            infer_string_type_display("Arn", "AWS::IAM::Role"),
+            "IamRoleArn"
+        );
+        // Other resources' Arn should display as generic Arn
+        assert_eq!(infer_string_type_display("Arn", "AWS::S3::Bucket"), "Arn");
+    }
 }
