@@ -237,6 +237,14 @@ impl CompletionProvider {
             ("aws.security_group", "security_group"),
             // awscc resources
             ("awscc.ec2_vpc", "awscc.ec2_vpc"),
+            (
+                "awscc.ec2_security_group_ingress",
+                "awscc.ec2_security_group_ingress",
+            ),
+            (
+                "awscc.ec2_security_group_egress",
+                "awscc.ec2_security_group_egress",
+            ),
             ("awscc.ec2_security_group", "awscc.ec2_security_group"),
             ("awscc.ec2_flow_log", "awscc.ec2_flow_log"),
             ("awscc.ec2_nat_gateway", "awscc.ec2_nat_gateway"),
@@ -746,6 +754,9 @@ impl CompletionProvider {
             AttributeType::Custom { name, .. } if name == "InstanceTenancy" => {
                 self.instance_tenancy_completions(resource_type)
             }
+            AttributeType::Custom { name, .. } if name == "IpProtocol" => {
+                self.ip_protocol_completions(resource_type)
+            }
             AttributeType::String | AttributeType::Custom { .. } => {
                 vec![CompletionItem {
                     label: "env".to_string(),
@@ -1035,6 +1046,28 @@ impl CompletionProvider {
                 ..Default::default()
             },
         ]
+    }
+
+    fn ip_protocol_completions(&self, resource_type: &str) -> Vec<CompletionItem> {
+        let prefix = format!("{}.IpProtocol", resource_type);
+        let protocols = vec![
+            ("tcp", "Transmission Control Protocol"),
+            ("udp", "User Datagram Protocol"),
+            ("icmp", "Internet Control Message Protocol"),
+            ("icmpv6", "Internet Control Message Protocol v6"),
+            ("all", "All protocols (-1)"),
+        ];
+
+        protocols
+            .into_iter()
+            .map(|(code, description)| CompletionItem {
+                label: format!("{}.{}", prefix, code),
+                kind: Some(CompletionItemKind::ENUM_MEMBER),
+                detail: Some(description.to_string()),
+                insert_text: Some(format!("{}.{}", prefix, code)),
+                ..Default::default()
+            })
+            .collect()
     }
 
     fn ref_type_completions(&self) -> Vec<CompletionItem> {

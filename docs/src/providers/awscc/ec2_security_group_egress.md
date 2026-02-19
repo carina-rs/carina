@@ -83,7 +83,7 @@ If the protocol is TCP or UDP, this is the end of the port range. If the protoco
 | `udp` | `awscc.ec2_security_group_egress.IpProtocol.udp` |
 | `icmp` | `awscc.ec2_security_group_egress.IpProtocol.icmp` |
 | `icmpv6` | `awscc.ec2_security_group_egress.IpProtocol.icmpv6` |
-| `-1` | `awscc.ec2_security_group_egress.IpProtocol._1` |
+| `-1` | `awscc.ec2_security_group_egress.IpProtocol.all` |
 
 Shorthand formats: `tcp` or `IpProtocol.tcp`
 

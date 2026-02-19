@@ -500,16 +500,26 @@ fn generate_markdown(schema: &CfnSchema, type_name: &str) -> Result<String> {
 
     // Enum values section
     if !enums.is_empty() {
+        let aliases = known_enum_aliases();
         md.push_str("## Enum Values\n\n");
         for (prop_name, enum_info) in &enums {
             let attr_name = prop_name.to_snake_case();
             let has_hyphens = enum_info.values.iter().any(|v| v.contains('-'));
+            let prop_aliases = aliases.get(prop_name.as_str());
             md.push_str(&format!("### {} ({})\n\n", attr_name, enum_info.type_name));
             md.push_str("| Value | DSL Identifier |\n");
             md.push_str("|-------|----------------|\n");
             for value in &enum_info.values {
-                // Convert hyphens to underscores in DSL identifier to match to_dsl behavior
-                let dsl_value = if has_hyphens {
+                // Check if this value has an alias
+                let dsl_value = if let Some(alias_list) = prop_aliases {
+                    if let Some((_, alias)) = alias_list.iter().find(|(c, _)| c == value) {
+                        alias.to_string()
+                    } else if has_hyphens {
+                        value.replace('-', "_")
+                    } else {
+                        value.clone()
+                    }
+                } else if has_hyphens {
                     value.replace('-', "_")
                 } else {
                     value.clone()
@@ -520,7 +530,15 @@ fn generate_markdown(schema: &CfnSchema, type_name: &str) -> Result<String> {
             md.push('\n');
             let empty = String::new();
             let first_value = enum_info.values.first().unwrap_or(&empty);
-            let first_dsl = if has_hyphens {
+            let first_dsl = if let Some(alias_list) = prop_aliases {
+                if let Some((_, alias)) = alias_list.iter().find(|(c, _)| c == first_value) {
+                    alias.to_string()
+                } else if has_hyphens {
+                    first_value.replace('-', "_")
+                } else {
+                    first_value.clone()
+                }
+            } else if has_hyphens {
                 first_value.replace('-', "_")
             } else {
                 first_value.clone()
@@ -831,17 +849,23 @@ use super::AwsccSchemaConfig;
     code.push('\n');
 
     // Generate enum constants and validation functions
+    let aliases = known_enum_aliases();
     for (prop_name, enum_info) in &enums {
         let const_name = format!("VALID_{}", prop_name.to_snake_case().to_uppercase());
         let fn_name = format!("validate_{}", prop_name.to_snake_case());
 
-        // Generate constant
-        let values_str = enum_info
+        // Generate constant (including alias values)
+        let mut all_values: Vec<String> = enum_info
             .values
             .iter()
             .map(|v| format!("\"{}\"", v))
-            .collect::<Vec<_>>()
-            .join(", ");
+            .collect();
+        if let Some(prop_aliases) = aliases.get(prop_name.as_str()) {
+            for (_, alias) in prop_aliases {
+                all_values.push(format!("\"{}\"", alias));
+            }
+        }
+        let values_str = all_values.join(", ");
         code.push_str(&format!(
             "const {}: &[&str] = &[{}];\n\n",
             const_name, values_str
@@ -924,12 +948,29 @@ pub fn {}() -> AwsccSchemaConfig {{
         let attr_type = if let Some(enum_info) = enums.get(prop_name) {
             // Use AttributeType::Custom for enums
             let validate_fn = format!("validate_{}", prop_name.to_snake_case());
-            // If any enum value contains hyphens, generate to_dsl to convert hyphens to underscores
+            // Build to_dsl closure: handles aliases and hyphen-to-underscore conversion
+            let prop_aliases = aliases.get(prop_name.as_str());
             let has_hyphens = enum_info.values.iter().any(|v| v.contains('-'));
-            let to_dsl_code = if has_hyphens {
-                "Some(|s: &str| s.replace('-', \"_\"))"
+            let to_dsl_code = if let Some(alias_list) = prop_aliases {
+                // Generate a closure that maps canonical values to aliases,
+                // with fallback to hyphen-to-underscore if needed
+                let mut match_arms: Vec<String> = alias_list
+                    .iter()
+                    .map(|(canonical, alias)| {
+                        format!("\"{}\" => \"{}\".to_string()", canonical, alias)
+                    })
+                    .collect();
+                let fallback = if has_hyphens {
+                    "_ => s.replace('-', \"_\")"
+                } else {
+                    "_ => s.to_string()"
+                };
+                match_arms.push(fallback.to_string());
+                format!("Some(|s: &str| match s {{ {} }})", match_arms.join(", "))
+            } else if has_hyphens {
+                "Some(|s: &str| s.replace('-', \"_\"))".to_string()
             } else {
-                "None"
+                "None".to_string()
             };
             format!(
                 r#"AttributeType::Custom {{
@@ -1015,6 +1056,37 @@ pub fn {}() -> AwsccSchemaConfig {{
             )
         }
     ));
+
+    // Generate enum_alias_reverse() function that maps DSL alias -> canonical AWS value
+    {
+        let mut match_arms: Vec<String> = Vec::new();
+        for prop_name in enums.keys() {
+            if let Some(prop_aliases) = aliases.get(prop_name.as_str()) {
+                let attr_name = prop_name.to_snake_case();
+                for (canonical, alias) in prop_aliases {
+                    match_arms.push(format!(
+                        "        (\"{}\", \"{}\") => Some(\"{}\")",
+                        attr_name, alias, canonical
+                    ));
+                }
+            }
+        }
+        code.push_str(
+            "\n/// Maps DSL alias values back to canonical AWS values for this module.\n\
+             /// e.g., (\"ip_protocol\", \"all\") -> Some(\"-1\")\n\
+             pub fn enum_alias_reverse(attr_name: &str, value: &str) -> Option<&'static str> {\n",
+        );
+        if match_arms.is_empty() {
+            code.push_str("    let _ = (attr_name, value);\n    None\n");
+        } else {
+            match_arms.push("        _ => None".to_string());
+            code.push_str(&format!(
+                "    match (attr_name, value) {{\n{}\n    }}\n",
+                match_arms.join(",\n")
+            ));
+        }
+        code.push_str("}\n");
+    }
 
     Ok(code)
 }
@@ -1257,6 +1329,19 @@ fn known_enum_overrides() -> &'static HashMap<&'static str, Vec<&'static str>> {
         m
     });
     &OVERRIDES
+}
+
+/// Known enum aliases for properties where an AWS canonical value should have
+/// a human-readable alias in DSL. Maps PropertyName -> [(canonical_aws_value, dsl_alias)].
+/// e.g., IpProtocol: "-1" -> "all"
+fn known_enum_aliases() -> &'static HashMap<&'static str, Vec<(&'static str, &'static str)>> {
+    static ALIASES: LazyLock<HashMap<&'static str, Vec<(&'static str, &'static str)>>> =
+        LazyLock::new(|| {
+            let mut m = HashMap::new();
+            m.insert("IpProtocol", vec![("-1", "all")]);
+            m
+        });
+    &ALIASES
 }
 
 /// Known integer range overrides for properties where CloudFormation schemas
@@ -3274,5 +3359,30 @@ mod tests {
         );
         // Other resources' Arn should display as generic Arn
         assert_eq!(infer_string_type_display("Arn", "AWS::S3::Bucket"), "Arn");
+    }
+
+    #[test]
+    fn test_known_enum_aliases() {
+        let aliases = known_enum_aliases();
+
+        // IpProtocol should have "-1" -> "all" alias
+        let ip_protocol = aliases.get("IpProtocol");
+        assert!(ip_protocol.is_some(), "IpProtocol should have aliases");
+        assert_eq!(ip_protocol.unwrap(), &vec![("-1", "all")]);
+    }
+
+    #[test]
+    fn test_known_enum_aliases_included_in_valid_values() {
+        // Verify that known_enum_overrides + known_enum_aliases produces correct VALID_* content
+        let overrides = known_enum_overrides();
+        let aliases = known_enum_aliases();
+
+        // IpProtocol should have "all" in the combined list
+        let ip_protocol_values = overrides.get("IpProtocol").unwrap();
+        assert!(ip_protocol_values.contains(&"-1"), "Should have -1");
+
+        let ip_protocol_aliases = aliases.get("IpProtocol").unwrap();
+        let alias_values: Vec<&str> = ip_protocol_aliases.iter().map(|(_, a)| *a).collect();
+        assert!(alias_values.contains(&"all"), "Should have 'all' alias");
     }
 }

@@ -44,3 +44,10 @@ pub fn enum_valid_values() -> (
 ) {
     ("ec2_subnet_route_table_association", &[])
 }
+
+/// Maps DSL alias values back to canonical AWS values for this module.
+/// e.g., ("ip_protocol", "all") -> Some("-1")
+pub fn enum_alias_reverse(attr_name: &str, value: &str) -> Option<&'static str> {
+    let _ = (attr_name, value);
+    None
+}
