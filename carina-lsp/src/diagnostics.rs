@@ -6,7 +6,7 @@ use crate::document::Document;
 use carina_core::parser::{InputParameter, ParseError, ParsedFile, TypeExpr};
 use carina_core::resource::Value;
 use carina_core::schema::{validate_cidr, validate_ipv6_cidr};
-use carina_provider_aws::schemas::{s3, types as aws_types, vpc};
+use carina_provider_aws::schemas::{generated as aws_generated, types as aws_types};
 use carina_provider_awscc::schemas::awscc_types;
 use carina_provider_awscc::schemas::generated::flow_log as awscc_flow_log;
 use carina_provider_awscc::schemas::generated::nat_gateway as awscc_nat_gateway;
@@ -30,18 +30,16 @@ impl DiagnosticEngine {
     pub fn new() -> Self {
         let mut valid_resource_types = HashSet::new();
 
-        // S3 resources
-        valid_resource_types.insert("s3.bucket".to_string());
-
-        // VPC resources
-        valid_resource_types.insert("vpc".to_string());
-        valid_resource_types.insert("subnet".to_string());
-        valid_resource_types.insert("internet_gateway".to_string());
-        valid_resource_types.insert("route_table".to_string());
-        valid_resource_types.insert("route".to_string());
-        valid_resource_types.insert("security_group".to_string());
-        valid_resource_types.insert("security_group.ingress_rule".to_string());
-        valid_resource_types.insert("security_group.egress_rule".to_string());
+        // AWS resources
+        valid_resource_types.insert("aws.ec2_vpc".to_string());
+        valid_resource_types.insert("aws.ec2_subnet".to_string());
+        valid_resource_types.insert("aws.ec2_internet_gateway".to_string());
+        valid_resource_types.insert("aws.ec2_route_table".to_string());
+        valid_resource_types.insert("aws.ec2_route".to_string());
+        valid_resource_types.insert("aws.ec2_security_group".to_string());
+        valid_resource_types.insert("aws.ec2_security_group_ingress".to_string());
+        valid_resource_types.insert("aws.ec2_security_group_egress".to_string());
+        valid_resource_types.insert("aws.s3_bucket".to_string());
 
         // AWS Cloud Control resources
         valid_resource_types.insert("awscc.ec2_vpc".to_string());
@@ -106,11 +104,7 @@ impl DiagnosticEngine {
                     &resource.id.resource_type,
                     &resource.id.name,
                 );
-                let full_resource_type = if provider == "awscc" {
-                    format!("awscc.{}", resource.id.resource_type)
-                } else {
-                    resource.id.resource_type.clone()
-                };
+                let full_resource_type = format!("{}.{}", provider, resource.id.resource_type);
 
                 if !self.valid_resource_types.contains(&full_resource_type) {
                     // Find the line where this resource is defined
@@ -408,15 +402,27 @@ impl DiagnosticEngine {
         resource_type: &str,
     ) -> Option<carina_core::schema::ResourceSchema> {
         match resource_type {
-            "s3_bucket" => Some(s3::bucket_schema()),
-            "vpc" => Some(vpc::vpc_schema()),
-            "subnet" => Some(vpc::subnet_schema()),
-            "internet_gateway" => Some(vpc::internet_gateway_schema()),
-            "route_table" => Some(vpc::route_table_schema()),
-            "route" => Some(vpc::route_schema()),
-            "security_group" => Some(vpc::security_group_schema()),
-            "security_group.ingress_rule" => Some(vpc::security_group_ingress_rule_schema()),
-            "security_group.egress_rule" => Some(vpc::security_group_egress_rule_schema()),
+            // AWS resources (auto-generated)
+            "aws.ec2_vpc" => Some(aws_generated::ec2_vpc::ec2_vpc_config().schema),
+            "aws.ec2_subnet" => Some(aws_generated::ec2_subnet::ec2_subnet_config().schema),
+            "aws.ec2_internet_gateway" => {
+                Some(aws_generated::ec2_internet_gateway::ec2_internet_gateway_config().schema)
+            }
+            "aws.ec2_route_table" => {
+                Some(aws_generated::ec2_route_table::ec2_route_table_config().schema)
+            }
+            "aws.ec2_route" => Some(aws_generated::ec2_route::ec2_route_config().schema),
+            "aws.ec2_security_group" => {
+                Some(aws_generated::ec2_security_group::ec2_security_group_config().schema)
+            }
+            "aws.ec2_security_group_ingress" => Some(
+                aws_generated::ec2_security_group_ingress::ec2_security_group_ingress_config()
+                    .schema,
+            ),
+            "aws.ec2_security_group_egress" => Some(
+                aws_generated::ec2_security_group_egress::ec2_security_group_egress_config().schema,
+            ),
+            "aws.s3_bucket" => Some(aws_generated::s3_bucket::s3_bucket_config().schema),
             // AWS Cloud Control resources
             "awscc.ec2_vpc" => Some(awscc_vpc::ec2_vpc_config().schema),
             "awscc.ec2_security_group" => {
@@ -432,12 +438,17 @@ impl DiagnosticEngine {
 
     fn find_resource_position(&self, doc: &Document, resource_type: &str) -> Option<(u32, u32)> {
         let text = doc.text();
-        // Convert resource_type back to DSL format: vpc -> aws.vpc, s3.bucket -> aws.s3.bucket
-        let dsl_type = format!("aws.{}", resource_type.replace('_', "."));
+        // Try both provider prefixes to find the resource in DSL text
+        let patterns = [
+            format!("aws.{}", resource_type),
+            format!("awscc.{}", resource_type),
+        ];
 
         for (line_idx, line) in text.lines().enumerate() {
-            if let Some(col) = line.find(&dsl_type) {
-                return Some((line_idx as u32, col as u32));
+            for pattern in &patterns {
+                if let Some(col) = line.find(pattern.as_str()) {
+                    return Some((line_idx as u32, col as u32));
+                }
             }
         }
         None

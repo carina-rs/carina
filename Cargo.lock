@@ -721,10 +721,16 @@ dependencies = [
 name = "carina-provider-aws"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "aws-config",
  "aws-sdk-ec2",
  "aws-sdk-s3",
  "carina-core",
+ "clap",
+ "heck",
+ "regex",
+ "serde",
+ "serde_json",
  "thiserror",
  "tokio",
 ]

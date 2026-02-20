@@ -2,7 +2,7 @@ use tower_lsp::lsp_types::{Hover, HoverContents, MarkupContent, MarkupKind, Posi
 
 use crate::document::Document;
 use carina_core::schema::ResourceSchema;
-use carina_provider_aws::schemas::{s3, vpc};
+use carina_provider_aws::schemas::generated as aws_generated;
 
 pub struct HoverProvider;
 
@@ -90,44 +90,63 @@ impl HoverProvider {
 
     fn resource_type_hover(&self, word: &str) -> Option<Hover> {
         // S3 resources
-        if word == "aws.s3.bucket" || word.contains("s3.bucket") {
-            return self.schema_hover("aws.s3.bucket", &s3::bucket_schema());
+        if word == "aws.s3_bucket" || word.contains("s3_bucket") {
+            return self.schema_hover(
+                "aws.s3_bucket",
+                &aws_generated::s3_bucket::s3_bucket_config().schema,
+            );
         }
 
         // EC2/VPC resources
-        if word == "aws.vpc" || word.contains(".vpc") && !word.contains("vpc_id") {
-            return self.schema_hover("aws.vpc", &vpc::vpc_schema());
-        }
-
-        if word == "aws.subnet" || word.contains(".subnet") && !word.contains("subnet_id") {
-            return self.schema_hover("aws.subnet", &vpc::subnet_schema());
-        }
-
-        if word == "aws.internet_gateway" || word.contains("internet_gateway") {
-            return self.schema_hover("aws.internet_gateway", &vpc::internet_gateway_schema());
-        }
-
-        if word == "aws.route_table" || word.contains("route_table") {
-            return self.schema_hover("aws.route_table", &vpc::route_table_schema());
-        }
-
-        if word == "aws.security_group.ingress_rule" || word.contains("security_group.ingress_rule")
-        {
+        if word == "aws.ec2_vpc" || word.contains("ec2_vpc") && !word.contains("vpc_id") {
             return self.schema_hover(
-                "aws.security_group.ingress_rule",
-                &vpc::security_group_ingress_rule_schema(),
+                "aws.ec2_vpc",
+                &aws_generated::ec2_vpc::ec2_vpc_config().schema,
             );
         }
 
-        if word == "aws.security_group.egress_rule" || word.contains("security_group.egress_rule") {
+        if word == "aws.ec2_subnet" || word.contains("ec2_subnet") && !word.contains("subnet_id") {
             return self.schema_hover(
-                "aws.security_group.egress_rule",
-                &vpc::security_group_egress_rule_schema(),
+                "aws.ec2_subnet",
+                &aws_generated::ec2_subnet::ec2_subnet_config().schema,
             );
         }
 
-        if word == "aws.security_group" || word.contains("security_group") {
-            return self.schema_hover("aws.security_group", &vpc::security_group_schema());
+        if word == "aws.ec2_internet_gateway" || word.contains("ec2_internet_gateway") {
+            return self.schema_hover(
+                "aws.ec2_internet_gateway",
+                &aws_generated::ec2_internet_gateway::ec2_internet_gateway_config().schema,
+            );
+        }
+
+        if word == "aws.ec2_route_table" || word.contains("ec2_route_table") {
+            return self.schema_hover(
+                "aws.ec2_route_table",
+                &aws_generated::ec2_route_table::ec2_route_table_config().schema,
+            );
+        }
+
+        if word == "aws.ec2_security_group_ingress" || word.contains("ec2_security_group_ingress") {
+            return self.schema_hover(
+                "aws.ec2_security_group_ingress",
+                &aws_generated::ec2_security_group_ingress::ec2_security_group_ingress_config()
+                    .schema,
+            );
+        }
+
+        if word == "aws.ec2_security_group_egress" || word.contains("ec2_security_group_egress") {
+            return self.schema_hover(
+                "aws.ec2_security_group_egress",
+                &aws_generated::ec2_security_group_egress::ec2_security_group_egress_config()
+                    .schema,
+            );
+        }
+
+        if word == "aws.ec2_security_group" || word.contains("ec2_security_group") {
+            return self.schema_hover(
+                "aws.ec2_security_group",
+                &aws_generated::ec2_security_group::ec2_security_group_config().schema,
+            );
         }
 
         None
@@ -162,14 +181,14 @@ impl HoverProvider {
     fn attribute_hover(&self, word: &str) -> Option<Hover> {
         // Check all schemas for the attribute
         let schemas = vec![
-            s3::bucket_schema(),
-            vpc::vpc_schema(),
-            vpc::subnet_schema(),
-            vpc::internet_gateway_schema(),
-            vpc::route_table_schema(),
-            vpc::security_group_schema(),
-            vpc::security_group_ingress_rule_schema(),
-            vpc::security_group_egress_rule_schema(),
+            aws_generated::s3_bucket::s3_bucket_config().schema,
+            aws_generated::ec2_vpc::ec2_vpc_config().schema,
+            aws_generated::ec2_subnet::ec2_subnet_config().schema,
+            aws_generated::ec2_internet_gateway::ec2_internet_gateway_config().schema,
+            aws_generated::ec2_route_table::ec2_route_table_config().schema,
+            aws_generated::ec2_security_group::ec2_security_group_config().schema,
+            aws_generated::ec2_security_group_ingress::ec2_security_group_ingress_config().schema,
+            aws_generated::ec2_security_group_egress::ec2_security_group_egress_config().schema,
         ];
 
         for schema in schemas {
@@ -205,7 +224,7 @@ impl HoverProvider {
                 "## provider\n\nDefines a provider block with configuration.\n\n```carina\nprovider aws {\n    region = aws.Region.ap_northeast_1\n}\n```"
             }
             "let" => {
-                "## let\n\nDefines a named resource or variable binding.\n\n```carina\nlet my_bucket = aws.s3.bucket {\n    name = \"my-bucket\"\n    region = aws.Region.ap_northeast_1\n}\n```"
+                "## let\n\nDefines a named resource or variable binding.\n\n```carina\nlet my_bucket = aws.s3_bucket {\n    name = \"my-bucket\"\n    region = aws.Region.ap_northeast_1\n}\n```"
             }
             "env" => {
                 "## env()\n\nReads a value from an environment variable.\n\n```carina\nname = env(\"BUCKET_NAME\")\n```"

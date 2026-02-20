@@ -359,7 +359,7 @@ async fn test_resource_attribute_completion() {
     client.initialize().await;
 
     let uri = "file:///tmp/test_attr.crn";
-    let text = "aws.s3.bucket {\n    \n}";
+    let text = "aws.s3_bucket {\n    \n}";
 
     client.open_document(uri, text).await;
 
@@ -384,8 +384,8 @@ async fn test_resource_attribute_completion() {
         labels
     );
     assert!(
-        labels.contains(&"versioning"),
-        "Should have 'versioning' attribute completion. Got: {:?}",
+        labels.contains(&"versioning_configuration"),
+        "Should have 'versioning_configuration' attribute completion. Got: {:?}",
         labels
     );
 
