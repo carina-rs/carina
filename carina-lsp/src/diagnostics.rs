@@ -129,8 +129,7 @@ impl DiagnosticEngine {
                             source: Some("carina".to_string()),
                             message: format!(
                                 "Unknown resource type: {}.{}",
-                                provider,
-                                resource.id.resource_type.replace('_', ".")
+                                provider, resource.id.resource_type
                             ),
                             ..Default::default()
                         });
