@@ -263,6 +263,19 @@ fn find_factory<'a>(
         .map(|f| f.as_ref())
 }
 
+fn schema_key_for_resource(factories: &[Box<dyn ProviderFactory>], resource: &Resource) -> String {
+    match resource.attributes.get("_provider") {
+        Some(Value::String(provider)) => {
+            if let Some(factory) = find_factory(factories, provider) {
+                factory.format_schema_key(&resource.id.resource_type)
+            } else {
+                resource.id.resource_type.clone()
+            }
+        }
+        _ => resource.id.resource_type.clone(),
+    }
+}
+
 fn get_schemas() -> HashMap<String, ResourceSchema> {
     let factories = provider_factories();
     let mut all_schemas = HashMap::new();
@@ -275,19 +288,12 @@ fn get_schemas() -> HashMap<String, ResourceSchema> {
 }
 
 fn validate_resources(resources: &[Resource]) -> Result<(), String> {
+    let factories = provider_factories();
     let schemas = get_schemas();
     let mut all_errors = Vec::new();
 
     for resource in resources {
-        // Construct schema key based on provider
-        // For aws provider, use just the resource_type (e.g., "vpc")
-        // For other providers, include the provider prefix (e.g., "awscc.ec2_vpc")
-        let schema_key = match resource.attributes.get("_provider") {
-            Some(Value::String(provider)) if provider != "aws" => {
-                format!("{}.{}", provider, resource.id.resource_type)
-            }
-            _ => resource.id.resource_type.clone(),
-        };
+        let schema_key = schema_key_for_resource(&factories, resource);
 
         match schemas.get(&schema_key) {
             Some(schema) => {
@@ -314,6 +320,7 @@ fn validate_resources(resources: &[Resource]) -> Result<(), String> {
 /// For example, if `ipv4_ipam_pool_id` expects `IpamPoolId` type,
 /// a reference like `vpc.vpc_id` (which is `AwsResourceId`) should be an error.
 fn validate_resource_ref_types(resources: &[Resource]) -> Result<(), String> {
+    let factories = provider_factories();
     let schemas = get_schemas();
     let mut all_errors = Vec::new();
 
@@ -326,12 +333,7 @@ fn validate_resource_ref_types(resources: &[Resource]) -> Result<(), String> {
     }
 
     for resource in resources {
-        let schema_key = match resource.attributes.get("_provider") {
-            Some(Value::String(provider)) if provider != "aws" => {
-                format!("{}.{}", provider, resource.id.resource_type)
-            }
-            _ => resource.id.resource_type.clone(),
-        };
+        let schema_key = schema_key_for_resource(&factories, resource);
 
         let Some(schema) = schemas.get(&schema_key) else {
             continue;
@@ -361,12 +363,7 @@ fn validate_resource_ref_types(resources: &[Resource]) -> Result<(), String> {
             let Some(ref_resource) = binding_map.get(ref_binding.as_str()) else {
                 continue; // Unknown binding, skip
             };
-            let ref_schema_key_str: String = match ref_resource.attributes.get("_provider") {
-                Some(Value::String(provider)) if provider != "aws" => {
-                    format!("{}.{}", provider, ref_resource.id.resource_type)
-                }
-                _ => ref_resource.id.resource_type.clone(),
-            };
+            let ref_schema_key_str = schema_key_for_resource(&factories, ref_resource);
             let Some(ref_schema) = schemas.get(&ref_schema_key_str) else {
                 continue;
             };
@@ -426,16 +423,12 @@ fn generate_random_suffix() -> String {
 ///
 /// Errors if both `<attr>_prefix` and `<attr>` are specified, or if prefix is empty.
 fn resolve_attr_prefixes(resources: &mut [Resource]) -> Result<(), String> {
+    let factories = provider_factories();
     let schemas = get_schemas();
     let mut all_errors = Vec::new();
 
     for resource in resources.iter_mut() {
-        let schema_key = match resource.attributes.get("_provider") {
-            Some(Value::String(provider)) if provider != "aws" => {
-                format!("{}.{}", provider, resource.id.resource_type)
-            }
-            _ => resource.id.resource_type.clone(),
-        };
+        let schema_key = schema_key_for_resource(&factories, resource);
 
         let schema = match schemas.get(&schema_key) {
             Some(s) => s,
@@ -548,6 +541,7 @@ fn compute_anonymous_identifiers(resources: &mut [Resource]) -> Result<(), Strin
     use std::collections::BTreeMap;
     use std::hash::{Hash, Hasher};
 
+    let factories = provider_factories();
     let schemas = get_schemas();
 
     for resource in resources.iter_mut() {
@@ -555,18 +549,11 @@ fn compute_anonymous_identifiers(resources: &mut [Resource]) -> Result<(), Strin
             continue;
         }
 
-        // Look up schema for this resource's provider
-        let schema_key = match resource.attributes.get("_provider") {
-            Some(Value::String(provider)) => {
-                if provider == "aws" {
-                    // AWS provider schemas use resource_type directly (e.g., "s3.bucket")
-                    resource.id.resource_type.clone()
-                } else {
-                    format!("{}.{}", provider, resource.id.resource_type)
-                }
-            }
-            _ => continue,
+        // Look up schema for this resource's provider (skip if no _provider set)
+        let Some(Value::String(_)) = resource.attributes.get("_provider") else {
+            continue;
         };
+        let schema_key = schema_key_for_resource(&factories, resource);
 
         let Some(schema) = schemas.get(&schema_key) else {
             continue;
