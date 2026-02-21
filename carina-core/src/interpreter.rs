@@ -17,6 +17,8 @@ pub enum EffectOutcome {
     Created { state: State },
     /// Update succeeded
     Updated { state: State },
+    /// Replace succeeded (delete then create)
+    Replaced { state: State },
     /// Delete succeeded
     Deleted,
     /// Skipped (e.g., dry-run)
@@ -119,6 +121,20 @@ impl<P: Provider> Interpreter<P> {
                 let state = self.provider.update(id, identifier, from, to).await?;
                 Ok(EffectOutcome::Updated { state })
             }
+            Effect::Replace {
+                id,
+                from,
+                to,
+                lifecycle,
+                ..
+            } => {
+                // Delete the existing resource first
+                let identifier = from.identifier.as_deref().unwrap_or("");
+                self.provider.delete(id, identifier, lifecycle).await?;
+                // Then create the new resource
+                let state = self.provider.create(to).await?;
+                Ok(EffectOutcome::Replaced { state })
+            }
             Effect::Delete {
                 id,
                 identifier,
@@ -204,6 +220,38 @@ mod tests {
 
         assert!(result.is_success());
         assert_eq!(result.success_count, 1);
+    }
+
+    #[tokio::test]
+    async fn apply_replace_effect() {
+        use crate::resource::Value;
+        use std::collections::HashMap;
+
+        let interpreter = Interpreter::new(TestProvider);
+        let mut plan = Plan::new();
+        plan.add(Effect::Replace {
+            id: ResourceId::new("test", "example"),
+            from: Box::new(
+                State::existing(
+                    ResourceId::new("test", "example"),
+                    HashMap::from([("key".to_string(), Value::String("old".to_string()))]),
+                )
+                .with_identifier("test-id"),
+            ),
+            to: Resource::new("test", "example")
+                .with_attribute("key", Value::String("new".to_string())),
+            lifecycle: LifecycleConfig::default(),
+            changed_create_only: vec!["key".to_string()],
+        });
+
+        let result = interpreter.apply(&plan).await;
+
+        assert!(result.is_success());
+        assert_eq!(result.success_count, 1);
+        assert!(matches!(
+            result.outcomes[0],
+            Ok(EffectOutcome::Replaced { .. })
+        ));
     }
 
     #[tokio::test]

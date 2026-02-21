@@ -47,6 +47,7 @@ impl Plan {
                 Effect::Read { .. } => summary.read += 1,
                 Effect::Create(_) => summary.create += 1,
                 Effect::Update { .. } => summary.update += 1,
+                Effect::Replace { .. } => summary.replace += 1,
                 Effect::Delete { .. } => summary.delete += 1,
             }
         }
@@ -59,24 +60,23 @@ pub struct PlanSummary {
     pub read: usize,
     pub create: usize,
     pub update: usize,
+    pub replace: usize,
     pub delete: usize,
 }
 
 impl std::fmt::Display for PlanSummary {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut parts = Vec::new();
         if self.read > 0 {
-            write!(
-                f,
-                "Plan: {} to read, {} to create, {} to update, {} to delete",
-                self.read, self.create, self.update, self.delete
-            )
-        } else {
-            write!(
-                f,
-                "Plan: {} to create, {} to update, {} to delete",
-                self.create, self.update, self.delete
-            )
+            parts.push(format!("{} to read", self.read));
         }
+        parts.push(format!("{} to create", self.create));
+        parts.push(format!("{} to update", self.update));
+        if self.replace > 0 {
+            parts.push(format!("{} to replace", self.replace));
+        }
+        parts.push(format!("{} to delete", self.delete));
+        write!(f, "Plan: {}", parts.join(", "))
     }
 }
 
@@ -144,6 +144,7 @@ impl ModularPlan {
             let source = match effect {
                 Effect::Create(r) => Self::extract_source(&r.attributes),
                 Effect::Update { to, .. } => Self::extract_source(&to.attributes),
+                Effect::Replace { to, .. } => Self::extract_source(&to.attributes),
                 Effect::Read { resource } => Self::extract_source(&resource.attributes),
                 Effect::Delete { .. } => ModuleSource::Root,
             };
@@ -241,10 +242,17 @@ impl ModularPlan {
 
         // Add summary
         let summary = self.plan.summary();
-        output.push_str(&format!(
-            "Summary: {} to create, {} to update, {} to delete\n",
-            summary.create, summary.update, summary.delete
-        ));
+        if summary.replace > 0 {
+            output.push_str(&format!(
+                "Summary: {} to create, {} to update, {} to replace, {} to delete\n",
+                summary.create, summary.update, summary.replace, summary.delete
+            ));
+        } else {
+            output.push_str(&format!(
+                "Summary: {} to create, {} to update, {} to delete\n",
+                summary.create, summary.update, summary.delete
+            ));
+        }
 
         output
     }
@@ -255,6 +263,7 @@ fn format_effect_brief(effect: &Effect) -> String {
     match effect {
         Effect::Create(r) => format!("+ {}", r.id),
         Effect::Update { id, .. } => format!("~ {}", id),
+        Effect::Replace { id, .. } => format!("-/+ {}", id),
         Effect::Delete { id, .. } => format!("- {}", id),
         Effect::Read { resource } => format!("<= {} (data source)", resource.id),
     }

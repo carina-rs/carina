@@ -23,6 +23,17 @@ pub enum Effect {
         to: Resource,
     },
 
+    /// Replace a resource (delete then create) due to create-only property changes
+    Replace {
+        id: ResourceId,
+        from: Box<State>,
+        to: Resource,
+        #[serde(default)]
+        lifecycle: LifecycleConfig,
+        /// Which create-only attributes forced the replacement
+        changed_create_only: Vec<String>,
+    },
+
     /// Delete a resource
     Delete {
         id: ResourceId,
@@ -39,6 +50,7 @@ impl Effect {
             Effect::Read { .. } => "read",
             Effect::Create(_) => "create",
             Effect::Update { .. } => "update",
+            Effect::Replace { .. } => "replace",
             Effect::Delete { .. } => "delete",
         }
     }
@@ -54,6 +66,7 @@ impl Effect {
             Effect::Read { resource } => &resource.id,
             Effect::Create(r) => &r.id,
             Effect::Update { id, .. } => id,
+            Effect::Replace { id, .. } => id,
             Effect::Delete { id, .. } => id,
         }
     }
@@ -107,6 +120,20 @@ mod tests {
                 )),
                 to: Resource::new("s3.bucket", "my-bucket")
                     .with_attribute("versioning", Value::String("Enabled".to_string())),
+            },
+            Effect::Replace {
+                id: ResourceId::new("ec2.vpc", "my-vpc"),
+                from: Box::new(State::existing(
+                    ResourceId::new("ec2.vpc", "my-vpc"),
+                    HashMap::from([(
+                        "cidr_block".to_string(),
+                        Value::String("10.0.0.0/16".to_string()),
+                    )]),
+                )),
+                to: Resource::new("ec2.vpc", "my-vpc")
+                    .with_attribute("cidr_block", Value::String("10.1.0.0/16".to_string())),
+                lifecycle: LifecycleConfig::default(),
+                changed_create_only: vec!["cidr_block".to_string()],
             },
             Effect::Delete {
                 id: ResourceId::new("s3.bucket", "old-bucket"),
