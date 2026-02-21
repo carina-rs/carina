@@ -1,4 +1,4 @@
-# awscc.ec2_flow_log
+# awscc.ec2.flow_log
 
 CloudFormation Type: `AWS::EC2::FlowLog`
 
@@ -94,9 +94,9 @@ The type of traffic to log. You can log traffic that the resource accepts or rej
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `cloud-watch-logs` | `awscc.ec2_flow_log.LogDestinationType.cloud_watch_logs` |
-| `s3` | `awscc.ec2_flow_log.LogDestinationType.s3` |
-| `kinesis-data-firehose` | `awscc.ec2_flow_log.LogDestinationType.kinesis_data_firehose` |
+| `cloud-watch-logs` | `awscc.ec2.flow_log.LogDestinationType.cloud_watch_logs` |
+| `s3` | `awscc.ec2.flow_log.LogDestinationType.s3` |
+| `kinesis-data-firehose` | `awscc.ec2.flow_log.LogDestinationType.kinesis_data_firehose` |
 
 Shorthand formats: `cloud_watch_logs` or `LogDestinationType.cloud_watch_logs`
 
@@ -104,12 +104,12 @@ Shorthand formats: `cloud_watch_logs` or `LogDestinationType.cloud_watch_logs`
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `NetworkInterface` | `awscc.ec2_flow_log.ResourceType.NetworkInterface` |
-| `Subnet` | `awscc.ec2_flow_log.ResourceType.Subnet` |
-| `VPC` | `awscc.ec2_flow_log.ResourceType.VPC` |
-| `TransitGateway` | `awscc.ec2_flow_log.ResourceType.TransitGateway` |
-| `TransitGatewayAttachment` | `awscc.ec2_flow_log.ResourceType.TransitGatewayAttachment` |
-| `RegionalNatGateway` | `awscc.ec2_flow_log.ResourceType.RegionalNatGateway` |
+| `NetworkInterface` | `awscc.ec2.flow_log.ResourceType.NetworkInterface` |
+| `Subnet` | `awscc.ec2.flow_log.ResourceType.Subnet` |
+| `VPC` | `awscc.ec2.flow_log.ResourceType.VPC` |
+| `TransitGateway` | `awscc.ec2.flow_log.ResourceType.TransitGateway` |
+| `TransitGatewayAttachment` | `awscc.ec2.flow_log.ResourceType.TransitGatewayAttachment` |
+| `RegionalNatGateway` | `awscc.ec2.flow_log.ResourceType.RegionalNatGateway` |
 
 Shorthand formats: `NetworkInterface` or `ResourceType.NetworkInterface`
 
@@ -117,9 +117,9 @@ Shorthand formats: `NetworkInterface` or `ResourceType.NetworkInterface`
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `ACCEPT` | `awscc.ec2_flow_log.TrafficType.ACCEPT` |
-| `ALL` | `awscc.ec2_flow_log.TrafficType.ALL` |
-| `REJECT` | `awscc.ec2_flow_log.TrafficType.REJECT` |
+| `ACCEPT` | `awscc.ec2.flow_log.TrafficType.ACCEPT` |
+| `ALL` | `awscc.ec2.flow_log.TrafficType.ALL` |
+| `REJECT` | `awscc.ec2.flow_log.TrafficType.REJECT` |
 
 Shorthand formats: `ACCEPT` or `TrafficType.ACCEPT`
 
@@ -144,11 +144,11 @@ Shorthand formats: `ACCEPT` or `TrafficType.ACCEPT`
 ## Example
 
 ```crn
-let vpc = awscc.ec2_vpc {
+let vpc = awscc.ec2.vpc {
   cidr_block = "10.0.0.0/16"
 }
 
-let flow_log = awscc.ec2_flow_log {
+let flow_log = awscc.ec2.flow_log {
   resource_id          = vpc.vpc_id
   resource_type        = VPC
   traffic_type         = ALL

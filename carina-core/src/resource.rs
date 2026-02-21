@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 pub struct ResourceId {
     /// Provider name (e.g., "aws", "awscc")
     pub provider: String,
-    /// Resource type (e.g., "s3_bucket", "ec2_instance")
+    /// Resource type (e.g., "s3.bucket", "ec2.instance")
     pub resource_type: String,
     /// Resource name (identifier specified in DSL)
     pub name: String,
@@ -238,7 +238,7 @@ mod tests {
         attrs.insert("versioning".to_string(), Value::Bool(true));
 
         let state = State::existing(
-            ResourceId::with_provider("aws", "s3_bucket", "my-bucket"),
+            ResourceId::with_provider("aws", "s3.bucket", "my-bucket"),
             attrs,
         )
         .with_identifier("my-bucket");

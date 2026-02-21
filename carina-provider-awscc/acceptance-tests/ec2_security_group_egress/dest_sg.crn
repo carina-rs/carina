@@ -6,21 +6,21 @@ provider awscc {
   region = awscc.Region.ap_northeast_1
 }
 
-let vpc = awscc.ec2_vpc {
+let vpc = awscc.ec2.vpc {
   cidr_block = "10.0.0.0/16"
 }
 
-let source_sg = awscc.ec2_security_group {
+let source_sg = awscc.ec2.security_group {
   vpc_id            = vpc.vpc_id
   group_description = "Source security group"
 }
 
-let dest_sg = awscc.ec2_security_group {
+let dest_sg = awscc.ec2.security_group {
   vpc_id            = vpc.vpc_id
   group_description = "Destination security group"
 }
 
-let egress = awscc.ec2_security_group_egress {
+let egress = awscc.ec2.security_group_egress {
   group_id                     = source_sg.group_id
   description                  = "Allow HTTPS to destination SG"
   ip_protocol                  = "tcp"

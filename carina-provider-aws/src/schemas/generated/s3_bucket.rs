@@ -18,7 +18,7 @@ fn validate_versioning_status(value: &Value) -> Result<(), String> {
     validate_namespaced_enum(
         value,
         "VersioningStatus",
-        "aws.s3_bucket",
+        "aws.s3.bucket",
         VALID_VERSIONING_STATUS,
     )
     .map_err(|reason| {
@@ -30,13 +30,13 @@ fn validate_versioning_status(value: &Value) -> Result<(), String> {
     })
 }
 
-/// Returns the schema config for s3_bucket (Smithy: com.amazonaws.s3)
+/// Returns the schema config for s3.bucket (Smithy: com.amazonaws.s3)
 pub fn s3_bucket_config() -> AwsSchemaConfig {
     AwsSchemaConfig {
         aws_type_name: "AWS::S3::Bucket",
-        resource_type_name: "s3_bucket",
+        resource_type_name: "s3.bucket",
         has_tags: true,
-        schema: ResourceSchema::new("aws.s3_bucket")
+        schema: ResourceSchema::new("aws.s3.bucket")
             .attribute(
                 AttributeSchema::new("name", AttributeType::String)
                     .with_description("Resource name"),
@@ -52,7 +52,7 @@ pub fn s3_bucket_config() -> AwsSchemaConfig {
                         name: "VersioningStatus".to_string(),
                         base: Box::new(AttributeType::String),
                         validate: validate_versioning_status,
-                        namespace: Some("aws.s3_bucket".to_string()),
+                        namespace: Some("aws.s3.bucket".to_string()),
                         to_dsl: None,
                     },
                 )
@@ -73,7 +73,7 @@ pub fn enum_valid_values() -> (
     &'static [(&'static str, &'static [&'static str])],
 ) {
     (
-        "s3_bucket",
+        "s3.bucket",
         &[("versioning_status", VALID_VERSIONING_STATUS)],
     )
 }

@@ -1,4 +1,4 @@
-# awscc.s3_bucket
+# awscc.s3.bucket
 
 CloudFormation Type: `AWS::S3::Bucket`
 
@@ -175,8 +175,8 @@ Information used to configure the bucket as a static website. For more informati
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `Enabled` | `awscc.s3_bucket.AbacStatus.Enabled` |
-| `Disabled` | `awscc.s3_bucket.AbacStatus.Disabled` |
+| `Enabled` | `awscc.s3.bucket.AbacStatus.Enabled` |
+| `Disabled` | `awscc.s3.bucket.AbacStatus.Disabled` |
 
 Shorthand formats: `Enabled` or `AbacStatus.Enabled`
 
@@ -184,14 +184,14 @@ Shorthand formats: `Enabled` or `AbacStatus.Enabled`
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `AuthenticatedRead` | `awscc.s3_bucket.AccessControl.AuthenticatedRead` |
-| `AwsExecRead` | `awscc.s3_bucket.AccessControl.AwsExecRead` |
-| `BucketOwnerFullControl` | `awscc.s3_bucket.AccessControl.BucketOwnerFullControl` |
-| `BucketOwnerRead` | `awscc.s3_bucket.AccessControl.BucketOwnerRead` |
-| `LogDeliveryWrite` | `awscc.s3_bucket.AccessControl.LogDeliveryWrite` |
-| `Private` | `awscc.s3_bucket.AccessControl.Private` |
-| `PublicRead` | `awscc.s3_bucket.AccessControl.PublicRead` |
-| `PublicReadWrite` | `awscc.s3_bucket.AccessControl.PublicReadWrite` |
+| `AuthenticatedRead` | `awscc.s3.bucket.AccessControl.AuthenticatedRead` |
+| `AwsExecRead` | `awscc.s3.bucket.AccessControl.AwsExecRead` |
+| `BucketOwnerFullControl` | `awscc.s3.bucket.AccessControl.BucketOwnerFullControl` |
+| `BucketOwnerRead` | `awscc.s3.bucket.AccessControl.BucketOwnerRead` |
+| `LogDeliveryWrite` | `awscc.s3.bucket.AccessControl.LogDeliveryWrite` |
+| `Private` | `awscc.s3.bucket.AccessControl.Private` |
+| `PublicRead` | `awscc.s3.bucket.AccessControl.PublicRead` |
+| `PublicReadWrite` | `awscc.s3.bucket.AccessControl.PublicReadWrite` |
 
 Shorthand formats: `AuthenticatedRead` or `AccessControl.AuthenticatedRead`
 

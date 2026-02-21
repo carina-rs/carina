@@ -16,7 +16,7 @@ use carina_core::utils::{extract_enum_value, validate_enum_namespace};
 pub struct AwsccSchemaConfig {
     /// AWS CloudFormation type name (e.g., "AWS::EC2::VPC")
     pub aws_type_name: &'static str,
-    /// Resource type name used in DSL (e.g., "ec2_vpc")
+    /// Resource type name used in DSL (e.g., "ec2.vpc")
     pub resource_type_name: &'static str,
     /// Whether this resource type uses tags
     pub has_tags: bool,
@@ -1685,15 +1685,15 @@ mod tests {
     fn auto_generated_get_enum_valid_values_known() {
         use crate::schemas::generated::get_enum_valid_values;
         assert_eq!(
-            get_enum_valid_values("ec2_ipam", "tier"),
+            get_enum_valid_values("ec2.ipam", "tier"),
             Some(["free", "advanced"].as_slice())
         );
         assert_eq!(
-            get_enum_valid_values("ec2_ipam_pool", "address_family"),
+            get_enum_valid_values("ec2.ipam_pool", "address_family"),
             Some(["IPv4", "IPv6"].as_slice())
         );
         assert_eq!(
-            get_enum_valid_values("ec2_vpc", "instance_tenancy"),
+            get_enum_valid_values("ec2.vpc", "instance_tenancy"),
             Some(["default", "dedicated", "host"].as_slice())
         );
     }
@@ -1702,15 +1702,15 @@ mod tests {
     fn auto_generated_get_enum_valid_values_transit_gateway() {
         use crate::schemas::generated::get_enum_valid_values;
         assert_eq!(
-            get_enum_valid_values("ec2_transit_gateway", "auto_accept_shared_attachments"),
+            get_enum_valid_values("ec2.transit_gateway", "auto_accept_shared_attachments"),
             Some(["enable", "disable"].as_slice())
         );
         assert_eq!(
-            get_enum_valid_values("ec2_transit_gateway", "dns_support"),
+            get_enum_valid_values("ec2.transit_gateway", "dns_support"),
             Some(["enable", "disable"].as_slice())
         );
         assert_eq!(
-            get_enum_valid_values("ec2_transit_gateway", "vpn_ecmp_support"),
+            get_enum_valid_values("ec2.transit_gateway", "vpn_ecmp_support"),
             Some(["enable", "disable"].as_slice())
         );
     }
@@ -1718,7 +1718,7 @@ mod tests {
     #[test]
     fn auto_generated_get_enum_valid_values_unknown() {
         use crate::schemas::generated::get_enum_valid_values;
-        assert_eq!(get_enum_valid_values("ec2_vpc", "cidr_block"), None);
+        assert_eq!(get_enum_valid_values("ec2.vpc", "cidr_block"), None);
         assert_eq!(get_enum_valid_values("unknown", "unknown"), None);
     }
 
@@ -1727,7 +1727,7 @@ mod tests {
         let result = validate_namespaced_enum(
             &Value::String("default".to_string()),
             "InstanceTenancy",
-            "awscc.ec2_vpc",
+            "awscc.ec2.vpc",
             &["default", "dedicated", "host"],
         );
         assert!(result.is_ok());
@@ -1738,7 +1738,7 @@ mod tests {
         let result = validate_namespaced_enum(
             &Value::String("InstanceTenancy.default".to_string()),
             "InstanceTenancy",
-            "awscc.ec2_vpc",
+            "awscc.ec2.vpc",
             &["default", "dedicated", "host"],
         );
         assert!(result.is_ok());
@@ -1747,9 +1747,9 @@ mod tests {
     #[test]
     fn validate_namespaced_enum_full_namespaced() {
         let result = validate_namespaced_enum(
-            &Value::String("awscc.ec2_vpc.InstanceTenancy.default".to_string()),
+            &Value::String("awscc.ec2.vpc.InstanceTenancy.default".to_string()),
             "InstanceTenancy",
-            "awscc.ec2_vpc",
+            "awscc.ec2.vpc",
             &["default", "dedicated", "host"],
         );
         assert!(result.is_ok());
@@ -1760,7 +1760,7 @@ mod tests {
         let result = validate_namespaced_enum(
             &Value::String("invalid".to_string()),
             "InstanceTenancy",
-            "awscc.ec2_vpc",
+            "awscc.ec2.vpc",
             &["default", "dedicated", "host"],
         );
         assert!(result.is_err());
@@ -1772,7 +1772,7 @@ mod tests {
         let result = validate_namespaced_enum(
             &Value::String("cloud_watch_logs".to_string()),
             "LogDestinationType",
-            "awscc.ec2_flow_log",
+            "awscc.ec2.flow_log",
             &["cloud-watch-logs", "s3", "kinesis-data-firehose"],
         );
         assert!(result.is_ok());
@@ -1784,7 +1784,7 @@ mod tests {
         let result = validate_namespaced_enum(
             &Value::String("ipv4".to_string()),
             "AddressFamily",
-            "awscc.ec2_ipam_pool",
+            "awscc.ec2.ipam_pool",
             &["IPv4", "IPv6"],
         );
         assert!(result.is_ok());
@@ -1794,9 +1794,9 @@ mod tests {
     fn validate_namespaced_enum_case_insensitive_with_namespace() {
         // Namespaced form with case-insensitive value
         let result = validate_namespaced_enum(
-            &Value::String("awscc.ec2_ipam_pool.AddressFamily.ipv4".to_string()),
+            &Value::String("awscc.ec2.ipam_pool.AddressFamily.ipv4".to_string()),
             "AddressFamily",
-            "awscc.ec2_ipam_pool",
+            "awscc.ec2.ipam_pool",
             &["IPv4", "IPv6"],
         );
         assert!(result.is_ok());
@@ -1808,7 +1808,7 @@ mod tests {
         let result = validate_namespaced_enum(
             &Value::String("Cloud_Watch_Logs".to_string()),
             "LogDestinationType",
-            "awscc.ec2_flow_log",
+            "awscc.ec2.flow_log",
             &["cloud-watch-logs", "s3", "kinesis-data-firehose"],
         );
         assert!(result.is_ok());
@@ -1817,9 +1817,9 @@ mod tests {
     #[test]
     fn validate_namespaced_enum_invalid_namespace() {
         let result = validate_namespaced_enum(
-            &Value::String("wrong.ec2_vpc.InstanceTenancy.default".to_string()),
+            &Value::String("wrong.ec2.vpc.InstanceTenancy.default".to_string()),
             "InstanceTenancy",
-            "awscc.ec2_vpc",
+            "awscc.ec2.vpc",
             &["default", "dedicated", "host"],
         );
         assert!(result.is_err());
@@ -1830,7 +1830,7 @@ mod tests {
         let result = validate_namespaced_enum(
             &Value::Int(42),
             "InstanceTenancy",
-            "awscc.ec2_vpc",
+            "awscc.ec2.vpc",
             &["default", "dedicated", "host"],
         );
         assert!(result.is_err());
@@ -1844,7 +1844,7 @@ mod tests {
         let result = validate_namespaced_enum(
             &Value::String("all".to_string()),
             "IpProtocol",
-            "awscc.ec2_security_group_egress",
+            "awscc.ec2.security_group_egress",
             valid_values,
         );
         assert!(result.is_ok(), "all should be accepted: {:?}", result);
@@ -1857,7 +1857,7 @@ mod tests {
         let result = validate_namespaced_enum(
             &Value::String("-1".to_string()),
             "IpProtocol",
-            "awscc.ec2_security_group_egress",
+            "awscc.ec2.security_group_egress",
             valid_values,
         );
         assert!(result.is_ok(), "-1 should still be accepted: {:?}", result);
@@ -1865,12 +1865,12 @@ mod tests {
 
     #[test]
     fn validate_ip_protocol_namespaced_all() {
-        // Full namespaced form: awscc.ec2_security_group_egress.IpProtocol.all
+        // Full namespaced form: awscc.ec2.security_group_egress.IpProtocol.all
         let valid_values = &["tcp", "udp", "icmp", "icmpv6", "-1", "all"];
         let result = validate_namespaced_enum(
-            &Value::String("awscc.ec2_security_group_egress.IpProtocol.all".to_string()),
+            &Value::String("awscc.ec2.security_group_egress.IpProtocol.all".to_string()),
             "IpProtocol",
-            "awscc.ec2_security_group_egress",
+            "awscc.ec2.security_group_egress",
             valid_values,
         );
         assert!(
@@ -1885,22 +1885,22 @@ mod tests {
         use crate::schemas::generated::get_enum_alias_reverse;
         // "all" maps to "-1" for ip_protocol on security_group_egress
         assert_eq!(
-            get_enum_alias_reverse("ec2_security_group_egress", "ip_protocol", "all"),
+            get_enum_alias_reverse("ec2.security_group_egress", "ip_protocol", "all"),
             Some("-1")
         );
         // "all" maps to "-1" for ip_protocol on security_group_ingress
         assert_eq!(
-            get_enum_alias_reverse("ec2_security_group_ingress", "ip_protocol", "all"),
+            get_enum_alias_reverse("ec2.security_group_ingress", "ip_protocol", "all"),
             Some("-1")
         );
         // "tcp" has no alias mapping
         assert_eq!(
-            get_enum_alias_reverse("ec2_security_group_egress", "ip_protocol", "tcp"),
+            get_enum_alias_reverse("ec2.security_group_egress", "ip_protocol", "tcp"),
             None
         );
         // Unknown resource has no alias mapping
         assert_eq!(
-            get_enum_alias_reverse("ec2_vpc", "instance_tenancy", "default"),
+            get_enum_alias_reverse("ec2.vpc", "instance_tenancy", "default"),
             None
         );
     }
@@ -1909,7 +1909,7 @@ mod tests {
     fn auto_generated_ip_protocol_valid_values_include_all() {
         use crate::schemas::generated::get_enum_valid_values;
         // VALID_IP_PROTOCOL should include "all" as an alias
-        let values = get_enum_valid_values("ec2_security_group_egress", "ip_protocol").unwrap();
+        let values = get_enum_valid_values("ec2.security_group_egress", "ip_protocol").unwrap();
         assert!(
             values.contains(&"all"),
             "VALID_IP_PROTOCOL should include 'all', got: {:?}",

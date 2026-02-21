@@ -7,24 +7,24 @@ provider awscc {
   region = awscc.Region.ap_northeast_1
 }
 
-let vpc1 = awscc.ec2_vpc {
+let vpc1 = awscc.ec2.vpc {
   cidr_block = "10.0.0.0/16"
 }
 
-let vpc2 = awscc.ec2_vpc {
+let vpc2 = awscc.ec2.vpc {
   cidr_block = "10.1.0.0/16"
 }
 
-let peering = awscc.ec2_vpc_peering_connection {
+let peering = awscc.ec2.vpc_peering_connection {
   vpc_id      = vpc1.vpc_id
   peer_vpc_id = vpc2.vpc_id
 }
 
-let rt = awscc.ec2_route_table {
+let rt = awscc.ec2.route_table {
   vpc_id = vpc1.vpc_id
 }
 
-let route = awscc.ec2_route {
+let route = awscc.ec2.route {
   route_table_id             = rt.route_table_id
   destination_cidr_block     = "10.1.0.0/16"
   vpc_peering_connection_id  = peering.id

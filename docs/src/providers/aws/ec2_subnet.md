@@ -1,4 +1,4 @@
-# aws.ec2_subnet
+# aws.ec2.subnet
 
 CloudFormation Type: `AWS::EC2::Subnet`
 

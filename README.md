@@ -168,7 +168,7 @@ Enum values support multiple formats. The shorthand forms are automatically reso
 
 ```hcl
 # Full namespace format
-instance_tenancy = aws.ec2_vpc.InstanceTenancy.dedicated
+instance_tenancy = aws.ec2.vpc.InstanceTenancy.dedicated
 
 # Type.value format
 instance_tenancy = InstanceTenancy.dedicated
@@ -182,7 +182,7 @@ instance_tenancy = dedicated
 Some resources support nested objects for inline configuration. Use repeated blocks for multiple items:
 
 ```hcl
-awscc.ec2_security_group {
+awscc.ec2.security_group {
   name              = "web-sg"
   vpc_id            = vpc.vpc_id
   group_description = "Web server security group"
@@ -449,7 +449,7 @@ provider aws {
   region = aws.Region.ap_northeast_1
 }
 
-aws.s3_bucket {
+aws.s3.bucket {
   name = "my-app-data"
 }
 ```

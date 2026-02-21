@@ -1,4 +1,4 @@
-# aws.ec2_route
+# aws.ec2.route
 
 CloudFormation Type: `AWS::EC2::Route`
 

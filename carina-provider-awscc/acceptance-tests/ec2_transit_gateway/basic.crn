@@ -6,7 +6,7 @@ provider awscc {
   region = awscc.Region.ap_northeast_1
 }
 
-let tgw = awscc.ec2_transit_gateway {
+let tgw = awscc.ec2.transit_gateway {
   description = "Acceptance test Transit Gateway"
 
   tags = {

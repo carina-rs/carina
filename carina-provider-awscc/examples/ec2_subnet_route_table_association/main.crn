@@ -7,23 +7,23 @@ provider awscc {
   region = awscc.Region.ap_northeast_1
 }
 
-let vpc = awscc.ec2_vpc {
+let vpc = awscc.ec2.vpc {
   cidr_block           = "10.0.0.0/16"
   enable_dns_support   = true
   enable_dns_hostnames = true
 }
 
-let subnet = awscc.ec2_subnet {
+let subnet = awscc.ec2.subnet {
   vpc_id            = vpc.vpc_id
   cidr_block        = "10.0.1.0/24"
   availability_zone = "ap-northeast-1a"
 }
 
-let rt = awscc.ec2_route_table {
+let rt = awscc.ec2.route_table {
   vpc_id = vpc.vpc_id
 }
 
-let rt_assoc = awscc.ec2_subnet_route_table_association {
+let rt_assoc = awscc.ec2.subnet_route_table_association {
   subnet_id      = subnet.subnet_id
   route_table_id = rt.route_table_id
 }

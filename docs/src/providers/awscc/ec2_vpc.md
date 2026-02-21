@@ -1,4 +1,4 @@
-# awscc.ec2_vpc
+# awscc.ec2.vpc
 
 CloudFormation Type: `AWS::EC2::VPC`
 
@@ -63,9 +63,9 @@ The tags for the VPC.
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `default` | `awscc.ec2_vpc.InstanceTenancy.default` |
-| `dedicated` | `awscc.ec2_vpc.InstanceTenancy.dedicated` |
-| `host` | `awscc.ec2_vpc.InstanceTenancy.host` |
+| `default` | `awscc.ec2.vpc.InstanceTenancy.default` |
+| `dedicated` | `awscc.ec2.vpc.InstanceTenancy.dedicated` |
+| `host` | `awscc.ec2.vpc.InstanceTenancy.host` |
 
 Shorthand formats: `default` or `InstanceTenancy.default`
 
@@ -96,7 +96,7 @@ Shorthand formats: `default` or `InstanceTenancy.default`
 ## Example
 
 ```crn
-let vpc = awscc.ec2_vpc {
+let vpc = awscc.ec2.vpc {
   cidr_block           = "10.0.0.0/16"
   enable_dns_support   = true
   enable_dns_hostnames = true

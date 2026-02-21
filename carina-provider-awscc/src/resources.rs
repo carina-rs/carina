@@ -51,23 +51,23 @@ mod tests {
 
     #[test]
     fn test_get_schema_config() {
-        assert!(get_config("ec2_vpc").is_some());
-        assert!(get_config("ec2_subnet").is_some());
+        assert!(get_config("ec2.vpc").is_some());
+        assert!(get_config("ec2.subnet").is_some());
         assert!(get_config("unknown").is_none());
     }
 
     #[test]
     fn test_schema_config_aws_type() {
         assert_eq!(
-            get_config("ec2_vpc").unwrap().aws_type_name,
+            get_config("ec2.vpc").unwrap().aws_type_name,
             "AWS::EC2::VPC"
         );
         assert_eq!(
-            get_config("ec2_subnet").unwrap().aws_type_name,
+            get_config("ec2.subnet").unwrap().aws_type_name,
             "AWS::EC2::Subnet"
         );
         assert_eq!(
-            get_config("ec2_security_group_ingress")
+            get_config("ec2.security_group_ingress")
                 .unwrap()
                 .aws_type_name,
             "AWS::EC2::SecurityGroupIngress"
@@ -76,15 +76,15 @@ mod tests {
 
     #[test]
     fn test_schema_config_has_tags() {
-        assert!(get_config("ec2_vpc").unwrap().has_tags);
-        assert!(get_config("ec2_subnet").unwrap().has_tags);
-        assert!(!get_config("ec2_route").unwrap().has_tags);
-        assert!(!get_config("ec2_vpc_gateway_attachment").unwrap().has_tags);
+        assert!(get_config("ec2.vpc").unwrap().has_tags);
+        assert!(get_config("ec2.subnet").unwrap().has_tags);
+        assert!(!get_config("ec2.route").unwrap().has_tags);
+        assert!(!get_config("ec2.vpc_gateway_attachment").unwrap().has_tags);
     }
 
     #[test]
     fn test_schema_config_provider_name() {
-        let vpc_config = get_config("ec2_vpc").unwrap();
+        let vpc_config = get_config("ec2.vpc").unwrap();
         let cidr_attr = vpc_config.schema.attributes.get("cidr_block").unwrap();
         assert_eq!(cidr_attr.provider_name.as_deref(), Some("CidrBlock"));
         let vpc_id_attr = vpc_config.schema.attributes.get("vpc_id").unwrap();

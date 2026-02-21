@@ -1,4 +1,4 @@
-# awscc.ec2_security_group_egress
+# awscc.ec2.security_group_egress
 
 CloudFormation Type: `AWS::EC2::SecurityGroupEgress`
 
@@ -79,11 +79,11 @@ If the protocol is TCP or UDP, this is the end of the port range. If the protoco
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `tcp` | `awscc.ec2_security_group_egress.IpProtocol.tcp` |
-| `udp` | `awscc.ec2_security_group_egress.IpProtocol.udp` |
-| `icmp` | `awscc.ec2_security_group_egress.IpProtocol.icmp` |
-| `icmpv6` | `awscc.ec2_security_group_egress.IpProtocol.icmpv6` |
-| `-1` | `awscc.ec2_security_group_egress.IpProtocol.all` |
+| `tcp` | `awscc.ec2.security_group_egress.IpProtocol.tcp` |
+| `udp` | `awscc.ec2.security_group_egress.IpProtocol.udp` |
+| `icmp` | `awscc.ec2.security_group_egress.IpProtocol.icmp` |
+| `icmpv6` | `awscc.ec2.security_group_egress.IpProtocol.icmpv6` |
+| `-1` | `awscc.ec2.security_group_egress.IpProtocol.all` |
 
 Shorthand formats: `tcp` or `IpProtocol.tcp`
 
@@ -98,16 +98,16 @@ Shorthand formats: `tcp` or `IpProtocol.tcp`
 ## Example
 
 ```crn
-let vpc = awscc.ec2_vpc {
+let vpc = awscc.ec2.vpc {
   cidr_block = "10.0.0.0/16"
 }
 
-let sg = awscc.ec2_security_group {
+let sg = awscc.ec2.security_group {
   vpc_id            = vpc.vpc_id
   group_description = "Example security group"
 }
 
-let egress = awscc.ec2_security_group_egress {
+let egress = awscc.ec2.security_group_egress {
   group_id    = sg.group_id
   description = "Allow all outbound traffic"
   ip_protocol = all

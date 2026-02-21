@@ -1,4 +1,4 @@
-# aws.s3_bucket
+# aws.s3.bucket
 
 CloudFormation Type: `AWS::S3::Bucket`
 
@@ -24,8 +24,8 @@ The tags for the resource.
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `Enabled` | `aws.s3_bucket.VersioningStatus.Enabled` |
-| `Suspended` | `aws.s3_bucket.VersioningStatus.Suspended` |
+| `Enabled` | `aws.s3.bucket.VersioningStatus.Enabled` |
+| `Suspended` | `aws.s3.bucket.VersioningStatus.Suspended` |
 
 Shorthand formats: `Enabled` or `VersioningStatus.Enabled`
 

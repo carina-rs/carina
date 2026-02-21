@@ -6,16 +6,16 @@ provider awscc {
   region = awscc.Region.ap_northeast_1
 }
 
-let vpc = awscc.ec2_vpc {
+let vpc = awscc.ec2.vpc {
   cidr_block = "10.0.0.0/16"
 }
 
-let sg = awscc.ec2_security_group {
+let sg = awscc.ec2.security_group {
   vpc_id            = vpc.vpc_id
   group_description = "SG for ingress rule test"
 }
 
-let ingress = awscc.ec2_security_group_ingress {
+let ingress = awscc.ec2.security_group_ingress {
   group_id    = sg.group_id
   description = "Allow HTTPS from VPC"
   ip_protocol = "tcp"

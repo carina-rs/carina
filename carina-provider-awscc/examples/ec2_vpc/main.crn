@@ -6,7 +6,7 @@ provider awscc {
   region = awscc.Region.ap_northeast_1
 }
 
-let vpc = awscc.ec2_vpc {
+let vpc = awscc.ec2.vpc {
   cidr_block           = "10.0.0.0/16"
   enable_dns_support   = true
   enable_dns_hostnames = true

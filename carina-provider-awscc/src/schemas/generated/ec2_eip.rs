@@ -15,7 +15,7 @@ const VALID_DOMAIN: &[&str] = &["vpc", "standard"];
 
 #[allow(dead_code)]
 fn validate_domain(value: &Value) -> Result<(), String> {
-    validate_namespaced_enum(value, "Domain", "awscc.ec2_eip", VALID_DOMAIN).map_err(|reason| {
+    validate_namespaced_enum(value, "Domain", "awscc.ec2.eip", VALID_DOMAIN).map_err(|reason| {
         if let Value::String(s) = value {
             format!("Invalid Domain '{}': {}", s, reason)
         } else {
@@ -28,9 +28,9 @@ fn validate_domain(value: &Value) -> Result<(), String> {
 pub fn ec2_eip_config() -> AwsccSchemaConfig {
     AwsccSchemaConfig {
         aws_type_name: "AWS::EC2::EIP",
-        resource_type_name: "ec2_eip",
+        resource_type_name: "ec2.eip",
         has_tags: true,
-        schema: ResourceSchema::new("awscc.ec2_eip")
+        schema: ResourceSchema::new("awscc.ec2.eip")
         .with_description("Specifies an Elastic IP (EIP) address and can, optionally, associate it with an Amazon EC2 instance.  You can allocate an Elastic IP address from an address pool owned by AWS or from an address pool c...")
         .attribute(
             AttributeSchema::new("address", AttributeType::String)
@@ -48,7 +48,7 @@ pub fn ec2_eip_config() -> AwsccSchemaConfig {
                 name: "Domain".to_string(),
                 base: Box::new(AttributeType::String),
                 validate: validate_domain,
-                namespace: Some("awscc.ec2_eip".to_string()),
+                namespace: Some("awscc.ec2.eip".to_string()),
                 to_dsl: None,
             })
                 .with_description("The network (``vpc``). If you define an Elastic IP address and associate it with a VPC that is defined in the same template, you must declare a depend...")
@@ -100,7 +100,7 @@ pub fn enum_valid_values() -> (
     &'static str,
     &'static [(&'static str, &'static [&'static str])],
 ) {
-    ("ec2_eip", &[("domain", VALID_DOMAIN)])
+    ("ec2.eip", &[("domain", VALID_DOMAIN)])
 }
 
 /// Maps DSL alias values back to canonical AWS values for this module.

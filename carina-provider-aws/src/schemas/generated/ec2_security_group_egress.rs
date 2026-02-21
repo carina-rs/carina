@@ -17,7 +17,7 @@ fn validate_ip_protocol(value: &Value) -> Result<(), String> {
     validate_namespaced_enum(
         value,
         "IpProtocol",
-        "aws.ec2_security_group_egress",
+        "aws.ec2.security_group_egress",
         VALID_IP_PROTOCOL,
     )
     .map_err(|reason| {
@@ -53,13 +53,13 @@ fn validate_to_port_range(value: &Value) -> Result<(), String> {
     }
 }
 
-/// Returns the schema config for ec2_security_group_egress (Smithy: com.amazonaws.ec2)
+/// Returns the schema config for ec2.security_group_egress (Smithy: com.amazonaws.ec2)
 pub fn ec2_security_group_egress_config() -> AwsSchemaConfig {
     AwsSchemaConfig {
         aws_type_name: "AWS::EC2::SecurityGroupEgress",
-        resource_type_name: "ec2_security_group_egress",
+        resource_type_name: "ec2.security_group_egress",
         has_tags: false,
-        schema: ResourceSchema::new("aws.ec2_security_group_egress")
+        schema: ResourceSchema::new("aws.ec2.security_group_egress")
             .with_description("Describes a security group rule.")
             .attribute(
                 AttributeSchema::new("name", AttributeType::String)
@@ -104,7 +104,7 @@ pub fn ec2_security_group_egress_config() -> AwsSchemaConfig {
                         name: "IpProtocol".to_string(),
                         base: Box::new(AttributeType::String),
                         validate: validate_ip_protocol,
-                        namespace: Some("aws.ec2_security_group_egress".to_string()),
+                        namespace: Some("aws.ec2.security_group_egress".to_string()),
                         to_dsl: Some(|s: &str| match s {
                             "-1" => "all".to_string(),
                             _ => s.replace('-', "_"),
@@ -157,7 +157,7 @@ pub fn enum_valid_values() -> (
     &'static [(&'static str, &'static [&'static str])],
 ) {
     (
-        "ec2_security_group_egress",
+        "ec2.security_group_egress",
         &[("ip_protocol", VALID_IP_PROTOCOL)],
     )
 }

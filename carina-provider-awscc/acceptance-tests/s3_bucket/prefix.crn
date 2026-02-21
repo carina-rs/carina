@@ -8,7 +8,7 @@ provider awscc {
   region = awscc.Region.ap_northeast_1
 }
 
-let bucket = awscc.s3_bucket {
+let bucket = awscc.s3.bucket {
   bucket_name_prefix = "carina-acc-test-"
 
   lifecycle {

@@ -1,4 +1,4 @@
-# awscc.ec2_ipam
+# awscc.ec2.ipam
 
 CloudFormation Type: `AWS::EC2::IPAM`
 
@@ -59,8 +59,8 @@ The tier of the IPAM.
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `ipam-owner` | `awscc.ec2_ipam.MeteredAccount.ipam_owner` |
-| `resource-owner` | `awscc.ec2_ipam.MeteredAccount.resource_owner` |
+| `ipam-owner` | `awscc.ec2.ipam.MeteredAccount.ipam_owner` |
+| `resource-owner` | `awscc.ec2.ipam.MeteredAccount.resource_owner` |
 
 Shorthand formats: `ipam_owner` or `MeteredAccount.ipam_owner`
 
@@ -68,8 +68,8 @@ Shorthand formats: `ipam_owner` or `MeteredAccount.ipam_owner`
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `free` | `awscc.ec2_ipam.Tier.free` |
-| `advanced` | `awscc.ec2_ipam.Tier.advanced` |
+| `free` | `awscc.ec2.ipam.Tier.free` |
+| `advanced` | `awscc.ec2.ipam.Tier.advanced` |
 
 Shorthand formats: `free` or `Tier.free`
 
@@ -126,7 +126,7 @@ Shorthand formats: `free` or `Tier.free`
 ## Example
 
 ```crn
-let ipam = awscc.ec2_ipam {
+let ipam = awscc.ec2.ipam {
   description = "Example IPAM"
   tier        = free
 

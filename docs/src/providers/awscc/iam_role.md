@@ -1,4 +1,4 @@
-# awscc.iam_role
+# awscc.iam.role
 
 CloudFormation Type: `AWS::IAM::Role`
 

@@ -18,7 +18,7 @@ fn validate_auto_accept_shared_attachments(value: &Value) -> Result<(), String> 
     validate_namespaced_enum(
         value,
         "AutoAcceptSharedAttachments",
-        "awscc.ec2_transit_gateway",
+        "awscc.ec2.transit_gateway",
         VALID_AUTO_ACCEPT_SHARED_ATTACHMENTS,
     )
     .map_err(|reason| {
@@ -38,7 +38,7 @@ fn validate_default_route_table_association(value: &Value) -> Result<(), String>
     validate_namespaced_enum(
         value,
         "DefaultRouteTableAssociation",
-        "awscc.ec2_transit_gateway",
+        "awscc.ec2.transit_gateway",
         VALID_DEFAULT_ROUTE_TABLE_ASSOCIATION,
     )
     .map_err(|reason| {
@@ -58,7 +58,7 @@ fn validate_default_route_table_propagation(value: &Value) -> Result<(), String>
     validate_namespaced_enum(
         value,
         "DefaultRouteTablePropagation",
-        "awscc.ec2_transit_gateway",
+        "awscc.ec2.transit_gateway",
         VALID_DEFAULT_ROUTE_TABLE_PROPAGATION,
     )
     .map_err(|reason| {
@@ -78,7 +78,7 @@ fn validate_dns_support(value: &Value) -> Result<(), String> {
     validate_namespaced_enum(
         value,
         "DnsSupport",
-        "awscc.ec2_transit_gateway",
+        "awscc.ec2.transit_gateway",
         VALID_DNS_SUPPORT,
     )
     .map_err(|reason| {
@@ -98,7 +98,7 @@ fn validate_encryption_support(value: &Value) -> Result<(), String> {
     validate_namespaced_enum(
         value,
         "EncryptionSupport",
-        "awscc.ec2_transit_gateway",
+        "awscc.ec2.transit_gateway",
         VALID_ENCRYPTION_SUPPORT,
     )
     .map_err(|reason| {
@@ -118,7 +118,7 @@ fn validate_multicast_support(value: &Value) -> Result<(), String> {
     validate_namespaced_enum(
         value,
         "MulticastSupport",
-        "awscc.ec2_transit_gateway",
+        "awscc.ec2.transit_gateway",
         VALID_MULTICAST_SUPPORT,
     )
     .map_err(|reason| {
@@ -138,7 +138,7 @@ fn validate_security_group_referencing_support(value: &Value) -> Result<(), Stri
     validate_namespaced_enum(
         value,
         "SecurityGroupReferencingSupport",
-        "awscc.ec2_transit_gateway",
+        "awscc.ec2.transit_gateway",
         VALID_SECURITY_GROUP_REFERENCING_SUPPORT,
     )
     .map_err(|reason| {
@@ -161,7 +161,7 @@ fn validate_vpn_ecmp_support(value: &Value) -> Result<(), String> {
     validate_namespaced_enum(
         value,
         "VpnEcmpSupport",
-        "awscc.ec2_transit_gateway",
+        "awscc.ec2.transit_gateway",
         VALID_VPN_ECMP_SUPPORT,
     )
     .map_err(|reason| {
@@ -177,9 +177,9 @@ fn validate_vpn_ecmp_support(value: &Value) -> Result<(), String> {
 pub fn ec2_transit_gateway_config() -> AwsccSchemaConfig {
     AwsccSchemaConfig {
         aws_type_name: "AWS::EC2::TransitGateway",
-        resource_type_name: "ec2_transit_gateway",
+        resource_type_name: "ec2.transit_gateway",
         has_tags: true,
-        schema: ResourceSchema::new("awscc.ec2_transit_gateway")
+        schema: ResourceSchema::new("awscc.ec2.transit_gateway")
             .with_description("Resource Type definition for AWS::EC2::TransitGateway")
             .attribute(
                 AttributeSchema::new("amazon_side_asn", AttributeType::Int)
@@ -200,7 +200,7 @@ pub fn ec2_transit_gateway_config() -> AwsccSchemaConfig {
                         name: "AutoAcceptSharedAttachments".to_string(),
                         base: Box::new(AttributeType::String),
                         validate: validate_auto_accept_shared_attachments,
-                        namespace: Some("awscc.ec2_transit_gateway".to_string()),
+                        namespace: Some("awscc.ec2.transit_gateway".to_string()),
                         to_dsl: None,
                     },
                 )
@@ -213,7 +213,7 @@ pub fn ec2_transit_gateway_config() -> AwsccSchemaConfig {
                         name: "DefaultRouteTableAssociation".to_string(),
                         base: Box::new(AttributeType::String),
                         validate: validate_default_route_table_association,
-                        namespace: Some("awscc.ec2_transit_gateway".to_string()),
+                        namespace: Some("awscc.ec2.transit_gateway".to_string()),
                         to_dsl: None,
                     },
                 )
@@ -226,7 +226,7 @@ pub fn ec2_transit_gateway_config() -> AwsccSchemaConfig {
                         name: "DefaultRouteTablePropagation".to_string(),
                         base: Box::new(AttributeType::String),
                         validate: validate_default_route_table_propagation,
-                        namespace: Some("awscc.ec2_transit_gateway".to_string()),
+                        namespace: Some("awscc.ec2.transit_gateway".to_string()),
                         to_dsl: None,
                     },
                 )
@@ -243,7 +243,7 @@ pub fn ec2_transit_gateway_config() -> AwsccSchemaConfig {
                         name: "DnsSupport".to_string(),
                         base: Box::new(AttributeType::String),
                         validate: validate_dns_support,
-                        namespace: Some("awscc.ec2_transit_gateway".to_string()),
+                        namespace: Some("awscc.ec2.transit_gateway".to_string()),
                         to_dsl: None,
                     },
                 )
@@ -256,7 +256,7 @@ pub fn ec2_transit_gateway_config() -> AwsccSchemaConfig {
                         name: "EncryptionSupport".to_string(),
                         base: Box::new(AttributeType::String),
                         validate: validate_encryption_support,
-                        namespace: Some("awscc.ec2_transit_gateway".to_string()),
+                        namespace: Some("awscc.ec2.transit_gateway".to_string()),
                         to_dsl: None,
                     },
                 )
@@ -279,7 +279,7 @@ pub fn ec2_transit_gateway_config() -> AwsccSchemaConfig {
                         name: "MulticastSupport".to_string(),
                         base: Box::new(AttributeType::String),
                         validate: validate_multicast_support,
-                        namespace: Some("awscc.ec2_transit_gateway".to_string()),
+                        namespace: Some("awscc.ec2.transit_gateway".to_string()),
                         to_dsl: None,
                     },
                 )
@@ -300,7 +300,7 @@ pub fn ec2_transit_gateway_config() -> AwsccSchemaConfig {
                         name: "SecurityGroupReferencingSupport".to_string(),
                         base: Box::new(AttributeType::String),
                         validate: validate_security_group_referencing_support,
-                        namespace: Some("awscc.ec2_transit_gateway".to_string()),
+                        namespace: Some("awscc.ec2.transit_gateway".to_string()),
                         to_dsl: None,
                     },
                 )
@@ -326,7 +326,7 @@ pub fn ec2_transit_gateway_config() -> AwsccSchemaConfig {
                         name: "VpnEcmpSupport".to_string(),
                         base: Box::new(AttributeType::String),
                         validate: validate_vpn_ecmp_support,
-                        namespace: Some("awscc.ec2_transit_gateway".to_string()),
+                        namespace: Some("awscc.ec2.transit_gateway".to_string()),
                         to_dsl: None,
                     },
                 )
@@ -341,7 +341,7 @@ pub fn enum_valid_values() -> (
     &'static [(&'static str, &'static [&'static str])],
 ) {
     (
-        "ec2_transit_gateway",
+        "ec2.transit_gateway",
         &[
             (
                 "auto_accept_shared_attachments",

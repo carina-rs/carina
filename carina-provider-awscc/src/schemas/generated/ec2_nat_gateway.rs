@@ -18,7 +18,7 @@ fn validate_availability_mode(value: &Value) -> Result<(), String> {
     validate_namespaced_enum(
         value,
         "AvailabilityMode",
-        "awscc.ec2_nat_gateway",
+        "awscc.ec2.nat_gateway",
         VALID_AVAILABILITY_MODE,
     )
     .map_err(|reason| {
@@ -38,7 +38,7 @@ fn validate_connectivity_type(value: &Value) -> Result<(), String> {
     validate_namespaced_enum(
         value,
         "ConnectivityType",
-        "awscc.ec2_nat_gateway",
+        "awscc.ec2.nat_gateway",
         VALID_CONNECTIVITY_TYPE,
     )
     .map_err(|reason| {
@@ -54,9 +54,9 @@ fn validate_connectivity_type(value: &Value) -> Result<(), String> {
 pub fn ec2_nat_gateway_config() -> AwsccSchemaConfig {
     AwsccSchemaConfig {
         aws_type_name: "AWS::EC2::NatGateway",
-        resource_type_name: "ec2_nat_gateway",
+        resource_type_name: "ec2.nat_gateway",
         has_tags: true,
-        schema: ResourceSchema::new("awscc.ec2_nat_gateway")
+        schema: ResourceSchema::new("awscc.ec2.nat_gateway")
         .with_description("Specifies a network address translation (NAT) gateway in the specified subnet. You can create either a public NAT gateway or a private NAT gateway. The default is a public NAT gateway. If you create a...")
         .attribute(
             AttributeSchema::new("allocation_id", super::aws_resource_id())
@@ -79,7 +79,7 @@ pub fn ec2_nat_gateway_config() -> AwsccSchemaConfig {
                 name: "AvailabilityMode".to_string(),
                 base: Box::new(AttributeType::String),
                 validate: validate_availability_mode,
-                namespace: Some("awscc.ec2_nat_gateway".to_string()),
+                namespace: Some("awscc.ec2.nat_gateway".to_string()),
                 to_dsl: None,
             })
                 .create_only()
@@ -103,7 +103,7 @@ pub fn ec2_nat_gateway_config() -> AwsccSchemaConfig {
                 name: "ConnectivityType".to_string(),
                 base: Box::new(AttributeType::String),
                 validate: validate_connectivity_type,
-                namespace: Some("awscc.ec2_nat_gateway".to_string()),
+                namespace: Some("awscc.ec2.nat_gateway".to_string()),
                 to_dsl: None,
             })
                 .create_only()
@@ -177,7 +177,7 @@ pub fn enum_valid_values() -> (
     &'static [(&'static str, &'static [&'static str])],
 ) {
     (
-        "ec2_nat_gateway",
+        "ec2.nat_gateway",
         &[
             ("availability_mode", VALID_AVAILABILITY_MODE),
             ("connectivity_type", VALID_CONNECTIVITY_TYPE),

@@ -6,11 +6,11 @@ provider awscc {
   region = awscc.Region.ap_northeast_1
 }
 
-let vpc = awscc.ec2_vpc {
+let vpc = awscc.ec2.vpc {
   cidr_block = "10.0.0.0/16"
 }
 
-let rt = awscc.ec2_route_table {
+let rt = awscc.ec2.route_table {
   vpc_id = vpc.vpc_id
 
   tags = {

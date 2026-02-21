@@ -8,13 +8,13 @@ use super::AwsSchemaConfig;
 use super::tags_type;
 use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
-/// Returns the schema config for ec2_internet_gateway (Smithy: com.amazonaws.ec2)
+/// Returns the schema config for ec2.internet_gateway (Smithy: com.amazonaws.ec2)
 pub fn ec2_internet_gateway_config() -> AwsSchemaConfig {
     AwsSchemaConfig {
         aws_type_name: "AWS::EC2::InternetGateway",
-        resource_type_name: "ec2_internet_gateway",
+        resource_type_name: "ec2.internet_gateway",
         has_tags: true,
-        schema: ResourceSchema::new("aws.ec2_internet_gateway")
+        schema: ResourceSchema::new("aws.ec2.internet_gateway")
             .with_description("Describes an internet gateway.")
             .attribute(
                 AttributeSchema::new("name", AttributeType::String)
@@ -42,7 +42,7 @@ pub fn enum_valid_values() -> (
     &'static str,
     &'static [(&'static str, &'static [&'static str])],
 ) {
-    ("ec2_internet_gateway", &[])
+    ("ec2.internet_gateway", &[])
 }
 
 /// Maps DSL alias values back to canonical AWS values for this module.

@@ -3,7 +3,7 @@ use tower_lsp::lsp_types::{SemanticToken, SemanticTokenType, SemanticTokensLegen
 /// Token types supported by this language server
 pub const TOKEN_TYPES: &[SemanticTokenType] = &[
     SemanticTokenType::KEYWORD,  // 0: provider, let
-    SemanticTokenType::TYPE,     // 1: aws.s3_bucket, aws.ec2_vpc, aws.Region.*
+    SemanticTokenType::TYPE,     // 1: aws.s3.bucket, aws.ec2.vpc, aws.Region.*
     SemanticTokenType::VARIABLE, // 2: variable names
     SemanticTokenType::PROPERTY, // 3: attribute names (name, region, etc.)
     SemanticTokenType::STRING,   // 4: string literals
@@ -142,7 +142,7 @@ impl SemanticTokensProvider {
             }
         }
 
-        // Resource type: aws.<service>.<resource> pattern
+        // Resource type: aws.service.resource pattern
         self.find_resource_types(line, &mut tokens);
 
         // Region patterns: aws.Region.* and awscc.Region.*
@@ -240,7 +240,7 @@ impl SemanticTokensProvider {
         tokens
     }
 
-    /// Find resource type patterns like aws.s3_bucket, aws.ec2_vpc
+    /// Find resource type patterns like aws.s3.bucket, aws.ec2.vpc
     fn find_resource_types(&self, line: &str, tokens: &mut Vec<(u32, u32, u32)>) {
         let chars: Vec<char> = line.chars().collect();
         let mut i = 0;
@@ -296,8 +296,7 @@ impl SemanticTokensProvider {
             parts.push(current_part);
         }
 
-        // Must have at least 2 parts: provider.resource (e.g., aws.ec2_vpc, awscc.ec2_vpc)
-        // or 3 parts: provider.service.resource (legacy, e.g., aws.security_group.ingress_rule)
+        // Must have at least 3 parts: provider.service.resource (e.g., aws.ec2.vpc, awscc.ec2.vpc)
         if parts.len() >= 2 && parts.len() <= 3 {
             // Exclude enum patterns like aws.Region, aws.Protocol (2nd part starts with uppercase)
             if parts.len() == 2 && parts[1].starts_with(|c: char| c.is_uppercase()) {
@@ -347,28 +346,28 @@ mod tests {
     #[test]
     fn test_resource_type_at_line_start() {
         let provider = SemanticTokensProvider::new();
-        let tokens = provider.tokenize("aws.s3_bucket {");
+        let tokens = provider.tokenize("aws.s3.bucket {");
 
-        // Should have at least one TYPE token for aws.s3_bucket
+        // Should have at least one TYPE token for aws.s3.bucket
         let type_tokens: Vec<_> = tokens.iter().filter(|t| t.token_type == 1).collect();
-        assert!(!type_tokens.is_empty(), "Should find aws.s3_bucket as TYPE");
+        assert!(!type_tokens.is_empty(), "Should find aws.s3.bucket as TYPE");
     }
 
     #[test]
     fn test_resource_type_after_let() {
         let provider = SemanticTokensProvider::new();
-        let tokens = provider.tokenize("let bucket = aws.s3_bucket {");
+        let tokens = provider.tokenize("let bucket = aws.s3.bucket {");
 
-        // Should have TYPE token for aws.s3_bucket
+        // Should have TYPE token for aws.s3.bucket
         let type_tokens: Vec<_> = tokens.iter().filter(|t| t.token_type == 1).collect();
-        assert!(!type_tokens.is_empty(), "Should find aws.s3_bucket as TYPE");
+        assert!(!type_tokens.is_empty(), "Should find aws.s3.bucket as TYPE");
     }
 
     #[test]
     fn test_find_resource_types_directly() {
         let provider = SemanticTokensProvider::new();
         let mut tokens = Vec::new();
-        provider.find_resource_types("aws.s3_bucket {", &mut tokens);
+        provider.find_resource_types("aws.s3.bucket {", &mut tokens);
 
         assert_eq!(tokens.len(), 1, "Should find one resource type");
         assert_eq!(
@@ -381,17 +380,17 @@ mod tests {
     #[test]
     fn test_tokenize_line_resource_type() {
         let provider = SemanticTokensProvider::new();
-        let line_tokens = provider.tokenize_line("aws.s3_bucket {", 0);
+        let line_tokens = provider.tokenize_line("aws.s3.bucket {", 0);
 
         println!("Line tokens: {:?}", line_tokens);
 
-        // Check that aws.s3_bucket is in the tokens as TYPE (1)
+        // Check that aws.s3.bucket is in the tokens as TYPE (1)
         let has_resource_type = line_tokens
             .iter()
             .any(|(start, len, typ)| *start == 0 && *len == 13 && *typ == 1);
         assert!(
             has_resource_type,
-            "Should have aws.s3_bucket as TYPE at position 0. Got: {:?}",
+            "Should have aws.s3.bucket as TYPE at position 0. Got: {:?}",
             line_tokens
         );
     }
@@ -430,7 +429,7 @@ mod tests {
     #[test]
     fn test_tokenize_full_file() {
         let provider = SemanticTokensProvider::new();
-        let content = "aws.s3_bucket {\n    name = \"test\"\n}";
+        let content = "aws.s3.bucket {\n    name = \"test\"\n}";
         let tokens = provider.tokenize(content);
 
         println!("Full tokenize result:");
@@ -441,7 +440,7 @@ mod tests {
             );
         }
 
-        // First token should be aws.s3_bucket (TYPE = 1)
+        // First token should be aws.s3.bucket (TYPE = 1)
         assert!(!tokens.is_empty(), "Should have tokens");
         let first = &tokens[0];
         assert_eq!(
@@ -451,7 +450,7 @@ mod tests {
         );
         assert_eq!(
             first.length, 13,
-            "First token length should be 13 (aws.s3_bucket)"
+            "First token length should be 13 (aws.s3.bucket)"
         );
     }
 }

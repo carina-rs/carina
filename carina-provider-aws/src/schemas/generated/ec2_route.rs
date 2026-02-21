@@ -7,13 +7,13 @@
 use super::AwsSchemaConfig;
 use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, types};
 
-/// Returns the schema config for ec2_route (Smithy: com.amazonaws.ec2)
+/// Returns the schema config for ec2.route (Smithy: com.amazonaws.ec2)
 pub fn ec2_route_config() -> AwsSchemaConfig {
     AwsSchemaConfig {
         aws_type_name: "AWS::EC2::Route",
-        resource_type_name: "ec2_route",
+        resource_type_name: "ec2.route",
         has_tags: false,
-        schema: ResourceSchema::new("aws.ec2_route")
+        schema: ResourceSchema::new("aws.ec2.route")
         .with_description("Describes a route in a route table.")
         .attribute(
             AttributeSchema::new("name", AttributeType::String)
@@ -104,7 +104,7 @@ pub fn enum_valid_values() -> (
     &'static str,
     &'static [(&'static str, &'static [&'static str])],
 ) {
-    ("ec2_route", &[])
+    ("ec2.route", &[])
 }
 
 /// Maps DSL alias values back to canonical AWS values for this module.

@@ -24,7 +24,7 @@ use carina_core::utils::convert_enum_value;
 /// Get the AwsccSchemaConfig for a resource type
 fn get_schema_config(resource_type: &str) -> Option<AwsccSchemaConfig> {
     crate::schemas::generated::configs().into_iter().find(|c| {
-        // Match by schema resource_type: "awscc.ec2_vpc" -> "ec2_vpc"
+        // Match by schema resource_type: "awscc.ec2.vpc" -> "ec2.vpc"
         c.schema
             .resource_type
             .strip_prefix("awscc.")
@@ -437,7 +437,7 @@ impl AwsccProvider {
         let mut attributes = HashMap::new();
 
         // Add region for VPC
-        if resource_type == "ec2_vpc" {
+        if resource_type == "ec2.vpc" {
             let region_dsl = format!("awscc.Region.{}", self.region.replace('-', "_"));
             attributes.insert("region".to_string(), Value::String(region_dsl));
         }
@@ -566,7 +566,7 @@ impl AwsccProvider {
         })?;
 
         // Only VPC supports in-place updates currently
-        if id.resource_type != "ec2_vpc" {
+        if id.resource_type != "ec2.vpc" {
             return Err(ProviderError::new(format!(
                 "Update not supported for {}, delete and recreate",
                 id.resource_type
@@ -638,7 +638,7 @@ impl AwsccProvider {
         self.pre_delete_operations(id, &config, identifier).await?;
 
         // Handle force_delete for S3 buckets: empty the bucket before deletion
-        if lifecycle.force_delete && id.resource_type == "s3_bucket" {
+        if lifecycle.force_delete && id.resource_type == "s3.bucket" {
             self.empty_s3_bucket(identifier).await.map_err(|e| {
                 ProviderError::new(format!("Failed to empty S3 bucket before deletion: {}", e))
                     .for_resource(id.clone())
@@ -910,7 +910,7 @@ impl AwsccProvider {
         attributes: &mut HashMap<String, Value>,
     ) {
         match resource_type {
-            "ec2_internet_gateway" => {
+            "ec2.internet_gateway" => {
                 // Get VPC attachment
                 if let Some(attachments) = props.get("Attachments").and_then(|v| v.as_array())
                     && let Some(first) = attachments.first()
@@ -919,7 +919,7 @@ impl AwsccProvider {
                     attributes.insert("vpc_id".to_string(), Value::String(vpc_id.to_string()));
                 }
             }
-            "ec2_vpc_endpoint" => {
+            "ec2.vpc_endpoint" => {
                 // Handle route_table_ids list
                 if let Some(rt_ids) = props.get("RouteTableIds").and_then(|v| v.as_array()) {
                     let ids: Vec<Value> = rt_ids
@@ -949,7 +949,7 @@ impl AwsccProvider {
         resource_type: &str,
         desired_state: &mut serde_json::Map<String, serde_json::Value>,
     ) {
-        if resource_type == "ec2_eip" && !desired_state.contains_key("Domain") {
+        if resource_type == "ec2.eip" && !desired_state.contains_key("Domain") {
             desired_state.insert("Domain".to_string(), json!("vpc"));
         }
     }
@@ -961,7 +961,7 @@ impl AwsccProvider {
         config: &AwsccSchemaConfig,
         identifier: &str,
     ) -> ProviderResult<()> {
-        if id.resource_type == "ec2_internet_gateway" {
+        if id.resource_type == "ec2.internet_gateway" {
             // Detach from VPC first
             if let Some(props) = self
                 .cc_get_resource(config.aws_type_name, identifier)
@@ -1024,7 +1024,7 @@ impl AwsccProvider {
 ///
 /// For each awscc resource, looks up the schema and resolves bare identifiers
 /// (e.g., `advanced`) or TypeName.value identifiers (e.g., `Tier.advanced`)
-/// into fully-qualified namespaced strings (e.g., `awscc.ec2_ipam.Tier.advanced`).
+/// into fully-qualified namespaced strings (e.g., `awscc.ec2.ipam.Tier.advanced`).
 pub fn resolve_enum_identifiers_impl(resources: &mut [Resource]) {
     let awscc_configs = crate::schemas::generated::configs();
 
@@ -1064,12 +1064,12 @@ pub fn resolve_enum_identifiers_impl(resources: &mut [Resource]) {
             {
                 let resolved = match value {
                     Value::UnresolvedIdent(ident, None) => {
-                        // bare identifier: advanced → awscc.ec2_ipam.Tier.advanced
+                        // bare identifier: advanced → awscc.ec2.ipam.Tier.advanced
                         let dsl_val = to_dsl.map_or_else(|| ident.clone(), |f| f(ident));
                         Value::String(format!("{}.{}.{}", ns, type_name, dsl_val))
                     }
                     Value::UnresolvedIdent(ident, Some(member)) if ident == type_name => {
-                        // TypeName.value: Tier.advanced → awscc.ec2_ipam.Tier.advanced
+                        // TypeName.value: Tier.advanced → awscc.ec2.ipam.Tier.advanced
                         let dsl_val = to_dsl.map_or_else(|| member.clone(), |f| f(member));
                         Value::String(format!("{}.{}.{}", ns, type_name, dsl_val))
                     }
@@ -1283,7 +1283,7 @@ mod tests {
 
     #[test]
     fn test_resolve_enum_identifiers_bare_ident() {
-        let mut resource = Resource::new("ec2_vpc", "test");
+        let mut resource = Resource::new("ec2.vpc", "test");
         resource
             .attributes
             .insert("_provider".to_string(), Value::String("awscc".to_string()));
@@ -1307,7 +1307,7 @@ mod tests {
 
     #[test]
     fn test_resolve_enum_identifiers_typename_value() {
-        let mut resource = Resource::new("ec2_vpc", "test");
+        let mut resource = Resource::new("ec2.vpc", "test");
         resource
             .attributes
             .insert("_provider".to_string(), Value::String("awscc".to_string()));
@@ -1330,7 +1330,7 @@ mod tests {
 
     #[test]
     fn test_resolve_enum_identifiers_skips_non_awscc() {
-        let mut resource = Resource::new("s3_bucket", "test");
+        let mut resource = Resource::new("s3.bucket", "test");
         resource
             .attributes
             .insert("_provider".to_string(), Value::String("aws".to_string()));
@@ -1351,7 +1351,7 @@ mod tests {
     #[test]
     fn test_resolve_enum_identifiers_hyphen_to_underscore() {
         // Test that flow log's log_destination_type with hyphens gets converted to underscores
-        let mut resource = Resource::new("ec2_flow_log", "test");
+        let mut resource = Resource::new("ec2.flow_log", "test");
         resource
             .attributes
             .insert("_provider".to_string(), Value::String("awscc".to_string()));
@@ -1365,7 +1365,7 @@ mod tests {
         match &resources[0].attributes["log_destination_type"] {
             Value::String(s) => {
                 assert_eq!(
-                    s, "awscc.ec2_flow_log.LogDestinationType.cloud_watch_logs",
+                    s, "awscc.ec2.flow_log.LogDestinationType.cloud_watch_logs",
                     "Expected underscored namespaced enum, got: {}",
                     s
                 );
@@ -1377,7 +1377,7 @@ mod tests {
     #[test]
     fn test_resolve_enum_identifiers_hyphen_string_to_underscore() {
         // Test that a plain string with hyphens is converted to underscores via to_dsl
-        let mut resource = Resource::new("ec2_flow_log", "test");
+        let mut resource = Resource::new("ec2.flow_log", "test");
         resource
             .attributes
             .insert("_provider".to_string(), Value::String("awscc".to_string()));
@@ -1391,7 +1391,7 @@ mod tests {
         match &resources[0].attributes["log_destination_type"] {
             Value::String(s) => {
                 assert_eq!(
-                    s, "awscc.ec2_flow_log.LogDestinationType.cloud_watch_logs",
+                    s, "awscc.ec2.flow_log.LogDestinationType.cloud_watch_logs",
                     "Hyphenated string should be converted to underscore form, got: {}",
                     s
                 );
@@ -1403,7 +1403,7 @@ mod tests {
     #[test]
     fn test_restore_create_only_attrs_impl_basic() {
         // Create a state that's missing a create-only attribute
-        let id = ResourceId::with_provider("awscc", "ec2_nat_gateway", "test");
+        let id = ResourceId::with_provider("awscc", "ec2.nat_gateway", "test");
         let mut state = State::existing(id.clone(), HashMap::new());
         state.attributes.insert(
             "nat_gateway_id".to_string(),
@@ -1433,7 +1433,7 @@ mod tests {
 
     #[test]
     fn test_restore_create_only_attrs_skips_non_awscc() {
-        let id = ResourceId::with_provider("aws", "s3_bucket", "test");
+        let id = ResourceId::with_provider("aws", "s3.bucket", "test");
         let state = State::existing(id.clone(), HashMap::new());
 
         let mut current_states = HashMap::new();
@@ -1452,7 +1452,7 @@ mod tests {
 
     #[test]
     fn test_restore_create_only_attrs_skips_already_present() {
-        let id = ResourceId::with_provider("awscc", "ec2_nat_gateway", "test");
+        let id = ResourceId::with_provider("awscc", "ec2.nat_gateway", "test");
         let mut attrs = HashMap::new();
         attrs.insert(
             "subnet_id".to_string(),
@@ -1483,7 +1483,7 @@ mod tests {
     #[test]
     fn test_resolve_enum_identifiers_ip_protocol_all_alias() {
         // Test that bare "all" identifier resolves to namespaced form for IpProtocol
-        let mut resource = Resource::new("ec2_security_group_egress", "test");
+        let mut resource = Resource::new("ec2.security_group_egress", "test");
         resource
             .attributes
             .insert("_provider".to_string(), Value::String("awscc".to_string()));
@@ -1497,7 +1497,7 @@ mod tests {
         match &resources[0].attributes["ip_protocol"] {
             Value::String(s) => {
                 assert_eq!(
-                    s, "awscc.ec2_security_group_egress.IpProtocol.all",
+                    s, "awscc.ec2.security_group_egress.IpProtocol.all",
                     "Expected namespaced IpProtocol.all, got: {}",
                     s
                 );
@@ -1509,7 +1509,7 @@ mod tests {
     #[test]
     fn test_resolve_enum_identifiers_ip_protocol_tcp() {
         // Test that bare "tcp" identifier resolves correctly
-        let mut resource = Resource::new("ec2_security_group_egress", "test");
+        let mut resource = Resource::new("ec2.security_group_egress", "test");
         resource
             .attributes
             .insert("_provider".to_string(), Value::String("awscc".to_string()));
@@ -1523,7 +1523,7 @@ mod tests {
         match &resources[0].attributes["ip_protocol"] {
             Value::String(s) => {
                 assert_eq!(
-                    s, "awscc.ec2_security_group_egress.IpProtocol.tcp",
+                    s, "awscc.ec2.security_group_egress.IpProtocol.tcp",
                     "Expected namespaced IpProtocol.tcp, got: {}",
                     s
                 );
@@ -1541,7 +1541,7 @@ mod tests {
                     name: "IpProtocol".to_string(),
                     base: Box::new(AttributeType::String),
                     validate: |_| Ok(()),
-                    namespace: Some("awscc.ec2_security_group".to_string()),
+                    namespace: Some("awscc.ec2.security_group".to_string()),
                     to_dsl: Some(|s: &str| match s {
                         "-1" => "all".to_string(),
                         _ => s.to_string(),
@@ -1570,7 +1570,7 @@ mod tests {
             if let Value::Map(m) = &items[0] {
                 match &m["ip_protocol"] {
                     Value::String(s) => {
-                        assert_eq!(s, "awscc.ec2_security_group.IpProtocol.all");
+                        assert_eq!(s, "awscc.ec2.security_group.IpProtocol.all");
                     }
                     other => panic!("Expected String, got: {:?}", other),
                 }
@@ -1599,7 +1599,7 @@ mod tests {
             if let Value::Map(m) = &items[0] {
                 match &m["ip_protocol"] {
                     Value::String(s) => {
-                        assert_eq!(s, "awscc.ec2_security_group.IpProtocol.tcp");
+                        assert_eq!(s, "awscc.ec2.security_group.IpProtocol.tcp");
                     }
                     other => panic!("Expected String, got: {:?}", other),
                 }
@@ -1618,7 +1618,7 @@ mod tests {
         // Already-resolved string with dots should pass through unchanged
         map.insert(
             "ip_protocol".to_string(),
-            Value::String("awscc.ec2_security_group.IpProtocol.tcp".to_string()),
+            Value::String("awscc.ec2.security_group.IpProtocol.tcp".to_string()),
         );
         let value = Value::List(vec![Value::Map(map)]);
 
@@ -1627,7 +1627,7 @@ mod tests {
             if let Value::Map(m) = &items[0] {
                 match &m["ip_protocol"] {
                     Value::String(s) => {
-                        assert_eq!(s, "awscc.ec2_security_group.IpProtocol.tcp");
+                        assert_eq!(s, "awscc.ec2.security_group.IpProtocol.tcp");
                     }
                     other => panic!("Expected String, got: {:?}", other),
                 }
@@ -1765,7 +1765,7 @@ mod tests {
     fn test_resolve_enum_identifiers_impl_struct_field() {
         // Test that resolve_enum_identifiers_impl handles struct field enums
         // in ec2_security_group
-        let mut resource = Resource::new("ec2_security_group", "test-sg");
+        let mut resource = Resource::new("ec2.security_group", "test-sg");
         resource
             .attributes
             .insert("_provider".to_string(), Value::String("awscc".to_string()));
@@ -1796,7 +1796,7 @@ mod tests {
                 match &m["ip_protocol"] {
                     Value::String(s) => {
                         assert_eq!(
-                            s, "awscc.ec2_security_group.IpProtocol.all",
+                            s, "awscc.ec2.security_group.IpProtocol.all",
                             "Expected namespaced IpProtocol.all in struct field, got: {}",
                             s
                         );

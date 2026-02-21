@@ -1,4 +1,4 @@
-# awscc.ec2_internet_gateway
+# awscc.ec2.internet_gateway
 
 CloudFormation Type: `AWS::EC2::InternetGateway`
 
@@ -24,7 +24,7 @@ Any tags to assign to the internet gateway.
 ## Example
 
 ```crn
-let igw = awscc.ec2_internet_gateway {
+let igw = awscc.ec2.internet_gateway {
   tags = {
     Environment = "example"
   }

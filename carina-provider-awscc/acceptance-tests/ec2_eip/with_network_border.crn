@@ -6,7 +6,7 @@ provider awscc {
   region = awscc.Region.ap_northeast_1
 }
 
-let eip = awscc.ec2_eip {
+let eip = awscc.ec2.eip {
   domain               = "vpc"
   network_border_group = "ap-northeast-1"
 

@@ -1,4 +1,4 @@
-# awscc.ec2_security_group
+# awscc.ec2.security_group
 
 CloudFormation Type: `AWS::EC2::SecurityGroup`
 
@@ -93,11 +93,11 @@ The ID of the VPC for the security group.
 ## Example
 
 ```crn
-let vpc = awscc.ec2_vpc {
+let vpc = awscc.ec2.vpc {
   cidr_block = "10.0.0.0/16"
 }
 
-let sg = awscc.ec2_security_group {
+let sg = awscc.ec2.security_group {
   vpc_id            = vpc.vpc_id
   group_description = "Example security group"
 

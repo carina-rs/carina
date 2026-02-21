@@ -1,4 +1,4 @@
-# awscc.logs_log_group
+# awscc.logs.log_group
 
 CloudFormation Type: `AWS::Logs::LogGroup`
 
@@ -79,9 +79,9 @@ An array of key-value pairs to apply to the log group. For more information, see
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `STANDARD` | `awscc.logs_log_group.LogGroupClass.STANDARD` |
-| `INFREQUENT_ACCESS` | `awscc.logs_log_group.LogGroupClass.INFREQUENT_ACCESS` |
-| `DELIVERY` | `awscc.logs_log_group.LogGroupClass.DELIVERY` |
+| `STANDARD` | `awscc.logs.log_group.LogGroupClass.STANDARD` |
+| `INFREQUENT_ACCESS` | `awscc.logs.log_group.LogGroupClass.INFREQUENT_ACCESS` |
+| `DELIVERY` | `awscc.logs.log_group.LogGroupClass.DELIVERY` |
 
 Shorthand formats: `STANDARD` or `LogGroupClass.STANDARD`
 

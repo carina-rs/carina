@@ -7,11 +7,11 @@ provider awscc {
   region = awscc.Region.ap_northeast_1
 }
 
-let vpc = awscc.ec2_vpc {
+let vpc = awscc.ec2.vpc {
   cidr_block = "10.0.0.0/16"
 }
 
-let flow_log = awscc.ec2_flow_log {
+let flow_log = awscc.ec2.flow_log {
   resource_id          = vpc.vpc_id
   resource_type        = VPC
   traffic_type         = ALL

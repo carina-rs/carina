@@ -37,9 +37,9 @@ fn validate_ipv6_netmask_length_range(value: &Value) -> Result<(), String> {
 pub fn ec2_subnet_config() -> AwsccSchemaConfig {
     AwsccSchemaConfig {
         aws_type_name: "AWS::EC2::Subnet",
-        resource_type_name: "ec2_subnet",
+        resource_type_name: "ec2.subnet",
         has_tags: true,
-        schema: ResourceSchema::new("awscc.ec2_subnet")
+        schema: ResourceSchema::new("awscc.ec2.subnet")
         .with_description("Specifies a subnet for the specified VPC.  For an IPv4 only subnet, specify an IPv4 CIDR block. If the VPC has an IPv6 CIDR block, you can create an IPv6 only subnet or a dual stack subnet instead. Fo...")
         .attribute(
             AttributeSchema::new("assign_ipv6_address_on_creation", AttributeType::Bool)
@@ -189,7 +189,7 @@ pub fn enum_valid_values() -> (
     &'static str,
     &'static [(&'static str, &'static [&'static str])],
 ) {
-    ("ec2_subnet", &[])
+    ("ec2.subnet", &[])
 }
 
 /// Maps DSL alias values back to canonical AWS values for this module.

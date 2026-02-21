@@ -1,4 +1,4 @@
-# aws.ec2_security_group_ingress
+# aws.ec2.security_group_ingress
 
 CloudFormation Type: `AWS::EC2::SecurityGroupIngress`
 
@@ -68,11 +68,11 @@ If the protocol is TCP or UDP, this is the end of the port range.      If the pr
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `tcp` | `aws.ec2_security_group_ingress.IpProtocol.tcp` |
-| `udp` | `aws.ec2_security_group_ingress.IpProtocol.udp` |
-| `icmp` | `aws.ec2_security_group_ingress.IpProtocol.icmp` |
-| `icmpv6` | `aws.ec2_security_group_ingress.IpProtocol.icmpv6` |
-| `-1` | `aws.ec2_security_group_ingress.IpProtocol.all` |
+| `tcp` | `aws.ec2.security_group_ingress.IpProtocol.tcp` |
+| `udp` | `aws.ec2.security_group_ingress.IpProtocol.udp` |
+| `icmp` | `aws.ec2.security_group_ingress.IpProtocol.icmp` |
+| `icmpv6` | `aws.ec2.security_group_ingress.IpProtocol.icmpv6` |
+| `-1` | `aws.ec2.security_group_ingress.IpProtocol.all` |
 
 Shorthand formats: `tcp` or `IpProtocol.tcp`
 

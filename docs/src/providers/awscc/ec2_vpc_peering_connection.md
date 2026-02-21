@@ -1,4 +1,4 @@
-# awscc.ec2_vpc_peering_connection
+# awscc.ec2.vpc_peering_connection
 
 CloudFormation Type: `AWS::EC2::VPCPeeringConnection`
 
@@ -57,15 +57,15 @@ The ID of the VPC.
 ## Example
 
 ```crn
-let vpc1 = awscc.ec2_vpc {
+let vpc1 = awscc.ec2.vpc {
   cidr_block = "10.0.0.0/16"
 }
 
-let vpc2 = awscc.ec2_vpc {
+let vpc2 = awscc.ec2.vpc {
   cidr_block = "10.1.0.0/16"
 }
 
-let peering = awscc.ec2_vpc_peering_connection {
+let peering = awscc.ec2.vpc_peering_connection {
   vpc_id      = vpc1.vpc_id
   peer_vpc_id = vpc2.vpc_id
 

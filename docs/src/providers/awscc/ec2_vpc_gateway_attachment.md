@@ -1,4 +1,4 @@
-# awscc.ec2_vpc_gateway_attachment
+# awscc.ec2.vpc_gateway_attachment
 
 CloudFormation Type: `AWS::EC2::VPCGatewayAttachment`
 
@@ -38,16 +38,16 @@ The ID of the virtual private gateway. You must specify either InternetGatewayId
 ## Example
 
 ```crn
-let vpc = awscc.ec2_vpc {
+let vpc = awscc.ec2.vpc {
   cidr_block           = "10.0.0.0/16"
   enable_dns_support   = true
   enable_dns_hostnames = true
 }
 
-let igw = awscc.ec2_internet_gateway {
+let igw = awscc.ec2.internet_gateway {
 }
 
-let igw_attachment = awscc.ec2_vpc_gateway_attachment {
+let igw_attachment = awscc.ec2.vpc_gateway_attachment {
   vpc_id              = vpc.vpc_id
   internet_gateway_id = igw.internet_gateway_id
 }

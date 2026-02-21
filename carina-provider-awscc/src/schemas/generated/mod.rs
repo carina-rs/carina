@@ -124,76 +124,76 @@ pub fn get_enum_alias_reverse(
     attr_name: &str,
     value: &str,
 ) -> Option<&'static str> {
-    if resource_type == "ec2_vpc" {
+    if resource_type == "ec2.vpc" {
         return ec2_vpc::enum_alias_reverse(attr_name, value);
     }
-    if resource_type == "ec2_subnet" {
+    if resource_type == "ec2.subnet" {
         return ec2_subnet::enum_alias_reverse(attr_name, value);
     }
-    if resource_type == "ec2_internet_gateway" {
+    if resource_type == "ec2.internet_gateway" {
         return ec2_internet_gateway::enum_alias_reverse(attr_name, value);
     }
-    if resource_type == "ec2_route_table" {
+    if resource_type == "ec2.route_table" {
         return ec2_route_table::enum_alias_reverse(attr_name, value);
     }
-    if resource_type == "ec2_route" {
+    if resource_type == "ec2.route" {
         return ec2_route::enum_alias_reverse(attr_name, value);
     }
-    if resource_type == "ec2_subnet_route_table_association" {
+    if resource_type == "ec2.subnet_route_table_association" {
         return ec2_subnet_route_table_association::enum_alias_reverse(attr_name, value);
     }
-    if resource_type == "ec2_eip" {
+    if resource_type == "ec2.eip" {
         return ec2_eip::enum_alias_reverse(attr_name, value);
     }
-    if resource_type == "ec2_nat_gateway" {
+    if resource_type == "ec2.nat_gateway" {
         return ec2_nat_gateway::enum_alias_reverse(attr_name, value);
     }
-    if resource_type == "ec2_security_group" {
+    if resource_type == "ec2.security_group" {
         return ec2_security_group::enum_alias_reverse(attr_name, value);
     }
-    if resource_type == "ec2_security_group_ingress" {
+    if resource_type == "ec2.security_group_ingress" {
         return ec2_security_group_ingress::enum_alias_reverse(attr_name, value);
     }
-    if resource_type == "ec2_security_group_egress" {
+    if resource_type == "ec2.security_group_egress" {
         return ec2_security_group_egress::enum_alias_reverse(attr_name, value);
     }
-    if resource_type == "ec2_vpc_endpoint" {
+    if resource_type == "ec2.vpc_endpoint" {
         return ec2_vpc_endpoint::enum_alias_reverse(attr_name, value);
     }
-    if resource_type == "ec2_vpc_gateway_attachment" {
+    if resource_type == "ec2.vpc_gateway_attachment" {
         return ec2_vpc_gateway_attachment::enum_alias_reverse(attr_name, value);
     }
-    if resource_type == "ec2_flow_log" {
+    if resource_type == "ec2.flow_log" {
         return ec2_flow_log::enum_alias_reverse(attr_name, value);
     }
-    if resource_type == "ec2_ipam" {
+    if resource_type == "ec2.ipam" {
         return ec2_ipam::enum_alias_reverse(attr_name, value);
     }
-    if resource_type == "ec2_ipam_pool" {
+    if resource_type == "ec2.ipam_pool" {
         return ec2_ipam_pool::enum_alias_reverse(attr_name, value);
     }
-    if resource_type == "ec2_vpn_gateway" {
+    if resource_type == "ec2.vpn_gateway" {
         return ec2_vpn_gateway::enum_alias_reverse(attr_name, value);
     }
-    if resource_type == "ec2_transit_gateway" {
+    if resource_type == "ec2.transit_gateway" {
         return ec2_transit_gateway::enum_alias_reverse(attr_name, value);
     }
-    if resource_type == "ec2_vpc_peering_connection" {
+    if resource_type == "ec2.vpc_peering_connection" {
         return ec2_vpc_peering_connection::enum_alias_reverse(attr_name, value);
     }
-    if resource_type == "ec2_egress_only_internet_gateway" {
+    if resource_type == "ec2.egress_only_internet_gateway" {
         return ec2_egress_only_internet_gateway::enum_alias_reverse(attr_name, value);
     }
-    if resource_type == "ec2_transit_gateway_attachment" {
+    if resource_type == "ec2.transit_gateway_attachment" {
         return ec2_transit_gateway_attachment::enum_alias_reverse(attr_name, value);
     }
-    if resource_type == "s3_bucket" {
+    if resource_type == "s3.bucket" {
         return s3_bucket::enum_alias_reverse(attr_name, value);
     }
-    if resource_type == "iam_role" {
+    if resource_type == "iam.role" {
         return iam_role::enum_alias_reverse(attr_name, value);
     }
-    if resource_type == "logs_log_group" {
+    if resource_type == "logs.log_group" {
         return logs_log_group::enum_alias_reverse(attr_name, value);
     }
     None

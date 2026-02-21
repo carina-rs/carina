@@ -31,23 +31,23 @@ impl DiagnosticEngine {
         let mut valid_resource_types = HashSet::new();
 
         // AWS resources
-        valid_resource_types.insert("aws.ec2_vpc".to_string());
-        valid_resource_types.insert("aws.ec2_subnet".to_string());
-        valid_resource_types.insert("aws.ec2_internet_gateway".to_string());
-        valid_resource_types.insert("aws.ec2_route_table".to_string());
-        valid_resource_types.insert("aws.ec2_route".to_string());
-        valid_resource_types.insert("aws.ec2_security_group".to_string());
-        valid_resource_types.insert("aws.ec2_security_group_ingress".to_string());
-        valid_resource_types.insert("aws.ec2_security_group_egress".to_string());
-        valid_resource_types.insert("aws.s3_bucket".to_string());
+        valid_resource_types.insert("aws.ec2.vpc".to_string());
+        valid_resource_types.insert("aws.ec2.subnet".to_string());
+        valid_resource_types.insert("aws.ec2.internet_gateway".to_string());
+        valid_resource_types.insert("aws.ec2.route_table".to_string());
+        valid_resource_types.insert("aws.ec2.route".to_string());
+        valid_resource_types.insert("aws.ec2.security_group".to_string());
+        valid_resource_types.insert("aws.ec2.security_group_ingress".to_string());
+        valid_resource_types.insert("aws.ec2.security_group_egress".to_string());
+        valid_resource_types.insert("aws.s3.bucket".to_string());
 
         // AWS Cloud Control resources
-        valid_resource_types.insert("awscc.ec2_vpc".to_string());
-        valid_resource_types.insert("awscc.ec2_security_group".to_string());
-        valid_resource_types.insert("awscc.ec2_flow_log".to_string());
-        valid_resource_types.insert("awscc.ec2_nat_gateway".to_string());
-        valid_resource_types.insert("awscc.ec2_vpc_endpoint".to_string());
-        valid_resource_types.insert("awscc.ec2_subnet".to_string());
+        valid_resource_types.insert("awscc.ec2.vpc".to_string());
+        valid_resource_types.insert("awscc.ec2.security_group".to_string());
+        valid_resource_types.insert("awscc.ec2.flow_log".to_string());
+        valid_resource_types.insert("awscc.ec2.nat_gateway".to_string());
+        valid_resource_types.insert("awscc.ec2.vpc_endpoint".to_string());
+        valid_resource_types.insert("awscc.ec2.subnet".to_string());
 
         Self {
             valid_resource_types,
@@ -85,11 +85,7 @@ impl DiagnosticEngine {
                 if let Some(Value::String(binding_name)) = res.attributes.get("_binding") {
                     let provider =
                         self.detect_resource_provider(doc, &res.id.resource_type, &res.id.name);
-                    let full_type = if provider == "awscc" {
-                        format!("awscc.{}", res.id.resource_type)
-                    } else {
-                        res.id.resource_type.clone()
-                    };
+                    let full_type = format!("{}.{}", provider, res.id.resource_type);
                     if let Some(s) = self.get_schema_for_type(&full_type) {
                         binding_schema_map.insert(binding_name.clone(), s);
                     }
@@ -451,35 +447,35 @@ impl DiagnosticEngine {
     ) -> Option<carina_core::schema::ResourceSchema> {
         match resource_type {
             // AWS resources (auto-generated)
-            "aws.ec2_vpc" => Some(aws_generated::ec2_vpc::ec2_vpc_config().schema),
-            "aws.ec2_subnet" => Some(aws_generated::ec2_subnet::ec2_subnet_config().schema),
-            "aws.ec2_internet_gateway" => {
+            "aws.ec2.vpc" => Some(aws_generated::ec2_vpc::ec2_vpc_config().schema),
+            "aws.ec2.subnet" => Some(aws_generated::ec2_subnet::ec2_subnet_config().schema),
+            "aws.ec2.internet_gateway" => {
                 Some(aws_generated::ec2_internet_gateway::ec2_internet_gateway_config().schema)
             }
-            "aws.ec2_route_table" => {
+            "aws.ec2.route_table" => {
                 Some(aws_generated::ec2_route_table::ec2_route_table_config().schema)
             }
-            "aws.ec2_route" => Some(aws_generated::ec2_route::ec2_route_config().schema),
-            "aws.ec2_security_group" => {
+            "aws.ec2.route" => Some(aws_generated::ec2_route::ec2_route_config().schema),
+            "aws.ec2.security_group" => {
                 Some(aws_generated::ec2_security_group::ec2_security_group_config().schema)
             }
-            "aws.ec2_security_group_ingress" => Some(
+            "aws.ec2.security_group_ingress" => Some(
                 aws_generated::ec2_security_group_ingress::ec2_security_group_ingress_config()
                     .schema,
             ),
-            "aws.ec2_security_group_egress" => Some(
+            "aws.ec2.security_group_egress" => Some(
                 aws_generated::ec2_security_group_egress::ec2_security_group_egress_config().schema,
             ),
-            "aws.s3_bucket" => Some(aws_generated::s3_bucket::s3_bucket_config().schema),
+            "aws.s3.bucket" => Some(aws_generated::s3_bucket::s3_bucket_config().schema),
             // AWS Cloud Control resources
-            "awscc.ec2_vpc" => Some(awscc_vpc::ec2_vpc_config().schema),
-            "awscc.ec2_security_group" => {
+            "awscc.ec2.vpc" => Some(awscc_vpc::ec2_vpc_config().schema),
+            "awscc.ec2.security_group" => {
                 Some(awscc_security_group::ec2_security_group_config().schema)
             }
-            "awscc.ec2_flow_log" => Some(awscc_flow_log::ec2_flow_log_config().schema),
-            "awscc.ec2_nat_gateway" => Some(awscc_nat_gateway::ec2_nat_gateway_config().schema),
-            "awscc.ec2_vpc_endpoint" => Some(awscc_vpc_endpoint::ec2_vpc_endpoint_config().schema),
-            "awscc.ec2_subnet" => Some(awscc_subnet::ec2_subnet_config().schema),
+            "awscc.ec2.flow_log" => Some(awscc_flow_log::ec2_flow_log_config().schema),
+            "awscc.ec2.nat_gateway" => Some(awscc_nat_gateway::ec2_nat_gateway_config().schema),
+            "awscc.ec2.vpc_endpoint" => Some(awscc_vpc_endpoint::ec2_vpc_endpoint_config().schema),
+            "awscc.ec2.subnet" => Some(awscc_subnet::ec2_subnet_config().schema),
             _ => None,
         }
     }
@@ -786,7 +782,7 @@ impl DiagnosticEngine {
         resource_name: &str,
     ) -> String {
         let text = doc.text();
-        // Look for patterns like "awscc.ec2_vpc {" or "let x = awscc.ec2_vpc {"
+        // Look for patterns like "awscc.ec2.vpc {" or "let x = awscc.ec2.vpc {"
         let awscc_pattern = format!("awscc.{}", resource_type);
 
         for line in text.lines() {
@@ -1323,7 +1319,7 @@ mod tests {
     region = awscc.Region.ap_northeast_1
 }
 
-let sg = awscc.ec2_security_group {
+let sg = awscc.ec2.security_group {
     group_description = "Test security group"
     security_group_ingress {
         ip_protocol = "tcp"
@@ -1352,7 +1348,7 @@ let sg = awscc.ec2_security_group {
     region = awscc.Region.ap_northeast_1
 }
 
-let sg = awscc.ec2_security_group {
+let sg = awscc.ec2.security_group {
     group_description = "Test security group"
     security_group_ingress {
         ip_protocol = "tcp"
@@ -1382,11 +1378,11 @@ let sg = awscc.ec2_security_group {
     region = awscc.Region.ap_northeast_1
 }
 
-let vpc = awscc.ec2_vpc {
+let vpc = awscc.ec2.vpc {
     cidr_block = "10.0.0.0/16"
 }
 
-let vpc2 = awscc.ec2_vpc {
+let vpc2 = awscc.ec2.vpc {
     ipv4_ipam_pool_id = vpc.vpc_id
 }"#,
         );
@@ -1413,11 +1409,11 @@ let vpc2 = awscc.ec2_vpc {
     region = awscc.Region.ap_northeast_1
 }
 
-let vpc = awscc.ec2_vpc {
+let vpc = awscc.ec2.vpc {
     cidr_block = "10.0.0.0/16"
 }
 
-let subnet = awscc.ec2_subnet {
+let subnet = awscc.ec2.subnet {
     vpc_id = vpc.vpc_id
     cidr_block = "10.0.1.0/24"
 }"#,
@@ -1443,7 +1439,7 @@ let subnet = awscc.ec2_subnet {
     region = awscc.Region.ap_northeast_1
 }
 
-let sg = awscc.ec2_security_group {
+let sg = awscc.ec2.security_group {
     group_description = "Test security group"
     security_group_ingress {
         ip_protocol = "tcp"
@@ -1490,17 +1486,17 @@ let sg = awscc.ec2_security_group {
     region = aws.Region.ap_northeast_1
 }
 
-aws.ec2_subnet {
+aws.ec2.subnet {
     name = "my-subnet"
     vpc_id = "vpc-123"
     cidr_block = "10.0.1.0/24"
 
     private_dns_name_options_on_launch {
-        hostname_type = aws.ec2_subnet.HostnameType.resource_name
+        hostname_type = aws.ec2.subnet.HostnameType.resource_name
     }
 
     private_dns_name_options_on_launch {
-        hostname_type = aws.ec2_subnet.HostnameType.ip_name
+        hostname_type = aws.ec2.subnet.HostnameType.ip_name
     }
 }"#,
         );
@@ -1547,13 +1543,13 @@ aws.ec2_subnet {
     region = aws.Region.ap_northeast_1
 }
 
-aws.ec2_subnet {
+aws.ec2.subnet {
     name = "my-subnet"
     vpc_id = "vpc-123"
     cidr_block = "10.0.1.0/24"
 
     private_dns_name_options_on_launch {
-        hostname_type = aws.ec2_subnet.HostnameType.resource_name
+        hostname_type = aws.ec2.subnet.HostnameType.resource_name
     }
 }"#,
         );

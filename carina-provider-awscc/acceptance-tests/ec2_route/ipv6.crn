@@ -7,19 +7,19 @@ provider awscc {
   region = awscc.Region.ap_northeast_1
 }
 
-let vpc = awscc.ec2_vpc {
+let vpc = awscc.ec2.vpc {
   cidr_block = "10.0.0.0/16"
 }
 
-let eoigw = awscc.ec2_egress_only_internet_gateway {
+let eoigw = awscc.ec2.egress_only_internet_gateway {
   vpc_id = vpc.vpc_id
 }
 
-let rt = awscc.ec2_route_table {
+let rt = awscc.ec2.route_table {
   vpc_id = vpc.vpc_id
 }
 
-let route = awscc.ec2_route {
+let route = awscc.ec2.route {
   route_table_id                  = rt.route_table_id
   destination_ipv6_cidr_block     = "::/0"
   egress_only_internet_gateway_id = eoigw.id

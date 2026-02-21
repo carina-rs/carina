@@ -1,4 +1,4 @@
-# awscc.ec2_transit_gateway_attachment
+# awscc.ec2.transit_gateway_attachment
 
 CloudFormation Type: `AWS::EC2::TransitGatewayAttachment`
 

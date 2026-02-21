@@ -18,7 +18,7 @@ fn validate_instance_tenancy(value: &Value) -> Result<(), String> {
     validate_namespaced_enum(
         value,
         "InstanceTenancy",
-        "awscc.ec2_vpc",
+        "awscc.ec2.vpc",
         VALID_INSTANCE_TENANCY,
     )
     .map_err(|reason| {
@@ -46,9 +46,9 @@ fn validate_ipv4_netmask_length_range(value: &Value) -> Result<(), String> {
 pub fn ec2_vpc_config() -> AwsccSchemaConfig {
     AwsccSchemaConfig {
         aws_type_name: "AWS::EC2::VPC",
-        resource_type_name: "ec2_vpc",
+        resource_type_name: "ec2.vpc",
         has_tags: true,
-        schema: ResourceSchema::new("awscc.ec2_vpc")
+        schema: ResourceSchema::new("awscc.ec2.vpc")
         .with_description("Specifies a virtual private cloud (VPC).  To add an IPv6 CIDR block to the VPC, see [AWS::EC2::VPCCidrBlock](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-ec2-vpccidrbloc...")
         .attribute(
             AttributeSchema::new("cidr_block", types::ipv4_cidr())
@@ -86,7 +86,7 @@ pub fn ec2_vpc_config() -> AwsccSchemaConfig {
                 name: "InstanceTenancy".to_string(),
                 base: Box::new(AttributeType::String),
                 validate: validate_instance_tenancy,
-                namespace: Some("awscc.ec2_vpc".to_string()),
+                namespace: Some("awscc.ec2.vpc".to_string()),
                 to_dsl: None,
             })
                 .with_description("The allowed tenancy of instances launched into the VPC.  + ``default``: An instance launched into the VPC runs on shared hardware by default, unless y...")
@@ -133,7 +133,7 @@ pub fn enum_valid_values() -> (
     &'static str,
     &'static [(&'static str, &'static [&'static str])],
 ) {
-    ("ec2_vpc", &[("instance_tenancy", VALID_INSTANCE_TENANCY)])
+    ("ec2.vpc", &[("instance_tenancy", VALID_INSTANCE_TENANCY)])
 }
 
 /// Maps DSL alias values back to canonical AWS values for this module.

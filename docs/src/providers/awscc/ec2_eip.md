@@ -1,4 +1,4 @@
-# awscc.ec2_eip
+# awscc.ec2.eip
 
 CloudFormation Type: `AWS::EC2::EIP`
 
@@ -70,8 +70,8 @@ The Elastic IP address you are accepting for transfer. You can only accept one t
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `vpc` | `awscc.ec2_eip.Domain.vpc` |
-| `standard` | `awscc.ec2_eip.Domain.standard` |
+| `vpc` | `awscc.ec2.eip.Domain.vpc` |
+| `standard` | `awscc.ec2.eip.Domain.standard` |
 
 Shorthand formats: `vpc` or `Domain.vpc`
 
@@ -90,7 +90,7 @@ Shorthand formats: `vpc` or `Domain.vpc`
 ## Example
 
 ```crn
-let eip = awscc.ec2_eip {
+let eip = awscc.ec2.eip {
   domain = "vpc"
 
   tags = {

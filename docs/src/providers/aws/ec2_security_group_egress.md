@@ -1,4 +1,4 @@
-# aws.ec2_security_group_egress
+# aws.ec2.security_group_egress
 
 CloudFormation Type: `AWS::EC2::SecurityGroupEgress`
 
@@ -61,11 +61,11 @@ Not supported. Use IP permissions instead.
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `tcp` | `aws.ec2_security_group_egress.IpProtocol.tcp` |
-| `udp` | `aws.ec2_security_group_egress.IpProtocol.udp` |
-| `icmp` | `aws.ec2_security_group_egress.IpProtocol.icmp` |
-| `icmpv6` | `aws.ec2_security_group_egress.IpProtocol.icmpv6` |
-| `-1` | `aws.ec2_security_group_egress.IpProtocol.all` |
+| `tcp` | `aws.ec2.security_group_egress.IpProtocol.tcp` |
+| `udp` | `aws.ec2.security_group_egress.IpProtocol.udp` |
+| `icmp` | `aws.ec2.security_group_egress.IpProtocol.icmp` |
+| `icmpv6` | `aws.ec2.security_group_egress.IpProtocol.icmpv6` |
+| `-1` | `aws.ec2.security_group_egress.IpProtocol.all` |
 
 Shorthand formats: `tcp` or `IpProtocol.tcp`
 

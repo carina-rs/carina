@@ -18,7 +18,7 @@ fn validate_address_family(value: &Value) -> Result<(), String> {
     validate_namespaced_enum(
         value,
         "AddressFamily",
-        "awscc.ec2_ipam_pool",
+        "awscc.ec2.ipam_pool",
         VALID_ADDRESS_FAMILY,
     )
     .map_err(|reason| {
@@ -38,7 +38,7 @@ fn validate_aws_service(value: &Value) -> Result<(), String> {
     validate_namespaced_enum(
         value,
         "AwsService",
-        "awscc.ec2_ipam_pool",
+        "awscc.ec2.ipam_pool",
         VALID_AWS_SERVICE,
     )
     .map_err(|reason| {
@@ -58,7 +58,7 @@ fn validate_ipam_scope_type(value: &Value) -> Result<(), String> {
     validate_namespaced_enum(
         value,
         "IpamScopeType",
-        "awscc.ec2_ipam_pool",
+        "awscc.ec2.ipam_pool",
         VALID_IPAM_SCOPE_TYPE,
     )
     .map_err(|reason| {
@@ -78,7 +78,7 @@ fn validate_public_ip_source(value: &Value) -> Result<(), String> {
     validate_namespaced_enum(
         value,
         "PublicIpSource",
-        "awscc.ec2_ipam_pool",
+        "awscc.ec2.ipam_pool",
         VALID_PUBLIC_IP_SOURCE,
     )
     .map_err(|reason| {
@@ -102,7 +102,7 @@ const VALID_STATE: &[&str] = &[
 
 #[allow(dead_code)]
 fn validate_state(value: &Value) -> Result<(), String> {
-    validate_namespaced_enum(value, "State", "awscc.ec2_ipam_pool", VALID_STATE).map_err(|reason| {
+    validate_namespaced_enum(value, "State", "awscc.ec2.ipam_pool", VALID_STATE).map_err(|reason| {
         if let Value::String(s) = value {
             format!("Invalid State '{}': {}", s, reason)
         } else {
@@ -115,16 +115,16 @@ fn validate_state(value: &Value) -> Result<(), String> {
 pub fn ec2_ipam_pool_config() -> AwsccSchemaConfig {
     AwsccSchemaConfig {
         aws_type_name: "AWS::EC2::IPAMPool",
-        resource_type_name: "ec2_ipam_pool",
+        resource_type_name: "ec2.ipam_pool",
         has_tags: true,
-        schema: ResourceSchema::new("awscc.ec2_ipam_pool")
+        schema: ResourceSchema::new("awscc.ec2.ipam_pool")
         .with_description("Resource Schema of AWS::EC2::IPAMPool Type")
         .attribute(
             AttributeSchema::new("address_family", AttributeType::Custom {
                 name: "AddressFamily".to_string(),
                 base: Box::new(AttributeType::String),
                 validate: validate_address_family,
-                namespace: Some("awscc.ec2_ipam_pool".to_string()),
+                namespace: Some("awscc.ec2.ipam_pool".to_string()),
                 to_dsl: None,
             })
                 .required()
@@ -167,7 +167,7 @@ pub fn ec2_ipam_pool_config() -> AwsccSchemaConfig {
                 name: "AwsService".to_string(),
                 base: Box::new(AttributeType::String),
                 validate: validate_aws_service,
-                namespace: Some("awscc.ec2_ipam_pool".to_string()),
+                namespace: Some("awscc.ec2.ipam_pool".to_string()),
                 to_dsl: Some(|s: &str| s.replace('-', "_")),
             })
                 .create_only()
@@ -205,7 +205,7 @@ pub fn ec2_ipam_pool_config() -> AwsccSchemaConfig {
                 name: "IpamScopeType".to_string(),
                 base: Box::new(AttributeType::String),
                 validate: validate_ipam_scope_type,
-                namespace: Some("awscc.ec2_ipam_pool".to_string()),
+                namespace: Some("awscc.ec2.ipam_pool".to_string()),
                 to_dsl: None,
             })
                 .with_description("Determines whether this scope contains publicly routable space or space for a private network (read-only)")
@@ -237,7 +237,7 @@ pub fn ec2_ipam_pool_config() -> AwsccSchemaConfig {
                 name: "PublicIpSource".to_string(),
                 base: Box::new(AttributeType::String),
                 validate: validate_public_ip_source,
-                namespace: Some("awscc.ec2_ipam_pool".to_string()),
+                namespace: Some("awscc.ec2.ipam_pool".to_string()),
                 to_dsl: None,
             })
                 .create_only()
@@ -274,7 +274,7 @@ pub fn ec2_ipam_pool_config() -> AwsccSchemaConfig {
                 name: "State".to_string(),
                 base: Box::new(AttributeType::String),
                 validate: validate_state,
-                namespace: Some("awscc.ec2_ipam_pool".to_string()),
+                namespace: Some("awscc.ec2.ipam_pool".to_string()),
                 to_dsl: Some(|s: &str| s.replace('-', "_")),
             })
                 .with_description("The state of this pool. This can be one of the following values: \"create-in-progress\", \"create-complete\", \"modify-in-progress\", \"modify-complet... (read-only)")
@@ -299,7 +299,7 @@ pub fn enum_valid_values() -> (
     &'static [(&'static str, &'static [&'static str])],
 ) {
     (
-        "ec2_ipam_pool",
+        "ec2.ipam_pool",
         &[
             ("address_family", VALID_ADDRESS_FAMILY),
             ("aws_service", VALID_AWS_SERVICE),
