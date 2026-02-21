@@ -4,6 +4,18 @@
 
 # Providers
 
+- [AWS Provider](providers/aws/index.md)
+  - [EC2]()
+    - [aws.ec2_vpc](providers/aws/ec2_vpc.md)
+    - [aws.ec2_subnet](providers/aws/ec2_subnet.md)
+    - [aws.ec2_internet_gateway](providers/aws/ec2_internet_gateway.md)
+    - [aws.ec2_route_table](providers/aws/ec2_route_table.md)
+    - [aws.ec2_route](providers/aws/ec2_route.md)
+    - [aws.ec2_security_group](providers/aws/ec2_security_group.md)
+    - [aws.ec2_security_group_ingress](providers/aws/ec2_security_group_ingress.md)
+    - [aws.ec2_security_group_egress](providers/aws/ec2_security_group_egress.md)
+  - [S3]()
+    - [aws.s3_bucket](providers/aws/s3_bucket.md)
 - [AWSCC Provider](providers/awscc/index.md)
   - [EC2]()
     - [awscc.ec2_vpc](providers/awscc/ec2_vpc.md)
