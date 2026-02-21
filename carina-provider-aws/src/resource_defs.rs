@@ -197,11 +197,8 @@ pub fn ec2_resources() -> Vec<ResourceDef> {
             type_overrides: vec![],
             exclude_fields: vec!["DryRun", "TagSpecifications"],
             create_only_overrides: vec![],
-            enum_aliases: vec![("ip_protocol", "all", "-1")],
-            to_dsl_overrides: vec![(
-                "ip_protocol",
-                r#"Some(|s: &str| match s { "-1" => "all".to_string(), _ => s.replace('-', "_") })"#,
-            )],
+            enum_aliases: vec![],
+            to_dsl_overrides: vec![],
             required_overrides: vec![],
             extra_read_only: vec![],
             read_only_overrides: vec![],
