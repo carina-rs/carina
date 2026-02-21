@@ -404,6 +404,14 @@ impl DiagnosticEngine {
                     // Run resource-level validator (e.g., mutually exclusive required fields)
                     if let Err(errors) = schema.validate(&resource.attributes) {
                         for error in errors {
+                            // Skip DuplicateStructBlock errors here; they are already
+                            // reported with precise block positions in the attribute-level check above.
+                            if matches!(
+                                error,
+                                carina_core::schema::TypeError::DuplicateStructBlock { .. }
+                            ) {
+                                continue;
+                            }
                             if let Some((line, _col)) =
                                 self.find_resource_position(doc, &resource.id.resource_type)
                             {
@@ -1489,6 +1497,19 @@ aws.s3_bucket {
             diag.range.start.line
         );
         assert_eq!(diag.severity, Some(DiagnosticSeverity::ERROR));
+
+        // Should only emit one duplicate block diagnostic (not duplicated by resource-level validator)
+        let dup_count = diagnostics
+            .iter()
+            .filter(|d| d.message.contains("single block attribute"))
+            .count();
+        assert_eq!(
+            dup_count,
+            1,
+            "Should have exactly 1 duplicate block diagnostic, got {}. All diagnostics: {:?}",
+            dup_count,
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
     }
 
     #[test]
