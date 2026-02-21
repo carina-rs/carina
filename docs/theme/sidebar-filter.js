@@ -102,6 +102,9 @@
             }
         });
 
+        // Remove empty categories (from other providers' sections in the TOC)
+        links = links.filter(function (cat) { return cat.resources.length > 0; });
+
         // Build header (title + filter) outside scrollbox
         var header = document.createElement("div");
         header.className = "sidebar-header";
