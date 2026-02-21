@@ -182,6 +182,40 @@ impl DiagnosticEngine {
 
                         // Type validation
                         if let Some(attr_schema) = schema.attributes.get(attr_name) {
+                            // Check for duplicate struct blocks:
+                            // If schema type is Struct (not List(Struct)) but value is a List with multiple items
+                            if matches!(
+                                &attr_schema.attr_type,
+                                carina_core::schema::AttributeType::Struct { .. }
+                            ) && let Value::List(items) = attr_value
+                                && items.len() > 1
+                            {
+                                // Find all block positions for this attribute
+                                let block_positions = self.find_all_block_positions(doc, attr_name);
+                                // Emit error on the second and subsequent blocks
+                                for pos in block_positions.iter().skip(1) {
+                                    diagnostics.push(Diagnostic {
+                                        range: Range {
+                                            start: Position {
+                                                line: pos.0,
+                                                character: pos.1,
+                                            },
+                                            end: Position {
+                                                line: pos.0,
+                                                character: pos.1 + attr_name.len() as u32,
+                                            },
+                                        },
+                                        severity: Some(DiagnosticSeverity::ERROR),
+                                        source: Some("carina".to_string()),
+                                        message: format!(
+                                            "'{}' is a single block attribute and cannot be specified more than once",
+                                            attr_name
+                                        ),
+                                        ..Default::default()
+                                    });
+                                }
+                            }
+
                             let type_error = match (&attr_schema.attr_type, attr_value) {
                                 // Bool type should not receive String
                                 (carina_core::schema::AttributeType::Bool, Value::String(s)) => {
@@ -574,6 +608,27 @@ impl DiagnosticEngine {
         }
 
         diagnostics
+    }
+
+    /// Find the start positions of ALL blocks with the given name.
+    /// Returns `(line, col)` for each occurrence of `block_name {`.
+    fn find_all_block_positions(&self, doc: &Document, block_name: &str) -> Vec<(u32, u32)> {
+        let text = doc.text();
+        let mut positions = Vec::new();
+
+        for (line_idx, line) in text.lines().enumerate() {
+            let trimmed = line.trim();
+            // Look for "block_name {" (without "=")
+            if trimmed.starts_with(block_name) && !trimmed.contains('=') {
+                let after = trimmed[block_name.len()..].trim();
+                if after.starts_with('{') {
+                    let leading_ws = line.len() - trimmed.len();
+                    positions.push((line_idx as u32, leading_ws as u32));
+                }
+            }
+        }
+
+        positions
     }
 
     /// Find the positions of a field inside ALL matching nested blocks
@@ -1391,6 +1446,77 @@ let sg = awscc.ec2_security_group {
             diag.range.start.line, 17,
             "Diagnostic should point to line 17 (0-indexed, in second block), got line {}",
             diag.range.start.line
+        );
+    }
+
+    #[test]
+    fn duplicate_struct_block_error() {
+        let engine = DiagnosticEngine::new();
+        let doc = create_document(
+            r#"provider aws {
+    region = aws.Region.ap_northeast_1
+}
+
+aws.s3_bucket {
+    name = "my-bucket"
+
+    versioning_configuration {
+        status = Enabled
+    }
+
+    versioning_configuration {
+        status = Suspended
+    }
+}"#,
+        );
+
+        let diagnostics = engine.analyze(&doc, None);
+
+        let dup_diag = diagnostics
+            .iter()
+            .find(|d| d.message.contains("single block attribute"));
+        assert!(
+            dup_diag.is_some(),
+            "Should error on duplicate struct block. Got diagnostics: {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+
+        // Error should point to the second block (line 11, 0-indexed)
+        let diag = dup_diag.unwrap();
+        assert_eq!(
+            diag.range.start.line, 11,
+            "Diagnostic should point to line 11 (0-indexed, second block), got line {}",
+            diag.range.start.line
+        );
+        assert_eq!(diag.severity, Some(DiagnosticSeverity::ERROR));
+    }
+
+    #[test]
+    fn single_struct_block_no_error() {
+        let engine = DiagnosticEngine::new();
+        let doc = create_document(
+            r#"provider aws {
+    region = aws.Region.ap_northeast_1
+}
+
+aws.s3_bucket {
+    name = "my-bucket"
+
+    versioning_configuration {
+        status = Enabled
+    }
+}"#,
+        );
+
+        let diagnostics = engine.analyze(&doc, None);
+
+        let dup_diag = diagnostics
+            .iter()
+            .find(|d| d.message.contains("single block attribute"));
+        assert!(
+            dup_diag.is_none(),
+            "Should NOT error on single struct block. Got diagnostics: {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
     }
 }

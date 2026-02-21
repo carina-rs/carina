@@ -172,6 +172,24 @@ impl AttributeType {
                 Ok(())
             }
 
+            // Struct type accepts Value::List with exactly one Map element
+            // (parser wraps all nested blocks in Value::List)
+            (AttributeType::Struct { name, fields: _ }, Value::List(items)) => {
+                if items.len() > 1 {
+                    return Err(TypeError::DuplicateStructBlock {
+                        attribute: name.clone(),
+                    });
+                }
+                if items.len() == 1 {
+                    return self.validate(&items[0]);
+                }
+                // Empty list - fall through to type mismatch
+                Err(TypeError::TypeMismatch {
+                    expected: self.type_name(),
+                    got: value.type_name(),
+                })
+            }
+
             (AttributeType::Struct { name, fields }, Value::Map(map)) => {
                 // Check required fields
                 for field in fields {
@@ -275,6 +293,9 @@ pub enum TypeError {
         field: String,
         inner: Box<TypeError>,
     },
+
+    #[error("'{attribute}' is a single block attribute and cannot be specified more than once")]
+    DuplicateStructBlock { attribute: String },
 }
 
 impl Value {
@@ -1110,6 +1131,49 @@ mod tests {
         // Invalid item in list
         let bad_list = Value::List(vec![Value::Map(HashMap::new())]);
         assert!(list_type.validate(&bad_list).is_err());
+    }
+
+    #[test]
+    fn struct_accepts_single_element_list() {
+        // Parser wraps all nested blocks in Value::List, so Struct type must accept
+        // Value::List with exactly one Map element
+        let struct_type = AttributeType::Struct {
+            name: "VersioningConfiguration".to_string(),
+            fields: vec![StructField::new("status", AttributeType::String).required()],
+        };
+
+        let mut map = HashMap::new();
+        map.insert("status".to_string(), Value::String("Enabled".to_string()));
+        let single_list = Value::List(vec![Value::Map(map)]);
+        assert!(struct_type.validate(&single_list).is_ok());
+    }
+
+    #[test]
+    fn struct_rejects_multiple_element_list() {
+        // Multiple blocks for a bare Struct attribute should be rejected
+        let struct_type = AttributeType::Struct {
+            name: "VersioningConfiguration".to_string(),
+            fields: vec![StructField::new("status", AttributeType::String).required()],
+        };
+
+        let mut map1 = HashMap::new();
+        map1.insert("status".to_string(), Value::String("Enabled".to_string()));
+        let mut map2 = HashMap::new();
+        map2.insert("status".to_string(), Value::String("Suspended".to_string()));
+        let multi_list = Value::List(vec![Value::Map(map1), Value::Map(map2)]);
+        let result = struct_type.validate(&multi_list);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        match &err {
+            TypeError::DuplicateStructBlock { attribute } => {
+                assert_eq!(attribute, "VersioningConfiguration");
+            }
+            other => panic!("Expected DuplicateStructBlock, got: {:?}", other),
+        }
+        assert!(
+            err.to_string()
+                .contains("single block attribute and cannot be specified more than once")
+        );
     }
 
     #[test]
