@@ -297,7 +297,7 @@ impl SemanticTokensProvider {
         }
 
         // Must have at least 2 parts: provider.resource (e.g., aws.ec2_vpc, awscc.ec2_vpc)
-        // or 3 parts: provider.service.resource (e.g., aws.s3.bucket — legacy)
+        // or 3 parts: provider.service.resource (legacy, e.g., aws.security_group.ingress_rule)
         if parts.len() >= 2 && parts.len() <= 3 {
             // Exclude enum patterns like aws.Region, aws.Protocol (2nd part starts with uppercase)
             if parts.len() == 2 && parts[1].starts_with(|c: char| c.is_uppercase()) {

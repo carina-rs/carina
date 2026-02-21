@@ -50,7 +50,7 @@ module_call = {
 // Module call argument: key = value
 module_call_arg = { identifier ~ "=" ~ expression }
 
-// Anonymous resource: aws.s3.bucket { ... } (top-level)
+// Anonymous resource: aws.s3_bucket { ... } (top-level)
 anonymous_resource = { namespaced_id ~ "{" ~ block_content* ~ "}" }
 
 // Provider block: provider aws { ... }
@@ -72,7 +72,7 @@ nested_block = { identifier ~ "{" ~ attribute* ~ "}" }
 
 identifier = @{ ASCII_ALPHA ~ (ASCII_ALPHANUMERIC | "_")* }
 
-// Namespaced identifier: aws.s3.bucket, aws.Region.ap_northeast_1
+// Namespaced identifier: aws.s3_bucket, aws.Region.ap_northeast_1
 namespaced_id = @{ identifier ~ ("." ~ identifier)+ }
 
 // Expression
@@ -112,10 +112,10 @@ map_entry = { identifier ~ "=" ~ expression ~ ","? }
 // Environment variable: env("VAR_NAME")
 env_var = { "env" ~ "(" ~ string ~ ")" }
 
-// Resource expression: aws.s3.bucket { ... }
+// Resource expression: aws.s3_bucket { ... }
 resource_expr = { namespaced_id ~ "{" ~ block_content* ~ "}" }
 
-// Read resource expression (data source): read aws.s3.bucket { ... }
+// Read resource expression (data source): read aws.s3_bucket { ... }
 read_resource_expr = { "read" ~ namespaced_id ~ "{" ~ block_content* ~ "}" }
 
 // Variable reference (with optional member access: bucket.name)

@@ -88,9 +88,9 @@ AWS-specific type definitions (e.g., region validation, versioning status) belon
 
 ### Resource Type Mapping
 
-Resource types in schemas use dot notation (`s3.bucket`, `vpc.vpc`), not underscore format (`s3_bucket`). When mapping between DSL resource types and schema lookups:
-- DSL: `aws.s3.bucket` → Schema key: `s3.bucket`
-- Ensure `extract_resource_type()` in completion.rs and `valid_resource_types` in diagnostics.rs use consistent dot notation
+Resource types in schemas use underscore format (`s3_bucket`, `ec2_vpc`). When mapping between DSL resource types and schema lookups:
+- DSL: `aws.s3_bucket` → Schema key: `s3_bucket`
+- Ensure `extract_resource_type()` in completion.rs and `valid_resource_types` in diagnostics.rs use consistent underscore notation
 
 ### Validation Formats
 

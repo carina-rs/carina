@@ -993,7 +993,7 @@ mod tests {
 
     #[test]
     fn test_format_normalizes_indentation() {
-        let input = "aws.s3.bucket {\n    name = \"test\"\n}";
+        let input = "aws.s3_bucket {\n    name = \"test\"\n}";
         let config = FormatConfig::default();
         let result = format(input, &config).unwrap();
 
@@ -1002,7 +1002,7 @@ mod tests {
 
     #[test]
     fn test_format_aligns_attributes() {
-        let input = "aws.s3.bucket {\nname = \"test\"\nversioning = true\n}";
+        let input = "aws.s3_bucket {\nname = \"test\"\nversioning = true\n}";
         let config = FormatConfig {
             align_attributes: true,
             ..Default::default()
@@ -1034,11 +1034,11 @@ mod tests {
 
     #[test]
     fn test_format_let_binding() {
-        let input = "let bucket=aws.s3.bucket {\nname=\"test\"\n}";
+        let input = "let bucket=aws.s3_bucket {\nname=\"test\"\n}";
         let config = FormatConfig::default();
         let result = format(input, &config).unwrap();
 
-        assert!(result.contains("let bucket = aws.s3.bucket {"));
+        assert!(result.contains("let bucket = aws.s3_bucket {"));
     }
 
     #[test]
