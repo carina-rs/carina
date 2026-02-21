@@ -1,8 +1,8 @@
 //! security_group_egress schema definition for AWS Cloud Control
 //!
-//! Auto-generated from CloudFormation schema: AWS::EC2::SecurityGroupEgress
+//! Auto-generated from Smithy model: com.amazonaws.ec2
 //!
-//! DO NOT EDIT MANUALLY - regenerate with aws-codegen
+//! DO NOT EDIT MANUALLY - regenerate with smithy-codegen
 
 use super::AwsSchemaConfig;
 use super::validate_namespaced_enum;
@@ -53,100 +53,101 @@ fn validate_to_port_range(value: &Value) -> Result<(), String> {
     }
 }
 
-/// Returns the schema config for ec2_security_group_egress (AWS::EC2::SecurityGroupEgress)
+/// Returns the schema config for ec2_security_group_egress (Smithy: com.amazonaws.ec2)
 pub fn ec2_security_group_egress_config() -> AwsSchemaConfig {
     AwsSchemaConfig {
         aws_type_name: "AWS::EC2::SecurityGroupEgress",
         resource_type_name: "ec2_security_group_egress",
         has_tags: false,
         schema: ResourceSchema::new("aws.ec2_security_group_egress")
-        .with_description("Adds the specified outbound (egress) rule to a security group.  An outbound rule permits instances to send traffic to the specified IPv4 or IPv6 address range, the IP addresses that are specified by a...")
-        .attribute(
-            AttributeSchema::new("name", AttributeType::String)
-                .with_description("Resource name"),
-        )
-        .attribute(
-            AttributeSchema::new("region", super::aws_region())
-                .with_description("The AWS region (inherited from provider if not specified)"),
-        )
-        .attribute(
-            AttributeSchema::new("cidr_ip", types::ipv4_cidr())
+            .with_description("Describes a security group rule.")
+            .attribute(
+                AttributeSchema::new("name", AttributeType::String)
+                    .with_description("Resource name"),
+            )
+            .attribute(
+                AttributeSchema::new("region", super::aws_region())
+                    .with_description("The AWS region (inherited from provider if not specified)"),
+            )
+            .attribute(
+                AttributeSchema::new("cidr_ip", types::ipv4_cidr())
+                    .create_only()
+                    .with_description("Not supported. Use IP permissions instead.")
+                    .with_provider_name("CidrIp"),
+            )
+            .attribute(
+                AttributeSchema::new(
+                    "from_port",
+                    AttributeType::Custom {
+                        name: "Int(-1..=65535)".to_string(),
+                        base: Box::new(AttributeType::Int),
+                        validate: validate_from_port_range,
+                        namespace: None,
+                        to_dsl: None,
+                    },
+                )
                 .create_only()
-                .with_description("The IPv4 address range, in CIDR format. You must specify exactly one of the following: ``CidrIp``, ``CidrIpv6``, ``DestinationPrefixListId``, or ``Des...")
-                .with_provider_name("CidrIp"),
-        )
-        .attribute(
-            AttributeSchema::new("cidr_ipv6", types::ipv6_cidr())
-                .create_only()
-                .with_description("The IPv6 address range, in CIDR format. You must specify exactly one of the following: ``CidrIp``, ``CidrIpv6``, ``DestinationPrefixListId``, or ``Des...")
-                .with_provider_name("CidrIpv6"),
-        )
-        .attribute(
-            AttributeSchema::new("description", AttributeType::String)
-                .with_description("The description of an egress (outbound) security group rule. Constraints: Up to 255 characters in length. Allowed characters are a-z, A-Z, 0-9, spaces...")
-                .with_provider_name("Description"),
-        )
-        .attribute(
-            AttributeSchema::new("destination_prefix_list_id", super::aws_resource_id())
-                .create_only()
-                .with_description("The prefix list IDs for an AWS service. This is the AWS service to access through a VPC endpoint from instances associated with the security group. Yo...")
-                .with_provider_name("DestinationPrefixListId"),
-        )
-        .attribute(
-            AttributeSchema::new("destination_security_group_id", super::security_group_id())
-                .create_only()
-                .with_description("The ID of the security group. You must specify exactly one of the following: ``CidrIp``, ``CidrIpv6``, ``DestinationPrefixListId``, or ``DestinationSe...")
-                .with_provider_name("DestinationSecurityGroupId"),
-        )
-        .attribute(
-            AttributeSchema::new("from_port", AttributeType::Custom {
-                name: "Int(-1..=65535)".to_string(),
-                base: Box::new(AttributeType::Int),
-                validate: validate_from_port_range,
-                namespace: None,
-                to_dsl: None,
-            })
-                .create_only()
-                .with_description("If the protocol is TCP or UDP, this is the start of the port range. If the protocol is ICMP or ICMPv6, this is the ICMP type or -1 (all ICMP types).")
+                .with_description("Not supported. Use IP permissions instead.")
                 .with_provider_name("FromPort"),
-        )
-        .attribute(
-            AttributeSchema::new("group_id", super::security_group_id())
+            )
+            .attribute(
+                AttributeSchema::new("group_id", super::security_group_id())
+                    .required()
+                    .create_only()
+                    .with_description("The ID of the security group.")
+                    .with_provider_name("GroupId"),
+            )
+            .attribute(
+                AttributeSchema::new(
+                    "ip_protocol",
+                    AttributeType::Custom {
+                        name: "IpProtocol".to_string(),
+                        base: Box::new(AttributeType::String),
+                        validate: validate_ip_protocol,
+                        namespace: Some("aws.ec2_security_group_egress".to_string()),
+                        to_dsl: Some(|s: &str| match s {
+                            "-1" => "all".to_string(),
+                            _ => s.replace('-', "_"),
+                        }),
+                    },
+                )
                 .required()
                 .create_only()
-                .with_description("The ID of the security group. You must specify either the security group ID or the security group name in the request. For security groups in a nondef...")
-                .with_provider_name("GroupId"),
-        )
-        .attribute(
-            AttributeSchema::new("id", AttributeType::String)
-                .with_description(" (read-only)")
-                .with_provider_name("Id"),
-        )
-        .attribute(
-            AttributeSchema::new("ip_protocol", AttributeType::Custom {
-                name: "IpProtocol".to_string(),
-                base: Box::new(AttributeType::String),
-                validate: validate_ip_protocol,
-                namespace: Some("aws.ec2_security_group_egress".to_string()),
-                to_dsl: Some(|s: &str| match s { "-1" => "all".to_string(), _ => s.replace('-', "_") }),
-            })
-                .required()
-                .create_only()
-                .with_description("The IP protocol name (``tcp``, ``udp``, ``icmp``, ``icmpv6``) or number (see [Protocol Numbers](https://docs.aws.amazon.com/http://www.iana.org/assign...")
+                .with_description("Not supported. Use IP permissions instead.")
                 .with_provider_name("IpProtocol"),
-        )
-        .attribute(
-            AttributeSchema::new("to_port", AttributeType::Custom {
-                name: "Int(-1..=65535)".to_string(),
-                base: Box::new(AttributeType::Int),
-                validate: validate_to_port_range,
-                namespace: None,
-                to_dsl: None,
-            })
+            )
+            .attribute(
+                AttributeSchema::new("source_security_group_name", AttributeType::String)
+                    .create_only()
+                    .with_description("Not supported. Use IP permissions instead.")
+                    .with_provider_name("SourceSecurityGroupName"),
+            )
+            .attribute(
+                AttributeSchema::new("source_security_group_owner_id", AttributeType::String)
+                    .create_only()
+                    .with_description("Not supported. Use IP permissions instead.")
+                    .with_provider_name("SourceSecurityGroupOwnerId"),
+            )
+            .attribute(
+                AttributeSchema::new(
+                    "to_port",
+                    AttributeType::Custom {
+                        name: "Int(-1..=65535)".to_string(),
+                        base: Box::new(AttributeType::Int),
+                        validate: validate_to_port_range,
+                        namespace: None,
+                        to_dsl: None,
+                    },
+                )
                 .create_only()
-                .with_description("If the protocol is TCP or UDP, this is the end of the port range. If the protocol is ICMP or ICMPv6, this is the ICMP code or -1 (all ICMP codes). If ...")
+                .with_description("Not supported. Use IP permissions instead.")
                 .with_provider_name("ToPort"),
-        )
+            )
+            .attribute(
+                AttributeSchema::new("security_group_rule_id", AttributeType::String)
+                    .with_description("The ID of the security group rule. (read-only)")
+                    .with_provider_name("SecurityGroupRuleId"),
+            ),
     }
 }
 

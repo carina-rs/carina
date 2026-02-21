@@ -1,8 +1,8 @@
 //! vpc schema definition for AWS Cloud Control
 //!
-//! Auto-generated from CloudFormation schema: AWS::EC2::VPC
+//! Auto-generated from Smithy model: com.amazonaws.ec2
 //!
-//! DO NOT EDIT MANUALLY - regenerate with aws-codegen
+//! DO NOT EDIT MANUALLY - regenerate with smithy-codegen
 
 use super::AwsSchemaConfig;
 use super::tags_type;
@@ -11,7 +11,7 @@ use carina_core::resource::Value;
 use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, types};
 
 #[allow(dead_code)]
-const VALID_INSTANCE_TENANCY: &[&str] = &["default", "dedicated", "host"];
+const VALID_INSTANCE_TENANCY: &[&str] = &["dedicated", "default", "host"];
 
 #[allow(dead_code)]
 fn validate_instance_tenancy(value: &Value) -> Result<(), String> {
@@ -42,14 +42,14 @@ fn validate_ipv4_netmask_length_range(value: &Value) -> Result<(), String> {
     }
 }
 
-/// Returns the schema config for ec2_vpc (AWS::EC2::VPC)
+/// Returns the schema config for ec2_vpc (Smithy: com.amazonaws.ec2)
 pub fn ec2_vpc_config() -> AwsSchemaConfig {
     AwsSchemaConfig {
         aws_type_name: "AWS::EC2::VPC",
         resource_type_name: "ec2_vpc",
         has_tags: true,
         schema: ResourceSchema::new("aws.ec2_vpc")
-        .with_description("Specifies a virtual private cloud (VPC).  To add an IPv6 CIDR block to the VPC, see [AWS::EC2::VPCCidrBlock](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-ec2-vpccidrbloc...")
+        .with_description("Describes a VPC.")
         .attribute(
             AttributeSchema::new("name", AttributeType::String)
                 .with_description("Resource name"),
@@ -61,27 +61,12 @@ pub fn ec2_vpc_config() -> AwsSchemaConfig {
         .attribute(
             AttributeSchema::new("cidr_block", types::ipv4_cidr())
                 .create_only()
-                .with_description("The IPv4 network range for the VPC, in CIDR notation. For example, ``10.0.0.0/16``. We modify the specified CIDR block to its canonical form; for exam...")
+                .with_description("The IPv4 network range for the VPC, in CIDR notation. For example, 10.0.0.0/16. We modify the specified CIDR block to its canonical form; for example,...")
                 .with_provider_name("CidrBlock"),
         )
         .attribute(
-            AttributeSchema::new("cidr_block_associations", AttributeType::List(Box::new(types::ipv4_cidr())))
-                .with_description(" (read-only)")
-                .with_provider_name("CidrBlockAssociations"),
-        )
-        .attribute(
-            AttributeSchema::new("default_network_acl", super::aws_resource_id())
-                .with_description(" (read-only)")
-                .with_provider_name("DefaultNetworkAcl"),
-        )
-        .attribute(
-            AttributeSchema::new("default_security_group", super::security_group_id())
-                .with_description(" (read-only)")
-                .with_provider_name("DefaultSecurityGroup"),
-        )
-        .attribute(
             AttributeSchema::new("enable_dns_hostnames", AttributeType::Bool)
-                .with_description("Indicates whether the instances launched in the VPC get DNS hostnames. If enabled, instances in the VPC get DNS hostnames; otherwise, they do not. Dis...")
+                .with_description("Indicates whether the instances launched in the VPC get DNS hostnames. If enabled, instances in the VPC get DNS hostnames; otherwise, they do not. You...")
                 .with_provider_name("EnableDnsHostnames"),
         )
         .attribute(
@@ -97,13 +82,14 @@ pub fn ec2_vpc_config() -> AwsSchemaConfig {
                 namespace: Some("aws.ec2_vpc".to_string()),
                 to_dsl: None,
             })
-                .with_description("The allowed tenancy of instances launched into the VPC.  + ``default``: An instance launched into the VPC runs on shared hardware by default, unless y...")
+                .create_only()
+                .with_description("The tenancy options for instances launched into the VPC. For default, instances are launched with shared tenancy by default. You can launch instances ...")
                 .with_provider_name("InstanceTenancy"),
         )
         .attribute(
             AttributeSchema::new("ipv4_ipam_pool_id", super::ipam_pool_id())
                 .create_only()
-                .with_description("The ID of an IPv4 IPAM pool you want to use for allocating this VPC's CIDR. For more information, see [What is IPAM?](https://docs.aws.amazon.com//vpc...")
+                .with_description("The ID of an IPv4 IPAM pool you want to use for allocating this VPC's CIDR. For more information, see What is IPAM? in the Amazon VPC IPAM User Guide.")
                 .with_provider_name("Ipv4IpamPoolId"),
         )
         .attribute(
@@ -119,19 +105,14 @@ pub fn ec2_vpc_config() -> AwsSchemaConfig {
                 .with_provider_name("Ipv4NetmaskLength"),
         )
         .attribute(
-            AttributeSchema::new("ipv6_cidr_blocks", AttributeType::List(Box::new(types::ipv6_cidr())))
-                .with_description(" (read-only)")
-                .with_provider_name("Ipv6CidrBlocks"),
+            AttributeSchema::new("vpc_id", super::vpc_id())
+                .with_description("The ID of the VPC. (read-only)")
+                .with_provider_name("VpcId"),
         )
         .attribute(
             AttributeSchema::new("tags", tags_type())
-                .with_description("The tags for the VPC.")
+                .with_description("The tags for the resource.")
                 .with_provider_name("Tags"),
-        )
-        .attribute(
-            AttributeSchema::new("vpc_id", super::vpc_id())
-                .with_description(" (read-only)")
-                .with_provider_name("VpcId"),
         )
     }
 }

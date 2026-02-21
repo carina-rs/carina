@@ -1,20 +1,20 @@
 //! route schema definition for AWS Cloud Control
 //!
-//! Auto-generated from CloudFormation schema: AWS::EC2::Route
+//! Auto-generated from Smithy model: com.amazonaws.ec2
 //!
-//! DO NOT EDIT MANUALLY - regenerate with aws-codegen
+//! DO NOT EDIT MANUALLY - regenerate with smithy-codegen
 
 use super::AwsSchemaConfig;
 use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, types};
 
-/// Returns the schema config for ec2_route (AWS::EC2::Route)
+/// Returns the schema config for ec2_route (Smithy: com.amazonaws.ec2)
 pub fn ec2_route_config() -> AwsSchemaConfig {
     AwsSchemaConfig {
         aws_type_name: "AWS::EC2::Route",
         resource_type_name: "ec2_route",
         has_tags: false,
         schema: ResourceSchema::new("aws.ec2_route")
-        .with_description("Specifies a route in a route table. For more information, see [Routes](https://docs.aws.amazon.com/vpc/latest/userguide/VPC_Route_Tables.html#route-table-routes) in the *Amazon VPC User Guide*.  You m...")
+        .with_description("Describes a route in a route table.")
         .attribute(
             AttributeSchema::new("name", AttributeType::String)
                 .with_description("Resource name"),
@@ -27,11 +27,6 @@ pub fn ec2_route_config() -> AwsSchemaConfig {
             AttributeSchema::new("carrier_gateway_id", super::aws_resource_id())
                 .with_description("The ID of the carrier gateway. You can only use this option when the VPC contains a subnet which is associated with a Wavelength Zone.")
                 .with_provider_name("CarrierGatewayId"),
-        )
-        .attribute(
-            AttributeSchema::new("cidr_block", types::ipv4_cidr())
-                .with_description(" (read-only)")
-                .with_provider_name("CidrBlock"),
         )
         .attribute(
             AttributeSchema::new("core_network_arn", super::arn())
@@ -85,13 +80,6 @@ pub fn ec2_route_config() -> AwsSchemaConfig {
             AttributeSchema::new("network_interface_id", super::aws_resource_id())
                 .with_description("The ID of a network interface.")
                 .with_provider_name("NetworkInterfaceId"),
-        )
-        .attribute(
-            AttributeSchema::new("route_table_id", super::route_table_id())
-                .required()
-                .create_only()
-                .with_description("The ID of the route table for the route.")
-                .with_provider_name("RouteTableId"),
         )
         .attribute(
             AttributeSchema::new("transit_gateway_id", super::transit_gateway_id())

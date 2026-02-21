@@ -1,7 +1,7 @@
 //! Auto-generated AWS provider resource schemas
 //!
 //! DO NOT EDIT MANUALLY - regenerate with:
-//!   aws-vault exec <profile> -- ./carina-provider-aws/scripts/generate-schemas.sh
+//!   ./carina-provider-aws/scripts/generate-schemas-smithy.sh
 
 use carina_core::schema::ResourceSchema;
 
@@ -22,14 +22,14 @@ pub mod s3_bucket;
 /// Returns all generated schema configs
 pub fn configs() -> Vec<AwsSchemaConfig> {
     vec![
-        ec2_vpc::ec2_vpc_config(),
-        ec2_subnet::ec2_subnet_config(),
         ec2_internet_gateway::ec2_internet_gateway_config(),
-        ec2_route_table::ec2_route_table_config(),
         ec2_route::ec2_route_config(),
+        ec2_route_table::ec2_route_table_config(),
         ec2_security_group::ec2_security_group_config(),
-        ec2_security_group_ingress::ec2_security_group_ingress_config(),
         ec2_security_group_egress::ec2_security_group_egress_config(),
+        ec2_security_group_ingress::ec2_security_group_ingress_config(),
+        ec2_subnet::ec2_subnet_config(),
+        ec2_vpc::ec2_vpc_config(),
         s3_bucket::s3_bucket_config(),
     ]
 }
@@ -49,14 +49,14 @@ pub fn get_enum_valid_values(
     attr_name: &str,
 ) -> Option<&'static [&'static str]> {
     let modules: &[(&str, &[(&str, &[&str])])] = &[
-        ec2_vpc::enum_valid_values(),
-        ec2_subnet::enum_valid_values(),
         ec2_internet_gateway::enum_valid_values(),
-        ec2_route_table::enum_valid_values(),
         ec2_route::enum_valid_values(),
+        ec2_route_table::enum_valid_values(),
         ec2_security_group::enum_valid_values(),
-        ec2_security_group_ingress::enum_valid_values(),
         ec2_security_group_egress::enum_valid_values(),
+        ec2_security_group_ingress::enum_valid_values(),
+        ec2_subnet::enum_valid_values(),
+        ec2_vpc::enum_valid_values(),
         s3_bucket::enum_valid_values(),
     ];
     for (rt, attrs) in modules {
@@ -79,29 +79,29 @@ pub fn get_enum_alias_reverse(
     attr_name: &str,
     value: &str,
 ) -> Option<&'static str> {
-    if resource_type == "ec2_vpc" {
-        return ec2_vpc::enum_alias_reverse(attr_name, value);
-    }
-    if resource_type == "ec2_subnet" {
-        return ec2_subnet::enum_alias_reverse(attr_name, value);
-    }
     if resource_type == "ec2_internet_gateway" {
         return ec2_internet_gateway::enum_alias_reverse(attr_name, value);
-    }
-    if resource_type == "ec2_route_table" {
-        return ec2_route_table::enum_alias_reverse(attr_name, value);
     }
     if resource_type == "ec2_route" {
         return ec2_route::enum_alias_reverse(attr_name, value);
     }
+    if resource_type == "ec2_route_table" {
+        return ec2_route_table::enum_alias_reverse(attr_name, value);
+    }
     if resource_type == "ec2_security_group" {
         return ec2_security_group::enum_alias_reverse(attr_name, value);
+    }
+    if resource_type == "ec2_security_group_egress" {
+        return ec2_security_group_egress::enum_alias_reverse(attr_name, value);
     }
     if resource_type == "ec2_security_group_ingress" {
         return ec2_security_group_ingress::enum_alias_reverse(attr_name, value);
     }
-    if resource_type == "ec2_security_group_egress" {
-        return ec2_security_group_egress::enum_alias_reverse(attr_name, value);
+    if resource_type == "ec2_subnet" {
+        return ec2_subnet::enum_alias_reverse(attr_name, value);
+    }
+    if resource_type == "ec2_vpc" {
+        return ec2_vpc::enum_alias_reverse(attr_name, value);
     }
     if resource_type == "s3_bucket" {
         return s3_bucket::enum_alias_reverse(attr_name, value);
