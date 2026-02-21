@@ -238,7 +238,7 @@ mod tests {
         attrs.insert("versioning".to_string(), Value::Bool(true));
 
         let state = State::existing(
-            ResourceId::with_provider("aws", "s3.bucket", "my-bucket"),
+            ResourceId::with_provider("aws", "s3_bucket", "my-bucket"),
             attrs,
         )
         .with_identifier("my-bucket");

@@ -23,7 +23,7 @@ backend_block = {
     kw_backend ~ trivia+ ~ identifier ~ trivia* ~ open_brace ~ block_content* ~ close_brace
 }
 
-// Anonymous resource: aws.s3.bucket { ... }
+// Anonymous resource: aws.s3_bucket { ... }
 anonymous_resource = {
     namespaced_id ~ trivia* ~ open_brace ~ block_content* ~ close_brace
 }
@@ -88,7 +88,7 @@ attribute = { identifier ~ trivia* ~ equals ~ trivia* ~ expression }
 
 identifier = @{ ASCII_ALPHA ~ (ASCII_ALPHANUMERIC | "_")* }
 
-// Namespaced identifier: aws.s3.bucket, aws.Region.ap_northeast_1
+// Namespaced identifier: aws.s3_bucket, aws.Region.ap_northeast_1
 namespaced_id = @{ identifier ~ ("." ~ identifier)+ }
 
 // Expression
@@ -135,7 +135,7 @@ map_entry = { identifier ~ trivia* ~ equals ~ trivia* ~ expression ~ trivia* ~ c
 // Environment variable: env("VAR_NAME")
 env_var = { kw_env ~ open_paren ~ trivia* ~ string ~ trivia* ~ close_paren }
 
-// Resource expression: aws.s3.bucket { ... }
+// Resource expression: aws.s3_bucket { ... }
 resource_expr = {
     namespaced_id ~ trivia* ~ open_brace ~ block_content* ~ close_brace
 }

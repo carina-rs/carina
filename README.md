@@ -449,7 +449,7 @@ provider aws {
   region = aws.Region.ap_northeast_1
 }
 
-aws.s3.bucket {
+aws.s3_bucket {
   name = "my-app-data"
 }
 ```

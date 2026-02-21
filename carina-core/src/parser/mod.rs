@@ -547,7 +547,7 @@ fn parse_anonymous_resource(
 
     let namespaced_type = inner.next().unwrap().as_str().to_string();
 
-    // Extract resource type from namespace (aws.s3.bucket -> s3.bucket)
+    // Extract resource type from namespace (aws.s3_bucket -> s3_bucket)
     let parts: Vec<&str> = namespaced_type.split('.').collect();
     if parts.len() < 2 {
         return Err(ParseError::InvalidResourceType(namespaced_type));
@@ -664,7 +664,7 @@ fn parse_resource_expr(
 
     let namespaced_type = inner.next().unwrap().as_str().to_string();
 
-    // Extract resource type from namespace (aws.s3.bucket -> s3.bucket)
+    // Extract resource type from namespace (aws.s3_bucket -> s3_bucket)
     let parts: Vec<&str> = namespaced_type.split('.').collect();
     if parts.len() < 2 {
         return Err(ParseError::InvalidResourceType(namespaced_type));
@@ -700,7 +700,7 @@ fn parse_resource_expr(
     })
 }
 
-/// Parse a read resource expression (data source): read aws.s3.bucket { ... }
+/// Parse a read resource expression (data source): read aws.s3_bucket { ... }
 fn parse_read_resource_expr(
     pair: pest::iterators::Pair<Rule>,
     ctx: &ParseContext,
@@ -710,7 +710,7 @@ fn parse_read_resource_expr(
 
     let namespaced_type = inner.next().unwrap().as_str().to_string();
 
-    // Extract resource type from namespace (aws.s3.bucket -> s3.bucket)
+    // Extract resource type from namespace (aws.s3_bucket -> s3_bucket)
     let parts: Vec<&str> = namespaced_type.split('.').collect();
     if parts.len() < 2 {
         return Err(ParseError::InvalidResourceType(namespaced_type));
@@ -1029,7 +1029,7 @@ mod tests {
     #[test]
     fn parse_resource_with_namespaced_type() {
         let input = r#"
-            let my_bucket = aws.s3.bucket {
+            let my_bucket = aws.s3_bucket {
                 name = "my-bucket"
                 region = aws.Region.ap_northeast_1
             }
@@ -1039,7 +1039,7 @@ mod tests {
         assert_eq!(result.resources.len(), 1);
 
         let resource = &result.resources[0];
-        assert_eq!(resource.id.resource_type, "s3.bucket");
+        assert_eq!(resource.id.resource_type, "s3_bucket");
         assert_eq!(resource.id.name, "my_bucket"); // binding name becomes the resource ID
         assert_eq!(
             resource.attributes.get("name"),
@@ -1054,11 +1054,11 @@ mod tests {
     #[test]
     fn parse_multiple_resources() {
         let input = r#"
-            let logs = aws.s3.bucket {
+            let logs = aws.s3_bucket {
                 name = "app-logs"
             }
 
-            let data = aws.s3.bucket {
+            let data = aws.s3_bucket {
                 name = "app-data"
             }
         "#;
@@ -1074,7 +1074,7 @@ mod tests {
         let input = r#"
             let default_region = aws.Region.ap_northeast_1
 
-            let my_bucket = aws.s3.bucket {
+            let my_bucket = aws.s3_bucket {
                 name = "my-bucket"
                 region = default_region
             }
@@ -1101,13 +1101,13 @@ mod tests {
             let retention_days = 90
 
             # Resources
-            let app_logs = aws.s3.bucket {
+            let app_logs = aws.s3_bucket {
                 name = "my-app-logs"
                 versioning = versioning
                 expiration_days = retention_days
             }
 
-            let app_data = aws.s3.bucket {
+            let app_data = aws.s3_bucket {
                 name = "my-app-data"
                 versioning = versioning
             }
@@ -1134,7 +1134,7 @@ mod tests {
         }
 
         let input = r#"
-            let my_bucket = aws.s3.bucket {
+            let my_bucket = aws.s3_bucket {
                 name = env("CARINA_TEST_VAR")
             }
         "#;
@@ -1172,7 +1172,7 @@ mod tests {
     #[test]
     fn parse_anonymous_resource() {
         let input = r#"
-            aws.s3.bucket {
+            aws.s3_bucket {
                 name = "my-anonymous-bucket"
                 region = aws.Region.ap_northeast_1
             }
@@ -1182,7 +1182,7 @@ mod tests {
         assert_eq!(result.resources.len(), 1);
 
         let resource = &result.resources[0];
-        assert_eq!(resource.id.resource_type, "s3.bucket");
+        assert_eq!(resource.id.resource_type, "s3_bucket");
         assert_eq!(resource.id.name, ""); // anonymous resources get empty name (computed later)
     }
 
@@ -1190,12 +1190,12 @@ mod tests {
     fn parse_mixed_resources() {
         let input = r#"
             # Anonymous resource
-            aws.s3.bucket {
+            aws.s3_bucket {
                 name = "anonymous-bucket"
             }
 
             # Named resource
-            let named = aws.s3.bucket {
+            let named = aws.s3_bucket {
                 name = "named-bucket"
             }
         "#;
@@ -1209,7 +1209,7 @@ mod tests {
     #[test]
     fn parse_anonymous_resource_without_name_succeeds() {
         let input = r#"
-            aws.s3.bucket {
+            aws.s3_bucket {
                 region = aws.Region.ap_northeast_1
             }
         "#;
@@ -1223,12 +1223,12 @@ mod tests {
     #[test]
     fn parse_resource_reference() {
         let input = r#"
-            let bucket = aws.s3.bucket {
+            let bucket = aws.s3_bucket {
                 name = "my-bucket"
                 region = aws.Region.ap_northeast_1
             }
 
-            let policy = aws.s3.bucket_policy {
+            let policy = aws.s3_bucket_policy {
                 name = "my-policy"
                 bucket = bucket.name
             }
@@ -1251,12 +1251,12 @@ mod tests {
     #[test]
     fn parse_and_resolve_resource_reference() {
         let input = r#"
-            let bucket = aws.s3.bucket {
+            let bucket = aws.s3_bucket {
                 name = "my-bucket"
                 region = aws.Region.ap_northeast_1
             }
 
-            let policy = aws.s3.bucket_policy {
+            let policy = aws.s3_bucket_policy {
                 name = "my-policy"
                 bucket = bucket.name
                 bucket_region = bucket.region
@@ -1283,7 +1283,7 @@ mod tests {
         // When a 2-part identifier references an unknown binding,
         // it becomes an UnresolvedIdent to be resolved during schema validation
         let input = r#"
-            let policy = aws.s3.bucket_policy {
+            let policy = aws.s3_bucket_policy {
                 name = "my-policy"
                 bucket = nonexistent.name
             }
@@ -1306,7 +1306,7 @@ mod tests {
     fn resource_reference_preserves_namespaced_id() {
         // Ensure that aws.Region.ap_northeast_1 is NOT treated as a resource reference
         let input = r#"
-            let bucket = aws.s3.bucket {
+            let bucket = aws.s3_bucket {
                 name = "my-bucket"
                 region = aws.Region.ap_northeast_1
             }
@@ -1624,7 +1624,7 @@ mod tests {
     #[test]
     fn parse_float_literal() {
         let input = r#"
-            let bucket = aws.s3.bucket {
+            let bucket = aws.s3_bucket {
                 name = "test"
                 weight = 2.5
             }
@@ -1640,7 +1640,7 @@ mod tests {
     #[test]
     fn parse_negative_float_literal() {
         let input = r#"
-            let bucket = aws.s3.bucket {
+            let bucket = aws.s3_bucket {
                 name = "test"
                 offset = -0.5
             }
@@ -1716,7 +1716,7 @@ mod tests {
                 region = aws.Region.ap_northeast_1
             }
 
-            aws.s3.bucket {
+            aws.s3_bucket {
                 name       = "my-state"
                 versioning = "Enabled"
             }
@@ -1744,7 +1744,7 @@ mod tests {
     #[test]
     fn parse_read_resource_expr() {
         let input = r#"
-            let existing = read aws.s3.bucket {
+            let existing = read aws.s3_bucket {
                 name = "my-existing-bucket"
             }
         "#;
@@ -1753,7 +1753,7 @@ mod tests {
         assert_eq!(result.resources.len(), 1);
 
         let resource = &result.resources[0];
-        assert_eq!(resource.id.resource_type, "s3.bucket");
+        assert_eq!(resource.id.resource_type, "s3_bucket");
         assert_eq!(resource.id.name, "existing"); // binding name becomes the resource ID
         assert!(resource.read_only);
         assert!(resource.is_data_source());
@@ -1766,7 +1766,7 @@ mod tests {
     #[test]
     fn parse_read_resource_without_name_uses_binding() {
         let input = r#"
-            let existing = read aws.s3.bucket {
+            let existing = read aws.s3_bucket {
                 region = aws.Region.ap_northeast_1
             }
         "#;
@@ -1781,12 +1781,12 @@ mod tests {
     fn parse_read_with_regular_resources() {
         let input = r#"
             # Read existing bucket (data source)
-            let existing_bucket = read aws.s3.bucket {
+            let existing_bucket = read aws.s3_bucket {
                 name = "existing-bucket"
             }
 
             # Create new bucket that depends on reading the existing one
-            let new_bucket = aws.s3.bucket {
+            let new_bucket = aws.s3_bucket {
                 name = "new-bucket"
             }
         "#;
