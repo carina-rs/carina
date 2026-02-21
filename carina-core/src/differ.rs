@@ -345,4 +345,29 @@ mod tests {
         assert_eq!(plan.effects().len(), 1);
         assert!(matches!(plan.effects()[0], Effect::Read { .. }));
     }
+
+    /// Regression test for issue #146: when neither desired nor current state has
+    /// a "name" attribute (the normal case for AWSCC resources after PR #151),
+    /// the differ should report NoChange, not a false update.
+    #[test]
+    fn no_false_update_without_name_attribute() {
+        // Simulate AWSCC resource: desired has cidr_block but no "name"
+        let desired = Resource::new("ec2.vpc", "vpc")
+            .with_attribute("cidr_block", Value::String("10.0.0.0/16".to_string()));
+
+        // Current state from provider read also has cidr_block but no "name"
+        let mut attrs = HashMap::new();
+        attrs.insert(
+            "cidr_block".to_string(),
+            Value::String("10.0.0.0/16".to_string()),
+        );
+        let current = State::existing(ResourceId::new("ec2.vpc", "vpc"), attrs);
+
+        let result = diff(&desired, &current);
+        assert!(
+            matches!(result, Diff::NoChange(_)),
+            "Expected NoChange when neither side has 'name', got {:?}",
+            result
+        );
+    }
 }
