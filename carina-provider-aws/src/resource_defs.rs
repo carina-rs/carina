@@ -202,7 +202,7 @@ pub fn ec2_resources() -> Vec<ResourceDef> {
                 "ip_protocol",
                 r#"Some(|s: &str| match s { "-1" => "all".to_string(), _ => s.replace('-', "_") })"#,
             )],
-            required_overrides: vec!["GroupDescription"],
+            required_overrides: vec![],
             extra_read_only: vec![],
             read_only_overrides: vec![],
         },

@@ -1265,7 +1265,14 @@ fn escape_description(desc: &str) -> String {
 
 fn truncate_str(s: &str, max_len: usize) -> String {
     if s.len() > max_len {
-        format!("{}...", &s[..max_len])
+        // Find a safe UTF-8 boundary at or before max_len
+        let boundary = s
+            .char_indices()
+            .take_while(|&(i, _)| i <= max_len)
+            .last()
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        format!("{}...", &s[..boundary])
     } else {
         s.to_string()
     }
