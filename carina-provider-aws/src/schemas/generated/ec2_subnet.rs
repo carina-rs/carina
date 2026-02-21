@@ -68,13 +68,13 @@ pub fn ec2_subnet_config() -> AwsSchemaConfig {
         )
         .attribute(
             AttributeSchema::new("assign_ipv6_address_on_creation", AttributeType::Bool)
-                .with_description("Indicates whether a network interface created in this subnet (including a network       interface created by RunInstances) receives an IPv6 address.")
+                .with_description("Indicates whether a network interface created in this subnet (including a network interface created by RunInstances) receives an IPv6 address.")
                 .with_provider_name("AssignIpv6AddressOnCreation"),
         )
         .attribute(
             AttributeSchema::new("availability_zone", super::availability_zone())
                 .create_only()
-                .with_description("The Availability Zone or Local Zone for the subnet.     Default: Amazon Web Services selects one for you. If you create more than one subnet in your V...")
+                .with_description("The Availability Zone or Local Zone for the subnet. Default: Amazon Web Services selects one for you. If you create more than one subnet in your VPC, ...")
                 .with_provider_name("AvailabilityZone"),
         )
         .attribute(
@@ -86,17 +86,17 @@ pub fn ec2_subnet_config() -> AwsSchemaConfig {
         .attribute(
             AttributeSchema::new("cidr_block", types::ipv4_cidr())
                 .create_only()
-                .with_description("The IPv4 network range for the subnet, in CIDR notation. For example, 10.0.0.0/24.       We modify the specified CIDR block to its canonical form; for...")
+                .with_description("The IPv4 network range for the subnet, in CIDR notation. For example, 10.0.0.0/24. We modify the specified CIDR block to its canonical form; for examp...")
                 .with_provider_name("CidrBlock"),
         )
         .attribute(
             AttributeSchema::new("enable_dns64", AttributeType::Bool)
-                .with_description("Indicates whether DNS queries made to the Amazon-provided DNS Resolver in this subnet       should return synthetic IPv6 addresses for IPv4-only desti...")
+                .with_description("Indicates whether DNS queries made to the Amazon-provided DNS Resolver in this subnet should return synthetic IPv6 addresses for IPv4-only destination...")
                 .with_provider_name("EnableDns64"),
         )
         .attribute(
             AttributeSchema::new("enable_lni_at_device_index", AttributeType::Int)
-                .with_description("Indicates the device position for local network interfaces in this subnet. For example,       1 indicates local network interfaces in this subnet are ...")
+                .with_description("Indicates the device position for local network interfaces in this subnet. For example, 1 indicates local network interfaces in this subnet are the se...")
                 .with_provider_name("EnableLniAtDeviceIndex"),
         )
         .attribute(
@@ -120,7 +120,7 @@ pub fn ec2_subnet_config() -> AwsSchemaConfig {
         .attribute(
             AttributeSchema::new("ipv6_cidr_block", types::ipv6_cidr())
                 .create_only()
-                .with_description("The IPv6 network range for the subnet, in CIDR notation. This parameter is required       for an IPv6 only subnet.")
+                .with_description("The IPv6 network range for the subnet, in CIDR notation. This parameter is required for an IPv6 only subnet.")
                 .with_provider_name("Ipv6CidrBlock"),
         )
         .attribute(
@@ -149,31 +149,31 @@ pub fn ec2_subnet_config() -> AwsSchemaConfig {
         )
         .attribute(
             AttributeSchema::new("map_public_ip_on_launch", AttributeType::Bool)
-                .with_description("Indicates whether instances launched in this subnet receive a public IPv4 address.     Amazon Web Services charges for all public IPv4 addresses, incl...")
+                .with_description("Indicates whether instances launched in this subnet receive a public IPv4 address. Amazon Web Services charges for all public IPv4 addresses, includin...")
                 .with_provider_name("MapPublicIpOnLaunch"),
         )
         .attribute(
             AttributeSchema::new("outpost_arn", super::arn())
                 .create_only()
-                .with_description("The Amazon Resource Name (ARN) of the Outpost. If you specify an Outpost ARN, you must also     specify the Availability Zone of the Outpost subnet.")
+                .with_description("The Amazon Resource Name (ARN) of the Outpost. If you specify an Outpost ARN, you must also specify the Availability Zone of the Outpost subnet.")
                 .with_provider_name("OutpostArn"),
         )
         .attribute(
             AttributeSchema::new("private_dns_name_options_on_launch", AttributeType::Struct {
                     name: "PrivateDnsNameOptionsOnLaunch".to_string(),
                     fields: vec![
-                    StructField::new("enable_resource_name_dns_aaaa_record", AttributeType::Bool).with_description("Indicates whether to respond to DNS queries for instance hostname with DNS AAAA       records.").with_provider_name("EnableResourceNameDnsAAAARecord"),
-                    StructField::new("enable_resource_name_dns_a_record", AttributeType::Bool).with_description("Indicates whether to respond to DNS queries for instance hostnames with DNS A       records.").with_provider_name("EnableResourceNameDnsARecord"),
+                    StructField::new("enable_resource_name_dns_aaaa_record", AttributeType::Bool).with_description("Indicates whether to respond to DNS queries for instance hostname with DNS AAAA records.").with_provider_name("EnableResourceNameDnsAAAARecord"),
+                    StructField::new("enable_resource_name_dns_a_record", AttributeType::Bool).with_description("Indicates whether to respond to DNS queries for instance hostnames with DNS A records.").with_provider_name("EnableResourceNameDnsARecord"),
                     StructField::new("hostname_type", AttributeType::Custom {
                 name: "HostnameType".to_string(),
                 base: Box::new(AttributeType::String),
                 validate: validate_hostname_type,
                 namespace: Some("aws.ec2_subnet".to_string()),
                 to_dsl: Some(|s: &str| s.replace('-', "_")),
-            }).with_description("The type of hostname for EC2 instances. For IPv4 only subnets, an instance DNS name       must be based on the instance IPv4 address. For IPv6 only su...").with_provider_name("HostnameType")
+            }).with_description("The type of hostname for EC2 instances. For IPv4 only subnets, an instance DNS name must be based on the instance IPv4 address. For IPv6 only subnets,...").with_provider_name("HostnameType")
                     ],
                 })
-                .with_description("The type of hostnames to assign to instances in the subnet at launch. An instance hostname       is based on the IPv4 address or ID of the instance.")
+                .with_description("The type of hostnames to assign to instances in the subnet at launch. An instance hostname is based on the IPv4 address or ID of the instance.")
                 .with_provider_name("PrivateDnsNameOptionsOnLaunch"),
         )
         .attribute(

@@ -72,7 +72,7 @@ pub fn ec2_security_group_ingress_config() -> AwsSchemaConfig {
         .attribute(
             AttributeSchema::new("cidr_ip", types::ipv4_cidr())
                 .create_only()
-                .with_description("The IPv4 address range, in CIDR format.                    Amazon Web Services canonicalizes IPv4 and IPv6 CIDRs. For example, if you specify 100.68.0...")
+                .with_description("The IPv4 address range, in CIDR format. Amazon Web Services canonicalizes IPv4 and IPv6 CIDRs. For example, if you specify 100.68.0.18/18 for the CIDR...")
                 .with_provider_name("CidrIp"),
         )
         .attribute(
@@ -84,7 +84,7 @@ pub fn ec2_security_group_ingress_config() -> AwsSchemaConfig {
                 to_dsl: None,
             })
                 .create_only()
-                .with_description("If the protocol is TCP or UDP, this is the start of the port range.      If the protocol is ICMP, this is the ICMP type or -1 (all ICMP types).     To...")
+                .with_description("If the protocol is TCP or UDP, this is the start of the port range. If the protocol is ICMP, this is the ICMP type or -1 (all ICMP types). To specify ...")
                 .with_provider_name("FromPort"),
         )
         .attribute(
@@ -96,7 +96,7 @@ pub fn ec2_security_group_ingress_config() -> AwsSchemaConfig {
         .attribute(
             AttributeSchema::new("group_name", AttributeType::String)
                 .create_only()
-                .with_description("[Default VPC] The name of the security group. For security groups for a default VPC     you can specify either the ID or the name of the security grou...")
+                .with_description("[Default VPC] The name of the security group. For security groups for a default VPC you can specify either the ID or the name of the security group. F...")
                 .with_provider_name("GroupName"),
         )
         .attribute(
@@ -109,19 +109,19 @@ pub fn ec2_security_group_ingress_config() -> AwsSchemaConfig {
             })
                 .required()
                 .create_only()
-                .with_description("The IP protocol name (tcp, udp, icmp) or number    (see Protocol Numbers). To specify all protocols, use -1.     To specify icmpv6, use IP permissions...")
+                .with_description("The IP protocol name (tcp, udp, icmp) or number (see Protocol Numbers). To specify all protocols, use -1. To specify icmpv6, use IP permissions instea...")
                 .with_provider_name("IpProtocol"),
         )
         .attribute(
             AttributeSchema::new("source_security_group_name", AttributeType::String)
                 .create_only()
-                .with_description("[Default VPC] The name of the source security group.     The rule grants full ICMP, UDP, and TCP access. To create a rule with a specific protocol    ...")
+                .with_description("[Default VPC] The name of the source security group. The rule grants full ICMP, UDP, and TCP access. To create a rule with a specific protocol and por...")
                 .with_provider_name("SourceSecurityGroupName"),
         )
         .attribute(
             AttributeSchema::new("source_security_group_owner_id", AttributeType::String)
                 .create_only()
-                .with_description("The Amazon Web Services account ID for the source security group, if the source security group is      in a different account.     The rule grants ful...")
+                .with_description("The Amazon Web Services account ID for the source security group, if the source security group is in a different account. The rule grants full ICMP, U...")
                 .with_provider_name("SourceSecurityGroupOwnerId"),
         )
         .attribute(
@@ -133,7 +133,7 @@ pub fn ec2_security_group_ingress_config() -> AwsSchemaConfig {
                 to_dsl: None,
             })
                 .create_only()
-                .with_description("If the protocol is TCP or UDP, this is the end of the port range.      If the protocol is ICMP, this is the ICMP code or -1 (all ICMP codes).       If...")
+                .with_description("If the protocol is TCP or UDP, this is the end of the port range. If the protocol is ICMP, this is the ICMP code or -1 (all ICMP codes). If the start ...")
                 .with_provider_name("ToPort"),
         )
         .attribute(

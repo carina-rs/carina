@@ -1273,12 +1273,22 @@ fn strip_html_tags(s: &str) -> String {
 
 fn escape_description(desc: &str) -> String {
     let stripped = strip_html_tags(desc);
-    stripped
-        .replace('"', "\\\"")
-        .replace(['\n', '\t'], " ")
-        .replace("  ", " ")
-        .trim()
-        .to_string()
+    let collapsed = stripped.replace('"', "\\\"").replace(['\n', '\t'], " ");
+    // Collapse all runs of multiple whitespace into a single space
+    let mut result = String::with_capacity(collapsed.len());
+    let mut prev_space = false;
+    for c in collapsed.chars() {
+        if c == ' ' {
+            if !prev_space {
+                result.push(' ');
+            }
+            prev_space = true;
+        } else {
+            result.push(c);
+            prev_space = false;
+        }
+    }
+    result.trim().to_string()
 }
 
 fn truncate_str(s: &str, max_len: usize) -> String {

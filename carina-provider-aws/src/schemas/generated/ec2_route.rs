@@ -25,7 +25,7 @@ pub fn ec2_route_config() -> AwsSchemaConfig {
         )
         .attribute(
             AttributeSchema::new("carrier_gateway_id", super::aws_resource_id())
-                .with_description("The ID of the carrier gateway.     You can only use this option when the VPC contains a subnet which is associated with a Wavelength Zone.")
+                .with_description("The ID of the carrier gateway. You can only use this option when the VPC contains a subnet which is associated with a Wavelength Zone.")
                 .with_provider_name("CarrierGatewayId"),
         )
         .attribute(
@@ -58,7 +58,7 @@ pub fn ec2_route_config() -> AwsSchemaConfig {
         )
         .attribute(
             AttributeSchema::new("gateway_id", super::aws_resource_id())
-                .with_description("The ID of an internet gateway or virtual private gateway attached to your  VPC.")
+                .with_description("The ID of an internet gateway or virtual private gateway attached to your VPC.")
                 .with_provider_name("GatewayId"),
         )
         .attribute(

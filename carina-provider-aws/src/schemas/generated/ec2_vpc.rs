@@ -61,17 +61,17 @@ pub fn ec2_vpc_config() -> AwsSchemaConfig {
         .attribute(
             AttributeSchema::new("cidr_block", types::ipv4_cidr())
                 .create_only()
-                .with_description("The IPv4 network range for the VPC, in CIDR notation. For example,      10.0.0.0/16. We modify the specified CIDR block to its canonical form; for exa...")
+                .with_description("The IPv4 network range for the VPC, in CIDR notation. For example, 10.0.0.0/16. We modify the specified CIDR block to its canonical form; for example,...")
                 .with_provider_name("CidrBlock"),
         )
         .attribute(
             AttributeSchema::new("enable_dns_hostnames", AttributeType::Bool)
-                .with_description("Indicates whether the instances launched in the VPC get DNS hostnames. If enabled, instances in the VPC get DNS hostnames; otherwise, they do not.    ...")
+                .with_description("Indicates whether the instances launched in the VPC get DNS hostnames. If enabled, instances in the VPC get DNS hostnames; otherwise, they do not. You...")
                 .with_provider_name("EnableDnsHostnames"),
         )
         .attribute(
             AttributeSchema::new("enable_dns_support", AttributeType::Bool)
-                .with_description("Indicates whether the DNS resolution is supported for the VPC. If enabled, queries to  the Amazon provided DNS server at the 169.254.169.253 IP addres...")
+                .with_description("Indicates whether the DNS resolution is supported for the VPC. If enabled, queries to the Amazon provided DNS server at the 169.254.169.253 IP address...")
                 .with_provider_name("EnableDnsSupport"),
         )
         .attribute(
@@ -83,7 +83,7 @@ pub fn ec2_vpc_config() -> AwsSchemaConfig {
                 to_dsl: None,
             })
                 .create_only()
-                .with_description("The tenancy options for instances launched into the VPC. For default, instances    are launched with shared tenancy by default. You can launch instanc...")
+                .with_description("The tenancy options for instances launched into the VPC. For default, instances are launched with shared tenancy by default. You can launch instances ...")
                 .with_provider_name("InstanceTenancy"),
         )
         .attribute(
