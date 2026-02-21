@@ -10,10 +10,10 @@
         var scrollbox = document.querySelector("mdbook-sidebar-scrollbox");
         if (!scrollbox) return;
 
-        var isProviderPage = window.location.pathname.indexOf("/providers/awscc/") !== -1;
+        var providerInfo = detectProvider();
 
-        if (isProviderPage) {
-            setupProviderSidebar(scrollbox);
+        if (providerInfo) {
+            setupProviderSidebar(scrollbox, providerInfo);
         } else {
             setupTopLevelSidebar(scrollbox);
         }
@@ -33,6 +33,22 @@
         setupSidebarResize();
     }
 
+    // Detect which provider page we're on, if any
+    // Returns { name, pathPrefix, displayName } or null
+    function detectProvider() {
+        var path = window.location.pathname;
+        var providers = [
+            { name: "awscc", pathPrefix: "/providers/awscc/", displayName: "AWSCC" },
+            { name: "aws", pathPrefix: "/providers/aws/", displayName: "AWS" }
+        ];
+        for (var i = 0; i < providers.length; i++) {
+            if (path.indexOf(providers[i].pathPrefix) !== -1) {
+                return providers[i];
+            }
+        }
+        return null;
+    }
+
     function setupTopLevelSidebar(scrollbox) {
         // On non-provider pages: hide nested resource items, show only top-level
         var sections = scrollbox.querySelectorAll("ol.section");
@@ -49,12 +65,13 @@
         if (onThisPage) onThisPage.style.display = "none";
     }
 
-    function setupProviderSidebar(scrollbox) {
-        // On provider pages: replace sidebar with AWSCC title + filter + resource list
+    function setupProviderSidebar(scrollbox, providerInfo) {
+        // On provider pages: replace sidebar with provider title + filter + resource list
 
         // Extract resource links from the existing sidebar before replacing
         var links = [];
         var currentCategory = null;
+        var providerHeaderName = providerInfo.displayName + " Provider";
 
         // Get ALL chapter-items in the sidebar (flat scan, no nesting assumptions)
         var allItems = scrollbox.querySelectorAll("li.chapter-item");
@@ -68,14 +85,14 @@
             if (span && !a) {
                 // Category header (EC2, S3, etc.) - has span text but no link
                 var name = span.textContent.replace(/^[\d.]+\s*/, "");
-                // Skip "AWSCC Provider" header
-                if (name === "AWSCC Provider") return;
+                // Skip provider header (e.g., "AWSCC Provider", "AWS Provider")
+                if (name === providerHeaderName) return;
                 currentCategory = { name: name, resources: [] };
                 links.push(currentCategory);
             } else if (a && currentCategory) {
                 // Resource link under a category
                 var href = a.getAttribute("href");
-                if (href && href.indexOf("providers/awscc/") !== -1) {
+                if (href && href.indexOf("providers/" + providerInfo.name + "/") !== -1) {
                     currentCategory.resources.push({
                         text: a.textContent.replace(/^[\d.]+\s*/, ""),
                         href: href,
@@ -91,7 +108,7 @@
 
         var title = document.createElement("div");
         title.className = "sidebar-provider-title";
-        title.textContent = "AWSCC";
+        title.textContent = providerInfo.displayName;
         header.appendChild(title);
 
         var input = document.createElement("input");
