@@ -740,7 +740,7 @@ impl AwsccProvider {
                 })
                 .collect();
             if !map.is_empty() {
-                return Some(Value::Map(map));
+                return Some(Value::List(vec![Value::Map(map)]));
             }
         }
 
@@ -846,7 +846,9 @@ impl AwsccProvider {
                 .collect();
             Some(serde_json::Value::Array(arr))
         } else if let AttributeType::Struct { fields, .. } = attr_type
-            && let Value::Map(map) = value
+            && let Value::List(items) = value
+            && items.len() == 1
+            && let Value::Map(map) = &items[0]
         {
             // Recurse into bare struct fields for type-aware conversion
             let obj: serde_json::Map<String, serde_json::Value> = fields
@@ -1634,6 +1636,128 @@ mod tests {
         } else {
             panic!("Expected List");
         }
+    }
+
+    #[tokio::test]
+    async fn test_aws_value_to_dsl_bare_struct_returns_list_wrapped_map() {
+        let provider = AwsccProvider::new("us-east-1").await;
+        let fields = vec![
+            StructField::new("status", AttributeType::String).with_provider_name("Status"),
+            StructField::new("mfa_delete", AttributeType::String).with_provider_name("MfaDelete"),
+        ];
+        let attr_type = AttributeType::Struct {
+            name: "VersioningConfiguration".to_string(),
+            fields,
+        };
+        let json_val = serde_json::json!({
+            "Status": "Enabled",
+        });
+
+        let result = provider.aws_value_to_dsl(
+            "versioning_configuration",
+            &json_val,
+            &attr_type,
+            "AWS::S3::Bucket",
+        );
+        let result = result.expect("Should return Some");
+
+        // Must be Value::List(vec![Value::Map(...)]) to match parser output
+        if let Value::List(items) = &result {
+            assert_eq!(items.len(), 1, "Expected single-element list");
+            if let Value::Map(map) = &items[0] {
+                assert_eq!(
+                    map.get("status"),
+                    Some(&Value::String("Enabled".to_string()))
+                );
+            } else {
+                panic!("Expected Map inside List, got: {:?}", items[0]);
+            }
+        } else {
+            panic!("Expected Value::List, got: {:?}", result);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_dsl_value_to_aws_unwraps_list_for_bare_struct() {
+        let provider = AwsccProvider::new("us-east-1").await;
+        let fields = vec![
+            StructField::new("status", AttributeType::String).with_provider_name("Status"),
+            StructField::new("mfa_delete", AttributeType::String).with_provider_name("MfaDelete"),
+        ];
+        let attr_type = AttributeType::Struct {
+            name: "VersioningConfiguration".to_string(),
+            fields,
+        };
+
+        // Parser produces Value::List(vec![Value::Map(...)])
+        let mut map = HashMap::new();
+        map.insert("status".to_string(), Value::String("Enabled".to_string()));
+        let dsl_value = Value::List(vec![Value::Map(map)]);
+
+        let result = provider.dsl_value_to_aws(
+            &dsl_value,
+            &attr_type,
+            "AWS::S3::Bucket",
+            "versioning_configuration",
+        );
+        let result = result.expect("Should return Some");
+
+        // Must produce a JSON object (not array)
+        if let serde_json::Value::Object(obj) = &result {
+            assert_eq!(obj.get("Status"), Some(&serde_json::json!("Enabled")));
+        } else {
+            panic!("Expected JSON Object, got: {:?}", result);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_bare_struct_roundtrip_no_spurious_diff() {
+        let provider = AwsccProvider::new("us-east-1").await;
+        let fields =
+            vec![StructField::new("status", AttributeType::String).with_provider_name("Status")];
+        let attr_type = AttributeType::Struct {
+            name: "VersioningConfiguration".to_string(),
+            fields,
+        };
+
+        // Simulate AWS API response (JSON object)
+        let aws_json = serde_json::json!({ "Status": "Enabled" });
+
+        // Read path: convert AWS JSON to DSL value
+        let dsl_value = provider
+            .aws_value_to_dsl(
+                "versioning_configuration",
+                &aws_json,
+                &attr_type,
+                "AWS::S3::Bucket",
+            )
+            .expect("read should succeed");
+
+        // Simulate parser output (what the user wrote in .crn)
+        let mut parser_map = HashMap::new();
+        parser_map.insert("status".to_string(), Value::String("Enabled".to_string()));
+        let parser_value = Value::List(vec![Value::Map(parser_map)]);
+
+        // The read value and parser value must be equal (no spurious diff)
+        assert_eq!(
+            dsl_value, parser_value,
+            "Read value should match parser value — no spurious diff"
+        );
+
+        // Write path: convert DSL value back to AWS JSON
+        let written_json = provider
+            .dsl_value_to_aws(
+                &dsl_value,
+                &attr_type,
+                "AWS::S3::Bucket",
+                "versioning_configuration",
+            )
+            .expect("write should succeed");
+
+        assert_eq!(
+            written_json, aws_json,
+            "Round-trip should produce original AWS JSON"
+        );
     }
 
     #[test]
