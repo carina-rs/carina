@@ -2,7 +2,7 @@
 
 CloudFormation Type: `AWS::EC2::SecurityGroupIngress`
 
-Resource Type definition for AWS::EC2::SecurityGroupIngress
+Describes a security group rule.
 
 ## Argument Reference
 
@@ -11,84 +11,56 @@ Resource Type definition for AWS::EC2::SecurityGroupIngress
 - **Type:** Ipv4Cidr
 - **Required:** No
 
-The IPv4 ranges
-
-### `cidr_ipv6`
-
-- **Type:** Ipv6Cidr
-- **Required:** No
-
-[VPC only] The IPv6 ranges
-
-### `description`
-
-- **Type:** String
-- **Required:** No
-
-Updates the description of an ingress (inbound) security group rule. You can replace an existing description, or add a description to a rule that did not have one previously
+The IPv4 address range, in CIDR format.                    Amazon Web Services canonicalizes IPv4 and IPv6 CIDRs. For example, if you specify 100.68.0.18/18 for the CIDR block,        Amazon Web Services canonicalizes the CIDR block to 100.68.0.0/18. Any subsequent DescribeSecurityGroups and DescribeSecurityGroupRules calls will        return the canonicalized form of the CIDR block. Additionally, if you attempt to add another rule with the        non-canonical form of the CIDR (such as 100.68.0.18/18) and there is already a rule for the canonicalized        form of the CIDR block (such as 100.68.0.0/18), the API throws an duplicate rule error.          To specify an IPv6 address range, use IP permissions instead.     To specify multiple rules and descriptions for the rules, use IP permissions instead.
 
 ### `from_port`
 
 - **Type:** Int(-1..=65535)
 - **Required:** No
 
-The start of port range for the TCP and UDP protocols, or an ICMP/ICMPv6 type number. A value of -1 indicates all ICMP/ICMPv6 types. If you specify all ICMP/ICMPv6 types, you must specify all codes. Use this for ICMP and any protocol that uses ports.
+If the protocol is TCP or UDP, this is the start of the port range.      If the protocol is ICMP, this is the ICMP type or -1 (all ICMP types).     To specify multiple rules and descriptions for the rules, use IP permissions instead.
 
 ### `group_id`
 
 - **Type:** SecurityGroupId
 - **Required:** No
 
-The ID of the security group. You must specify either the security group ID or the security group name in the request. For security groups in a nondefault VPC, you must specify the security group ID. You must specify the GroupName property or the GroupId property. For security groups that are in a VPC, you must use the GroupId property.
+The ID of the security group.
 
 ### `group_name`
 
 - **Type:** String
 - **Required:** No
 
-The name of the security group.
+[Default VPC] The name of the security group. For security groups for a default VPC     you can specify either the ID or the name of the security group. For security groups for     a nondefault VPC, you must specify the ID of the security group.
 
 ### `ip_protocol`
 
 - **Type:** [Enum (IpProtocol)](#ip_protocol-ipprotocol)
 - **Required:** Yes
 
-The IP protocol name (tcp, udp, icmp, icmpv6) or number (see Protocol Numbers). [VPC only] Use -1 to specify all protocols. When authorizing security group rules, specifying -1 or a protocol number other than tcp, udp, icmp, or icmpv6 allows traffic on all ports, regardless of any port range you specify. For tcp, udp, and icmp, you must specify a port range. For icmpv6, the port range is optional; if you omit the port range, traffic for all types and codes is allowed.
-
-### `source_prefix_list_id`
-
-- **Type:** AwsResourceId
-- **Required:** No
-
-[EC2-VPC only] The ID of a prefix list. 
-
-### `source_security_group_id`
-
-- **Type:** SecurityGroupId
-- **Required:** No
-
-The ID of the security group. You must specify either the security group ID or the security group name. For security groups in a nondefault VPC, you must specify the security group ID.
+The IP protocol name (tcp, udp, icmp) or number    (see Protocol Numbers). To specify all protocols, use -1.     To specify icmpv6, use IP permissions instead.     If you specify a protocol other than one of the supported values, traffic is allowed      on all ports, regardless of any ports that you specify.     To specify multiple rules and descriptions for the rules, use IP permissions instead.
 
 ### `source_security_group_name`
 
 - **Type:** String
 - **Required:** No
 
-[EC2-Classic, default VPC] The name of the source security group. You must specify the GroupName property or the GroupId property. For security groups that are in a VPC, you must use the GroupId property.
+[Default VPC] The name of the source security group.     The rule grants full ICMP, UDP, and TCP access. To create a rule with a specific protocol       and port range, specify a set of IP permissions instead.
 
 ### `source_security_group_owner_id`
 
 - **Type:** String
 - **Required:** No
 
-[nondefault VPC] The AWS account ID that owns the source security group. You can't specify this property with an IP address range. If you specify SourceSecurityGroupName or SourceSecurityGroupId and that security group is owned by a different account than the account creating the stack, you must specify the SourceSecurityGroupOwnerId; otherwise, this property is optional.
+The Amazon Web Services account ID for the source security group, if the source security group is      in a different account.     The rule grants full ICMP, UDP, and TCP access. To create a rule with a specific protocol      and port range, use IP permissions instead.
 
 ### `to_port`
 
 - **Type:** Int(-1..=65535)
 - **Required:** No
 
-The end of port range for the TCP and UDP protocols, or an ICMP/ICMPv6 code. A value of -1 indicates all ICMP/ICMPv6 codes for the specified ICMP type. If you specify all ICMP/ICMPv6 types, you must specify all codes. Use this for ICMP and any protocol that uses ports.
+If the protocol is TCP or UDP, this is the end of the port range.      If the protocol is ICMP, this is the ICMP code or -1 (all ICMP codes).       If the start port is -1 (all ICMP types), then the end port must be -1 (all ICMP codes).     To specify multiple rules and descriptions for the rules, use IP permissions instead.
 
 ## Enum Values
 
@@ -106,8 +78,7 @@ Shorthand formats: `tcp` or `IpProtocol.tcp`
 
 ## Attribute Reference
 
-### `id`
+### `security_group_rule_id`
 
 - **Type:** String
-
 

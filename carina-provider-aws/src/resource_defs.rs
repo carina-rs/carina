@@ -3,6 +3,15 @@
 //! Each `ResourceDef` describes how to map AWS API operations to a Carina resource schema.
 //! These definitions are consumed by the `smithy-codegen` binary.
 
+/// A read operation that retrieves specific fields from an API response.
+/// Used for resources that have no single "describe" structure (e.g., S3).
+pub struct ReadOp {
+    /// Operation short name (e.g., "GetBucketVersioning")
+    pub operation: &'static str,
+    /// Fields to extract: (smithy_output_field_name, optional_rename)
+    pub fields: Vec<(&'static str, Option<&'static str>)>,
+}
+
 /// Defines how to map an AWS API resource to a Carina schema.
 pub struct ResourceDef {
     /// Carina resource name (e.g., "ec2_vpc")
@@ -11,8 +20,12 @@ pub struct ResourceDef {
     pub service_namespace: &'static str,
     /// Create operation short name (e.g., "CreateVpc")
     pub create_op: &'static str,
-    /// Smithy structure name representing the read state (e.g., "Vpc")
-    pub read_structure: &'static str,
+    /// Smithy structure name representing the read state (e.g., "Vpc").
+    /// None for resources that use read_ops instead.
+    pub read_structure: Option<&'static str>,
+    /// Read operations for multi-operation resources (e.g., S3).
+    /// When read_structure is None, fields are gathered from these operations.
+    pub read_ops: Vec<ReadOp>,
     /// Delete operation short name (e.g., "DeleteVpc")
     pub delete_op: &'static str,
     /// Operations that modify existing resources
@@ -57,7 +70,8 @@ pub fn ec2_resources() -> Vec<ResourceDef> {
             name: "ec2_vpc",
             service_namespace: "com.amazonaws.ec2",
             create_op: "CreateVpc",
-            read_structure: "Vpc",
+            read_structure: Some("Vpc"),
+            read_ops: vec![],
             delete_op: "DeleteVpc",
             update_ops: vec![UpdateOp {
                 operation: "ModifyVpcAttribute",
@@ -89,7 +103,8 @@ pub fn ec2_resources() -> Vec<ResourceDef> {
             name: "ec2_subnet",
             service_namespace: "com.amazonaws.ec2",
             create_op: "CreateSubnet",
-            read_structure: "Subnet",
+            read_structure: Some("Subnet"),
+            read_ops: vec![],
             delete_op: "DeleteSubnet",
             update_ops: vec![UpdateOp {
                 operation: "ModifySubnetAttribute",
@@ -117,7 +132,8 @@ pub fn ec2_resources() -> Vec<ResourceDef> {
             name: "ec2_internet_gateway",
             service_namespace: "com.amazonaws.ec2",
             create_op: "CreateInternetGateway",
-            read_structure: "InternetGateway",
+            read_structure: Some("InternetGateway"),
+            read_ops: vec![],
             delete_op: "DeleteInternetGateway",
             update_ops: vec![],
             identifier: "InternetGatewayId",
@@ -136,7 +152,8 @@ pub fn ec2_resources() -> Vec<ResourceDef> {
             name: "ec2_route_table",
             service_namespace: "com.amazonaws.ec2",
             create_op: "CreateRouteTable",
-            read_structure: "RouteTable",
+            read_structure: Some("RouteTable"),
+            read_ops: vec![],
             delete_op: "DeleteRouteTable",
             update_ops: vec![],
             identifier: "RouteTableId",
@@ -155,7 +172,8 @@ pub fn ec2_resources() -> Vec<ResourceDef> {
             name: "ec2_route",
             service_namespace: "com.amazonaws.ec2",
             create_op: "CreateRoute",
-            read_structure: "Route",
+            read_structure: Some("Route"),
+            read_ops: vec![],
             delete_op: "DeleteRoute",
             update_ops: vec![UpdateOp {
                 operation: "ReplaceRoute",
@@ -189,7 +207,8 @@ pub fn ec2_resources() -> Vec<ResourceDef> {
             name: "ec2_security_group",
             service_namespace: "com.amazonaws.ec2",
             create_op: "CreateSecurityGroup",
-            read_structure: "SecurityGroup",
+            read_structure: Some("SecurityGroup"),
+            read_ops: vec![],
             delete_op: "DeleteSecurityGroup",
             update_ops: vec![],
             identifier: "GroupId",
@@ -208,7 +227,8 @@ pub fn ec2_resources() -> Vec<ResourceDef> {
             name: "ec2_security_group_ingress",
             service_namespace: "com.amazonaws.ec2",
             create_op: "AuthorizeSecurityGroupIngress",
-            read_structure: "SecurityGroupRule",
+            read_structure: Some("SecurityGroupRule"),
+            read_ops: vec![],
             delete_op: "RevokeSecurityGroupIngress",
             update_ops: vec![],
             identifier: "SecurityGroupRuleId",
@@ -235,7 +255,8 @@ pub fn ec2_resources() -> Vec<ResourceDef> {
             name: "ec2_security_group_egress",
             service_namespace: "com.amazonaws.ec2",
             create_op: "AuthorizeSecurityGroupEgress",
-            read_structure: "SecurityGroupRule",
+            read_structure: Some("SecurityGroupRule"),
+            read_ops: vec![],
             delete_op: "RevokeSecurityGroupEgress",
             update_ops: vec![],
             identifier: "SecurityGroupRuleId",
@@ -254,6 +275,53 @@ pub fn ec2_resources() -> Vec<ResourceDef> {
                 r#"Some(|s: &str| match s { "-1" => "all".to_string(), _ => s.replace('-', "_") })"#,
             )],
             required_overrides: vec!["IpProtocol", "GroupId"],
+            extra_read_only: vec![],
+            read_only_overrides: vec![],
+        },
+    ]
+}
+
+/// Returns S3 resource definitions.
+pub fn s3_resources() -> Vec<ResourceDef> {
+    vec![
+        // s3_bucket
+        ResourceDef {
+            name: "s3_bucket",
+            service_namespace: "com.amazonaws.s3",
+            create_op: "CreateBucket",
+            read_structure: None,
+            read_ops: vec![ReadOp {
+                operation: "GetBucketVersioning",
+                fields: vec![("Status", Some("VersioningStatus"))],
+            }],
+            delete_op: "DeleteBucket",
+            update_ops: vec![UpdateOp {
+                operation: "PutBucketVersioning",
+                fields: vec!["VersioningStatus"],
+            }],
+            identifier: "Bucket",
+            has_tags: true,
+            type_overrides: vec![],
+            exclude_fields: vec![
+                "ACL",
+                "GrantFullControl",
+                "GrantRead",
+                "GrantReadACP",
+                "GrantWrite",
+                "GrantWriteACP",
+                "CreateBucketConfiguration",
+                "ObjectLockEnabledForBucket",
+                "ObjectOwnership",
+                "ContentMD5",
+                "ChecksumAlgorithm",
+                "MFA",
+                "ExpectedBucketOwner",
+                "VersioningConfiguration",
+            ],
+            create_only_overrides: vec![],
+            enum_aliases: vec![],
+            to_dsl_overrides: vec![],
+            required_overrides: vec![],
             extra_read_only: vec![],
             read_only_overrides: vec![],
         },

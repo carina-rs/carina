@@ -2,17 +2,9 @@
 
 CloudFormation Type: `AWS::EC2::RouteTable`
 
-Specifies a route table for the specified VPC. After you create a route table, you can add routes and associate the table with a subnet.
- For more information, see [Route tables](https://docs.aws.amazon.com/vpc/latest/userguide/VPC_Route_Tables.html) in the *Amazon VPC User Guide*.
+Describes a route table.
 
 ## Argument Reference
-
-### `tags`
-
-- **Type:** Map
-- **Required:** No
-
-Any tags assigned to the route table.
 
 ### `vpc_id`
 
@@ -21,10 +13,16 @@ Any tags assigned to the route table.
 
 The ID of the VPC.
 
+### `tags`
+
+- **Type:** Map
+- **Required:** No
+
+The tags for the resource.
+
 ## Attribute Reference
 
 ### `route_table_id`
 
-- **Type:** RouteTableId
-
+- **Type:** route_table_id
 

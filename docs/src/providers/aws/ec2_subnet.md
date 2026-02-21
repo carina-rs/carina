@@ -2,9 +2,7 @@
 
 CloudFormation Type: `AWS::EC2::Subnet`
 
-Specifies a subnet for the specified VPC.
- For an IPv4 only subnet, specify an IPv4 CIDR block. If the VPC has an IPv6 CIDR block, you can create an IPv6 only subnet or a dual stack subnet instead. For an IPv6 only subnet, specify an IPv6 CIDR block. For a dual stack subnet, specify both an IPv4 CIDR block and an IPv6 CIDR block.
- For more information, see [Subnets for your VPC](https://docs.aws.amazon.com/vpc/latest/userguide/configure-subnets.html) in the *Amazon VPC User Guide*.
+Describes a subnet.
 
 ## Argument Reference
 
@@ -13,42 +11,42 @@ Specifies a subnet for the specified VPC.
 - **Type:** Bool
 - **Required:** No
 
-Indicates whether a network interface created in this subnet receives an IPv6 address. The default value is ``false``. If you specify ``AssignIpv6AddressOnCreation``, you must also specify an IPv6 CIDR block.
+Indicates whether a network interface created in this subnet (including a network       interface created by RunInstances) receives an IPv6 address.
 
 ### `availability_zone`
 
 - **Type:** AvailabilityZone
 - **Required:** No
 
-The Availability Zone of the subnet. If you update this property, you must also update the ``CidrBlock`` property.
+The Availability Zone or Local Zone for the subnet.     Default: Amazon Web Services selects one for you. If you create more than one subnet in your VPC, we      do not necessarily select a different zone for each subnet.     To create a subnet in a Local Zone, set this value to the Local Zone ID, for example      us-west-2-lax-1a. For information about the Regions that support Local Zones,       see Available Local Zones.     To create a subnet in an Outpost, set this value to the Availability Zone for the      Outpost and specify the Outpost ARN.
 
 ### `availability_zone_id`
 
 - **Type:** String
 - **Required:** No
 
-The AZ ID of the subnet.
+The AZ ID or the Local Zone ID of the subnet.
 
 ### `cidr_block`
 
 - **Type:** Ipv4Cidr
 - **Required:** No
 
-The IPv4 CIDR block assigned to the subnet. If you update this property, we create a new subnet, and then delete the existing one.
+The IPv4 network range for the subnet, in CIDR notation. For example, 10.0.0.0/24.       We modify the specified CIDR block to its canonical form; for example, if you specify       100.68.0.18/18, we modify it to 100.68.0.0/18.     This parameter is not supported for an IPv6 only subnet.
 
 ### `enable_dns64`
 
 - **Type:** Bool
 - **Required:** No
 
-Indicates whether DNS queries made to the Amazon-provided DNS Resolver in this subnet should return synthetic IPv6 addresses for IPv4-only destinations.  You must first configure a NAT gateway in a public subnet (separate from the subnet containing the IPv6-only workloads). For example, the subnet containing the NAT gateway should have a ``0.0.0.0/0`` route pointing to the internet gateway. For more information, see [Configure DNS64 and NAT64](https://docs.aws.amazon.com/vpc/latest/userguide/nat-gateway-nat64-dns64.html#nat-gateway-nat64-dns64-walkthrough) in the *User Guide*.
+Indicates whether DNS queries made to the Amazon-provided DNS Resolver in this subnet       should return synthetic IPv6 addresses for IPv4-only destinations.
 
 ### `enable_lni_at_device_index`
 
 - **Type:** Int
 - **Required:** No
 
-Indicates the device position for local network interfaces in this subnet. For example, ``1`` indicates local network interfaces in this subnet are the secondary network interface (eth1).
+Indicates the device position for local network interfaces in this subnet. For example,       1 indicates local network interfaces in this subnet are the secondary       network interface (eth1).
 
 ### `ipv4_ipam_pool_id`
 
@@ -69,7 +67,7 @@ An IPv4 netmask length for the subnet.
 - **Type:** Ipv6Cidr
 - **Required:** No
 
-The IPv6 CIDR block. If you specify ``AssignIpv6AddressOnCreation``, you must also specify an IPv6 CIDR block.
+The IPv6 network range for the subnet, in CIDR notation. This parameter is required       for an IPv6 only subnet.
 
 ### `ipv6_ipam_pool_id`
 
@@ -83,7 +81,7 @@ An IPv6 IPAM pool ID for the subnet.
 - **Type:** Bool
 - **Required:** No
 
-Indicates whether this is an IPv6 only subnet. For more information, see [Subnet basics](https://docs.aws.amazon.com/vpc/latest/userguide/VPC_Subnets.html#subnet-basics) in the *User Guide*.
+Indicates whether to create an IPv6 only subnet.
 
 ### `ipv6_netmask_length`
 
@@ -97,68 +95,49 @@ An IPv6 netmask length for the subnet.
 - **Type:** Bool
 - **Required:** No
 
-Indicates whether instances launched in this subnet receive a public IPv4 address. The default value is ``false``. AWS charges for all public IPv4 addresses, including public IPv4 addresses associated with running instances and Elastic IP addresses. For more information, see the *Public IPv4 Address* tab on the [VPC pricing page](https://docs.aws.amazon.com/vpc/pricing/).
+Indicates whether instances launched in this subnet receive a public IPv4 address.     Amazon Web Services charges for all public IPv4 addresses, including public IPv4 addresses associated with running instances and Elastic IP addresses. For more information, see the Public IPv4 Address tab on the Amazon VPC pricing page.
 
 ### `outpost_arn`
 
 - **Type:** Arn
 - **Required:** No
 
-The Amazon Resource Name (ARN) of the Outpost.
+The Amazon Resource Name (ARN) of the Outpost. If you specify an Outpost ARN, you must also     specify the Availability Zone of the Outpost subnet.
 
 ### `private_dns_name_options_on_launch`
 
 - **Type:** [Struct(PrivateDnsNameOptionsOnLaunch)](#privatednsnameoptionsonlaunch)
 - **Required:** No
 
-The hostname type for EC2 instances launched into this subnet and how DNS A and AAAA record queries to the instances should be handled. For more information, see [Amazon EC2 instance hostname types](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ec2-instance-naming.html) in the *User Guide*. Available options:  + EnableResourceNameDnsAAAARecord (true | false)  + EnableResourceNameDnsARecord (true | false)  + HostnameType (ip-name | resource-name)
-
-### `tags`
-
-- **Type:** Map
-- **Required:** No
-
-Any tags assigned to the subnet.
+The type of hostnames to assign to instances in the subnet at launch. An instance hostname       is based on the IPv4 address or ID of the instance.
 
 ### `vpc_id`
 
 - **Type:** VpcId
 - **Required:** Yes
 
-The ID of the VPC the subnet is in. If you update this property, you must also update the ``CidrBlock`` property.
+The ID of the VPC.
+
+### `tags`
+
+- **Type:** Map
+- **Required:** No
+
+The tags for the resource.
 
 ## Struct Definitions
-
-### BlockPublicAccessStates
-
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `internet_gateway_block_mode` | String | No | The mode of VPC BPA. Options here are off, block-bidirectional, block-ingress  |
 
 ### PrivateDnsNameOptionsOnLaunch
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `enable_resource_name_dns_aaaa_record` | Bool | No |  |
-| `enable_resource_name_dns_a_record` | Bool | No |  |
-| `hostname_type` | Enum | No |  |
+| `enable_resource_name_dns_aaaa_record` | Bool | No | Indicates whether to respond to DNS queries for instance hostname with DNS AAAA       records. |
+| `enable_resource_name_dns_a_record` | Bool | No | Indicates whether to respond to DNS queries for instance hostnames with DNS A       records. |
+| `hostname_type` | [Enum (HostnameType)](#hostname_type-hostnametype) | No | The type of hostname for EC2 instances. For IPv4 only subnets, an instance DNS name       must be ba... |
 
 ## Attribute Reference
-
-### `block_public_access_states`
-
-- **Type:** [Struct(BlockPublicAccessStates)](#blockpublicaccessstates)
-
-### `ipv6_cidr_blocks`
-
-- **Type:** `List<Ipv6Cidr>`
-
-### `network_acl_association_id`
-
-- **Type:** String
 
 ### `subnet_id`
 
 - **Type:** SubnetId
-
 
