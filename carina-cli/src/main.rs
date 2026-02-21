@@ -3295,6 +3295,14 @@ fn format_value_with_key(value: &Value, _key: Option<&str>) -> String {
             format!("\"{}\"", s)
         }
         Value::Int(n) => n.to_string(),
+        Value::Float(f) => {
+            let s = f.to_string();
+            if s.contains('.') {
+                s
+            } else {
+                format!("{}.0", s)
+            }
+        }
         Value::Bool(b) => b.to_string(),
         Value::List(items) => {
             let strs: Vec<_> = items.iter().map(format_value).collect();
@@ -3403,6 +3411,9 @@ fn value_to_json(value: &Value) -> serde_json::Value {
     match value {
         Value::String(s) => serde_json::Value::String(s.clone()),
         Value::Int(n) => serde_json::Value::Number((*n).into()),
+        Value::Float(f) => serde_json::Value::Number(
+            serde_json::Number::from_f64(*f).unwrap_or_else(|| serde_json::Number::from(0)),
+        ),
         Value::Bool(b) => serde_json::Value::Bool(*b),
         Value::List(items) => serde_json::Value::Array(items.iter().map(value_to_json).collect()),
         Value::Map(map) => {
@@ -3428,7 +3439,13 @@ fn value_to_json(value: &Value) -> serde_json::Value {
 fn json_to_dsl_value(json: &serde_json::Value) -> Value {
     match json {
         serde_json::Value::String(s) => Value::String(s.clone()),
-        serde_json::Value::Number(n) => Value::Int(n.as_i64().unwrap_or(0)),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                Value::Int(i)
+            } else {
+                Value::Float(n.as_f64().unwrap_or(0.0))
+            }
+        }
         serde_json::Value::Bool(b) => Value::Bool(*b),
         serde_json::Value::Array(items) => {
             Value::List(items.iter().map(json_to_dsl_value).collect())
@@ -3634,6 +3651,9 @@ impl FileProvider {
         match value {
             Value::String(s) => serde_json::Value::String(s.clone()),
             Value::Int(n) => serde_json::Value::Number((*n).into()),
+            Value::Float(f) => serde_json::Value::Number(
+                serde_json::Number::from_f64(*f).unwrap_or_else(|| serde_json::Number::from(0)),
+            ),
             Value::Bool(b) => serde_json::Value::Bool(*b),
             Value::List(items) => {
                 serde_json::Value::Array(items.iter().map(Self::value_to_json).collect())
@@ -3662,7 +3682,13 @@ impl FileProvider {
     fn json_to_value(json: &serde_json::Value) -> Value {
         match json {
             serde_json::Value::String(s) => Value::String(s.clone()),
-            serde_json::Value::Number(n) => Value::Int(n.as_i64().unwrap_or(0)),
+            serde_json::Value::Number(n) => {
+                if let Some(i) = n.as_i64() {
+                    Value::Int(i)
+                } else {
+                    Value::Float(n.as_f64().unwrap_or(0.0))
+                }
+            }
             serde_json::Value::Bool(b) => Value::Bool(*b),
             serde_json::Value::Array(items) => {
                 Value::List(items.iter().map(Self::json_to_value).collect())

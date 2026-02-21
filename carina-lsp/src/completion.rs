@@ -741,6 +741,9 @@ impl CompletionProvider {
             AttributeType::Int => {
                 vec![] // No specific completions for integers
             }
+            AttributeType::Float => {
+                vec![] // No specific completions for floats
+            }
             AttributeType::Custom { name, .. } if name == "Cidr" || name == "Ipv4Cidr" => {
                 self.cidr_completions()
             }
@@ -1240,6 +1243,7 @@ impl CompletionProvider {
             parser::TypeExpr::String => "string".to_string(),
             parser::TypeExpr::Bool => "bool".to_string(),
             parser::TypeExpr::Int => "int".to_string(),
+            parser::TypeExpr::Float => "float".to_string(),
             parser::TypeExpr::Cidr => "cidr".to_string(),
             parser::TypeExpr::List(inner) => format!("list({})", self.format_type_expr(inner)),
             parser::TypeExpr::Map(inner) => format!("map({})", self.format_type_expr(inner)),

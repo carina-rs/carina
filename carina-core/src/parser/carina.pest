@@ -25,9 +25,9 @@ output_param = {
     identifier ~ ":" ~ type_expr ~ ("=" ~ expression)?
 }
 
-// Type expression: string, bool, int, list(type), map(type), ref(resource_type)
+// Type expression: string, bool, int, float, list(type), map(type), ref(resource_type)
 type_expr = { type_ref | type_generic | type_simple }
-type_simple = @{ "string" | "bool" | "int" | "cidr" }
+type_simple = @{ "string" | "bool" | "int" | "float" | "cidr" }
 type_generic = { ("list" | "map") ~ "(" ~ type_expr ~ ")" }
 type_ref = { "ref" ~ "(" ~ resource_type_path ~ ")" }
 resource_type_path = @{ identifier ~ ("." ~ identifier)+ }
@@ -93,6 +93,7 @@ primary = {
   | map
   | namespaced_id
   | boolean
+  | float
   | number
   | string
   | variable_ref
@@ -122,6 +123,7 @@ variable_ref = { identifier ~ ("." ~ identifier)? }
 
 // Literals
 boolean = { "true" | "false" }
+float = @{ "-"? ~ ASCII_DIGIT+ ~ "." ~ ASCII_DIGIT+ }
 number = @{ "-"? ~ ASCII_DIGIT+ }
 string = ${ "\"" ~ inner_string ~ "\"" }
 inner_string = @{ char* }

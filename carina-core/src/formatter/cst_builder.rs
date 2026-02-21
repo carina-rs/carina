@@ -123,6 +123,7 @@ impl<'a> CstBuilder<'a> {
             }
             Rule::identifier => Some(CstChild::Token(Token::new(pair.as_str().to_string(), span))),
             Rule::string => Some(CstChild::Token(Token::new(pair.as_str().to_string(), span))),
+            Rule::float => Some(CstChild::Token(Token::new(pair.as_str().to_string(), span))),
             Rule::number => Some(CstChild::Token(Token::new(pair.as_str().to_string(), span))),
             Rule::boolean => Some(CstChild::Token(Token::new(pair.as_str().to_string(), span))),
             Rule::inner_string | Rule::char => None,

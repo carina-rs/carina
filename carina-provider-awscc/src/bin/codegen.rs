@@ -251,7 +251,8 @@ fn list_element_type_display(items: &CfnProperty, prop_name: &str, resource_type
             let element_type = infer_string_type_display(prop_name, resource_type);
             format!("`List<{}>`", element_type)
         }
-        Some("integer") | Some("number") => "`List<Int>`".to_string(),
+        Some("integer") => "`List<Int>`".to_string(),
+        Some("number") => "`List<Float>`".to_string(),
         Some("boolean") => "`List<Bool>`".to_string(),
         _ => "`List<String>`".to_string(),
     }
@@ -382,7 +383,7 @@ fn type_display_string(
                 }
             }
             Some("boolean") => "Bool".to_string(),
-            Some("integer") | Some("number") => {
+            Some("integer") => {
                 let range = if let (Some(min), Some(max)) = (prop.minimum, prop.maximum) {
                     Some((min, max))
                 } else {
@@ -392,6 +393,18 @@ fn type_display_string(
                     format!("Int({}..={})", min, max)
                 } else {
                     "Int".to_string()
+                }
+            }
+            Some("number") => {
+                let range = if let (Some(min), Some(max)) = (prop.minimum, prop.maximum) {
+                    Some((min, max))
+                } else {
+                    known_int_range_overrides().get(prop_name).copied()
+                };
+                if let Some((min, max)) = range {
+                    format!("Float({}..={})", min, max)
+                } else {
+                    "Float".to_string()
                 }
             }
             Some("array") => {
@@ -576,7 +589,7 @@ fn generate_markdown(schema: &CfnSchema, type_name: &str) -> Result<String> {
                             }
                         }
                         Some("boolean") => "Bool".to_string(),
-                        Some("integer") | Some("number") => {
+                        Some("integer") => {
                             let range = if let (Some(min), Some(max)) =
                                 (field_prop.minimum, field_prop.maximum)
                             {
@@ -590,6 +603,22 @@ fn generate_markdown(schema: &CfnSchema, type_name: &str) -> Result<String> {
                                 format!("Int({}..={})", min, max)
                             } else {
                                 "Int".to_string()
+                            }
+                        }
+                        Some("number") => {
+                            let range = if let (Some(min), Some(max)) =
+                                (field_prop.minimum, field_prop.maximum)
+                            {
+                                Some((min, max))
+                            } else {
+                                known_int_range_overrides()
+                                    .get(field_name.as_str())
+                                    .copied()
+                            };
+                            if let Some((min, max)) = range {
+                                format!("Float({}..={})", min, max)
+                            } else {
+                                "Float".to_string()
                             }
                         }
                         Some("array") => {
@@ -742,6 +771,7 @@ fn generate_schema_code(schema: &CfnSchema, type_name: &str) -> Result<String> {
     let mut needs_struct_field = false;
     let mut enums: BTreeMap<String, EnumInfo> = BTreeMap::new();
     let mut ranged_ints: BTreeMap<String, (i64, i64)> = BTreeMap::new();
+    let mut ranged_floats: BTreeMap<String, (i64, i64)> = BTreeMap::new();
 
     for (prop_name, prop) in &schema.properties {
         let (attr_type, enum_info) =
@@ -761,16 +791,27 @@ fn generate_schema_code(schema: &CfnSchema, type_name: &str) -> Result<String> {
         if let Some(info) = enum_info {
             enums.insert(prop_name.clone(), info);
         }
-        // Collect ranged integer properties
-        if matches!(
-            prop.prop_type.as_ref().and_then(|t| t.as_str()),
-            Some("integer") | Some("number")
-        ) {
-            if let (Some(min), Some(max)) = (prop.minimum, prop.maximum) {
-                ranged_ints.insert(prop_name.clone(), (min, max));
-            } else if let Some(&(min, max)) = known_int_range_overrides().get(prop_name.as_str()) {
-                ranged_ints.insert(prop_name.clone(), (min, max));
+        // Collect ranged integer/number properties
+        match prop.prop_type.as_ref().and_then(|t| t.as_str()) {
+            Some("integer") => {
+                if let (Some(min), Some(max)) = (prop.minimum, prop.maximum) {
+                    ranged_ints.insert(prop_name.clone(), (min, max));
+                } else if let Some(&(min, max)) =
+                    known_int_range_overrides().get(prop_name.as_str())
+                {
+                    ranged_ints.insert(prop_name.clone(), (min, max));
+                }
             }
+            Some("number") => {
+                if let (Some(min), Some(max)) = (prop.minimum, prop.maximum) {
+                    ranged_floats.insert(prop_name.clone(), (min, max));
+                } else if let Some(&(min, max)) =
+                    known_int_range_overrides().get(prop_name.as_str())
+                {
+                    ranged_floats.insert(prop_name.clone(), (min, max));
+                }
+            }
+            _ => {}
         }
     }
 
@@ -780,16 +821,18 @@ fn generate_schema_code(schema: &CfnSchema, type_name: &str) -> Result<String> {
         for def in definitions.values() {
             if let Some(props) = &def.properties {
                 for (field_name, field_prop) in props {
-                    if matches!(
-                        field_prop.prop_type.as_ref().and_then(|t| t.as_str()),
-                        Some("integer") | Some("number")
-                    ) && field_prop.minimum.is_none()
+                    let prop_type = field_prop.prop_type.as_ref().and_then(|t| t.as_str());
+                    if matches!(prop_type, Some("integer") | Some("number"))
+                        && field_prop.minimum.is_none()
                         && field_prop.maximum.is_none()
                         && int_overrides.contains_key(field_name.as_str())
                     {
-                        // Mark that we need ranged ints (for imports)
-                        if !ranged_ints.contains_key(field_name) {
-                            let (min, max) = int_overrides[field_name.as_str()];
+                        let (min, max) = int_overrides[field_name.as_str()];
+                        if prop_type == Some("number") {
+                            if !ranged_floats.contains_key(field_name) {
+                                ranged_floats.insert(field_name.clone(), (min, max));
+                            }
+                        } else if !ranged_ints.contains_key(field_name) {
                             ranged_ints.insert(field_name.clone(), (min, max));
                         }
                     }
@@ -825,14 +868,15 @@ fn generate_schema_code(schema: &CfnSchema, type_name: &str) -> Result<String> {
 
     let has_enums = !enums.is_empty();
     let has_ranged_ints = !ranged_ints.is_empty();
+    let has_ranged_floats = !ranged_floats.is_empty();
 
     // Enums use AttributeType::Custom with AttributeType::String base
     if has_enums {
         needs_attribute_type = true;
     }
 
-    // Ranged ints use AttributeType::Custom with AttributeType::Int base
-    if has_ranged_ints {
+    // Ranged ints/floats use AttributeType::Custom with AttributeType::Int/Float base
+    if has_ranged_ints || has_ranged_floats {
         needs_attribute_type = true;
     }
 
@@ -864,7 +908,7 @@ use super::AwsccSchemaConfig;
         resource, type_name, schema_imports_str
     ));
 
-    if has_enums || has_ranged_ints {
+    if has_enums || has_ranged_ints || has_ranged_floats {
         code.push_str("use carina_core::resource::Value;\n");
     }
     if needs_tags_type {
@@ -930,6 +974,28 @@ fn {}(value: &Value) -> Result<(), String> {{
         }}
     }} else {{
         Err("Expected integer".to_string())
+    }}
+}}
+
+"#,
+            fn_name, min, max, min, max
+        ));
+    }
+
+    // Generate range validation functions for float (number) properties
+    for (prop_name, (min, max)) in &ranged_floats {
+        let fn_name = format!("validate_{}_range", prop_name.to_snake_case());
+        code.push_str(&format!(
+            r#"fn {}(value: &Value) -> Result<(), String> {{
+    let n = match value {{
+        Value::Int(i) => *i as f64,
+        Value::Float(f) => *f,
+        _ => return Err("Expected number".to_string()),
+    }};
+    if n < {}.0 || n > {}.0 {{
+        Err(format!("Value {{}} is out of range {}..={}", n))
+    }} else {{
+        Ok(())
     }}
 }}
 
@@ -1689,7 +1755,8 @@ fn cfn_type_to_carina_type_with_enum(
         let all_ints = enum_values.iter().all(|v| matches!(v, EnumValue::Int(_)));
         if all_ints {
             return match prop.prop_type.as_ref().and_then(|t| t.as_str()) {
-                Some("integer") | Some("number") => ("AttributeType::Int".to_string(), None),
+                Some("integer") => ("AttributeType::Int".to_string(), None),
+                Some("number") => ("AttributeType::Float".to_string(), None),
                 _ => ("AttributeType::String".to_string(), None),
             };
         }
@@ -1793,7 +1860,7 @@ fn cfn_type_to_carina_type_with_enum(
             ("AttributeType::String".to_string(), None)
         }
         Some("boolean") => ("AttributeType::Bool".to_string(), None),
-        Some("integer") | Some("number") => {
+        Some("integer") => {
             // Use CF min/max if available, otherwise check known overrides
             let range = if let (Some(min), Some(max)) = (prop.minimum, prop.maximum) {
                 Some((min, max))
@@ -1818,6 +1885,33 @@ fn cfn_type_to_carina_type_with_enum(
                 )
             } else {
                 ("AttributeType::Int".to_string(), None)
+            }
+        }
+        Some("number") => {
+            // Use CF min/max if available, otherwise check known overrides
+            let range = if let (Some(min), Some(max)) = (prop.minimum, prop.maximum) {
+                Some((min, max))
+            } else {
+                known_int_range_overrides().get(prop_name).copied()
+            };
+            if let Some((min, max)) = range {
+                // Generate a ranged float type with validation
+                let validate_fn = format!("validate_{}_range", prop_name.to_snake_case());
+                (
+                    format!(
+                        r#"AttributeType::Custom {{
+                name: "Float({}..={})".to_string(),
+                base: Box::new(AttributeType::Float),
+                validate: {},
+                namespace: None,
+                to_dsl: None,
+            }}"#,
+                        min, max, validate_fn
+                    ),
+                    None,
+                )
+            } else {
+                ("AttributeType::Float".to_string(), None)
             }
         }
         Some("array") => {
@@ -3124,8 +3218,8 @@ mod tests {
     }
 
     #[test]
-    fn test_number_with_range_produces_custom_type() {
-        // "number" type should also support range constraints
+    fn test_number_with_range_produces_custom_float_type() {
+        // "number" type should produce Float with range constraints
         let prop = CfnProperty {
             prop_type: Some(TypeValue::Single("number".to_string())),
             description: Some("Port number.".to_string()),
@@ -3153,8 +3247,13 @@ mod tests {
         let (type_str, _) =
             cfn_type_to_carina_type_with_enum(&prop, "FromPort", &schema, "", &BTreeMap::new());
         assert!(
-            type_str.contains("Int(0..=65535)"),
-            "Number with range should include range in type name, got: {}",
+            type_str.contains("Float(0..=65535)"),
+            "Number with range should produce Float type, got: {}",
+            type_str
+        );
+        assert!(
+            type_str.contains("AttributeType::Float"),
+            "Number type should use AttributeType::Float base, got: {}",
             type_str
         );
     }

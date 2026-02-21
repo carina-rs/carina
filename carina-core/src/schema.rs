@@ -61,6 +61,8 @@ pub enum AttributeType {
     String,
     /// Integer
     Int,
+    /// Floating-point number
+    Float,
     /// Boolean
     Bool,
     /// Enum (list of allowed values)
@@ -96,6 +98,8 @@ impl AttributeType {
             // ResourceRef values resolve to strings at runtime, so they're valid for String types
             (AttributeType::String, Value::String(_) | Value::ResourceRef { .. }) => Ok(()),
             (AttributeType::Int, Value::Int(_)) => Ok(()),
+            (AttributeType::Float, Value::Float(_)) => Ok(()),
+            (AttributeType::Float, Value::Int(_)) => Ok(()), // integers are valid numbers
             (AttributeType::Bool, Value::Bool(_)) => Ok(()),
 
             (AttributeType::Enum(variants), Value::String(s)) => {
@@ -238,6 +242,7 @@ impl AttributeType {
         match self {
             AttributeType::String => "String".to_string(),
             AttributeType::Int => "Int".to_string(),
+            AttributeType::Float => "Float".to_string(),
             AttributeType::Bool => "Bool".to_string(),
             AttributeType::Enum(variants) => format!("Enum({})", variants.join(" | ")),
             AttributeType::Custom { name, .. } => name.clone(),
@@ -303,6 +308,7 @@ impl Value {
         match self {
             Value::String(_) => "String".to_string(),
             Value::Int(_) => "Int".to_string(),
+            Value::Float(_) => "Float".to_string(),
             Value::Bool(_) => "Bool".to_string(),
             Value::List(_) => "List".to_string(),
             Value::Map(_) => "Map".to_string(),
@@ -855,6 +861,23 @@ mod tests {
         assert!(t.validate(&Value::String("a".to_string())).is_ok());
         assert!(t.validate(&Value::String("Type.a".to_string())).is_ok());
         assert!(t.validate(&Value::String("c".to_string())).is_err());
+    }
+
+    #[test]
+    fn validate_float_type() {
+        let t = AttributeType::Float;
+        assert!(t.validate(&Value::Float(2.5)).is_ok());
+        assert!(t.validate(&Value::Float(-0.5)).is_ok());
+        assert!(t.validate(&Value::Int(42)).is_ok()); // integers are valid numbers
+        assert!(t.validate(&Value::String("3.14".to_string())).is_err());
+        assert!(t.validate(&Value::Bool(true)).is_err());
+    }
+
+    #[test]
+    fn validate_int_rejects_float() {
+        let t = AttributeType::Int;
+        assert!(t.validate(&Value::Int(42)).is_ok());
+        assert!(t.validate(&Value::Float(2.5)).is_err()); // strict integer typing
     }
 
     #[test]

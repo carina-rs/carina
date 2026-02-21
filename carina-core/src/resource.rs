@@ -61,6 +61,7 @@ impl std::fmt::Display for ResourceId {
 pub enum Value {
     String(String),
     Int(i64),
+    Float(f64),
     Bool(bool),
     List(Vec<Value>),
     Map(HashMap<String, Value>),
@@ -191,6 +192,8 @@ mod tests {
         let values = vec![
             Value::String("hello".to_string()),
             Value::Int(42),
+            Value::Float(2.5),
+            Value::Float(-0.5),
             Value::Bool(true),
             Value::List(vec![Value::String("a".to_string()), Value::Int(1)]),
             Value::Map(HashMap::from([

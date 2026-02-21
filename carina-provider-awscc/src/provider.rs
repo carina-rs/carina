@@ -756,7 +756,7 @@ impl AwsccProvider {
                 if let Some(i) = n.as_i64() {
                     Some(Value::Int(i))
                 } else {
-                    n.as_f64().map(|f| Value::Int(f as i64))
+                    n.as_f64().map(Value::Float)
                 }
             }
             serde_json::Value::Array(arr) => {
@@ -881,6 +881,7 @@ impl AwsccProvider {
             Value::String(s) => Some(json!(s)),
             Value::Bool(b) => Some(json!(b)),
             Value::Int(i) => Some(json!(i)),
+            Value::Float(f) => Some(json!(f)),
             Value::List(items) => {
                 let arr: Vec<serde_json::Value> =
                     items.iter().filter_map(|v| self.value_to_json(v)).collect();

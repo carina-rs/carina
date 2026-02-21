@@ -231,6 +231,13 @@ impl DiagnosticEngine {
                                         s
                                     ))
                                 }
+                                // Float type should not receive String
+                                (carina_core::schema::AttributeType::Float, Value::String(s)) => {
+                                    Some(format!(
+                                        "Type mismatch: expected Float, got String \"{}\".",
+                                        s
+                                    ))
+                                }
                                 // ResourceRef type check for Custom types
                                 (
                                     carina_core::schema::AttributeType::Custom {
@@ -582,6 +589,9 @@ impl DiagnosticEngine {
                             (carina_core::schema::AttributeType::Int, Value::String(s)) => Some(
                                 format!("Type mismatch: expected Int, got String \"{}\".", s),
                             ),
+                            (carina_core::schema::AttributeType::Float, Value::String(s)) => Some(
+                                format!("Type mismatch: expected Float, got String \"{}\".", s),
+                            ),
                             // Custom types with Int base (e.g., ranged integers)
                             (
                                 carina_core::schema::AttributeType::Custom { base, .. },
@@ -589,6 +599,16 @@ impl DiagnosticEngine {
                             ) if matches!(**base, carina_core::schema::AttributeType::Int) => Some(
                                 format!("Type mismatch: expected Int, got String \"{}\".", s),
                             ),
+                            // Custom types with Float base (e.g., ranged floats)
+                            (
+                                carina_core::schema::AttributeType::Custom { base, .. },
+                                Value::String(s),
+                            ) if matches!(**base, carina_core::schema::AttributeType::Float) => {
+                                Some(format!(
+                                    "Type mismatch: expected Float, got String \"{}\".",
+                                    s
+                                ))
+                            }
                             _ => None,
                         };
 
@@ -995,6 +1015,11 @@ impl DiagnosticEngine {
             // Int type validation
             (TypeExpr::Int, Value::String(s)) => Some(format!(
                 "Type mismatch: expected int, got string \"{}\".",
+                s
+            )),
+            // Float type validation
+            (TypeExpr::Float, Value::String(s)) => Some(format!(
+                "Type mismatch: expected float, got string \"{}\".",
                 s
             )),
             _ => None,
