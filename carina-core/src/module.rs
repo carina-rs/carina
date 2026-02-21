@@ -126,6 +126,14 @@ fn format_value(value: &Value) -> String {
             }
         }
         Value::Int(n) => n.to_string(),
+        Value::Float(f) => {
+            let s = f.to_string();
+            if s.contains('.') {
+                s
+            } else {
+                format!("{}.0", s)
+            }
+        }
         Value::Bool(b) => b.to_string(),
         Value::List(items) => {
             if items.is_empty() {

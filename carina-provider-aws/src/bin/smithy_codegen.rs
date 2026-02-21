@@ -835,7 +835,7 @@ fn resolve_type(
             }
         }
         Some(ShapeKind::Float) | Some(ShapeKind::Double) => {
-            ("AttributeType::Int".to_string(), None)
+            ("AttributeType::Float".to_string(), None)
         }
         Some(ShapeKind::Enum) => {
             // Get enum values from Smithy model
@@ -1557,7 +1557,7 @@ fn type_display_string_md<'a>(
                 "Int".to_string()
             }
         }
-        Some(ShapeKind::Float) | Some(ShapeKind::Double) => "Int".to_string(),
+        Some(ShapeKind::Float) | Some(ShapeKind::Double) => "Float".to_string(),
         Some(ShapeKind::Enum) => {
             if let Some(values) = model.enum_values(target) {
                 let type_name = field_name.to_string();

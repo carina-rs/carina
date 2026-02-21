@@ -67,7 +67,7 @@ type_expr = {
     type_ref | type_list | type_map | type_primitive
 }
 
-type_primitive = @{ "string" | "bool" | "int" | "cidr" }
+type_primitive = @{ "string" | "bool" | "int" | "float" | "cidr" }
 
 type_list = { kw_list ~ trivia* ~ open_paren ~ trivia* ~ type_expr ~ trivia* ~ close_paren }
 
@@ -110,6 +110,7 @@ primary = {
   | map
   | namespaced_id
   | boolean
+  | float
   | number
   | string
   | variable_ref
@@ -144,6 +145,7 @@ variable_ref = { identifier ~ ("." ~ identifier)? }
 
 // Literals
 boolean = { "true" | "false" }
+float = @{ "-"? ~ ASCII_DIGIT+ ~ "." ~ ASCII_DIGIT+ }
 number = @{ "-"? ~ ASCII_DIGIT+ }
 string = ${ "\"" ~ inner_string ~ "\"" }
 inner_string = @{ char* }

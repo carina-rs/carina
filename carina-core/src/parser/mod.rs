@@ -81,6 +81,7 @@ pub enum TypeExpr {
     String,
     Bool,
     Int,
+    Float,
     /// CIDR block (e.g., "10.0.0.0/16")
     Cidr,
     List(Box<TypeExpr>),
@@ -95,6 +96,7 @@ impl std::fmt::Display for TypeExpr {
             TypeExpr::String => write!(f, "string"),
             TypeExpr::Bool => write!(f, "bool"),
             TypeExpr::Int => write!(f, "int"),
+            TypeExpr::Float => write!(f, "float"),
             TypeExpr::Cidr => write!(f, "cidr"),
             TypeExpr::List(inner) => write!(f, "list({})", inner),
             TypeExpr::Map(inner) => write!(f, "map({})", inner),
@@ -357,6 +359,7 @@ fn parse_type_expr(pair: pest::iterators::Pair<Rule>) -> Result<TypeExpr, ParseE
             "string" => Ok(TypeExpr::String),
             "bool" => Ok(TypeExpr::Bool),
             "int" => Ok(TypeExpr::Int),
+            "float" => Ok(TypeExpr::Float),
             "cidr" => Ok(TypeExpr::Cidr),
             _ => Ok(TypeExpr::String), // Default fallback
         },
@@ -863,6 +866,10 @@ fn parse_primary_value(
         Rule::boolean => {
             let b = inner.as_str() == "true";
             Ok(Value::Bool(b))
+        }
+        Rule::float => {
+            let f: f64 = inner.as_str().parse().unwrap();
+            Ok(Value::Float(f))
         }
         Rule::number => {
             let n: i64 = inner.as_str().parse().unwrap();
@@ -1612,6 +1619,43 @@ mod tests {
             TypeExpr::Ref(ResourceTypePath::new("aws", "vpc")).to_string(),
             "ref(aws.vpc)"
         );
+    }
+
+    #[test]
+    fn parse_float_literal() {
+        let input = r#"
+            let bucket = aws.s3.bucket {
+                name = "test"
+                weight = 2.5
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+        assert_eq!(
+            result.resources[0].attributes.get("weight"),
+            Some(&Value::Float(2.5))
+        );
+    }
+
+    #[test]
+    fn parse_negative_float_literal() {
+        let input = r#"
+            let bucket = aws.s3.bucket {
+                name = "test"
+                offset = -0.5
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+        assert_eq!(
+            result.resources[0].attributes.get("offset"),
+            Some(&Value::Float(-0.5))
+        );
+    }
+
+    #[test]
+    fn type_expr_display_float() {
+        assert_eq!(TypeExpr::Float.to_string(), "float");
     }
 
     #[test]
