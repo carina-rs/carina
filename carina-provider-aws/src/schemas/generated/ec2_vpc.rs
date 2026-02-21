@@ -49,7 +49,7 @@ pub fn ec2_vpc_config() -> AwsSchemaConfig {
         resource_type_name: "ec2_vpc",
         has_tags: true,
         schema: ResourceSchema::new("aws.ec2_vpc")
-        .with_description("<p>Describes a VPC.</p>")
+        .with_description("Describes a VPC.")
         .attribute(
             AttributeSchema::new("name", AttributeType::String)
                 .with_description("Resource name"),
@@ -61,17 +61,17 @@ pub fn ec2_vpc_config() -> AwsSchemaConfig {
         .attribute(
             AttributeSchema::new("cidr_block", types::ipv4_cidr())
                 .create_only()
-                .with_description("<p>The IPv4 network range for the VPC, in CIDR notation. For example, 		    <code>10.0.0.0/16</code>. We modify the specified CIDR block to its canoni...")
+                .with_description("The IPv4 network range for the VPC, in CIDR notation. For example,      10.0.0.0/16. We modify the specified CIDR block to its canonical form; for exa...")
                 .with_provider_name("CidrBlock"),
         )
         .attribute(
             AttributeSchema::new("enable_dns_hostnames", AttributeType::Bool)
-                .with_description("<p>Indicates whether the instances launched in the VPC get DNS hostnames. If enabled, instances in the VPC get DNS hostnames; otherwise, they do not.<...")
+                .with_description("Indicates whether the instances launched in the VPC get DNS hostnames. If enabled, instances in the VPC get DNS hostnames; otherwise, they do not.    ...")
                 .with_provider_name("EnableDnsHostnames"),
         )
         .attribute(
             AttributeSchema::new("enable_dns_support", AttributeType::Bool)
-                .with_description("<p>Indicates whether the DNS resolution is supported for the VPC. If enabled, queries to 			the Amazon provided DNS server at the 169.254.169.253 IP a...")
+                .with_description("Indicates whether the DNS resolution is supported for the VPC. If enabled, queries to  the Amazon provided DNS server at the 169.254.169.253 IP addres...")
                 .with_provider_name("EnableDnsSupport"),
         )
         .attribute(
@@ -83,13 +83,13 @@ pub fn ec2_vpc_config() -> AwsSchemaConfig {
                 to_dsl: None,
             })
                 .create_only()
-                .with_description("<p>The tenancy options for instances launched into the VPC. For <code>default</code>, instances    are launched with shared tenancy by default. You ca...")
+                .with_description("The tenancy options for instances launched into the VPC. For default, instances    are launched with shared tenancy by default. You can launch instanc...")
                 .with_provider_name("InstanceTenancy"),
         )
         .attribute(
             AttributeSchema::new("ipv4_ipam_pool_id", super::ipam_pool_id())
                 .create_only()
-                .with_description("<p>The ID of an IPv4 IPAM pool you want to use for allocating this VPC's CIDR. For more information, see <a href=\"https://docs.aws.amazon.com/vpc/lat...")
+                .with_description("The ID of an IPv4 IPAM pool you want to use for allocating this VPC's CIDR. For more information, see What is IPAM? in the Amazon VPC IPAM User Guide.")
                 .with_provider_name("Ipv4IpamPoolId"),
         )
         .attribute(
@@ -101,12 +101,12 @@ pub fn ec2_vpc_config() -> AwsSchemaConfig {
                 to_dsl: None,
             })
                 .create_only()
-                .with_description("<p>The netmask length of the IPv4 CIDR you want to allocate to this VPC from an Amazon VPC IP Address Manager (IPAM) pool. For more information about ...")
+                .with_description("The netmask length of the IPv4 CIDR you want to allocate to this VPC from an Amazon VPC IP Address Manager (IPAM) pool. For more information about IPA...")
                 .with_provider_name("Ipv4NetmaskLength"),
         )
         .attribute(
             AttributeSchema::new("vpc_id", super::vpc_id())
-                .with_description("<p>The ID of the VPC.</p> (read-only)")
+                .with_description("The ID of the VPC. (read-only)")
                 .with_provider_name("VpcId"),
         )
         .attribute(

@@ -15,7 +15,7 @@ pub fn ec2_internet_gateway_config() -> AwsSchemaConfig {
         resource_type_name: "ec2_internet_gateway",
         has_tags: true,
         schema: ResourceSchema::new("aws.ec2_internet_gateway")
-            .with_description("<p>Describes an internet gateway.</p>")
+            .with_description("Describes an internet gateway.")
             .attribute(
                 AttributeSchema::new("name", AttributeType::String)
                     .with_description("Resource name"),
@@ -26,7 +26,7 @@ pub fn ec2_internet_gateway_config() -> AwsSchemaConfig {
             )
             .attribute(
                 AttributeSchema::new("internet_gateway_id", super::internet_gateway_id())
-                    .with_description("<p>The ID of the internet gateway.</p> (read-only)")
+                    .with_description("The ID of the internet gateway. (read-only)")
                     .with_provider_name("InternetGatewayId"),
             )
             .attribute(

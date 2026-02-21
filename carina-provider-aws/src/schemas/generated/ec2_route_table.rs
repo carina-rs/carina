@@ -15,7 +15,7 @@ pub fn ec2_route_table_config() -> AwsSchemaConfig {
         resource_type_name: "ec2_route_table",
         has_tags: true,
         schema: ResourceSchema::new("aws.ec2_route_table")
-            .with_description("<p>Describes a route table.</p>")
+            .with_description("Describes a route table.")
             .attribute(
                 AttributeSchema::new("name", AttributeType::String)
                     .with_description("Resource name"),
@@ -28,12 +28,12 @@ pub fn ec2_route_table_config() -> AwsSchemaConfig {
                 AttributeSchema::new("vpc_id", super::vpc_id())
                     .required()
                     .create_only()
-                    .with_description("<p>The ID of the VPC.</p>")
+                    .with_description("The ID of the VPC.")
                     .with_provider_name("VpcId"),
             )
             .attribute(
                 AttributeSchema::new("route_table_id", super::route_table_id())
-                    .with_description("<p>The ID of the route table.</p> (read-only)")
+                    .with_description("The ID of the route table. (read-only)")
                     .with_provider_name("RouteTableId"),
             )
             .attribute(

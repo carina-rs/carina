@@ -15,7 +15,7 @@ pub fn ec2_security_group_config() -> AwsSchemaConfig {
         resource_type_name: "ec2_security_group",
         has_tags: true,
         schema: ResourceSchema::new("aws.ec2_security_group")
-        .with_description("<p>Describes a security group.</p>")
+        .with_description("Describes a security group.")
         .attribute(
             AttributeSchema::new("name", AttributeType::String)
                 .with_description("Resource name"),
@@ -28,25 +28,25 @@ pub fn ec2_security_group_config() -> AwsSchemaConfig {
             AttributeSchema::new("description", AttributeType::String)
                 .required()
                 .create_only()
-                .with_description("<p>A description for the security group.</p>     <p>Constraints: Up to 255 characters in length</p>     <p>Valid characters: a-z, A-Z, 0-9, spaces, an...")
+                .with_description("A description for the security group.     Constraints: Up to 255 characters in length     Valid characters: a-z, A-Z, 0-9, spaces, and ._-:/()#,@[]+=&...")
                 .with_provider_name("Description"),
         )
         .attribute(
             AttributeSchema::new("group_name", AttributeType::String)
                 .required()
                 .create_only()
-                .with_description("<p>The name of the security group. Names are case-insensitive and must be unique within the VPC.</p>     <p>Constraints: Up to 255 characters in lengt...")
+                .with_description("The name of the security group. Names are case-insensitive and must be unique within the VPC.     Constraints: Up to 255 characters in length. Can't s...")
                 .with_provider_name("GroupName"),
         )
         .attribute(
             AttributeSchema::new("vpc_id", super::vpc_id())
                 .create_only()
-                .with_description("<p>The ID of the VPC. Required for a nondefault VPC.</p>")
+                .with_description("The ID of the VPC. Required for a nondefault VPC.")
                 .with_provider_name("VpcId"),
         )
         .attribute(
             AttributeSchema::new("group_id", super::security_group_id())
-                .with_description("<p>The ID of the security group.</p> (read-only)")
+                .with_description("The ID of the security group. (read-only)")
                 .with_provider_name("GroupId"),
         )
         .attribute(

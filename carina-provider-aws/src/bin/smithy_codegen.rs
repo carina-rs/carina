@@ -1257,10 +1257,28 @@ fn cf_type_name(resource_name: &str) -> &'static str {
     }
 }
 
+fn strip_html_tags(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut in_tag = false;
+    for c in s.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => result.push(c),
+            _ => {}
+        }
+    }
+    result
+}
+
 fn escape_description(desc: &str) -> String {
-    desc.replace('"', "\\\"")
-        .replace('\n', " ")
+    let stripped = strip_html_tags(desc);
+    stripped
+        .replace('"', "\\\"")
+        .replace(['\n', '\t'], " ")
         .replace("  ", " ")
+        .trim()
+        .to_string()
 }
 
 fn truncate_str(s: &str, max_len: usize) -> String {

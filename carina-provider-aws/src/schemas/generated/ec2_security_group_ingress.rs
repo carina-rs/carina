@@ -60,7 +60,7 @@ pub fn ec2_security_group_ingress_config() -> AwsSchemaConfig {
         resource_type_name: "ec2_security_group_ingress",
         has_tags: false,
         schema: ResourceSchema::new("aws.ec2_security_group_ingress")
-        .with_description("<p>Describes a security group rule.</p>")
+        .with_description("Describes a security group rule.")
         .attribute(
             AttributeSchema::new("name", AttributeType::String)
                 .with_description("Resource name"),
@@ -72,7 +72,7 @@ pub fn ec2_security_group_ingress_config() -> AwsSchemaConfig {
         .attribute(
             AttributeSchema::new("cidr_ip", types::ipv4_cidr())
                 .create_only()
-                .with_description("<p>The IPv4 address range, in CIDR format.</p>     <note>       <p>        Amazon Web Services <a href=\"https://en.wikipedia.org/wiki/Canonicalizatio...")
+                .with_description("The IPv4 address range, in CIDR format.                    Amazon Web Services canonicalizes IPv4 and IPv6 CIDRs. For example, if you specify 100.68.0...")
                 .with_provider_name("CidrIp"),
         )
         .attribute(
@@ -84,19 +84,19 @@ pub fn ec2_security_group_ingress_config() -> AwsSchemaConfig {
                 to_dsl: None,
             })
                 .create_only()
-                .with_description("<p>If the protocol is TCP or UDP, this is the start of the port range.      If the protocol is ICMP, this is the ICMP type or -1 (all ICMP types).</p>...")
+                .with_description("If the protocol is TCP or UDP, this is the start of the port range.      If the protocol is ICMP, this is the ICMP type or -1 (all ICMP types).     To...")
                 .with_provider_name("FromPort"),
         )
         .attribute(
             AttributeSchema::new("group_id", super::security_group_id())
                 .create_only()
-                .with_description("<p>The ID of the security group.</p>")
+                .with_description("The ID of the security group.")
                 .with_provider_name("GroupId"),
         )
         .attribute(
             AttributeSchema::new("group_name", AttributeType::String)
                 .create_only()
-                .with_description("<p>[Default VPC] The name of the security group. For security groups for a default VPC     you can specify either the ID or the name of the security g...")
+                .with_description("[Default VPC] The name of the security group. For security groups for a default VPC     you can specify either the ID or the name of the security grou...")
                 .with_provider_name("GroupName"),
         )
         .attribute(
@@ -109,19 +109,19 @@ pub fn ec2_security_group_ingress_config() -> AwsSchemaConfig {
             })
                 .required()
                 .create_only()
-                .with_description("<p>The IP protocol name (<code>tcp</code>, <code>udp</code>, <code>icmp</code>) or number    (see <a href=\"http://www.iana.org/assignments/protocol-n...")
+                .with_description("The IP protocol name (tcp, udp, icmp) or number    (see Protocol Numbers). To specify all protocols, use -1.     To specify icmpv6, use IP permissions...")
                 .with_provider_name("IpProtocol"),
         )
         .attribute(
             AttributeSchema::new("source_security_group_name", AttributeType::String)
                 .create_only()
-                .with_description("<p>[Default VPC] The name of the source security group.</p>     <p>The rule grants full ICMP, UDP, and TCP access. To create a rule with a specific pr...")
+                .with_description("[Default VPC] The name of the source security group.     The rule grants full ICMP, UDP, and TCP access. To create a rule with a specific protocol    ...")
                 .with_provider_name("SourceSecurityGroupName"),
         )
         .attribute(
             AttributeSchema::new("source_security_group_owner_id", AttributeType::String)
                 .create_only()
-                .with_description("<p>The Amazon Web Services account ID for the source security group, if the source security group is      in a different account.</p>     <p>The rule ...")
+                .with_description("The Amazon Web Services account ID for the source security group, if the source security group is      in a different account.     The rule grants ful...")
                 .with_provider_name("SourceSecurityGroupOwnerId"),
         )
         .attribute(
@@ -133,12 +133,12 @@ pub fn ec2_security_group_ingress_config() -> AwsSchemaConfig {
                 to_dsl: None,
             })
                 .create_only()
-                .with_description("<p>If the protocol is TCP or UDP, this is the end of the port range.      If the protocol is ICMP, this is the ICMP code or -1 (all ICMP codes).      ...")
+                .with_description("If the protocol is TCP or UDP, this is the end of the port range.      If the protocol is ICMP, this is the ICMP code or -1 (all ICMP codes).       If...")
                 .with_provider_name("ToPort"),
         )
         .attribute(
             AttributeSchema::new("security_group_rule_id", AttributeType::String)
-                .with_description("<p>The ID of the security group rule.</p> (read-only)")
+                .with_description("The ID of the security group rule. (read-only)")
                 .with_provider_name("SecurityGroupRuleId"),
         )
     }

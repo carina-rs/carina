@@ -60,7 +60,7 @@ pub fn ec2_security_group_egress_config() -> AwsSchemaConfig {
         resource_type_name: "ec2_security_group_egress",
         has_tags: false,
         schema: ResourceSchema::new("aws.ec2_security_group_egress")
-            .with_description("<p>Describes a security group rule.</p>")
+            .with_description("Describes a security group rule.")
             .attribute(
                 AttributeSchema::new("name", AttributeType::String)
                     .with_description("Resource name"),
@@ -72,7 +72,7 @@ pub fn ec2_security_group_egress_config() -> AwsSchemaConfig {
             .attribute(
                 AttributeSchema::new("cidr_ip", types::ipv4_cidr())
                     .create_only()
-                    .with_description("<p>Not supported. Use IP permissions instead.</p>")
+                    .with_description("Not supported. Use IP permissions instead.")
                     .with_provider_name("CidrIp"),
             )
             .attribute(
@@ -87,14 +87,14 @@ pub fn ec2_security_group_egress_config() -> AwsSchemaConfig {
                     },
                 )
                 .create_only()
-                .with_description("<p>Not supported. Use IP permissions instead.</p>")
+                .with_description("Not supported. Use IP permissions instead.")
                 .with_provider_name("FromPort"),
             )
             .attribute(
                 AttributeSchema::new("group_id", super::security_group_id())
                     .required()
                     .create_only()
-                    .with_description("<p>The ID of the security group.</p>")
+                    .with_description("The ID of the security group.")
                     .with_provider_name("GroupId"),
             )
             .attribute(
@@ -113,19 +113,19 @@ pub fn ec2_security_group_egress_config() -> AwsSchemaConfig {
                 )
                 .required()
                 .create_only()
-                .with_description("<p>Not supported. Use IP permissions instead.</p>")
+                .with_description("Not supported. Use IP permissions instead.")
                 .with_provider_name("IpProtocol"),
             )
             .attribute(
                 AttributeSchema::new("source_security_group_name", AttributeType::String)
                     .create_only()
-                    .with_description("<p>Not supported. Use IP permissions instead.</p>")
+                    .with_description("Not supported. Use IP permissions instead.")
                     .with_provider_name("SourceSecurityGroupName"),
             )
             .attribute(
                 AttributeSchema::new("source_security_group_owner_id", AttributeType::String)
                     .create_only()
-                    .with_description("<p>Not supported. Use IP permissions instead.</p>")
+                    .with_description("Not supported. Use IP permissions instead.")
                     .with_provider_name("SourceSecurityGroupOwnerId"),
             )
             .attribute(
@@ -140,12 +140,12 @@ pub fn ec2_security_group_egress_config() -> AwsSchemaConfig {
                     },
                 )
                 .create_only()
-                .with_description("<p>Not supported. Use IP permissions instead.</p>")
+                .with_description("Not supported. Use IP permissions instead.")
                 .with_provider_name("ToPort"),
             )
             .attribute(
                 AttributeSchema::new("security_group_rule_id", AttributeType::String)
-                    .with_description("<p>The ID of the security group rule.</p> (read-only)")
+                    .with_description("The ID of the security group rule. (read-only)")
                     .with_provider_name("SecurityGroupRuleId"),
             ),
     }
