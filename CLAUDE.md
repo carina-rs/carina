@@ -54,7 +54,7 @@ DSL (.crn) → Parser → Resources → Differ → Plan (Effects) → Interprete
 
 The parser uses [pest](https://pest.rs/) grammar defined in `carina-core/src/parser/carina.pest`. Key constructs:
 - `provider <name> { ... }` - Provider configuration
-- `<provider>.<service>.<resource> { ... }` - Anonymous resource (ID from `name` attribute)
+- `<provider>.<resource_type> { ... }` - Anonymous resource (ID from `name` attribute)
 - `let <binding> = <resource>` - Named resource binding
 
 ### Region Format Conversion
