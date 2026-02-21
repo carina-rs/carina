@@ -234,7 +234,7 @@ impl CompletionProvider {
                 "aws.ec2_security_group_egress",
             ),
             ("aws.ec2_security_group", "aws.ec2_security_group"),
-            ("aws.s3_bucket", "aws.s3_bucket"),
+            ("aws.s3.bucket", "aws.s3.bucket"),
             // awscc resources
             ("awscc.ec2_vpc", "awscc.ec2_vpc"),
             (

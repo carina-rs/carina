@@ -39,7 +39,7 @@ impl DiagnosticEngine {
         valid_resource_types.insert("aws.ec2_security_group".to_string());
         valid_resource_types.insert("aws.ec2_security_group_ingress".to_string());
         valid_resource_types.insert("aws.ec2_security_group_egress".to_string());
-        valid_resource_types.insert("aws.s3_bucket".to_string());
+        valid_resource_types.insert("aws.s3.bucket".to_string());
 
         // AWS Cloud Control resources
         valid_resource_types.insert("awscc.ec2_vpc".to_string());
@@ -470,7 +470,7 @@ impl DiagnosticEngine {
             "aws.ec2_security_group_egress" => Some(
                 aws_generated::ec2_security_group_egress::ec2_security_group_egress_config().schema,
             ),
-            "aws.s3_bucket" => Some(aws_generated::s3_bucket::s3_bucket_config().schema),
+            "aws.s3.bucket" => Some(aws_generated::s3_bucket::s3_bucket_config().schema),
             // AWS Cloud Control resources
             "awscc.ec2_vpc" => Some(awscc_vpc::ec2_vpc_config().schema),
             "awscc.ec2_security_group" => {
@@ -1566,6 +1566,44 @@ aws.ec2_subnet {
         assert!(
             dup_diag.is_none(),
             "Should NOT error on single struct block. Got diagnostics: {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn s3_bucket_schema_lookup_with_dot_notation() {
+        let engine = DiagnosticEngine::new();
+        let doc = create_document(
+            r#"provider aws {
+    region = aws.Region.ap_northeast_1
+}
+
+let my_bucket = aws.s3.bucket {
+    name   = "my-bucket"
+    region = aws.Region.ap_northeast_1
+    unknown_attr = "bad"
+}"#,
+        );
+
+        let diagnostics = engine.analyze(&doc, None);
+
+        // Should NOT report "Unknown resource type" for aws.s3.bucket
+        let unknown_type_diag = diagnostics
+            .iter()
+            .find(|d| d.message.contains("Unknown resource type"));
+        assert!(
+            unknown_type_diag.is_none(),
+            "aws.s3.bucket should be a recognized resource type. Got diagnostics: {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+
+        // Should report unknown attribute "unknown_attr" (schema validation works)
+        let unknown_attr_diag = diagnostics
+            .iter()
+            .find(|d| d.message.contains("Unknown attribute 'unknown_attr'"));
+        assert!(
+            unknown_attr_diag.is_some(),
+            "Should warn about unknown attribute in aws.s3.bucket. Got diagnostics: {:?}",
             diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
     }
