@@ -1,0 +1,222 @@
+{
+  "smithy": "2.0",
+  "metadata": {},
+  "shapes": {
+    "com.example#MyService": {
+      "type": "service",
+      "version": "2024-01-01",
+      "operations": [
+        { "target": "com.example#CreateThing" },
+        { "target": "com.example#DescribeThing" },
+        { "target": "com.example#DeleteThing" }
+      ],
+      "traits": {
+        "smithy.api#title": "My Service",
+        "smithy.api#documentation": "A test service"
+      }
+    },
+    "com.example#CreateThing": {
+      "type": "operation",
+      "input": { "target": "com.example#CreateThingRequest" },
+      "output": { "target": "com.example#CreateThingResult" },
+      "traits": {
+        "smithy.api#documentation": "Creates a thing"
+      }
+    },
+    "com.example#DescribeThing": {
+      "type": "operation",
+      "input": { "target": "com.example#DescribeThingRequest" },
+      "output": { "target": "com.example#DescribeThingResult" },
+      "traits": {}
+    },
+    "com.example#DeleteThing": {
+      "type": "operation",
+      "input": { "target": "com.example#DeleteThingRequest" },
+      "output": { "target": "smithy.api#Unit" },
+      "traits": {}
+    },
+    "com.example#CreateThingRequest": {
+      "type": "structure",
+      "members": {
+        "Name": {
+          "target": "smithy.api#String",
+          "traits": {
+            "smithy.api#required": {},
+            "smithy.api#documentation": "The name of the thing"
+          }
+        },
+        "Color": {
+          "target": "com.example#Color",
+          "traits": {
+            "smithy.api#documentation": "The color"
+          }
+        },
+        "Tags": {
+          "target": "com.example#TagList",
+          "traits": {}
+        },
+        "Metadata": {
+          "target": "com.example#MetadataMap",
+          "traits": {}
+        }
+      },
+      "traits": {
+        "smithy.api#input": {}
+      }
+    },
+    "com.example#CreateThingResult": {
+      "type": "structure",
+      "members": {
+        "Thing": {
+          "target": "com.example#Thing",
+          "traits": {}
+        }
+      },
+      "traits": {
+        "smithy.api#output": {}
+      }
+    },
+    "com.example#DescribeThingRequest": {
+      "type": "structure",
+      "members": {
+        "ThingId": {
+          "target": "com.example#ThingId",
+          "traits": {
+            "smithy.api#required": {}
+          }
+        }
+      },
+      "traits": {
+        "smithy.api#input": {}
+      }
+    },
+    "com.example#DescribeThingResult": {
+      "type": "structure",
+      "members": {
+        "Thing": {
+          "target": "com.example#Thing",
+          "traits": {}
+        }
+      },
+      "traits": {
+        "smithy.api#output": {}
+      }
+    },
+    "com.example#DeleteThingRequest": {
+      "type": "structure",
+      "members": {
+        "ThingId": {
+          "target": "com.example#ThingId",
+          "traits": {
+            "smithy.api#required": {}
+          }
+        }
+      },
+      "traits": {
+        "smithy.api#input": {}
+      }
+    },
+    "com.example#Thing": {
+      "type": "structure",
+      "members": {
+        "ThingId": {
+          "target": "com.example#ThingId",
+          "traits": {}
+        },
+        "Name": {
+          "target": "smithy.api#String",
+          "traits": {}
+        },
+        "Color": {
+          "target": "com.example#Color",
+          "traits": {}
+        },
+        "Status": {
+          "target": "com.example#ThingStatus",
+          "traits": {}
+        },
+        "CreatedAt": {
+          "target": "smithy.api#Timestamp",
+          "traits": {}
+        }
+      },
+      "traits": {
+        "smithy.api#documentation": "A thing resource"
+      }
+    },
+    "com.example#ThingId": {
+      "type": "string",
+      "traits": {
+        "smithy.api#documentation": "The unique identifier for a thing"
+      }
+    },
+    "com.example#Color": {
+      "type": "enum",
+      "members": {
+        "RED": {
+          "target": "smithy.api#Unit",
+          "traits": { "smithy.api#enumValue": "red" }
+        },
+        "GREEN": {
+          "target": "smithy.api#Unit",
+          "traits": { "smithy.api#enumValue": "green" }
+        },
+        "BLUE": {
+          "target": "smithy.api#Unit",
+          "traits": { "smithy.api#enumValue": "blue" }
+        }
+      }
+    },
+    "com.example#ThingStatus": {
+      "type": "enum",
+      "members": {
+        "ACTIVE": {
+          "target": "smithy.api#Unit",
+          "traits": { "smithy.api#enumValue": "active" }
+        },
+        "INACTIVE": {
+          "target": "smithy.api#Unit",
+          "traits": { "smithy.api#enumValue": "inactive" }
+        }
+      }
+    },
+    "com.example#TagList": {
+      "type": "list",
+      "member": {
+        "target": "com.example#Tag",
+        "traits": {}
+      }
+    },
+    "com.example#Tag": {
+      "type": "structure",
+      "members": {
+        "Key": {
+          "target": "smithy.api#String",
+          "traits": { "smithy.api#required": {} }
+        },
+        "Value": {
+          "target": "smithy.api#String",
+          "traits": {}
+        }
+      }
+    },
+    "com.example#MetadataMap": {
+      "type": "map",
+      "key": { "target": "smithy.api#String" },
+      "value": { "target": "smithy.api#String" }
+    },
+    "com.example#Filter": {
+      "type": "union",
+      "members": {
+        "ByName": {
+          "target": "smithy.api#String",
+          "traits": { "smithy.api#documentation": "Filter by name" }
+        },
+        "ByColor": {
+          "target": "com.example#Color",
+          "traits": { "smithy.api#documentation": "Filter by color" }
+        }
+      }
+    }
+  }
+}

@@ -754,6 +754,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "carina-smithy"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "carina-state"
 version = "0.1.0"
 dependencies = [
