@@ -90,61 +90,61 @@ impl HoverProvider {
 
     fn resource_type_hover(&self, word: &str) -> Option<Hover> {
         // S3 resources
-        if word == "aws.s3_bucket" || word.contains("s3_bucket") {
+        if word == "aws.s3.bucket" || word.contains("s3.bucket") {
             return self.schema_hover(
-                "aws.s3_bucket",
+                "aws.s3.bucket",
                 &aws_generated::s3_bucket::s3_bucket_config().schema,
             );
         }
 
         // EC2/VPC resources
-        if word == "aws.ec2_vpc" || word.contains("ec2_vpc") && !word.contains("vpc_id") {
+        if word == "aws.ec2.vpc" || word.contains("ec2.vpc") && !word.contains("vpc_id") {
             return self.schema_hover(
-                "aws.ec2_vpc",
+                "aws.ec2.vpc",
                 &aws_generated::ec2_vpc::ec2_vpc_config().schema,
             );
         }
 
-        if word == "aws.ec2_subnet" || word.contains("ec2_subnet") && !word.contains("subnet_id") {
+        if word == "aws.ec2.subnet" || word.contains("ec2.subnet") && !word.contains("subnet_id") {
             return self.schema_hover(
-                "aws.ec2_subnet",
+                "aws.ec2.subnet",
                 &aws_generated::ec2_subnet::ec2_subnet_config().schema,
             );
         }
 
-        if word == "aws.ec2_internet_gateway" || word.contains("ec2_internet_gateway") {
+        if word == "aws.ec2.internet_gateway" || word.contains("ec2.internet_gateway") {
             return self.schema_hover(
-                "aws.ec2_internet_gateway",
+                "aws.ec2.internet_gateway",
                 &aws_generated::ec2_internet_gateway::ec2_internet_gateway_config().schema,
             );
         }
 
-        if word == "aws.ec2_route_table" || word.contains("ec2_route_table") {
+        if word == "aws.ec2.route_table" || word.contains("ec2.route_table") {
             return self.schema_hover(
-                "aws.ec2_route_table",
+                "aws.ec2.route_table",
                 &aws_generated::ec2_route_table::ec2_route_table_config().schema,
             );
         }
 
-        if word == "aws.ec2_security_group_ingress" || word.contains("ec2_security_group_ingress") {
+        if word == "aws.ec2.security_group_ingress" || word.contains("ec2.security_group_ingress") {
             return self.schema_hover(
-                "aws.ec2_security_group_ingress",
+                "aws.ec2.security_group_ingress",
                 &aws_generated::ec2_security_group_ingress::ec2_security_group_ingress_config()
                     .schema,
             );
         }
 
-        if word == "aws.ec2_security_group_egress" || word.contains("ec2_security_group_egress") {
+        if word == "aws.ec2.security_group_egress" || word.contains("ec2.security_group_egress") {
             return self.schema_hover(
-                "aws.ec2_security_group_egress",
+                "aws.ec2.security_group_egress",
                 &aws_generated::ec2_security_group_egress::ec2_security_group_egress_config()
                     .schema,
             );
         }
 
-        if word == "aws.ec2_security_group" || word.contains("ec2_security_group") {
+        if word == "aws.ec2.security_group" || word.contains("ec2.security_group") {
             return self.schema_hover(
-                "aws.ec2_security_group",
+                "aws.ec2.security_group",
                 &aws_generated::ec2_security_group::ec2_security_group_config().schema,
             );
         }
@@ -224,7 +224,7 @@ impl HoverProvider {
                 "## provider\n\nDefines a provider block with configuration.\n\n```carina\nprovider aws {\n    region = aws.Region.ap_northeast_1\n}\n```"
             }
             "let" => {
-                "## let\n\nDefines a named resource or variable binding.\n\n```carina\nlet my_bucket = aws.s3_bucket {\n    name = \"my-bucket\"\n    region = aws.Region.ap_northeast_1\n}\n```"
+                "## let\n\nDefines a named resource or variable binding.\n\n```carina\nlet my_bucket = aws.s3.bucket {\n    name = \"my-bucket\"\n    region = aws.Region.ap_northeast_1\n}\n```"
             }
             "env" => {
                 "## env()\n\nReads a value from an environment variable.\n\n```carina\nname = env(\"BUCKET_NAME\")\n```"

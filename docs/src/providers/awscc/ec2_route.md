@@ -1,4 +1,4 @@
-# awscc.ec2_route
+# awscc.ec2.route
 
 CloudFormation Type: `AWS::EC2::Route`
 
@@ -124,25 +124,25 @@ The ID of a VPC peering connection.
 ## Example
 
 ```crn
-let vpc = awscc.ec2_vpc {
+let vpc = awscc.ec2.vpc {
   cidr_block           = "10.0.0.0/16"
   enable_dns_support   = true
   enable_dns_hostnames = true
 }
 
-let igw = awscc.ec2_internet_gateway {
+let igw = awscc.ec2.internet_gateway {
 }
 
-let igw_attachment = awscc.ec2_vpc_gateway_attachment {
+let igw_attachment = awscc.ec2.vpc_gateway_attachment {
   vpc_id              = vpc.vpc_id
   internet_gateway_id = igw.internet_gateway_id
 }
 
-let rt = awscc.ec2_route_table {
+let rt = awscc.ec2.route_table {
   vpc_id = vpc.vpc_id
 }
 
-let route = awscc.ec2_route {
+let route = awscc.ec2.route {
   route_table_id         = rt.route_table_id
   destination_cidr_block = "0.0.0.0/0"
   gateway_id             = igw_attachment.internet_gateway_id

@@ -18,7 +18,7 @@ fn validate_log_destination_type(value: &Value) -> Result<(), String> {
     validate_namespaced_enum(
         value,
         "LogDestinationType",
-        "awscc.ec2_flow_log",
+        "awscc.ec2.flow_log",
         VALID_LOG_DESTINATION_TYPE,
     )
     .map_err(|reason| {
@@ -45,7 +45,7 @@ fn validate_resource_type(value: &Value) -> Result<(), String> {
     validate_namespaced_enum(
         value,
         "ResourceType",
-        "awscc.ec2_flow_log",
+        "awscc.ec2.flow_log",
         VALID_RESOURCE_TYPE,
     )
     .map_err(|reason| {
@@ -65,7 +65,7 @@ fn validate_traffic_type(value: &Value) -> Result<(), String> {
     validate_namespaced_enum(
         value,
         "TrafficType",
-        "awscc.ec2_flow_log",
+        "awscc.ec2.flow_log",
         VALID_TRAFFIC_TYPE,
     )
     .map_err(|reason| {
@@ -81,9 +81,9 @@ fn validate_traffic_type(value: &Value) -> Result<(), String> {
 pub fn ec2_flow_log_config() -> AwsccSchemaConfig {
     AwsccSchemaConfig {
         aws_type_name: "AWS::EC2::FlowLog",
-        resource_type_name: "ec2_flow_log",
+        resource_type_name: "ec2.flow_log",
         has_tags: true,
-        schema: ResourceSchema::new("awscc.ec2_flow_log")
+        schema: ResourceSchema::new("awscc.ec2.flow_log")
         .with_description("Specifies a VPC flow log, which enables you to capture IP traffic for a specific network interface, subnet, or VPC.")
         .attribute(
             AttributeSchema::new("deliver_cross_account_role", super::iam_role_arn())
@@ -125,7 +125,7 @@ pub fn ec2_flow_log_config() -> AwsccSchemaConfig {
                 name: "LogDestinationType".to_string(),
                 base: Box::new(AttributeType::String),
                 validate: validate_log_destination_type,
-                namespace: Some("awscc.ec2_flow_log".to_string()),
+                namespace: Some("awscc.ec2.flow_log".to_string()),
                 to_dsl: Some(|s: &str| s.replace('-', "_")),
             })
                 .create_only()
@@ -162,7 +162,7 @@ pub fn ec2_flow_log_config() -> AwsccSchemaConfig {
                 name: "ResourceType".to_string(),
                 base: Box::new(AttributeType::String),
                 validate: validate_resource_type,
-                namespace: Some("awscc.ec2_flow_log".to_string()),
+                namespace: Some("awscc.ec2.flow_log".to_string()),
                 to_dsl: None,
             })
                 .required()
@@ -180,7 +180,7 @@ pub fn ec2_flow_log_config() -> AwsccSchemaConfig {
                 name: "TrafficType".to_string(),
                 base: Box::new(AttributeType::String),
                 validate: validate_traffic_type,
-                namespace: Some("awscc.ec2_flow_log".to_string()),
+                namespace: Some("awscc.ec2.flow_log".to_string()),
                 to_dsl: None,
             })
                 .create_only()
@@ -196,7 +196,7 @@ pub fn enum_valid_values() -> (
     &'static [(&'static str, &'static [&'static str])],
 ) {
     (
-        "ec2_flow_log",
+        "ec2.flow_log",
         &[
             ("log_destination_type", VALID_LOG_DESTINATION_TYPE),
             ("resource_type", VALID_RESOURCE_TYPE),

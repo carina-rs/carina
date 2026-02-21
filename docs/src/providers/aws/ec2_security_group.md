@@ -1,4 +1,4 @@
-# aws.ec2_security_group
+# aws.ec2.security_group
 
 CloudFormation Type: `AWS::EC2::SecurityGroup`
 

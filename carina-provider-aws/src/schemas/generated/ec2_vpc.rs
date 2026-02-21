@@ -18,7 +18,7 @@ fn validate_instance_tenancy(value: &Value) -> Result<(), String> {
     validate_namespaced_enum(
         value,
         "InstanceTenancy",
-        "aws.ec2_vpc",
+        "aws.ec2.vpc",
         VALID_INSTANCE_TENANCY,
     )
     .map_err(|reason| {
@@ -42,13 +42,13 @@ fn validate_ipv4_netmask_length_range(value: &Value) -> Result<(), String> {
     }
 }
 
-/// Returns the schema config for ec2_vpc (Smithy: com.amazonaws.ec2)
+/// Returns the schema config for ec2.vpc (Smithy: com.amazonaws.ec2)
 pub fn ec2_vpc_config() -> AwsSchemaConfig {
     AwsSchemaConfig {
         aws_type_name: "AWS::EC2::VPC",
-        resource_type_name: "ec2_vpc",
+        resource_type_name: "ec2.vpc",
         has_tags: true,
-        schema: ResourceSchema::new("aws.ec2_vpc")
+        schema: ResourceSchema::new("aws.ec2.vpc")
         .with_description("Describes a VPC.")
         .attribute(
             AttributeSchema::new("name", AttributeType::String)
@@ -79,7 +79,7 @@ pub fn ec2_vpc_config() -> AwsSchemaConfig {
                 name: "InstanceTenancy".to_string(),
                 base: Box::new(AttributeType::String),
                 validate: validate_instance_tenancy,
-                namespace: Some("aws.ec2_vpc".to_string()),
+                namespace: Some("aws.ec2.vpc".to_string()),
                 to_dsl: None,
             })
                 .create_only()
@@ -122,7 +122,7 @@ pub fn enum_valid_values() -> (
     &'static str,
     &'static [(&'static str, &'static [&'static str])],
 ) {
-    ("ec2_vpc", &[("instance_tenancy", VALID_INSTANCE_TENANCY)])
+    ("ec2.vpc", &[("instance_tenancy", VALID_INSTANCE_TENANCY)])
 }
 
 /// Maps DSL alias values back to canonical AWS values for this module.

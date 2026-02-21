@@ -75,7 +75,7 @@ pub struct S3BucketType;
 
 impl ResourceType for S3BucketType {
     fn name(&self) -> &'static str {
-        "s3_bucket"
+        "s3.bucket"
     }
 
     fn schema(&self) -> ResourceSchema {
@@ -88,7 +88,7 @@ pub struct VpcType;
 
 impl ResourceType for VpcType {
     fn name(&self) -> &'static str {
-        "ec2_vpc"
+        "ec2.vpc"
     }
 
     fn schema(&self) -> ResourceSchema {
@@ -101,7 +101,7 @@ pub struct SubnetType;
 
 impl ResourceType for SubnetType {
     fn name(&self) -> &'static str {
-        "ec2_subnet"
+        "ec2.subnet"
     }
 
     fn schema(&self) -> ResourceSchema {
@@ -114,7 +114,7 @@ pub struct InternetGatewayType;
 
 impl ResourceType for InternetGatewayType {
     fn name(&self) -> &'static str {
-        "ec2_internet_gateway"
+        "ec2.internet_gateway"
     }
 
     fn schema(&self) -> ResourceSchema {
@@ -127,7 +127,7 @@ pub struct RouteTableType;
 
 impl ResourceType for RouteTableType {
     fn name(&self) -> &'static str {
-        "ec2_route_table"
+        "ec2.route_table"
     }
 
     fn schema(&self) -> ResourceSchema {
@@ -140,7 +140,7 @@ pub struct RouteType;
 
 impl ResourceType for RouteType {
     fn name(&self) -> &'static str {
-        "ec2_route"
+        "ec2.route"
     }
 
     fn schema(&self) -> ResourceSchema {
@@ -153,7 +153,7 @@ pub struct SecurityGroupType;
 
 impl ResourceType for SecurityGroupType {
     fn name(&self) -> &'static str {
-        "ec2_security_group"
+        "ec2.security_group"
     }
 
     fn schema(&self) -> ResourceSchema {
@@ -166,7 +166,7 @@ pub struct SecurityGroupIngressRuleType;
 
 impl ResourceType for SecurityGroupIngressRuleType {
     fn name(&self) -> &'static str {
-        "ec2_security_group_ingress"
+        "ec2.security_group_ingress"
     }
 
     fn schema(&self) -> ResourceSchema {
@@ -179,7 +179,7 @@ pub struct SecurityGroupEgressRuleType;
 
 impl ResourceType for SecurityGroupEgressRuleType {
     fn name(&self) -> &'static str {
-        "ec2_security_group_egress"
+        "ec2.security_group_egress"
     }
 
     fn schema(&self) -> ResourceSchema {
@@ -1308,7 +1308,7 @@ impl AwsProvider {
         route_table_id: &str,
         destination_cidr_block: &str,
     ) -> ProviderResult<State> {
-        let id = ResourceId::with_provider("aws", "ec2_route", name);
+        let id = ResourceId::with_provider("aws", "ec2.route", name);
 
         // Describe the route table to get its routes
         let result = self
@@ -2023,24 +2023,24 @@ impl Provider for AwsProvider {
         let identifier = identifier.map(String::from);
         Box::pin(async move {
             match id.resource_type.as_str() {
-                "s3_bucket" => self.read_s3_bucket(&id, identifier.as_deref()).await,
-                "ec2_vpc" => self.read_ec2_vpc(&id, identifier.as_deref()).await,
-                "ec2_subnet" => self.read_ec2_subnet(&id, identifier.as_deref()).await,
-                "ec2_internet_gateway" => {
+                "s3.bucket" => self.read_s3_bucket(&id, identifier.as_deref()).await,
+                "ec2.vpc" => self.read_ec2_vpc(&id, identifier.as_deref()).await,
+                "ec2.subnet" => self.read_ec2_subnet(&id, identifier.as_deref()).await,
+                "ec2.internet_gateway" => {
                     self.read_ec2_internet_gateway(&id, identifier.as_deref())
                         .await
                 }
-                "ec2_route_table" => self.read_ec2_route_table(&id, identifier.as_deref()).await,
-                "ec2_route" => self.read_ec2_route(&id, identifier.as_deref()).await,
-                "ec2_security_group" => {
+                "ec2.route_table" => self.read_ec2_route_table(&id, identifier.as_deref()).await,
+                "ec2.route" => self.read_ec2_route(&id, identifier.as_deref()).await,
+                "ec2.security_group" => {
                     self.read_ec2_security_group(&id, identifier.as_deref())
                         .await
                 }
-                "ec2_security_group_ingress" => {
+                "ec2.security_group_ingress" => {
                     self.read_ec2_security_group_rule(&id, identifier.as_deref(), true)
                         .await
                 }
-                "ec2_security_group_egress" => {
+                "ec2.security_group_egress" => {
                     self.read_ec2_security_group_rule(&id, identifier.as_deref(), false)
                         .await
                 }
@@ -2057,17 +2057,17 @@ impl Provider for AwsProvider {
         let resource = resource.clone();
         Box::pin(async move {
             match resource.id.resource_type.as_str() {
-                "s3_bucket" => self.create_s3_bucket(resource).await,
-                "ec2_vpc" => self.create_ec2_vpc(resource).await,
-                "ec2_subnet" => self.create_ec2_subnet(resource).await,
-                "ec2_internet_gateway" => self.create_ec2_internet_gateway(resource).await,
-                "ec2_route_table" => self.create_ec2_route_table(resource).await,
-                "ec2_route" => self.create_ec2_route(resource).await,
-                "ec2_security_group" => self.create_ec2_security_group(resource).await,
-                "ec2_security_group_ingress" => {
+                "s3.bucket" => self.create_s3_bucket(resource).await,
+                "ec2.vpc" => self.create_ec2_vpc(resource).await,
+                "ec2.subnet" => self.create_ec2_subnet(resource).await,
+                "ec2.internet_gateway" => self.create_ec2_internet_gateway(resource).await,
+                "ec2.route_table" => self.create_ec2_route_table(resource).await,
+                "ec2.route" => self.create_ec2_route(resource).await,
+                "ec2.security_group" => self.create_ec2_security_group(resource).await,
+                "ec2.security_group_ingress" => {
                     self.create_ec2_security_group_rule(resource, true).await
                 }
-                "ec2_security_group_egress" => {
+                "ec2.security_group_egress" => {
                     self.create_ec2_security_group_rule(resource, false).await
                 }
                 _ => Err(ProviderError::new(format!(
@@ -2091,20 +2091,20 @@ impl Provider for AwsProvider {
         let to = to.clone();
         Box::pin(async move {
             match id.resource_type.as_str() {
-                "s3_bucket" => self.update_s3_bucket(id, &identifier, to).await,
-                "ec2_vpc" => self.update_ec2_vpc(id, &identifier, to).await,
-                "ec2_subnet" => self.update_ec2_subnet(id, &identifier, to).await,
-                "ec2_internet_gateway" => {
+                "s3.bucket" => self.update_s3_bucket(id, &identifier, to).await,
+                "ec2.vpc" => self.update_ec2_vpc(id, &identifier, to).await,
+                "ec2.subnet" => self.update_ec2_subnet(id, &identifier, to).await,
+                "ec2.internet_gateway" => {
                     self.update_ec2_internet_gateway(id, &identifier, to).await
                 }
-                "ec2_route_table" => self.update_ec2_route_table(id, &identifier, to).await,
-                "ec2_route" => self.update_ec2_route(id, &identifier, to).await,
-                "ec2_security_group" => self.update_ec2_security_group(id, &identifier, to).await,
-                "ec2_security_group_ingress" => {
+                "ec2.route_table" => self.update_ec2_route_table(id, &identifier, to).await,
+                "ec2.route" => self.update_ec2_route(id, &identifier, to).await,
+                "ec2.security_group" => self.update_ec2_security_group(id, &identifier, to).await,
+                "ec2.security_group_ingress" => {
                     self.update_ec2_security_group_rule(id, &identifier, to, true)
                         .await
                 }
-                "ec2_security_group_egress" => {
+                "ec2.security_group_egress" => {
                     self.update_ec2_security_group_rule(id, &identifier, to, false)
                         .await
                 }
@@ -2127,23 +2127,23 @@ impl Provider for AwsProvider {
         let identifier = identifier.to_string();
         Box::pin(async move {
             match id.resource_type.as_str() {
-                "s3_bucket" => self.delete_s3_bucket(id, &identifier).await,
-                "ec2_vpc" => self.delete_ec2_vpc(id, &identifier).await,
-                "ec2_subnet" => self.delete_ec2_subnet(id, &identifier).await,
-                "ec2_internet_gateway" => self.delete_ec2_internet_gateway(id, &identifier).await,
-                "ec2_route_table" => self.delete_ec2_route_table(id, &identifier).await,
-                "ec2_route" => {
+                "s3.bucket" => self.delete_s3_bucket(id, &identifier).await,
+                "ec2.vpc" => self.delete_ec2_vpc(id, &identifier).await,
+                "ec2.subnet" => self.delete_ec2_subnet(id, &identifier).await,
+                "ec2.internet_gateway" => self.delete_ec2_internet_gateway(id, &identifier).await,
+                "ec2.route_table" => self.delete_ec2_route_table(id, &identifier).await,
+                "ec2.route" => {
                     // Route deletion requires route_table_id and destination_cidr_block
                     // which are not available from ResourceId alone.
                     // Routes are typically deleted when the route table is deleted.
                     Ok(())
                 }
-                "ec2_security_group" => self.delete_ec2_security_group(id, &identifier).await,
-                "ec2_security_group_ingress" => {
+                "ec2.security_group" => self.delete_ec2_security_group(id, &identifier).await,
+                "ec2.security_group_ingress" => {
                     self.delete_ec2_security_group_rule(id, &identifier, true)
                         .await
                 }
-                "ec2_security_group_egress" => {
+                "ec2.security_group_egress" => {
                     self.delete_ec2_security_group_rule(id, &identifier, false)
                         .await
                 }
@@ -2175,6 +2175,6 @@ mod tests {
     #[test]
     fn test_s3_bucket_type_name() {
         let bucket_type = S3BucketType;
-        assert_eq!(bucket_type.name(), "s3_bucket");
+        assert_eq!(bucket_type.name(), "s3.bucket");
     }
 }

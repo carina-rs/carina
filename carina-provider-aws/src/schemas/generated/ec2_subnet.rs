@@ -15,7 +15,7 @@ const VALID_HOSTNAME_TYPE: &[&str] = &["ip-name", "resource-name"];
 
 #[allow(dead_code)]
 fn validate_hostname_type(value: &Value) -> Result<(), String> {
-    validate_namespaced_enum(value, "HostnameType", "aws.ec2_subnet", VALID_HOSTNAME_TYPE).map_err(
+    validate_namespaced_enum(value, "HostnameType", "aws.ec2.subnet", VALID_HOSTNAME_TYPE).map_err(
         |reason| {
             if let Value::String(s) = value {
                 format!("Invalid HostnameType '{}': {}", s, reason)
@@ -50,13 +50,13 @@ fn validate_ipv6_netmask_length_range(value: &Value) -> Result<(), String> {
     }
 }
 
-/// Returns the schema config for ec2_subnet (Smithy: com.amazonaws.ec2)
+/// Returns the schema config for ec2.subnet (Smithy: com.amazonaws.ec2)
 pub fn ec2_subnet_config() -> AwsSchemaConfig {
     AwsSchemaConfig {
         aws_type_name: "AWS::EC2::Subnet",
-        resource_type_name: "ec2_subnet",
+        resource_type_name: "ec2.subnet",
         has_tags: true,
-        schema: ResourceSchema::new("aws.ec2_subnet")
+        schema: ResourceSchema::new("aws.ec2.subnet")
         .with_description("Describes a subnet.")
         .attribute(
             AttributeSchema::new("name", AttributeType::String)
@@ -168,7 +168,7 @@ pub fn ec2_subnet_config() -> AwsSchemaConfig {
                 name: "HostnameType".to_string(),
                 base: Box::new(AttributeType::String),
                 validate: validate_hostname_type,
-                namespace: Some("aws.ec2_subnet".to_string()),
+                namespace: Some("aws.ec2.subnet".to_string()),
                 to_dsl: Some(|s: &str| s.replace('-', "_")),
             }).with_description("The type of hostname for EC2 instances. For IPv4 only subnets, an instance DNS name must be based on the instance IPv4 address. For IPv6 only subnets,...").with_provider_name("HostnameType")
                     ],
@@ -201,7 +201,7 @@ pub fn enum_valid_values() -> (
     &'static str,
     &'static [(&'static str, &'static [&'static str])],
 ) {
-    ("ec2_subnet", &[("hostname_type", VALID_HOSTNAME_TYPE)])
+    ("ec2.subnet", &[("hostname_type", VALID_HOSTNAME_TYPE)])
 }
 
 /// Maps DSL alias values back to canonical AWS values for this module.

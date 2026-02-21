@@ -115,7 +115,7 @@ impl CompletionProvider {
             }
             let trimmed = line.trim();
 
-            // Look for resource type declaration: "aws.vpc {" or "let x = aws.vpc {"
+            // Look for resource type declaration: "aws.ec2.vpc {" or "let x = aws.ec2.vpc {"
             if let Some(rt) = self.extract_resource_type(line)
                 && brace_depth == 0
             {
@@ -213,46 +213,35 @@ impl CompletionProvider {
         CompletionContext::TopLevel
     }
 
-    /// Extract resource type from a line like "aws.vpc {" or "let x = aws.vpc {"
+    /// Extract resource type from a line like "aws.ec2.vpc {" or "let x = aws.ec2.vpc {"
+    /// Returns the resource type (e.g., "aws.ec2.vpc") for schema lookups
     fn extract_resource_type(&self, line: &str) -> Option<String> {
         let trimmed = line.trim();
 
-        // Pattern: "aws.xxx.yyy {" or "let name = aws.xxx.yyy {"
-        // Maps DSL format to schema resource_type
-        for (pattern, schema_type) in [
-            ("aws.ec2_vpc", "aws.ec2_vpc"),
-            ("aws.ec2_subnet", "aws.ec2_subnet"),
-            ("aws.ec2_internet_gateway", "aws.ec2_internet_gateway"),
-            ("aws.ec2_route_table", "aws.ec2_route_table"),
-            ("aws.ec2_route", "aws.ec2_route"),
-            (
-                "aws.ec2_security_group_ingress",
-                "aws.ec2_security_group_ingress",
-            ),
-            (
-                "aws.ec2_security_group_egress",
-                "aws.ec2_security_group_egress",
-            ),
-            ("aws.ec2_security_group", "aws.ec2_security_group"),
-            ("aws.s3_bucket", "aws.s3_bucket"),
-            // awscc resources
-            ("awscc.ec2_vpc", "awscc.ec2_vpc"),
-            (
-                "awscc.ec2_security_group_ingress",
-                "awscc.ec2_security_group_ingress",
-            ),
-            (
-                "awscc.ec2_security_group_egress",
-                "awscc.ec2_security_group_egress",
-            ),
-            ("awscc.ec2_security_group", "awscc.ec2_security_group"),
-            ("awscc.ec2_flow_log", "awscc.ec2_flow_log"),
-            ("awscc.ec2_nat_gateway", "awscc.ec2_nat_gateway"),
-            ("awscc.ec2_vpc_endpoint", "awscc.ec2_vpc_endpoint"),
-            ("awscc.ec2_subnet", "awscc.ec2_subnet"),
-        ] {
+        // Match DSL resource type patterns (provider.service.resource)
+        // Longer patterns first to avoid partial matches
+        let patterns = [
+            "aws.ec2.security_group_ingress",
+            "aws.ec2.security_group_egress",
+            "aws.ec2.security_group",
+            "aws.ec2.internet_gateway",
+            "aws.ec2.route_table",
+            "aws.ec2.route",
+            "aws.ec2.subnet",
+            "aws.ec2.vpc",
+            "aws.s3.bucket",
+            "awscc.ec2.security_group_ingress",
+            "awscc.ec2.security_group_egress",
+            "awscc.ec2.security_group",
+            "awscc.ec2.flow_log",
+            "awscc.ec2.nat_gateway",
+            "awscc.ec2.vpc_endpoint",
+            "awscc.ec2.subnet",
+            "awscc.ec2.vpc",
+        ];
+        for pattern in patterns {
             if trimmed.contains(pattern) {
-                return Some(schema_type.to_string());
+                return Some(pattern.to_string());
             }
         }
         None
@@ -316,7 +305,7 @@ impl CompletionProvider {
             CompletionItem {
                 label: "read".to_string(),
                 kind: Some(CompletionItemKind::KEYWORD),
-                insert_text: Some("let ${1:name} = read ${2:aws.s3_bucket} {\n    name = \"${3:existing-resource}\"\n}".to_string()),
+                insert_text: Some("let ${1:name} = read ${2:aws.s3.bucket} {\n    name = \"${3:existing-resource}\"\n}".to_string()),
                 insert_text_format: Some(InsertTextFormat::SNIPPET),
                 detail: Some("Read existing resource (data source)".to_string()),
                 ..Default::default()
@@ -356,95 +345,95 @@ impl CompletionProvider {
             CompletionItem {
                 label: "ref".to_string(),
                 kind: Some(CompletionItemKind::TYPE_PARAMETER),
-                insert_text: Some("ref(${1:aws.ec2_vpc})".to_string()),
+                insert_text: Some("ref(${1:aws.ec2.vpc})".to_string()),
                 insert_text_format: Some(InsertTextFormat::SNIPPET),
                 detail: Some("Typed resource reference".to_string()),
                 ..Default::default()
             },
             // EC2 resources
             CompletionItem {
-                label: "aws.ec2_vpc".to_string(),
+                label: "aws.ec2.vpc".to_string(),
                 kind: Some(CompletionItemKind::CLASS),
                 text_edit: Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(TextEdit {
                     range: replacement_range,
-                    new_text: "aws.ec2_vpc {\n    cidr_block = \"${1:10.0.0.0/16}\"\n}".to_string(),
+                    new_text: "aws.ec2.vpc {\n    cidr_block = \"${1:10.0.0.0/16}\"\n}".to_string(),
                 })),
                 insert_text_format: Some(InsertTextFormat::SNIPPET),
                 detail: Some("VPC resource".to_string()),
                 ..Default::default()
             },
             CompletionItem {
-                label: "aws.ec2_subnet".to_string(),
+                label: "aws.ec2.subnet".to_string(),
                 kind: Some(CompletionItemKind::CLASS),
                 text_edit: Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(TextEdit {
                     range: replacement_range,
-                    new_text: "aws.ec2_subnet {\n    vpc_id            = ${1:vpc.vpc_id}\n    cidr_block        = \"${2:10.0.1.0/24}\"\n    availability_zone = \"${3:ap-northeast-1a}\"\n}".to_string(),
+                    new_text: "aws.ec2.subnet {\n    vpc_id            = ${1:vpc.vpc_id}\n    cidr_block        = \"${2:10.0.1.0/24}\"\n    availability_zone = \"${3:ap-northeast-1a}\"\n}".to_string(),
                 })),
                 insert_text_format: Some(InsertTextFormat::SNIPPET),
                 detail: Some("Subnet resource".to_string()),
                 ..Default::default()
             },
             CompletionItem {
-                label: "aws.ec2_internet_gateway".to_string(),
+                label: "aws.ec2.internet_gateway".to_string(),
                 kind: Some(CompletionItemKind::CLASS),
                 text_edit: Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(TextEdit {
                     range: replacement_range,
-                    new_text: "aws.ec2_internet_gateway {\n}".to_string(),
+                    new_text: "aws.ec2.internet_gateway {\n}".to_string(),
                 })),
                 insert_text_format: Some(InsertTextFormat::SNIPPET),
                 detail: Some("Internet Gateway resource".to_string()),
                 ..Default::default()
             },
             CompletionItem {
-                label: "aws.ec2_route_table".to_string(),
+                label: "aws.ec2.route_table".to_string(),
                 kind: Some(CompletionItemKind::CLASS),
                 text_edit: Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(TextEdit {
                     range: replacement_range,
-                    new_text: "aws.ec2_route_table {\n    vpc_id = ${1:vpc.vpc_id}\n}".to_string(),
+                    new_text: "aws.ec2.route_table {\n    vpc_id = ${1:vpc.vpc_id}\n}".to_string(),
                 })),
                 insert_text_format: Some(InsertTextFormat::SNIPPET),
                 detail: Some("Route Table resource".to_string()),
                 ..Default::default()
             },
             CompletionItem {
-                label: "aws.ec2_route".to_string(),
+                label: "aws.ec2.route".to_string(),
                 kind: Some(CompletionItemKind::CLASS),
                 text_edit: Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(TextEdit {
                     range: replacement_range,
-                    new_text: "aws.ec2_route {\n    route_table_id         = ${1:rt.route_table_id}\n    destination_cidr_block = \"${2:0.0.0.0/0}\"\n    gateway_id             = ${3:igw.internet_gateway_id}\n}".to_string(),
+                    new_text: "aws.ec2.route {\n    route_table_id         = ${1:rt.route_table_id}\n    destination_cidr_block = \"${2:0.0.0.0/0}\"\n    gateway_id             = ${3:igw.internet_gateway_id}\n}".to_string(),
                 })),
                 insert_text_format: Some(InsertTextFormat::SNIPPET),
                 detail: Some("Route in a Route Table".to_string()),
                 ..Default::default()
             },
             CompletionItem {
-                label: "aws.ec2_security_group".to_string(),
+                label: "aws.ec2.security_group".to_string(),
                 kind: Some(CompletionItemKind::CLASS),
                 text_edit: Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(TextEdit {
                     range: replacement_range,
-                    new_text: "aws.ec2_security_group {\n    vpc_id           = ${1:vpc.vpc_id}\n    group_description = \"${2:Security group description}\"\n}".to_string(),
+                    new_text: "aws.ec2.security_group {\n    vpc_id           = ${1:vpc.vpc_id}\n    group_description = \"${2:Security group description}\"\n}".to_string(),
                 })),
                 insert_text_format: Some(InsertTextFormat::SNIPPET),
                 detail: Some("Security Group resource".to_string()),
                 ..Default::default()
             },
             CompletionItem {
-                label: "aws.ec2_security_group_ingress".to_string(),
+                label: "aws.ec2.security_group_ingress".to_string(),
                 kind: Some(CompletionItemKind::CLASS),
                 text_edit: Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(TextEdit {
                     range: replacement_range,
-                    new_text: "aws.ec2_security_group_ingress {\n    group_id    = ${1:sg.group_id}\n    ip_protocol = \"${2:tcp}\"\n    from_port   = ${3:80}\n    to_port     = ${4:80}\n    cidr_ip     = \"${5:0.0.0.0/0}\"\n}".to_string(),
+                    new_text: "aws.ec2.security_group_ingress {\n    group_id    = ${1:sg.group_id}\n    ip_protocol = \"${2:tcp}\"\n    from_port   = ${3:80}\n    to_port     = ${4:80}\n    cidr_ip     = \"${5:0.0.0.0/0}\"\n}".to_string(),
                 })),
                 insert_text_format: Some(InsertTextFormat::SNIPPET),
                 detail: Some("Security Group Ingress Rule".to_string()),
                 ..Default::default()
             },
             CompletionItem {
-                label: "aws.ec2_security_group_egress".to_string(),
+                label: "aws.ec2.security_group_egress".to_string(),
                 kind: Some(CompletionItemKind::CLASS),
                 text_edit: Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(TextEdit {
                     range: replacement_range,
-                    new_text: "aws.ec2_security_group_egress {\n    group_id    = ${1:sg.group_id}\n    ip_protocol = \"${2:-1}\"\n    cidr_ip     = \"${3:0.0.0.0/0}\"\n}".to_string(),
+                    new_text: "aws.ec2.security_group_egress {\n    group_id    = ${1:sg.group_id}\n    ip_protocol = \"${2:-1}\"\n    cidr_ip     = \"${3:0.0.0.0/0}\"\n}".to_string(),
                 })),
                 insert_text_format: Some(InsertTextFormat::SNIPPET),
                 detail: Some("Security Group Egress Rule".to_string()),
@@ -452,11 +441,11 @@ impl CompletionProvider {
             },
             // S3 resources
             CompletionItem {
-                label: "aws.s3_bucket".to_string(),
+                label: "aws.s3.bucket".to_string(),
                 kind: Some(CompletionItemKind::CLASS),
                 text_edit: Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(TextEdit {
                     range: replacement_range,
-                    new_text: "aws.s3_bucket {\n    name = \"${1:bucket-name}\"\n}".to_string(),
+                    new_text: "aws.s3.bucket {\n    name = \"${1:bucket-name}\"\n}".to_string(),
                 })),
                 insert_text_format: Some(InsertTextFormat::SNIPPET),
                 detail: Some("S3 bucket resource".to_string()),
@@ -464,11 +453,11 @@ impl CompletionProvider {
             },
             // AWS Cloud Control resources
             CompletionItem {
-                label: "awscc.ec2_vpc".to_string(),
+                label: "awscc.ec2.vpc".to_string(),
                 kind: Some(CompletionItemKind::CLASS),
                 text_edit: Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(TextEdit {
                     range: replacement_range,
-                    new_text: "let ${1:vpc} = awscc.ec2_vpc {\n    cidr_block           = \"${2:10.0.0.0/16}\"\n    enable_dns_support   = true\n    enable_dns_hostnames = true\n}".to_string(),
+                    new_text: "let ${1:vpc} = awscc.ec2.vpc {\n    cidr_block           = \"${2:10.0.0.0/16}\"\n    enable_dns_support   = true\n    enable_dns_hostnames = true\n}".to_string(),
                 })),
                 insert_text_format: Some(InsertTextFormat::SNIPPET),
                 detail: Some("VPC resource (Cloud Control API)".to_string()),
@@ -1002,17 +991,17 @@ impl CompletionProvider {
     fn versioning_status_completions(&self) -> Vec<CompletionItem> {
         vec![
             CompletionItem {
-                label: "aws.s3_bucket.VersioningStatus.Enabled".to_string(),
+                label: "aws.s3.bucket.VersioningStatus.Enabled".to_string(),
                 kind: Some(CompletionItemKind::ENUM_MEMBER),
                 detail: Some("Enable versioning".to_string()),
-                insert_text: Some("aws.s3_bucket.VersioningStatus.Enabled".to_string()),
+                insert_text: Some("aws.s3.bucket.VersioningStatus.Enabled".to_string()),
                 ..Default::default()
             },
             CompletionItem {
-                label: "aws.s3_bucket.VersioningStatus.Suspended".to_string(),
+                label: "aws.s3.bucket.VersioningStatus.Suspended".to_string(),
                 kind: Some(CompletionItemKind::ENUM_MEMBER),
                 detail: Some("Suspend versioning".to_string()),
-                insert_text: Some("aws.s3_bucket.VersioningStatus.Suspended".to_string()),
+                insert_text: Some("aws.s3.bucket.VersioningStatus.Suspended".to_string()),
                 ..Default::default()
             },
         ]
@@ -1021,9 +1010,9 @@ impl CompletionProvider {
     fn instance_tenancy_completions(&self, resource_type: &str) -> Vec<CompletionItem> {
         // Determine prefix based on resource type
         let prefix = if resource_type.starts_with("awscc") {
-            "awscc.ec2_vpc.InstanceTenancy"
+            "awscc.ec2.vpc.InstanceTenancy"
         } else {
-            "aws.ec2_vpc.InstanceTenancy"
+            "aws.ec2.vpc.InstanceTenancy"
         };
 
         vec![
@@ -1076,30 +1065,30 @@ impl CompletionProvider {
     fn ref_type_completions(&self) -> Vec<CompletionItem> {
         // Provide completions for ref(aws.xxx) type syntax
         let resource_types = vec![
-            ("aws.ec2_vpc", "VPC resource reference"),
-            ("aws.ec2_subnet", "Subnet resource reference"),
+            ("aws.ec2.vpc", "VPC resource reference"),
+            ("aws.ec2.subnet", "Subnet resource reference"),
             (
-                "aws.ec2_internet_gateway",
+                "aws.ec2.internet_gateway",
                 "Internet Gateway resource reference",
             ),
-            ("aws.ec2_route_table", "Route Table resource reference"),
-            ("aws.ec2_route", "Route resource reference"),
+            ("aws.ec2.route_table", "Route Table resource reference"),
+            ("aws.ec2.route", "Route resource reference"),
             (
-                "aws.ec2_security_group",
+                "aws.ec2.security_group",
                 "Security Group resource reference",
             ),
             (
-                "aws.ec2_security_group_ingress",
+                "aws.ec2.security_group_ingress",
                 "Security Group Ingress Rule reference",
             ),
             (
-                "aws.ec2_security_group_egress",
+                "aws.ec2.security_group_egress",
                 "Security Group Egress Rule reference",
             ),
-            ("aws.s3_bucket", "S3 Bucket resource reference"),
+            ("aws.s3.bucket", "S3 Bucket resource reference"),
             // awscc resources
             (
-                "awscc.ec2_vpc",
+                "awscc.ec2.vpc",
                 "VPC resource reference (Cloud Control API)",
             ),
         ];
@@ -1374,11 +1363,11 @@ mod tests {
 
         let completions = provider.complete(&doc, position, None);
 
-        // Find the aws.s3_bucket completion
+        // Find the aws.s3.bucket completion
         let s3_completion = completions
             .iter()
-            .find(|c| c.label == "aws.s3_bucket")
-            .expect("Should have aws.s3_bucket completion");
+            .find(|c| c.label == "aws.s3.bucket")
+            .expect("Should have aws.s3.bucket completion");
 
         // Verify it uses text_edit, not insert_text
         assert!(
@@ -1395,8 +1384,8 @@ mod tests {
             );
             assert_eq!(edit.range.end.character, 5, "Should replace up to cursor");
             assert!(
-                edit.new_text.starts_with("aws.s3_bucket"),
-                "new_text should start with aws.s3_bucket"
+                edit.new_text.starts_with("aws.s3.bucket"),
+                "new_text should start with aws.s3.bucket"
             );
         } else {
             panic!("Expected CompletionTextEdit::Edit");
@@ -1415,11 +1404,11 @@ mod tests {
 
         let completions = provider.complete(&doc, position, None);
 
-        // Find the aws.ec2_vpc completion
+        // Find the aws.ec2.vpc completion
         let vpc_completion = completions
             .iter()
-            .find(|c| c.label == "aws.ec2_vpc")
-            .expect("Should have aws.ec2_vpc completion");
+            .find(|c| c.label == "aws.ec2.vpc")
+            .expect("Should have aws.ec2.vpc completion");
 
         if let Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(edit)) =
             &vpc_completion.text_edit
@@ -1447,11 +1436,11 @@ mod tests {
 
         let completions = provider.complete(&doc, position, None);
 
-        // Find the aws.ec2_vpc completion (should still be offered)
-        let vpc_completion = completions.iter().find(|c| c.label == "aws.ec2_vpc");
+        // Find the aws.ec2.vpc completion (should still be offered)
+        let vpc_completion = completions.iter().find(|c| c.label == "aws.ec2.vpc");
         assert!(
             vpc_completion.is_some(),
-            "Should offer aws.ec2_vpc completion"
+            "Should offer aws.ec2.vpc completion"
         );
 
         if let Some(c) = vpc_completion
@@ -1480,12 +1469,12 @@ mod tests {
         // Create main.crn with input parameters
         let module_content = r#"
 input {
-    vpc: ref(aws.ec2_vpc)
+    vpc: ref(aws.ec2.vpc)
     cidr_blocks: list(cidr)
     enable_https: bool = true
 }
 
-let web_sg = aws.ec2_security_group {
+let web_sg = aws.ec2.security_group {
     name = "web-sg"
 }
 "#;
@@ -1602,7 +1591,7 @@ simple {
     fn instance_tenancy_completion_for_aws_vpc() {
         let provider = CompletionProvider::new();
         let doc = create_document(
-            r#"aws.ec2_vpc {
+            r#"aws.ec2.vpc {
     name = "my-vpc"
     instance_tenancy =
 }"#,
@@ -1618,18 +1607,18 @@ simple {
         // Should have namespaced instance_tenancy completions
         let default_completion = completions
             .iter()
-            .find(|c| c.label == "aws.ec2_vpc.InstanceTenancy.default");
+            .find(|c| c.label == "aws.ec2.vpc.InstanceTenancy.default");
         assert!(
             default_completion.is_some(),
-            "Should have 'aws.ec2_vpc.InstanceTenancy.default' completion"
+            "Should have 'aws.ec2.vpc.InstanceTenancy.default' completion"
         );
 
         let dedicated_completion = completions
             .iter()
-            .find(|c| c.label == "aws.ec2_vpc.InstanceTenancy.dedicated");
+            .find(|c| c.label == "aws.ec2.vpc.InstanceTenancy.dedicated");
         assert!(
             dedicated_completion.is_some(),
-            "Should have 'aws.ec2_vpc.InstanceTenancy.dedicated' completion"
+            "Should have 'aws.ec2.vpc.InstanceTenancy.dedicated' completion"
         );
     }
 
@@ -1641,7 +1630,7 @@ simple {
     fn versioning_status_completion_for_s3_bucket() {
         let provider = CompletionProvider::new();
         let doc = create_document(
-            r#"aws.s3_bucket {
+            r#"aws.s3.bucket {
     name = "my-bucket"
 
 }"#,
@@ -1666,7 +1655,7 @@ simple {
     fn struct_field_completion_inside_nested_block() {
         let provider = CompletionProvider::new();
         let doc = create_document(
-            r#"awscc.ec2_security_group {
+            r#"awscc.ec2.security_group {
     group_description = "test"
     security_group_ingress {
 
@@ -1718,7 +1707,7 @@ simple {
         let provider = CompletionProvider::new();
         // flow_log's destination_options has Bool fields
         let doc = create_document(
-            r#"let flow_log = awscc.ec2_flow_log {
+            r#"let flow_log = awscc.ec2.flow_log {
     destination_options {
         hive_compatible_partitions =
     }
@@ -1749,7 +1738,7 @@ simple {
     fn struct_field_completion_inside_second_repeated_block() {
         let provider = CompletionProvider::new();
         let doc = create_document(
-            r#"awscc.ec2_security_group {
+            r#"awscc.ec2.security_group {
     group_description = "test"
     security_group_ingress {
         ip_protocol = "tcp"
@@ -1787,7 +1776,7 @@ simple {
     #[test]
     fn context_detection_returns_struct_context() {
         let provider = CompletionProvider::new();
-        let text = r#"awscc.ec2_security_group {
+        let text = r#"awscc.ec2.security_group {
     group_description = "test"
     security_group_ingress {
 
@@ -1807,7 +1796,7 @@ simple {
                 CompletionContext::InsideStructBlock {
                     ref resource_type,
                     ref attr_name,
-                } if resource_type == "awscc.ec2_security_group" && attr_name == "security_group_ingress"
+                } if resource_type == "awscc.ec2.security_group" && attr_name == "security_group_ingress"
             ),
             "Should detect InsideStructBlock context, got: {:?}",
             context

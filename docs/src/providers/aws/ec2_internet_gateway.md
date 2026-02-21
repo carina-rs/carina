@@ -1,4 +1,4 @@
-# aws.ec2_internet_gateway
+# aws.ec2.internet_gateway
 
 CloudFormation Type: `AWS::EC2::InternetGateway`
 

@@ -6,24 +6,24 @@ provider awscc {
   region = awscc.Region.ap_northeast_1
 }
 
-let vpc = awscc.ec2_vpc {
+let vpc = awscc.ec2.vpc {
   cidr_block           = "10.0.0.0/16"
   enable_dns_support   = true
   enable_dns_hostnames = true
 }
 
-let public_subnet = awscc.ec2_subnet {
+let public_subnet = awscc.ec2.subnet {
   vpc_id                  = vpc.vpc_id
   cidr_block              = "10.0.1.0/24"
   availability_zone       = "ap-northeast-1a"
   map_public_ip_on_launch = true
 }
 
-let eip = awscc.ec2_eip {
+let eip = awscc.ec2.eip {
   domain = "vpc"
 }
 
-let nat_gw = awscc.ec2_nat_gateway {
+let nat_gw = awscc.ec2.nat_gateway {
   allocation_id = eip.allocation_id
   subnet_id     = public_subnet.subnet_id
 

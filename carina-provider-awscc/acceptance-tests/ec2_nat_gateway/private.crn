@@ -6,17 +6,17 @@ provider awscc {
   region = awscc.Region.ap_northeast_1
 }
 
-let vpc = awscc.ec2_vpc {
+let vpc = awscc.ec2.vpc {
   cidr_block = "10.0.0.0/16"
 }
 
-let private_subnet = awscc.ec2_subnet {
+let private_subnet = awscc.ec2.subnet {
   vpc_id            = vpc.vpc_id
   cidr_block        = "10.0.1.0/24"
   availability_zone = "ap-northeast-1a"
 }
 
-let nat_gw = awscc.ec2_nat_gateway {
+let nat_gw = awscc.ec2.nat_gateway {
   subnet_id          = private_subnet.subnet_id
   connectivity_type  = private
   private_ip_address = "10.0.1.100"

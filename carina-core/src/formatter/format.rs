@@ -993,7 +993,7 @@ mod tests {
 
     #[test]
     fn test_format_normalizes_indentation() {
-        let input = "aws.s3_bucket {\n    name = \"test\"\n}";
+        let input = "aws.s3.bucket {\n    name = \"test\"\n}";
         let config = FormatConfig::default();
         let result = format(input, &config).unwrap();
 
@@ -1002,7 +1002,7 @@ mod tests {
 
     #[test]
     fn test_format_aligns_attributes() {
-        let input = "aws.s3_bucket {\nname = \"test\"\nversioning = true\n}";
+        let input = "aws.s3.bucket {\nname = \"test\"\nversioning = true\n}";
         let config = FormatConfig {
             align_attributes: true,
             ..Default::default()
@@ -1034,11 +1034,11 @@ mod tests {
 
     #[test]
     fn test_format_let_binding() {
-        let input = "let bucket=aws.s3_bucket {\nname=\"test\"\n}";
+        let input = "let bucket=aws.s3.bucket {\nname=\"test\"\n}";
         let config = FormatConfig::default();
         let result = format(input, &config).unwrap();
 
-        assert!(result.contains("let bucket = aws.s3_bucket {"));
+        assert!(result.contains("let bucket = aws.s3.bucket {"));
     }
 
     #[test]
@@ -1054,7 +1054,7 @@ mod tests {
 
     #[test]
     fn test_format_map() {
-        let input = "awscc.ec2_vpc {\ntags = {Environment=\"dev\"Project=\"test\"}\n}";
+        let input = "awscc.ec2.vpc {\ntags = {Environment=\"dev\"Project=\"test\"}\n}";
         let config = FormatConfig::default();
         let result = format(input, &config).unwrap();
 
@@ -1083,7 +1083,7 @@ mod tests {
 
     #[test]
     fn test_format_map_aligns_entries() {
-        let input = "awscc.ec2_vpc {\ntags = {Environment=\"dev\"\nProject=\"test\"}\n}";
+        let input = "awscc.ec2.vpc {\ntags = {Environment=\"dev\"\nProject=\"test\"}\n}";
         let config = FormatConfig {
             align_attributes: true,
             ..Default::default()
@@ -1108,7 +1108,7 @@ mod tests {
 
     #[test]
     fn test_format_map_idempotent() {
-        let input = "awscc.ec2_vpc {\n  tags = {\n    Environment = \"dev\"\n    Project = \"test\"\n  }\n}\n";
+        let input = "awscc.ec2.vpc {\n  tags = {\n    Environment = \"dev\"\n    Project = \"test\"\n  }\n}\n";
         let config = FormatConfig::default();
 
         let first = format(input, &config).unwrap();
@@ -1119,7 +1119,7 @@ mod tests {
 
     #[test]
     fn test_format_preserves_blank_lines_between_attributes() {
-        let input = "awscc.ec2_vpc {\n  name = \"test\"\n  cidr = \"10.0.0.0/16\"\n\n  tags = {\n    Env = \"dev\"\n  }\n}\n";
+        let input = "awscc.ec2.vpc {\n  name = \"test\"\n  cidr = \"10.0.0.0/16\"\n\n  tags = {\n    Env = \"dev\"\n  }\n}\n";
         let config = FormatConfig::default();
         let result = format(input, &config).unwrap();
 
@@ -1143,7 +1143,7 @@ mod tests {
 
     #[test]
     fn test_format_blank_lines_idempotent() {
-        let input = "awscc.ec2_vpc {\n  name = \"test\"\n\n  tags = {\n    Env = \"dev\"\n  }\n}\n";
+        let input = "awscc.ec2.vpc {\n  name = \"test\"\n\n  tags = {\n    Env = \"dev\"\n  }\n}\n";
         let config = FormatConfig::default();
 
         let first = format(input, &config).unwrap();
@@ -1157,7 +1157,7 @@ mod tests {
         // Attributes before blank line should be aligned together
         // Attributes after blank line should be aligned separately
         let input =
-            "awscc.ec2_vpc {\nenable_dns_hostnames = true\nname = \"test\"\n\ntags = {}\n}\n";
+            "awscc.ec2.vpc {\nenable_dns_hostnames = true\nname = \"test\"\n\ntags = {}\n}\n";
         let config = FormatConfig {
             align_attributes: true,
             ..Default::default()

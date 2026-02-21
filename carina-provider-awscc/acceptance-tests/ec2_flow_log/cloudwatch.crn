@@ -7,16 +7,16 @@ provider awscc {
   region = awscc.Region.ap_northeast_1
 }
 
-let vpc = awscc.ec2_vpc {
+let vpc = awscc.ec2.vpc {
   cidr_block = "10.0.0.0/16"
 }
 
-let log_group = awscc.logs_log_group {
+let log_group = awscc.logs.log_group {
   log_group_name    = "/acceptance-test/vpc-flow-logs"
   retention_in_days = 1
 }
 
-let flow_log_role = awscc.iam_role {
+let flow_log_role = awscc.iam.role {
   role_name = "acceptance-test-flow-log-role"
   assume_role_policy_document = {
     version = "2012-10-17"
@@ -30,7 +30,7 @@ let flow_log_role = awscc.iam_role {
   }
 }
 
-let flow_log = awscc.ec2_flow_log {
+let flow_log = awscc.ec2.flow_log {
   resource_id                 = vpc.vpc_id
   resource_type               = VPC
   traffic_type                = ALL

@@ -18,7 +18,7 @@ fn validate_ip_protocol(value: &Value) -> Result<(), String> {
     validate_namespaced_enum(
         value,
         "IpProtocol",
-        "awscc.ec2_security_group",
+        "awscc.ec2.security_group",
         VALID_IP_PROTOCOL,
     )
     .map_err(|reason| {
@@ -58,9 +58,9 @@ fn validate_to_port_range(value: &Value) -> Result<(), String> {
 pub fn ec2_security_group_config() -> AwsccSchemaConfig {
     AwsccSchemaConfig {
         aws_type_name: "AWS::EC2::SecurityGroup",
-        resource_type_name: "ec2_security_group",
+        resource_type_name: "ec2.security_group",
         has_tags: true,
-        schema: ResourceSchema::new("awscc.ec2_security_group")
+        schema: ResourceSchema::new("awscc.ec2.security_group")
         .with_description("Resource Type definition for AWS::EC2::SecurityGroup")
         .attribute(
             AttributeSchema::new("group_description", AttributeType::String)
@@ -105,7 +105,7 @@ pub fn ec2_security_group_config() -> AwsccSchemaConfig {
                 name: "IpProtocol".to_string(),
                 base: Box::new(AttributeType::String),
                 validate: validate_ip_protocol,
-                namespace: Some("awscc.ec2_security_group".to_string()),
+                namespace: Some("awscc.ec2.security_group".to_string()),
                 to_dsl: Some(|s: &str| match s { "-1" => "all".to_string(), _ => s.replace('-', "_") }),
             }).required().with_provider_name("IpProtocol"),
                     StructField::new("to_port", AttributeType::Custom {
@@ -138,7 +138,7 @@ pub fn ec2_security_group_config() -> AwsccSchemaConfig {
                 name: "IpProtocol".to_string(),
                 base: Box::new(AttributeType::String),
                 validate: validate_ip_protocol,
-                namespace: Some("awscc.ec2_security_group".to_string()),
+                namespace: Some("awscc.ec2.security_group".to_string()),
                 to_dsl: Some(|s: &str| match s { "-1" => "all".to_string(), _ => s.replace('-', "_") }),
             }).required().with_provider_name("IpProtocol"),
                     StructField::new("source_prefix_list_id", super::aws_resource_id()).with_provider_name("SourcePrefixListId"),
@@ -176,7 +176,7 @@ pub fn enum_valid_values() -> (
     &'static str,
     &'static [(&'static str, &'static [&'static str])],
 ) {
-    ("ec2_security_group", &[("ip_protocol", VALID_IP_PROTOCOL)])
+    ("ec2.security_group", &[("ip_protocol", VALID_IP_PROTOCOL)])
 }
 
 /// Maps DSL alias values back to canonical AWS values for this module.

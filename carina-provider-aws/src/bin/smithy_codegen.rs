@@ -29,7 +29,7 @@ struct Args {
     #[arg(long)]
     output_dir: PathBuf,
 
-    /// Generate only the specified resource (e.g., "ec2_vpc")
+    /// Generate only the specified resource (e.g., "ec2.vpc")
     #[arg(long)]
     resource: Option<String>,
 
@@ -73,6 +73,12 @@ struct AttrInfo {
 struct IntRange {
     min: i64,
     max: i64,
+}
+
+/// Convert a DSL resource name to a Rust module name.
+/// e.g., "ec2.vpc" -> "ec2_vpc", "ec2.security_group_ingress" -> "ec2_security_group_ingress"
+fn module_name(name: &str) -> String {
+    name.replace('.', "_")
 }
 
 fn main() -> Result<()> {
@@ -119,7 +125,8 @@ fn main() -> Result<()> {
                 let model = models.get(res.service_namespace).unwrap();
                 let code = generate_resource(res, model)?;
 
-                let output_path = args.output_dir.join(format!("{}.rs", res.name));
+                let mod_name = module_name(res.name);
+                let output_path = args.output_dir.join(format!("{}.rs", mod_name));
                 std::fs::write(&output_path, &code)
                     .with_context(|| format!("Failed to write {}", output_path.display()))?;
                 eprintln!("Generated: {}", output_path.display());
@@ -138,7 +145,9 @@ fn main() -> Result<()> {
                 let model = models.get(res.service_namespace).unwrap();
                 let md = generate_markdown_resource(res, model)?;
 
-                let output_path = args.output_dir.join(format!("{}.md", res.name));
+                let output_path = args
+                    .output_dir
+                    .join(format!("{}.md", module_name(res.name)));
                 std::fs::write(&output_path, &md)
                     .with_context(|| format!("Failed to write {}", output_path.display()))?;
                 eprintln!("Generated: {}", output_path.display());
@@ -426,12 +435,13 @@ fn generate_resource(res: &ResourceDef, model: &SmithyModel) -> Result<String> {
 
     // Build code
     let mut code = String::new();
+    let mod_name = module_name(res.name);
 
     // Header
     let resource_short = res
         .name
-        .strip_prefix("ec2_")
-        .or_else(|| res.name.strip_prefix("s3_"))
+        .strip_prefix("ec2.")
+        .or_else(|| res.name.strip_prefix("s3."))
         .unwrap_or(res.name);
     let mut schema_imports = vec!["AttributeSchema", "ResourceSchema"];
     schema_imports.insert(1, "AttributeType");
@@ -538,7 +548,7 @@ fn generate_resource(res: &ResourceDef, model: &SmithyModel) -> Result<String> {
          \x20       schema: ResourceSchema::new(\"{}\")\n",
         res.name,
         ns,
-        res.name,
+        mod_name,
         cf_type_name(res.name),
         res.name,
         res.has_tags,
@@ -1051,8 +1061,8 @@ fn get_int_range(model: &SmithyModel, target: &str, field_name: &str) -> Option<
         .map(|&(min, max)| IntRange { min, max })
 }
 
-/// Generate mod.rs that includes all modules plus s3_bucket (kept from CF codegen).
-fn generate_mod_rs(modules: &[&str]) -> String {
+/// Generate mod.rs that includes all generated modules.
+fn generate_mod_rs(dsl_names: &[&str]) -> String {
     let mut code = String::new();
 
     code.push_str(
@@ -1066,11 +1076,13 @@ fn generate_mod_rs(modules: &[&str]) -> String {
          pub use super::types::*;\n\n",
     );
 
+    // Sort by module name for deterministic output
+    let mut sorted: Vec<&str> = dsl_names.to_vec();
+    sorted.sort_by_key(|n| module_name(n));
+
     // Module declarations
-    let mut all_modules: Vec<&str> = modules.to_vec();
-    all_modules.sort();
-    for module in &all_modules {
-        code.push_str(&format!("pub mod {};\n", module));
+    for name in &sorted {
+        code.push_str(&format!("pub mod {};\n", module_name(name)));
     }
 
     // configs() function
@@ -1079,8 +1091,9 @@ fn generate_mod_rs(modules: &[&str]) -> String {
          pub fn configs() -> Vec<AwsSchemaConfig> {\n\
          \x20   vec![\n",
     );
-    for module in &all_modules {
-        code.push_str(&format!("\x20       {}::{}_config(),\n", module, module));
+    for name in &sorted {
+        let mn = module_name(name);
+        code.push_str(&format!("\x20       {}::{}_config(),\n", mn, mn));
     }
     code.push_str(
         "\x20   ]\n\
@@ -1101,8 +1114,11 @@ fn generate_mod_rs(modules: &[&str]) -> String {
          pub fn get_enum_valid_values(resource_type: &str, attr_name: &str) -> Option<&'static [&'static str]> {\n\
          \x20   let modules: &[(&str, &[(&str, &[&str])])] = &[\n",
     );
-    for module in &all_modules {
-        code.push_str(&format!("\x20       {}::enum_valid_values(),\n", module));
+    for name in &sorted {
+        code.push_str(&format!(
+            "\x20       {}::enum_valid_values(),\n",
+            module_name(name)
+        ));
     }
     code.push_str(
         "\x20   ];\n\
@@ -1126,12 +1142,13 @@ fn generate_mod_rs(modules: &[&str]) -> String {
          /// Dispatches to per-module enum_alias_reverse() functions.\n\
          pub fn get_enum_alias_reverse(resource_type: &str, attr_name: &str, value: &str) -> Option<&'static str> {\n",
     );
-    for module in &all_modules {
+    for name in &sorted {
+        let mn = module_name(name);
         code.push_str(&format!(
             "\x20   if resource_type == \"{}\" {{\n\
              \x20       return {}::enum_alias_reverse(attr_name, value);\n\
              \x20   }}\n",
-            module, module
+            name, mn
         ));
     }
     code.push_str("    None\n}\n");
@@ -1845,15 +1862,15 @@ fn get_resource_id_type(prop_name: &str) -> &'static str {
 /// Map resource name to CloudFormation type name for backward compatibility.
 fn cf_type_name(resource_name: &str) -> &'static str {
     match resource_name {
-        "ec2_vpc" => "AWS::EC2::VPC",
-        "ec2_subnet" => "AWS::EC2::Subnet",
-        "ec2_internet_gateway" => "AWS::EC2::InternetGateway",
-        "ec2_route_table" => "AWS::EC2::RouteTable",
-        "ec2_route" => "AWS::EC2::Route",
-        "ec2_security_group" => "AWS::EC2::SecurityGroup",
-        "ec2_security_group_ingress" => "AWS::EC2::SecurityGroupIngress",
-        "ec2_security_group_egress" => "AWS::EC2::SecurityGroupEgress",
-        "s3_bucket" => "AWS::S3::Bucket",
+        "ec2.vpc" => "AWS::EC2::VPC",
+        "ec2.subnet" => "AWS::EC2::Subnet",
+        "ec2.internet_gateway" => "AWS::EC2::InternetGateway",
+        "ec2.route_table" => "AWS::EC2::RouteTable",
+        "ec2.route" => "AWS::EC2::Route",
+        "ec2.security_group" => "AWS::EC2::SecurityGroup",
+        "ec2.security_group_ingress" => "AWS::EC2::SecurityGroupIngress",
+        "ec2.security_group_egress" => "AWS::EC2::SecurityGroupEgress",
+        "s3.bucket" => "AWS::S3::Bucket",
         _ => "UNKNOWN",
     }
 }

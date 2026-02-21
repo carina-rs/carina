@@ -6,7 +6,7 @@ provider awscc {
   region = awscc.Region.ap_northeast_1
 }
 
-let ipam = awscc.ec2_ipam {
+let ipam = awscc.ec2.ipam {
   description = "Example IPAM"
   tier        = free
 
@@ -17,7 +17,7 @@ let ipam = awscc.ec2_ipam {
   ]
 }
 
-let ipam_pool = awscc.ec2_ipam_pool {
+let ipam_pool = awscc.ec2.ipam_pool {
   ipam_scope_id  = ipam.private_default_scope_id
   address_family = "IPv4"
   locale         = "ap-northeast-1"

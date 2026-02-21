@@ -246,7 +246,7 @@ async fn test_struct_field_completion() {
     client.initialize().await;
 
     let uri = "file:///tmp/test_struct.crn";
-    let text = r#"awscc.ec2_security_group {
+    let text = r#"awscc.ec2.security_group {
     group_description = "test"
     security_group_ingress {
 
@@ -313,7 +313,7 @@ async fn test_diagnostics_for_unknown_struct_field() {
     region = awscc.Region.ap_northeast_1
 }
 
-awscc.ec2_security_group {
+awscc.ec2.security_group {
     name = "test-sg"
     group_description = "Test security group"
     security_group_ingress {
@@ -359,7 +359,7 @@ async fn test_resource_attribute_completion() {
     client.initialize().await;
 
     let uri = "file:///tmp/test_attr.crn";
-    let text = "aws.s3_bucket {\n    \n}";
+    let text = "aws.s3.bucket {\n    \n}";
 
     client.open_document(uri, text).await;
 

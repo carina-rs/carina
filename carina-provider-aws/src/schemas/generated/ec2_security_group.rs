@@ -8,13 +8,13 @@ use super::AwsSchemaConfig;
 use super::tags_type;
 use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
-/// Returns the schema config for ec2_security_group (Smithy: com.amazonaws.ec2)
+/// Returns the schema config for ec2.security_group (Smithy: com.amazonaws.ec2)
 pub fn ec2_security_group_config() -> AwsSchemaConfig {
     AwsSchemaConfig {
         aws_type_name: "AWS::EC2::SecurityGroup",
-        resource_type_name: "ec2_security_group",
+        resource_type_name: "ec2.security_group",
         has_tags: true,
-        schema: ResourceSchema::new("aws.ec2_security_group")
+        schema: ResourceSchema::new("aws.ec2.security_group")
         .with_description("Describes a security group.")
         .attribute(
             AttributeSchema::new("name", AttributeType::String)
@@ -62,7 +62,7 @@ pub fn enum_valid_values() -> (
     &'static str,
     &'static [(&'static str, &'static [&'static str])],
 ) {
-    ("ec2_security_group", &[])
+    ("ec2.security_group", &[])
 }
 
 /// Maps DSL alias values back to canonical AWS values for this module.

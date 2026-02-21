@@ -79,31 +79,31 @@ pub fn get_enum_alias_reverse(
     attr_name: &str,
     value: &str,
 ) -> Option<&'static str> {
-    if resource_type == "ec2_internet_gateway" {
+    if resource_type == "ec2.internet_gateway" {
         return ec2_internet_gateway::enum_alias_reverse(attr_name, value);
     }
-    if resource_type == "ec2_route" {
+    if resource_type == "ec2.route" {
         return ec2_route::enum_alias_reverse(attr_name, value);
     }
-    if resource_type == "ec2_route_table" {
+    if resource_type == "ec2.route_table" {
         return ec2_route_table::enum_alias_reverse(attr_name, value);
     }
-    if resource_type == "ec2_security_group" {
+    if resource_type == "ec2.security_group" {
         return ec2_security_group::enum_alias_reverse(attr_name, value);
     }
-    if resource_type == "ec2_security_group_egress" {
+    if resource_type == "ec2.security_group_egress" {
         return ec2_security_group_egress::enum_alias_reverse(attr_name, value);
     }
-    if resource_type == "ec2_security_group_ingress" {
+    if resource_type == "ec2.security_group_ingress" {
         return ec2_security_group_ingress::enum_alias_reverse(attr_name, value);
     }
-    if resource_type == "ec2_subnet" {
+    if resource_type == "ec2.subnet" {
         return ec2_subnet::enum_alias_reverse(attr_name, value);
     }
-    if resource_type == "ec2_vpc" {
+    if resource_type == "ec2.vpc" {
         return ec2_vpc::enum_alias_reverse(attr_name, value);
     }
-    if resource_type == "s3_bucket" {
+    if resource_type == "s3.bucket" {
         return s3_bucket::enum_alias_reverse(attr_name, value);
     }
     None

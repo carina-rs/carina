@@ -12,9 +12,9 @@ use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, Struct
 pub fn ec2_transit_gateway_attachment_config() -> AwsccSchemaConfig {
     AwsccSchemaConfig {
         aws_type_name: "AWS::EC2::TransitGatewayAttachment",
-        resource_type_name: "ec2_transit_gateway_attachment",
+        resource_type_name: "ec2.transit_gateway_attachment",
         has_tags: true,
-        schema: ResourceSchema::new("awscc.ec2_transit_gateway_attachment")
+        schema: ResourceSchema::new("awscc.ec2.transit_gateway_attachment")
         .with_description("Resource Type definition for AWS::EC2::TransitGatewayAttachment")
         .attribute(
             AttributeSchema::new("id", AttributeType::String)
@@ -63,7 +63,7 @@ pub fn enum_valid_values() -> (
     &'static str,
     &'static [(&'static str, &'static [&'static str])],
 ) {
-    ("ec2_transit_gateway_attachment", &[])
+    ("ec2.transit_gateway_attachment", &[])
 }
 
 /// Maps DSL alias values back to canonical AWS values for this module.

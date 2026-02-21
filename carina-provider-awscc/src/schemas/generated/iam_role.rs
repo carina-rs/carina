@@ -25,9 +25,9 @@ fn validate_max_session_duration_range(value: &Value) -> Result<(), String> {
 pub fn iam_role_config() -> AwsccSchemaConfig {
     AwsccSchemaConfig {
         aws_type_name: "AWS::IAM::Role",
-        resource_type_name: "iam_role",
+        resource_type_name: "iam.role",
         has_tags: true,
-        schema: ResourceSchema::new("awscc.iam_role")
+        schema: ResourceSchema::new("awscc.iam.role")
         .with_description("Creates a new role for your AWS-account.   For more information about roles, see [IAM roles](https://docs.aws.amazon.com/IAM/latest/UserGuide/id_roles.html) in the *IAM User Guide*. For information ab...")
         .attribute(
             AttributeSchema::new("arn", super::iam_role_arn())
@@ -107,7 +107,7 @@ pub fn enum_valid_values() -> (
     &'static str,
     &'static [(&'static str, &'static [&'static str])],
 ) {
-    ("iam_role", &[])
+    ("iam.role", &[])
 }
 
 /// Maps DSL alias values back to canonical AWS values for this module.

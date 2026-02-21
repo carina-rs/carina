@@ -12,9 +12,9 @@ use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 pub fn ec2_vpc_peering_connection_config() -> AwsccSchemaConfig {
     AwsccSchemaConfig {
         aws_type_name: "AWS::EC2::VPCPeeringConnection",
-        resource_type_name: "ec2_vpc_peering_connection",
+        resource_type_name: "ec2.vpc_peering_connection",
         has_tags: true,
-        schema: ResourceSchema::new("awscc.ec2_vpc_peering_connection")
+        schema: ResourceSchema::new("awscc.ec2.vpc_peering_connection")
         .with_description("Resource Type definition for AWS::EC2::VPCPeeringConnection")
         .attribute(
             AttributeSchema::new("id", AttributeType::String)
@@ -65,7 +65,7 @@ pub fn enum_valid_values() -> (
     &'static str,
     &'static [(&'static str, &'static [&'static str])],
 ) {
-    ("ec2_vpc_peering_connection", &[])
+    ("ec2.vpc_peering_connection", &[])
 }
 
 /// Maps DSL alias values back to canonical AWS values for this module.

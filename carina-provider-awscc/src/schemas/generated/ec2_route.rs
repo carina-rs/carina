@@ -11,9 +11,9 @@ use carina_core::schema::{AttributeSchema, ResourceSchema, types};
 pub fn ec2_route_config() -> AwsccSchemaConfig {
     AwsccSchemaConfig {
         aws_type_name: "AWS::EC2::Route",
-        resource_type_name: "ec2_route",
+        resource_type_name: "ec2.route",
         has_tags: false,
-        schema: ResourceSchema::new("awscc.ec2_route")
+        schema: ResourceSchema::new("awscc.ec2.route")
         .with_description("Specifies a route in a route table. For more information, see [Routes](https://docs.aws.amazon.com/vpc/latest/userguide/VPC_Route_Tables.html#route-table-routes) in the *Amazon VPC User Guide*.  You m...")
         .attribute(
             AttributeSchema::new("carrier_gateway_id", super::aws_resource_id())
@@ -108,7 +108,7 @@ pub fn enum_valid_values() -> (
     &'static str,
     &'static [(&'static str, &'static [&'static str])],
 ) {
-    ("ec2_route", &[])
+    ("ec2.route", &[])
 }
 
 /// Maps DSL alias values back to canonical AWS values for this module.

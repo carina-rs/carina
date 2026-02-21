@@ -11,9 +11,9 @@ use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 pub fn ec2_vpc_gateway_attachment_config() -> AwsccSchemaConfig {
     AwsccSchemaConfig {
         aws_type_name: "AWS::EC2::VPCGatewayAttachment",
-        resource_type_name: "ec2_vpc_gateway_attachment",
+        resource_type_name: "ec2.vpc_gateway_attachment",
         has_tags: false,
-        schema: ResourceSchema::new("awscc.ec2_vpc_gateway_attachment")
+        schema: ResourceSchema::new("awscc.ec2.vpc_gateway_attachment")
         .with_description("Resource Type definition for AWS::EC2::VPCGatewayAttachment")
         .attribute(
             AttributeSchema::new("attachment_type", AttributeType::String)
@@ -45,7 +45,7 @@ pub fn enum_valid_values() -> (
     &'static str,
     &'static [(&'static str, &'static [&'static str])],
 ) {
-    ("ec2_vpc_gateway_attachment", &[])
+    ("ec2.vpc_gateway_attachment", &[])
 }
 
 /// Maps DSL alias values back to canonical AWS values for this module.

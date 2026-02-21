@@ -1,4 +1,4 @@
-# aws.ec2_vpc
+# aws.ec2.vpc
 
 CloudFormation Type: `AWS::EC2::VPC`
 
@@ -47,9 +47,9 @@ The tags for the resource.
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `dedicated` | `aws.ec2_vpc.InstanceTenancy.dedicated` |
-| `default` | `aws.ec2_vpc.InstanceTenancy.default` |
-| `host` | `aws.ec2_vpc.InstanceTenancy.host` |
+| `dedicated` | `aws.ec2.vpc.InstanceTenancy.dedicated` |
+| `default` | `aws.ec2.vpc.InstanceTenancy.default` |
+| `host` | `aws.ec2.vpc.InstanceTenancy.host` |
 
 Shorthand formats: `dedicated` or `InstanceTenancy.dedicated`
 

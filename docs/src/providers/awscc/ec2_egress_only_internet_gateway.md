@@ -1,4 +1,4 @@
-# awscc.ec2_egress_only_internet_gateway
+# awscc.ec2.egress_only_internet_gateway
 
 CloudFormation Type: `AWS::EC2::EgressOnlyInternetGateway`
 
@@ -31,11 +31,11 @@ The ID of the VPC for which to create the egress-only internet gateway.
 ## Example
 
 ```crn
-let vpc = awscc.ec2_vpc {
+let vpc = awscc.ec2.vpc {
   cidr_block = "10.0.0.0/16"
 }
 
-let eoigw = awscc.ec2_egress_only_internet_gateway {
+let eoigw = awscc.ec2.egress_only_internet_gateway {
   vpc_id = vpc.vpc_id
 
   tags = {

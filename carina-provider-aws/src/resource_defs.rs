@@ -14,7 +14,7 @@ pub struct ReadOp {
 
 /// Defines how to map an AWS API resource to a Carina schema.
 pub struct ResourceDef {
-    /// Carina resource name (e.g., "ec2_vpc")
+    /// Carina DSL resource name (e.g., "ec2.vpc")
     pub name: &'static str,
     /// Smithy service namespace (e.g., "com.amazonaws.ec2")
     pub service_namespace: &'static str,
@@ -65,9 +65,9 @@ pub struct UpdateOp {
 /// Returns EC2 resource definitions.
 pub fn ec2_resources() -> Vec<ResourceDef> {
     vec![
-        // ec2_vpc
+        // ec2.vpc
         ResourceDef {
-            name: "ec2_vpc",
+            name: "ec2.vpc",
             service_namespace: "com.amazonaws.ec2",
             create_op: "CreateVpc",
             read_structure: Some("Vpc"),
@@ -98,9 +98,9 @@ pub fn ec2_resources() -> Vec<ResourceDef> {
             extra_read_only: vec![],
             read_only_overrides: vec![],
         },
-        // ec2_subnet
+        // ec2.subnet
         ResourceDef {
-            name: "ec2_subnet",
+            name: "ec2.subnet",
             service_namespace: "com.amazonaws.ec2",
             create_op: "CreateSubnet",
             read_structure: Some("Subnet"),
@@ -127,9 +127,9 @@ pub fn ec2_resources() -> Vec<ResourceDef> {
             extra_read_only: vec![],
             read_only_overrides: vec![],
         },
-        // ec2_internet_gateway
+        // ec2.internet_gateway
         ResourceDef {
-            name: "ec2_internet_gateway",
+            name: "ec2.internet_gateway",
             service_namespace: "com.amazonaws.ec2",
             create_op: "CreateInternetGateway",
             read_structure: Some("InternetGateway"),
@@ -147,9 +147,9 @@ pub fn ec2_resources() -> Vec<ResourceDef> {
             extra_read_only: vec![],
             read_only_overrides: vec![],
         },
-        // ec2_route_table
+        // ec2.route_table
         ResourceDef {
-            name: "ec2_route_table",
+            name: "ec2.route_table",
             service_namespace: "com.amazonaws.ec2",
             create_op: "CreateRouteTable",
             read_structure: Some("RouteTable"),
@@ -167,9 +167,9 @@ pub fn ec2_resources() -> Vec<ResourceDef> {
             extra_read_only: vec![],
             read_only_overrides: vec![],
         },
-        // ec2_route
+        // ec2.route
         ResourceDef {
-            name: "ec2_route",
+            name: "ec2.route",
             service_namespace: "com.amazonaws.ec2",
             create_op: "CreateRoute",
             read_structure: Some("Route"),
@@ -202,9 +202,9 @@ pub fn ec2_resources() -> Vec<ResourceDef> {
             extra_read_only: vec![],
             read_only_overrides: vec![],
         },
-        // ec2_security_group
+        // ec2.security_group
         ResourceDef {
-            name: "ec2_security_group",
+            name: "ec2.security_group",
             service_namespace: "com.amazonaws.ec2",
             create_op: "CreateSecurityGroup",
             read_structure: Some("SecurityGroup"),
@@ -222,9 +222,9 @@ pub fn ec2_resources() -> Vec<ResourceDef> {
             extra_read_only: vec![],
             read_only_overrides: vec![],
         },
-        // ec2_security_group_ingress
+        // ec2.security_group_ingress
         ResourceDef {
-            name: "ec2_security_group_ingress",
+            name: "ec2.security_group_ingress",
             service_namespace: "com.amazonaws.ec2",
             create_op: "AuthorizeSecurityGroupIngress",
             read_structure: Some("SecurityGroupRule"),
@@ -250,9 +250,9 @@ pub fn ec2_resources() -> Vec<ResourceDef> {
             extra_read_only: vec![],
             read_only_overrides: vec![],
         },
-        // ec2_security_group_egress
+        // ec2.security_group_egress
         ResourceDef {
-            name: "ec2_security_group_egress",
+            name: "ec2.security_group_egress",
             service_namespace: "com.amazonaws.ec2",
             create_op: "AuthorizeSecurityGroupEgress",
             read_structure: Some("SecurityGroupRule"),
@@ -284,9 +284,9 @@ pub fn ec2_resources() -> Vec<ResourceDef> {
 /// Returns S3 resource definitions.
 pub fn s3_resources() -> Vec<ResourceDef> {
     vec![
-        // s3_bucket
+        // s3.bucket
         ResourceDef {
-            name: "s3_bucket",
+            name: "s3.bucket",
             service_namespace: "com.amazonaws.s3",
             create_op: "CreateBucket",
             read_structure: None,

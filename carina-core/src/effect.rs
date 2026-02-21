@@ -72,14 +72,14 @@ mod tests {
 
     #[test]
     fn create_is_mutating() {
-        let resource = Resource::new("s3_bucket", "my-bucket");
+        let resource = Resource::new("s3.bucket", "my-bucket");
         let effect = Effect::Create(resource);
         assert!(effect.is_mutating());
     }
 
     #[test]
     fn resource_id_returns_correct_id() {
-        let resource = Resource::new("s3_bucket", "my-bucket").with_read_only(true);
+        let resource = Resource::new("s3.bucket", "my-bucket").with_read_only(true);
         let effect = Effect::Read {
             resource: resource.clone(),
         };
@@ -92,24 +92,24 @@ mod tests {
         use std::collections::HashMap;
 
         let effects = vec![
-            Effect::Create(Resource::new("s3_bucket", "my-bucket")),
+            Effect::Create(Resource::new("s3.bucket", "my-bucket")),
             Effect::Read {
-                resource: Resource::new("s3_bucket", "existing").with_read_only(true),
+                resource: Resource::new("s3.bucket", "existing").with_read_only(true),
             },
             Effect::Update {
-                id: ResourceId::new("s3_bucket", "my-bucket"),
+                id: ResourceId::new("s3.bucket", "my-bucket"),
                 from: Box::new(State::existing(
-                    ResourceId::new("s3_bucket", "my-bucket"),
+                    ResourceId::new("s3.bucket", "my-bucket"),
                     HashMap::from([(
                         "versioning".to_string(),
                         Value::String("Disabled".to_string()),
                     )]),
                 )),
-                to: Resource::new("s3_bucket", "my-bucket")
+                to: Resource::new("s3.bucket", "my-bucket")
                     .with_attribute("versioning", Value::String("Enabled".to_string())),
             },
             Effect::Delete {
-                id: ResourceId::new("s3_bucket", "old-bucket"),
+                id: ResourceId::new("s3.bucket", "old-bucket"),
                 identifier: "old-bucket".to_string(),
                 lifecycle: LifecycleConfig::default(),
             },

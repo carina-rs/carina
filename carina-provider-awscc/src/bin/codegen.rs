@@ -56,6 +56,11 @@ struct Args {
     #[arg(long)]
     print_full_resource_name: bool,
 
+    /// Print DSL resource name (service.resource) for the given type and exit
+    /// e.g., AWS::EC2::SecurityGroupEgress -> ec2.security_group_egress
+    #[arg(long)]
+    print_dsl_resource_name: bool,
+
     /// Output format: rust (default) or markdown (for documentation)
     #[arg(long, default_value = "rust")]
     format: String,
@@ -175,6 +180,7 @@ fn module_name_from_type(type_name: &str) -> Result<String> {
 
 /// Compute full resource name (service_resource) from CloudFormation type name
 /// e.g., "AWS::EC2::SecurityGroupEgress" -> "ec2_security_group_egress"
+/// Used for Rust module names, file names, and function names.
 fn full_resource_name_from_type(type_name: &str) -> Result<String> {
     let parts: Vec<&str> = type_name.split("::").collect();
     if parts.len() != 3 {
@@ -183,6 +189,19 @@ fn full_resource_name_from_type(type_name: &str) -> Result<String> {
     let service = parts[1].to_lowercase();
     let resource = parts[2].to_snake_case();
     Ok(format!("{}_{}", service, resource))
+}
+
+/// Compute DSL resource name (service.resource) from CloudFormation type name
+/// e.g., "AWS::EC2::SecurityGroupEgress" -> "ec2.security_group_egress"
+/// Used for DSL-facing strings (resource_type_name, namespace, display).
+fn dsl_resource_name_from_type(type_name: &str) -> Result<String> {
+    let parts: Vec<&str> = type_name.split("::").collect();
+    if parts.len() != 3 {
+        anyhow::bail!("Invalid type name format: {}", type_name);
+    }
+    let service = parts[1].to_lowercase();
+    let resource = parts[2].to_snake_case();
+    Ok(format!("{}.{}", service, resource))
 }
 
 fn main() -> Result<()> {
@@ -195,6 +214,11 @@ fn main() -> Result<()> {
 
     if args.print_full_resource_name {
         println!("{}", full_resource_name_from_type(&args.type_name)?);
+        return Ok(());
+    }
+
+    if args.print_dsl_resource_name {
+        println!("{}", dsl_resource_name_from_type(&args.type_name)?);
         return Ok(());
     }
 
@@ -450,8 +474,8 @@ fn type_display_string(
 fn generate_markdown(schema: &CfnSchema, type_name: &str) -> Result<String> {
     let mut md = String::new();
 
-    let full_resource = full_resource_name_from_type(type_name)?;
-    let namespace = format!("awscc.{}", full_resource);
+    let dsl_resource = dsl_resource_name_from_type(type_name)?;
+    let namespace = format!("awscc.{}", dsl_resource);
 
     // Build read-only properties set
     let read_only: HashSet<String> = schema
@@ -477,7 +501,7 @@ fn generate_markdown(schema: &CfnSchema, type_name: &str) -> Result<String> {
     }
 
     // Title
-    md.push_str(&format!("# awscc.{}\n\n", full_resource));
+    md.push_str(&format!("# awscc.{}\n\n", dsl_resource));
     md.push_str(&format!("CloudFormation Type: `{}`\n\n", type_name));
 
     // Description
@@ -745,8 +769,9 @@ fn generate_schema_code(schema: &CfnSchema, type_name: &str) -> Result<String> {
     }
     let resource = parts[2].to_snake_case();
     let full_resource = full_resource_name_from_type(type_name)?;
-    // Namespace for enums: awscc.ec2_vpc
-    let namespace = format!("awscc.{}", full_resource);
+    let dsl_resource = dsl_resource_name_from_type(type_name)?;
+    // Namespace for enums: awscc.ec2.vpc
+    let namespace = format!("awscc.{}", dsl_resource);
 
     // Build read-only properties set
     let read_only: HashSet<String> = schema
@@ -1006,8 +1031,8 @@ fn {}(value: &Value) -> Result<(), String> {{
 
     // Generate config function
     let config_fn_name = format!("{}_config", full_resource);
-    // Use awscc.service_resource format (e.g., awscc.ec2_vpc)
-    let schema_name = format!("awscc.{}", full_resource);
+    // Use awscc.service.resource format (e.g., awscc.ec2.vpc)
+    let schema_name = format!("awscc.{}", dsl_resource);
 
     code.push_str(&format!(
         r#"/// Returns the schema config for {} ({})
@@ -1018,7 +1043,7 @@ pub fn {}() -> AwsccSchemaConfig {{
         has_tags: {},
         schema: ResourceSchema::new("{}")
 "#,
-        full_resource, type_name, config_fn_name, type_name, full_resource, has_tags, schema_name
+        full_resource, type_name, config_fn_name, type_name, dsl_resource, has_tags, schema_name
     ));
 
     // Add description
@@ -1134,7 +1159,7 @@ pub fn {}() -> AwsccSchemaConfig {{
          {}\
          }}\n",
         if enums.is_empty() {
-            format!("    (\"{}\", &[])\n", full_resource)
+            format!("    (\"{}\", &[])\n", dsl_resource)
         } else {
             let entries: Vec<String> = enums
                 .keys()
@@ -1146,7 +1171,7 @@ pub fn {}() -> AwsccSchemaConfig {{
                 .collect();
             format!(
                 "    (\"{}\", &[\n{}\n    ])\n",
-                full_resource,
+                dsl_resource,
                 entries.join("\n")
             )
         }

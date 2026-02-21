@@ -275,10 +275,10 @@ mod tests {
     #[test]
     fn plan_summary() {
         let mut plan = Plan::new();
-        plan.add(Effect::Create(Resource::new("s3_bucket", "a")));
-        plan.add(Effect::Create(Resource::new("s3_bucket", "b")));
+        plan.add(Effect::Create(Resource::new("s3.bucket", "a")));
+        plan.add(Effect::Create(Resource::new("s3.bucket", "b")));
         plan.add(Effect::Delete {
-            id: crate::resource::ResourceId::new("s3_bucket", "c"),
+            id: crate::resource::ResourceId::new("s3.bucket", "c"),
             identifier: String::new(),
             lifecycle: crate::resource::LifecycleConfig::default(),
         });
@@ -355,9 +355,9 @@ mod tests {
         use crate::resource::ResourceId;
 
         let mut plan = Plan::new();
-        plan.add(Effect::Create(Resource::new("s3_bucket", "a")));
+        plan.add(Effect::Create(Resource::new("s3.bucket", "a")));
         plan.add(Effect::Delete {
-            id: ResourceId::new("s3_bucket", "b"),
+            id: ResourceId::new("s3.bucket", "b"),
             identifier: "b-id".to_string(),
             lifecycle: crate::resource::LifecycleConfig::default(),
         });

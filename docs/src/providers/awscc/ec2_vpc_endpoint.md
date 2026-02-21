@@ -1,4 +1,4 @@
-# awscc.ec2_vpc_endpoint
+# awscc.ec2.vpc_endpoint
 
 CloudFormation Type: `AWS::EC2::VPCEndpoint`
 
@@ -113,10 +113,10 @@ The ID of the VPC.
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `ipv4` | `awscc.ec2_vpc_endpoint.IpAddressType.ipv4` |
-| `ipv6` | `awscc.ec2_vpc_endpoint.IpAddressType.ipv6` |
-| `dualstack` | `awscc.ec2_vpc_endpoint.IpAddressType.dualstack` |
-| `not-specified` | `awscc.ec2_vpc_endpoint.IpAddressType.not_specified` |
+| `ipv4` | `awscc.ec2.vpc_endpoint.IpAddressType.ipv4` |
+| `ipv6` | `awscc.ec2.vpc_endpoint.IpAddressType.ipv6` |
+| `dualstack` | `awscc.ec2.vpc_endpoint.IpAddressType.dualstack` |
+| `not-specified` | `awscc.ec2.vpc_endpoint.IpAddressType.not_specified` |
 
 Shorthand formats: `ipv4` or `IpAddressType.ipv4`
 
@@ -124,11 +124,11 @@ Shorthand formats: `ipv4` or `IpAddressType.ipv4`
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `Interface` | `awscc.ec2_vpc_endpoint.VpcEndpointType.Interface` |
-| `Gateway` | `awscc.ec2_vpc_endpoint.VpcEndpointType.Gateway` |
-| `GatewayLoadBalancer` | `awscc.ec2_vpc_endpoint.VpcEndpointType.GatewayLoadBalancer` |
-| `ServiceNetwork` | `awscc.ec2_vpc_endpoint.VpcEndpointType.ServiceNetwork` |
-| `Resource` | `awscc.ec2_vpc_endpoint.VpcEndpointType.Resource` |
+| `Interface` | `awscc.ec2.vpc_endpoint.VpcEndpointType.Interface` |
+| `Gateway` | `awscc.ec2.vpc_endpoint.VpcEndpointType.Gateway` |
+| `GatewayLoadBalancer` | `awscc.ec2.vpc_endpoint.VpcEndpointType.GatewayLoadBalancer` |
+| `ServiceNetwork` | `awscc.ec2.vpc_endpoint.VpcEndpointType.ServiceNetwork` |
+| `Resource` | `awscc.ec2.vpc_endpoint.VpcEndpointType.Resource` |
 
 Shorthand formats: `Interface` or `VpcEndpointType.Interface`
 
@@ -166,24 +166,24 @@ Shorthand formats: `Interface` or `VpcEndpointType.Interface`
 ## Example
 
 ```crn
-let vpc = awscc.ec2_vpc {
+let vpc = awscc.ec2.vpc {
   cidr_block           = "10.0.0.0/16"
   enable_dns_support   = true
   enable_dns_hostnames = true
 }
 
-let subnet = awscc.ec2_subnet {
+let subnet = awscc.ec2.subnet {
   vpc_id            = vpc.vpc_id
   cidr_block        = "10.0.100.0/24"
   availability_zone = "ap-northeast-1a"
 }
 
-let sg = awscc.ec2_security_group {
+let sg = awscc.ec2.security_group {
   vpc_id            = vpc.vpc_id
   group_description = "SG for VPC Endpoint"
 }
 
-let ingress = awscc.ec2_security_group_ingress {
+let ingress = awscc.ec2.security_group_ingress {
   group_id    = sg.group_id
   description = "Allow HTTPS from VPC"
   ip_protocol = "tcp"
@@ -192,7 +192,7 @@ let ingress = awscc.ec2_security_group_ingress {
   cidr_ip     = "10.0.0.0/16"
 }
 
-let vpc_endpoint = awscc.ec2_vpc_endpoint {
+let vpc_endpoint = awscc.ec2.vpc_endpoint {
   vpc_id              = vpc.vpc_id
   service_name        = "com.amazonaws.ap-northeast-1.ecr.dkr"
   vpc_endpoint_type   = "Interface"

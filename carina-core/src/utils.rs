@@ -9,7 +9,7 @@
 /// use carina_core::utils::extract_enum_value;
 ///
 /// assert_eq!(extract_enum_value("aws.Region.ap_northeast_1"), "ap_northeast_1");
-/// assert_eq!(extract_enum_value("aws.s3.VersioningStatus.Enabled"), "Enabled");
+/// assert_eq!(extract_enum_value("aws.s3.bucket.VersioningStatus.Enabled"), "Enabled");
 /// assert_eq!(extract_enum_value("Enabled"), "Enabled");
 /// ```
 pub fn extract_enum_value(s: &str) -> &str {
@@ -26,6 +26,7 @@ pub fn extract_enum_value(s: &str) -> &str {
 /// - 2-part: `TypeName.value_name` -> `value-name`
 /// - 3-part: `provider.TypeName.value_name` -> `value-name`
 /// - 4-part: `provider.resource.TypeName.value_name` -> `value-name`
+/// - 5-part: `provider.service.resource.TypeName.value_name` -> `value-name`
 ///
 /// The first component of TypeName must be uppercase.
 /// Underscores in the extracted value are replaced with hyphens.
@@ -38,7 +39,7 @@ pub fn extract_enum_value(s: &str) -> &str {
 ///
 /// assert_eq!(convert_enum_value("aws.Region.ap_northeast_1"), "ap-northeast-1");
 /// assert_eq!(convert_enum_value("Region.ap_northeast_1"), "ap-northeast-1");
-/// assert_eq!(convert_enum_value("awscc.ec2_ipam.Tier.advanced"), "advanced");
+/// assert_eq!(convert_enum_value("awscc.ec2.ipam.Tier.advanced"), "advanced");
 /// assert_eq!(convert_enum_value("eu-west-1"), "eu-west-1");
 /// ```
 pub fn convert_enum_value(value: &str) -> String {
@@ -65,7 +66,7 @@ pub fn convert_enum_value(value: &str) -> String {
             }
         }
         // 4-part: provider.resource.TypeName.value
-        // e.g., "awscc.ec2_ipam.Tier.advanced" -> "advanced"
+        // e.g., "aws.s3.VersioningStatus.Enabled" -> "Enabled"
         4 => {
             let provider = parts[0];
             let type_name = parts[2];
@@ -73,6 +74,19 @@ pub fn convert_enum_value(value: &str) -> String {
                 && type_name.chars().next().is_some_and(|c| c.is_uppercase())
             {
                 parts[3]
+            } else {
+                return value.to_string();
+            }
+        }
+        // 5-part: provider.service.resource.TypeName.value
+        // e.g., "awscc.ec2.vpc.InstanceTenancy.default" -> "default"
+        5 => {
+            let provider = parts[0];
+            let type_name = parts[3];
+            if provider.chars().all(|c| c.is_lowercase())
+                && type_name.chars().next().is_some_and(|c| c.is_uppercase())
+            {
+                parts[4]
             } else {
                 return value.to_string();
             }
@@ -96,7 +110,7 @@ pub fn convert_enum_value(value: &str) -> String {
 /// # Arguments
 /// * `s` - The input string to validate
 /// * `type_name` - Expected type name (e.g., `"Region"`, `"InstanceTenancy"`)
-/// * `namespace` - Expected namespace prefix (e.g., `"aws"`, `"aws.s3"`, `"awscc.ec2_vpc"`)
+/// * `namespace` - Expected namespace prefix (e.g., `"aws"`, `"aws.s3.bucket"`, `"awscc.ec2.vpc"`)
 ///
 /// # Returns
 /// * `Ok(())` if namespace is valid or string has no dots
@@ -116,7 +130,7 @@ pub fn convert_enum_value(value: &str) -> String {
 ///
 /// // Full namespaced form
 /// assert!(validate_enum_namespace("aws.Region.ap_northeast_1", "Region", "aws").is_ok());
-/// assert!(validate_enum_namespace("aws.s3.VersioningStatus.Enabled", "VersioningStatus", "aws.s3").is_ok());
+/// assert!(validate_enum_namespace("aws.s3.bucket.VersioningStatus.Enabled", "VersioningStatus", "aws.s3.bucket").is_ok());
 /// ```
 pub fn validate_enum_namespace(s: &str, type_name: &str, namespace: &str) -> Result<(), String> {
     if !s.contains('.') {
@@ -170,11 +184,11 @@ mod tests {
             "ap_northeast_1"
         );
         assert_eq!(
-            extract_enum_value("aws.s3.VersioningStatus.Enabled"),
+            extract_enum_value("aws.s3.bucket.VersioningStatus.Enabled"),
             "Enabled"
         );
         assert_eq!(
-            extract_enum_value("aws.vpc.InstanceTenancy.default"),
+            extract_enum_value("awscc.ec2.vpc.InstanceTenancy.default"),
             "default"
         );
         assert_eq!(extract_enum_value("InstanceTenancy.dedicated"), "dedicated");
@@ -215,15 +229,24 @@ mod tests {
     #[test]
     fn test_convert_enum_value_4_part() {
         assert_eq!(
-            convert_enum_value("awscc.ec2_ipam.Tier.advanced"),
+            convert_enum_value("aws.s3.VersioningStatus.Enabled"),
+            "Enabled"
+        );
+        assert_eq!(convert_enum_value("aws.ec2.IpProtocol.tcp"), "tcp");
+    }
+
+    #[test]
+    fn test_convert_enum_value_5_part() {
+        assert_eq!(
+            convert_enum_value("awscc.ec2.ipam.Tier.advanced"),
             "advanced"
         );
         assert_eq!(
-            convert_enum_value("awscc.ec2_ipam_pool.AddressFamily.IPv4"),
+            convert_enum_value("awscc.ec2.ipam_pool.AddressFamily.IPv4"),
             "IPv4"
         );
         assert_eq!(
-            convert_enum_value("awscc.ec2_vpc.InstanceTenancy.default"),
+            convert_enum_value("awscc.ec2.vpc.InstanceTenancy.default"),
             "default"
         );
     }
@@ -248,27 +271,27 @@ mod tests {
     #[test]
     fn test_validate_namespace_no_dots() {
         // Plain values pass through without validation
-        assert!(validate_enum_namespace("Enabled", "VersioningStatus", "aws.s3").is_ok());
+        assert!(validate_enum_namespace("Enabled", "VersioningStatus", "aws.s3.bucket").is_ok());
         assert!(validate_enum_namespace("ap-northeast-1", "Region", "aws").is_ok());
-        assert!(validate_enum_namespace("default", "InstanceTenancy", "aws.vpc").is_ok());
+        assert!(validate_enum_namespace("default", "InstanceTenancy", "awscc.ec2.vpc").is_ok());
     }
 
     #[test]
     fn test_validate_namespace_2_part_valid() {
         assert!(validate_enum_namespace("Region.ap_northeast_1", "Region", "aws").is_ok());
         assert!(
-            validate_enum_namespace("VersioningStatus.Enabled", "VersioningStatus", "aws.s3")
-                .is_ok()
-        );
-        assert!(
-            validate_enum_namespace("InstanceTenancy.default", "InstanceTenancy", "aws.vpc")
-                .is_ok()
+            validate_enum_namespace(
+                "VersioningStatus.Enabled",
+                "VersioningStatus",
+                "aws.s3.bucket"
+            )
+            .is_ok()
         );
         assert!(
             validate_enum_namespace(
                 "InstanceTenancy.default",
                 "InstanceTenancy",
-                "awscc.ec2_vpc"
+                "awscc.ec2.vpc"
             )
             .is_ok()
         );
@@ -278,9 +301,12 @@ mod tests {
     fn test_validate_namespace_2_part_invalid() {
         assert!(validate_enum_namespace("Location.ap_northeast_1", "Region", "aws").is_err());
         assert!(
-            validate_enum_namespace("Versioning.Enabled", "VersioningStatus", "aws.s3").is_err()
+            validate_enum_namespace("Versioning.Enabled", "VersioningStatus", "aws.s3.bucket")
+                .is_err()
         );
-        assert!(validate_enum_namespace("Tenancy.default", "InstanceTenancy", "aws.vpc").is_err());
+        assert!(
+            validate_enum_namespace("Tenancy.default", "InstanceTenancy", "awscc.ec2.vpc").is_err()
+        );
     }
 
     #[test]
@@ -295,36 +321,16 @@ mod tests {
         assert!(validate_enum_namespace("gcp.Region.ap_northeast_1", "Region", "aws").is_err());
         // Wrong type name
         assert!(validate_enum_namespace("aws.Location.ap_northeast_1", "Region", "aws").is_err());
-        // 3-part is invalid for 2-segment namespace (e.g., "aws.s3")
-        assert!(
-            validate_enum_namespace("vpc.InstanceTenancy.default", "InstanceTenancy", "aws.vpc")
-                .is_err()
-        );
     }
 
     #[test]
     fn test_validate_namespace_4_part_valid() {
+        // 4-part is valid for 2-segment namespace (e.g., "aws.s3")
         assert!(
             validate_enum_namespace(
                 "aws.s3.VersioningStatus.Enabled",
                 "VersioningStatus",
                 "aws.s3"
-            )
-            .is_ok()
-        );
-        assert!(
-            validate_enum_namespace(
-                "aws.vpc.InstanceTenancy.default",
-                "InstanceTenancy",
-                "aws.vpc"
-            )
-            .is_ok()
-        );
-        assert!(
-            validate_enum_namespace(
-                "awscc.ec2_vpc.InstanceTenancy.default",
-                "InstanceTenancy",
-                "awscc.ec2_vpc"
             )
             .is_ok()
         );
@@ -335,7 +341,7 @@ mod tests {
         // Wrong provider
         assert!(
             validate_enum_namespace(
-                "awscc.s3.VersioningStatus.Enabled",
+                "gcp.s3.VersioningStatus.Enabled",
                 "VersioningStatus",
                 "aws.s3"
             )
@@ -358,10 +364,54 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_namespace_5_part_valid() {
+        assert!(
+            validate_enum_namespace(
+                "aws.s3.bucket.VersioningStatus.Enabled",
+                "VersioningStatus",
+                "aws.s3.bucket"
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_enum_namespace(
+                "awscc.ec2.vpc.InstanceTenancy.default",
+                "InstanceTenancy",
+                "awscc.ec2.vpc"
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn test_validate_namespace_5_part_invalid() {
+        // Wrong provider
+        assert!(
+            validate_enum_namespace(
+                "gcp.ec2.vpc.InstanceTenancy.default",
+                "InstanceTenancy",
+                "awscc.ec2.vpc"
+            )
+            .is_err()
+        );
+        // Wrong type name
+        assert!(
+            validate_enum_namespace(
+                "awscc.ec2.vpc.Tenancy.default",
+                "InstanceTenancy",
+                "awscc.ec2.vpc"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn test_validate_namespace_wrong_part_count() {
         // Too many parts for 1-segment namespace
         assert!(validate_enum_namespace("foo.bar.baz.ap_northeast_1", "Region", "aws").is_err());
-        // 5-part is invalid for 2-segment namespace
-        assert!(validate_enum_namespace("a.b.c.d.e", "VersioningStatus", "aws.s3").is_err());
+        // 6-part is invalid for 3-segment namespace
+        assert!(
+            validate_enum_namespace("a.b.c.d.e.f", "VersioningStatus", "aws.s3.bucket").is_err()
+        );
     }
 }

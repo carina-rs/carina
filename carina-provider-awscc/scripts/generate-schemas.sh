@@ -190,8 +190,9 @@ EOF
 # Add enum_alias_reverse() dispatches dynamically
 for TYPE_NAME in "${RESOURCE_TYPES[@]}"; do
     MODNAME=$("$CODEGEN_BIN" --type-name "$TYPE_NAME" --print-full-resource-name)
+    DSL_NAME=$("$CODEGEN_BIN" --type-name "$TYPE_NAME" --print-dsl-resource-name)
     cat >> "$OUTPUT_DIR/mod.rs" << INNEREOF
-    if resource_type == "${MODNAME}" {
+    if resource_type == "${DSL_NAME}" {
         return ${MODNAME}::enum_alias_reverse(attr_name, value);
     }
 INNEREOF

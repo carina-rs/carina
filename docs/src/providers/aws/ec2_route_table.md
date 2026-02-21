@@ -1,4 +1,4 @@
-# aws.ec2_route_table
+# aws.ec2.route_table
 
 CloudFormation Type: `AWS::EC2::RouteTable`
 

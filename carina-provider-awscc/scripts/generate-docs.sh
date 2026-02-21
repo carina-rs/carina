@@ -137,13 +137,14 @@ PREV_SERVICE=""
 for TYPE_NAME in "${RESOURCE_TYPES[@]}"; do
     SERVICE=$(echo "$TYPE_NAME" | awk -F'::' '{print $2}')
     FULL_RESOURCE=$("$CODEGEN_BIN" --type-name "$TYPE_NAME" --print-full-resource-name)
+    DSL_NAME=$("$CODEGEN_BIN" --type-name "$TYPE_NAME" --print-dsl-resource-name)
 
     if [ "$SERVICE" != "$PREV_SERVICE" ]; then
         echo "  - [${SERVICE}]()" >> "docs/src/SUMMARY.md"
         PREV_SERVICE="$SERVICE"
     fi
 
-    echo "    - [awscc.${FULL_RESOURCE}](providers/awscc/${FULL_RESOURCE}.md)" >> "docs/src/SUMMARY.md"
+    echo "    - [awscc.${DSL_NAME}](providers/awscc/${FULL_RESOURCE}.md)" >> "docs/src/SUMMARY.md"
 done
 
 # Auto-generate index.md with categorized resource listing
@@ -164,10 +165,10 @@ provider awscc {
 
 ## Usage
 
-Resources are defined using the `awscc.<resource_type>` syntax:
+Resources are defined using the `awscc.<service>.<resource_type>` syntax:
 
 ```crn
-let vpc = awscc.ec2_vpc {
+let vpc = awscc.ec2.vpc {
   name       = "my-vpc"
   cidr_block = "10.0.0.0/16"
   tags = {
@@ -179,7 +180,7 @@ let vpc = awscc.ec2_vpc {
 Named resources (using `let`) can be referenced by other resources:
 
 ```crn
-let subnet = awscc.ec2_subnet {
+let subnet = awscc.ec2.subnet {
   name              = "my-subnet"
   vpc_id            = vpc.vpc_id
   cidr_block        = "10.0.1.0/24"
@@ -193,7 +194,7 @@ Some attributes accept enum values. These can be specified in three formats:
 
 - **Bare value**: `instance_tenancy = default`
 - **TypeName.value**: `instance_tenancy = InstanceTenancy.default`
-- **Full namespace**: `instance_tenancy = awscc.ec2_vpc.InstanceTenancy.default`
+- **Full namespace**: `instance_tenancy = awscc.ec2.vpc.InstanceTenancy.default`
 EOF
 
 echo ""

@@ -18,7 +18,7 @@ fn validate_metered_account(value: &Value) -> Result<(), String> {
     validate_namespaced_enum(
         value,
         "MeteredAccount",
-        "awscc.ec2_ipam",
+        "awscc.ec2.ipam",
         VALID_METERED_ACCOUNT,
     )
     .map_err(|reason| {
@@ -35,7 +35,7 @@ const VALID_TIER: &[&str] = &["free", "advanced"];
 
 #[allow(dead_code)]
 fn validate_tier(value: &Value) -> Result<(), String> {
-    validate_namespaced_enum(value, "Tier", "awscc.ec2_ipam", VALID_TIER).map_err(|reason| {
+    validate_namespaced_enum(value, "Tier", "awscc.ec2.ipam", VALID_TIER).map_err(|reason| {
         if let Value::String(s) = value {
             format!("Invalid Tier '{}': {}", s, reason)
         } else {
@@ -48,9 +48,9 @@ fn validate_tier(value: &Value) -> Result<(), String> {
 pub fn ec2_ipam_config() -> AwsccSchemaConfig {
     AwsccSchemaConfig {
         aws_type_name: "AWS::EC2::IPAM",
-        resource_type_name: "ec2_ipam",
+        resource_type_name: "ec2.ipam",
         has_tags: true,
-        schema: ResourceSchema::new("awscc.ec2_ipam")
+        schema: ResourceSchema::new("awscc.ec2.ipam")
         .with_description("Resource Schema of AWS::EC2::IPAM Type")
         .attribute(
             AttributeSchema::new("arn", super::arn())
@@ -96,7 +96,7 @@ pub fn ec2_ipam_config() -> AwsccSchemaConfig {
                 name: "MeteredAccount".to_string(),
                 base: Box::new(AttributeType::String),
                 validate: validate_metered_account,
-                namespace: Some("awscc.ec2_ipam".to_string()),
+                namespace: Some("awscc.ec2.ipam".to_string()),
                 to_dsl: Some(|s: &str| s.replace('-', "_")),
             })
                 .with_description("A metered account is an account that is charged for active IP addresses managed in IPAM")
@@ -142,7 +142,7 @@ pub fn ec2_ipam_config() -> AwsccSchemaConfig {
                 name: "Tier".to_string(),
                 base: Box::new(AttributeType::String),
                 validate: validate_tier,
-                namespace: Some("awscc.ec2_ipam".to_string()),
+                namespace: Some("awscc.ec2.ipam".to_string()),
                 to_dsl: None,
             })
                 .with_description("The tier of the IPAM.")
@@ -157,7 +157,7 @@ pub fn enum_valid_values() -> (
     &'static [(&'static str, &'static [&'static str])],
 ) {
     (
-        "ec2_ipam",
+        "ec2.ipam",
         &[
             ("metered_account", VALID_METERED_ACCOUNT),
             ("tier", VALID_TIER),

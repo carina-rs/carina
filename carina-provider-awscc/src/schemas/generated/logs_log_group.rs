@@ -18,7 +18,7 @@ fn validate_log_group_class(value: &Value) -> Result<(), String> {
     validate_namespaced_enum(
         value,
         "LogGroupClass",
-        "awscc.logs_log_group",
+        "awscc.logs.log_group",
         VALID_LOG_GROUP_CLASS,
     )
     .map_err(|reason| {
@@ -34,9 +34,9 @@ fn validate_log_group_class(value: &Value) -> Result<(), String> {
 pub fn logs_log_group_config() -> AwsccSchemaConfig {
     AwsccSchemaConfig {
         aws_type_name: "AWS::Logs::LogGroup",
-        resource_type_name: "logs_log_group",
+        resource_type_name: "logs.log_group",
         has_tags: true,
-        schema: ResourceSchema::new("awscc.logs_log_group")
+        schema: ResourceSchema::new("awscc.logs.log_group")
         .with_description("The ``AWS::Logs::LogGroup`` resource specifies a log group. A log group defines common properties for log streams, such as their retention and access control rules. Each log stream must belong to one ...")
         .attribute(
             AttributeSchema::new("arn", super::arn())
@@ -68,7 +68,7 @@ pub fn logs_log_group_config() -> AwsccSchemaConfig {
                 name: "LogGroupClass".to_string(),
                 base: Box::new(AttributeType::String),
                 validate: validate_log_group_class,
-                namespace: Some("awscc.logs_log_group".to_string()),
+                namespace: Some("awscc.logs.log_group".to_string()),
                 to_dsl: None,
             })
                 .with_description("Specifies the log group class for this log group. There are two classes:  + The ``Standard`` log class supports all CWL features.  + The ``Infrequent ...")
@@ -104,7 +104,7 @@ pub fn enum_valid_values() -> (
     &'static [(&'static str, &'static [&'static str])],
 ) {
     (
-        "logs_log_group",
+        "logs.log_group",
         &[("log_group_class", VALID_LOG_GROUP_CLASS)],
     )
 }

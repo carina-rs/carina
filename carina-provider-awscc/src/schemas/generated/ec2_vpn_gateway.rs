@@ -12,9 +12,9 @@ use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 pub fn ec2_vpn_gateway_config() -> AwsccSchemaConfig {
     AwsccSchemaConfig {
         aws_type_name: "AWS::EC2::VPNGateway",
-        resource_type_name: "ec2_vpn_gateway",
+        resource_type_name: "ec2.vpn_gateway",
         has_tags: true,
-        schema: ResourceSchema::new("awscc.ec2_vpn_gateway")
+        schema: ResourceSchema::new("awscc.ec2.vpn_gateway")
         .with_description("Specifies a virtual private gateway. A virtual private gateway is the endpoint on the VPC side of your VPN connection. You can create a virtual private gateway before creating the VPC itself.  For mor...")
         .attribute(
             AttributeSchema::new("amazon_side_asn", AttributeType::Int)
@@ -47,7 +47,7 @@ pub fn enum_valid_values() -> (
     &'static str,
     &'static [(&'static str, &'static [&'static str])],
 ) {
-    ("ec2_vpn_gateway", &[])
+    ("ec2.vpn_gateway", &[])
 }
 
 /// Maps DSL alias values back to canonical AWS values for this module.

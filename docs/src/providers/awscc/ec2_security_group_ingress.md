@@ -1,4 +1,4 @@
-# awscc.ec2_security_group_ingress
+# awscc.ec2.security_group_ingress
 
 CloudFormation Type: `AWS::EC2::SecurityGroupIngress`
 
@@ -96,11 +96,11 @@ The end of port range for the TCP and UDP protocols, or an ICMP/ICMPv6 code. A v
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `tcp` | `awscc.ec2_security_group_ingress.IpProtocol.tcp` |
-| `udp` | `awscc.ec2_security_group_ingress.IpProtocol.udp` |
-| `icmp` | `awscc.ec2_security_group_ingress.IpProtocol.icmp` |
-| `icmpv6` | `awscc.ec2_security_group_ingress.IpProtocol.icmpv6` |
-| `-1` | `awscc.ec2_security_group_ingress.IpProtocol.all` |
+| `tcp` | `awscc.ec2.security_group_ingress.IpProtocol.tcp` |
+| `udp` | `awscc.ec2.security_group_ingress.IpProtocol.udp` |
+| `icmp` | `awscc.ec2.security_group_ingress.IpProtocol.icmp` |
+| `icmpv6` | `awscc.ec2.security_group_ingress.IpProtocol.icmpv6` |
+| `-1` | `awscc.ec2.security_group_ingress.IpProtocol.all` |
 
 Shorthand formats: `tcp` or `IpProtocol.tcp`
 
@@ -115,16 +115,16 @@ Shorthand formats: `tcp` or `IpProtocol.tcp`
 ## Example
 
 ```crn
-let vpc = awscc.ec2_vpc {
+let vpc = awscc.ec2.vpc {
   cidr_block = "10.0.0.0/16"
 }
 
-let sg = awscc.ec2_security_group {
+let sg = awscc.ec2.security_group {
   vpc_id            = vpc.vpc_id
   group_description = "Example security group"
 }
 
-let ingress = awscc.ec2_security_group_ingress {
+let ingress = awscc.ec2.security_group_ingress {
   group_id    = sg.group_id
   description = "Allow HTTPS from VPC"
   ip_protocol = "tcp"
