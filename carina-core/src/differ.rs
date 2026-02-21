@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use crate::effect::Effect;
 use crate::plan::Plan;
 use crate::resource::{LifecycleConfig, Resource, ResourceId, State, Value};
+use crate::schema::ResourceSchema;
 
 /// Result of a diff operation
 #[derive(Debug, Clone, PartialEq)]
@@ -54,6 +55,31 @@ pub fn diff(desired: &Resource, current: &State) -> Diff {
     }
 }
 
+/// Check which changed attributes are create-only according to the schema
+fn find_changed_create_only(
+    resource_type: &str,
+    changed_attributes: &[String],
+    schemas: &HashMap<String, ResourceSchema>,
+) -> Vec<String> {
+    // Try to find the schema — look up by resource_type directly,
+    // then try with common provider prefixes
+    let schema = schemas
+        .get(resource_type)
+        .or_else(|| schemas.get(&format!("awscc.{}", resource_type)))
+        .or_else(|| schemas.get(&format!("aws.{}", resource_type)));
+
+    let Some(schema) = schema else {
+        return Vec::new();
+    };
+
+    let create_only_attrs = schema.create_only_attributes();
+    changed_attributes
+        .iter()
+        .filter(|attr| create_only_attrs.contains(&attr.as_str()))
+        .cloned()
+        .collect()
+}
+
 /// Find changed attributes between desired and current state
 fn find_changed_attributes(
     desired: &HashMap<String, Value>,
@@ -85,6 +111,7 @@ pub fn create_plan(
     desired: &[Resource],
     current_states: &HashMap<ResourceId, State>,
     lifecycles: &HashMap<ResourceId, LifecycleConfig>,
+    schemas: &HashMap<String, ResourceSchema>,
 ) -> Plan {
     let mut plan = Plan::new();
 
@@ -109,8 +136,30 @@ pub fn create_plan(
 
         match d {
             Diff::Create(r) => plan.add(Effect::Create(r)),
-            Diff::Update { id, from, to, .. } => {
-                plan.add(Effect::Update { id, from, to });
+            Diff::Update {
+                id,
+                from,
+                to,
+                changed_attributes,
+            } => {
+                // Check if any changed attributes are create-only
+                let changed_create_only = find_changed_create_only(
+                    &resource.id.resource_type,
+                    &changed_attributes,
+                    schemas,
+                );
+
+                if changed_create_only.is_empty() {
+                    plan.add(Effect::Update { id, from, to });
+                } else {
+                    plan.add(Effect::Replace {
+                        id,
+                        from,
+                        to,
+                        lifecycle: resource.lifecycle.clone(),
+                        changed_create_only,
+                    });
+                }
             }
             Diff::NoChange(_) => {}
             Diff::Delete(id) => {
@@ -212,7 +261,12 @@ mod tests {
             State::existing(ResourceId::new("bucket", "existing-bucket"), attrs),
         );
 
-        let plan = create_plan(&resources, &current_states, &HashMap::new());
+        let plan = create_plan(
+            &resources,
+            &current_states,
+            &HashMap::new(),
+            &HashMap::new(),
+        );
 
         assert_eq!(plan.effects().len(), 2);
         assert!(matches!(plan.effects()[0], Effect::Create(_)));
@@ -229,7 +283,12 @@ mod tests {
         ];
 
         let current_states = HashMap::new();
-        let plan = create_plan(&resources, &current_states, &HashMap::new());
+        let plan = create_plan(
+            &resources,
+            &current_states,
+            &HashMap::new(),
+            &HashMap::new(),
+        );
 
         // Should have 2 effects: Read for data source, Create for new bucket
         assert_eq!(plan.effects().len(), 2);
@@ -301,7 +360,7 @@ mod tests {
             State::existing(ResourceId::new("bucket", "orphaned-bucket"), orphan_attrs),
         );
 
-        let plan = create_plan(&desired, &current_states, &HashMap::new());
+        let plan = create_plan(&desired, &current_states, &HashMap::new(), &HashMap::new());
 
         // Should have 1 effect: Delete for orphaned-bucket
         // (keep-this has NoChange, so no effect)
@@ -339,7 +398,12 @@ mod tests {
             State::existing(ResourceId::new("bucket", "existing-bucket"), attrs),
         );
 
-        let plan = create_plan(&resources, &current_states, &HashMap::new());
+        let plan = create_plan(
+            &resources,
+            &current_states,
+            &HashMap::new(),
+            &HashMap::new(),
+        );
 
         // Should still have Read effect, not NoChange
         assert_eq!(plan.effects().len(), 1);
@@ -368,6 +432,173 @@ mod tests {
             matches!(result, Diff::NoChange(_)),
             "Expected NoChange when neither side has 'name', got {:?}",
             result
+        );
+    }
+
+    #[test]
+    fn replace_when_create_only_attr_changed() {
+        use crate::schema::{AttributeSchema, AttributeType};
+
+        let resources = vec![
+            Resource::new("ec2.vpc", "my-vpc")
+                .with_attribute("cidr_block", Value::String("10.1.0.0/16".to_string())),
+        ];
+
+        let mut current_states = HashMap::new();
+        let mut attrs = HashMap::new();
+        attrs.insert(
+            "cidr_block".to_string(),
+            Value::String("10.0.0.0/16".to_string()),
+        );
+        current_states.insert(
+            ResourceId::new("ec2.vpc", "my-vpc"),
+            State::existing(ResourceId::new("ec2.vpc", "my-vpc"), attrs),
+        );
+
+        // Build schema with cidr_block marked as create-only
+        let mut schemas = HashMap::new();
+        schemas.insert(
+            "ec2.vpc".to_string(),
+            crate::schema::ResourceSchema::new("ec2.vpc")
+                .attribute(AttributeSchema::new("cidr_block", AttributeType::String).create_only()),
+        );
+
+        let plan = create_plan(&resources, &current_states, &HashMap::new(), &schemas);
+
+        assert_eq!(plan.effects().len(), 1);
+        match &plan.effects()[0] {
+            Effect::Replace {
+                changed_create_only,
+                ..
+            } => {
+                assert_eq!(changed_create_only, &vec!["cidr_block".to_string()]);
+            }
+            other => panic!("Expected Replace, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn normal_update_when_non_create_only_attr_changed() {
+        use crate::schema::{AttributeSchema, AttributeType};
+
+        let resources = vec![
+            Resource::new("ec2.vpc", "my-vpc")
+                .with_attribute("enable_dns_support", Value::Bool(true)),
+        ];
+
+        let mut current_states = HashMap::new();
+        let mut attrs = HashMap::new();
+        attrs.insert("enable_dns_support".to_string(), Value::Bool(false));
+        current_states.insert(
+            ResourceId::new("ec2.vpc", "my-vpc"),
+            State::existing(ResourceId::new("ec2.vpc", "my-vpc"), attrs),
+        );
+
+        // cidr_block is create-only, but enable_dns_support is not
+        let mut schemas = HashMap::new();
+        schemas.insert(
+            "ec2.vpc".to_string(),
+            crate::schema::ResourceSchema::new("ec2.vpc")
+                .attribute(AttributeSchema::new("cidr_block", AttributeType::String).create_only())
+                .attribute(AttributeSchema::new(
+                    "enable_dns_support",
+                    AttributeType::Bool,
+                )),
+        );
+
+        let plan = create_plan(&resources, &current_states, &HashMap::new(), &schemas);
+
+        assert_eq!(plan.effects().len(), 1);
+        assert!(
+            matches!(plan.effects()[0], Effect::Update { .. }),
+            "Expected Update, got {:?}",
+            plan.effects()[0]
+        );
+    }
+
+    #[test]
+    fn replace_when_mix_of_create_only_and_normal_attrs_changed() {
+        use crate::schema::{AttributeSchema, AttributeType};
+
+        let resources = vec![
+            Resource::new("ec2.vpc", "my-vpc")
+                .with_attribute("cidr_block", Value::String("10.1.0.0/16".to_string()))
+                .with_attribute("enable_dns_support", Value::Bool(true)),
+        ];
+
+        let mut current_states = HashMap::new();
+        let mut attrs = HashMap::new();
+        attrs.insert(
+            "cidr_block".to_string(),
+            Value::String("10.0.0.0/16".to_string()),
+        );
+        attrs.insert("enable_dns_support".to_string(), Value::Bool(false));
+        current_states.insert(
+            ResourceId::new("ec2.vpc", "my-vpc"),
+            State::existing(ResourceId::new("ec2.vpc", "my-vpc"), attrs),
+        );
+
+        let mut schemas = HashMap::new();
+        schemas.insert(
+            "ec2.vpc".to_string(),
+            crate::schema::ResourceSchema::new("ec2.vpc")
+                .attribute(AttributeSchema::new("cidr_block", AttributeType::String).create_only())
+                .attribute(AttributeSchema::new(
+                    "enable_dns_support",
+                    AttributeType::Bool,
+                )),
+        );
+
+        let plan = create_plan(&resources, &current_states, &HashMap::new(), &schemas);
+
+        assert_eq!(plan.effects().len(), 1);
+        match &plan.effects()[0] {
+            Effect::Replace {
+                changed_create_only,
+                ..
+            } => {
+                assert_eq!(changed_create_only, &vec!["cidr_block".to_string()]);
+            }
+            other => panic!("Expected Replace, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn replace_with_provider_prefixed_schema_key() {
+        use crate::schema::{AttributeSchema, AttributeType};
+
+        // In production, schemas are keyed by "awscc.ec2.vpc" but resource_type is "ec2.vpc"
+        let resources = vec![
+            Resource::new("ec2.vpc", "my-vpc")
+                .with_attribute("cidr_block", Value::String("10.1.0.0/16".to_string())),
+        ];
+
+        let mut current_states = HashMap::new();
+        let mut attrs = HashMap::new();
+        attrs.insert(
+            "cidr_block".to_string(),
+            Value::String("10.0.0.0/16".to_string()),
+        );
+        current_states.insert(
+            ResourceId::new("ec2.vpc", "my-vpc"),
+            State::existing(ResourceId::new("ec2.vpc", "my-vpc"), attrs),
+        );
+
+        // Schema keyed with provider prefix (as in production)
+        let mut schemas = HashMap::new();
+        schemas.insert(
+            "awscc.ec2.vpc".to_string(),
+            crate::schema::ResourceSchema::new("awscc.ec2.vpc")
+                .attribute(AttributeSchema::new("cidr_block", AttributeType::String).create_only()),
+        );
+
+        let plan = create_plan(&resources, &current_states, &HashMap::new(), &schemas);
+
+        assert_eq!(plan.effects().len(), 1);
+        assert!(
+            matches!(plan.effects()[0], Effect::Replace { .. }),
+            "Expected Replace with awscc-prefixed schema key, got {:?}",
+            plan.effects()[0]
         );
     }
 }

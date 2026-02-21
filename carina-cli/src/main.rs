@@ -1423,7 +1423,8 @@ async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
     resolve_refs_with_state(&mut resources_for_plan, &current_states);
     provider.resolve_enum_identifiers(&mut resources_for_plan);
     let lifecycles = build_lifecycles_from_state(&state_file);
-    let plan = create_plan(&resources_for_plan, &current_states, &lifecycles);
+    let schemas = get_schemas();
+    let plan = create_plan(&resources_for_plan, &current_states, &lifecycles, &schemas);
 
     if plan.is_empty() {
         println!("{}", "No changes needed.".green());
@@ -1546,6 +1547,55 @@ async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
                                 attrs.insert(k.clone(), v.clone());
                             }
                             binding_map.insert(binding_name.clone(), attrs);
+                        }
+                    }
+                    Err(e) => {
+                        println!("  {} {} - {}", "✗".red(), format_effect(effect), e);
+                        failure_count += 1;
+                    }
+                }
+            }
+            Effect::Replace {
+                id,
+                from,
+                to,
+                lifecycle,
+                ..
+            } => {
+                // Delete the existing resource
+                let identifier = from.identifier.as_deref().unwrap_or("");
+                match provider.delete(id, identifier, lifecycle).await {
+                    Ok(()) => {
+                        // Re-resolve references with current binding_map
+                        let mut resolved_resource = to.clone();
+                        for (key, value) in &to.attributes {
+                            resolved_resource
+                                .attributes
+                                .insert(key.clone(), resolve_ref_value(value, &binding_map));
+                        }
+
+                        // Create the new resource
+                        match provider.create(&resolved_resource).await {
+                            Ok(state) => {
+                                println!("  {} {}", "✓".green(), format_effect(effect));
+                                success_count += 1;
+
+                                applied_states.insert(to.id.clone(), state.clone());
+
+                                if let Some(Value::String(binding_name)) =
+                                    to.attributes.get("_binding")
+                                {
+                                    let mut attrs = resolved_resource.attributes.clone();
+                                    for (k, v) in &state.attributes {
+                                        attrs.insert(k.clone(), v.clone());
+                                    }
+                                    binding_map.insert(binding_name.clone(), attrs);
+                                }
+                            }
+                            Err(e) => {
+                                println!("  {} {} - {}", "✗".red(), format_effect(effect), e);
+                                failure_count += 1;
+                            }
                         }
                     }
                     Err(e) => {
@@ -1978,6 +2028,51 @@ async fn run_apply_from_plan(plan_path: &PathBuf, auto_approve: bool) -> Result<
                                 attrs.insert(k.clone(), v.clone());
                             }
                             binding_map.insert(binding_name.clone(), attrs);
+                        }
+                    }
+                    Err(e) => {
+                        println!("  {} {} - {}", "✗".red(), format_effect(effect), e);
+                        failure_count += 1;
+                    }
+                }
+            }
+            Effect::Replace {
+                id,
+                from,
+                to,
+                lifecycle,
+                ..
+            } => {
+                let identifier = from.identifier.as_deref().unwrap_or("");
+                match provider.delete(id, identifier, lifecycle).await {
+                    Ok(()) => {
+                        let mut resolved_resource = to.clone();
+                        for (key, value) in &to.attributes {
+                            resolved_resource
+                                .attributes
+                                .insert(key.clone(), resolve_ref_value(value, &binding_map));
+                        }
+
+                        match provider.create(&resolved_resource).await {
+                            Ok(state) => {
+                                println!("  {} {}", "✓".green(), format_effect(effect));
+                                success_count += 1;
+                                applied_states.insert(to.id.clone(), state.clone());
+
+                                if let Some(Value::String(binding_name)) =
+                                    to.attributes.get("_binding")
+                                {
+                                    let mut attrs = resolved_resource.attributes.clone();
+                                    for (k, v) in &state.attributes {
+                                        attrs.insert(k.clone(), v.clone());
+                                    }
+                                    binding_map.insert(binding_name.clone(), attrs);
+                                }
+                            }
+                            Err(e) => {
+                                println!("  {} {} - {}", "✗".red(), format_effect(effect), e);
+                                failure_count += 1;
+                            }
                         }
                     }
                     Err(e) => {
@@ -2810,7 +2905,8 @@ async fn create_plan_from_parsed(
     // Build lifecycles map from state file for orphaned resource deletion
     let lifecycles = build_lifecycles_from_state(state_file);
 
-    let plan = create_plan(&resources, &current_states, &lifecycles);
+    let schemas = get_schemas();
+    let plan = create_plan(&resources, &current_states, &lifecycles, &schemas);
     Ok(PlanContext {
         plan,
         sorted_resources,
@@ -2833,6 +2929,7 @@ fn print_plan(plan: &Plan) {
         let (resource, deps) = match effect {
             Effect::Create(r) => (Some(r), get_resource_dependencies(r)),
             Effect::Update { to, .. } => (Some(to), get_resource_dependencies(to)),
+            Effect::Replace { to, .. } => (Some(to), get_resource_dependencies(to)),
             Effect::Read { resource } => (Some(resource), get_resource_dependencies(resource)),
             Effect::Delete { .. } => (None, HashSet::new()),
         };
@@ -2900,6 +2997,7 @@ fn print_plan(plan: &Plan) {
         let colored_symbol = match effect {
             Effect::Create(_) => "+".green().bold(),
             Effect::Update { .. } => "~".yellow().bold(),
+            Effect::Replace { .. } => "-/+".magenta().bold(),
             Effect::Delete { .. } => "-".red().bold(),
             Effect::Read { .. } => "<=".cyan().bold(),
         };
@@ -3007,6 +3105,77 @@ fn print_plan(plan: &Plan) {
                     }
                 }
             }
+            Effect::Replace {
+                id,
+                from,
+                to,
+                changed_create_only,
+                ..
+            } => {
+                println!(
+                    "{}{}{} {} \"{}\" {}",
+                    base_indent,
+                    connector,
+                    colored_symbol,
+                    id.display_type().cyan().bold(),
+                    id.name.magenta().bold(),
+                    "(must be replaced)".magenta()
+                );
+                let attr_prefix = if indent == 0 {
+                    format!("{}{}", base_indent, attr_base)
+                } else {
+                    let continuation = if is_last {
+                        format!("{}   ", prefix)
+                    } else {
+                        format!("{}│  ", prefix)
+                    };
+                    format!("{}{}   ", base_indent, continuation)
+                };
+                let mut keys: Vec<_> = to
+                    .attributes
+                    .keys()
+                    .filter(|k| !k.starts_with('_'))
+                    .collect();
+                keys.sort();
+                for key in keys {
+                    let new_value = &to.attributes[key];
+                    let old_value = from.attributes.get(key);
+                    let forces_replacement = changed_create_only.contains(key);
+                    if old_value != Some(new_value) {
+                        if is_list_of_maps(new_value) {
+                            let suffix = if forces_replacement {
+                                format!(" {}", "(forces replacement)".magenta())
+                            } else {
+                                String::new()
+                            };
+                            println!("{}{}:{}", attr_prefix, key, suffix);
+                            println!("{}", format_list_diff(old_value, new_value, &attr_prefix));
+                        } else {
+                            let old_str = old_value
+                                .map(|v| format_value_with_key(v, Some(key)))
+                                .unwrap_or_else(|| "(none)".to_string());
+                            if forces_replacement {
+                                println!(
+                                    "{}{}: {} → {} {}",
+                                    attr_prefix,
+                                    key,
+                                    old_str.red(),
+                                    format_value_with_key(new_value, Some(key)).green(),
+                                    "(forces replacement)".magenta()
+                                );
+                            } else {
+                                println!(
+                                    "{}{}: {} → {}",
+                                    attr_prefix,
+                                    key,
+                                    old_str.red(),
+                                    format_value_with_key(new_value, Some(key)).green()
+                                );
+                            }
+                        }
+                    }
+                }
+            }
             Effect::Delete { id, .. } => {
                 println!(
                     "{}{}{} {} \"{}\"",
@@ -3088,28 +3257,27 @@ fn print_plan(plan: &Plan) {
 
     println!();
     let summary = plan.summary();
+    let mut parts = Vec::new();
     if summary.read > 0 {
-        println!(
-            "Plan: {} to read, {} to add, {} to change, {} to destroy.",
-            summary.read.to_string().cyan(),
-            summary.create.to_string().green(),
-            summary.update.to_string().yellow(),
-            summary.delete.to_string().red()
-        );
-    } else {
-        println!(
-            "Plan: {} to add, {} to change, {} to destroy.",
-            summary.create.to_string().green(),
-            summary.update.to_string().yellow(),
-            summary.delete.to_string().red()
-        );
+        parts.push(format!("{} to read", summary.read.to_string().cyan()));
     }
+    parts.push(format!("{} to add", summary.create.to_string().green()));
+    parts.push(format!("{} to change", summary.update.to_string().yellow()));
+    if summary.replace > 0 {
+        parts.push(format!(
+            "{} to replace",
+            summary.replace.to_string().magenta()
+        ));
+    }
+    parts.push(format!("{} to destroy", summary.delete.to_string().red()));
+    println!("Plan: {}.", parts.join(", "));
 }
 
 fn format_effect(effect: &Effect) -> String {
     match effect {
         Effect::Create(r) => format!("Create {}", r.id),
         Effect::Update { id, .. } => format!("Update {}", id),
+        Effect::Replace { id, .. } => format!("Replace {}", id),
         Effect::Delete { id, .. } => format!("Delete {}", id),
         Effect::Read { resource } => {
             format!("Read {}", resource.id)
