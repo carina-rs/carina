@@ -8,13 +8,13 @@ use carina_core::resource::Value;
 use carina_core::schema::{validate_cidr, validate_ipv6_cidr};
 use carina_provider_aws::schemas::{generated as aws_generated, types as aws_types};
 use carina_provider_awscc::schemas::awscc_types;
-use carina_provider_awscc::schemas::generated::flow_log as awscc_flow_log;
-use carina_provider_awscc::schemas::generated::nat_gateway as awscc_nat_gateway;
-use carina_provider_awscc::schemas::generated::security_group as awscc_security_group;
-use carina_provider_awscc::schemas::generated::subnet as awscc_subnet;
+use carina_provider_awscc::schemas::generated::ec2_flow_log as awscc_flow_log;
+use carina_provider_awscc::schemas::generated::ec2_nat_gateway as awscc_nat_gateway;
+use carina_provider_awscc::schemas::generated::ec2_security_group as awscc_security_group;
+use carina_provider_awscc::schemas::generated::ec2_subnet as awscc_subnet;
+use carina_provider_awscc::schemas::generated::ec2_vpc as awscc_vpc;
+use carina_provider_awscc::schemas::generated::ec2_vpc_endpoint as awscc_vpc_endpoint;
 use carina_provider_awscc::schemas::generated::validate_arn;
-use carina_provider_awscc::schemas::generated::vpc as awscc_vpc;
-use carina_provider_awscc::schemas::generated::vpc_endpoint as awscc_vpc_endpoint;
 
 pub struct DiagnosticEngine {
     valid_resource_types: HashSet<String>,

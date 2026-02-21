@@ -9,58 +9,58 @@ use carina_core::schema::ResourceSchema;
 // generated schema files can use `super::` to access them.
 pub use super::awscc_types::*;
 
-pub mod bucket;
-pub mod egress_only_internet_gateway;
-pub mod eip;
-pub mod flow_log;
-pub mod internet_gateway;
-pub mod ipam;
-pub mod ipam_pool;
-pub mod log_group;
-pub mod nat_gateway;
-pub mod role;
-pub mod route;
-pub mod route_table;
-pub mod security_group;
-pub mod security_group_egress;
-pub mod security_group_ingress;
-pub mod subnet;
-pub mod subnet_route_table_association;
-pub mod transit_gateway;
-pub mod transit_gateway_attachment;
-pub mod vpc;
-pub mod vpc_endpoint;
-pub mod vpc_gateway_attachment;
-pub mod vpc_peering_connection;
-pub mod vpn_gateway;
+pub mod ec2_egress_only_internet_gateway;
+pub mod ec2_eip;
+pub mod ec2_flow_log;
+pub mod ec2_internet_gateway;
+pub mod ec2_ipam;
+pub mod ec2_ipam_pool;
+pub mod ec2_nat_gateway;
+pub mod ec2_route;
+pub mod ec2_route_table;
+pub mod ec2_security_group;
+pub mod ec2_security_group_egress;
+pub mod ec2_security_group_ingress;
+pub mod ec2_subnet;
+pub mod ec2_subnet_route_table_association;
+pub mod ec2_transit_gateway;
+pub mod ec2_transit_gateway_attachment;
+pub mod ec2_vpc;
+pub mod ec2_vpc_endpoint;
+pub mod ec2_vpc_gateway_attachment;
+pub mod ec2_vpc_peering_connection;
+pub mod ec2_vpn_gateway;
+pub mod iam_role;
+pub mod logs_log_group;
+pub mod s3_bucket;
 
 /// Returns all generated schema configs
 pub fn configs() -> Vec<AwsccSchemaConfig> {
     vec![
-        vpc::ec2_vpc_config(),
-        subnet::ec2_subnet_config(),
-        internet_gateway::ec2_internet_gateway_config(),
-        route_table::ec2_route_table_config(),
-        route::ec2_route_config(),
-        subnet_route_table_association::ec2_subnet_route_table_association_config(),
-        eip::ec2_eip_config(),
-        nat_gateway::ec2_nat_gateway_config(),
-        security_group::ec2_security_group_config(),
-        security_group_ingress::ec2_security_group_ingress_config(),
-        security_group_egress::ec2_security_group_egress_config(),
-        vpc_endpoint::ec2_vpc_endpoint_config(),
-        vpc_gateway_attachment::ec2_vpc_gateway_attachment_config(),
-        flow_log::ec2_flow_log_config(),
-        ipam::ec2_ipam_config(),
-        ipam_pool::ec2_ipam_pool_config(),
-        vpn_gateway::ec2_vpn_gateway_config(),
-        transit_gateway::ec2_transit_gateway_config(),
-        vpc_peering_connection::ec2_vpc_peering_connection_config(),
-        egress_only_internet_gateway::ec2_egress_only_internet_gateway_config(),
-        transit_gateway_attachment::ec2_transit_gateway_attachment_config(),
-        bucket::s3_bucket_config(),
-        role::iam_role_config(),
-        log_group::logs_log_group_config(),
+        ec2_vpc::ec2_vpc_config(),
+        ec2_subnet::ec2_subnet_config(),
+        ec2_internet_gateway::ec2_internet_gateway_config(),
+        ec2_route_table::ec2_route_table_config(),
+        ec2_route::ec2_route_config(),
+        ec2_subnet_route_table_association::ec2_subnet_route_table_association_config(),
+        ec2_eip::ec2_eip_config(),
+        ec2_nat_gateway::ec2_nat_gateway_config(),
+        ec2_security_group::ec2_security_group_config(),
+        ec2_security_group_ingress::ec2_security_group_ingress_config(),
+        ec2_security_group_egress::ec2_security_group_egress_config(),
+        ec2_vpc_endpoint::ec2_vpc_endpoint_config(),
+        ec2_vpc_gateway_attachment::ec2_vpc_gateway_attachment_config(),
+        ec2_flow_log::ec2_flow_log_config(),
+        ec2_ipam::ec2_ipam_config(),
+        ec2_ipam_pool::ec2_ipam_pool_config(),
+        ec2_vpn_gateway::ec2_vpn_gateway_config(),
+        ec2_transit_gateway::ec2_transit_gateway_config(),
+        ec2_vpc_peering_connection::ec2_vpc_peering_connection_config(),
+        ec2_egress_only_internet_gateway::ec2_egress_only_internet_gateway_config(),
+        ec2_transit_gateway_attachment::ec2_transit_gateway_attachment_config(),
+        s3_bucket::s3_bucket_config(),
+        iam_role::iam_role_config(),
+        logs_log_group::logs_log_group_config(),
     ]
 }
 
@@ -79,30 +79,30 @@ pub fn get_enum_valid_values(
     attr_name: &str,
 ) -> Option<&'static [&'static str]> {
     let modules: &[(&str, &[(&str, &[&str])])] = &[
-        vpc::enum_valid_values(),
-        subnet::enum_valid_values(),
-        internet_gateway::enum_valid_values(),
-        route_table::enum_valid_values(),
-        route::enum_valid_values(),
-        subnet_route_table_association::enum_valid_values(),
-        eip::enum_valid_values(),
-        nat_gateway::enum_valid_values(),
-        security_group::enum_valid_values(),
-        security_group_ingress::enum_valid_values(),
-        security_group_egress::enum_valid_values(),
-        vpc_endpoint::enum_valid_values(),
-        vpc_gateway_attachment::enum_valid_values(),
-        flow_log::enum_valid_values(),
-        ipam::enum_valid_values(),
-        ipam_pool::enum_valid_values(),
-        vpn_gateway::enum_valid_values(),
-        transit_gateway::enum_valid_values(),
-        vpc_peering_connection::enum_valid_values(),
-        egress_only_internet_gateway::enum_valid_values(),
-        transit_gateway_attachment::enum_valid_values(),
-        bucket::enum_valid_values(),
-        role::enum_valid_values(),
-        log_group::enum_valid_values(),
+        ec2_vpc::enum_valid_values(),
+        ec2_subnet::enum_valid_values(),
+        ec2_internet_gateway::enum_valid_values(),
+        ec2_route_table::enum_valid_values(),
+        ec2_route::enum_valid_values(),
+        ec2_subnet_route_table_association::enum_valid_values(),
+        ec2_eip::enum_valid_values(),
+        ec2_nat_gateway::enum_valid_values(),
+        ec2_security_group::enum_valid_values(),
+        ec2_security_group_ingress::enum_valid_values(),
+        ec2_security_group_egress::enum_valid_values(),
+        ec2_vpc_endpoint::enum_valid_values(),
+        ec2_vpc_gateway_attachment::enum_valid_values(),
+        ec2_flow_log::enum_valid_values(),
+        ec2_ipam::enum_valid_values(),
+        ec2_ipam_pool::enum_valid_values(),
+        ec2_vpn_gateway::enum_valid_values(),
+        ec2_transit_gateway::enum_valid_values(),
+        ec2_vpc_peering_connection::enum_valid_values(),
+        ec2_egress_only_internet_gateway::enum_valid_values(),
+        ec2_transit_gateway_attachment::enum_valid_values(),
+        s3_bucket::enum_valid_values(),
+        iam_role::enum_valid_values(),
+        logs_log_group::enum_valid_values(),
     ];
     for (rt, attrs) in modules {
         if *rt == resource_type {
@@ -125,76 +125,76 @@ pub fn get_enum_alias_reverse(
     value: &str,
 ) -> Option<&'static str> {
     if resource_type == "ec2_vpc" {
-        return vpc::enum_alias_reverse(attr_name, value);
+        return ec2_vpc::enum_alias_reverse(attr_name, value);
     }
     if resource_type == "ec2_subnet" {
-        return subnet::enum_alias_reverse(attr_name, value);
+        return ec2_subnet::enum_alias_reverse(attr_name, value);
     }
     if resource_type == "ec2_internet_gateway" {
-        return internet_gateway::enum_alias_reverse(attr_name, value);
+        return ec2_internet_gateway::enum_alias_reverse(attr_name, value);
     }
     if resource_type == "ec2_route_table" {
-        return route_table::enum_alias_reverse(attr_name, value);
+        return ec2_route_table::enum_alias_reverse(attr_name, value);
     }
     if resource_type == "ec2_route" {
-        return route::enum_alias_reverse(attr_name, value);
+        return ec2_route::enum_alias_reverse(attr_name, value);
     }
     if resource_type == "ec2_subnet_route_table_association" {
-        return subnet_route_table_association::enum_alias_reverse(attr_name, value);
+        return ec2_subnet_route_table_association::enum_alias_reverse(attr_name, value);
     }
     if resource_type == "ec2_eip" {
-        return eip::enum_alias_reverse(attr_name, value);
+        return ec2_eip::enum_alias_reverse(attr_name, value);
     }
     if resource_type == "ec2_nat_gateway" {
-        return nat_gateway::enum_alias_reverse(attr_name, value);
+        return ec2_nat_gateway::enum_alias_reverse(attr_name, value);
     }
     if resource_type == "ec2_security_group" {
-        return security_group::enum_alias_reverse(attr_name, value);
+        return ec2_security_group::enum_alias_reverse(attr_name, value);
     }
     if resource_type == "ec2_security_group_ingress" {
-        return security_group_ingress::enum_alias_reverse(attr_name, value);
+        return ec2_security_group_ingress::enum_alias_reverse(attr_name, value);
     }
     if resource_type == "ec2_security_group_egress" {
-        return security_group_egress::enum_alias_reverse(attr_name, value);
+        return ec2_security_group_egress::enum_alias_reverse(attr_name, value);
     }
     if resource_type == "ec2_vpc_endpoint" {
-        return vpc_endpoint::enum_alias_reverse(attr_name, value);
+        return ec2_vpc_endpoint::enum_alias_reverse(attr_name, value);
     }
     if resource_type == "ec2_vpc_gateway_attachment" {
-        return vpc_gateway_attachment::enum_alias_reverse(attr_name, value);
+        return ec2_vpc_gateway_attachment::enum_alias_reverse(attr_name, value);
     }
     if resource_type == "ec2_flow_log" {
-        return flow_log::enum_alias_reverse(attr_name, value);
+        return ec2_flow_log::enum_alias_reverse(attr_name, value);
     }
     if resource_type == "ec2_ipam" {
-        return ipam::enum_alias_reverse(attr_name, value);
+        return ec2_ipam::enum_alias_reverse(attr_name, value);
     }
     if resource_type == "ec2_ipam_pool" {
-        return ipam_pool::enum_alias_reverse(attr_name, value);
+        return ec2_ipam_pool::enum_alias_reverse(attr_name, value);
     }
     if resource_type == "ec2_vpn_gateway" {
-        return vpn_gateway::enum_alias_reverse(attr_name, value);
+        return ec2_vpn_gateway::enum_alias_reverse(attr_name, value);
     }
     if resource_type == "ec2_transit_gateway" {
-        return transit_gateway::enum_alias_reverse(attr_name, value);
+        return ec2_transit_gateway::enum_alias_reverse(attr_name, value);
     }
     if resource_type == "ec2_vpc_peering_connection" {
-        return vpc_peering_connection::enum_alias_reverse(attr_name, value);
+        return ec2_vpc_peering_connection::enum_alias_reverse(attr_name, value);
     }
     if resource_type == "ec2_egress_only_internet_gateway" {
-        return egress_only_internet_gateway::enum_alias_reverse(attr_name, value);
+        return ec2_egress_only_internet_gateway::enum_alias_reverse(attr_name, value);
     }
     if resource_type == "ec2_transit_gateway_attachment" {
-        return transit_gateway_attachment::enum_alias_reverse(attr_name, value);
+        return ec2_transit_gateway_attachment::enum_alias_reverse(attr_name, value);
     }
     if resource_type == "s3_bucket" {
-        return bucket::enum_alias_reverse(attr_name, value);
+        return s3_bucket::enum_alias_reverse(attr_name, value);
     }
     if resource_type == "iam_role" {
-        return role::enum_alias_reverse(attr_name, value);
+        return iam_role::enum_alias_reverse(attr_name, value);
     }
     if resource_type == "logs_log_group" {
-        return log_group::enum_alias_reverse(attr_name, value);
+        return logs_log_group::enum_alias_reverse(attr_name, value);
     }
     None
 }
