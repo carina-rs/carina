@@ -1,67 +1,21 @@
 //! security_group schema definition for AWS Cloud Control
 //!
-//! Auto-generated from CloudFormation schema: AWS::EC2::SecurityGroup
+//! Auto-generated from Smithy model: com.amazonaws.ec2
 //!
-//! DO NOT EDIT MANUALLY - regenerate with aws-codegen
+//! DO NOT EDIT MANUALLY - regenerate with smithy-codegen
 
 use super::AwsSchemaConfig;
 use super::tags_type;
-use super::validate_namespaced_enum;
-use carina_core::resource::Value;
-use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField, types};
+use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
-#[allow(dead_code)]
-const VALID_IP_PROTOCOL: &[&str] = &["tcp", "udp", "icmp", "icmpv6", "-1", "all"];
-
-#[allow(dead_code)]
-fn validate_ip_protocol(value: &Value) -> Result<(), String> {
-    validate_namespaced_enum(
-        value,
-        "IpProtocol",
-        "aws.ec2_security_group",
-        VALID_IP_PROTOCOL,
-    )
-    .map_err(|reason| {
-        if let Value::String(s) = value {
-            format!("Invalid IpProtocol '{}': {}", s, reason)
-        } else {
-            reason
-        }
-    })
-}
-
-fn validate_from_port_range(value: &Value) -> Result<(), String> {
-    if let Value::Int(n) = value {
-        if *n < -1 || *n > 65535 {
-            Err(format!("Value {} is out of range -1..=65535", n))
-        } else {
-            Ok(())
-        }
-    } else {
-        Err("Expected integer".to_string())
-    }
-}
-
-fn validate_to_port_range(value: &Value) -> Result<(), String> {
-    if let Value::Int(n) = value {
-        if *n < -1 || *n > 65535 {
-            Err(format!("Value {} is out of range -1..=65535", n))
-        } else {
-            Ok(())
-        }
-    } else {
-        Err("Expected integer".to_string())
-    }
-}
-
-/// Returns the schema config for ec2_security_group (AWS::EC2::SecurityGroup)
+/// Returns the schema config for ec2_security_group (Smithy: com.amazonaws.ec2)
 pub fn ec2_security_group_config() -> AwsSchemaConfig {
     AwsSchemaConfig {
         aws_type_name: "AWS::EC2::SecurityGroup",
         resource_type_name: "ec2_security_group",
         has_tags: true,
         schema: ResourceSchema::new("aws.ec2_security_group")
-        .with_description("Resource Type definition for AWS::EC2::SecurityGroup")
+        .with_description("<p>Describes a security group.</p>")
         .attribute(
             AttributeSchema::new("name", AttributeType::String)
                 .with_description("Resource name"),
@@ -71,110 +25,34 @@ pub fn ec2_security_group_config() -> AwsSchemaConfig {
                 .with_description("The AWS region (inherited from provider if not specified)"),
         )
         .attribute(
-            AttributeSchema::new("group_description", AttributeType::String)
+            AttributeSchema::new("description", AttributeType::String)
                 .required()
                 .create_only()
-                .with_description("A description for the security group.")
-                .with_provider_name("GroupDescription"),
-        )
-        .attribute(
-            AttributeSchema::new("group_id", super::security_group_id())
-                .with_description("The group ID of the specified security group. (read-only)")
-                .with_provider_name("GroupId"),
+                .with_description("<p>A description for the security group.</p>     <p>Constraints: Up to 255 characters in length</p>     <p>Valid characters: a-z, A-Z, 0-9, spaces, an...")
+                .with_provider_name("Description"),
         )
         .attribute(
             AttributeSchema::new("group_name", AttributeType::String)
+                .required()
                 .create_only()
-                .with_description("The name of the security group.")
+                .with_description("<p>The name of the security group. Names are case-insensitive and must be unique within the VPC.</p>     <p>Constraints: Up to 255 characters in lengt...")
                 .with_provider_name("GroupName"),
-        )
-        .attribute(
-            AttributeSchema::new("id", AttributeType::String)
-                .with_description("The group name or group ID depending on whether the SG is created in default or specific VPC (read-only)")
-                .with_provider_name("Id"),
-        )
-        .attribute(
-            AttributeSchema::new("security_group_egress", AttributeType::List(Box::new(AttributeType::Struct {
-                    name: "Egress".to_string(),
-                    fields: vec![
-                    StructField::new("cidr_ip", types::ipv4_cidr()).with_provider_name("CidrIp"),
-                    StructField::new("cidr_ipv6", types::ipv6_cidr()).with_provider_name("CidrIpv6"),
-                    StructField::new("description", AttributeType::String).with_provider_name("Description"),
-                    StructField::new("destination_prefix_list_id", super::aws_resource_id()).with_provider_name("DestinationPrefixListId"),
-                    StructField::new("destination_security_group_id", super::security_group_id()).with_provider_name("DestinationSecurityGroupId"),
-                    StructField::new("from_port", AttributeType::Custom {
-                name: "Int(-1..=65535)".to_string(),
-                base: Box::new(AttributeType::Int),
-                validate: validate_from_port_range,
-                namespace: None,
-                to_dsl: None,
-            }).with_provider_name("FromPort"),
-                    StructField::new("ip_protocol", AttributeType::Custom {
-                name: "IpProtocol".to_string(),
-                base: Box::new(AttributeType::String),
-                validate: validate_ip_protocol,
-                namespace: Some("aws.ec2_security_group".to_string()),
-                to_dsl: Some(|s: &str| match s { "-1" => "all".to_string(), _ => s.replace('-', "_") }),
-            }).required().with_provider_name("IpProtocol"),
-                    StructField::new("to_port", AttributeType::Custom {
-                name: "Int(-1..=65535)".to_string(),
-                base: Box::new(AttributeType::Int),
-                validate: validate_to_port_range,
-                namespace: None,
-                to_dsl: None,
-            }).with_provider_name("ToPort")
-                    ],
-                })))
-                .with_description("[VPC only] The outbound rules associated with the security group. There is a short interruption during which you cannot connect to the security group.")
-                .with_provider_name("SecurityGroupEgress"),
-        )
-        .attribute(
-            AttributeSchema::new("security_group_ingress", AttributeType::List(Box::new(AttributeType::Struct {
-                    name: "Ingress".to_string(),
-                    fields: vec![
-                    StructField::new("cidr_ip", types::ipv4_cidr()).with_provider_name("CidrIp"),
-                    StructField::new("cidr_ipv6", types::ipv6_cidr()).with_provider_name("CidrIpv6"),
-                    StructField::new("description", AttributeType::String).with_provider_name("Description"),
-                    StructField::new("from_port", AttributeType::Custom {
-                name: "Int(-1..=65535)".to_string(),
-                base: Box::new(AttributeType::Int),
-                validate: validate_from_port_range,
-                namespace: None,
-                to_dsl: None,
-            }).with_provider_name("FromPort"),
-                    StructField::new("ip_protocol", AttributeType::Custom {
-                name: "IpProtocol".to_string(),
-                base: Box::new(AttributeType::String),
-                validate: validate_ip_protocol,
-                namespace: Some("aws.ec2_security_group".to_string()),
-                to_dsl: Some(|s: &str| match s { "-1" => "all".to_string(), _ => s.replace('-', "_") }),
-            }).required().with_provider_name("IpProtocol"),
-                    StructField::new("source_prefix_list_id", super::aws_resource_id()).with_provider_name("SourcePrefixListId"),
-                    StructField::new("source_security_group_id", super::security_group_id()).with_provider_name("SourceSecurityGroupId"),
-                    StructField::new("source_security_group_name", AttributeType::String).with_provider_name("SourceSecurityGroupName"),
-                    StructField::new("source_security_group_owner_id", AttributeType::String).with_provider_name("SourceSecurityGroupOwnerId"),
-                    StructField::new("to_port", AttributeType::Custom {
-                name: "Int(-1..=65535)".to_string(),
-                base: Box::new(AttributeType::Int),
-                validate: validate_to_port_range,
-                namespace: None,
-                to_dsl: None,
-            }).with_provider_name("ToPort")
-                    ],
-                })))
-                .with_description("The inbound rules associated with the security group. There is a short interruption during which you cannot connect to the security group.")
-                .with_provider_name("SecurityGroupIngress"),
-        )
-        .attribute(
-            AttributeSchema::new("tags", tags_type())
-                .with_description("Any tags assigned to the security group.")
-                .with_provider_name("Tags"),
         )
         .attribute(
             AttributeSchema::new("vpc_id", super::vpc_id())
                 .create_only()
-                .with_description("The ID of the VPC for the security group.")
+                .with_description("<p>The ID of the VPC. Required for a nondefault VPC.</p>")
                 .with_provider_name("VpcId"),
+        )
+        .attribute(
+            AttributeSchema::new("group_id", super::security_group_id())
+                .with_description("<p>The ID of the security group.</p> (read-only)")
+                .with_provider_name("GroupId"),
+        )
+        .attribute(
+            AttributeSchema::new("tags", tags_type())
+                .with_description("The tags for the resource.")
+                .with_provider_name("Tags"),
         )
     }
 }
@@ -184,7 +62,7 @@ pub fn enum_valid_values() -> (
     &'static str,
     &'static [(&'static str, &'static [&'static str])],
 ) {
-    ("ec2_security_group", &[("ip_protocol", VALID_IP_PROTOCOL)])
+    ("ec2_security_group", &[])
 }
 
 /// Maps DSL alias values back to canonical AWS values for this module.

@@ -8,8 +8,13 @@ license = "MIT"
 name = "aws-codegen"
 path = "src/bin/codegen.rs"
 
+[[bin]]
+name = "smithy-codegen"
+path = "src/bin/smithy_codegen.rs"
+
 [dependencies]
 carina-core = { path = "../carina-core" }
+carina-smithy = { path = "../carina-smithy" }
 aws-config = "1"
 aws-sdk-s3 = "1"
 aws-sdk-ec2 = "1"
@@ -23,4 +28,3 @@ anyhow = "1.0"
 clap = { version = "4.0", features = ["derive"] }
 
 [dev-dependencies]
-carina-smithy = { path = "../carina-smithy" }
