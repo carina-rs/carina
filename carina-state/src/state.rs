@@ -102,7 +102,7 @@ impl Default for StateFile {
 /// State of a single managed resource
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResourceState {
-    /// Resource type (e.g., "s3.bucket", "vpc.vpc")
+    /// Resource type (e.g., "s3_bucket", "ec2_vpc")
     pub resource_type: String,
     /// Resource name (from the `name` attribute in DSL)
     pub name: String,
@@ -190,14 +190,14 @@ mod tests {
     fn test_state_file_upsert_resource() {
         let mut state = StateFile::new();
 
-        let resource1 = ResourceState::new("s3.bucket", "my-bucket", "aws")
+        let resource1 = ResourceState::new("s3_bucket", "my-bucket", "aws")
             .with_attribute("region".to_string(), serde_json::json!("ap-northeast-1"));
 
         state.upsert_resource(resource1);
         assert_eq!(state.resources.len(), 1);
 
         // Update the same resource
-        let resource2 = ResourceState::new("s3.bucket", "my-bucket", "aws")
+        let resource2 = ResourceState::new("s3_bucket", "my-bucket", "aws")
             .with_attribute("region".to_string(), serde_json::json!("us-west-2"));
 
         state.upsert_resource(resource2);
@@ -212,29 +212,29 @@ mod tests {
     fn test_state_file_remove_resource() {
         let mut state = StateFile::new();
 
-        let resource = ResourceState::new("s3.bucket", "my-bucket", "aws");
+        let resource = ResourceState::new("s3_bucket", "my-bucket", "aws");
         state.upsert_resource(resource);
         assert_eq!(state.resources.len(), 1);
 
-        let removed = state.remove_resource("s3.bucket", "my-bucket");
+        let removed = state.remove_resource("s3_bucket", "my-bucket");
         assert!(removed.is_some());
         assert_eq!(state.resources.len(), 0);
 
         // Removing non-existent resource returns None
-        let removed = state.remove_resource("s3.bucket", "other-bucket");
+        let removed = state.remove_resource("s3_bucket", "other-bucket");
         assert!(removed.is_none());
     }
 
     #[test]
     fn test_resource_state_protected() {
-        let resource = ResourceState::new("s3.bucket", "state-bucket", "aws").with_protected(true);
+        let resource = ResourceState::new("s3_bucket", "state-bucket", "aws").with_protected(true);
         assert!(resource.protected);
     }
 
     #[test]
     fn test_state_file_serialization() {
         let mut state = StateFile::new();
-        let resource = ResourceState::new("s3.bucket", "my-bucket", "aws")
+        let resource = ResourceState::new("s3_bucket", "my-bucket", "aws")
             .with_attribute("region".to_string(), serde_json::json!("ap-northeast-1"))
             .with_attribute("versioning".to_string(), serde_json::json!("Enabled"));
 
@@ -272,7 +272,7 @@ mod tests {
     fn test_resource_state_backward_compatibility_without_prefixes() {
         // Simulate an old state file without the prefixes field
         let json = r#"{
-            "resource_type": "s3.bucket",
+            "resource_type": "s3_bucket",
             "name": "my-bucket",
             "provider": "aws",
             "attributes": {"region": "ap-northeast-1"},
