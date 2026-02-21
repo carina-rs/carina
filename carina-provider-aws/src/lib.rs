@@ -247,7 +247,12 @@ impl AwsProvider {
                         .status()
                         .map(|s| s.as_str().to_string())
                         .unwrap_or_else(|| "Suspended".to_string());
-                    attributes.insert("versioning".to_string(), Value::String(status));
+                    let mut versioning_map = HashMap::new();
+                    versioning_map.insert("status".to_string(), Value::String(status));
+                    attributes.insert(
+                        "versioning_configuration".to_string(),
+                        Value::List(vec![Value::Map(versioning_map)]),
+                    );
                 }
 
                 // Get lifecycle configuration
@@ -340,7 +345,10 @@ impl AwsProvider {
         })?;
 
         // Configure versioning
-        if let Some(Value::String(status)) = resource.attributes.get("versioning") {
+        if let Some(Value::List(vc_list)) = resource.attributes.get("versioning_configuration")
+            && let Some(Value::Map(vc)) = vc_list.first()
+            && let Some(Value::String(status)) = vc.get("status")
+        {
             use aws_sdk_s3::types::{BucketVersioningStatus, VersioningConfiguration};
             let normalized = extract_enum_value(status);
             let versioning_status = if normalized == "Enabled" {
@@ -416,7 +424,10 @@ impl AwsProvider {
         let bucket_name = identifier.to_string();
 
         // Update versioning configuration
-        if let Some(Value::String(status)) = to.attributes.get("versioning") {
+        if let Some(Value::List(vc_list)) = to.attributes.get("versioning_configuration")
+            && let Some(Value::Map(vc)) = vc_list.first()
+            && let Some(Value::String(status)) = vc.get("status")
+        {
             use aws_sdk_s3::types::{BucketVersioningStatus, VersioningConfiguration};
             let normalized = extract_enum_value(status);
             let versioning_status = if normalized == "Enabled" {
