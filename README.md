@@ -168,13 +168,12 @@ Enum values support multiple formats. The shorthand forms are automatically reso
 
 ```hcl
 # Full namespace format
-versioning = aws.s3.VersioningStatus.Enabled
+instance_tenancy = aws.ec2_vpc.InstanceTenancy.dedicated
 
 # Type.value format
-versioning = VersioningStatus.Enabled
+instance_tenancy = InstanceTenancy.dedicated
 
 # Value-only format (shortest, recommended)
-versioning = Enabled
 instance_tenancy = dedicated
 ```
 
