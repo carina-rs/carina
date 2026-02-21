@@ -19,7 +19,7 @@ download() {
         echo "Already downloaded: $dest"
     else
         echo "Downloading $name model..."
-        curl -sL "$BASE_URL/$path" -o "$dest"
+        curl -fsSL "$BASE_URL/$path" -o "$dest"
         echo "  -> $dest ($(du -h "$dest" | cut -f1))"
     fi
 }
