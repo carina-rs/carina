@@ -32,6 +32,10 @@ struct Args {
     /// Generate only the specified resource (e.g., "ec2_vpc")
     #[arg(long)]
     resource: Option<String>,
+
+    /// Output format: rust (default) or markdown (for documentation)
+    #[arg(long, default_value = "rust")]
+    format: String,
 }
 
 /// Information about a detected enum type
@@ -77,7 +81,8 @@ fn main() -> Result<()> {
     std::fs::create_dir_all(&args.output_dir)?;
 
     // Collect all resource definitions
-    let all_resources = resource_defs::ec2_resources();
+    let mut all_resources = resource_defs::ec2_resources();
+    all_resources.extend(resource_defs::s3_resources());
 
     // Filter to requested resource if specified
     let resources: Vec<&ResourceDef> = if let Some(ref name) = args.resource {
@@ -106,25 +111,41 @@ fn main() -> Result<()> {
         models.insert(res.service_namespace, model);
     }
 
-    // Generate each resource
-    let mut generated_modules: Vec<&str> = Vec::new();
-    for res in &resources {
-        let model = models.get(res.service_namespace).unwrap();
-        let code = generate_resource(res, model)?;
+    match args.format.as_str() {
+        "rust" => {
+            // Generate each resource
+            let mut generated_modules: Vec<&str> = Vec::new();
+            for res in &resources {
+                let model = models.get(res.service_namespace).unwrap();
+                let code = generate_resource(res, model)?;
 
-        let output_path = args.output_dir.join(format!("{}.rs", res.name));
-        std::fs::write(&output_path, &code)
-            .with_context(|| format!("Failed to write {}", output_path.display()))?;
-        eprintln!("Generated: {}", output_path.display());
-        generated_modules.push(res.name);
+                let output_path = args.output_dir.join(format!("{}.rs", res.name));
+                std::fs::write(&output_path, &code)
+                    .with_context(|| format!("Failed to write {}", output_path.display()))?;
+                eprintln!("Generated: {}", output_path.display());
+                generated_modules.push(res.name);
+            }
+
+            // Generate mod.rs
+            let mod_rs = generate_mod_rs(&generated_modules);
+            let mod_path = args.output_dir.join("mod.rs");
+            std::fs::write(&mod_path, &mod_rs)
+                .with_context(|| format!("Failed to write {}", mod_path.display()))?;
+            eprintln!("Generated: {}", mod_path.display());
+        }
+        "markdown" | "md" => {
+            for res in &resources {
+                let model = models.get(res.service_namespace).unwrap();
+                let md = generate_markdown_resource(res, model)?;
+
+                let output_path = args.output_dir.join(format!("{}.md", res.name));
+                std::fs::write(&output_path, &md)
+                    .with_context(|| format!("Failed to write {}", output_path.display()))?;
+                eprintln!("Generated: {}", output_path.display());
+            }
+        }
+        other => anyhow::bail!("Unknown format: {}. Use 'rust' or 'markdown'.", other),
     }
-
-    // Generate mod.rs
-    let mod_rs = generate_mod_rs(&generated_modules);
-    let mod_path = args.output_dir.join("mod.rs");
-    std::fs::write(&mod_path, &mod_rs)
-        .with_context(|| format!("Failed to write {}", mod_path.display()))?;
-    eprintln!("Generated: {}", mod_path.display());
 
     Ok(())
 }
@@ -186,11 +207,17 @@ fn generate_resource(res: &ResourceDef, model: &SmithyModel) -> Result<String> {
         .operation_input(&create_op_id)
         .with_context(|| format!("Cannot find create input for {}", create_op_id))?;
 
-    // Resolve read structure fields
-    let read_structure_id = format!("{}#{}", ns, res.read_structure);
-    let read_structure = model
-        .get_structure(&read_structure_id)
-        .with_context(|| format!("Cannot find read structure {}", read_structure_id))?;
+    // Resolve read structure fields (if present)
+    let read_structure = if let Some(read_struct_name) = res.read_structure {
+        let read_structure_id = format!("{}#{}", ns, read_struct_name);
+        Some(
+            model
+                .get_structure(&read_structure_id)
+                .with_context(|| format!("Cannot find read structure {}", read_structure_id))?,
+        )
+    } else {
+        None
+    };
 
     // Resolve update input fields and their structures
     let mut updatable_fields: HashSet<String> = HashSet::new();
@@ -224,18 +251,41 @@ fn generate_resource(res: &ResourceDef, model: &SmithyModel) -> Result<String> {
         writable_fields.insert(name.clone(), member_ref);
     }
 
-    // Add updatable-only fields: fields in update ops that are NOT in create input.
-    // First check read structure, then check update op inputs.
-    // (e.g., EnableDnsHostnames for VPC is in ModifyVpcAttributeRequest but not in Vpc struct)
-    for (name, member_ref) in &read_structure.members {
-        if exclude.contains(name.as_str()) || name == "Tags" || name == res.identifier {
-            continue;
+    // For read_ops resources: resolve fields from operation outputs and add them
+    // as writable fields (if they match an update op) or read-only.
+    let mut read_op_read_only: BTreeMap<String, &carina_smithy::ShapeRef> = BTreeMap::new();
+    for read_op in &res.read_ops {
+        let op_id = format!("{}#{}", ns, read_op.operation);
+        let output = model
+            .operation_output(&op_id)
+            .with_context(|| format!("Cannot find output for {}", op_id))?;
+        for (field_name, rename) in &read_op.fields {
+            let effective_name = rename.unwrap_or(field_name);
+            if let Some(member_ref) = output.members.get(*field_name) {
+                if updatable_fields.contains(effective_name)
+                    && !writable_fields.contains_key(effective_name)
+                {
+                    writable_fields.insert(effective_name.to_string(), member_ref);
+                } else if !writable_fields.contains_key(effective_name) {
+                    read_op_read_only.insert(effective_name.to_string(), member_ref);
+                }
+            }
         }
-        if writable_fields.contains_key(name) {
-            continue;
-        }
-        if updatable_fields.contains(name.as_str()) {
-            writable_fields.insert(name.clone(), member_ref);
+    }
+
+    // Add updatable-only fields from read structure and update op inputs
+    if let Some(read_struct) = read_structure {
+        // (e.g., EnableDnsHostnames for VPC is in ModifyVpcAttributeRequest but not in Vpc struct)
+        for (name, member_ref) in &read_struct.members {
+            if exclude.contains(name.as_str()) || name == "Tags" || name == res.identifier {
+                continue;
+            }
+            if writable_fields.contains_key(name) {
+                continue;
+            }
+            if updatable_fields.contains(name.as_str()) {
+                writable_fields.insert(name.clone(), member_ref);
+            }
         }
     }
     // Also check update operation inputs for fields not found in create input or read structure
@@ -255,20 +305,28 @@ fn generate_resource(res: &ResourceDef, model: &SmithyModel) -> Result<String> {
 
     // Collect read-only fields from read structure
     let mut read_only_fields: BTreeMap<String, &carina_smithy::ShapeRef> = BTreeMap::new();
-    for (name, member_ref) in &read_structure.members {
-        if exclude.contains(name.as_str()) {
-            continue;
+    if let Some(read_struct) = read_structure {
+        for (name, member_ref) in &read_struct.members {
+            if exclude.contains(name.as_str()) {
+                continue;
+            }
+            if name == "Tags" {
+                continue;
+            }
+            // Skip fields already in writable set
+            if writable_fields.contains_key(name) {
+                continue;
+            }
+            // Include the identifier and extra read-only fields
+            if name == res.identifier || extra_read_only.contains(name.as_str()) {
+                read_only_fields.insert(name.clone(), member_ref);
+            }
         }
-        if name == "Tags" {
-            continue;
-        }
-        // Skip fields already in writable set
-        if writable_fields.contains_key(name) {
-            continue;
-        }
-        // Include the identifier and extra read-only fields
-        if name == res.identifier || extra_read_only.contains(name.as_str()) {
-            read_only_fields.insert(name.clone(), member_ref);
+    }
+    // Add read-only fields from read_ops
+    for (name, member_ref) in read_op_read_only {
+        if !writable_fields.contains_key(&name) && !read_only_fields.contains_key(&name) {
+            read_only_fields.insert(name, member_ref);
         }
     }
 
@@ -370,7 +428,11 @@ fn generate_resource(res: &ResourceDef, model: &SmithyModel) -> Result<String> {
     let mut code = String::new();
 
     // Header
-    let resource_short = res.name.strip_prefix("ec2_").unwrap_or(res.name);
+    let resource_short = res
+        .name
+        .strip_prefix("ec2_")
+        .or_else(|| res.name.strip_prefix("s3_"))
+        .unwrap_or(res.name);
     let mut schema_imports = vec!["AttributeSchema", "ResourceSchema"];
     schema_imports.insert(1, "AttributeType");
     if needs_struct_field {
@@ -483,8 +545,15 @@ fn generate_resource(res: &ResourceDef, model: &SmithyModel) -> Result<String> {
         namespace,
     ));
 
-    // Description from read structure
-    if let Some(desc) = SmithyModel::documentation(&read_structure.traits) {
+    // Description from read structure (or create input for multi-op resources)
+    let desc_traits = if let Some(read_struct) = read_structure {
+        Some(&read_struct.traits)
+    } else {
+        Some(&create_input.traits)
+    };
+    if let Some(traits) = desc_traits
+        && let Some(desc) = SmithyModel::documentation(traits)
+    {
         let escaped = escape_description(desc);
         let truncated = truncate_str(&escaped, 200);
         code.push_str(&format!(
@@ -999,10 +1068,6 @@ fn generate_mod_rs(modules: &[&str]) -> String {
 
     // Module declarations
     let mut all_modules: Vec<&str> = modules.to_vec();
-    // Keep s3_bucket from CF codegen
-    if !all_modules.contains(&"s3_bucket") {
-        all_modules.push("s3_bucket");
-    }
     all_modules.sort();
     for module in &all_modules {
         code.push_str(&format!("pub mod {};\n", module));
@@ -1072,6 +1137,541 @@ fn generate_mod_rs(modules: &[&str]) -> String {
     code.push_str("    None\n}\n");
 
     code
+}
+
+// ── Markdown documentation generation ──
+
+/// Generate markdown documentation for a single resource.
+fn generate_markdown_resource(res: &ResourceDef, model: &SmithyModel) -> Result<String> {
+    let ns = res.service_namespace;
+    let namespace = format!("aws.{}", res.name);
+
+    let exclude: HashSet<&str> = res.exclude_fields.iter().copied().collect();
+    let type_overrides: HashMap<&str, &str> = res.type_overrides.iter().copied().collect();
+    let required_overrides: HashSet<&str> = res.required_overrides.iter().copied().collect();
+    let read_only_overrides: HashSet<&str> = res.read_only_overrides.iter().copied().collect();
+    let extra_read_only: HashSet<&str> = res.extra_read_only.iter().copied().collect();
+    let enum_alias_map: HashMap<&str, Vec<(&str, &str)>> = {
+        let mut m: HashMap<&str, Vec<(&str, &str)>> = HashMap::new();
+        for (attr, alias, canonical) in &res.enum_aliases {
+            m.entry(attr).or_default().push((canonical, alias));
+        }
+        m
+    };
+
+    // Resolve create input
+    let create_op_id = format!("{}#{}", ns, res.create_op);
+    let create_input = model
+        .operation_input(&create_op_id)
+        .with_context(|| format!("Cannot find create input for {}", create_op_id))?;
+
+    // Resolve read structure
+    let read_structure = if let Some(read_struct_name) = res.read_structure {
+        let read_structure_id = format!("{}#{}", ns, read_struct_name);
+        Some(
+            model
+                .get_structure(&read_structure_id)
+                .with_context(|| format!("Cannot find read structure {}", read_structure_id))?,
+        )
+    } else {
+        None
+    };
+
+    // Resolve update fields
+    let mut updatable_fields: HashSet<String> = HashSet::new();
+    for update_op in &res.update_ops {
+        for field in &update_op.fields {
+            updatable_fields.insert(field.to_string());
+        }
+    }
+
+    // Collect writable fields
+    let mut writable_fields: BTreeMap<String, &carina_smithy::ShapeRef> = BTreeMap::new();
+    for (name, member_ref) in &create_input.members {
+        if exclude.contains(name.as_str()) || name == res.identifier || name == "Tags" {
+            continue;
+        }
+        writable_fields.insert(name.clone(), member_ref);
+    }
+
+    // Read ops fields
+    let mut read_op_read_only: BTreeMap<String, &carina_smithy::ShapeRef> = BTreeMap::new();
+    for read_op in &res.read_ops {
+        let op_id = format!("{}#{}", ns, read_op.operation);
+        let output = model
+            .operation_output(&op_id)
+            .with_context(|| format!("Cannot find output for {}", op_id))?;
+        for (field_name, rename) in &read_op.fields {
+            let effective_name = rename.unwrap_or(field_name);
+            if let Some(member_ref) = output.members.get(*field_name) {
+                if updatable_fields.contains(effective_name)
+                    && !writable_fields.contains_key(effective_name)
+                {
+                    writable_fields.insert(effective_name.to_string(), member_ref);
+                } else if !writable_fields.contains_key(effective_name) {
+                    read_op_read_only.insert(effective_name.to_string(), member_ref);
+                }
+            }
+        }
+    }
+
+    // Add updatable-only fields from read structure
+    if let Some(read_struct) = read_structure {
+        for (name, member_ref) in &read_struct.members {
+            if exclude.contains(name.as_str()) || name == "Tags" || name == res.identifier {
+                continue;
+            }
+            if !writable_fields.contains_key(name) && updatable_fields.contains(name.as_str()) {
+                writable_fields.insert(name.clone(), member_ref);
+            }
+        }
+    }
+
+    // Read-only fields
+    let mut read_only_fields: BTreeMap<String, &carina_smithy::ShapeRef> = BTreeMap::new();
+    if let Some(read_struct) = read_structure {
+        for (name, member_ref) in &read_struct.members {
+            if exclude.contains(name.as_str())
+                || name == "Tags"
+                || writable_fields.contains_key(name)
+            {
+                continue;
+            }
+            if name == res.identifier || extra_read_only.contains(name.as_str()) {
+                read_only_fields.insert(name.clone(), member_ref);
+            }
+        }
+    }
+    for (name, member_ref) in read_op_read_only {
+        if !writable_fields.contains_key(&name) && !read_only_fields.contains_key(&name) {
+            read_only_fields.insert(name, member_ref);
+        }
+    }
+
+    // Collect enum info for documentation
+    let mut all_enums: BTreeMap<String, EnumInfo> = BTreeMap::new();
+    // Struct definitions for documentation
+    let mut struct_defs: BTreeMap<String, Vec<(String, &carina_smithy::ShapeRef)>> =
+        BTreeMap::new();
+
+    // Build attr info for writable fields
+    struct MdAttrInfo {
+        snake_name: String,
+        type_display: String,
+        is_required: bool,
+        description: Option<String>,
+    }
+
+    let mut writable_attrs: Vec<MdAttrInfo> = Vec::new();
+    for (name, member_ref) in &writable_fields {
+        let snake_name = name.to_snake_case();
+        let is_required = (SmithyModel::is_required(member_ref)
+            || required_overrides.contains(name.as_str()))
+            && !read_only_overrides.contains(name.as_str());
+        let description = SmithyModel::documentation(&member_ref.traits).map(|s| s.to_string());
+        let type_display = type_display_string_md(
+            model,
+            &member_ref.target,
+            name,
+            &namespace,
+            &type_overrides,
+            &mut all_enums,
+            &mut struct_defs,
+        );
+
+        writable_attrs.push(MdAttrInfo {
+            snake_name,
+            type_display,
+            is_required,
+            description,
+        });
+    }
+
+    let mut read_only_attrs: Vec<MdAttrInfo> = Vec::new();
+    for (name, member_ref) in &read_only_fields {
+        let snake_name = name.to_snake_case();
+        let description = SmithyModel::documentation(&member_ref.traits).map(|s| s.to_string());
+        let type_display = type_display_string_md(
+            model,
+            &member_ref.target,
+            name,
+            &namespace,
+            &type_overrides,
+            &mut all_enums,
+            &mut struct_defs,
+        );
+
+        read_only_attrs.push(MdAttrInfo {
+            snake_name,
+            type_display,
+            is_required: false,
+            description,
+        });
+    }
+
+    // Build markdown output
+    let mut md = String::new();
+
+    // Title
+    md.push_str(&format!("# aws.{}\n\n", res.name));
+    md.push_str(&format!(
+        "CloudFormation Type: `{}`\n\n",
+        cf_type_name(res.name)
+    ));
+
+    // Description
+    let desc_traits = if let Some(read_struct) = read_structure {
+        Some(&read_struct.traits)
+    } else {
+        Some(&create_input.traits)
+    };
+    if let Some(traits) = desc_traits
+        && let Some(desc) = SmithyModel::documentation(traits)
+    {
+        let cleaned = strip_html_tags(desc).replace('\n', " ").replace("  ", " ");
+        md.push_str(&format!("{}\n\n", cleaned.trim()));
+    }
+
+    // Argument Reference
+    md.push_str("## Argument Reference\n\n");
+
+    for attr in &writable_attrs {
+        md.push_str(&format!("### `{}`\n\n", attr.snake_name));
+        md.push_str(&format!("- **Type:** {}\n", attr.type_display));
+        md.push_str(&format!(
+            "- **Required:** {}\n",
+            if attr.is_required { "Yes" } else { "No" }
+        ));
+        md.push('\n');
+
+        if let Some(ref desc) = attr.description {
+            let cleaned = strip_html_tags(desc).replace('\n', " ").replace("  ", " ");
+            md.push_str(&format!("{}\n\n", cleaned.trim()));
+        }
+    }
+
+    // Tags
+    if res.has_tags {
+        md.push_str("### `tags`\n\n");
+        md.push_str("- **Type:** Map\n");
+        md.push_str("- **Required:** No\n\n");
+        md.push_str("The tags for the resource.\n\n");
+    }
+
+    // Enum Values section
+    if !all_enums.is_empty() {
+        md.push_str("## Enum Values\n\n");
+        for (prop_name, enum_info) in &all_enums {
+            let attr_name = prop_name.to_snake_case();
+            let has_hyphens = enum_info.values.iter().any(|v| v.contains('-'));
+            let prop_aliases = enum_alias_map.get(attr_name.as_str());
+
+            md.push_str(&format!("### {} ({})\n\n", attr_name, enum_info.type_name));
+            md.push_str("| Value | DSL Identifier |\n");
+            md.push_str("|-------|----------------|\n");
+
+            for value in &enum_info.values {
+                let dsl_value = if let Some(alias_list) = prop_aliases {
+                    if let Some((_, alias)) = alias_list.iter().find(|(c, _)| *c == value.as_str())
+                    {
+                        alias.to_string()
+                    } else if has_hyphens {
+                        value.replace('-', "_")
+                    } else {
+                        value.clone()
+                    }
+                } else if has_hyphens {
+                    value.replace('-', "_")
+                } else {
+                    value.clone()
+                };
+                let dsl_id = format!("{}.{}.{}", namespace, enum_info.type_name, dsl_value);
+                md.push_str(&format!("| `{}` | `{}` |\n", value, dsl_id));
+            }
+            md.push('\n');
+
+            let first_value = enum_info.values.first().map(|s| s.as_str()).unwrap_or("");
+            let first_dsl = if let Some(alias_list) = prop_aliases {
+                if let Some((_, alias)) = alias_list.iter().find(|(c, _)| *c == first_value) {
+                    alias.to_string()
+                } else if has_hyphens {
+                    first_value.replace('-', "_")
+                } else {
+                    first_value.to_string()
+                }
+            } else if has_hyphens {
+                first_value.replace('-', "_")
+            } else {
+                first_value.to_string()
+            };
+            md.push_str(&format!(
+                "Shorthand formats: `{}` or `{}.{}`\n\n",
+                first_dsl, enum_info.type_name, first_dsl,
+            ));
+        }
+    }
+
+    // Struct Definitions section
+    if !struct_defs.is_empty() {
+        md.push_str("## Struct Definitions\n\n");
+        for (struct_name, fields) in &struct_defs {
+            md.push_str(&format!("### {}\n\n", struct_name));
+            md.push_str("| Field | Type | Required | Description |\n");
+            md.push_str("|-------|------|----------|-------------|\n");
+            for (field_name, member_ref) in fields {
+                let snake_name = field_name.to_snake_case();
+                let is_required = SmithyModel::is_required(member_ref);
+                let field_type_display = type_display_string_md(
+                    model,
+                    &member_ref.target,
+                    field_name,
+                    &namespace,
+                    &type_overrides,
+                    &mut all_enums,
+                    &mut BTreeMap::new(),
+                );
+                let desc = SmithyModel::documentation(&member_ref.traits)
+                    .map(|s| {
+                        let cleaned = strip_html_tags(s).replace('\n', " ").replace("  ", " ");
+                        let trimmed = cleaned.trim().to_string();
+                        if trimmed.len() > 100 {
+                            // Find a safe UTF-8 boundary
+                            let boundary = trimmed
+                                .char_indices()
+                                .take_while(|&(i, _)| i <= 100)
+                                .last()
+                                .map(|(i, _)| i)
+                                .unwrap_or(0);
+                            format!("{}...", &trimmed[..boundary])
+                        } else {
+                            trimmed
+                        }
+                    })
+                    .unwrap_or_default();
+                md.push_str(&format!(
+                    "| `{}` | {} | {} | {} |\n",
+                    snake_name,
+                    field_type_display,
+                    if is_required { "Yes" } else { "No" },
+                    desc
+                ));
+            }
+            md.push('\n');
+        }
+    }
+
+    // Attribute Reference (read-only)
+    if !read_only_attrs.is_empty() {
+        md.push_str("## Attribute Reference\n\n");
+        for attr in &read_only_attrs {
+            md.push_str(&format!("### `{}`\n\n", attr.snake_name));
+            md.push_str(&format!("- **Type:** {}\n\n", attr.type_display));
+        }
+    }
+
+    Ok(md)
+}
+
+/// Determine the display string for a type in markdown docs.
+#[allow(clippy::only_used_in_recursion)]
+fn type_display_string_md<'a>(
+    model: &'a SmithyModel,
+    target: &str,
+    field_name: &str,
+    namespace: &str,
+    type_overrides: &HashMap<&str, &str>,
+    all_enums: &mut BTreeMap<String, EnumInfo>,
+    struct_defs: &mut BTreeMap<String, Vec<(String, &'a carina_smithy::ShapeRef)>>,
+) -> String {
+    // Check type overrides
+    if let Some(&override_type) = type_overrides.get(field_name) {
+        return type_code_to_display(override_type);
+    }
+
+    // Check known enum overrides
+    if let Some(values) = known_enum_overrides().get(field_name) {
+        let type_name = field_name.to_string();
+        let enum_info = EnumInfo {
+            type_name: type_name.clone(),
+            values: values.iter().map(|s| s.to_string()).collect(),
+        };
+        all_enums
+            .entry(field_name.to_string())
+            .or_insert_with(|| enum_info);
+        return format!(
+            "[Enum ({})](#{}-{})",
+            type_name,
+            field_name.to_snake_case(),
+            type_name.to_lowercase()
+        );
+    }
+
+    let kind = model.shape_kind(target);
+
+    match kind {
+        Some(ShapeKind::String) => {
+            if let Some(inferred) = infer_string_type(field_name) {
+                return type_code_to_display(&inferred);
+            }
+            let lower = field_name.to_lowercase();
+            if lower.contains("cidr") {
+                return if lower.contains("ipv6") {
+                    "Ipv6Cidr".to_string()
+                } else {
+                    "Ipv4Cidr".to_string()
+                };
+            }
+            if (lower.contains("ipaddress")
+                || lower.ends_with("ip")
+                || lower.contains("ipaddresses"))
+                && !lower.contains("cidr")
+                && !lower.contains("count")
+                && !lower.contains("type")
+            {
+                return if lower.contains("ipv6") {
+                    "Ipv6Address".to_string()
+                } else {
+                    "Ipv4Address".to_string()
+                };
+            }
+            if is_ipam_pool_id_property(field_name) {
+                return "IpamPoolId".to_string();
+            }
+            if is_aws_resource_id_property(field_name) {
+                return resource_id_display(field_name);
+            }
+            if lower.ends_with("arn") || lower.ends_with("arns") || lower.contains("_arn") {
+                return "Arn".to_string();
+            }
+            if lower == "availabilityzone" {
+                return "AvailabilityZone".to_string();
+            }
+            "String".to_string()
+        }
+        Some(ShapeKind::Boolean) => "Bool".to_string(),
+        Some(ShapeKind::Integer) | Some(ShapeKind::Long) => {
+            let range = get_int_range(model, target, field_name);
+            if let Some(r) = range {
+                format!("Int({}..={})", r.min, r.max)
+            } else {
+                "Int".to_string()
+            }
+        }
+        Some(ShapeKind::Float) | Some(ShapeKind::Double) => "Int".to_string(),
+        Some(ShapeKind::Enum) => {
+            if let Some(values) = model.enum_values(target) {
+                let type_name = field_name.to_string();
+                let string_values: Vec<String> = values.into_iter().map(|(_, v)| v).collect();
+                let enum_info = EnumInfo {
+                    type_name: type_name.clone(),
+                    values: string_values,
+                };
+                all_enums
+                    .entry(field_name.to_string())
+                    .or_insert_with(|| enum_info);
+                format!(
+                    "[Enum ({})](#{}-{})",
+                    type_name,
+                    field_name.to_snake_case(),
+                    type_name.to_lowercase()
+                )
+            } else {
+                "String".to_string()
+            }
+        }
+        Some(ShapeKind::IntEnum) => "Int".to_string(),
+        Some(ShapeKind::List) => {
+            if let Some(carina_smithy::Shape::List(list_shape)) = model.get_shape(target) {
+                let item_display = type_display_string_md(
+                    model,
+                    &list_shape.member.target,
+                    field_name,
+                    namespace,
+                    type_overrides,
+                    all_enums,
+                    struct_defs,
+                );
+                format!("`List<{}>`", item_display)
+            } else {
+                "`List<String>`".to_string()
+            }
+        }
+        Some(ShapeKind::Map) => "Map".to_string(),
+        Some(ShapeKind::Structure) => {
+            let shape_name = SmithyModel::shape_name(target);
+            if shape_name == "TagList" || shape_name == "Tag" {
+                return "Map".to_string();
+            }
+            if shape_name == "AttributeBooleanValue" {
+                return "Bool".to_string();
+            }
+            if let Some(structure) = model.get_structure(target) {
+                // Register struct definition for docs
+                let fields: Vec<(String, &carina_smithy::ShapeRef)> = structure
+                    .members
+                    .iter()
+                    .map(|(n, r)| (n.clone(), r))
+                    .collect();
+                struct_defs.entry(shape_name.to_string()).or_insert(fields);
+                format!("[Struct({})](#{})", shape_name, shape_name.to_lowercase())
+            } else {
+                "String".to_string()
+            }
+        }
+        _ => {
+            if let Some(inferred) = infer_string_type(field_name) {
+                type_code_to_display(&inferred)
+            } else {
+                "String".to_string()
+            }
+        }
+    }
+}
+
+/// Convert a Rust type code string to a human-readable display name.
+fn type_code_to_display(type_code: &str) -> String {
+    match type_code {
+        "AttributeType::String" => "String".to_string(),
+        "AttributeType::Bool" => "Bool".to_string(),
+        "AttributeType::Int" => "Int".to_string(),
+        s if s.contains("ipv4_cidr") => "Ipv4Cidr".to_string(),
+        s if s.contains("ipv6_cidr") => "Ipv6Cidr".to_string(),
+        s if s.contains("ipv4_address") => "Ipv4Address".to_string(),
+        s if s.contains("ipv6_address") => "Ipv6Address".to_string(),
+        s if s.contains("iam_role_arn") => "IamRoleArn".to_string(),
+        s if s.contains("iam_policy_arn") => "IamPolicyArn".to_string(),
+        s if s.contains("kms_key_arn") => "KmsKeyArn".to_string(),
+        s if s.contains("kms_key_id") => "KmsKeyId".to_string(),
+        s if s.contains("vpc_id") => "VpcId".to_string(),
+        s if s.contains("subnet_id") => "SubnetId".to_string(),
+        s if s.contains("security_group_id") => "SecurityGroupId".to_string(),
+        s if s.contains("ipam_pool_id") => "IpamPoolId".to_string(),
+        s if s.contains("arn()") => "Arn".to_string(),
+        s if s.contains("aws_resource_id") => "AwsResourceId".to_string(),
+        s if s.contains("availability_zone") => "AvailabilityZone".to_string(),
+        _ => type_code
+            .trim_start_matches("super::")
+            .trim_end_matches("()")
+            .to_string(),
+    }
+}
+
+/// Get the human-readable display name for a resource ID type.
+fn resource_id_display(prop_name: &str) -> String {
+    match classify_resource_id(prop_name) {
+        ResourceIdKind::VpcId => "VpcId".to_string(),
+        ResourceIdKind::SubnetId => "SubnetId".to_string(),
+        ResourceIdKind::SecurityGroupId => "SecurityGroupId".to_string(),
+        ResourceIdKind::EgressOnlyInternetGatewayId => "EgressOnlyInternetGatewayId".to_string(),
+        ResourceIdKind::InternetGatewayId => "InternetGatewayId".to_string(),
+        ResourceIdKind::RouteTableId => "RouteTableId".to_string(),
+        ResourceIdKind::NatGatewayId => "NatGatewayId".to_string(),
+        ResourceIdKind::VpcPeeringConnectionId => "VpcPeeringConnectionId".to_string(),
+        ResourceIdKind::TransitGatewayId => "TransitGatewayId".to_string(),
+        ResourceIdKind::VpnGatewayId => "VpnGatewayId".to_string(),
+        ResourceIdKind::VpcEndpointId => "VpcEndpointId".to_string(),
+        ResourceIdKind::Generic => "AwsResourceId".to_string(),
+    }
 }
 
 // ── Type inference helpers (ported from codegen.rs) ──
@@ -1253,6 +1853,7 @@ fn cf_type_name(resource_name: &str) -> &'static str {
         "ec2_security_group" => "AWS::EC2::SecurityGroup",
         "ec2_security_group_ingress" => "AWS::EC2::SecurityGroupIngress",
         "ec2_security_group_egress" => "AWS::EC2::SecurityGroupEgress",
+        "s3_bucket" => "AWS::S3::Bucket",
         _ => "UNKNOWN",
     }
 }

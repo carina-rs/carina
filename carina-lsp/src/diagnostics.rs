@@ -1465,15 +1465,17 @@ let sg = awscc.ec2_security_group {
     region = aws.Region.ap_northeast_1
 }
 
-aws.s3_bucket {
-    name = "my-bucket"
+aws.ec2_subnet {
+    name = "my-subnet"
+    vpc_id = "vpc-123"
+    cidr_block = "10.0.1.0/24"
 
-    versioning_configuration {
-        status = Enabled
+    private_dns_name_options_on_launch {
+        hostname_type = aws.ec2_subnet.HostnameType.resource_name
     }
 
-    versioning_configuration {
-        status = Suspended
+    private_dns_name_options_on_launch {
+        hostname_type = aws.ec2_subnet.HostnameType.ip_name
     }
 }"#,
         );
@@ -1489,11 +1491,11 @@ aws.s3_bucket {
             diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
 
-        // Error should point to the second block (line 11, 0-indexed)
+        // Error should point to the second block (line 13, 0-indexed)
         let diag = dup_diag.unwrap();
         assert_eq!(
-            diag.range.start.line, 11,
-            "Diagnostic should point to line 11 (0-indexed, second block), got line {}",
+            diag.range.start.line, 13,
+            "Diagnostic should point to line 13 (0-indexed, second block), got line {}",
             diag.range.start.line
         );
         assert_eq!(diag.severity, Some(DiagnosticSeverity::ERROR));
@@ -1520,11 +1522,13 @@ aws.s3_bucket {
     region = aws.Region.ap_northeast_1
 }
 
-aws.s3_bucket {
-    name = "my-bucket"
+aws.ec2_subnet {
+    name = "my-subnet"
+    vpc_id = "vpc-123"
+    cidr_block = "10.0.1.0/24"
 
-    versioning_configuration {
-        status = Enabled
+    private_dns_name_options_on_launch {
+        hostname_type = aws.ec2_subnet.HostnameType.resource_name
     }
 }"#,
         );

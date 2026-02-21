@@ -1634,7 +1634,7 @@ simple {
     // instead of the custom InstanceTenancy type that provides completions.
 
     #[test]
-    fn versioning_configuration_completion_for_s3_bucket() {
+    fn versioning_status_completion_for_s3_bucket() {
         let provider = CompletionProvider::new();
         let doc = create_document(
             r#"aws.s3_bucket {
@@ -1650,13 +1650,11 @@ simple {
 
         let completions = provider.complete(&doc, position, None);
 
-        // Should have versioning_configuration as attribute completion
-        let versioning_completion = completions
-            .iter()
-            .find(|c| c.label == "versioning_configuration");
+        // Should have versioning_status as attribute completion
+        let versioning_completion = completions.iter().find(|c| c.label == "versioning_status");
         assert!(
             versioning_completion.is_some(),
-            "Should have 'versioning_configuration' attribute completion"
+            "Should have 'versioning_status' attribute completion"
         );
     }
 

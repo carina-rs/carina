@@ -471,6 +471,7 @@ pub(crate) fn iam_policy_arn() -> AttributeType {
 }
 
 /// KMS Key ARN type
+#[allow(dead_code)]
 pub(crate) fn kms_key_arn() -> AttributeType {
     AttributeType::Custom {
         name: "KmsKeyArn".to_string(),
@@ -488,6 +489,7 @@ pub(crate) fn kms_key_arn() -> AttributeType {
 }
 
 /// KMS Key ID type (can be ARN, alias, or UUID)
+#[allow(dead_code)]
 pub(crate) fn kms_key_id() -> AttributeType {
     AttributeType::Custom {
         name: "KmsKeyId".to_string(),

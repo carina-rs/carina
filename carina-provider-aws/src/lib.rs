@@ -248,31 +248,7 @@ impl AwsProvider {
                         .status()
                         .map(|s| s.as_str().to_string())
                         .unwrap_or_else(|| "Suspended".to_string());
-                    let mut versioning_map = HashMap::new();
-                    versioning_map.insert("status".to_string(), Value::String(status));
-                    attributes.insert(
-                        "versioning_configuration".to_string(),
-                        Value::List(vec![Value::Map(versioning_map)]),
-                    );
-                }
-
-                // Get lifecycle configuration
-                if let Ok(lifecycle) = self
-                    .s3_client
-                    .get_bucket_lifecycle_configuration()
-                    .bucket(name)
-                    .send()
-                    .await
-                {
-                    for rule in lifecycle.rules() {
-                        if rule.id() == Some("auto-expiration")
-                            && let Some(expiration) = rule.expiration()
-                            && let Some(days) = expiration.days
-                        {
-                            attributes
-                                .insert("expiration_days".to_string(), Value::Int(days as i64));
-                        }
-                    }
+                    attributes.insert("versioning_status".to_string(), Value::String(status));
                 }
 
                 // S3 bucket identifier is the bucket name
@@ -346,10 +322,7 @@ impl AwsProvider {
         })?;
 
         // Configure versioning
-        if let Some(Value::List(vc_list)) = resource.attributes.get("versioning_configuration")
-            && let Some(Value::Map(vc)) = vc_list.first()
-            && let Some(Value::String(status)) = vc.get("status")
-        {
+        if let Some(Value::String(status)) = resource.attributes.get("versioning_status") {
             use aws_sdk_s3::types::{BucketVersioningStatus, VersioningConfiguration};
             let normalized = extract_enum_value(status);
             let versioning_status = if normalized == "Enabled" {
@@ -372,45 +345,6 @@ impl AwsProvider {
                 })?;
         }
 
-        // Configure lifecycle rule (expiration_days)
-        if let Some(Value::Int(days)) = resource.attributes.get("expiration_days") {
-            use aws_sdk_s3::types::{
-                BucketLifecycleConfiguration, ExpirationStatus, LifecycleExpiration, LifecycleRule,
-                LifecycleRuleFilter,
-            };
-            let expiration = LifecycleExpiration::builder().days(*days as i32).build();
-            let filter = LifecycleRuleFilter::builder().prefix("").build();
-            let rule = LifecycleRule::builder()
-                .id("auto-expiration")
-                .status(ExpirationStatus::Enabled)
-                .filter(filter)
-                .expiration(expiration)
-                .build()
-                .map_err(|e| {
-                    ProviderError::new(format!("Failed to build lifecycle rule: {}", e))
-                        .for_resource(resource.id.clone())
-                })?;
-
-            let config = BucketLifecycleConfiguration::builder()
-                .rules(rule)
-                .build()
-                .map_err(|e| {
-                    ProviderError::new(format!("Failed to build lifecycle config: {}", e))
-                        .for_resource(resource.id.clone())
-                })?;
-
-            self.s3_client
-                .put_bucket_lifecycle_configuration()
-                .bucket(&bucket_name)
-                .lifecycle_configuration(config)
-                .send()
-                .await
-                .map_err(|e| {
-                    ProviderError::new(format!("Failed to set lifecycle: {}", e))
-                        .for_resource(resource.id.clone())
-                })?;
-        }
-
         // Return state after creation
         self.read_s3_bucket(&resource.id, Some(&bucket_name)).await
     }
@@ -424,11 +358,8 @@ impl AwsProvider {
     ) -> ProviderResult<State> {
         let bucket_name = identifier.to_string();
 
-        // Update versioning configuration
-        if let Some(Value::List(vc_list)) = to.attributes.get("versioning_configuration")
-            && let Some(Value::Map(vc)) = vc_list.first()
-            && let Some(Value::String(status)) = vc.get("status")
-        {
+        // Update versioning status
+        if let Some(Value::String(status)) = to.attributes.get("versioning_status") {
             use aws_sdk_s3::types::{BucketVersioningStatus, VersioningConfiguration};
             let normalized = extract_enum_value(status);
             let versioning_status = if normalized == "Enabled" {
@@ -447,45 +378,6 @@ impl AwsProvider {
                 .await
                 .map_err(|e| {
                     ProviderError::new(format!("Failed to update versioning: {}", e))
-                        .for_resource(id.clone())
-                })?;
-        }
-
-        // Update lifecycle rule (expiration_days)
-        if let Some(Value::Int(days)) = to.attributes.get("expiration_days") {
-            use aws_sdk_s3::types::{
-                BucketLifecycleConfiguration, ExpirationStatus, LifecycleExpiration, LifecycleRule,
-                LifecycleRuleFilter,
-            };
-            let expiration = LifecycleExpiration::builder().days(*days as i32).build();
-            let filter = LifecycleRuleFilter::builder().prefix("").build();
-            let rule = LifecycleRule::builder()
-                .id("auto-expiration")
-                .status(ExpirationStatus::Enabled)
-                .filter(filter)
-                .expiration(expiration)
-                .build()
-                .map_err(|e| {
-                    ProviderError::new(format!("Failed to build lifecycle rule: {}", e))
-                        .for_resource(id.clone())
-                })?;
-
-            let config = BucketLifecycleConfiguration::builder()
-                .rules(rule)
-                .build()
-                .map_err(|e| {
-                    ProviderError::new(format!("Failed to build lifecycle config: {}", e))
-                        .for_resource(id.clone())
-                })?;
-
-            self.s3_client
-                .put_bucket_lifecycle_configuration()
-                .bucket(&bucket_name)
-                .lifecycle_configuration(config)
-                .send()
-                .await
-                .map_err(|e| {
-                    ProviderError::new(format!("Failed to set lifecycle: {}", e))
                         .for_resource(id.clone())
                 })?;
         }

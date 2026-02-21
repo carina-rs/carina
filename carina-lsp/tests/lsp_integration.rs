@@ -384,8 +384,8 @@ async fn test_resource_attribute_completion() {
         labels
     );
     assert!(
-        labels.contains(&"versioning_configuration"),
-        "Should have 'versioning_configuration' attribute completion. Got: {:?}",
+        labels.contains(&"versioning_status"),
+        "Should have 'versioning_status' attribute completion. Got: {:?}",
         labels
     );
 

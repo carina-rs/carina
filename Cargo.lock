@@ -729,7 +729,6 @@ dependencies = [
  "carina-smithy",
  "clap",
  "heck",
- "regex",
  "serde",
  "serde_json",
  "thiserror",
