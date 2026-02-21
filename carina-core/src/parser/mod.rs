@@ -1853,4 +1853,50 @@ mod tests {
         assert!(result.resources[0].lifecycle.force_delete);
         assert!(!result.resources[0].attributes.contains_key("lifecycle"));
     }
+
+    /// Regression test for issue #146: anonymous AWSCC resources should not have
+    /// a spurious "name" attribute injected into the attributes map.
+    #[test]
+    fn anonymous_resource_no_spurious_name_attribute() {
+        let input = r#"
+            awscc.ec2.vpc {
+                cidr_block = "10.0.0.0/16"
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+        assert_eq!(result.resources.len(), 1);
+
+        let resource = &result.resources[0];
+        assert_eq!(resource.id.name, ""); // anonymous → empty name
+        // "name" must NOT appear in attributes unless the user explicitly wrote it
+        assert!(
+            !resource.attributes.contains_key("name"),
+            "Anonymous AWSCC resource should not have 'name' in attributes, but found: {:?}",
+            resource.attributes.get("name")
+        );
+    }
+
+    /// Regression test for issue #146: let-bound AWSCC resources should not have
+    /// a spurious "name" attribute injected by the parser.
+    #[test]
+    fn let_bound_resource_no_spurious_name_attribute() {
+        let input = r#"
+            let vpc = awscc.ec2.vpc {
+                cidr_block = "10.0.0.0/16"
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+        assert_eq!(result.resources.len(), 1);
+
+        let resource = &result.resources[0];
+        assert_eq!(resource.id.name, "vpc"); // binding name → resource name
+        // "name" must NOT appear in attributes (it's only the id.name, not an attribute)
+        assert!(
+            !resource.attributes.contains_key("name"),
+            "Let-bound AWSCC resource should not have 'name' in attributes, but found: {:?}",
+            resource.attributes.get("name")
+        );
+    }
 }
