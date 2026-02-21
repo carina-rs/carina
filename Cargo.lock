@@ -726,6 +726,7 @@ dependencies = [
  "aws-sdk-ec2",
  "aws-sdk-s3",
  "carina-core",
+ "carina-smithy",
  "clap",
  "heck",
  "regex",

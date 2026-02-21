@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 fn fixture_path(name: &str) -> PathBuf {
     let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    path.push("tests/fixtures/aws");
+    path.push("tests/fixtures/smithy");
     path.push(format!("{name}.json"));
     path
 }
@@ -12,7 +12,7 @@ fn load_model(name: &str) -> SmithyModel {
     let path = fixture_path(name);
     if !path.exists() {
         panic!(
-            "Model file not found: {}\nRun scripts/download-models.sh first",
+            "Model file not found: {}\nRun scripts/download-smithy-models.sh first",
             path.display()
         );
     }
