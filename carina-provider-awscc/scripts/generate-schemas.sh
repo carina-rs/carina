@@ -77,8 +77,8 @@ if [ ! -f "$CODEGEN_BIN" ]; then
 fi
 
 for TYPE_NAME in "${RESOURCE_TYPES[@]}"; do
-    # Use codegen to compute the module name (e.g., security_group_egress)
-    MODNAME=$("$CODEGEN_BIN" --type-name "$TYPE_NAME" --print-module-name)
+    # Use codegen to compute the module name (e.g., ec2_security_group_egress)
+    MODNAME=$("$CODEGEN_BIN" --type-name "$TYPE_NAME" --print-full-resource-name)
     OUTPUT_FILE="$OUTPUT_DIR/${MODNAME}.rs"
 
     echo "Generating $TYPE_NAME -> $OUTPUT_FILE"
@@ -123,7 +123,7 @@ EOF
 
 # Add module declarations
 for TYPE_NAME in "${RESOURCE_TYPES[@]}"; do
-    MODNAME=$("$CODEGEN_BIN" --type-name "$TYPE_NAME" --print-module-name)
+    MODNAME=$("$CODEGEN_BIN" --type-name "$TYPE_NAME" --print-full-resource-name)
     echo "pub mod ${MODNAME};" >> "$OUTPUT_DIR/mod.rs"
 done
 
@@ -137,9 +137,8 @@ EOF
 
 # Add config function calls dynamically
 for TYPE_NAME in "${RESOURCE_TYPES[@]}"; do
-    MODNAME=$("$CODEGEN_BIN" --type-name "$TYPE_NAME" --print-module-name)
-    FULL_RESOURCE=$("$CODEGEN_BIN" --type-name "$TYPE_NAME" --print-full-resource-name)
-    FUNC_NAME="${FULL_RESOURCE}_config"
+    MODNAME=$("$CODEGEN_BIN" --type-name "$TYPE_NAME" --print-full-resource-name)
+    FUNC_NAME="${MODNAME}_config"
 
     echo "        ${MODNAME}::${FUNC_NAME}()," >> "$OUTPUT_DIR/mod.rs"
 done
@@ -164,7 +163,7 @@ EOF
 
 # Add enum_valid_values() calls dynamically
 for TYPE_NAME in "${RESOURCE_TYPES[@]}"; do
-    MODNAME=$("$CODEGEN_BIN" --type-name "$TYPE_NAME" --print-module-name)
+    MODNAME=$("$CODEGEN_BIN" --type-name "$TYPE_NAME" --print-full-resource-name)
     echo "        ${MODNAME}::enum_valid_values()," >> "$OUTPUT_DIR/mod.rs"
 done
 
@@ -190,10 +189,9 @@ EOF
 
 # Add enum_alias_reverse() dispatches dynamically
 for TYPE_NAME in "${RESOURCE_TYPES[@]}"; do
-    MODNAME=$("$CODEGEN_BIN" --type-name "$TYPE_NAME" --print-module-name)
-    FULL_RESOURCE=$("$CODEGEN_BIN" --type-name "$TYPE_NAME" --print-full-resource-name)
+    MODNAME=$("$CODEGEN_BIN" --type-name "$TYPE_NAME" --print-full-resource-name)
     cat >> "$OUTPUT_DIR/mod.rs" << INNEREOF
-    if resource_type == "${FULL_RESOURCE}" {
+    if resource_type == "${MODNAME}" {
         return ${MODNAME}::enum_alias_reverse(attr_name, value);
     }
 INNEREOF
