@@ -726,6 +726,7 @@ dependencies = [
  "aws-sdk-ec2",
  "aws-sdk-s3",
  "carina-core",
+ "carina-smithy",
  "clap",
  "heck",
  "regex",
@@ -751,6 +752,14 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tokio",
+]
+
+[[package]]
+name = "carina-smithy"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
