@@ -8,31 +8,39 @@ fn fixture_path(name: &str) -> PathBuf {
     path
 }
 
-fn load_model(name: &str) -> SmithyModel {
+/// Load a Smithy model from the fixtures directory.
+/// Returns `None` if the model file doesn't exist (skips test in CI).
+/// Run `scripts/download-smithy-models.sh` to download models for local testing.
+fn load_model(name: &str) -> Option<SmithyModel> {
     let path = fixture_path(name);
     if !path.exists() {
-        panic!(
-            "Model file not found: {}\nRun scripts/download-smithy-models.sh first",
+        eprintln!(
+            "Skipping: model file not found: {}\nRun scripts/download-smithy-models.sh to enable this test",
             path.display()
         );
+        return None;
     }
     let file = std::fs::File::open(&path).expect("Failed to open model file");
     let reader = std::io::BufReader::new(file);
-    parse_reader(reader).expect("Failed to parse model")
+    Some(parse_reader(reader).expect("Failed to parse model"))
 }
 
 // ── EC2 Tests ──
 
 #[test]
 fn test_ec2_parse() {
-    let model = load_model("ec2");
+    let Some(model) = load_model("ec2") else {
+        return;
+    };
     assert_eq!(model.smithy, "2.0");
     assert!(model.shapes.len() > 4000); // EC2 has ~4,715 shapes
 }
 
 #[test]
 fn test_ec2_find_service() {
-    let model = load_model("ec2");
+    let Some(model) = load_model("ec2") else {
+        return;
+    };
     let (id, service) = model.find_service().expect("No service found");
     assert_eq!(id, "com.amazonaws.ec2#AmazonEC2");
     assert_eq!(service.version, "2016-11-15");
@@ -41,7 +49,9 @@ fn test_ec2_find_service() {
 
 #[test]
 fn test_ec2_create_vpc_operation() {
-    let model = load_model("ec2");
+    let Some(model) = load_model("ec2") else {
+        return;
+    };
     let op = model
         .get_operation("com.amazonaws.ec2#CreateVpc")
         .expect("CreateVpc not found");
@@ -59,7 +69,9 @@ fn test_ec2_create_vpc_operation() {
 
 #[test]
 fn test_ec2_create_vpc_input() {
-    let model = load_model("ec2");
+    let Some(model) = load_model("ec2") else {
+        return;
+    };
     let input = model
         .operation_input("com.amazonaws.ec2#CreateVpc")
         .expect("No input");
@@ -74,7 +86,9 @@ fn test_ec2_create_vpc_input() {
 
 #[test]
 fn test_ec2_create_vpc_output() {
-    let model = load_model("ec2");
+    let Some(model) = load_model("ec2") else {
+        return;
+    };
     let output = model
         .operation_output("com.amazonaws.ec2#CreateVpc")
         .expect("No output");
@@ -85,7 +99,9 @@ fn test_ec2_create_vpc_output() {
 
 #[test]
 fn test_ec2_vpc_structure() {
-    let model = load_model("ec2");
+    let Some(model) = load_model("ec2") else {
+        return;
+    };
     let vpc = model
         .get_structure("com.amazonaws.ec2#Vpc")
         .expect("Vpc not found");
@@ -110,7 +126,9 @@ fn test_ec2_vpc_structure() {
 
 #[test]
 fn test_ec2_delete_vpc_unit_output() {
-    let model = load_model("ec2");
+    let Some(model) = load_model("ec2") else {
+        return;
+    };
     // DeleteVpc returns smithy.api#Unit
     assert!(
         model
@@ -121,7 +139,9 @@ fn test_ec2_delete_vpc_unit_output() {
 
 #[test]
 fn test_ec2_delete_vpc_required_field() {
-    let model = load_model("ec2");
+    let Some(model) = load_model("ec2") else {
+        return;
+    };
     let input = model
         .operation_input("com.amazonaws.ec2#DeleteVpc")
         .expect("No input");
@@ -132,7 +152,9 @@ fn test_ec2_delete_vpc_required_field() {
 
 #[test]
 fn test_ec2_tenancy_enum() {
-    let model = load_model("ec2");
+    let Some(model) = load_model("ec2") else {
+        return;
+    };
     let values = model
         .enum_values("com.amazonaws.ec2#Tenancy")
         .expect("Tenancy enum not found");
@@ -145,7 +167,9 @@ fn test_ec2_tenancy_enum() {
 
 #[test]
 fn test_ec2_vpc_state_enum() {
-    let model = load_model("ec2");
+    let Some(model) = load_model("ec2") else {
+        return;
+    };
     let values = model
         .enum_values("com.amazonaws.ec2#VpcState")
         .expect("VpcState enum not found");
@@ -157,7 +181,9 @@ fn test_ec2_vpc_state_enum() {
 
 #[test]
 fn test_ec2_internet_gateway() {
-    let model = load_model("ec2");
+    let Some(model) = load_model("ec2") else {
+        return;
+    };
 
     // Operation exists
     let op = model
@@ -178,7 +204,9 @@ fn test_ec2_internet_gateway() {
 
 #[test]
 fn test_ec2_describe_vpcs_paginated() {
-    let model = load_model("ec2");
+    let Some(model) = load_model("ec2") else {
+        return;
+    };
     let op = model
         .get_operation("com.amazonaws.ec2#DescribeVpcs")
         .expect("DescribeVpcs not found");
@@ -189,7 +217,9 @@ fn test_ec2_describe_vpcs_paginated() {
 
 #[test]
 fn test_ec2_shape_kind_resolution() {
-    let model = load_model("ec2");
+    let Some(model) = load_model("ec2") else {
+        return;
+    };
 
     assert_eq!(
         model.shape_kind("com.amazonaws.ec2#AmazonEC2"),
@@ -225,21 +255,27 @@ fn test_ec2_shape_kind_resolution() {
 
 #[test]
 fn test_s3_parse() {
-    let model = load_model("s3");
+    let Some(model) = load_model("s3") else {
+        return;
+    };
     assert_eq!(model.smithy, "2.0");
     assert!(model.shapes.len() > 700);
 }
 
 #[test]
 fn test_s3_find_service() {
-    let model = load_model("s3");
+    let Some(model) = load_model("s3") else {
+        return;
+    };
     let (id, _service) = model.find_service().expect("No service found");
     assert_eq!(id, "com.amazonaws.s3#AmazonS3");
 }
 
 #[test]
 fn test_s3_create_bucket() {
-    let model = load_model("s3");
+    let Some(model) = load_model("s3") else {
+        return;
+    };
     let op = model
         .get_operation("com.amazonaws.s3#CreateBucket")
         .expect("CreateBucket not found");
@@ -249,7 +285,9 @@ fn test_s3_create_bucket() {
 
 #[test]
 fn test_s3_has_union_shapes() {
-    let model = load_model("s3");
+    let Some(model) = load_model("s3") else {
+        return;
+    };
     // S3 has union shapes (e.g., AnalyticsFilter, MetricsFilter)
     let mut union_count = 0;
     for shape in model.shapes.values() {
@@ -262,7 +300,9 @@ fn test_s3_has_union_shapes() {
 
 #[test]
 fn test_s3_has_map_shapes() {
-    let model = load_model("s3");
+    let Some(model) = load_model("s3") else {
+        return;
+    };
     // S3 has map shapes (e.g., Metadata)
     let metadata = model.get_shape("com.amazonaws.s3#Metadata");
     assert!(metadata.is_some());
@@ -276,7 +316,9 @@ fn test_s3_has_map_shapes() {
 
 #[test]
 fn test_s3_has_timestamp_shapes() {
-    let model = load_model("s3");
+    let Some(model) = load_model("s3") else {
+        return;
+    };
     let mut timestamp_count = 0;
     for shape in model.shapes.values() {
         if let Shape::Timestamp(_) = shape {
