@@ -68,6 +68,10 @@ impl ProviderFactory for AwsProviderFactory {
     fn schemas(&self) -> Vec<carina_core::schema::ResourceSchema> {
         schemas::all_schemas()
     }
+
+    fn identity_attributes(&self) -> Vec<&str> {
+        vec!["region"]
+    }
 }
 
 /// S3 Bucket resource type

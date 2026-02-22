@@ -190,6 +190,14 @@ pub trait ProviderFactory: Send + Sync {
     fn format_schema_key(&self, resource_type: &str) -> String {
         format!("{}.{}", self.name(), resource_type)
     }
+
+    /// Attribute names (beyond schema create-only properties) that contribute
+    /// to anonymous resource identity. For example, AWS providers return
+    /// `["region"]` because the same resource type in different regions must
+    /// produce different identifiers.
+    fn identity_attributes(&self) -> Vec<&str> {
+        vec![]
+    }
 }
 
 /// Provider implementation for Box<dyn Provider>

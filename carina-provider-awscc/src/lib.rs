@@ -76,6 +76,10 @@ impl ProviderFactory for AwsccProviderFactory {
     fn schemas(&self) -> Vec<carina_core::schema::ResourceSchema> {
         schemas::all_schemas()
     }
+
+    fn identity_attributes(&self) -> Vec<&str> {
+        vec!["region"]
+    }
 }
 
 // =============================================================================
