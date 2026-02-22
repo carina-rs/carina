@@ -87,7 +87,9 @@ pub struct LifecycleConfig {
     /// If true, force-delete the resource (e.g., empty S3 bucket before deletion)
     #[serde(default)]
     pub force_delete: bool,
-    // Future: create_before_destroy, prevent_destroy (issue #150)
+    /// If true, create the new resource before destroying the old one during replacement
+    #[serde(default)]
+    pub create_before_destroy: bool,
 }
 
 /// Desired state declared in DSL
@@ -246,5 +248,26 @@ mod tests {
         let json = serde_json::to_string(&state).unwrap();
         let deserialized: State = serde_json::from_str(&json).unwrap();
         assert_eq!(state, deserialized);
+    }
+
+    #[test]
+    fn lifecycle_config_serde_with_create_before_destroy() {
+        let config = LifecycleConfig {
+            force_delete: false,
+            create_before_destroy: true,
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let deserialized: LifecycleConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(config, deserialized);
+        assert!(deserialized.create_before_destroy);
+    }
+
+    #[test]
+    fn lifecycle_config_backward_compatible_deserialize() {
+        // Old JSON without create_before_destroy field should deserialize with default (false)
+        let json = r#"{"force_delete":true}"#;
+        let config: LifecycleConfig = serde_json::from_str(json).unwrap();
+        assert!(config.force_delete);
+        assert!(!config.create_before_destroy);
     }
 }

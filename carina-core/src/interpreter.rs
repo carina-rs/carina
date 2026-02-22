@@ -128,12 +128,21 @@ impl<P: Provider> Interpreter<P> {
                 lifecycle,
                 ..
             } => {
-                // Delete the existing resource first
-                let identifier = from.identifier.as_deref().unwrap_or("");
-                self.provider.delete(id, identifier, lifecycle).await?;
-                // Then create the new resource
-                let state = self.provider.create(to).await?;
-                Ok(EffectOutcome::Replaced { state })
+                if lifecycle.create_before_destroy {
+                    // Create the new resource first
+                    let state = self.provider.create(to).await?;
+                    // Then delete the old resource
+                    let identifier = from.identifier.as_deref().unwrap_or("");
+                    self.provider.delete(id, identifier, lifecycle).await?;
+                    Ok(EffectOutcome::Replaced { state })
+                } else {
+                    // Delete the existing resource first
+                    let identifier = from.identifier.as_deref().unwrap_or("");
+                    self.provider.delete(id, identifier, lifecycle).await?;
+                    // Then create the new resource
+                    let state = self.provider.create(to).await?;
+                    Ok(EffectOutcome::Replaced { state })
+                }
             }
             Effect::Delete {
                 id,
@@ -271,5 +280,125 @@ mod tests {
             result.outcomes[0],
             Ok(EffectOutcome::Skipped { .. })
         ));
+    }
+
+    /// Provider that tracks the order of operations
+    struct OrderTrackingProvider {
+        ops: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl Provider for OrderTrackingProvider {
+        fn name(&self) -> &'static str {
+            "order_tracking"
+        }
+
+        fn resource_types(&self) -> Vec<Box<dyn crate::provider::ResourceType>> {
+            vec![]
+        }
+
+        fn read(
+            &self,
+            id: &ResourceId,
+            _identifier: Option<&str>,
+        ) -> BoxFuture<'_, ProviderResult<State>> {
+            let id = id.clone();
+            Box::pin(async move { Ok(State::not_found(id)) })
+        }
+
+        fn create(&self, resource: &Resource) -> BoxFuture<'_, ProviderResult<State>> {
+            self.ops.lock().unwrap().push("create".to_string());
+            let state = State::existing(resource.id.clone(), resource.attributes.clone())
+                .with_identifier("test-id");
+            Box::pin(async move { Ok(state) })
+        }
+
+        fn update(
+            &self,
+            id: &ResourceId,
+            _identifier: &str,
+            _from: &State,
+            to: &Resource,
+        ) -> BoxFuture<'_, ProviderResult<State>> {
+            self.ops.lock().unwrap().push("update".to_string());
+            let state = State::existing(id.clone(), to.attributes.clone());
+            Box::pin(async move { Ok(state) })
+        }
+
+        fn delete(
+            &self,
+            _id: &ResourceId,
+            _identifier: &str,
+            _lifecycle: &LifecycleConfig,
+        ) -> BoxFuture<'_, ProviderResult<()>> {
+            self.ops.lock().unwrap().push("delete".to_string());
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    #[tokio::test]
+    async fn replace_default_order_delete_then_create() {
+        use crate::resource::Value;
+        use std::collections::HashMap;
+
+        let ops = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = OrderTrackingProvider { ops: ops.clone() };
+        let interpreter = Interpreter::new(provider);
+
+        let mut plan = Plan::new();
+        plan.add(Effect::Replace {
+            id: ResourceId::new("test", "example"),
+            from: Box::new(
+                State::existing(
+                    ResourceId::new("test", "example"),
+                    HashMap::from([("key".to_string(), Value::String("old".to_string()))]),
+                )
+                .with_identifier("test-id"),
+            ),
+            to: Resource::new("test", "example")
+                .with_attribute("key", Value::String("new".to_string())),
+            lifecycle: LifecycleConfig::default(),
+            changed_create_only: vec!["key".to_string()],
+        });
+
+        let result = interpreter.apply(&plan).await;
+        assert!(result.is_success());
+
+        let ops = ops.lock().unwrap();
+        assert_eq!(*ops, vec!["delete", "create"]);
+    }
+
+    #[tokio::test]
+    async fn replace_create_before_destroy_order() {
+        use crate::resource::Value;
+        use std::collections::HashMap;
+
+        let ops = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = OrderTrackingProvider { ops: ops.clone() };
+        let interpreter = Interpreter::new(provider);
+
+        let mut plan = Plan::new();
+        plan.add(Effect::Replace {
+            id: ResourceId::new("test", "example"),
+            from: Box::new(
+                State::existing(
+                    ResourceId::new("test", "example"),
+                    HashMap::from([("key".to_string(), Value::String("old".to_string()))]),
+                )
+                .with_identifier("test-id"),
+            ),
+            to: Resource::new("test", "example")
+                .with_attribute("key", Value::String("new".to_string())),
+            lifecycle: LifecycleConfig {
+                force_delete: false,
+                create_before_destroy: true,
+            },
+            changed_create_only: vec!["key".to_string()],
+        });
+
+        let result = interpreter.apply(&plan).await;
+        assert!(result.is_success());
+
+        let ops = ops.lock().unwrap();
+        assert_eq!(*ops, vec!["create", "delete"]);
     }
 }

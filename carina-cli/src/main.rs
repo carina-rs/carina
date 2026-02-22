@@ -1562,45 +1562,88 @@ async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
                 lifecycle,
                 ..
             } => {
-                // Delete the existing resource
-                let identifier = from.identifier.as_deref().unwrap_or("");
-                match provider.delete(id, identifier, lifecycle).await {
-                    Ok(()) => {
-                        // Re-resolve references with current binding_map
-                        let mut resolved_resource = to.clone();
-                        for (key, value) in &to.attributes {
-                            resolved_resource
-                                .attributes
-                                .insert(key.clone(), resolve_ref_value(value, &binding_map));
-                        }
+                if lifecycle.create_before_destroy {
+                    // Create the new resource first
+                    let mut resolved_resource = to.clone();
+                    for (key, value) in &to.attributes {
+                        resolved_resource
+                            .attributes
+                            .insert(key.clone(), resolve_ref_value(value, &binding_map));
+                    }
 
-                        // Create the new resource
-                        match provider.create(&resolved_resource).await {
-                            Ok(state) => {
-                                println!("  {} {}", "✓".green(), format_effect(effect));
-                                success_count += 1;
+                    match provider.create(&resolved_resource).await {
+                        Ok(state) => {
+                            // Then delete the old resource
+                            let identifier = from.identifier.as_deref().unwrap_or("");
+                            match provider.delete(id, identifier, lifecycle).await {
+                                Ok(()) => {
+                                    println!("  {} {}", "✓".green(), format_effect(effect));
+                                    success_count += 1;
 
-                                applied_states.insert(to.id.clone(), state.clone());
+                                    applied_states.insert(to.id.clone(), state.clone());
 
-                                if let Some(Value::String(binding_name)) =
-                                    to.attributes.get("_binding")
-                                {
-                                    let mut attrs = resolved_resource.attributes.clone();
-                                    for (k, v) in &state.attributes {
-                                        attrs.insert(k.clone(), v.clone());
+                                    if let Some(Value::String(binding_name)) =
+                                        to.attributes.get("_binding")
+                                    {
+                                        let mut attrs = resolved_resource.attributes.clone();
+                                        for (k, v) in &state.attributes {
+                                            attrs.insert(k.clone(), v.clone());
+                                        }
+                                        binding_map.insert(binding_name.clone(), attrs);
                                     }
-                                    binding_map.insert(binding_name.clone(), attrs);
+                                }
+                                Err(e) => {
+                                    println!("  {} {} - {}", "✗".red(), format_effect(effect), e);
+                                    failure_count += 1;
                                 }
                             }
-                            Err(e) => {
-                                println!("  {} {} - {}", "✗".red(), format_effect(effect), e);
-                                failure_count += 1;
-                            }
+                        }
+                        Err(e) => {
+                            println!("  {} {} - {}", "✗".red(), format_effect(effect), e);
+                            failure_count += 1;
                         }
                     }
-                    Err(e) => {
-                        println!("  {} {} - {}", "✗".red(), format_effect(effect), e);
-                        failure_count += 1;
+                } else {
+                    // Delete the existing resource first
+                    let identifier = from.identifier.as_deref().unwrap_or("");
+                    match provider.delete(id, identifier, lifecycle).await {
+                        Ok(()) => {
+                            // Re-resolve references with current binding_map
+                            let mut resolved_resource = to.clone();
+                            for (key, value) in &to.attributes {
+                                resolved_resource
+                                    .attributes
+                                    .insert(key.clone(), resolve_ref_value(value, &binding_map));
+                            }
+
+                            // Create the new resource
+                            match provider.create(&resolved_resource).await {
+                                Ok(state) => {
+                                    println!("  {} {}", "✓".green(), format_effect(effect));
+                                    success_count += 1;
+
+                                    applied_states.insert(to.id.clone(), state.clone());
+
+                                    if let Some(Value::String(binding_name)) =
+                                        to.attributes.get("_binding")
+                                    {
+                                        let mut attrs = resolved_resource.attributes.clone();
+                                        for (k, v) in &state.attributes {
+                                            attrs.insert(k.clone(), v.clone());
+                                        }
+                                        binding_map.insert(binding_name.clone(), attrs);
+                                    }
+                                }
+                                Err(e) => {
+                                    println!("  {} {} - {}", "✗".red(), format_effect(effect), e);
+                                    failure_count += 1;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            println!("  {} {} - {}", "✗".red(), format_effect(effect), e);
+                            failure_count += 1;
+                        }
                     }
                 }
             }
@@ -2043,41 +2086,83 @@ async fn run_apply_from_plan(plan_path: &PathBuf, auto_approve: bool) -> Result<
                 lifecycle,
                 ..
             } => {
-                let identifier = from.identifier.as_deref().unwrap_or("");
-                match provider.delete(id, identifier, lifecycle).await {
-                    Ok(()) => {
-                        let mut resolved_resource = to.clone();
-                        for (key, value) in &to.attributes {
-                            resolved_resource
-                                .attributes
-                                .insert(key.clone(), resolve_ref_value(value, &binding_map));
-                        }
+                if lifecycle.create_before_destroy {
+                    // Create the new resource first
+                    let mut resolved_resource = to.clone();
+                    for (key, value) in &to.attributes {
+                        resolved_resource
+                            .attributes
+                            .insert(key.clone(), resolve_ref_value(value, &binding_map));
+                    }
 
-                        match provider.create(&resolved_resource).await {
-                            Ok(state) => {
-                                println!("  {} {}", "✓".green(), format_effect(effect));
-                                success_count += 1;
-                                applied_states.insert(to.id.clone(), state.clone());
+                    match provider.create(&resolved_resource).await {
+                        Ok(state) => {
+                            // Then delete the old resource
+                            let identifier = from.identifier.as_deref().unwrap_or("");
+                            match provider.delete(id, identifier, lifecycle).await {
+                                Ok(()) => {
+                                    println!("  {} {}", "✓".green(), format_effect(effect));
+                                    success_count += 1;
+                                    applied_states.insert(to.id.clone(), state.clone());
 
-                                if let Some(Value::String(binding_name)) =
-                                    to.attributes.get("_binding")
-                                {
-                                    let mut attrs = resolved_resource.attributes.clone();
-                                    for (k, v) in &state.attributes {
-                                        attrs.insert(k.clone(), v.clone());
+                                    if let Some(Value::String(binding_name)) =
+                                        to.attributes.get("_binding")
+                                    {
+                                        let mut attrs = resolved_resource.attributes.clone();
+                                        for (k, v) in &state.attributes {
+                                            attrs.insert(k.clone(), v.clone());
+                                        }
+                                        binding_map.insert(binding_name.clone(), attrs);
                                     }
-                                    binding_map.insert(binding_name.clone(), attrs);
+                                }
+                                Err(e) => {
+                                    println!("  {} {} - {}", "✗".red(), format_effect(effect), e);
+                                    failure_count += 1;
                                 }
                             }
-                            Err(e) => {
-                                println!("  {} {} - {}", "✗".red(), format_effect(effect), e);
-                                failure_count += 1;
-                            }
+                        }
+                        Err(e) => {
+                            println!("  {} {} - {}", "✗".red(), format_effect(effect), e);
+                            failure_count += 1;
                         }
                     }
-                    Err(e) => {
-                        println!("  {} {} - {}", "✗".red(), format_effect(effect), e);
-                        failure_count += 1;
+                } else {
+                    let identifier = from.identifier.as_deref().unwrap_or("");
+                    match provider.delete(id, identifier, lifecycle).await {
+                        Ok(()) => {
+                            let mut resolved_resource = to.clone();
+                            for (key, value) in &to.attributes {
+                                resolved_resource
+                                    .attributes
+                                    .insert(key.clone(), resolve_ref_value(value, &binding_map));
+                            }
+
+                            match provider.create(&resolved_resource).await {
+                                Ok(state) => {
+                                    println!("  {} {}", "✓".green(), format_effect(effect));
+                                    success_count += 1;
+                                    applied_states.insert(to.id.clone(), state.clone());
+
+                                    if let Some(Value::String(binding_name)) =
+                                        to.attributes.get("_binding")
+                                    {
+                                        let mut attrs = resolved_resource.attributes.clone();
+                                        for (k, v) in &state.attributes {
+                                            attrs.insert(k.clone(), v.clone());
+                                        }
+                                        binding_map.insert(binding_name.clone(), attrs);
+                                    }
+                                }
+                                Err(e) => {
+                                    println!("  {} {} - {}", "✗".red(), format_effect(effect), e);
+                                    failure_count += 1;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            println!("  {} {} - {}", "✗".red(), format_effect(effect), e);
+                            failure_count += 1;
+                        }
                     }
                 }
             }
@@ -2997,7 +3082,13 @@ fn print_plan(plan: &Plan) {
         let colored_symbol = match effect {
             Effect::Create(_) => "+".green().bold(),
             Effect::Update { .. } => "~".yellow().bold(),
-            Effect::Replace { .. } => "-/+".magenta().bold(),
+            Effect::Replace { lifecycle, .. } => {
+                if lifecycle.create_before_destroy {
+                    "+/-".magenta().bold()
+                } else {
+                    "-/+".magenta().bold()
+                }
+            }
             Effect::Delete { .. } => "-".red().bold(),
             Effect::Read { .. } => "<=".cyan().bold(),
         };
@@ -3110,8 +3201,13 @@ fn print_plan(plan: &Plan) {
                 from,
                 to,
                 changed_create_only,
-                ..
+                lifecycle,
             } => {
+                let replace_note = if lifecycle.create_before_destroy {
+                    "(must be replaced, create before destroy)"
+                } else {
+                    "(must be replaced)"
+                };
                 println!(
                     "{}{}{} {} \"{}\" {}",
                     base_indent,
@@ -3119,7 +3215,7 @@ fn print_plan(plan: &Plan) {
                     colored_symbol,
                     id.display_type().cyan().bold(),
                     id.name.magenta().bold(),
-                    "(must be replaced)".magenta()
+                    replace_note.magenta()
                 );
                 let attr_prefix = if indent == 0 {
                     format!("{}{}", base_indent, attr_base)
@@ -3277,7 +3373,13 @@ fn format_effect(effect: &Effect) -> String {
     match effect {
         Effect::Create(r) => format!("Create {}", r.id),
         Effect::Update { id, .. } => format!("Update {}", id),
-        Effect::Replace { id, .. } => format!("Replace {}", id),
+        Effect::Replace { id, lifecycle, .. } => {
+            if lifecycle.create_before_destroy {
+                format!("Replace {} (create-before-destroy)", id)
+            } else {
+                format!("Replace {}", id)
+            }
+        }
         Effect::Delete { id, .. } => format!("Delete {}", id),
         Effect::Read { resource } => {
             format!("Read {}", resource.id)

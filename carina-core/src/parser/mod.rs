@@ -649,7 +649,12 @@ fn extract_lifecycle_config(attributes: &mut HashMap<String, Value>) -> Lifecycl
         // Take the first lifecycle block (there should only be one)
         if let Some(Value::Map(map)) = blocks.into_iter().next() {
             let force_delete = matches!(map.get("force_delete"), Some(Value::Bool(true)));
-            return LifecycleConfig { force_delete };
+            let create_before_destroy =
+                matches!(map.get("create_before_destroy"), Some(Value::Bool(true)));
+            return LifecycleConfig {
+                force_delete,
+                create_before_destroy,
+            };
         }
     }
     LifecycleConfig::default()
@@ -1898,5 +1903,46 @@ mod tests {
             "Let-bound AWSCC resource should not have 'name' in attributes, but found: {:?}",
             resource.attributes.get("name")
         );
+    }
+
+    #[test]
+    fn parse_lifecycle_create_before_destroy() {
+        let input = r#"
+            let vpc = awscc.ec2.vpc {
+                cidr_block = "10.0.0.0/16"
+                lifecycle {
+                    create_before_destroy = true
+                }
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+        assert_eq!(result.resources.len(), 1);
+
+        let resource = &result.resources[0];
+        assert!(resource.lifecycle.create_before_destroy);
+        assert!(!resource.lifecycle.force_delete);
+        assert!(!resource.attributes.contains_key("lifecycle"));
+    }
+
+    #[test]
+    fn parse_lifecycle_both_force_delete_and_create_before_destroy() {
+        let input = r#"
+            let bucket = awscc.s3_bucket {
+                bucket_name = "my-bucket"
+                lifecycle {
+                    force_delete = true
+                    create_before_destroy = true
+                }
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+        assert_eq!(result.resources.len(), 1);
+
+        let resource = &result.resources[0];
+        assert!(resource.lifecycle.force_delete);
+        assert!(resource.lifecycle.create_before_destroy);
+        assert!(!resource.attributes.contains_key("lifecycle"));
     }
 }
