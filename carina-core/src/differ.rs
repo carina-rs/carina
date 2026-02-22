@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use crate::effect::Effect;
 use crate::plan::Plan;
 use crate::resource::{LifecycleConfig, Resource, ResourceId, State, Value};
-use crate::schema::ResourceSchema;
+use crate::schema::{AttributeType, ResourceSchema};
 
 /// Result of a diff operation
 #[derive(Debug, Clone, PartialEq)]
@@ -106,6 +106,103 @@ fn find_changed_attributes(
     changed
 }
 
+/// Normalize a Value based on its AttributeType.
+///
+/// The parser produces `Value::Map(...)` for `= { ... }` syntax and
+/// `Value::List(vec![Value::Map(...)])` for block syntax. The read path
+/// (`aws_value_to_dsl`) always produces `Value::List(vec![Value::Map(...)])`
+/// for bare Struct types. This function normalizes `Value::Map` to
+/// `Value::List(vec![Value::Map])` for bare Struct types so both syntaxes
+/// compare correctly against the read result.
+fn normalize_value_for_type(value: &Value, attr_type: &AttributeType) -> Value {
+    match (attr_type, value) {
+        // Bare Struct + Map → wrap in List to match read path convention
+        (AttributeType::Struct { fields, .. }, Value::Map(map)) => {
+            let normalized_map: HashMap<String, Value> = map
+                .iter()
+                .map(|(k, v)| {
+                    let field_type = fields.iter().find(|f| f.name == *k).map(|f| &f.field_type);
+                    let normalized_v = if let Some(ft) = field_type {
+                        normalize_value_for_type(v, ft)
+                    } else {
+                        v.clone()
+                    };
+                    (k.clone(), normalized_v)
+                })
+                .collect();
+            Value::List(vec![Value::Map(normalized_map)])
+        }
+        // Bare Struct + List → normalize inner maps recursively
+        (AttributeType::Struct { fields, .. }, Value::List(items)) => {
+            let normalized: Vec<Value> = items
+                .iter()
+                .map(|item| {
+                    if let Value::Map(map) = item {
+                        let normalized_map: HashMap<String, Value> = map
+                            .iter()
+                            .map(|(k, v)| {
+                                let field_type =
+                                    fields.iter().find(|f| f.name == *k).map(|f| &f.field_type);
+                                let normalized_v = if let Some(ft) = field_type {
+                                    normalize_value_for_type(v, ft)
+                                } else {
+                                    v.clone()
+                                };
+                                (k.clone(), normalized_v)
+                            })
+                            .collect();
+                        Value::Map(normalized_map)
+                    } else {
+                        item.clone()
+                    }
+                })
+                .collect();
+            Value::List(normalized)
+        }
+        // List(inner) → recurse into list items
+        (AttributeType::List(inner), Value::List(items)) => {
+            let normalized: Vec<Value> = items
+                .iter()
+                .map(|item| normalize_value_for_type(item, inner))
+                .collect();
+            Value::List(normalized)
+        }
+        _ => value.clone(),
+    }
+}
+
+/// Normalize resource attributes based on schema types.
+///
+/// Converts `Value::Map` to `Value::List(vec![Value::Map])` for bare Struct
+/// typed attributes, ensuring consistent representation between the two
+/// equivalent DSL syntaxes (`= { ... }` and block `{ ... }`).
+fn normalize_resource_attributes(
+    resource: &Resource,
+    schemas: &HashMap<String, ResourceSchema>,
+) -> Resource {
+    let schema = schemas.get(&resource.id.resource_type).or_else(|| {
+        schemas.get(&format!(
+            "{}.{}",
+            resource.id.provider, resource.id.resource_type
+        ))
+    });
+
+    let Some(schema) = schema else {
+        return resource.clone();
+    };
+
+    let mut normalized = resource.clone();
+    for (attr_name, value) in &resource.attributes {
+        if let Some(attr_schema) = schema.attributes.get(attr_name) {
+            let normalized_value = normalize_value_for_type(value, &attr_schema.attr_type);
+            normalized
+                .attributes
+                .insert(attr_name.clone(), normalized_value);
+        }
+    }
+    normalized
+}
+
 /// Compute Diff for multiple resources and generate a Plan
 ///
 /// The `lifecycles` map provides lifecycle configuration for orphaned resources
@@ -136,7 +233,10 @@ pub fn create_plan(
             .cloned()
             .unwrap_or_else(|| State::not_found(resource.id.clone()));
 
-        let d = diff(resource, &current);
+        // Normalize desired attributes so both `= { ... }` and block syntax
+        // produce the same Value representation for Struct types
+        let normalized_resource = normalize_resource_attributes(resource, schemas);
+        let d = diff(&normalized_resource, &current);
 
         match d {
             Diff::Create(r) => plan.add(Effect::Create(r)),
@@ -652,6 +752,95 @@ mod tests {
             matches!(plan.effects()[0], Effect::Replace { .. }),
             "Expected Replace with awscc-prefixed schema key, got {:?}",
             plan.effects()[0]
+        );
+    }
+
+    #[test]
+    fn normalize_map_to_list_for_bare_struct() {
+        use crate::schema::StructField;
+
+        let attr_type = AttributeType::Struct {
+            name: "TestStruct".to_string(),
+            fields: vec![
+                StructField::new("name", AttributeType::String),
+                StructField::new("value", AttributeType::String),
+            ],
+        };
+
+        let mut map = HashMap::new();
+        map.insert("name".to_string(), Value::String("foo".to_string()));
+        map.insert("value".to_string(), Value::String("bar".to_string()));
+        let input = Value::Map(map.clone());
+
+        let result = normalize_value_for_type(&input, &attr_type);
+        assert_eq!(result, Value::List(vec![Value::Map(map)]));
+    }
+
+    #[test]
+    fn normalize_list_unchanged_for_bare_struct() {
+        use crate::schema::StructField;
+
+        let attr_type = AttributeType::Struct {
+            name: "TestStruct".to_string(),
+            fields: vec![StructField::new("name", AttributeType::String)],
+        };
+
+        let mut map = HashMap::new();
+        map.insert("name".to_string(), Value::String("foo".to_string()));
+        let input = Value::List(vec![Value::Map(map.clone())]);
+
+        let result = normalize_value_for_type(&input, &attr_type);
+        assert_eq!(result, Value::List(vec![Value::Map(map)]));
+    }
+
+    #[test]
+    fn create_plan_normalizes_map_syntax_for_struct() {
+        use crate::schema::{AttributeSchema, StructField};
+
+        // Simulate: user wrote `config = { name = "test" }` (Map syntax)
+        // for a Struct-typed attribute
+        let struct_type = AttributeType::Struct {
+            name: "Config".to_string(),
+            fields: vec![StructField::new("name", AttributeType::String)],
+        };
+
+        let mut desired_map = HashMap::new();
+        desired_map.insert("name".to_string(), Value::String("test".to_string()));
+
+        let resource = Resource::with_provider("awscc", "test.resource", "my-res")
+            .with_attribute("config", Value::Map(desired_map.clone()));
+
+        // Simulate: aws_value_to_dsl returns List([Map]) for bare Struct
+        let mut current_map = HashMap::new();
+        current_map.insert("name".to_string(), Value::String("test".to_string()));
+        let mut current_attrs = HashMap::new();
+        current_attrs.insert(
+            "config".to_string(),
+            Value::List(vec![Value::Map(current_map)]),
+        );
+        let mut current_states = HashMap::new();
+        current_states.insert(
+            ResourceId::with_provider("awscc", "test.resource", "my-res"),
+            State::existing(
+                ResourceId::with_provider("awscc", "test.resource", "my-res"),
+                current_attrs,
+            ),
+        );
+
+        let mut schemas = HashMap::new();
+        schemas.insert(
+            "test.resource".to_string(),
+            ResourceSchema::new("test.resource")
+                .attribute(AttributeSchema::new("config", struct_type)),
+        );
+
+        let plan = create_plan(&[resource], &current_states, &HashMap::new(), &schemas);
+
+        // Should detect NO change — Map and List([Map]) are equivalent for Struct
+        assert!(
+            plan.effects().is_empty(),
+            "Expected no effects (no spurious diff), got {:?}",
+            plan.effects()
         );
     }
 }
