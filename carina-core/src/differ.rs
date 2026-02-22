@@ -106,6 +106,28 @@ fn find_changed_attributes(
     changed
 }
 
+/// Normalize struct field values recursively.
+///
+/// Recurses into each field's value based on its type, but does NOT wrap
+/// the map itself in a List. This is used when processing items inside
+/// a List(Struct) where the map should remain a map.
+fn normalize_struct_fields(
+    map: &HashMap<String, Value>,
+    fields: &[crate::schema::StructField],
+) -> HashMap<String, Value> {
+    map.iter()
+        .map(|(k, v)| {
+            let field_type = fields.iter().find(|f| f.name == *k).map(|f| &f.field_type);
+            let normalized_v = if let Some(ft) = field_type {
+                normalize_value_for_type(v, ft)
+            } else {
+                v.clone()
+            };
+            (k.clone(), normalized_v)
+        })
+        .collect()
+}
+
 /// Normalize a Value based on its AttributeType.
 ///
 /// The parser produces `Value::Map(...)` for `= { ... }` syntax and
@@ -118,40 +140,35 @@ fn normalize_value_for_type(value: &Value, attr_type: &AttributeType) -> Value {
     match (attr_type, value) {
         // Bare Struct + Map → wrap in List to match read path convention
         (AttributeType::Struct { fields, .. }, Value::Map(map)) => {
-            let normalized_map: HashMap<String, Value> = map
-                .iter()
-                .map(|(k, v)| {
-                    let field_type = fields.iter().find(|f| f.name == *k).map(|f| &f.field_type);
-                    let normalized_v = if let Some(ft) = field_type {
-                        normalize_value_for_type(v, ft)
-                    } else {
-                        v.clone()
-                    };
-                    (k.clone(), normalized_v)
-                })
-                .collect();
-            Value::List(vec![Value::Map(normalized_map)])
+            Value::List(vec![Value::Map(normalize_struct_fields(map, fields))])
         }
-        // Bare Struct + List → normalize inner maps recursively
+        // Bare Struct + List → normalize inner maps' fields recursively
         (AttributeType::Struct { fields, .. }, Value::List(items)) => {
             let normalized: Vec<Value> = items
                 .iter()
                 .map(|item| {
                     if let Value::Map(map) = item {
-                        let normalized_map: HashMap<String, Value> = map
-                            .iter()
-                            .map(|(k, v)| {
-                                let field_type =
-                                    fields.iter().find(|f| f.name == *k).map(|f| &f.field_type);
-                                let normalized_v = if let Some(ft) = field_type {
-                                    normalize_value_for_type(v, ft)
-                                } else {
-                                    v.clone()
-                                };
-                                (k.clone(), normalized_v)
-                            })
-                            .collect();
-                        Value::Map(normalized_map)
+                        Value::Map(normalize_struct_fields(map, fields))
+                    } else {
+                        item.clone()
+                    }
+                })
+                .collect();
+            Value::List(normalized)
+        }
+        // List(Struct) → normalize struct fields in each item (without wrapping)
+        (AttributeType::List(inner), Value::List(items))
+            if matches!(inner.as_ref(), AttributeType::Struct { .. }) =>
+        {
+            let fields = match inner.as_ref() {
+                AttributeType::Struct { fields, .. } => fields,
+                _ => unreachable!(),
+            };
+            let normalized: Vec<Value> = items
+                .iter()
+                .map(|item| {
+                    if let Value::Map(map) = item {
+                        Value::Map(normalize_struct_fields(map, fields))
                     } else {
                         item.clone()
                     }
@@ -842,5 +859,72 @@ mod tests {
             "Expected no effects (no spurious diff), got {:?}",
             plan.effects()
         );
+    }
+
+    #[test]
+    fn normalize_does_not_double_wrap_list_struct_items() {
+        use crate::schema::StructField;
+
+        // Simulate IamPolicyDocument with statement field (List(Struct))
+        let statement_struct = AttributeType::Struct {
+            name: "Statement".to_string(),
+            fields: vec![
+                StructField::new("effect", AttributeType::String),
+                StructField::new("action", AttributeType::String),
+            ],
+        };
+
+        let doc_type = AttributeType::Struct {
+            name: "PolicyDocument".to_string(),
+            fields: vec![
+                StructField::new("version", AttributeType::String),
+                StructField::new("statement", AttributeType::List(Box::new(statement_struct))),
+            ],
+        };
+
+        // Simulate `= { ... }` syntax: parser produces Value::Map
+        let mut stmt_map = HashMap::new();
+        stmt_map.insert("effect".to_string(), Value::String("Allow".to_string()));
+        stmt_map.insert(
+            "action".to_string(),
+            Value::String("sts:AssumeRole".to_string()),
+        );
+
+        let mut doc_map = HashMap::new();
+        doc_map.insert(
+            "version".to_string(),
+            Value::String("2012-10-17".to_string()),
+        );
+        doc_map.insert(
+            "statement".to_string(),
+            Value::List(vec![Value::Map(stmt_map.clone())]),
+        );
+
+        let input = Value::Map(doc_map);
+        let result = normalize_value_for_type(&input, &doc_type);
+
+        // Should be List([Map({version, statement: List([Map({effect, action})])})]),
+        // NOT List([Map({version, statement: List([List([Map({effect, action})])])})])
+        if let Value::List(items) = &result {
+            assert_eq!(items.len(), 1);
+            if let Value::Map(map) = &items[0] {
+                let stmt = map.get("statement").unwrap();
+                if let Value::List(stmts) = stmt {
+                    assert_eq!(stmts.len(), 1);
+                    // Each statement item should be a Map, NOT a List
+                    assert!(
+                        matches!(&stmts[0], Value::Map(_)),
+                        "Statement item should be Map, got: {:?}",
+                        stmts[0]
+                    );
+                } else {
+                    panic!("Expected List for statement, got: {:?}", stmt);
+                }
+            } else {
+                panic!("Expected Map inside outer List");
+            }
+        } else {
+            panic!("Expected outer List, got: {:?}", result);
+        }
     }
 }
