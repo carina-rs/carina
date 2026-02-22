@@ -373,10 +373,11 @@ fn validate_resource_ref_types(resources: &[Resource]) -> Result<(), String> {
             let ref_type_name = ref_attr_schema.attr_type.type_name();
 
             // Type compatibility check:
+            // - Union type accepts any member type name -> OK
             // - Same type -> OK
             // - Either is "String" -> OK (String is the base type for Custom types)
             // - Different Custom types -> Error
-            if expected_type_name == ref_type_name {
+            if attr_schema.attr_type.accepts_type_name(&ref_type_name) {
                 continue;
             }
             if expected_type_name == "String" || ref_type_name == "String" {
@@ -400,10 +401,11 @@ fn validate_resource_ref_types(resources: &[Resource]) -> Result<(), String> {
 /// Check if an AttributeType is string-compatible (can accept a string value).
 fn is_string_compatible_type(attr_type: &carina_core::schema::AttributeType) -> bool {
     use carina_core::schema::AttributeType;
-    matches!(
-        attr_type,
-        AttributeType::String | AttributeType::Custom { .. } | AttributeType::Enum(_)
-    )
+    match attr_type {
+        AttributeType::String | AttributeType::Custom { .. } | AttributeType::Enum(_) => true,
+        AttributeType::Union(types) => types.iter().all(is_string_compatible_type),
+        _ => false,
+    }
 }
 
 /// Generate a random 8-character lowercase hex suffix using UUID v4.

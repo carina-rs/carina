@@ -234,6 +234,45 @@ impl DiagnosticEngine {
                                         s
                                     ))
                                 }
+                                // ResourceRef type check for Union types
+                                (
+                                    carina_core::schema::AttributeType::Union(_),
+                                    Value::ResourceRef {
+                                        binding_name: ref_binding,
+                                        attribute_name: ref_attr,
+                                        ..
+                                    },
+                                ) => {
+                                    if let Some(ref_schema) =
+                                        binding_schema_map.get(ref_binding.as_str())
+                                    {
+                                        if let Some(ref_attr_schema) =
+                                            ref_schema.attributes.get(ref_attr.as_str())
+                                        {
+                                            let ref_type_name =
+                                                ref_attr_schema.attr_type.type_name();
+                                            if attr_schema
+                                                .attr_type
+                                                .accepts_type_name(&ref_type_name)
+                                                || ref_type_name == "String"
+                                            {
+                                                None
+                                            } else {
+                                                Some(format!(
+                                                    "Type mismatch: expected {}, got {} (from {}.{})",
+                                                    attr_schema.attr_type.type_name(),
+                                                    ref_type_name,
+                                                    ref_binding,
+                                                    ref_attr
+                                                ))
+                                            }
+                                        } else {
+                                            None
+                                        }
+                                    } else {
+                                        None
+                                    }
+                                }
                                 // ResourceRef type check for Custom types
                                 (
                                     carina_core::schema::AttributeType::Custom {

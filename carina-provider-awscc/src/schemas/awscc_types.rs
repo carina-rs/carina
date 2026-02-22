@@ -367,6 +367,12 @@ pub(crate) fn vpn_gateway_id() -> AttributeType {
     }
 }
 
+/// Gateway ID type — union of InternetGatewayId and VpnGatewayId.
+/// Used for attributes like ec2_route.gateway_id that accept both igw-* and vgw-* IDs.
+pub(crate) fn gateway_id() -> AttributeType {
+    AttributeType::Union(vec![internet_gateway_id(), vpn_gateway_id()])
+}
+
 /// Egress Only Internet Gateway ID type (e.g., "eigw-12345678")
 #[allow(dead_code)] // TODO: codegen should use this instead of internet_gateway_id() for eigw attributes
 pub(crate) fn egress_only_internet_gateway_id() -> AttributeType {
@@ -1165,6 +1171,48 @@ mod tests {
             t.validate(&Value::String("eigw-0123456789abcdef0".to_string()))
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn validate_gateway_id_union() {
+        let t = gateway_id();
+        // InternetGatewayId (igw-*) should be accepted
+        assert!(
+            t.validate(&Value::String("igw-12345678".to_string()))
+                .is_ok()
+        );
+        assert!(
+            t.validate(&Value::String("igw-0123456789abcdef0".to_string()))
+                .is_ok()
+        );
+        // VpnGatewayId (vgw-*) should be accepted
+        assert!(
+            t.validate(&Value::String("vgw-12345678".to_string()))
+                .is_ok()
+        );
+        assert!(
+            t.validate(&Value::String("vgw-0123456789abcdef0".to_string()))
+                .is_ok()
+        );
+        // Other prefixes should be rejected
+        assert!(
+            t.validate(&Value::String("vpc-12345678".to_string()))
+                .is_err()
+        );
+        assert!(
+            t.validate(&Value::String("nat-12345678".to_string()))
+                .is_err()
+        );
+        // ResourceRef should be accepted
+        assert!(
+            t.validate(&Value::ResourceRef {
+                binding_name: "igw".to_string(),
+                attribute_name: "internet_gateway_id".to_string(),
+            })
+            .is_ok()
+        );
+        // type_name should show both members
+        assert_eq!(t.type_name(), "InternetGatewayId | VpnGatewayId");
     }
 
     #[test]
