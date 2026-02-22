@@ -81,6 +81,53 @@ pub enum Value {
     UnresolvedIdent(String, Option<String>),
 }
 
+impl Value {
+    /// Semantic equality: for Lists, compares as multisets (order-insensitive);
+    /// for Maps, compares values recursively with semantic equality;
+    /// for all other variants, falls back to PartialEq.
+    pub fn semantically_equal(&self, other: &Value) -> bool {
+        match (self, other) {
+            (Value::List(a), Value::List(b)) => lists_equal(a, b),
+            (Value::Map(a), Value::Map(b)) => maps_semantically_equal(a, b),
+            _ => self == other,
+        }
+    }
+}
+
+/// Compare two maps using semantic equality for their values.
+/// This ensures nested lists within maps are compared order-insensitively.
+fn maps_semantically_equal(a: &HashMap<String, Value>, b: &HashMap<String, Value>) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter()
+        .all(|(k, v)| b.get(k).map(|bv| v.semantically_equal(bv)).unwrap_or(false))
+}
+
+/// Multiset (bag) comparison for two lists of Values.
+/// Returns true if both lists contain the same elements with the same multiplicities,
+/// regardless of order. Uses O(n²) matching to handle non-hashable Values.
+fn lists_equal(a: &[Value], b: &[Value]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut matched = vec![false; b.len()];
+    for item_a in a {
+        let mut found = false;
+        for (j, item_b) in b.iter().enumerate() {
+            if !matched[j] && item_a.semantically_equal(item_b) {
+                matched[j] = true;
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            return false;
+        }
+    }
+    true
+}
+
 /// Lifecycle configuration for a resource
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct LifecycleConfig {
@@ -269,5 +316,135 @@ mod tests {
         let config: LifecycleConfig = serde_json::from_str(json).unwrap();
         assert!(config.force_delete);
         assert!(!config.create_before_destroy);
+    }
+
+    #[test]
+    fn semantically_equal_lists_same_order() {
+        let a = Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(3)]);
+        let b = Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(3)]);
+        assert!(a.semantically_equal(&b));
+    }
+
+    #[test]
+    fn semantically_equal_lists_different_order() {
+        let a = Value::List(vec![Value::Int(3), Value::Int(1), Value::Int(2)]);
+        let b = Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(3)]);
+        assert!(a.semantically_equal(&b));
+    }
+
+    #[test]
+    fn semantically_equal_lists_different_content() {
+        let a = Value::List(vec![Value::Int(1), Value::Int(2)]);
+        let b = Value::List(vec![Value::Int(1), Value::Int(3)]);
+        assert!(!a.semantically_equal(&b));
+    }
+
+    #[test]
+    fn semantically_equal_lists_different_lengths() {
+        let a = Value::List(vec![Value::Int(1), Value::Int(2)]);
+        let b = Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(3)]);
+        assert!(!a.semantically_equal(&b));
+    }
+
+    #[test]
+    fn semantically_equal_lists_with_duplicates() {
+        let a = Value::List(vec![Value::Int(1), Value::Int(1), Value::Int(2)]);
+        let b = Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(1)]);
+        assert!(a.semantically_equal(&b));
+
+        // Different multiplicities should not be equal
+        let c = Value::List(vec![Value::Int(1), Value::Int(1), Value::Int(2)]);
+        let d = Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(2)]);
+        assert!(!c.semantically_equal(&d));
+    }
+
+    #[test]
+    fn semantically_equal_empty_lists() {
+        let a = Value::List(vec![]);
+        let b = Value::List(vec![]);
+        assert!(a.semantically_equal(&b));
+    }
+
+    #[test]
+    fn semantically_equal_lists_of_maps_different_order() {
+        let mut map1 = HashMap::new();
+        map1.insert("port".to_string(), Value::Int(80));
+        map1.insert("protocol".to_string(), Value::String("tcp".to_string()));
+
+        let mut map2 = HashMap::new();
+        map2.insert("port".to_string(), Value::Int(443));
+        map2.insert("protocol".to_string(), Value::String("tcp".to_string()));
+
+        let a = Value::List(vec![Value::Map(map1.clone()), Value::Map(map2.clone())]);
+        let b = Value::List(vec![Value::Map(map2), Value::Map(map1)]);
+        assert!(a.semantically_equal(&b));
+    }
+
+    #[test]
+    fn semantically_equal_lists_of_strings() {
+        let a = Value::List(vec![
+            Value::String("b".to_string()),
+            Value::String("a".to_string()),
+        ]);
+        let b = Value::List(vec![
+            Value::String("a".to_string()),
+            Value::String("b".to_string()),
+        ]);
+        assert!(a.semantically_equal(&b));
+    }
+
+    #[test]
+    fn semantically_equal_non_list_values() {
+        // Non-list values should use regular equality
+        assert!(Value::Int(42).semantically_equal(&Value::Int(42)));
+        assert!(!Value::Int(42).semantically_equal(&Value::Int(43)));
+        assert!(
+            Value::String("hello".to_string())
+                .semantically_equal(&Value::String("hello".to_string()))
+        );
+        assert!(Value::Bool(true).semantically_equal(&Value::Bool(true)));
+    }
+
+    #[test]
+    fn semantically_equal_nested_lists() {
+        // Lists inside maps are compared order-insensitively via recursive semantically_equal
+        let mut map1 = HashMap::new();
+        map1.insert(
+            "ports".to_string(),
+            Value::List(vec![Value::Int(80), Value::Int(443)]),
+        );
+
+        let mut map2 = HashMap::new();
+        map2.insert(
+            "ports".to_string(),
+            Value::List(vec![Value::Int(443), Value::Int(80)]),
+        );
+
+        let a = Value::Map(map1);
+        let b = Value::Map(map2);
+        assert!(a.semantically_equal(&b));
+    }
+
+    #[test]
+    fn semantically_equal_maps_different_keys() {
+        let mut map1 = HashMap::new();
+        map1.insert("a".to_string(), Value::Int(1));
+
+        let mut map2 = HashMap::new();
+        map2.insert("b".to_string(), Value::Int(1));
+
+        assert!(!Value::Map(map1).semantically_equal(&Value::Map(map2)));
+    }
+
+    #[test]
+    fn semantically_equal_maps_different_sizes() {
+        let mut map1 = HashMap::new();
+        map1.insert("a".to_string(), Value::Int(1));
+
+        let mut map2 = HashMap::new();
+        map2.insert("a".to_string(), Value::Int(1));
+        map2.insert("b".to_string(), Value::Int(2));
+
+        assert!(!Value::Map(map1).semantically_equal(&Value::Map(map2)));
     }
 }

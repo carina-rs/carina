@@ -3302,7 +3302,10 @@ fn print_plan(plan: &Plan) {
                 for key in keys {
                     let new_value = &to.attributes[key];
                     let old_value = from.attributes.get(key);
-                    if old_value != Some(new_value) {
+                    let is_same = old_value
+                        .map(|ov| ov.semantically_equal(new_value))
+                        .unwrap_or(false);
+                    if !is_same {
                         if is_list_of_maps(new_value) {
                             println!("{}{}:", attr_prefix, key);
                             println!("{}", format_list_diff(old_value, new_value, &attr_prefix));
@@ -3362,7 +3365,10 @@ fn print_plan(plan: &Plan) {
                     let new_value = &to.attributes[key];
                     let old_value = from.attributes.get(key);
                     let forces_replacement = changed_create_only.contains(key);
-                    if old_value != Some(new_value) {
+                    let is_same = old_value
+                        .map(|ov| ov.semantically_equal(new_value))
+                        .unwrap_or(false);
+                    if !is_same {
                         if is_list_of_maps(new_value) {
                             let suffix = if forces_replacement {
                                 format!(" {}", "(forces replacement)".magenta())
@@ -3627,98 +3633,193 @@ fn format_list_of_maps(value: &Value, attr_prefix: &str) -> String {
     lines.join("\n")
 }
 
-/// Format a list-of-maps diff for Update effect display
-/// Uses index-based comparison: + for added, - for removed, ~ for modified items
+/// Format a list-of-maps diff for Update effect display.
+/// Uses content-matched comparison (multiset matching) instead of index-based.
+/// 1. Find exact matches between old and new items
+/// 2. Pair remaining unmatched items by similarity for field-level diffs
+/// 3. Display unchanged, modified (~), added (+), and removed (-) items
 fn format_list_diff(old_value: Option<&Value>, new_value: &Value, attr_prefix: &str) -> String {
     let new_items = match new_value {
         Value::List(items) => items,
         _ => return format_value(new_value),
     };
     let old_items = match old_value {
-        Some(Value::List(items)) => items.clone(),
-        _ => vec![],
+        Some(Value::List(items)) => items,
+        _ => &vec![] as &Vec<Value>,
     };
 
-    let mut lines = Vec::new();
-    let max_len = std::cmp::max(old_items.len(), new_items.len());
+    let mut old_matched = vec![false; old_items.len()];
+    let mut new_matched = vec![false; new_items.len()];
 
-    for i in 0..max_len {
-        let old = old_items.get(i);
-        let new = new_items.get(i);
-        match (old, new) {
-            (None, Some(Value::Map(map))) => {
-                // Added item
-                let mut keys: Vec<_> = map.keys().collect();
-                keys.sort();
-                let fields: Vec<String> = keys
-                    .iter()
-                    .map(|k| format!("{}: {}", k, format_value(&map[*k])))
-                    .collect();
-                lines.push(format!(
-                    "{}  {} {{{}}}",
-                    attr_prefix,
-                    "+".green().bold(),
-                    fields.join(", ")
-                ));
-            }
-            (Some(Value::Map(map)), None) => {
-                // Removed item
-                let mut keys: Vec<_> = map.keys().collect();
-                keys.sort();
-                let fields: Vec<String> = keys
-                    .iter()
-                    .map(|k| format!("{}: {}", k, format_value(&map[*k])))
-                    .collect();
-                lines.push(format!(
-                    "{}  {} {{{}}}",
-                    attr_prefix,
-                    "-".red().bold(),
-                    fields.join(", ")
-                ));
-            }
-            (Some(old_item), Some(new_item)) if old_item != new_item => {
-                // Modified item
-                if let (Value::Map(old_map), Value::Map(new_map)) = (old_item, new_item) {
-                    let mut keys: Vec<_> = new_map.keys().collect();
-                    keys.sort();
-                    let fields: Vec<String> = keys
-                        .iter()
-                        .map(|k| {
-                            let new_v = format_value(&new_map[*k]);
-                            if old_map.get(*k) != Some(&new_map[*k]) {
-                                let old_v = old_map
-                                    .get(*k)
-                                    .map(format_value)
-                                    .unwrap_or_else(|| "(none)".to_string());
-                                format!("{}: {} → {}", k, old_v.red(), new_v.green())
-                            } else {
-                                format!("{}: {}", k, new_v)
-                            }
-                        })
-                        .collect();
-                    lines.push(format!(
-                        "{}  {} {{{}}}",
-                        attr_prefix,
-                        "~".yellow().bold(),
-                        fields.join(", ")
-                    ));
-                }
-            }
-            _ => {
-                // Unchanged item (same in both)
-                if let Some(Value::Map(map)) = new {
-                    let mut keys: Vec<_> = map.keys().collect();
-                    keys.sort();
-                    let fields: Vec<String> = keys
-                        .iter()
-                        .map(|k| format!("{}: {}", k, format_value(&map[*k])))
-                        .collect();
-                    lines.push(format!("{}    {{{}}}", attr_prefix, fields.join(", ")));
-                }
+    // Phase 1: Find exact matches (semantically equal items)
+    for (ni, new_item) in new_items.iter().enumerate() {
+        for (oi, old_item) in old_items.iter().enumerate() {
+            if !old_matched[oi] && old_item.semantically_equal(new_item) {
+                old_matched[oi] = true;
+                new_matched[ni] = true;
+                break;
             }
         }
     }
+
+    // Collect unmatched items
+    let unmatched_old: Vec<usize> = old_matched
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| !**m)
+        .map(|(i, _)| i)
+        .collect();
+    let unmatched_new: Vec<usize> = new_matched
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| !**m)
+        .map(|(i, _)| i)
+        .collect();
+
+    // Phase 2: Pair unmatched items by similarity (most shared key-value pairs)
+    let mut paired: Vec<(usize, usize)> = Vec::new();
+    let mut paired_old = vec![false; unmatched_old.len()];
+    let mut paired_new = vec![false; unmatched_new.len()];
+
+    for (ui_new, &ni) in unmatched_new.iter().enumerate() {
+        let mut best_oi_idx = None;
+        let mut best_sim = 0usize;
+        for (ui_old, &oi) in unmatched_old.iter().enumerate() {
+            if paired_old[ui_old] {
+                continue;
+            }
+            let sim = map_similarity(&old_items[oi], &new_items[ni]);
+            if sim > best_sim {
+                best_sim = sim;
+                best_oi_idx = Some(ui_old);
+            }
+        }
+        if let Some(ui_old) = best_oi_idx.filter(|_| best_sim > 0) {
+            paired.push((unmatched_old[ui_old], ni));
+            paired_old[ui_old] = true;
+            paired_new[ui_new] = true;
+        }
+    }
+
+    // Remaining truly added/removed items
+    let added: Vec<usize> = unmatched_new
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !paired_new[*i])
+        .map(|(_, &ni)| ni)
+        .collect();
+    let removed: Vec<usize> = unmatched_old
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !paired_old[*i])
+        .map(|(_, &oi)| oi)
+        .collect();
+
+    // Phase 3: Build output
+    let mut lines = Vec::new();
+
+    // Show unchanged items (exact matches from new list order)
+    for (ni, new_item) in new_items.iter().enumerate() {
+        if let Value::Map(map) = new_item
+            && new_matched[ni]
+        {
+            let mut keys: Vec<_> = map.keys().collect();
+            keys.sort();
+            let fields: Vec<String> = keys
+                .iter()
+                .map(|k| format!("{}: {}", k, format_value(&map[*k])))
+                .collect();
+            lines.push(format!("{}    {{{}}}", attr_prefix, fields.join(", ")));
+        }
+    }
+
+    // Show modified items (paired by similarity)
+    for &(oi, ni) in &paired {
+        if let (Value::Map(old_map), Value::Map(new_map)) = (&old_items[oi], &new_items[ni]) {
+            let mut keys: Vec<_> = new_map.keys().collect();
+            keys.sort();
+            let fields: Vec<String> = keys
+                .iter()
+                .map(|k| {
+                    let new_v = format_value(&new_map[*k]);
+                    let field_same = old_map
+                        .get(*k)
+                        .map(|ov| ov.semantically_equal(&new_map[*k]))
+                        .unwrap_or(false);
+                    if !field_same {
+                        let old_v = old_map
+                            .get(*k)
+                            .map(format_value)
+                            .unwrap_or_else(|| "(none)".to_string());
+                        format!("{}: {} → {}", k, old_v.red(), new_v.green())
+                    } else {
+                        format!("{}: {}", k, new_v)
+                    }
+                })
+                .collect();
+            lines.push(format!(
+                "{}  {} {{{}}}",
+                attr_prefix,
+                "~".yellow().bold(),
+                fields.join(", ")
+            ));
+        }
+    }
+
+    // Show added items
+    for &ni in &added {
+        if let Value::Map(map) = &new_items[ni] {
+            let mut keys: Vec<_> = map.keys().collect();
+            keys.sort();
+            let fields: Vec<String> = keys
+                .iter()
+                .map(|k| format!("{}: {}", k, format_value(&map[*k])))
+                .collect();
+            lines.push(format!(
+                "{}  {} {{{}}}",
+                attr_prefix,
+                "+".green().bold(),
+                fields.join(", ")
+            ));
+        }
+    }
+
+    // Show removed items
+    for &oi in &removed {
+        if let Value::Map(map) = &old_items[oi] {
+            let mut keys: Vec<_> = map.keys().collect();
+            keys.sort();
+            let fields: Vec<String> = keys
+                .iter()
+                .map(|k| format!("{}: {}", k, format_value(&map[*k])))
+                .collect();
+            lines.push(format!(
+                "{}  {} {{{}}}",
+                attr_prefix,
+                "-".red().bold(),
+                fields.join(", ")
+            ));
+        }
+    }
+
     lines.join("\n")
+}
+
+/// Count the number of shared key-value pairs between two map Values.
+/// Uses semantically_equal for value comparison so nested lists are order-insensitive.
+/// Returns 0 if either value is not a Map.
+fn map_similarity(a: &Value, b: &Value) -> usize {
+    match (a, b) {
+        (Value::Map(ma), Value::Map(mb)) => ma
+            .iter()
+            .filter(|(k, v)| {
+                mb.get(*k)
+                    .map(|bv| v.semantically_equal(bv))
+                    .unwrap_or(false)
+            })
+            .count(),
+        _ => 0,
+    }
 }
 
 fn format_value(value: &Value) -> String {
