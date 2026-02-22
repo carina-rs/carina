@@ -813,13 +813,37 @@ fn parse_primary_value(
         }
         Rule::map => {
             let mut map = HashMap::new();
+            let mut nested_blocks: HashMap<String, Vec<Value>> = HashMap::new();
             for entry in inner.into_inner() {
-                if entry.as_rule() == Rule::map_entry {
-                    let mut entry_inner = entry.into_inner();
-                    let key = entry_inner.next().unwrap().as_str().to_string();
-                    let value = parse_expression(entry_inner.next().unwrap(), ctx)?;
-                    map.insert(key, value);
+                match entry.as_rule() {
+                    Rule::map_entry => {
+                        let mut entry_inner = entry.into_inner();
+                        let key = entry_inner.next().unwrap().as_str().to_string();
+                        let value = parse_expression(entry_inner.next().unwrap(), ctx)?;
+                        map.insert(key, value);
+                    }
+                    Rule::nested_block => {
+                        let mut block_inner = entry.into_inner();
+                        let block_name = block_inner.next().unwrap().as_str().to_string();
+                        let mut block_attrs = HashMap::new();
+                        for attr_pair in block_inner {
+                            if attr_pair.as_rule() == Rule::attribute {
+                                let mut attr_inner = attr_pair.into_inner();
+                                let key = attr_inner.next().unwrap().as_str().to_string();
+                                let value = parse_expression(attr_inner.next().unwrap(), ctx)?;
+                                block_attrs.insert(key, value);
+                            }
+                        }
+                        nested_blocks
+                            .entry(block_name)
+                            .or_default()
+                            .push(Value::Map(block_attrs));
+                    }
+                    _ => {}
                 }
+            }
+            for (name, blocks) in nested_blocks {
+                map.insert(name, Value::List(blocks));
             }
             Ok(Value::Map(map))
         }
@@ -1944,5 +1968,120 @@ mod tests {
         assert!(resource.lifecycle.force_delete);
         assert!(resource.lifecycle.create_before_destroy);
         assert!(!resource.attributes.contains_key("lifecycle"));
+    }
+
+    #[test]
+    fn parse_block_syntax_inside_map() {
+        let input = r#"
+            let role = awscc.iam.role {
+                assume_role_policy_document = {
+                    version = "2012-10-17"
+                    statement {
+                        effect    = "Allow"
+                        principal = { service = "lambda.amazonaws.com" }
+                        action    = "sts:AssumeRole"
+                    }
+                }
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+        assert_eq!(result.resources.len(), 1);
+
+        let role = &result.resources[0];
+        let doc = role.attributes.get("assume_role_policy_document").unwrap();
+        if let Value::Map(map) = doc {
+            assert_eq!(
+                map.get("version"),
+                Some(&Value::String("2012-10-17".to_string()))
+            );
+            // statement block becomes a list with one element
+            let statement = map.get("statement").unwrap();
+            if let Value::List(stmts) = statement {
+                assert_eq!(stmts.len(), 1);
+                if let Value::Map(stmt) = &stmts[0] {
+                    assert_eq!(
+                        stmt.get("effect"),
+                        Some(&Value::String("Allow".to_string()))
+                    );
+                    assert_eq!(
+                        stmt.get("action"),
+                        Some(&Value::String("sts:AssumeRole".to_string()))
+                    );
+                } else {
+                    panic!("Expected map for statement");
+                }
+            } else {
+                panic!("Expected list for statement");
+            }
+        } else {
+            panic!("Expected map for assume_role_policy_document");
+        }
+    }
+
+    #[test]
+    fn parse_multiple_blocks_inside_map() {
+        let input = r#"
+            let role = awscc.iam.role {
+                policy_document = {
+                    version = "2012-10-17"
+                    statement {
+                        effect = "Allow"
+                        action = "s3:GetObject"
+                    }
+                    statement {
+                        effect = "Deny"
+                        action = "s3:DeleteObject"
+                    }
+                }
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+        let role = &result.resources[0];
+        let doc = role.attributes.get("policy_document").unwrap();
+        if let Value::Map(map) = doc {
+            let statement = map.get("statement").unwrap();
+            if let Value::List(stmts) = statement {
+                assert_eq!(stmts.len(), 2);
+            } else {
+                panic!("Expected list for statement");
+            }
+        } else {
+            panic!("Expected map for policy_document");
+        }
+    }
+
+    #[test]
+    fn parse_list_syntax_inside_map_still_works() {
+        // Backward compatibility: list literal syntax still works
+        let input = r#"
+            let role = awscc.iam.role {
+                assume_role_policy_document = {
+                    version = "2012-10-17"
+                    statement = [
+                        {
+                            effect    = "Allow"
+                            principal = { service = "lambda.amazonaws.com" }
+                            action    = "sts:AssumeRole"
+                        }
+                    ]
+                }
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+        let role = &result.resources[0];
+        let doc = role.attributes.get("assume_role_policy_document").unwrap();
+        if let Value::Map(map) = doc {
+            let statement = map.get("statement").unwrap();
+            if let Value::List(stmts) = statement {
+                assert_eq!(stmts.len(), 1);
+            } else {
+                panic!("Expected list for statement");
+            }
+        } else {
+            panic!("Expected map for assume_role_policy_document");
+        }
     }
 }
