@@ -7,7 +7,7 @@ use std::collections::HashMap;
 
 use crate::effect::Effect;
 use crate::plan::Plan;
-use crate::resource::{LifecycleConfig, Resource, ResourceId, State, Value};
+use crate::resource::{LifecycleConfig, Resource, ResourceId, State, Value, merge_with_saved};
 use crate::schema::ResourceSchema;
 
 /// Result of a diff operation
@@ -35,13 +35,15 @@ impl Diff {
     }
 }
 
-/// Compare desired state with current state to compute a Diff
-pub fn diff(desired: &Resource, current: &State) -> Diff {
+/// Compare desired state with current state to compute a Diff.
+/// If `saved` is provided, unmanaged nested fields from the saved state are merged
+/// into desired before comparison, preventing false diffs when AWS returns extra fields.
+pub fn diff(desired: &Resource, current: &State, saved: Option<&HashMap<String, Value>>) -> Diff {
     if !current.exists {
         return Diff::Create(desired.clone());
     }
 
-    let changed = find_changed_attributes(&desired.attributes, &current.attributes);
+    let changed = find_changed_attributes(&desired.attributes, &current.attributes, saved);
 
     if changed.is_empty() {
         Diff::NoChange(desired.id.clone())
@@ -84,10 +86,13 @@ fn find_changed_create_only(
         .collect()
 }
 
-/// Find changed attributes between desired and current state
+/// Find changed attributes between desired and current state.
+/// If `saved` is provided, each desired value is merged with the saved value
+/// before comparison, filling in unmanaged nested fields.
 fn find_changed_attributes(
     desired: &HashMap<String, Value>,
     current: &HashMap<String, Value>,
+    saved: Option<&HashMap<String, Value>>,
 ) -> Vec<String> {
     let mut changed = Vec::new();
 
@@ -97,9 +102,22 @@ fn find_changed_attributes(
             continue;
         }
 
-        match current.get(key) {
-            Some(current_value) if current_value.semantically_equal(desired_value) => {}
-            _ => changed.push(key.clone()),
+        let is_equal = match saved.and_then(|s| s.get(key)) {
+            Some(saved_value) => {
+                let effective_desired = merge_with_saved(desired_value, saved_value);
+                current
+                    .get(key)
+                    .map(|cv| cv.semantically_equal(&effective_desired))
+                    .unwrap_or(false)
+            }
+            None => current
+                .get(key)
+                .map(|cv| cv.semantically_equal(desired_value))
+                .unwrap_or(false),
+        };
+
+        if !is_equal {
+            changed.push(key.clone());
         }
     }
 
@@ -111,11 +129,16 @@ fn find_changed_attributes(
 /// The `lifecycles` map provides lifecycle configuration for orphaned resources
 /// (resources in state but not in desired). For desired resources, the lifecycle
 /// is read directly from the Resource struct.
+///
+/// The `saved_attrs` map provides the last-known attribute values from the state file.
+/// This is used to merge unmanaged nested fields into desired values before comparison,
+/// preventing false diffs when AWS returns extra fields not specified in the .crn file.
 pub fn create_plan(
     desired: &[Resource],
     current_states: &HashMap<ResourceId, State>,
     lifecycles: &HashMap<ResourceId, LifecycleConfig>,
     schemas: &HashMap<String, ResourceSchema>,
+    saved_attrs: &HashMap<ResourceId, HashMap<String, Value>>,
 ) -> Plan {
     let mut plan = Plan::new();
 
@@ -136,7 +159,8 @@ pub fn create_plan(
             .cloned()
             .unwrap_or_else(|| State::not_found(resource.id.clone()));
 
-        let d = diff(resource, &current);
+        let saved = saved_attrs.get(&resource.id);
+        let d = diff(resource, &current, saved);
 
         match d {
             Diff::Create(r) => plan.add(Effect::Create(r)),
@@ -207,7 +231,7 @@ mod tests {
         let desired = Resource::new("bucket", "test");
         let current = State::not_found(ResourceId::new("bucket", "test"));
 
-        let result = diff(&desired, &current);
+        let result = diff(&desired, &current, None);
         assert!(matches!(result, Diff::Create(_)));
     }
 
@@ -223,7 +247,7 @@ mod tests {
         );
         let current = State::existing(ResourceId::new("bucket", "test"), attrs);
 
-        let result = diff(&desired, &current);
+        let result = diff(&desired, &current, None);
         assert!(matches!(result, Diff::NoChange(_)));
     }
 
@@ -239,7 +263,7 @@ mod tests {
         );
         let current = State::existing(ResourceId::new("bucket", "test"), attrs);
 
-        let result = diff(&desired, &current);
+        let result = diff(&desired, &current, None);
         match result {
             Diff::Update {
                 changed_attributes, ..
@@ -271,6 +295,7 @@ mod tests {
             &current_states,
             &HashMap::new(),
             &HashMap::new(),
+            &HashMap::new(),
         );
 
         assert_eq!(plan.effects().len(), 2);
@@ -291,6 +316,7 @@ mod tests {
         let plan = create_plan(
             &resources,
             &current_states,
+            &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
         );
@@ -328,7 +354,7 @@ mod tests {
             current_attrs,
         );
 
-        let result = diff(&desired, &current);
+        let result = diff(&desired, &current, None);
         match result {
             Diff::Update {
                 changed_attributes, ..
@@ -365,7 +391,13 @@ mod tests {
             State::existing(ResourceId::new("bucket", "orphaned-bucket"), orphan_attrs),
         );
 
-        let plan = create_plan(&desired, &current_states, &HashMap::new(), &HashMap::new());
+        let plan = create_plan(
+            &desired,
+            &current_states,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
 
         // Should have 1 effect: Delete for orphaned-bucket
         // (keep-this has NoChange, so no effect)
@@ -408,6 +440,7 @@ mod tests {
             &current_states,
             &HashMap::new(),
             &HashMap::new(),
+            &HashMap::new(),
         );
 
         // Should still have Read effect, not NoChange
@@ -432,7 +465,7 @@ mod tests {
         );
         let current = State::existing(ResourceId::new("ec2.vpc", "vpc"), attrs);
 
-        let result = diff(&desired, &current);
+        let result = diff(&desired, &current, None);
         assert!(
             matches!(result, Diff::NoChange(_)),
             "Expected NoChange when neither side has 'name', got {:?}",
@@ -468,7 +501,13 @@ mod tests {
                 .attribute(AttributeSchema::new("cidr_block", AttributeType::String).create_only()),
         );
 
-        let plan = create_plan(&resources, &current_states, &HashMap::new(), &schemas);
+        let plan = create_plan(
+            &resources,
+            &current_states,
+            &HashMap::new(),
+            &schemas,
+            &HashMap::new(),
+        );
 
         assert_eq!(plan.effects().len(), 1);
         match &plan.effects()[0] {
@@ -511,7 +550,13 @@ mod tests {
                 )),
         );
 
-        let plan = create_plan(&resources, &current_states, &HashMap::new(), &schemas);
+        let plan = create_plan(
+            &resources,
+            &current_states,
+            &HashMap::new(),
+            &schemas,
+            &HashMap::new(),
+        );
 
         assert_eq!(plan.effects().len(), 1);
         assert!(
@@ -554,7 +599,13 @@ mod tests {
                 )),
         );
 
-        let plan = create_plan(&resources, &current_states, &HashMap::new(), &schemas);
+        let plan = create_plan(
+            &resources,
+            &current_states,
+            &HashMap::new(),
+            &schemas,
+            &HashMap::new(),
+        );
 
         assert_eq!(plan.effects().len(), 1);
         match &plan.effects()[0] {
@@ -596,7 +647,13 @@ mod tests {
                 .attribute(AttributeSchema::new("cidr_block", AttributeType::String).create_only()),
         );
 
-        let plan = create_plan(&resources, &current_states, &HashMap::new(), &schemas);
+        let plan = create_plan(
+            &resources,
+            &current_states,
+            &HashMap::new(),
+            &schemas,
+            &HashMap::new(),
+        );
 
         assert_eq!(plan.effects().len(), 1);
         match &plan.effects()[0] {
@@ -641,7 +698,7 @@ mod tests {
             current_attrs,
         );
 
-        let result = diff(&desired, &current);
+        let result = diff(&desired, &current, None);
         assert!(
             matches!(result, Diff::NoChange(_)),
             "Expected NoChange when list-of-maps has same content in different order, got {:?}",
@@ -682,13 +739,182 @@ mod tests {
                 .attribute(AttributeSchema::new("cidr_block", AttributeType::String).create_only()),
         );
 
-        let plan = create_plan(&resources, &current_states, &HashMap::new(), &schemas);
+        let plan = create_plan(
+            &resources,
+            &current_states,
+            &HashMap::new(),
+            &schemas,
+            &HashMap::new(),
+        );
 
         assert_eq!(plan.effects().len(), 1);
         assert!(
             matches!(plan.effects()[0], Effect::Replace { .. }),
             "Expected Replace with awscc-prefixed schema key, got {:?}",
             plan.effects()[0]
+        );
+    }
+
+    /// Regression test for issue #172: desired has 2 fields in a struct,
+    /// current (AWS) returns 3, saved state has 3. Should be NoChange.
+    #[test]
+    fn diff_no_change_when_struct_has_extra_fields_with_saved() {
+        let desired = Resource::new("ec2.subnet", "test-subnet").with_attribute(
+            "private_dns_name_options_on_launch",
+            Value::Map(HashMap::from([
+                (
+                    "hostname_type".to_string(),
+                    Value::String("ip-name".to_string()),
+                ),
+                (
+                    "enable_resource_name_dns_a_record".to_string(),
+                    Value::Bool(true),
+                ),
+            ])),
+        );
+
+        let current_attrs = HashMap::from([(
+            "private_dns_name_options_on_launch".to_string(),
+            Value::Map(HashMap::from([
+                (
+                    "hostname_type".to_string(),
+                    Value::String("ip-name".to_string()),
+                ),
+                (
+                    "enable_resource_name_dns_a_record".to_string(),
+                    Value::Bool(true),
+                ),
+                (
+                    "enable_resource_name_dns_aaaa_record".to_string(),
+                    Value::Bool(false),
+                ),
+            ])),
+        )]);
+        let current = State::existing(ResourceId::new("ec2.subnet", "test-subnet"), current_attrs);
+
+        let saved = HashMap::from([
+            (
+                "hostname_type".to_string(),
+                Value::String("ip-name".to_string()),
+            ),
+            (
+                "enable_resource_name_dns_a_record".to_string(),
+                Value::Bool(true),
+            ),
+            (
+                "enable_resource_name_dns_aaaa_record".to_string(),
+                Value::Bool(false),
+            ),
+        ]);
+        let saved_map = HashMap::from([(
+            "private_dns_name_options_on_launch".to_string(),
+            Value::Map(saved),
+        )]);
+
+        let result = diff(&desired, &current, Some(&saved_map));
+        assert!(
+            matches!(result, Diff::NoChange(_)),
+            "Expected NoChange when saved fills extra struct fields, got {:?}",
+            result
+        );
+    }
+
+    /// When an unmanaged field drifts externally, diff should still detect the change.
+    #[test]
+    fn diff_detects_drift_on_unmanaged_field() {
+        let desired = Resource::new("ec2.subnet", "test-subnet").with_attribute(
+            "private_dns_name_options_on_launch",
+            Value::Map(HashMap::from([
+                (
+                    "hostname_type".to_string(),
+                    Value::String("ip-name".to_string()),
+                ),
+                (
+                    "enable_resource_name_dns_a_record".to_string(),
+                    Value::Bool(true),
+                ),
+            ])),
+        );
+
+        // AWS returns aaaa_record: true (drifted from saved false)
+        let current_attrs = HashMap::from([(
+            "private_dns_name_options_on_launch".to_string(),
+            Value::Map(HashMap::from([
+                (
+                    "hostname_type".to_string(),
+                    Value::String("ip-name".to_string()),
+                ),
+                (
+                    "enable_resource_name_dns_a_record".to_string(),
+                    Value::Bool(true),
+                ),
+                (
+                    "enable_resource_name_dns_aaaa_record".to_string(),
+                    Value::Bool(true),
+                ),
+            ])),
+        )]);
+        let current = State::existing(ResourceId::new("ec2.subnet", "test-subnet"), current_attrs);
+
+        let saved = HashMap::from([
+            (
+                "hostname_type".to_string(),
+                Value::String("ip-name".to_string()),
+            ),
+            (
+                "enable_resource_name_dns_a_record".to_string(),
+                Value::Bool(true),
+            ),
+            (
+                "enable_resource_name_dns_aaaa_record".to_string(),
+                Value::Bool(false),
+            ),
+        ]);
+        let saved_map = HashMap::from([(
+            "private_dns_name_options_on_launch".to_string(),
+            Value::Map(saved),
+        )]);
+
+        let result = diff(&desired, &current, Some(&saved_map));
+        assert!(
+            matches!(result, Diff::Update { .. }),
+            "Expected Update when unmanaged field drifted, got {:?}",
+            result
+        );
+    }
+
+    /// When saved state is None, behavior should be unchanged from before.
+    #[test]
+    fn diff_works_without_saved_state() {
+        // Desired has 2 fields, current has 3 (extra field). Without saved state,
+        // this should still be NoChange because find_changed_attributes only checks
+        // desired keys against current (not the other direction).
+        let desired = Resource::new("ec2.subnet", "test-subnet").with_attribute(
+            "opts",
+            Value::Map(HashMap::from([
+                ("a".to_string(), Value::Int(1)),
+                ("b".to_string(), Value::Int(2)),
+            ])),
+        );
+
+        let current_attrs = HashMap::from([(
+            "opts".to_string(),
+            Value::Map(HashMap::from([
+                ("a".to_string(), Value::Int(1)),
+                ("b".to_string(), Value::Int(2)),
+                ("c".to_string(), Value::Int(3)),
+            ])),
+        )]);
+        let current = State::existing(ResourceId::new("ec2.subnet", "test-subnet"), current_attrs);
+
+        // Without saved state, the map comparison uses semantically_equal which
+        // checks both key count AND values. Since desired map has 2 keys and current
+        // has 3, this will show as Update (which is the existing behavior).
+        let result = diff(&desired, &current, None);
+        assert!(
+            matches!(result, Diff::Update { .. }),
+            "Expected Update without saved state when maps have different sizes, got {:?}",
+            result
         );
     }
 }

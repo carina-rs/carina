@@ -1469,7 +1469,13 @@ async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
     provider.resolve_enum_identifiers(&mut resources_for_plan);
     let lifecycles = build_lifecycles_from_state(&state_file);
     let schemas = get_schemas();
-    let plan = create_plan(&resources_for_plan, &current_states, &lifecycles, &schemas);
+    let plan = create_plan(
+        &resources_for_plan,
+        &current_states,
+        &lifecycles,
+        &schemas,
+        &saved_attrs,
+    );
 
     if plan.is_empty() {
         println!("{}", "No changes needed.".green());
@@ -3116,7 +3122,13 @@ async fn create_plan_from_parsed(
     let lifecycles = build_lifecycles_from_state(state_file);
 
     let schemas = get_schemas();
-    let plan = create_plan(&resources, &current_states, &lifecycles, &schemas);
+    let plan = create_plan(
+        &resources,
+        &current_states,
+        &lifecycles,
+        &schemas,
+        &saved_attrs,
+    );
     Ok(PlanContext {
         plan,
         sorted_resources,
