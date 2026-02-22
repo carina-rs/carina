@@ -1520,10 +1520,28 @@ async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
 
     let mut success_count = 0;
     let mut failure_count = 0;
+    let mut skip_count = 0;
     let mut applied_states: HashMap<ResourceId, State> = HashMap::new();
+    let mut failed_bindings: HashSet<String> = HashSet::new();
 
     // Apply each effect in order, resolving references dynamically
     for effect in plan.effects() {
+        // Check if any dependency has failed - skip this effect if so
+        if let Some(failed_dep) = find_failed_dependency(effect, &failed_bindings) {
+            println!(
+                "  {} {} - dependency '{}' failed",
+                "⊘".yellow(),
+                format_effect(effect),
+                failed_dep
+            );
+            skip_count += 1;
+            // Propagate failure to this binding so transitive dependents are also skipped
+            if let Some(binding) = get_effect_binding_name(effect) {
+                failed_bindings.insert(binding);
+            }
+            continue;
+        }
+
         match effect {
             Effect::Create(resource) => {
                 // Re-resolve references with current binding_map
@@ -1556,6 +1574,9 @@ async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
                     Err(e) => {
                         println!("  {} {} - {}", "✗".red(), format_effect(effect), e);
                         failure_count += 1;
+                        if let Some(binding) = get_effect_binding_name(effect) {
+                            failed_bindings.insert(binding);
+                        }
                     }
                 }
             }
@@ -1590,6 +1611,9 @@ async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
                     Err(e) => {
                         println!("  {} {} - {}", "✗".red(), format_effect(effect), e);
                         failure_count += 1;
+                        if let Some(binding) = get_effect_binding_name(effect) {
+                            failed_bindings.insert(binding);
+                        }
                     }
                 }
             }
@@ -1633,12 +1657,18 @@ async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
                                 Err(e) => {
                                     println!("  {} {} - {}", "✗".red(), format_effect(effect), e);
                                     failure_count += 1;
+                                    if let Some(binding) = get_effect_binding_name(effect) {
+                                        failed_bindings.insert(binding);
+                                    }
                                 }
                             }
                         }
                         Err(e) => {
                             println!("  {} {} - {}", "✗".red(), format_effect(effect), e);
                             failure_count += 1;
+                            if let Some(binding) = get_effect_binding_name(effect) {
+                                failed_bindings.insert(binding);
+                            }
                         }
                     }
                 } else {
@@ -1675,12 +1705,18 @@ async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
                                 Err(e) => {
                                     println!("  {} {} - {}", "✗".red(), format_effect(effect), e);
                                     failure_count += 1;
+                                    if let Some(binding) = get_effect_binding_name(effect) {
+                                        failed_bindings.insert(binding);
+                                    }
                                 }
                             }
                         }
                         Err(e) => {
                             println!("  {} {} - {}", "✗".red(), format_effect(effect), e);
                             failure_count += 1;
+                            if let Some(binding) = get_effect_binding_name(effect) {
+                                failed_bindings.insert(binding);
+                            }
                         }
                     }
                 }
@@ -1749,7 +1785,7 @@ async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
     }
 
     println!();
-    if failure_count == 0 {
+    if failure_count == 0 && skip_count == 0 {
         println!(
             "{}",
             format!("Apply complete! {} changes applied.", success_count)
@@ -1758,10 +1794,14 @@ async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
         );
         Ok(())
     } else {
-        Err(format!(
-            "Apply failed. {} succeeded, {} failed.",
-            success_count, failure_count
-        ))
+        let mut parts = vec![format!("{} succeeded", success_count)];
+        if failure_count > 0 {
+            parts.push(format!("{} failed", failure_count));
+        }
+        if skip_count > 0 {
+            parts.push(format!("{} skipped", skip_count));
+        }
+        Err(format!("Apply failed. {}.", parts.join(", ")))
     }
 }
 
@@ -2053,10 +2093,28 @@ async fn run_apply_from_plan(plan_path: &PathBuf, auto_approve: bool) -> Result<
 
     let mut success_count = 0;
     let mut failure_count = 0;
+    let mut skip_count = 0;
     let mut applied_states: HashMap<ResourceId, State> = HashMap::new();
+    let mut failed_bindings: HashSet<String> = HashSet::new();
 
     // Apply each effect in order, resolving references dynamically
     for effect in plan.effects() {
+        // Check if any dependency has failed - skip this effect if so
+        if let Some(failed_dep) = find_failed_dependency(effect, &failed_bindings) {
+            println!(
+                "  {} {} - dependency '{}' failed",
+                "⊘".yellow(),
+                format_effect(effect),
+                failed_dep
+            );
+            skip_count += 1;
+            // Propagate failure to this binding so transitive dependents are also skipped
+            if let Some(binding) = get_effect_binding_name(effect) {
+                failed_bindings.insert(binding);
+            }
+            continue;
+        }
+
         match effect {
             Effect::Create(resource) => {
                 let mut resolved_resource = resource.clone();
@@ -2085,6 +2143,9 @@ async fn run_apply_from_plan(plan_path: &PathBuf, auto_approve: bool) -> Result<
                     Err(e) => {
                         println!("  {} {} - {}", "✗".red(), format_effect(effect), e);
                         failure_count += 1;
+                        if let Some(binding) = get_effect_binding_name(effect) {
+                            failed_bindings.insert(binding);
+                        }
                     }
                 }
             }
@@ -2114,6 +2175,9 @@ async fn run_apply_from_plan(plan_path: &PathBuf, auto_approve: bool) -> Result<
                     Err(e) => {
                         println!("  {} {} - {}", "✗".red(), format_effect(effect), e);
                         failure_count += 1;
+                        if let Some(binding) = get_effect_binding_name(effect) {
+                            failed_bindings.insert(binding);
+                        }
                     }
                 }
             }
@@ -2156,12 +2220,18 @@ async fn run_apply_from_plan(plan_path: &PathBuf, auto_approve: bool) -> Result<
                                 Err(e) => {
                                     println!("  {} {} - {}", "✗".red(), format_effect(effect), e);
                                     failure_count += 1;
+                                    if let Some(binding) = get_effect_binding_name(effect) {
+                                        failed_bindings.insert(binding);
+                                    }
                                 }
                             }
                         }
                         Err(e) => {
                             println!("  {} {} - {}", "✗".red(), format_effect(effect), e);
                             failure_count += 1;
+                            if let Some(binding) = get_effect_binding_name(effect) {
+                                failed_bindings.insert(binding);
+                            }
                         }
                     }
                 } else {
@@ -2194,12 +2264,18 @@ async fn run_apply_from_plan(plan_path: &PathBuf, auto_approve: bool) -> Result<
                                 Err(e) => {
                                     println!("  {} {} - {}", "✗".red(), format_effect(effect), e);
                                     failure_count += 1;
+                                    if let Some(binding) = get_effect_binding_name(effect) {
+                                        failed_bindings.insert(binding);
+                                    }
                                 }
                             }
                         }
                         Err(e) => {
                             println!("  {} {} - {}", "✗".red(), format_effect(effect), e);
                             failure_count += 1;
+                            if let Some(binding) = get_effect_binding_name(effect) {
+                                failed_bindings.insert(binding);
+                            }
                         }
                     }
                 }
@@ -2264,7 +2340,7 @@ async fn run_apply_from_plan(plan_path: &PathBuf, auto_approve: bool) -> Result<
     println!("  {} Lock released", "✓".green());
 
     println!();
-    if failure_count == 0 {
+    if failure_count == 0 && skip_count == 0 {
         println!(
             "{}",
             format!("Apply complete! {} changes applied.", success_count)
@@ -2273,10 +2349,14 @@ async fn run_apply_from_plan(plan_path: &PathBuf, auto_approve: bool) -> Result<
         );
         Ok(())
     } else {
-        Err(format!(
-            "Apply failed. {} succeeded, {} failed.",
-            success_count, failure_count
-        ))
+        let mut parts = vec![format!("{} succeeded", success_count)];
+        if failure_count > 0 {
+            parts.push(format!("{} failed", failure_count));
+        }
+        if skip_count > 0 {
+            parts.push(format!("{} skipped", skip_count));
+        }
+        Err(format!("Apply failed. {}.", parts.join(", ")))
     }
 }
 
@@ -3405,6 +3485,35 @@ fn print_plan(plan: &Plan) {
     }
     parts.push(format!("{} to destroy", summary.delete.to_string().red()));
     println!("Plan: {}.", parts.join(", "));
+}
+
+/// Get the resource from an effect for dependency checking
+fn get_effect_resource(effect: &Effect) -> Option<&Resource> {
+    match effect {
+        Effect::Create(resource) => Some(resource),
+        Effect::Update { to, .. } => Some(to),
+        Effect::Replace { to, .. } => Some(to),
+        Effect::Read { resource } => Some(resource),
+        Effect::Delete { .. } => None,
+    }
+}
+
+/// Get the binding name for an effect's resource
+fn get_effect_binding_name(effect: &Effect) -> Option<String> {
+    get_effect_resource(effect).and_then(|r| {
+        r.attributes.get("_binding").and_then(|v| match v {
+            Value::String(s) => Some(s.clone()),
+            _ => None,
+        })
+    })
+}
+
+/// Check if an effect has any dependency on failed bindings.
+/// Returns the name of the first failed dependency found, or None.
+fn find_failed_dependency(effect: &Effect, failed_bindings: &HashSet<String>) -> Option<String> {
+    let resource = get_effect_resource(effect)?;
+    let deps = get_resource_dependencies(resource);
+    deps.into_iter().find(|dep| failed_bindings.contains(dep))
 }
 
 fn format_effect(effect: &Effect) -> String {
@@ -4796,5 +4905,113 @@ mod tests {
 
         // Name should remain unchanged
         assert_eq!(resources[0].id.name, "my_vpc");
+    }
+
+    #[test]
+    fn test_get_effect_resource_create() {
+        let resource = make_resource("a", &[]);
+        let effect = Effect::Create(resource.clone());
+        assert_eq!(get_effect_resource(&effect).unwrap().id, resource.id);
+    }
+
+    #[test]
+    fn test_get_effect_resource_delete_returns_none() {
+        let effect = Effect::Delete {
+            id: ResourceId::new("test", "a"),
+            identifier: "id-123".to_string(),
+            lifecycle: LifecycleConfig::default(),
+        };
+        assert!(get_effect_resource(&effect).is_none());
+    }
+
+    #[test]
+    fn test_get_effect_binding_name() {
+        let resource = make_resource("my_binding", &[]);
+        let effect = Effect::Create(resource);
+        assert_eq!(
+            get_effect_binding_name(&effect),
+            Some("my_binding".to_string())
+        );
+    }
+
+    #[test]
+    fn test_get_effect_binding_name_no_binding() {
+        let mut resource = Resource::new("test", "no_binding");
+        // No _binding attribute
+        resource
+            .attributes
+            .insert("name".to_string(), Value::String("test".to_string()));
+        let effect = Effect::Create(resource);
+        assert_eq!(get_effect_binding_name(&effect), None);
+    }
+
+    #[test]
+    fn test_find_failed_dependency_direct() {
+        // resource "b" depends on "a"
+        let resource = make_resource("b", &["a"]);
+        let effect = Effect::Create(resource);
+
+        let mut failed = HashSet::new();
+        failed.insert("a".to_string());
+
+        let result = find_failed_dependency(&effect, &failed);
+        assert_eq!(result, Some("a".to_string()));
+    }
+
+    #[test]
+    fn test_find_failed_dependency_none() {
+        let resource = make_resource("b", &["a"]);
+        let effect = Effect::Create(resource);
+
+        let failed: HashSet<String> = HashSet::new();
+
+        let result = find_failed_dependency(&effect, &failed);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_find_failed_dependency_no_deps() {
+        let resource = make_resource("a", &[]);
+        let effect = Effect::Create(resource);
+
+        let mut failed = HashSet::new();
+        failed.insert("x".to_string());
+
+        let result = find_failed_dependency(&effect, &failed);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_find_failed_dependency_transitive_propagation() {
+        // Simulates the apply loop behavior:
+        // c depends on b, b depends on a
+        // a fails -> b gets added to failed_bindings (by apply loop)
+        // c should be skipped because b is in failed_bindings
+        let resource_c = make_resource("c", &["b"]);
+        let effect_c = Effect::Create(resource_c);
+
+        let mut failed = HashSet::new();
+        // "a" failed initially, "b" was added when skipped (simulating apply loop propagation)
+        failed.insert("a".to_string());
+        failed.insert("b".to_string());
+
+        let result = find_failed_dependency(&effect_c, &failed);
+        assert_eq!(result, Some("b".to_string()));
+    }
+
+    #[test]
+    fn test_find_failed_dependency_delete_effect() {
+        // Delete effects have no resource, so no dependencies to check
+        let effect = Effect::Delete {
+            id: ResourceId::new("test", "a"),
+            identifier: "id-123".to_string(),
+            lifecycle: LifecycleConfig::default(),
+        };
+
+        let mut failed = HashSet::new();
+        failed.insert("some_binding".to_string());
+
+        let result = find_failed_dependency(&effect, &failed);
+        assert_eq!(result, None);
     }
 }
