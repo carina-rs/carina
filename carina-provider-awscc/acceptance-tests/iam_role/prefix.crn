@@ -13,12 +13,10 @@ let role = awscc.iam.role {
 
   assume_role_policy_document = {
     version = "2012-10-17"
-    statement = [
-      {
-        effect    = "Allow"
-        principal = { service = "lambda.amazonaws.com" }
-        action    = "sts:AssumeRole"
-      }
-    ]
+    statement {
+      effect    = "Allow"
+      principal = { service = "lambda.amazonaws.com" }
+      action    = "sts:AssumeRole"
+    }
   }
 }

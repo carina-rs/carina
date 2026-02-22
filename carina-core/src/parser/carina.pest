@@ -104,7 +104,7 @@ primary = {
 list = { "[" ~ (expression ~ ("," ~ expression)*)? ~ ","? ~ "]" }
 
 // Map: { key = value, ... } (commas are optional, newlines work too)
-map = { "{" ~ map_entry* ~ "}" }
+map = { "{" ~ (map_entry | nested_block)* ~ "}" }
 
 // Map entry: key = value (with optional trailing comma)
 map_entry = { identifier ~ "=" ~ expression ~ ","? }
