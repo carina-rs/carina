@@ -363,6 +363,7 @@ fn override_type_to_display_name(override_type: &str) -> &str {
         "super::iam_policy_arn()" => "IamPolicyArn",
         "super::kms_key_arn()" => "KmsKeyArn",
         "super::kms_key_id()" => "KmsKeyId",
+        "super::gateway_id()" => "GatewayId",
         _ => "String",
     }
 }
@@ -1550,6 +1551,8 @@ fn resource_specific_type_overrides() -> &'static HashMap<(&'static str, &'stati
             let mut m = HashMap::new();
             // IAM Role's Arn is always an IAM Role ARN
             m.insert(("AWS::IAM::Role", "Arn"), "super::iam_role_arn()");
+            // EC2 Route's GatewayId accepts both igw-* and vgw-*
+            m.insert(("AWS::EC2::Route", "GatewayId"), "super::gateway_id()");
             m
         });
     &OVERRIDES
@@ -3600,6 +3603,16 @@ mod tests {
             infer_string_type("VpcId", "AWS::IAM::Role"),
             Some("super::vpc_id()".to_string())
         );
+        // EC2 Route's GatewayId should use gateway_id (union), not generic aws_resource_id
+        assert_eq!(
+            infer_string_type("GatewayId", "AWS::EC2::Route"),
+            Some("super::gateway_id()".to_string())
+        );
+        // Other resources' GatewayId should use generic resource ID type
+        assert_eq!(
+            infer_string_type("GatewayId", "AWS::EC2::VPNGatewayRoutePropagation"),
+            Some("super::aws_resource_id()".to_string())
+        );
     }
 
     #[test]
@@ -3611,6 +3624,16 @@ mod tests {
         );
         // Other resources' Arn should display as generic Arn
         assert_eq!(infer_string_type_display("Arn", "AWS::S3::Bucket"), "Arn");
+        // EC2 Route's GatewayId should display as GatewayId
+        assert_eq!(
+            infer_string_type_display("GatewayId", "AWS::EC2::Route"),
+            "GatewayId"
+        );
+        // Other resources' GatewayId should use generic type
+        assert_eq!(
+            infer_string_type_display("GatewayId", "AWS::EC2::VPNGatewayRoutePropagation"),
+            "AwsResourceId"
+        );
     }
 
     #[test]

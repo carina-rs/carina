@@ -89,6 +89,8 @@ pub enum AttributeType {
         name: String,
         fields: Vec<StructField>,
     },
+    /// Union of multiple types (value is valid if it matches any member)
+    Union(Vec<AttributeType>),
 }
 
 impl AttributeType {
@@ -231,6 +233,19 @@ impl AttributeType {
                 Ok(())
             }
 
+            // Union type: valid if any member accepts the value
+            (AttributeType::Union(types), _) => {
+                for member in types {
+                    if member.validate(value).is_ok() {
+                        return Ok(());
+                    }
+                }
+                Err(TypeError::TypeMismatch {
+                    expected: self.type_name(),
+                    got: value.type_name(),
+                })
+            }
+
             _ => Err(TypeError::TypeMismatch {
                 expected: self.type_name(),
                 got: value.type_name(),
@@ -249,6 +264,20 @@ impl AttributeType {
             AttributeType::List(inner) => format!("List<{}>", inner.type_name()),
             AttributeType::Map(inner) => format!("Map<{}>", inner.type_name()),
             AttributeType::Struct { name, .. } => format!("Struct({})", name),
+            AttributeType::Union(types) => {
+                let names: Vec<String> = types.iter().map(|t| t.type_name()).collect();
+                names.join(" | ")
+            }
+        }
+    }
+
+    /// Check if a type name is accepted by this type.
+    /// For Union types, returns true if any member accepts the name.
+    /// For other types, returns true if self.type_name() == name.
+    pub fn accepts_type_name(&self, name: &str) -> bool {
+        match self {
+            AttributeType::Union(types) => types.iter().any(|t| t.accepts_type_name(name)),
+            _ => self.type_name() == name,
         }
     }
 }
@@ -1513,5 +1542,123 @@ mod tests {
         );
         let result = schema.validate(&attrs4);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn validate_union_type() {
+        // Create two Custom types that validate different prefixes
+        let type_a = AttributeType::Custom {
+            name: "TypeA".to_string(),
+            base: Box::new(AttributeType::String),
+            validate: |value| {
+                if let Value::String(s) = value {
+                    if s.starts_with("a-") {
+                        Ok(())
+                    } else {
+                        Err(format!("Expected 'a-' prefix, got '{}'", s))
+                    }
+                } else {
+                    Err("Expected string".to_string())
+                }
+            },
+            namespace: None,
+            to_dsl: None,
+        };
+        let type_b = AttributeType::Custom {
+            name: "TypeB".to_string(),
+            base: Box::new(AttributeType::String),
+            validate: |value| {
+                if let Value::String(s) = value {
+                    if s.starts_with("b-") {
+                        Ok(())
+                    } else {
+                        Err(format!("Expected 'b-' prefix, got '{}'", s))
+                    }
+                } else {
+                    Err("Expected string".to_string())
+                }
+            },
+            namespace: None,
+            to_dsl: None,
+        };
+
+        let union_type = AttributeType::Union(vec![type_a, type_b]);
+
+        // Valid: matches first member
+        assert!(
+            union_type
+                .validate(&Value::String("a-12345678".to_string()))
+                .is_ok()
+        );
+        // Valid: matches second member
+        assert!(
+            union_type
+                .validate(&Value::String("b-12345678".to_string()))
+                .is_ok()
+        );
+        // Invalid: matches neither
+        assert!(
+            union_type
+                .validate(&Value::String("c-12345678".to_string()))
+                .is_err()
+        );
+        // Valid: ResourceRef is accepted by Custom members
+        assert!(
+            union_type
+                .validate(&Value::ResourceRef {
+                    binding_name: "gw".to_string(),
+                    attribute_name: "id".to_string(),
+                })
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn union_type_name() {
+        let type_a = AttributeType::Custom {
+            name: "TypeA".to_string(),
+            base: Box::new(AttributeType::String),
+            validate: |_| Ok(()),
+            namespace: None,
+            to_dsl: None,
+        };
+        let type_b = AttributeType::Custom {
+            name: "TypeB".to_string(),
+            base: Box::new(AttributeType::String),
+            validate: |_| Ok(()),
+            namespace: None,
+            to_dsl: None,
+        };
+
+        let union_type = AttributeType::Union(vec![type_a, type_b]);
+        assert_eq!(union_type.type_name(), "TypeA | TypeB");
+    }
+
+    #[test]
+    fn union_accepts_type_name() {
+        let type_a = AttributeType::Custom {
+            name: "TypeA".to_string(),
+            base: Box::new(AttributeType::String),
+            validate: |_| Ok(()),
+            namespace: None,
+            to_dsl: None,
+        };
+        let type_b = AttributeType::Custom {
+            name: "TypeB".to_string(),
+            base: Box::new(AttributeType::String),
+            validate: |_| Ok(()),
+            namespace: None,
+            to_dsl: None,
+        };
+
+        let union_type = AttributeType::Union(vec![type_a, type_b]);
+        assert!(union_type.accepts_type_name("TypeA"));
+        assert!(union_type.accepts_type_name("TypeB"));
+        assert!(!union_type.accepts_type_name("TypeC"));
+
+        // Non-union types
+        let simple = AttributeType::String;
+        assert!(simple.accepts_type_name("String"));
+        assert!(!simple.accepts_type_name("Int"));
     }
 }

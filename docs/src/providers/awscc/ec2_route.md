@@ -52,7 +52,7 @@ The ID of a prefix list used for the destination match.
 
 ### `gateway_id`
 
-- **Type:** AwsResourceId
+- **Type:** GatewayId
 - **Required:** No
 
 The ID of an internet gateway or virtual private gateway attached to your VPC.

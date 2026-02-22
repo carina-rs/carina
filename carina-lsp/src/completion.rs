@@ -749,7 +749,7 @@ impl CompletionProvider {
             AttributeType::Custom { name, .. } if name == "IpProtocol" => {
                 self.ip_protocol_completions(resource_type)
             }
-            AttributeType::String | AttributeType::Custom { .. } => {
+            AttributeType::Union(_) | AttributeType::String | AttributeType::Custom { .. } => {
                 vec![CompletionItem {
                     label: "env".to_string(),
                     kind: Some(CompletionItemKind::FUNCTION),
