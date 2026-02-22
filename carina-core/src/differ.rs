@@ -564,6 +564,50 @@ mod tests {
     }
 
     #[test]
+    fn replace_carries_create_before_destroy_lifecycle() {
+        use crate::schema::{AttributeSchema, AttributeType};
+
+        let mut resource = Resource::new("ec2.vpc", "my-vpc")
+            .with_attribute("cidr_block", Value::String("10.1.0.0/16".to_string()));
+        resource.lifecycle.create_before_destroy = true;
+
+        let resources = vec![resource];
+
+        let mut current_states = HashMap::new();
+        let mut attrs = HashMap::new();
+        attrs.insert(
+            "cidr_block".to_string(),
+            Value::String("10.0.0.0/16".to_string()),
+        );
+        current_states.insert(
+            ResourceId::new("ec2.vpc", "my-vpc"),
+            State::existing(ResourceId::new("ec2.vpc", "my-vpc"), attrs),
+        );
+
+        let mut schemas = HashMap::new();
+        schemas.insert(
+            "ec2.vpc".to_string(),
+            crate::schema::ResourceSchema::new("ec2.vpc")
+                .attribute(AttributeSchema::new("cidr_block", AttributeType::String).create_only()),
+        );
+
+        let plan = create_plan(&resources, &current_states, &HashMap::new(), &schemas);
+
+        assert_eq!(plan.effects().len(), 1);
+        match &plan.effects()[0] {
+            Effect::Replace {
+                lifecycle,
+                changed_create_only,
+                ..
+            } => {
+                assert!(lifecycle.create_before_destroy);
+                assert_eq!(changed_create_only, &vec!["cidr_block".to_string()]);
+            }
+            other => panic!("Expected Replace, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn replace_with_provider_prefixed_schema_key() {
         use crate::schema::{AttributeSchema, AttributeType};
 

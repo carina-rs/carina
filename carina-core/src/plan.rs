@@ -263,7 +263,13 @@ fn format_effect_brief(effect: &Effect) -> String {
     match effect {
         Effect::Create(r) => format!("+ {}", r.id),
         Effect::Update { id, .. } => format!("~ {}", id),
-        Effect::Replace { id, .. } => format!("-/+ {}", id),
+        Effect::Replace { id, lifecycle, .. } => {
+            if lifecycle.create_before_destroy {
+                format!("+/- {}", id)
+            } else {
+                format!("-/+ {}", id)
+            }
+        }
         Effect::Delete { id, .. } => format!("- {}", id),
         Effect::Read { resource } => format!("<= {} (data source)", resource.id),
     }
