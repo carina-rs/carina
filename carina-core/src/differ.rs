@@ -98,7 +98,7 @@ fn find_changed_attributes(
         }
 
         match current.get(key) {
-            Some(current_value) if current_value == desired_value => {}
+            Some(current_value) if current_value.semantically_equal(desired_value) => {}
             _ => changed.push(key.clone()),
         }
     }
@@ -610,6 +610,43 @@ mod tests {
             }
             other => panic!("Expected Replace, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn diff_no_change_when_list_of_maps_reordered() {
+        let mut rule1 = HashMap::new();
+        rule1.insert("ip_protocol".to_string(), Value::String("tcp".to_string()));
+        rule1.insert("from_port".to_string(), Value::Int(80));
+        rule1.insert("to_port".to_string(), Value::Int(80));
+
+        let mut rule2 = HashMap::new();
+        rule2.insert("ip_protocol".to_string(), Value::String("tcp".to_string()));
+        rule2.insert("from_port".to_string(), Value::Int(443));
+        rule2.insert("to_port".to_string(), Value::Int(443));
+
+        // Desired: [rule1, rule2]
+        let desired = Resource::new("ec2_security_group", "test-sg").with_attribute(
+            "security_group_egress",
+            Value::List(vec![Value::Map(rule1.clone()), Value::Map(rule2.clone())]),
+        );
+
+        // Current (from AWS): [rule2, rule1] — same content, different order
+        let mut current_attrs = HashMap::new();
+        current_attrs.insert(
+            "security_group_egress".to_string(),
+            Value::List(vec![Value::Map(rule2), Value::Map(rule1)]),
+        );
+        let current = State::existing(
+            ResourceId::new("ec2_security_group", "test-sg"),
+            current_attrs,
+        );
+
+        let result = diff(&desired, &current);
+        assert!(
+            matches!(result, Diff::NoChange(_)),
+            "Expected NoChange when list-of-maps has same content in different order, got {:?}",
+            result
+        );
     }
 
     #[test]
