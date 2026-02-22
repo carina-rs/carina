@@ -473,6 +473,13 @@ impl DiagnosticEngine {
                             }
                         }
                     }
+
+                    // Lint: prefer block syntax for List<Struct> attributes
+                    diagnostics.extend(self.check_list_struct_syntax(
+                        doc,
+                        &resource.attributes,
+                        &schema,
+                    ));
                 }
             }
         }
@@ -692,6 +699,86 @@ impl DiagnosticEngine {
         }
 
         positions
+    }
+
+    /// Find position of list literal syntax (`attr_name = [`) in source text.
+    /// Returns `(line, col)` if found.
+    fn find_list_literal_position(&self, doc: &Document, attr_name: &str) -> Option<(u32, u32)> {
+        let text = doc.text();
+
+        for (line_idx, line) in text.lines().enumerate() {
+            let trimmed = line.trim_start();
+            if !trimmed.starts_with(attr_name) {
+                continue;
+            }
+            let after = &trimmed[attr_name.len()..];
+            // Must be followed by whitespace or '=' (not part of a longer identifier)
+            if !after.starts_with(' ') && !after.starts_with('=') {
+                continue;
+            }
+            // Check for `= [` pattern (list literal)
+            let after_trimmed = after.trim_start();
+            if let Some(rest) = after_trimmed.strip_prefix('=') {
+                let rest_trimmed = rest.trim_start();
+                if rest_trimmed.starts_with('[') {
+                    let leading_ws = line.len() - trimmed.len();
+                    return Some((line_idx as u32, leading_ws as u32));
+                }
+            }
+        }
+        None
+    }
+
+    /// Check List<Struct> attributes for list literal syntax and suggest block syntax.
+    fn check_list_struct_syntax(
+        &self,
+        doc: &Document,
+        resource_attrs: &std::collections::HashMap<String, Value>,
+        schema: &carina_core::schema::ResourceSchema,
+    ) -> Vec<Diagnostic> {
+        use carina_core::schema::AttributeType;
+
+        let mut diagnostics = Vec::new();
+
+        for (attr_name, attr_schema) in &schema.attributes {
+            // Only check List<Struct> attributes
+            let is_list_struct = matches!(
+                &attr_schema.attr_type,
+                AttributeType::List(inner) if matches!(inner.as_ref(), AttributeType::Struct { .. })
+            );
+            if !is_list_struct {
+                continue;
+            }
+
+            // Only check attributes that actually exist in the resource
+            if !resource_attrs.contains_key(attr_name) {
+                continue;
+            }
+
+            if let Some((line, col)) = self.find_list_literal_position(doc, attr_name) {
+                diagnostics.push(Diagnostic {
+                    range: Range {
+                        start: Position {
+                            line,
+                            character: col,
+                        },
+                        end: Position {
+                            line,
+                            character: col + attr_name.len() as u32,
+                        },
+                    },
+                    severity: Some(DiagnosticSeverity::HINT),
+                    source: Some("carina".to_string()),
+                    message: format!(
+                        "Prefer block syntax for '{}'. Use `{} {{ ... }}` instead of `{} = [{{ ... }}]`.",
+                        attr_name, attr_name, attr_name
+                    ),
+                    ..Default::default()
+                });
+            }
+        }
+
+        diagnostics
     }
 
     /// Find the positions of a field inside ALL matching nested blocks
@@ -1601,6 +1688,98 @@ aws.ec2.subnet {
         assert!(
             dup_diag.is_none(),
             "Should NOT error on single struct block. Got diagnostics: {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn lint_list_literal_for_list_struct() {
+        let engine = DiagnosticEngine::new();
+        let doc = create_document(
+            r#"provider awscc {
+    region = awscc.Region.ap_northeast_1
+}
+
+let sg = awscc.ec2.security_group {
+    group_description = "Test security group"
+    security_group_ingress = [{
+        ip_protocol = "tcp"
+        from_port = 80
+        to_port = 80
+        cidr_ip = "0.0.0.0/0"
+    }]
+}"#,
+        );
+
+        let diagnostics = engine.analyze(&doc, None);
+
+        let lint_diag = diagnostics
+            .iter()
+            .find(|d| d.message.contains("Prefer block syntax"));
+        assert!(
+            lint_diag.is_some(),
+            "Should emit HINT for list literal syntax on List<Struct>. Got diagnostics: {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+
+        let diag = lint_diag.unwrap();
+        assert_eq!(diag.severity, Some(DiagnosticSeverity::HINT));
+        assert!(diag.message.contains("security_group_ingress"));
+    }
+
+    #[test]
+    fn lint_block_syntax_no_warning() {
+        let engine = DiagnosticEngine::new();
+        let doc = create_document(
+            r#"provider awscc {
+    region = awscc.Region.ap_northeast_1
+}
+
+let sg = awscc.ec2.security_group {
+    group_description = "Test security group"
+    security_group_ingress {
+        ip_protocol = "tcp"
+        from_port = 80
+        to_port = 80
+        cidr_ip = "0.0.0.0/0"
+    }
+}"#,
+        );
+
+        let diagnostics = engine.analyze(&doc, None);
+
+        let lint_diag = diagnostics
+            .iter()
+            .find(|d| d.message.contains("Prefer block syntax"));
+        assert!(
+            lint_diag.is_none(),
+            "Block syntax should NOT produce lint warning. Got diagnostics: {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn lint_string_attr_no_warning() {
+        let engine = DiagnosticEngine::new();
+        // group_description is a String attribute — lint should not flag it
+        let doc = create_document(
+            r#"provider awscc {
+    region = awscc.Region.ap_northeast_1
+}
+
+let sg = awscc.ec2.security_group {
+    group_description = "Test security group"
+}"#,
+        );
+
+        let diagnostics = engine.analyze(&doc, None);
+
+        let lint_diag = diagnostics
+            .iter()
+            .find(|d| d.message.contains("Prefer block syntax"));
+        assert!(
+            lint_diag.is_none(),
+            "String attributes should NOT produce lint warning. Got diagnostics: {:?}",
             diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
     }
