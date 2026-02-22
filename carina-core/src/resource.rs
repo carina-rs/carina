@@ -128,6 +128,91 @@ fn lists_equal(a: &[Value], b: &[Value]) -> bool {
     true
 }
 
+/// Merge desired value with saved state to fill in unmanaged nested fields.
+/// For Maps: start with saved, overlay desired fields on top (desired wins).
+/// For Lists: match elements by similarity, merge each pair.
+/// For other types: return desired as-is.
+pub fn merge_with_saved(desired: &Value, saved: &Value) -> Value {
+    match (desired, saved) {
+        (Value::Map(desired_map), Value::Map(saved_map)) => {
+            let mut merged = saved_map.clone();
+            for (k, v) in desired_map {
+                let merged_v = if let Some(saved_v) = saved_map.get(k) {
+                    merge_with_saved(v, saved_v)
+                } else {
+                    v.clone()
+                };
+                merged.insert(k.clone(), merged_v);
+            }
+            Value::Map(merged)
+        }
+        (Value::List(desired_list), Value::List(saved_list)) => {
+            Value::List(merge_lists(desired_list, saved_list))
+        }
+        _ => desired.clone(),
+    }
+}
+
+/// Merge two lists by pairing elements via similarity score, then merging each pair.
+fn merge_lists(desired: &[Value], saved: &[Value]) -> Vec<Value> {
+    if desired.is_empty() {
+        return desired.to_vec();
+    }
+
+    let mut used = vec![false; saved.len()];
+    let mut result = Vec::with_capacity(desired.len());
+
+    for d in desired {
+        // Find the best matching saved element
+        let mut best_idx = None;
+        let mut best_score = 0;
+
+        for (j, s) in saved.iter().enumerate() {
+            if used[j] {
+                continue;
+            }
+            let score = similarity_score(d, s);
+            if score > best_score {
+                best_score = score;
+                best_idx = Some(j);
+            }
+        }
+
+        if let Some(idx) = best_idx {
+            used[idx] = true;
+            result.push(merge_with_saved(d, &saved[idx]));
+        } else {
+            result.push(d.clone());
+        }
+    }
+
+    result
+}
+
+/// Compute a similarity score between two Values.
+/// For Maps: count matching key-value pairs.
+/// For equal scalars: return 1.
+/// Otherwise: return 0.
+fn similarity_score(a: &Value, b: &Value) -> usize {
+    match (a, b) {
+        (Value::Map(am), Value::Map(bm)) => am
+            .iter()
+            .filter(|(k, v)| {
+                bm.get(*k)
+                    .map(|bv| v.semantically_equal(bv))
+                    .unwrap_or(false)
+            })
+            .count(),
+        _ => {
+            if a.semantically_equal(b) {
+                1
+            } else {
+                0
+            }
+        }
+    }
+}
+
 /// Lifecycle configuration for a resource
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct LifecycleConfig {
@@ -446,5 +531,83 @@ mod tests {
         map2.insert("b".to_string(), Value::Int(2));
 
         assert!(!Value::Map(map1).semantically_equal(&Value::Map(map2)));
+    }
+
+    #[test]
+    fn merge_with_saved_map_fills_extra_keys() {
+        let desired = Value::Map(HashMap::from([
+            (
+                "hostname_type".to_string(),
+                Value::String("ip-name".to_string()),
+            ),
+            ("a_record".to_string(), Value::Bool(true)),
+        ]));
+        let saved = Value::Map(HashMap::from([
+            (
+                "hostname_type".to_string(),
+                Value::String("ip-name".to_string()),
+            ),
+            ("a_record".to_string(), Value::Bool(true)),
+            ("aaaa_record".to_string(), Value::Bool(false)),
+        ]));
+
+        let merged = merge_with_saved(&desired, &saved);
+        let expected = Value::Map(HashMap::from([
+            (
+                "hostname_type".to_string(),
+                Value::String("ip-name".to_string()),
+            ),
+            ("a_record".to_string(), Value::Bool(true)),
+            ("aaaa_record".to_string(), Value::Bool(false)),
+        ]));
+        assert!(merged.semantically_equal(&expected), "Merged: {:?}", merged);
+    }
+
+    #[test]
+    fn merge_with_saved_desired_wins() {
+        let desired = Value::Map(HashMap::from([("a".to_string(), Value::Int(10))]));
+        let saved = Value::Map(HashMap::from([
+            ("a".to_string(), Value::Int(5)),
+            ("b".to_string(), Value::Int(20)),
+        ]));
+
+        let merged = merge_with_saved(&desired, &saved);
+        let expected = Value::Map(HashMap::from([
+            ("a".to_string(), Value::Int(10)),
+            ("b".to_string(), Value::Int(20)),
+        ]));
+        assert!(merged.semantically_equal(&expected), "Merged: {:?}", merged);
+    }
+
+    #[test]
+    fn merge_with_saved_list_of_maps() {
+        let desired = Value::List(vec![Value::Map(HashMap::from([(
+            "port".to_string(),
+            Value::Int(80),
+        )]))]);
+        let saved = Value::List(vec![Value::Map(HashMap::from([
+            ("port".to_string(), Value::Int(80)),
+            ("protocol".to_string(), Value::String("tcp".to_string())),
+        ]))]);
+
+        let merged = merge_with_saved(&desired, &saved);
+        let expected = Value::List(vec![Value::Map(HashMap::from([
+            ("port".to_string(), Value::Int(80)),
+            ("protocol".to_string(), Value::String("tcp".to_string())),
+        ]))]);
+        assert!(merged.semantically_equal(&expected), "Merged: {:?}", merged);
+    }
+
+    #[test]
+    fn merge_with_saved_non_map() {
+        let desired = Value::String("hello".to_string());
+        let saved = Value::String("world".to_string());
+        let merged = merge_with_saved(&desired, &saved);
+        assert_eq!(merged, Value::String("hello".to_string()));
+
+        let desired = Value::Int(42);
+        let saved = Value::Int(99);
+        let merged = merge_with_saved(&desired, &saved);
+        assert_eq!(merged, Value::Int(42));
     }
 }
