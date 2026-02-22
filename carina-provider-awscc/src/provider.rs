@@ -46,7 +46,6 @@ const CREATE_RETRY_MAX_DELAY_SECS: u64 = 120;
 pub struct AwsccProvider {
     cloudcontrol_client: CloudControlClient,
     aws_config: aws_config::SdkConfig,
-    region: String,
 }
 
 impl AwsccProvider {
@@ -60,7 +59,6 @@ impl AwsccProvider {
         Self {
             cloudcontrol_client: CloudControlClient::new(&config),
             aws_config: config,
-            region: region.to_string(),
         }
     }
 
@@ -435,12 +433,6 @@ impl AwsccProvider {
         };
 
         let mut attributes = HashMap::new();
-
-        // Add region for VPC
-        if resource_type == "ec2.vpc" {
-            let region_dsl = format!("awscc.Region.{}", self.region.replace('-', "_"));
-            attributes.insert("region".to_string(), Value::String(region_dsl));
-        }
 
         // Map AWS attributes to DSL attributes using provider_name
         for (dsl_name, attr_schema) in &config.schema.attributes {
