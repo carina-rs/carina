@@ -123,6 +123,7 @@ if [ "$COMMAND" = "cleanup" ]; then
 
             for TEST_FILE in "${TESTS[@]}"; do
                 REL_PATH="${TEST_FILE#$SCRIPT_DIR/}"
+                echo "RUNNING destroy $REL_PATH"
                 DESTROY_OUTPUT=$(cd "$STATE_DIR" && aws-vault exec "$ACCOUNT" -- "$CARINA_BIN" destroy --auto-approve "$TEST_FILE" 2>&1)
                 DESTROY_RC=$?
                 if [ $DESTROY_RC -eq 0 ]; then
@@ -147,6 +148,7 @@ if [ "$COMMAND" = "cleanup" ]; then
     done
 
     echo ""
+    echo "Logs: $WORK_DIR/slot_*.log"
     echo "Waiting for all accounts to finish cleanup..."
     echo ""
 
@@ -262,6 +264,7 @@ if [ "$COMMAND" = "full" ]; then
                 CURRENT_TEST_FILE="$TEST_FILE"
 
                 # Apply (run from STATE_DIR so each account has its own state file)
+                echo "RUNNING apply $REL_PATH"
                 APPLY_OUTPUT=$(cd "$STATE_DIR" && aws-vault exec "$ACCOUNT" -- "$CARINA_BIN" apply --auto-approve "$TEST_FILE" 2>&1)
                 APPLY_RC=$?
                 if [ $INTERRUPTED -eq 1 ]; then
@@ -278,6 +281,7 @@ if [ "$COMMAND" = "full" ]; then
                 fi
 
                 # Post-apply plan verification (idempotency check)
+                echo "RUNNING plan-verify $REL_PATH"
                 PLAN_OUTPUT=$(cd "$STATE_DIR" && aws-vault exec "$ACCOUNT" -- "$CARINA_BIN" plan --detailed-exitcode "$TEST_FILE" 2>&1)
                 PLAN_RC=$?
                 if [ $INTERRUPTED -eq 1 ]; then
@@ -302,6 +306,7 @@ if [ "$COMMAND" = "full" ]; then
                 fi
 
                 # Destroy
+                echo "RUNNING destroy $REL_PATH"
                 DESTROY_OUTPUT=$(cd "$STATE_DIR" && aws-vault exec "$ACCOUNT" -- "$CARINA_BIN" destroy --auto-approve "$TEST_FILE" 2>&1)
                 DESTROY_RC=$?
                 if [ $DESTROY_RC -ne 0 ] || echo "$DESTROY_OUTPUT" | grep -q "failed"; then
@@ -326,6 +331,7 @@ if [ "$COMMAND" = "full" ]; then
     done
 
     echo ""
+    echo "Logs: $WORK_DIR/slot_*.log"
     echo "Waiting for all accounts to finish..."
     echo ""
 
