@@ -1807,6 +1807,63 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_vpc_endpoint_type_roundtrip_no_false_diff() {
+        // Issue #175: vpc_endpoint_type shows false diff after apply
+        // DSL uses bare `Gateway`, AWS returns "Gateway" as string.
+        // Both must normalize to the same namespaced value.
+
+        let config = crate::schemas::generated::ec2_vpc_endpoint::ec2_vpc_endpoint_config();
+        let attr_schema = config.schema.attributes.get("vpc_endpoint_type").unwrap();
+
+        // 1. DSL side: resolve_enum_identifiers_impl converts bare `Gateway` ident
+        let mut resource = Resource::new("ec2.vpc_endpoint", "test");
+        resource
+            .attributes
+            .insert("_provider".to_string(), Value::String("awscc".to_string()));
+        resource
+            .attributes
+            .insert("vpc_id".to_string(), Value::String("vpc-123".to_string()));
+        resource.attributes.insert(
+            "vpc_endpoint_type".to_string(),
+            Value::UnresolvedIdent("Gateway".to_string(), None),
+        );
+
+        let mut resources = vec![resource];
+        resolve_enum_identifiers_impl(&mut resources);
+
+        let dsl_resolved = &resources[0].attributes["vpc_endpoint_type"];
+        assert_eq!(
+            dsl_resolved,
+            &Value::String("awscc.ec2.vpc_endpoint.VpcEndpointType.Gateway".to_string()),
+            "DSL bare ident `Gateway` should resolve to namespaced form"
+        );
+
+        // 2. AWS read-back side: aws_value_to_dsl converts "Gateway" string
+        let provider = AwsccProvider::new("ap-northeast-1").await;
+        let aws_json = serde_json::json!("Gateway");
+        let aws_dsl = provider
+            .aws_value_to_dsl(
+                "vpc_endpoint_type",
+                &aws_json,
+                &attr_schema.attr_type,
+                "ec2.vpc_endpoint",
+            )
+            .expect("aws_value_to_dsl should return Some");
+
+        assert_eq!(
+            aws_dsl,
+            Value::String("awscc.ec2.vpc_endpoint.VpcEndpointType.Gateway".to_string()),
+            "AWS read-back 'Gateway' should normalize to namespaced form"
+        );
+
+        // 3. Both must be equal (no false diff)
+        assert_eq!(
+            dsl_resolved, &aws_dsl,
+            "DSL resolved value and AWS read-back value must match — no false diff"
+        );
+    }
+
     #[test]
     fn test_resolve_enum_identifiers_impl_struct_field() {
         // Test that resolve_enum_identifiers_impl handles struct field enums
