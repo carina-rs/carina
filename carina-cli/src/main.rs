@@ -536,7 +536,7 @@ fn reconcile_prefixed_names(resources: &mut [Resource], state_file: &Option<Stat
 }
 
 /// Compute stable identifiers for anonymous resources (those with empty ResourceId.name).
-/// Uses create-only properties from the schema to generate a deterministic hash.
+/// Uses create-only properties and provider identity attributes to generate a deterministic hash.
 fn compute_anonymous_identifiers(resources: &mut [Resource]) -> Result<(), String> {
     use std::collections::BTreeMap;
     use std::hash::{Hash, Hasher};
@@ -544,13 +544,16 @@ fn compute_anonymous_identifiers(resources: &mut [Resource]) -> Result<(), Strin
     let factories = provider_factories();
     let schemas = get_schemas();
 
-    for resource in resources.iter_mut() {
+    // First pass: compute identifiers and detect collisions
+    let mut computed: Vec<(usize, String)> = Vec::new();
+
+    for (idx, resource) in resources.iter().enumerate() {
         if !resource.id.name.is_empty() {
             continue;
         }
 
         // Look up schema for this resource's provider (skip if no _provider set)
-        let Some(Value::String(_)) = resource.attributes.get("_provider") else {
+        let Some(Value::String(provider_name)) = resource.attributes.get("_provider") else {
             continue;
         };
         let schema_key = schema_key_for_resource(&factories, resource);
@@ -565,6 +568,16 @@ fn compute_anonymous_identifiers(resources: &mut [Resource]) -> Result<(), Strin
                 "Anonymous resource '{}' has no create-only properties. Use `let` binding for identification.",
                 resource.id.display_type()
             ));
+        }
+
+        // Collect identity attribute values (e.g., region) in sorted order
+        let mut identity_values: BTreeMap<&str, String> = BTreeMap::new();
+        if let Some(factory) = find_factory(&factories, provider_name) {
+            for attr_name in factory.identity_attributes() {
+                if let Some(value) = resource.attributes.get(attr_name) {
+                    identity_values.insert(attr_name, format!("{:?}", value));
+                }
+            }
         }
 
         // Collect create-only values in sorted order for deterministic hashing
@@ -582,8 +595,12 @@ fn compute_anonymous_identifiers(resources: &mut [Resource]) -> Result<(), Strin
             ));
         }
 
-        // Compute deterministic hash
+        // Compute deterministic hash: identity attributes first, then create-only values
         let mut hasher = std::hash::DefaultHasher::new();
+        for (k, v) in &identity_values {
+            k.hash(&mut hasher);
+            v.hash(&mut hasher);
+        }
         for (k, v) in &create_only_values {
             k.hash(&mut hasher);
             v.hash(&mut hasher);
@@ -597,11 +614,30 @@ fn compute_anonymous_identifiers(resources: &mut [Resource]) -> Result<(), Strin
             resource.id.resource_type.replace('.', "_"),
             hash_str
         );
-        resource.id = ResourceId::with_provider(
-            &resource.id.provider,
-            &resource.id.resource_type,
-            identifier,
-        );
+
+        computed.push((idx, identifier));
+    }
+
+    // Detect collisions
+    let mut seen: HashMap<String, usize> = HashMap::new();
+    for (idx, identifier) in &computed {
+        if let Some(first_idx) = seen.get(identifier) {
+            return Err(format!(
+                "Anonymous resource identifier collision: '{}' and '{}' produce the same identifier '{}'. \
+                 Use `let` bindings to give them distinct names.",
+                resources[*first_idx].id.display_type(),
+                resources[*idx].id.display_type(),
+                identifier,
+            ));
+        }
+        seen.insert(identifier.clone(), *idx);
+    }
+
+    // Second pass: apply identifiers
+    for (idx, identifier) in computed {
+        let provider = resources[idx].id.provider.clone();
+        let resource_type = resources[idx].id.resource_type.clone();
+        resources[idx].id = ResourceId::with_provider(&provider, &resource_type, identifier);
     }
 
     Ok(())
@@ -4635,5 +4671,128 @@ mod tests {
         plan.add(Effect::Create(Resource::new("s3.bucket", "test")));
         let has_changes = !plan.is_empty();
         assert!(has_changes);
+    }
+
+    #[test]
+    fn test_anonymous_id_different_regions_produce_different_identifiers() {
+        // Two anonymous ec2_vpc resources with same cidr_block but different regions
+        let mut r1 = Resource::with_provider("awscc", "ec2.vpc", "");
+        r1.attributes
+            .insert("_provider".to_string(), Value::String("awscc".to_string()));
+        r1.attributes.insert(
+            "cidr_block".to_string(),
+            Value::String("10.0.0.0/16".to_string()),
+        );
+        r1.attributes.insert(
+            "region".to_string(),
+            Value::String("awscc.Region.us_east_1".to_string()),
+        );
+
+        let mut r2 = Resource::with_provider("awscc", "ec2.vpc", "");
+        r2.attributes
+            .insert("_provider".to_string(), Value::String("awscc".to_string()));
+        r2.attributes.insert(
+            "cidr_block".to_string(),
+            Value::String("10.0.0.0/16".to_string()),
+        );
+        r2.attributes.insert(
+            "region".to_string(),
+            Value::String("awscc.Region.us_west_2".to_string()),
+        );
+
+        let mut resources = vec![r1, r2];
+        compute_anonymous_identifiers(&mut resources).unwrap();
+
+        // Both should have identifiers assigned
+        assert!(!resources[0].id.name.is_empty());
+        assert!(!resources[1].id.name.is_empty());
+        // They must be different
+        assert_ne!(resources[0].id.name, resources[1].id.name);
+    }
+
+    #[test]
+    fn test_anonymous_id_same_region_same_create_only_collides() {
+        // Two anonymous ec2_vpc resources with same cidr_block and same region → collision
+        let mut r1 = Resource::with_provider("awscc", "ec2.vpc", "");
+        r1.attributes
+            .insert("_provider".to_string(), Value::String("awscc".to_string()));
+        r1.attributes.insert(
+            "cidr_block".to_string(),
+            Value::String("10.0.0.0/16".to_string()),
+        );
+        r1.attributes.insert(
+            "region".to_string(),
+            Value::String("awscc.Region.us_east_1".to_string()),
+        );
+
+        let mut r2 = Resource::with_provider("awscc", "ec2.vpc", "");
+        r2.attributes
+            .insert("_provider".to_string(), Value::String("awscc".to_string()));
+        r2.attributes.insert(
+            "cidr_block".to_string(),
+            Value::String("10.0.0.0/16".to_string()),
+        );
+        r2.attributes.insert(
+            "region".to_string(),
+            Value::String("awscc.Region.us_east_1".to_string()),
+        );
+
+        let mut resources = vec![r1, r2];
+        let result = compute_anonymous_identifiers(&mut resources);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("collision"));
+    }
+
+    #[test]
+    fn test_anonymous_id_different_create_only_same_region_no_collision() {
+        // Two anonymous ec2_vpc resources with different cidr_block in same region → no collision
+        let mut r1 = Resource::with_provider("awscc", "ec2.vpc", "");
+        r1.attributes
+            .insert("_provider".to_string(), Value::String("awscc".to_string()));
+        r1.attributes.insert(
+            "cidr_block".to_string(),
+            Value::String("10.0.0.0/16".to_string()),
+        );
+        r1.attributes.insert(
+            "region".to_string(),
+            Value::String("awscc.Region.us_east_1".to_string()),
+        );
+
+        let mut r2 = Resource::with_provider("awscc", "ec2.vpc", "");
+        r2.attributes
+            .insert("_provider".to_string(), Value::String("awscc".to_string()));
+        r2.attributes.insert(
+            "cidr_block".to_string(),
+            Value::String("10.1.0.0/16".to_string()),
+        );
+        r2.attributes.insert(
+            "region".to_string(),
+            Value::String("awscc.Region.us_east_1".to_string()),
+        );
+
+        let mut resources = vec![r1, r2];
+        compute_anonymous_identifiers(&mut resources).unwrap();
+
+        assert!(!resources[0].id.name.is_empty());
+        assert!(!resources[1].id.name.is_empty());
+        assert_ne!(resources[0].id.name, resources[1].id.name);
+    }
+
+    #[test]
+    fn test_anonymous_id_named_resources_are_skipped() {
+        // Named resources should not be processed by compute_anonymous_identifiers
+        let mut r1 = Resource::with_provider("awscc", "ec2.vpc", "my_vpc");
+        r1.attributes
+            .insert("_provider".to_string(), Value::String("awscc".to_string()));
+        r1.attributes.insert(
+            "cidr_block".to_string(),
+            Value::String("10.0.0.0/16".to_string()),
+        );
+
+        let mut resources = vec![r1];
+        compute_anonymous_identifiers(&mut resources).unwrap();
+
+        // Name should remain unchanged
+        assert_eq!(resources[0].id.name, "my_vpc");
     }
 }
