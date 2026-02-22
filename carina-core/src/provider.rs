@@ -139,12 +139,13 @@ pub trait Provider: Send + Sync {
     /// Default implementation is a no-op for providers without enum types.
     fn resolve_enum_identifiers(&self, _resources: &mut [Resource]) {}
 
-    /// Restore create-only attributes from saved state into current read states.
+    /// Restore unreturned attributes from saved state into current read states.
     ///
-    /// Some APIs (e.g., CloudControl) don't return create-only properties in read responses.
+    /// Some APIs (e.g., CloudControl) don't return certain properties in read responses
+    /// (create-only properties, or normal properties like `description` on some resources).
     /// This method carries them forward from previously saved attribute values.
     /// Default implementation is a no-op.
-    fn restore_create_only_attrs(
+    fn restore_unreturned_attrs(
         &self,
         _current_states: &mut HashMap<ResourceId, State>,
         _saved_attrs: &HashMap<ResourceId, HashMap<String, Value>>,
@@ -246,12 +247,12 @@ impl Provider for Box<dyn Provider> {
         (**self).resolve_enum_identifiers(resources)
     }
 
-    fn restore_create_only_attrs(
+    fn restore_unreturned_attrs(
         &self,
         current_states: &mut HashMap<ResourceId, State>,
         saved_attrs: &HashMap<ResourceId, HashMap<String, Value>>,
     ) {
-        (**self).restore_create_only_attrs(current_states, saved_attrs)
+        (**self).restore_unreturned_attrs(current_states, saved_attrs)
     }
 }
 
