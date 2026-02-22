@@ -34,7 +34,7 @@ fn get_schema_config(resource_type: &str) -> Option<AwsccSchemaConfig> {
 }
 
 /// Maximum number of retry attempts for retryable create errors
-const CREATE_RETRY_MAX_ATTEMPTS: u32 = 12;
+const CREATE_RETRY_MAX_ATTEMPTS: u32 = 20;
 
 /// Initial delay in seconds before retrying a failed create operation
 const CREATE_RETRY_INITIAL_DELAY_SECS: u64 = 10;
