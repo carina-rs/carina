@@ -117,6 +117,12 @@ enum Commands {
         #[command(subcommand)]
         command: StateCommands,
     },
+    /// Lint .crn files for style issues
+    Lint {
+        /// Path to .crn file or directory
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
     /// Generate shell completions
     Completions {
         /// Shell to generate completions for
@@ -237,6 +243,7 @@ async fn main() {
         Commands::Module { command } => run_module_command(command),
         Commands::ForceUnlock { lock_id, path } => run_force_unlock(&lock_id, &path).await,
         Commands::State { command } => run_state_command(command).await,
+        Commands::Lint { path } => run_lint(&path),
         Commands::Completions { shell } => {
             generate(shell, &mut Cli::command(), "carina", &mut std::io::stdout());
             Ok(())
@@ -4422,6 +4429,132 @@ fn print_diff(file: &Path, original: &str, formatted: &str) {
     }
 }
 
+/// A lint warning with file, line, and message info.
+struct LintWarning {
+    file: PathBuf,
+    line: usize,
+    message: String,
+}
+
+/// Find list literal syntax (`attr = [...]`) for the given attribute names.
+/// Returns attribute name and 1-indexed line number for each occurrence.
+fn find_list_literal_attrs(source: &str, attr_names: &HashSet<String>) -> Vec<(String, usize)> {
+    let mut results = Vec::new();
+
+    for (line_idx, line) in source.lines().enumerate() {
+        let trimmed = line.trim_start();
+        for attr_name in attr_names {
+            if !trimmed.starts_with(attr_name.as_str()) {
+                continue;
+            }
+            let after = &trimmed[attr_name.len()..];
+            // Must be followed by whitespace or '=' (not part of a longer identifier)
+            if !after.starts_with(' ') && !after.starts_with('=') {
+                continue;
+            }
+            // Check for `= [` pattern (list literal)
+            let after_trimmed = after.trim_start();
+            if let Some(rest) = after_trimmed.strip_prefix('=') {
+                let rest_trimmed = rest.trim_start();
+                if rest_trimmed.starts_with('[') {
+                    results.push((attr_name.clone(), line_idx + 1)); // 1-indexed line
+                }
+            }
+        }
+    }
+
+    results
+}
+
+/// Collect all List<Struct> attribute names from a schema.
+fn list_struct_attr_names(schema: &ResourceSchema) -> HashSet<String> {
+    use carina_core::schema::AttributeType;
+    schema
+        .attributes
+        .iter()
+        .filter(|(_, attr_schema)| {
+            matches!(
+                &attr_schema.attr_type,
+                AttributeType::List(inner) if matches!(inner.as_ref(), AttributeType::Struct { .. })
+            )
+        })
+        .map(|(name, _)| name.clone())
+        .collect()
+}
+
+fn run_lint(path: &PathBuf) -> Result<(), String> {
+    let mut parsed = load_configuration(path)?.parsed;
+
+    let base_dir = get_base_dir(path);
+
+    // Resolve modules
+    module_resolver::resolve_modules(&mut parsed, base_dir)
+        .map_err(|e| format!("Module resolution error: {}", e))?;
+
+    let factories = provider_factories();
+    let schemas = get_schemas();
+
+    // Collect source texts for each .crn file
+    let source_texts: Vec<(PathBuf, String)> = if path.is_file() {
+        let content = fs::read_to_string(path)
+            .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
+        vec![(path.clone(), content)]
+    } else if path.is_dir() {
+        let files = find_crn_files_in_dir(path)?;
+        let mut texts = Vec::new();
+        for file in files {
+            let content = fs::read_to_string(&file)
+                .map_err(|e| format!("Failed to read {}: {}", file.display(), e))?;
+            texts.push((file, content));
+        }
+        texts
+    } else {
+        return Err(format!("Path not found: {}", path.display()));
+    };
+
+    // Collect all List<Struct> attribute names from schemas of parsed resources
+    let mut all_list_struct_attrs: HashSet<String> = HashSet::new();
+    for resource in &parsed.resources {
+        let schema_key = schema_key_for_resource(&factories, resource);
+        if let Some(schema) = schemas.get(&schema_key) {
+            all_list_struct_attrs.extend(list_struct_attr_names(schema));
+        }
+    }
+
+    // Scan each source file for list literal usage of List<Struct> attributes
+    let mut warnings: Vec<LintWarning> = Vec::new();
+
+    for (file_path, source) in &source_texts {
+        let hits = find_list_literal_attrs(source, &all_list_struct_attrs);
+        for (attr_name, line) in hits {
+            warnings.push(LintWarning {
+                file: file_path.clone(),
+                line,
+                message: format!(
+                    "Prefer block syntax for '{}'. Use `{} {{ ... }}` instead of `{} = [{{ ... }}]`.",
+                    attr_name, attr_name, attr_name
+                ),
+            });
+        }
+    }
+
+    if warnings.is_empty() {
+        println!("{}", "No lint warnings found.".green().bold());
+        Ok(())
+    } else {
+        for w in &warnings {
+            eprintln!(
+                "{} {}:{}  {}",
+                "warning:".yellow().bold(),
+                w.file.display(),
+                w.line,
+                w.message
+            );
+        }
+        Err(format!("Found {} lint warning(s).", warnings.len()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5013,5 +5146,100 @@ mod tests {
 
         let result = find_failed_dependency(&effect, &failed);
         assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_find_list_literal_attrs_detects_list_literal() {
+        let source = r#"
+awscc.ec2.security_group {
+    group_description = "test"
+    security_group_ingress = [{
+        ip_protocol = "tcp"
+        from_port = 80
+        to_port = 80
+    }]
+}
+"#;
+
+        let attr_names: HashSet<String> =
+            ["security_group_ingress".to_string()].into_iter().collect();
+        let results = find_list_literal_attrs(source, &attr_names);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, "security_group_ingress");
+        assert_eq!(results[0].1, 4); // line 4 (1-indexed)
+    }
+
+    #[test]
+    fn test_find_list_literal_attrs_ignores_block_syntax() {
+        let source = r#"
+awscc.ec2.security_group {
+    group_description = "test"
+    security_group_ingress {
+        ip_protocol = "tcp"
+        from_port = 80
+        to_port = 80
+    }
+}
+"#;
+
+        let attr_names: HashSet<String> =
+            ["security_group_ingress".to_string()].into_iter().collect();
+        let results = find_list_literal_attrs(source, &attr_names);
+        assert!(
+            results.is_empty(),
+            "Block syntax should not produce lint warnings"
+        );
+    }
+
+    #[test]
+    fn test_find_list_literal_attrs_ignores_non_listed_attrs() {
+        let source = r#"
+awscc.ec2.security_group {
+    group_description = "test"
+    tags = ["a", "b"]
+}
+"#;
+
+        // "tags" is not in the list of List<Struct> attr names
+        let attr_names: HashSet<String> =
+            ["security_group_ingress".to_string()].into_iter().collect();
+        let results = find_list_literal_attrs(source, &attr_names);
+        assert!(
+            results.is_empty(),
+            "Non-listed attributes should not produce lint warnings"
+        );
+    }
+
+    #[test]
+    fn test_list_struct_attr_names() {
+        use carina_core::schema::{AttributeType, StructField};
+
+        let schema = ResourceSchema::new("ec2.security_group")
+            .attribute(carina_core::schema::AttributeSchema::new(
+                "security_group_ingress",
+                AttributeType::List(Box::new(AttributeType::Struct {
+                    name: "Ingress".to_string(),
+                    fields: vec![StructField::new("ip_protocol", AttributeType::String)],
+                })),
+            ))
+            .attribute(carina_core::schema::AttributeSchema::new(
+                "tags",
+                AttributeType::List(Box::new(AttributeType::String)),
+            ))
+            .attribute(carina_core::schema::AttributeSchema::new(
+                "group_description",
+                AttributeType::String,
+            ));
+
+        let names = list_struct_attr_names(&schema);
+        assert!(names.contains("security_group_ingress"));
+        assert!(
+            !names.contains("tags"),
+            "List<String> should not be included"
+        );
+        assert!(
+            !names.contains("group_description"),
+            "String should not be included"
+        );
     }
 }
