@@ -35,6 +35,48 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 COMMAND="${1:-validate}"
 FILTER="${2:-}"
 
+# ── File-based lock to prevent concurrent executions ──────────────────
+# Uses mkdir (atomic on POSIX) + PID file for stale lock detection.
+# Applies to all commands except 'validate' which doesn't use AWS.
+LOCK_DIR="/tmp/carina-acceptance-tests.lock"
+
+acquire_lock() {
+    if mkdir "$LOCK_DIR" 2>/dev/null; then
+        echo $$ > "$LOCK_DIR/pid"
+        return 0
+    fi
+
+    # Lock exists - check if the holding process is still alive
+    if [ -f "$LOCK_DIR/pid" ]; then
+        OLD_PID=$(cat "$LOCK_DIR/pid" 2>/dev/null || echo "")
+        if [ -n "$OLD_PID" ] && kill -0 "$OLD_PID" 2>/dev/null; then
+            echo "ERROR: Another run-tests.sh instance is already running (PID $OLD_PID, lock: $LOCK_DIR)"
+            return 1
+        fi
+    fi
+
+    # Stale lock (process no longer running) - reclaim it
+    echo "Removing stale lock (previous process no longer running)"
+    rm -rf "$LOCK_DIR"
+    mkdir "$LOCK_DIR" 2>/dev/null || {
+        echo "ERROR: Failed to acquire lock (race condition). Retry."
+        return 1
+    }
+    echo $$ > "$LOCK_DIR/pid"
+    return 0
+}
+
+release_lock() {
+    rm -rf "$LOCK_DIR"
+}
+
+if [ "$COMMAND" != "validate" ]; then
+    if ! acquire_lock; then
+        exit 1
+    fi
+    trap release_lock EXIT
+fi
+
 ACCOUNTS=(
     carina-test-000
     carina-test-001
@@ -93,7 +135,7 @@ if [ "$COMMAND" = "cleanup" ]; then
     echo ""
 
     WORK_DIR=$(mktemp -d)
-    trap "rm -rf $WORK_DIR" EXIT
+    trap "rm -rf $WORK_DIR; release_lock" EXIT
 
     # Pre-authenticate all accounts
     echo "Pre-authenticating AWS accounts..."
@@ -199,12 +241,13 @@ if [ "$COMMAND" = "full" ]; then
         done
         echo "All workers finished."
         rm -rf "$WORK_DIR"
+        release_lock
         exit 1
     }
     trap cleanup_main INT TERM
 
-    # Clean up temp dir on normal exit
-    trap "rm -rf $WORK_DIR" EXIT
+    # Clean up temp dir and release lock on normal exit
+    trap "rm -rf $WORK_DIR; release_lock" EXIT
 
     # Pre-authenticate all accounts sequentially to avoid opening
     # multiple SSO browser tabs simultaneously
