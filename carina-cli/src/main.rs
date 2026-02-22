@@ -546,7 +546,10 @@ fn reconcile_prefixed_names(resources: &mut [Resource], state_file: &Option<Stat
 
 /// Compute stable identifiers for anonymous resources (those with empty ResourceId.name).
 /// Uses create-only properties and provider identity attributes to generate a deterministic hash.
-fn compute_anonymous_identifiers(resources: &mut [Resource]) -> Result<(), String> {
+fn compute_anonymous_identifiers(
+    resources: &mut [Resource],
+    providers: &[ProviderConfig],
+) -> Result<(), String> {
     use std::collections::BTreeMap;
     use std::hash::{Hash, Hasher};
 
@@ -579,11 +582,13 @@ fn compute_anonymous_identifiers(resources: &mut [Resource]) -> Result<(), Strin
             ));
         }
 
-        // Collect identity attribute values (e.g., region) in sorted order
+        // Collect identity attribute values (e.g., region) from provider config
         let mut identity_values: BTreeMap<&str, String> = BTreeMap::new();
-        if let Some(factory) = find_factory(&factories, provider_name) {
+        if let Some(factory) = find_factory(&factories, provider_name)
+            && let Some(pc) = providers.iter().find(|p| p.name == *provider_name)
+        {
             for attr_name in factory.identity_attributes() {
-                if let Some(value) = resource.attributes.get(attr_name) {
+                if let Some(value) = pc.attributes.get(attr_name) {
                     identity_values.insert(attr_name, format!("{:?}", value));
                 }
             }
@@ -994,15 +999,12 @@ fn run_validate(path: &PathBuf) -> Result<(), String> {
     module_resolver::resolve_modules(&mut parsed, base_dir)
         .map_err(|e| format!("Module resolution error: {}", e))?;
 
-    // Apply default region from provider
-    apply_default_region(&mut parsed);
-
     println!("{}", "Validating...".cyan());
 
     resolve_attr_prefixes(&mut parsed.resources)?;
     validate_resources(&parsed.resources)?;
     validate_resource_ref_types(&parsed.resources)?;
-    compute_anonymous_identifiers(&mut parsed.resources)?;
+    compute_anonymous_identifiers(&mut parsed.resources, &parsed.providers)?;
 
     println!(
         "{}",
@@ -1032,13 +1034,10 @@ async fn run_plan(path: &PathBuf, out: Option<&PathBuf>) -> Result<bool, String>
     // Validate provider region
     validate_provider_region(&parsed)?;
 
-    // Apply default region from provider
-    apply_default_region(&mut parsed);
-
     resolve_attr_prefixes(&mut parsed.resources)?;
     validate_resources(&parsed.resources)?;
     validate_resource_ref_types(&parsed.resources)?;
-    compute_anonymous_identifiers(&mut parsed.resources)?;
+    compute_anonymous_identifiers(&mut parsed.resources, &parsed.providers)?;
 
     // Check for backend configuration and load state
     // Use local backend by default if no backend is configured
@@ -1200,13 +1199,10 @@ async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
     // Validate provider region
     validate_provider_region(&parsed)?;
 
-    // Apply default region from provider
-    apply_default_region(&mut parsed);
-
     resolve_attr_prefixes(&mut parsed.resources)?;
     validate_resources(&parsed.resources)?;
     validate_resource_ref_types(&parsed.resources)?;
-    compute_anonymous_identifiers(&mut parsed.resources)?;
+    compute_anonymous_identifiers(&mut parsed.resources, &parsed.providers)?;
 
     // Check for backend configuration - use local backend by default
     let backend_config = parsed.backend.as_ref();
@@ -2400,11 +2396,8 @@ async fn run_destroy(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
     // Validate provider region
     validate_provider_region(&parsed)?;
 
-    // Apply default region from provider
-    apply_default_region(&mut parsed);
-
     resolve_attr_prefixes(&mut parsed.resources)?;
-    compute_anonymous_identifiers(&mut parsed.resources)?;
+    compute_anonymous_identifiers(&mut parsed.resources, &parsed.providers)?;
 
     if parsed.resources.is_empty() {
         println!("{}", "No resources defined in configuration.".yellow());
@@ -2869,25 +2862,6 @@ fn get_identifier_from_state(
         return Some(name.clone());
     }
     None
-}
-
-/// Apply default region from provider to resources that don't have a region specified
-fn apply_default_region(parsed: &mut ParsedFile) {
-    let factories = provider_factories();
-    for provider_config in &parsed.providers {
-        if let Some(factory) = find_factory(&factories, &provider_config.name)
-            && let Some(default_region) = factory.extract_region_dsl(&provider_config.attributes)
-        {
-            for resource in &mut parsed.resources {
-                if !resource.attributes.contains_key("region") {
-                    resource
-                        .attributes
-                        .insert("region".to_string(), Value::String(default_region.clone()));
-                }
-            }
-            return;
-        }
-    }
 }
 
 /// Extract region in SDK format from the first matching provider config
@@ -5030,19 +5004,24 @@ mod tests {
         assert!(has_changes);
     }
 
+    fn make_awscc_provider(region_dsl: &str) -> ProviderConfig {
+        let mut attrs = HashMap::new();
+        attrs.insert("region".to_string(), Value::String(region_dsl.to_string()));
+        ProviderConfig {
+            name: "awscc".to_string(),
+            attributes: attrs,
+        }
+    }
+
     #[test]
     fn test_anonymous_id_different_regions_produce_different_identifiers() {
-        // Two anonymous ec2_vpc resources with same cidr_block but different regions
+        // Two anonymous ec2_vpc resources with same cidr_block but different provider regions
         let mut r1 = Resource::with_provider("awscc", "ec2.vpc", "");
         r1.attributes
             .insert("_provider".to_string(), Value::String("awscc".to_string()));
         r1.attributes.insert(
             "cidr_block".to_string(),
             Value::String("10.0.0.0/16".to_string()),
-        );
-        r1.attributes.insert(
-            "region".to_string(),
-            Value::String("awscc.Region.us_east_1".to_string()),
         );
 
         let mut r2 = Resource::with_provider("awscc", "ec2.vpc", "");
@@ -5052,34 +5031,34 @@ mod tests {
             "cidr_block".to_string(),
             Value::String("10.0.0.0/16".to_string()),
         );
-        r2.attributes.insert(
-            "region".to_string(),
-            Value::String("awscc.Region.us_west_2".to_string()),
-        );
 
-        let mut resources = vec![r1, r2];
-        compute_anonymous_identifiers(&mut resources).unwrap();
+        // Use two different provider configs with different regions
+        // Resources get identity from their provider, not from resource attributes
+        let providers_east = vec![make_awscc_provider("awscc.Region.us_east_1")];
+        let providers_west = vec![make_awscc_provider("awscc.Region.us_west_2")];
+
+        let mut resources_east = vec![r1];
+        compute_anonymous_identifiers(&mut resources_east, &providers_east).unwrap();
+
+        let mut resources_west = vec![r2];
+        compute_anonymous_identifiers(&mut resources_west, &providers_west).unwrap();
 
         // Both should have identifiers assigned
-        assert!(!resources[0].id.name.is_empty());
-        assert!(!resources[1].id.name.is_empty());
-        // They must be different
-        assert_ne!(resources[0].id.name, resources[1].id.name);
+        assert!(!resources_east[0].id.name.is_empty());
+        assert!(!resources_west[0].id.name.is_empty());
+        // They must be different because providers have different regions
+        assert_ne!(resources_east[0].id.name, resources_west[0].id.name);
     }
 
     #[test]
     fn test_anonymous_id_same_region_same_create_only_collides() {
-        // Two anonymous ec2_vpc resources with same cidr_block and same region → collision
+        // Two anonymous ec2_vpc resources with same cidr_block and same provider region → collision
         let mut r1 = Resource::with_provider("awscc", "ec2.vpc", "");
         r1.attributes
             .insert("_provider".to_string(), Value::String("awscc".to_string()));
         r1.attributes.insert(
             "cidr_block".to_string(),
             Value::String("10.0.0.0/16".to_string()),
-        );
-        r1.attributes.insert(
-            "region".to_string(),
-            Value::String("awscc.Region.us_east_1".to_string()),
         );
 
         let mut r2 = Resource::with_provider("awscc", "ec2.vpc", "");
@@ -5089,30 +5068,23 @@ mod tests {
             "cidr_block".to_string(),
             Value::String("10.0.0.0/16".to_string()),
         );
-        r2.attributes.insert(
-            "region".to_string(),
-            Value::String("awscc.Region.us_east_1".to_string()),
-        );
 
+        let providers = vec![make_awscc_provider("awscc.Region.us_east_1")];
         let mut resources = vec![r1, r2];
-        let result = compute_anonymous_identifiers(&mut resources);
+        let result = compute_anonymous_identifiers(&mut resources, &providers);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("collision"));
     }
 
     #[test]
     fn test_anonymous_id_different_create_only_same_region_no_collision() {
-        // Two anonymous ec2_vpc resources with different cidr_block in same region → no collision
+        // Two anonymous ec2_vpc resources with different cidr_block in same provider region → no collision
         let mut r1 = Resource::with_provider("awscc", "ec2.vpc", "");
         r1.attributes
             .insert("_provider".to_string(), Value::String("awscc".to_string()));
         r1.attributes.insert(
             "cidr_block".to_string(),
             Value::String("10.0.0.0/16".to_string()),
-        );
-        r1.attributes.insert(
-            "region".to_string(),
-            Value::String("awscc.Region.us_east_1".to_string()),
         );
 
         let mut r2 = Resource::with_provider("awscc", "ec2.vpc", "");
@@ -5122,13 +5094,10 @@ mod tests {
             "cidr_block".to_string(),
             Value::String("10.1.0.0/16".to_string()),
         );
-        r2.attributes.insert(
-            "region".to_string(),
-            Value::String("awscc.Region.us_east_1".to_string()),
-        );
 
+        let providers = vec![make_awscc_provider("awscc.Region.us_east_1")];
         let mut resources = vec![r1, r2];
-        compute_anonymous_identifiers(&mut resources).unwrap();
+        compute_anonymous_identifiers(&mut resources, &providers).unwrap();
 
         assert!(!resources[0].id.name.is_empty());
         assert!(!resources[1].id.name.is_empty());
@@ -5146,8 +5115,9 @@ mod tests {
             Value::String("10.0.0.0/16".to_string()),
         );
 
+        let providers = vec![make_awscc_provider("awscc.Region.us_east_1")];
         let mut resources = vec![r1];
-        compute_anonymous_identifiers(&mut resources).unwrap();
+        compute_anonymous_identifiers(&mut resources, &providers).unwrap();
 
         // Name should remain unchanged
         assert_eq!(resources[0].id.name, "my_vpc");
