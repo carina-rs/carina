@@ -57,16 +57,20 @@ pub fn diff(desired: &Resource, current: &State) -> Diff {
 
 /// Check which changed attributes are create-only according to the schema
 fn find_changed_create_only(
+    provider: &str,
     resource_type: &str,
     changed_attributes: &[String],
     schemas: &HashMap<String, ResourceSchema>,
 ) -> Vec<String> {
     // Try to find the schema — look up by resource_type directly,
-    // then try with common provider prefixes
-    let schema = schemas
-        .get(resource_type)
-        .or_else(|| schemas.get(&format!("awscc.{}", resource_type)))
-        .or_else(|| schemas.get(&format!("aws.{}", resource_type)));
+    // then try with provider prefix
+    let schema = schemas.get(resource_type).or_else(|| {
+        if !provider.is_empty() {
+            schemas.get(&format!("{}.{}", provider, resource_type))
+        } else {
+            None
+        }
+    });
 
     let Some(schema) = schema else {
         return Vec::new();
@@ -144,6 +148,7 @@ pub fn create_plan(
             } => {
                 // Check if any changed attributes are create-only
                 let changed_create_only = find_changed_create_only(
+                    &resource.id.provider,
                     &resource.id.resource_type,
                     &changed_attributes,
                     schemas,
@@ -612,8 +617,9 @@ mod tests {
         use crate::schema::{AttributeSchema, AttributeType};
 
         // In production, schemas are keyed by "awscc.ec2.vpc" but resource_type is "ec2.vpc"
+        // The resource must have provider set so the generic lookup works
         let resources = vec![
-            Resource::new("ec2.vpc", "my-vpc")
+            Resource::with_provider("awscc", "ec2.vpc", "my-vpc")
                 .with_attribute("cidr_block", Value::String("10.1.0.0/16".to_string())),
         ];
 
@@ -624,8 +630,11 @@ mod tests {
             Value::String("10.0.0.0/16".to_string()),
         );
         current_states.insert(
-            ResourceId::new("ec2.vpc", "my-vpc"),
-            State::existing(ResourceId::new("ec2.vpc", "my-vpc"), attrs),
+            ResourceId::with_provider("awscc", "ec2.vpc", "my-vpc"),
+            State::existing(
+                ResourceId::with_provider("awscc", "ec2.vpc", "my-vpc"),
+                attrs,
+            ),
         );
 
         // Schema keyed with provider prefix (as in production)
