@@ -178,6 +178,9 @@ impl AttributeType {
                 Ok(())
             }
 
+            // ResourceRef values resolve at runtime, so they're valid for Struct types
+            (AttributeType::Struct { .. }, Value::ResourceRef { .. }) => Ok(()),
+
             // Struct type accepts Value::List with exactly one Map element
             // (parser wraps all nested blocks in Value::List)
             (AttributeType::Struct { name, fields: _ }, Value::List(items)) => {

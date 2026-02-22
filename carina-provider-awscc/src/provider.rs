@@ -846,6 +846,29 @@ impl AwsccProvider {
                 .collect();
             Some(serde_json::Value::Array(arr))
         } else if let AttributeType::Struct { fields, .. } = attr_type
+            && let Value::Map(map) = value
+        {
+            // Direct map value for struct type (e.g., `= { ... }` syntax)
+            let obj: serde_json::Map<String, serde_json::Value> = fields
+                .iter()
+                .filter_map(|field| {
+                    let dsl_val = map.get(&field.name)?;
+                    let provider_key = field
+                        .provider_name
+                        .as_deref()
+                        .unwrap_or(&field.name)
+                        .to_string();
+                    let json_val = self.dsl_value_to_aws(
+                        dsl_val,
+                        &field.field_type,
+                        resource_type,
+                        &field.name,
+                    );
+                    json_val.map(|v| (provider_key, v))
+                })
+                .collect();
+            Some(serde_json::Value::Object(obj))
+        } else if let AttributeType::Struct { fields, .. } = attr_type
             && let Value::List(items) = value
             && items.len() == 1
             && let Value::Map(map) = &items[0]

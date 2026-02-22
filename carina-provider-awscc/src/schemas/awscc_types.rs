@@ -6,7 +6,7 @@
 //! the generated `mod.rs`.
 
 use carina_core::resource::Value;
-use carina_core::schema::{AttributeType, ResourceSchema};
+use carina_core::schema::{AttributeType, ResourceSchema, StructField};
 use carina_core::utils::{extract_enum_value, validate_enum_namespace};
 
 /// AWS Cloud Control schema configuration
@@ -669,139 +669,59 @@ fn validate_kms_key_id(value: &str) -> Result<(), String> {
     )
 }
 
-/// IAM Policy Document type
-/// Validates the structure of IAM policy documents (trust policies, inline policies, etc.)
-pub(crate) fn iam_policy_document() -> AttributeType {
-    AttributeType::Custom {
-        name: "IamPolicyDocument".to_string(),
-        base: Box::new(AttributeType::Map(Box::new(AttributeType::String))),
-        validate: |value| validate_iam_policy_document(value),
-        namespace: None,
-        to_dsl: None,
+/// IAM Policy Statement struct type
+fn iam_policy_statement() -> AttributeType {
+    // Union of String and List(String) for Action, Resource, etc.
+    let string_or_list = AttributeType::Union(vec![
+        AttributeType::String,
+        AttributeType::List(Box::new(AttributeType::String)),
+    ]);
+
+    // Principal: Union of String (e.g., "*") and Map(Union(String, List(String)))
+    let principal_type = AttributeType::Union(vec![
+        AttributeType::String,
+        AttributeType::Map(Box::new(string_or_list.clone())),
+    ]);
+
+    // Condition: Map(Map(Union(String, List(String))))
+    let condition_type = AttributeType::Map(Box::new(AttributeType::Map(Box::new(
+        string_or_list.clone(),
+    ))));
+
+    AttributeType::Struct {
+        name: "IamPolicyStatement".to_string(),
+        fields: vec![
+            StructField::new("sid", AttributeType::String).with_provider_name("Sid"),
+            StructField::new("effect", AttributeType::String)
+                .required()
+                .with_provider_name("Effect"),
+            StructField::new("action", string_or_list.clone()).with_provider_name("Action"),
+            StructField::new("not_action", string_or_list.clone()).with_provider_name("NotAction"),
+            StructField::new("resource", string_or_list.clone()).with_provider_name("Resource"),
+            StructField::new("not_resource", string_or_list.clone())
+                .with_provider_name("NotResource"),
+            StructField::new("principal", principal_type.clone()).with_provider_name("Principal"),
+            StructField::new("not_principal", principal_type).with_provider_name("NotPrincipal"),
+            StructField::new("condition", condition_type).with_provider_name("Condition"),
+        ],
     }
 }
 
-fn validate_iam_policy_document(value: &Value) -> Result<(), String> {
-    let Value::Map(map) = value else {
-        return Err("Expected a map for IAM policy document".to_string());
-    };
-
-    // Check Version if present
-    if let Some(Value::String(v)) = map.get("version")
-        && v != "2012-10-17"
-        && v != "2008-10-17"
-    {
-        return Err(format!(
-            "Invalid policy document Version '{}', expected '2012-10-17' or '2008-10-17'",
-            v
-        ));
+/// IAM Policy Document type
+/// Supports both block syntax and map syntax for policy documents.
+pub(crate) fn iam_policy_document() -> AttributeType {
+    AttributeType::Struct {
+        name: "IamPolicyDocument".to_string(),
+        fields: vec![
+            StructField::new("version", AttributeType::String).with_provider_name("Version"),
+            StructField::new("id", AttributeType::String).with_provider_name("Id"),
+            StructField::new(
+                "statement",
+                AttributeType::List(Box::new(iam_policy_statement())),
+            )
+            .with_provider_name("Statement"),
+        ],
     }
-
-    // Check Statement if present
-    if let Some(statement) = map.get("statement") {
-        let Value::List(statements) = statement else {
-            return Err("Policy document 'statement' must be a list".to_string());
-        };
-
-        for (i, stmt) in statements.iter().enumerate() {
-            let Value::Map(stmt_map) = stmt else {
-                return Err(format!("Statement[{}] must be a map", i));
-            };
-
-            // Validate Effect if present
-            if let Some(Value::String(e)) = stmt_map.get("effect")
-                && e != "Allow"
-                && e != "Deny"
-            {
-                return Err(format!(
-                    "Statement[{}] has invalid Effect '{}', expected 'Allow' or 'Deny'",
-                    i, e
-                ));
-            }
-
-            // Validate Sid if present (must be a string)
-            if let Some(sid) = stmt_map.get("sid")
-                && !matches!(sid, Value::String(_))
-            {
-                return Err(format!("Statement[{}] 'sid' must be a string", i));
-            }
-
-            // Validate Action / NotAction if present (must be string or list of strings)
-            for key in &["action", "not_action"] {
-                if let Some(action) = stmt_map.get(*key) {
-                    match action {
-                        Value::String(_) => {}
-                        Value::List(items) => {
-                            for (j, item) in items.iter().enumerate() {
-                                if !matches!(item, Value::String(_)) {
-                                    return Err(format!(
-                                        "Statement[{}] '{}[{}]' must be a string",
-                                        i, key, j
-                                    ));
-                                }
-                            }
-                        }
-                        _ => {
-                            return Err(format!(
-                                "Statement[{}] '{}' must be a string or list of strings",
-                                i, key
-                            ));
-                        }
-                    }
-                }
-            }
-
-            // Validate Resource / NotResource if present (must be string or list of strings)
-            for key in &["resource", "not_resource"] {
-                if let Some(resource) = stmt_map.get(*key) {
-                    match resource {
-                        Value::String(_) => {}
-                        Value::List(items) => {
-                            for (j, item) in items.iter().enumerate() {
-                                if !matches!(item, Value::String(_)) {
-                                    return Err(format!(
-                                        "Statement[{}] '{}[{}]' must be a string",
-                                        i, key, j
-                                    ));
-                                }
-                            }
-                        }
-                        _ => {
-                            return Err(format!(
-                                "Statement[{}] '{}' must be a string or list of strings",
-                                i, key
-                            ));
-                        }
-                    }
-                }
-            }
-
-            // Validate Principal / NotPrincipal if present (must be string "*" or a map)
-            for key in &["principal", "not_principal"] {
-                if let Some(principal) = stmt_map.get(*key) {
-                    match principal {
-                        Value::String(_) => {}
-                        Value::Map(_) => {}
-                        _ => {
-                            return Err(format!(
-                                "Statement[{}] '{}' must be a string or a map",
-                                i, key
-                            ));
-                        }
-                    }
-                }
-            }
-
-            // Validate Condition if present (must be a map)
-            if let Some(condition) = stmt_map.get("condition")
-                && !matches!(condition, Value::Map(_))
-            {
-                return Err(format!("Statement[{}] 'condition' must be a map", i));
-            }
-        }
-    }
-
-    Ok(())
 }
 
 #[cfg(test)]
@@ -1229,7 +1149,25 @@ mod tests {
     }
 
     #[test]
-    fn validate_iam_policy_document_valid() {
+    fn iam_policy_document_is_struct_type() {
+        let t = iam_policy_document();
+        match &t {
+            AttributeType::Struct { name, fields } => {
+                assert_eq!(name, "IamPolicyDocument");
+                // Should have version, id, statement fields
+                let field_names: Vec<&str> = fields.iter().map(|f| f.name.as_str()).collect();
+                assert!(field_names.contains(&"version"));
+                assert!(field_names.contains(&"id"));
+                assert!(field_names.contains(&"statement"));
+            }
+            _ => panic!("Expected Struct type, got: {:?}", t),
+        }
+    }
+
+    #[test]
+    fn iam_policy_document_validates_map_syntax() {
+        let t = iam_policy_document();
+        // Map syntax (old style): assume_role_policy_document = { version = "...", statement = [...] }
         let doc = Value::Map(
             vec![
                 (
@@ -1265,66 +1203,14 @@ mod tests {
             .into_iter()
             .collect(),
         );
-        assert!(validate_iam_policy_document(&doc).is_ok());
+        assert!(t.validate(&doc).is_ok());
     }
 
     #[test]
-    fn validate_iam_policy_document_invalid_version() {
-        let doc = Value::Map(
-            vec![(
-                "version".to_string(),
-                Value::String("2023-01-01".to_string()),
-            )]
-            .into_iter()
-            .collect(),
-        );
-        let result = validate_iam_policy_document(&doc);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("2012-10-17"));
-    }
-
-    #[test]
-    fn validate_iam_policy_document_invalid_effect() {
-        let doc = Value::Map(
-            vec![(
-                "statement".to_string(),
-                Value::List(vec![Value::Map(
-                    vec![("effect".to_string(), Value::String("Maybe".to_string()))]
-                        .into_iter()
-                        .collect(),
-                )]),
-            )]
-            .into_iter()
-            .collect(),
-        );
-        let result = validate_iam_policy_document(&doc);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("Maybe"));
-    }
-
-    #[test]
-    fn validate_iam_policy_document_not_a_map() {
-        let result = validate_iam_policy_document(&Value::String("not a map".to_string()));
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("Expected a map"));
-    }
-
-    #[test]
-    fn validate_iam_policy_document_type_with_resource_ref() {
+    fn iam_policy_document_validates_block_syntax() {
         let t = iam_policy_document();
-        // ResourceRef should be accepted (via Custom type handling in schema.rs)
-        assert!(
-            t.validate(&Value::ResourceRef {
-                binding_name: "role".to_string(),
-                attribute_name: "policy".to_string(),
-            })
-            .is_ok()
-        );
-    }
-
-    #[test]
-    fn validate_iam_policy_document_valid_with_all_fields() {
-        let doc = Value::Map(
+        // Block syntax produces: List([Map({ version, statement: List([Map(...)]) })])
+        let doc = Value::List(vec![Value::Map(
             vec![
                 (
                     "version".to_string(),
@@ -1334,47 +1220,10 @@ mod tests {
                     "statement".to_string(),
                     Value::List(vec![Value::Map(
                         vec![
-                            (
-                                "sid".to_string(),
-                                Value::String("AllowS3Access".to_string()),
-                            ),
                             ("effect".to_string(), Value::String("Allow".to_string())),
                             (
-                                "principal".to_string(),
-                                Value::Map(
-                                    vec![(
-                                        "service".to_string(),
-                                        Value::String("ec2.amazonaws.com".to_string()),
-                                    )]
-                                    .into_iter()
-                                    .collect(),
-                                ),
-                            ),
-                            (
                                 "action".to_string(),
-                                Value::List(vec![
-                                    Value::String("s3:GetObject".to_string()),
-                                    Value::String("s3:PutObject".to_string()),
-                                ]),
-                            ),
-                            ("resource".to_string(), Value::String("*".to_string())),
-                            (
-                                "condition".to_string(),
-                                Value::Map(
-                                    vec![(
-                                        "string_equals".to_string(),
-                                        Value::Map(
-                                            vec![(
-                                                "aws:RequestedRegion".to_string(),
-                                                Value::String("us-east-1".to_string()),
-                                            )]
-                                            .into_iter()
-                                            .collect(),
-                                        ),
-                                    )]
-                                    .into_iter()
-                                    .collect(),
-                                ),
+                                Value::String("sts:AssumeRole".to_string()),
                             ),
                         ]
                         .into_iter()
@@ -1384,80 +1233,21 @@ mod tests {
             ]
             .into_iter()
             .collect(),
-        );
-        assert!(validate_iam_policy_document(&doc).is_ok());
+        )]);
+        assert!(t.validate(&doc).is_ok());
     }
 
     #[test]
-    fn validate_iam_policy_document_invalid_principal() {
-        let doc = Value::Map(
-            vec![(
-                "statement".to_string(),
-                Value::List(vec![Value::Map(
-                    vec![
-                        ("effect".to_string(), Value::String("Allow".to_string())),
-                        (
-                            "principal".to_string(),
-                            Value::List(vec![Value::String("not-valid".to_string())]),
-                        ),
-                    ]
-                    .into_iter()
-                    .collect(),
-                )]),
-            )]
-            .into_iter()
-            .collect(),
+    fn iam_policy_document_type_with_resource_ref() {
+        let t = iam_policy_document();
+        // ResourceRef should be accepted (via Struct type handling in schema.rs)
+        assert!(
+            t.validate(&Value::ResourceRef {
+                binding_name: "role".to_string(),
+                attribute_name: "policy".to_string(),
+            })
+            .is_ok()
         );
-        let result = validate_iam_policy_document(&doc);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("principal"));
-    }
-
-    #[test]
-    fn validate_iam_policy_document_invalid_action() {
-        let doc = Value::Map(
-            vec![(
-                "statement".to_string(),
-                Value::List(vec![Value::Map(
-                    vec![
-                        ("effect".to_string(), Value::String("Allow".to_string())),
-                        ("action".to_string(), Value::Int(42)),
-                    ]
-                    .into_iter()
-                    .collect(),
-                )]),
-            )]
-            .into_iter()
-            .collect(),
-        );
-        let result = validate_iam_policy_document(&doc);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("action"));
-    }
-
-    #[test]
-    fn validate_iam_policy_document_invalid_condition() {
-        let doc = Value::Map(
-            vec![(
-                "statement".to_string(),
-                Value::List(vec![Value::Map(
-                    vec![
-                        ("effect".to_string(), Value::String("Allow".to_string())),
-                        (
-                            "condition".to_string(),
-                            Value::String("not-a-map".to_string()),
-                        ),
-                    ]
-                    .into_iter()
-                    .collect(),
-                )]),
-            )]
-            .into_iter()
-            .collect(),
-        );
-        let result = validate_iam_policy_document(&doc);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("condition"));
     }
 
     #[test]

@@ -68,7 +68,7 @@ block_content = { attribute | nested_block }
 attribute = { identifier ~ "=" ~ expression }
 
 // Nested block: key { ... } (like Terraform's ingress { ... })
-nested_block = { identifier ~ "{" ~ attribute* ~ "}" }
+nested_block = { identifier ~ "{" ~ block_content* ~ "}" }
 
 identifier = @{ ASCII_ALPHA ~ (ASCII_ALPHANUMERIC | "_")* }
 

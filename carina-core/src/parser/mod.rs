@@ -602,17 +602,7 @@ fn parse_block_contents(
                     Rule::nested_block => {
                         let mut block_inner = inner.into_inner();
                         let block_name = block_inner.next().unwrap().as_str().to_string();
-
-                        // Parse nested block attributes into a map
-                        let mut block_attrs = HashMap::new();
-                        for attr_pair in block_inner {
-                            if attr_pair.as_rule() == Rule::attribute {
-                                let mut attr_inner = attr_pair.into_inner();
-                                let key = attr_inner.next().unwrap().as_str().to_string();
-                                let value = parse_expression(attr_inner.next().unwrap(), ctx)?;
-                                block_attrs.insert(key, value);
-                            }
-                        }
+                        let block_attrs = parse_block_contents(block_inner, ctx)?;
 
                         // Add to the list of blocks with this name
                         nested_blocks
@@ -1923,6 +1913,73 @@ mod tests {
         assert!(resource.lifecycle.create_before_destroy);
         assert!(!resource.lifecycle.force_delete);
         assert!(!resource.attributes.contains_key("lifecycle"));
+    }
+
+    #[test]
+    fn parse_recursive_nested_blocks() {
+        let input = r#"
+            let role = awscc.iam.role {
+                role_name = "my-role"
+                assume_role_policy_document {
+                    version = "2012-10-17"
+                    statement {
+                        effect    = "Allow"
+                        principal = { service = "lambda.amazonaws.com" }
+                        action    = "sts:AssumeRole"
+                    }
+                }
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+        assert_eq!(result.resources.len(), 1);
+
+        let role = &result.resources[0];
+
+        // assume_role_policy_document should be a list with one map (from nested block)
+        let doc = role.attributes.get("assume_role_policy_document").unwrap();
+        if let Value::List(doc_items) = doc {
+            assert_eq!(doc_items.len(), 1);
+            if let Value::Map(doc_map) = &doc_items[0] {
+                assert_eq!(
+                    doc_map.get("version"),
+                    Some(&Value::String("2012-10-17".to_string()))
+                );
+
+                // statement should be a list with one map (nested block inside nested block)
+                let stmt = doc_map.get("statement").unwrap();
+                if let Value::List(stmt_items) = stmt {
+                    assert_eq!(stmt_items.len(), 1);
+                    if let Value::Map(stmt_map) = &stmt_items[0] {
+                        assert_eq!(
+                            stmt_map.get("effect"),
+                            Some(&Value::String("Allow".to_string()))
+                        );
+                        assert_eq!(
+                            stmt_map.get("action"),
+                            Some(&Value::String("sts:AssumeRole".to_string()))
+                        );
+                        // principal should be a map
+                        if let Some(Value::Map(principal)) = stmt_map.get("principal") {
+                            assert_eq!(
+                                principal.get("service"),
+                                Some(&Value::String("lambda.amazonaws.com".to_string()))
+                            );
+                        } else {
+                            panic!("Expected map for principal");
+                        }
+                    } else {
+                        panic!("Expected map for statement item");
+                    }
+                } else {
+                    panic!("Expected list for statement");
+                }
+            } else {
+                panic!("Expected map for document item");
+            }
+        } else {
+            panic!("Expected list for assume_role_policy_document");
+        }
     }
 
     #[test]
