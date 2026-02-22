@@ -2,7 +2,7 @@
 # Run acceptance tests for AWSCC provider
 #
 # Usage (from project root):
-#   ./carina-provider-awscc/acceptance-tests/run-tests.sh [command] [filter]
+#   ./carina-provider-awscc/acceptance-tests/run-tests.sh [command] [filter...]
 #
 # Commands:
 #   validate   - Validate .crn files (default, no AWS credentials needed)
@@ -17,13 +17,16 @@
 # For full, aws-vault is called internally per account (carina-test-000..009).
 #
 # Filter (optional):
-#   A substring to match against test paths.
+#   One or more substrings to match against test paths.
+#   A test is included if it matches ANY of the provided filters (OR logic).
+#   When no filter is provided, all tests are included.
 #
 # Examples:
 #   ./run-tests.sh validate                          # validate all
 #   ./run-tests.sh validate ec2_vpc/basic            # validate specific test
 #   ./run-tests.sh full                              # apply+plan-verify+destroy, 10 parallel accounts
 #   ./run-tests.sh full ec2_vpc                      # apply+plan-verify+destroy VPC tests only
+#   ./run-tests.sh full ec2_ipam ec2_vpc/with_ipam   # multiple filters in single invocation
 #   ./run-tests.sh cleanup                           # destroy all matching tests across 10 accounts
 #   ./run-tests.sh cleanup ec2_vpc                   # destroy VPC tests only across 10 accounts
 
@@ -33,7 +36,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 COMMAND="${1:-validate}"
-FILTER="${2:-}"
+shift || true
+FILTERS=("$@")
 
 # ── File-based lock to prevent concurrent executions ──────────────────
 # Uses mkdir (atomic on POSIX) + PID file for stale lock detection.
@@ -97,7 +101,7 @@ case "$COMMAND" in
         ;;
     *)
         echo "ERROR: Unknown command '$COMMAND'"
-        echo "Usage: $0 [validate|plan|apply|destroy|full|cleanup] [filter]"
+        echo "Usage: $0 [validate|plan|apply|destroy|full|cleanup] [filter...]"
         exit 1
         ;;
 esac
@@ -114,17 +118,35 @@ if [ ! -f "$CARINA_BIN" ]; then
 fi
 
 # Find test files
+# matches_any_filter: returns 0 if rel_path matches any filter, or if no filters given
+matches_any_filter() {
+    local rel_path="$1"
+    if [ ${#FILTERS[@]} -eq 0 ]; then
+        return 0
+    fi
+    for f in "${FILTERS[@]}"; do
+        if [[ "$rel_path" == *"$f"* ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
 TESTS=()
 while IFS= read -r -d '' file; do
     REL_PATH="${file#$SCRIPT_DIR/}"
-    if [ -n "$FILTER" ] && [[ "$REL_PATH" != *"$FILTER"* ]]; then
+    if ! matches_any_filter "$REL_PATH"; then
         continue
     fi
     TESTS+=("$file")
 done < <(find "$SCRIPT_DIR" -name "*.crn" -print0 | sort -z)
 
 if [ ${#TESTS[@]} -eq 0 ]; then
-    echo "No test files found${FILTER:+ matching '$FILTER'}"
+    if [ ${#FILTERS[@]} -gt 0 ]; then
+        echo "No test files found matching: ${FILTERS[*]}"
+    else
+        echo "No test files found"
+    fi
     exit 0
 fi
 
