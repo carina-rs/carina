@@ -1440,9 +1440,9 @@ async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
         current_states.insert(resource.id.clone(), state);
     }
 
-    // Restore create-only attributes from state file (CloudControl doesn't return them)
+    // Restore unreturned attributes from state file (CloudControl doesn't always return them)
     let saved_attrs = build_saved_attrs_from_state(&state_file);
-    provider.restore_create_only_attrs(&mut current_states, &saved_attrs);
+    provider.restore_unreturned_attrs(&mut current_states, &saved_attrs);
 
     // Build initial binding map for reference resolution
     let mut binding_map: HashMap<String, HashMap<String, Value>> = HashMap::new();
@@ -3109,9 +3109,9 @@ async fn create_plan_from_parsed(
         current_states.insert(resource.id.clone(), state);
     }
 
-    // Restore create-only attributes from state file (CloudControl doesn't return them)
+    // Restore unreturned attributes from state file (CloudControl doesn't always return them)
     let saved_attrs = build_saved_attrs_from_state(state_file);
-    provider.restore_create_only_attrs(&mut current_states, &saved_attrs);
+    provider.restore_unreturned_attrs(&mut current_states, &saved_attrs);
 
     // Resolve ResourceRef values and enum identifiers using AWS state
     let mut resources = sorted_resources.clone();
@@ -4016,7 +4016,7 @@ fn json_to_dsl_value(json: &serde_json::Value) -> Value {
 
 /// Build a map of saved attributes from a state file, converting JSON values to DSL values.
 ///
-/// This is used to pass saved attribute data to the provider's `restore_create_only_attrs` method.
+/// This is used to pass saved attribute data to the provider's `restore_unreturned_attrs` method.
 fn build_saved_attrs_from_state(
     state_file: &Option<StateFile>,
 ) -> HashMap<ResourceId, HashMap<String, Value>> {

@@ -538,12 +538,12 @@ impl AwsccProvider {
             )
             .await?;
 
-        // Preserve create-only attributes from the desired resource.
-        // CloudControl API doesn't return create-only properties in GetResource responses,
-        // so we need to carry them forward from the desired state.
-        for (dsl_name, attr_schema) in &config.schema.attributes {
-            if attr_schema.create_only
-                && !state.attributes.contains_key(dsl_name)
+        // Preserve desired attributes not returned by CloudControl API.
+        // CloudControl doesn't always return all properties in GetResource responses
+        // (create-only properties, and some normal properties like `description`).
+        // Carry them forward from the desired state.
+        for dsl_name in config.schema.attributes.keys() {
+            if !state.attributes.contains_key(dsl_name)
                 && let Some(value) = resource.attributes.get(dsl_name.as_str())
             {
                 state.attributes.insert(dsl_name.to_string(), value.clone());
@@ -618,8 +618,22 @@ impl AwsccProvider {
             .await
             .map_err(|e| e.for_resource(id.clone()))?;
 
-        self.read_resource(&id.resource_type, &id.name, Some(identifier))
-            .await
+        let mut state = self
+            .read_resource(&id.resource_type, &id.name, Some(identifier))
+            .await?;
+
+        // Preserve desired attributes not returned by CloudControl API.
+        // Same logic as create_resource: carry forward attributes that were accepted
+        // by the API but aren't included in the read response.
+        for dsl_name in config.schema.attributes.keys() {
+            if !state.attributes.contains_key(dsl_name)
+                && let Some(value) = to.attributes.get(dsl_name.as_str())
+            {
+                state.attributes.insert(dsl_name.to_string(), value.clone());
+            }
+        }
+
+        Ok(state)
     }
 
     /// Delete a resource
@@ -1160,11 +1174,12 @@ fn resolve_struct_enum_values(value: &Value, fields: &[StructField]) -> Value {
     }
 }
 
-/// Restore create-only attributes from saved state into current read states.
+/// Restore unreturned attributes from saved state into current read states.
 ///
-/// CloudControl API doesn't return create-only properties in GetResource responses,
-/// so we carry them forward from the previously saved attribute values.
-pub fn restore_create_only_attrs_impl(
+/// CloudControl API doesn't always return all properties in GetResource responses
+/// (create-only properties, and some normal properties like `description`).
+/// We carry them forward from the previously saved attribute values.
+pub fn restore_unreturned_attrs_impl(
     current_states: &mut HashMap<ResourceId, State>,
     saved_attrs: &HashMap<ResourceId, HashMap<String, Value>>,
 ) {
@@ -1185,9 +1200,8 @@ pub fn restore_create_only_attrs_impl(
             Some(attrs) => attrs,
             None => continue,
         };
-        for (dsl_name, attr_schema) in &config.schema.attributes {
-            if attr_schema.create_only
-                && !state.attributes.contains_key(dsl_name)
+        for dsl_name in config.schema.attributes.keys() {
+            if !state.attributes.contains_key(dsl_name)
                 && let Some(value) = saved.get(dsl_name)
             {
                 state.attributes.insert(dsl_name.clone(), value.clone());
@@ -1401,7 +1415,7 @@ mod tests {
     }
 
     #[test]
-    fn test_restore_create_only_attrs_impl_basic() {
+    fn test_restore_unreturned_attrs_impl_create_only() {
         // Create a state that's missing a create-only attribute
         let id = ResourceId::with_provider("awscc", "ec2.nat_gateway", "test");
         let mut state = State::existing(id.clone(), HashMap::new());
@@ -1422,7 +1436,7 @@ mod tests {
         let mut saved_attrs = HashMap::new();
         saved_attrs.insert(id.clone(), saved);
 
-        restore_create_only_attrs_impl(&mut current_states, &saved_attrs);
+        restore_unreturned_attrs_impl(&mut current_states, &saved_attrs);
 
         // subnet_id is create-only on nat_gateway, so it should be restored
         assert_eq!(
@@ -1432,7 +1446,7 @@ mod tests {
     }
 
     #[test]
-    fn test_restore_create_only_attrs_skips_non_awscc() {
+    fn test_restore_unreturned_attrs_skips_non_awscc() {
         let id = ResourceId::with_provider("aws", "s3.bucket", "test");
         let state = State::existing(id.clone(), HashMap::new());
 
@@ -1444,14 +1458,14 @@ mod tests {
         let mut saved_attrs = HashMap::new();
         saved_attrs.insert(id.clone(), saved);
 
-        restore_create_only_attrs_impl(&mut current_states, &saved_attrs);
+        restore_unreturned_attrs_impl(&mut current_states, &saved_attrs);
 
         // Should not have added anything since provider is "aws"
         assert!(!current_states[&id].attributes.contains_key("some_attr"));
     }
 
     #[test]
-    fn test_restore_create_only_attrs_skips_already_present() {
+    fn test_restore_unreturned_attrs_skips_already_present() {
         let id = ResourceId::with_provider("awscc", "ec2.nat_gateway", "test");
         let mut attrs = HashMap::new();
         attrs.insert(
@@ -1471,12 +1485,44 @@ mod tests {
         let mut saved_attrs = HashMap::new();
         saved_attrs.insert(id.clone(), saved);
 
-        restore_create_only_attrs_impl(&mut current_states, &saved_attrs);
+        restore_unreturned_attrs_impl(&mut current_states, &saved_attrs);
 
         // Should keep the current value, not overwrite with saved
         assert_eq!(
             current_states[&id].attributes.get("subnet_id"),
             Some(&Value::String("subnet-current".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_restore_unreturned_attrs_impl_non_create_only() {
+        // Test that non-create-only attributes (like description on security_group_egress)
+        // are also restored when CloudControl doesn't return them
+        let id = ResourceId::with_provider("awscc", "ec2.security_group_egress", "test");
+        let mut state = State::existing(id.clone(), HashMap::new());
+        state.attributes.insert(
+            "ip_protocol".to_string(),
+            Value::String("awscc.ec2.security_group_egress.IpProtocol.all".to_string()),
+        );
+
+        let mut current_states = HashMap::new();
+        current_states.insert(id.clone(), state);
+
+        // description is NOT create-only but CloudControl doesn't return it
+        let mut saved = HashMap::new();
+        saved.insert(
+            "description".to_string(),
+            Value::String("Allow all outbound".to_string()),
+        );
+        let mut saved_attrs = HashMap::new();
+        saved_attrs.insert(id.clone(), saved);
+
+        restore_unreturned_attrs_impl(&mut current_states, &saved_attrs);
+
+        // description should be restored even though it's not create-only
+        assert_eq!(
+            current_states[&id].attributes.get("description"),
+            Some(&Value::String("Allow all outbound".to_string()))
         );
     }
 

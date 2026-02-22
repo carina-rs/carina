@@ -142,11 +142,11 @@ impl Provider for AwsccProvider {
         crate::provider::resolve_enum_identifiers_impl(resources);
     }
 
-    fn restore_create_only_attrs(
+    fn restore_unreturned_attrs(
         &self,
         current_states: &mut HashMap<ResourceId, State>,
         saved_attrs: &HashMap<ResourceId, HashMap<String, Value>>,
     ) {
-        crate::provider::restore_create_only_attrs_impl(current_states, saved_attrs);
+        crate::provider::restore_unreturned_attrs_impl(current_states, saved_attrs);
     }
 }
