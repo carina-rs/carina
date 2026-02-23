@@ -84,11 +84,19 @@ pub enum Value {
 impl Value {
     /// Semantic equality: for Lists, compares as multisets (order-insensitive);
     /// for Maps, compares values recursively with semantic equality;
+    /// for single-element List([Map]) vs Map, treats them as equivalent (bare struct);
     /// for all other variants, falls back to PartialEq.
     pub fn semantically_equal(&self, other: &Value) -> bool {
         match (self, other) {
             (Value::List(a), Value::List(b)) => lists_equal(a, b),
             (Value::Map(a), Value::Map(b)) => maps_semantically_equal(a, b),
+            // Bare struct equivalence: List([Map]) ↔ Map
+            (Value::List(items), Value::Map(_)) if items.len() == 1 => {
+                items[0].semantically_equal(other)
+            }
+            (Value::Map(_), Value::List(items)) if items.len() == 1 => {
+                self.semantically_equal(&items[0])
+            }
             _ => self == other,
         }
     }
@@ -131,6 +139,7 @@ fn lists_equal(a: &[Value], b: &[Value]) -> bool {
 /// Merge desired value with saved state to fill in unmanaged nested fields.
 /// For Maps: start with saved, overlay desired fields on top (desired wins).
 /// For Lists: match elements by similarity, merge each pair.
+/// For cross-type Map/List([Map]): unwrap the single-element list and merge as Maps.
 /// For other types: return desired as-is.
 pub fn merge_with_saved(desired: &Value, saved: &Value) -> Value {
     match (desired, saved) {
@@ -148,6 +157,22 @@ pub fn merge_with_saved(desired: &Value, saved: &Value) -> Value {
         }
         (Value::List(desired_list), Value::List(saved_list)) => {
             Value::List(merge_lists(desired_list, saved_list))
+        }
+        // Bare struct cross-type: desired is Map, saved is List([Map]) — unwrap saved
+        (Value::Map(_), Value::List(saved_list)) if saved_list.len() == 1 => {
+            if let Value::Map(_) = &saved_list[0] {
+                merge_with_saved(desired, &saved_list[0])
+            } else {
+                desired.clone()
+            }
+        }
+        // Bare struct cross-type: desired is List([Map]), saved is Map — unwrap desired, merge, re-wrap
+        (Value::List(desired_list), Value::Map(_)) if desired_list.len() == 1 => {
+            if let Value::Map(_) = &desired_list[0] {
+                Value::List(vec![merge_with_saved(&desired_list[0], saved)])
+            } else {
+                desired.clone()
+            }
         }
         _ => desired.clone(),
     }
@@ -609,5 +634,141 @@ mod tests {
         let saved = Value::Int(99);
         let merged = merge_with_saved(&desired, &saved);
         assert_eq!(merged, Value::Int(42));
+    }
+
+    #[test]
+    fn semantically_equal_map_vs_list_of_map() {
+        let map = Value::Map(HashMap::from([
+            (
+                "hostname_type".to_string(),
+                Value::String("ip-name".to_string()),
+            ),
+            ("a_record".to_string(), Value::Bool(true)),
+        ]));
+        let list = Value::List(vec![Value::Map(HashMap::from([
+            (
+                "hostname_type".to_string(),
+                Value::String("ip-name".to_string()),
+            ),
+            ("a_record".to_string(), Value::Bool(true)),
+        ]))]);
+
+        // Map vs List([Map]) — both directions
+        assert!(map.semantically_equal(&list));
+        assert!(list.semantically_equal(&map));
+    }
+
+    #[test]
+    fn semantically_equal_map_vs_list_of_map_not_equal() {
+        let map = Value::Map(HashMap::from([("a".to_string(), Value::Int(1))]));
+        let list = Value::List(vec![Value::Map(HashMap::from([(
+            "a".to_string(),
+            Value::Int(2),
+        )]))]);
+
+        assert!(!map.semantically_equal(&list));
+        assert!(!list.semantically_equal(&map));
+    }
+
+    #[test]
+    fn semantically_equal_map_vs_list_multi_element_not_equivalent() {
+        // List with 2+ elements should NOT be equivalent to a Map
+        let map = Value::Map(HashMap::from([("a".to_string(), Value::Int(1))]));
+        let list = Value::List(vec![
+            Value::Map(HashMap::from([("a".to_string(), Value::Int(1))])),
+            Value::Map(HashMap::from([("b".to_string(), Value::Int(2))])),
+        ]);
+
+        assert!(!map.semantically_equal(&list));
+        assert!(!list.semantically_equal(&map));
+    }
+
+    #[test]
+    fn merge_with_saved_map_desired_list_saved() {
+        // desired is Map (from `= {}` syntax), saved is List([Map]) (from provider read)
+        let desired = Value::Map(HashMap::from([
+            (
+                "hostname_type".to_string(),
+                Value::String("ip-name".to_string()),
+            ),
+            ("a_record".to_string(), Value::Bool(true)),
+        ]));
+        let saved = Value::List(vec![Value::Map(HashMap::from([
+            (
+                "hostname_type".to_string(),
+                Value::String("ip-name".to_string()),
+            ),
+            ("a_record".to_string(), Value::Bool(true)),
+            ("aaaa_record".to_string(), Value::Bool(false)),
+        ]))]);
+
+        let merged = merge_with_saved(&desired, &saved);
+        let expected = Value::Map(HashMap::from([
+            (
+                "hostname_type".to_string(),
+                Value::String("ip-name".to_string()),
+            ),
+            ("a_record".to_string(), Value::Bool(true)),
+            ("aaaa_record".to_string(), Value::Bool(false)),
+        ]));
+        assert!(merged.semantically_equal(&expected), "Merged: {:?}", merged);
+    }
+
+    #[test]
+    fn merge_with_saved_list_desired_map_saved() {
+        // desired is List([Map]) (from block syntax), saved is Map
+        let desired = Value::List(vec![Value::Map(HashMap::from([(
+            "hostname_type".to_string(),
+            Value::String("ip-name".to_string()),
+        )]))]);
+        let saved = Value::Map(HashMap::from([
+            (
+                "hostname_type".to_string(),
+                Value::String("ip-name".to_string()),
+            ),
+            ("aaaa_record".to_string(), Value::Bool(false)),
+        ]));
+
+        let merged = merge_with_saved(&desired, &saved);
+        let expected = Value::List(vec![Value::Map(HashMap::from([
+            (
+                "hostname_type".to_string(),
+                Value::String("ip-name".to_string()),
+            ),
+            ("aaaa_record".to_string(), Value::Bool(false)),
+        ]))]);
+        assert!(merged.semantically_equal(&expected), "Merged: {:?}", merged);
+    }
+
+    #[test]
+    fn bare_struct_full_diff_scenario_no_change() {
+        // Simulates: desired=Map({2 fields}), current=List([Map({3 fields})]),
+        // saved=List([Map({3 fields})]) → after merge, desired matches current → NoChange
+        let desired = Value::Map(HashMap::from([
+            (
+                "hostname_type".to_string(),
+                Value::String("ip-name".to_string()),
+            ),
+            ("a_record".to_string(), Value::Bool(true)),
+        ]));
+        let current = Value::List(vec![Value::Map(HashMap::from([
+            (
+                "hostname_type".to_string(),
+                Value::String("ip-name".to_string()),
+            ),
+            ("a_record".to_string(), Value::Bool(true)),
+            ("aaaa_record".to_string(), Value::Bool(false)),
+        ]))]);
+        let saved = current.clone();
+
+        // After merging desired with saved, it should pick up the aaaa_record field
+        let merged = merge_with_saved(&desired, &saved);
+        // And the merged result should be semantically equal to current
+        assert!(
+            merged.semantically_equal(&current),
+            "Expected merged to equal current.\nMerged: {:?}\nCurrent: {:?}",
+            merged,
+            current
+        );
     }
 }
