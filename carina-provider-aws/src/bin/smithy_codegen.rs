@@ -140,6 +140,13 @@ fn main() -> Result<()> {
                 .with_context(|| format!("Failed to write {}", mod_path.display()))?;
             eprintln!("Generated: {}", mod_path.display());
         }
+        "provider" => {
+            let code = generate_provider_code(&all_resources);
+            let output_path = args.output_dir.join("provider_generated.rs");
+            std::fs::write(&output_path, &code)
+                .with_context(|| format!("Failed to write {}", output_path.display()))?;
+            eprintln!("Generated: {}", output_path.display());
+        }
         "markdown" | "md" => {
             for res in &resources {
                 let model = models.get(res.service_namespace).unwrap();
@@ -1209,6 +1216,152 @@ fn generate_mod_rs(dsl_names: &[&str]) -> String {
     code.push_str("    None\n}\n");
 
     code
+}
+
+// ── Provider boilerplate generation ──
+
+/// Generate the provider_generated.rs file from ResourceDef metadata.
+/// This does NOT need Smithy models — it only uses ResourceDef fields.
+fn generate_provider_code(all_resources: &[ResourceDef]) -> String {
+    let mut code = String::new();
+
+    // Header
+    code.push_str(
+        "//! Auto-generated provider boilerplate\n\
+         //!\n\
+         //! DO NOT EDIT MANUALLY - regenerate with:\n\
+         //!   ./carina-provider-aws/scripts/generate-provider.sh\n\n\
+         use carina_core::provider::{ProviderError, ProviderResult, ResourceSchema, ResourceType};\n\
+         use carina_core::resource::{Resource, ResourceId, State};\n\n\
+         use crate::AwsProvider;\n\n",
+    );
+
+    // Generate ResourceType structs + impls
+    code.push_str("// ===== ResourceType Implementations =====\n\n");
+    for res in all_resources {
+        let struct_name = format!("{}Type", res.type_struct_name);
+        code.push_str(&format!(
+            "/// {} resource type\n\
+             pub struct {};\n\n\
+             impl ResourceType for {} {{\n\
+             \x20   fn name(&self) -> &'static str {{\n\
+             \x20       \"{}\"\n\
+             \x20   }}\n\n\
+             \x20   fn schema(&self) -> ResourceSchema {{\n\
+             \x20       ResourceSchema::default()\n\
+             \x20   }}\n\
+             }}\n\n",
+            res.name, struct_name, struct_name, res.name,
+        ));
+    }
+
+    // Generate resource_types() function
+    code.push_str(
+        "/// Returns all resource types for the AWS provider.\n\
+         pub fn resource_types() -> Vec<Box<dyn ResourceType>> {\n\
+         \x20   vec![\n",
+    );
+    for res in all_resources {
+        code.push_str(&format!(
+            "\x20       Box::new({}Type),\n",
+            res.type_struct_name
+        ));
+    }
+    code.push_str("\x20   ]\n}\n\n");
+
+    // Generate methods on AwsProvider
+    code.push_str("// ===== Generated Methods on AwsProvider =====\n\n");
+    code.push_str("impl AwsProvider {\n");
+
+    // Simple delete methods
+    for res in all_resources.iter().filter(|r| r.simple_delete) {
+        let method_name = format!("delete_{}", res.name.replace('.', "_"));
+        let client_field = client_field_name(res.service_namespace);
+        let sdk_method = pascal_to_snake(res.delete_op);
+        let id_setter = pascal_to_snake(res.identifier);
+
+        // Human-readable resource name for error message
+        let display_name = res
+            .name
+            .split('.')
+            .next_back()
+            .unwrap_or(res.name)
+            .replace('_', " ");
+
+        code.push_str(&format!(
+            "\x20   /// Delete {} (generated)\n\
+             \x20   pub(crate) async fn {}(\n\
+             \x20       &self,\n\
+             \x20       id: ResourceId,\n\
+             \x20       identifier: &str,\n\
+             \x20   ) -> ProviderResult<()> {{\n\
+             \x20       self.{}.{}().{}(identifier).send().await.map_err(|e| {{\n\
+             \x20           ProviderError::new(format!(\"Failed to delete {}: {{:?}}\", e))\n\
+             \x20               .for_resource(id.clone())\n\
+             \x20       }})?;\n\
+             \x20       Ok(())\n\
+             \x20   }}\n\n",
+            res.name, method_name, client_field, sdk_method, id_setter, display_name,
+        ));
+    }
+
+    // No-op update methods
+    for res in all_resources.iter().filter(|r| r.noop_update) {
+        let method_name = format!("update_{}", res.name.replace('.', "_"));
+        let read_method = format!("read_{}", res.name.replace('.', "_"));
+
+        code.push_str(&format!(
+            "\x20   /// Update {} (no-op, just read back current state) (generated)\n\
+             \x20   pub(crate) async fn {}(\n\
+             \x20       &self,\n\
+             \x20       id: ResourceId,\n\
+             \x20       identifier: &str,\n\
+             \x20       _to: Resource,\n\
+             \x20   ) -> ProviderResult<State> {{\n\
+             \x20       self.{}(&id, Some(identifier)).await\n\
+             \x20   }}\n\n",
+            res.name, method_name, read_method,
+        ));
+    }
+
+    code.push_str("}\n");
+
+    code
+}
+
+/// Convert a PascalCase string to snake_case.
+/// e.g., "DeleteVpc" -> "delete_vpc", "VpcId" -> "vpc_id"
+fn pascal_to_snake(s: &str) -> String {
+    let mut result = String::new();
+    for (i, c) in s.chars().enumerate() {
+        if c.is_uppercase() {
+            if i > 0 {
+                // Don't insert underscore between consecutive uppercase letters
+                // unless the next char is lowercase (e.g., "VPCId" -> "vpc_id")
+                let prev = s.chars().nth(i - 1).unwrap();
+                if prev.is_lowercase() || prev.is_ascii_digit() {
+                    result.push('_');
+                } else if let Some(next) = s.chars().nth(i + 1)
+                    && next.is_lowercase()
+                {
+                    result.push('_');
+                }
+            }
+            result.push(c.to_lowercase().next().unwrap());
+        } else {
+            result.push(c);
+        }
+    }
+    result
+}
+
+/// Get the client field name from a service namespace.
+/// e.g., "com.amazonaws.ec2" -> "ec2_client", "com.amazonaws.s3" -> "s3_client"
+fn client_field_name(service_namespace: &str) -> String {
+    let service = service_namespace
+        .strip_prefix("com.amazonaws.")
+        .unwrap_or(service_namespace);
+    format!("{}_client", service)
 }
 
 // ── Markdown documentation generation ──
