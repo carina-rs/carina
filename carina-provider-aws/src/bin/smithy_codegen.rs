@@ -1277,8 +1277,8 @@ fn generate_provider_code(all_resources: &[ResourceDef]) -> String {
     for res in all_resources.iter().filter(|r| r.simple_delete) {
         let method_name = format!("delete_{}", res.name.replace('.', "_"));
         let client_field = client_field_name(res.service_namespace);
-        let sdk_method = pascal_to_snake(res.delete_op);
-        let id_setter = pascal_to_snake(res.identifier);
+        let sdk_method = res.delete_op.to_snake_case();
+        let id_setter = res.identifier.to_snake_case();
 
         // Human-readable resource name for error message
         let display_name = res
@@ -1327,32 +1327,6 @@ fn generate_provider_code(all_resources: &[ResourceDef]) -> String {
     code.push_str("}\n");
 
     code
-}
-
-/// Convert a PascalCase string to snake_case.
-/// e.g., "DeleteVpc" -> "delete_vpc", "VpcId" -> "vpc_id"
-fn pascal_to_snake(s: &str) -> String {
-    let mut result = String::new();
-    for (i, c) in s.chars().enumerate() {
-        if c.is_uppercase() {
-            if i > 0 {
-                // Don't insert underscore between consecutive uppercase letters
-                // unless the next char is lowercase (e.g., "VPCId" -> "vpc_id")
-                let prev = s.chars().nth(i - 1).unwrap();
-                if prev.is_lowercase() || prev.is_ascii_digit() {
-                    result.push('_');
-                } else if let Some(next) = s.chars().nth(i + 1)
-                    && next.is_lowercase()
-                {
-                    result.push('_');
-                }
-            }
-            result.push(c.to_lowercase().next().unwrap());
-        } else {
-            result.push(c);
-        }
-    }
-    result
 }
 
 /// Get the client field name from a service namespace.
