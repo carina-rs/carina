@@ -883,6 +883,72 @@ mod tests {
         );
     }
 
+    /// Regression test for issue #350: desired is Map (from `= {}` syntax),
+    /// but current and saved are List([Map]) (from provider read path).
+    /// After merge + semantic comparison, this should be NoChange.
+    #[test]
+    fn diff_no_change_when_bare_struct_cross_type() {
+        let desired = Resource::new("ec2.subnet", "test-subnet").with_attribute(
+            "private_dns_name_options_on_launch",
+            Value::Map(HashMap::from([
+                (
+                    "hostname_type".to_string(),
+                    Value::String("ip-name".to_string()),
+                ),
+                (
+                    "enable_resource_name_dns_a_record".to_string(),
+                    Value::Bool(true),
+                ),
+            ])),
+        );
+
+        // Provider read returns List([Map]) for bare struct
+        let current_attrs = HashMap::from([(
+            "private_dns_name_options_on_launch".to_string(),
+            Value::List(vec![Value::Map(HashMap::from([
+                (
+                    "hostname_type".to_string(),
+                    Value::String("ip-name".to_string()),
+                ),
+                (
+                    "enable_resource_name_dns_a_record".to_string(),
+                    Value::Bool(true),
+                ),
+                (
+                    "enable_resource_name_dns_aaaa_record".to_string(),
+                    Value::Bool(false),
+                ),
+            ]))]),
+        )]);
+        let current = State::existing(ResourceId::new("ec2.subnet", "test-subnet"), current_attrs);
+
+        // Saved state also has List([Map]) from previous provider read
+        let saved_map = HashMap::from([(
+            "private_dns_name_options_on_launch".to_string(),
+            Value::List(vec![Value::Map(HashMap::from([
+                (
+                    "hostname_type".to_string(),
+                    Value::String("ip-name".to_string()),
+                ),
+                (
+                    "enable_resource_name_dns_a_record".to_string(),
+                    Value::Bool(true),
+                ),
+                (
+                    "enable_resource_name_dns_aaaa_record".to_string(),
+                    Value::Bool(false),
+                ),
+            ]))]),
+        )]);
+
+        let result = diff(&desired, &current, Some(&saved_map));
+        assert!(
+            matches!(result, Diff::NoChange(_)),
+            "Expected NoChange for bare struct cross-type (Map desired vs List([Map]) current/saved), got {:?}",
+            result
+        );
+    }
+
     /// When saved state is None, behavior should be unchanged from before.
     #[test]
     fn diff_works_without_saved_state() {
