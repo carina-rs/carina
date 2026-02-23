@@ -84,6 +84,7 @@ pub enum Value {
 impl Value {
     /// Semantic equality: for Lists, compares as multisets (order-insensitive);
     /// for Maps, compares values recursively with semantic equality;
+    /// for single-element List([Map]) vs Map, treats them as equivalent (bare struct);
     /// for all other variants, falls back to PartialEq.
     pub fn semantically_equal(&self, other: &Value) -> bool {
         match (self, other) {
@@ -138,6 +139,7 @@ fn lists_equal(a: &[Value], b: &[Value]) -> bool {
 /// Merge desired value with saved state to fill in unmanaged nested fields.
 /// For Maps: start with saved, overlay desired fields on top (desired wins).
 /// For Lists: match elements by similarity, merge each pair.
+/// For cross-type Map/List([Map]): unwrap the single-element list and merge as Maps.
 /// For other types: return desired as-is.
 pub fn merge_with_saved(desired: &Value, saved: &Value) -> Value {
     match (desired, saved) {
