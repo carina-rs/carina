@@ -103,6 +103,9 @@ impl Provider for AwsccProvider {
         let id = id.clone();
         let identifier = identifier.map(|s| s.to_string());
         Box::pin(async move {
+            if id.resource_type == "sts.caller_identity" {
+                return self.read_sts_caller_identity(&id).await;
+            }
             self.read_resource(&id.resource_type, &id.name, identifier.as_deref())
                 .await
         })

@@ -33,6 +33,7 @@ pub mod ec2_vpn_gateway;
 pub mod iam_role;
 pub mod logs_log_group;
 pub mod s3_bucket;
+pub mod sts_caller_identity;
 
 /// Returns all generated schema configs
 pub fn configs() -> Vec<AwsccSchemaConfig> {
@@ -61,6 +62,7 @@ pub fn configs() -> Vec<AwsccSchemaConfig> {
         s3_bucket::s3_bucket_config(),
         iam_role::iam_role_config(),
         logs_log_group::logs_log_group_config(),
+        sts_caller_identity::sts_caller_identity_config(),
     ]
 }
 
@@ -103,6 +105,7 @@ pub fn get_enum_valid_values(
         s3_bucket::enum_valid_values(),
         iam_role::enum_valid_values(),
         logs_log_group::enum_valid_values(),
+        sts_caller_identity::enum_valid_values(),
     ];
     for (rt, attrs) in modules {
         if *rt == resource_type {
@@ -195,6 +198,9 @@ pub fn get_enum_alias_reverse(
     }
     if resource_type == "logs.log_group" {
         return logs_log_group::enum_alias_reverse(attr_name, value);
+    }
+    if resource_type == "sts.caller_identity" {
+        return sts_caller_identity::enum_alias_reverse(attr_name, value);
     }
     None
 }

@@ -33,6 +33,8 @@
     - [awscc.iam.role](providers/awscc/iam_role.md)
   - [Logs]()
     - [awscc.logs.log_group](providers/awscc/logs_log_group.md)
+  - [STS]()
+    - [awscc.sts.caller_identity](providers/awscc/sts_caller_identity.md)
 - [AWS Provider](providers/aws/index.md)
   - [EC2]()
     - [aws.ec2.vpc](providers/aws/ec2_vpc.md)
