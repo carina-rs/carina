@@ -3,6 +3,18 @@
 //! Each `ResourceDef` describes how to map AWS API operations to a Carina resource schema.
 //! These definitions are consumed by the `smithy-codegen` binary.
 
+/// An additional writable field not present in the create operation input.
+/// Used to add fields from the read structure or synthetic fields.
+pub struct ExtraField {
+    /// PascalCase name for the generated attribute (e.g., "CidrIpv6", "SourcePrefixListId")
+    pub name: &'static str,
+    /// If Some, the field type is resolved from this read structure member.
+    /// If None, type is inferred from the field name (e.g., resource ID patterns).
+    pub read_source: Option<&'static str>,
+    /// Manual description (used when read_source is None, or to override Smithy docs)
+    pub description: Option<&'static str>,
+}
+
 /// A read operation that retrieves specific fields from an API response.
 /// Used for resources that have no single "describe" structure (e.g., S3).
 pub struct ReadOp {
@@ -52,6 +64,9 @@ pub struct ResourceDef {
     pub extra_read_only: Vec<&'static str>,
     /// Fields to force as read-only even if they appear in create input
     pub read_only_overrides: Vec<&'static str>,
+    /// Extra writable fields to add as create-only attributes.
+    /// These are fields not present in the create operation input.
+    pub extra_writable: Vec<ExtraField>,
 }
 
 /// An update operation and the fields it can modify.
@@ -97,6 +112,7 @@ pub fn ec2_resources() -> Vec<ResourceDef> {
             required_overrides: vec![],
             extra_read_only: vec![],
             read_only_overrides: vec![],
+            extra_writable: vec![],
         },
         // ec2.subnet
         ResourceDef {
@@ -126,6 +142,7 @@ pub fn ec2_resources() -> Vec<ResourceDef> {
             required_overrides: vec![],
             extra_read_only: vec![],
             read_only_overrides: vec![],
+            extra_writable: vec![],
         },
         // ec2.internet_gateway
         ResourceDef {
@@ -146,6 +163,7 @@ pub fn ec2_resources() -> Vec<ResourceDef> {
             required_overrides: vec![],
             extra_read_only: vec![],
             read_only_overrides: vec![],
+            extra_writable: vec![],
         },
         // ec2.route_table
         ResourceDef {
@@ -166,6 +184,7 @@ pub fn ec2_resources() -> Vec<ResourceDef> {
             required_overrides: vec![],
             extra_read_only: vec![],
             read_only_overrides: vec![],
+            extra_writable: vec![],
         },
         // ec2.route
         ResourceDef {
@@ -201,6 +220,7 @@ pub fn ec2_resources() -> Vec<ResourceDef> {
             required_overrides: vec![],
             extra_read_only: vec![],
             read_only_overrides: vec![],
+            extra_writable: vec![],
         },
         // ec2.security_group
         ResourceDef {
@@ -221,6 +241,7 @@ pub fn ec2_resources() -> Vec<ResourceDef> {
             required_overrides: vec![],
             extra_read_only: vec![],
             read_only_overrides: vec![],
+            extra_writable: vec![],
         },
         // ec2.security_group_ingress
         ResourceDef {
@@ -249,6 +270,28 @@ pub fn ec2_resources() -> Vec<ResourceDef> {
             required_overrides: vec!["IpProtocol"],
             extra_read_only: vec![],
             read_only_overrides: vec![],
+            extra_writable: vec![
+                ExtraField {
+                    name: "CidrIpv6",
+                    read_source: Some("CidrIpv6"),
+                    description: None,
+                },
+                ExtraField {
+                    name: "Description",
+                    read_source: Some("Description"),
+                    description: None,
+                },
+                ExtraField {
+                    name: "SourcePrefixListId",
+                    read_source: Some("PrefixListId"),
+                    description: Some("The ID of the source prefix list."),
+                },
+                ExtraField {
+                    name: "SourceSecurityGroupId",
+                    read_source: None,
+                    description: Some("The ID of the source security group."),
+                },
+            ],
         },
         // ec2.security_group_egress
         ResourceDef {
@@ -277,6 +320,28 @@ pub fn ec2_resources() -> Vec<ResourceDef> {
             required_overrides: vec!["IpProtocol", "GroupId"],
             extra_read_only: vec![],
             read_only_overrides: vec![],
+            extra_writable: vec![
+                ExtraField {
+                    name: "CidrIpv6",
+                    read_source: Some("CidrIpv6"),
+                    description: None,
+                },
+                ExtraField {
+                    name: "Description",
+                    read_source: Some("Description"),
+                    description: None,
+                },
+                ExtraField {
+                    name: "DestinationPrefixListId",
+                    read_source: Some("PrefixListId"),
+                    description: Some("The ID of the destination prefix list."),
+                },
+                ExtraField {
+                    name: "DestinationSecurityGroupId",
+                    read_source: None,
+                    description: Some("The ID of the destination security group."),
+                },
+            ],
         },
     ]
 }
@@ -324,6 +389,7 @@ pub fn s3_resources() -> Vec<ResourceDef> {
             required_overrides: vec![],
             extra_read_only: vec![],
             read_only_overrides: vec![],
+            extra_writable: vec![],
         },
     ]
 }

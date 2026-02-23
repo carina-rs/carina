@@ -13,6 +13,27 @@ Describes a security group rule.
 
 Not supported. Use IP permissions instead.
 
+### `cidr_ipv6`
+
+- **Type:** Ipv6Cidr
+- **Required:** No
+
+The IPv6 CIDR range.
+
+### `description`
+
+- **Type:** String
+- **Required:** No
+
+The security group rule description.
+
+### `destination_prefix_list_id`
+
+- **Type:** AwsResourceId
+- **Required:** No
+
+The ID of the destination prefix list.
+
 ### `from_port`
 
 - **Type:** Int(-1..=65535)
@@ -54,6 +75,13 @@ Not supported. Use IP permissions instead.
 - **Required:** No
 
 Not supported. Use IP permissions instead.
+
+### `destination_security_group_id`
+
+- **Type:** SecurityGroupId
+- **Required:** No
+
+The ID of the destination security group.
 
 ## Enum Values
 

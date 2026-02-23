@@ -76,6 +76,24 @@ pub fn ec2_security_group_egress_config() -> AwsSchemaConfig {
                     .with_provider_name("CidrIp"),
             )
             .attribute(
+                AttributeSchema::new("cidr_ipv6", types::ipv6_cidr())
+                    .create_only()
+                    .with_description("The IPv6 CIDR range.")
+                    .with_provider_name("CidrIpv6"),
+            )
+            .attribute(
+                AttributeSchema::new("description", AttributeType::String)
+                    .create_only()
+                    .with_description("The security group rule description.")
+                    .with_provider_name("Description"),
+            )
+            .attribute(
+                AttributeSchema::new("destination_prefix_list_id", super::aws_resource_id())
+                    .create_only()
+                    .with_description("The ID of the destination prefix list.")
+                    .with_provider_name("DestinationPrefixListId"),
+            )
+            .attribute(
                 AttributeSchema::new(
                     "from_port",
                     AttributeType::Custom {
@@ -142,6 +160,12 @@ pub fn ec2_security_group_egress_config() -> AwsSchemaConfig {
                 .create_only()
                 .with_description("Not supported. Use IP permissions instead.")
                 .with_provider_name("ToPort"),
+            )
+            .attribute(
+                AttributeSchema::new("destination_security_group_id", super::security_group_id())
+                    .create_only()
+                    .with_description("The ID of the destination security group.")
+                    .with_provider_name("DestinationSecurityGroupId"),
             )
             .attribute(
                 AttributeSchema::new("security_group_rule_id", AttributeType::String)

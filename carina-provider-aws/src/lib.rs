@@ -1779,6 +1779,47 @@ impl AwsProvider {
             attributes.insert("cidr_blocks".to_string(), Value::List(cidr_blocks));
         }
 
+        // IPv6 CIDR
+        if let Some(cidr_ipv6) = first_rule.cidr_ipv6() {
+            attributes.insert(
+                "cidr_ipv6".to_string(),
+                Value::String(cidr_ipv6.to_string()),
+            );
+        }
+
+        // Description
+        if let Some(description) = first_rule.description() {
+            attributes.insert(
+                "description".to_string(),
+                Value::String(description.to_string()),
+            );
+        }
+
+        // Prefix list ID (source for ingress, destination for egress)
+        if let Some(prefix_list_id) = first_rule.prefix_list_id() {
+            let attr_name = if is_ingress {
+                "source_prefix_list_id"
+            } else {
+                "destination_prefix_list_id"
+            };
+            attributes.insert(
+                attr_name.to_string(),
+                Value::String(prefix_list_id.to_string()),
+            );
+        }
+
+        // Referenced security group ID (source for ingress, destination for egress)
+        if let Some(ref_group) = first_rule.referenced_group_info()
+            && let Some(group_id) = ref_group.group_id()
+        {
+            let attr_name = if is_ingress {
+                "source_security_group_id"
+            } else {
+                "destination_security_group_id"
+            };
+            attributes.insert(attr_name.to_string(), Value::String(group_id.to_string()));
+        }
+
         let state = State::existing(id.clone(), attributes);
         Ok(if let Some(id_str) = rule_identifier {
             state.with_identifier(id_str)
@@ -1832,8 +1873,39 @@ impl AwsProvider {
                 .collect(),
             _ => match resource.attributes.get("cidr") {
                 Some(Value::String(s)) => vec![s.clone()],
-                _ => vec!["0.0.0.0/0".to_string()],
+                _ => vec![],
             },
+        };
+
+        // New schema fields
+        let cidr_ipv6 = match resource.attributes.get("cidr_ipv6") {
+            Some(Value::String(s)) => Some(s.clone()),
+            _ => None,
+        };
+
+        let description = match resource.attributes.get("description") {
+            Some(Value::String(s)) => Some(s.clone()),
+            _ => None,
+        };
+
+        let prefix_list_attr = if is_ingress {
+            "source_prefix_list_id"
+        } else {
+            "destination_prefix_list_id"
+        };
+        let prefix_list_id = match resource.attributes.get(prefix_list_attr) {
+            Some(Value::String(s)) => Some(s.clone()),
+            _ => None,
+        };
+
+        let sg_ref_attr = if is_ingress {
+            "source_security_group_id"
+        } else {
+            "destination_security_group_id"
+        };
+        let ref_security_group_id = match resource.attributes.get(sg_ref_attr) {
+            Some(Value::String(s)) => Some(s.clone()),
+            _ => None,
         };
 
         let mut permission_builder = aws_sdk_ec2::types::IpPermission::builder()
@@ -1841,9 +1913,41 @@ impl AwsProvider {
             .from_port(from_port)
             .to_port(to_port);
 
+        // IPv4 CIDR ranges
         for cidr in &cidrs {
-            permission_builder = permission_builder
-                .ip_ranges(aws_sdk_ec2::types::IpRange::builder().cidr_ip(cidr).build());
+            let mut range_builder = aws_sdk_ec2::types::IpRange::builder().cidr_ip(cidr);
+            if let Some(ref desc) = description {
+                range_builder = range_builder.description(desc);
+            }
+            permission_builder = permission_builder.ip_ranges(range_builder.build());
+        }
+
+        // IPv6 CIDR range
+        if let Some(ref cidr_v6) = cidr_ipv6 {
+            let mut range_builder = aws_sdk_ec2::types::Ipv6Range::builder().cidr_ipv6(cidr_v6);
+            if let Some(ref desc) = description {
+                range_builder = range_builder.description(desc);
+            }
+            permission_builder = permission_builder.ipv6_ranges(range_builder.build());
+        }
+
+        // Prefix list
+        if let Some(ref pl_id) = prefix_list_id {
+            let mut pl_builder = aws_sdk_ec2::types::PrefixListId::builder().prefix_list_id(pl_id);
+            if let Some(ref desc) = description {
+                pl_builder = pl_builder.description(desc);
+            }
+            permission_builder = permission_builder.prefix_list_ids(pl_builder.build());
+        }
+
+        // Security group reference
+        if let Some(ref ref_sg_id) = ref_security_group_id {
+            let mut pair_builder =
+                aws_sdk_ec2::types::UserIdGroupPair::builder().group_id(ref_sg_id);
+            if let Some(ref desc) = description {
+                pair_builder = pair_builder.description(desc);
+            }
+            permission_builder = permission_builder.user_id_group_pairs(pair_builder.build());
         }
 
         let permission = permission_builder.build();

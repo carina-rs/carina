@@ -76,6 +76,18 @@ pub fn ec2_security_group_ingress_config() -> AwsSchemaConfig {
                 .with_provider_name("CidrIp"),
         )
         .attribute(
+            AttributeSchema::new("cidr_ipv6", types::ipv6_cidr())
+                .create_only()
+                .with_description("The IPv6 CIDR range.")
+                .with_provider_name("CidrIpv6"),
+        )
+        .attribute(
+            AttributeSchema::new("description", AttributeType::String)
+                .create_only()
+                .with_description("The security group rule description.")
+                .with_provider_name("Description"),
+        )
+        .attribute(
             AttributeSchema::new("from_port", AttributeType::Custom {
                 name: "Int(-1..=65535)".to_string(),
                 base: Box::new(AttributeType::Int),
@@ -113,6 +125,12 @@ pub fn ec2_security_group_ingress_config() -> AwsSchemaConfig {
                 .with_provider_name("IpProtocol"),
         )
         .attribute(
+            AttributeSchema::new("source_prefix_list_id", super::aws_resource_id())
+                .create_only()
+                .with_description("The ID of the source prefix list.")
+                .with_provider_name("SourcePrefixListId"),
+        )
+        .attribute(
             AttributeSchema::new("source_security_group_name", AttributeType::String)
                 .create_only()
                 .with_description("[Default VPC] The name of the source security group. The rule grants full ICMP, UDP, and TCP access. To create a rule with a specific protocol and por...")
@@ -135,6 +153,12 @@ pub fn ec2_security_group_ingress_config() -> AwsSchemaConfig {
                 .create_only()
                 .with_description("If the protocol is TCP or UDP, this is the end of the port range. If the protocol is ICMP, this is the ICMP code or -1 (all ICMP codes). If the start ...")
                 .with_provider_name("ToPort"),
+        )
+        .attribute(
+            AttributeSchema::new("source_security_group_id", super::security_group_id())
+                .create_only()
+                .with_description("The ID of the source security group.")
+                .with_provider_name("SourceSecurityGroupId"),
         )
         .attribute(
             AttributeSchema::new("security_group_rule_id", AttributeType::String)

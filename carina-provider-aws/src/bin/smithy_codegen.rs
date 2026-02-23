@@ -312,6 +312,20 @@ fn generate_resource(res: &ResourceDef, model: &SmithyModel) -> Result<String> {
         }
     }
 
+    // Add extra writable fields from read structure
+    for extra in &res.extra_writable {
+        if writable_fields.contains_key(extra.name) {
+            continue;
+        }
+        if let Some(source_field) = extra.read_source
+            && let Some(read_struct) = read_structure
+            && let Some(member_ref) = read_struct.members.get(source_field)
+        {
+            writable_fields.insert(extra.name.to_string(), member_ref);
+        }
+        // Synthetic fields (read_source = None) are handled after main attribute generation
+    }
+
     // Collect read-only fields from read structure
     let mut read_only_fields: BTreeMap<String, &carina_smithy::ShapeRef> = BTreeMap::new();
     if let Some(read_struct) = read_structure {
@@ -339,6 +353,15 @@ fn generate_resource(res: &ResourceDef, model: &SmithyModel) -> Result<String> {
         }
     }
 
+    // Build extra_writable description override map
+    let extra_writable_descs: HashMap<&str, Option<&str>> = res
+        .extra_writable
+        .iter()
+        .map(|e| (e.name, e.description))
+        .collect();
+    // Set of field names that are from extra_writable (always create-only)
+    let extra_writable_names: HashSet<&str> = res.extra_writable.iter().map(|e| e.name).collect();
+
     // Build attribute list
     let mut attrs: Vec<AttrInfo> = Vec::new();
 
@@ -351,11 +374,18 @@ fn generate_resource(res: &ResourceDef, model: &SmithyModel) -> Result<String> {
         let is_read_only = read_only_overrides.contains(name.as_str());
         let is_create_only = if is_read_only {
             false
+        } else if extra_writable_names.contains(name.as_str()) {
+            true // Extra writable fields are always create-only
         } else {
             create_only_overrides.contains(name.as_str())
                 || !updatable_fields.contains(name.as_str())
         };
-        let description = SmithyModel::documentation(&member_ref.traits).map(|s| s.to_string());
+        // Use ExtraField description override if available, otherwise Smithy docs
+        let description = if let Some(Some(desc)) = extra_writable_descs.get(name.as_str()) {
+            Some(desc.to_string())
+        } else {
+            SmithyModel::documentation(&member_ref.traits).map(|s| s.to_string())
+        };
 
         let (type_code, enum_info) = resolve_type(
             model,
@@ -378,6 +408,31 @@ fn generate_resource(res: &ResourceDef, model: &SmithyModel) -> Result<String> {
             is_read_only,
             description,
             enum_info,
+        });
+    }
+
+    // Process synthetic extra writable fields (no read_source)
+    for extra in &res.extra_writable {
+        if extra.read_source.is_some() {
+            continue; // Already handled via writable_fields
+        }
+        let snake_name = extra.name.to_snake_case();
+        let type_code = if let Some(&override_type) = type_overrides.get(extra.name) {
+            override_type.to_string()
+        } else if let Some(inferred) = infer_string_type(extra.name) {
+            inferred
+        } else {
+            "AttributeType::String".to_string()
+        };
+        attrs.push(AttrInfo {
+            snake_name,
+            provider_name: extra.name.to_string(),
+            type_code,
+            is_required: false,
+            is_create_only: true,
+            is_read_only: false,
+            description: extra.description.map(|s| s.to_string()),
+            enum_info: None,
         });
     }
 
@@ -1244,6 +1299,19 @@ fn generate_markdown_resource(res: &ResourceDef, model: &SmithyModel) -> Result<
         }
     }
 
+    // Add extra writable fields from read structure
+    for extra in &res.extra_writable {
+        if writable_fields.contains_key(extra.name) {
+            continue;
+        }
+        if let Some(source_field) = extra.read_source
+            && let Some(read_struct) = read_structure
+            && let Some(member_ref) = read_struct.members.get(source_field)
+        {
+            writable_fields.insert(extra.name.to_string(), member_ref);
+        }
+    }
+
     // Read-only fields
     let mut read_only_fields: BTreeMap<String, &carina_smithy::ShapeRef> = BTreeMap::new();
     if let Some(read_struct) = read_structure {
@@ -1279,13 +1347,24 @@ fn generate_markdown_resource(res: &ResourceDef, model: &SmithyModel) -> Result<
         description: Option<String>,
     }
 
+    // Build extra_writable description override map
+    let extra_writable_descs: HashMap<&str, Option<&str>> = res
+        .extra_writable
+        .iter()
+        .map(|e| (e.name, e.description))
+        .collect();
+
     let mut writable_attrs: Vec<MdAttrInfo> = Vec::new();
     for (name, member_ref) in &writable_fields {
         let snake_name = name.to_snake_case();
         let is_required = (SmithyModel::is_required(member_ref)
             || required_overrides.contains(name.as_str()))
             && !read_only_overrides.contains(name.as_str());
-        let description = SmithyModel::documentation(&member_ref.traits).map(|s| s.to_string());
+        let description = if let Some(Some(desc)) = extra_writable_descs.get(name.as_str()) {
+            Some(desc.to_string())
+        } else {
+            SmithyModel::documentation(&member_ref.traits).map(|s| s.to_string())
+        };
         let type_display = type_display_string_md(
             model,
             &member_ref.target,
@@ -1301,6 +1380,27 @@ fn generate_markdown_resource(res: &ResourceDef, model: &SmithyModel) -> Result<
             type_display,
             is_required,
             description,
+        });
+    }
+
+    // Add synthetic extra writable fields (no read_source) to markdown
+    for extra in &res.extra_writable {
+        if extra.read_source.is_some() {
+            continue;
+        }
+        let snake_name = extra.name.to_snake_case();
+        let type_display = if let Some(&override_type) = type_overrides.get(extra.name) {
+            type_code_to_display(override_type)
+        } else if is_aws_resource_id_property(extra.name) {
+            resource_id_display(extra.name)
+        } else {
+            "String".to_string()
+        };
+        writable_attrs.push(MdAttrInfo {
+            snake_name,
+            type_display,
+            is_required: false,
+            description: extra.description.map(|s| s.to_string()),
         });
     }
 

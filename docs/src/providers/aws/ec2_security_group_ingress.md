@@ -13,6 +13,20 @@ Describes a security group rule.
 
 The IPv4 address range, in CIDR format.                    Amazon Web Services canonicalizes IPv4 and IPv6 CIDRs. For example, if you specify 100.68.0.18/18 for the CIDR block,        Amazon Web Services canonicalizes the CIDR block to 100.68.0.0/18. Any subsequent DescribeSecurityGroups and DescribeSecurityGroupRules calls will        return the canonicalized form of the CIDR block. Additionally, if you attempt to add another rule with the        non-canonical form of the CIDR (such as 100.68.0.18/18) and there is already a rule for the canonicalized        form of the CIDR block (such as 100.68.0.0/18), the API throws an duplicate rule error.          To specify an IPv6 address range, use IP permissions instead.     To specify multiple rules and descriptions for the rules, use IP permissions instead.
 
+### `cidr_ipv6`
+
+- **Type:** Ipv6Cidr
+- **Required:** No
+
+The IPv6 CIDR range.
+
+### `description`
+
+- **Type:** String
+- **Required:** No
+
+The security group rule description.
+
 ### `from_port`
 
 - **Type:** Int(-1..=65535)
@@ -41,6 +55,13 @@ The ID of the security group.
 
 The IP protocol name (tcp, udp, icmp) or number    (see Protocol Numbers). To specify all protocols, use -1.     To specify icmpv6, use IP permissions instead.     If you specify a protocol other than one of the supported values, traffic is allowed      on all ports, regardless of any ports that you specify.     To specify multiple rules and descriptions for the rules, use IP permissions instead.
 
+### `source_prefix_list_id`
+
+- **Type:** AwsResourceId
+- **Required:** No
+
+The ID of the source prefix list.
+
 ### `source_security_group_name`
 
 - **Type:** String
@@ -61,6 +82,13 @@ The Amazon Web Services account ID for the source security group, if the source 
 - **Required:** No
 
 If the protocol is TCP or UDP, this is the end of the port range.      If the protocol is ICMP, this is the ICMP code or -1 (all ICMP codes).       If the start port is -1 (all ICMP types), then the end port must be -1 (all ICMP codes).     To specify multiple rules and descriptions for the rules, use IP permissions instead.
+
+### `source_security_group_id`
+
+- **Type:** SecurityGroupId
+- **Required:** No
+
+The ID of the source security group.
 
 ## Enum Values
 
