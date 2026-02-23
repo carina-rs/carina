@@ -1751,15 +1751,15 @@ impl AwsProvider {
 
         // Store security group ID
         if let Some(sg_id) = first_rule.group_id() {
-            attributes.insert(
-                "security_group_id".to_string(),
-                Value::String(sg_id.to_string()),
-            );
+            attributes.insert("group_id".to_string(), Value::String(sg_id.to_string()));
         }
 
         if let Some(protocol) = first_rule.ip_protocol() {
             // Keep protocol as raw string for comparison (tcp, udp, icmp, -1)
-            attributes.insert("protocol".to_string(), Value::String(protocol.to_string()));
+            attributes.insert(
+                "ip_protocol".to_string(),
+                Value::String(protocol.to_string()),
+            );
         }
 
         if let Some(from_port) = first_rule.from_port() {
@@ -1770,13 +1770,9 @@ impl AwsProvider {
             attributes.insert("to_port".to_string(), Value::Int(to_port as i64));
         }
 
-        // Aggregate cidr_blocks from all rules with the same name
-        let cidr_blocks: Vec<Value> = rules
-            .iter()
-            .filter_map(|r| r.cidr_ipv4().map(|c| Value::String(c.to_string())))
-            .collect();
-        if !cidr_blocks.is_empty() {
-            attributes.insert("cidr_blocks".to_string(), Value::List(cidr_blocks));
+        // IPv4 CIDR
+        if let Some(cidr_ip) = first_rule.cidr_ipv4() {
+            attributes.insert("cidr_ip".to_string(), Value::String(cidr_ip.to_string()));
         }
 
         // IPv6 CIDR
@@ -1839,15 +1835,17 @@ impl AwsProvider {
             _ => None,
         });
 
-        let sg_id = match resource.attributes.get("security_group_id") {
+        let sg_id = match resource.attributes.get("group_id") {
             Some(Value::String(s)) => s.clone(),
             _ => {
-                return Err(ProviderError::new("Security Group ID is required")
-                    .for_resource(resource.id.clone()));
+                return Err(
+                    ProviderError::new("Security Group ID (group_id) is required")
+                        .for_resource(resource.id.clone()),
+                );
             }
         };
 
-        let protocol = match resource.attributes.get("protocol") {
+        let protocol = match resource.attributes.get("ip_protocol") {
             Some(Value::String(s)) => convert_protocol_value(s),
             _ => "-1".to_string(),
         };
@@ -1862,22 +1860,11 @@ impl AwsProvider {
             _ => 0,
         };
 
-        // Support both cidr_blocks (list) and cidr (single value) for backwards compatibility
-        let cidrs: Vec<String> = match resource.attributes.get("cidr_blocks") {
-            Some(Value::List(items)) => items
-                .iter()
-                .filter_map(|v| match v {
-                    Value::String(s) => Some(s.clone()),
-                    _ => None,
-                })
-                .collect(),
-            _ => match resource.attributes.get("cidr") {
-                Some(Value::String(s)) => vec![s.clone()],
-                _ => vec![],
-            },
+        let cidr_ip = match resource.attributes.get("cidr_ip") {
+            Some(Value::String(s)) => Some(s.clone()),
+            _ => None,
         };
 
-        // New schema fields
         let cidr_ipv6 = match resource.attributes.get("cidr_ipv6") {
             Some(Value::String(s)) => Some(s.clone()),
             _ => None,
@@ -1913,8 +1900,8 @@ impl AwsProvider {
             .from_port(from_port)
             .to_port(to_port);
 
-        // IPv4 CIDR ranges
-        for cidr in &cidrs {
+        // IPv4 CIDR range
+        if let Some(ref cidr) = cidr_ip {
             let mut range_builder = aws_sdk_ec2::types::IpRange::builder().cidr_ip(cidr);
             if let Some(ref desc) = description {
                 range_builder = range_builder.description(desc);
