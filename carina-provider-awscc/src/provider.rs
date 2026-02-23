@@ -305,11 +305,12 @@ impl AwsccProvider {
         Ok(())
     }
 
-    /// Delete a resource using Cloud Control API.
+    /// Delete a resource using Cloud Control API, with retry logic for retryable errors.
     ///
     /// Uses resource-type-specific polling timeouts. IPAM-related resources
     /// get a longer timeout since their deletion via CloudControl API can
-    /// take 15-30 minutes.
+    /// take 15-30 minutes. Retries with exponential backoff on transient errors
+    /// such as throttling or service unavailability.
     pub async fn cc_delete_resource(
         &self,
         type_name: &str,
