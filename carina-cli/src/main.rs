@@ -28,8 +28,6 @@ use carina_state::{
 };
 use std::collections::HashSet;
 
-use carina_provider_aws::AwsProvider;
-
 #[derive(Parser)]
 #[command(name = "carina")]
 #[command(about = "A functional infrastructure management tool", long_about = None)]
@@ -1045,7 +1043,7 @@ async fn run_plan(path: &PathBuf, out: Option<&PathBuf>) -> Result<bool, String>
     let mut state_bucket_name = String::new();
     let mut state_file: Option<StateFile> = None;
 
-    let _backend: Box<dyn StateBackend> = if let Some(config) = parsed.backend.as_ref() {
+    let plan_backend: Box<dyn StateBackend> = if let Some(config) = parsed.backend.as_ref() {
         let state_config = convert_backend_config(config);
         let backend = create_backend(&state_config)
             .await
@@ -1073,8 +1071,9 @@ async fn run_plan(path: &PathBuf, out: Option<&PathBuf>) -> Result<bool, String>
                 })
                 .ok_or("Backend bucket name not specified")?;
 
+            let backend_resource_type = backend.resource_type().unwrap_or("s3.bucket");
             let has_bucket_resource = parsed.resources.iter().any(|r| {
-                r.id.resource_type == "s3.bucket"
+                r.id.resource_type == backend_resource_type
                     && r.attributes
                         .get("name")
                         .is_some_and(|v| matches!(v, Value::String(s) if s == &bucket_name))
@@ -1114,11 +1113,17 @@ async fn run_plan(path: &PathBuf, out: Option<&PathBuf>) -> Result<bool, String>
 
     // Show bootstrap plan if needed
     if will_create_state_bucket {
+        let backend_provider = plan_backend.provider_name().unwrap_or("aws");
+        let backend_resource_type = plan_backend.resource_type().unwrap_or("s3.bucket");
         println!("{}", "Bootstrap Plan:".cyan().bold());
         println!(
             "  {} {} (state bucket with versioning enabled)",
             "+".green(),
-            format!("aws.s3.bucket.{}", state_bucket_name).green()
+            format!(
+                "{}.{}.{}",
+                backend_provider, backend_resource_type, state_bucket_name
+            )
+            .green()
         );
         println!(
             "  {} Resource definition will be added to .crn file",
@@ -1246,19 +1251,32 @@ async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
                 })
                 .ok_or("Missing bucket name in backend configuration")?;
 
-            // Check if there's an s3_bucket resource defined with matching name
-            if let Some(bucket_resource) = find_state_bucket_resource(&parsed, &bucket_name) {
+            // Check if there's a bucket resource defined with matching name
+            let backend_resource_type = backend.resource_type().unwrap_or("s3.bucket");
+            if let Some(bucket_resource) =
+                find_state_bucket_resource(&parsed, &bucket_name, backend_resource_type)
+            {
                 println!("Found state bucket resource in configuration.");
                 println!(
                     "Creating bucket '{}' before other resources...",
                     bucket_name.cyan()
                 );
 
-                // Create the bucket resource first
-                let region = get_region_for_provider(&parsed, "aws");
-                let aws_provider = AwsProvider::new(&region).await;
+                // Create the bucket resource using the factory pattern
+                let backend_provider_name = backend.provider_name().unwrap_or("aws");
+                let factories = provider_factories();
+                let factory = find_factory(&factories, backend_provider_name).ok_or_else(|| {
+                    format!("No provider factory found for '{}'", backend_provider_name)
+                })?;
+                let provider_config_attrs = parsed
+                    .providers
+                    .iter()
+                    .find(|p| p.name == backend_provider_name)
+                    .map(|p| p.attributes.clone())
+                    .unwrap_or_default();
+                let bucket_provider = factory.create_provider(&provider_config_attrs).await;
 
-                match aws_provider.create(bucket_resource).await {
+                match bucket_provider.create(bucket_resource).await {
                     Ok(_) => {
                         println!("  {} Created state bucket: {}", "✓".green(), bucket_name);
                     }
@@ -1285,17 +1303,21 @@ async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
                         .map_err(|e| format!("Failed to create bucket: {}", e))?;
                     println!("  {} Created state bucket", "✓".green());
 
-                    // Get region from backend config using AWS factory
-                    let aws_factory = AwsProviderFactory;
-                    let region = aws_factory.extract_region(&config.attributes);
+                    // Get region from backend config using factory
+                    let backend_provider_name = backend.provider_name().unwrap_or("aws");
+                    let factories = provider_factories();
+                    let factory =
+                        find_factory(&factories, backend_provider_name).ok_or_else(|| {
+                            format!("No provider factory found for '{}'", backend_provider_name)
+                        })?;
+                    let region = factory.extract_region(&config.attributes);
 
                     // Append resource definition to backend file
                     let target_file = backend_file.clone().unwrap_or_else(|| path.clone());
 
-                    let resource_code = format!(
-                        "\n# Auto-generated by carina (state bucket)\naws.s3.bucket {{\n    name              = \"{}\"\n    versioning_status = Enabled\n}}\n",
-                        bucket_name
-                    );
+                    let resource_code = backend
+                        .resource_definition(&bucket_name)
+                        .ok_or("Backend does not support resource definition generation")?;
 
                     // Read existing content if file exists, then append
                     let mut content = if target_file.exists() {
@@ -1316,14 +1338,19 @@ async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
                     );
 
                     // Create a protected ResourceState for the auto-created bucket
-                    let bucket_state = ResourceState::new("s3.bucket", &bucket_name, "aws")
-                        .with_attribute("name".to_string(), serde_json::json!(bucket_name))
-                        .with_attribute("region".to_string(), serde_json::json!(region))
-                        .with_attribute(
-                            "versioning_status".to_string(),
-                            serde_json::json!("Enabled"),
-                        )
-                        .with_protected(true);
+                    let backend_resource_type = backend.resource_type().unwrap_or("s3.bucket");
+                    let bucket_state = ResourceState::new(
+                        backend_resource_type,
+                        &bucket_name,
+                        backend_provider_name,
+                    )
+                    .with_attribute("name".to_string(), serde_json::json!(bucket_name))
+                    .with_attribute("region".to_string(), serde_json::json!(region))
+                    .with_attribute(
+                        "versioning_status".to_string(),
+                        serde_json::json!("Enabled"),
+                    )
+                    .with_protected(true);
 
                     // Initialize state with the protected bucket
                     let mut initial_state = StateFile::new();
@@ -2492,7 +2519,8 @@ async fn run_destroy(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
             }
 
             // Check if this is the protected state bucket
-            if r.id.resource_type == "s3.bucket"
+            if let Some(backend_rt) = backend.resource_type()
+                && r.id.resource_type == backend_rt
                 && let Some(ref bucket_name) = protected_bucket
                 && let Some(Value::String(name)) = r.attributes.get("name")
                 && name == bucket_name
@@ -2867,19 +2895,6 @@ fn get_identifier_from_state(
         return Some(name.clone());
     }
     None
-}
-
-/// Extract region in SDK format from the first matching provider config
-fn get_region_for_provider(parsed: &ParsedFile, provider_name: &str) -> String {
-    let factories = provider_factories();
-    for provider_config in &parsed.providers {
-        if provider_config.name == provider_name
-            && let Some(factory) = find_factory(&factories, &provider_config.name)
-        {
-            return factory.extract_region(&provider_config.attributes);
-        }
-    }
-    "ap-northeast-1".to_string()
 }
 
 /// Determine and return the appropriate Provider
@@ -3875,9 +3890,10 @@ fn convert_backend_config(config: &BackendConfig) -> StateBackendConfig {
 fn find_state_bucket_resource<'a>(
     parsed: &'a ParsedFile,
     bucket_name: &str,
+    resource_type: &str,
 ) -> Option<&'a Resource> {
     parsed.resources.iter().find(|r| {
-        r.id.resource_type == "s3.bucket"
+        r.id.resource_type == resource_type
             && matches!(r.attributes.get("name"), Some(Value::String(name)) if name == bucket_name)
     })
 }
@@ -4114,20 +4130,36 @@ async fn run_state_bucket_delete(
         }
     }
 
-    // Get region from backend config using AWS factory
-    let aws_factory = AwsProviderFactory;
-    let region = aws_factory.extract_region(&backend_config.attributes);
+    // Create backend to get provider metadata
+    let state_config = convert_backend_config(backend_config);
+    let backend = create_backend(&state_config)
+        .await
+        .map_err(|e| format!("Failed to create backend: {}", e))?;
 
-    // Create AWS provider to delete the bucket
-    let aws_provider = AwsProvider::new(&region).await;
+    // Get provider metadata from backend
+    let backend_provider_name = backend.provider_name().unwrap_or("aws");
+    let backend_resource_type = backend.resource_type().unwrap_or("s3.bucket");
+    let factories = provider_factories();
+    let factory = find_factory(&factories, backend_provider_name)
+        .ok_or_else(|| format!("No provider factory found for '{}'", backend_provider_name))?;
+
+    // Create provider to delete the bucket
+    let provider_config_attrs = parsed
+        .providers
+        .iter()
+        .find(|p| p.name == backend_provider_name)
+        .map(|p| p.attributes.clone())
+        .unwrap_or_default();
+    let bucket_provider = factory.create_provider(&provider_config_attrs).await;
 
     // First, try to empty the bucket (delete all objects and versions)
     println!();
     println!("{}", "Emptying bucket...".cyan());
 
-    // Delete the bucket resource (for S3, identifier is the bucket name)
-    let bucket_id = ResourceId::with_provider("aws", "s3.bucket", bucket_name);
-    match aws_provider
+    // Delete the bucket resource (identifier is the bucket name)
+    let bucket_id =
+        ResourceId::with_provider(backend_provider_name, backend_resource_type, bucket_name);
+    match bucket_provider
         .delete(&bucket_id, bucket_name, &LifecycleConfig::default())
         .await
     {
@@ -5340,5 +5372,31 @@ awscc.ec2.security_group {
             !names.contains("group_description"),
             "String should not be included"
         );
+    }
+
+    #[test]
+    fn test_find_state_bucket_resource_matching_type() {
+        let parsed = ParsedFile {
+            providers: vec![],
+            backend: None,
+            resources: vec![
+                Resource::with_provider("aws", "s3.bucket", "my-bucket")
+                    .with_attribute("name", Value::String("my-bucket".to_string())),
+            ],
+            variables: HashMap::new(),
+            imports: vec![],
+            module_calls: vec![],
+            inputs: vec![],
+            outputs: vec![],
+        };
+
+        // Matching resource type
+        assert!(find_state_bucket_resource(&parsed, "my-bucket", "s3.bucket").is_some());
+
+        // Non-matching resource type
+        assert!(find_state_bucket_resource(&parsed, "my-bucket", "gcs.bucket").is_none());
+
+        // Non-matching bucket name
+        assert!(find_state_bucket_resource(&parsed, "other-bucket", "s3.bucket").is_none());
     }
 }

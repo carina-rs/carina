@@ -133,6 +133,21 @@ pub trait StateBackend: Send + Sync {
     /// - Server-side encryption (AES256)
     /// - Public access blocked
     async fn create_bucket(&self) -> BackendResult<()>;
+
+    /// Provider name for this backend's storage resource (e.g., "aws" for S3)
+    fn provider_name(&self) -> Option<&str> {
+        None
+    }
+
+    /// Resource type of the storage resource (e.g., "s3.bucket")
+    fn resource_type(&self) -> Option<&str> {
+        None
+    }
+
+    /// DSL resource definition for auto-generating bootstrap code
+    fn resource_definition(&self, _name: &str) -> Option<String> {
+        None
+    }
 }
 
 /// Configuration for a state backend

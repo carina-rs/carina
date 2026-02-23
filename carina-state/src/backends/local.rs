@@ -258,4 +258,12 @@ mod tests {
         let backend = LocalBackend::from_config(&config).unwrap();
         assert_eq!(backend.state_path(), &PathBuf::from("custom.state.json"));
     }
+
+    #[test]
+    fn test_local_backend_provider_metadata() {
+        let backend = LocalBackend::new();
+        assert_eq!(backend.provider_name(), None);
+        assert_eq!(backend.resource_type(), None);
+        assert_eq!(backend.resource_definition("test"), None);
+    }
 }
