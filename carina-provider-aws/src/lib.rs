@@ -2,6 +2,7 @@
 //!
 //! AWS Provider implementation
 
+pub mod provider_generated;
 pub mod resource_defs;
 pub mod schemas;
 
@@ -11,8 +12,7 @@ use aws_config::Region;
 use aws_sdk_ec2::Client as Ec2Client;
 use aws_sdk_s3::Client as S3Client;
 use carina_core::provider::{
-    BoxFuture, Provider, ProviderError, ProviderFactory, ProviderResult, ResourceSchema,
-    ResourceType,
+    BoxFuture, Provider, ProviderError, ProviderFactory, ProviderResult, ResourceType,
 };
 use carina_core::resource::{LifecycleConfig, Resource, ResourceId, State, Value};
 use carina_core::utils::{convert_enum_value, extract_enum_value};
@@ -71,123 +71,6 @@ impl ProviderFactory for AwsProviderFactory {
 
     fn identity_attributes(&self) -> Vec<&str> {
         vec!["region"]
-    }
-}
-
-/// S3 Bucket resource type
-pub struct S3BucketType;
-
-impl ResourceType for S3BucketType {
-    fn name(&self) -> &'static str {
-        "s3.bucket"
-    }
-
-    fn schema(&self) -> ResourceSchema {
-        ResourceSchema::default()
-    }
-}
-
-/// VPC resource type
-pub struct VpcType;
-
-impl ResourceType for VpcType {
-    fn name(&self) -> &'static str {
-        "ec2.vpc"
-    }
-
-    fn schema(&self) -> ResourceSchema {
-        ResourceSchema::default()
-    }
-}
-
-/// Subnet resource type
-pub struct SubnetType;
-
-impl ResourceType for SubnetType {
-    fn name(&self) -> &'static str {
-        "ec2.subnet"
-    }
-
-    fn schema(&self) -> ResourceSchema {
-        ResourceSchema::default()
-    }
-}
-
-/// Internet Gateway resource type
-pub struct InternetGatewayType;
-
-impl ResourceType for InternetGatewayType {
-    fn name(&self) -> &'static str {
-        "ec2.internet_gateway"
-    }
-
-    fn schema(&self) -> ResourceSchema {
-        ResourceSchema::default()
-    }
-}
-
-/// Route Table resource type
-pub struct RouteTableType;
-
-impl ResourceType for RouteTableType {
-    fn name(&self) -> &'static str {
-        "ec2.route_table"
-    }
-
-    fn schema(&self) -> ResourceSchema {
-        ResourceSchema::default()
-    }
-}
-
-/// Route resource type
-pub struct RouteType;
-
-impl ResourceType for RouteType {
-    fn name(&self) -> &'static str {
-        "ec2.route"
-    }
-
-    fn schema(&self) -> ResourceSchema {
-        ResourceSchema::default()
-    }
-}
-
-/// Security Group resource type
-pub struct SecurityGroupType;
-
-impl ResourceType for SecurityGroupType {
-    fn name(&self) -> &'static str {
-        "ec2.security_group"
-    }
-
-    fn schema(&self) -> ResourceSchema {
-        ResourceSchema::default()
-    }
-}
-
-/// Security Group Ingress Rule resource type
-pub struct SecurityGroupIngressRuleType;
-
-impl ResourceType for SecurityGroupIngressRuleType {
-    fn name(&self) -> &'static str {
-        "ec2.security_group_ingress"
-    }
-
-    fn schema(&self) -> ResourceSchema {
-        ResourceSchema::default()
-    }
-}
-
-/// Security Group Egress Rule resource type
-pub struct SecurityGroupEgressRuleType;
-
-impl ResourceType for SecurityGroupEgressRuleType {
-    fn name(&self) -> &'static str {
-        "ec2.security_group_egress"
-    }
-
-    fn schema(&self) -> ResourceSchema {
-        ResourceSchema::default()
     }
 }
 
@@ -387,21 +270,6 @@ impl AwsProvider {
         }
 
         self.read_s3_bucket(&id, Some(&bucket_name)).await
-    }
-
-    /// Delete an S3 bucket
-    async fn delete_s3_bucket(&self, id: ResourceId, identifier: &str) -> ProviderResult<()> {
-        self.s3_client
-            .delete_bucket()
-            .bucket(identifier)
-            .send()
-            .await
-            .map_err(|e| {
-                ProviderError::new(format!("Failed to delete bucket: {}", e))
-                    .for_resource(id.clone())
-            })?;
-
-        Ok(())
     }
 
     // ========== EC2 VPC Operations ==========
@@ -674,22 +542,6 @@ impl AwsProvider {
         self.read_ec2_vpc(&id, Some(identifier)).await
     }
 
-    /// Delete an EC2 VPC
-    async fn delete_ec2_vpc(&self, id: ResourceId, identifier: &str) -> ProviderResult<()> {
-        // identifier is the VPC ID
-        self.ec2_client
-            .delete_vpc()
-            .vpc_id(identifier)
-            .send()
-            .await
-            .map_err(|e| {
-                ProviderError::new(format!("Failed to delete VPC: {:?}", e))
-                    .for_resource(id.clone())
-            })?;
-
-        Ok(())
-    }
-
     // ========== EC2 Subnet Operations ==========
 
     /// Read an EC2 Subnet
@@ -844,33 +696,6 @@ impl AwsProvider {
         self.read_ec2_subnet(&resource.id, Some(subnet_id)).await
     }
 
-    /// Update an EC2 Subnet (limited - most attributes are immutable)
-    async fn update_ec2_subnet(
-        &self,
-        id: ResourceId,
-        identifier: &str,
-        _to: Resource,
-    ) -> ProviderResult<State> {
-        // Subnet attributes (cidr_block, vpc, availability_zone) are immutable
-        // Only tags can be updated
-        self.read_ec2_subnet(&id, Some(identifier)).await
-    }
-
-    /// Delete an EC2 Subnet
-    async fn delete_ec2_subnet(&self, id: ResourceId, identifier: &str) -> ProviderResult<()> {
-        self.ec2_client
-            .delete_subnet()
-            .subnet_id(identifier)
-            .send()
-            .await
-            .map_err(|e| {
-                ProviderError::new(format!("Failed to delete subnet: {:?}", e))
-                    .for_resource(id.clone())
-            })?;
-
-        Ok(())
-    }
-
     // ========== EC2 Internet Gateway Operations ==========
 
     /// Read an EC2 Internet Gateway
@@ -1011,18 +836,6 @@ impl AwsProvider {
         // Read back using IGW ID (reliable identifier)
         self.read_ec2_internet_gateway(&resource.id, Some(igw_id))
             .await
-    }
-
-    /// Update an EC2 Internet Gateway
-    async fn update_ec2_internet_gateway(
-        &self,
-        id: ResourceId,
-        identifier: &str,
-        _to: Resource,
-    ) -> ProviderResult<State> {
-        // Internet Gateway attributes are mostly immutable
-        // VPC attachment changes would require detach/attach
-        self.read_ec2_internet_gateway(&id, Some(identifier)).await
     }
 
     /// Delete an EC2 Internet Gateway
@@ -1262,33 +1075,6 @@ impl AwsProvider {
 
         // Read back using route table ID (reliable identifier)
         self.read_ec2_route_table(&resource.id, Some(rt_id)).await
-    }
-
-    /// Update an EC2 Route Table
-    async fn update_ec2_route_table(
-        &self,
-        id: ResourceId,
-        identifier: &str,
-        _to: Resource,
-    ) -> ProviderResult<State> {
-        // Route updates would require deleting and recreating routes
-        // For now, just return current state
-        self.read_ec2_route_table(&id, Some(identifier)).await
-    }
-
-    /// Delete an EC2 Route Table
-    async fn delete_ec2_route_table(&self, id: ResourceId, identifier: &str) -> ProviderResult<()> {
-        self.ec2_client
-            .delete_route_table()
-            .route_table_id(identifier)
-            .send()
-            .await
-            .map_err(|e| {
-                ProviderError::new(format!("Failed to delete route table: {:?}", e))
-                    .for_resource(id.clone())
-            })?;
-
-        Ok(())
     }
 
     // ========== EC2 Route Operations ==========
@@ -1616,37 +1402,6 @@ impl AwsProvider {
         // Read back using security group ID (reliable identifier)
         self.read_ec2_security_group(&resource.id, Some(sg_id))
             .await
-    }
-
-    /// Update an EC2 Security Group
-    async fn update_ec2_security_group(
-        &self,
-        id: ResourceId,
-        identifier: &str,
-        _to: Resource,
-    ) -> ProviderResult<State> {
-        // Security group rule updates would require revoking and re-adding rules
-        // For now, just return current state
-        self.read_ec2_security_group(&id, Some(identifier)).await
-    }
-
-    /// Delete an EC2 Security Group
-    async fn delete_ec2_security_group(
-        &self,
-        id: ResourceId,
-        identifier: &str,
-    ) -> ProviderResult<()> {
-        self.ec2_client
-            .delete_security_group()
-            .group_id(identifier)
-            .send()
-            .await
-            .map_err(|e| {
-                ProviderError::new(format!("Failed to delete security group: {:?}", e))
-                    .for_resource(id.clone())
-            })?;
-
-        Ok(())
     }
 
     // ========== EC2 Security Group Rule Operations ==========
@@ -2096,17 +1851,7 @@ impl Provider for AwsProvider {
     }
 
     fn resource_types(&self) -> Vec<Box<dyn ResourceType>> {
-        vec![
-            Box::new(S3BucketType),
-            Box::new(VpcType),
-            Box::new(SubnetType),
-            Box::new(InternetGatewayType),
-            Box::new(RouteTableType),
-            Box::new(RouteType),
-            Box::new(SecurityGroupType),
-            Box::new(SecurityGroupIngressRuleType),
-            Box::new(SecurityGroupEgressRuleType),
-        ]
+        provider_generated::resource_types()
     }
 
     fn read(
@@ -2269,7 +2014,7 @@ mod tests {
 
     #[test]
     fn test_s3_bucket_type_name() {
-        let bucket_type = S3BucketType;
+        let bucket_type = provider_generated::S3BucketType;
         assert_eq!(bucket_type.name(), "s3.bucket");
     }
 }
