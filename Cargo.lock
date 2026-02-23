@@ -743,6 +743,7 @@ dependencies = [
  "aws-config",
  "aws-sdk-cloudcontrol",
  "aws-sdk-s3",
+ "aws-sdk-sts",
  "carina-core",
  "clap",
  "heck",

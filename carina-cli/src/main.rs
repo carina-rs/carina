@@ -1130,7 +1130,7 @@ async fn run_plan(path: &PathBuf, out: Option<&PathBuf>) -> Result<bool, String>
     reconcile_prefixed_names(&mut parsed.resources, &state_file);
 
     let ctx = create_plan_from_parsed(&parsed, &state_file).await?;
-    let has_changes = !ctx.plan.is_empty();
+    let has_changes = ctx.plan.mutation_count() > 0;
     print_plan(&ctx.plan);
 
     // Save plan to file if --out was specified
@@ -2482,6 +2482,11 @@ async fn run_destroy(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
     let resources_to_destroy: Vec<&Resource> = destroy_order
         .iter()
         .filter(|r| {
+            // Skip data sources (read-only resources) — nothing to destroy
+            if r.read_only {
+                return false;
+            }
+
             if !current_states.get(&r.id).map(|s| s.exists).unwrap_or(false) {
                 return false;
             }
@@ -4991,17 +4996,28 @@ mod tests {
     fn test_detailed_exitcode_no_changes() {
         // An empty plan means no changes — has_changes should be false
         let plan = Plan::new();
-        let has_changes = !plan.is_empty();
+        let has_changes = plan.mutation_count() > 0;
         assert!(!has_changes);
     }
 
     #[test]
     fn test_detailed_exitcode_with_changes() {
-        // A plan with effects means changes — has_changes should be true
+        // A plan with mutating effects means changes — has_changes should be true
         let mut plan = Plan::new();
         plan.add(Effect::Create(Resource::new("s3.bucket", "test")));
-        let has_changes = !plan.is_empty();
+        let has_changes = plan.mutation_count() > 0;
         assert!(has_changes);
+    }
+
+    #[test]
+    fn test_detailed_exitcode_read_only_no_changes() {
+        // A plan with only Read effects should NOT count as changes
+        let mut plan = Plan::new();
+        plan.add(Effect::Read {
+            resource: Resource::new("sts.caller_identity", "identity").with_read_only(true),
+        });
+        let has_changes = plan.mutation_count() > 0;
+        assert!(!has_changes);
     }
 
     fn make_awscc_provider(region_dsl: &str) -> ProviderConfig {
