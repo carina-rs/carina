@@ -1865,7 +1865,6 @@ impl AwsProvider {
             _ => None,
         };
 
-        // New schema fields
         let cidr_ipv6 = match resource.attributes.get("cidr_ipv6") {
             Some(Value::String(s)) => Some(s.clone()),
             _ => None,
