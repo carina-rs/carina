@@ -42,6 +42,15 @@ const CREATE_RETRY_INITIAL_DELAY_SECS: u64 = 10;
 /// Maximum delay in seconds between create retry attempts
 const CREATE_RETRY_MAX_DELAY_SECS: u64 = 120;
 
+/// Maximum number of retry attempts for retryable delete errors
+const DELETE_RETRY_MAX_ATTEMPTS: u32 = 12;
+
+/// Initial delay in seconds before retrying a failed delete operation
+const DELETE_RETRY_INITIAL_DELAY_SECS: u64 = 10;
+
+/// Maximum delay in seconds between delete retry attempts
+const DELETE_RETRY_MAX_DELAY_SECS: u64 = 120;
+
 /// AWS Cloud Control Provider
 pub struct AwsccProvider {
     cloudcontrol_client: CloudControlClient,
@@ -296,32 +305,87 @@ impl AwsccProvider {
         Ok(())
     }
 
-    /// Delete a resource using Cloud Control API.
+    /// Delete a resource using Cloud Control API, with retry logic for retryable errors.
     ///
     /// Uses resource-type-specific polling timeouts. IPAM-related resources
     /// get a longer timeout since their deletion via CloudControl API can
-    /// take 15-30 minutes.
+    /// take 15-30 minutes. Retries with exponential backoff on transient errors
+    /// such as throttling or service unavailability.
     pub async fn cc_delete_resource(
         &self,
         type_name: &str,
         identifier: &str,
     ) -> ProviderResult<()> {
-        let result = self
-            .cloudcontrol_client
-            .delete_resource()
-            .type_name(type_name)
-            .identifier(identifier)
-            .send()
-            .await
-            .map_err(|e| ProviderError::new(format!("Failed to delete resource: {:?}", e)))?;
+        let mut delay_secs = DELETE_RETRY_INITIAL_DELAY_SECS;
+        let max_polling_attempts = Self::max_polling_attempts(type_name, "delete");
 
-        if let Some(request_token) = result.progress_event().and_then(|p| p.request_token()) {
-            let max_attempts = Self::max_polling_attempts(type_name, "delete");
-            self.wait_for_operation_with_attempts(request_token, max_attempts)
-                .await?;
+        for attempt in 0..=DELETE_RETRY_MAX_ATTEMPTS {
+            let result = self
+                .cloudcontrol_client
+                .delete_resource()
+                .type_name(type_name)
+                .identifier(identifier)
+                .send()
+                .await;
+
+            match result {
+                Ok(response) => {
+                    if let Some(request_token) =
+                        response.progress_event().and_then(|p| p.request_token())
+                    {
+                        match self
+                            .wait_for_operation_with_attempts(request_token, max_polling_attempts)
+                            .await
+                        {
+                            Ok(_) => return Ok(()),
+                            Err(e)
+                                if Self::is_retryable_error(&e.message)
+                                    && attempt < DELETE_RETRY_MAX_ATTEMPTS =>
+                            {
+                                eprintln!(
+                                    "  Retryable error deleting {} (attempt {}/{}): {}. Retrying in {}s...",
+                                    type_name,
+                                    attempt + 1,
+                                    DELETE_RETRY_MAX_ATTEMPTS,
+                                    e.message,
+                                    delay_secs,
+                                );
+                                tokio::time::sleep(Duration::from_secs(delay_secs)).await;
+                                delay_secs = (delay_secs * 2).min(DELETE_RETRY_MAX_DELAY_SECS);
+                                continue;
+                            }
+                            Err(e) => return Err(e),
+                        }
+                    }
+                    return Ok(());
+                }
+                Err(e) => {
+                    let err_str = format!("{:?}", e);
+                    if Self::is_retryable_error(&err_str) && attempt < DELETE_RETRY_MAX_ATTEMPTS {
+                        eprintln!(
+                            "  Retryable error deleting {} (attempt {}/{}): {}. Retrying in {}s...",
+                            type_name,
+                            attempt + 1,
+                            DELETE_RETRY_MAX_ATTEMPTS,
+                            err_str,
+                            delay_secs,
+                        );
+                        tokio::time::sleep(Duration::from_secs(delay_secs)).await;
+                        delay_secs = (delay_secs * 2).min(DELETE_RETRY_MAX_DELAY_SECS);
+                        continue;
+                    }
+                    return Err(ProviderError::new(format!(
+                        "Failed to delete resource: {:?}",
+                        e
+                    )));
+                }
+            }
         }
 
-        Ok(())
+        Err(ProviderError::new(format!(
+            "Failed to delete resource {} after {} retry attempts",
+            type_name, DELETE_RETRY_MAX_ATTEMPTS
+        )))
     }
 
     /// Returns the max polling attempts for a given resource type and operation.
@@ -1879,6 +1943,24 @@ mod tests {
             dsl_resolved, &aws_dsl,
             "DSL resolved value and AWS read-back value must match — no false diff"
         );
+    }
+
+    #[test]
+    fn test_delete_retry_constants() {
+        assert_eq!(DELETE_RETRY_MAX_ATTEMPTS, 12);
+        assert_eq!(DELETE_RETRY_INITIAL_DELAY_SECS, 10);
+        assert_eq!(DELETE_RETRY_MAX_DELAY_SECS, 120);
+    }
+
+    #[test]
+    fn test_delete_retry_constants_match_create() {
+        // Delete retry should use the same strategy as create retry
+        assert_eq!(DELETE_RETRY_MAX_ATTEMPTS, CREATE_RETRY_MAX_ATTEMPTS);
+        assert_eq!(
+            DELETE_RETRY_INITIAL_DELAY_SECS,
+            CREATE_RETRY_INITIAL_DELAY_SECS
+        );
+        assert_eq!(DELETE_RETRY_MAX_DELAY_SECS, CREATE_RETRY_MAX_DELAY_SECS);
     }
 
     #[test]
