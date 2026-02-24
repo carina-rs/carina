@@ -249,7 +249,7 @@ fn generate_resource(res: &ResourceDef, model: &SmithyModel) -> Result<String> {
     let mut updatable_fields: HashSet<String> = HashSet::new();
     let mut update_inputs: Vec<&carina_smithy::StructureShape> = Vec::new();
     for update_op in &res.update_ops {
-        for field in &update_op.fields {
+        for field in update_op.fields.field_names() {
             updatable_fields.insert(field.to_string());
         }
         let update_op_id = format!("{}#{}", ns, update_op.operation);
@@ -1441,11 +1441,12 @@ fn generate_provider_code(
         }
     }
 
-    // Write helpers for update_ops with wrapper
-    for res in all_resources
-        .iter()
-        .filter(|r| r.update_ops.iter().any(|op| op.wrapper.is_some()))
-    {
+    // Write helpers for update_ops with InsideStruct layout
+    for res in all_resources.iter().filter(|r| {
+        r.update_ops
+            .iter()
+            .any(|op| matches!(op.fields, resource_defs::FieldLayout::InsideStruct { .. }))
+    }) {
         let model = match models.get(res.service_namespace) {
             Some(m) => m,
             None => continue,
@@ -1466,28 +1467,34 @@ fn generate_provider_code(
             }
         }
 
-        for update_op in res.update_ops.iter().filter(|op| op.wrapper.is_some()) {
-            let wrapper_name = update_op.wrapper.unwrap();
+        for update_op in &res.update_ops {
+            let resource_defs::FieldLayout::InsideStruct {
+                name: struct_name,
+                fields: update_fields,
+            } = &update_op.fields
+            else {
+                continue;
+            };
             let suffix = op_suffix(update_op.operation, res.identifier);
             let method_name = format!("write_{}_{}", resource_name, suffix);
             let sdk_method = update_op.operation.to_snake_case();
-            let wrapper_setter = wrapper_name.to_snake_case();
+            let struct_setter = struct_name.to_snake_case();
 
-            // Resolve the wrapper struct from the Put input
+            // Resolve the nested struct from the Put input
             let op_id = format!("{}#{}", ns, update_op.operation);
             let input = match model.operation_input(&op_id) {
                 Some(i) => i,
                 None => continue,
             };
-            let wrapper_ref = match input.members.get(wrapper_name) {
+            let struct_ref = match input.members.get(*struct_name) {
                 Some(r) => r,
                 None => continue,
             };
-            let wrapper_struct = match model.get_structure(&wrapper_ref.target) {
+            let nested_struct = match model.get_structure(&struct_ref.target) {
                 Some(s) => s,
                 None => continue,
             };
-            let wrapper_type_name = SmithyModel::shape_name(&wrapper_ref.target);
+            let struct_type_name = SmithyModel::shape_name(&struct_ref.target);
 
             // Collect field info and use types
             struct FieldInfo {
@@ -1496,9 +1503,9 @@ fn generate_provider_code(
                 enum_type_name: Option<String>,
             }
             let mut fields = Vec::new();
-            let mut use_types: Vec<String> = vec![wrapper_type_name.to_string()];
+            let mut use_types: Vec<String> = vec![struct_type_name.to_string()];
 
-            for effective_name in &update_op.fields {
+            for effective_name in update_fields {
                 let original_name = reverse_rename
                     .get(*effective_name)
                     .copied()
@@ -1506,9 +1513,9 @@ fn generate_provider_code(
                 let attr_snake = effective_name.to_snake_case();
                 let builder_setter = original_name.to_snake_case();
 
-                // Look up field in wrapper struct to resolve enum type
+                // Look up field in nested struct to resolve enum type
                 let enum_type_name =
-                    if let Some(member_ref) = wrapper_struct.members.get(original_name) {
+                    if let Some(member_ref) = nested_struct.members.get(original_name) {
                         if matches!(model.shape_kind(&member_ref.target), Some(ShapeKind::Enum)) {
                             let type_name = SmithyModel::shape_name(&member_ref.target).to_string();
                             use_types.push(type_name.clone());
@@ -1546,10 +1553,10 @@ fn generate_provider_code(
                 sdk_crate_name, use_list
             ));
 
-            // Build wrapper
+            // Build nested struct
             code.push_str(&format!(
                 "\x20       let mut builder = {}::builder();\n",
-                wrapper_type_name
+                struct_type_name
             ));
             code.push_str("\x20       let mut has_changes = false;\n");
 
@@ -1579,7 +1586,7 @@ fn generate_provider_code(
             code.push_str("\x20           let config = builder.build();\n");
             code.push_str(&format!(
                 "\x20           self.{}.{}().{}(identifier).{}(config).send().await.map_err(|e| {{\n",
-                client_field, sdk_method, id_setter, wrapper_setter
+                client_field, sdk_method, id_setter, struct_setter
             ));
             code.push_str(&format!(
                 "\x20               ProviderError::new(format!(\"Failed to {}: {{}}\", e))\n",
@@ -1683,7 +1690,7 @@ fn generate_markdown_resource(res: &ResourceDef, model: &SmithyModel) -> Result<
     // Resolve update fields
     let mut updatable_fields: HashSet<String> = HashSet::new();
     for update_op in &res.update_ops {
-        for field in &update_op.fields {
+        for field in update_op.fields.field_names() {
             updatable_fields.insert(field.to_string());
         }
     }

@@ -82,15 +82,33 @@ pub struct ResourceDef {
     pub extra_writable: Vec<ExtraField>,
 }
 
+/// How fields are passed to an update API operation.
+pub enum FieldLayout {
+    /// Fields are top-level parameters of the API input.
+    Flat(Vec<&'static str>),
+    /// Fields are nested inside a named struct in the API input.
+    InsideStruct {
+        name: &'static str,
+        fields: Vec<&'static str>,
+    },
+}
+
+impl FieldLayout {
+    /// Returns the field names regardless of layout.
+    pub fn field_names(&self) -> &[&'static str] {
+        match self {
+            FieldLayout::Flat(fields) => fields,
+            FieldLayout::InsideStruct { fields, .. } => fields,
+        }
+    }
+}
+
 /// An update operation and the fields it can modify.
 pub struct UpdateOp {
     /// Operation short name (e.g., "ModifyVpcAttribute")
     pub operation: &'static str,
-    /// Fields this operation can update
-    pub fields: Vec<&'static str>,
-    /// Wrapper struct member name in the Put input (e.g., "VersioningConfiguration").
-    /// When set, fields are nested inside this wrapper struct in the API input.
-    pub wrapper: Option<&'static str>,
+    /// How fields are passed to the API
+    pub fields: FieldLayout,
 }
 
 /// Returns EC2 resource definitions.
@@ -109,8 +127,7 @@ pub fn ec2_resources() -> Vec<ResourceDef> {
             delete_op: "DeleteVpc",
             update_ops: vec![UpdateOp {
                 operation: "ModifyVpcAttribute",
-                fields: vec!["EnableDnsHostnames", "EnableDnsSupport"],
-                wrapper: None,
+                fields: FieldLayout::Flat(vec!["EnableDnsHostnames", "EnableDnsSupport"]),
             }],
             identifier: "VpcId",
             has_tags: true,
@@ -147,14 +164,13 @@ pub fn ec2_resources() -> Vec<ResourceDef> {
             delete_op: "DeleteSubnet",
             update_ops: vec![UpdateOp {
                 operation: "ModifySubnetAttribute",
-                fields: vec![
+                fields: FieldLayout::Flat(vec![
                     "AssignIpv6AddressOnCreation",
                     "MapPublicIpOnLaunch",
                     "EnableDns64",
                     "EnableLniAtDeviceIndex",
                     "PrivateDnsNameOptionsOnLaunch",
-                ],
-                wrapper: None,
+                ]),
             }],
             identifier: "SubnetId",
             has_tags: true,
@@ -229,7 +245,7 @@ pub fn ec2_resources() -> Vec<ResourceDef> {
             delete_op: "DeleteRoute",
             update_ops: vec![UpdateOp {
                 operation: "ReplaceRoute",
-                fields: vec![
+                fields: FieldLayout::Flat(vec![
                     "GatewayId",
                     "InstanceId",
                     "NatGatewayId",
@@ -241,8 +257,7 @@ pub fn ec2_resources() -> Vec<ResourceDef> {
                     "EgressOnlyInternetGatewayId",
                     "VpcEndpointId",
                     "CoreNetworkArn",
-                ],
-                wrapper: None,
+                ]),
             }],
             identifier: "RouteTableId",
             has_tags: false,
@@ -447,8 +462,10 @@ pub fn s3_resources() -> Vec<ResourceDef> {
             delete_op: "DeleteBucket",
             update_ops: vec![UpdateOp {
                 operation: "PutBucketVersioning",
-                fields: vec!["VersioningStatus"],
-                wrapper: Some("VersioningConfiguration"),
+                fields: FieldLayout::InsideStruct {
+                    name: "VersioningConfiguration",
+                    fields: vec!["VersioningStatus"],
+                },
             }],
             identifier: "Bucket",
             has_tags: true,
