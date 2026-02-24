@@ -59,6 +59,7 @@ pub fn ec2_security_group_egress_config() -> AwsSchemaConfig {
         aws_type_name: "AWS::EC2::SecurityGroupEgress",
         resource_type_name: "ec2.security_group_egress",
         has_tags: false,
+        data_source: false,
         schema: ResourceSchema::new("aws.ec2.security_group_egress")
             .with_description("Describes a security group rule.")
             .attribute(

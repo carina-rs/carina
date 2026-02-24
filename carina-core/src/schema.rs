@@ -487,6 +487,8 @@ pub struct ResourceSchema {
     /// Optional validator function for cross-attribute validation
     /// (e.g., mutually exclusive required fields)
     pub validator: Option<ResourceValidator>,
+    /// If true, this resource type is a data source and must be used with `read`
+    pub data_source: bool,
 }
 
 impl ResourceSchema {
@@ -496,6 +498,7 @@ impl ResourceSchema {
             attributes: HashMap::new(),
             description: None,
             validator: None,
+            data_source: false,
         }
     }
 
@@ -511,6 +514,11 @@ impl ResourceSchema {
 
     pub fn with_validator(mut self, validator: ResourceValidator) -> Self {
         self.validator = Some(validator);
+        self
+    }
+
+    pub fn as_data_source(mut self) -> Self {
+        self.data_source = true;
         self
     }
 
@@ -876,6 +884,18 @@ fn validate_ipv6_group(group: &str, addr: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resource_schema_data_source_default_false() {
+        let schema = ResourceSchema::new("test.resource");
+        assert!(!schema.data_source);
+    }
+
+    #[test]
+    fn resource_schema_as_data_source_sets_flag() {
+        let schema = ResourceSchema::new("test.resource").as_data_source();
+        assert!(schema.data_source);
+    }
 
     #[test]
     fn validate_string_type() {

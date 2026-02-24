@@ -620,6 +620,7 @@ fn generate_resource(res: &ResourceDef, model: &SmithyModel) -> Result<String> {
          \x20       aws_type_name: \"{}\",\n\
          \x20       resource_type_name: \"{}\",\n\
          \x20       has_tags: {},\n\
+         \x20       data_source: {},\n\
          \x20       schema: ResourceSchema::new(\"{}\")\n",
         res.name,
         ns,
@@ -627,6 +628,7 @@ fn generate_resource(res: &ResourceDef, model: &SmithyModel) -> Result<String> {
         cf_type_name(res.name),
         res.name,
         res.has_tags,
+        is_data_source,
         namespace,
     ));
 
@@ -645,6 +647,11 @@ fn generate_resource(res: &ResourceDef, model: &SmithyModel) -> Result<String> {
             "\x20       .with_description(\"{}\")\n",
             truncated
         ));
+    }
+
+    // Mark data sources
+    if is_data_source {
+        code.push_str("\x20       .as_data_source()\n");
     }
 
     // Inject carina-specific attributes (name, region) — skip for data sources

@@ -36,6 +36,7 @@ pub fn s3_bucket_config() -> AwsSchemaConfig {
         aws_type_name: "AWS::S3::Bucket",
         resource_type_name: "s3.bucket",
         has_tags: true,
+        data_source: false,
         schema: ResourceSchema::new("aws.s3.bucket")
             .attribute(
                 AttributeSchema::new("name", AttributeType::String)
