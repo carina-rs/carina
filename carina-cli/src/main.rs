@@ -302,6 +302,12 @@ fn validate_resources(resources: &[Resource]) -> Result<(), String> {
 
         match schemas.get(&schema_key) {
             Some(schema) => {
+                if schema.data_source && !resource.read_only {
+                    all_errors.push(format!(
+                        "{} is a data source and must be used with the `read` keyword:\n  let <name> = read {} {{ }}",
+                        schema.resource_type, schema.resource_type
+                    ));
+                }
                 if let Err(errors) = schema.validate(&resource.attributes) {
                     for error in errors {
                         all_errors.push(format!("{}: {}", resource.id, error));
@@ -5398,5 +5404,52 @@ awscc.ec2.security_group {
 
         // Non-matching bucket name
         assert!(find_state_bucket_resource(&parsed, "other-bucket", "s3.bucket").is_none());
+    }
+
+    #[test]
+    fn validate_data_source_without_read_keyword_errors() {
+        let resource = Resource::with_provider("aws", "sts.caller_identity", "identity")
+            .with_attribute("_provider", Value::String("aws".to_string()));
+        // read_only defaults to false, simulating missing `read` keyword
+        let result = validate_resources(&[resource]);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("data source"),
+            "Error should mention 'data source': {}",
+            err
+        );
+        assert!(
+            err.contains("read"),
+            "Error should mention 'read' keyword: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn validate_data_source_with_read_keyword_passes() {
+        let resource = Resource::with_provider("aws", "sts.caller_identity", "identity")
+            .with_attribute("_provider", Value::String("aws".to_string()))
+            .with_read_only(true);
+        let result = validate_resources(&[resource]);
+        assert!(
+            result.is_ok(),
+            "Data source with read keyword should pass: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn validate_regular_resource_without_read_keyword_passes() {
+        let resource = Resource::with_provider("aws", "s3.bucket", "my-bucket")
+            .with_attribute("_provider", Value::String("aws".to_string()))
+            .with_attribute("name", Value::String("my-bucket".to_string()))
+            .with_attribute("region", Value::String("ap-northeast-1".to_string()));
+        let result = validate_resources(&[resource]);
+        assert!(
+            result.is_ok(),
+            "Regular resource without read should pass: {:?}",
+            result
+        );
     }
 }

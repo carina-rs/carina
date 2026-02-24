@@ -135,6 +135,37 @@ impl DiagnosticEngine {
 
                 // Semantic validation using schema
                 let schema = self.get_schema_for_type(&full_resource_type);
+                if let Some(schema) = &schema {
+                    // Check data source without `read` keyword
+                    if schema.data_source
+                        && !resource.read_only
+                        && let Some((line, col)) =
+                            self.find_resource_position(doc, &resource.id.resource_type)
+                    {
+                        diagnostics.push(Diagnostic {
+                            range: Range {
+                                start: Position {
+                                    line,
+                                    character: col,
+                                },
+                                end: Position {
+                                    line,
+                                    character: col
+                                        + resource.id.resource_type.len() as u32
+                                        + provider.len() as u32
+                                        + 1,
+                                },
+                            },
+                            severity: Some(DiagnosticSeverity::ERROR),
+                            source: Some("carina".to_string()),
+                            message: format!(
+                                "{} is a data source and must be used with the `read` keyword:\n  let <name> = read {} {{ }}",
+                                full_resource_type, full_resource_type
+                            ),
+                            ..Default::default()
+                        });
+                    }
+                }
                 if let Some(schema) = schema {
                     for (attr_name, attr_value) in &resource.attributes {
                         if attr_name.starts_with('_') {
@@ -1784,6 +1815,77 @@ let sg = awscc.ec2.security_group {
         assert!(
             lint_diag.is_none(),
             "String attributes should NOT produce lint warning. Got diagnostics: {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn data_source_without_read_keyword_errors() {
+        let engine = DiagnosticEngine::new();
+        let doc = create_document(
+            r#"provider aws {
+    region = aws.Region.ap_northeast_1
+}
+
+aws.sts.caller_identity {}"#,
+        );
+
+        let diagnostics = engine.analyze(&doc, None);
+
+        let data_source_diag = diagnostics
+            .iter()
+            .find(|d| d.message.contains("data source") && d.message.contains("read"));
+        assert!(
+            data_source_diag.is_some(),
+            "Should error when data source is used without `read`. Got diagnostics: {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn data_source_with_read_keyword_no_error() {
+        let engine = DiagnosticEngine::new();
+        let doc = create_document(
+            r#"provider aws {
+    region = aws.Region.ap_northeast_1
+}
+
+let identity = read aws.sts.caller_identity {}"#,
+        );
+
+        let diagnostics = engine.analyze(&doc, None);
+
+        let data_source_diag = diagnostics
+            .iter()
+            .find(|d| d.message.contains("data source") && d.message.contains("read"));
+        assert!(
+            data_source_diag.is_none(),
+            "Should NOT error when data source is used with `read`. Got diagnostics: {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn regular_resource_without_read_no_data_source_error() {
+        let engine = DiagnosticEngine::new();
+        let doc = create_document(
+            r#"provider aws {
+    region = aws.Region.ap_northeast_1
+}
+
+let bucket = aws.s3.bucket {
+    name = "my-bucket"
+}"#,
+        );
+
+        let diagnostics = engine.analyze(&doc, None);
+
+        let data_source_diag = diagnostics
+            .iter()
+            .find(|d| d.message.contains("data source"));
+        assert!(
+            data_source_diag.is_none(),
+            "Regular resource should NOT trigger data source error. Got diagnostics: {:?}",
             diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
     }
