@@ -5465,7 +5465,7 @@ awscc.ec2.security_group {
         let data_source = Resource::with_provider("awscc", "sts.caller_identity", "identity")
             .with_read_only(true);
 
-        let destroy_order = vec![managed.clone(), data_source.clone()];
+        let destroy_order = vec![managed, data_source];
 
         // Build current_states only for managed resources (data sources are skipped)
         let mut current_states: HashMap<ResourceId, State> = HashMap::new();
