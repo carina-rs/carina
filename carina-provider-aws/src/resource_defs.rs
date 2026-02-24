@@ -381,6 +381,43 @@ pub fn ec2_resources() -> Vec<ResourceDef> {
     ]
 }
 
+/// Returns STS resource definitions (data sources).
+pub fn sts_resources() -> Vec<ResourceDef> {
+    vec![
+        // sts.caller_identity (data source: no create/delete)
+        ResourceDef {
+            name: "sts.caller_identity",
+            service_namespace: "com.amazonaws.sts",
+            type_struct_name: "StsCallerIdentity",
+            simple_delete: false,
+            noop_update: false,
+            create_op: "",
+            read_structure: None,
+            read_ops: vec![ReadOp {
+                operation: "GetCallerIdentity",
+                fields: vec![
+                    ("Account", Some("AccountId")),
+                    ("Arn", None),
+                    ("UserId", None),
+                ],
+            }],
+            delete_op: "",
+            update_ops: vec![],
+            identifier: "",
+            has_tags: false,
+            type_overrides: vec![],
+            exclude_fields: vec![],
+            create_only_overrides: vec![],
+            enum_aliases: vec![],
+            to_dsl_overrides: vec![],
+            required_overrides: vec![],
+            extra_read_only: vec![],
+            read_only_overrides: vec![],
+            extra_writable: vec![],
+        },
+    ]
+}
+
 /// Returns S3 resource definitions.
 pub fn s3_resources() -> Vec<ResourceDef> {
     vec![

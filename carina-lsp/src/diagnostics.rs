@@ -40,6 +40,7 @@ impl DiagnosticEngine {
         valid_resource_types.insert("aws.ec2.security_group_ingress".to_string());
         valid_resource_types.insert("aws.ec2.security_group_egress".to_string());
         valid_resource_types.insert("aws.s3.bucket".to_string());
+        valid_resource_types.insert("aws.sts.caller_identity".to_string());
 
         // AWS Cloud Control resources
         valid_resource_types.insert("awscc.ec2.vpc".to_string());
@@ -513,6 +514,9 @@ impl DiagnosticEngine {
                 aws_generated::ec2_security_group_egress::ec2_security_group_egress_config().schema,
             ),
             "aws.s3.bucket" => Some(aws_generated::s3_bucket::s3_bucket_config().schema),
+            "aws.sts.caller_identity" => {
+                Some(aws_generated::sts_caller_identity::sts_caller_identity_config().schema)
+            }
             // AWS Cloud Control resources
             "awscc.ec2.vpc" => Some(awscc_vpc::ec2_vpc_config().schema),
             "awscc.ec2.security_group" => {

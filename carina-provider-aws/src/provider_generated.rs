@@ -127,6 +127,19 @@ impl ResourceType for S3BucketType {
     }
 }
 
+/// sts.caller_identity resource type
+pub struct StsCallerIdentityType;
+
+impl ResourceType for StsCallerIdentityType {
+    fn name(&self) -> &'static str {
+        "sts.caller_identity"
+    }
+
+    fn schema(&self) -> ResourceSchema {
+        ResourceSchema::default()
+    }
+}
+
 /// Returns all resource types for the AWS provider.
 pub fn resource_types() -> Vec<Box<dyn ResourceType>> {
     vec![
@@ -139,6 +152,7 @@ pub fn resource_types() -> Vec<Box<dyn ResourceType>> {
         Box::new(SecurityGroupIngressRuleType),
         Box::new(SecurityGroupEgressRuleType),
         Box::new(S3BucketType),
+        Box::new(StsCallerIdentityType),
     ]
 }
 

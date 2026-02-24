@@ -89,6 +89,7 @@ fn main() -> Result<()> {
     // Collect all resource definitions
     let mut all_resources = resource_defs::ec2_resources();
     all_resources.extend(resource_defs::s3_resources());
+    all_resources.extend(resource_defs::sts_resources());
 
     // Filter to requested resource if specified
     let resources: Vec<&ResourceDef> = if let Some(ref name) = args.resource {
@@ -217,11 +218,20 @@ fn generate_resource(res: &ResourceDef, model: &SmithyModel) -> Result<String> {
     // Build to_dsl override map
     let to_dsl_overrides: HashMap<&str, &str> = res.to_dsl_overrides.iter().copied().collect();
 
-    // Resolve create input fields
-    let create_op_id = format!("{}#{}", ns, res.create_op);
-    let create_input = model
-        .operation_input(&create_op_id)
-        .with_context(|| format!("Cannot find create input for {}", create_op_id))?;
+    // Data sources have no create_op — skip create input resolution
+    let is_data_source = res.create_op.is_empty();
+
+    // Resolve create input fields (skip for data sources)
+    let create_input = if !is_data_source {
+        let create_op_id = format!("{}#{}", ns, res.create_op);
+        Some(
+            model
+                .operation_input(&create_op_id)
+                .with_context(|| format!("Cannot find create input for {}", create_op_id))?,
+        )
+    } else {
+        None
+    };
 
     // Resolve read structure fields (if present)
     let read_structure = if let Some(read_struct_name) = res.read_structure {
@@ -252,19 +262,21 @@ fn generate_resource(res: &ResourceDef, model: &SmithyModel) -> Result<String> {
     let mut all_enums: BTreeMap<String, EnumInfo> = BTreeMap::new();
     let mut all_ranged_ints: BTreeMap<String, IntRange> = BTreeMap::new();
 
-    // Collect writable fields from create input
+    // Collect writable fields from create input (empty for data sources)
     let mut writable_fields: BTreeMap<String, &carina_smithy::ShapeRef> = BTreeMap::new();
-    for (name, member_ref) in &create_input.members {
-        if exclude.contains(name.as_str()) {
-            continue;
+    if let Some(create_input) = &create_input {
+        for (name, member_ref) in &create_input.members {
+            if exclude.contains(name.as_str()) {
+                continue;
+            }
+            if name == res.identifier {
+                continue;
+            }
+            if name == "Tags" {
+                continue; // handled separately
+            }
+            writable_fields.insert(name.clone(), member_ref);
         }
-        if name == res.identifier {
-            continue;
-        }
-        if name == "Tags" {
-            continue; // handled separately
-        }
-        writable_fields.insert(name.clone(), member_ref);
     }
 
     // For read_ops resources: resolve fields from operation outputs and add them
@@ -504,6 +516,7 @@ fn generate_resource(res: &ResourceDef, model: &SmithyModel) -> Result<String> {
         .name
         .strip_prefix("ec2.")
         .or_else(|| res.name.strip_prefix("s3."))
+        .or_else(|| res.name.strip_prefix("sts."))
         .unwrap_or(res.name);
     let mut schema_imports = vec!["AttributeSchema", "ResourceSchema"];
     schema_imports.insert(1, "AttributeType");
@@ -621,7 +634,7 @@ fn generate_resource(res: &ResourceDef, model: &SmithyModel) -> Result<String> {
     let desc_traits = if let Some(read_struct) = read_structure {
         Some(&read_struct.traits)
     } else {
-        Some(&create_input.traits)
+        create_input.as_ref().map(|ci| &ci.traits)
     };
     if let Some(traits) = desc_traits
         && let Some(desc) = SmithyModel::documentation(traits)
@@ -634,17 +647,19 @@ fn generate_resource(res: &ResourceDef, model: &SmithyModel) -> Result<String> {
         ));
     }
 
-    // Inject carina-specific attributes (name, region)
-    code.push_str(
-        "\x20       .attribute(\n\
-         \x20           AttributeSchema::new(\"name\", AttributeType::String)\n\
-         \x20               .with_description(\"Resource name\"),\n\
-         \x20       )\n\
-         \x20       .attribute(\n\
-         \x20           AttributeSchema::new(\"region\", super::aws_region())\n\
-         \x20               .with_description(\"The AWS region (inherited from provider if not specified)\"),\n\
-         \x20       )\n",
-    );
+    // Inject carina-specific attributes (name, region) — skip for data sources
+    if !is_data_source {
+        code.push_str(
+            "\x20       .attribute(\n\
+             \x20           AttributeSchema::new(\"name\", AttributeType::String)\n\
+             \x20               .with_description(\"Resource name\"),\n\
+             \x20       )\n\
+             \x20       .attribute(\n\
+             \x20           AttributeSchema::new(\"region\", super::aws_region())\n\
+             \x20               .with_description(\"The AWS region (inherited from provider if not specified)\"),\n\
+             \x20       )\n",
+        );
+    }
 
     // Generate attributes
     for attr in &attrs {
@@ -1345,6 +1360,8 @@ fn generate_markdown_resource(res: &ResourceDef, model: &SmithyModel) -> Result<
     let ns = res.service_namespace;
     let namespace = format!("aws.{}", res.name);
 
+    let is_data_source = res.create_op.is_empty();
+
     let exclude: HashSet<&str> = res.exclude_fields.iter().copied().collect();
     let type_overrides: HashMap<&str, &str> = res.type_overrides.iter().copied().collect();
     let required_overrides: HashSet<&str> = res.required_overrides.iter().copied().collect();
@@ -1358,11 +1375,17 @@ fn generate_markdown_resource(res: &ResourceDef, model: &SmithyModel) -> Result<
         m
     };
 
-    // Resolve create input
-    let create_op_id = format!("{}#{}", ns, res.create_op);
-    let create_input = model
-        .operation_input(&create_op_id)
-        .with_context(|| format!("Cannot find create input for {}", create_op_id))?;
+    // Resolve create input (skip for data sources)
+    let create_input = if !is_data_source {
+        let create_op_id = format!("{}#{}", ns, res.create_op);
+        Some(
+            model
+                .operation_input(&create_op_id)
+                .with_context(|| format!("Cannot find create input for {}", create_op_id))?,
+        )
+    } else {
+        None
+    };
 
     // Resolve read structure
     let read_structure = if let Some(read_struct_name) = res.read_structure {
@@ -1384,13 +1407,15 @@ fn generate_markdown_resource(res: &ResourceDef, model: &SmithyModel) -> Result<
         }
     }
 
-    // Collect writable fields
+    // Collect writable fields (empty for data sources)
     let mut writable_fields: BTreeMap<String, &carina_smithy::ShapeRef> = BTreeMap::new();
-    for (name, member_ref) in &create_input.members {
-        if exclude.contains(name.as_str()) || name == res.identifier || name == "Tags" {
-            continue;
+    if let Some(create_input) = &create_input {
+        for (name, member_ref) in &create_input.members {
+            if exclude.contains(name.as_str()) || name == res.identifier || name == "Tags" {
+                continue;
+            }
+            writable_fields.insert(name.clone(), member_ref);
         }
-        writable_fields.insert(name.clone(), member_ref);
     }
 
     // Read ops fields
@@ -1567,7 +1592,7 @@ fn generate_markdown_resource(res: &ResourceDef, model: &SmithyModel) -> Result<
     let desc_traits = if let Some(read_struct) = read_structure {
         Some(&read_struct.traits)
     } else {
-        Some(&create_input.traits)
+        create_input.as_ref().map(|ci| &ci.traits)
     };
     if let Some(traits) = desc_traits
         && let Some(desc) = SmithyModel::documentation(traits)
@@ -1576,8 +1601,10 @@ fn generate_markdown_resource(res: &ResourceDef, model: &SmithyModel) -> Result<
         md.push_str(&format!("{}\n\n", cleaned.trim()));
     }
 
-    // Argument Reference
-    md.push_str("## Argument Reference\n\n");
+    // Argument Reference (skip for data sources)
+    if !is_data_source {
+        md.push_str("## Argument Reference\n\n");
+    }
 
     for attr in &writable_attrs {
         md.push_str(&format!("### `{}`\n\n", attr.snake_name));
@@ -2098,6 +2125,7 @@ fn cf_type_name(resource_name: &str) -> &'static str {
         "ec2.security_group_ingress" => "AWS::EC2::SecurityGroupIngress",
         "ec2.security_group_egress" => "AWS::EC2::SecurityGroupEgress",
         "s3.bucket" => "AWS::S3::Bucket",
+        "sts.caller_identity" => "AWS::STS::CallerIdentity",
         _ => "UNKNOWN",
     }
 }
