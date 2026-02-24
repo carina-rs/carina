@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use aws_config::Region;
 use aws_sdk_ec2::Client as Ec2Client;
 use aws_sdk_s3::Client as S3Client;
+use aws_sdk_sts::Client as StsClient;
 use carina_core::provider::{
     BoxFuture, Provider, ProviderError, ProviderFactory, ProviderResult, ResourceType,
 };
@@ -78,6 +79,7 @@ impl ProviderFactory for AwsProviderFactory {
 pub struct AwsProvider {
     s3_client: S3Client,
     ec2_client: Ec2Client,
+    sts_client: StsClient,
     region: String,
 }
 
@@ -92,15 +94,22 @@ impl AwsProvider {
         Self {
             s3_client: S3Client::new(&config),
             ec2_client: Ec2Client::new(&config),
+            sts_client: StsClient::new(&config),
             region: region.to_string(),
         }
     }
 
     /// Create with specific clients (for testing)
-    pub fn with_clients(s3_client: S3Client, ec2_client: Ec2Client, region: String) -> Self {
+    pub fn with_clients(
+        s3_client: S3Client,
+        ec2_client: Ec2Client,
+        sts_client: StsClient,
+        region: String,
+    ) -> Self {
         Self {
             s3_client,
             ec2_client,
+            sts_client,
             region,
         }
     }
@@ -1404,6 +1413,37 @@ impl AwsProvider {
             .await
     }
 
+    // ========== STS Operations ==========
+
+    /// Read STS caller identity (data source)
+    ///
+    /// Calls STS GetCallerIdentity and returns account_id, arn, user_id.
+    /// Always succeeds regardless of identifier (STS doesn't need one).
+    async fn read_sts_caller_identity(&self, id: &ResourceId) -> ProviderResult<State> {
+        let response = self
+            .sts_client
+            .get_caller_identity()
+            .send()
+            .await
+            .map_err(|e| {
+                ProviderError::new(format!("Failed to get STS caller identity: {:?}", e))
+                    .for_resource(id.clone())
+            })?;
+
+        let mut attributes = HashMap::new();
+        if let Some(account) = response.account() {
+            attributes.insert("account_id".to_string(), Value::String(account.to_string()));
+        }
+        if let Some(arn) = response.arn() {
+            attributes.insert("arn".to_string(), Value::String(arn.to_string()));
+        }
+        if let Some(user_id) = response.user_id() {
+            attributes.insert("user_id".to_string(), Value::String(user_id.to_string()));
+        }
+
+        Ok(State::existing(id.clone(), attributes))
+    }
+
     // ========== EC2 Security Group Rule Operations ==========
 
     /// Find all Security Group Rules by Name tag (returns all rules with the same name)
@@ -1884,6 +1924,7 @@ impl Provider for AwsProvider {
                     self.read_ec2_security_group_rule(&id, identifier.as_deref(), false)
                         .await
                 }
+                "sts.caller_identity" => self.read_sts_caller_identity(&id).await,
                 _ => Err(ProviderError::new(format!(
                     "Unknown resource type: {}",
                     id.resource_type

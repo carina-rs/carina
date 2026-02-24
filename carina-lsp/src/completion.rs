@@ -230,6 +230,7 @@ impl CompletionProvider {
             "aws.ec2.subnet",
             "aws.ec2.vpc",
             "aws.s3.bucket",
+            "aws.sts.caller_identity",
             "awscc.ec2.security_group_ingress",
             "awscc.ec2.security_group_egress",
             "awscc.ec2.security_group",

@@ -18,6 +18,7 @@ pub mod ec2_security_group_ingress;
 pub mod ec2_subnet;
 pub mod ec2_vpc;
 pub mod s3_bucket;
+pub mod sts_caller_identity;
 
 /// Returns all generated schema configs
 pub fn configs() -> Vec<AwsSchemaConfig> {
@@ -31,6 +32,7 @@ pub fn configs() -> Vec<AwsSchemaConfig> {
         ec2_subnet::ec2_subnet_config(),
         ec2_vpc::ec2_vpc_config(),
         s3_bucket::s3_bucket_config(),
+        sts_caller_identity::sts_caller_identity_config(),
     ]
 }
 
@@ -58,6 +60,7 @@ pub fn get_enum_valid_values(
         ec2_subnet::enum_valid_values(),
         ec2_vpc::enum_valid_values(),
         s3_bucket::enum_valid_values(),
+        sts_caller_identity::enum_valid_values(),
     ];
     for (rt, attrs) in modules {
         if *rt == resource_type {
@@ -105,6 +108,9 @@ pub fn get_enum_alias_reverse(
     }
     if resource_type == "s3.bucket" {
         return s3_bucket::enum_alias_reverse(attr_name, value);
+    }
+    if resource_type == "sts.caller_identity" {
+        return sts_caller_identity::enum_alias_reverse(attr_name, value);
     }
     None
 }
