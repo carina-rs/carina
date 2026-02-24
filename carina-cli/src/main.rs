@@ -2498,9 +2498,13 @@ async fn run_destroy(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
     // Select appropriate Provider based on configuration
     let provider: Box<dyn Provider> = get_provider(&parsed).await;
 
-    // Read states for all resources using identifier from state
+    // Read states for managed resources using identifier from state
+    // Skip data sources (read-only) — they won't be destroyed
     let mut current_states: HashMap<ResourceId, State> = HashMap::new();
     for resource in &destroy_order {
+        if resource.read_only {
+            continue;
+        }
         let identifier = get_identifier_from_state(&state_file, resource);
         let state = provider
             .read(&resource.id, identifier.as_deref())
@@ -5450,6 +5454,52 @@ awscc.ec2.security_group {
             result.is_ok(),
             "Regular resource without read should pass: {:?}",
             result
+        );
+    }
+
+    #[test]
+    fn destroy_plan_excludes_data_sources() {
+        // Simulate the destroy filtering logic: data sources (read_only=true)
+        // should be excluded from the destroy candidate list.
+        let managed = Resource::with_provider("awscc", "ec2.vpc", "vpc");
+        let data_source = Resource::with_provider("awscc", "sts.caller_identity", "identity")
+            .with_read_only(true);
+
+        let destroy_order = vec![managed.clone(), data_source.clone()];
+
+        // Build current_states only for managed resources (data sources are skipped)
+        let mut current_states: HashMap<ResourceId, State> = HashMap::new();
+        for resource in &destroy_order {
+            if resource.read_only {
+                continue;
+            }
+            current_states.insert(
+                resource.id.clone(),
+                State::existing(resource.id.clone(), HashMap::new()),
+            );
+        }
+
+        // Apply the same filtering logic as run_destroy()
+        let resources_to_destroy: Vec<&Resource> = destroy_order
+            .iter()
+            .filter(|r| {
+                if r.read_only {
+                    return false;
+                }
+                if !current_states.get(&r.id).map(|s| s.exists).unwrap_or(false) {
+                    return false;
+                }
+                true
+            })
+            .collect();
+
+        assert_eq!(resources_to_destroy.len(), 1);
+        assert_eq!(resources_to_destroy[0].id.resource_type, "ec2.vpc");
+
+        // Verify data source is NOT in the destroy list
+        assert!(
+            !resources_to_destroy.iter().any(|r| r.read_only),
+            "Data sources should not appear in destroy plan"
         );
     }
 }
