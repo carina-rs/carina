@@ -133,19 +133,7 @@ impl AwsProvider {
                 attributes.insert("region".to_string(), Value::String(region_dsl));
 
                 // Get versioning status
-                if let Ok(versioning) = self
-                    .s3_client
-                    .get_bucket_versioning()
-                    .bucket(name)
-                    .send()
-                    .await
-                {
-                    let status = versioning
-                        .status()
-                        .map(|s| s.as_str().to_string())
-                        .unwrap_or_else(|| "Suspended".to_string());
-                    attributes.insert("versioning_status".to_string(), Value::String(status));
-                }
+                self.read_s3_bucket_versioning(name, &mut attributes).await;
 
                 // S3 bucket identifier is the bucket name
                 Ok(State::existing(id.clone(), attributes).with_identifier(name))
@@ -218,28 +206,8 @@ impl AwsProvider {
         })?;
 
         // Configure versioning
-        if let Some(Value::String(status)) = resource.attributes.get("versioning_status") {
-            use aws_sdk_s3::types::{BucketVersioningStatus, VersioningConfiguration};
-            let normalized = extract_enum_value(status);
-            let versioning_status = if normalized == "Enabled" {
-                BucketVersioningStatus::Enabled
-            } else {
-                BucketVersioningStatus::Suspended
-            };
-            let config = VersioningConfiguration::builder()
-                .status(versioning_status)
-                .build();
-            self.s3_client
-                .put_bucket_versioning()
-                .bucket(&bucket_name)
-                .versioning_configuration(config)
-                .send()
-                .await
-                .map_err(|e| {
-                    ProviderError::new(format!("Failed to configure versioning: {}", e))
-                        .for_resource(resource.id.clone())
-                })?;
-        }
+        self.write_s3_bucket_versioning(&resource.id, &bucket_name, &resource.attributes)
+            .await?;
 
         // Return state after creation
         self.read_s3_bucket(&resource.id, Some(&bucket_name)).await
@@ -255,28 +223,8 @@ impl AwsProvider {
         let bucket_name = identifier.to_string();
 
         // Update versioning status
-        if let Some(Value::String(status)) = to.attributes.get("versioning_status") {
-            use aws_sdk_s3::types::{BucketVersioningStatus, VersioningConfiguration};
-            let normalized = extract_enum_value(status);
-            let versioning_status = if normalized == "Enabled" {
-                BucketVersioningStatus::Enabled
-            } else {
-                BucketVersioningStatus::Suspended
-            };
-            let config = VersioningConfiguration::builder()
-                .status(versioning_status)
-                .build();
-            self.s3_client
-                .put_bucket_versioning()
-                .bucket(&bucket_name)
-                .versioning_configuration(config)
-                .send()
-                .await
-                .map_err(|e| {
-                    ProviderError::new(format!("Failed to update versioning: {}", e))
-                        .for_resource(id.clone())
-                })?;
-        }
+        self.write_s3_bucket_versioning(&id, &bucket_name, &to.attributes)
+            .await?;
 
         self.read_s3_bucket(&id, Some(&bucket_name)).await
     }

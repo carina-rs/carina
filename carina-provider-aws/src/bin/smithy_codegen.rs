@@ -142,7 +142,7 @@ fn main() -> Result<()> {
             eprintln!("Generated: {}", mod_path.display());
         }
         "provider" => {
-            let code = generate_provider_code(&all_resources);
+            let code = generate_provider_code(&all_resources, &models);
             let output_path = args.output_dir.join("provider_generated.rs");
             std::fs::write(&output_path, &code)
                 .with_context(|| format!("Failed to write {}", output_path.display()))?;
@@ -1242,9 +1242,12 @@ fn generate_mod_rs(dsl_names: &[&str]) -> String {
 
 // ── Provider boilerplate generation ──
 
-/// Generate the provider_generated.rs file from ResourceDef metadata.
-/// This does NOT need Smithy models — it only uses ResourceDef fields.
-fn generate_provider_code(all_resources: &[ResourceDef]) -> String {
+/// Generate the provider_generated.rs file from ResourceDef metadata and Smithy models.
+/// Uses Smithy models to resolve types for read/write helper generation.
+fn generate_provider_code(
+    all_resources: &[ResourceDef],
+    models: &HashMap<&str, SmithyModel>,
+) -> String {
     let mut code = String::new();
 
     // Header
@@ -1253,8 +1256,10 @@ fn generate_provider_code(all_resources: &[ResourceDef]) -> String {
          //!\n\
          //! DO NOT EDIT MANUALLY - regenerate with:\n\
          //!   ./carina-provider-aws/scripts/generate-provider.sh\n\n\
+         use std::collections::HashMap;\n\n\
          use carina_core::provider::{ProviderError, ProviderResult, ResourceSchema, ResourceType};\n\
-         use carina_core::resource::{Resource, ResourceId, State};\n\n\
+         use carina_core::resource::{Resource, ResourceId, State, Value};\n\
+         use carina_core::utils::extract_enum_value;\n\n\
          use crate::AwsProvider;\n\n",
     );
 
@@ -1346,9 +1351,278 @@ fn generate_provider_code(all_resources: &[ResourceDef]) -> String {
         ));
     }
 
+    // Read helpers for read_ops (non-data-source resources only)
+    for res in all_resources
+        .iter()
+        .filter(|r| !r.read_ops.is_empty() && !r.identifier.is_empty())
+    {
+        let model = match models.get(res.service_namespace) {
+            Some(m) => m,
+            None => continue,
+        };
+        let ns = res.service_namespace;
+        let client_field = client_field_name(ns);
+        let id_setter = res.identifier.to_snake_case();
+        let resource_name = res.name.replace('.', "_");
+
+        for read_op in &res.read_ops {
+            let suffix = op_suffix(read_op.operation, res.identifier);
+            let method_name = format!("read_{}_{}", resource_name, suffix);
+            let sdk_method = read_op.operation.to_snake_case();
+
+            // Resolve output structure
+            let op_id = format!("{}#{}", ns, read_op.operation);
+            let output = match model.operation_output(&op_id) {
+                Some(o) => o,
+                None => continue,
+            };
+
+            // Build defaults map
+            let defaults: HashMap<&str, &str> = read_op.defaults.iter().copied().collect();
+
+            // Method signature
+            code.push_str(&format!(
+                "\x20   /// Read {} {} (generated)\n",
+                res.name, read_op.operation
+            ));
+            code.push_str(&format!("\x20   pub(crate) async fn {}(\n", method_name));
+            code.push_str("\x20       &self,\n");
+            code.push_str("\x20       identifier: &str,\n");
+            code.push_str("\x20       attributes: &mut HashMap<String, Value>,\n");
+            code.push_str("\x20   ) {\n");
+            code.push_str(&format!(
+                "\x20       if let Ok(output) = self.{}.{}().{}(identifier).send().await {{\n",
+                client_field, sdk_method, id_setter
+            ));
+
+            // Extract each field
+            for (field_name, rename) in &read_op.fields {
+                let effective_name = rename.unwrap_or(field_name);
+                let attr_snake = effective_name.to_snake_case();
+                let accessor = field_name.to_snake_case();
+
+                // Determine if field is an enum
+                let is_enum = if let Some(member_ref) = output.members.get(*field_name) {
+                    matches!(model.shape_kind(&member_ref.target), Some(ShapeKind::Enum))
+                } else {
+                    false
+                };
+
+                let value_expr = if is_enum {
+                    "v.as_str().to_string()"
+                } else {
+                    "v.to_string()"
+                };
+
+                if let Some(default_value) = defaults.get(effective_name) {
+                    code.push_str(&format!(
+                        "\x20           let value = output.{}().map(|v| {}).unwrap_or_else(|| \"{}\".to_string());\n",
+                        accessor, value_expr, default_value,
+                    ));
+                    code.push_str(&format!(
+                        "\x20           attributes.insert(\"{}\".to_string(), Value::String(value));\n",
+                        attr_snake,
+                    ));
+                } else {
+                    code.push_str(&format!(
+                        "\x20           if let Some(v) = output.{}() {{\n",
+                        accessor,
+                    ));
+                    code.push_str(&format!(
+                        "\x20               attributes.insert(\"{}\".to_string(), Value::String({}));\n",
+                        attr_snake, value_expr,
+                    ));
+                    code.push_str("\x20           }\n");
+                }
+            }
+
+            code.push_str("\x20       }\n");
+            code.push_str("\x20   }\n\n");
+        }
+    }
+
+    // Write helpers for update_ops with wrapper
+    for res in all_resources
+        .iter()
+        .filter(|r| r.update_ops.iter().any(|op| op.wrapper.is_some()))
+    {
+        let model = match models.get(res.service_namespace) {
+            Some(m) => m,
+            None => continue,
+        };
+        let ns = res.service_namespace;
+        let client_field = client_field_name(ns);
+        let id_setter = res.identifier.to_snake_case();
+        let resource_name = res.name.replace('.', "_");
+        let sdk_crate_name = sdk_crate_name(ns);
+
+        // Build reverse rename map from read_ops: effective_name -> original_smithy_name
+        let mut reverse_rename: HashMap<&str, &str> = HashMap::new();
+        for read_op in &res.read_ops {
+            for (field_name, rename) in &read_op.fields {
+                if let Some(renamed) = rename {
+                    reverse_rename.insert(renamed, field_name);
+                }
+            }
+        }
+
+        for update_op in res.update_ops.iter().filter(|op| op.wrapper.is_some()) {
+            let wrapper_name = update_op.wrapper.unwrap();
+            let suffix = op_suffix(update_op.operation, res.identifier);
+            let method_name = format!("write_{}_{}", resource_name, suffix);
+            let sdk_method = update_op.operation.to_snake_case();
+            let wrapper_setter = wrapper_name.to_snake_case();
+
+            // Resolve the wrapper struct from the Put input
+            let op_id = format!("{}#{}", ns, update_op.operation);
+            let input = match model.operation_input(&op_id) {
+                Some(i) => i,
+                None => continue,
+            };
+            let wrapper_ref = match input.members.get(wrapper_name) {
+                Some(r) => r,
+                None => continue,
+            };
+            let wrapper_struct = match model.get_structure(&wrapper_ref.target) {
+                Some(s) => s,
+                None => continue,
+            };
+            let wrapper_type_name = SmithyModel::shape_name(&wrapper_ref.target);
+
+            // Collect field info and use types
+            struct FieldInfo {
+                attr_snake: String,
+                builder_setter: String,
+                enum_type_name: Option<String>,
+            }
+            let mut fields = Vec::new();
+            let mut use_types: Vec<String> = vec![wrapper_type_name.to_string()];
+
+            for effective_name in &update_op.fields {
+                let original_name = reverse_rename
+                    .get(*effective_name)
+                    .copied()
+                    .unwrap_or(effective_name);
+                let attr_snake = effective_name.to_snake_case();
+                let builder_setter = original_name.to_snake_case();
+
+                // Look up field in wrapper struct to resolve enum type
+                let enum_type_name =
+                    if let Some(member_ref) = wrapper_struct.members.get(original_name) {
+                        if matches!(model.shape_kind(&member_ref.target), Some(ShapeKind::Enum)) {
+                            let type_name = SmithyModel::shape_name(&member_ref.target).to_string();
+                            use_types.push(type_name.clone());
+                            Some(type_name)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+
+                fields.push(FieldInfo {
+                    attr_snake,
+                    builder_setter,
+                    enum_type_name,
+                });
+            }
+
+            let op_desc = sdk_method.replace('_', " ");
+            let use_list = use_types.join(", ");
+
+            // Method signature
+            code.push_str(&format!(
+                "\x20   /// Write {} {} (generated)\n",
+                res.name, update_op.operation
+            ));
+            code.push_str(&format!("\x20   pub(crate) async fn {}(\n", method_name));
+            code.push_str("\x20       &self,\n");
+            code.push_str("\x20       id: &ResourceId,\n");
+            code.push_str("\x20       identifier: &str,\n");
+            code.push_str("\x20       attributes: &HashMap<String, Value>,\n");
+            code.push_str("\x20   ) -> ProviderResult<()> {\n");
+            code.push_str(&format!(
+                "\x20       use {}::types::{{{}}};\n",
+                sdk_crate_name, use_list
+            ));
+
+            // Build wrapper
+            code.push_str(&format!(
+                "\x20       let mut builder = {}::builder();\n",
+                wrapper_type_name
+            ));
+            code.push_str("\x20       let mut has_changes = false;\n");
+
+            for field in &fields {
+                code.push_str(&format!(
+                    "\x20       if let Some(Value::String(val)) = attributes.get(\"{}\") {{\n",
+                    field.attr_snake
+                ));
+                if let Some(ref enum_type) = field.enum_type_name {
+                    code.push_str("\x20           let normalized = extract_enum_value(val);\n");
+                    code.push_str(&format!(
+                        "\x20           builder = builder.{}({}::from(normalized));\n",
+                        field.builder_setter, enum_type
+                    ));
+                } else {
+                    code.push_str(&format!(
+                        "\x20           builder = builder.{}(val.as_str());\n",
+                        field.builder_setter
+                    ));
+                }
+                code.push_str("\x20           has_changes = true;\n");
+                code.push_str("\x20       }\n");
+            }
+
+            // Send API call
+            code.push_str("\x20       if has_changes {\n");
+            code.push_str("\x20           let config = builder.build();\n");
+            code.push_str(&format!(
+                "\x20           self.{}.{}().{}(identifier).{}(config).send().await.map_err(|e| {{\n",
+                client_field, sdk_method, id_setter, wrapper_setter
+            ));
+            code.push_str(&format!(
+                "\x20               ProviderError::new(format!(\"Failed to {}: {{}}\", e))\n",
+                op_desc
+            ));
+            code.push_str("\x20                   .for_resource(id.clone())\n");
+            code.push_str("\x20           })?;\n");
+            code.push_str("\x20       }\n");
+            code.push_str("\x20       Ok(())\n");
+            code.push_str("\x20   }\n\n");
+        }
+    }
+
     code.push_str("}\n");
 
     code
+}
+
+/// Derive a short suffix from an operation name by stripping the verb prefix and identifier.
+/// e.g., "GetBucketVersioning" with identifier "Bucket" -> "versioning"
+fn op_suffix(operation: &str, identifier: &str) -> String {
+    let without_verb = operation
+        .strip_prefix("Get")
+        .or_else(|| operation.strip_prefix("Put"))
+        .or_else(|| operation.strip_prefix("Describe"))
+        .unwrap_or(operation);
+    let without_id = if !identifier.is_empty() {
+        without_verb
+            .strip_prefix(identifier)
+            .unwrap_or(without_verb)
+    } else {
+        without_verb
+    };
+    without_id.to_snake_case()
+}
+
+/// Get the SDK crate name from a service namespace.
+/// e.g., "com.amazonaws.s3" -> "aws_sdk_s3"
+fn sdk_crate_name(service_namespace: &str) -> String {
+    let service = service_namespace
+        .strip_prefix("com.amazonaws.")
+        .unwrap_or(service_namespace);
+    format!("aws_sdk_{}", service)
 }
 
 /// Get the client field name from a service namespace.

@@ -22,6 +22,8 @@ pub struct ReadOp {
     pub operation: &'static str,
     /// Fields to extract: (smithy_output_field_name, optional_rename)
     pub fields: Vec<(&'static str, Option<&'static str>)>,
+    /// Default values when the API returns None: (effective_field_name, default_value)
+    pub defaults: Vec<(&'static str, &'static str)>,
 }
 
 /// Defines how to map an AWS API resource to a Carina schema.
@@ -86,6 +88,9 @@ pub struct UpdateOp {
     pub operation: &'static str,
     /// Fields this operation can update
     pub fields: Vec<&'static str>,
+    /// Wrapper struct member name in the Put input (e.g., "VersioningConfiguration").
+    /// When set, fields are nested inside this wrapper struct in the API input.
+    pub wrapper: Option<&'static str>,
 }
 
 /// Returns EC2 resource definitions.
@@ -105,6 +110,7 @@ pub fn ec2_resources() -> Vec<ResourceDef> {
             update_ops: vec![UpdateOp {
                 operation: "ModifyVpcAttribute",
                 fields: vec!["EnableDnsHostnames", "EnableDnsSupport"],
+                wrapper: None,
             }],
             identifier: "VpcId",
             has_tags: true,
@@ -148,6 +154,7 @@ pub fn ec2_resources() -> Vec<ResourceDef> {
                     "EnableLniAtDeviceIndex",
                     "PrivateDnsNameOptionsOnLaunch",
                 ],
+                wrapper: None,
             }],
             identifier: "SubnetId",
             has_tags: true,
@@ -235,6 +242,7 @@ pub fn ec2_resources() -> Vec<ResourceDef> {
                     "VpcEndpointId",
                     "CoreNetworkArn",
                 ],
+                wrapper: None,
             }],
             identifier: "RouteTableId",
             has_tags: false,
@@ -400,6 +408,7 @@ pub fn sts_resources() -> Vec<ResourceDef> {
                     ("Arn", None),
                     ("UserId", None),
                 ],
+                defaults: vec![],
             }],
             delete_op: "",
             update_ops: vec![],
@@ -433,11 +442,13 @@ pub fn s3_resources() -> Vec<ResourceDef> {
             read_ops: vec![ReadOp {
                 operation: "GetBucketVersioning",
                 fields: vec![("Status", Some("VersioningStatus"))],
+                defaults: vec![("VersioningStatus", "Suspended")],
             }],
             delete_op: "DeleteBucket",
             update_ops: vec![UpdateOp {
                 operation: "PutBucketVersioning",
                 fields: vec!["VersioningStatus"],
+                wrapper: Some("VersioningConfiguration"),
             }],
             identifier: "Bucket",
             has_tags: true,
