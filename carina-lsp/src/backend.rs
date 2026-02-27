@@ -1,4 +1,9 @@
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use carina_core::formatter::{self, FormatConfig};
+use carina_core::provider::ProviderFactory;
+use carina_core::schema::CompletionValue;
 use dashmap::DashMap;
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
@@ -20,13 +25,42 @@ pub struct Backend {
 }
 
 impl Backend {
-    pub fn new(client: Client) -> Self {
+    pub fn new(client: Client, factories: Vec<Box<dyn ProviderFactory>>) -> Self {
+        // Build shared schema map from all factories
+        let mut schemas = HashMap::new();
+        for factory in &factories {
+            for schema in factory.schemas() {
+                schemas.insert(schema.resource_type.clone(), schema);
+            }
+        }
+        let schemas = Arc::new(schemas);
+
+        // Collect provider names
+        let provider_names: Vec<String> = factories.iter().map(|f| f.name().to_string()).collect();
+
+        // Collect region completions from all factories
+        let region_completions: Vec<CompletionValue> = factories
+            .iter()
+            .flat_map(|f| f.region_completions())
+            .collect();
+
+        // Wrap factories in Arc for sharing
+        let factories: Arc<Vec<Box<dyn ProviderFactory>>> = Arc::new(factories);
+
         Self {
             client,
             documents: DashMap::new(),
-            diagnostic_engine: DiagnosticEngine::new(),
-            completion_provider: CompletionProvider::new(),
-            hover_provider: HoverProvider::new(),
+            diagnostic_engine: DiagnosticEngine::new(
+                Arc::clone(&schemas),
+                provider_names.clone(),
+                Arc::clone(&factories),
+            ),
+            completion_provider: CompletionProvider::new(
+                Arc::clone(&schemas),
+                provider_names.clone(),
+                region_completions.clone(),
+            ),
+            hover_provider: HoverProvider::new(Arc::clone(&schemas), region_completions),
             semantic_tokens_provider: SemanticTokensProvider::new(),
         }
     }
