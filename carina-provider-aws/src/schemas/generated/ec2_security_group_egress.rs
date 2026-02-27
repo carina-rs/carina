@@ -7,7 +7,7 @@
 use super::AwsSchemaConfig;
 use super::validate_namespaced_enum;
 use carina_core::resource::Value;
-use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, types};
+use carina_core::schema::{AttributeSchema, AttributeType, CompletionValue, ResourceSchema, types};
 
 #[allow(dead_code)]
 const VALID_IP_PROTOCOL: &[&str] = &["tcp", "udp", "icmp", "icmpv6", "-1", "all"];
@@ -133,7 +133,17 @@ pub fn ec2_security_group_egress_config() -> AwsSchemaConfig {
                 .required()
                 .create_only()
                 .with_description("Not supported. Use IP permissions instead.")
-                .with_provider_name("IpProtocol"),
+                .with_provider_name("IpProtocol")
+                .with_completions(vec![
+                    CompletionValue::new("aws.ec2.security_group_egress.IpProtocol.tcp", "tcp"),
+                    CompletionValue::new("aws.ec2.security_group_egress.IpProtocol.udp", "udp"),
+                    CompletionValue::new("aws.ec2.security_group_egress.IpProtocol.icmp", "icmp"),
+                    CompletionValue::new(
+                        "aws.ec2.security_group_egress.IpProtocol.icmpv6",
+                        "icmpv6",
+                    ),
+                    CompletionValue::new("aws.ec2.security_group_egress.IpProtocol.all", "-1"),
+                ]),
             )
             .attribute(
                 AttributeSchema::new("source_security_group_name", AttributeType::String)

@@ -495,7 +495,7 @@ impl CompletionProvider {
                 return completions;
             }
             // Fall back to type-based completions
-            completions.extend(self.completions_for_type(&attr_schema.attr_type, resource_type));
+            completions.extend(self.completions_for_type(&attr_schema.attr_type));
             return completions;
         }
 
@@ -578,11 +578,7 @@ impl CompletionProvider {
         bindings
     }
 
-    fn completions_for_type(
-        &self,
-        attr_type: &AttributeType,
-        resource_type: &str,
-    ) -> Vec<CompletionItem> {
+    fn completions_for_type(&self, attr_type: &AttributeType) -> Vec<CompletionItem> {
         match attr_type {
             AttributeType::Bool => {
                 vec![
@@ -618,13 +614,6 @@ impl CompletionProvider {
                 {
                     return self.region_completions();
                 }
-                // Check if this is a protocol enum
-                if variants
-                    .iter()
-                    .any(|v| v == "tcp" || v == "udp" || v == "icmp")
-                {
-                    return self.protocol_completions();
-                }
                 // Generic enum completions - wrap in quotes since they're string values
                 variants
                     .iter()
@@ -649,15 +638,6 @@ impl CompletionProvider {
                 self.ipv6_cidr_completions()
             }
             AttributeType::Custom { name, .. } if name == "Arn" => self.arn_completions(),
-            AttributeType::Custom { name, .. } if name == "VersioningStatus" => {
-                self.versioning_status_completions()
-            }
-            AttributeType::Custom { name, .. } if name == "InstanceTenancy" => {
-                self.instance_tenancy_completions(resource_type)
-            }
-            AttributeType::Custom { name, .. } if name == "IpProtocol" => {
-                self.ip_protocol_completions(resource_type)
-            }
             AttributeType::Union(_) | AttributeType::String | AttributeType::Custom { .. } => {
                 vec![CompletionItem {
                     label: "env".to_string(),
@@ -744,7 +724,7 @@ impl CompletionProvider {
             && let Some(fields) = self.extract_struct_fields(&attr_schema.attr_type)
             && let Some(field) = fields.iter().find(|f| f.name == field_name)
         {
-            self.completions_for_type(&field.field_type, resource_type)
+            self.completions_for_type(&field.field_type)
         } else {
             vec![]
         }
@@ -792,26 +772,6 @@ impl CompletionProvider {
                 kind: Some(CompletionItemKind::ENUM_MEMBER),
                 detail: Some(c.description.clone()),
                 insert_text: Some(c.value.clone()),
-                ..Default::default()
-            })
-            .collect()
-    }
-
-    fn protocol_completions(&self) -> Vec<CompletionItem> {
-        let protocols = vec![
-            ("tcp", "Transmission Control Protocol"),
-            ("udp", "User Datagram Protocol"),
-            ("icmp", "Internet Control Message Protocol"),
-            ("all", "All protocols (-1)"),
-        ];
-
-        protocols
-            .into_iter()
-            .map(|(code, description)| CompletionItem {
-                label: format!("aws.Protocol.{}", code),
-                kind: Some(CompletionItemKind::ENUM_MEMBER),
-                detail: Some(description.to_string()),
-                insert_text: Some(format!("aws.Protocol.{}", code)),
                 ..Default::default()
             })
             .collect()
@@ -872,80 +832,6 @@ impl CompletionProvider {
             detail: Some("ARN format: arn:partition:service:region:account:resource".to_string()),
             ..Default::default()
         }]
-    }
-
-    fn versioning_status_completions(&self) -> Vec<CompletionItem> {
-        vec![
-            CompletionItem {
-                label: "aws.s3.bucket.VersioningStatus.Enabled".to_string(),
-                kind: Some(CompletionItemKind::ENUM_MEMBER),
-                detail: Some("Enable versioning".to_string()),
-                insert_text: Some("aws.s3.bucket.VersioningStatus.Enabled".to_string()),
-                ..Default::default()
-            },
-            CompletionItem {
-                label: "aws.s3.bucket.VersioningStatus.Suspended".to_string(),
-                kind: Some(CompletionItemKind::ENUM_MEMBER),
-                detail: Some("Suspend versioning".to_string()),
-                insert_text: Some("aws.s3.bucket.VersioningStatus.Suspended".to_string()),
-                ..Default::default()
-            },
-        ]
-    }
-
-    fn instance_tenancy_completions(&self, resource_type: &str) -> Vec<CompletionItem> {
-        // Determine prefix based on resource type
-        let prefix = if resource_type.starts_with("awscc") {
-            "awscc.ec2.vpc.InstanceTenancy"
-        } else {
-            "aws.ec2.vpc.InstanceTenancy"
-        };
-
-        vec![
-            CompletionItem {
-                label: format!("{}.default", prefix),
-                kind: Some(CompletionItemKind::ENUM_MEMBER),
-                detail: Some("Instances can have any tenancy".to_string()),
-                insert_text: Some(format!("{}.default", prefix)),
-                ..Default::default()
-            },
-            CompletionItem {
-                label: format!("{}.dedicated", prefix),
-                kind: Some(CompletionItemKind::ENUM_MEMBER),
-                detail: Some("Instances will be dedicated tenancy".to_string()),
-                insert_text: Some(format!("{}.dedicated", prefix)),
-                ..Default::default()
-            },
-            CompletionItem {
-                label: format!("{}.host", prefix),
-                kind: Some(CompletionItemKind::ENUM_MEMBER),
-                detail: Some("Instances will run on dedicated hosts".to_string()),
-                insert_text: Some(format!("{}.host", prefix)),
-                ..Default::default()
-            },
-        ]
-    }
-
-    fn ip_protocol_completions(&self, resource_type: &str) -> Vec<CompletionItem> {
-        let prefix = format!("{}.IpProtocol", resource_type);
-        let protocols = vec![
-            ("tcp", "Transmission Control Protocol"),
-            ("udp", "User Datagram Protocol"),
-            ("icmp", "Internet Control Message Protocol"),
-            ("icmpv6", "Internet Control Message Protocol v6"),
-            ("all", "All protocols (-1)"),
-        ];
-
-        protocols
-            .into_iter()
-            .map(|(code, description)| CompletionItem {
-                label: format!("{}.{}", prefix, code),
-                kind: Some(CompletionItemKind::ENUM_MEMBER),
-                detail: Some(description.to_string()),
-                insert_text: Some(format!("{}.{}", prefix, code)),
-                ..Default::default()
-            })
-            .collect()
     }
 
     fn ref_type_completions(&self) -> Vec<CompletionItem> {

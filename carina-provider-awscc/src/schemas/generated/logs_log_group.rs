@@ -8,7 +8,7 @@ use super::AwsccSchemaConfig;
 use super::tags_type;
 use super::validate_namespaced_enum;
 use carina_core::resource::Value;
-use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+use carina_core::schema::{AttributeSchema, AttributeType, CompletionValue, ResourceSchema};
 
 #[allow(dead_code)]
 const VALID_LOG_GROUP_CLASS: &[&str] = &["STANDARD", "INFREQUENT_ACCESS", "DELIVERY"];
@@ -72,7 +72,8 @@ pub fn logs_log_group_config() -> AwsccSchemaConfig {
                 to_dsl: None,
             })
                 .with_description("Specifies the log group class for this log group. There are two classes:  + The ``Standard`` log class supports all CWL features.  + The ``Infrequent ...")
-                .with_provider_name("LogGroupClass"),
+                .with_provider_name("LogGroupClass")
+                .with_completions(vec![CompletionValue::new("awscc.logs.log_group.LogGroupClass.STANDARD", "STANDARD"), CompletionValue::new("awscc.logs.log_group.LogGroupClass.INFREQUENT_ACCESS", "INFREQUENT_ACCESS"), CompletionValue::new("awscc.logs.log_group.LogGroupClass.DELIVERY", "DELIVERY")]),
         )
         .attribute(
             AttributeSchema::new("log_group_name", AttributeType::String)

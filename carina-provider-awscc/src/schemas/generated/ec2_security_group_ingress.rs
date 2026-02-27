@@ -7,7 +7,7 @@
 use super::AwsccSchemaConfig;
 use super::validate_namespaced_enum;
 use carina_core::resource::Value;
-use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, types};
+use carina_core::schema::{AttributeSchema, AttributeType, CompletionValue, ResourceSchema, types};
 
 #[allow(dead_code)]
 const VALID_IP_PROTOCOL: &[&str] = &["tcp", "udp", "icmp", "icmpv6", "-1", "all"];
@@ -118,7 +118,8 @@ pub fn ec2_security_group_ingress_config() -> AwsccSchemaConfig {
                 .required()
                 .create_only()
                 .with_description("The IP protocol name (tcp, udp, icmp, icmpv6) or number (see Protocol Numbers). [VPC only] Use -1 to specify all protocols. When authorizing security ...")
-                .with_provider_name("IpProtocol"),
+                .with_provider_name("IpProtocol")
+                .with_completions(vec![CompletionValue::new("awscc.ec2.security_group_ingress.IpProtocol.tcp", "tcp"), CompletionValue::new("awscc.ec2.security_group_ingress.IpProtocol.udp", "udp"), CompletionValue::new("awscc.ec2.security_group_ingress.IpProtocol.icmp", "icmp"), CompletionValue::new("awscc.ec2.security_group_ingress.IpProtocol.icmpv6", "icmpv6"), CompletionValue::new("awscc.ec2.security_group_ingress.IpProtocol.all", "-1")]),
         )
         .attribute(
             AttributeSchema::new("source_prefix_list_id", super::aws_resource_id())

@@ -520,6 +520,9 @@ fn generate_resource(res: &ResourceDef, model: &SmithyModel) -> Result<String> {
         .unwrap_or(res.name);
     let mut schema_imports = vec!["AttributeSchema", "ResourceSchema"];
     schema_imports.insert(1, "AttributeType");
+    if attrs.iter().any(|a| a.enum_info.is_some()) {
+        schema_imports.push("CompletionValue");
+    }
     if needs_struct_field {
         schema_imports.push("StructField");
     }
@@ -743,10 +746,45 @@ fn generate_resource(res: &ResourceDef, model: &SmithyModel) -> Result<String> {
         }
 
         attr_code.push_str(&format!(
-            "\n\x20               .with_provider_name(\"{}\"),",
+            "\n\x20               .with_provider_name(\"{}\")",
             attr.provider_name
         ));
-        attr_code.push_str("\n\x20       )\n");
+
+        // Generate .with_completions() for enum attributes
+        if let Some(ref ei) = attr.enum_info {
+            let has_hyphens = ei.values.iter().any(|v| v.contains('-'));
+            let snake = attr.provider_name.to_snake_case();
+            let prop_aliases = enum_alias_map.get(snake.as_str());
+            let completion_entries: Vec<String> = ei
+                .values
+                .iter()
+                .map(|value| {
+                    let dsl_value = if let Some(alias_list) = prop_aliases {
+                        if let Some((_, alias)) =
+                            alias_list.iter().find(|(c, _)| *c == value.as_str())
+                        {
+                            alias.to_string()
+                        } else if has_hyphens {
+                            value.replace('-', "_")
+                        } else {
+                            value.clone()
+                        }
+                    } else if has_hyphens {
+                        value.replace('-', "_")
+                    } else {
+                        value.clone()
+                    };
+                    let dsl_id = format!("{}.{}.{}", namespace, ei.type_name, dsl_value);
+                    format!("CompletionValue::new(\"{}\", \"{}\")", dsl_id, value)
+                })
+                .collect();
+            attr_code.push_str(&format!(
+                "\n\x20               .with_completions(vec![{}])",
+                completion_entries.join(", ")
+            ));
+        }
+
+        attr_code.push_str(",\n\x20       )\n");
         code.push_str(&attr_code);
     }
 

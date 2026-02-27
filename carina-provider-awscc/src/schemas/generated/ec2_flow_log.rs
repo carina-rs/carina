@@ -8,7 +8,9 @@ use super::AwsccSchemaConfig;
 use super::tags_type;
 use super::validate_namespaced_enum;
 use carina_core::resource::Value;
-use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
+use carina_core::schema::{
+    AttributeSchema, AttributeType, CompletionValue, ResourceSchema, StructField,
+};
 
 #[allow(dead_code)]
 const VALID_LOG_DESTINATION_TYPE: &[&str] = &["cloud-watch-logs", "s3", "kinesis-data-firehose"];
@@ -130,7 +132,8 @@ pub fn ec2_flow_log_config() -> AwsccSchemaConfig {
             })
                 .create_only()
                 .with_description("Specifies the type of destination to which the flow log data is to be published. Flow log data can be published to CloudWatch Logs or Amazon S3.")
-                .with_provider_name("LogDestinationType"),
+                .with_provider_name("LogDestinationType")
+                .with_completions(vec![CompletionValue::new("awscc.ec2.flow_log.LogDestinationType.cloud_watch_logs", "cloud-watch-logs"), CompletionValue::new("awscc.ec2.flow_log.LogDestinationType.s3", "s3"), CompletionValue::new("awscc.ec2.flow_log.LogDestinationType.kinesis_data_firehose", "kinesis-data-firehose")]),
         )
         .attribute(
             AttributeSchema::new("log_format", AttributeType::String)
@@ -168,7 +171,8 @@ pub fn ec2_flow_log_config() -> AwsccSchemaConfig {
                 .required()
                 .create_only()
                 .with_description("The type of resource for which to create the flow log. For example, if you specified a VPC ID for the ResourceId property, specify VPC for this proper...")
-                .with_provider_name("ResourceType"),
+                .with_provider_name("ResourceType")
+                .with_completions(vec![CompletionValue::new("awscc.ec2.flow_log.ResourceType.NetworkInterface", "NetworkInterface"), CompletionValue::new("awscc.ec2.flow_log.ResourceType.Subnet", "Subnet"), CompletionValue::new("awscc.ec2.flow_log.ResourceType.VPC", "VPC"), CompletionValue::new("awscc.ec2.flow_log.ResourceType.TransitGateway", "TransitGateway"), CompletionValue::new("awscc.ec2.flow_log.ResourceType.TransitGatewayAttachment", "TransitGatewayAttachment"), CompletionValue::new("awscc.ec2.flow_log.ResourceType.RegionalNatGateway", "RegionalNatGateway")]),
         )
         .attribute(
             AttributeSchema::new("tags", tags_type())
@@ -185,7 +189,8 @@ pub fn ec2_flow_log_config() -> AwsccSchemaConfig {
             })
                 .create_only()
                 .with_description("The type of traffic to log. You can log traffic that the resource accepts or rejects, or all traffic.")
-                .with_provider_name("TrafficType"),
+                .with_provider_name("TrafficType")
+                .with_completions(vec![CompletionValue::new("awscc.ec2.flow_log.TrafficType.ACCEPT", "ACCEPT"), CompletionValue::new("awscc.ec2.flow_log.TrafficType.ALL", "ALL"), CompletionValue::new("awscc.ec2.flow_log.TrafficType.REJECT", "REJECT")]),
         )
     }
 }

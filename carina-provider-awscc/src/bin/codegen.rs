@@ -914,6 +914,9 @@ fn generate_schema_code(schema: &CfnSchema, type_name: &str) -> Result<String> {
     if needs_attribute_type {
         schema_imports.insert(1, "AttributeType");
     }
+    if schema.properties.keys().any(|k| enums.contains_key(k)) {
+        schema_imports.push("CompletionValue");
+    }
     if needs_struct_field {
         schema_imports.push("StructField");
     }
@@ -1145,6 +1148,38 @@ pub fn {}() -> AwsccSchemaConfig {{
             "\n                .with_provider_name(\"{}\")",
             prop_name
         ));
+
+        // Generate .with_completions() for enum attributes
+        if let Some(enum_info) = enums.get(prop_name) {
+            let has_hyphens = enum_info.values.iter().any(|v| v.contains('-'));
+            let aliases = known_enum_aliases();
+            let prop_aliases = aliases.get(prop_name.as_str());
+            let completion_entries: Vec<String> = enum_info
+                .values
+                .iter()
+                .map(|value| {
+                    let dsl_value = if let Some(alias_list) = prop_aliases {
+                        if let Some((_, alias)) = alias_list.iter().find(|(c, _)| c == value) {
+                            alias.to_string()
+                        } else if has_hyphens {
+                            value.replace('-', "_")
+                        } else {
+                            value.clone()
+                        }
+                    } else if has_hyphens {
+                        value.replace('-', "_")
+                    } else {
+                        value.clone()
+                    };
+                    let dsl_id = format!("{}.{}.{}", namespace, enum_info.type_name, dsl_value);
+                    format!("CompletionValue::new(\"{}\", \"{}\")", dsl_id, value)
+                })
+                .collect();
+            attr_code.push_str(&format!(
+                "\n                .with_completions(vec![{}])",
+                completion_entries.join(", ")
+            ));
+        }
 
         attr_code.push_str(",\n        )\n");
         code.push_str(&attr_code);

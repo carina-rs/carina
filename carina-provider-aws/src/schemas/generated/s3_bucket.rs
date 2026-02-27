@@ -8,7 +8,7 @@ use super::AwsSchemaConfig;
 use super::tags_type;
 use super::validate_namespaced_enum;
 use carina_core::resource::Value;
-use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+use carina_core::schema::{AttributeSchema, AttributeType, CompletionValue, ResourceSchema};
 
 #[allow(dead_code)]
 const VALID_VERSIONING_STATUS: &[&str] = &["Enabled", "Suspended"];
@@ -58,7 +58,11 @@ pub fn s3_bucket_config() -> AwsSchemaConfig {
                     },
                 )
                 .with_description("The versioning state of the bucket.")
-                .with_provider_name("VersioningStatus"),
+                .with_provider_name("VersioningStatus")
+                .with_completions(vec![
+                    CompletionValue::new("aws.s3.bucket.VersioningStatus.Enabled", "Enabled"),
+                    CompletionValue::new("aws.s3.bucket.VersioningStatus.Suspended", "Suspended"),
+                ]),
             )
             .attribute(
                 AttributeSchema::new("tags", tags_type())

@@ -8,7 +8,9 @@ use super::AwsccSchemaConfig;
 use super::tags_type;
 use super::validate_namespaced_enum;
 use carina_core::resource::Value;
-use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
+use carina_core::schema::{
+    AttributeSchema, AttributeType, CompletionValue, ResourceSchema, StructField,
+};
 
 #[allow(dead_code)]
 const VALID_ADDRESS_FAMILY: &[&str] = &["IPv4", "IPv6"];
@@ -130,7 +132,8 @@ pub fn ec2_ipam_pool_config() -> AwsccSchemaConfig {
                 .required()
                 .create_only()
                 .with_description("The address family of the address space in this pool. Either IPv4 or IPv6.")
-                .with_provider_name("AddressFamily"),
+                .with_provider_name("AddressFamily")
+                .with_completions(vec![CompletionValue::new("awscc.ec2.ipam_pool.AddressFamily.IPv4", "IPv4"), CompletionValue::new("awscc.ec2.ipam_pool.AddressFamily.IPv6", "IPv6")]),
         )
         .attribute(
             AttributeSchema::new("allocation_default_netmask_length", AttributeType::Int)
@@ -172,7 +175,8 @@ pub fn ec2_ipam_pool_config() -> AwsccSchemaConfig {
             })
                 .create_only()
                 .with_description("Limits which service in Amazon Web Services that the pool can be used in.")
-                .with_provider_name("AwsService"),
+                .with_provider_name("AwsService")
+                .with_completions(vec![CompletionValue::new("awscc.ec2.ipam_pool.AwsService.ec2", "ec2"), CompletionValue::new("awscc.ec2.ipam_pool.AwsService.global_services", "global-services")]),
         )
         .attribute(
             AttributeSchema::new("description", AttributeType::String)
@@ -209,7 +213,8 @@ pub fn ec2_ipam_pool_config() -> AwsccSchemaConfig {
                 to_dsl: None,
             })
                 .with_description("Determines whether this scope contains publicly routable space or space for a private network (read-only)")
-                .with_provider_name("IpamScopeType"),
+                .with_provider_name("IpamScopeType")
+                .with_completions(vec![CompletionValue::new("awscc.ec2.ipam_pool.IpamScopeType.public", "public"), CompletionValue::new("awscc.ec2.ipam_pool.IpamScopeType.private", "private")]),
         )
         .attribute(
             AttributeSchema::new("locale", AttributeType::String)
@@ -242,7 +247,8 @@ pub fn ec2_ipam_pool_config() -> AwsccSchemaConfig {
             })
                 .create_only()
                 .with_description("The IP address source for pools in the public scope. Only used for provisioning IP address CIDRs to pools in the public scope. Default is `byoip`.")
-                .with_provider_name("PublicIpSource"),
+                .with_provider_name("PublicIpSource")
+                .with_completions(vec![CompletionValue::new("awscc.ec2.ipam_pool.PublicIpSource.byoip", "byoip"), CompletionValue::new("awscc.ec2.ipam_pool.PublicIpSource.amazon", "amazon")]),
         )
         .attribute(
             AttributeSchema::new("publicly_advertisable", AttributeType::Bool)
@@ -278,7 +284,8 @@ pub fn ec2_ipam_pool_config() -> AwsccSchemaConfig {
                 to_dsl: Some(|s: &str| s.replace('-', "_")),
             })
                 .with_description("The state of this pool. This can be one of the following values: \"create-in-progress\", \"create-complete\", \"modify-in-progress\", \"modify-complet... (read-only)")
-                .with_provider_name("State"),
+                .with_provider_name("State")
+                .with_completions(vec![CompletionValue::new("awscc.ec2.ipam_pool.State.create_in_progress", "create-in-progress"), CompletionValue::new("awscc.ec2.ipam_pool.State.create_complete", "create-complete"), CompletionValue::new("awscc.ec2.ipam_pool.State.modify_in_progress", "modify-in-progress"), CompletionValue::new("awscc.ec2.ipam_pool.State.modify_complete", "modify-complete"), CompletionValue::new("awscc.ec2.ipam_pool.State.delete_in_progress", "delete-in-progress"), CompletionValue::new("awscc.ec2.ipam_pool.State.delete_complete", "delete-complete")]),
         )
         .attribute(
             AttributeSchema::new("state_message", AttributeType::String)

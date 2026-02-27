@@ -8,7 +8,7 @@ use super::AwsccSchemaConfig;
 use super::tags_type;
 use super::validate_namespaced_enum;
 use carina_core::resource::Value;
-use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, types};
+use carina_core::schema::{AttributeSchema, AttributeType, CompletionValue, ResourceSchema, types};
 
 #[allow(dead_code)]
 const VALID_INSTANCE_TENANCY: &[&str] = &["default", "dedicated", "host"];
@@ -90,7 +90,8 @@ pub fn ec2_vpc_config() -> AwsccSchemaConfig {
                 to_dsl: None,
             })
                 .with_description("The allowed tenancy of instances launched into the VPC.  + ``default``: An instance launched into the VPC runs on shared hardware by default, unless y...")
-                .with_provider_name("InstanceTenancy"),
+                .with_provider_name("InstanceTenancy")
+                .with_completions(vec![CompletionValue::new("awscc.ec2.vpc.InstanceTenancy.default", "default"), CompletionValue::new("awscc.ec2.vpc.InstanceTenancy.dedicated", "dedicated"), CompletionValue::new("awscc.ec2.vpc.InstanceTenancy.host", "host")]),
         )
         .attribute(
             AttributeSchema::new("ipv4_ipam_pool_id", super::ipam_pool_id())
