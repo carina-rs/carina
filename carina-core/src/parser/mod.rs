@@ -1750,7 +1750,7 @@ mod tests {
                 versioning = "Enabled"
             }
 
-            aws.vpc.vpc {
+            aws.ec2.vpc {
                 name       = "main-vpc"
                 cidr_block = "10.0.0.0/16"
             }
