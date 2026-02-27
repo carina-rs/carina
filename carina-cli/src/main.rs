@@ -19,7 +19,7 @@ use carina_core::provider::{
 };
 use carina_core::resource::{LifecycleConfig, Resource, ResourceId, State, Value};
 use carina_core::schema::ResourceSchema;
-use carina_core::schema::validate_cidr;
+use carina_core::schema::validate_ipv4_cidr;
 use carina_provider_aws::AwsProviderFactory;
 use carina_provider_awscc::AwsccProviderFactory;
 use carina_state::{
@@ -964,12 +964,12 @@ fn get_base_dir(path: &Path) -> &Path {
 /// Validate a module argument value against its expected type
 fn validate_module_arg_type(type_expr: &TypeExpr, value: &Value) -> Option<String> {
     match (type_expr, value) {
-        (TypeExpr::Cidr, Value::String(s)) => validate_cidr(s).err(),
+        (TypeExpr::Cidr, Value::String(s)) => validate_ipv4_cidr(s).err(),
         (TypeExpr::List(inner), Value::List(items)) => {
             if let TypeExpr::Cidr = inner.as_ref() {
                 for (i, item) in items.iter().enumerate() {
                     if let Value::String(s) = item {
-                        if let Err(e) = validate_cidr(s) {
+                        if let Err(e) = validate_ipv4_cidr(s) {
                             return Some(format!("element {}: {}", i, e));
                         }
                     } else {

@@ -611,23 +611,6 @@ pub mod types {
         }
     }
 
-    /// CIDR block type — alias for `ipv4_cidr()` for backward compatibility
-    pub fn cidr() -> AttributeType {
-        AttributeType::Custom {
-            name: "Cidr".to_string(),
-            base: Box::new(AttributeType::String),
-            validate: |value| {
-                if let Value::String(s) = value {
-                    validate_ipv4_cidr(s)
-                } else {
-                    Err("Expected string".to_string())
-                }
-            },
-            namespace: None,
-            to_dsl: None,
-        }
-    }
-
     /// IPv4 address type (e.g., "10.0.1.5", "192.168.0.1")
     pub fn ipv4_address() -> AttributeType {
         AttributeType::Custom {
@@ -727,11 +710,6 @@ pub fn validate_ipv4_cidr(cidr: &str) -> Result<(), String> {
             prefix
         )),
     }
-}
-
-/// Backward-compatible alias for `validate_ipv4_cidr`
-pub fn validate_cidr(cidr: &str) -> Result<(), String> {
-    validate_ipv4_cidr(cidr)
 }
 
 /// Validate IPv6 CIDR block format (e.g., "2001:db8::/32", "::/0")
@@ -965,7 +943,7 @@ mod tests {
 
     #[test]
     fn validate_cidr_type() {
-        let t = types::cidr();
+        let t = types::ipv4_cidr();
 
         // Valid CIDRs
         assert!(

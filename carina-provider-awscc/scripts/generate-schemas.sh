@@ -113,8 +113,6 @@ cat > "$OUTPUT_DIR/mod.rs" << 'EOF'
 //! DO NOT EDIT MANUALLY - regenerate with:
 //!   aws-vault exec <profile> -- ./carina-provider-awscc/scripts/generate-schemas.sh
 
-use carina_core::schema::ResourceSchema;
-
 // Re-export all types and validators from awscc_types so that
 // generated schema files can use `super::` to access them.
 pub use super::awscc_types::*;
@@ -145,11 +143,6 @@ done
 
 cat >> "$OUTPUT_DIR/mod.rs" << 'EOF'
     ]
-}
-
-/// Returns all generated schemas (for backward compatibility)
-pub fn schemas() -> Vec<ResourceSchema> {
-    configs().into_iter().map(|c| c.schema).collect()
 }
 
 /// Get valid enum values for a given resource type and attribute name.

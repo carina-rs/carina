@@ -1154,7 +1154,6 @@ fn generate_mod_rs(dsl_names: &[&str]) -> String {
          //!\n\
          //! DO NOT EDIT MANUALLY - regenerate with:\n\
          //!   ./carina-provider-aws/scripts/generate-schemas-smithy.sh\n\n\
-         use carina_core::schema::ResourceSchema;\n\n\
          // Re-export all types and validators from types so that\n\
          // generated schema files can use `super::` to access them.\n\
          pub use super::types::*;\n\n",
@@ -1181,10 +1180,6 @@ fn generate_mod_rs(dsl_names: &[&str]) -> String {
     }
     code.push_str(
         "\x20   ]\n\
-         }\n\n\
-         /// Returns all generated schemas (for backward compatibility)\n\
-         pub fn schemas() -> Vec<ResourceSchema> {\n\
-         \x20   configs().into_iter().map(|c| c.schema).collect()\n\
          }\n\n",
     );
 

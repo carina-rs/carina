@@ -7,5 +7,5 @@ use carina_core::schema::ResourceSchema;
 
 /// Returns all AWS schemas
 pub fn all_schemas() -> Vec<ResourceSchema> {
-    generated::schemas()
+    generated::configs().into_iter().map(|c| c.schema).collect()
 }
