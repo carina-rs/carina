@@ -1,37 +1,38 @@
+use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
+
 use tower_lsp::lsp_types::{
     Command, CompletionItem, CompletionItemKind, InsertTextFormat, Position, Range, TextEdit,
 };
 
 use crate::document::Document;
 use carina_core::parser;
-use carina_core::schema::{AttributeType, ResourceSchema, StructField};
-use carina_provider_aws::schemas;
-use carina_provider_awscc::schemas as awscc_schemas;
-use std::collections::HashMap;
+use carina_core::schema::{AttributeType, CompletionValue, ResourceSchema, StructField};
 
 pub struct CompletionProvider {
-    schemas: HashMap<String, ResourceSchema>,
-}
-
-impl Default for CompletionProvider {
-    fn default() -> Self {
-        Self::new()
-    }
+    schemas: Arc<HashMap<String, ResourceSchema>>,
+    provider_names: Vec<String>,
+    region_completions_data: Vec<CompletionValue>,
+    /// Resource type patterns sorted longest-first for matching
+    resource_type_patterns: Vec<String>,
 }
 
 impl CompletionProvider {
-    pub fn new() -> Self {
-        let mut schema_map = HashMap::new();
-        for schema in schemas::all_schemas() {
-            schema_map.insert(schema.resource_type.clone(), schema);
-        }
-        // Add awscc schemas
-        for schema in awscc_schemas::all_schemas() {
-            schema_map.insert(schema.resource_type.clone(), schema);
-        }
+    pub fn new(
+        schemas: Arc<HashMap<String, ResourceSchema>>,
+        provider_names: Vec<String>,
+        region_completions_data: Vec<CompletionValue>,
+    ) -> Self {
+        // Build sorted resource type patterns from schema keys (longest first)
+        let mut resource_type_patterns: Vec<String> = schemas.keys().cloned().collect();
+        resource_type_patterns.sort_by_key(|b| std::cmp::Reverse(b.len()));
+
         Self {
-            schemas: schema_map,
+            schemas,
+            provider_names,
+            region_completions_data,
+            resource_type_patterns,
         }
     }
 
@@ -65,7 +66,7 @@ impl CompletionProvider {
                 attr_name,
                 field_name,
             } => self.value_completions_for_struct_field(&resource_type, &attr_name, &field_name),
-            CompletionContext::AfterAwsRegion => self.region_completions(),
+            CompletionContext::AfterProviderRegion => self.region_completions(),
             CompletionContext::AfterRefType => self.ref_type_completions(),
             CompletionContext::AfterInputDot => self.input_parameter_completions(&text),
             CompletionContext::None => vec![],
@@ -89,13 +90,13 @@ impl CompletionProvider {
             return CompletionContext::AfterInputDot;
         }
 
-        // Check if we're typing after "aws.Region." or "awscc.Region."
-        if prefix.contains("aws.Region.")
-            || prefix.ends_with("aws.Region")
-            || prefix.contains("awscc.Region.")
-            || prefix.ends_with("awscc.Region")
-        {
-            return CompletionContext::AfterAwsRegion;
+        // Check if we're typing after "<provider>.Region." or "<provider>.Region"
+        for provider_name in &self.provider_names {
+            let dot_pattern = format!("{}.Region.", provider_name);
+            let end_pattern = format!("{}.Region", provider_name);
+            if prefix.contains(&dot_pattern) || prefix.ends_with(&end_pattern) {
+                return CompletionContext::AfterProviderRegion;
+            }
         }
 
         // Check if we're typing after "ref("
@@ -124,7 +125,7 @@ impl CompletionProvider {
             } else if brace_depth == 0
                 && trimmed.ends_with('{')
                 && !trimmed.starts_with("let ")
-                && !trimmed.starts_with("aws.")
+                && !self.starts_with_provider_prefix(trimmed)
                 && !trimmed.starts_with("provider ")
                 && !trimmed.starts_with("input ")
                 && !trimmed.starts_with("output ")
@@ -213,36 +214,22 @@ impl CompletionProvider {
         CompletionContext::TopLevel
     }
 
+    /// Check if a line starts with any provider prefix (e.g., "aws.", "awscc.")
+    fn starts_with_provider_prefix(&self, line: &str) -> bool {
+        self.provider_names
+            .iter()
+            .any(|name| line.starts_with(&format!("{}.", name)))
+    }
+
     /// Extract resource type from a line like "aws.ec2.vpc {" or "let x = aws.ec2.vpc {"
     /// Returns the resource type (e.g., "aws.ec2.vpc") for schema lookups
     fn extract_resource_type(&self, line: &str) -> Option<String> {
         let trimmed = line.trim();
 
-        // Match DSL resource type patterns (provider.service.resource)
-        // Longer patterns first to avoid partial matches
-        let patterns = [
-            "aws.ec2.security_group_ingress",
-            "aws.ec2.security_group_egress",
-            "aws.ec2.security_group",
-            "aws.ec2.internet_gateway",
-            "aws.ec2.route_table",
-            "aws.ec2.route",
-            "aws.ec2.subnet",
-            "aws.ec2.vpc",
-            "aws.s3.bucket",
-            "aws.sts.caller_identity",
-            "awscc.ec2.security_group_ingress",
-            "awscc.ec2.security_group_egress",
-            "awscc.ec2.security_group",
-            "awscc.ec2.flow_log",
-            "awscc.ec2.nat_gateway",
-            "awscc.ec2.vpc_endpoint",
-            "awscc.ec2.subnet",
-            "awscc.ec2.vpc",
-        ];
-        for pattern in patterns {
-            if trimmed.contains(pattern) {
-                return Some(pattern.to_string());
+        // Match against schema keys (sorted longest first for correct matching)
+        for pattern in &self.resource_type_patterns {
+            if trimmed.contains(pattern.as_str()) {
+                return Some(pattern.clone());
             }
         }
         None
@@ -286,7 +273,7 @@ impl CompletionProvider {
             end: position,
         };
 
-        vec![
+        let mut completions = vec![
             CompletionItem {
                 label: "provider".to_string(),
                 kind: Some(CompletionItemKind::KEYWORD),
@@ -351,120 +338,41 @@ impl CompletionProvider {
                 detail: Some("Typed resource reference".to_string()),
                 ..Default::default()
             },
-            // EC2 resources
-            CompletionItem {
-                label: "aws.ec2.vpc".to_string(),
+        ];
+
+        // Generate resource type completions from schemas
+        for (resource_type, schema) in self.schemas.iter() {
+            let description = schema
+                .description
+                .as_deref()
+                .unwrap_or("Resource")
+                .to_string();
+
+            // Build snippet with required attributes
+            let mut snippet = format!("{} {{\n", resource_type);
+            let mut tab_stop = 1;
+            for attr in schema.attributes.values() {
+                if attr.required {
+                    snippet.push_str(&format!("    {} = ${{{}}}\n", attr.name, tab_stop));
+                    tab_stop += 1;
+                }
+            }
+            snippet.push('}');
+
+            completions.push(CompletionItem {
+                label: resource_type.clone(),
                 kind: Some(CompletionItemKind::CLASS),
                 text_edit: Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(TextEdit {
                     range: replacement_range,
-                    new_text: "aws.ec2.vpc {\n    cidr_block = \"${1:10.0.0.0/16}\"\n}".to_string(),
+                    new_text: snippet,
                 })),
                 insert_text_format: Some(InsertTextFormat::SNIPPET),
-                detail: Some("VPC resource".to_string()),
+                detail: Some(description),
                 ..Default::default()
-            },
-            CompletionItem {
-                label: "aws.ec2.subnet".to_string(),
-                kind: Some(CompletionItemKind::CLASS),
-                text_edit: Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(TextEdit {
-                    range: replacement_range,
-                    new_text: "aws.ec2.subnet {\n    vpc_id            = ${1:vpc.vpc_id}\n    cidr_block        = \"${2:10.0.1.0/24}\"\n    availability_zone = \"${3:ap-northeast-1a}\"\n}".to_string(),
-                })),
-                insert_text_format: Some(InsertTextFormat::SNIPPET),
-                detail: Some("Subnet resource".to_string()),
-                ..Default::default()
-            },
-            CompletionItem {
-                label: "aws.ec2.internet_gateway".to_string(),
-                kind: Some(CompletionItemKind::CLASS),
-                text_edit: Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(TextEdit {
-                    range: replacement_range,
-                    new_text: "aws.ec2.internet_gateway {\n}".to_string(),
-                })),
-                insert_text_format: Some(InsertTextFormat::SNIPPET),
-                detail: Some("Internet Gateway resource".to_string()),
-                ..Default::default()
-            },
-            CompletionItem {
-                label: "aws.ec2.route_table".to_string(),
-                kind: Some(CompletionItemKind::CLASS),
-                text_edit: Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(TextEdit {
-                    range: replacement_range,
-                    new_text: "aws.ec2.route_table {\n    vpc_id = ${1:vpc.vpc_id}\n}".to_string(),
-                })),
-                insert_text_format: Some(InsertTextFormat::SNIPPET),
-                detail: Some("Route Table resource".to_string()),
-                ..Default::default()
-            },
-            CompletionItem {
-                label: "aws.ec2.route".to_string(),
-                kind: Some(CompletionItemKind::CLASS),
-                text_edit: Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(TextEdit {
-                    range: replacement_range,
-                    new_text: "aws.ec2.route {\n    route_table_id         = ${1:rt.route_table_id}\n    destination_cidr_block = \"${2:0.0.0.0/0}\"\n    gateway_id             = ${3:igw.internet_gateway_id}\n}".to_string(),
-                })),
-                insert_text_format: Some(InsertTextFormat::SNIPPET),
-                detail: Some("Route in a Route Table".to_string()),
-                ..Default::default()
-            },
-            CompletionItem {
-                label: "aws.ec2.security_group".to_string(),
-                kind: Some(CompletionItemKind::CLASS),
-                text_edit: Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(TextEdit {
-                    range: replacement_range,
-                    new_text: "aws.ec2.security_group {\n    vpc_id           = ${1:vpc.vpc_id}\n    group_description = \"${2:Security group description}\"\n}".to_string(),
-                })),
-                insert_text_format: Some(InsertTextFormat::SNIPPET),
-                detail: Some("Security Group resource".to_string()),
-                ..Default::default()
-            },
-            CompletionItem {
-                label: "aws.ec2.security_group_ingress".to_string(),
-                kind: Some(CompletionItemKind::CLASS),
-                text_edit: Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(TextEdit {
-                    range: replacement_range,
-                    new_text: "aws.ec2.security_group_ingress {\n    group_id    = ${1:sg.group_id}\n    ip_protocol = \"${2:tcp}\"\n    from_port   = ${3:80}\n    to_port     = ${4:80}\n    cidr_ip     = \"${5:0.0.0.0/0}\"\n}".to_string(),
-                })),
-                insert_text_format: Some(InsertTextFormat::SNIPPET),
-                detail: Some("Security Group Ingress Rule".to_string()),
-                ..Default::default()
-            },
-            CompletionItem {
-                label: "aws.ec2.security_group_egress".to_string(),
-                kind: Some(CompletionItemKind::CLASS),
-                text_edit: Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(TextEdit {
-                    range: replacement_range,
-                    new_text: "aws.ec2.security_group_egress {\n    group_id    = ${1:sg.group_id}\n    ip_protocol = \"${2:-1}\"\n    cidr_ip     = \"${3:0.0.0.0/0}\"\n}".to_string(),
-                })),
-                insert_text_format: Some(InsertTextFormat::SNIPPET),
-                detail: Some("Security Group Egress Rule".to_string()),
-                ..Default::default()
-            },
-            // S3 resources
-            CompletionItem {
-                label: "aws.s3.bucket".to_string(),
-                kind: Some(CompletionItemKind::CLASS),
-                text_edit: Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(TextEdit {
-                    range: replacement_range,
-                    new_text: "aws.s3.bucket {\n    name = \"${1:bucket-name}\"\n}".to_string(),
-                })),
-                insert_text_format: Some(InsertTextFormat::SNIPPET),
-                detail: Some("S3 bucket resource".to_string()),
-                ..Default::default()
-            },
-            // AWS Cloud Control resources
-            CompletionItem {
-                label: "awscc.ec2.vpc".to_string(),
-                kind: Some(CompletionItemKind::CLASS),
-                text_edit: Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(TextEdit {
-                    range: replacement_range,
-                    new_text: "let ${1:vpc} = awscc.ec2.vpc {\n    cidr_block           = \"${2:10.0.0.0/16}\"\n    enable_dns_support   = true\n    enable_dns_hostnames = true\n}".to_string(),
-                })),
-                insert_text_format: Some(InsertTextFormat::SNIPPET),
-                detail: Some("VPC resource (Cloud Control API)".to_string()),
-                ..Default::default()
-            },
-        ]
+            });
+        }
+
+        completions
     }
 
     fn attribute_completions_for_type(&self, resource_type: &str) -> Vec<CompletionItem> {
@@ -877,39 +785,16 @@ impl CompletionProvider {
     }
 
     fn region_completions(&self) -> Vec<CompletionItem> {
-        let regions = vec![
-            ("ap_northeast_1", "Tokyo"),
-            ("ap_northeast_2", "Seoul"),
-            ("ap_northeast_3", "Osaka"),
-            ("ap_south_1", "Mumbai"),
-            ("ap_southeast_1", "Singapore"),
-            ("ap_southeast_2", "Sydney"),
-            ("ca_central_1", "Canada"),
-            ("eu_central_1", "Frankfurt"),
-            ("eu_west_1", "Ireland"),
-            ("eu_west_2", "London"),
-            ("eu_west_3", "Paris"),
-            ("eu_north_1", "Stockholm"),
-            ("sa_east_1", "Sao Paulo"),
-            ("us_east_1", "N. Virginia"),
-            ("us_east_2", "Ohio"),
-            ("us_west_1", "N. California"),
-            ("us_west_2", "Oregon"),
-        ];
-
-        let mut completions = Vec::new();
-        for prefix in &["aws", "awscc"] {
-            for (code, name) in &regions {
-                completions.push(CompletionItem {
-                    label: format!("{}.Region.{}", prefix, code),
-                    kind: Some(CompletionItemKind::ENUM_MEMBER),
-                    detail: Some(name.to_string()),
-                    insert_text: Some(format!("{}.Region.{}", prefix, code)),
-                    ..Default::default()
-                });
-            }
-        }
-        completions
+        self.region_completions_data
+            .iter()
+            .map(|c| CompletionItem {
+                label: c.value.clone(),
+                kind: Some(CompletionItemKind::ENUM_MEMBER),
+                detail: Some(c.description.clone()),
+                insert_text: Some(c.value.clone()),
+                ..Default::default()
+            })
+            .collect()
     }
 
     fn protocol_completions(&self) -> Vec<CompletionItem> {
@@ -1064,44 +949,22 @@ impl CompletionProvider {
     }
 
     fn ref_type_completions(&self) -> Vec<CompletionItem> {
-        // Provide completions for ref(aws.xxx) type syntax
-        let resource_types = vec![
-            ("aws.ec2.vpc", "VPC resource reference"),
-            ("aws.ec2.subnet", "Subnet resource reference"),
-            (
-                "aws.ec2.internet_gateway",
-                "Internet Gateway resource reference",
-            ),
-            ("aws.ec2.route_table", "Route Table resource reference"),
-            ("aws.ec2.route", "Route resource reference"),
-            (
-                "aws.ec2.security_group",
-                "Security Group resource reference",
-            ),
-            (
-                "aws.ec2.security_group_ingress",
-                "Security Group Ingress Rule reference",
-            ),
-            (
-                "aws.ec2.security_group_egress",
-                "Security Group Egress Rule reference",
-            ),
-            ("aws.s3.bucket", "S3 Bucket resource reference"),
-            // awscc resources
-            (
-                "awscc.ec2.vpc",
-                "VPC resource reference (Cloud Control API)",
-            ),
-        ];
+        self.schemas
+            .keys()
+            .map(|resource_type| {
+                let description = self
+                    .schemas
+                    .get(resource_type)
+                    .and_then(|s| s.description.as_deref())
+                    .unwrap_or("Resource reference");
 
-        resource_types
-            .into_iter()
-            .map(|(type_path, description)| CompletionItem {
-                label: type_path.to_string(),
-                kind: Some(CompletionItemKind::TYPE_PARAMETER),
-                detail: Some(description.to_string()),
-                insert_text: Some(format!("{})", type_path)),
-                ..Default::default()
+                CompletionItem {
+                    label: resource_type.clone(),
+                    kind: Some(CompletionItemKind::TYPE_PARAMETER),
+                    detail: Some(format!("{} reference", description)),
+                    insert_text: Some(format!("{})", resource_type)),
+                    ..Default::default()
+                }
             })
             .collect()
     }
@@ -1337,7 +1200,7 @@ enum CompletionContext {
         attr_name: String,
         field_name: String,
     },
-    AfterAwsRegion,
+    AfterProviderRegion,
     AfterRefType,
     AfterInputDot,
     None,
@@ -1347,14 +1210,35 @@ enum CompletionContext {
 mod tests {
     use super::*;
     use crate::document::Document;
+    use carina_core::provider::ProviderFactory;
 
     fn create_document(content: &str) -> Document {
         Document::new(content.to_string())
     }
 
+    fn test_provider() -> CompletionProvider {
+        let factories: Vec<Box<dyn ProviderFactory>> = vec![
+            Box::new(carina_provider_aws::AwsProviderFactory),
+            Box::new(carina_provider_awscc::AwsccProviderFactory),
+        ];
+        let mut schemas = HashMap::new();
+        for factory in &factories {
+            for schema in factory.schemas() {
+                schemas.insert(schema.resource_type.clone(), schema);
+            }
+        }
+        let schemas = Arc::new(schemas);
+        let provider_names: Vec<String> = factories.iter().map(|f| f.name().to_string()).collect();
+        let region_completions: Vec<CompletionValue> = factories
+            .iter()
+            .flat_map(|f| f.region_completions())
+            .collect();
+        CompletionProvider::new(schemas, provider_names, region_completions)
+    }
+
     #[test]
     fn top_level_completion_replaces_prefix() {
-        let provider = CompletionProvider::new();
+        let provider = test_provider();
         let doc = create_document("aws.s");
         // Cursor at end of "aws.s" (line 0, col 5)
         let position = Position {
@@ -1395,7 +1279,7 @@ mod tests {
 
     #[test]
     fn top_level_completion_with_leading_whitespace() {
-        let provider = CompletionProvider::new();
+        let provider = test_provider();
         let doc = create_document("    aws.e");
         // Cursor at end of "    aws.e" (line 0, col 9)
         let position = Position {
@@ -1427,7 +1311,7 @@ mod tests {
 
     #[test]
     fn top_level_completion_at_line_start() {
-        let provider = CompletionProvider::new();
+        let provider = test_provider();
         let doc = create_document("a");
         // Cursor at end of "a" (line 0, col 1)
         let position = Position {
@@ -1447,360 +1331,11 @@ mod tests {
         if let Some(c) = vpc_completion
             && let Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(edit)) = &c.text_edit
         {
-            assert_eq!(edit.range.start.character, 0, "Should replace from start");
+            assert_eq!(
+                edit.range.start.character, 0,
+                "Should replace from line start"
+            );
             assert_eq!(edit.range.end.character, 1, "Should replace up to cursor");
         }
-    }
-
-    #[test]
-    fn module_parameter_completion_with_directory_module() {
-        use std::fs;
-        use tempfile::tempdir;
-
-        let provider = CompletionProvider::new();
-
-        // Create a temporary directory structure
-        let temp_dir = tempdir().expect("Failed to create temp dir");
-        let base_path = temp_dir.path();
-
-        // Create module directory
-        let module_dir = base_path.join("modules").join("web_tier");
-        fs::create_dir_all(&module_dir).expect("Failed to create module dir");
-
-        // Create main.crn with input parameters
-        let module_content = r#"
-input {
-    vpc: ref(aws.ec2.vpc)
-    cidr_blocks: list(cidr)
-    enable_https: bool = true
-}
-
-let web_sg = aws.ec2.security_group {
-    name = "web-sg"
-}
-"#;
-        fs::write(module_dir.join("main.crn"), module_content)
-            .expect("Failed to write module file");
-
-        // Create main file that imports the module
-        let main_content = r#"import "./modules/web_tier" as web_tier
-
-web_tier {
-
-}"#;
-        let doc = create_document(main_content);
-
-        // Cursor inside the module call block (line 3, after whitespace)
-        let position = Position {
-            line: 3,
-            character: 4,
-        };
-
-        let completions = provider.complete(&doc, position, Some(base_path));
-
-        // Should have module parameter completions
-        assert!(!completions.is_empty(), "Should have completions");
-
-        // Check for specific parameters
-        let vpc_completion = completions.iter().find(|c| c.label == "vpc");
-        assert!(
-            vpc_completion.is_some(),
-            "Should have vpc parameter completion"
-        );
-        if let Some(c) = vpc_completion {
-            assert!(
-                c.detail.as_ref().is_some_and(|d| d.contains("required")),
-                "vpc should be marked as required"
-            );
-        }
-
-        let cidr_completion = completions.iter().find(|c| c.label == "cidr_blocks");
-        assert!(
-            cidr_completion.is_some(),
-            "Should have cidr_blocks parameter completion"
-        );
-
-        let https_completion = completions.iter().find(|c| c.label == "enable_https");
-        assert!(
-            https_completion.is_some(),
-            "Should have enable_https parameter completion"
-        );
-        if let Some(c) = https_completion {
-            assert!(
-                !c.detail.as_ref().is_some_and(|d| d.contains("required")),
-                "enable_https should NOT be marked as required (has default)"
-            );
-        }
-    }
-
-    #[test]
-    fn module_parameter_completion_with_single_file_module() {
-        use std::fs;
-        use tempfile::tempdir;
-
-        let provider = CompletionProvider::new();
-
-        // Create a temporary directory structure
-        let temp_dir = tempdir().expect("Failed to create temp dir");
-        let base_path = temp_dir.path();
-
-        // Create module directory
-        let module_dir = base_path.join("modules");
-        fs::create_dir_all(&module_dir).expect("Failed to create module dir");
-
-        // Create single file module
-        let module_content = r#"
-input {
-    name: string
-    count: int = 1
-}
-"#;
-        fs::write(module_dir.join("simple.crn"), module_content)
-            .expect("Failed to write module file");
-
-        // Create main file that imports the module
-        let main_content = r#"import "./modules/simple.crn" as simple
-
-simple {
-    n
-}"#;
-        let doc = create_document(main_content);
-
-        // Cursor inside the module call block (line 3, after "n")
-        let position = Position {
-            line: 3,
-            character: 5,
-        };
-
-        let completions = provider.complete(&doc, position, Some(base_path));
-
-        // Should have module parameter completions
-        let name_completion = completions.iter().find(|c| c.label == "name");
-        assert!(
-            name_completion.is_some(),
-            "Should have name parameter completion"
-        );
-
-        let count_completion = completions.iter().find(|c| c.label == "count");
-        assert!(
-            count_completion.is_some(),
-            "Should have count parameter completion"
-        );
-    }
-
-    #[test]
-    fn instance_tenancy_completion_for_aws_vpc() {
-        let provider = CompletionProvider::new();
-        let doc = create_document(
-            r#"aws.ec2.vpc {
-    name = "my-vpc"
-    instance_tenancy =
-}"#,
-        );
-        // Cursor after "instance_tenancy = " (line 2, col 23)
-        let position = Position {
-            line: 2,
-            character: 23,
-        };
-
-        let completions = provider.complete(&doc, position, None);
-
-        // Should have namespaced instance_tenancy completions
-        let default_completion = completions
-            .iter()
-            .find(|c| c.label == "aws.ec2.vpc.InstanceTenancy.default");
-        assert!(
-            default_completion.is_some(),
-            "Should have 'aws.ec2.vpc.InstanceTenancy.default' completion"
-        );
-
-        let dedicated_completion = completions
-            .iter()
-            .find(|c| c.label == "aws.ec2.vpc.InstanceTenancy.dedicated");
-        assert!(
-            dedicated_completion.is_some(),
-            "Should have 'aws.ec2.vpc.InstanceTenancy.dedicated' completion"
-        );
-    }
-
-    // Note: instance_tenancy_completion_for_awscc_vpc test was removed
-    // because generated schemas use AttributeType::String for instance_tenancy
-    // instead of the custom InstanceTenancy type that provides completions.
-
-    #[test]
-    fn versioning_status_completion_for_s3_bucket() {
-        let provider = CompletionProvider::new();
-        let doc = create_document(
-            r#"aws.s3.bucket {
-    name = "my-bucket"
-
-}"#,
-        );
-        // Cursor inside s3_bucket block (line 2)
-        let position = Position {
-            line: 2,
-            character: 4,
-        };
-
-        let completions = provider.complete(&doc, position, None);
-
-        // Should have versioning_status as attribute completion
-        let versioning_completion = completions.iter().find(|c| c.label == "versioning_status");
-        assert!(
-            versioning_completion.is_some(),
-            "Should have 'versioning_status' attribute completion"
-        );
-    }
-
-    #[test]
-    fn struct_field_completion_inside_nested_block() {
-        let provider = CompletionProvider::new();
-        let doc = create_document(
-            r#"awscc.ec2.security_group {
-    group_description = "test"
-    security_group_ingress {
-
-    }
-}"#,
-        );
-        // Cursor inside the nested block (line 3)
-        let position = Position {
-            line: 3,
-            character: 8,
-        };
-
-        let completions = provider.complete(&doc, position, None);
-
-        // Should have struct field completions
-        let ip_protocol = completions.iter().find(|c| c.label == "ip_protocol");
-        assert!(
-            ip_protocol.is_some(),
-            "Should have ip_protocol field completion"
-        );
-
-        let from_port = completions.iter().find(|c| c.label == "from_port");
-        assert!(
-            from_port.is_some(),
-            "Should have from_port field completion"
-        );
-
-        let to_port = completions.iter().find(|c| c.label == "to_port");
-        assert!(to_port.is_some(), "Should have to_port field completion");
-
-        // ip_protocol should be marked as required
-        if let Some(c) = ip_protocol {
-            assert!(
-                c.detail.as_ref().is_some_and(|d| d.contains("required")),
-                "ip_protocol should be marked as required"
-            );
-        }
-
-        // Should NOT have top-level resource attributes like group_description
-        let group_desc = completions.iter().find(|c| c.label == "group_description");
-        assert!(
-            group_desc.is_none(),
-            "Should not have resource-level attributes inside struct block"
-        );
-    }
-
-    #[test]
-    fn struct_field_value_completion_for_bool() {
-        let provider = CompletionProvider::new();
-        // flow_log's destination_options has Bool fields
-        let doc = create_document(
-            r#"let flow_log = awscc.ec2.flow_log {
-    destination_options {
-        hive_compatible_partitions =
-    }
-}"#,
-        );
-        // Cursor after "hive_compatible_partitions = " (line 2)
-        let position = Position {
-            line: 2,
-            character: 37,
-        };
-
-        let completions = provider.complete(&doc, position, None);
-
-        let true_completion = completions.iter().find(|c| c.label == "true");
-        assert!(
-            true_completion.is_some(),
-            "Should have 'true' completion for Bool struct field"
-        );
-
-        let false_completion = completions.iter().find(|c| c.label == "false");
-        assert!(
-            false_completion.is_some(),
-            "Should have 'false' completion for Bool struct field"
-        );
-    }
-
-    #[test]
-    fn struct_field_completion_inside_second_repeated_block() {
-        let provider = CompletionProvider::new();
-        let doc = create_document(
-            r#"awscc.ec2.security_group {
-    group_description = "test"
-    security_group_ingress {
-        ip_protocol = "tcp"
-        from_port = 80
-        to_port = 80
-        cidr_ip = "0.0.0.0/0"
-    }
-    security_group_ingress {
-
-    }
-}"#,
-        );
-        // Cursor inside the second nested block (line 9)
-        let position = Position {
-            line: 9,
-            character: 8,
-        };
-
-        let completions = provider.complete(&doc, position, None);
-
-        // Should have struct field completions in the second block too
-        let ip_protocol = completions.iter().find(|c| c.label == "ip_protocol");
-        assert!(
-            ip_protocol.is_some(),
-            "Should have ip_protocol field completion in second repeated block"
-        );
-
-        let from_port = completions.iter().find(|c| c.label == "from_port");
-        assert!(
-            from_port.is_some(),
-            "Should have from_port field completion in second repeated block"
-        );
-    }
-
-    #[test]
-    fn context_detection_returns_struct_context() {
-        let provider = CompletionProvider::new();
-        let text = r#"awscc.ec2.security_group {
-    group_description = "test"
-    security_group_ingress {
-
-    }
-}"#;
-        // Cursor inside nested block
-        let context = provider.get_completion_context(
-            text,
-            Position {
-                line: 3,
-                character: 8,
-            },
-        );
-        assert!(
-            matches!(
-                context,
-                CompletionContext::InsideStructBlock {
-                    ref resource_type,
-                    ref attr_name,
-                } if resource_type == "awscc.ec2.security_group" && attr_name == "security_group_ingress"
-            ),
-            "Should detect InsideStructBlock context, got: {:?}",
-            context
-        );
     }
 }

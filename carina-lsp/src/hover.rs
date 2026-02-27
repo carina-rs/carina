@@ -1,20 +1,25 @@
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use tower_lsp::lsp_types::{Hover, HoverContents, MarkupContent, MarkupKind, Position};
 
 use crate::document::Document;
-use carina_core::schema::ResourceSchema;
-use carina_provider_aws::schemas::generated as aws_generated;
+use carina_core::schema::{CompletionValue, ResourceSchema};
 
-pub struct HoverProvider;
-
-impl Default for HoverProvider {
-    fn default() -> Self {
-        Self::new()
-    }
+pub struct HoverProvider {
+    schemas: Arc<HashMap<String, ResourceSchema>>,
+    region_completions: Vec<CompletionValue>,
 }
 
 impl HoverProvider {
-    pub fn new() -> Self {
-        Self
+    pub fn new(
+        schemas: Arc<HashMap<String, ResourceSchema>>,
+        region_completions: Vec<CompletionValue>,
+    ) -> Self {
+        Self {
+            schemas,
+            region_completions,
+        }
     }
 
     pub fn hover(&self, doc: &Document, position: Position) -> Option<Hover> {
@@ -53,7 +58,7 @@ impl HoverProvider {
 
         // Look backwards to find if we're in a module call block
         // Module calls look like: module_name { ... }
-        // They don't start with "let" or "aws."
+        // They don't start with "let" or a provider prefix
         let mut brace_depth = 0;
 
         for line_idx in (0..=current_line).rev() {
@@ -69,9 +74,19 @@ impl HoverProvider {
                         brace_depth -= 1;
                     } else {
                         // Found opening brace, check if it's a module call
-                        // Module calls: identifier { (not "let x = ..." or "aws.x.y {")
+                        // Module calls: identifier { (not "let x = ..." or "provider." prefix)
+                        // Check if any provider name prefix matches
+                        let provider_prefixes: Vec<&str> = self
+                            .schemas
+                            .keys()
+                            .filter_map(|k| k.split('.').next())
+                            .collect();
+                        let starts_with_provider = provider_prefixes
+                            .iter()
+                            .any(|p| trimmed.starts_with(&format!("{}.", p)));
+
                         if !trimmed.starts_with("let ")
-                            && !trimmed.starts_with("aws.")
+                            && !starts_with_provider
                             && !trimmed.starts_with("provider ")
                             && !trimmed.starts_with("input ")
                             && !trimmed.starts_with("output ")
@@ -89,66 +104,18 @@ impl HoverProvider {
     }
 
     fn resource_type_hover(&self, word: &str) -> Option<Hover> {
-        // S3 resources
-        if word == "aws.s3.bucket" || word.contains("s3.bucket") {
-            return self.schema_hover(
-                "aws.s3.bucket",
-                &aws_generated::s3_bucket::s3_bucket_config().schema,
-            );
+        // Check against all schema keys
+        for (resource_type, schema) in self.schemas.iter() {
+            if word == resource_type || word.contains(resource_type.as_str()) {
+                // Avoid matching substrings like "vpc_id" for "vpc"
+                if word.contains(&format!("{}_", resource_type))
+                    || word.contains(&format!("_{}", resource_type))
+                {
+                    continue;
+                }
+                return self.schema_hover(resource_type, schema);
+            }
         }
-
-        // EC2/VPC resources
-        if word == "aws.ec2.vpc" || word.contains("ec2.vpc") && !word.contains("vpc_id") {
-            return self.schema_hover(
-                "aws.ec2.vpc",
-                &aws_generated::ec2_vpc::ec2_vpc_config().schema,
-            );
-        }
-
-        if word == "aws.ec2.subnet" || word.contains("ec2.subnet") && !word.contains("subnet_id") {
-            return self.schema_hover(
-                "aws.ec2.subnet",
-                &aws_generated::ec2_subnet::ec2_subnet_config().schema,
-            );
-        }
-
-        if word == "aws.ec2.internet_gateway" || word.contains("ec2.internet_gateway") {
-            return self.schema_hover(
-                "aws.ec2.internet_gateway",
-                &aws_generated::ec2_internet_gateway::ec2_internet_gateway_config().schema,
-            );
-        }
-
-        if word == "aws.ec2.route_table" || word.contains("ec2.route_table") {
-            return self.schema_hover(
-                "aws.ec2.route_table",
-                &aws_generated::ec2_route_table::ec2_route_table_config().schema,
-            );
-        }
-
-        if word == "aws.ec2.security_group_ingress" || word.contains("ec2.security_group_ingress") {
-            return self.schema_hover(
-                "aws.ec2.security_group_ingress",
-                &aws_generated::ec2_security_group_ingress::ec2_security_group_ingress_config()
-                    .schema,
-            );
-        }
-
-        if word == "aws.ec2.security_group_egress" || word.contains("ec2.security_group_egress") {
-            return self.schema_hover(
-                "aws.ec2.security_group_egress",
-                &aws_generated::ec2_security_group_egress::ec2_security_group_egress_config()
-                    .schema,
-            );
-        }
-
-        if word == "aws.ec2.security_group" || word.contains("ec2.security_group") {
-            return self.schema_hover(
-                "aws.ec2.security_group",
-                &aws_generated::ec2_security_group::ec2_security_group_config().schema,
-            );
-        }
-
         None
     }
 
@@ -180,18 +147,7 @@ impl HoverProvider {
 
     fn attribute_hover(&self, word: &str) -> Option<Hover> {
         // Check all schemas for the attribute
-        let schemas = vec![
-            aws_generated::s3_bucket::s3_bucket_config().schema,
-            aws_generated::ec2_vpc::ec2_vpc_config().schema,
-            aws_generated::ec2_subnet::ec2_subnet_config().schema,
-            aws_generated::ec2_internet_gateway::ec2_internet_gateway_config().schema,
-            aws_generated::ec2_route_table::ec2_route_table_config().schema,
-            aws_generated::ec2_security_group::ec2_security_group_config().schema,
-            aws_generated::ec2_security_group_ingress::ec2_security_group_ingress_config().schema,
-            aws_generated::ec2_security_group_egress::ec2_security_group_egress_config().schema,
-        ];
-
-        for schema in schemas {
+        for schema in self.schemas.values() {
             if let Some(attr) = schema.attributes.get(word) {
                 let description = attr.description.as_deref().unwrap_or("No description");
                 let required = if attr.required {
@@ -246,35 +202,32 @@ impl HoverProvider {
             return None;
         }
 
-        let regions = vec![
-            ("ap_northeast_1", "Asia Pacific (Tokyo)", "ap-northeast-1"),
-            ("ap_northeast_2", "Asia Pacific (Seoul)", "ap-northeast-2"),
-            ("ap_northeast_3", "Asia Pacific (Osaka)", "ap-northeast-3"),
-            ("ap_south_1", "Asia Pacific (Mumbai)", "ap-south-1"),
-            (
-                "ap_southeast_1",
-                "Asia Pacific (Singapore)",
-                "ap-southeast-1",
-            ),
-            ("ap_southeast_2", "Asia Pacific (Sydney)", "ap-southeast-2"),
-            ("ca_central_1", "Canada (Central)", "ca-central-1"),
-            ("eu_central_1", "Europe (Frankfurt)", "eu-central-1"),
-            ("eu_west_1", "Europe (Ireland)", "eu-west-1"),
-            ("eu_west_2", "Europe (London)", "eu-west-2"),
-            ("eu_west_3", "Europe (Paris)", "eu-west-3"),
-            ("eu_north_1", "Europe (Stockholm)", "eu-north-1"),
-            ("sa_east_1", "South America (Sao Paulo)", "sa-east-1"),
-            ("us_east_1", "US East (N. Virginia)", "us-east-1"),
-            ("us_east_2", "US East (Ohio)", "us-east-2"),
-            ("us_west_1", "US West (N. California)", "us-west-1"),
-            ("us_west_2", "US West (Oregon)", "us-west-2"),
-        ];
+        // Find matching region from completions data
+        for completion in &self.region_completions {
+            // Extract region code from value like "aws.Region.ap_northeast_1"
+            if let Some(code) = completion.value.split('.').next_back()
+                && word.contains(code)
+            {
+                // Derive AWS format from underscore format
+                let aws_code = code.replace('_', "-");
 
-        for (code, name, aws_code) in regions {
-            if word.contains(code) {
+                // Collect all provider prefixes that have this region
+                let prefixes: Vec<&str> = self
+                    .region_completions
+                    .iter()
+                    .filter(|c| c.value.ends_with(code))
+                    .filter_map(|c| c.value.strip_suffix(&format!(".Region.{}", code)))
+                    .collect();
+
+                let dsl_formats = prefixes
+                    .iter()
+                    .map(|p| format!("`{}.Region.{}`", p, code))
+                    .collect::<Vec<_>>()
+                    .join(" / ");
+
                 let content = format!(
-                    "## AWS Region\n\n**{}**\n\n- DSL format: `aws.Region.{}` / `awscc.Region.{}`\n- AWS format: `{}`",
-                    name, code, code, aws_code
+                    "## AWS Region\n\n**{}**\n\n- DSL format: {}\n- AWS format: `{}`",
+                    completion.description, dsl_formats, aws_code
                 );
 
                 return Some(Hover {

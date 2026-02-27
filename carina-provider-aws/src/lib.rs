@@ -73,6 +73,37 @@ impl ProviderFactory for AwsProviderFactory {
     fn identity_attributes(&self) -> Vec<&str> {
         vec!["region"]
     }
+
+    fn region_completions(&self) -> Vec<carina_core::schema::CompletionValue> {
+        aws_region_completions("aws")
+    }
+}
+
+fn aws_region_completions(prefix: &str) -> Vec<carina_core::schema::CompletionValue> {
+    use carina_core::schema::CompletionValue;
+    let regions = [
+        ("ap_northeast_1", "Asia Pacific (Tokyo)"),
+        ("ap_northeast_2", "Asia Pacific (Seoul)"),
+        ("ap_northeast_3", "Asia Pacific (Osaka)"),
+        ("ap_south_1", "Asia Pacific (Mumbai)"),
+        ("ap_southeast_1", "Asia Pacific (Singapore)"),
+        ("ap_southeast_2", "Asia Pacific (Sydney)"),
+        ("ca_central_1", "Canada (Central)"),
+        ("eu_central_1", "Europe (Frankfurt)"),
+        ("eu_west_1", "Europe (Ireland)"),
+        ("eu_west_2", "Europe (London)"),
+        ("eu_west_3", "Europe (Paris)"),
+        ("eu_north_1", "Europe (Stockholm)"),
+        ("sa_east_1", "South America (Sao Paulo)"),
+        ("us_east_1", "US East (N. Virginia)"),
+        ("us_east_2", "US East (Ohio)"),
+        ("us_west_1", "US West (N. California)"),
+        ("us_west_2", "US West (Oregon)"),
+    ];
+    regions
+        .iter()
+        .map(|(code, name)| CompletionValue::new(format!("{}.Region.{}", prefix, code), *name))
+        .collect()
 }
 
 /// AWS Provider

@@ -198,6 +198,13 @@ pub trait ProviderFactory: Send + Sync {
     fn identity_attributes(&self) -> Vec<&str> {
         vec![]
     }
+
+    /// Region completions for this provider.
+    /// Returns a list of `CompletionValue` with DSL-format region values
+    /// (e.g., "aws.Region.ap_northeast_1") and display names.
+    fn region_completions(&self) -> Vec<crate::schema::CompletionValue> {
+        vec![]
+    }
 }
 
 /// Provider implementation for Box<dyn Provider>

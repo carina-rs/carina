@@ -1,57 +1,31 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::Arc;
+
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
 
 use crate::document::Document;
 use carina_core::parser::{InputParameter, ParseError, ParsedFile, TypeExpr};
+use carina_core::provider::ProviderFactory;
 use carina_core::resource::Value;
-use carina_core::schema::{validate_ipv4_cidr, validate_ipv6_cidr};
-use carina_provider_aws::schemas::{generated as aws_generated, types as aws_types};
-use carina_provider_awscc::schemas::awscc_types;
-use carina_provider_awscc::schemas::generated::ec2_flow_log as awscc_flow_log;
-use carina_provider_awscc::schemas::generated::ec2_nat_gateway as awscc_nat_gateway;
-use carina_provider_awscc::schemas::generated::ec2_security_group as awscc_security_group;
-use carina_provider_awscc::schemas::generated::ec2_subnet as awscc_subnet;
-use carina_provider_awscc::schemas::generated::ec2_vpc as awscc_vpc;
-use carina_provider_awscc::schemas::generated::ec2_vpc_endpoint as awscc_vpc_endpoint;
-use carina_provider_awscc::schemas::generated::validate_arn;
+use carina_core::schema::{ResourceSchema, validate_ipv4_cidr};
 
 pub struct DiagnosticEngine {
-    valid_resource_types: HashSet<String>,
-}
-
-impl Default for DiagnosticEngine {
-    fn default() -> Self {
-        Self::new()
-    }
+    schemas: Arc<HashMap<String, ResourceSchema>>,
+    provider_names: Vec<String>,
+    factories: Arc<Vec<Box<dyn ProviderFactory>>>,
 }
 
 impl DiagnosticEngine {
-    pub fn new() -> Self {
-        let mut valid_resource_types = HashSet::new();
-
-        // AWS resources
-        valid_resource_types.insert("aws.ec2.vpc".to_string());
-        valid_resource_types.insert("aws.ec2.subnet".to_string());
-        valid_resource_types.insert("aws.ec2.internet_gateway".to_string());
-        valid_resource_types.insert("aws.ec2.route_table".to_string());
-        valid_resource_types.insert("aws.ec2.route".to_string());
-        valid_resource_types.insert("aws.ec2.security_group".to_string());
-        valid_resource_types.insert("aws.ec2.security_group_ingress".to_string());
-        valid_resource_types.insert("aws.ec2.security_group_egress".to_string());
-        valid_resource_types.insert("aws.s3.bucket".to_string());
-        valid_resource_types.insert("aws.sts.caller_identity".to_string());
-
-        // AWS Cloud Control resources
-        valid_resource_types.insert("awscc.ec2.vpc".to_string());
-        valid_resource_types.insert("awscc.ec2.security_group".to_string());
-        valid_resource_types.insert("awscc.ec2.flow_log".to_string());
-        valid_resource_types.insert("awscc.ec2.nat_gateway".to_string());
-        valid_resource_types.insert("awscc.ec2.vpc_endpoint".to_string());
-        valid_resource_types.insert("awscc.ec2.subnet".to_string());
-
+    pub fn new(
+        schemas: Arc<HashMap<String, ResourceSchema>>,
+        provider_names: Vec<String>,
+        factories: Arc<Vec<Box<dyn ProviderFactory>>>,
+    ) -> Self {
         Self {
-            valid_resource_types,
+            schemas,
+            provider_names,
+            factories,
         }
     }
 
@@ -80,14 +54,13 @@ impl DiagnosticEngine {
                 diagnostics.extend(self.check_module_calls(doc, parsed, base));
             }
             // Build binding_name -> (provider, resource_type) map for ResourceRef type checking
-            let mut binding_schema_map: HashMap<String, carina_core::schema::ResourceSchema> =
-                HashMap::new();
+            let mut binding_schema_map: HashMap<String, ResourceSchema> = HashMap::new();
             for res in &parsed.resources {
                 if let Some(Value::String(binding_name)) = res.attributes.get("_binding") {
                     let provider =
                         self.detect_resource_provider(doc, &res.id.resource_type, &res.id.name);
                     let full_type = format!("{}.{}", provider, res.id.resource_type);
-                    if let Some(s) = self.get_schema_for_type(&full_type) {
+                    if let Some(s) = self.schemas.get(&full_type).cloned() {
                         binding_schema_map.insert(binding_name.clone(), s);
                     }
                 }
@@ -95,7 +68,7 @@ impl DiagnosticEngine {
 
             // Check resource types
             for resource in &parsed.resources {
-                // Detect the provider from the DSL (aws. or awscc.)
+                // Detect the provider (aws or awscc) for a resource by looking at the DSL
                 let provider = self.detect_resource_provider(
                     doc,
                     &resource.id.resource_type,
@@ -103,7 +76,7 @@ impl DiagnosticEngine {
                 );
                 let full_resource_type = format!("{}.{}", provider, resource.id.resource_type);
 
-                if !self.valid_resource_types.contains(&full_resource_type) {
+                if !self.schemas.contains_key(&full_resource_type) {
                     // Find the line where this resource is defined
                     if let Some((line, col)) =
                         self.find_resource_position(doc, &resource.id.resource_type)
@@ -134,7 +107,7 @@ impl DiagnosticEngine {
                 }
 
                 // Semantic validation using schema
-                let schema = self.get_schema_for_type(&full_resource_type);
+                let schema = self.schemas.get(&full_resource_type).cloned();
                 if let Some(schema) = &schema {
                     // Check data source without `read` keyword
                     if schema.data_source
@@ -345,7 +318,7 @@ impl DiagnosticEngine {
                                         None
                                     }
                                 }
-                                // Custom type validation (VersioningStatus, InstanceTenancy, Cidr, Region, etc.)
+                                // Custom type validation (all Custom types use their validate fn)
                                 (
                                     carina_core::schema::AttributeType::Custom {
                                         name,
@@ -380,32 +353,8 @@ impl DiagnosticEngine {
                                         _ => value.clone(),
                                     };
 
-                                    if name == "Cidr" || name == "Ipv4Cidr" {
-                                        if let Value::String(s) = &resolved_value {
-                                            validate_ipv4_cidr(s).err()
-                                        } else {
-                                            None
-                                        }
-                                    } else if name == "Ipv6Cidr" {
-                                        if let Value::String(s) = &resolved_value {
-                                            validate_ipv6_cidr(s).err()
-                                        } else {
-                                            None
-                                        }
-                                    } else if name == "Arn" {
-                                        if let Value::String(s) = &resolved_value {
-                                            validate_arn(s)
-                                                .map_err(|reason| {
-                                                    format!("Invalid ARN '{}': {}", s, reason)
-                                                })
-                                                .err()
-                                        } else {
-                                            None
-                                        }
-                                    } else {
-                                        // Use schema's validate function for other Custom types
-                                        validate(&resolved_value).err().map(|e| e.to_string())
-                                    }
+                                    // Use schema's validate function for all Custom types
+                                    validate(&resolved_value).err().map(|e| e.to_string())
                                 }
                                 // String type - check for bare resource binding
                                 (carina_core::schema::AttributeType::String, Value::String(s)) => {
@@ -519,58 +468,12 @@ impl DiagnosticEngine {
         diagnostics
     }
 
-    fn get_schema_for_type(
-        &self,
-        resource_type: &str,
-    ) -> Option<carina_core::schema::ResourceSchema> {
-        match resource_type {
-            // AWS resources (auto-generated)
-            "aws.ec2.vpc" => Some(aws_generated::ec2_vpc::ec2_vpc_config().schema),
-            "aws.ec2.subnet" => Some(aws_generated::ec2_subnet::ec2_subnet_config().schema),
-            "aws.ec2.internet_gateway" => {
-                Some(aws_generated::ec2_internet_gateway::ec2_internet_gateway_config().schema)
-            }
-            "aws.ec2.route_table" => {
-                Some(aws_generated::ec2_route_table::ec2_route_table_config().schema)
-            }
-            "aws.ec2.route" => Some(aws_generated::ec2_route::ec2_route_config().schema),
-            "aws.ec2.security_group" => {
-                Some(aws_generated::ec2_security_group::ec2_security_group_config().schema)
-            }
-            "aws.ec2.security_group_ingress" => Some(
-                aws_generated::ec2_security_group_ingress::ec2_security_group_ingress_config()
-                    .schema,
-            ),
-            "aws.ec2.security_group_egress" => Some(
-                aws_generated::ec2_security_group_egress::ec2_security_group_egress_config().schema,
-            ),
-            "aws.s3.bucket" => Some(aws_generated::s3_bucket::s3_bucket_config().schema),
-            "aws.sts.caller_identity" => {
-                Some(aws_generated::sts_caller_identity::sts_caller_identity_config().schema)
-            }
-            // AWS Cloud Control resources
-            "awscc.ec2.vpc" => Some(awscc_vpc::ec2_vpc_config().schema),
-            "awscc.ec2.security_group" => {
-                Some(awscc_security_group::ec2_security_group_config().schema)
-            }
-            "awscc.ec2.flow_log" => Some(awscc_flow_log::ec2_flow_log_config().schema),
-            "awscc.ec2.nat_gateway" => Some(awscc_nat_gateway::ec2_nat_gateway_config().schema),
-            "awscc.ec2.vpc_endpoint" => Some(awscc_vpc_endpoint::ec2_vpc_endpoint_config().schema),
-            "awscc.ec2.subnet" => Some(awscc_subnet::ec2_subnet_config().schema),
-            _ => None,
-        }
-    }
-
     fn find_resource_position(&self, doc: &Document, resource_type: &str) -> Option<(u32, u32)> {
         let text = doc.text();
-        // Try both provider prefixes to find the resource in DSL text
-        let patterns = [
-            format!("aws.{}", resource_type),
-            format!("awscc.{}", resource_type),
-        ];
 
         for (line_idx, line) in text.lines().enumerate() {
-            for pattern in &patterns {
+            for provider_name in &self.provider_names {
+                let pattern = format!("{}.{}", provider_name, resource_type);
                 if let Some(col) = line.find(pattern.as_str()) {
                     return Some((line_idx as u32, col as u32));
                 }
@@ -769,7 +672,7 @@ impl DiagnosticEngine {
         &self,
         doc: &Document,
         resource_attrs: &std::collections::HashMap<String, Value>,
-        schema: &carina_core::schema::ResourceSchema,
+        schema: &ResourceSchema,
     ) -> Vec<Diagnostic> {
         use carina_core::schema::AttributeType;
 
@@ -880,17 +783,15 @@ impl DiagnosticEngine {
         positions
     }
 
-    /// Check provider region attribute
+    /// Check provider region attribute using factory validate_config
     fn check_provider_region(&self, doc: &Document, parsed: &ParsedFile) -> Vec<Diagnostic> {
         let mut diagnostics = Vec::new();
-        let aws_region_type = aws_types::aws_region();
-        let awscc_region_type = awscc_types::awscc_region();
 
         for provider in &parsed.providers {
-            if provider.name == "aws"
-                && let Some(region_value) = provider.attributes.get("region")
-                && let Err(e) = aws_region_type.validate(region_value)
-                && let Some((line, col)) = self.find_provider_region_position(doc, "aws")
+            // Find the matching factory for this provider
+            if let Some(factory) = self.factories.iter().find(|f| f.name() == provider.name)
+                && let Err(e) = factory.validate_config(&provider.attributes)
+                && let Some((line, col)) = self.find_provider_region_position(doc, &provider.name)
             {
                 diagnostics.push(Diagnostic {
                     range: Range {
@@ -905,29 +806,7 @@ impl DiagnosticEngine {
                     },
                     severity: Some(DiagnosticSeverity::WARNING),
                     source: Some("carina".to_string()),
-                    message: format!("provider aws: {}", e),
-                    ..Default::default()
-                });
-            }
-            if provider.name == "awscc"
-                && let Some(region_value) = provider.attributes.get("region")
-                && let Err(e) = awscc_region_type.validate(region_value)
-                && let Some((line, col)) = self.find_provider_region_position(doc, "awscc")
-            {
-                diagnostics.push(Diagnostic {
-                    range: Range {
-                        start: Position {
-                            line,
-                            character: col,
-                        },
-                        end: Position {
-                            line,
-                            character: col + 6, // "region"
-                        },
-                    },
-                    severity: Some(DiagnosticSeverity::WARNING),
-                    source: Some("carina".to_string()),
-                    message: format!("provider awscc: {}", e),
+                    message: format!("provider {}: {}", provider.name, e),
                     ..Default::default()
                 });
             }
@@ -935,7 +814,7 @@ impl DiagnosticEngine {
         diagnostics
     }
 
-    /// Detect the provider (aws or awscc) for a resource by looking at the DSL
+    /// Detect the provider for a resource by looking at the DSL text
     fn detect_resource_provider(
         &self,
         doc: &Document,
@@ -943,53 +822,66 @@ impl DiagnosticEngine {
         resource_name: &str,
     ) -> String {
         let text = doc.text();
-        // Look for patterns like "awscc.ec2.vpc {" or "let x = awscc.ec2.vpc {"
-        let awscc_pattern = format!("awscc.{}", resource_type);
 
-        for line in text.lines() {
-            let trimmed = line.trim();
-            // Check if this line defines the resource with awscc provider
-            if trimmed.contains(&awscc_pattern) {
-                // Verify it's the right resource by checking the name attribute
-                // For now, just check if awscc pattern exists
-                return "awscc".to_string();
+        // Check provider names in reverse length order (longest first)
+        // to match "awscc" before "aws"
+        let mut sorted_names = self.provider_names.clone();
+        sorted_names.sort_by_key(|b| std::cmp::Reverse(b.len()));
+
+        // First pass: check for non-default provider patterns
+        let default_provider = self.provider_names.first().cloned().unwrap_or_default();
+        for provider_name in &sorted_names {
+            if *provider_name == default_provider {
+                continue;
+            }
+            let pattern = format!("{}.{}", provider_name, resource_type);
+            for line in text.lines() {
+                let trimmed = line.trim();
+                if trimmed.contains(&pattern) {
+                    return provider_name.clone();
+                }
             }
         }
 
         // Also check for the name attribute to be more precise
-        let mut in_awscc_block = false;
-        let mut brace_depth = 0;
-
-        for line in text.lines() {
-            let trimmed = line.trim();
-
-            if trimmed.contains(&awscc_pattern) && trimmed.contains('{') {
-                in_awscc_block = true;
-                brace_depth = 1;
+        for provider_name in &sorted_names {
+            if *provider_name == default_provider {
                 continue;
             }
+            let pattern = format!("{}.{}", provider_name, resource_type);
+            let mut in_block = false;
+            let mut brace_depth = 0;
 
-            if in_awscc_block {
-                for ch in trimmed.chars() {
-                    if ch == '{' {
-                        brace_depth += 1;
-                    } else if ch == '}' {
-                        brace_depth -= 1;
+            for line in text.lines() {
+                let trimmed = line.trim();
+
+                if trimmed.contains(&pattern) && trimmed.contains('{') {
+                    in_block = true;
+                    brace_depth = 1;
+                    continue;
+                }
+
+                if in_block {
+                    for ch in trimmed.chars() {
+                        if ch == '{' {
+                            brace_depth += 1;
+                        } else if ch == '}' {
+                            brace_depth -= 1;
+                        }
                     }
-                }
 
-                // Check if this block has the matching name
-                if trimmed.starts_with("name") && trimmed.contains(resource_name) {
-                    return "awscc".to_string();
-                }
+                    if trimmed.starts_with("name") && trimmed.contains(resource_name) {
+                        return provider_name.clone();
+                    }
 
-                if brace_depth == 0 {
-                    in_awscc_block = false;
+                    if brace_depth == 0 {
+                        in_block = false;
+                    }
                 }
             }
         }
 
-        "aws".to_string()
+        default_provider
     }
 
     /// Find the position of the region attribute in a provider block
@@ -1273,8 +1165,12 @@ impl DiagnosticEngine {
                     continue;
                 }
 
-                // Skip if it starts with "aws." or "awscc." (enum values like aws.Region.xxx)
-                if after_eq_trimmed.starts_with("aws.") || after_eq_trimmed.starts_with("awscc.") {
+                // Skip if it starts with a provider prefix (enum values like aws.Region.xxx)
+                let is_provider_prefix = self
+                    .provider_names
+                    .iter()
+                    .any(|name| after_eq_trimmed.starts_with(&format!("{}.", name)));
+                if is_provider_prefix {
                     continue;
                 }
 
@@ -1467,14 +1363,32 @@ fn parse_error_to_diagnostic(error: &ParseError) -> Diagnostic {
 mod tests {
     use super::*;
     use crate::document::Document;
+    use carina_core::provider::ProviderFactory;
 
     fn create_document(content: &str) -> Document {
         Document::new(content.to_string())
     }
 
+    fn test_engine() -> DiagnosticEngine {
+        let factories: Vec<Box<dyn ProviderFactory>> = vec![
+            Box::new(carina_provider_aws::AwsProviderFactory),
+            Box::new(carina_provider_awscc::AwsccProviderFactory),
+        ];
+        let mut schemas = HashMap::new();
+        for factory in &factories {
+            for schema in factory.schemas() {
+                schemas.insert(schema.resource_type.clone(), schema);
+            }
+        }
+        let schemas = Arc::new(schemas);
+        let provider_names: Vec<String> = factories.iter().map(|f| f.name().to_string()).collect();
+        let factories = Arc::new(factories);
+        DiagnosticEngine::new(schemas, provider_names, factories)
+    }
+
     #[test]
     fn unknown_field_in_struct_block() {
-        let engine = DiagnosticEngine::new();
+        let engine = test_engine();
         let doc = create_document(
             r#"provider awscc {
     region = awscc.Region.ap_northeast_1
@@ -1503,7 +1417,7 @@ let sg = awscc.ec2.security_group {
 
     #[test]
     fn type_mismatch_in_struct_field() {
-        let engine = DiagnosticEngine::new();
+        let engine = test_engine();
         let doc = create_document(
             r#"provider awscc {
     region = awscc.Region.ap_northeast_1
@@ -1532,7 +1446,7 @@ let sg = awscc.ec2.security_group {
 
     #[test]
     fn resource_ref_type_mismatch() {
-        let engine = DiagnosticEngine::new();
+        let engine = test_engine();
         // vpc.vpc_id is AwsResourceId, but ipv4_ipam_pool_id expects IpamPoolId
         let doc = create_document(
             r#"provider awscc {
@@ -1562,7 +1476,7 @@ let vpc2 = awscc.ec2.vpc {
 
     #[test]
     fn resource_ref_compatible_type() {
-        let engine = DiagnosticEngine::new();
+        let engine = test_engine();
         // ipam_pool.ipam_pool_id is IpamPoolId, and ipv4_ipam_pool_id expects IpamPoolId -> OK
         // Using vpc.vpc_id in a vpc_id field (same type) should not produce a warning
         let doc = create_document(
@@ -1594,7 +1508,7 @@ let subnet = awscc.ec2.subnet {
 
     #[test]
     fn unknown_field_in_second_repeated_block() {
-        let engine = DiagnosticEngine::new();
+        let engine = test_engine();
         let doc = create_document(
             r#"provider awscc {
     region = awscc.Region.ap_northeast_1
@@ -1641,7 +1555,7 @@ let sg = awscc.ec2.security_group {
 
     #[test]
     fn duplicate_struct_block_error() {
-        let engine = DiagnosticEngine::new();
+        let engine = test_engine();
         let doc = create_document(
             r#"provider aws {
     region = aws.Region.ap_northeast_1
@@ -1698,7 +1612,7 @@ aws.ec2.subnet {
 
     #[test]
     fn single_struct_block_no_error() {
-        let engine = DiagnosticEngine::new();
+        let engine = test_engine();
         let doc = create_document(
             r#"provider aws {
     region = aws.Region.ap_northeast_1
@@ -1729,7 +1643,7 @@ aws.ec2.subnet {
 
     #[test]
     fn lint_list_literal_for_list_struct() {
-        let engine = DiagnosticEngine::new();
+        let engine = test_engine();
         let doc = create_document(
             r#"provider awscc {
     region = awscc.Region.ap_northeast_1
@@ -1764,7 +1678,7 @@ let sg = awscc.ec2.security_group {
 
     #[test]
     fn lint_block_syntax_no_warning() {
-        let engine = DiagnosticEngine::new();
+        let engine = test_engine();
         let doc = create_document(
             r#"provider awscc {
     region = awscc.Region.ap_northeast_1
@@ -1795,7 +1709,7 @@ let sg = awscc.ec2.security_group {
 
     #[test]
     fn lint_string_attr_no_warning() {
-        let engine = DiagnosticEngine::new();
+        let engine = test_engine();
         // group_description is a String attribute — lint should not flag it
         let doc = create_document(
             r#"provider awscc {
@@ -1821,7 +1735,7 @@ let sg = awscc.ec2.security_group {
 
     #[test]
     fn data_source_without_read_keyword_errors() {
-        let engine = DiagnosticEngine::new();
+        let engine = test_engine();
         let doc = create_document(
             r#"provider aws {
     region = aws.Region.ap_northeast_1
@@ -1844,7 +1758,7 @@ aws.sts.caller_identity {}"#,
 
     #[test]
     fn data_source_with_read_keyword_no_error() {
-        let engine = DiagnosticEngine::new();
+        let engine = test_engine();
         let doc = create_document(
             r#"provider aws {
     region = aws.Region.ap_northeast_1
@@ -1867,7 +1781,7 @@ let identity = read aws.sts.caller_identity {}"#,
 
     #[test]
     fn regular_resource_without_read_no_data_source_error() {
-        let engine = DiagnosticEngine::new();
+        let engine = test_engine();
         let doc = create_document(
             r#"provider aws {
     region = aws.Region.ap_northeast_1
