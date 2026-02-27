@@ -96,6 +96,71 @@ pub fn convert_enum_value(value: &str) -> String {
     raw_value.replace('_', "-")
 }
 
+/// Check if a string is in DSL enum format (a namespaced identifier).
+///
+/// Recognizes the following patterns:
+/// - `TypeName.value` (2-part, e.g., `Region.ap_northeast_1`)
+/// - `provider.TypeName.value` (3-part, e.g., `aws.Region.ap_northeast_1`)
+/// - `provider.resource.TypeName.value` (4-part, e.g., `aws.s3.VersioningStatus.Enabled`)
+/// - `provider.service.resource.TypeName.value` (5-part, e.g., `awscc.ec2.vpc.InstanceTenancy.default`)
+///
+/// # Examples
+///
+/// ```
+/// use carina_core::utils::is_dsl_enum_format;
+///
+/// assert!(is_dsl_enum_format("Region.ap_northeast_1"));
+/// assert!(is_dsl_enum_format("aws.Region.ap_northeast_1"));
+/// assert!(is_dsl_enum_format("aws.s3.VersioningStatus.Enabled"));
+/// assert!(is_dsl_enum_format("awscc.ec2.vpc.InstanceTenancy.default"));
+/// assert!(!is_dsl_enum_format("my-bucket"));
+/// assert!(!is_dsl_enum_format("some.random.string"));
+/// ```
+pub fn is_dsl_enum_format(s: &str) -> bool {
+    let parts: Vec<&str> = s.split('.').collect();
+
+    match parts.len() {
+        // TypeName.value
+        2 => parts[0].chars().next().is_some_and(|c| c.is_uppercase()),
+        // provider.TypeName.value
+        3 => {
+            let provider = parts[0];
+            let type_name = parts[1];
+            // provider should be lowercase, TypeName should start with uppercase
+            provider.chars().all(|c| c.is_lowercase())
+                && type_name.chars().next().is_some_and(|c| c.is_uppercase())
+        }
+        // provider.resource.TypeName.value (e.g., aws.s3.VersioningStatus.Enabled)
+        4 => {
+            let provider = parts[0];
+            let resource = parts[1];
+            let type_name = parts[2];
+            // provider and resource should be lowercase/digits, TypeName should start with uppercase
+            provider.chars().all(|c| c.is_lowercase())
+                && resource
+                    .chars()
+                    .all(|c| c.is_lowercase() || c.is_ascii_digit() || c == '_')
+                && type_name.chars().next().is_some_and(|c| c.is_uppercase())
+        }
+        // provider.service.resource.TypeName.value (e.g., awscc.ec2.vpc.InstanceTenancy.default)
+        5 => {
+            let provider = parts[0];
+            let service = parts[1];
+            let resource = parts[2];
+            let type_name = parts[3];
+            provider.chars().all(|c| c.is_lowercase())
+                && service
+                    .chars()
+                    .all(|c| c.is_lowercase() || c.is_ascii_digit())
+                && resource
+                    .chars()
+                    .all(|c| c.is_lowercase() || c.is_ascii_digit() || c == '_')
+                && type_name.chars().next().is_some_and(|c| c.is_uppercase())
+        }
+        _ => false,
+    }
+}
+
 /// Validate namespace format for an enum identifier.
 ///
 /// Handles the following formats:
@@ -413,5 +478,47 @@ mod tests {
         assert!(
             validate_enum_namespace("a.b.c.d.e.f", "VersioningStatus", "aws.s3.bucket").is_err()
         );
+    }
+
+    // is_dsl_enum_format tests
+
+    #[test]
+    fn test_is_dsl_enum_format_2_part() {
+        assert!(is_dsl_enum_format("Region.ap_northeast_1"));
+        assert!(is_dsl_enum_format("VersioningStatus.Enabled"));
+        // lowercase first part → not a TypeName
+        assert!(!is_dsl_enum_format("region.ap_northeast_1"));
+    }
+
+    #[test]
+    fn test_is_dsl_enum_format_3_part() {
+        assert!(is_dsl_enum_format("aws.Region.ap_northeast_1"));
+        assert!(is_dsl_enum_format("gcp.Region.us_central1"));
+        // uppercase provider → not valid
+        assert!(!is_dsl_enum_format("AWS.Region.ap_northeast_1"));
+        // lowercase TypeName → not valid
+        assert!(!is_dsl_enum_format("aws.region.ap_northeast_1"));
+    }
+
+    #[test]
+    fn test_is_dsl_enum_format_4_part() {
+        assert!(is_dsl_enum_format("aws.s3.VersioningStatus.Enabled"));
+        assert!(is_dsl_enum_format("aws.ec2.IpProtocol.tcp"));
+        // resource with digits
+        assert!(is_dsl_enum_format("aws.s3.VersioningStatus.Suspended"));
+    }
+
+    #[test]
+    fn test_is_dsl_enum_format_5_part() {
+        assert!(is_dsl_enum_format("awscc.ec2.vpc.InstanceTenancy.default"));
+        assert!(is_dsl_enum_format("awscc.ec2.ipam_pool.AddressFamily.IPv4"));
+    }
+
+    #[test]
+    fn test_is_dsl_enum_format_non_matching() {
+        assert!(!is_dsl_enum_format("my-bucket"));
+        assert!(!is_dsl_enum_format("ap-northeast-1"));
+        assert!(!is_dsl_enum_format("some.random.string"));
+        assert!(!is_dsl_enum_format("a.b.c.d.e.f"));
     }
 }

@@ -20,6 +20,7 @@ use carina_core::provider::{
 use carina_core::resource::{LifecycleConfig, Resource, ResourceId, State, Value};
 use carina_core::schema::ResourceSchema;
 use carina_core::schema::validate_ipv4_cidr;
+use carina_core::utils::is_dsl_enum_format;
 use carina_provider_aws::AwsProviderFactory;
 use carina_provider_awscc::AwsccProviderFactory;
 use carina_state::{
@@ -1077,7 +1078,9 @@ async fn run_plan(path: &PathBuf, out: Option<&PathBuf>) -> Result<bool, String>
                 })
                 .ok_or("Backend bucket name not specified")?;
 
-            let backend_resource_type = backend.resource_type().unwrap_or("s3.bucket");
+            let backend_resource_type = backend
+                .resource_type()
+                .ok_or("Backend does not specify a resource type")?;
             let has_bucket_resource = parsed.resources.iter().any(|r| {
                 r.id.resource_type == backend_resource_type
                     && r.attributes
@@ -1119,8 +1122,12 @@ async fn run_plan(path: &PathBuf, out: Option<&PathBuf>) -> Result<bool, String>
 
     // Show bootstrap plan if needed
     if will_create_state_bucket {
-        let backend_provider = plan_backend.provider_name().unwrap_or("aws");
-        let backend_resource_type = plan_backend.resource_type().unwrap_or("s3.bucket");
+        let backend_provider = plan_backend
+            .provider_name()
+            .ok_or("Backend does not specify a provider name")?;
+        let backend_resource_type = plan_backend
+            .resource_type()
+            .ok_or("Backend does not specify a resource type")?;
         println!("{}", "Bootstrap Plan:".cyan().bold());
         println!(
             "  {} {} (state bucket with versioning enabled)",
@@ -1258,7 +1265,9 @@ async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
                 .ok_or("Missing bucket name in backend configuration")?;
 
             // Check if there's a bucket resource defined with matching name
-            let backend_resource_type = backend.resource_type().unwrap_or("s3.bucket");
+            let backend_resource_type = backend
+                .resource_type()
+                .ok_or("Backend does not specify a resource type")?;
             if let Some(bucket_resource) =
                 find_state_bucket_resource(&parsed, &bucket_name, backend_resource_type)
             {
@@ -1269,7 +1278,9 @@ async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
                 );
 
                 // Create the bucket resource using the factory pattern
-                let backend_provider_name = backend.provider_name().unwrap_or("aws");
+                let backend_provider_name = backend
+                    .provider_name()
+                    .ok_or("Backend does not specify a provider name")?;
                 let factories = provider_factories();
                 let factory = find_factory(&factories, backend_provider_name).ok_or_else(|| {
                     format!("No provider factory found for '{}'", backend_provider_name)
@@ -1310,7 +1321,9 @@ async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
                     println!("  {} Created state bucket", "✓".green());
 
                     // Get region from backend config using factory
-                    let backend_provider_name = backend.provider_name().unwrap_or("aws");
+                    let backend_provider_name = backend
+                        .provider_name()
+                        .ok_or("Backend does not specify a provider name")?;
                     let factories = provider_factories();
                     let factory =
                         find_factory(&factories, backend_provider_name).ok_or_else(|| {
@@ -1344,7 +1357,9 @@ async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
                     );
 
                     // Create a protected ResourceState for the auto-created bucket
-                    let backend_resource_type = backend.resource_type().unwrap_or("s3.bucket");
+                    let backend_resource_type = backend
+                        .resource_type()
+                        .ok_or("Backend does not specify a resource type")?;
                     let bucket_state = ResourceState::new(
                         backend_resource_type,
                         &bucket_name,
@@ -2908,7 +2923,7 @@ fn get_identifier_from_state(
     {
         return resource_state.identifier.clone();
     }
-    // Fallback: use name attribute for initial lookup (aws provider)
+    // Fallback: use name attribute for initial lookup
     if let Some(Value::String(name)) = resource.attributes.get("name") {
         return Some(name.clone());
     }
@@ -3571,57 +3586,6 @@ fn format_effect(effect: &Effect) -> String {
     }
 }
 
-/// Check if a string is in DSL enum format
-/// Patterns:
-/// - provider.TypeName.value (e.g., aws.Region.ap_northeast_1, gcp.Region.us_central1)
-/// - TypeName.value (e.g., Region.ap_northeast_1)
-/// - provider.resource.TypeName.value (e.g., aws.s3.VersioningStatus.Enabled)
-/// - provider.service.resource.TypeName.value (e.g., awscc.ec2.vpc.InstanceTenancy.default)
-fn is_dsl_enum_format(s: &str) -> bool {
-    let parts: Vec<&str> = s.split('.').collect();
-
-    match parts.len() {
-        // TypeName.value
-        2 => parts[0].chars().next().is_some_and(|c| c.is_uppercase()),
-        // provider.TypeName.value
-        3 => {
-            let provider = parts[0];
-            let type_name = parts[1];
-            // provider should be lowercase, TypeName should start with uppercase
-            provider.chars().all(|c| c.is_lowercase())
-                && type_name.chars().next().is_some_and(|c| c.is_uppercase())
-        }
-        // provider.resource.TypeName.value (e.g., aws.s3.VersioningStatus.Enabled)
-        4 => {
-            let provider = parts[0];
-            let resource = parts[1];
-            let type_name = parts[2];
-            // provider and resource should be lowercase/digits, TypeName should start with uppercase
-            provider.chars().all(|c| c.is_lowercase())
-                && resource
-                    .chars()
-                    .all(|c| c.is_lowercase() || c.is_ascii_digit() || c == '_')
-                && type_name.chars().next().is_some_and(|c| c.is_uppercase())
-        }
-        // provider.service.resource.TypeName.value (e.g., awscc.ec2.vpc.InstanceTenancy.default)
-        5 => {
-            let provider = parts[0];
-            let service = parts[1];
-            let resource = parts[2];
-            let type_name = parts[3];
-            provider.chars().all(|c| c.is_lowercase())
-                && service
-                    .chars()
-                    .all(|c| c.is_lowercase() || c.is_ascii_digit())
-                && resource
-                    .chars()
-                    .all(|c| c.is_lowercase() || c.is_ascii_digit() || c == '_')
-                && type_name.chars().next().is_some_and(|c| c.is_uppercase())
-        }
-        _ => false,
-    }
-}
-
 /// Check if a value is a list of maps (list-of-struct)
 fn is_list_of_maps(value: &Value) -> bool {
     if let Value::List(items) = value {
@@ -3922,14 +3886,7 @@ fn resource_to_state(
     state: &State,
     existing_state: Option<&ResourceState>,
 ) -> ResourceState {
-    let provider = resource
-        .attributes
-        .get("_provider")
-        .and_then(|v| match v {
-            Value::String(s) => Some(s.clone()),
-            _ => None,
-        })
-        .unwrap_or_else(|| "aws".to_string());
+    let provider = resource.id.provider.clone();
 
     let mut resource_state =
         ResourceState::new(&resource.id.resource_type, &resource.id.name, provider);
@@ -4155,8 +4112,12 @@ async fn run_state_bucket_delete(
         .map_err(|e| format!("Failed to create backend: {}", e))?;
 
     // Get provider metadata from backend
-    let backend_provider_name = backend.provider_name().unwrap_or("aws");
-    let backend_resource_type = backend.resource_type().unwrap_or("s3.bucket");
+    let backend_provider_name = backend
+        .provider_name()
+        .ok_or("Backend does not specify a provider name")?;
+    let backend_resource_type = backend
+        .resource_type()
+        .ok_or("Backend does not specify a resource type")?;
     let factories = provider_factories();
     let factory = find_factory(&factories, backend_provider_name)
         .ok_or_else(|| format!("No provider factory found for '{}'", backend_provider_name))?;
