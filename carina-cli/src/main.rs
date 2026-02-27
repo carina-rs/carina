@@ -1565,6 +1565,7 @@ async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
     let mut skip_count = 0;
     let mut applied_states: HashMap<ResourceId, State> = HashMap::new();
     let mut failed_bindings: HashSet<String> = HashSet::new();
+    let mut successfully_deleted: HashSet<ResourceId> = HashSet::new();
 
     // Apply each effect in order, resolving references dynamically
     for effect in plan.effects() {
@@ -1771,6 +1772,7 @@ async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
                 Ok(()) => {
                     println!("  {} {}", "✓".green(), format_effect(effect));
                     success_count += 1;
+                    successfully_deleted.insert(id.clone());
                 }
                 Err(e) => {
                     println!("  {} {} - {}", "✗".red(), format_effect(effect), e);
@@ -1802,9 +1804,11 @@ async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
         }
     }
 
-    // Remove deleted resources from state
+    // Remove only successfully deleted resources from state
     for effect in plan.effects() {
-        if let Effect::Delete { id, .. } = effect {
+        if let Effect::Delete { id, .. } = effect
+            && successfully_deleted.contains(id)
+        {
             state.remove_resource(&id.resource_type, &id.name);
         }
     }
@@ -2138,6 +2142,7 @@ async fn run_apply_from_plan(plan_path: &PathBuf, auto_approve: bool) -> Result<
     let mut skip_count = 0;
     let mut applied_states: HashMap<ResourceId, State> = HashMap::new();
     let mut failed_bindings: HashSet<String> = HashSet::new();
+    let mut successfully_deleted: HashSet<ResourceId> = HashSet::new();
 
     // Apply each effect in order, resolving references dynamically
     for effect in plan.effects() {
@@ -2330,6 +2335,7 @@ async fn run_apply_from_plan(plan_path: &PathBuf, auto_approve: bool) -> Result<
                 Ok(()) => {
                     println!("  {} {}", "✓".green(), format_effect(effect));
                     success_count += 1;
+                    successfully_deleted.insert(id.clone());
                 }
                 Err(e) => {
                     println!("  {} {} - {}", "✗".red(), format_effect(effect), e);
@@ -2359,9 +2365,11 @@ async fn run_apply_from_plan(plan_path: &PathBuf, auto_approve: bool) -> Result<
         }
     }
 
-    // Remove deleted resources from state
+    // Remove only successfully deleted resources from state
     for effect in plan.effects() {
-        if let Effect::Delete { id, .. } = effect {
+        if let Effect::Delete { id, .. } = effect
+            && successfully_deleted.contains(id)
+        {
             state.remove_resource(&id.resource_type, &id.name);
         }
     }
