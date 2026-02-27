@@ -5,7 +5,7 @@ use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
 use crate::document::Document;
 use carina_core::parser::{InputParameter, ParseError, ParsedFile, TypeExpr};
 use carina_core::resource::Value;
-use carina_core::schema::{validate_cidr, validate_ipv6_cidr};
+use carina_core::schema::{validate_ipv4_cidr, validate_ipv6_cidr};
 use carina_provider_aws::schemas::{generated as aws_generated, types as aws_types};
 use carina_provider_awscc::schemas::awscc_types;
 use carina_provider_awscc::schemas::generated::ec2_flow_log as awscc_flow_log;
@@ -382,7 +382,7 @@ impl DiagnosticEngine {
 
                                     if name == "Cidr" || name == "Ipv4Cidr" {
                                         if let Value::String(s) = &resolved_value {
-                                            validate_cidr(s).err()
+                                            validate_ipv4_cidr(s).err()
                                         } else {
                                             None
                                         }
@@ -1148,13 +1148,13 @@ impl DiagnosticEngine {
     fn validate_module_arg_type(&self, type_expr: &TypeExpr, value: &Value) -> Option<String> {
         match (type_expr, value) {
             // CIDR type validation
-            (TypeExpr::Cidr, Value::String(s)) => validate_cidr(s).err(),
+            (TypeExpr::Cidr, Value::String(s)) => validate_ipv4_cidr(s).err(),
             // List of CIDR type validation
             (TypeExpr::List(inner), Value::List(items)) => {
                 if let TypeExpr::Cidr = inner.as_ref() {
                     for (i, item) in items.iter().enumerate() {
                         if let Value::String(s) = item {
-                            if let Err(e) = validate_cidr(s) {
+                            if let Err(e) = validate_ipv4_cidr(s) {
                                 return Some(format!("Element {}: {}", i, e));
                             }
                         } else {

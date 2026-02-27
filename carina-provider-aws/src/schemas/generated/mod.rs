@@ -3,8 +3,6 @@
 //! DO NOT EDIT MANUALLY - regenerate with:
 //!   ./carina-provider-aws/scripts/generate-schemas-smithy.sh
 
-use carina_core::schema::ResourceSchema;
-
 // Re-export all types and validators from types so that
 // generated schema files can use `super::` to access them.
 pub use super::types::*;
@@ -34,11 +32,6 @@ pub fn configs() -> Vec<AwsSchemaConfig> {
         s3_bucket::s3_bucket_config(),
         sts_caller_identity::sts_caller_identity_config(),
     ]
-}
-
-/// Returns all generated schemas (for backward compatibility)
-pub fn schemas() -> Vec<ResourceSchema> {
-    configs().into_iter().map(|c| c.schema).collect()
 }
 
 /// Get valid enum values for a given resource type and attribute name.

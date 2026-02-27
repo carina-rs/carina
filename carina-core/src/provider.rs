@@ -98,8 +98,7 @@ pub trait Provider: Send + Sync {
     /// Get the current state of a resource
     ///
     /// If identifier is provided, use it to read the resource directly.
-    /// Otherwise, fall back to name-based lookup (for backwards compatibility).
-    /// Returns `State::not_found()` if the resource does not exist.
+    /// Returns `State::not_found()` if no identifier is provided or the resource does not exist.
     fn read(
         &self,
         id: &ResourceId,
