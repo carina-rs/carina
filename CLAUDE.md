@@ -112,7 +112,7 @@ Enum values use namespaced identifiers like `aws.s3.VersioningStatus.Enabled` or
    resource.chars().all(|c| c.is_lowercase() || c.is_ascii_digit() || c == '_')
    ```
 
-2. **Update `is_dsl_enum_format()` in `carina-cli/src/main.rs`** for new patterns (e.g., 4-part identifiers like `provider.resource.TypeName.value`)
+2. **Update `is_dsl_enum_format()` in `carina-core/src/utils.rs`** for new patterns (e.g., 4-part identifiers like `provider.resource.TypeName.value`)
 
 3. **Plan display should not quote namespaced identifiers** - They are identifiers, not strings
 
