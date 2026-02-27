@@ -8,7 +8,7 @@ use super::AwsccSchemaConfig;
 use super::tags_type;
 use super::validate_namespaced_enum;
 use carina_core::resource::Value;
-use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, types};
+use carina_core::schema::{AttributeSchema, AttributeType, CompletionValue, ResourceSchema, types};
 
 #[allow(dead_code)]
 const VALID_AUTO_ACCEPT_SHARED_ATTACHMENTS: &[&str] = &["enable", "disable"];
@@ -204,7 +204,17 @@ pub fn ec2_transit_gateway_config() -> AwsccSchemaConfig {
                         to_dsl: None,
                     },
                 )
-                .with_provider_name("AutoAcceptSharedAttachments"),
+                .with_provider_name("AutoAcceptSharedAttachments")
+                .with_completions(vec![
+                    CompletionValue::new(
+                        "awscc.ec2.transit_gateway.AutoAcceptSharedAttachments.enable",
+                        "enable",
+                    ),
+                    CompletionValue::new(
+                        "awscc.ec2.transit_gateway.AutoAcceptSharedAttachments.disable",
+                        "disable",
+                    ),
+                ]),
             )
             .attribute(
                 AttributeSchema::new(
@@ -217,7 +227,17 @@ pub fn ec2_transit_gateway_config() -> AwsccSchemaConfig {
                         to_dsl: None,
                     },
                 )
-                .with_provider_name("DefaultRouteTableAssociation"),
+                .with_provider_name("DefaultRouteTableAssociation")
+                .with_completions(vec![
+                    CompletionValue::new(
+                        "awscc.ec2.transit_gateway.DefaultRouteTableAssociation.enable",
+                        "enable",
+                    ),
+                    CompletionValue::new(
+                        "awscc.ec2.transit_gateway.DefaultRouteTableAssociation.disable",
+                        "disable",
+                    ),
+                ]),
             )
             .attribute(
                 AttributeSchema::new(
@@ -230,7 +250,17 @@ pub fn ec2_transit_gateway_config() -> AwsccSchemaConfig {
                         to_dsl: None,
                     },
                 )
-                .with_provider_name("DefaultRouteTablePropagation"),
+                .with_provider_name("DefaultRouteTablePropagation")
+                .with_completions(vec![
+                    CompletionValue::new(
+                        "awscc.ec2.transit_gateway.DefaultRouteTablePropagation.enable",
+                        "enable",
+                    ),
+                    CompletionValue::new(
+                        "awscc.ec2.transit_gateway.DefaultRouteTablePropagation.disable",
+                        "disable",
+                    ),
+                ]),
             )
             .attribute(
                 AttributeSchema::new("description", AttributeType::String)
@@ -247,7 +277,11 @@ pub fn ec2_transit_gateway_config() -> AwsccSchemaConfig {
                         to_dsl: None,
                     },
                 )
-                .with_provider_name("DnsSupport"),
+                .with_provider_name("DnsSupport")
+                .with_completions(vec![
+                    CompletionValue::new("awscc.ec2.transit_gateway.DnsSupport.enable", "enable"),
+                    CompletionValue::new("awscc.ec2.transit_gateway.DnsSupport.disable", "disable"),
+                ]),
             )
             .attribute(
                 AttributeSchema::new(
@@ -260,7 +294,17 @@ pub fn ec2_transit_gateway_config() -> AwsccSchemaConfig {
                         to_dsl: None,
                     },
                 )
-                .with_provider_name("EncryptionSupport"),
+                .with_provider_name("EncryptionSupport")
+                .with_completions(vec![
+                    CompletionValue::new(
+                        "awscc.ec2.transit_gateway.EncryptionSupport.disable",
+                        "disable",
+                    ),
+                    CompletionValue::new(
+                        "awscc.ec2.transit_gateway.EncryptionSupport.enable",
+                        "enable",
+                    ),
+                ]),
             )
             .attribute(
                 AttributeSchema::new("encryption_support_state", AttributeType::String)
@@ -284,7 +328,17 @@ pub fn ec2_transit_gateway_config() -> AwsccSchemaConfig {
                     },
                 )
                 .create_only()
-                .with_provider_name("MulticastSupport"),
+                .with_provider_name("MulticastSupport")
+                .with_completions(vec![
+                    CompletionValue::new(
+                        "awscc.ec2.transit_gateway.MulticastSupport.enable",
+                        "enable",
+                    ),
+                    CompletionValue::new(
+                        "awscc.ec2.transit_gateway.MulticastSupport.disable",
+                        "disable",
+                    ),
+                ]),
             )
             .attribute(
                 AttributeSchema::new(
@@ -304,7 +358,17 @@ pub fn ec2_transit_gateway_config() -> AwsccSchemaConfig {
                         to_dsl: None,
                     },
                 )
-                .with_provider_name("SecurityGroupReferencingSupport"),
+                .with_provider_name("SecurityGroupReferencingSupport")
+                .with_completions(vec![
+                    CompletionValue::new(
+                        "awscc.ec2.transit_gateway.SecurityGroupReferencingSupport.enable",
+                        "enable",
+                    ),
+                    CompletionValue::new(
+                        "awscc.ec2.transit_gateway.SecurityGroupReferencingSupport.disable",
+                        "disable",
+                    ),
+                ]),
             )
             .attribute(AttributeSchema::new("tags", tags_type()).with_provider_name("Tags"))
             .attribute(
@@ -330,7 +394,17 @@ pub fn ec2_transit_gateway_config() -> AwsccSchemaConfig {
                         to_dsl: None,
                     },
                 )
-                .with_provider_name("VpnEcmpSupport"),
+                .with_provider_name("VpnEcmpSupport")
+                .with_completions(vec![
+                    CompletionValue::new(
+                        "awscc.ec2.transit_gateway.VpnEcmpSupport.enable",
+                        "enable",
+                    ),
+                    CompletionValue::new(
+                        "awscc.ec2.transit_gateway.VpnEcmpSupport.disable",
+                        "disable",
+                    ),
+                ]),
             ),
     }
 }

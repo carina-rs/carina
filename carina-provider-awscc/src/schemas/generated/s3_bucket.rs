@@ -8,7 +8,9 @@ use super::AwsccSchemaConfig;
 use super::tags_type;
 use super::validate_namespaced_enum;
 use carina_core::resource::Value;
-use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
+use carina_core::schema::{
+    AttributeSchema, AttributeType, CompletionValue, ResourceSchema, StructField,
+};
 
 #[allow(dead_code)]
 const VALID_ABAC_STATUS: &[&str] = &["Enabled", "Disabled"];
@@ -398,7 +400,8 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                 to_dsl: None,
             })
                 .with_description("The ABAC status of the general purpose bucket. When ABAC is enabled for the general purpose bucket, you can use tags to manage access to the general p...")
-                .with_provider_name("AbacStatus"),
+                .with_provider_name("AbacStatus")
+                .with_completions(vec![CompletionValue::new("awscc.s3.bucket.AbacStatus.Enabled", "Enabled"), CompletionValue::new("awscc.s3.bucket.AbacStatus.Disabled", "Disabled")]),
         )
         .attribute(
             AttributeSchema::new("accelerate_configuration", AttributeType::Struct {
@@ -425,7 +428,8 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                 to_dsl: None,
             })
                 .with_description("This is a legacy property, and it is not recommended for most use cases. A majority of modern use cases in Amazon S3 no longer require the use of ACLs...")
-                .with_provider_name("AccessControl"),
+                .with_provider_name("AccessControl")
+                .with_completions(vec![CompletionValue::new("awscc.s3.bucket.AccessControl.AuthenticatedRead", "AuthenticatedRead"), CompletionValue::new("awscc.s3.bucket.AccessControl.AwsExecRead", "AwsExecRead"), CompletionValue::new("awscc.s3.bucket.AccessControl.BucketOwnerFullControl", "BucketOwnerFullControl"), CompletionValue::new("awscc.s3.bucket.AccessControl.BucketOwnerRead", "BucketOwnerRead"), CompletionValue::new("awscc.s3.bucket.AccessControl.LogDeliveryWrite", "LogDeliveryWrite"), CompletionValue::new("awscc.s3.bucket.AccessControl.Private", "Private"), CompletionValue::new("awscc.s3.bucket.AccessControl.PublicRead", "PublicRead"), CompletionValue::new("awscc.s3.bucket.AccessControl.PublicReadWrite", "PublicReadWrite")]),
         )
         .attribute(
             AttributeSchema::new("analytics_configurations", AttributeType::List(Box::new(AttributeType::Struct {

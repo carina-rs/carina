@@ -8,7 +8,9 @@ use super::AwsccSchemaConfig;
 use super::tags_type;
 use super::validate_namespaced_enum;
 use carina_core::resource::Value;
-use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
+use carina_core::schema::{
+    AttributeSchema, AttributeType, CompletionValue, ResourceSchema, StructField,
+};
 
 #[allow(dead_code)]
 const VALID_DNS_RECORD_IP_TYPE: &[&str] = &[
@@ -194,7 +196,8 @@ pub fn ec2_vpc_endpoint_config() -> AwsccSchemaConfig {
                 to_dsl: Some(|s: &str| s.replace('-', "_")),
             })
                 .with_description("The supported IP address types.")
-                .with_provider_name("IpAddressType"),
+                .with_provider_name("IpAddressType")
+                .with_completions(vec![CompletionValue::new("awscc.ec2.vpc_endpoint.IpAddressType.ipv4", "ipv4"), CompletionValue::new("awscc.ec2.vpc_endpoint.IpAddressType.ipv6", "ipv6"), CompletionValue::new("awscc.ec2.vpc_endpoint.IpAddressType.dualstack", "dualstack"), CompletionValue::new("awscc.ec2.vpc_endpoint.IpAddressType.not_specified", "not-specified")]),
         )
         .attribute(
             AttributeSchema::new("network_interface_ids", AttributeType::List(Box::new(super::aws_resource_id())))
@@ -265,7 +268,8 @@ pub fn ec2_vpc_endpoint_config() -> AwsccSchemaConfig {
             })
                 .create_only()
                 .with_description("The type of endpoint. Default: Gateway")
-                .with_provider_name("VpcEndpointType"),
+                .with_provider_name("VpcEndpointType")
+                .with_completions(vec![CompletionValue::new("awscc.ec2.vpc_endpoint.VpcEndpointType.Interface", "Interface"), CompletionValue::new("awscc.ec2.vpc_endpoint.VpcEndpointType.Gateway", "Gateway"), CompletionValue::new("awscc.ec2.vpc_endpoint.VpcEndpointType.GatewayLoadBalancer", "GatewayLoadBalancer"), CompletionValue::new("awscc.ec2.vpc_endpoint.VpcEndpointType.ServiceNetwork", "ServiceNetwork"), CompletionValue::new("awscc.ec2.vpc_endpoint.VpcEndpointType.Resource", "Resource")]),
         )
         .attribute(
             AttributeSchema::new("vpc_id", super::vpc_id())

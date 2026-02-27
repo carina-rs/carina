@@ -8,7 +8,9 @@ use super::AwsccSchemaConfig;
 use super::tags_type;
 use super::validate_namespaced_enum;
 use carina_core::resource::Value;
-use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField, types};
+use carina_core::schema::{
+    AttributeSchema, AttributeType, CompletionValue, ResourceSchema, StructField, types,
+};
 
 #[allow(dead_code)]
 const VALID_AVAILABILITY_MODE: &[&str] = &["zonal", "regional"];
@@ -84,7 +86,8 @@ pub fn ec2_nat_gateway_config() -> AwsccSchemaConfig {
             })
                 .create_only()
                 .with_description("Indicates whether this is a zonal (single-AZ) or regional (multi-AZ) NAT gateway. A zonal NAT gateway is a NAT Gateway that provides redundancy and sc...")
-                .with_provider_name("AvailabilityMode"),
+                .with_provider_name("AvailabilityMode")
+                .with_completions(vec![CompletionValue::new("awscc.ec2.nat_gateway.AvailabilityMode.zonal", "zonal"), CompletionValue::new("awscc.ec2.nat_gateway.AvailabilityMode.regional", "regional")]),
         )
         .attribute(
             AttributeSchema::new("availability_zone_addresses", AttributeType::List(Box::new(AttributeType::Struct {
@@ -108,7 +111,8 @@ pub fn ec2_nat_gateway_config() -> AwsccSchemaConfig {
             })
                 .create_only()
                 .with_description("Indicates whether the NAT gateway supports public or private connectivity. The default is public connectivity.")
-                .with_provider_name("ConnectivityType"),
+                .with_provider_name("ConnectivityType")
+                .with_completions(vec![CompletionValue::new("awscc.ec2.nat_gateway.ConnectivityType.public", "public"), CompletionValue::new("awscc.ec2.nat_gateway.ConnectivityType.private", "private")]),
         )
         .attribute(
             AttributeSchema::new("eni_id", super::aws_resource_id())

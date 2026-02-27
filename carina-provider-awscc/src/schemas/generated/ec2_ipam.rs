@@ -8,7 +8,9 @@ use super::AwsccSchemaConfig;
 use super::tags_type;
 use super::validate_namespaced_enum;
 use carina_core::resource::Value;
-use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
+use carina_core::schema::{
+    AttributeSchema, AttributeType, CompletionValue, ResourceSchema, StructField,
+};
 
 #[allow(dead_code)]
 const VALID_METERED_ACCOUNT: &[&str] = &["ipam-owner", "resource-owner"];
@@ -100,7 +102,8 @@ pub fn ec2_ipam_config() -> AwsccSchemaConfig {
                 to_dsl: Some(|s: &str| s.replace('-', "_")),
             })
                 .with_description("A metered account is an account that is charged for active IP addresses managed in IPAM")
-                .with_provider_name("MeteredAccount"),
+                .with_provider_name("MeteredAccount")
+                .with_completions(vec![CompletionValue::new("awscc.ec2.ipam.MeteredAccount.ipam_owner", "ipam-owner"), CompletionValue::new("awscc.ec2.ipam.MeteredAccount.resource_owner", "resource-owner")]),
         )
         .attribute(
             AttributeSchema::new("operating_regions", AttributeType::List(Box::new(AttributeType::Struct {
@@ -146,7 +149,8 @@ pub fn ec2_ipam_config() -> AwsccSchemaConfig {
                 to_dsl: None,
             })
                 .with_description("The tier of the IPAM.")
-                .with_provider_name("Tier"),
+                .with_provider_name("Tier")
+                .with_completions(vec![CompletionValue::new("awscc.ec2.ipam.Tier.free", "free"), CompletionValue::new("awscc.ec2.ipam.Tier.advanced", "advanced")]),
         )
     }
 }
