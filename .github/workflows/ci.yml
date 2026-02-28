@@ -40,12 +40,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --all-targets --all-features -- -D warnings
 
-  provider-agnostic:
-    name: Core Provider-Agnostic Check
+  provider-boundaries:
+    name: Provider Boundary Check
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: bash scripts/check-core-provider-agnostic.sh
+      - run: bash scripts/check-provider-boundaries.sh
 
   test:
     name: Test
