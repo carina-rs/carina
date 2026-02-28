@@ -3,9 +3,9 @@
 #
 # Enforces architectural boundaries:
 # 1. carina-core Cargo.toml must not depend on provider crates
-# 2. carina-core must not import provider crates (use carina_provider_*)
+# 2. carina-core must not reference provider crates (use/inline carina_provider_*)
 # 3. carina-core must not contain hardcoded provider string literals
-# 4. carina-lsp lib code must not import provider crates (main.rs wiring excluded)
+# 4. carina-lsp lib code must not reference provider crates (main.rs wiring excluded)
 set -euo pipefail
 
 violations=0
@@ -71,7 +71,7 @@ for crate in carina-core carina-lsp; do
     fi
 
     for dep in carina-provider-aws carina-provider-awscc; do
-        if grep -q "^$dep\b\|^$dep " "$toml" 2>/dev/null; then
+        if grep -qE "^$dep( |=)" "$toml" 2>/dev/null; then
             # For carina-lsp, provider deps in Cargo.toml are allowed
             # because main.rs (wiring) needs them
             if [ "$crate" = "carina-lsp" ]; then
@@ -85,11 +85,11 @@ done
 
 echo "  Done."
 
-# ── Check 2: carina-core must not import provider crates ─────────────────────
-echo "=== Check 2: carina-core provider imports ==="
+# ── Check 2: carina-core must not reference provider crates ───────────────────
+echo "=== Check 2: carina-core provider references ==="
 check_rust_files "carina-core/src" \
-    'use carina_provider_' \
-    "carina-core provider import"
+    'carina_provider_' \
+    "carina-core provider reference"
 echo "  Done."
 
 # ── Check 3: carina-core must not contain provider string literals ───────────
@@ -99,13 +99,13 @@ check_rust_files "carina-core/src" \
     "carina-core provider string"
 echo "  Done."
 
-# ── Check 4: carina-lsp lib must not import provider crates ──────────────────
+# ── Check 4: carina-lsp lib must not reference provider crates ────────────────
 # main.rs is excluded because it is the wiring entry point that legitimately
 # instantiates provider factories.
-echo "=== Check 4: carina-lsp provider imports (excluding main.rs wiring) ==="
+echo "=== Check 4: carina-lsp provider references (excluding main.rs wiring) ==="
 check_rust_files "carina-lsp/src" \
-    'use carina_provider_' \
-    "carina-lsp provider import" \
+    'carina_provider_' \
+    "carina-lsp provider reference" \
     "main.rs"
 echo "  Done."
 
