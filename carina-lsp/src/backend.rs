@@ -60,8 +60,8 @@ impl Backend {
                 provider_names.clone(),
                 region_completions.clone(),
             ),
+            semantic_tokens_provider: SemanticTokensProvider::new(&region_completions),
             hover_provider: HoverProvider::new(Arc::clone(&schemas), region_completions),
-            semantic_tokens_provider: SemanticTokensProvider::new(),
         }
     }
 

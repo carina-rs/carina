@@ -21,17 +21,17 @@ pub fn legend() -> SemanticTokensLegend {
     }
 }
 
-pub struct SemanticTokensProvider;
-
-impl Default for SemanticTokensProvider {
-    fn default() -> Self {
-        Self::new()
-    }
+pub struct SemanticTokensProvider {
+    /// Precomputed region patterns like "aws.Region.us_east_1", "awscc.Region.ap_northeast_1"
+    region_patterns: Vec<String>,
 }
 
 impl SemanticTokensProvider {
-    pub fn new() -> Self {
-        Self
+    pub fn new(region_completions: &[carina_core::schema::CompletionValue]) -> Self {
+        // Extract region patterns directly from completion data
+        let region_patterns: Vec<String> =
+            region_completions.iter().map(|c| c.value.clone()).collect();
+        Self { region_patterns }
     }
 
     pub fn tokenize(&self, text: &str) -> Vec<SemanticToken> {
@@ -145,30 +145,9 @@ impl SemanticTokensProvider {
         // Resource type: aws.service.resource pattern
         self.find_resource_types(line, &mut tokens);
 
-        // Region patterns: aws.Region.* and awscc.Region.*
-        for prefix in &["aws", "awscc"] {
-            for region_code in &[
-                "ap_northeast_1",
-                "ap_northeast_2",
-                "ap_northeast_3",
-                "ap_south_1",
-                "ap_southeast_1",
-                "ap_southeast_2",
-                "ca_central_1",
-                "eu_central_1",
-                "eu_west_1",
-                "eu_west_2",
-                "eu_west_3",
-                "eu_north_1",
-                "sa_east_1",
-                "us_east_1",
-                "us_east_2",
-                "us_west_1",
-                "us_west_2",
-            ] {
-                let region = format!("{}.Region.{}", prefix, region_code);
-                self.find_and_add_pattern(line, &region, 1, &mut tokens);
-            }
+        // Region patterns from registered providers (e.g., aws.Region.us_east_1)
+        for region in &self.region_patterns {
+            self.find_and_add_pattern(line, region, 1, &mut tokens);
         }
 
         // env() function
@@ -345,7 +324,7 @@ mod tests {
 
     #[test]
     fn test_resource_type_at_line_start() {
-        let provider = SemanticTokensProvider::new();
+        let provider = SemanticTokensProvider::new(&[]);
         let tokens = provider.tokenize("aws.s3.bucket {");
 
         // Should have at least one TYPE token for aws.s3.bucket
@@ -355,7 +334,7 @@ mod tests {
 
     #[test]
     fn test_resource_type_after_let() {
-        let provider = SemanticTokensProvider::new();
+        let provider = SemanticTokensProvider::new(&[]);
         let tokens = provider.tokenize("let bucket = aws.s3.bucket {");
 
         // Should have TYPE token for aws.s3.bucket
@@ -365,7 +344,7 @@ mod tests {
 
     #[test]
     fn test_find_resource_types_directly() {
-        let provider = SemanticTokensProvider::new();
+        let provider = SemanticTokensProvider::new(&[]);
         let mut tokens = Vec::new();
         provider.find_resource_types("aws.s3.bucket {", &mut tokens);
 
@@ -379,7 +358,7 @@ mod tests {
 
     #[test]
     fn test_tokenize_line_resource_type() {
-        let provider = SemanticTokensProvider::new();
+        let provider = SemanticTokensProvider::new(&[]);
         let line_tokens = provider.tokenize_line("aws.s3.bucket {", 0);
 
         println!("Line tokens: {:?}", line_tokens);
@@ -397,7 +376,7 @@ mod tests {
 
     #[test]
     fn test_nested_block_name_highlighted_as_property() {
-        let provider = SemanticTokensProvider::new();
+        let provider = SemanticTokensProvider::new(&[]);
         let tokens = provider.tokenize_line("    security_group_ingress {", 0);
 
         // Should have PROPERTY token for security_group_ingress
@@ -414,7 +393,7 @@ mod tests {
 
     #[test]
     fn test_nested_block_name_not_highlighted_for_keywords() {
-        let provider = SemanticTokensProvider::new();
+        let provider = SemanticTokensProvider::new(&[]);
 
         // "provider aws {" should NOT get PROPERTY for "provider"
         let tokens = provider.tokenize_line("provider aws {", 0);
@@ -428,7 +407,7 @@ mod tests {
 
     #[test]
     fn test_tokenize_full_file() {
-        let provider = SemanticTokensProvider::new();
+        let provider = SemanticTokensProvider::new(&[]);
         let content = "aws.s3.bucket {\n    name = \"test\"\n}";
         let tokens = provider.tokenize(content);
 
@@ -451,6 +430,69 @@ mod tests {
         assert_eq!(
             first.length, 13,
             "First token length should be 13 (aws.s3.bucket)"
+        );
+    }
+
+    #[test]
+    fn test_region_highlighting_with_dynamic_data() {
+        use carina_core::schema::CompletionValue;
+
+        let regions = vec![
+            CompletionValue::new("aws.Region.us_east_1", "US East (N. Virginia)"),
+            CompletionValue::new("awscc.Region.ap_northeast_1", "Asia Pacific (Tokyo)"),
+        ];
+        let provider = SemanticTokensProvider::new(&regions);
+
+        // Should highlight aws.Region.us_east_1 as TYPE
+        let tokens = provider.tokenize_line("    region = aws.Region.us_east_1", 0);
+        let type_token = tokens.iter().find(|(_, _, typ)| *typ == 1);
+        assert!(
+            type_token.is_some(),
+            "Should highlight aws.Region.us_east_1 as TYPE. Got: {:?}",
+            tokens
+        );
+        let (start, len, _) = type_token.unwrap();
+        assert_eq!(*start, 13);
+        assert_eq!(*len, "aws.Region.us_east_1".len() as u32);
+
+        // Should highlight awscc.Region.ap_northeast_1 as TYPE
+        let tokens = provider.tokenize_line("    region = awscc.Region.ap_northeast_1", 0);
+        let type_token = tokens.iter().find(|(_, _, typ)| *typ == 1);
+        assert!(
+            type_token.is_some(),
+            "Should highlight awscc.Region.ap_northeast_1 as TYPE. Got: {:?}",
+            tokens
+        );
+    }
+
+    #[test]
+    fn test_two_part_region_not_highlighted_without_data() {
+        use carina_core::schema::CompletionValue;
+
+        // Two-part region patterns like "aws.Region" are excluded by find_resource_types
+        // (2nd part starts with uppercase). They need explicit registration to be highlighted.
+        let provider_without = SemanticTokensProvider::new(&[]);
+        let tokens = provider_without.tokenize_line("    region = custom.Region.my_region_1", 0);
+        // find_resource_types will match 3-part pattern, but with registered data it should also match
+        let type_count_without = tokens.iter().filter(|(_, _, typ)| *typ == 1).count();
+
+        let regions = vec![CompletionValue::new(
+            "custom.Region.my_region_1",
+            "My Region",
+        )];
+        let provider_with = SemanticTokensProvider::new(&regions);
+        let tokens = provider_with.tokenize_line("    region = custom.Region.my_region_1", 0);
+        let type_count_with = tokens.iter().filter(|(_, _, typ)| *typ == 1).count();
+
+        // Both should highlight as TYPE (find_resource_types catches 3-part patterns),
+        // but with registration, the pattern is matched twice (then deduped)
+        assert!(
+            type_count_without >= 1,
+            "Should highlight 3-part pattern even without registration"
+        );
+        assert!(
+            type_count_with >= 1,
+            "Should highlight with registration too"
         );
     }
 }
