@@ -71,6 +71,20 @@ impl AwsccProvider {
         }
     }
 
+    /// Create a lightweight provider for unit tests that don't make network calls.
+    /// Avoids TLS initialization which can fail in environments without root certificates.
+    #[cfg(test)]
+    fn new_for_test(region: &str) -> Self {
+        let config = aws_config::SdkConfig::builder()
+            .behavior_version(aws_config::BehaviorVersion::latest())
+            .region(Region::new(region.to_string()))
+            .build();
+        Self {
+            cloudcontrol_client: CloudControlClient::new(&config),
+            aws_config: config,
+        }
+    }
+
     /// Create an S3 client from the stored config
     fn s3_client(&self) -> aws_sdk_s3::Client {
         aws_sdk_s3::Client::new(&self.aws_config)
@@ -1741,9 +1755,9 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_aws_value_to_dsl_bare_struct_returns_list_wrapped_map() {
-        let provider = AwsccProvider::new("us-east-1").await;
+    #[test]
+    fn test_aws_value_to_dsl_bare_struct_returns_list_wrapped_map() {
+        let provider = AwsccProvider::new_for_test("us-east-1");
         let fields = vec![
             StructField::new("status", AttributeType::String).with_provider_name("Status"),
             StructField::new("mfa_delete", AttributeType::String).with_provider_name("MfaDelete"),
@@ -1780,9 +1794,9 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_dsl_value_to_aws_unwraps_list_for_bare_struct() {
-        let provider = AwsccProvider::new("us-east-1").await;
+    #[test]
+    fn test_dsl_value_to_aws_unwraps_list_for_bare_struct() {
+        let provider = AwsccProvider::new_for_test("us-east-1");
         let fields = vec![
             StructField::new("status", AttributeType::String).with_provider_name("Status"),
             StructField::new("mfa_delete", AttributeType::String).with_provider_name("MfaDelete"),
@@ -1813,9 +1827,9 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_bare_struct_roundtrip_no_spurious_diff() {
-        let provider = AwsccProvider::new("us-east-1").await;
+    #[test]
+    fn test_bare_struct_roundtrip_no_spurious_diff() {
+        let provider = AwsccProvider::new_for_test("us-east-1");
         let fields =
             vec![StructField::new("status", AttributeType::String).with_provider_name("Status")];
         let attr_type = AttributeType::Struct {
@@ -1863,8 +1877,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_vpc_endpoint_type_roundtrip_no_false_diff() {
+    #[test]
+    fn test_vpc_endpoint_type_roundtrip_no_false_diff() {
         // Issue #175: vpc_endpoint_type shows false diff after apply
         // DSL uses bare `Gateway`, AWS returns "Gateway" as string.
         // Both must normalize to the same namespaced value.
@@ -1896,7 +1910,7 @@ mod tests {
         );
 
         // 2. AWS read-back side: aws_value_to_dsl converts "Gateway" string
-        let provider = AwsccProvider::new("ap-northeast-1").await;
+        let provider = AwsccProvider::new_for_test("ap-northeast-1");
         let aws_json = serde_json::json!("Gateway");
         let aws_dsl = provider
             .aws_value_to_dsl(

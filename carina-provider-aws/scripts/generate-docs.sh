@@ -49,5 +49,9 @@ for DOC_FILE in "$DOCS_DIR"/*.md; do
     fi
 done
 
+# Generate SUMMARY.md (shared across all providers)
+echo ""
+"$PROJECT_ROOT/docs/scripts/generate-summary.sh"
+
 echo ""
 echo "Done! Generated documentation in $DOCS_DIR"
