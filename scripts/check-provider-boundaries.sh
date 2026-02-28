@@ -5,7 +5,8 @@
 # 1. carina-core Cargo.toml must not depend on provider crates
 # 2. carina-core must not reference provider crates (use/inline carina_provider_*)
 # 3. carina-core must not contain hardcoded provider string literals
-# 4. carina-lsp lib code must not reference provider crates (main.rs wiring excluded)
+# 4. carina-lsp must not contain hardcoded provider string literals (main.rs excluded)
+# 5. carina-lsp lib code must not reference provider crates (main.rs wiring excluded)
 set -euo pipefail
 
 violations=0
@@ -99,10 +100,18 @@ check_rust_files "carina-core/src" \
     "carina-core provider string"
 echo "  Done."
 
-# ── Check 4: carina-lsp lib must not reference provider crates ────────────────
+# ── Check 4: carina-lsp must not contain provider string literals ──────────────
+echo "=== Check 4: carina-lsp provider string literals ==="
+check_rust_files "carina-lsp/src" \
+    '"awscc\.|"aws\.|"awscc"|"aws"' \
+    "carina-lsp provider string" \
+    "main.rs"
+echo "  Done."
+
+# ── Check 5: carina-lsp lib must not reference provider crates ────────────────
 # main.rs is excluded because it is the wiring entry point that legitimately
 # instantiates provider factories.
-echo "=== Check 4: carina-lsp provider references (excluding main.rs wiring) ==="
+echo "=== Check 5: carina-lsp provider references (excluding main.rs wiring) ==="
 check_rust_files "carina-lsp/src" \
     'carina_provider_' \
     "carina-lsp provider reference" \

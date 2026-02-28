@@ -597,16 +597,6 @@ impl CompletionProvider {
                 ]
             }
             AttributeType::Enum(variants) => {
-                // Check if this is an availability zone enum (ends with digit + zone letter like 1a, 2b)
-                if variants.iter().any(|v| {
-                    v.len() > 2
-                        && v.chars().last().is_some_and(|c| c.is_ascii_lowercase())
-                        && v.chars()
-                            .nth(v.len() - 2)
-                            .is_some_and(|c| c.is_ascii_digit())
-                }) {
-                    return self.availability_zone_completions(variants);
-                }
                 // Check if this is a region enum (has region-like names but no zone suffix)
                 if variants
                     .iter()
@@ -638,6 +628,11 @@ impl CompletionProvider {
                 self.ipv6_cidr_completions()
             }
             AttributeType::Custom { name, .. } if name == "Arn" => self.arn_completions(),
+            AttributeType::Custom {
+                name, namespace, ..
+            } if name == "AvailabilityZone" => {
+                self.availability_zone_completions(namespace.as_deref().unwrap_or(""), name)
+            }
             AttributeType::Union(_) | AttributeType::String | AttributeType::Custom { .. } => {
                 vec![CompletionItem {
                     label: "env".to_string(),
@@ -742,12 +737,6 @@ impl CompletionProvider {
                 label: "false".to_string(),
                 kind: Some(CompletionItemKind::VALUE),
                 detail: Some("Boolean false".to_string()),
-                ..Default::default()
-            },
-            CompletionItem {
-                label: "aws.Region.ap_northeast_1".to_string(),
-                kind: Some(CompletionItemKind::ENUM_MEMBER),
-                detail: Some("Tokyo region".to_string()),
                 ..Default::default()
             },
             CompletionItem {
@@ -1018,48 +1007,61 @@ impl CompletionProvider {
         None
     }
 
-    fn availability_zone_completions(&self, variants: &[String]) -> Vec<CompletionItem> {
-        // Group AZs by region for better display
-        let region_names: std::collections::HashMap<&str, &str> = [
-            ("ap_northeast_1", "Tokyo"),
-            ("ap_northeast_2", "Seoul"),
-            ("ap_northeast_3", "Osaka"),
-            ("ap_southeast_1", "Singapore"),
-            ("ap_southeast_2", "Sydney"),
-            ("ap_south_1", "Mumbai"),
-            ("us_east_1", "N. Virginia"),
-            ("us_east_2", "Ohio"),
-            ("us_west_1", "N. California"),
-            ("us_west_2", "Oregon"),
-            ("eu_west_1", "Ireland"),
-            ("eu_west_2", "London"),
-            ("eu_central_1", "Frankfurt"),
-        ]
-        .into_iter()
-        .collect();
+    fn availability_zone_completions(
+        &self,
+        namespace: &str,
+        type_name: &str,
+    ) -> Vec<CompletionItem> {
+        let prefix = if namespace.is_empty() {
+            type_name.to_string()
+        } else {
+            format!("{}.{}", namespace, type_name)
+        };
 
-        variants
+        // Build region display names from region_completions_data, filtered by namespace
+        let region_prefix = format!("{}.Region.", namespace);
+        let region_names: std::collections::HashMap<String, String> = self
+            .region_completions_data
             .iter()
-            .map(|az| {
-                // Extract region from AZ (e.g., "ap_northeast_1" from "ap_northeast_1a")
-                let region = &az[..az.len() - 1];
-                let zone_letter = az.chars().last().unwrap_or('?');
-                let region_name = region_names.get(region).unwrap_or(&"");
-                let detail = if region_name.is_empty() {
-                    format!("Zone {}", zone_letter)
-                } else {
-                    format!("{} Zone {}", region_name, zone_letter)
-                };
+            .filter(|c| c.value.starts_with(&region_prefix))
+            .filter_map(|c| {
+                let region_code = c.value.strip_prefix(&region_prefix)?;
+                // Extract short name from description like "Asia Pacific (Tokyo)" -> "Tokyo"
+                let short_name = c
+                    .description
+                    .find('(')
+                    .and_then(|start| {
+                        c.description[start + 1..]
+                            .find(')')
+                            .map(|end| &c.description[start + 1..start + 1 + end])
+                    })
+                    .unwrap_or(&c.description);
+                Some((region_code.to_string(), short_name.to_string()))
+            })
+            .collect();
 
-                CompletionItem {
-                    label: format!("awscc.AvailabilityZone.{}", az),
+        // Generate AZ completions for each region with zone letters a-d
+        let zone_letters = ['a', 'b', 'c', 'd'];
+        let mut completions = Vec::new();
+
+        for (region_code, region_name) in &region_names {
+            for &zone_letter in &zone_letters {
+                let az = format!("{}{}", region_code, zone_letter);
+                let label = format!("{}.{}", prefix, az);
+                let detail = format!("{} Zone {}", region_name, zone_letter);
+                completions.push(CompletionItem {
+                    label: label.clone(),
                     kind: Some(CompletionItemKind::ENUM_MEMBER),
                     detail: Some(detail),
-                    insert_text: Some(format!("awscc.AvailabilityZone.{}", az)),
+                    insert_text: Some(label),
                     ..Default::default()
-                }
-            })
-            .collect()
+                });
+            }
+        }
+
+        // Sort by label for consistent ordering
+        completions.sort_by(|a, b| a.label.cmp(&b.label));
+        completions
     }
 }
 
