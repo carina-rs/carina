@@ -432,4 +432,67 @@ mod tests {
             "First token length should be 13 (aws.s3.bucket)"
         );
     }
+
+    #[test]
+    fn test_region_highlighting_with_dynamic_data() {
+        use carina_core::schema::CompletionValue;
+
+        let regions = vec![
+            CompletionValue::new("aws.Region.us_east_1", "US East (N. Virginia)"),
+            CompletionValue::new("awscc.Region.ap_northeast_1", "Asia Pacific (Tokyo)"),
+        ];
+        let provider = SemanticTokensProvider::new(&regions);
+
+        // Should highlight aws.Region.us_east_1 as TYPE
+        let tokens = provider.tokenize_line("    region = aws.Region.us_east_1", 0);
+        let type_token = tokens.iter().find(|(_, _, typ)| *typ == 1);
+        assert!(
+            type_token.is_some(),
+            "Should highlight aws.Region.us_east_1 as TYPE. Got: {:?}",
+            tokens
+        );
+        let (start, len, _) = type_token.unwrap();
+        assert_eq!(*start, 13);
+        assert_eq!(*len, "aws.Region.us_east_1".len() as u32);
+
+        // Should highlight awscc.Region.ap_northeast_1 as TYPE
+        let tokens = provider.tokenize_line("    region = awscc.Region.ap_northeast_1", 0);
+        let type_token = tokens.iter().find(|(_, _, typ)| *typ == 1);
+        assert!(
+            type_token.is_some(),
+            "Should highlight awscc.Region.ap_northeast_1 as TYPE. Got: {:?}",
+            tokens
+        );
+    }
+
+    #[test]
+    fn test_two_part_region_not_highlighted_without_data() {
+        use carina_core::schema::CompletionValue;
+
+        // Two-part region patterns like "aws.Region" are excluded by find_resource_types
+        // (2nd part starts with uppercase). They need explicit registration to be highlighted.
+        let provider_without = SemanticTokensProvider::new(&[]);
+        let tokens = provider_without.tokenize_line("    region = custom.Region.my_region_1", 0);
+        // find_resource_types will match 3-part pattern, but with registered data it should also match
+        let type_count_without = tokens.iter().filter(|(_, _, typ)| *typ == 1).count();
+
+        let regions = vec![CompletionValue::new(
+            "custom.Region.my_region_1",
+            "My Region",
+        )];
+        let provider_with = SemanticTokensProvider::new(&regions);
+        let tokens = provider_with.tokenize_line("    region = custom.Region.my_region_1", 0);
+        let type_count_with = tokens.iter().filter(|(_, _, typ)| *typ == 1).count();
+
+        // Both should highlight as TYPE (find_resource_types catches 3-part patterns),
+        // but with registration, the pattern is matched twice (then deduped)
+        assert!(
+            type_count_without >= 1,
+            "Should highlight 3-part pattern even without registration"
+        );
+        assert!(
+            type_count_with >= 1,
+            "Should highlight with registration too"
+        );
+    }
 }

@@ -1578,4 +1578,44 @@ simple {
             context
         );
     }
+
+    #[test]
+    fn availability_zone_completions_use_dynamic_prefix() {
+        let provider = test_provider();
+
+        // availability_zone_completions should use the namespace and type_name to build the prefix
+        let completions = provider.availability_zone_completions("awscc", "AvailabilityZone");
+
+        // Should have completions
+        assert!(
+            !completions.is_empty(),
+            "Should generate AZ completions from region data"
+        );
+
+        // All completions should use the dynamic prefix
+        for item in &completions {
+            assert!(
+                item.label.starts_with("awscc.AvailabilityZone."),
+                "Label should start with 'awscc.AvailabilityZone.', got: {}",
+                item.label
+            );
+        }
+
+        // Should include specific regions from the factory data
+        let has_tokyo = completions
+            .iter()
+            .any(|c| c.label == "awscc.AvailabilityZone.ap_northeast_1a");
+        assert!(has_tokyo, "Should include Tokyo region AZs");
+
+        // Detail should include region display name
+        let tokyo_a = completions
+            .iter()
+            .find(|c| c.label == "awscc.AvailabilityZone.ap_northeast_1a")
+            .unwrap();
+        assert_eq!(
+            tokyo_a.detail.as_deref(),
+            Some("Tokyo Zone a"),
+            "Detail should show region name and zone letter"
+        );
+    }
 }
