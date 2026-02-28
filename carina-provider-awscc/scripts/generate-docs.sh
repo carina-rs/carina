@@ -118,34 +118,10 @@ for TYPE_NAME in "${RESOURCE_TYPES[@]}"; do
     fi
 done
 
-# Auto-generate SUMMARY.md with service category grouping
+# Generate SUMMARY.md (shared across all providers)
 echo ""
-echo "Generating docs/src/SUMMARY.md"
-
-cat > "docs/src/SUMMARY.md" << 'EOF'
-# Summary
-
-[Introduction](introduction.md)
-
-# Providers
-
-- [AWSCC Provider](providers/awscc/index.md)
-EOF
-
-# Group resources by service category
-PREV_SERVICE=""
-for TYPE_NAME in "${RESOURCE_TYPES[@]}"; do
-    SERVICE=$(echo "$TYPE_NAME" | awk -F'::' '{print $2}')
-    FULL_RESOURCE=$("$CODEGEN_BIN" --type-name "$TYPE_NAME" --print-full-resource-name)
-    DSL_NAME=$("$CODEGEN_BIN" --type-name "$TYPE_NAME" --print-dsl-resource-name)
-
-    if [ "$SERVICE" != "$PREV_SERVICE" ]; then
-        echo "  - [${SERVICE}]()" >> "docs/src/SUMMARY.md"
-        PREV_SERVICE="$SERVICE"
-    fi
-
-    echo "    - [awscc.${DSL_NAME}](providers/awscc/${FULL_RESOURCE}.md)" >> "docs/src/SUMMARY.md"
-done
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+"$(cd "$SCRIPT_DIR/../.." && pwd)/docs/scripts/generate-summary.sh"
 
 # Auto-generate index.md with categorized resource listing
 echo "Generating $DOCS_DIR/index.md"
