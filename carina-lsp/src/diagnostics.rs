@@ -1907,9 +1907,9 @@ let vpc = awscc.ec2.vpc {
     }
 
     #[test]
-    fn detect_provider_schema_fallback_independent_of_factory_order() {
-        // Test with a resource type that exists only in one provider's schema,
-        // without a provider prefix in the text (edge case for schema-based fallback)
+    fn detect_provider_anonymous_resource_independent_of_factory_order() {
+        // Anonymous resource (no let binding) — verify detection works the same
+        // regardless of factory order
         let engine = test_engine();
         let engine_rev = test_engine_reversed();
 
@@ -1926,18 +1926,15 @@ aws.s3.bucket {
         let diags_normal = engine.analyze(&doc, None);
         let diags_reversed = engine_rev.analyze(&doc, None);
 
-        // Both should produce the same diagnostics regardless of factory order
+        let messages_normal: Vec<_> = diags_normal.iter().map(|d| &d.message).collect();
+        let messages_reversed: Vec<_> = diags_reversed.iter().map(|d| &d.message).collect();
+
         assert_eq!(
-            diags_normal.len(),
-            diags_reversed.len(),
-            "Diagnostic count should be the same regardless of factory order.\n\
+            messages_normal, messages_reversed,
+            "Diagnostics should be identical regardless of factory order.\n\
              Normal: {:?}\n\
              Reversed: {:?}",
-            diags_normal.iter().map(|d| &d.message).collect::<Vec<_>>(),
-            diags_reversed
-                .iter()
-                .map(|d| &d.message)
-                .collect::<Vec<_>>()
+            messages_normal, messages_reversed
         );
     }
 }
