@@ -1838,31 +1838,21 @@ let bucket = aws.s3.bucket {
 }"#,
         );
 
-        // With normal order (aws first)
         let engine = test_engine();
-        let diags_normal = engine.analyze(&doc, None);
-        let unknown_type_normal = diags_normal
-            .iter()
-            .any(|d| d.message.contains("Unknown resource type"));
-
-        // With reversed order (awscc first)
         let engine_rev = test_engine_reversed();
+
+        let diags_normal = engine.analyze(&doc, None);
         let diags_reversed = engine_rev.analyze(&doc, None);
-        let unknown_type_reversed = diags_reversed
-            .iter()
-            .any(|d| d.message.contains("Unknown resource type"));
+
+        let messages_normal: Vec<_> = diags_normal.iter().map(|d| &d.message).collect();
+        let messages_reversed: Vec<_> = diags_reversed.iter().map(|d| &d.message).collect();
 
         assert_eq!(
-            unknown_type_normal,
-            unknown_type_reversed,
-            "aws.s3.bucket detection should not depend on factory order.\n\
-             Normal order diagnostics: {:?}\n\
-             Reversed order diagnostics: {:?}",
-            diags_normal.iter().map(|d| &d.message).collect::<Vec<_>>(),
-            diags_reversed
-                .iter()
-                .map(|d| &d.message)
-                .collect::<Vec<_>>()
+            messages_normal, messages_reversed,
+            "aws.s3.bucket diagnostics should not depend on factory order.\n\
+             Normal: {:?}\n\
+             Reversed: {:?}",
+            messages_normal, messages_reversed
         );
     }
 
@@ -1878,31 +1868,21 @@ let vpc = awscc.ec2.vpc {
 }"#,
         );
 
-        // With normal order (aws first)
         let engine = test_engine();
-        let diags_normal = engine.analyze(&doc, None);
-        let unknown_type_normal = diags_normal
-            .iter()
-            .any(|d| d.message.contains("Unknown resource type"));
-
-        // With reversed order (awscc first)
         let engine_rev = test_engine_reversed();
+
+        let diags_normal = engine.analyze(&doc, None);
         let diags_reversed = engine_rev.analyze(&doc, None);
-        let unknown_type_reversed = diags_reversed
-            .iter()
-            .any(|d| d.message.contains("Unknown resource type"));
+
+        let messages_normal: Vec<_> = diags_normal.iter().map(|d| &d.message).collect();
+        let messages_reversed: Vec<_> = diags_reversed.iter().map(|d| &d.message).collect();
 
         assert_eq!(
-            unknown_type_normal,
-            unknown_type_reversed,
-            "awscc.ec2.vpc detection should not depend on factory order.\n\
-             Normal order diagnostics: {:?}\n\
-             Reversed order diagnostics: {:?}",
-            diags_normal.iter().map(|d| &d.message).collect::<Vec<_>>(),
-            diags_reversed
-                .iter()
-                .map(|d| &d.message)
-                .collect::<Vec<_>>()
+            messages_normal, messages_reversed,
+            "awscc.ec2.vpc diagnostics should not depend on factory order.\n\
+             Normal: {:?}\n\
+             Reversed: {:?}",
+            messages_normal, messages_reversed
         );
     }
 
