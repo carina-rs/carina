@@ -814,7 +814,10 @@ impl DiagnosticEngine {
         diagnostics
     }
 
-    /// Detect the provider for a resource by looking at the DSL text
+    /// Detect the provider for a resource by looking at the DSL text.
+    ///
+    /// Checks all providers equally (sorted by reverse length to match "awscc" before "aws"),
+    /// with no implicit default based on factory ordering.
     fn detect_resource_provider(
         &self,
         doc: &Document,
@@ -828,12 +831,8 @@ impl DiagnosticEngine {
         let mut sorted_names = self.provider_names.clone();
         sorted_names.sort_by_key(|b| std::cmp::Reverse(b.len()));
 
-        // First pass: check for non-default provider patterns
-        let default_provider = self.provider_names.first().cloned().unwrap_or_default();
+        // First pass: check for provider.resource_type pattern in text
         for provider_name in &sorted_names {
-            if *provider_name == default_provider {
-                continue;
-            }
             let pattern = format!("{}.{}", provider_name, resource_type);
             for line in text.lines() {
                 let trimmed = line.trim();
@@ -843,11 +842,8 @@ impl DiagnosticEngine {
             }
         }
 
-        // Also check for the name attribute to be more precise
+        // Second pass: check name attribute within resource block for precision
         for provider_name in &sorted_names {
-            if *provider_name == default_provider {
-                continue;
-            }
             let pattern = format!("{}.{}", provider_name, resource_type);
             let mut in_block = false;
             let mut brace_depth = 0;
@@ -881,7 +877,15 @@ impl DiagnosticEngine {
             }
         }
 
-        default_provider
+        // Fallback: check which provider's schema contains this resource type
+        for provider_name in &sorted_names {
+            let full_type = format!("{}.{}", provider_name, resource_type);
+            if self.schemas.contains_key(&full_type) {
+                return provider_name.clone();
+            }
+        }
+
+        self.provider_names.first().cloned().unwrap_or_default()
     }
 
     /// Find the position of the region attribute in a provider block
@@ -1801,6 +1805,116 @@ let bucket = aws.s3.bucket {
             data_source_diag.is_none(),
             "Regular resource should NOT trigger data source error. Got diagnostics: {:?}",
             diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    /// Create a DiagnosticEngine with reversed factory order (awscc first, aws second)
+    fn test_engine_reversed() -> DiagnosticEngine {
+        let factories: Vec<Box<dyn ProviderFactory>> = vec![
+            Box::new(carina_provider_awscc::AwsccProviderFactory),
+            Box::new(carina_provider_aws::AwsProviderFactory),
+        ];
+        let mut schemas = HashMap::new();
+        for factory in &factories {
+            for schema in factory.schemas() {
+                schemas.insert(schema.resource_type.clone(), schema);
+            }
+        }
+        let schemas = Arc::new(schemas);
+        let provider_names: Vec<String> = factories.iter().map(|f| f.name().to_string()).collect();
+        let factories = Arc::new(factories);
+        DiagnosticEngine::new(schemas, provider_names, factories)
+    }
+
+    #[test]
+    fn detect_provider_aws_resource_independent_of_factory_order() {
+        let doc = create_document(
+            r#"provider aws {
+    region = aws.Region.ap_northeast_1
+}
+
+let bucket = aws.s3.bucket {
+    name = "my-bucket"
+}"#,
+        );
+
+        let engine = test_engine();
+        let engine_rev = test_engine_reversed();
+
+        let diags_normal = engine.analyze(&doc, None);
+        let diags_reversed = engine_rev.analyze(&doc, None);
+
+        let messages_normal: Vec<_> = diags_normal.iter().map(|d| &d.message).collect();
+        let messages_reversed: Vec<_> = diags_reversed.iter().map(|d| &d.message).collect();
+
+        assert_eq!(
+            messages_normal, messages_reversed,
+            "aws.s3.bucket diagnostics should not depend on factory order.\n\
+             Normal: {:?}\n\
+             Reversed: {:?}",
+            messages_normal, messages_reversed
+        );
+    }
+
+    #[test]
+    fn detect_provider_awscc_resource_independent_of_factory_order() {
+        let doc = create_document(
+            r#"provider awscc {
+    region = awscc.Region.ap_northeast_1
+}
+
+let vpc = awscc.ec2.vpc {
+    cidr_block = "10.0.0.0/16"
+}"#,
+        );
+
+        let engine = test_engine();
+        let engine_rev = test_engine_reversed();
+
+        let diags_normal = engine.analyze(&doc, None);
+        let diags_reversed = engine_rev.analyze(&doc, None);
+
+        let messages_normal: Vec<_> = diags_normal.iter().map(|d| &d.message).collect();
+        let messages_reversed: Vec<_> = diags_reversed.iter().map(|d| &d.message).collect();
+
+        assert_eq!(
+            messages_normal, messages_reversed,
+            "awscc.ec2.vpc diagnostics should not depend on factory order.\n\
+             Normal: {:?}\n\
+             Reversed: {:?}",
+            messages_normal, messages_reversed
+        );
+    }
+
+    #[test]
+    fn detect_provider_anonymous_resource_independent_of_factory_order() {
+        // Anonymous resource (no let binding) — verify detection works the same
+        // regardless of factory order
+        let engine = test_engine();
+        let engine_rev = test_engine_reversed();
+
+        let doc = create_document(
+            r#"provider aws {
+    region = aws.Region.ap_northeast_1
+}
+
+aws.s3.bucket {
+    name = "test-bucket"
+}"#,
+        );
+
+        let diags_normal = engine.analyze(&doc, None);
+        let diags_reversed = engine_rev.analyze(&doc, None);
+
+        let messages_normal: Vec<_> = diags_normal.iter().map(|d| &d.message).collect();
+        let messages_reversed: Vec<_> = diags_reversed.iter().map(|d| &d.message).collect();
+
+        assert_eq!(
+            messages_normal, messages_reversed,
+            "Diagnostics should be identical regardless of factory order.\n\
+             Normal: {:?}\n\
+             Reversed: {:?}",
+            messages_normal, messages_reversed
         );
     }
 }
