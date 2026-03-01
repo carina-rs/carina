@@ -988,8 +988,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                     ],
                 })
                 .with_description("Configuration that defines how Amazon S3 handles Object Ownership rules.")
-                .with_provider_name("OwnershipControls")
-                .with_block_name("ownership_control"),
+                .with_provider_name("OwnershipControls"),
         )
         .attribute(
             AttributeSchema::new("public_access_block_configuration", AttributeType::Struct {

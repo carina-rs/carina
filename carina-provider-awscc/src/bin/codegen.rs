@@ -1157,7 +1157,7 @@ pub fn {}() -> AwsccSchemaConfig {{
         ));
 
         // Add block_name for List(Struct) attributes with a natural singular form
-        if attr_type.contains("AttributeType::List(Box::new(AttributeType::Struct")
+        if attr_type.starts_with("AttributeType::List(Box::new(AttributeType::Struct")
             && let Some(singular) = compute_block_name(&attr_name)
             && !all_attr_names.contains(&singular)
         {
