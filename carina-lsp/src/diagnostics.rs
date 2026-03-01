@@ -831,18 +831,10 @@ impl DiagnosticEngine {
         let mut sorted_names = self.provider_names.clone();
         sorted_names.sort_by_key(|b| std::cmp::Reverse(b.len()));
 
-        // First pass: check for provider.resource_type pattern in text
-        for provider_name in &sorted_names {
-            let pattern = format!("{}.{}", provider_name, resource_type);
-            for line in text.lines() {
-                let trimmed = line.trim();
-                if trimmed.contains(&pattern) {
-                    return provider_name.clone();
-                }
-            }
-        }
-
-        // Second pass: check name attribute within resource block for precision
+        // Pass 1: block-scoped name matching (most precise)
+        // Enters each resource block and checks if the `name` attribute matches,
+        // which correctly disambiguates when the same resource type exists under
+        // multiple providers (e.g., aws.ec2.vpc and awscc.ec2.vpc in the same file).
         for provider_name in &sorted_names {
             let pattern = format!("{}.{}", provider_name, resource_type);
             let mut in_block = false;
@@ -873,6 +865,18 @@ impl DiagnosticEngine {
                     if brace_depth == 0 {
                         in_block = false;
                     }
+                }
+            }
+        }
+
+        // Pass 2: line-level matching (fallback for resources without a name attribute
+        // or when block-scoped matching didn't find a match)
+        for provider_name in &sorted_names {
+            let pattern = format!("{}.{}", provider_name, resource_type);
+            for line in text.lines() {
+                let trimmed = line.trim();
+                if trimmed.contains(&pattern) {
+                    return provider_name.clone();
                 }
             }
         }
@@ -1915,6 +1919,49 @@ aws.s3.bucket {
              Normal: {:?}\n\
              Reversed: {:?}",
             messages_normal, messages_reversed
+        );
+    }
+
+    #[test]
+    fn detect_provider_disambiguates_same_resource_type_across_providers() {
+        // When the same resource type (ec2.vpc) exists under both aws and awscc,
+        // detect_resource_provider should use block-scoped name matching to
+        // correctly identify each resource's provider.
+        let engine = test_engine();
+
+        let doc = create_document(
+            r#"provider aws {
+    region = aws.Region.ap_northeast_1
+}
+
+provider awscc {
+    region = awscc.Region.ap_northeast_1
+}
+
+let vpc1 = aws.ec2.vpc {
+    name = "vpc1"
+    cidr_block = "10.0.0.0/16"
+}
+
+let vpc2 = awscc.ec2.vpc {
+    cidr_block = "10.1.0.0/16"
+}"#,
+        );
+
+        // vpc1 should be detected as aws provider
+        let provider1 = engine.detect_resource_provider(&doc, "ec2.vpc", "vpc1");
+        assert_eq!(
+            provider1, "aws",
+            "vpc1 should be detected as aws provider, got '{}'",
+            provider1
+        );
+
+        // vpc2 should be detected as awscc provider
+        let provider2 = engine.detect_resource_provider(&doc, "ec2.vpc", "vpc2");
+        assert_eq!(
+            provider2, "awscc",
+            "vpc2 should be detected as awscc provider, got '{}'",
+            provider2
         );
     }
 }
