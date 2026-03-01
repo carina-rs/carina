@@ -81,7 +81,8 @@ pub fn iam_role_config() -> AwsccSchemaConfig {
                     ],
                 })))
                 .with_description("Adds or updates an inline policy document that is embedded in the specified IAM role. When you embed an inline policy in a role, the inline policy is ...")
-                .with_provider_name("Policies"),
+                .with_provider_name("Policies")
+                .with_block_name("policy"),
         )
         .attribute(
             AttributeSchema::new("role_id", AttributeType::String)

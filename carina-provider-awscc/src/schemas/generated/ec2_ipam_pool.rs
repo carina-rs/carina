@@ -235,7 +235,8 @@ pub fn ec2_ipam_pool_config() -> AwsccSchemaConfig {
                     ],
                 })))
                 .with_description("A list of cidrs representing the address space available for allocation in this pool.")
-                .with_provider_name("ProvisionedCidrs"),
+                .with_provider_name("ProvisionedCidrs")
+                .with_block_name("provisioned_cidr"),
         )
         .attribute(
             AttributeSchema::new("public_ip_source", AttributeType::Custom {

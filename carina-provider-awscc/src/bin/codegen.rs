@@ -1061,6 +1061,13 @@ pub fn {}() -> AwsccSchemaConfig {{
         code.push_str(&format!("        .with_description(\"{}\")\n", truncated));
     }
 
+    // Collect all attribute names for block_name collision detection
+    let all_attr_names: HashSet<String> = schema
+        .properties
+        .keys()
+        .map(|k| k.to_snake_case())
+        .collect();
+
     // Generate attributes for each property
     for (prop_name, prop) in &schema.properties {
         let attr_name = prop_name.to_snake_case();
@@ -1148,6 +1155,17 @@ pub fn {}() -> AwsccSchemaConfig {{
             "\n                .with_provider_name(\"{}\")",
             prop_name
         ));
+
+        // Add block_name for List(Struct) attributes with a natural singular form
+        if attr_type.contains("AttributeType::List(Box::new(AttributeType::Struct")
+            && let Some(singular) = compute_block_name(&attr_name)
+            && !all_attr_names.contains(&singular)
+        {
+            attr_code.push_str(&format!(
+                "\n                .with_block_name(\"{}\")",
+                singular
+            ));
+        }
 
         // Generate .with_completions() for enum attributes
         if let Some(enum_info) = enums.get(prop_name) {
@@ -2054,6 +2072,41 @@ fn cfn_type_to_carina_type_with_enum(
                 ("AttributeType::String".to_string(), None)
             }
         }
+    }
+}
+
+/// Compute singular block name from a plural snake_case attribute name.
+///
+/// Returns `Some(singular)` if the singular differs from the original,
+/// or `None` if the name is already singular or doesn't match known patterns.
+fn compute_block_name(name: &str) -> Option<String> {
+    let singular = if let Some(stem) = name.strip_suffix("ies") {
+        // policies -> policy, entries -> entry
+        format!("{}y", stem)
+    } else if let Some(stem) = name.strip_suffix("sses") {
+        // accesses -> access
+        format!("{}ss", stem)
+    } else if let Some(stem) = name.strip_suffix("xes") {
+        // boxes -> box
+        format!("{}x", stem)
+    } else if let Some(stem) = name.strip_suffix("ses") {
+        // buses -> bus
+        format!("{}s", stem)
+    } else if let Some(stem) = name.strip_suffix('s') {
+        if name.ends_with("ss") || name.ends_with("us") {
+            // "access" ends in "ss", "status" ends in "us" -> skip
+            return None;
+        }
+        // regions -> region, tags -> tag, sizes -> size
+        stem.to_string()
+    } else {
+        return None;
+    };
+
+    if singular == name || singular.is_empty() {
+        None
+    } else {
+        Some(singular)
     }
 }
 
@@ -3694,5 +3747,42 @@ mod tests {
         let ip_protocol_aliases = aliases.get("IpProtocol").unwrap();
         let alias_values: Vec<&str> = ip_protocol_aliases.iter().map(|(_, a)| *a).collect();
         assert!(alias_values.contains(&"all"), "Should have 'all' alias");
+    }
+
+    #[test]
+    fn test_compute_block_name_simple_plural() {
+        assert_eq!(compute_block_name("regions"), Some("region".to_string()));
+        assert_eq!(compute_block_name("tags"), Some("tag".to_string()));
+        assert_eq!(
+            compute_block_name("operating_regions"),
+            Some("operating_region".to_string())
+        );
+    }
+
+    #[test]
+    fn test_compute_block_name_ies_suffix() {
+        assert_eq!(compute_block_name("policies"), Some("policy".to_string()));
+        assert_eq!(compute_block_name("entries"), Some("entry".to_string()));
+    }
+
+    #[test]
+    fn test_compute_block_name_ses_xes_suffix() {
+        assert_eq!(compute_block_name("buses"), Some("bus".to_string()));
+        assert_eq!(compute_block_name("boxes"), Some("box".to_string()));
+    }
+
+    #[test]
+    fn test_compute_block_name_sses_suffix() {
+        assert_eq!(compute_block_name("accesses"), Some("access".to_string()));
+        // "addresses" -> "address" (sses rule takes priority)
+        assert_eq!(compute_block_name("addresses"), Some("address".to_string()));
+    }
+
+    #[test]
+    fn test_compute_block_name_no_change() {
+        // Already singular or doesn't match patterns
+        assert_eq!(compute_block_name("name"), None);
+        assert_eq!(compute_block_name("status"), None);
+        assert_eq!(compute_block_name("access"), None);
     }
 }
