@@ -831,51 +831,17 @@ impl DiagnosticEngine {
         let mut sorted_names = self.provider_names.clone();
         sorted_names.sort_by_key(|b| std::cmp::Reverse(b.len()));
 
-        // Pass 1: block-scoped name matching (most precise)
-        // Enters each resource block and checks if the `name` attribute matches,
-        // which correctly disambiguates when the same resource type exists under
-        // multiple providers (e.g., aws.ec2.vpc and awscc.ec2.vpc in the same file).
-        for provider_name in &sorted_names {
-            let pattern = format!("{}.{}", provider_name, resource_type);
-            let mut in_block = false;
-            let mut brace_depth = 0;
-
-            for line in text.lines() {
-                let trimmed = line.trim();
-
-                if trimmed.contains(&pattern) && trimmed.contains('{') {
-                    in_block = true;
-                    brace_depth = 1;
-                    continue;
-                }
-
-                if in_block {
-                    for ch in trimmed.chars() {
-                        if ch == '{' {
-                            brace_depth += 1;
-                        } else if ch == '}' {
-                            brace_depth -= 1;
-                        }
-                    }
-
-                    if trimmed.starts_with("name") && trimmed.contains(resource_name) {
-                        return provider_name.clone();
-                    }
-
-                    if brace_depth == 0 {
-                        in_block = false;
-                    }
-                }
-            }
-        }
-
-        // Pass 2: line-level matching (fallback for resources without a name attribute
-        // or when block-scoped matching didn't find a match)
+        // Line-level matching: check for provider.resource_type pattern in text.
+        // When resource_name is non-empty (let-bound resources), require both the
+        // pattern and the binding name on the same line to disambiguate when the
+        // same resource type exists under multiple providers.
         for provider_name in &sorted_names {
             let pattern = format!("{}.{}", provider_name, resource_type);
             for line in text.lines() {
                 let trimmed = line.trim();
-                if trimmed.contains(&pattern) {
+                if trimmed.contains(&pattern)
+                    && (resource_name.is_empty() || trimmed.contains(resource_name))
+                {
                     return provider_name.clone();
                 }
             }
@@ -1925,8 +1891,9 @@ aws.s3.bucket {
     #[test]
     fn detect_provider_disambiguates_same_resource_type_across_providers() {
         // When the same resource type (ec2.vpc) exists under both aws and awscc,
-        // detect_resource_provider should use block-scoped name matching to
-        // correctly identify each resource's provider.
+        // detect_resource_provider should use the binding name on the declaration
+        // line to correctly identify each resource's provider.
+        // This works even without a `name` attribute in the resource block.
         let engine = test_engine();
 
         let doc = create_document(
@@ -1939,7 +1906,6 @@ provider awscc {
 }
 
 let vpc1 = aws.ec2.vpc {
-    name = "vpc1"
     cidr_block = "10.0.0.0/16"
 }
 
