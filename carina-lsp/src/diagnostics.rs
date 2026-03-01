@@ -57,9 +57,7 @@ impl DiagnosticEngine {
             let mut binding_schema_map: HashMap<String, ResourceSchema> = HashMap::new();
             for res in &parsed.resources {
                 if let Some(Value::String(binding_name)) = res.attributes.get("_binding") {
-                    let provider =
-                        self.detect_resource_provider(doc, &res.id.resource_type, &res.id.name);
-                    let full_type = format!("{}.{}", provider, res.id.resource_type);
+                    let full_type = format!("{}.{}", res.id.provider, res.id.resource_type);
                     if let Some(s) = self.schemas.get(&full_type).cloned() {
                         binding_schema_map.insert(binding_name.clone(), s);
                     }
@@ -68,12 +66,7 @@ impl DiagnosticEngine {
 
             // Check resource types
             for resource in &parsed.resources {
-                // Detect the provider (aws or awscc) for a resource by looking at the DSL
-                let provider = self.detect_resource_provider(
-                    doc,
-                    &resource.id.resource_type,
-                    &resource.id.name,
-                );
+                let provider = &resource.id.provider;
                 let full_resource_type = format!("{}.{}", provider, resource.id.resource_type);
 
                 if !self.schemas.contains_key(&full_resource_type) {
@@ -812,80 +805,6 @@ impl DiagnosticEngine {
             }
         }
         diagnostics
-    }
-
-    /// Detect the provider for a resource by looking at the DSL text.
-    ///
-    /// Checks all providers equally (sorted by reverse length to match "awscc" before "aws"),
-    /// with no implicit default based on factory ordering.
-    fn detect_resource_provider(
-        &self,
-        doc: &Document,
-        resource_type: &str,
-        resource_name: &str,
-    ) -> String {
-        let text = doc.text();
-
-        // Check provider names in reverse length order (longest first)
-        // to match "awscc" before "aws"
-        let mut sorted_names = self.provider_names.clone();
-        sorted_names.sort_by_key(|b| std::cmp::Reverse(b.len()));
-
-        // First pass: check for provider.resource_type pattern in text
-        for provider_name in &sorted_names {
-            let pattern = format!("{}.{}", provider_name, resource_type);
-            for line in text.lines() {
-                let trimmed = line.trim();
-                if trimmed.contains(&pattern) {
-                    return provider_name.clone();
-                }
-            }
-        }
-
-        // Second pass: check name attribute within resource block for precision
-        for provider_name in &sorted_names {
-            let pattern = format!("{}.{}", provider_name, resource_type);
-            let mut in_block = false;
-            let mut brace_depth = 0;
-
-            for line in text.lines() {
-                let trimmed = line.trim();
-
-                if trimmed.contains(&pattern) && trimmed.contains('{') {
-                    in_block = true;
-                    brace_depth = 1;
-                    continue;
-                }
-
-                if in_block {
-                    for ch in trimmed.chars() {
-                        if ch == '{' {
-                            brace_depth += 1;
-                        } else if ch == '}' {
-                            brace_depth -= 1;
-                        }
-                    }
-
-                    if trimmed.starts_with("name") && trimmed.contains(resource_name) {
-                        return provider_name.clone();
-                    }
-
-                    if brace_depth == 0 {
-                        in_block = false;
-                    }
-                }
-            }
-        }
-
-        // Fallback: check which provider's schema contains this resource type
-        for provider_name in &sorted_names {
-            let full_type = format!("{}.{}", provider_name, resource_type);
-            if self.schemas.contains_key(&full_type) {
-                return provider_name.clone();
-            }
-        }
-
-        self.provider_names.first().cloned().unwrap_or_default()
     }
 
     /// Find the position of the region attribute in a provider block
