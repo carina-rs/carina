@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::fmt;
 
-use crate::resource::Value;
+use crate::resource::{Resource, Value};
 use crate::utils::extract_enum_value;
 
 /// Type alias for resource validator functions
@@ -431,6 +431,8 @@ pub struct AttributeSchema {
     pub provider_name: Option<String>,
     /// Whether this attribute is create-only (immutable after creation)
     pub create_only: bool,
+    /// Alternative block name for repeated block syntax (e.g., "operating_region" for "operating_regions")
+    pub block_name: Option<String>,
 }
 
 impl AttributeSchema {
@@ -444,6 +446,7 @@ impl AttributeSchema {
             completions: None,
             provider_name: None,
             create_only: false,
+            block_name: None,
         }
     }
 
@@ -474,6 +477,11 @@ impl AttributeSchema {
 
     pub fn with_provider_name(mut self, name: impl Into<String>) -> Self {
         self.provider_name = Some(name.into());
+        self
+    }
+
+    pub fn with_block_name(mut self, name: impl Into<String>) -> Self {
+        self.block_name = Some(name.into());
         self
     }
 }
@@ -522,6 +530,20 @@ impl ResourceSchema {
         self
     }
 
+    /// Returns a map of block_name -> canonical attribute name
+    /// for all attributes that have a block_name set.
+    pub fn block_name_map(&self) -> HashMap<String, String> {
+        self.attributes
+            .iter()
+            .filter_map(|(attr_name, schema)| {
+                schema
+                    .block_name
+                    .as_ref()
+                    .map(|bn| (bn.clone(), attr_name.clone()))
+            })
+            .collect()
+    }
+
     /// Returns the names of create-only (immutable) attributes
     pub fn create_only_attributes(&self) -> Vec<&str> {
         self.attributes
@@ -564,6 +586,60 @@ impl ResourceSchema {
         } else {
             Err(errors)
         }
+    }
+}
+
+/// Resolve block name aliases in resources.
+///
+/// For each resource attribute key that matches a `block_name` in the schema,
+/// renames it to the canonical attribute name. Errors if both the block_name
+/// (singular) and the canonical attribute name (plural) are present.
+///
+/// The `schema_key_fn` closure computes the schema lookup key for a resource.
+pub fn resolve_block_names(
+    resources: &mut [Resource],
+    schemas: &HashMap<String, ResourceSchema>,
+    schema_key_fn: impl Fn(&Resource) -> String,
+) -> Result<(), String> {
+    let mut all_errors = Vec::new();
+
+    for resource in resources.iter_mut() {
+        let schema_key = schema_key_fn(resource);
+        let schema = match schemas.get(&schema_key) {
+            Some(s) => s,
+            None => continue,
+        };
+
+        let bn_map = schema.block_name_map();
+        if bn_map.is_empty() {
+            continue;
+        }
+
+        // Collect keys to rename: (block_name_key, canonical_attr_name)
+        let renames: Vec<(String, String)> = resource
+            .attributes
+            .keys()
+            .filter_map(|key| bn_map.get(key).map(|canon| (key.clone(), canon.clone())))
+            .collect();
+
+        for (block_key, canon_key) in renames {
+            if resource.attributes.contains_key(&canon_key) {
+                all_errors.push(format!(
+                    "{}: cannot use both '{}' and '{}' (they refer to the same attribute)",
+                    resource.id, block_key, canon_key
+                ));
+                continue;
+            }
+
+            let value = resource.attributes.remove(&block_key).unwrap();
+            resource.attributes.insert(canon_key, value);
+        }
+    }
+
+    if all_errors.is_empty() {
+        Ok(())
+    } else {
+        Err(all_errors.join("\n"))
     }
 }
 
@@ -1658,5 +1734,141 @@ mod tests {
         let simple = AttributeType::String;
         assert!(simple.accepts_type_name("String"));
         assert!(!simple.accepts_type_name("Int"));
+    }
+
+    #[test]
+    fn with_block_name_builder() {
+        let attr = AttributeSchema::new("operating_regions", AttributeType::String)
+            .with_block_name("operating_region");
+        assert_eq!(attr.block_name.as_deref(), Some("operating_region"));
+    }
+
+    #[test]
+    fn block_name_default_is_none() {
+        let attr = AttributeSchema::new("name", AttributeType::String);
+        assert!(attr.block_name.is_none());
+    }
+
+    #[test]
+    fn block_name_map_returns_mapping() {
+        let schema = ResourceSchema::new("test.resource")
+            .attribute(
+                AttributeSchema::new("operating_regions", AttributeType::String)
+                    .with_block_name("operating_region"),
+            )
+            .attribute(AttributeSchema::new("name", AttributeType::String));
+
+        let map = schema.block_name_map();
+        assert_eq!(map.len(), 1);
+        assert_eq!(map.get("operating_region").unwrap(), "operating_regions");
+    }
+
+    #[test]
+    fn block_name_map_empty_when_no_block_names() {
+        let schema = ResourceSchema::new("test.resource")
+            .attribute(AttributeSchema::new("name", AttributeType::String));
+
+        let map = schema.block_name_map();
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn resolve_block_names_renames_key() {
+        let mut resources = vec![{
+            let mut r = Resource::new("ec2.ipam", "my-ipam");
+            r.attributes.insert(
+                "operating_region".to_string(),
+                Value::String("us-east-1".to_string()),
+            );
+            r.attributes
+                .insert("_provider".to_string(), Value::String("awscc".to_string()));
+            r
+        }];
+
+        let mut schemas = HashMap::new();
+        schemas.insert(
+            "ec2.ipam".to_string(),
+            ResourceSchema::new("ec2.ipam").attribute(
+                AttributeSchema::new("operating_regions", AttributeType::String)
+                    .with_block_name("operating_region"),
+            ),
+        );
+
+        resolve_block_names(&mut resources, &schemas, |r| r.id.resource_type.clone()).unwrap();
+
+        assert!(resources[0].attributes.contains_key("operating_regions"));
+        assert!(!resources[0].attributes.contains_key("operating_region"));
+    }
+
+    #[test]
+    fn resolve_block_names_noop_when_no_match() {
+        let mut resources = vec![{
+            let mut r = Resource::new("ec2.ipam", "my-ipam");
+            r.attributes
+                .insert("name".to_string(), Value::String("test".to_string()));
+            r
+        }];
+
+        let mut schemas = HashMap::new();
+        schemas.insert(
+            "ec2.ipam".to_string(),
+            ResourceSchema::new("ec2.ipam")
+                .attribute(AttributeSchema::new("name", AttributeType::String)),
+        );
+
+        resolve_block_names(&mut resources, &schemas, |r| r.id.resource_type.clone()).unwrap();
+
+        assert!(resources[0].attributes.contains_key("name"));
+    }
+
+    #[test]
+    fn resolve_block_names_errors_on_mixed_syntax() {
+        let mut resources = vec![{
+            let mut r = Resource::new("ec2.ipam", "my-ipam");
+            r.attributes.insert(
+                "operating_region".to_string(),
+                Value::String("us-east-1".to_string()),
+            );
+            r.attributes.insert(
+                "operating_regions".to_string(),
+                Value::String("us-west-2".to_string()),
+            );
+            r
+        }];
+
+        let mut schemas = HashMap::new();
+        schemas.insert(
+            "ec2.ipam".to_string(),
+            ResourceSchema::new("ec2.ipam").attribute(
+                AttributeSchema::new("operating_regions", AttributeType::String)
+                    .with_block_name("operating_region"),
+            ),
+        );
+
+        let result = resolve_block_names(&mut resources, &schemas, |r| r.id.resource_type.clone());
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("operating_region"));
+        assert!(err.contains("operating_regions"));
+    }
+
+    #[test]
+    fn resolve_block_names_skips_unknown_schema() {
+        let mut resources = vec![{
+            let mut r = Resource::new("unknown.type", "test");
+            r.attributes.insert(
+                "operating_region".to_string(),
+                Value::String("us-east-1".to_string()),
+            );
+            r
+        }];
+
+        let schemas = HashMap::new();
+
+        // Should not error for unknown resource types
+        resolve_block_names(&mut resources, &schemas, |r| r.id.resource_type.clone()).unwrap();
+
+        // Key should remain unchanged
+        assert!(resources[0].attributes.contains_key("operating_region"));
     }
 }

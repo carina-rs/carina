@@ -18,8 +18,8 @@ use carina_core::provider::{
     BoxFuture, Provider, ProviderError, ProviderFactory, ProviderResult, ResourceType,
 };
 use carina_core::resource::{LifecycleConfig, Resource, ResourceId, State, Value};
-use carina_core::schema::ResourceSchema;
 use carina_core::schema::validate_ipv4_cidr;
+use carina_core::schema::{ResourceSchema, resolve_block_names};
 use carina_core::utils::is_dsl_enum_format;
 use carina_provider_aws::AwsProviderFactory;
 use carina_provider_awscc::AwsccProviderFactory;
@@ -425,6 +425,16 @@ fn generate_random_suffix() -> String {
     let uuid = uuid::Uuid::new_v4();
     let hex = uuid.as_simple().to_string();
     hex[..8].to_string()
+}
+
+/// Resolve block name aliases and attribute prefixes in one step.
+fn resolve_names(resources: &mut [Resource]) -> Result<(), String> {
+    let factories = provider_factories();
+    let schemas = get_schemas();
+    resolve_block_names(resources, &schemas, |r| {
+        schema_key_for_resource(&factories, r)
+    })?;
+    resolve_attr_prefixes(resources)
 }
 
 /// Resolve `<attr>_prefix` meta-attributes in resources.
@@ -1006,7 +1016,7 @@ fn run_validate(path: &PathBuf) -> Result<(), String> {
 
     println!("{}", "Validating...".cyan());
 
-    resolve_attr_prefixes(&mut parsed.resources)?;
+    resolve_names(&mut parsed.resources)?;
     validate_resources(&parsed.resources)?;
     validate_resource_ref_types(&parsed.resources)?;
     compute_anonymous_identifiers(&mut parsed.resources, &parsed.providers)?;
@@ -1039,7 +1049,7 @@ async fn run_plan(path: &PathBuf, out: Option<&PathBuf>) -> Result<bool, String>
     // Validate provider region
     validate_provider_region(&parsed)?;
 
-    resolve_attr_prefixes(&mut parsed.resources)?;
+    resolve_names(&mut parsed.resources)?;
     validate_resources(&parsed.resources)?;
     validate_resource_ref_types(&parsed.resources)?;
     compute_anonymous_identifiers(&mut parsed.resources, &parsed.providers)?;
@@ -1217,7 +1227,7 @@ async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
     // Validate provider region
     validate_provider_region(&parsed)?;
 
-    resolve_attr_prefixes(&mut parsed.resources)?;
+    resolve_names(&mut parsed.resources)?;
     validate_resources(&parsed.resources)?;
     validate_resource_ref_types(&parsed.resources)?;
     compute_anonymous_identifiers(&mut parsed.resources, &parsed.providers)?;
@@ -1392,7 +1402,7 @@ async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
                     {
                         return Err(format!("Module resolution error: {}", e));
                     }
-                    resolve_attr_prefixes(&mut parsed.resources)?;
+                    resolve_names(&mut parsed.resources)?;
                 } else {
                     return Err(format!(
                         "Backend bucket '{}' not found and auto_create is disabled",
@@ -2452,7 +2462,7 @@ async fn run_destroy(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
     // Validate provider region
     validate_provider_region(&parsed)?;
 
-    resolve_attr_prefixes(&mut parsed.resources)?;
+    resolve_names(&mut parsed.resources)?;
     compute_anonymous_identifiers(&mut parsed.resources, &parsed.providers)?;
 
     if parsed.resources.is_empty() {
@@ -4616,11 +4626,18 @@ fn run_lint(path: &PathBuf) -> Result<(), String> {
     };
 
     // Collect all List<Struct> attribute names from schemas of parsed resources
+    // and build a map of attr_name -> block_name for lint suggestions
     let mut all_list_struct_attrs: HashSet<String> = HashSet::new();
+    let mut block_name_suggestions: HashMap<String, String> = HashMap::new();
     for resource in &parsed.resources {
         let schema_key = schema_key_for_resource(&factories, resource);
         if let Some(schema) = schemas.get(&schema_key) {
             all_list_struct_attrs.extend(list_struct_attr_names(schema));
+            for (attr_name, attr_schema) in &schema.attributes {
+                if let Some(bn) = &attr_schema.block_name {
+                    block_name_suggestions.insert(attr_name.clone(), bn.clone());
+                }
+            }
         }
     }
 
@@ -4630,12 +4647,16 @@ fn run_lint(path: &PathBuf) -> Result<(), String> {
     for (file_path, source) in &source_texts {
         let hits = find_list_literal_attrs(source, &all_list_struct_attrs);
         for (attr_name, line) in hits {
+            let suggested_name = block_name_suggestions
+                .get(&attr_name)
+                .map(|s| s.as_str())
+                .unwrap_or(&attr_name);
             warnings.push(LintWarning {
                 file: file_path.clone(),
                 line,
                 message: format!(
                     "Prefer block syntax for '{}'. Use `{} {{ ... }}` instead of `{} = [{{ ... }}]`.",
-                    attr_name, attr_name, attr_name
+                    attr_name, suggested_name, attr_name
                 ),
             });
         }
@@ -4911,6 +4932,33 @@ mod tests {
         let result = resolve_attr_prefixes(&mut resources);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("cannot be empty"));
+    }
+
+    #[test]
+    fn test_resolve_names_handles_block_name_before_prefix() {
+        // resolve_names should first resolve block names, then resolve attr prefixes
+        let mut resource = Resource::with_provider("awscc", "ec2.ipam", "test-ipam");
+        resource
+            .attributes
+            .insert("_provider".to_string(), Value::String("awscc".to_string()));
+        resource.attributes.insert(
+            "operating_region".to_string(),
+            Value::Map(
+                vec![(
+                    "region_name".to_string(),
+                    Value::String("us-east-1".to_string()),
+                )]
+                .into_iter()
+                .collect(),
+            ),
+        );
+
+        let mut resources = vec![resource];
+        resolve_names(&mut resources).unwrap();
+
+        // operating_region should be renamed to operating_regions
+        assert!(resources[0].attributes.contains_key("operating_regions"));
+        assert!(!resources[0].attributes.contains_key("operating_region"));
     }
 
     #[test]

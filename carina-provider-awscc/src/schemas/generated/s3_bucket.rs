@@ -467,7 +467,8 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                     ],
                 })))
                 .with_description("Specifies the configuration and any analyses for the analytics filter of an Amazon S3 bucket.")
-                .with_provider_name("AnalyticsConfigurations"),
+                .with_provider_name("AnalyticsConfigurations")
+                .with_block_name("analytics_configuration"),
         )
         .attribute(
             AttributeSchema::new("arn", super::arn())
@@ -568,7 +569,8 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                     ],
                 })))
                 .with_description("Defines how Amazon S3 handles Intelligent-Tiering storage.")
-                .with_provider_name("IntelligentTieringConfigurations"),
+                .with_provider_name("IntelligentTieringConfigurations")
+                .with_block_name("intelligent_tiering_configuration"),
         )
         .attribute(
             AttributeSchema::new("inventory_configurations", AttributeType::List(Box::new(AttributeType::Struct {
@@ -610,7 +612,8 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                     ],
                 })))
                 .with_description("Specifies the S3 Inventory configuration for an Amazon S3 bucket. For more information, see [GET Bucket inventory](https://docs.aws.amazon.com/AmazonS...")
-                .with_provider_name("InventoryConfigurations"),
+                .with_provider_name("InventoryConfigurations")
+                .with_block_name("inventory_configuration"),
         )
         .attribute(
             AttributeSchema::new("lifecycle_configuration", AttributeType::Struct {
@@ -842,7 +845,8 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                     ],
                 })))
                 .with_description("Specifies a metrics configuration for the CloudWatch request metrics (specified by the metrics configuration ID) from an Amazon S3 bucket. If you're u...")
-                .with_provider_name("MetricsConfigurations"),
+                .with_provider_name("MetricsConfigurations")
+                .with_block_name("metrics_configuration"),
         )
         .attribute(
             AttributeSchema::new("notification_configuration", AttributeType::Struct {

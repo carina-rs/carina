@@ -399,6 +399,23 @@ impl CompletionProvider {
                     command: Some(trigger_suggest.clone()),
                     ..Default::default()
                 });
+
+                // For List(Struct) attributes with block_name, offer block syntax completion
+                if let Some(bn) = &attr.block_name
+                    && matches!(
+                        &attr.attr_type,
+                        AttributeType::List(inner) if matches!(inner.as_ref(), AttributeType::Struct { .. })
+                    )
+                {
+                    completions.push(CompletionItem {
+                        label: bn.clone(),
+                        kind: Some(CompletionItemKind::SNIPPET),
+                        detail: Some(format!("Block syntax for '{}'", attr.name)),
+                        insert_text: Some(format!("{} {{\n  $0\n}}", bn)),
+                        insert_text_format: Some(InsertTextFormat::SNIPPET),
+                        ..Default::default()
+                    });
+                }
             }
         } else {
             // Fall back to all attributes from all schemas
@@ -662,6 +679,22 @@ impl CompletionProvider {
         }
     }
 
+    /// Look up attribute schema by name, falling back to block_name match.
+    fn find_attr_schema<'a>(
+        &self,
+        schema: &'a ResourceSchema,
+        attr_name: &str,
+    ) -> Option<&'a carina_core::schema::AttributeSchema> {
+        if let Some(attr_schema) = schema.attributes.get(attr_name) {
+            return Some(attr_schema);
+        }
+        // Fallback: check if attr_name matches a block_name
+        schema
+            .attributes
+            .values()
+            .find(|a| a.block_name.as_ref().is_some_and(|bn| bn == attr_name))
+    }
+
     /// Provide completions for struct fields inside a nested block
     fn struct_field_completions(
         &self,
@@ -675,7 +708,7 @@ impl CompletionProvider {
         };
 
         if let Some(schema) = self.schemas.get(resource_type)
-            && let Some(attr_schema) = schema.attributes.get(attr_name)
+            && let Some(attr_schema) = self.find_attr_schema(schema, attr_name)
             && let Some(fields) = self.extract_struct_fields(&attr_schema.attr_type)
         {
             fields
@@ -715,7 +748,7 @@ impl CompletionProvider {
         field_name: &str,
     ) -> Vec<CompletionItem> {
         if let Some(schema) = self.schemas.get(resource_type)
-            && let Some(attr_schema) = schema.attributes.get(attr_name)
+            && let Some(attr_schema) = self.find_attr_schema(schema, attr_name)
             && let Some(fields) = self.extract_struct_fields(&attr_schema.attr_type)
             && let Some(field) = fields.iter().find(|f| f.name == field_name)
         {
@@ -1616,6 +1649,41 @@ simple {
             tokyo_a.detail.as_deref(),
             Some("Tokyo Zone a"),
             "Detail should show region name and zone letter"
+        );
+    }
+
+    #[test]
+    fn struct_field_completions_via_block_name() {
+        let provider = test_provider();
+        // Use singular "operating_region" (block_name) to get struct fields
+        let completions = provider.struct_field_completions("awscc.ec2.ipam", "operating_region");
+        assert!(
+            !completions.is_empty(),
+            "Should provide struct field completions via block_name"
+        );
+        let field_names: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+        assert!(
+            field_names.contains(&"region_name"),
+            "Should include region_name field. Got: {:?}",
+            field_names
+        );
+    }
+
+    #[test]
+    fn attribute_completions_include_block_name_snippet() {
+        let provider = test_provider();
+        let completions = provider.attribute_completions_for_type("awscc.ec2.ipam");
+        let block_name_completion = completions.iter().find(|c| c.label == "operating_region");
+        assert!(
+            block_name_completion.is_some(),
+            "Should offer block_name 'operating_region' as a completion. Labels: {:?}",
+            completions.iter().map(|c| &c.label).collect::<Vec<_>>()
+        );
+        let item = block_name_completion.unwrap();
+        assert_eq!(item.kind, Some(CompletionItemKind::SNIPPET));
+        assert!(
+            item.detail.as_ref().unwrap().contains("operating_regions"),
+            "Detail should reference canonical name"
         );
     }
 }

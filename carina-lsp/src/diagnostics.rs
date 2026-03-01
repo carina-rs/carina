@@ -133,13 +133,51 @@ impl DiagnosticEngine {
                     }
                 }
                 if let Some(schema) = schema {
+                    // Build block_name -> canonical_name map for this schema
+                    let bn_map = schema.block_name_map();
+
                     for (attr_name, attr_value) in &resource.attributes {
                         if attr_name.starts_with('_') {
                             continue; // Skip internal attributes
                         }
 
+                        // Resolve block_name to canonical attribute name
+                        let canonical_name = bn_map
+                            .get(attr_name)
+                            .map(|s| s.as_str())
+                            .unwrap_or(attr_name);
+
+                        // Check for mixed syntax: both block_name and canonical name present
+                        if let Some(canon) = bn_map.get(attr_name)
+                            && resource.attributes.contains_key(canon)
+                        {
+                            if let Some((line, col)) = self.find_attribute_position(doc, attr_name)
+                            {
+                                diagnostics.push(Diagnostic {
+                                    range: Range {
+                                        start: Position {
+                                            line,
+                                            character: col,
+                                        },
+                                        end: Position {
+                                            line,
+                                            character: col + attr_name.len() as u32,
+                                        },
+                                    },
+                                    severity: Some(DiagnosticSeverity::ERROR),
+                                    source: Some("carina".to_string()),
+                                    message: format!(
+                                        "Cannot use both '{}' and '{}' (they refer to the same attribute)",
+                                        attr_name, canon
+                                    ),
+                                    ..Default::default()
+                                });
+                            }
+                            continue;
+                        }
+
                         // Check for unknown attributes
-                        if !schema.attributes.contains_key(attr_name) {
+                        if !schema.attributes.contains_key(canonical_name) {
                             if let Some((line, col)) = self.find_attribute_position(doc, attr_name)
                             {
                                 // Check if there's a similar attribute (e.g., vpc -> vpc_id)
@@ -175,7 +213,7 @@ impl DiagnosticEngine {
                         }
 
                         // Type validation
-                        if let Some(attr_schema) = schema.attributes.get(attr_name) {
+                        if let Some(attr_schema) = schema.attributes.get(canonical_name) {
                             // Check for duplicate struct blocks:
                             // If schema type is Struct (not List(Struct)) but value is a List with multiple items
                             if matches!(
@@ -185,7 +223,11 @@ impl DiagnosticEngine {
                                 && items.len() > 1
                             {
                                 // Find all block positions for this attribute
-                                let block_positions = self.find_all_block_positions(doc, attr_name);
+                                // Use block_name if this attribute was accessed via block_name
+                                let search_name =
+                                    attr_schema.block_name.as_deref().unwrap_or(attr_name);
+                                let block_positions =
+                                    self.find_all_block_positions(doc, search_name);
                                 // Emit error on the second and subsequent blocks
                                 for pos in block_positions.iter().skip(1) {
                                     diagnostics.push(Diagnostic {
@@ -196,14 +238,14 @@ impl DiagnosticEngine {
                                             },
                                             end: Position {
                                                 line: pos.0,
-                                                character: pos.1 + attr_name.len() as u32,
+                                                character: pos.1 + search_name.len() as u32,
                                             },
                                         },
                                         severity: Some(DiagnosticSeverity::ERROR),
                                         source: Some("carina".to_string()),
                                         message: format!(
                                             "'{}' is a single block attribute and cannot be specified more than once",
-                                            attr_name
+                                            search_name
                                         ),
                                         ..Default::default()
                                     });
@@ -1834,6 +1876,69 @@ aws.s3.bucket {
              Normal: {:?}\n\
              Reversed: {:?}",
             messages_normal, messages_reversed
+        );
+    }
+
+    #[test]
+    fn block_name_not_flagged_as_unknown() {
+        let engine = test_engine();
+        // Use operating_region (singular block_name) instead of operating_regions
+        let doc = create_document(
+            r#"provider awscc {
+    region = awscc.Region.ap_northeast_1
+}
+
+awscc.ec2.ipam {
+    name = "test-ipam"
+    operating_region {
+        region_name = "ap-northeast-1"
+    }
+}"#,
+        );
+
+        let diagnostics = engine.analyze(&doc, None);
+
+        let unknown = diagnostics
+            .iter()
+            .find(|d| d.message.contains("Unknown attribute 'operating_region'"));
+        assert!(
+            unknown.is_none(),
+            "block_name 'operating_region' should not be flagged as unknown. Got: {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn block_name_mixed_syntax_error() {
+        let engine = test_engine();
+        // Use both operating_region and operating_regions - should error
+        let doc = create_document(
+            r#"provider awscc {
+    region = awscc.Region.ap_northeast_1
+}
+
+awscc.ec2.ipam {
+    name = "test-ipam"
+    operating_region {
+        region_name = "ap-northeast-1"
+    }
+    operating_regions = [{
+        region_name = "us-east-1"
+    }]
+}"#,
+        );
+
+        let diagnostics = engine.analyze(&doc, None);
+
+        let mixed_error = diagnostics.iter().find(|d| {
+            d.message.contains("operating_region")
+                && d.message.contains("operating_regions")
+                && d.message.contains("same attribute")
+        });
+        assert!(
+            mixed_error.is_some(),
+            "Should error on mixed block_name and canonical name. Got: {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
     }
 }

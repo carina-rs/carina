@@ -99,7 +99,8 @@ pub fn ec2_nat_gateway_config() -> AwsccSchemaConfig {
                     ],
                 })))
                 .with_description("For regional NAT gateways only: Specifies which Availability Zones you want the NAT gateway to support and the Elastic IP addresses (EIPs) to use in e...")
-                .with_provider_name("AvailabilityZoneAddresses"),
+                .with_provider_name("AvailabilityZoneAddresses")
+                .with_block_name("availability_zone_address"),
         )
         .attribute(
             AttributeSchema::new("connectivity_type", AttributeType::Custom {

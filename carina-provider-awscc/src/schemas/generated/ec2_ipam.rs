@@ -77,7 +77,8 @@ pub fn ec2_ipam_config() -> AwsccSchemaConfig {
                     ],
                 })))
                 .with_description("A set of organizational unit (OU) exclusions for the default resource discovery, created with this IPAM.")
-                .with_provider_name("DefaultResourceDiscoveryOrganizationalUnitExclusions"),
+                .with_provider_name("DefaultResourceDiscoveryOrganizationalUnitExclusions")
+                .with_block_name("default_resource_discovery_organizational_unit_exclusion"),
         )
         .attribute(
             AttributeSchema::new("description", AttributeType::String)
@@ -113,7 +114,8 @@ pub fn ec2_ipam_config() -> AwsccSchemaConfig {
                     ],
                 })))
                 .with_description("The regions IPAM is enabled for. Allows pools to be created in these regions, as well as enabling monitoring")
-                .with_provider_name("OperatingRegions"),
+                .with_provider_name("OperatingRegions")
+                .with_block_name("operating_region"),
         )
         .attribute(
             AttributeSchema::new("private_default_scope_id", AttributeType::String)
