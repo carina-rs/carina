@@ -21,6 +21,7 @@ use carina_core::plan::Plan;
 use carina_core::provider::{
     BoxFuture, Provider, ProviderError, ProviderFactory, ProviderResult, ResourceType,
 };
+use carina_core::resolver::{resolve_ref_value, resolve_refs_with_state};
 use carina_core::resource::{LifecycleConfig, Resource, ResourceId, State, Value};
 use carina_core::schema::validate_ipv4_cidr;
 use carina_core::schema::{ResourceSchema, resolve_block_names};
@@ -2961,77 +2962,6 @@ async fn get_provider(parsed: &ParsedFile) -> Box<dyn Provider> {
     // Use file-based mock for other cases
     println!("{}", "Using file-based mock provider".cyan());
     Box::new(FileProvider::new())
-}
-
-/// Resolve ResourceRef values using current AWS state
-fn resolve_refs_with_state(
-    resources: &mut [Resource],
-    current_states: &HashMap<ResourceId, State>,
-) {
-    // Build a map of binding_name -> attributes (merged from DSL and AWS state)
-    let mut binding_map: HashMap<String, HashMap<String, Value>> = HashMap::new();
-
-    for resource in resources.iter() {
-        if let Some(Value::String(binding_name)) = resource.attributes.get("_binding") {
-            let mut attrs = resource.attributes.clone();
-
-            // Merge AWS state attributes (like `id`) if available
-            if let Some(state) = current_states.get(&resource.id)
-                && state.exists
-            {
-                for (k, v) in &state.attributes {
-                    if !attrs.contains_key(k) {
-                        attrs.insert(k.clone(), v.clone());
-                    }
-                }
-            }
-
-            binding_map.insert(binding_name.clone(), attrs);
-        }
-    }
-
-    // Resolve ResourceRef values in all resources
-    for resource in resources.iter_mut() {
-        let mut resolved_attrs = HashMap::new();
-        for (key, value) in &resource.attributes {
-            resolved_attrs.insert(key.clone(), resolve_ref_value(value, &binding_map));
-        }
-        resource.attributes = resolved_attrs;
-    }
-}
-
-fn resolve_ref_value(
-    value: &Value,
-    binding_map: &HashMap<String, HashMap<String, Value>>,
-) -> Value {
-    match value {
-        Value::ResourceRef {
-            binding_name,
-            attribute_name,
-            ..
-        } => {
-            if let Some(attrs) = binding_map.get(binding_name)
-                && let Some(attr_value) = attrs.get(attribute_name)
-            {
-                // Recursively resolve
-                return resolve_ref_value(attr_value, binding_map);
-            }
-            // Keep as-is if not found
-            value.clone()
-        }
-        Value::List(items) => Value::List(
-            items
-                .iter()
-                .map(|v| resolve_ref_value(v, binding_map))
-                .collect(),
-        ),
-        Value::Map(map) => Value::Map(
-            map.iter()
-                .map(|(k, v)| (k.clone(), resolve_ref_value(v, binding_map)))
-                .collect(),
-        ),
-        _ => value.clone(),
-    }
 }
 
 async fn create_plan_from_parsed(
