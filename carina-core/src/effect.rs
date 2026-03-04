@@ -70,6 +70,29 @@ impl Effect {
             Effect::Delete { id, .. } => id,
         }
     }
+
+    /// Returns a reference to the resource for this effect, if it has one.
+    /// Delete effects have no resource.
+    pub fn resource(&self) -> Option<&Resource> {
+        match self {
+            Effect::Create(resource) => Some(resource),
+            Effect::Update { to, .. } => Some(to),
+            Effect::Replace { to, .. } => Some(to),
+            Effect::Read { resource } => Some(resource),
+            Effect::Delete { .. } => None,
+        }
+    }
+
+    /// Returns the binding name for this effect's resource, if it has one.
+    pub fn binding_name(&self) -> Option<String> {
+        use crate::resource::Value;
+        self.resource().and_then(|r| {
+            r.attributes.get("_binding").and_then(|v| match v {
+                Value::String(s) => Some(s.clone()),
+                _ => None,
+            })
+        })
+    }
 }
 
 #[cfg(test)]
@@ -97,6 +120,41 @@ mod tests {
             resource: resource.clone(),
         };
         assert_eq!(effect.resource_id(), &resource.id);
+    }
+
+    #[test]
+    fn resource_returns_some_for_create() {
+        let resource = Resource::new("s3.bucket", "my-bucket");
+        let effect = Effect::Create(resource.clone());
+        assert_eq!(effect.resource().unwrap().id, resource.id);
+    }
+
+    #[test]
+    fn resource_returns_none_for_delete() {
+        let effect = Effect::Delete {
+            id: ResourceId::new("test", "a"),
+            identifier: "id-123".to_string(),
+            lifecycle: LifecycleConfig::default(),
+        };
+        assert!(effect.resource().is_none());
+    }
+
+    #[test]
+    fn binding_name_returns_binding() {
+        use crate::resource::Value;
+        let resource = Resource::new("test", "my_binding")
+            .with_attribute("_binding", Value::String("my_binding".to_string()));
+        let effect = Effect::Create(resource);
+        assert_eq!(effect.binding_name(), Some("my_binding".to_string()));
+    }
+
+    #[test]
+    fn binding_name_returns_none_without_binding() {
+        use crate::resource::Value;
+        let resource = Resource::new("test", "no_binding")
+            .with_attribute("name", Value::String("test".to_string()));
+        let effect = Effect::Create(resource);
+        assert_eq!(effect.binding_name(), None);
     }
 
     #[test]
