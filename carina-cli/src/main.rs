@@ -16,6 +16,7 @@ use carina_core::differ::create_plan;
 use carina_core::effect::Effect;
 use carina_core::formatter::{self, FormatConfig};
 use carina_core::identifier::{self, PrefixStateInfo};
+use carina_core::lint::{find_list_literal_attrs, list_struct_attr_names};
 use carina_core::module_resolver;
 use carina_core::parser::{self, BackendConfig, ParsedFile, ProviderConfig};
 use carina_core::plan::Plan;
@@ -3770,8 +3771,6 @@ struct LintWarning {
     line: usize,
     message: String,
 }
-
-use carina_core::lint::{find_list_literal_attrs, list_struct_attr_names};
 
 fn run_lint(path: &PathBuf) -> Result<(), String> {
     let mut parsed = load_configuration(path)?.parsed;
