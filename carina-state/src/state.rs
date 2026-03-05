@@ -1,6 +1,7 @@
 //! State file structures for persisting infrastructure state
 
-use carina_core::resource::LifecycleConfig;
+use carina_core::resource::{LifecycleConfig, Resource, ResourceId, Value};
+use carina_core::value::json_to_dsl_value;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -77,6 +78,44 @@ impl StateFile {
         } else {
             self.resources.push(resource);
         }
+    }
+
+    /// Get the identifier for a resource from state, falling back to the name attribute.
+    pub fn get_identifier_for_resource(&self, resource: &Resource) -> Option<String> {
+        if let Some(resource_state) =
+            self.find_resource(&resource.id.resource_type, &resource.id.name)
+        {
+            return resource_state.identifier.clone();
+        }
+        if let Some(Value::String(name)) = resource.attributes.get("name") {
+            return Some(name.clone());
+        }
+        None
+    }
+
+    /// Build a map of ResourceId -> LifecycleConfig from this state file.
+    pub fn build_lifecycles(&self) -> HashMap<ResourceId, LifecycleConfig> {
+        let mut lifecycles = HashMap::new();
+        for rs in &self.resources {
+            let id = ResourceId::with_provider(&rs.provider, &rs.resource_type, &rs.name);
+            lifecycles.insert(id, rs.lifecycle.clone());
+        }
+        lifecycles
+    }
+
+    /// Build a map of saved attributes, converting JSON values to DSL values.
+    pub fn build_saved_attrs(&self) -> HashMap<ResourceId, HashMap<String, Value>> {
+        let mut result = HashMap::new();
+        for rs in &self.resources {
+            let id = ResourceId::with_provider(&rs.provider, &rs.resource_type, &rs.name);
+            let attrs: HashMap<String, Value> = rs
+                .attributes
+                .iter()
+                .map(|(k, v)| (k.clone(), json_to_dsl_value(v)))
+                .collect();
+            result.insert(id, attrs);
+        }
+        result
     }
 
     /// Remove a resource from the state
@@ -265,6 +304,80 @@ mod tests {
         assert_eq!(
             deserialized.prefixes.get("bucket_name"),
             Some(&"my-app-".to_string())
+        );
+    }
+
+    #[test]
+    fn test_get_identifier_for_resource_from_state() {
+        use carina_core::resource::Resource;
+
+        let mut state = StateFile::new();
+        let rs = ResourceState::new("s3.bucket", "my-bucket", "awscc")
+            .with_identifier("my-bucket-abcd1234");
+        state.upsert_resource(rs);
+
+        let resource = Resource::with_provider("awscc", "s3.bucket", "my-bucket");
+        assert_eq!(
+            state.get_identifier_for_resource(&resource),
+            Some("my-bucket-abcd1234".to_string())
+        );
+    }
+
+    #[test]
+    fn test_get_identifier_for_resource_fallback_to_name_attr() {
+        use carina_core::resource::{Resource, Value};
+
+        let state = StateFile::new();
+
+        let mut resource = Resource::with_provider("awscc", "s3.bucket", "my-bucket");
+        resource.attributes.insert(
+            "name".to_string(),
+            Value::String("my-bucket-name".to_string()),
+        );
+        assert_eq!(
+            state.get_identifier_for_resource(&resource),
+            Some("my-bucket-name".to_string())
+        );
+    }
+
+    #[test]
+    fn test_get_identifier_for_resource_returns_none() {
+        use carina_core::resource::Resource;
+
+        let state = StateFile::new();
+        let resource = Resource::with_provider("awscc", "s3.bucket", "my-bucket");
+        assert_eq!(state.get_identifier_for_resource(&resource), None);
+    }
+
+    #[test]
+    fn test_build_lifecycles() {
+        use carina_core::resource::ResourceId;
+
+        let mut state = StateFile::new();
+        let mut rs = ResourceState::new("s3.bucket", "my-bucket", "awscc");
+        rs.lifecycle.force_delete = true;
+        state.upsert_resource(rs);
+
+        let lifecycles = state.build_lifecycles();
+        let id = ResourceId::with_provider("awscc", "s3.bucket", "my-bucket");
+        assert!(lifecycles.get(&id).unwrap().force_delete);
+    }
+
+    #[test]
+    fn test_build_saved_attrs() {
+        use carina_core::resource::{ResourceId, Value};
+
+        let mut state = StateFile::new();
+        let rs = ResourceState::new("s3.bucket", "my-bucket", "awscc")
+            .with_attribute("region".to_string(), serde_json::json!("ap-northeast-1"));
+        state.upsert_resource(rs);
+
+        let saved = state.build_saved_attrs();
+        let id = ResourceId::with_provider("awscc", "s3.bucket", "my-bucket");
+        let attrs = saved.get(&id).unwrap();
+        assert_eq!(
+            attrs.get("region"),
+            Some(&Value::String("ap-northeast-1".to_string()))
         );
     }
 

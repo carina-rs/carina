@@ -1007,7 +1007,9 @@ async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
     // In identifier-based approach, if there's no identifier in state, the resource doesn't exist
     let mut current_states: HashMap<ResourceId, State> = HashMap::new();
     for resource in &sorted_resources {
-        let identifier = get_identifier_from_state(&state_file, resource);
+        let identifier = state_file
+            .as_ref()
+            .and_then(|sf| sf.get_identifier_for_resource(resource));
         let state = provider
             .read(&resource.id, identifier.as_deref())
             .await
@@ -1016,7 +1018,10 @@ async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
     }
 
     // Restore unreturned attributes from state file (CloudControl doesn't always return them)
-    let saved_attrs = build_saved_attrs_from_state(&state_file);
+    let saved_attrs = state_file
+        .as_ref()
+        .map(|sf| sf.build_saved_attrs())
+        .unwrap_or_default();
     provider.restore_unreturned_attrs(&mut current_states, &saved_attrs);
 
     // Build initial binding map for reference resolution
@@ -1042,7 +1047,10 @@ async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
     let mut resources_for_plan = sorted_resources.clone();
     resolve_refs_with_state(&mut resources_for_plan, &current_states);
     provider.resolve_enum_identifiers(&mut resources_for_plan);
-    let lifecycles = build_lifecycles_from_state(&state_file);
+    let lifecycles = state_file
+        .as_ref()
+        .map(|sf| sf.build_lifecycles())
+        .unwrap_or_default();
     let schemas = get_schemas();
     let plan = create_plan(
         &resources_for_plan,
@@ -2059,7 +2067,9 @@ async fn run_destroy(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
         if resource.read_only {
             continue;
         }
-        let identifier = get_identifier_from_state(&state_file, resource);
+        let identifier = state_file
+            .as_ref()
+            .and_then(|sf| sf.get_identifier_for_resource(resource));
         let state = provider
             .read(&resource.id, identifier.as_deref())
             .await
@@ -2443,24 +2453,6 @@ async fn run_destroy(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
 }
 
 /// Get identifier from state file for a resource
-fn get_identifier_from_state(
-    state_file: &Option<StateFile>,
-    resource: &Resource,
-) -> Option<String> {
-    // First: try stored state
-    if let Some(state) = state_file
-        && let Some(resource_state) =
-            state.find_resource(&resource.id.resource_type, &resource.id.name)
-    {
-        return resource_state.identifier.clone();
-    }
-    // Fallback: use name attribute for initial lookup
-    if let Some(Value::String(name)) = resource.attributes.get("name") {
-        return Some(name.clone());
-    }
-    None
-}
-
 /// Determine and return the appropriate Provider
 async fn get_provider(parsed: &ParsedFile) -> Box<dyn Provider> {
     let factories = provider_factories();
@@ -2493,7 +2485,9 @@ async fn create_plan_from_parsed(
     // In identifier-based approach, if there's no identifier in state, the resource doesn't exist
     let mut current_states: HashMap<ResourceId, State> = HashMap::new();
     for resource in &sorted_resources {
-        let identifier = get_identifier_from_state(state_file, resource);
+        let identifier = state_file
+            .as_ref()
+            .and_then(|sf| sf.get_identifier_for_resource(resource));
         let state = provider
             .read(&resource.id, identifier.as_deref())
             .await
@@ -2502,7 +2496,10 @@ async fn create_plan_from_parsed(
     }
 
     // Restore unreturned attributes from state file (CloudControl doesn't always return them)
-    let saved_attrs = build_saved_attrs_from_state(state_file);
+    let saved_attrs = state_file
+        .as_ref()
+        .map(|sf| sf.build_saved_attrs())
+        .unwrap_or_default();
     provider.restore_unreturned_attrs(&mut current_states, &saved_attrs);
 
     // Resolve ResourceRef values and enum identifiers using AWS state
@@ -2511,7 +2508,10 @@ async fn create_plan_from_parsed(
     provider.resolve_enum_identifiers(&mut resources);
 
     // Build lifecycles map from state file for orphaned resource deletion
-    let lifecycles = build_lifecycles_from_state(state_file);
+    let lifecycles = state_file
+        .as_ref()
+        .map(|sf| sf.build_lifecycles())
+        .unwrap_or_default();
 
     let schemas = get_schemas();
     let plan = create_plan(
@@ -3177,43 +3177,6 @@ fn resource_to_state(
     resource_state.prefixes = resource.prefixes.clone();
 
     resource_state
-}
-
-/// Build a map of ResourceId -> LifecycleConfig from the state file
-fn build_lifecycles_from_state(
-    state_file: &Option<StateFile>,
-) -> HashMap<ResourceId, LifecycleConfig> {
-    let mut lifecycles = HashMap::new();
-    if let Some(sf) = state_file {
-        for rs in &sf.resources {
-            let id = ResourceId::with_provider(&rs.provider, &rs.resource_type, &rs.name);
-            lifecycles.insert(id, rs.lifecycle.clone());
-        }
-    }
-    lifecycles
-}
-
-/// Build a map of saved attributes from a state file, converting JSON values to DSL values.
-///
-/// This is used to pass saved attribute data to the provider's `restore_unreturned_attrs` method.
-fn build_saved_attrs_from_state(
-    state_file: &Option<StateFile>,
-) -> HashMap<ResourceId, HashMap<String, Value>> {
-    let mut result = HashMap::new();
-    let state_file = match state_file {
-        Some(sf) => sf,
-        None => return result,
-    };
-    for rs in &state_file.resources {
-        let id = ResourceId::with_provider(&rs.provider, &rs.resource_type, &rs.name);
-        let attrs: HashMap<String, Value> = rs
-            .attributes
-            .iter()
-            .map(|(k, v)| (k.clone(), json_to_dsl_value(v)))
-            .collect();
-        result.insert(id, attrs);
-    }
-    result
 }
 
 /// Run force-unlock command
