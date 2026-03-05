@@ -892,7 +892,7 @@ impl CompletionProvider {
             && let Some(base) = base_path
         {
             let module_path = base.join(&import_path);
-            if let Some(parsed) = self.load_module(&module_path) {
+            if let Some(parsed) = carina_core::module_resolver::load_module(&module_path) {
                 // Extract input parameters from the module
                 for input in &parsed.inputs {
                     let type_str = self.format_type_expr(&input.type_expr);
@@ -921,58 +921,6 @@ impl CompletionProvider {
         }
 
         completions
-    }
-
-    /// Load module from path, handling both file and directory-based modules
-    fn load_module(&self, path: &Path) -> Option<parser::ParsedFile> {
-        if path.is_dir() {
-            // Directory-based module: load main.crn
-            let main_path = path.join("main.crn");
-            if main_path.exists() {
-                let content = std::fs::read_to_string(&main_path).ok()?;
-                parser::parse(&content).ok()
-            } else {
-                // Fallback: merge all .crn files in the directory
-                self.load_directory_module(path)
-            }
-        } else {
-            // Single file module
-            let content = std::fs::read_to_string(path).ok()?;
-            parser::parse(&content).ok()
-        }
-    }
-
-    /// Load all .crn files from a directory and merge them
-    fn load_directory_module(&self, dir_path: &Path) -> Option<parser::ParsedFile> {
-        let entries = std::fs::read_dir(dir_path).ok()?;
-        let mut merged = parser::ParsedFile {
-            providers: vec![],
-            resources: vec![],
-            variables: HashMap::new(),
-            imports: vec![],
-            module_calls: vec![],
-            inputs: vec![],
-            outputs: vec![],
-            backend: None,
-        };
-
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().is_some_and(|ext| ext == "crn")
-                && let Ok(content) = std::fs::read_to_string(&path)
-                && let Ok(parsed) = parser::parse(&content)
-            {
-                merged.providers.extend(parsed.providers);
-                merged.resources.extend(parsed.resources);
-                merged.variables.extend(parsed.variables);
-                merged.imports.extend(parsed.imports);
-                merged.module_calls.extend(parsed.module_calls);
-                merged.inputs.extend(parsed.inputs);
-                merged.outputs.extend(parsed.outputs);
-            }
-        }
-
-        Some(merged)
     }
 
     /// Provide completions for input parameters in the current file (after "input.")

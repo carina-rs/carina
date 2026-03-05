@@ -386,10 +386,10 @@ fn run_module_command(command: ModuleCommands) -> Result<(), String> {
     }
 }
 
-fn run_module_info(path: &PathBuf) -> Result<(), String> {
+fn run_module_info(path: &Path) -> Result<(), String> {
     let parsed = if path.is_dir() {
         // Read all .crn files in the directory and merge them
-        load_module_from_directory(path)?
+        module_resolver::load_module_from_directory(path)?
     } else {
         module_resolver::get_parsed_file(path).map_err(|e| format!("Failed to load file: {}", e))?
     };
@@ -397,7 +397,7 @@ fn run_module_info(path: &PathBuf) -> Result<(), String> {
     // Derive module name from directory structure
     // For directory-based modules like modules/web_tier/, use the directory name
     // For file-based modules like modules/web_tier.crn, use the file stem
-    let module_name = derive_module_name(path);
+    let module_name = module_resolver::derive_module_name(path);
 
     // Build and display the file signature (module or root config)
     let signature =
@@ -405,81 +405,6 @@ fn run_module_info(path: &PathBuf) -> Result<(), String> {
     println!("{}", signature.display());
 
     Ok(())
-}
-
-/// Load a module from a directory by reading all .crn files
-fn load_module_from_directory(dir: &PathBuf) -> Result<ParsedFile, String> {
-    let entries = fs::read_dir(dir)
-        .map_err(|e| format!("Failed to read directory {}: {}", dir.display(), e))?;
-
-    let mut merged = ParsedFile {
-        providers: vec![],
-        resources: vec![],
-        variables: std::collections::HashMap::new(),
-        imports: vec![],
-        module_calls: vec![],
-        inputs: vec![],
-        outputs: vec![],
-        backend: None,
-    };
-
-    for entry in entries {
-        let entry = entry.map_err(|e| e.to_string())?;
-        let path = entry.path();
-
-        if path.extension().is_some_and(|ext| ext == "crn") {
-            let content = fs::read_to_string(&path)
-                .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
-
-            let parsed = parser::parse(&content)
-                .map_err(|e| format!("Failed to parse {}: {}", path.display(), e))?;
-
-            // Merge parsed content
-            merged.providers.extend(parsed.providers);
-            merged.resources.extend(parsed.resources);
-            merged.variables.extend(parsed.variables);
-            merged.imports.extend(parsed.imports);
-            merged.module_calls.extend(parsed.module_calls);
-            merged.inputs.extend(parsed.inputs);
-            merged.outputs.extend(parsed.outputs);
-        }
-    }
-
-    Ok(merged)
-}
-
-/// Derive the module name from a file or directory path
-/// Examples:
-/// - modules/web_tier/ -> web_tier (directory)
-/// - modules/web_tier/main.crn -> web_tier (directory-based)
-/// - modules/web_tier.crn -> web_tier (file-based)
-/// - web_tier.crn -> web_tier
-fn derive_module_name(path: &Path) -> String {
-    // If it's a directory, use the directory name
-    if path.is_dir() {
-        return path
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("unknown")
-            .to_string();
-    }
-
-    let file_stem = path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("unknown");
-
-    // If file is named main.crn, use the parent directory name
-    if file_stem == "main"
-        && let Some(parent) = path.parent()
-        && let Some(parent_name) = parent.file_name()
-        && let Some(name) = parent_name.to_str()
-    {
-        return name.to_string();
-    }
-
-    // Otherwise use the file stem
-    file_stem.to_string()
 }
 
 fn validate_provider_region(parsed: &ParsedFile) -> Result<(), String> {
@@ -492,65 +417,12 @@ fn validate_module_calls(parsed: &ParsedFile, base_dir: &Path) -> Result<(), Str
     let mut imported_modules = HashMap::new();
     for import in &parsed.imports {
         let module_path = base_dir.join(&import.path);
-        if let Some(module_parsed) = load_module(&module_path) {
+        if let Some(module_parsed) = module_resolver::load_module(&module_path) {
             imported_modules.insert(import.alias.clone(), module_parsed.inputs);
         }
     }
 
     validation::validate_module_calls(&parsed.module_calls, &imported_modules)
-}
-
-/// Load a module from a file or directory
-fn load_module(path: &Path) -> Option<ParsedFile> {
-    if path.is_dir() {
-        let main_path = path.join("main.crn");
-        if main_path.exists() {
-            let content = fs::read_to_string(&main_path).ok()?;
-            parser::parse(&content).ok()
-        } else {
-            load_directory_module(path)
-        }
-    } else {
-        let content = fs::read_to_string(path).ok()?;
-        parser::parse(&content).ok()
-    }
-}
-
-/// Load all .crn files from a directory and merge them
-fn load_directory_module(dir_path: &Path) -> Option<ParsedFile> {
-    let entries = fs::read_dir(dir_path).ok()?;
-    let mut merged = ParsedFile {
-        providers: vec![],
-        resources: vec![],
-        variables: HashMap::new(),
-        imports: vec![],
-        module_calls: vec![],
-        inputs: vec![],
-        outputs: vec![],
-        backend: None,
-    };
-
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().is_some_and(|ext| ext == "crn")
-            && let Ok(content) = fs::read_to_string(&path)
-            && let Ok(parsed) = parser::parse(&content)
-        {
-            merged.providers.extend(parsed.providers);
-            merged.resources.extend(parsed.resources);
-            merged.variables.extend(parsed.variables);
-            merged.imports.extend(parsed.imports);
-            merged.module_calls.extend(parsed.module_calls);
-            merged.inputs.extend(parsed.inputs);
-            merged.outputs.extend(parsed.outputs);
-        }
-    }
-
-    if merged.inputs.is_empty() && merged.outputs.is_empty() {
-        None
-    } else {
-        Some(merged)
-    }
 }
 
 /// Result of loading configuration, includes the file path containing backend block
