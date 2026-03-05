@@ -17,3 +17,4 @@ pub mod resource;
 pub mod schema;
 pub mod utils;
 pub mod validation;
+pub mod value;

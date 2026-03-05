@@ -24,8 +24,11 @@ use carina_core::provider::{
 use carina_core::resolver::{resolve_ref_value, resolve_refs_with_state};
 use carina_core::resource::{LifecycleConfig, Resource, ResourceId, State, Value};
 use carina_core::schema::{ResourceSchema, resolve_block_names};
-use carina_core::utils::is_dsl_enum_format;
 use carina_core::validation;
+use carina_core::value::{
+    format_value, format_value_with_key, is_list_of_maps, json_to_dsl_value, map_similarity,
+    value_to_json,
+};
 use carina_provider_aws::AwsProviderFactory;
 use carina_provider_awscc::AwsccProviderFactory;
 use carina_state::{
@@ -3240,15 +3243,6 @@ fn format_effect(effect: &Effect) -> String {
     }
 }
 
-/// Check if a value is a list of maps (list-of-struct)
-fn is_list_of_maps(value: &Value) -> bool {
-    if let Value::List(items) = value {
-        !items.is_empty() && items.iter().all(|item| matches!(item, Value::Map(_)))
-    } else {
-        false
-    }
-}
-
 /// Format a list-of-maps for Create effect display (multi-line with + prefix)
 fn format_list_of_maps(value: &Value, attr_prefix: &str) -> String {
     let items = match value {
@@ -3447,69 +3441,6 @@ fn format_list_diff(old_value: Option<&Value>, new_value: &Value, attr_prefix: &
     lines.join("\n")
 }
 
-/// Count the number of shared key-value pairs between two map Values.
-/// Uses semantically_equal for value comparison so nested lists are order-insensitive.
-/// Returns 0 if either value is not a Map.
-fn map_similarity(a: &Value, b: &Value) -> usize {
-    match (a, b) {
-        (Value::Map(ma), Value::Map(mb)) => ma
-            .iter()
-            .filter(|(k, v)| {
-                mb.get(*k)
-                    .map(|bv| v.semantically_equal(bv))
-                    .unwrap_or(false)
-            })
-            .count(),
-        _ => 0,
-    }
-}
-
-fn format_value(value: &Value) -> String {
-    format_value_with_key(value, None)
-}
-
-fn format_value_with_key(value: &Value, _key: Option<&str>) -> String {
-    match value {
-        Value::String(s) => {
-            // DSL enum format (namespaced identifiers) - display without quotes
-            if is_dsl_enum_format(s) {
-                return s.clone();
-            }
-            format!("\"{}\"", s)
-        }
-        Value::Int(n) => n.to_string(),
-        Value::Float(f) => {
-            let s = f.to_string();
-            if s.contains('.') {
-                s
-            } else {
-                format!("{}.0", s)
-            }
-        }
-        Value::Bool(b) => b.to_string(),
-        Value::List(items) => {
-            let strs: Vec<_> = items.iter().map(format_value).collect();
-            format!("[{}]", strs.join(", "))
-        }
-        Value::Map(map) => {
-            let strs: Vec<_> = map
-                .iter()
-                .map(|(k, v)| format!("{}: {}", k, format_value(v)))
-                .collect();
-            format!("{{{}}}", strs.join(", "))
-        }
-        Value::ResourceRef {
-            binding_name,
-            attribute_name,
-            ..
-        } => format!("{}.{}", binding_name, attribute_name),
-        Value::UnresolvedIdent(name, member) => match member {
-            Some(m) => format!("{}.{}", name, m),
-            None => name.clone(),
-        },
-    }
-}
-
 // =============================================================================
 // State Management Functions
 // =============================================================================
@@ -3581,61 +3512,6 @@ fn build_lifecycles_from_state(
         }
     }
     lifecycles
-}
-
-/// Convert Value to serde_json::Value
-fn value_to_json(value: &Value) -> serde_json::Value {
-    match value {
-        Value::String(s) => serde_json::Value::String(s.clone()),
-        Value::Int(n) => serde_json::Value::Number((*n).into()),
-        Value::Float(f) => serde_json::Value::Number(
-            serde_json::Number::from_f64(*f).unwrap_or_else(|| serde_json::Number::from(0)),
-        ),
-        Value::Bool(b) => serde_json::Value::Bool(*b),
-        Value::List(items) => serde_json::Value::Array(items.iter().map(value_to_json).collect()),
-        Value::Map(map) => {
-            let obj: serde_json::Map<_, _> = map
-                .iter()
-                .map(|(k, v)| (k.clone(), value_to_json(v)))
-                .collect();
-            serde_json::Value::Object(obj)
-        }
-        Value::ResourceRef {
-            binding_name,
-            attribute_name,
-            ..
-        } => serde_json::Value::String(format!("${{{}.{}}}", binding_name, attribute_name)),
-        Value::UnresolvedIdent(name, member) => match member {
-            Some(m) => serde_json::Value::String(format!("{}.{}", name, m)),
-            None => serde_json::Value::String(name.clone()),
-        },
-    }
-}
-
-/// Convert serde_json::Value to DSL Value
-fn json_to_dsl_value(json: &serde_json::Value) -> Value {
-    match json {
-        serde_json::Value::String(s) => Value::String(s.clone()),
-        serde_json::Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                Value::Int(i)
-            } else {
-                Value::Float(n.as_f64().unwrap_or(0.0))
-            }
-        }
-        serde_json::Value::Bool(b) => Value::Bool(*b),
-        serde_json::Value::Array(items) => {
-            Value::List(items.iter().map(json_to_dsl_value).collect())
-        }
-        serde_json::Value::Object(map) => {
-            let m: HashMap<_, _> = map
-                .iter()
-                .map(|(k, v)| (k.clone(), json_to_dsl_value(v)))
-                .collect();
-            Value::Map(m)
-        }
-        serde_json::Value::Null => Value::String("null".to_string()),
-    }
 }
 
 /// Build a map of saved attributes from a state file, converting JSON values to DSL values.
@@ -3843,63 +3719,6 @@ impl FileProvider {
     fn resource_key(id: &ResourceId) -> String {
         format!("{}.{}", id.resource_type, id.name)
     }
-
-    fn value_to_json(value: &Value) -> serde_json::Value {
-        match value {
-            Value::String(s) => serde_json::Value::String(s.clone()),
-            Value::Int(n) => serde_json::Value::Number((*n).into()),
-            Value::Float(f) => serde_json::Value::Number(
-                serde_json::Number::from_f64(*f).unwrap_or_else(|| serde_json::Number::from(0)),
-            ),
-            Value::Bool(b) => serde_json::Value::Bool(*b),
-            Value::List(items) => {
-                serde_json::Value::Array(items.iter().map(Self::value_to_json).collect())
-            }
-            Value::Map(map) => {
-                let obj: serde_json::Map<_, _> = map
-                    .iter()
-                    .map(|(k, v)| (k.clone(), Self::value_to_json(v)))
-                    .collect();
-                serde_json::Value::Object(obj)
-            }
-            // ResourceRef should be resolved before reaching here, but handle it as a string
-            Value::ResourceRef {
-                binding_name,
-                attribute_name,
-                ..
-            } => serde_json::Value::String(format!("${{{}.{}}}", binding_name, attribute_name)),
-            // UnresolvedIdent should be resolved before reaching here, but handle it as a string
-            Value::UnresolvedIdent(name, member) => match member {
-                Some(m) => serde_json::Value::String(format!("{}.{}", name, m)),
-                None => serde_json::Value::String(name.clone()),
-            },
-        }
-    }
-
-    fn json_to_value(json: &serde_json::Value) -> Value {
-        match json {
-            serde_json::Value::String(s) => Value::String(s.clone()),
-            serde_json::Value::Number(n) => {
-                if let Some(i) = n.as_i64() {
-                    Value::Int(i)
-                } else {
-                    Value::Float(n.as_f64().unwrap_or(0.0))
-                }
-            }
-            serde_json::Value::Bool(b) => Value::Bool(*b),
-            serde_json::Value::Array(items) => {
-                Value::List(items.iter().map(Self::json_to_value).collect())
-            }
-            serde_json::Value::Object(map) => {
-                let m: HashMap<_, _> = map
-                    .iter()
-                    .map(|(k, v)| (k.clone(), Self::json_to_value(v)))
-                    .collect();
-                Value::Map(m)
-            }
-            serde_json::Value::Null => Value::String("null".to_string()),
-        }
-    }
 }
 
 impl Provider for FileProvider {
@@ -3924,7 +3743,7 @@ impl Provider for FileProvider {
             if let Some(attrs) = states.get(&key) {
                 let attributes: HashMap<String, Value> = attrs
                     .iter()
-                    .map(|(k, v)| (k.clone(), Self::json_to_value(v)))
+                    .map(|(k, v)| (k.clone(), json_to_dsl_value(v)))
                     .collect();
                 Ok(State::existing(id, attributes).with_identifier("file-id"))
             } else {
@@ -3942,7 +3761,7 @@ impl Provider for FileProvider {
             let attrs: HashMap<String, serde_json::Value> = resource
                 .attributes
                 .iter()
-                .map(|(k, v)| (k.clone(), Self::value_to_json(v)))
+                .map(|(k, v)| (k.clone(), value_to_json(v)))
                 .collect();
 
             states.insert(key, attrs);
@@ -3972,7 +3791,7 @@ impl Provider for FileProvider {
             let attrs: HashMap<String, serde_json::Value> = to
                 .attributes
                 .iter()
-                .map(|(k, v)| (k.clone(), Self::value_to_json(v)))
+                .map(|(k, v)| (k.clone(), value_to_json(v)))
                 .collect();
 
             states.insert(key, attrs);
