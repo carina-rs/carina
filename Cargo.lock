@@ -684,7 +684,6 @@ dependencies = [
  "serde_json",
  "similar",
  "tokio",
- "uuid",
 ]
 
 [[package]]
@@ -697,6 +696,7 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tokio",
+ "uuid",
 ]
 
 [[package]]
