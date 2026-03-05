@@ -182,6 +182,15 @@ impl BackendConfig {
     }
 }
 
+impl From<&carina_core::parser::BackendConfig> for BackendConfig {
+    fn from(config: &carina_core::parser::BackendConfig) -> Self {
+        Self {
+            backend_type: config.backend_type.clone(),
+            attributes: config.attributes.clone(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -213,5 +222,25 @@ mod tests {
 
         let error = BackendError::BucketNotFound("my-bucket".to_string());
         assert_eq!(error.to_string(), "Bucket not found: my-bucket");
+    }
+
+    #[test]
+    fn test_backend_config_from_parser_config() {
+        use carina_core::resource::Value;
+
+        let parser_config = carina_core::parser::BackendConfig {
+            backend_type: "s3".to_string(),
+            attributes: [
+                ("bucket".to_string(), Value::String("my-bucket".to_string())),
+                ("key".to_string(), Value::String("state.json".to_string())),
+            ]
+            .into_iter()
+            .collect(),
+        };
+
+        let state_config = BackendConfig::from(&parser_config);
+        assert_eq!(state_config.backend_type, "s3");
+        assert_eq!(state_config.get_string("bucket"), Some("my-bucket"));
+        assert_eq!(state_config.get_string("key"), Some("state.json"));
     }
 }

@@ -3033,57 +3033,23 @@ fn format_list_diff(old_value: Option<&Value>, new_value: &Value, attr_prefix: &
 
 /// Convert parser BackendConfig to state BackendConfig
 fn convert_backend_config(config: &BackendConfig) -> StateBackendConfig {
-    StateBackendConfig {
-        backend_type: config.backend_type.clone(),
-        attributes: config.attributes.clone(),
-    }
+    StateBackendConfig::from(config)
 }
 
-/// Find the state bucket resource in the parsed file
 fn find_state_bucket_resource<'a>(
     parsed: &'a ParsedFile,
     bucket_name: &str,
     resource_type: &str,
 ) -> Option<&'a Resource> {
-    parsed.resources.iter().find(|r| {
-        r.id.resource_type == resource_type
-            && matches!(r.attributes.get("name"), Some(Value::String(name)) if name == bucket_name)
-    })
+    parsed.find_resource_by_name(resource_type, bucket_name)
 }
 
-/// Convert a Resource to ResourceState for the state file
 fn resource_to_state(
     resource: &Resource,
     state: &State,
     existing_state: Option<&ResourceState>,
 ) -> ResourceState {
-    let provider = resource.id.provider.clone();
-
-    let mut resource_state =
-        ResourceState::new(&resource.id.resource_type, &resource.id.name, provider);
-
-    // Copy identifier from state
-    resource_state.identifier = state.identifier.clone();
-
-    // Set attributes directly (not nested)
-    for (k, v) in &state.attributes {
-        resource_state
-            .attributes
-            .insert(k.clone(), value_to_json(v));
-    }
-
-    // Preserve protected flag from existing state
-    if let Some(existing) = existing_state {
-        resource_state.protected = existing.protected;
-    }
-
-    // Copy lifecycle configuration from resource
-    resource_state.lifecycle = resource.lifecycle.clone();
-
-    // Copy attribute prefixes from resource
-    resource_state.prefixes = resource.prefixes.clone();
-
-    resource_state
+    ResourceState::from_provider_state(resource, state, existing_state)
 }
 
 /// Run force-unlock command
