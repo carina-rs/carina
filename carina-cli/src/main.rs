@@ -2452,7 +2452,6 @@ async fn run_destroy(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
     }
 }
 
-/// Get identifier from state file for a resource
 /// Determine and return the appropriate Provider
 async fn get_provider(parsed: &ParsedFile) -> Box<dyn Provider> {
     let factories = provider_factories();
