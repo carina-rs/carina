@@ -8,6 +8,7 @@ pub mod effect;
 pub mod formatter;
 pub mod identifier;
 pub mod interpreter;
+pub mod lint;
 pub mod module;
 pub mod module_resolver;
 pub mod parser;
