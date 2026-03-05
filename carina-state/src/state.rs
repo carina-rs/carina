@@ -1,7 +1,7 @@
 //! State file structures for persisting infrastructure state
 
-use carina_core::resource::{LifecycleConfig, Resource, ResourceId, Value};
-use carina_core::value::json_to_dsl_value;
+use carina_core::resource::{LifecycleConfig, Resource, ResourceId, State, Value};
+use carina_core::value::{json_to_dsl_value, value_to_json};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -200,6 +200,31 @@ impl ResourceState {
         self.protected = protected;
         self
     }
+
+    /// Build a ResourceState from a Resource and its provider-returned State.
+    ///
+    /// If `existing` is provided, the `protected` flag is preserved from it.
+    pub fn from_provider_state(
+        resource: &Resource,
+        state: &State,
+        existing: Option<&ResourceState>,
+    ) -> Self {
+        let mut rs = Self::new(
+            &resource.id.resource_type,
+            &resource.id.name,
+            resource.id.provider.clone(),
+        );
+        rs.identifier = state.identifier.clone();
+        for (k, v) in &state.attributes {
+            rs.attributes.insert(k.clone(), value_to_json(v));
+        }
+        if let Some(existing) = existing {
+            rs.protected = existing.protected;
+        }
+        rs.lifecycle = resource.lifecycle.clone();
+        rs.prefixes = resource.prefixes.clone();
+        rs
+    }
 }
 
 #[cfg(test)]
@@ -394,5 +419,60 @@ mod tests {
 
         let deserialized: ResourceState = serde_json::from_str(json).unwrap();
         assert!(deserialized.prefixes.is_empty());
+    }
+
+    #[test]
+    fn test_from_provider_state() {
+        use carina_core::resource::{Resource, State as ProviderState, Value};
+
+        let mut resource = Resource::with_provider("awscc", "s3.bucket", "my-bucket");
+        resource.lifecycle.force_delete = true;
+        resource
+            .prefixes
+            .insert("bucket_name".to_string(), "my-app-".to_string());
+
+        let provider_state = ProviderState {
+            id: resource.id.clone(),
+            identifier: Some("my-bucket-abcd1234".to_string()),
+            attributes: [(
+                "region".to_string(),
+                Value::String("ap-northeast-1".to_string()),
+            )]
+            .into_iter()
+            .collect(),
+            exists: true,
+        };
+
+        let existing = ResourceState::new("s3.bucket", "my-bucket", "awscc").with_protected(true);
+
+        let rs = ResourceState::from_provider_state(&resource, &provider_state, Some(&existing));
+
+        assert_eq!(rs.identifier, Some("my-bucket-abcd1234".to_string()));
+        assert_eq!(
+            rs.attributes.get("region"),
+            Some(&serde_json::json!("ap-northeast-1"))
+        );
+        assert!(rs.protected);
+        assert!(rs.lifecycle.force_delete);
+        assert_eq!(rs.prefixes.get("bucket_name"), Some(&"my-app-".to_string()));
+    }
+
+    #[test]
+    fn test_from_provider_state_without_existing() {
+        use carina_core::resource::{Resource, State as ProviderState, Value};
+
+        let resource = Resource::with_provider("aws", "s3.bucket", "test");
+        let provider_state = ProviderState {
+            id: resource.id.clone(),
+            identifier: Some("test-id".to_string()),
+            attributes: [("name".to_string(), Value::String("test".to_string()))]
+                .into_iter()
+                .collect(),
+            exists: true,
+        };
+
+        let rs = ResourceState::from_provider_state(&resource, &provider_state, None);
+        assert!(!rs.protected);
+        assert_eq!(rs.identifier, Some("test-id".to_string()));
     }
 }

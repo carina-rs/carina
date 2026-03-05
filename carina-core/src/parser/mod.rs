@@ -170,6 +170,16 @@ pub struct ParsedFile {
     pub backend: Option<BackendConfig>,
 }
 
+impl ParsedFile {
+    /// Find a resource by resource type and name attribute value
+    pub fn find_resource_by_name(&self, resource_type: &str, name: &str) -> Option<&Resource> {
+        self.resources.iter().find(|r| {
+            r.id.resource_type == resource_type
+                && matches!(r.attributes.get("name"), Some(Value::String(n)) if n == name)
+        })
+    }
+}
+
 /// Parse context (variable scope)
 struct ParseContext {
     variables: HashMap<String, Value>,
@@ -2083,5 +2093,39 @@ mod tests {
         } else {
             panic!("Expected map for assume_role_policy_document");
         }
+    }
+
+    #[test]
+    fn test_find_resource_by_name() {
+        let input = r#"
+            aws.s3.bucket {
+                name = "my-bucket"
+            }
+            aws.s3.bucket {
+                name = "other-bucket"
+            }
+        "#;
+        let parsed = parse(input).unwrap();
+
+        assert!(
+            parsed
+                .find_resource_by_name("s3.bucket", "my-bucket")
+                .is_some()
+        );
+        assert!(
+            parsed
+                .find_resource_by_name("s3.bucket", "other-bucket")
+                .is_some()
+        );
+        assert!(
+            parsed
+                .find_resource_by_name("s3.bucket", "no-such")
+                .is_none()
+        );
+        assert!(
+            parsed
+                .find_resource_by_name("ec2.vpc", "my-bucket")
+                .is_none()
+        );
     }
 }
