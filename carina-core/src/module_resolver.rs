@@ -290,6 +290,141 @@ pub fn get_parsed_file(path: &Path) -> Result<ParsedFile, ModuleError> {
     Ok(parsed)
 }
 
+/// Load a module from a file or directory path.
+///
+/// For directories, tries `main.crn` first, then falls back to merging all `.crn` files.
+/// Returns `None` if the path cannot be read/parsed, or if the directory contains
+/// no module definitions (no inputs or outputs).
+pub fn load_module(path: &Path) -> Option<ParsedFile> {
+    if path.is_dir() {
+        let main_path = path.join("main.crn");
+        if main_path.exists() {
+            let content = fs::read_to_string(&main_path).ok()?;
+            crate::parser::parse(&content).ok()
+        } else {
+            load_directory_module(path)
+        }
+    } else {
+        let content = fs::read_to_string(path).ok()?;
+        crate::parser::parse(&content).ok()
+    }
+}
+
+/// Load all `.crn` files from a directory and merge them into a single `ParsedFile`.
+///
+/// Returns `None` if no module definitions (inputs/outputs) are found.
+pub fn load_directory_module(dir_path: &Path) -> Option<ParsedFile> {
+    let entries = fs::read_dir(dir_path).ok()?;
+    let mut merged = ParsedFile {
+        providers: vec![],
+        resources: vec![],
+        variables: HashMap::new(),
+        imports: vec![],
+        module_calls: vec![],
+        inputs: vec![],
+        outputs: vec![],
+        backend: None,
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_some_and(|ext| ext == "crn")
+            && let Ok(content) = fs::read_to_string(&path)
+            && let Ok(parsed) = crate::parser::parse(&content)
+        {
+            merged.providers.extend(parsed.providers);
+            merged.resources.extend(parsed.resources);
+            merged.variables.extend(parsed.variables);
+            merged.imports.extend(parsed.imports);
+            merged.module_calls.extend(parsed.module_calls);
+            merged.inputs.extend(parsed.inputs);
+            merged.outputs.extend(parsed.outputs);
+        }
+    }
+
+    if merged.inputs.is_empty() && merged.outputs.is_empty() {
+        None
+    } else {
+        Some(merged)
+    }
+}
+
+/// Derive the module name from a file or directory path.
+///
+/// Examples:
+/// - `modules/web_tier/` → `web_tier` (directory)
+/// - `modules/web_tier/main.crn` → `web_tier` (directory-based)
+/// - `modules/web_tier.crn` → `web_tier` (file-based)
+/// - `web_tier.crn` → `web_tier`
+pub fn derive_module_name(path: &Path) -> String {
+    if path.is_dir() {
+        return path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("unknown")
+            .to_string();
+    }
+
+    let file_stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("unknown");
+
+    // If file is named main.crn, use the parent directory name
+    if file_stem == "main"
+        && let Some(parent) = path.parent()
+        && let Some(parent_name) = parent.file_name()
+        && let Some(name) = parent_name.to_str()
+    {
+        return name.to_string();
+    }
+
+    file_stem.to_string()
+}
+
+/// Load a module from a directory by reading all `.crn` files.
+///
+/// Unlike [`load_directory_module`], this returns a `Result` with descriptive error messages
+/// and does not check for module definitions (inputs/outputs).
+pub fn load_module_from_directory(dir: &Path) -> Result<ParsedFile, String> {
+    let entries = fs::read_dir(dir)
+        .map_err(|e| format!("Failed to read directory {}: {}", dir.display(), e))?;
+
+    let mut merged = ParsedFile {
+        providers: vec![],
+        resources: vec![],
+        variables: HashMap::new(),
+        imports: vec![],
+        module_calls: vec![],
+        inputs: vec![],
+        outputs: vec![],
+        backend: None,
+    };
+
+    for entry in entries {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let path = entry.path();
+
+        if path.extension().is_some_and(|ext| ext == "crn") {
+            let content = fs::read_to_string(&path)
+                .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
+
+            let parsed = crate::parser::parse(&content)
+                .map_err(|e| format!("Failed to parse {}: {}", path.display(), e))?;
+
+            merged.providers.extend(parsed.providers);
+            merged.resources.extend(parsed.resources);
+            merged.variables.extend(parsed.variables);
+            merged.imports.extend(parsed.imports);
+            merged.module_calls.extend(parsed.module_calls);
+            merged.inputs.extend(parsed.inputs);
+            merged.outputs.extend(parsed.outputs);
+        }
+    }
+
+    Ok(merged)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
