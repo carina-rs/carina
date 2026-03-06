@@ -675,6 +675,7 @@ dependencies = [
  "carina-core",
  "carina-provider-aws",
  "carina-provider-awscc",
+ "carina-provider-mock",
  "carina-state",
  "chrono",
  "clap",
@@ -752,6 +753,14 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tokio",
+]
+
+[[package]]
+name = "carina-provider-mock"
+version = "0.1.0"
+dependencies = [
+ "carina-core",
+ "serde_json",
 ]
 
 [[package]]

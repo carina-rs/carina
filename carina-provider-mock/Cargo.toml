@@ -1,5 +1,5 @@
 [package]
-name = "carina-provider-file"
+name = "carina-provider-mock"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"

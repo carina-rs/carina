@@ -6,11 +6,11 @@ use carina_core::provider::{BoxFuture, Provider, ProviderError, ProviderResult, 
 use carina_core::resource::{LifecycleConfig, Resource, ResourceId, State, Value};
 use carina_core::value::{json_to_dsl_value, value_to_json};
 
-pub struct FileProvider {
+pub struct MockProvider {
     state_file: PathBuf,
 }
 
-impl FileProvider {
+impl MockProvider {
     pub fn new() -> Self {
         Self {
             state_file: PathBuf::from(".carina/state.json"),
@@ -41,15 +41,15 @@ impl FileProvider {
     }
 }
 
-impl Default for FileProvider {
+impl Default for MockProvider {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl Provider for FileProvider {
+impl Provider for MockProvider {
     fn name(&self) -> &'static str {
-        "file"
+        "mock"
     }
 
     fn resource_types(&self) -> Vec<Box<dyn ResourceType>> {
@@ -71,7 +71,7 @@ impl Provider for FileProvider {
                     .iter()
                     .map(|(k, v)| (k.clone(), json_to_dsl_value(v)))
                     .collect();
-                Ok(State::existing(id, attributes).with_identifier("file-id"))
+                Ok(State::existing(id, attributes).with_identifier("mock-id"))
             } else {
                 Ok(State::not_found(id))
             }
@@ -96,7 +96,7 @@ impl Provider for FileProvider {
 
             Ok(
                 State::existing(resource.id.clone(), resource.attributes.clone())
-                    .with_identifier("file-id"),
+                    .with_identifier("mock-id"),
             )
         })
     }

@@ -31,7 +31,7 @@ use carina_core::validation;
 use carina_core::value::{format_value, format_value_with_key, is_list_of_maps, map_similarity};
 use carina_provider_aws::AwsProviderFactory;
 use carina_provider_awscc::AwsccProviderFactory;
-use carina_provider_file::FileProvider;
+use carina_provider_mock::MockProvider;
 use carina_state::{
     BackendConfig as StateBackendConfig, BackendError, LockInfo, ResourceState, StateBackend,
     StateFile, create_backend, create_local_backend,
@@ -1851,8 +1851,8 @@ async fn create_provider_from_config(config: &ProviderConfig) -> Box<dyn Provide
         return factory.create_provider(&config.attributes).await;
     }
 
-    println!("{}", "Using file-based mock provider".cyan());
-    Box::new(FileProvider::new())
+    println!("{}", "Using mock provider".cyan());
+    Box::new(MockProvider::new())
 }
 
 async fn run_destroy(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
@@ -2342,8 +2342,8 @@ async fn get_provider(parsed: &ParsedFile) -> Box<dyn Provider> {
     }
 
     // Use file-based mock for other cases
-    println!("{}", "Using file-based mock provider".cyan());
-    Box::new(FileProvider::new())
+    println!("{}", "Using mock provider".cyan());
+    Box::new(MockProvider::new())
 }
 
 async fn create_plan_from_parsed(

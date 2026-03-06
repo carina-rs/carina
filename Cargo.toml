@@ -5,7 +5,7 @@ members = [
     "carina-lsp",
     "carina-provider-aws",
     "carina-provider-awscc",
-    "carina-provider-file",
+    "carina-provider-mock",
     "carina-smithy",
     "carina-state",
 ]
