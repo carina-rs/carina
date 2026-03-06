@@ -902,10 +902,10 @@ mod tests {
             ])),
         );
 
-        // Provider read returns List([Map]) for bare struct
+        // Provider read now returns Map for bare struct
         let current_attrs = HashMap::from([(
             "private_dns_name_options_on_launch".to_string(),
-            Value::List(vec![Value::Map(HashMap::from([
+            Value::Map(HashMap::from([
                 (
                     "hostname_type".to_string(),
                     Value::String("ip-name".to_string()),
@@ -918,11 +918,11 @@ mod tests {
                     "enable_resource_name_dns_aaaa_record".to_string(),
                     Value::Bool(false),
                 ),
-            ]))]),
+            ])),
         )]);
         let current = State::existing(ResourceId::new("ec2.subnet", "test-subnet"), current_attrs);
 
-        // Saved state also has List([Map]) from previous provider read
+        // Saved state may still have List([Map]) from before the fix
         let saved_map = HashMap::from([(
             "private_dns_name_options_on_launch".to_string(),
             Value::List(vec![Value::Map(HashMap::from([
@@ -944,7 +944,7 @@ mod tests {
         let result = diff(&desired, &current, Some(&saved_map));
         assert!(
             matches!(result, Diff::NoChange(_)),
-            "Expected NoChange for bare struct cross-type (Map desired vs List([Map]) current/saved), got {:?}",
+            "Expected NoChange for bare struct cross-type (Map desired vs List([Map]) saved), got {:?}",
             result
         );
     }
