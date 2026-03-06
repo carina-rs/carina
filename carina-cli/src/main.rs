@@ -2417,22 +2417,18 @@ async fn run_state_refresh(path: &PathBuf) -> Result<(), String> {
     println!("  {} Lock acquired", "✓".green());
 
     // Read current state from backend
-    let state_file = backend
+    let mut state_file = backend
         .read_state()
         .await
         .map_err(|e| format!("Failed to read state: {}", e))?;
 
-    let Some(mut state) = state_file else {
-        println!("{}", "No state file found. Nothing to refresh.".yellow());
-        backend
-            .release_lock(&lock)
-            .await
-            .map_err(|e| format!("Failed to release lock: {}", e))?;
-        return Ok(());
-    };
-
-    if state.resources.is_empty() {
-        println!("{}", "No resources in state. Nothing to refresh.".yellow());
+    if state_file.as_ref().is_none_or(|s| s.resources.is_empty()) {
+        let msg = if state_file.is_none() {
+            "No state file found. Nothing to refresh."
+        } else {
+            "No resources in state. Nothing to refresh."
+        };
+        println!("{}", msg.yellow());
         backend
             .release_lock(&lock)
             .await
@@ -2440,12 +2436,40 @@ async fn run_state_refresh(path: &PathBuf) -> Result<(), String> {
         return Ok(());
     }
 
-    reconcile_prefixed_names(&mut parsed.resources, &Some(state.clone()));
+    reconcile_prefixed_names(&mut parsed.resources, &state_file);
 
     let sorted_resources = sort_resources_by_dependencies(&parsed.resources);
 
     // Select provider
     let provider: Box<dyn Provider> = get_provider(&parsed).await;
+
+    // Read states for all resources using identifier from state
+    let mut current_states: HashMap<ResourceId, State> = HashMap::new();
+    for resource in &sorted_resources {
+        let identifier = state_file
+            .as_ref()
+            .and_then(|sf| sf.get_identifier_for_resource(resource));
+
+        // Skip resources not in state (no identifier means not managed)
+        if identifier.is_none() {
+            continue;
+        }
+
+        let fresh_state = provider
+            .read(&resource.id, identifier.as_deref())
+            .await
+            .map_err(|e| format!("Failed to read state for {}: {}", resource.id, e))?;
+        current_states.insert(resource.id.clone(), fresh_state);
+    }
+
+    // Restore unreturned attributes from state file (CloudControl doesn't always return them)
+    let saved_attrs = state_file
+        .as_ref()
+        .map(|sf| sf.build_saved_attrs())
+        .unwrap_or_default();
+    provider.restore_unreturned_attrs(&mut current_states, &saved_attrs);
+
+    let mut state = state_file.take().unwrap();
 
     println!();
     println!("{}", "Refreshing state...".cyan().bold());
@@ -2455,18 +2479,10 @@ async fn run_state_refresh(path: &PathBuf) -> Result<(), String> {
     let mut unchanged_count = 0u32;
 
     for resource in &sorted_resources {
-        let identifier = state.get_identifier_for_resource(resource);
-        let identifier_str = identifier.as_deref();
-
-        // Skip resources not in state (no identifier means not managed)
-        if identifier_str.is_none() {
-            continue;
-        }
-
-        let new_state = provider
-            .read(&resource.id, identifier_str)
-            .await
-            .map_err(|e| format!("Failed to read state for {}: {}", resource.id, e))?;
+        let fresh_state = match current_states.get(&resource.id) {
+            Some(s) => s,
+            None => continue, // Not in state, skip
+        };
 
         // Compare old state attributes with new
         let existing = state.find_resource(&resource.id.resource_type, &resource.id.name);
@@ -2482,21 +2498,21 @@ async fn run_state_refresh(path: &PathBuf) -> Result<(), String> {
                 .map(|(k, v)| (k.clone(), json_to_dsl_value(v)))
                 .collect();
 
-            if !new_state.exists {
+            if !fresh_state.exists {
                 // Resource was deleted externally
                 has_changes = true;
                 changes.push(format!("    {} resource no longer exists", "-".red()));
             } else {
                 // Check for modified and removed attributes
                 let mut all_keys: HashSet<&String> = old_attrs.keys().collect();
-                all_keys.extend(new_state.attributes.keys());
+                all_keys.extend(fresh_state.attributes.keys());
 
                 let mut sorted_keys: Vec<&&String> = all_keys.iter().collect();
                 sorted_keys.sort();
 
                 for key in sorted_keys {
                     let old_val = old_attrs.get(*key);
-                    let new_val = new_state.attributes.get(*key);
+                    let new_val = fresh_state.attributes.get(*key);
 
                     match (old_val, new_val) {
                         (Some(old), Some(new)) if old != new => {
@@ -2553,10 +2569,10 @@ async fn run_state_refresh(path: &PathBuf) -> Result<(), String> {
         }
 
         // Update state with refreshed data
-        if new_state.exists {
+        if fresh_state.exists {
             let existing_rs = state.find_resource(&resource.id.resource_type, &resource.id.name);
             let resource_state =
-                ResourceState::from_provider_state(resource, &new_state, existing_rs);
+                ResourceState::from_provider_state(resource, fresh_state, existing_rs);
             state.upsert_resource(resource_state);
         } else {
             state.remove_resource(&resource.id.resource_type, &resource.id.name);
