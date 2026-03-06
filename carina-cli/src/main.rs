@@ -23,20 +23,15 @@ use carina_core::lint::{find_list_literal_attrs, list_struct_attr_names};
 use carina_core::module_resolver;
 use carina_core::parser::{BackendConfig, ParsedFile, ProviderConfig};
 use carina_core::plan::Plan;
-use carina_core::provider::{
-    self as provider_mod, BoxFuture, Provider, ProviderError, ProviderFactory, ProviderResult,
-    ResourceType,
-};
+use carina_core::provider::{self as provider_mod, Provider, ProviderFactory};
 use carina_core::resolver::{resolve_ref_value, resolve_refs_with_state};
 use carina_core::resource::{LifecycleConfig, Resource, ResourceId, State, Value};
 use carina_core::schema::{ResourceSchema, resolve_block_names};
 use carina_core::validation;
-use carina_core::value::{
-    format_value, format_value_with_key, is_list_of_maps, json_to_dsl_value, map_similarity,
-    value_to_json,
-};
+use carina_core::value::{format_value, format_value_with_key, is_list_of_maps, map_similarity};
 use carina_provider_aws::AwsProviderFactory;
 use carina_provider_awscc::AwsccProviderFactory;
+use carina_provider_file::FileProvider;
 use carina_state::{
     BackendConfig as StateBackendConfig, BackendError, LockInfo, ResourceState, StateBackend,
     StateFile, create_backend, create_local_backend,
@@ -3173,142 +3168,6 @@ async fn run_state_bucket_delete(
 }
 
 // File-based mock Provider (saves state to JSON file)
-struct FileProvider {
-    state_file: PathBuf,
-}
-
-impl FileProvider {
-    fn new() -> Self {
-        Self {
-            state_file: PathBuf::from(".carina/state.json"),
-        }
-    }
-
-    fn load_states(&self) -> HashMap<String, HashMap<String, serde_json::Value>> {
-        if let Ok(content) = fs::read_to_string(&self.state_file) {
-            serde_json::from_str(&content).unwrap_or_default()
-        } else {
-            HashMap::new()
-        }
-    }
-
-    fn save_states(
-        &self,
-        states: &HashMap<String, HashMap<String, serde_json::Value>>,
-    ) -> Result<(), std::io::Error> {
-        if let Some(parent) = self.state_file.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let content = serde_json::to_string_pretty(states)?;
-        fs::write(&self.state_file, content)
-    }
-
-    fn resource_key(id: &ResourceId) -> String {
-        format!("{}.{}", id.resource_type, id.name)
-    }
-}
-
-impl Provider for FileProvider {
-    fn name(&self) -> &'static str {
-        "file"
-    }
-
-    fn resource_types(&self) -> Vec<Box<dyn ResourceType>> {
-        vec![]
-    }
-
-    fn read(
-        &self,
-        id: &ResourceId,
-        _identifier: Option<&str>,
-    ) -> BoxFuture<'_, ProviderResult<State>> {
-        let id = id.clone();
-        Box::pin(async move {
-            let states = self.load_states();
-            let key = Self::resource_key(&id);
-
-            if let Some(attrs) = states.get(&key) {
-                let attributes: HashMap<String, Value> = attrs
-                    .iter()
-                    .map(|(k, v)| (k.clone(), json_to_dsl_value(v)))
-                    .collect();
-                Ok(State::existing(id, attributes).with_identifier("file-id"))
-            } else {
-                Ok(State::not_found(id))
-            }
-        })
-    }
-
-    fn create(&self, resource: &Resource) -> BoxFuture<'_, ProviderResult<State>> {
-        let resource = resource.clone();
-        Box::pin(async move {
-            let mut states = self.load_states();
-            let key = Self::resource_key(&resource.id);
-
-            let attrs: HashMap<String, serde_json::Value> = resource
-                .attributes
-                .iter()
-                .map(|(k, v)| (k.clone(), value_to_json(v)))
-                .collect();
-
-            states.insert(key, attrs);
-            self.save_states(&states)
-                .map_err(|e| ProviderError::new(format!("Failed to save state: {}", e)))?;
-
-            Ok(
-                State::existing(resource.id.clone(), resource.attributes.clone())
-                    .with_identifier("file-id"),
-            )
-        })
-    }
-
-    fn update(
-        &self,
-        id: &ResourceId,
-        _identifier: &str,
-        _from: &State,
-        to: &Resource,
-    ) -> BoxFuture<'_, ProviderResult<State>> {
-        let id = id.clone();
-        let to = to.clone();
-        Box::pin(async move {
-            let mut states = self.load_states();
-            let key = Self::resource_key(&id);
-
-            let attrs: HashMap<String, serde_json::Value> = to
-                .attributes
-                .iter()
-                .map(|(k, v)| (k.clone(), value_to_json(v)))
-                .collect();
-
-            states.insert(key, attrs);
-            self.save_states(&states)
-                .map_err(|e| ProviderError::new(format!("Failed to save state: {}", e)))?;
-
-            Ok(State::existing(id, to.attributes.clone()))
-        })
-    }
-
-    fn delete(
-        &self,
-        id: &ResourceId,
-        _identifier: &str,
-        _lifecycle: &LifecycleConfig,
-    ) -> BoxFuture<'_, ProviderResult<()>> {
-        let id = id.clone();
-        Box::pin(async move {
-            let mut states = self.load_states();
-            let key = Self::resource_key(&id);
-
-            states.remove(&key);
-            self.save_states(&states)
-                .map_err(|e| ProviderError::new(format!("Failed to save state: {}", e)))?;
-
-            Ok(())
-        })
-    }
-}
-
 // Format command implementation
 fn run_fmt(path: &PathBuf, check: bool, show_diff: bool, recursive: bool) -> Result<(), String> {
     let config = FormatConfig::default();

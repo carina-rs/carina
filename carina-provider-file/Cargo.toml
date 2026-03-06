@@ -1,0 +1,9 @@
+[package]
+name = "carina-provider-file"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[dependencies]
+carina-core = { path = "../carina-core" }
+serde_json = "1"
