@@ -613,16 +613,8 @@ fn parse_block_contents(
                         let mut block_inner = inner.into_inner();
                         let block_name = block_inner.next().unwrap().as_str().to_string();
 
-                        // Parse nested block attributes into a map
-                        let mut block_attrs = HashMap::new();
-                        for attr_pair in block_inner {
-                            if attr_pair.as_rule() == Rule::attribute {
-                                let mut attr_inner = attr_pair.into_inner();
-                                let key = attr_inner.next().unwrap().as_str().to_string();
-                                let value = parse_expression(attr_inner.next().unwrap(), ctx)?;
-                                block_attrs.insert(key, value);
-                            }
-                        }
+                        // Recursively parse nested block contents (supports arbitrary depth)
+                        let block_attrs = parse_block_contents(block_inner, ctx)?;
 
                         // Add to the list of blocks with this name
                         nested_blocks
@@ -835,15 +827,7 @@ fn parse_primary_value(
                     Rule::nested_block => {
                         let mut block_inner = entry.into_inner();
                         let block_name = block_inner.next().unwrap().as_str().to_string();
-                        let mut block_attrs = HashMap::new();
-                        for attr_pair in block_inner {
-                            if attr_pair.as_rule() == Rule::attribute {
-                                let mut attr_inner = attr_pair.into_inner();
-                                let key = attr_inner.next().unwrap().as_str().to_string();
-                                let value = parse_expression(attr_inner.next().unwrap(), ctx)?;
-                                block_attrs.insert(key, value);
-                            }
-                        }
+                        let block_attrs = parse_block_contents(block_inner, ctx)?;
                         nested_blocks
                             .entry(block_name)
                             .or_default()

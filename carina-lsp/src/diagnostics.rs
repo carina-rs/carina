@@ -642,6 +642,25 @@ impl DiagnosticEngine {
                                 ..Default::default()
                             });
                         }
+
+                        // Recurse into nested Struct / List<Struct> fields
+                        let nested_fields = match &field.field_type {
+                            carina_core::schema::AttributeType::Struct { fields, .. } => {
+                                Some(fields)
+                            }
+                            carina_core::schema::AttributeType::List(inner) => {
+                                match inner.as_ref() {
+                                    carina_core::schema::AttributeType::Struct {
+                                        fields, ..
+                                    } => Some(fields),
+                                    _ => None,
+                                }
+                            }
+                            _ => None,
+                        };
+                        if let Some(nested) = nested_fields {
+                            diagnostics.extend(self.validate_struct_value(doc, key, val, nested));
+                        }
                     }
                 }
             }
@@ -769,10 +788,17 @@ impl DiagnosticEngine {
         for (line_idx, line) in text.lines().enumerate() {
             let trimmed = line.trim();
 
-            // Look for "block_name {" (without "=")
-            if !in_block && trimmed.starts_with(block_name) && !trimmed.contains('=') {
-                let after = trimmed[block_name.len()..].trim();
-                if after.starts_with('{') {
+            // Look for "block_name {" (without "=") or "block_name = {" (with "=")
+            if !in_block && trimmed.starts_with(block_name) {
+                let after_name = trimmed[block_name.len()..].trim();
+                let has_opening_brace = if after_name.starts_with('{') {
+                    true
+                } else if let Some(after_eq) = after_name.strip_prefix('=') {
+                    after_eq.trim().starts_with('{')
+                } else {
+                    false
+                };
+                if has_opening_brace {
                     in_block = true;
                     brace_depth = 1;
                     found_in_current_block = None;
@@ -781,6 +807,16 @@ impl DiagnosticEngine {
             }
 
             if in_block {
+                // Check for field name BEFORE counting braces so that lines like
+                // "field_name {" are detected at the current depth (before '{' increments it)
+                if brace_depth == 1
+                    && let Some(after) = trimmed.strip_prefix(field_name)
+                    && (after.starts_with(' ') || after.starts_with('=') || after.starts_with('{'))
+                {
+                    let leading_ws = line.len() - trimmed.len();
+                    found_in_current_block = Some((line_idx as u32, leading_ws as u32));
+                }
+
                 for ch in trimmed.chars() {
                     if ch == '{' {
                         brace_depth += 1;
@@ -792,16 +828,6 @@ impl DiagnosticEngine {
                             found_in_current_block = None;
                             break;
                         }
-                    }
-                }
-
-                if in_block && brace_depth == 1 {
-                    // Check if this line starts with the field name
-                    if let Some(after) = trimmed.strip_prefix(field_name)
-                        && (after.starts_with(' ') || after.starts_with('='))
-                    {
-                        let leading_ws = line.len() - trimmed.len();
-                        found_in_current_block = Some((line_idx as u32, leading_ws as u32));
                     }
                 }
             }
@@ -1822,6 +1848,121 @@ awscc.ec2.ipam {
             unknown.is_none(),
             "block_name 'operating_region' should not be flagged as unknown. Got: {:?}",
             diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    /// Create a DiagnosticEngine with a schema that has deeply nested structs for testing.
+    /// Schema: test.nested.resource has:
+    ///   - "outer" (List<Struct>) with fields: "inner" (List<Struct>), "outer_field" (String)
+    ///   - "inner" contains: "leaf_field" (String), "leaf_int" (Int)
+    fn test_engine_with_nested_structs() -> DiagnosticEngine {
+        use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
+
+        let inner_struct = AttributeType::List(Box::new(AttributeType::Struct {
+            name: "InnerStruct".to_string(),
+            fields: vec![
+                StructField::new("leaf_field", AttributeType::String),
+                StructField::new("leaf_int", AttributeType::Int),
+            ],
+        }));
+
+        let outer_struct = AttributeType::List(Box::new(AttributeType::Struct {
+            name: "OuterStruct".to_string(),
+            fields: vec![
+                StructField::new("inner", inner_struct),
+                StructField::new("outer_field", AttributeType::String),
+            ],
+        }));
+
+        let schema = ResourceSchema::new("test.nested.resource")
+            .attribute(AttributeSchema::new("outer", outer_struct));
+
+        let mut schemas = HashMap::new();
+        schemas.insert("test.nested.resource".to_string(), schema);
+
+        DiagnosticEngine::new(
+            Arc::new(schemas),
+            vec!["test".to_string()],
+            Arc::new(vec![]),
+        )
+    }
+
+    #[test]
+    fn unknown_field_in_nested_struct_block() {
+        let engine = test_engine_with_nested_structs();
+        let doc = create_document(
+            r#"let r = test.nested.resource {
+    outer {
+        inner {
+            unknown_nested = "bad"
+        }
+    }
+}"#,
+        );
+
+        let diagnostics = engine.analyze(&doc, None);
+
+        let unknown = diagnostics
+            .iter()
+            .find(|d| d.message.contains("Unknown field 'unknown_nested'"));
+        assert!(
+            unknown.is_some(),
+            "Should warn about unknown field in nested struct block. Got: {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn type_mismatch_in_nested_struct_field() {
+        let engine = test_engine_with_nested_structs();
+        let doc = create_document(
+            r#"let r = test.nested.resource {
+    outer {
+        inner {
+            leaf_int = "not_a_number"
+        }
+    }
+}"#,
+        );
+
+        let diagnostics = engine.analyze(&doc, None);
+
+        let mismatch = diagnostics
+            .iter()
+            .find(|d| d.message.contains("Type mismatch") && d.message.contains("Int"));
+        assert!(
+            mismatch.is_some(),
+            "Should warn about type mismatch in nested struct field. Got: {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn valid_nested_struct_no_diagnostics() {
+        let engine = test_engine_with_nested_structs();
+        let doc = create_document(
+            r#"let r = test.nested.resource {
+    outer {
+        inner {
+            leaf_field = "valid"
+            leaf_int = 42
+        }
+        outer_field = "also valid"
+    }
+}"#,
+        );
+
+        let diagnostics = engine.analyze(&doc, None);
+
+        // Filter to only struct-related diagnostics (ignore unknown attribute warnings from test schema)
+        let struct_diags: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| d.message.contains("Unknown field") || d.message.contains("Type mismatch"))
+            .collect();
+        assert!(
+            struct_diags.is_empty(),
+            "Valid nested struct should have no field diagnostics. Got: {:?}",
+            struct_diags.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
     }
 
