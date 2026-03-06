@@ -59,13 +59,13 @@ impl CompletionProvider {
             } => self.value_completions_for_attr(&resource_type, &attr_name, &text),
             CompletionContext::InsideStructBlock {
                 resource_type,
-                attr_name,
-            } => self.struct_field_completions(&resource_type, &attr_name),
+                attr_path,
+            } => self.struct_field_completions(&resource_type, &attr_path),
             CompletionContext::AfterEqualsInStruct {
                 resource_type,
-                attr_name,
+                attr_path,
                 field_name,
-            } => self.value_completions_for_struct_field(&resource_type, &attr_name, &field_name),
+            } => self.value_completions_for_struct_field(&resource_type, &attr_path, &field_name),
             CompletionContext::AfterProviderRegion => self.region_completions(),
             CompletionContext::AfterRefType => self.ref_type_completions(),
             CompletionContext::AfterInputDot => self.input_parameter_completions(&text),
@@ -105,10 +105,11 @@ impl CompletionProvider {
         }
 
         // Check if we're inside a resource block or module call and find the type
-        let mut brace_depth = 0;
+        let mut brace_depth: i32 = 0;
         let mut resource_type = String::new();
         let mut module_name: Option<String> = None;
-        let mut nested_block_name: Option<String> = None;
+        // Track nested block names at each depth level (index 0 = depth 1, etc.)
+        let mut nested_block_names: Vec<String> = Vec::new();
 
         for (i, line) in lines.iter().enumerate() {
             if i > line_idx {
@@ -139,15 +140,18 @@ impl CompletionProvider {
                 }
             }
 
-            // At brace_depth == 1, detect nested block: "identifier {" (without "=")
-            if brace_depth == 1
+            // At brace_depth >= 1, detect nested block: "identifier {" (without "=")
+            if brace_depth >= 1
                 && trimmed.ends_with('{')
                 && !trimmed.contains('=')
                 && !resource_type.is_empty()
             {
                 let name = trimmed.trim_end_matches('{').trim();
                 if !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_') {
-                    nested_block_name = Some(name.to_string());
+                    // Truncate to current depth level and push the new block name
+                    let depth_index = (brace_depth - 1) as usize;
+                    nested_block_names.truncate(depth_index);
+                    nested_block_names.push(name.to_string());
                 }
             }
 
@@ -159,33 +163,34 @@ impl CompletionProvider {
                     if brace_depth == 0 {
                         resource_type.clear();
                         module_name = None;
-                        nested_block_name = None;
-                    } else if brace_depth == 1 {
-                        nested_block_name = None;
+                        nested_block_names.clear();
+                    } else {
+                        // Truncate to current depth
+                        let depth_index = (brace_depth - 1) as usize;
+                        if nested_block_names.len() > depth_index {
+                            nested_block_names.truncate(depth_index);
+                        }
                     }
                 }
             }
         }
 
         // Check if we're inside a nested struct block (brace_depth > 1)
-        if let Some(attr_name) = nested_block_name
-            && brace_depth > 1
-            && !resource_type.is_empty()
-        {
+        if !nested_block_names.is_empty() && brace_depth > 1 && !resource_type.is_empty() {
             if prefix.contains('=') {
                 let after_eq = prefix.split('=').next_back().unwrap_or("").trim();
                 if !after_eq.starts_with('"') || after_eq == "\"" {
                     let field_name = self.extract_attr_name(&prefix);
                     return CompletionContext::AfterEqualsInStruct {
                         resource_type: resource_type.clone(),
-                        attr_name,
+                        attr_path: nested_block_names,
                         field_name,
                     };
                 }
             }
             return CompletionContext::InsideStructBlock {
                 resource_type: resource_type.clone(),
-                attr_name,
+                attr_path: nested_block_names,
             };
         }
 
@@ -696,10 +701,36 @@ impl CompletionProvider {
     }
 
     /// Provide completions for struct fields inside a nested block
+    /// Resolve struct fields by walking down a path of nested block names.
+    /// For a single-element path like ["versioning_configuration"], looks up the attribute directly.
+    /// For multi-element paths like ["assume_role_policy_document", "statement"],
+    /// walks down the struct hierarchy.
+    fn resolve_struct_fields_for_path<'a>(
+        &self,
+        schema: &'a ResourceSchema,
+        attr_path: &[String],
+    ) -> Option<&'a Vec<StructField>> {
+        if attr_path.is_empty() {
+            return None;
+        }
+
+        // Find the top-level attribute
+        let attr_schema = self.find_attr_schema(schema, &attr_path[0])?;
+        let mut fields = self.extract_struct_fields(&attr_schema.attr_type)?;
+
+        // Walk down the remaining path
+        for name in &attr_path[1..] {
+            let field = fields.iter().find(|f| f.name == *name)?;
+            fields = self.extract_struct_fields(&field.field_type)?;
+        }
+
+        Some(fields)
+    }
+
     fn struct_field_completions(
         &self,
         resource_type: &str,
-        attr_name: &str,
+        attr_path: &[String],
     ) -> Vec<CompletionItem> {
         let trigger_suggest = Command {
             title: "Trigger Suggest".to_string(),
@@ -708,8 +739,7 @@ impl CompletionProvider {
         };
 
         if let Some(schema) = self.schemas.get(resource_type)
-            && let Some(attr_schema) = self.find_attr_schema(schema, attr_name)
-            && let Some(fields) = self.extract_struct_fields(&attr_schema.attr_type)
+            && let Some(fields) = self.resolve_struct_fields_for_path(schema, attr_path)
         {
             fields
                 .iter()
@@ -744,12 +774,11 @@ impl CompletionProvider {
     fn value_completions_for_struct_field(
         &self,
         resource_type: &str,
-        attr_name: &str,
+        attr_path: &[String],
         field_name: &str,
     ) -> Vec<CompletionItem> {
         if let Some(schema) = self.schemas.get(resource_type)
-            && let Some(attr_schema) = self.find_attr_schema(schema, attr_name)
-            && let Some(fields) = self.extract_struct_fields(&attr_schema.attr_type)
+            && let Some(fields) = self.resolve_struct_fields_for_path(schema, attr_path)
             && let Some(field) = fields.iter().find(|f| f.name == field_name)
         {
             self.completions_for_type(&field.field_type)
@@ -1062,11 +1091,11 @@ enum CompletionContext {
     },
     InsideStructBlock {
         resource_type: String,
-        attr_name: String,
+        attr_path: Vec<String>,
     },
     AfterEqualsInStruct {
         resource_type: String,
-        attr_name: String,
+        attr_path: Vec<String>,
         field_name: String,
     },
     AfterProviderRegion,
@@ -1546,8 +1575,8 @@ simple {
                 context,
                 CompletionContext::InsideStructBlock {
                     ref resource_type,
-                    ref attr_name,
-                } if resource_type == "awscc.ec2.security_group" && attr_name == "security_group_ingress"
+                    ref attr_path,
+                } if resource_type == "awscc.ec2.security_group" && attr_path == &["security_group_ingress".to_string()]
             ),
             "Should detect InsideStructBlock context, got: {:?}",
             context
@@ -1598,7 +1627,8 @@ simple {
     fn struct_field_completions_via_block_name() {
         let provider = test_provider();
         // Use singular "operating_region" (block_name) to get struct fields
-        let completions = provider.struct_field_completions("awscc.ec2.ipam", "operating_region");
+        let completions =
+            provider.struct_field_completions("awscc.ec2.ipam", &["operating_region".to_string()]);
         assert!(
             !completions.is_empty(),
             "Should provide struct field completions via block_name"
@@ -1608,6 +1638,118 @@ simple {
             field_names.contains(&"region_name"),
             "Should include region_name field. Got: {:?}",
             field_names
+        );
+    }
+
+    /// Create a CompletionProvider with a schema that has deeply nested structs for testing.
+    /// Schema: test.nested.resource has an attribute "outer" which is a Struct
+    /// containing a field "inner" which is also a Struct containing a field "leaf_field".
+    fn test_provider_with_nested_structs() -> CompletionProvider {
+        use carina_core::schema::{AttributeSchema, ResourceSchema};
+
+        let inner_struct = AttributeType::Struct {
+            name: "InnerStruct".to_string(),
+            fields: vec![
+                StructField::new("leaf_field", AttributeType::String),
+                StructField::new("leaf_bool", AttributeType::Bool),
+            ],
+        };
+
+        let outer_struct = AttributeType::Struct {
+            name: "OuterStruct".to_string(),
+            fields: vec![
+                StructField::new("inner", inner_struct),
+                StructField::new("outer_field", AttributeType::String),
+            ],
+        };
+
+        let schema = ResourceSchema::new("test.nested.resource")
+            .attribute(AttributeSchema::new("outer", outer_struct));
+
+        let mut schemas = HashMap::new();
+        schemas.insert("test.nested.resource".to_string(), schema);
+
+        CompletionProvider::new(Arc::new(schemas), vec!["test".to_string()], vec![])
+    }
+
+    #[test]
+    fn nested_struct_completion_depth_2() {
+        let provider = test_provider_with_nested_structs();
+        let text = r#"let r = test.nested.resource {
+    outer {
+        inner {
+
+        }
+    }
+}"#;
+        let context = provider.get_completion_context(
+            text,
+            Position {
+                line: 3,
+                character: 12,
+            },
+        );
+        assert!(
+            matches!(
+                context,
+                CompletionContext::InsideStructBlock {
+                    ref resource_type,
+                    ref attr_path,
+                } if resource_type == "test.nested.resource"
+                    && attr_path == &["outer".to_string(), "inner".to_string()]
+            ),
+            "Should detect InsideStructBlock with nested path, got: {:?}",
+            context
+        );
+
+        // Verify actual completions work
+        let completions = provider.struct_field_completions(
+            "test.nested.resource",
+            &["outer".to_string(), "inner".to_string()],
+        );
+        let field_names: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+        assert!(
+            field_names.contains(&"leaf_field"),
+            "Should include leaf_field in nested completions. Got: {:?}",
+            field_names
+        );
+        assert!(
+            field_names.contains(&"leaf_bool"),
+            "Should include leaf_bool in nested completions. Got: {:?}",
+            field_names
+        );
+    }
+
+    #[test]
+    fn nested_struct_after_equals_depth_2() {
+        let provider = test_provider_with_nested_structs();
+        let text = r#"let r = test.nested.resource {
+    outer {
+        inner {
+            leaf_field =
+        }
+    }
+}"#;
+        let context = provider.get_completion_context(
+            text,
+            Position {
+                line: 3,
+                character: 25,
+            },
+        );
+        assert!(
+            matches!(
+                context,
+                CompletionContext::AfterEqualsInStruct {
+                    ref resource_type,
+                    ref attr_path,
+                    ref field_name,
+                } if resource_type == "test.nested.resource"
+                    && attr_path == &["outer".to_string(), "inner".to_string()]
+                    && field_name == "leaf_field"
+            ),
+            "Should detect AfterEqualsInStruct with nested path, got: {:?}",
+            context
         );
     }
 
