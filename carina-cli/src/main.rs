@@ -2384,6 +2384,9 @@ async fn run_state_refresh(path: &PathBuf) -> Result<(), String> {
     module_resolver::resolve_modules(&mut parsed, base_dir)
         .map_err(|e| format!("Module resolution error: {}", e))?;
 
+    // Validate provider region
+    validate_provider_region(&parsed)?;
+
     resolve_names(&mut parsed.resources)?;
     compute_anonymous_identifiers(&mut parsed.resources, &parsed.providers)?;
 
@@ -2443,6 +2446,9 @@ async fn run_state_refresh(path: &PathBuf) -> Result<(), String> {
     // Select provider
     let provider: Box<dyn Provider> = get_provider(&parsed).await;
 
+    println!();
+    println!("{}", "Refreshing state...".cyan().bold());
+
     // Read states for all resources using identifier from state
     let mut current_states: HashMap<ResourceId, State> = HashMap::new();
     for resource in &sorted_resources {
@@ -2471,8 +2477,6 @@ async fn run_state_refresh(path: &PathBuf) -> Result<(), String> {
 
     let mut state = state_file.take().unwrap();
 
-    println!();
-    println!("{}", "Refreshing state...".cyan().bold());
     println!();
 
     let mut updated_count = 0u32;
@@ -2557,7 +2561,7 @@ async fn run_state_refresh(path: &PathBuf) -> Result<(), String> {
             updated_count += 1;
             println!(
                 "  {} \"{}\":",
-                resource.id.resource_type.cyan(),
+                resource.id.display_type().cyan(),
                 resource.id.name
             );
             for change in &changes {
