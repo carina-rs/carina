@@ -1,3 +1,6 @@
+mod display;
+mod wiring;
+
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -12,31 +15,37 @@ use carina_core::config_loader::{
     find_crn_files_in_dir, find_crn_files_recursive, get_base_dir, load_configuration,
 };
 use carina_core::deps::{
-    build_dependents_map, find_failed_dependency, find_failed_dependent, get_resource_dependencies,
+    build_dependents_map, find_failed_dependency, find_failed_dependent,
     sort_resources_by_dependencies,
 };
 use carina_core::differ::create_plan;
 use carina_core::effect::Effect;
 use carina_core::formatter::{self, FormatConfig};
-use carina_core::identifier::{self, PrefixStateInfo};
 use carina_core::lint::{find_list_literal_attrs, list_struct_attr_names};
 use carina_core::module_resolver;
-use carina_core::parser::{BackendConfig, ParsedFile, ProviderConfig};
+#[cfg(test)]
+use carina_core::parser::ParsedFile;
+use carina_core::parser::{BackendConfig, ProviderConfig};
 use carina_core::plan::Plan;
-use carina_core::provider::{self as provider_mod, Provider, ProviderFactory};
+use carina_core::provider::{self as provider_mod, Provider};
 use carina_core::resolver::{resolve_ref_value, resolve_refs_with_state};
 use carina_core::resource::{LifecycleConfig, Resource, ResourceId, State, Value};
-use carina_core::schema::{ResourceSchema, resolve_block_names};
-use carina_core::validation;
-use carina_core::value::{format_value, format_value_with_key, is_list_of_maps, map_similarity};
-use carina_provider_aws::AwsProviderFactory;
-use carina_provider_awscc::AwsccProviderFactory;
-use carina_provider_mock::MockProvider;
+use carina_core::value::format_value;
 use carina_state::{
     BackendConfig as StateBackendConfig, BackendError, LockInfo, ResourceState, StateBackend,
     StateFile, create_backend, create_local_backend,
 };
 use std::collections::HashSet;
+
+use display::{format_effect, print_plan};
+#[cfg(test)]
+use wiring::resolve_attr_prefixes;
+use wiring::{
+    compute_anonymous_identifiers, create_plan_from_parsed, create_provider_from_config,
+    get_provider, get_schemas, provider_factories, reconcile_prefixed_names, resolve_names,
+    validate_module_calls, validate_provider_region, validate_resource_ref_types,
+    validate_resources,
+};
 
 #[derive(Parser)]
 #[command(name = "carina")]
@@ -199,13 +208,6 @@ struct CurrentStateEntry {
     state: State,
 }
 
-/// Result of creating a plan, with context needed for saving
-struct PlanContext {
-    plan: Plan,
-    sorted_resources: Vec<Resource>,
-    current_states: HashMap<ResourceId, State>,
-}
-
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
@@ -264,91 +266,6 @@ async fn main() {
     }
 }
 
-fn provider_factories() -> Vec<Box<dyn ProviderFactory>> {
-    vec![Box::new(AwsProviderFactory), Box::new(AwsccProviderFactory)]
-}
-
-fn get_schemas() -> HashMap<String, ResourceSchema> {
-    provider_mod::collect_schemas(&provider_factories())
-}
-
-fn validate_resources(resources: &[Resource]) -> Result<(), String> {
-    let factories = provider_factories();
-    let schemas = get_schemas();
-    validation::validate_resources(resources, &schemas, &|r| {
-        provider_mod::schema_key_for_resource(&factories, r)
-    })
-}
-
-fn validate_resource_ref_types(resources: &[Resource]) -> Result<(), String> {
-    let factories = provider_factories();
-    let schemas = get_schemas();
-    validation::validate_resource_ref_types(resources, &schemas, &|r| {
-        provider_mod::schema_key_for_resource(&factories, r)
-    })
-}
-
-/// Resolve block name aliases and attribute prefixes in one step.
-fn resolve_names(resources: &mut [Resource]) -> Result<(), String> {
-    let factories = provider_factories();
-    let schemas = get_schemas();
-    resolve_block_names(resources, &schemas, |r| {
-        provider_mod::schema_key_for_resource(&factories, r)
-    })?;
-    resolve_attr_prefixes(resources)
-}
-
-fn resolve_attr_prefixes(resources: &mut [Resource]) -> Result<(), String> {
-    let factories = provider_factories();
-    let schemas = get_schemas();
-    identifier::resolve_attr_prefixes(resources, &schemas, &|r| {
-        provider_mod::schema_key_for_resource(&factories, r)
-    })
-}
-
-fn reconcile_prefixed_names(resources: &mut [Resource], state_file: &Option<StateFile>) {
-    let state_file = match state_file {
-        Some(sf) => sf,
-        None => return,
-    };
-
-    identifier::reconcile_prefixed_names(resources, &|resource_type, name| {
-        let sr = state_file.find_resource(resource_type, name)?;
-        Some(PrefixStateInfo {
-            prefixes: sr.prefixes.clone(),
-            attribute_values: sr
-                .attributes
-                .iter()
-                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-                .collect(),
-        })
-    });
-}
-
-fn compute_anonymous_identifiers(
-    resources: &mut [Resource],
-    providers: &[ProviderConfig],
-) -> Result<(), String> {
-    let factories = provider_factories();
-    let schemas = get_schemas();
-    identifier::compute_anonymous_identifiers(
-        resources,
-        providers,
-        &schemas,
-        &|r| provider_mod::schema_key_for_resource(&factories, r),
-        &|name| {
-            provider_mod::find_factory(&factories, name)
-                .map(|f| {
-                    f.identity_attributes()
-                        .into_iter()
-                        .map(|s| s.to_string())
-                        .collect()
-                })
-                .unwrap_or_default()
-        },
-    )
-}
-
 fn run_module_command(command: ModuleCommands) -> Result<(), String> {
     match command {
         ModuleCommands::Info { file } => run_module_info(&file),
@@ -374,24 +291,6 @@ fn run_module_info(path: &Path) -> Result<(), String> {
     println!("{}", signature.display());
 
     Ok(())
-}
-
-fn validate_provider_region(parsed: &ParsedFile) -> Result<(), String> {
-    let factories = provider_factories();
-    validation::validate_provider_config(parsed, &factories)
-}
-
-fn validate_module_calls(parsed: &ParsedFile, base_dir: &Path) -> Result<(), String> {
-    // Build a map of imported modules: alias -> inputs
-    let mut imported_modules = HashMap::new();
-    for import in &parsed.imports {
-        let module_path = base_dir.join(&import.path);
-        if let Some(module_parsed) = module_resolver::load_module(&module_path) {
-            imported_modules.insert(import.alias.clone(), module_parsed.inputs);
-        }
-    }
-
-    validation::validate_module_calls(&parsed.module_calls, &imported_modules)
 }
 
 fn run_validate(path: &PathBuf) -> Result<(), String> {
@@ -456,7 +355,7 @@ async fn run_plan(path: &PathBuf, out: Option<&PathBuf>) -> Result<bool, String>
     let mut state_file: Option<StateFile> = None;
 
     let plan_backend: Box<dyn StateBackend> = if let Some(config) = parsed.backend.as_ref() {
-        let state_config = convert_backend_config(config);
+        let state_config = StateBackendConfig::from(config);
         let backend = create_backend(&state_config)
             .await
             .map_err(|e| format!("Failed to create backend: {}", e))?;
@@ -630,7 +529,7 @@ async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
     // Check for backend configuration - use local backend by default
     let backend_config = parsed.backend.as_ref();
     let backend: Box<dyn StateBackend> = if let Some(config) = backend_config {
-        let state_config = convert_backend_config(config);
+        let state_config = StateBackendConfig::from(config);
         create_backend(&state_config)
             .await
             .map_err(|e| format!("Failed to create backend: {}", e))?
@@ -674,7 +573,7 @@ async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
                 .resource_type()
                 .ok_or("Backend does not specify a resource type")?;
             if let Some(bucket_resource) =
-                find_state_bucket_resource(&parsed, &bucket_name, backend_resource_type)
+                parsed.find_resource_by_name(backend_resource_type, &bucket_name)
             {
                 println!("Found state bucket resource in configuration.");
                 println!(
@@ -1223,12 +1122,14 @@ async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
     for resource in &sorted_resources {
         let existing = state.find_resource(&resource.id.resource_type, &resource.id.name);
         if let Some(applied_state) = applied_states.get(&resource.id) {
-            let resource_state = resource_to_state(resource, applied_state, existing);
+            let resource_state =
+                ResourceState::from_provider_state(resource, applied_state, existing);
             state.upsert_resource(resource_state);
         } else if let Some(current_state) = current_states.get(&resource.id)
             && current_state.exists
         {
-            let resource_state = resource_to_state(resource, current_state, existing);
+            let resource_state =
+                ResourceState::from_provider_state(resource, current_state, existing);
             state.upsert_resource(resource_state);
         }
     }
@@ -1318,7 +1219,7 @@ async fn run_apply_from_plan(plan_path: &PathBuf, auto_approve: bool) -> Result<
 
     // Set up backend
     let backend: Box<dyn StateBackend> = if let Some(config) = plan_file.backend_config.as_ref() {
-        let state_config = convert_backend_config(config);
+        let state_config = StateBackendConfig::from(config);
         create_backend(&state_config)
             .await
             .map_err(|e| format!("Failed to create backend: {}", e))?
@@ -1784,12 +1685,14 @@ async fn run_apply_from_plan(plan_path: &PathBuf, auto_approve: bool) -> Result<
     for resource in sorted_resources {
         let existing = state.find_resource(&resource.id.resource_type, &resource.id.name);
         if let Some(applied_state) = applied_states.get(&resource.id) {
-            let resource_state = resource_to_state(resource, applied_state, existing);
+            let resource_state =
+                ResourceState::from_provider_state(resource, applied_state, existing);
             state.upsert_resource(resource_state);
         } else if let Some(current_state) = current_states.get(&resource.id)
             && current_state.exists
         {
-            let resource_state = resource_to_state(resource, current_state, existing);
+            let resource_state =
+                ResourceState::from_provider_state(resource, current_state, existing);
             state.upsert_resource(resource_state);
         }
     }
@@ -1840,21 +1743,6 @@ async fn run_apply_from_plan(plan_path: &PathBuf, auto_approve: bool) -> Result<
 }
 
 /// Create a provider from a saved ProviderConfig
-async fn create_provider_from_config(config: &ProviderConfig) -> Box<dyn Provider> {
-    let factories = provider_factories();
-    if let Some(factory) = provider_mod::find_factory(&factories, &config.name) {
-        let region = factory.extract_region(&config.attributes);
-        println!(
-            "{}",
-            format!("Using {} (region: {})", factory.display_name(), region).cyan()
-        );
-        return factory.create_provider(&config.attributes).await;
-    }
-
-    println!("{}", "Using mock provider".cyan());
-    Box::new(MockProvider::new())
-}
-
 async fn run_destroy(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
     let mut parsed = load_configuration(path)?.parsed;
 
@@ -1877,7 +1765,7 @@ async fn run_destroy(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
     // Check for backend configuration - use local backend by default
     let backend_config = parsed.backend.as_ref();
     let backend: Box<dyn StateBackend> = if let Some(config) = backend_config {
-        let state_config = convert_backend_config(config);
+        let state_config = StateBackendConfig::from(config);
         create_backend(&state_config)
             .await
             .map_err(|e| format!("Failed to create backend: {}", e))?
@@ -2327,697 +2215,9 @@ async fn run_destroy(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
     }
 }
 
-/// Determine and return the appropriate Provider
-async fn get_provider(parsed: &ParsedFile) -> Box<dyn Provider> {
-    let factories = provider_factories();
-    for provider_config in &parsed.providers {
-        if let Some(factory) = provider_mod::find_factory(&factories, &provider_config.name) {
-            let region = factory.extract_region(&provider_config.attributes);
-            println!(
-                "{}",
-                format!("Using {} (region: {})", factory.display_name(), region).cyan()
-            );
-            return factory.create_provider(&provider_config.attributes).await;
-        }
-    }
-
-    // Use mock provider for other cases
-    println!("{}", "Using mock provider".cyan());
-    Box::new(MockProvider::new())
-}
-
-async fn create_plan_from_parsed(
-    parsed: &ParsedFile,
-    state_file: &Option<StateFile>,
-) -> Result<PlanContext, String> {
-    let sorted_resources = sort_resources_by_dependencies(&parsed.resources);
-
-    // Select appropriate Provider based on configuration
-    let provider: Box<dyn Provider> = get_provider(parsed).await;
-
-    // Read states for all resources using identifier from state
-    // In identifier-based approach, if there's no identifier in state, the resource doesn't exist
-    let mut current_states: HashMap<ResourceId, State> = HashMap::new();
-    for resource in &sorted_resources {
-        let identifier = state_file
-            .as_ref()
-            .and_then(|sf| sf.get_identifier_for_resource(resource));
-        let state = provider
-            .read(&resource.id, identifier.as_deref())
-            .await
-            .map_err(|e| format!("Failed to read state: {}", e))?;
-        current_states.insert(resource.id.clone(), state);
-    }
-
-    // Restore unreturned attributes from state file (CloudControl doesn't always return them)
-    let saved_attrs = state_file
-        .as_ref()
-        .map(|sf| sf.build_saved_attrs())
-        .unwrap_or_default();
-    provider.restore_unreturned_attrs(&mut current_states, &saved_attrs);
-
-    // Resolve ResourceRef values and enum identifiers using AWS state
-    let mut resources = sorted_resources.clone();
-    resolve_refs_with_state(&mut resources, &current_states);
-    provider.resolve_enum_identifiers(&mut resources);
-
-    // Build lifecycles map from state file for orphaned resource deletion
-    let lifecycles = state_file
-        .as_ref()
-        .map(|sf| sf.build_lifecycles())
-        .unwrap_or_default();
-
-    let schemas = get_schemas();
-    let plan = create_plan(
-        &resources,
-        &current_states,
-        &lifecycles,
-        &schemas,
-        &saved_attrs,
-    );
-    Ok(PlanContext {
-        plan,
-        sorted_resources,
-        current_states,
-    })
-}
-
-fn print_plan(plan: &Plan) {
-    if plan.is_empty() {
-        println!("{}", "No changes. Infrastructure is up-to-date.".green());
-        return;
-    }
-
-    // Build dependency graph from effects
-    let mut binding_to_effect: HashMap<String, usize> = HashMap::new();
-    let mut effect_deps: HashMap<usize, HashSet<String>> = HashMap::new();
-    let mut effect_bindings: HashMap<usize, String> = HashMap::new();
-
-    for (idx, effect) in plan.effects().iter().enumerate() {
-        let (resource, deps) = match effect {
-            Effect::Create(r) => (Some(r), get_resource_dependencies(r)),
-            Effect::Update { to, .. } => (Some(to), get_resource_dependencies(to)),
-            Effect::Replace { to, .. } => (Some(to), get_resource_dependencies(to)),
-            Effect::Read { resource } => (Some(resource), get_resource_dependencies(resource)),
-            Effect::Delete { .. } => (None, HashSet::new()),
-        };
-
-        if let Some(r) = resource {
-            let binding = r
-                .attributes
-                .get("_binding")
-                .and_then(|v| match v {
-                    Value::String(s) => Some(s.clone()),
-                    _ => None,
-                })
-                .unwrap_or_else(|| r.id.to_string());
-            binding_to_effect.insert(binding.clone(), idx);
-            effect_bindings.insert(idx, binding);
-        }
-        effect_deps.insert(idx, deps);
-    }
-
-    // Build reverse dependency map (who depends on this resource)
-    let mut dependents: HashMap<usize, Vec<usize>> = HashMap::new();
-    for idx in 0..plan.effects().len() {
-        dependents.insert(idx, Vec::new());
-    }
-
-    for (idx, deps) in &effect_deps {
-        for dep in deps {
-            if let Some(&dep_idx) = binding_to_effect.get(dep) {
-                dependents.get_mut(&dep_idx).unwrap().push(*idx);
-            }
-        }
-    }
-
-    // Find root resources (no dependencies within the plan)
-    let mut roots: Vec<usize> = Vec::new();
-    for (idx, deps) in &effect_deps {
-        let has_dep_in_plan = deps.iter().any(|d| binding_to_effect.contains_key(d));
-        if !has_dep_in_plan {
-            roots.push(*idx);
-        }
-    }
-    roots.sort();
-
-    println!("{}", "Execution Plan:".cyan().bold());
-    println!();
-
-    // Track printed effects to avoid duplicates
-    let mut printed: HashSet<usize> = HashSet::new();
-
-    fn print_effect_tree(
-        idx: usize,
-        plan: &Plan,
-        dependents: &HashMap<usize, Vec<usize>>,
-        printed: &mut HashSet<usize>,
-        indent: usize,
-        is_last: bool,
-        prefix: &str,
-    ) {
-        if printed.contains(&idx) {
-            return;
-        }
-        printed.insert(idx);
-
-        let effect = &plan.effects()[idx];
-        let colored_symbol = match effect {
-            Effect::Create(_) => "+".green().bold(),
-            Effect::Update { .. } => "~".yellow().bold(),
-            Effect::Replace { lifecycle, .. } => {
-                if lifecycle.create_before_destroy {
-                    "+/-".magenta().bold()
-                } else {
-                    "-/+".magenta().bold()
-                }
-            }
-            Effect::Delete { .. } => "-".red().bold(),
-            Effect::Read { .. } => "<=".cyan().bold(),
-        };
-
-        // Build the tree connector (shown before child resources)
-        let connector = if indent == 0 {
-            "".to_string()
-        } else if is_last {
-            format!("{}└─ ", prefix)
-        } else {
-            format!("{}├─ ", prefix)
-        };
-
-        // Base indentation for this resource
-        let base_indent = "  ";
-        // Attribute indentation (4 spaces from resource line)
-        let attr_base = "    ";
-
-        match effect {
-            Effect::Create(r) => {
-                println!(
-                    "{}{}{} {} \"{}\"",
-                    base_indent,
-                    connector,
-                    colored_symbol,
-                    r.id.display_type().cyan().bold(),
-                    r.id.name.white().bold()
-                );
-                // Attribute prefix aligns with the resource content
-                let attr_prefix = if indent == 0 {
-                    format!("{}{}", base_indent, attr_base)
-                } else {
-                    let continuation = if is_last {
-                        format!("{}   ", prefix)
-                    } else {
-                        format!("{}│  ", prefix)
-                    };
-                    format!("{}{}   ", base_indent, continuation)
-                };
-                let mut keys: Vec<_> = r
-                    .attributes
-                    .keys()
-                    .filter(|k| !k.starts_with('_'))
-                    .collect();
-                keys.sort();
-                for key in keys {
-                    let value = &r.attributes[key];
-                    if is_list_of_maps(value) {
-                        println!("{}{}:", attr_prefix, key);
-                        println!("{}", format_list_of_maps(value, &attr_prefix));
-                    } else {
-                        println!(
-                            "{}{}: {}",
-                            attr_prefix,
-                            key,
-                            format_value_with_key(value, Some(key)).green()
-                        );
-                    }
-                }
-            }
-            Effect::Update { id, from, to, .. } => {
-                println!(
-                    "{}{}{} {} \"{}\"",
-                    base_indent,
-                    connector,
-                    colored_symbol,
-                    id.display_type().cyan().bold(),
-                    id.name.yellow().bold()
-                );
-                let attr_prefix = if indent == 0 {
-                    format!("{}{}", base_indent, attr_base)
-                } else {
-                    let continuation = if is_last {
-                        format!("{}   ", prefix)
-                    } else {
-                        format!("{}│  ", prefix)
-                    };
-                    format!("{}{}   ", base_indent, continuation)
-                };
-                let mut keys: Vec<_> = to
-                    .attributes
-                    .keys()
-                    .filter(|k| !k.starts_with('_'))
-                    .collect();
-                keys.sort();
-                for key in keys {
-                    let new_value = &to.attributes[key];
-                    let old_value = from.attributes.get(key);
-                    let is_same = old_value
-                        .map(|ov| ov.semantically_equal(new_value))
-                        .unwrap_or(false);
-                    if !is_same {
-                        if is_list_of_maps(new_value) {
-                            println!("{}{}:", attr_prefix, key);
-                            println!("{}", format_list_diff(old_value, new_value, &attr_prefix));
-                        } else {
-                            let old_str = old_value
-                                .map(|v| format_value_with_key(v, Some(key)))
-                                .unwrap_or_else(|| "(none)".to_string());
-                            println!(
-                                "{}{}: {} → {}",
-                                attr_prefix,
-                                key,
-                                old_str.red(),
-                                format_value_with_key(new_value, Some(key)).green()
-                            );
-                        }
-                    }
-                }
-            }
-            Effect::Replace {
-                id,
-                from,
-                to,
-                changed_create_only,
-                lifecycle,
-            } => {
-                let replace_note = if lifecycle.create_before_destroy {
-                    "(must be replaced, create before destroy)"
-                } else {
-                    "(must be replaced)"
-                };
-                println!(
-                    "{}{}{} {} \"{}\" {}",
-                    base_indent,
-                    connector,
-                    colored_symbol,
-                    id.display_type().cyan().bold(),
-                    id.name.magenta().bold(),
-                    replace_note.magenta()
-                );
-                let attr_prefix = if indent == 0 {
-                    format!("{}{}", base_indent, attr_base)
-                } else {
-                    let continuation = if is_last {
-                        format!("{}   ", prefix)
-                    } else {
-                        format!("{}│  ", prefix)
-                    };
-                    format!("{}{}   ", base_indent, continuation)
-                };
-                let mut keys: Vec<_> = to
-                    .attributes
-                    .keys()
-                    .filter(|k| !k.starts_with('_'))
-                    .collect();
-                keys.sort();
-                for key in keys {
-                    let new_value = &to.attributes[key];
-                    let old_value = from.attributes.get(key);
-                    let forces_replacement = changed_create_only.contains(key);
-                    let is_same = old_value
-                        .map(|ov| ov.semantically_equal(new_value))
-                        .unwrap_or(false);
-                    if !is_same {
-                        if is_list_of_maps(new_value) {
-                            let suffix = if forces_replacement {
-                                format!(" {}", "(forces replacement)".magenta())
-                            } else {
-                                String::new()
-                            };
-                            println!("{}{}:{}", attr_prefix, key, suffix);
-                            println!("{}", format_list_diff(old_value, new_value, &attr_prefix));
-                        } else {
-                            let old_str = old_value
-                                .map(|v| format_value_with_key(v, Some(key)))
-                                .unwrap_or_else(|| "(none)".to_string());
-                            if forces_replacement {
-                                println!(
-                                    "{}{}: {} → {} {}",
-                                    attr_prefix,
-                                    key,
-                                    old_str.red(),
-                                    format_value_with_key(new_value, Some(key)).green(),
-                                    "(forces replacement)".magenta()
-                                );
-                            } else {
-                                println!(
-                                    "{}{}: {} → {}",
-                                    attr_prefix,
-                                    key,
-                                    old_str.red(),
-                                    format_value_with_key(new_value, Some(key)).green()
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-            Effect::Delete { id, .. } => {
-                println!(
-                    "{}{}{} {} \"{}\"",
-                    base_indent,
-                    connector,
-                    colored_symbol,
-                    id.display_type().cyan().bold(),
-                    id.name.red().bold()
-                );
-            }
-            Effect::Read { resource } => {
-                println!(
-                    "{}{}{} {} \"{}\" {}",
-                    base_indent,
-                    connector,
-                    colored_symbol,
-                    resource.id.display_type().cyan().bold(),
-                    resource.id.name.cyan().bold(),
-                    "(data source)".dimmed()
-                );
-            }
-        }
-
-        // Print children (dependents)
-        let children = dependents.get(&idx).cloned().unwrap_or_default();
-        let unprinted_children: Vec<_> = children
-            .iter()
-            .filter(|c| !printed.contains(c))
-            .cloned()
-            .collect();
-
-        // New prefix for children: align with attribute indentation
-        let new_prefix = if indent == 0 {
-            format!("{}  ", attr_base)
-        } else {
-            let continuation = if is_last {
-                format!("{}   ", prefix)
-            } else {
-                format!("{}│  ", prefix)
-            };
-            format!("{}   ", continuation)
-        };
-
-        for (i, child_idx) in unprinted_children.iter().enumerate() {
-            let child_is_last = i == unprinted_children.len() - 1;
-            print_effect_tree(
-                *child_idx,
-                plan,
-                dependents,
-                printed,
-                indent + 1,
-                child_is_last,
-                &new_prefix,
-            );
-        }
-    }
-
-    // Print from roots
-    for (i, root_idx) in roots.iter().enumerate() {
-        print_effect_tree(
-            *root_idx,
-            plan,
-            &dependents,
-            &mut printed,
-            0,
-            i == roots.len() - 1,
-            "",
-        );
-    }
-
-    // Print any remaining effects that weren't reachable from roots
-    // (e.g., circular dependencies or isolated resources)
-    let remaining: Vec<_> = (0..plan.effects().len())
-        .filter(|idx| !printed.contains(idx))
-        .collect();
-    for idx in remaining {
-        print_effect_tree(idx, plan, &dependents, &mut printed, 0, true, "");
-    }
-
-    println!();
-    let summary = plan.summary();
-    let mut parts = Vec::new();
-    if summary.read > 0 {
-        parts.push(format!("{} to read", summary.read.to_string().cyan()));
-    }
-    parts.push(format!("{} to add", summary.create.to_string().green()));
-    parts.push(format!("{} to change", summary.update.to_string().yellow()));
-    if summary.replace > 0 {
-        parts.push(format!(
-            "{} to replace",
-            summary.replace.to_string().magenta()
-        ));
-    }
-    parts.push(format!("{} to destroy", summary.delete.to_string().red()));
-    println!("Plan: {}.", parts.join(", "));
-}
-
-fn format_effect(effect: &Effect) -> String {
-    match effect {
-        Effect::Create(r) => format!("Create {}", r.id),
-        Effect::Update { id, .. } => format!("Update {}", id),
-        Effect::Replace { id, lifecycle, .. } => {
-            if lifecycle.create_before_destroy {
-                format!("Replace {} (create-before-destroy)", id)
-            } else {
-                format!("Replace {}", id)
-            }
-        }
-        Effect::Delete { id, .. } => format!("Delete {}", id),
-        Effect::Read { resource } => {
-            format!("Read {}", resource.id)
-        }
-    }
-}
-
-/// Format a list-of-maps for Create effect display (multi-line with + prefix)
-fn format_list_of_maps(value: &Value, attr_prefix: &str) -> String {
-    let items = match value {
-        Value::List(items) => items,
-        _ => return format_value(value),
-    };
-    let mut lines = Vec::new();
-    for item in items {
-        if let Value::Map(map) = item {
-            let mut keys: Vec<_> = map.keys().collect();
-            keys.sort();
-            let fields: Vec<String> = keys
-                .iter()
-                .map(|k| format!("{}: {}", k, format_value(&map[*k])))
-                .collect();
-            lines.push(format!(
-                "{}  {} {{{}}}",
-                attr_prefix,
-                "+".green().bold(),
-                fields.join(", ")
-            ));
-        }
-    }
-    lines.join("\n")
-}
-
-/// Format a list-of-maps diff for Update effect display.
-/// Uses content-matched comparison (multiset matching) instead of index-based.
-/// 1. Find exact matches between old and new items
-/// 2. Pair remaining unmatched items by similarity for field-level diffs
-/// 3. Display unchanged, modified (~), added (+), and removed (-) items
-fn format_list_diff(old_value: Option<&Value>, new_value: &Value, attr_prefix: &str) -> String {
-    let new_items = match new_value {
-        Value::List(items) => items,
-        _ => return format_value(new_value),
-    };
-    let old_items = match old_value {
-        Some(Value::List(items)) => items,
-        _ => &vec![] as &Vec<Value>,
-    };
-
-    let mut old_matched = vec![false; old_items.len()];
-    let mut new_matched = vec![false; new_items.len()];
-
-    // Phase 1: Find exact matches (semantically equal items)
-    for (ni, new_item) in new_items.iter().enumerate() {
-        for (oi, old_item) in old_items.iter().enumerate() {
-            if !old_matched[oi] && old_item.semantically_equal(new_item) {
-                old_matched[oi] = true;
-                new_matched[ni] = true;
-                break;
-            }
-        }
-    }
-
-    // Collect unmatched items
-    let unmatched_old: Vec<usize> = old_matched
-        .iter()
-        .enumerate()
-        .filter(|(_, m)| !**m)
-        .map(|(i, _)| i)
-        .collect();
-    let unmatched_new: Vec<usize> = new_matched
-        .iter()
-        .enumerate()
-        .filter(|(_, m)| !**m)
-        .map(|(i, _)| i)
-        .collect();
-
-    // Phase 2: Pair unmatched items by similarity (most shared key-value pairs)
-    let mut paired: Vec<(usize, usize)> = Vec::new();
-    let mut paired_old = vec![false; unmatched_old.len()];
-    let mut paired_new = vec![false; unmatched_new.len()];
-
-    for (ui_new, &ni) in unmatched_new.iter().enumerate() {
-        let mut best_oi_idx = None;
-        let mut best_sim = 0usize;
-        for (ui_old, &oi) in unmatched_old.iter().enumerate() {
-            if paired_old[ui_old] {
-                continue;
-            }
-            let sim = map_similarity(&old_items[oi], &new_items[ni]);
-            if sim > best_sim {
-                best_sim = sim;
-                best_oi_idx = Some(ui_old);
-            }
-        }
-        if let Some(ui_old) = best_oi_idx.filter(|_| best_sim > 0) {
-            paired.push((unmatched_old[ui_old], ni));
-            paired_old[ui_old] = true;
-            paired_new[ui_new] = true;
-        }
-    }
-
-    // Remaining truly added/removed items
-    let added: Vec<usize> = unmatched_new
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| !paired_new[*i])
-        .map(|(_, &ni)| ni)
-        .collect();
-    let removed: Vec<usize> = unmatched_old
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| !paired_old[*i])
-        .map(|(_, &oi)| oi)
-        .collect();
-
-    // Phase 3: Build output
-    let mut lines = Vec::new();
-
-    // Show unchanged items (exact matches from new list order)
-    for (ni, new_item) in new_items.iter().enumerate() {
-        if let Value::Map(map) = new_item
-            && new_matched[ni]
-        {
-            let mut keys: Vec<_> = map.keys().collect();
-            keys.sort();
-            let fields: Vec<String> = keys
-                .iter()
-                .map(|k| format!("{}: {}", k, format_value(&map[*k])))
-                .collect();
-            lines.push(format!("{}    {{{}}}", attr_prefix, fields.join(", ")));
-        }
-    }
-
-    // Show modified items (paired by similarity)
-    for &(oi, ni) in &paired {
-        if let (Value::Map(old_map), Value::Map(new_map)) = (&old_items[oi], &new_items[ni]) {
-            let mut keys: Vec<_> = new_map.keys().collect();
-            keys.sort();
-            let fields: Vec<String> = keys
-                .iter()
-                .map(|k| {
-                    let new_v = format_value(&new_map[*k]);
-                    let field_same = old_map
-                        .get(*k)
-                        .map(|ov| ov.semantically_equal(&new_map[*k]))
-                        .unwrap_or(false);
-                    if !field_same {
-                        let old_v = old_map
-                            .get(*k)
-                            .map(format_value)
-                            .unwrap_or_else(|| "(none)".to_string());
-                        format!("{}: {} → {}", k, old_v.red(), new_v.green())
-                    } else {
-                        format!("{}: {}", k, new_v)
-                    }
-                })
-                .collect();
-            lines.push(format!(
-                "{}  {} {{{}}}",
-                attr_prefix,
-                "~".yellow().bold(),
-                fields.join(", ")
-            ));
-        }
-    }
-
-    // Show added items
-    for &ni in &added {
-        if let Value::Map(map) = &new_items[ni] {
-            let mut keys: Vec<_> = map.keys().collect();
-            keys.sort();
-            let fields: Vec<String> = keys
-                .iter()
-                .map(|k| format!("{}: {}", k, format_value(&map[*k])))
-                .collect();
-            lines.push(format!(
-                "{}  {} {{{}}}",
-                attr_prefix,
-                "+".green().bold(),
-                fields.join(", ")
-            ));
-        }
-    }
-
-    // Show removed items
-    for &oi in &removed {
-        if let Value::Map(map) = &old_items[oi] {
-            let mut keys: Vec<_> = map.keys().collect();
-            keys.sort();
-            let fields: Vec<String> = keys
-                .iter()
-                .map(|k| format!("{}: {}", k, format_value(&map[*k])))
-                .collect();
-            lines.push(format!(
-                "{}  {} {{{}}}",
-                attr_prefix,
-                "-".red().bold(),
-                fields.join(", ")
-            ));
-        }
-    }
-
-    lines.join("\n")
-}
-
 // =============================================================================
 // State Management Functions
 // =============================================================================
-
-/// Convert parser BackendConfig to state BackendConfig
-fn convert_backend_config(config: &BackendConfig) -> StateBackendConfig {
-    StateBackendConfig::from(config)
-}
-
-fn find_state_bucket_resource<'a>(
-    parsed: &'a ParsedFile,
-    bucket_name: &str,
-    resource_type: &str,
-) -> Option<&'a Resource> {
-    parsed.find_resource_by_name(resource_type, bucket_name)
-}
-
-fn resource_to_state(
-    resource: &Resource,
-    state: &State,
-    existing_state: Option<&ResourceState>,
-) -> ResourceState {
-    ResourceState::from_provider_state(resource, state, existing_state)
-}
 
 /// Run force-unlock command
 async fn run_force_unlock(lock_id: &str, path: &PathBuf) -> Result<(), String> {
@@ -3028,7 +2228,7 @@ async fn run_force_unlock(lock_id: &str, path: &PathBuf) -> Result<(), String> {
         .as_ref()
         .ok_or("No backend configuration found. force-unlock requires a backend.")?;
 
-    let state_config = convert_backend_config(backend_config);
+    let state_config = StateBackendConfig::from(backend_config);
     let backend = create_backend(&state_config)
         .await
         .map_err(|e| format!("Failed to create backend: {}", e))?;
@@ -3118,7 +2318,7 @@ async fn run_state_bucket_delete(
     }
 
     // Create backend to get provider metadata
-    let state_config = convert_backend_config(backend_config);
+    let state_config = StateBackendConfig::from(backend_config);
     let backend = create_backend(&state_config)
         .await
         .map_err(|e| format!("Failed to create backend: {}", e))?;
@@ -3792,13 +2992,25 @@ mod tests {
         };
 
         // Matching resource type
-        assert!(find_state_bucket_resource(&parsed, "my-bucket", "s3.bucket").is_some());
+        assert!(
+            parsed
+                .find_resource_by_name("s3.bucket", "my-bucket")
+                .is_some()
+        );
 
         // Non-matching resource type
-        assert!(find_state_bucket_resource(&parsed, "my-bucket", "gcs.bucket").is_none());
+        assert!(
+            parsed
+                .find_resource_by_name("gcs.bucket", "my-bucket")
+                .is_none()
+        );
 
         // Non-matching bucket name
-        assert!(find_state_bucket_resource(&parsed, "other-bucket", "s3.bucket").is_none());
+        assert!(
+            parsed
+                .find_resource_by_name("s3.bucket", "other-bucket")
+                .is_none()
+        );
     }
 
     #[test]
