@@ -613,16 +613,8 @@ fn parse_block_contents(
                         let mut block_inner = inner.into_inner();
                         let block_name = block_inner.next().unwrap().as_str().to_string();
 
-                        // Parse nested block attributes into a map
-                        let mut block_attrs = HashMap::new();
-                        for attr_pair in block_inner {
-                            if attr_pair.as_rule() == Rule::attribute {
-                                let mut attr_inner = attr_pair.into_inner();
-                                let key = attr_inner.next().unwrap().as_str().to_string();
-                                let value = parse_expression(attr_inner.next().unwrap(), ctx)?;
-                                block_attrs.insert(key, value);
-                            }
-                        }
+                        // Recursively parse nested block contents (supports arbitrary depth)
+                        let block_attrs = parse_block_contents(block_inner, ctx)?;
 
                         // Add to the list of blocks with this name
                         nested_blocks
@@ -835,15 +827,7 @@ fn parse_primary_value(
                     Rule::nested_block => {
                         let mut block_inner = entry.into_inner();
                         let block_name = block_inner.next().unwrap().as_str().to_string();
-                        let mut block_attrs = HashMap::new();
-                        for attr_pair in block_inner {
-                            if attr_pair.as_rule() == Rule::attribute {
-                                let mut attr_inner = attr_pair.into_inner();
-                                let key = attr_inner.next().unwrap().as_str().to_string();
-                                let value = parse_expression(attr_inner.next().unwrap(), ctx)?;
-                                block_attrs.insert(key, value);
-                            }
-                        }
+                        let block_attrs = parse_block_contents(block_inner, ctx)?;
                         nested_blocks
                             .entry(block_name)
                             .or_default()
@@ -2092,6 +2076,83 @@ mod tests {
             }
         } else {
             panic!("Expected map for assume_role_policy_document");
+        }
+    }
+
+    #[test]
+    fn parse_deeply_nested_blocks() {
+        // Test nested blocks at depth 2: resource { outer { inner { ... } } }
+        let input = r#"
+            let r = aws.test.resource {
+                outer {
+                    inner {
+                        leaf = "value"
+                    }
+                }
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+        let r = &result.resources[0];
+
+        let outer = r.attributes.get("outer").unwrap();
+        if let Value::List(outer_items) = outer {
+            assert_eq!(outer_items.len(), 1);
+            if let Value::Map(outer_map) = &outer_items[0] {
+                let inner = outer_map.get("inner").unwrap();
+                if let Value::List(inner_items) = inner {
+                    assert_eq!(inner_items.len(), 1);
+                    if let Value::Map(inner_map) = &inner_items[0] {
+                        assert_eq!(
+                            inner_map.get("leaf"),
+                            Some(&Value::String("value".to_string()))
+                        );
+                    } else {
+                        panic!("Expected map for inner block");
+                    }
+                } else {
+                    panic!("Expected list for inner");
+                }
+            } else {
+                panic!("Expected map for outer block");
+            }
+        } else {
+            panic!("Expected list for outer");
+        }
+    }
+
+    #[test]
+    fn parse_nested_block_in_map() {
+        // Test nested block inside map value: attr = { block { ... } }
+        let input = r#"
+            let role = aws.iam.role {
+                policy_document = {
+                    statement {
+                        effect = "Allow"
+                        action = "s3:GetObject"
+                    }
+                }
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+        let role = &result.resources[0];
+
+        let doc = role.attributes.get("policy_document").unwrap();
+        if let Value::Map(map) = doc {
+            let statement = map.get("statement").unwrap();
+            if let Value::List(items) = statement {
+                assert_eq!(items.len(), 1);
+                if let Value::Map(s) = &items[0] {
+                    assert_eq!(s.get("effect"), Some(&Value::String("Allow".to_string())));
+                } else {
+                    panic!("Expected map for statement");
+                }
+            } else {
+                panic!("Expected list for statement");
+            }
+        } else {
+            panic!("Expected map for policy_document");
         }
     }
 
