@@ -113,6 +113,7 @@ pub fn ec2_subnet_config() -> AwsSchemaConfig {
                 validate: validate_ipv4_netmask_length_range,
                 namespace: None,
                 to_dsl: None,
+                scope: None,
             })
                 .create_only()
                 .with_description("An IPv4 netmask length for the subnet.")
@@ -143,6 +144,7 @@ pub fn ec2_subnet_config() -> AwsSchemaConfig {
                 validate: validate_ipv6_netmask_length_range,
                 namespace: None,
                 to_dsl: None,
+                scope: None,
             })
                 .create_only()
                 .with_description("An IPv6 netmask length for the subnet.")
@@ -171,6 +173,7 @@ pub fn ec2_subnet_config() -> AwsSchemaConfig {
                 validate: validate_hostname_type,
                 namespace: Some("aws.ec2.subnet".to_string()),
                 to_dsl: Some(|s: &str| s.replace('-', "_")),
+                scope: None,
             }).with_description("The type of hostname for EC2 instances. For IPv4 only subnets, an instance DNS name must be based on the instance IPv4 address. For IPv6 only subnets,...").with_provider_name("HostnameType")
                     ],
                 })

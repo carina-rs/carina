@@ -398,6 +398,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                 validate: validate_abac_status,
                 namespace: Some("awscc.s3.bucket".to_string()),
                 to_dsl: None,
+                scope: None,
             })
                 .with_description("The ABAC status of the general purpose bucket. When ABAC is enabled for the general purpose bucket, you can use tags to manage access to the general p...")
                 .with_provider_name("AbacStatus")
@@ -413,6 +414,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                 validate: validate_acceleration_status,
                 namespace: Some("awscc.s3.bucket".to_string()),
                 to_dsl: None,
+                scope: None,
             }).required().with_description("Specifies the transfer acceleration status of the bucket.").with_provider_name("AccelerationStatus")
                     ],
                 })
@@ -426,6 +428,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                 validate: validate_access_control,
                 namespace: Some("awscc.s3.bucket".to_string()),
                 to_dsl: None,
+                scope: None,
             })
                 .with_description("This is a legacy property, and it is not recommended for most use cases. A majority of modern use cases in Amazon S3 no longer require the use of ACLs...")
                 .with_provider_name("AccessControl")
@@ -454,6 +457,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                 validate: validate_format,
                 namespace: Some("awscc.s3.bucket".to_string()),
                 to_dsl: None,
+                scope: None,
             }).required().with_description("Specifies the file format used when exporting data to Amazon S3. *Allowed values*: ``CSV`` | ``ORC`` | ``Parquet``").with_provider_name("Format"),
                     StructField::new("prefix", AttributeType::String).with_description("The prefix to use when exporting data. The prefix is prepended to all results.").with_provider_name("Prefix")
                     ],
@@ -551,6 +555,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                 validate: validate_status,
                 namespace: Some("awscc.s3.bucket".to_string()),
                 to_dsl: None,
+                scope: None,
             }).required().with_description("Specifies the status of the configuration.").with_provider_name("Status"),
                     StructField::new("tag_filters", AttributeType::List(Box::new(tags_type()))).with_description("A container for a key-value pair.").with_provider_name("TagFilters"),
                     StructField::new("tierings", AttributeType::List(Box::new(AttributeType::Struct {
@@ -562,6 +567,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                 validate: validate_access_tier,
                 namespace: Some("awscc.s3.bucket".to_string()),
                 to_dsl: None,
+                scope: None,
             }).required().with_description("S3 Intelligent-Tiering access tier. See [Storage class for automatically optimizing frequently and infrequently accessed objects](https://docs.aws.ama...").with_provider_name("AccessTier"),
                     StructField::new("days", AttributeType::Int).required().with_description("The number of consecutive days of no access after which an object will be eligible to be transitioned to the corresponding tier. The minimum number of...").with_provider_name("Days")
                     ],
@@ -587,6 +593,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                 validate: validate_format,
                 namespace: Some("awscc.s3.bucket".to_string()),
                 to_dsl: None,
+                scope: None,
             }).required().with_description("Specifies the file format used when exporting data to Amazon S3. *Allowed values*: ``CSV`` | ``ORC`` | ``Parquet``").with_provider_name("Format"),
                     StructField::new("prefix", AttributeType::String).with_description("The prefix to use when exporting data. The prefix is prepended to all results.").with_provider_name("Prefix")
                     ],
@@ -599,6 +606,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                 validate: validate_included_object_versions,
                 namespace: Some("awscc.s3.bucket".to_string()),
                 to_dsl: None,
+                scope: None,
             }).required().with_description("Object versions to include in the inventory list. If set to ``All``, the list includes all the object versions, which adds the version-related fields ...").with_provider_name("IncludedObjectVersions"),
                     StructField::new("optional_fields", AttributeType::List(Box::new(AttributeType::String))).with_description("Contains the optional fields that are included in the inventory results.").with_provider_name("OptionalFields"),
                     StructField::new("prefix", AttributeType::String).with_description("Specifies the inventory filter prefix.").with_provider_name("Prefix"),
@@ -608,6 +616,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                 validate: validate_schedule_frequency,
                 namespace: Some("awscc.s3.bucket".to_string()),
                 to_dsl: None,
+                scope: None,
             }).required().with_description("Specifies the schedule for generating inventory results.").with_provider_name("ScheduleFrequency")
                     ],
                 })))
@@ -650,6 +659,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                 validate: validate_storage_class,
                 namespace: Some("awscc.s3.bucket".to_string()),
                 to_dsl: None,
+                scope: None,
             }).required().with_description("The class of storage used to store the object.").with_provider_name("StorageClass"),
                     StructField::new("transition_in_days", AttributeType::Int).required().with_description("Specifies the number of days an object is noncurrent before Amazon S3 can perform the associated action. For information about the noncurrent days cal...").with_provider_name("TransitionInDays")
                     ],
@@ -664,6 +674,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                 validate: validate_storage_class,
                 namespace: Some("awscc.s3.bucket".to_string()),
                 to_dsl: None,
+                scope: None,
             }).required().with_description("The class of storage used to store the object.").with_provider_name("StorageClass"),
                     StructField::new("transition_in_days", AttributeType::Int).required().with_description("Specifies the number of days an object is noncurrent before Amazon S3 can perform the associated action. For information about the noncurrent days cal...").with_provider_name("TransitionInDays")
                     ],
@@ -677,6 +688,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                 validate: validate_status,
                 namespace: Some("awscc.s3.bucket".to_string()),
                 to_dsl: None,
+                scope: None,
             }).required().with_description("If ``Enabled``, the rule is currently being applied. If ``Disabled``, the rule is not currently being applied.").with_provider_name("Status"),
                     StructField::new("tag_filters", AttributeType::List(Box::new(tags_type()))).with_description("Tags to use to identify a subset of objects to which the lifecycle rule applies.").with_provider_name("TagFilters"),
                     StructField::new("transition", AttributeType::Struct {
@@ -688,6 +700,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                 validate: validate_storage_class,
                 namespace: Some("awscc.s3.bucket".to_string()),
                 to_dsl: None,
+                scope: None,
             }).required().with_description("The storage class to which you want the object to transition.").with_provider_name("StorageClass"),
                     StructField::new("transition_date", AttributeType::String).with_description("Indicates when objects are transitioned to the specified storage class. The date value must be in ISO 8601 format. The time is always midnight UTC.").with_provider_name("TransitionDate"),
                     StructField::new("transition_in_days", AttributeType::Int).with_description("Indicates the number of days after creation when objects are transitioned to the specified storage class. If the specified storage class is ``INTELLIG...").with_provider_name("TransitionInDays")
@@ -702,6 +715,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                 validate: validate_storage_class,
                 namespace: Some("awscc.s3.bucket".to_string()),
                 to_dsl: None,
+                scope: None,
             }).required().with_description("The storage class to which you want the object to transition.").with_provider_name("StorageClass"),
                     StructField::new("transition_date", AttributeType::String).with_description("Indicates when objects are transitioned to the specified storage class. The date value must be in ISO 8601 format. The time is always midnight UTC.").with_provider_name("TransitionDate"),
                     StructField::new("transition_in_days", AttributeType::Int).with_description("Indicates the number of days after creation when objects are transitioned to the specified storage class. If the specified storage class is ``INTELLIG...").with_provider_name("TransitionInDays")
@@ -715,6 +729,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                 validate: validate_transition_default_minimum_object_size,
                 namespace: Some("awscc.s3.bucket".to_string()),
                 to_dsl: None,
+                scope: None,
             }).with_description("Indicates which default minimum object size behavior is applied to the lifecycle configuration.  This parameter applies to general purpose buckets onl...").with_provider_name("TransitionDefaultMinimumObjectSize")
                     ],
                 })
@@ -747,6 +762,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                 validate: validate_table_bucket_type,
                 namespace: Some("awscc.s3.bucket".to_string()),
                 to_dsl: None,
+                scope: None,
             }).required().with_description("The type of the table bucket where the metadata configuration is stored. The ``aws`` value indicates an AWS managed table bucket, and the ``customer``...").with_provider_name("TableBucketType"),
                     StructField::new("table_namespace", AttributeType::String).with_description("The namespace in the table bucket where the metadata tables for a metadata configuration are stored.").with_provider_name("TableNamespace")
                     ],
@@ -760,6 +776,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                 validate: validate_configuration_state,
                 namespace: Some("awscc.s3.bucket".to_string()),
                 to_dsl: None,
+                scope: None,
             }).required().with_description("The configuration state of the inventory table, indicating whether the inventory table is enabled or disabled.").with_provider_name("ConfigurationState"),
                     StructField::new("encryption_configuration", AttributeType::Struct {
                     name: "MetadataTableEncryptionConfiguration".to_string(),
@@ -771,6 +788,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                 validate: validate_sse_algorithm,
                 namespace: Some("awscc.s3.bucket".to_string()),
                 to_dsl: None,
+                scope: None,
             }).required().with_description("The encryption type specified for a metadata table. To specify server-side encryption with KMSlong (KMS) keys (SSE-KMS), use the ``aws:kms`` value. To...").with_provider_name("SseAlgorithm")
                     ],
                 }).with_description("The encryption configuration for the inventory table.").with_provider_name("EncryptionConfiguration"),
@@ -791,6 +809,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                 validate: validate_sse_algorithm,
                 namespace: Some("awscc.s3.bucket".to_string()),
                 to_dsl: None,
+                scope: None,
             }).required().with_description("The encryption type specified for a metadata table. To specify server-side encryption with KMSlong (KMS) keys (SSE-KMS), use the ``aws:kms`` value. To...").with_provider_name("SseAlgorithm")
                     ],
                 }).with_description("The encryption configuration for the journal table.").with_provider_name("EncryptionConfiguration"),
@@ -804,6 +823,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                 validate: validate_expiration,
                 namespace: Some("awscc.s3.bucket".to_string()),
                 to_dsl: None,
+                scope: None,
             }).required().with_description("Specifies whether journal table record expiration is enabled or disabled.").with_provider_name("Expiration")
                     ],
                 }).required().with_description("The journal table record expiration settings for the journal table.").with_provider_name("RecordExpiration"),
@@ -953,6 +973,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                 validate: validate_mode,
                 namespace: Some("awscc.s3.bucket".to_string()),
                 to_dsl: None,
+                scope: None,
             }).with_description("The default Object Lock retention mode you want to apply to new objects placed in the specified bucket. If Object Lock is turned on, you must specify ...").with_provider_name("Mode"),
                     StructField::new("years", AttributeType::Int).with_description("The number of years that you want to specify for the default retention period. If Object Lock is turned on, you must specify ``Mode`` and specify eith...").with_provider_name("Years")
                     ],
@@ -982,6 +1003,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                 validate: validate_object_ownership,
                 namespace: Some("awscc.s3.bucket".to_string()),
                 to_dsl: None,
+                scope: None,
             }).with_description("Specifies an object ownership rule.").with_provider_name("ObjectOwnership")
                     ],
                 }))).required().with_description("Specifies the container element for Object Ownership rules.").with_provider_name("Rules")
@@ -1025,6 +1047,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                 validate: validate_status,
                 namespace: Some("awscc.s3.bucket".to_string()),
                 to_dsl: None,
+                scope: None,
             }).with_description("Indicates whether to replicate delete markers.").with_provider_name("Status")
                     ],
                 }).with_description("Specifies whether Amazon S3 replicates delete markers. If you specify a ``Filter`` in your replication configuration, you must also include a ``Delete...").with_provider_name("DeleteMarkerReplication"),
@@ -1060,6 +1083,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                 validate: validate_status,
                 namespace: Some("awscc.s3.bucket".to_string()),
                 to_dsl: None,
+                scope: None,
             }).required().with_description("Specifies whether the replication metrics are enabled.").with_provider_name("Status")
                     ],
                 }).with_description("A container specifying replication metrics-related settings enabling replication metrics and events.").with_provider_name("Metrics"),
@@ -1072,6 +1096,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                 validate: validate_status,
                 namespace: Some("awscc.s3.bucket".to_string()),
                 to_dsl: None,
+                scope: None,
             }).required().with_description("Specifies whether the replication time is enabled.").with_provider_name("Status"),
                     StructField::new("time", AttributeType::Struct {
                     name: "ReplicationTimeValue".to_string(),
@@ -1087,6 +1112,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                 validate: validate_storage_class,
                 namespace: Some("awscc.s3.bucket".to_string()),
                 to_dsl: None,
+                scope: None,
             }).with_description("The storage class to use when replicating objects, such as S3 Standard or reduced redundancy. By default, Amazon S3 uses the storage class of the sour...").with_provider_name("StorageClass")
                     ],
                 }).required().with_description("A container for information about the replication destination and its configurations including enabling the S3 Replication Time Control (S3 RTC).").with_provider_name("Destination"),
@@ -1119,6 +1145,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                 validate: validate_status,
                 namespace: Some("awscc.s3.bucket".to_string()),
                 to_dsl: None,
+                scope: None,
             }).required().with_description("Specifies whether Amazon S3 replicates modifications on replicas. *Allowed values*: ``Enabled`` | ``Disabled``").with_provider_name("Status")
                     ],
                 }).with_description("A filter that you can specify for selection for modifications on replicas.").with_provider_name("ReplicaModifications"),
@@ -1131,6 +1158,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                 validate: validate_status,
                 namespace: Some("awscc.s3.bucket".to_string()),
                 to_dsl: None,
+                scope: None,
             }).required().with_description("Specifies whether Amazon S3 replicates objects created with server-side encryption using an AWS KMS key stored in AWS Key Management Service.").with_provider_name("Status")
                     ],
                 }).with_description("A container for filter information for the selection of Amazon S3 objects encrypted with AWS KMS.").with_provider_name("SseKmsEncryptedObjects")
@@ -1142,6 +1170,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                 validate: validate_status,
                 namespace: Some("awscc.s3.bucket".to_string()),
                 to_dsl: None,
+                scope: None,
             }).required().with_description("Specifies whether the rule is enabled.").with_provider_name("Status")
                     ],
                 }))).required().with_description("A container for one or more replication rules. A replication configuration must have at least one rule and can contain a maximum of 1,000 rules.").with_provider_name("Rules")
@@ -1165,6 +1194,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                 validate: validate_status,
                 namespace: Some("awscc.s3.bucket".to_string()),
                 to_dsl: None,
+                scope: None,
             }).required().with_description("The versioning state of the bucket.").with_provider_name("Status")
                     ],
                 })
@@ -1187,6 +1217,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                 validate: validate_protocol,
                 namespace: Some("awscc.s3.bucket".to_string()),
                 to_dsl: None,
+                scope: None,
             }).with_description("Protocol to use when redirecting requests. The default is the protocol that is used in the original request.").with_provider_name("Protocol")
                     ],
                 }).with_description("The redirect behavior for every request to this bucket's website endpoint.  If you specify this property, you can't specify any other property.").with_provider_name("RedirectAllRequestsTo"),
@@ -1204,6 +1235,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                 validate: validate_protocol,
                 namespace: Some("awscc.s3.bucket".to_string()),
                 to_dsl: None,
+                scope: None,
             }).with_description("Protocol to use when redirecting requests. The default is the protocol that is used in the original request.").with_provider_name("Protocol"),
                     StructField::new("replace_key_prefix_with", AttributeType::Custom {
                 name: "ReplaceKeyPrefixWith".to_string(),
@@ -1211,6 +1243,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                 validate: validate_replace_key_prefix_with,
                 namespace: Some("awscc.s3.bucket".to_string()),
                 to_dsl: None,
+                scope: None,
             }).with_description("The object key prefix to use in the redirect request. For example, to redirect requests for all pages with prefix ``docs/`` (objects in the ``docs/`` ...").with_provider_name("ReplaceKeyPrefixWith"),
                     StructField::new("replace_key_with", AttributeType::String).with_description("The specific object key to use in the redirect request. For example, redirect request to ``error.html``. Not required if one of the siblings is presen...").with_provider_name("ReplaceKeyWith")
                     ],

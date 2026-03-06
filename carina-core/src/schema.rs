@@ -79,6 +79,10 @@ pub enum AttributeType {
         /// For example, availability_zone uses `|s| s.replace('-', "_")` to convert
         /// "ap-northeast-1a" to "ap_northeast_1a" for DSL identifier form.
         to_dsl: Option<fn(&str) -> String>,
+        /// Scope indicating which resource/service this type belongs to.
+        /// Prevents name collisions across different resource contexts.
+        /// e.g., "ec2.route" for gateway_id, "ec2.vpc" for instance_tenancy
+        scope: Option<String>,
     },
     /// List
     List(Box<AttributeType>),
@@ -90,7 +94,13 @@ pub enum AttributeType {
         fields: Vec<StructField>,
     },
     /// Union of multiple types (value is valid if it matches any member)
-    Union(Vec<AttributeType>),
+    Union {
+        types: Vec<AttributeType>,
+        /// Scope indicating which resource/service this union belongs to.
+        /// Prevents name collisions when different resources use unions with the same member types.
+        /// e.g., "ec2.route" for gateway_id (InternetGatewayId | VpnGatewayId)
+        scope: Option<String>,
+    },
 }
 
 impl AttributeType {
@@ -225,7 +235,7 @@ impl AttributeType {
             }
 
             // Union type: valid if any member accepts the value
-            (AttributeType::Union(types), _) => {
+            (AttributeType::Union { types, .. }, _) => {
                 for member in types {
                     if member.validate(value).is_ok() {
                         return Ok(());
@@ -255,7 +265,7 @@ impl AttributeType {
             AttributeType::List(inner) => format!("List<{}>", inner.type_name()),
             AttributeType::Map(inner) => format!("Map<{}>", inner.type_name()),
             AttributeType::Struct { name, .. } => format!("Struct({})", name),
-            AttributeType::Union(types) => {
+            AttributeType::Union { types, .. } => {
                 let names: Vec<String> = types.iter().map(|t| t.type_name()).collect();
                 names.join(" | ")
             }
@@ -267,7 +277,7 @@ impl AttributeType {
     /// For other types, returns true if self.type_name() == name.
     pub fn accepts_type_name(&self, name: &str) -> bool {
         match self {
-            AttributeType::Union(types) => types.iter().any(|t| t.accepts_type_name(name)),
+            AttributeType::Union { types, .. } => types.iter().any(|t| t.accepts_type_name(name)),
             _ => self.type_name() == name,
         }
     }
@@ -658,6 +668,7 @@ pub mod types {
             },
             namespace: None,
             to_dsl: None,
+            scope: None,
         }
     }
 
@@ -675,6 +686,7 @@ pub mod types {
             },
             namespace: None,
             to_dsl: None,
+            scope: None,
         }
     }
 
@@ -692,6 +704,7 @@ pub mod types {
             },
             namespace: None,
             to_dsl: None,
+            scope: None,
         }
     }
 
@@ -709,6 +722,7 @@ pub mod types {
             },
             namespace: None,
             to_dsl: None,
+            scope: None,
         }
     }
 
@@ -726,6 +740,7 @@ pub mod types {
             },
             namespace: None,
             to_dsl: None,
+            scope: None,
         }
     }
 }
@@ -1635,6 +1650,7 @@ mod tests {
             },
             namespace: None,
             to_dsl: None,
+            scope: None,
         };
         let type_b = AttributeType::Custom {
             name: "TypeB".to_string(),
@@ -1652,9 +1668,13 @@ mod tests {
             },
             namespace: None,
             to_dsl: None,
+            scope: None,
         };
 
-        let union_type = AttributeType::Union(vec![type_a, type_b]);
+        let union_type = AttributeType::Union {
+            types: vec![type_a, type_b],
+            scope: None,
+        };
 
         // Valid: matches first member
         assert!(
@@ -1693,6 +1713,7 @@ mod tests {
             validate: |_| Ok(()),
             namespace: None,
             to_dsl: None,
+            scope: None,
         };
         let type_b = AttributeType::Custom {
             name: "TypeB".to_string(),
@@ -1700,9 +1721,13 @@ mod tests {
             validate: |_| Ok(()),
             namespace: None,
             to_dsl: None,
+            scope: None,
         };
 
-        let union_type = AttributeType::Union(vec![type_a, type_b]);
+        let union_type = AttributeType::Union {
+            types: vec![type_a, type_b],
+            scope: None,
+        };
         assert_eq!(union_type.type_name(), "TypeA | TypeB");
     }
 
@@ -1714,6 +1739,7 @@ mod tests {
             validate: |_| Ok(()),
             namespace: None,
             to_dsl: None,
+            scope: None,
         };
         let type_b = AttributeType::Custom {
             name: "TypeB".to_string(),
@@ -1721,9 +1747,13 @@ mod tests {
             validate: |_| Ok(()),
             namespace: None,
             to_dsl: None,
+            scope: None,
         };
 
-        let union_type = AttributeType::Union(vec![type_a, type_b]);
+        let union_type = AttributeType::Union {
+            types: vec![type_a, type_b],
+            scope: None,
+        };
         assert!(union_type.accepts_type_name("TypeA"));
         assert!(union_type.accepts_type_name("TypeB"));
         assert!(!union_type.accepts_type_name("TypeC"));
@@ -1732,6 +1762,62 @@ mod tests {
         let simple = AttributeType::String;
         assert!(simple.accepts_type_name("String"));
         assert!(!simple.accepts_type_name("Int"));
+    }
+
+    #[test]
+    fn custom_type_scope() {
+        let scoped = AttributeType::Custom {
+            name: "GatewayId".to_string(),
+            base: Box::new(AttributeType::String),
+            validate: |_| Ok(()),
+            namespace: None,
+            to_dsl: None,
+            scope: Some("ec2.route".to_string()),
+        };
+        let unscoped = AttributeType::Custom {
+            name: "GatewayId".to_string(),
+            base: Box::new(AttributeType::String),
+            validate: |_| Ok(()),
+            namespace: None,
+            to_dsl: None,
+            scope: None,
+        };
+
+        // Both have the same type_name (scope doesn't affect display)
+        assert_eq!(scoped.type_name(), "GatewayId");
+        assert_eq!(unscoped.type_name(), "GatewayId");
+
+        // Scope is stored and accessible
+        if let AttributeType::Custom { scope, .. } = &scoped {
+            assert_eq!(scope.as_deref(), Some("ec2.route"));
+        }
+        if let AttributeType::Custom { scope, .. } = &unscoped {
+            assert_eq!(*scope, None);
+        }
+    }
+
+    #[test]
+    fn union_type_scope() {
+        let scoped_union = AttributeType::Union {
+            types: vec![AttributeType::String, AttributeType::Int],
+            scope: Some("ec2.route".to_string()),
+        };
+        let unscoped_union = AttributeType::Union {
+            types: vec![AttributeType::String, AttributeType::Int],
+            scope: None,
+        };
+
+        // Both display the same type name
+        assert_eq!(scoped_union.type_name(), "String | Int");
+        assert_eq!(unscoped_union.type_name(), "String | Int");
+
+        // Scope is stored and accessible
+        if let AttributeType::Union { scope, .. } = &scoped_union {
+            assert_eq!(scope.as_deref(), Some("ec2.route"));
+        }
+        if let AttributeType::Union { scope, .. } = &unscoped_union {
+            assert_eq!(*scope, None);
+        }
     }
 
     #[test]

@@ -57,6 +57,7 @@ pub fn iam_role_config() -> AwsccSchemaConfig {
                 validate: validate_max_session_duration_range,
                 namespace: None,
                 to_dsl: None,
+                scope: None,
             })
                 .with_description("The maximum session duration (in seconds) that you want to set for the specified role. If you do not specify a value for this setting, the default val...")
                 .with_provider_name("MaxSessionDuration"),

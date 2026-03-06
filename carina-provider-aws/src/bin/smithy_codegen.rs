@@ -709,6 +709,7 @@ fn generate_resource(res: &ResourceDef, model: &SmithyModel) -> Result<String> {
                  \x20               validate: {},\n\
                  \x20               namespace: Some(\"{}\".to_string()),\n\
                  \x20               to_dsl: {},\n\
+                 \x20               scope: None,\n\
                  \x20           }}",
                 ei.type_name, validate_fn, namespace, to_dsl_code
             )
@@ -957,6 +958,7 @@ fn resolve_type(
                          \x20               validate: {},\n\
                          \x20               namespace: None,\n\
                          \x20               to_dsl: None,\n\
+                         \x20               scope: None,\n\
                          \x20           }}",
                         r.min, r.max, validate_fn
                     ),
@@ -1122,6 +1124,7 @@ fn generate_struct_type(
                  \x20               validate: {},\n\
                  \x20               namespace: Some(\"{}\".to_string()),\n\
                  \x20               to_dsl: {},\n\
+                 \x20               scope: None,\n\
                  \x20           }}",
                 ei.type_name, validate_fn, namespace, to_dsl_code
             )

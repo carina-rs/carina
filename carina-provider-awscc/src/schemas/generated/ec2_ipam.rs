@@ -101,6 +101,7 @@ pub fn ec2_ipam_config() -> AwsccSchemaConfig {
                 validate: validate_metered_account,
                 namespace: Some("awscc.ec2.ipam".to_string()),
                 to_dsl: Some(|s: &str| s.replace('-', "_")),
+                scope: None,
             })
                 .with_description("A metered account is an account that is charged for active IP addresses managed in IPAM")
                 .with_provider_name("MeteredAccount")
@@ -149,6 +150,7 @@ pub fn ec2_ipam_config() -> AwsccSchemaConfig {
                 validate: validate_tier,
                 namespace: Some("awscc.ec2.ipam".to_string()),
                 to_dsl: None,
+                scope: None,
             })
                 .with_description("The tier of the IPAM.")
                 .with_provider_name("Tier")

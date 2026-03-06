@@ -103,6 +103,7 @@ pub fn ec2_security_group_egress_config() -> AwsSchemaConfig {
                         validate: validate_from_port_range,
                         namespace: None,
                         to_dsl: None,
+                        scope: None,
                     },
                 )
                 .create_only()
@@ -128,6 +129,7 @@ pub fn ec2_security_group_egress_config() -> AwsSchemaConfig {
                             "-1" => "all".to_string(),
                             _ => s.replace('-', "_"),
                         }),
+                        scope: None,
                     },
                 )
                 .required()
@@ -166,6 +168,7 @@ pub fn ec2_security_group_egress_config() -> AwsSchemaConfig {
                         validate: validate_to_port_range,
                         namespace: None,
                         to_dsl: None,
+                        scope: None,
                     },
                 )
                 .create_only()

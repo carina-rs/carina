@@ -139,6 +139,7 @@ pub fn aws_region() -> AttributeType {
         },
         namespace: Some("aws".to_string()),
         to_dsl: None,
+        scope: None,
     }
 }
 
@@ -195,6 +196,7 @@ pub(crate) fn aws_resource_id() -> AttributeType {
         },
         namespace: None,
         to_dsl: None,
+        scope: None,
     }
 }
 
@@ -213,6 +215,7 @@ pub(crate) fn vpc_id() -> AttributeType {
         },
         namespace: None,
         to_dsl: None,
+        scope: None,
     }
 }
 
@@ -231,6 +234,7 @@ pub(crate) fn subnet_id() -> AttributeType {
         },
         namespace: None,
         to_dsl: None,
+        scope: None,
     }
 }
 
@@ -249,6 +253,7 @@ pub(crate) fn security_group_id() -> AttributeType {
         },
         namespace: None,
         to_dsl: None,
+        scope: None,
     }
 }
 
@@ -267,6 +272,7 @@ pub(crate) fn internet_gateway_id() -> AttributeType {
         },
         namespace: None,
         to_dsl: None,
+        scope: None,
     }
 }
 
@@ -285,6 +291,7 @@ pub(crate) fn route_table_id() -> AttributeType {
         },
         namespace: None,
         to_dsl: None,
+        scope: None,
     }
 }
 
@@ -303,6 +310,7 @@ pub(crate) fn nat_gateway_id() -> AttributeType {
         },
         namespace: None,
         to_dsl: None,
+        scope: None,
     }
 }
 
@@ -322,6 +330,7 @@ pub(crate) fn vpc_peering_connection_id() -> AttributeType {
         },
         namespace: None,
         to_dsl: None,
+        scope: None,
     }
 }
 
@@ -340,6 +349,7 @@ pub(crate) fn transit_gateway_id() -> AttributeType {
         },
         namespace: None,
         to_dsl: None,
+        scope: None,
     }
 }
 
@@ -359,6 +369,7 @@ pub(crate) fn vpn_gateway_id() -> AttributeType {
         },
         namespace: None,
         to_dsl: None,
+        scope: None,
     }
 }
 
@@ -381,6 +392,7 @@ pub(crate) fn egress_only_internet_gateway_id() -> AttributeType {
         },
         namespace: None,
         to_dsl: None,
+        scope: None,
     }
 }
 
@@ -399,6 +411,7 @@ pub(crate) fn vpc_endpoint_id() -> AttributeType {
         },
         namespace: None,
         to_dsl: None,
+        scope: None,
     }
 }
 
@@ -418,6 +431,7 @@ pub(crate) fn arn() -> AttributeType {
         },
         namespace: None,
         to_dsl: None,
+        scope: None,
     }
 }
 
@@ -450,6 +464,7 @@ pub(crate) fn iam_role_arn() -> AttributeType {
         },
         namespace: None,
         to_dsl: None,
+        scope: None,
     }
 }
 
@@ -469,6 +484,7 @@ pub(crate) fn iam_policy_arn() -> AttributeType {
         },
         namespace: None,
         to_dsl: None,
+        scope: None,
     }
 }
 
@@ -487,6 +503,7 @@ pub(crate) fn kms_key_arn() -> AttributeType {
         },
         namespace: None,
         to_dsl: None,
+        scope: None,
     }
 }
 
@@ -505,6 +522,7 @@ pub(crate) fn kms_key_id() -> AttributeType {
         },
         namespace: None,
         to_dsl: None,
+        scope: None,
     }
 }
 
@@ -525,6 +543,7 @@ pub(crate) fn ipam_pool_id() -> AttributeType {
         },
         namespace: None,
         to_dsl: None,
+        scope: None,
     }
 }
 
@@ -572,6 +591,7 @@ pub(crate) fn availability_zone() -> AttributeType {
         },
         namespace: None,
         to_dsl: None,
+        scope: None,
     }
 }
 

@@ -161,6 +161,7 @@ pub fn ec2_vpc_endpoint_config() -> AwsccSchemaConfig {
                 validate: validate_dns_record_ip_type,
                 namespace: Some("awscc.ec2.vpc_endpoint".to_string()),
                 to_dsl: Some(|s: &str| s.replace('-', "_")),
+                scope: None,
             }).with_description("The DNS records created for the endpoint.").with_provider_name("DnsRecordIpType"),
                     StructField::new("private_dns_only_for_inbound_resolver_endpoint", AttributeType::Custom {
                 name: "PrivateDnsOnlyForInboundResolverEndpoint".to_string(),
@@ -168,6 +169,7 @@ pub fn ec2_vpc_endpoint_config() -> AwsccSchemaConfig {
                 validate: validate_private_dns_only_for_inbound_resolver_endpoint,
                 namespace: Some("awscc.ec2.vpc_endpoint".to_string()),
                 to_dsl: None,
+                scope: None,
             }).with_description("Indicates whether to enable private DNS only for inbound endpoints. This option is available only for services that support both gateway and interface...").with_provider_name("PrivateDnsOnlyForInboundResolverEndpoint"),
                     StructField::new("private_dns_preference", AttributeType::Custom {
                 name: "PrivateDnsPreference".to_string(),
@@ -175,6 +177,7 @@ pub fn ec2_vpc_endpoint_config() -> AwsccSchemaConfig {
                 validate: validate_private_dns_preference,
                 namespace: Some("awscc.ec2.vpc_endpoint".to_string()),
                 to_dsl: None,
+                scope: None,
             }).with_description("The preference for which private domains have a private hosted zone created for and associated with the specified VPC. Only supported when private DNS...").with_provider_name("PrivateDnsPreference"),
                     StructField::new("private_dns_specified_domains", AttributeType::List(Box::new(AttributeType::String))).with_description("Indicates which of the private domains to create private hosted zones for and associate with the specified VPC. Only supported when private DNS is ena...").with_provider_name("PrivateDnsSpecifiedDomains")
                     ],
@@ -194,6 +197,7 @@ pub fn ec2_vpc_endpoint_config() -> AwsccSchemaConfig {
                 validate: validate_ip_address_type,
                 namespace: Some("awscc.ec2.vpc_endpoint".to_string()),
                 to_dsl: Some(|s: &str| s.replace('-', "_")),
+                scope: None,
             })
                 .with_description("The supported IP address types.")
                 .with_provider_name("IpAddressType")
@@ -265,6 +269,7 @@ pub fn ec2_vpc_endpoint_config() -> AwsccSchemaConfig {
                 validate: validate_vpc_endpoint_type,
                 namespace: Some("awscc.ec2.vpc_endpoint".to_string()),
                 to_dsl: None,
+                scope: None,
             })
                 .create_only()
                 .with_description("The type of endpoint. Default: Gateway")

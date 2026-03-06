@@ -137,7 +137,7 @@ pub fn validate_resource_ref_types(
 pub fn is_string_compatible_type(attr_type: &AttributeType) -> bool {
     match attr_type {
         AttributeType::String | AttributeType::Custom { .. } | AttributeType::Enum(_) => true,
-        AttributeType::Union(types) => types.iter().all(is_string_compatible_type),
+        AttributeType::Union { types, .. } => types.iter().all(is_string_compatible_type),
         _ => false,
     }
 }

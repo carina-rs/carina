@@ -102,6 +102,7 @@ pub(crate) fn ipam_pool_id() -> AttributeType {
         },
         namespace: None,
         to_dsl: None,
+        scope: None,
     }
 }
 
@@ -132,6 +133,7 @@ pub(crate) fn arn() -> AttributeType {
         },
         namespace: None,
         to_dsl: None,
+        scope: None,
     }
 }
 
@@ -164,6 +166,7 @@ pub(crate) fn aws_resource_id() -> AttributeType {
         },
         namespace: None,
         to_dsl: None,
+        scope: None,
     }
 }
 
@@ -219,6 +222,7 @@ pub(crate) fn vpc_id() -> AttributeType {
         },
         namespace: None,
         to_dsl: None,
+        scope: None,
     }
 }
 
@@ -237,6 +241,7 @@ pub(crate) fn subnet_id() -> AttributeType {
         },
         namespace: None,
         to_dsl: None,
+        scope: None,
     }
 }
 
@@ -255,6 +260,7 @@ pub(crate) fn security_group_id() -> AttributeType {
         },
         namespace: None,
         to_dsl: None,
+        scope: None,
     }
 }
 
@@ -273,6 +279,7 @@ pub(crate) fn internet_gateway_id() -> AttributeType {
         },
         namespace: None,
         to_dsl: None,
+        scope: None,
     }
 }
 
@@ -291,6 +298,7 @@ pub(crate) fn route_table_id() -> AttributeType {
         },
         namespace: None,
         to_dsl: None,
+        scope: None,
     }
 }
 
@@ -309,6 +317,7 @@ pub(crate) fn nat_gateway_id() -> AttributeType {
         },
         namespace: None,
         to_dsl: None,
+        scope: None,
     }
 }
 
@@ -328,6 +337,7 @@ pub(crate) fn vpc_peering_connection_id() -> AttributeType {
         },
         namespace: None,
         to_dsl: None,
+        scope: None,
     }
 }
 
@@ -346,6 +356,7 @@ pub(crate) fn transit_gateway_id() -> AttributeType {
         },
         namespace: None,
         to_dsl: None,
+        scope: None,
     }
 }
 
@@ -364,13 +375,17 @@ pub(crate) fn vpn_gateway_id() -> AttributeType {
         },
         namespace: None,
         to_dsl: None,
+        scope: None,
     }
 }
 
 /// Gateway ID type — union of InternetGatewayId and VpnGatewayId.
 /// Used for attributes like ec2_route.gateway_id that accept both igw-* and vgw-* IDs.
 pub(crate) fn gateway_id() -> AttributeType {
-    AttributeType::Union(vec![internet_gateway_id(), vpn_gateway_id()])
+    AttributeType::Union {
+        types: vec![internet_gateway_id(), vpn_gateway_id()],
+        scope: None,
+    }
 }
 
 /// Egress Only Internet Gateway ID type (e.g., "eigw-12345678")
@@ -393,6 +408,7 @@ pub(crate) fn egress_only_internet_gateway_id() -> AttributeType {
         },
         namespace: None,
         to_dsl: None,
+        scope: None,
     }
 }
 
@@ -411,6 +427,7 @@ pub(crate) fn vpc_endpoint_id() -> AttributeType {
         },
         namespace: None,
         to_dsl: None,
+        scope: None,
     }
 }
 
@@ -464,6 +481,7 @@ pub fn awscc_region() -> AttributeType {
         },
         namespace: Some("awscc".to_string()),
         to_dsl: None,
+        scope: None,
     }
 }
 
@@ -487,6 +505,7 @@ pub(crate) fn availability_zone() -> AttributeType {
         },
         namespace: Some("awscc".to_string()),
         to_dsl: Some(|s: &str| s.replace('-', "_")),
+        scope: None,
     }
 }
 
@@ -566,6 +585,7 @@ pub(crate) fn iam_role_arn() -> AttributeType {
         },
         namespace: None,
         to_dsl: None,
+        scope: None,
     }
 }
 
@@ -584,6 +604,7 @@ pub(crate) fn iam_policy_arn() -> AttributeType {
         },
         namespace: None,
         to_dsl: None,
+        scope: None,
     }
 }
 
@@ -602,6 +623,7 @@ pub(crate) fn kms_key_arn() -> AttributeType {
         },
         namespace: None,
         to_dsl: None,
+        scope: None,
     }
 }
 
@@ -624,6 +646,7 @@ pub(crate) fn kms_key_id() -> AttributeType {
         },
         namespace: None,
         to_dsl: None,
+        scope: None,
     }
 }
 
@@ -671,18 +694,24 @@ fn validate_kms_key_id(value: &str) -> Result<(), String> {
 
 /// String or list of strings type — for IAM policy fields like action, resource
 fn string_or_list_of_strings() -> AttributeType {
-    AttributeType::Union(vec![
-        AttributeType::String,
-        AttributeType::List(Box::new(AttributeType::String)),
-    ])
+    AttributeType::Union {
+        types: vec![
+            AttributeType::String,
+            AttributeType::List(Box::new(AttributeType::String)),
+        ],
+        scope: None,
+    }
 }
 
 /// String or map type — for IAM policy principal fields
 fn string_or_map() -> AttributeType {
-    AttributeType::Union(vec![
-        AttributeType::String,
-        AttributeType::Map(Box::new(string_or_list_of_strings())),
-    ])
+    AttributeType::Union {
+        types: vec![
+            AttributeType::String,
+            AttributeType::Map(Box::new(string_or_list_of_strings())),
+        ],
+        scope: None,
+    }
 }
 
 /// IAM Policy Effect enum type
@@ -706,6 +735,7 @@ fn iam_policy_effect() -> AttributeType {
         },
         namespace: None,
         to_dsl: None,
+        scope: None,
     }
 }
 
@@ -730,6 +760,7 @@ fn iam_policy_version() -> AttributeType {
         },
         namespace: None,
         to_dsl: None,
+        scope: None,
     }
 }
 
@@ -776,6 +807,7 @@ pub(crate) fn iam_policy_document() -> AttributeType {
         validate: |value| validate_iam_policy_document(value),
         namespace: None,
         to_dsl: None,
+        scope: None,
     }
 }
 

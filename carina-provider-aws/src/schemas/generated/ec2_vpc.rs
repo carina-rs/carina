@@ -82,6 +82,7 @@ pub fn ec2_vpc_config() -> AwsSchemaConfig {
                 validate: validate_instance_tenancy,
                 namespace: Some("aws.ec2.vpc".to_string()),
                 to_dsl: None,
+                scope: None,
             })
                 .create_only()
                 .with_description("The tenancy options for instances launched into the VPC. For default, instances are launched with shared tenancy by default. You can launch instances ...")
@@ -101,6 +102,7 @@ pub fn ec2_vpc_config() -> AwsSchemaConfig {
                 validate: validate_ipv4_netmask_length_range,
                 namespace: None,
                 to_dsl: None,
+                scope: None,
             })
                 .create_only()
                 .with_description("The netmask length of the IPv4 CIDR you want to allocate to this VPC from an Amazon VPC IP Address Manager (IPAM) pool. For more information about IPA...")

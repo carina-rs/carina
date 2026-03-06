@@ -655,7 +655,7 @@ impl CompletionProvider {
             } if name == "AvailabilityZone" => {
                 self.availability_zone_completions(namespace.as_deref().unwrap_or(""), name)
             }
-            AttributeType::Union(_) | AttributeType::String | AttributeType::Custom { .. } => {
+            AttributeType::Union { .. } | AttributeType::String | AttributeType::Custom { .. } => {
                 vec![CompletionItem {
                     label: "env".to_string(),
                     kind: Some(CompletionItemKind::FUNCTION),

@@ -1109,6 +1109,7 @@ pub fn {}() -> AwsccSchemaConfig {{
                 validate: {},
                 namespace: Some("{}".to_string()),
                 to_dsl: {},
+                scope: None,
             }}"#,
                 enum_info.type_name, validate_fn, namespace, to_dsl_code
             )
@@ -1473,6 +1474,7 @@ fn generate_struct_type(
                 validate: {},
                 namespace: Some("{}".to_string()),
                 to_dsl: {},
+                scope: None,
             }}"#,
                         enum_info.type_name, validate_fn, namespace, to_dsl_code
                     )
@@ -1959,6 +1961,7 @@ fn cfn_type_to_carina_type_with_enum(
                 validate: {},
                 namespace: None,
                 to_dsl: None,
+                scope: None,
             }}"#,
                         min, max, validate_fn
                     ),
@@ -1986,6 +1989,7 @@ fn cfn_type_to_carina_type_with_enum(
                 validate: {},
                 namespace: None,
                 to_dsl: None,
+                scope: None,
             }}"#,
                         min, max, validate_fn
                     ),

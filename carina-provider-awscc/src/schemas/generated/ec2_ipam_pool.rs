@@ -128,6 +128,7 @@ pub fn ec2_ipam_pool_config() -> AwsccSchemaConfig {
                 validate: validate_address_family,
                 namespace: Some("awscc.ec2.ipam_pool".to_string()),
                 to_dsl: None,
+                scope: None,
             })
                 .required()
                 .create_only()
@@ -172,6 +173,7 @@ pub fn ec2_ipam_pool_config() -> AwsccSchemaConfig {
                 validate: validate_aws_service,
                 namespace: Some("awscc.ec2.ipam_pool".to_string()),
                 to_dsl: Some(|s: &str| s.replace('-', "_")),
+                scope: None,
             })
                 .create_only()
                 .with_description("Limits which service in Amazon Web Services that the pool can be used in.")
@@ -211,6 +213,7 @@ pub fn ec2_ipam_pool_config() -> AwsccSchemaConfig {
                 validate: validate_ipam_scope_type,
                 namespace: Some("awscc.ec2.ipam_pool".to_string()),
                 to_dsl: None,
+                scope: None,
             })
                 .with_description("Determines whether this scope contains publicly routable space or space for a private network (read-only)")
                 .with_provider_name("IpamScopeType")
@@ -245,6 +248,7 @@ pub fn ec2_ipam_pool_config() -> AwsccSchemaConfig {
                 validate: validate_public_ip_source,
                 namespace: Some("awscc.ec2.ipam_pool".to_string()),
                 to_dsl: None,
+                scope: None,
             })
                 .create_only()
                 .with_description("The IP address source for pools in the public scope. Only used for provisioning IP address CIDRs to pools in the public scope. Default is `byoip`.")
@@ -283,6 +287,7 @@ pub fn ec2_ipam_pool_config() -> AwsccSchemaConfig {
                 validate: validate_state,
                 namespace: Some("awscc.ec2.ipam_pool".to_string()),
                 to_dsl: Some(|s: &str| s.replace('-', "_")),
+                scope: None,
             })
                 .with_description("The state of this pool. This can be one of the following values: \"create-in-progress\", \"create-complete\", \"modify-in-progress\", \"modify-complet... (read-only)")
                 .with_provider_name("State")

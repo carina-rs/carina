@@ -55,6 +55,7 @@ pub fn s3_bucket_config() -> AwsSchemaConfig {
                         validate: validate_versioning_status,
                         namespace: Some("aws.s3.bucket".to_string()),
                         to_dsl: None,
+                        scope: None,
                     },
                 )
                 .with_description("The versioning state of the bucket.")

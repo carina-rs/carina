@@ -100,6 +100,7 @@ pub fn ec2_security_group_config() -> AwsccSchemaConfig {
                 validate: validate_from_port_range,
                 namespace: None,
                 to_dsl: None,
+                scope: None,
             }).with_provider_name("FromPort"),
                     StructField::new("ip_protocol", AttributeType::Custom {
                 name: "IpProtocol".to_string(),
@@ -107,6 +108,7 @@ pub fn ec2_security_group_config() -> AwsccSchemaConfig {
                 validate: validate_ip_protocol,
                 namespace: Some("awscc.ec2.security_group".to_string()),
                 to_dsl: Some(|s: &str| match s { "-1" => "all".to_string(), _ => s.replace('-', "_") }),
+                scope: None,
             }).required().with_provider_name("IpProtocol"),
                     StructField::new("to_port", AttributeType::Custom {
                 name: "Int(-1..=65535)".to_string(),
@@ -114,6 +116,7 @@ pub fn ec2_security_group_config() -> AwsccSchemaConfig {
                 validate: validate_to_port_range,
                 namespace: None,
                 to_dsl: None,
+                scope: None,
             }).with_provider_name("ToPort")
                     ],
                 })))
@@ -133,6 +136,7 @@ pub fn ec2_security_group_config() -> AwsccSchemaConfig {
                 validate: validate_from_port_range,
                 namespace: None,
                 to_dsl: None,
+                scope: None,
             }).with_provider_name("FromPort"),
                     StructField::new("ip_protocol", AttributeType::Custom {
                 name: "IpProtocol".to_string(),
@@ -140,6 +144,7 @@ pub fn ec2_security_group_config() -> AwsccSchemaConfig {
                 validate: validate_ip_protocol,
                 namespace: Some("awscc.ec2.security_group".to_string()),
                 to_dsl: Some(|s: &str| match s { "-1" => "all".to_string(), _ => s.replace('-', "_") }),
+                scope: None,
             }).required().with_provider_name("IpProtocol"),
                     StructField::new("source_prefix_list_id", super::aws_resource_id()).with_provider_name("SourcePrefixListId"),
                     StructField::new("source_security_group_id", super::security_group_id()).with_provider_name("SourceSecurityGroupId"),
@@ -151,6 +156,7 @@ pub fn ec2_security_group_config() -> AwsccSchemaConfig {
                 validate: validate_to_port_range,
                 namespace: None,
                 to_dsl: None,
+                scope: None,
             }).with_provider_name("ToPort")
                     ],
                 })))

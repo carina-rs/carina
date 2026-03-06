@@ -273,7 +273,7 @@ impl DiagnosticEngine {
                                 }
                                 // ResourceRef type check for Union types
                                 (
-                                    carina_core::schema::AttributeType::Union(_),
+                                    carina_core::schema::AttributeType::Union { .. },
                                     Value::ResourceRef {
                                         binding_name: ref_binding,
                                         attribute_name: ref_attr,

@@ -1685,6 +1685,7 @@ mod tests {
                         "-1" => "all".to_string(),
                         _ => s.to_string(),
                     }),
+                    scope: None,
                 },
             )
             .with_provider_name("IpProtocol"),
