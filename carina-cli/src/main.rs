@@ -24,7 +24,8 @@ use carina_core::module_resolver;
 use carina_core::parser::{BackendConfig, ParsedFile, ProviderConfig};
 use carina_core::plan::Plan;
 use carina_core::provider::{
-    BoxFuture, Provider, ProviderError, ProviderFactory, ProviderResult, ResourceType,
+    self as provider_mod, BoxFuture, Provider, ProviderError, ProviderFactory, ProviderResult,
+    ResourceType,
 };
 use carina_core::resolver::{resolve_ref_value, resolve_refs_with_state};
 use carina_core::resource::{LifecycleConfig, Resource, ResourceId, State, Value};
@@ -272,45 +273,15 @@ fn provider_factories() -> Vec<Box<dyn ProviderFactory>> {
     vec![Box::new(AwsProviderFactory), Box::new(AwsccProviderFactory)]
 }
 
-fn find_factory<'a>(
-    factories: &'a [Box<dyn ProviderFactory>],
-    name: &str,
-) -> Option<&'a dyn ProviderFactory> {
-    factories
-        .iter()
-        .find(|f| f.name() == name)
-        .map(|f| f.as_ref())
-}
-
-fn schema_key_for_resource(factories: &[Box<dyn ProviderFactory>], resource: &Resource) -> String {
-    match resource.attributes.get("_provider") {
-        Some(Value::String(provider)) => {
-            if let Some(factory) = find_factory(factories, provider) {
-                factory.format_schema_key(&resource.id.resource_type)
-            } else {
-                resource.id.resource_type.clone()
-            }
-        }
-        _ => resource.id.resource_type.clone(),
-    }
-}
-
 fn get_schemas() -> HashMap<String, ResourceSchema> {
-    let factories = provider_factories();
-    let mut all_schemas = HashMap::new();
-    for factory in &factories {
-        for schema in factory.schemas() {
-            all_schemas.insert(schema.resource_type.clone(), schema);
-        }
-    }
-    all_schemas
+    provider_mod::collect_schemas(&provider_factories())
 }
 
 fn validate_resources(resources: &[Resource]) -> Result<(), String> {
     let factories = provider_factories();
     let schemas = get_schemas();
     validation::validate_resources(resources, &schemas, &|r| {
-        schema_key_for_resource(&factories, r)
+        provider_mod::schema_key_for_resource(&factories, r)
     })
 }
 
@@ -318,7 +289,7 @@ fn validate_resource_ref_types(resources: &[Resource]) -> Result<(), String> {
     let factories = provider_factories();
     let schemas = get_schemas();
     validation::validate_resource_ref_types(resources, &schemas, &|r| {
-        schema_key_for_resource(&factories, r)
+        provider_mod::schema_key_for_resource(&factories, r)
     })
 }
 
@@ -327,7 +298,7 @@ fn resolve_names(resources: &mut [Resource]) -> Result<(), String> {
     let factories = provider_factories();
     let schemas = get_schemas();
     resolve_block_names(resources, &schemas, |r| {
-        schema_key_for_resource(&factories, r)
+        provider_mod::schema_key_for_resource(&factories, r)
     })?;
     resolve_attr_prefixes(resources)
 }
@@ -336,7 +307,7 @@ fn resolve_attr_prefixes(resources: &mut [Resource]) -> Result<(), String> {
     let factories = provider_factories();
     let schemas = get_schemas();
     identifier::resolve_attr_prefixes(resources, &schemas, &|r| {
-        schema_key_for_resource(&factories, r)
+        provider_mod::schema_key_for_resource(&factories, r)
     })
 }
 
@@ -369,9 +340,9 @@ fn compute_anonymous_identifiers(
         resources,
         providers,
         &schemas,
-        &|r| schema_key_for_resource(&factories, r),
+        &|r| provider_mod::schema_key_for_resource(&factories, r),
         &|name| {
-            find_factory(&factories, name)
+            provider_mod::find_factory(&factories, name)
                 .map(|f| {
                     f.identity_attributes()
                         .into_iter()
@@ -721,9 +692,10 @@ async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
                     .provider_name()
                     .ok_or("Backend does not specify a provider name")?;
                 let factories = provider_factories();
-                let factory = find_factory(&factories, backend_provider_name).ok_or_else(|| {
-                    format!("No provider factory found for '{}'", backend_provider_name)
-                })?;
+                let factory = provider_mod::find_factory(&factories, backend_provider_name)
+                    .ok_or_else(|| {
+                        format!("No provider factory found for '{}'", backend_provider_name)
+                    })?;
                 let provider_config_attrs = parsed
                     .providers
                     .iter()
@@ -764,8 +736,8 @@ async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
                         .provider_name()
                         .ok_or("Backend does not specify a provider name")?;
                     let factories = provider_factories();
-                    let factory =
-                        find_factory(&factories, backend_provider_name).ok_or_else(|| {
+                    let factory = provider_mod::find_factory(&factories, backend_provider_name)
+                        .ok_or_else(|| {
                             format!("No provider factory found for '{}'", backend_provider_name)
                         })?;
                     let region = factory.extract_region(&config.attributes);
@@ -1875,7 +1847,7 @@ async fn run_apply_from_plan(plan_path: &PathBuf, auto_approve: bool) -> Result<
 /// Create a provider from a saved ProviderConfig
 async fn create_provider_from_config(config: &ProviderConfig) -> Box<dyn Provider> {
     let factories = provider_factories();
-    if let Some(factory) = find_factory(&factories, &config.name) {
+    if let Some(factory) = provider_mod::find_factory(&factories, &config.name) {
         let region = factory.extract_region(&config.attributes);
         println!(
             "{}",
@@ -2364,7 +2336,7 @@ async fn run_destroy(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
 async fn get_provider(parsed: &ParsedFile) -> Box<dyn Provider> {
     let factories = provider_factories();
     for provider_config in &parsed.providers {
-        if let Some(factory) = find_factory(&factories, &provider_config.name) {
+        if let Some(factory) = provider_mod::find_factory(&factories, &provider_config.name) {
             let region = factory.extract_region(&provider_config.attributes);
             println!(
                 "{}",
@@ -3164,7 +3136,7 @@ async fn run_state_bucket_delete(
         .resource_type()
         .ok_or("Backend does not specify a resource type")?;
     let factories = provider_factories();
-    let factory = find_factory(&factories, backend_provider_name)
+    let factory = provider_mod::find_factory(&factories, backend_provider_name)
         .ok_or_else(|| format!("No provider factory found for '{}'", backend_provider_name))?;
 
     // Create provider to delete the bucket
@@ -3472,7 +3444,7 @@ fn run_lint(path: &PathBuf) -> Result<(), String> {
     let mut all_list_struct_attrs: HashSet<String> = HashSet::new();
     let mut block_name_suggestions: HashMap<String, String> = HashMap::new();
     for resource in &parsed.resources {
-        let schema_key = schema_key_for_resource(&factories, resource);
+        let schema_key = provider_mod::schema_key_for_resource(&factories, resource);
         if let Some(schema) = schemas.get(&schema_key) {
             all_list_struct_attrs.extend(list_struct_attr_names(schema));
             for (attr_name, attr_schema) in &schema.attributes {

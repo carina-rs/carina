@@ -1,8 +1,7 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use carina_core::formatter::{self, FormatConfig};
-use carina_core::provider::ProviderFactory;
+use carina_core::provider::{self as provider_mod, ProviderFactory};
 use carina_core::schema::CompletionValue;
 use dashmap::DashMap;
 use tower_lsp::jsonrpc::Result;
@@ -27,13 +26,7 @@ pub struct Backend {
 impl Backend {
     pub fn new(client: Client, factories: Vec<Box<dyn ProviderFactory>>) -> Self {
         // Build shared schema map from all factories
-        let mut schemas = HashMap::new();
-        for factory in &factories {
-            for schema in factory.schemas() {
-                schemas.insert(schema.resource_type.clone(), schema);
-            }
-        }
-        let schemas = Arc::new(schemas);
+        let schemas = Arc::new(provider_mod::collect_schemas(&factories));
 
         // Collect provider names
         let provider_names: Vec<String> = factories.iter().map(|f| f.name().to_string()).collect();

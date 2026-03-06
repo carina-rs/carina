@@ -207,6 +207,47 @@ pub trait ProviderFactory: Send + Sync {
     }
 }
 
+/// Find a factory by provider name.
+pub fn find_factory<'a>(
+    factories: &'a [Box<dyn ProviderFactory>],
+    name: &str,
+) -> Option<&'a dyn ProviderFactory> {
+    factories
+        .iter()
+        .find(|f| f.name() == name)
+        .map(|f| f.as_ref())
+}
+
+/// Collect all resource schemas from the given factories into a single map.
+pub fn collect_schemas(
+    factories: &[Box<dyn ProviderFactory>],
+) -> HashMap<String, crate::schema::ResourceSchema> {
+    let mut all_schemas = HashMap::new();
+    for factory in factories {
+        for schema in factory.schemas() {
+            all_schemas.insert(schema.resource_type.clone(), schema);
+        }
+    }
+    all_schemas
+}
+
+/// Determine the schema lookup key for a resource based on its provider.
+pub fn schema_key_for_resource(
+    factories: &[Box<dyn ProviderFactory>],
+    resource: &Resource,
+) -> String {
+    match resource.attributes.get("_provider") {
+        Some(Value::String(provider)) => {
+            if let Some(factory) = find_factory(factories, provider) {
+                factory.format_schema_key(&resource.id.resource_type)
+            } else {
+                resource.id.resource_type.clone()
+            }
+        }
+        _ => resource.id.resource_type.clone(),
+    }
+}
+
 /// Provider implementation for Box<dyn Provider>
 /// This enables dynamic dispatch for Providers
 impl Provider for Box<dyn Provider> {

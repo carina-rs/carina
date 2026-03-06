@@ -1079,7 +1079,7 @@ enum CompletionContext {
 mod tests {
     use super::*;
     use crate::document::Document;
-    use carina_core::provider::ProviderFactory;
+    use carina_core::provider::{self as provider_mod, ProviderFactory};
 
     fn create_document(content: &str) -> Document {
         Document::new(content.to_string())
@@ -1090,13 +1090,7 @@ mod tests {
             Box::new(carina_provider_aws::AwsProviderFactory),
             Box::new(carina_provider_awscc::AwsccProviderFactory),
         ];
-        let mut schemas = HashMap::new();
-        for factory in &factories {
-            for schema in factory.schemas() {
-                schemas.insert(schema.resource_type.clone(), schema);
-            }
-        }
-        let schemas = Arc::new(schemas);
+        let schemas = Arc::new(provider_mod::collect_schemas(&factories));
         let provider_names: Vec<String> = factories.iter().map(|f| f.name().to_string()).collect();
         let region_completions: Vec<CompletionValue> = factories
             .iter()
