@@ -214,22 +214,19 @@ impl DiagnosticEngine {
 
                         // Type validation
                         if let Some(attr_schema) = schema.attributes.get(canonical_name) {
-                            // Check for duplicate struct blocks:
-                            // If schema type is Struct (not List(Struct)) but value is a List with multiple items
+                            // Check for block syntax on bare Struct attributes:
+                            // Block syntax produces Value::List, but bare Struct requires
+                            // map assignment syntax: attr = { ... }
                             if matches!(
                                 &attr_schema.attr_type,
                                 carina_core::schema::AttributeType::Struct { .. }
-                            ) && let Value::List(items) = attr_value
-                                && items.len() > 1
+                            ) && matches!(attr_value, Value::List(_))
                             {
-                                // Find all block positions for this attribute
-                                // Use block_name if this attribute was accessed via block_name
                                 let search_name =
                                     attr_schema.block_name.as_deref().unwrap_or(attr_name);
                                 let block_positions =
                                     self.find_all_block_positions(doc, search_name);
-                                // Emit error on the second and subsequent blocks
-                                for pos in block_positions.iter().skip(1) {
+                                for pos in &block_positions {
                                     diagnostics.push(Diagnostic {
                                         range: Range {
                                             start: Position {
@@ -244,8 +241,8 @@ impl DiagnosticEngine {
                                         severity: Some(DiagnosticSeverity::ERROR),
                                         source: Some("carina".to_string()),
                                         message: format!(
-                                            "'{}' is a single block attribute and cannot be specified more than once",
-                                            search_name
+                                            "'{}' cannot use block syntax; use map assignment: {} = {{ ... }}",
+                                            search_name, search_name
                                         ),
                                         ..Default::default()
                                     });
@@ -462,11 +459,11 @@ impl DiagnosticEngine {
                     // Run resource-level validator (e.g., mutually exclusive required fields)
                     if let Err(errors) = schema.validate(&resource.attributes) {
                         for error in errors {
-                            // Skip DuplicateStructBlock errors here; they are already
+                            // Skip BlockSyntaxNotAllowed errors here; they are already
                             // reported with precise block positions in the attribute-level check above.
                             if matches!(
                                 error,
-                                carina_core::schema::TypeError::DuplicateStructBlock { .. }
+                                carina_core::schema::TypeError::BlockSyntaxNotAllowed { .. }
                             ) {
                                 continue;
                             }
@@ -1456,7 +1453,45 @@ let sg = awscc.ec2.security_group {
     }
 
     #[test]
-    fn duplicate_struct_block_error() {
+    fn block_syntax_rejected_for_bare_struct() {
+        let engine = test_engine();
+        let doc = create_document(
+            r#"provider aws {
+    region = aws.Region.ap_northeast_1
+}
+
+aws.ec2.subnet {
+    name = "my-subnet"
+    vpc_id = "vpc-123"
+    cidr_block = "10.0.1.0/24"
+
+    private_dns_name_options_on_launch {
+        hostname_type = aws.ec2.subnet.HostnameType.resource_name
+    }
+}"#,
+        );
+
+        let diagnostics = engine.analyze(&doc, None);
+
+        let block_diag = diagnostics
+            .iter()
+            .find(|d| d.message.contains("cannot use block syntax"));
+        assert!(
+            block_diag.is_some(),
+            "Should error on block syntax for bare Struct. Got diagnostics: {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+
+        let diag = block_diag.unwrap();
+        assert_eq!(diag.severity, Some(DiagnosticSeverity::ERROR));
+        assert!(
+            diag.message
+                .contains("use map assignment: private_dns_name_options_on_launch = { ... }")
+        );
+    }
+
+    #[test]
+    fn block_syntax_rejected_for_bare_struct_multiple_blocks() {
         let engine = test_engine();
         let doc = create_document(
             r#"provider aws {
@@ -1480,65 +1515,16 @@ aws.ec2.subnet {
 
         let diagnostics = engine.analyze(&doc, None);
 
-        let dup_diag = diagnostics
+        // Both blocks should get errors
+        let block_count = diagnostics
             .iter()
-            .find(|d| d.message.contains("single block attribute"));
-        assert!(
-            dup_diag.is_some(),
-            "Should error on duplicate struct block. Got diagnostics: {:?}",
-            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
-        );
-
-        // Error should point to the second block (line 13, 0-indexed)
-        let diag = dup_diag.unwrap();
-        assert_eq!(
-            diag.range.start.line, 13,
-            "Diagnostic should point to line 13 (0-indexed, second block), got line {}",
-            diag.range.start.line
-        );
-        assert_eq!(diag.severity, Some(DiagnosticSeverity::ERROR));
-
-        // Should only emit one duplicate block diagnostic (not duplicated by resource-level validator)
-        let dup_count = diagnostics
-            .iter()
-            .filter(|d| d.message.contains("single block attribute"))
+            .filter(|d| d.message.contains("cannot use block syntax"))
             .count();
         assert_eq!(
-            dup_count,
-            1,
-            "Should have exactly 1 duplicate block diagnostic, got {}. All diagnostics: {:?}",
-            dup_count,
-            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
-    fn single_struct_block_no_error() {
-        let engine = test_engine();
-        let doc = create_document(
-            r#"provider aws {
-    region = aws.Region.ap_northeast_1
-}
-
-aws.ec2.subnet {
-    name = "my-subnet"
-    vpc_id = "vpc-123"
-    cidr_block = "10.0.1.0/24"
-
-    private_dns_name_options_on_launch {
-        hostname_type = aws.ec2.subnet.HostnameType.resource_name
-    }
-}"#,
-        );
-
-        let diagnostics = engine.analyze(&doc, None);
-
-        let dup_diag = diagnostics
-            .iter()
-            .find(|d| d.message.contains("single block attribute"));
-        assert!(
-            dup_diag.is_none(),
-            "Should NOT error on single struct block. Got diagnostics: {:?}",
+            block_count,
+            2,
+            "Should have 2 block syntax diagnostics (one per block), got {}. All diagnostics: {:?}",
+            block_count,
             diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
     }

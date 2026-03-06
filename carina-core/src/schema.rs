@@ -178,21 +178,12 @@ impl AttributeType {
                 Ok(())
             }
 
-            // Struct type accepts Value::List with exactly one Map element
-            // (parser wraps all nested blocks in Value::List)
-            (AttributeType::Struct { name, fields: _ }, Value::List(items)) => {
-                if items.len() > 1 {
-                    return Err(TypeError::DuplicateStructBlock {
-                        attribute: name.clone(),
-                    });
-                }
-                if items.len() == 1 {
-                    return self.validate(&items[0]);
-                }
-                // Empty list - fall through to type mismatch
-                Err(TypeError::TypeMismatch {
-                    expected: self.type_name(),
-                    got: value.type_name(),
+            // Struct type rejects Value::List (block syntax)
+            // Block syntax produces Value::List([Value::Map(...)]), but bare Struct
+            // requires map assignment syntax: attr = { ... }
+            (AttributeType::Struct { name, .. }, Value::List(_)) => {
+                Err(TypeError::BlockSyntaxNotAllowed {
+                    attribute: name.clone(),
                 })
             }
 
@@ -328,8 +319,8 @@ pub enum TypeError {
         inner: Box<TypeError>,
     },
 
-    #[error("'{attribute}' is a single block attribute and cannot be specified more than once")]
-    DuplicateStructBlock { attribute: String },
+    #[error("'{attribute}' cannot use block syntax; use map assignment: {attribute} = {{ ... }}")]
+    BlockSyntaxNotAllowed { attribute: String },
 }
 
 impl Value {
@@ -1260,9 +1251,9 @@ mod tests {
     }
 
     #[test]
-    fn struct_accepts_single_element_list() {
-        // Parser wraps all nested blocks in Value::List, so Struct type must accept
-        // Value::List with exactly one Map element
+    fn struct_rejects_block_syntax_single_element() {
+        // Block syntax produces Value::List([Value::Map(...)]) which should be rejected
+        // for bare Struct attributes
         let struct_type = AttributeType::Struct {
             name: "VersioningConfiguration".to_string(),
             fields: vec![StructField::new("status", AttributeType::String).required()],
@@ -1271,12 +1262,24 @@ mod tests {
         let mut map = HashMap::new();
         map.insert("status".to_string(), Value::String("Enabled".to_string()));
         let single_list = Value::List(vec![Value::Map(map)]);
-        assert!(struct_type.validate(&single_list).is_ok());
+        let result = struct_type.validate(&single_list);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        match &err {
+            TypeError::BlockSyntaxNotAllowed { attribute } => {
+                assert_eq!(attribute, "VersioningConfiguration");
+            }
+            other => panic!("Expected BlockSyntaxNotAllowed, got: {:?}", other),
+        }
+        assert!(
+            err.to_string()
+                .contains("cannot use block syntax; use map assignment")
+        );
     }
 
     #[test]
-    fn struct_rejects_multiple_element_list() {
-        // Multiple blocks for a bare Struct attribute should be rejected
+    fn struct_rejects_block_syntax_multiple_elements() {
+        // Multiple blocks for a bare Struct attribute should also be rejected
         let struct_type = AttributeType::Struct {
             name: "VersioningConfiguration".to_string(),
             fields: vec![StructField::new("status", AttributeType::String).required()],
@@ -1289,17 +1292,12 @@ mod tests {
         let multi_list = Value::List(vec![Value::Map(map1), Value::Map(map2)]);
         let result = struct_type.validate(&multi_list);
         assert!(result.is_err());
-        let err = result.unwrap_err();
-        match &err {
-            TypeError::DuplicateStructBlock { attribute } => {
+        match result.unwrap_err() {
+            TypeError::BlockSyntaxNotAllowed { attribute } => {
                 assert_eq!(attribute, "VersioningConfiguration");
             }
-            other => panic!("Expected DuplicateStructBlock, got: {:?}", other),
+            other => panic!("Expected BlockSyntaxNotAllowed, got: {:?}", other),
         }
-        assert!(
-            err.to_string()
-                .contains("single block attribute and cannot be specified more than once")
-        );
     }
 
     #[test]
