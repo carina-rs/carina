@@ -3167,7 +3167,6 @@ async fn run_state_bucket_delete(
     }
 }
 
-// File-based mock Provider (saves state to JSON file)
 // Format command implementation
 fn run_fmt(path: &PathBuf, check: bool, show_diff: bool, recursive: bool) -> Result<(), String> {
     let config = FormatConfig::default();
