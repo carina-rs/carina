@@ -4,7 +4,7 @@ use std::path::Path;
 use colored::Colorize;
 
 use carina_core::deps::sort_resources_by_dependencies;
-use carina_core::differ::create_plan;
+use carina_core::differ::{cascade_dependent_updates, create_plan};
 use carina_core::identifier::{self, PrefixStateInfo};
 use carina_core::module_resolver;
 use carina_core::parser::{ParsedFile, ProviderConfig};
@@ -204,13 +204,19 @@ pub async fn create_plan_from_parsed(
         .unwrap_or_default();
 
     let schemas = get_schemas();
-    let plan = create_plan(
+    let mut plan = create_plan(
         &resources,
         &current_states,
         &lifecycles,
         &schemas,
         &saved_attrs,
     );
+
+    // Populate cascading updates for Replace effects with create_before_destroy.
+    // Uses unresolved resources (sorted_resources) so dependent Update effects
+    // retain ResourceRef values for re-resolution at apply time.
+    cascade_dependent_updates(&mut plan, &sorted_resources, &current_states);
+
     Ok(PlanContext {
         plan,
         sorted_resources,

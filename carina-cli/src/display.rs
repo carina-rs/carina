@@ -214,6 +214,8 @@ pub fn print_plan(plan: &Plan) {
                 to,
                 changed_create_only,
                 lifecycle,
+                cascading_updates,
+                ..
             } => {
                 let replace_note = if lifecycle.create_before_destroy {
                     "(must be replaced, create before destroy)"
@@ -284,6 +286,21 @@ pub fn print_plan(plan: &Plan) {
                                 );
                             }
                         }
+                    }
+                }
+                if !cascading_updates.is_empty() {
+                    println!(
+                        "{}  {} cascading update(s):",
+                        attr_prefix,
+                        cascading_updates.len()
+                    );
+                    for cascade in cascading_updates {
+                        println!(
+                            "{}  ~ {} \"{}\"",
+                            attr_prefix,
+                            cascade.id.display_type().cyan(),
+                            cascade.id.name.magenta()
+                        );
                     }
                 }
             }
@@ -388,9 +405,22 @@ pub fn format_effect(effect: &Effect) -> String {
     match effect {
         Effect::Create(r) => format!("Create {}", r.id),
         Effect::Update { id, .. } => format!("Update {}", id),
-        Effect::Replace { id, lifecycle, .. } => {
+        Effect::Replace {
+            id,
+            lifecycle,
+            cascading_updates,
+            ..
+        } => {
             if lifecycle.create_before_destroy {
-                format!("Replace {} (create-before-destroy)", id)
+                if cascading_updates.is_empty() {
+                    format!("Replace {} (create-before-destroy)", id)
+                } else {
+                    format!(
+                        "Replace {} (create-before-destroy, {} cascade)",
+                        id,
+                        cascading_updates.len()
+                    )
+                }
             } else {
                 format!("Replace {}", id)
             }

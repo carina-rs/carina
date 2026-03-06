@@ -126,11 +126,19 @@ impl<P: Provider> Interpreter<P> {
                 from,
                 to,
                 lifecycle,
+                cascading_updates,
                 ..
             } => {
                 if lifecycle.create_before_destroy {
                     // Create the new resource first
                     let state = self.provider.create(to).await?;
+                    // Execute cascading updates for dependent resources
+                    for cascade in cascading_updates {
+                        let cascade_identifier = cascade.from.identifier.as_deref().unwrap_or("");
+                        self.provider
+                            .update(&cascade.id, cascade_identifier, &cascade.from, &cascade.to)
+                            .await?;
+                    }
                     // Then delete the old resource
                     let identifier = from.identifier.as_deref().unwrap_or("");
                     self.provider.delete(id, identifier, lifecycle).await?;
@@ -251,6 +259,7 @@ mod tests {
                 .with_attribute("key", Value::String("new".to_string())),
             lifecycle: LifecycleConfig::default(),
             changed_create_only: vec!["key".to_string()],
+            cascading_updates: vec![],
         });
 
         let result = interpreter.apply(&plan).await;
@@ -358,6 +367,7 @@ mod tests {
                 .with_attribute("key", Value::String("new".to_string())),
             lifecycle: LifecycleConfig::default(),
             changed_create_only: vec!["key".to_string()],
+            cascading_updates: vec![],
         });
 
         let result = interpreter.apply(&plan).await;
@@ -393,6 +403,7 @@ mod tests {
                 create_before_destroy: true,
             },
             changed_create_only: vec!["key".to_string()],
+            cascading_updates: vec![],
         });
 
         let result = interpreter.apply(&plan).await;
@@ -400,5 +411,60 @@ mod tests {
 
         let ops = ops.lock().unwrap();
         assert_eq!(*ops, vec!["create", "delete"]);
+    }
+
+    #[tokio::test]
+    async fn replace_create_before_destroy_with_cascading_updates() {
+        use crate::effect::CascadingUpdate;
+        use crate::resource::Value;
+        use std::collections::HashMap;
+
+        let ops = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = OrderTrackingProvider { ops: ops.clone() };
+        let interpreter = Interpreter::new(provider);
+
+        let mut plan = Plan::new();
+        plan.add(Effect::Replace {
+            id: ResourceId::new("ec2.vpc", "my-vpc"),
+            from: Box::new(
+                State::existing(
+                    ResourceId::new("ec2.vpc", "my-vpc"),
+                    HashMap::from([(
+                        "cidr_block".to_string(),
+                        Value::String("10.0.0.0/16".to_string()),
+                    )]),
+                )
+                .with_identifier("vpc-old"),
+            ),
+            to: Resource::new("ec2.vpc", "my-vpc")
+                .with_attribute("cidr_block", Value::String("10.1.0.0/16".to_string())),
+            lifecycle: LifecycleConfig {
+                force_delete: false,
+                create_before_destroy: true,
+            },
+            changed_create_only: vec!["cidr_block".to_string()],
+            cascading_updates: vec![CascadingUpdate {
+                id: ResourceId::new("ec2.subnet", "my-subnet"),
+                from: Box::new(
+                    State::existing(
+                        ResourceId::new("ec2.subnet", "my-subnet"),
+                        HashMap::from([(
+                            "vpc_id".to_string(),
+                            Value::String("vpc-old".to_string()),
+                        )]),
+                    )
+                    .with_identifier("subnet-123"),
+                ),
+                to: Resource::new("ec2.subnet", "my-subnet")
+                    .with_attribute("vpc_id", Value::String("vpc-new".to_string())),
+            }],
+        });
+
+        let result = interpreter.apply(&plan).await;
+        assert!(result.is_success());
+
+        // Verify order: create (new VPC) → update (subnet cascade) → delete (old VPC)
+        let ops = ops.lock().unwrap();
+        assert_eq!(*ops, vec!["create", "update", "delete"]);
     }
 }

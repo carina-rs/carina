@@ -7,6 +7,20 @@ use serde::{Deserialize, Serialize};
 
 use crate::resource::{LifecycleConfig, Resource, ResourceId, State};
 
+/// A dependent resource that must be updated during a create_before_destroy replacement.
+///
+/// When a resource is replaced with create_before_destroy, dependent resources that
+/// reference the replaced resource's computed attributes need to be updated between
+/// the create (new) and delete (old) steps. The `to` field retains unresolved
+/// `ResourceRef` values so that the apply phase can re-resolve them using the
+/// newly created resource's state.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CascadingUpdate {
+    pub id: ResourceId,
+    pub from: Box<State>,
+    pub to: Resource,
+}
+
 /// Effect representing an operation on a resource
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Effect {
@@ -32,6 +46,9 @@ pub enum Effect {
         lifecycle: LifecycleConfig,
         /// Which create-only attributes forced the replacement
         changed_create_only: Vec<String>,
+        /// Dependent resources to update between create and delete (create_before_destroy only)
+        #[serde(default)]
+        cascading_updates: Vec<CascadingUpdate>,
     },
 
     /// Delete a resource
@@ -192,6 +209,7 @@ mod tests {
                     .with_attribute("cidr_block", Value::String("10.1.0.0/16".to_string())),
                 lifecycle: LifecycleConfig::default(),
                 changed_create_only: vec!["cidr_block".to_string()],
+                cascading_updates: vec![],
             },
             Effect::Delete {
                 id: ResourceId::new("s3.bucket", "old-bucket"),
