@@ -887,7 +887,7 @@ mod tests {
     /// but current and saved are List([Map]) (from provider read path).
     /// After merge + semantic comparison, this should be NoChange.
     #[test]
-    fn diff_no_change_when_bare_struct_cross_type() {
+    fn diff_no_change_when_bare_struct_with_extra_fields() {
         let desired = Resource::new("ec2.subnet", "test-subnet").with_attribute(
             "private_dns_name_options_on_launch",
             Value::Map(HashMap::from([
@@ -902,10 +902,10 @@ mod tests {
             ])),
         );
 
-        // Provider read returns List([Map]) for bare struct
+        // Provider read returns Map with extra fields not in desired
         let current_attrs = HashMap::from([(
             "private_dns_name_options_on_launch".to_string(),
-            Value::List(vec![Value::Map(HashMap::from([
+            Value::Map(HashMap::from([
                 (
                     "hostname_type".to_string(),
                     Value::String("ip-name".to_string()),
@@ -918,14 +918,14 @@ mod tests {
                     "enable_resource_name_dns_aaaa_record".to_string(),
                     Value::Bool(false),
                 ),
-            ]))]),
+            ])),
         )]);
         let current = State::existing(ResourceId::new("ec2.subnet", "test-subnet"), current_attrs);
 
-        // Saved state also has List([Map]) from previous provider read
+        // Saved state has the same Map with extra fields
         let saved_map = HashMap::from([(
             "private_dns_name_options_on_launch".to_string(),
-            Value::List(vec![Value::Map(HashMap::from([
+            Value::Map(HashMap::from([
                 (
                     "hostname_type".to_string(),
                     Value::String("ip-name".to_string()),
@@ -938,13 +938,13 @@ mod tests {
                     "enable_resource_name_dns_aaaa_record".to_string(),
                     Value::Bool(false),
                 ),
-            ]))]),
+            ])),
         )]);
 
         let result = diff(&desired, &current, Some(&saved_map));
         assert!(
             matches!(result, Diff::NoChange(_)),
-            "Expected NoChange for bare struct cross-type (Map desired vs List([Map]) current/saved), got {:?}",
+            "Expected NoChange for bare struct with extra fields from saved, got {:?}",
             result
         );
     }

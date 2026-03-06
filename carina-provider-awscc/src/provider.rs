@@ -824,7 +824,7 @@ impl AwsccProvider {
                 })
                 .collect();
             if !map.is_empty() {
-                return Some(Value::List(vec![Value::Map(map)]));
+                return Some(Value::Map(map));
             }
         }
 
@@ -930,11 +930,34 @@ impl AwsccProvider {
                 .collect();
             Some(serde_json::Value::Array(arr))
         } else if let AttributeType::Struct { fields, .. } = attr_type
+            && let Value::Map(map) = value
+        {
+            // Recurse into bare struct fields for type-aware conversion (map assignment syntax)
+            let obj: serde_json::Map<String, serde_json::Value> = fields
+                .iter()
+                .filter_map(|field| {
+                    let dsl_val = map.get(&field.name)?;
+                    let provider_key = field
+                        .provider_name
+                        .as_deref()
+                        .unwrap_or(&field.name)
+                        .to_string();
+                    let json_val = self.dsl_value_to_aws(
+                        dsl_val,
+                        &field.field_type,
+                        resource_type,
+                        &field.name,
+                    );
+                    json_val.map(|v| (provider_key, v))
+                })
+                .collect();
+            Some(serde_json::Value::Object(obj))
+        } else if let AttributeType::Struct { fields, .. } = attr_type
             && let Value::List(items) = value
             && items.len() == 1
             && let Value::Map(map) = &items[0]
         {
-            // Recurse into bare struct fields for type-aware conversion
+            // Recurse into bare struct fields for type-aware conversion (block syntax)
             let obj: serde_json::Map<String, serde_json::Value> = fields
                 .iter()
                 .filter_map(|field| {
@@ -1756,7 +1779,7 @@ mod tests {
     }
 
     #[test]
-    fn test_aws_value_to_dsl_bare_struct_returns_list_wrapped_map() {
+    fn test_aws_value_to_dsl_bare_struct_returns_map() {
         let provider = AwsccProvider::new_for_test("us-east-1");
         let fields = vec![
             StructField::new("status", AttributeType::String).with_provider_name("Status"),
@@ -1778,24 +1801,19 @@ mod tests {
         );
         let result = result.expect("Should return Some");
 
-        // Must be Value::List(vec![Value::Map(...)]) to match parser output
-        if let Value::List(items) = &result {
-            assert_eq!(items.len(), 1, "Expected single-element list");
-            if let Value::Map(map) = &items[0] {
-                assert_eq!(
-                    map.get("status"),
-                    Some(&Value::String("Enabled".to_string()))
-                );
-            } else {
-                panic!("Expected Map inside List, got: {:?}", items[0]);
-            }
+        // Must be Value::Map(...) to match parser output for map assignment syntax
+        if let Value::Map(map) = &result {
+            assert_eq!(
+                map.get("status"),
+                Some(&Value::String("Enabled".to_string()))
+            );
         } else {
-            panic!("Expected Value::List, got: {:?}", result);
+            panic!("Expected Value::Map, got: {:?}", result);
         }
     }
 
     #[test]
-    fn test_dsl_value_to_aws_unwraps_list_for_bare_struct() {
+    fn test_dsl_value_to_aws_map_for_bare_struct() {
         let provider = AwsccProvider::new_for_test("us-east-1");
         let fields = vec![
             StructField::new("status", AttributeType::String).with_provider_name("Status"),
@@ -1806,7 +1824,40 @@ mod tests {
             fields,
         };
 
-        // Parser produces Value::List(vec![Value::Map(...)])
+        // Parser produces Value::Map(...) for map assignment syntax (= { ... })
+        let mut map = HashMap::new();
+        map.insert("status".to_string(), Value::String("Enabled".to_string()));
+        let dsl_value = Value::Map(map);
+
+        let result = provider.dsl_value_to_aws(
+            &dsl_value,
+            &attr_type,
+            "AWS::S3::Bucket",
+            "versioning_configuration",
+        );
+        let result = result.expect("Should return Some");
+
+        // Must produce a JSON object (not array)
+        if let serde_json::Value::Object(obj) = &result {
+            assert_eq!(obj.get("Status"), Some(&serde_json::json!("Enabled")));
+        } else {
+            panic!("Expected JSON Object, got: {:?}", result);
+        }
+    }
+
+    #[test]
+    fn test_dsl_value_to_aws_list_for_bare_struct() {
+        let provider = AwsccProvider::new_for_test("us-east-1");
+        let fields = vec![
+            StructField::new("status", AttributeType::String).with_provider_name("Status"),
+            StructField::new("mfa_delete", AttributeType::String).with_provider_name("MfaDelete"),
+        ];
+        let attr_type = AttributeType::Struct {
+            name: "VersioningConfiguration".to_string(),
+            fields,
+        };
+
+        // Parser produces Value::List(vec![Value::Map(...)]) for block syntax (name { ... })
         let mut map = HashMap::new();
         map.insert("status".to_string(), Value::String("Enabled".to_string()));
         let dsl_value = Value::List(vec![Value::Map(map)]);
@@ -1850,10 +1901,10 @@ mod tests {
             )
             .expect("read should succeed");
 
-        // Simulate parser output (what the user wrote in .crn)
+        // Simulate parser output (what the user wrote in .crn with map assignment syntax)
         let mut parser_map = HashMap::new();
         parser_map.insert("status".to_string(), Value::String("Enabled".to_string()));
-        let parser_value = Value::List(vec![Value::Map(parser_map)]);
+        let parser_value = Value::Map(parser_map);
 
         // The read value and parser value must be equal (no spurious diff)
         assert_eq!(
