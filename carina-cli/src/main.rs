@@ -2341,7 +2341,7 @@ async fn get_provider(parsed: &ParsedFile) -> Box<dyn Provider> {
         }
     }
 
-    // Use file-based mock for other cases
+    // Use mock provider for other cases
     println!("{}", "Using mock provider".cyan());
     Box::new(MockProvider::new())
 }
