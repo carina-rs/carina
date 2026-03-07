@@ -1918,7 +1918,7 @@ fn generate_markdown_resource(res: &ResourceDef, model: &SmithyModel) -> Result<
     if let Some(traits) = desc_traits
         && let Some(desc) = SmithyModel::documentation(traits)
     {
-        let cleaned = strip_html_tags(desc).replace('\n', " ").replace("  ", " ");
+        let cleaned = collapse_whitespace(&strip_html_tags(desc).replace(['\n', '\t'], " "));
         md.push_str(&format!("{}\n\n", cleaned.trim()));
     }
 
@@ -1937,7 +1937,7 @@ fn generate_markdown_resource(res: &ResourceDef, model: &SmithyModel) -> Result<
         md.push('\n');
 
         if let Some(ref desc) = attr.description {
-            let cleaned = strip_html_tags(desc).replace('\n', " ").replace("  ", " ");
+            let cleaned = collapse_whitespace(&strip_html_tags(desc).replace(['\n', '\t'], " "));
             md.push_str(&format!("{}\n\n", cleaned.trim()));
         }
     }
@@ -2024,7 +2024,8 @@ fn generate_markdown_resource(res: &ResourceDef, model: &SmithyModel) -> Result<
                 );
                 let desc = SmithyModel::documentation(&member_ref.traits)
                     .map(|s| {
-                        let cleaned = strip_html_tags(s).replace('\n', " ").replace("  ", " ");
+                        let cleaned =
+                            collapse_whitespace(&strip_html_tags(s).replace(['\n', '\t'], " "));
                         let trimmed = cleaned.trim().to_string();
                         if trimmed.len() > 100 {
                             // Find a safe UTF-8 boundary
@@ -2465,13 +2466,10 @@ fn strip_html_tags(s: &str) -> String {
     result
 }
 
-fn escape_description(desc: &str) -> String {
-    let stripped = strip_html_tags(desc);
-    let collapsed = stripped.replace('"', "\\\"").replace(['\n', '\t'], " ");
-    // Collapse all runs of multiple whitespace into a single space
-    let mut result = String::with_capacity(collapsed.len());
+fn collapse_whitespace(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
     let mut prev_space = false;
-    for c in collapsed.chars() {
+    for c in s.chars() {
         if c == ' ' {
             if !prev_space {
                 result.push(' ');
@@ -2482,7 +2480,13 @@ fn escape_description(desc: &str) -> String {
             prev_space = false;
         }
     }
-    result.trim().to_string()
+    result
+}
+
+fn escape_description(desc: &str) -> String {
+    let stripped = strip_html_tags(desc);
+    let normalized = stripped.replace('"', "\\\"").replace(['\n', '\t'], " ");
+    collapse_whitespace(&normalized).trim().to_string()
 }
 
 fn truncate_str(s: &str, max_len: usize) -> String {

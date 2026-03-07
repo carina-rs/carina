@@ -11,14 +11,14 @@ Describes a security group.
 - **Type:** String
 - **Required:** Yes
 
-A description for the security group.     Constraints: Up to 255 characters in length     Valid characters: a-z, A-Z, 0-9, spaces, and ._-:/()#,@[]+=&;{}!$*
+A description for the security group. Constraints: Up to 255 characters in length Valid characters: a-z, A-Z, 0-9, spaces, and ._-:/()#,@[]+=&;{}!$*
 
 ### `group_name`
 
 - **Type:** String
 - **Required:** Yes
 
-The name of the security group. Names are case-insensitive and must be unique within the VPC.     Constraints: Up to 255 characters in length. Can't start with sg-.     Valid characters: a-z, A-Z, 0-9, spaces, and ._-:/()#,@[]+=&;{}!$*
+The name of the security group. Names are case-insensitive and must be unique within the VPC. Constraints: Up to 255 characters in length. Can't start with sg-. Valid characters: a-z, A-Z, 0-9, spaces, and ._-:/()#,@[]+=&;{}!$*
 
 ### `vpc_id`
 

@@ -11,7 +11,7 @@ Describes a route in a route table.
 - **Type:** AwsResourceId
 - **Required:** No
 
-The ID of the carrier gateway.     You can only use this option when the VPC contains a subnet which is associated with a Wavelength Zone.
+The ID of the carrier gateway. You can only use this option when the VPC contains a subnet which is associated with a Wavelength Zone.
 
 ### `core_network_arn`
 
@@ -53,7 +53,7 @@ The ID of a prefix list used for the destination match.
 - **Type:** AwsResourceId
 - **Required:** No
 
-The ID of an internet gateway or virtual private gateway attached to your 			VPC.
+The ID of an internet gateway or virtual private gateway attached to your VPC.
 
 ### `instance_id`
 

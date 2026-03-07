@@ -9,7 +9,7 @@ CloudFormation Type: `AWS::S3::Bucket`
 - **Type:** Bool
 - **Required:** No
 
-Specifies whether you want S3 Object Lock to be enabled for the new bucket.            This functionality is not supported for directory buckets.
+Specifies whether you want S3 Object Lock to be enabled for the new bucket. This functionality is not supported for directory buckets.
 
 ### `object_ownership`
 
