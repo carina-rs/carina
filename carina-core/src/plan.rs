@@ -34,6 +34,35 @@ impl Plan {
         self.effects.is_empty()
     }
 
+    /// Set cascading updates on Replace effects that match the given replaced bindings.
+    pub fn set_cascading_updates(
+        &mut self,
+        replaced_bindings: &std::collections::HashSet<String>,
+        updates_by_binding: &std::collections::HashMap<String, Vec<crate::effect::CascadingUpdate>>,
+    ) {
+        for effect in &mut self.effects {
+            if let Effect::Replace {
+                to,
+                lifecycle,
+                cascading_updates,
+                ..
+            } = effect
+                && lifecycle.create_before_destroy
+            {
+                let binding = to.attributes.get("_binding").and_then(|v| match v {
+                    Value::String(s) => Some(s.clone()),
+                    _ => None,
+                });
+                if let Some(binding) = binding
+                    && replaced_bindings.contains(&binding)
+                    && let Some(updates) = updates_by_binding.get(&binding)
+                {
+                    *cascading_updates = updates.clone();
+                }
+            }
+        }
+    }
+
     /// Number of mutating Effects
     pub fn mutation_count(&self) -> usize {
         self.effects.iter().filter(|e| e.is_mutating()).count()

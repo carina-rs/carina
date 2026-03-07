@@ -18,7 +18,7 @@ use carina_core::deps::{
     build_dependents_map, find_failed_dependency, find_failed_dependent,
     sort_resources_by_dependencies,
 };
-use carina_core::differ::create_plan;
+use carina_core::differ::{cascade_dependent_updates, create_plan};
 use carina_core::effect::Effect;
 use carina_core::formatter::{self, FormatConfig};
 use carina_core::lint::{find_list_literal_attrs, list_struct_attr_names};
@@ -832,13 +832,17 @@ async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
         .map(|sf| sf.build_lifecycles())
         .unwrap_or_default();
     let schemas = get_schemas();
-    let plan = create_plan(
+    let mut plan = create_plan(
         &resources_for_plan,
         &current_states,
         &lifecycles,
         &schemas,
         &saved_attrs,
     );
+
+    // Populate cascading updates for create_before_destroy Replace effects.
+    // Uses unresolved resources (sorted_resources) so dependents retain ResourceRef values.
+    cascade_dependent_updates(&mut plan, &sorted_resources, &current_states);
 
     if plan.is_empty() {
         println!("{}", "No changes needed.".green());
@@ -999,6 +1003,7 @@ async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
                 from,
                 to,
                 lifecycle,
+                cascading_updates,
                 ..
             } => {
                 if lifecycle.create_before_destroy {
@@ -1012,30 +1017,95 @@ async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
 
                     match provider.create(&resolved_resource).await {
                         Ok(state) => {
-                            // Then delete the old resource
-                            let identifier = from.identifier.as_deref().unwrap_or("");
-                            match provider.delete(id, identifier, lifecycle).await {
-                                Ok(()) => {
-                                    println!("  {} {}", "✓".green(), format_effect(effect));
-                                    success_count += 1;
+                            // Update binding_map with the new resource's state before cascading
+                            if let Some(Value::String(binding_name)) = to.attributes.get("_binding")
+                            {
+                                let mut attrs = resolved_resource.attributes.clone();
+                                for (k, v) in &state.attributes {
+                                    attrs.insert(k.clone(), v.clone());
+                                }
+                                binding_map.insert(binding_name.clone(), attrs);
+                            }
 
-                                    applied_states.insert(to.id.clone(), state.clone());
-
-                                    if let Some(Value::String(binding_name)) =
-                                        to.attributes.get("_binding")
-                                    {
-                                        let mut attrs = resolved_resource.attributes.clone();
-                                        for (k, v) in &state.attributes {
-                                            attrs.insert(k.clone(), v.clone());
+                            // Execute cascading updates for dependent resources
+                            let mut cascade_failed = false;
+                            for cascade in cascading_updates {
+                                let mut resolved_to = cascade.to.clone();
+                                for (key, value) in &cascade.to.attributes {
+                                    resolved_to.attributes.insert(
+                                        key.clone(),
+                                        resolve_ref_value(value, &binding_map),
+                                    );
+                                }
+                                let cascade_identifier =
+                                    cascade.from.identifier.as_deref().unwrap_or("");
+                                match provider
+                                    .update(
+                                        &cascade.id,
+                                        cascade_identifier,
+                                        &cascade.from,
+                                        &resolved_to,
+                                    )
+                                    .await
+                                {
+                                    Ok(cascade_state) => {
+                                        println!(
+                                            "  {} Update {} (cascade)",
+                                            "✓".green(),
+                                            cascade.id
+                                        );
+                                        applied_states
+                                            .insert(cascade.id.clone(), cascade_state.clone());
+                                        if let Some(Value::String(binding_name)) =
+                                            cascade.to.attributes.get("_binding")
+                                        {
+                                            let mut attrs = resolved_to.attributes.clone();
+                                            for (k, v) in &cascade_state.attributes {
+                                                attrs.insert(k.clone(), v.clone());
+                                            }
+                                            binding_map.insert(binding_name.clone(), attrs);
                                         }
-                                        binding_map.insert(binding_name.clone(), attrs);
+                                    }
+                                    Err(e) => {
+                                        println!(
+                                            "  {} Update {} (cascade) - {}",
+                                            "✗".red(),
+                                            cascade.id,
+                                            e
+                                        );
+                                        cascade_failed = true;
+                                        failure_count += 1;
+                                        break;
                                     }
                                 }
-                                Err(e) => {
-                                    println!("  {} {} - {}", "✗".red(), format_effect(effect), e);
-                                    failure_count += 1;
-                                    if let Some(binding) = effect.binding_name() {
-                                        failed_bindings.insert(binding);
+                            }
+
+                            if cascade_failed {
+                                // Don't delete old resource if cascade failed
+                                if let Some(binding) = effect.binding_name() {
+                                    failed_bindings.insert(binding);
+                                }
+                            } else {
+                                // Then delete the old resource
+                                let identifier = from.identifier.as_deref().unwrap_or("");
+                                match provider.delete(id, identifier, lifecycle).await {
+                                    Ok(()) => {
+                                        println!("  {} {}", "✓".green(), format_effect(effect));
+                                        success_count += 1;
+
+                                        applied_states.insert(to.id.clone(), state.clone());
+                                    }
+                                    Err(e) => {
+                                        println!(
+                                            "  {} {} - {}",
+                                            "✗".red(),
+                                            format_effect(effect),
+                                            e
+                                        );
+                                        failure_count += 1;
+                                        if let Some(binding) = effect.binding_name() {
+                                            failed_bindings.insert(binding);
+                                        }
                                     }
                                 }
                             }
@@ -1569,6 +1639,7 @@ async fn run_apply_from_plan(plan_path: &PathBuf, auto_approve: bool) -> Result<
                 from,
                 to,
                 lifecycle,
+                cascading_updates,
                 ..
             } => {
                 if lifecycle.create_before_destroy {
@@ -1582,29 +1653,93 @@ async fn run_apply_from_plan(plan_path: &PathBuf, auto_approve: bool) -> Result<
 
                     match provider.create(&resolved_resource).await {
                         Ok(state) => {
-                            // Then delete the old resource
-                            let identifier = from.identifier.as_deref().unwrap_or("");
-                            match provider.delete(id, identifier, lifecycle).await {
-                                Ok(()) => {
-                                    println!("  {} {}", "✓".green(), format_effect(effect));
-                                    success_count += 1;
-                                    applied_states.insert(to.id.clone(), state.clone());
+                            // Update binding_map with the new resource's state before cascading
+                            if let Some(Value::String(binding_name)) = to.attributes.get("_binding")
+                            {
+                                let mut attrs = resolved_resource.attributes.clone();
+                                for (k, v) in &state.attributes {
+                                    attrs.insert(k.clone(), v.clone());
+                                }
+                                binding_map.insert(binding_name.clone(), attrs);
+                            }
 
-                                    if let Some(Value::String(binding_name)) =
-                                        to.attributes.get("_binding")
-                                    {
-                                        let mut attrs = resolved_resource.attributes.clone();
-                                        for (k, v) in &state.attributes {
-                                            attrs.insert(k.clone(), v.clone());
+                            // Execute cascading updates for dependent resources
+                            let mut cascade_failed = false;
+                            for cascade in cascading_updates {
+                                let mut resolved_to = cascade.to.clone();
+                                for (key, value) in &cascade.to.attributes {
+                                    resolved_to.attributes.insert(
+                                        key.clone(),
+                                        resolve_ref_value(value, &binding_map),
+                                    );
+                                }
+                                let cascade_identifier =
+                                    cascade.from.identifier.as_deref().unwrap_or("");
+                                match provider
+                                    .update(
+                                        &cascade.id,
+                                        cascade_identifier,
+                                        &cascade.from,
+                                        &resolved_to,
+                                    )
+                                    .await
+                                {
+                                    Ok(cascade_state) => {
+                                        println!(
+                                            "  {} Update {} (cascade)",
+                                            "✓".green(),
+                                            cascade.id
+                                        );
+                                        applied_states
+                                            .insert(cascade.id.clone(), cascade_state.clone());
+                                        if let Some(Value::String(binding_name)) =
+                                            cascade.to.attributes.get("_binding")
+                                        {
+                                            let mut attrs = resolved_to.attributes.clone();
+                                            for (k, v) in &cascade_state.attributes {
+                                                attrs.insert(k.clone(), v.clone());
+                                            }
+                                            binding_map.insert(binding_name.clone(), attrs);
                                         }
-                                        binding_map.insert(binding_name.clone(), attrs);
+                                    }
+                                    Err(e) => {
+                                        println!(
+                                            "  {} Update {} (cascade) - {}",
+                                            "✗".red(),
+                                            cascade.id,
+                                            e
+                                        );
+                                        cascade_failed = true;
+                                        failure_count += 1;
+                                        break;
                                     }
                                 }
-                                Err(e) => {
-                                    println!("  {} {} - {}", "✗".red(), format_effect(effect), e);
-                                    failure_count += 1;
-                                    if let Some(binding) = effect.binding_name() {
-                                        failed_bindings.insert(binding);
+                            }
+
+                            if cascade_failed {
+                                if let Some(binding) = effect.binding_name() {
+                                    failed_bindings.insert(binding);
+                                }
+                            } else {
+                                // Then delete the old resource
+                                let identifier = from.identifier.as_deref().unwrap_or("");
+                                match provider.delete(id, identifier, lifecycle).await {
+                                    Ok(()) => {
+                                        println!("  {} {}", "✓".green(), format_effect(effect));
+                                        success_count += 1;
+                                        applied_states.insert(to.id.clone(), state.clone());
+                                    }
+                                    Err(e) => {
+                                        println!(
+                                            "  {} {} - {}",
+                                            "✗".red(),
+                                            format_effect(effect),
+                                            e
+                                        );
+                                        failure_count += 1;
+                                        if let Some(binding) = effect.binding_name() {
+                                            failed_bindings.insert(binding);
+                                        }
                                     }
                                 }
                             }
