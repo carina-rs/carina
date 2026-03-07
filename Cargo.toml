@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "carina-cli",
+    "carina-codegen-aws",
     "carina-core",
     "carina-lsp",
     "carina-provider-aws",

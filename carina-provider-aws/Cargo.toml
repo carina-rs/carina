@@ -4,13 +4,8 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 
-[[bin]]
-name = "smithy-codegen"
-path = "src/bin/smithy_codegen.rs"
-
 [dependencies]
 carina-core = { path = "../carina-core" }
-carina-smithy = { path = "../carina-smithy" }
 aws-config = "1"
 aws-sdk-s3 = "1"
 aws-sdk-ec2 = "1"
@@ -20,7 +15,5 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 heck = "0.5"
-anyhow = "1.0"
-clap = { version = "4.0", features = ["derive"] }
 
 [dev-dependencies]

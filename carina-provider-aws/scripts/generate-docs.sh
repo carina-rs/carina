@@ -23,7 +23,7 @@ echo "Output directory: $DOCS_DIR"
 echo ""
 
 cd "$PROJECT_ROOT"
-cargo run --bin smithy-codegen -- \
+cargo run -p carina-codegen-aws --bin smithy-codegen -- \
   --model-dir "$SCRIPT_DIR/../tests/fixtures/smithy" \
   --output-dir "$DOCS_DIR" \
   --format markdown

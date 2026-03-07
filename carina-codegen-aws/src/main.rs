@@ -15,7 +15,7 @@ use carina_smithy::{ShapeKind, SmithyModel};
 use clap::Parser;
 use heck::ToSnakeCase;
 
-use carina_provider_aws::resource_defs::{self, ResourceDef};
+use carina_codegen_aws::resource_defs::{self, ResourceDef};
 
 #[derive(Parser, Debug)]
 #[command(name = "smithy-codegen")]

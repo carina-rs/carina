@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 fn fixture_path(name: &str) -> PathBuf {
     let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    path.push("tests/fixtures/smithy");
+    path.push("../carina-provider-aws/tests/fixtures/smithy");
     path.push(format!("{name}.json"));
     path
 }
