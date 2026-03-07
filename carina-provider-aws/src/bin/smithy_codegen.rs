@@ -1419,19 +1419,24 @@ fn generate_provider_code(
             let defaults: HashMap<&str, &str> = read_op.defaults.iter().copied().collect();
 
             // Method signature
-            code.push_str(&format!(
-                "\x20   /// Read {} {} (generated)\n",
-                res.name, read_op.operation
-            ));
+            let op_desc = format!("{} {}", res.name, read_op.operation);
+            code.push_str(&format!("\x20   /// Read {} (generated)\n", op_desc));
             code.push_str(&format!("\x20   pub(crate) async fn {}(\n", method_name));
             code.push_str("\x20       &self,\n");
+            code.push_str("\x20       id: &ResourceId,\n");
             code.push_str("\x20       identifier: &str,\n");
             code.push_str("\x20       attributes: &mut HashMap<String, Value>,\n");
-            code.push_str("\x20   ) {\n");
+            code.push_str("\x20   ) -> ProviderResult<()> {\n");
             code.push_str(&format!(
-                "\x20       if let Ok(output) = self.{}.{}().{}(identifier).send().await {{\n",
+                "\x20       let output = self.{}.{}().{}(identifier).send().await.map_err(|e| {{\n",
                 client_field, sdk_method, id_setter
             ));
+            code.push_str(&format!(
+                "\x20           ProviderError::new(format!(\"Failed to read {}: {{}}\", e))\n",
+                op_desc
+            ));
+            code.push_str("\x20               .for_resource(id.clone())\n");
+            code.push_str("\x20       })?;\n");
 
             // Extract each field
             for (field_name, rename) in &read_op.fields {
@@ -1454,27 +1459,27 @@ fn generate_provider_code(
 
                 if let Some(default_value) = defaults.get(effective_name) {
                     code.push_str(&format!(
-                        "\x20           let value = output.{}().map(|v| {}).unwrap_or_else(|| \"{}\".to_string());\n",
+                        "\x20       let value = output.{}().map(|v| {}).unwrap_or_else(|| \"{}\".to_string());\n",
                         accessor, value_expr, default_value,
                     ));
                     code.push_str(&format!(
-                        "\x20           attributes.insert(\"{}\".to_string(), Value::String(value));\n",
+                        "\x20       attributes.insert(\"{}\".to_string(), Value::String(value));\n",
                         attr_snake,
                     ));
                 } else {
                     code.push_str(&format!(
-                        "\x20           if let Some(v) = output.{}() {{\n",
+                        "\x20       if let Some(v) = output.{}() {{\n",
                         accessor,
                     ));
                     code.push_str(&format!(
-                        "\x20               attributes.insert(\"{}\".to_string(), Value::String({}));\n",
+                        "\x20           attributes.insert(\"{}\".to_string(), Value::String({}));\n",
                         attr_snake, value_expr,
                     ));
-                    code.push_str("\x20           }\n");
+                    code.push_str("\x20       }\n");
                 }
             }
 
-            code.push_str("\x20       }\n");
+            code.push_str("\x20       Ok(())\n");
             code.push_str("\x20   }\n\n");
         }
     }

@@ -217,7 +217,8 @@ impl AwsProvider {
                 attributes.insert("region".to_string(), Value::String(region_dsl));
 
                 // Get versioning status
-                self.read_s3_bucket_versioning(name, &mut attributes).await;
+                self.read_s3_bucket_versioning(id, name, &mut attributes)
+                    .await?;
 
                 // Get object ownership
                 self.read_s3_bucket_ownership_controls(id, name, &mut attributes)
