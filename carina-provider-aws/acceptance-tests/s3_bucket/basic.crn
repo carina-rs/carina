@@ -1,0 +1,17 @@
+# S3 Bucket - Basic test
+#
+# Tests: bucket creation with name, versioning_status, tags
+
+provider aws {
+  region = aws.Region.ap_northeast_1
+}
+
+let bucket = aws.s3.bucket {
+  name = "carina-acc-test-aws-s3-basic"
+
+  versioning_status = aws.s3.bucket.VersioningStatus.Enabled
+
+  tags = {
+    Environment = "acceptance-test"
+  }
+}
