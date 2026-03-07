@@ -12,53 +12,52 @@ set -euo pipefail
 violations=0
 
 # ── Helper: scan Rust files for a grep pattern, skipping tests and comments ──
+# Uses bulk grep instead of per-line bash loops for performance.
 check_rust_files() {
     local dir="$1"
     local pattern="$2"
     local description="$3"
     local exclude_files="${4:-}"
 
-    for file in $(find "$dir" -name '*.rs' -type f); do
-        # Skip excluded files
-        if [ -n "$exclude_files" ]; then
-            local basename
-            basename=$(basename "$file")
-            if echo "$exclude_files" | grep -qw "$basename"; then
-                continue
-            fi
-        fi
+    local find_args=("$dir" -name '*.rs' -type f)
 
-        local in_test=false
-        local line_num=0
+    # Build -not -name args for excluded files
+    if [ -n "$exclude_files" ]; then
+        for excl in $exclude_files; do
+            find_args+=(-not -name "$excl")
+        done
+    fi
 
-        while IFS= read -r line; do
-            line_num=$((line_num + 1))
+    # For each file: grep with line numbers, then filter out test blocks and comments.
+    # This preserves correct line numbers unlike sed-then-grep.
+    while IFS= read -r file; do
+        # Find where #[cfg(test)] starts (if any)
+        local test_line
+        test_line=$(grep -n '#\[cfg(test)\]' "$file" 2>/dev/null | head -1 | cut -d: -f1) || true
 
-            # Track #[cfg(test)] mod blocks
-            if echo "$line" | grep -q '#\[cfg(test)\]'; then
-                in_test=true
-                continue
-            fi
+        # grep with line numbers
+        local matches
+        matches=$(grep -nE "$pattern" "$file" 2>/dev/null) || continue
 
-            # Skip test code
-            if $in_test; then
+        while IFS= read -r match; do
+            local line_num="${match%%:*}"
+            local line_content="${match#*:}"
+
+            # Skip if in test block
+            if [ -n "${test_line:-}" ] && [ "$line_num" -ge "$test_line" ]; then
                 continue
             fi
 
             # Skip comment lines
-            local stripped
-            stripped=$(echo "$line" | sed 's/^[[:space:]]*//')
-            if echo "$stripped" | grep -q '^//'; then
+            local stripped="${line_content#"${line_content%%[![:space:]]*}"}"
+            if [[ "$stripped" == //* ]]; then
                 continue
             fi
 
-            # Check for pattern
-            if echo "$line" | grep -qE "$pattern"; then
-                echo "VIOLATION ($description): $file:$line_num: $line"
-                violations=$((violations + 1))
-            fi
-        done < "$file"
-    done
+            echo "VIOLATION ($description): $file:$line_num: $line_content"
+            violations=$((violations + 1))
+        done <<< "$matches"
+    done < <(find "${find_args[@]}")
 }
 
 # ── Check 1: Cargo.toml dependency check ─────────────────────────────────────
