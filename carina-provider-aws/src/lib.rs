@@ -689,7 +689,6 @@ impl AwsProvider {
 
     // ========== EC2 VPC Operations ==========
 
-    /// Find VPC ID by Name tag
     /// Read an EC2 VPC
     async fn read_ec2_vpc(
         &self,
