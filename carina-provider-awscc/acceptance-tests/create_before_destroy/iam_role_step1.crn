@@ -1,0 +1,23 @@
+# IAM Role - create_before_destroy temporary name test (Step 1: Initial)
+#
+# Creates an IAM role with a fixed name and path="/".
+# Step 2 will change path (create-only) with create_before_destroy lifecycle,
+# triggering replacement with automatic temporary name generation.
+
+provider awscc {
+  region = awscc.Region.ap_northeast_1
+}
+
+let role = awscc.iam.role {
+  role_name = "carina-acc-test-cbd-role"
+  path      = "/"
+
+  assume_role_policy_document = {
+    version = "2012-10-17"
+    statement {
+      effect    = "Allow"
+      principal = { service = "lambda.amazonaws.com" }
+      action    = "sts:AssumeRole"
+    }
+  }
+}
