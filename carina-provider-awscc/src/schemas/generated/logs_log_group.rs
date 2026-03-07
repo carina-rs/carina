@@ -71,7 +71,7 @@ pub fn logs_log_group_config() -> AwsccSchemaConfig {
                 namespace: Some("awscc.logs.log_group".to_string()),
                 to_dsl: None,
             })
-                .with_description("Specifies the log group class for this log group. There are two classes:  + The ``Standard`` log class supports all CWL features.  + The ``Infrequent ...")
+                .with_description("Specifies the log group class for this log group. There are two classes: + The ``Standard`` log class supports all CWL features. + The ``Infrequent Ac...")
                 .with_provider_name("LogGroupClass")
                 .with_completions(vec![CompletionValue::new("awscc.logs.log_group.LogGroupClass.STANDARD", "STANDARD"), CompletionValue::new("awscc.logs.log_group.LogGroupClass.INFREQUENT_ACCESS", "INFREQUENT_ACCESS"), CompletionValue::new("awscc.logs.log_group.LogGroupClass.DELIVERY", "DELIVERY")]),
         )

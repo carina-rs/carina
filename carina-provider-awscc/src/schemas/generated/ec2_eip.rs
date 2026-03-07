@@ -57,7 +57,7 @@ pub fn ec2_eip_config() -> AwsccSchemaConfig {
         )
         .attribute(
             AttributeSchema::new("instance_id", super::aws_resource_id())
-                .with_description("The ID of the instance.  Updates to the ``InstanceId`` property may require *some interruptions*. Updates on an EIP reassociates the address on its as...")
+                .with_description("The ID of the instance. Updates to the ``InstanceId`` property may require *some interruptions*. Updates on an EIP reassociates the address on its ass...")
                 .with_provider_name("InstanceId"),
         )
         .attribute(
@@ -79,12 +79,12 @@ pub fn ec2_eip_config() -> AwsccSchemaConfig {
         )
         .attribute(
             AttributeSchema::new("public_ipv4_pool", AttributeType::String)
-                .with_description("The ID of an address pool that you own. Use this parameter to let Amazon EC2 select an address from the address pool.  Updates to the ``PublicIpv4Pool...")
+                .with_description("The ID of an address pool that you own. Use this parameter to let Amazon EC2 select an address from the address pool. Updates to the ``PublicIpv4Pool`...")
                 .with_provider_name("PublicIpv4Pool"),
         )
         .attribute(
             AttributeSchema::new("tags", tags_type())
-                .with_description("Any tags assigned to the Elastic IP address.  Updates to the ``Tags`` property may require *some interruptions*. Updates on an EIP reassociates the ad...")
+                .with_description("Any tags assigned to the Elastic IP address. Updates to the ``Tags`` property may require *some interruptions*. Updates on an EIP reassociates the add...")
                 .with_provider_name("Tags"),
         )
         .attribute(
