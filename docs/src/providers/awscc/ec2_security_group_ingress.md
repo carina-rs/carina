@@ -4,6 +4,28 @@ CloudFormation Type: `AWS::EC2::SecurityGroupIngress`
 
 Resource Type definition for AWS::EC2::SecurityGroupIngress
 
+## Example
+
+```crn
+let vpc = awscc.ec2.vpc {
+  cidr_block = "10.0.0.0/16"
+}
+
+let sg = awscc.ec2.security_group {
+  vpc_id            = vpc.vpc_id
+  group_description = "Example security group"
+}
+
+awscc.ec2.security_group_ingress {
+  group_id    = sg.group_id
+  description = "Allow HTTPS from VPC"
+  ip_protocol = "tcp"
+  from_port   = 443
+  to_port     = 443
+  cidr_ip     = "10.0.0.0/16"
+}
+```
+
 ## Argument Reference
 
 ### `cidr_ip`
@@ -111,25 +133,3 @@ Shorthand formats: `tcp` or `IpProtocol.tcp`
 - **Type:** String
 
 
-
-## Example
-
-```crn
-let vpc = awscc.ec2.vpc {
-  cidr_block = "10.0.0.0/16"
-}
-
-let sg = awscc.ec2.security_group {
-  vpc_id            = vpc.vpc_id
-  group_description = "Example security group"
-}
-
-awscc.ec2.security_group_ingress {
-  group_id    = sg.group_id
-  description = "Allow HTTPS from VPC"
-  ip_protocol = "tcp"
-  from_port   = 443
-  to_port     = 443
-  cidr_ip     = "10.0.0.0/16"
-}
-```
