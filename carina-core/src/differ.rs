@@ -243,12 +243,20 @@ pub fn cascade_dependent_updates(
     unresolved_resources: &[Resource],
     current_states: &HashMap<ResourceId, State>,
 ) {
-    // Build binding name -> unresolved resource mapping
+    // Build binding/key -> unresolved resource mapping.
+    // Uses the same key logic as the dependent lookup below so anonymous resources
+    // (without _binding) are also found.
     let mut binding_to_unresolved: HashMap<String, &Resource> = HashMap::new();
     for resource in unresolved_resources {
-        if let Some(Value::String(binding_name)) = resource.attributes.get("_binding") {
-            binding_to_unresolved.insert(binding_name.clone(), resource);
-        }
+        let key = resource
+            .attributes
+            .get("_binding")
+            .and_then(|v| match v {
+                Value::String(s) => Some(s.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| format!("{}:{}", resource.id.resource_type, resource.id.name));
+        binding_to_unresolved.insert(key, resource);
     }
 
     // Build reverse dependency map: replaced_binding -> [dependent_bindings]
@@ -1412,6 +1420,78 @@ mod tests {
         } = &plan.effects()[0]
         {
             assert_eq!(cascading_updates.len(), 1);
+            assert_eq!(cascading_updates[0].id, subnet_id);
+        } else {
+            panic!("Expected Replace effect");
+        }
+    }
+
+    #[test]
+    fn cascade_anonymous_resource_dependent() {
+        // Anonymous resource (no _binding) that depends on a replaced resource
+        // should still get a cascading update
+
+        let vpc_id = ResourceId::new("ec2.vpc", "my-vpc");
+        let subnet_id = ResourceId::new("ec2.subnet", "my-subnet");
+
+        let vpc = Resource::new("ec2.vpc", "my-vpc")
+            .with_attribute("_binding", Value::String("vpc".to_string()))
+            .with_attribute("cidr_block", Value::String("10.1.0.0/16".to_string()));
+
+        // Anonymous subnet (no _binding) with a ResourceRef to the VPC
+        let subnet = Resource::new("ec2.subnet", "my-subnet").with_attribute(
+            "vpc_id",
+            Value::ResourceRef {
+                binding_name: "vpc".to_string(),
+                attribute_name: "vpc_id".to_string(),
+            },
+        );
+
+        let unresolved_resources = vec![vpc.clone(), subnet.clone()];
+
+        let mut current_states = HashMap::new();
+        let mut vpc_attrs = HashMap::new();
+        vpc_attrs.insert(
+            "cidr_block".to_string(),
+            Value::String("10.0.0.0/16".to_string()),
+        );
+        vpc_attrs.insert("vpc_id".to_string(), Value::String("vpc-old".to_string()));
+        current_states.insert(
+            vpc_id.clone(),
+            State::existing(vpc_id.clone(), vpc_attrs).with_identifier("vpc-old"),
+        );
+
+        let mut subnet_attrs = HashMap::new();
+        subnet_attrs.insert("vpc_id".to_string(), Value::String("vpc-old".to_string()));
+        current_states.insert(
+            subnet_id.clone(),
+            State::existing(subnet_id.clone(), subnet_attrs).with_identifier("subnet-123"),
+        );
+
+        let mut plan = Plan::new();
+        plan.add(Effect::Replace {
+            id: vpc_id.clone(),
+            from: Box::new(current_states.get(&vpc_id).unwrap().clone()),
+            to: vpc.clone(),
+            lifecycle: LifecycleConfig {
+                force_delete: false,
+                create_before_destroy: true,
+            },
+            changed_create_only: vec!["cidr_block".to_string()],
+            cascading_updates: vec![],
+        });
+
+        cascade_dependent_updates(&mut plan, &unresolved_resources, &current_states);
+
+        if let Effect::Replace {
+            cascading_updates, ..
+        } = &plan.effects()[0]
+        {
+            assert_eq!(
+                cascading_updates.len(),
+                1,
+                "Anonymous resource should get cascading update"
+            );
             assert_eq!(cascading_updates[0].id, subnet_id);
         } else {
             panic!("Expected Replace effect");
