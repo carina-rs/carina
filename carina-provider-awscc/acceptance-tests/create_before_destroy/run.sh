@@ -1,20 +1,20 @@
 #!/bin/bash
-# Multi-step acceptance test for create_before_destroy with temporary name generation
+# Multi-step acceptance tests for create_before_destroy
 #
 # Usage:
-#   aws-vault exec <profile> -- ./run.sh
+#   aws-vault exec <profile> -- ./run.sh [filter]
 #
-# This test verifies:
-#   1. Create initial IAM role with fixed name and path="/"
-#   2. Change path (create-only) with create_before_destroy → triggers replacement
-#      with automatic temporary name for role_name
-#   3. Plan-verify after replacement is idempotent
-#   4. Destroy all resources
+# Tests:
+#   iam_role - Replacement with temporary name (name_attribute + other create-only)
+#   ec2_vpc  - Replacement without temporary name (no name_attribute)
+#
+# Filter (optional): substring to match test names (e.g. "iam_role", "ec2_vpc")
 
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+FILTER="${1:-}"
 
 CARINA_BIN="$PROJECT_ROOT/target/debug/carina"
 if [ ! -f "$CARINA_BIN" ]; then
@@ -22,107 +22,145 @@ if [ ! -f "$CARINA_BIN" ]; then
     cargo build --quiet 2>/dev/null || cargo build
 fi
 
-WORK_DIR=$(mktemp -d)
-trap "rm -rf $WORK_DIR" EXIT
-
-STEP1="$SCRIPT_DIR/iam_role_step1.crn"
-STEP2="$SCRIPT_DIR/iam_role_step2.crn"
-
-PASSED=0
-FAILED=0
+TOTAL_PASSED=0
+TOTAL_FAILED=0
 
 run_step() {
-    local description="$1"
-    local command="$2"
-    local crn_file="$3"
-    local extra_args="${4:-}"
+    local work_dir="$1"
+    local description="$2"
+    local command="$3"
+    local crn_file="$4"
+    local extra_args="${5:-}"
 
     printf "  %-55s " "$description"
 
     local output
-    if output=$(cd "$WORK_DIR" && "$CARINA_BIN" $command $extra_args "$crn_file" 2>&1); then
+    if output=$(cd "$work_dir" && "$CARINA_BIN" $command $extra_args "$crn_file" 2>&1); then
         echo "OK"
-        PASSED=$((PASSED + 1))
+        TOTAL_PASSED=$((TOTAL_PASSED + 1))
         return 0
     else
         echo "FAIL"
         echo "  ERROR: $output"
-        FAILED=$((FAILED + 1))
+        TOTAL_FAILED=$((TOTAL_FAILED + 1))
         return 1
     fi
 }
 
 run_plan_verify() {
-    local description="$1"
-    local crn_file="$2"
+    local work_dir="$1"
+    local description="$2"
+    local crn_file="$3"
 
     printf "  %-55s " "$description"
 
     local output
     local rc
-    output=$(cd "$WORK_DIR" && "$CARINA_BIN" plan --detailed-exitcode "$crn_file" 2>&1) || rc=$?
+    output=$(cd "$work_dir" && "$CARINA_BIN" plan --detailed-exitcode "$crn_file" 2>&1) || rc=$?
     rc=${rc:-0}
 
     if [ $rc -eq 2 ]; then
         echo "FAIL"
         echo "  ERROR: Post-apply plan detected changes (not idempotent):"
         echo "  $output"
-        FAILED=$((FAILED + 1))
+        TOTAL_FAILED=$((TOTAL_FAILED + 1))
         return 1
     elif [ $rc -ne 0 ]; then
         echo "FAIL"
         echo "  ERROR: $output"
-        FAILED=$((FAILED + 1))
+        TOTAL_FAILED=$((TOTAL_FAILED + 1))
         return 1
     fi
 
     echo "OK"
-    PASSED=$((PASSED + 1))
+    TOTAL_PASSED=$((TOTAL_PASSED + 1))
     return 0
 }
 
-echo "create_before_destroy temporary name test (IAM Role)"
+# Cleanup helper: try to destroy with both step configs
+cleanup() {
+    local work_dir="$1"
+    local step2="$2"
+    local step1="$3"
+    cd "$work_dir" && "$CARINA_BIN" destroy --auto-approve "$step2" 2>&1 || true
+    cd "$work_dir" && "$CARINA_BIN" destroy --auto-approve "$step1" 2>&1 || true
+}
+
+# Run a single multi-step test
+# Args: test_name step1_crn step2_crn description
+run_test() {
+    local test_name="$1"
+    local step1="$2"
+    local step2="$3"
+    local desc="$4"
+
+    # Apply filter
+    if [ -n "$FILTER" ] && [[ "$test_name" != *"$FILTER"* ]]; then
+        return 0
+    fi
+
+    local work_dir
+    work_dir=$(mktemp -d)
+
+    echo "$desc"
+    echo ""
+
+    # Step 1: Apply initial config
+    if ! run_step "$work_dir" "step1: apply initial" "apply" "$step1" "--auto-approve"; then
+        rm -rf "$work_dir"
+        return 1
+    fi
+
+    # Step 1b: Plan-verify initial state
+    if ! run_plan_verify "$work_dir" "step1: plan-verify initial" "$step1"; then
+        cleanup "$work_dir" "$step2" "$step1"
+        rm -rf "$work_dir"
+        return 1
+    fi
+
+    # Step 2: Apply modified config (triggers create_before_destroy replacement)
+    if ! run_step "$work_dir" "step2: apply replace (create_before_destroy)" "apply" "$step2" "--auto-approve"; then
+        cleanup "$work_dir" "$step2" "$step1"
+        rm -rf "$work_dir"
+        return 1
+    fi
+
+    # Step 3: Plan-verify after replacement
+    if ! run_plan_verify "$work_dir" "step3: plan-verify after replace" "$step2"; then
+        cleanup "$work_dir" "$step2" "$step1"
+        rm -rf "$work_dir"
+        return 1
+    fi
+
+    # Step 4: Destroy
+    run_step "$work_dir" "step4: destroy" "destroy" "$step2" "--auto-approve"
+
+    rm -rf "$work_dir"
+    echo ""
+}
+
+echo "create_before_destroy multi-step acceptance tests"
+echo "════════════════════════════════════════"
 echo ""
 
-# Step 1: Apply initial config
-if ! run_step "step1: apply initial (path=/)" "apply" "$STEP1" "--auto-approve"; then
-    echo ""
-    echo "Results: $PASSED passed, $FAILED failed"
-    exit 1
-fi
+# Test 1: IAM Role - replacement WITH temporary name
+# name_attribute=role_name, path is another create-only property
+run_test "iam_role" \
+    "$SCRIPT_DIR/iam_role_step1.crn" \
+    "$SCRIPT_DIR/iam_role_step2.crn" \
+    "Test 1: IAM Role (temporary name generation, can_rename=false)"
 
-# Step 1b: Plan-verify initial state
-if ! run_plan_verify "step1: plan-verify initial" "$STEP1"; then
-    cd "$WORK_DIR" && "$CARINA_BIN" destroy --auto-approve "$STEP1" 2>&1 || true
-    echo ""
-    echo "Results: $PASSED passed, $FAILED failed"
-    exit 1
-fi
+# Test 2: EC2 VPC - replacement WITHOUT temporary name
+# No name_attribute, cidr_block is create-only
+run_test "ec2_vpc" \
+    "$SCRIPT_DIR/ec2_vpc_step1.crn" \
+    "$SCRIPT_DIR/ec2_vpc_step2.crn" \
+    "Test 2: EC2 VPC (no name_attribute, no temporary name)"
 
-# Step 2: Apply modified config (path changes → replacement with temp name)
-if ! run_step "step2: apply replace (path=/carina/, cbd)" "apply" "$STEP2" "--auto-approve"; then
-    # Try to destroy with both configs to clean up
-    cd "$WORK_DIR" && "$CARINA_BIN" destroy --auto-approve "$STEP2" 2>&1 || true
-    cd "$WORK_DIR" && "$CARINA_BIN" destroy --auto-approve "$STEP1" 2>&1 || true
-    echo ""
-    echo "Results: $PASSED passed, $FAILED failed"
-    exit 1
-fi
+echo "════════════════════════════════════════"
+echo "Total: $TOTAL_PASSED passed, $TOTAL_FAILED failed"
+echo "════════════════════════════════════════"
 
-# Step 3: Plan-verify after replacement
-if ! run_plan_verify "step3: plan-verify after replace" "$STEP2"; then
-    cd "$WORK_DIR" && "$CARINA_BIN" destroy --auto-approve "$STEP2" 2>&1 || true
-    echo ""
-    echo "Results: $PASSED passed, $FAILED failed"
-    exit 1
-fi
-
-# Step 4: Destroy
-run_step "step4: destroy" "destroy" "$STEP2" "--auto-approve"
-
-echo ""
-echo "Results: $PASSED passed, $FAILED failed"
-
-if [ $FAILED -gt 0 ]; then
+if [ $TOTAL_FAILED -gt 0 ]; then
     exit 1
 fi
