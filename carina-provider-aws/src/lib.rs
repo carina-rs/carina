@@ -397,17 +397,11 @@ impl AwsProvider {
                 attributes.insert("id".to_string(), Value::String(vpc_id.clone()));
             }
 
-            // Instance tenancy - convert to DSL format
+            // Instance tenancy - return plain value, normalize_state_enums handles namespacing
             if let Some(tenancy) = vpc.instance_tenancy() {
-                let tenancy_str = match tenancy {
-                    aws_sdk_ec2::types::Tenancy::Default => "aws.vpc.InstanceTenancy.default",
-                    aws_sdk_ec2::types::Tenancy::Dedicated => "aws.vpc.InstanceTenancy.dedicated",
-                    aws_sdk_ec2::types::Tenancy::Host => "aws.vpc.InstanceTenancy.host",
-                    _ => "aws.vpc.InstanceTenancy.default",
-                };
                 attributes.insert(
                     "instance_tenancy".to_string(),
-                    Value::String(tenancy_str.to_string()),
+                    Value::String(tenancy.as_str().to_string()),
                 );
             }
 
