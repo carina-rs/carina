@@ -11,6 +11,25 @@ use carina_core::resource::Value;
 use carina_core::schema::{AttributeSchema, AttributeType, CompletionValue, ResourceSchema};
 
 #[allow(dead_code)]
+const VALID_ACL: &[&str] = &[
+    "authenticated-read",
+    "private",
+    "public-read",
+    "public-read-write",
+];
+
+#[allow(dead_code)]
+fn validate_acl(value: &Value) -> Result<(), String> {
+    validate_namespaced_enum(value, "ACL", "aws.s3.bucket", VALID_ACL).map_err(|reason| {
+        if let Value::String(s) = value {
+            format!("Invalid ACL '{}': {}", s, reason)
+        } else {
+            reason
+        }
+    })
+}
+
+#[allow(dead_code)]
 const VALID_OBJECT_OWNERSHIP: &[&str] = &[
     "BucketOwnerEnforced",
     "BucketOwnerPreferred",
@@ -71,6 +90,43 @@ pub fn s3_bucket_config() -> AwsSchemaConfig {
                 .with_description("The AWS region (inherited from provider if not specified)"),
         )
         .attribute(
+            AttributeSchema::new("acl", AttributeType::Custom {
+                name: "ACL".to_string(),
+                base: Box::new(AttributeType::String),
+                validate: validate_acl,
+                namespace: Some("aws.s3.bucket".to_string()),
+                to_dsl: Some(|s: &str| s.replace('-', "_")),
+            })
+                .with_description("The canned ACL to apply to the bucket. This functionality is not supported for directory buckets.")
+                .with_provider_name("ACL")
+                .with_completions(vec![CompletionValue::new("aws.s3.bucket.ACL.authenticated_read", "authenticated-read"), CompletionValue::new("aws.s3.bucket.ACL.private", "private"), CompletionValue::new("aws.s3.bucket.ACL.public_read", "public-read"), CompletionValue::new("aws.s3.bucket.ACL.public_read_write", "public-read-write")]),
+        )
+        .attribute(
+            AttributeSchema::new("grant_full_control", AttributeType::String)
+                .with_description("Allows grantee the read, write, read ACP, and write ACP permissions on the bucket. This functionality is not supported for directory buckets.")
+                .with_provider_name("GrantFullControl"),
+        )
+        .attribute(
+            AttributeSchema::new("grant_read", AttributeType::String)
+                .with_description("Allows grantee to list the objects in the bucket. This functionality is not supported for directory buckets.")
+                .with_provider_name("GrantRead"),
+        )
+        .attribute(
+            AttributeSchema::new("grant_read_acp", AttributeType::String)
+                .with_description("Allows grantee to read the bucket ACL. This functionality is not supported for directory buckets.")
+                .with_provider_name("GrantReadACP"),
+        )
+        .attribute(
+            AttributeSchema::new("grant_write", AttributeType::String)
+                .with_description("Allows grantee to create new objects in the bucket. For the bucket and object owners of existing objects, also allows deletions and overwrites of thos...")
+                .with_provider_name("GrantWrite"),
+        )
+        .attribute(
+            AttributeSchema::new("grant_write_acp", AttributeType::String)
+                .with_description("Allows grantee to write the ACL for the applicable bucket. This functionality is not supported for directory buckets.")
+                .with_provider_name("GrantWriteACP"),
+        )
+        .attribute(
             AttributeSchema::new("object_lock_enabled_for_bucket", AttributeType::Bool)
                 .create_only()
                 .with_description("Specifies whether you want S3 Object Lock to be enabled for the new bucket. This functionality is not supported for directory buckets.")
@@ -115,6 +171,7 @@ pub fn enum_valid_values() -> (
     (
         "s3.bucket",
         &[
+            ("acl", VALID_ACL),
             ("object_ownership", VALID_OBJECT_OWNERSHIP),
             ("versioning_status", VALID_VERSIONING_STATUS),
         ],

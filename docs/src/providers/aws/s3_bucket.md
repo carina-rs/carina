@@ -4,6 +4,48 @@ CloudFormation Type: `AWS::S3::Bucket`
 
 ## Argument Reference
 
+### `acl`
+
+- **Type:** [Enum (ACL)](#acl-acl)
+- **Required:** No
+
+The canned ACL to apply to the bucket. This functionality is not supported for directory buckets.
+
+### `grant_full_control`
+
+- **Type:** String
+- **Required:** No
+
+Allows grantee the read, write, read ACP, and write ACP permissions on the bucket. This functionality is not supported for directory buckets.
+
+### `grant_read`
+
+- **Type:** String
+- **Required:** No
+
+Allows grantee to list the objects in the bucket. This functionality is not supported for directory buckets.
+
+### `grant_read_acp`
+
+- **Type:** String
+- **Required:** No
+
+Allows grantee to read the bucket ACL. This functionality is not supported for directory buckets.
+
+### `grant_write`
+
+- **Type:** String
+- **Required:** No
+
+Allows grantee to create new objects in the bucket. For the bucket and object owners of existing objects, also allows deletions and overwrites of those objects. This functionality is not supported for directory buckets.
+
+### `grant_write_acp`
+
+- **Type:** String
+- **Required:** No
+
+Allows grantee to write the ACL for the applicable bucket. This functionality is not supported for directory buckets.
+
 ### `object_lock_enabled_for_bucket`
 
 - **Type:** Bool
@@ -31,6 +73,17 @@ The versioning state of the bucket.
 The tags for the resource.
 
 ## Enum Values
+
+### acl (ACL)
+
+| Value | DSL Identifier |
+|-------|----------------|
+| `authenticated-read` | `aws.s3.bucket.ACL.authenticated_read` |
+| `private` | `aws.s3.bucket.ACL.private` |
+| `public-read` | `aws.s3.bucket.ACL.public_read` |
+| `public-read-write` | `aws.s3.bucket.ACL.public_read_write` |
+
+Shorthand formats: `authenticated_read` or `ACL.authenticated_read`
 
 ### object_ownership (ObjectOwnership)
 

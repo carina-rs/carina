@@ -174,6 +174,9 @@ impl AwsProvider {
                 // Get Object Lock status
                 self.read_s3_bucket_object_lock(name, &mut attributes).await;
 
+                // Get ACL
+                self.read_s3_bucket_acl(name, &mut attributes).await;
+
                 // S3 bucket identifier is the bucket name
                 Ok(State::existing(id.clone(), attributes).with_identifier(name))
             }
@@ -251,6 +254,28 @@ impl AwsProvider {
             req = req.object_ownership(ObjectOwnership::from(normalized));
         }
 
+        // Set ACL on create
+        if let Some(Value::String(val)) = resource.attributes.get("acl") {
+            use aws_sdk_s3::types::BucketCannedAcl;
+            let normalized = extract_enum_value(val);
+            req = req.acl(BucketCannedAcl::from(normalized));
+        }
+        if let Some(Value::String(val)) = resource.attributes.get("grant_full_control") {
+            req = req.grant_full_control(val);
+        }
+        if let Some(Value::String(val)) = resource.attributes.get("grant_read") {
+            req = req.grant_read(val);
+        }
+        if let Some(Value::String(val)) = resource.attributes.get("grant_read_acp") {
+            req = req.grant_read_acp(val);
+        }
+        if let Some(Value::String(val)) = resource.attributes.get("grant_write") {
+            req = req.grant_write(val);
+        }
+        if let Some(Value::String(val)) = resource.attributes.get("grant_write_acp") {
+            req = req.grant_write_acp(val);
+        }
+
         req.send().await.map_err(|e| {
             ProviderError::new(format!("Failed to create bucket: {:?}", e))
                 .for_resource(resource.id.clone())
@@ -279,6 +304,10 @@ impl AwsProvider {
 
         // Update object ownership
         self.write_s3_bucket_ownership_controls(&id, &bucket_name, &to.attributes)
+            .await?;
+
+        // Update ACL
+        self.write_s3_bucket_acl(&id, &bucket_name, &to.attributes)
             .await?;
 
         self.read_s3_bucket(&id, Some(&bucket_name)).await
@@ -373,6 +402,159 @@ impl AwsProvider {
                 );
             }
         }
+    }
+
+    /// Read S3 bucket ACL
+    async fn read_s3_bucket_acl(&self, identifier: &str, attributes: &mut HashMap<String, Value>) {
+        let Ok(output) = self
+            .s3_client
+            .get_bucket_acl()
+            .bucket(identifier)
+            .send()
+            .await
+        else {
+            return;
+        };
+
+        let owner_id = output
+            .owner()
+            .and_then(|o| o.id())
+            .unwrap_or("")
+            .to_string();
+
+        let grants = output.grants();
+
+        // Classify grants by permission, collecting grantee strings
+        let mut full_control: Vec<String> = Vec::new();
+        let mut read: Vec<String> = Vec::new();
+        let mut read_acp: Vec<String> = Vec::new();
+        let mut write: Vec<String> = Vec::new();
+        let mut write_acp: Vec<String> = Vec::new();
+
+        for grant in grants {
+            let Some(grantee) = grant.grantee() else {
+                continue;
+            };
+            let Some(permission) = grant.permission() else {
+                continue;
+            };
+
+            // Build grantee string in header format
+            let grantee_str = if let Some(uri) = grantee.uri() {
+                format!("uri=\"{}\"", uri)
+            } else if let Some(id) = grantee.id() {
+                format!("id=\"{}\"", id)
+            } else if let Some(email) = grantee.email_address() {
+                format!("emailAddress=\"{}\"", email)
+            } else {
+                continue;
+            };
+
+            // Skip owner's FULL_CONTROL (it's implicit)
+            let is_owner = grantee.id().is_some_and(|id| id == owner_id);
+
+            use aws_sdk_s3::types::Permission;
+            match permission {
+                Permission::FullControl => {
+                    if !is_owner {
+                        full_control.push(grantee_str);
+                    }
+                }
+                Permission::Read => read.push(grantee_str),
+                Permission::ReadAcp => read_acp.push(grantee_str),
+                Permission::Write => write.push(grantee_str),
+                Permission::WriteAcp => write_acp.push(grantee_str),
+                _ => {}
+            }
+        }
+
+        // Try to infer canned ACL
+        let canned_acl = infer_canned_acl(&full_control, &read, &read_acp, &write, &write_acp);
+
+        if let Some(acl) = canned_acl {
+            attributes.insert("acl".to_string(), Value::String(acl.to_string()));
+        }
+
+        // Set grant fields if non-empty
+        if !full_control.is_empty() {
+            attributes.insert(
+                "grant_full_control".to_string(),
+                Value::String(full_control.join(", ")),
+            );
+        }
+        if !read.is_empty() {
+            attributes.insert("grant_read".to_string(), Value::String(read.join(", ")));
+        }
+        if !read_acp.is_empty() {
+            attributes.insert(
+                "grant_read_acp".to_string(),
+                Value::String(read_acp.join(", ")),
+            );
+        }
+        if !write.is_empty() {
+            attributes.insert("grant_write".to_string(), Value::String(write.join(", ")));
+        }
+        if !write_acp.is_empty() {
+            attributes.insert(
+                "grant_write_acp".to_string(),
+                Value::String(write_acp.join(", ")),
+            );
+        }
+    }
+
+    /// Write S3 bucket ACL
+    async fn write_s3_bucket_acl(
+        &self,
+        id: &ResourceId,
+        identifier: &str,
+        attributes: &HashMap<String, Value>,
+    ) -> ProviderResult<()> {
+        let acl = extract_string_attr(attributes, "acl");
+        let grant_full_control = extract_string_attr(attributes, "grant_full_control");
+        let grant_read = extract_string_attr(attributes, "grant_read");
+        let grant_read_acp = extract_string_attr(attributes, "grant_read_acp");
+        let grant_write = extract_string_attr(attributes, "grant_write");
+        let grant_write_acp = extract_string_attr(attributes, "grant_write_acp");
+
+        let has_acl = acl.is_some()
+            || grant_full_control.is_some()
+            || grant_read.is_some()
+            || grant_read_acp.is_some()
+            || grant_write.is_some()
+            || grant_write_acp.is_some();
+
+        if !has_acl {
+            return Ok(());
+        }
+
+        use aws_sdk_s3::types::BucketCannedAcl;
+        let mut req = self.s3_client.put_bucket_acl().bucket(identifier);
+
+        if let Some(val) = acl {
+            let normalized = extract_enum_value(val);
+            req = req.acl(BucketCannedAcl::from(normalized));
+        }
+        if let Some(val) = grant_full_control {
+            req = req.grant_full_control(val);
+        }
+        if let Some(val) = grant_read {
+            req = req.grant_read(val);
+        }
+        if let Some(val) = grant_read_acp {
+            req = req.grant_read_acp(val);
+        }
+        if let Some(val) = grant_write {
+            req = req.grant_write(val);
+        }
+        if let Some(val) = grant_write_acp {
+            req = req.grant_write_acp(val);
+        }
+
+        req.send().await.map_err(|e| {
+            ProviderError::new(format!("Failed to put bucket ACL: {}", e)).for_resource(id.clone())
+        })?;
+
+        Ok(())
     }
 
     // ========== EC2 VPC Operations ==========
@@ -2248,6 +2430,76 @@ fn normalize_state_enums(resource_type: &str, attributes: &mut HashMap<String, V
     }
 }
 
+fn extract_string_attr<'a>(attributes: &'a HashMap<String, Value>, key: &str) -> Option<&'a str> {
+    match attributes.get(key) {
+        Some(Value::String(s)) => Some(s.as_str()),
+        _ => None,
+    }
+}
+
+const ALL_USERS_URI: &str = "http://acs.amazonaws.com/groups/global/AllUsers";
+const AUTH_USERS_URI: &str = "http://acs.amazonaws.com/groups/global/AuthenticatedUsers";
+
+/// Infer a canned ACL from the grant lists.
+/// Returns None if the grants don't match any known canned ACL pattern.
+fn infer_canned_acl(
+    full_control: &[String],
+    read: &[String],
+    read_acp: &[String],
+    write: &[String],
+    write_acp: &[String],
+) -> Option<&'static str> {
+    let all_users_read = format!("uri=\"{}\"", ALL_USERS_URI);
+    let all_users_write = format!("uri=\"{}\"", ALL_USERS_URI);
+    let auth_users_read = format!("uri=\"{}\"", AUTH_USERS_URI);
+
+    // private: no non-owner grants
+    if full_control.is_empty()
+        && read.is_empty()
+        && read_acp.is_empty()
+        && write.is_empty()
+        && write_acp.is_empty()
+    {
+        return Some("private");
+    }
+
+    // public-read: AllUsers READ, nothing else
+    if full_control.is_empty()
+        && read.len() == 1
+        && read[0] == all_users_read
+        && read_acp.is_empty()
+        && write.is_empty()
+        && write_acp.is_empty()
+    {
+        return Some("public-read");
+    }
+
+    // public-read-write: AllUsers READ + WRITE, nothing else
+    if full_control.is_empty()
+        && read.len() == 1
+        && read[0] == all_users_read
+        && read_acp.is_empty()
+        && write.len() == 1
+        && write[0] == all_users_write
+        && write_acp.is_empty()
+    {
+        return Some("public-read-write");
+    }
+
+    // authenticated-read: AuthenticatedUsers READ, nothing else
+    if full_control.is_empty()
+        && read.len() == 1
+        && read[0] == auth_users_read
+        && read_acp.is_empty()
+        && write.is_empty()
+        && write_acp.is_empty()
+    {
+        return Some("authenticated-read");
+    }
+
+    None
+}
+
 /// Convert protocol value from DSL format to AWS format
 /// - aws.Protocol.tcp / Protocol.tcp / tcp -> tcp
 /// - aws.Protocol.all / Protocol.all / all / -1 -> -1
@@ -2452,5 +2704,40 @@ mod tests {
                 "aws.s3.bucket.VersioningStatus.Enabled".to_string()
             ))
         );
+    }
+
+    #[test]
+    fn test_infer_canned_acl_private() {
+        let result = infer_canned_acl(&[], &[], &[], &[], &[]);
+        assert_eq!(result, Some("private"));
+    }
+
+    #[test]
+    fn test_infer_canned_acl_public_read() {
+        let all_users_read = format!("uri=\"{}\"", ALL_USERS_URI);
+        let result = infer_canned_acl(&[], &[all_users_read], &[], &[], &[]);
+        assert_eq!(result, Some("public-read"));
+    }
+
+    #[test]
+    fn test_infer_canned_acl_public_read_write() {
+        let all_users_read = format!("uri=\"{}\"", ALL_USERS_URI);
+        let all_users_write = format!("uri=\"{}\"", ALL_USERS_URI);
+        let result = infer_canned_acl(&[], &[all_users_read], &[], &[all_users_write], &[]);
+        assert_eq!(result, Some("public-read-write"));
+    }
+
+    #[test]
+    fn test_infer_canned_acl_authenticated_read() {
+        let auth_users_read = format!("uri=\"{}\"", AUTH_USERS_URI);
+        let result = infer_canned_acl(&[], &[auth_users_read], &[], &[], &[]);
+        assert_eq!(result, Some("authenticated-read"));
+    }
+
+    #[test]
+    fn test_infer_canned_acl_unknown() {
+        let custom = vec!["id=\"abc123\"".to_string()];
+        let result = infer_canned_acl(&custom, &[], &[], &[], &[]);
+        assert_eq!(result, None);
     }
 }
