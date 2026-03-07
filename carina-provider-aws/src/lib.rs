@@ -146,6 +146,75 @@ impl AwsProvider {
         }
     }
 
+    /// Extract tags (excluding "Name") from EC2 tag list into a Value::Map
+    fn ec2_tags_to_value(tags: &[aws_sdk_ec2::types::Tag]) -> Option<Value> {
+        let mut tag_map = HashMap::new();
+        for tag in tags {
+            if let (Some(key), Some(value)) = (tag.key(), tag.value())
+                && key != "Name"
+            {
+                tag_map.insert(key.to_string(), Value::String(value.to_string()));
+            }
+        }
+        if tag_map.is_empty() {
+            None
+        } else {
+            Some(Value::Map(tag_map))
+        }
+    }
+
+    /// Build EC2 Tag list from Value::Map (excluding "Name" which is handled separately)
+    fn value_to_ec2_tags(value: &Value) -> Vec<aws_sdk_ec2::types::Tag> {
+        let mut tags = Vec::new();
+        if let Value::Map(map) = value {
+            for (key, val) in map {
+                if let Value::String(v) = val {
+                    tags.push(aws_sdk_ec2::types::Tag::builder().key(key).value(v).build());
+                }
+            }
+        }
+        tags
+    }
+
+    /// Apply tags to an EC2 resource (Name tag + user tags)
+    async fn apply_ec2_tags(
+        &self,
+        resource_id: &ResourceId,
+        ec2_resource_id: &str,
+        name: Option<&str>,
+        attributes: &HashMap<String, Value>,
+    ) -> ProviderResult<()> {
+        let mut tags = Vec::new();
+
+        // Name tag
+        if let Some(name) = name {
+            tags.push(
+                aws_sdk_ec2::types::Tag::builder()
+                    .key("Name")
+                    .value(name)
+                    .build(),
+            );
+        }
+
+        // User-defined tags
+        if let Some(tag_value) = attributes.get("tags") {
+            tags.extend(Self::value_to_ec2_tags(tag_value));
+        }
+
+        if !tags.is_empty() {
+            let mut req = self.ec2_client.create_tags().resources(ec2_resource_id);
+            for tag in tags {
+                req = req.tags(tag);
+            }
+            req.send().await.map_err(|e| {
+                ProviderError::new(format!("Failed to tag resource: {:?}", e))
+                    .for_resource(resource_id.clone())
+            })?;
+        }
+
+        Ok(())
+    }
+
     /// Read an S3 bucket
     async fn read_s3_bucket(
         &self,
@@ -176,6 +245,9 @@ impl AwsProvider {
 
                 // Get ACL
                 self.read_s3_bucket_acl(name, &mut attributes).await;
+
+                // Get tags
+                self.read_s3_bucket_tags(name, &mut attributes).await;
 
                 // S3 bucket identifier is the bucket name
                 Ok(State::existing(id.clone(), attributes).with_identifier(name))
@@ -285,6 +357,10 @@ impl AwsProvider {
         self.write_s3_bucket_versioning(&resource.id, &bucket_name, &resource.attributes)
             .await?;
 
+        // Set tags
+        self.write_s3_bucket_tags(&resource.id, &bucket_name, &resource.attributes)
+            .await?;
+
         // Return state after creation
         self.read_s3_bucket(&resource.id, Some(&bucket_name)).await
     }
@@ -308,6 +384,10 @@ impl AwsProvider {
 
         // Update ACL
         self.write_s3_bucket_acl(&id, &bucket_name, &to.attributes)
+            .await?;
+
+        // Update tags
+        self.write_s3_bucket_tags(&id, &bucket_name, &to.attributes)
             .await?;
 
         self.read_s3_bucket(&id, Some(&bucket_name)).await
@@ -559,6 +639,71 @@ impl AwsProvider {
         Ok(())
     }
 
+    /// Read S3 bucket tags
+    async fn read_s3_bucket_tags(&self, identifier: &str, attributes: &mut HashMap<String, Value>) {
+        if let Ok(output) = self
+            .s3_client
+            .get_bucket_tagging()
+            .bucket(identifier)
+            .send()
+            .await
+        {
+            let mut tag_map = HashMap::new();
+            for tag in output.tag_set() {
+                tag_map.insert(
+                    tag.key().to_string(),
+                    Value::String(tag.value().to_string()),
+                );
+            }
+            if !tag_map.is_empty() {
+                attributes.insert("tags".to_string(), Value::Map(tag_map));
+            }
+        }
+    }
+
+    /// Write S3 bucket tags
+    async fn write_s3_bucket_tags(
+        &self,
+        id: &ResourceId,
+        identifier: &str,
+        attributes: &HashMap<String, Value>,
+    ) -> ProviderResult<()> {
+        if let Some(Value::Map(tag_map)) = attributes.get("tags") {
+            use aws_sdk_s3::types::{Tag, Tagging};
+            let tags: Vec<Tag> = tag_map
+                .iter()
+                .filter_map(|(k, v)| {
+                    if let Value::String(val) = v {
+                        Some(Tag::builder().key(k).value(val).build().ok()?)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            let tagging = Tagging::builder()
+                .set_tag_set(Some(tags))
+                .build()
+                .map_err(|e| {
+                    ProviderError::new(format!("Failed to build tagging: {:?}", e))
+                        .for_resource(id.clone())
+                })?;
+
+            self.s3_client
+                .put_bucket_tagging()
+                .bucket(identifier)
+                .tagging(tagging)
+                .send()
+                .await
+                .map_err(|e| {
+                    ProviderError::new(format!("Failed to put bucket tags: {:?}", e))
+                        .for_resource(id.clone())
+                })?;
+        }
+
+        Ok(())
+    }
+
     // ========== EC2 VPC Operations ==========
 
     /// Find VPC ID by Name tag
@@ -628,6 +773,11 @@ impl AwsProvider {
                     "instance_tenancy".to_string(),
                     Value::String(tenancy.as_str().to_string()),
                 );
+            }
+
+            // Extract user-defined tags (excluding Name)
+            if let Some(tags_value) = Self::ec2_tags_to_value(vpc.tags()) {
+                attributes.insert("tags".to_string(), tags_value);
             }
 
             // Get VPC attributes for DNS settings
@@ -715,24 +865,9 @@ impl AwsProvider {
             ProviderError::new("VPC created but no ID returned").for_resource(resource.id.clone())
         })?;
 
-        // Tag with Name (if provided)
-        if let Some(ref name) = name {
-            self.ec2_client
-                .create_tags()
-                .resources(vpc_id)
-                .tags(
-                    aws_sdk_ec2::types::Tag::builder()
-                        .key("Name")
-                        .value(name)
-                        .build(),
-                )
-                .send()
-                .await
-                .map_err(|e| {
-                    ProviderError::new(format!("Failed to tag VPC: {:?}", e))
-                        .for_resource(resource.id.clone())
-                })?;
-        }
+        // Apply tags (Name + user-defined tags)
+        self.apply_ec2_tags(&resource.id, vpc_id, name.as_deref(), &resource.attributes)
+            .await?;
 
         // Configure DNS support
         if let Some(Value::Bool(enabled)) = resource.attributes.get("enable_dns_support") {
@@ -819,6 +954,14 @@ impl AwsProvider {
                         .for_resource(id.clone())
                 })?;
         }
+
+        // Update tags
+        let name = to.attributes.get("name").and_then(|v| match v {
+            Value::String(s) => Some(s.clone()),
+            _ => None,
+        });
+        self.apply_ec2_tags(&id, &vpc_id, name.as_deref(), &to.attributes)
+            .await?;
 
         self.read_ec2_vpc(&id, Some(identifier)).await
     }
