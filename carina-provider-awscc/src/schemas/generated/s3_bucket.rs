@@ -446,7 +446,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                     StructField::new("destination", AttributeType::Struct {
                     name: "Destination".to_string(),
                     fields: vec![
-                    StructField::new("bucket_account_id", AttributeType::String).with_description("The account ID that owns the destination S3 bucket. If no account ID is provided, the owner is not validated before exporting data.  Although this val...").with_provider_name("BucketAccountId"),
+                    StructField::new("bucket_account_id", AttributeType::String).with_description("The account ID that owns the destination S3 bucket. If no account ID is provided, the owner is not validated before exporting data. Although this valu...").with_provider_name("BucketAccountId"),
                     StructField::new("bucket_arn", super::arn()).required().with_description("The Amazon Resource Name (ARN) of the bucket to which data is exported.").with_provider_name("BucketArn"),
                     StructField::new("format", AttributeType::Custom {
                 name: "Format".to_string(),
@@ -485,15 +485,15 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                     StructField::new("blocked_encryption_types", AttributeType::Struct {
                     name: "BlockedEncryptionTypes".to_string(),
                     fields: vec![
-                    StructField::new("encryption_type", AttributeType::String).with_description("The object encryption type that you want to block or unblock for an Amazon S3 general purpose bucket.  Currently, this parameter only supports blockin...").with_provider_name("EncryptionType")
+                    StructField::new("encryption_type", AttributeType::String).with_description("The object encryption type that you want to block or unblock for an Amazon S3 general purpose bucket. Currently, this parameter only supports blocking...").with_provider_name("EncryptionType")
                     ],
                 }).with_description("A bucket-level setting for Amazon S3 general purpose buckets used to prevent the upload of new objects encrypted with the specified server-side encryp...").with_provider_name("BlockedEncryptionTypes"),
                     StructField::new("bucket_key_enabled", AttributeType::Bool).with_description("Specifies whether Amazon S3 should use an S3 Bucket Key with server-side encryption using KMS (SSE-KMS) for new objects in the bucket. Existing object...").with_provider_name("BucketKeyEnabled"),
                     StructField::new("server_side_encryption_by_default", AttributeType::Struct {
                     name: "ServerSideEncryptionByDefault".to_string(),
                     fields: vec![
-                    StructField::new("kms_master_key_id", super::kms_key_id()).with_description("AWS Key Management Service (KMS) customer managed key ID to use for the default encryption.   + *General purpose buckets* - This parameter is allowed ...").with_provider_name("KMSMasterKeyID"),
-                    StructField::new("sse_algorithm", AttributeType::Enum(vec!["aws:kms".to_string(), "AES256".to_string(), "aws:kms:dsse".to_string()])).required().with_description("Server-side encryption algorithm to use for the default encryption.  For directory buckets, there are only two supported values for server-side encryp...").with_provider_name("SSEAlgorithm")
+                    StructField::new("kms_master_key_id", super::kms_key_id()).with_description("AWS Key Management Service (KMS) customer managed key ID to use for the default encryption. + *General purpose buckets* - This parameter is allowed if...").with_provider_name("KMSMasterKeyID"),
+                    StructField::new("sse_algorithm", AttributeType::Enum(vec!["aws:kms".to_string(), "AES256".to_string(), "aws:kms:dsse".to_string()])).required().with_description("Server-side encryption algorithm to use for the default encryption. For directory buckets, there are only two supported values for server-side encrypt...").with_provider_name("SSEAlgorithm")
                     ],
                 }).with_description("Specifies the default server-side encryption to apply to new objects in the bucket. If a PUT Object request doesn't specify any server-side encryption...").with_provider_name("ServerSideEncryptionByDefault")
                     ],
@@ -579,7 +579,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                     StructField::new("destination", AttributeType::Struct {
                     name: "Destination".to_string(),
                     fields: vec![
-                    StructField::new("bucket_account_id", AttributeType::String).with_description("The account ID that owns the destination S3 bucket. If no account ID is provided, the owner is not validated before exporting data.  Although this val...").with_provider_name("BucketAccountId"),
+                    StructField::new("bucket_account_id", AttributeType::String).with_description("The account ID that owns the destination S3 bucket. If no account ID is provided, the owner is not validated before exporting data. Although this valu...").with_provider_name("BucketAccountId"),
                     StructField::new("bucket_arn", super::arn()).required().with_description("The Amazon Resource Name (ARN) of the bucket to which data is exported.").with_provider_name("BucketArn"),
                     StructField::new("format", AttributeType::Custom {
                 name: "Format".to_string(),
@@ -670,7 +670,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                 }))).with_description("For buckets with versioning enabled (or suspended), one or more transition rules that specify when non-current objects transition to a specified stora...").with_provider_name("NoncurrentVersionTransitions"),
                     StructField::new("object_size_greater_than", AttributeType::String).with_description("Specifies the minimum object size in bytes for this rule to apply to. Objects must be larger than this value in bytes. For more information about size...").with_provider_name("ObjectSizeGreaterThan"),
                     StructField::new("object_size_less_than", AttributeType::String).with_description("Specifies the maximum object size in bytes for this rule to apply to. Objects must be smaller than this value in bytes. For more information about siz...").with_provider_name("ObjectSizeLessThan"),
-                    StructField::new("prefix", AttributeType::String).with_description("Object key prefix that identifies one or more objects to which this rule applies.  Replacement must be made for object keys containing special charact...").with_provider_name("Prefix"),
+                    StructField::new("prefix", AttributeType::String).with_description("Object key prefix that identifies one or more objects to which this rule applies. Replacement must be made for object keys containing special characte...").with_provider_name("Prefix"),
                     StructField::new("status", AttributeType::Custom {
                 name: "Status".to_string(),
                 base: Box::new(AttributeType::String),
@@ -715,7 +715,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                 validate: validate_transition_default_minimum_object_size,
                 namespace: Some("awscc.s3.bucket".to_string()),
                 to_dsl: None,
-            }).with_description("Indicates which default minimum object size behavior is applied to the lifecycle configuration.  This parameter applies to general purpose buckets onl...").with_provider_name("TransitionDefaultMinimumObjectSize")
+            }).with_description("Indicates which default minimum object size behavior is applied to the lifecycle configuration. This parameter applies to general purpose buckets only...").with_provider_name("TransitionDefaultMinimumObjectSize")
                     ],
                 })
                 .with_description("Specifies the lifecycle configuration for objects in an Amazon S3 bucket. For more information, see [Object Lifecycle Management](https://docs.aws.ama...")
@@ -961,7 +961,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                 }).with_description("Specifies the Object Lock rule for the specified object. Enable this rule when you apply ``ObjectLockConfiguration`` to a bucket. If Object Lock is tu...").with_provider_name("Rule")
                     ],
                 })
-                .with_description("This operation is not supported for directory buckets.  Places an Object Lock configuration on the specified bucket. The rule specified in the Object ...")
+                .with_description("This operation is not supported for directory buckets. Places an Object Lock configuration on the specified bucket. The rule specified in the Object L...")
                 .with_provider_name("ObjectLockConfiguration"),
         )
         .attribute(
@@ -1051,7 +1051,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                     StructField::new("event_threshold", AttributeType::Struct {
                     name: "ReplicationTimeValue".to_string(),
                     fields: vec![
-                    StructField::new("minutes", AttributeType::Int).required().with_description("Contains an integer specifying time in minutes.  Valid value: 15").with_provider_name("Minutes")
+                    StructField::new("minutes", AttributeType::Int).required().with_description("Contains an integer specifying time in minutes. Valid value: 15").with_provider_name("Minutes")
                     ],
                 }).with_description("A container specifying the time threshold for emitting the ``s3:Replication:OperationMissedThreshold`` event.").with_provider_name("EventThreshold"),
                     StructField::new("status", AttributeType::Custom {
@@ -1076,7 +1076,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                     StructField::new("time", AttributeType::Struct {
                     name: "ReplicationTimeValue".to_string(),
                     fields: vec![
-                    StructField::new("minutes", AttributeType::Int).required().with_description("Contains an integer specifying time in minutes.  Valid value: 15").with_provider_name("Minutes")
+                    StructField::new("minutes", AttributeType::Int).required().with_description("Contains an integer specifying time in minutes. Valid value: 15").with_provider_name("Minutes")
                     ],
                 }).required().with_description("A container specifying the time by which replication should be complete for all objects and operations on objects.").with_provider_name("Time")
                     ],
@@ -1100,8 +1100,8 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                     StructField::new("tag_filters", AttributeType::List(Box::new(tags_type()))).with_description("An array of tags containing key and value pairs.").with_provider_name("TagFilters")
                     ],
                 }).with_description("A container for specifying rule filters. The filters determine the subset of objects to which the rule applies. This element is required only if you s...").with_provider_name("And"),
-                    StructField::new("prefix", AttributeType::String).with_description("An object key name prefix that identifies the subset of objects to which the rule applies.  Replacement must be made for object keys containing specia...").with_provider_name("Prefix"),
-                    StructField::new("tag_filter", tags_type()).with_description("A container for specifying a tag key and value.  The rule applies only to objects that have the tag in their tag set.").with_provider_name("TagFilter")
+                    StructField::new("prefix", AttributeType::String).with_description("An object key name prefix that identifies the subset of objects to which the rule applies. Replacement must be made for object keys containing special...").with_provider_name("Prefix"),
+                    StructField::new("tag_filter", tags_type()).with_description("A container for specifying a tag key and value. The rule applies only to objects that have the tag in their tag set.").with_provider_name("TagFilter")
                     ],
                 }).with_description("A filter that identifies the subset of objects to which the replication rule applies. A ``Filter`` must specify exactly one ``Prefix``, ``TagFilter``,...").with_provider_name("Filter"),
                     StructField::new("id", AttributeType::String).with_description("A unique identifier for the rule. The maximum value is 255 characters. If you don't specify a value, AWS CloudFormation generates a random ID. When us...").with_provider_name("Id"),
@@ -1189,7 +1189,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                 to_dsl: None,
             }).with_description("Protocol to use when redirecting requests. The default is the protocol that is used in the original request.").with_provider_name("Protocol")
                     ],
-                }).with_description("The redirect behavior for every request to this bucket's website endpoint.  If you specify this property, you can't specify any other property.").with_provider_name("RedirectAllRequestsTo"),
+                }).with_description("The redirect behavior for every request to this bucket's website endpoint. If you specify this property, you can't specify any other property.").with_provider_name("RedirectAllRequestsTo"),
                     StructField::new("routing_rules", AttributeType::List(Box::new(AttributeType::Struct {
                     name: "RoutingRule".to_string(),
                     fields: vec![

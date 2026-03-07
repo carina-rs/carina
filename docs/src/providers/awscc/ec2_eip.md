@@ -39,7 +39,7 @@ The network (``vpc``). If you define an Elastic IP address and associate it with
 - **Type:** AwsResourceId
 - **Required:** No
 
-The ID of the instance.  Updates to the ``InstanceId`` property may require *some interruptions*. Updates on an EIP reassociates the address on its associated resource.
+The ID of the instance. Updates to the ``InstanceId`` property may require *some interruptions*. Updates on an EIP reassociates the address on its associated resource.
 
 ### `ipam_pool_id`
 
@@ -60,14 +60,14 @@ A unique set of Availability Zones, Local Zones, or Wavelength Zones from which 
 - **Type:** String
 - **Required:** No
 
-The ID of an address pool that you own. Use this parameter to let Amazon EC2 select an address from the address pool.  Updates to the ``PublicIpv4Pool`` property may require *some interruptions*. Updates on an EIP reassociates the address on its associated resource.
+The ID of an address pool that you own. Use this parameter to let Amazon EC2 select an address from the address pool. Updates to the ``PublicIpv4Pool`` property may require *some interruptions*. Updates on an EIP reassociates the address on its associated resource.
 
 ### `tags`
 
 - **Type:** Map
 - **Required:** No
 
-Any tags assigned to the Elastic IP address.  Updates to the ``Tags`` property may require *some interruptions*. Updates on an EIP reassociates the address on its associated resource.
+Any tags assigned to the Elastic IP address. Updates to the ``Tags`` property may require *some interruptions*. Updates on an EIP reassociates the address on its associated resource.
 
 ### `transfer_address`
 

@@ -89,7 +89,7 @@ pub fn ec2_vpc_config() -> AwsccSchemaConfig {
                 namespace: Some("awscc.ec2.vpc".to_string()),
                 to_dsl: None,
             })
-                .with_description("The allowed tenancy of instances launched into the VPC.  + ``default``: An instance launched into the VPC runs on shared hardware by default, unless y...")
+                .with_description("The allowed tenancy of instances launched into the VPC. + ``default``: An instance launched into the VPC runs on shared hardware by default, unless yo...")
                 .with_provider_name("InstanceTenancy")
                 .with_completions(vec![CompletionValue::new("awscc.ec2.vpc.InstanceTenancy.default", "default"), CompletionValue::new("awscc.ec2.vpc.InstanceTenancy.dedicated", "dedicated"), CompletionValue::new("awscc.ec2.vpc.InstanceTenancy.host", "host")]),
         )

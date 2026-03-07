@@ -532,7 +532,7 @@ fn generate_markdown(schema: &CfnSchema, type_name: &str) -> Result<String> {
         md.push('\n');
 
         if let Some(d) = &prop.description {
-            let desc = d.replace('\n', " ").replace("  ", " ");
+            let desc = collapse_whitespace(&d.replace('\n', " "));
             md.push_str(&format!("{}\n\n", desc));
         }
     }
@@ -657,12 +657,13 @@ fn generate_markdown(schema: &CfnSchema, type_name: &str) -> Result<String> {
                         _ => infer_string_type_display(field_name, &schema.type_name),
                     }
                 };
-                let desc = field_prop
-                    .description
-                    .as_deref()
-                    .unwrap_or("")
-                    .replace('\n', " ")
-                    .replace("  ", " ");
+                let desc = collapse_whitespace(
+                    &field_prop
+                        .description
+                        .as_deref()
+                        .unwrap_or("")
+                        .replace('\n', " "),
+                );
                 let truncated = if desc.len() > 100 {
                     format!("{}...", &desc[..100])
                 } else {
@@ -1132,10 +1133,7 @@ pub fn {}() -> AwsccSchemaConfig {{
         }
 
         if let Some(desc) = &prop.description {
-            let escaped = desc
-                .replace('"', "\\\"")
-                .replace('\n', " ")
-                .replace("  ", " ");
+            let escaped = collapse_whitespace(&desc.replace('"', "\\\"").replace('\n', " "));
             let truncated = if escaped.len() > 150 {
                 format!("{}...", &escaped[..150])
             } else {
@@ -1522,10 +1520,7 @@ fn generate_struct_type(
                 field_code.push_str(".required()");
             }
             if let Some(desc) = &field_prop.description {
-                let escaped = desc
-                    .replace('"', "\\\"")
-                    .replace('\n', " ")
-                    .replace("  ", " ");
+                let escaped = collapse_whitespace(&desc.replace('"', "\\\"").replace('\n', " "));
                 let truncated = if escaped.len() > 150 {
                     format!("{}...", &escaped[..150])
                 } else {
@@ -2147,9 +2142,36 @@ pub fn tags_type() -> AttributeType {
 "#
 }
 
+fn collapse_whitespace(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut prev_space = false;
+    for c in s.chars() {
+        if c == ' ' {
+            if !prev_space {
+                result.push(' ');
+            }
+            prev_space = true;
+        } else {
+            result.push(c);
+            prev_space = false;
+        }
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_collapse_whitespace() {
+        assert_eq!(collapse_whitespace("no  extra"), "no extra");
+        assert_eq!(collapse_whitespace("many      spaces"), "many spaces");
+        assert_eq!(collapse_whitespace("a  b  c"), "a b c");
+        assert_eq!(collapse_whitespace("already fine"), "already fine");
+        assert_eq!(collapse_whitespace("            12 spaces"), " 12 spaces");
+        assert_eq!(collapse_whitespace(""), "");
+    }
 
     #[test]
     fn test_looks_like_property_name() {
