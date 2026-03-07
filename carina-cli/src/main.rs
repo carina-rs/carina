@@ -607,7 +607,7 @@ async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
                 .resource_type()
                 .ok_or("Backend does not specify a resource type")?;
             if let Some(bucket_resource) =
-                parsed.find_resource_by_name(backend_resource_type, &bucket_name)
+                parsed.find_resource_by_attr(backend_resource_type, "bucket", &bucket_name)
             {
                 println!("Found state bucket resource in configuration.");
                 println!(
@@ -704,7 +704,7 @@ async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
                         &bucket_name,
                         backend_provider_name,
                     )
-                    .with_attribute("name".to_string(), serde_json::json!(bucket_name))
+                    .with_attribute("bucket".to_string(), serde_json::json!(bucket_name))
                     .with_attribute("region".to_string(), serde_json::json!(region))
                     .with_attribute(
                         "versioning_status".to_string(),
@@ -3087,7 +3087,7 @@ mod tests {
         let mut plan = Plan::new();
         plan.add(Effect::Create(
             Resource::with_provider("aws", "s3.bucket", "my-bucket")
-                .with_attribute("name", Value::String("my-bucket".to_string())),
+                .with_attribute("bucket", Value::String("my-bucket".to_string())),
         ));
         plan.add(Effect::Delete {
             id: ResourceId::with_provider("aws", "s3.bucket", "old-bucket"),
@@ -3097,7 +3097,7 @@ mod tests {
 
         let sorted_resources = vec![
             Resource::with_provider("aws", "s3.bucket", "my-bucket")
-                .with_attribute("name", Value::String("my-bucket".to_string())),
+                .with_attribute("bucket", Value::String("my-bucket".to_string())),
         ];
 
         let current_states = vec![CurrentStateEntry {
@@ -3507,7 +3507,7 @@ mod tests {
             backend: None,
             resources: vec![
                 Resource::with_provider("aws", "s3.bucket", "my-bucket")
-                    .with_attribute("name", Value::String("my-bucket".to_string())),
+                    .with_attribute("bucket", Value::String("my-bucket".to_string())),
             ],
             variables: HashMap::new(),
             imports: vec![],
@@ -3519,21 +3519,21 @@ mod tests {
         // Matching resource type
         assert!(
             parsed
-                .find_resource_by_name("s3.bucket", "my-bucket")
+                .find_resource_by_attr("s3.bucket", "bucket", "my-bucket")
                 .is_some()
         );
 
         // Non-matching resource type
         assert!(
             parsed
-                .find_resource_by_name("gcs.bucket", "my-bucket")
+                .find_resource_by_attr("gcs.bucket", "bucket", "my-bucket")
                 .is_none()
         );
 
         // Non-matching bucket name
         assert!(
             parsed
-                .find_resource_by_name("s3.bucket", "other-bucket")
+                .find_resource_by_attr("s3.bucket", "bucket", "other-bucket")
                 .is_none()
         );
     }
@@ -3575,7 +3575,7 @@ mod tests {
     fn validate_regular_resource_without_read_keyword_passes() {
         let resource = Resource::with_provider("aws", "s3.bucket", "my-bucket")
             .with_attribute("_provider", Value::String("aws".to_string()))
-            .with_attribute("name", Value::String("my-bucket".to_string()))
+            .with_attribute("bucket", Value::String("my-bucket".to_string()))
             .with_attribute("region", Value::String("ap-northeast-1".to_string()));
         let result = validate_resources(&[resource]);
         assert!(

@@ -6,7 +6,7 @@
 
 use super::AwsSchemaConfig;
 use super::tags_type;
-use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+use carina_core::schema::{AttributeSchema, ResourceSchema};
 
 /// Returns the schema config for ec2.internet_gateway (Smithy: com.amazonaws.ec2)
 pub fn ec2_internet_gateway_config() -> AwsSchemaConfig {
@@ -17,10 +17,6 @@ pub fn ec2_internet_gateway_config() -> AwsSchemaConfig {
         data_source: false,
         schema: ResourceSchema::new("aws.ec2.internet_gateway")
             .with_description("Describes an internet gateway.")
-            .attribute(
-                AttributeSchema::new("name", AttributeType::String)
-                    .with_description("Resource name"),
-            )
             .attribute(
                 AttributeSchema::new("region", super::aws_region())
                     .with_description("The AWS region (inherited from provider if not specified)"),

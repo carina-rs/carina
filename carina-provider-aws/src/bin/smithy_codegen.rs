@@ -269,9 +269,6 @@ fn generate_resource(res: &ResourceDef, model: &SmithyModel) -> Result<String> {
             if exclude.contains(name.as_str()) {
                 continue;
             }
-            if name == res.identifier {
-                continue;
-            }
             if name == "Tags" {
                 continue; // handled separately
             }
@@ -519,7 +516,19 @@ fn generate_resource(res: &ResourceDef, model: &SmithyModel) -> Result<String> {
         .or_else(|| res.name.strip_prefix("sts."))
         .unwrap_or(res.name);
     let mut schema_imports = vec!["AttributeSchema", "ResourceSchema"];
-    schema_imports.insert(1, "AttributeType");
+    let needs_attribute_type = attrs.iter().any(|a| {
+        matches!(
+            a.type_code.as_str(),
+            "AttributeType::String"
+                | "AttributeType::Bool"
+                | "AttributeType::Int"
+                | "AttributeType::Float"
+                | "AttributeType::Map"
+        ) || a.type_code.starts_with("AttributeType::Custom")
+    });
+    if needs_attribute_type {
+        schema_imports.insert(1, "AttributeType");
+    }
     if attrs.iter().any(|a| a.enum_info.is_some()) {
         schema_imports.push("CompletionValue");
     }
@@ -657,14 +666,10 @@ fn generate_resource(res: &ResourceDef, model: &SmithyModel) -> Result<String> {
         code.push_str("\x20       .as_data_source()\n");
     }
 
-    // Inject carina-specific attributes (name, region) — skip for data sources
+    // Inject carina-specific attributes (region) — skip for data sources
     if !is_data_source {
         code.push_str(
             "\x20       .attribute(\n\
-             \x20           AttributeSchema::new(\"name\", AttributeType::String)\n\
-             \x20               .with_description(\"Resource name\"),\n\
-             \x20       )\n\
-             \x20       .attribute(\n\
              \x20           AttributeSchema::new(\"region\", super::aws_region())\n\
              \x20               .with_description(\"The AWS region (inherited from provider if not specified)\"),\n\
              \x20       )\n",
@@ -1732,7 +1737,7 @@ fn generate_markdown_resource(res: &ResourceDef, model: &SmithyModel) -> Result<
     let mut writable_fields: BTreeMap<String, &carina_smithy::ShapeRef> = BTreeMap::new();
     if let Some(create_input) = &create_input {
         for (name, member_ref) in &create_input.members {
-            if exclude.contains(name.as_str()) || name == res.identifier || name == "Tags" {
+            if exclude.contains(name.as_str()) || name == "Tags" {
                 continue;
             }
             writable_fields.insert(name.clone(), member_ref);

@@ -146,13 +146,11 @@ impl AwsProvider {
         }
     }
 
-    /// Extract tags (excluding "Name") from EC2 tag list into a Value::Map
+    /// Extract tags from EC2 tag list into a Value::Map
     fn ec2_tags_to_value(tags: &[aws_sdk_ec2::types::Tag]) -> Option<Value> {
         let mut tag_map = HashMap::new();
         for tag in tags {
-            if let (Some(key), Some(value)) = (tag.key(), tag.value())
-                && key != "Name"
-            {
+            if let (Some(key), Some(value)) = (tag.key(), tag.value()) {
                 tag_map.insert(key.to_string(), Value::String(value.to_string()));
             }
         }
@@ -163,7 +161,7 @@ impl AwsProvider {
         }
     }
 
-    /// Build EC2 Tag list from Value::Map (excluding "Name" which is handled separately)
+    /// Build EC2 Tag list from Value::Map
     fn value_to_ec2_tags(value: &Value) -> Vec<aws_sdk_ec2::types::Tag> {
         let mut tags = Vec::new();
         if let Value::Map(map) = value {
@@ -176,40 +174,25 @@ impl AwsProvider {
         tags
     }
 
-    /// Apply tags to an EC2 resource (Name tag + user tags)
+    /// Apply tags to an EC2 resource
     async fn apply_ec2_tags(
         &self,
         resource_id: &ResourceId,
         ec2_resource_id: &str,
-        name: Option<&str>,
         attributes: &HashMap<String, Value>,
     ) -> ProviderResult<()> {
-        let mut tags = Vec::new();
-
-        // Name tag
-        if let Some(name) = name {
-            tags.push(
-                aws_sdk_ec2::types::Tag::builder()
-                    .key("Name")
-                    .value(name)
-                    .build(),
-            );
-        }
-
-        // User-defined tags
         if let Some(tag_value) = attributes.get("tags") {
-            tags.extend(Self::value_to_ec2_tags(tag_value));
-        }
-
-        if !tags.is_empty() {
-            let mut req = self.ec2_client.create_tags().resources(ec2_resource_id);
-            for tag in tags {
-                req = req.tags(tag);
+            let tags = Self::value_to_ec2_tags(tag_value);
+            if !tags.is_empty() {
+                let mut req = self.ec2_client.create_tags().resources(ec2_resource_id);
+                for tag in tags {
+                    req = req.tags(tag);
+                }
+                req.send().await.map_err(|e| {
+                    ProviderError::new(format!("Failed to tag resource: {:?}", e))
+                        .for_resource(resource_id.clone())
+                })?;
             }
-            req.send().await.map_err(|e| {
-                ProviderError::new(format!("Failed to tag resource: {:?}", e))
-                    .for_resource(resource_id.clone())
-            })?;
         }
 
         Ok(())
@@ -228,7 +211,7 @@ impl AwsProvider {
         match self.s3_client.head_bucket().bucket(name).send().await {
             Ok(_) => {
                 let mut attributes = HashMap::new();
-                attributes.insert("name".to_string(), Value::String(name.to_string()));
+                attributes.insert("bucket".to_string(), Value::String(name.to_string()));
                 // Return region in DSL format
                 let region_dsl = format!("aws.Region.{}", self.region.replace('-', "_"));
                 attributes.insert("region".to_string(), Value::String(region_dsl));
@@ -283,7 +266,7 @@ impl AwsProvider {
 
     /// Create an S3 bucket
     async fn create_s3_bucket(&self, resource: Resource) -> ProviderResult<State> {
-        let bucket_name = match resource.attributes.get("name") {
+        let bucket_name = match resource.attributes.get("bucket") {
             Some(Value::String(s)) => s.clone(),
             _ => {
                 return Err(
@@ -719,15 +702,7 @@ impl AwsProvider {
             return Ok(State::not_found(id.clone()));
         };
 
-        // If identifier starts with vpc-, look up by VPC ID; otherwise by Name tag
-        let filter = if identifier.starts_with("vpc-") {
-            Filter::builder().name("vpc-id").values(identifier).build()
-        } else {
-            Filter::builder()
-                .name("tag:Name")
-                .values(identifier)
-                .build()
-        };
+        let filter = Filter::builder().name("vpc-id").values(identifier).build();
 
         let result = self
             .ec2_client
@@ -742,16 +717,6 @@ impl AwsProvider {
 
         if let Some(vpc) = result.vpcs().first() {
             let mut attributes = HashMap::new();
-
-            // Extract Name tag from VPC
-            if let Some(name_tag) = vpc
-                .tags()
-                .iter()
-                .find(|t| t.key() == Some("Name"))
-                .and_then(|t| t.value())
-            {
-                attributes.insert("name".to_string(), Value::String(name_tag.to_string()));
-            }
 
             // Return region in DSL format
             let region_dsl = format!("aws.Region.{}", self.region.replace('-', "_"));
@@ -826,11 +791,6 @@ impl AwsProvider {
 
     /// Create an EC2 VPC
     async fn create_ec2_vpc(&self, resource: Resource) -> ProviderResult<State> {
-        let name = resource.attributes.get("name").and_then(|v| match v {
-            Value::String(s) => Some(s.clone()),
-            _ => None,
-        });
-
         let cidr_block = match resource.attributes.get("cidr_block") {
             Some(Value::String(s)) => s.clone(),
             _ => {
@@ -865,8 +825,8 @@ impl AwsProvider {
             ProviderError::new("VPC created but no ID returned").for_resource(resource.id.clone())
         })?;
 
-        // Apply tags (Name + user-defined tags)
-        self.apply_ec2_tags(&resource.id, vpc_id, name.as_deref(), &resource.attributes)
+        // Apply tags
+        self.apply_ec2_tags(&resource.id, vpc_id, &resource.attributes)
             .await?;
 
         // Configure DNS support
@@ -956,12 +916,7 @@ impl AwsProvider {
         }
 
         // Update tags
-        let name = to.attributes.get("name").and_then(|v| match v {
-            Value::String(s) => Some(s.clone()),
-            _ => None,
-        });
-        self.apply_ec2_tags(&id, &vpc_id, name.as_deref(), &to.attributes)
-            .await?;
+        self.apply_ec2_tags(&id, &vpc_id, &to.attributes).await?;
 
         self.read_ec2_vpc(&id, Some(identifier)).await
     }
@@ -980,18 +935,10 @@ impl AwsProvider {
             return Ok(State::not_found(id.clone()));
         };
 
-        // If identifier starts with subnet-, look up by subnet ID; otherwise by Name tag
-        let filter = if identifier.starts_with("subnet-") {
-            Filter::builder()
-                .name("subnet-id")
-                .values(identifier)
-                .build()
-        } else {
-            Filter::builder()
-                .name("tag:Name")
-                .values(identifier)
-                .build()
-        };
+        let filter = Filter::builder()
+            .name("subnet-id")
+            .values(identifier)
+            .build();
 
         let result = self
             .ec2_client
@@ -1006,16 +953,6 @@ impl AwsProvider {
 
         if let Some(subnet) = result.subnets().first() {
             let mut attributes = HashMap::new();
-
-            // Extract Name tag from subnet
-            if let Some(name_tag) = subnet
-                .tags()
-                .iter()
-                .find(|t| t.key() == Some("Name"))
-                .and_then(|t| t.value())
-            {
-                attributes.insert("name".to_string(), Value::String(name_tag.to_string()));
-            }
 
             let region_dsl = format!("aws.Region.{}", self.region.replace('-', "_"));
             attributes.insert("region".to_string(), Value::String(region_dsl));
@@ -1054,11 +991,6 @@ impl AwsProvider {
 
     /// Create an EC2 Subnet
     async fn create_ec2_subnet(&self, resource: Resource) -> ProviderResult<State> {
-        let name = resource.attributes.get("name").and_then(|v| match v {
-            Value::String(s) => Some(s.clone()),
-            _ => None,
-        });
-
         let cidr_block = match resource.attributes.get("cidr_block") {
             Some(Value::String(s)) => s.clone(),
             _ => {
@@ -1097,24 +1029,9 @@ impl AwsProvider {
                 .for_resource(resource.id.clone())
         })?;
 
-        // Tag with Name (if provided)
-        if let Some(ref name) = name {
-            self.ec2_client
-                .create_tags()
-                .resources(subnet_id)
-                .tags(
-                    aws_sdk_ec2::types::Tag::builder()
-                        .key("Name")
-                        .value(name)
-                        .build(),
-                )
-                .send()
-                .await
-                .map_err(|e| {
-                    ProviderError::new(format!("Failed to tag subnet: {:?}", e))
-                        .for_resource(resource.id.clone())
-                })?;
-        }
+        // Apply tags
+        self.apply_ec2_tags(&resource.id, subnet_id, &resource.attributes)
+            .await?;
 
         // Read back using subnet ID (reliable identifier)
         self.read_ec2_subnet(&resource.id, Some(subnet_id)).await
@@ -1134,18 +1051,10 @@ impl AwsProvider {
             return Ok(State::not_found(id.clone()));
         };
 
-        // If identifier starts with igw-, look up by IGW ID; otherwise by Name tag
-        let filter = if identifier.starts_with("igw-") {
-            Filter::builder()
-                .name("internet-gateway-id")
-                .values(identifier)
-                .build()
-        } else {
-            Filter::builder()
-                .name("tag:Name")
-                .values(identifier)
-                .build()
-        };
+        let filter = Filter::builder()
+            .name("internet-gateway-id")
+            .values(identifier)
+            .build();
 
         let result = self
             .ec2_client
@@ -1160,16 +1069,6 @@ impl AwsProvider {
 
         if let Some(igw) = result.internet_gateways().first() {
             let mut attributes = HashMap::new();
-
-            // Extract Name tag from IGW
-            if let Some(name_tag) = igw
-                .tags()
-                .iter()
-                .find(|t| t.key() == Some("Name"))
-                .and_then(|t| t.value())
-            {
-                attributes.insert("name".to_string(), Value::String(name_tag.to_string()));
-            }
 
             let region_dsl = format!("aws.Region.{}", self.region.replace('-', "_"));
             attributes.insert("region".to_string(), Value::String(region_dsl));
@@ -1200,11 +1099,6 @@ impl AwsProvider {
 
     /// Create an EC2 Internet Gateway
     async fn create_ec2_internet_gateway(&self, resource: Resource) -> ProviderResult<State> {
-        let name = resource.attributes.get("name").and_then(|v| match v {
-            Value::String(s) => Some(s.clone()),
-            _ => None,
-        });
-
         // Create Internet Gateway
         let result = self
             .ec2_client
@@ -1224,24 +1118,9 @@ impl AwsProvider {
                     .for_resource(resource.id.clone())
             })?;
 
-        // Tag with Name (if provided)
-        if let Some(ref name) = name {
-            self.ec2_client
-                .create_tags()
-                .resources(igw_id)
-                .tags(
-                    aws_sdk_ec2::types::Tag::builder()
-                        .key("Name")
-                        .value(name)
-                        .build(),
-                )
-                .send()
-                .await
-                .map_err(|e| {
-                    ProviderError::new(format!("Failed to tag internet gateway: {:?}", e))
-                        .for_resource(resource.id.clone())
-                })?;
-        }
+        // Apply tags
+        self.apply_ec2_tags(&resource.id, igw_id, &resource.attributes)
+            .await?;
 
         // Attach to VPC if specified
         if let Some(Value::String(vpc_id)) = resource.attributes.get("vpc_id") {
@@ -1326,18 +1205,10 @@ impl AwsProvider {
             return Ok(State::not_found(id.clone()));
         };
 
-        // If identifier starts with rtb-, look up by route table ID; otherwise by Name tag
-        let filter = if identifier.starts_with("rtb-") {
-            Filter::builder()
-                .name("route-table-id")
-                .values(identifier)
-                .build()
-        } else {
-            Filter::builder()
-                .name("tag:Name")
-                .values(identifier)
-                .build()
-        };
+        let filter = Filter::builder()
+            .name("route-table-id")
+            .values(identifier)
+            .build();
 
         let result = self
             .ec2_client
@@ -1352,16 +1223,6 @@ impl AwsProvider {
 
         if let Some(rt) = result.route_tables().first() {
             let mut attributes = HashMap::new();
-
-            // Extract Name tag from route table
-            if let Some(name_tag) = rt
-                .tags()
-                .iter()
-                .find(|t| t.key() == Some("Name"))
-                .and_then(|t| t.value())
-            {
-                attributes.insert("name".to_string(), Value::String(name_tag.to_string()));
-            }
 
             let region_dsl = format!("aws.Region.{}", self.region.replace('-', "_"));
             attributes.insert("region".to_string(), Value::String(region_dsl));
@@ -1408,11 +1269,6 @@ impl AwsProvider {
 
     /// Create an EC2 Route Table
     async fn create_ec2_route_table(&self, resource: Resource) -> ProviderResult<State> {
-        let name = resource.attributes.get("name").and_then(|v| match v {
-            Value::String(s) => Some(s.clone()),
-            _ => None,
-        });
-
         let vpc_id = match resource.attributes.get("vpc_id") {
             Some(Value::String(s)) => s.clone(),
             _ => {
@@ -1442,24 +1298,9 @@ impl AwsProvider {
                     .for_resource(resource.id.clone())
             })?;
 
-        // Tag with Name (if provided)
-        if let Some(ref name) = name {
-            self.ec2_client
-                .create_tags()
-                .resources(rt_id)
-                .tags(
-                    aws_sdk_ec2::types::Tag::builder()
-                        .key("Name")
-                        .value(name)
-                        .build(),
-                )
-                .send()
-                .await
-                .map_err(|e| {
-                    ProviderError::new(format!("Failed to tag route table: {:?}", e))
-                        .for_resource(resource.id.clone())
-                })?;
-        }
+        // Apply tags
+        self.apply_ec2_tags(&resource.id, rt_id, &resource.attributes)
+            .await?;
 
         // Add routes
         if let Some(Value::List(routes)) = resource.attributes.get("routes") {
@@ -1509,9 +1350,8 @@ impl AwsProvider {
         id: &ResourceId,
         _identifier: Option<&str>,
     ) -> ProviderResult<State> {
-        // Routes don't have a "name" in AWS - we use the name for identification
-        // The actual route is identified by route_table_id + destination_cidr_block
-        // For read, we return not_found since we can't look up by name alone
+        // Routes are identified by route_table_id + destination_cidr_block
+        // For read, we return not_found since we can't look up by identifier alone
         Ok(State::not_found(id.clone()))
     }
 
@@ -1541,7 +1381,6 @@ impl AwsProvider {
             for route in rt.routes() {
                 if route.destination_cidr_block() == Some(destination_cidr_block) {
                     let mut attributes = HashMap::new();
-                    attributes.insert("name".to_string(), Value::String(name.to_string()));
                     attributes.insert(
                         "route_table_id".to_string(),
                         Value::String(route_table_id.to_string()),
@@ -1577,15 +1416,6 @@ impl AwsProvider {
 
     /// Create an EC2 Route
     async fn create_ec2_route(&self, resource: Resource) -> ProviderResult<State> {
-        let name = match resource.attributes.get("name") {
-            Some(Value::String(s)) => s.clone(),
-            _ => {
-                return Err(
-                    ProviderError::new("Route name is required").for_resource(resource.id.clone())
-                );
-            }
-        };
-
         let route_table_id = match resource.attributes.get("route_table_id") {
             Some(Value::String(s)) => s.clone(),
             _ => {
@@ -1623,13 +1453,9 @@ impl AwsProvider {
                 .for_resource(resource.id.clone())
         })?;
 
-        // Return state with the route attributes
-        let mut attributes = resource.attributes.clone();
-        attributes.insert("name".to_string(), Value::String(name));
-
         // Route identifier is route_table_id|destination_cidr_block
         let identifier = format!("{}|{}", route_table_id, destination_cidr);
-        Ok(State::existing(resource.id, attributes).with_identifier(identifier))
+        Ok(State::existing(resource.id, resource.attributes).with_identifier(identifier))
     }
 
     /// Update an EC2 Route (replace the route)
@@ -1695,18 +1521,10 @@ impl AwsProvider {
             return Ok(State::not_found(id.clone()));
         };
 
-        // If identifier starts with sg-, look up by security group ID; otherwise by Name tag
-        let filter = if identifier.starts_with("sg-") {
-            Filter::builder()
-                .name("group-id")
-                .values(identifier)
-                .build()
-        } else {
-            Filter::builder()
-                .name("tag:Name")
-                .values(identifier)
-                .build()
-        };
+        let filter = Filter::builder()
+            .name("group-id")
+            .values(identifier)
+            .build();
 
         let result = self
             .ec2_client
@@ -1722,18 +1540,15 @@ impl AwsProvider {
         if let Some(sg) = result.security_groups().first() {
             let mut attributes = HashMap::new();
 
-            // Extract Name tag from security group
-            if let Some(name_tag) = sg
-                .tags()
-                .iter()
-                .find(|t| t.key() == Some("Name"))
-                .and_then(|t| t.value())
-            {
-                attributes.insert("name".to_string(), Value::String(name_tag.to_string()));
-            }
-
             let region_dsl = format!("aws.Region.{}", self.region.replace('-', "_"));
             attributes.insert("region".to_string(), Value::String(region_dsl));
+
+            if let Some(group_name) = sg.group_name() {
+                attributes.insert(
+                    "group_name".to_string(),
+                    Value::String(group_name.to_string()),
+                );
+            }
 
             if let Some(desc) = sg.description() {
                 attributes.insert("description".to_string(), Value::String(desc.to_string()));
@@ -1763,11 +1578,6 @@ impl AwsProvider {
 
     /// Create an EC2 Security Group
     async fn create_ec2_security_group(&self, resource: Resource) -> ProviderResult<State> {
-        let name = resource.attributes.get("name").and_then(|v| match v {
-            Value::String(s) => Some(s.clone()),
-            _ => None,
-        });
-
         let vpc_id = match resource.attributes.get("vpc_id") {
             Some(Value::String(s)) => s.clone(),
             _ => {
@@ -1779,11 +1589,14 @@ impl AwsProvider {
 
         let description = match resource.attributes.get("description") {
             Some(Value::String(s)) => s.clone(),
-            _ => name.clone().unwrap_or_default(), // Use name as description if not specified
+            _ => String::new(),
         };
 
         // group_name is required for CreateSecurityGroup API
-        let group_name = name.clone().unwrap_or_else(|| resource.id.name.clone());
+        let group_name = match resource.attributes.get("group_name") {
+            Some(Value::String(s)) => s.clone(),
+            _ => resource.id.name.clone(),
+        };
 
         // Create Security Group
         let result = self
@@ -1804,24 +1617,9 @@ impl AwsProvider {
                 .for_resource(resource.id.clone())
         })?;
 
-        // Tag with Name (if provided)
-        if let Some(ref name) = name {
-            self.ec2_client
-                .create_tags()
-                .resources(sg_id)
-                .tags(
-                    aws_sdk_ec2::types::Tag::builder()
-                        .key("Name")
-                        .value(name)
-                        .build(),
-                )
-                .send()
-                .await
-                .map_err(|e| {
-                    ProviderError::new(format!("Failed to tag security group: {:?}", e))
-                        .for_resource(resource.id.clone())
-                })?;
-        }
+        // Apply tags
+        self.apply_ec2_tags(&resource.id, sg_id, &resource.attributes)
+            .await?;
 
         // Read back using security group ID (reliable identifier)
         self.read_ec2_security_group(&resource.id, Some(sg_id))
@@ -1861,37 +1659,6 @@ impl AwsProvider {
 
     // ========== EC2 Security Group Rule Operations ==========
 
-    /// Find all Security Group Rules by Name tag (returns all rules with the same name)
-    async fn find_security_group_rules_by_name(
-        &self,
-        name: &str,
-        is_ingress: bool,
-    ) -> ProviderResult<Vec<aws_sdk_ec2::types::SecurityGroupRule>> {
-        use aws_sdk_ec2::types::Filter;
-
-        let filter = Filter::builder().name("tag:Name").values(name).build();
-
-        let result = self
-            .ec2_client
-            .describe_security_group_rules()
-            .filters(filter)
-            .send()
-            .await
-            .map_err(|e| {
-                ProviderError::new(format!("Failed to describe security group rules: {:?}", e))
-            })?;
-
-        // Filter by ingress/egress and collect all matching rules
-        let rules: Vec<_> = result
-            .security_group_rules()
-            .iter()
-            .filter(|rule| rule.is_egress() == Some(!is_ingress))
-            .cloned()
-            .collect();
-
-        Ok(rules)
-    }
-
     /// Read an EC2 Security Group Rule
     async fn read_ec2_security_group_rule(
         &self,
@@ -1903,28 +1670,22 @@ impl AwsProvider {
             return Ok(State::not_found(id.clone()));
         };
 
-        // If identifier starts with sgr-, look up by rule ID; otherwise by Name tag
-        let rules = if identifier.starts_with("sgr-") {
-            // Look up by rule IDs (may be comma-separated)
-            let rule_ids: Vec<&str> = identifier.split(',').collect();
-            let mut req = self.ec2_client.describe_security_group_rules();
-            for rule_id in &rule_ids {
-                req = req.security_group_rule_ids(*rule_id);
-            }
-            let result = req.send().await.map_err(|e| {
-                ProviderError::new(format!("Failed to describe security group rules: {:?}", e))
-                    .for_resource(id.clone())
-            })?;
-            result
-                .security_group_rules()
-                .iter()
-                .filter(|rule| rule.is_egress() == Some(!is_ingress))
-                .cloned()
-                .collect::<Vec<_>>()
-        } else {
-            self.find_security_group_rules_by_name(identifier, is_ingress)
-                .await?
-        };
+        // Look up by rule IDs (may be comma-separated)
+        let rule_ids: Vec<&str> = identifier.split(',').collect();
+        let mut req = self.ec2_client.describe_security_group_rules();
+        for rule_id in &rule_ids {
+            req = req.security_group_rule_ids(*rule_id);
+        }
+        let result = req.send().await.map_err(|e| {
+            ProviderError::new(format!("Failed to describe security group rules: {:?}", e))
+                .for_resource(id.clone())
+        })?;
+        let rules: Vec<_> = result
+            .security_group_rules()
+            .iter()
+            .filter(|rule| rule.is_egress() == Some(!is_ingress))
+            .cloned()
+            .collect();
 
         if rules.is_empty() {
             return Ok(State::not_found(id.clone()));
@@ -1933,16 +1694,6 @@ impl AwsProvider {
         // Use the first rule for common attributes
         let first_rule = &rules[0];
         let mut attributes = HashMap::new();
-
-        // Extract Name tag from rules
-        if let Some(name_tag) = first_rule
-            .tags()
-            .iter()
-            .find(|t| t.key() == Some("Name"))
-            .and_then(|t| t.value())
-        {
-            attributes.insert("name".to_string(), Value::String(name_tag.to_string()));
-        }
 
         let region_dsl = format!("aws.Region.{}", self.region.replace('-', "_"));
         attributes.insert("region".to_string(), Value::String(region_dsl));
@@ -2040,11 +1791,6 @@ impl AwsProvider {
         resource: Resource,
         is_ingress: bool,
     ) -> ProviderResult<State> {
-        let name = resource.attributes.get("name").and_then(|v| match v {
-            Value::String(s) => Some(s.clone()),
-            _ => None,
-        });
-
         let sg_id = match resource.attributes.get("group_id") {
             Some(Value::String(s)) => s.clone(),
             _ => {
@@ -2186,29 +1932,6 @@ impl AwsProvider {
                 .filter_map(|r| r.security_group_rule_id().map(String::from))
                 .collect()
         };
-
-        // Tag ALL rules with the same Name (if name provided)
-        if let Some(ref name) = name
-            && !rule_ids.is_empty()
-        {
-            let mut tag_request = self.ec2_client.create_tags();
-            for rule_id in &rule_ids {
-                tag_request = tag_request.resources(rule_id);
-            }
-            tag_request
-                .tags(
-                    aws_sdk_ec2::types::Tag::builder()
-                        .key("Name")
-                        .value(name)
-                        .build(),
-                )
-                .send()
-                .await
-                .map_err(|e| {
-                    ProviderError::new(format!("Failed to tag security group rules: {:?}", e))
-                        .for_resource(resource.id.clone())
-                })?;
-        }
 
         // Read back using rule IDs (reliable identifier)
         let identifier = rule_ids.join(",");
@@ -2805,7 +2528,7 @@ mod tests {
     #[test]
     fn test_normalize_state_enums() {
         let mut attributes = HashMap::from([
-            ("name".to_string(), Value::String("my-bucket".to_string())),
+            ("bucket".to_string(), Value::String("my-bucket".to_string())),
             (
                 "versioning_status".to_string(),
                 Value::String("Enabled".to_string()),
@@ -2830,7 +2553,7 @@ mod tests {
         );
         // Non-enum attributes should not be modified
         assert_eq!(
-            attributes.get("name"),
+            attributes.get("bucket"),
             Some(&Value::String("my-bucket".to_string()))
         );
     }

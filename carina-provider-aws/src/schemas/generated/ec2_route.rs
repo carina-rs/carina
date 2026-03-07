@@ -5,7 +5,7 @@
 //! DO NOT EDIT MANUALLY - regenerate with smithy-codegen
 
 use super::AwsSchemaConfig;
-use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, types};
+use carina_core::schema::{AttributeSchema, ResourceSchema, types};
 
 /// Returns the schema config for ec2.route (Smithy: com.amazonaws.ec2)
 pub fn ec2_route_config() -> AwsSchemaConfig {
@@ -16,10 +16,6 @@ pub fn ec2_route_config() -> AwsSchemaConfig {
         data_source: false,
         schema: ResourceSchema::new("aws.ec2.route")
         .with_description("Describes a route in a route table.")
-        .attribute(
-            AttributeSchema::new("name", AttributeType::String)
-                .with_description("Resource name"),
-        )
         .attribute(
             AttributeSchema::new("region", super::aws_region())
                 .with_description("The AWS region (inherited from provider if not specified)"),
@@ -81,6 +77,13 @@ pub fn ec2_route_config() -> AwsSchemaConfig {
             AttributeSchema::new("network_interface_id", super::aws_resource_id())
                 .with_description("The ID of a network interface.")
                 .with_provider_name("NetworkInterfaceId"),
+        )
+        .attribute(
+            AttributeSchema::new("route_table_id", super::route_table_id())
+                .required()
+                .create_only()
+                .with_description("The ID of the route table for the route.")
+                .with_provider_name("RouteTableId"),
         )
         .attribute(
             AttributeSchema::new("transit_gateway_id", super::transit_gateway_id())

@@ -6,7 +6,7 @@
 
 use super::AwsSchemaConfig;
 use super::tags_type;
-use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+use carina_core::schema::{AttributeSchema, ResourceSchema};
 
 /// Returns the schema config for ec2.route_table (Smithy: com.amazonaws.ec2)
 pub fn ec2_route_table_config() -> AwsSchemaConfig {
@@ -17,10 +17,6 @@ pub fn ec2_route_table_config() -> AwsSchemaConfig {
         data_source: false,
         schema: ResourceSchema::new("aws.ec2.route_table")
             .with_description("Describes a route table.")
-            .attribute(
-                AttributeSchema::new("name", AttributeType::String)
-                    .with_description("Resource name"),
-            )
             .attribute(
                 AttributeSchema::new("region", super::aws_region())
                     .with_description("The AWS region (inherited from provider if not specified)"),
