@@ -1004,6 +1004,7 @@ async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
                 to,
                 lifecycle,
                 cascading_updates,
+                temporary_name,
                 ..
             } => {
                 if lifecycle.create_before_destroy {
@@ -1090,10 +1091,51 @@ async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
                                 let identifier = from.identifier.as_deref().unwrap_or("");
                                 match provider.delete(id, identifier, lifecycle).await {
                                     Ok(()) => {
+                                        // If a temporary name was used and the name is updatable,
+                                        // rename the resource back to the desired name
+                                        let final_state = if let Some(temp) = temporary_name
+                                            && temp.can_rename
+                                        {
+                                            let new_identifier =
+                                                state.identifier.as_deref().unwrap_or("");
+                                            let mut rename_to = to.clone();
+                                            rename_to.attributes.insert(
+                                                temp.attribute.clone(),
+                                                Value::String(temp.original_value.clone()),
+                                            );
+                                            match provider
+                                                .update(id, new_identifier, &state, &rename_to)
+                                                .await
+                                            {
+                                                Ok(renamed_state) => {
+                                                    println!(
+                                                        "  {} Rename {} \"{}\" → \"{}\"",
+                                                        "✓".green(),
+                                                        id,
+                                                        temp.temporary_value,
+                                                        temp.original_value
+                                                    );
+                                                    renamed_state
+                                                }
+                                                Err(e) => {
+                                                    println!(
+                                                        "  {} Rename {} - {}",
+                                                        "✗".red(),
+                                                        id,
+                                                        e
+                                                    );
+                                                    // Use the state with temp name
+                                                    state.clone()
+                                                }
+                                            }
+                                        } else {
+                                            state.clone()
+                                        };
+
                                         println!("  {} {}", "✓".green(), format_effect(effect));
                                         success_count += 1;
 
-                                        applied_states.insert(to.id.clone(), state.clone());
+                                        applied_states.insert(to.id.clone(), final_state);
                                     }
                                     Err(e) => {
                                         println!(
@@ -1640,6 +1682,7 @@ async fn run_apply_from_plan(plan_path: &PathBuf, auto_approve: bool) -> Result<
                 to,
                 lifecycle,
                 cascading_updates,
+                temporary_name,
                 ..
             } => {
                 if lifecycle.create_before_destroy {
@@ -1725,9 +1768,50 @@ async fn run_apply_from_plan(plan_path: &PathBuf, auto_approve: bool) -> Result<
                                 let identifier = from.identifier.as_deref().unwrap_or("");
                                 match provider.delete(id, identifier, lifecycle).await {
                                     Ok(()) => {
+                                        // If a temporary name was used and the name is updatable,
+                                        // rename the resource back to the desired name
+                                        let final_state = if let Some(temp) = temporary_name
+                                            && temp.can_rename
+                                        {
+                                            let new_identifier =
+                                                state.identifier.as_deref().unwrap_or("");
+                                            let mut rename_to = to.clone();
+                                            rename_to.attributes.insert(
+                                                temp.attribute.clone(),
+                                                Value::String(temp.original_value.clone()),
+                                            );
+                                            match provider
+                                                .update(id, new_identifier, &state, &rename_to)
+                                                .await
+                                            {
+                                                Ok(renamed_state) => {
+                                                    println!(
+                                                        "  {} Rename {} \"{}\" → \"{}\"",
+                                                        "✓".green(),
+                                                        id,
+                                                        temp.temporary_value,
+                                                        temp.original_value
+                                                    );
+                                                    renamed_state
+                                                }
+                                                Err(e) => {
+                                                    println!(
+                                                        "  {} Rename {} - {}",
+                                                        "✗".red(),
+                                                        id,
+                                                        e
+                                                    );
+                                                    // Use the state with temp name
+                                                    state.clone()
+                                                }
+                                            }
+                                        } else {
+                                            state.clone()
+                                        };
+
                                         println!("  {} {}", "✓".green(), format_effect(effect));
                                         success_count += 1;
-                                        applied_states.insert(to.id.clone(), state.clone());
+                                        applied_states.insert(to.id.clone(), final_state);
                                     }
                                     Err(e) => {
                                         println!(

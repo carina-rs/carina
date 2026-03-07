@@ -127,10 +127,11 @@ impl<P: Provider> Interpreter<P> {
                 to,
                 lifecycle,
                 cascading_updates,
+                temporary_name,
                 ..
             } => {
                 if lifecycle.create_before_destroy {
-                    // Create the new resource first
+                    // Create the new resource first (possibly with a temporary name)
                     let state = self.provider.create(to).await?;
                     // Execute cascading updates for dependent resources
                     for cascade in cascading_updates {
@@ -142,6 +143,24 @@ impl<P: Provider> Interpreter<P> {
                     // Then delete the old resource
                     let identifier = from.identifier.as_deref().unwrap_or("");
                     self.provider.delete(id, identifier, lifecycle).await?;
+                    // If a temporary name was used and the name is updatable,
+                    // rename the new resource back to the desired name
+                    let state = if let Some(temp) = temporary_name
+                        && temp.can_rename
+                    {
+                        let new_identifier = state.identifier.as_deref().unwrap_or("");
+                        // Build a rename resource with the original name
+                        let mut rename_to = to.clone();
+                        rename_to.attributes.insert(
+                            temp.attribute.clone(),
+                            crate::resource::Value::String(temp.original_value.clone()),
+                        );
+                        self.provider
+                            .update(id, new_identifier, &state, &rename_to)
+                            .await?
+                    } else {
+                        state
+                    };
                     Ok(EffectOutcome::Replaced { state })
                 } else {
                     // Delete the existing resource first
@@ -260,6 +279,7 @@ mod tests {
             lifecycle: LifecycleConfig::default(),
             changed_create_only: vec!["key".to_string()],
             cascading_updates: vec![],
+            temporary_name: None,
         });
 
         let result = interpreter.apply(&plan).await;
@@ -368,6 +388,7 @@ mod tests {
             lifecycle: LifecycleConfig::default(),
             changed_create_only: vec!["key".to_string()],
             cascading_updates: vec![],
+            temporary_name: None,
         });
 
         let result = interpreter.apply(&plan).await;
@@ -404,6 +425,7 @@ mod tests {
             },
             changed_create_only: vec!["key".to_string()],
             cascading_updates: vec![],
+            temporary_name: None,
         });
 
         let result = interpreter.apply(&plan).await;
@@ -458,6 +480,7 @@ mod tests {
                 to: Resource::new("ec2.subnet", "my-subnet")
                     .with_attribute("vpc_id", Value::String("vpc-new".to_string())),
             }],
+            temporary_name: None,
         });
 
         let result = interpreter.apply(&plan).await;
@@ -466,5 +489,113 @@ mod tests {
         // Verify order: create (new VPC) → update (subnet cascade) → delete (old VPC)
         let ops = ops.lock().unwrap();
         assert_eq!(*ops, vec!["create", "update", "delete"]);
+    }
+
+    #[tokio::test]
+    async fn replace_create_before_destroy_with_temporary_name_and_rename() {
+        use crate::effect::TemporaryName;
+        use crate::resource::Value;
+        use std::collections::HashMap;
+
+        let ops = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = OrderTrackingProvider { ops: ops.clone() };
+        let interpreter = Interpreter::new(provider);
+
+        let mut plan = Plan::new();
+        plan.add(Effect::Replace {
+            id: ResourceId::new("s3.bucket", "my-bucket"),
+            from: Box::new(
+                State::existing(
+                    ResourceId::new("s3.bucket", "my-bucket"),
+                    HashMap::from([
+                        (
+                            "bucket_name".to_string(),
+                            Value::String("my-bucket".to_string()),
+                        ),
+                        ("object_lock_enabled".to_string(), Value::Bool(false)),
+                    ]),
+                )
+                .with_identifier("my-bucket"),
+            ),
+            to: Resource::new("s3.bucket", "my-bucket")
+                .with_attribute(
+                    "bucket_name",
+                    Value::String("my-bucket-abc12345".to_string()),
+                )
+                .with_attribute("object_lock_enabled", Value::Bool(true)),
+            lifecycle: LifecycleConfig {
+                force_delete: false,
+                create_before_destroy: true,
+            },
+            changed_create_only: vec!["object_lock_enabled".to_string()],
+            cascading_updates: vec![],
+            temporary_name: Some(TemporaryName {
+                attribute: "bucket_name".to_string(),
+                original_value: "my-bucket".to_string(),
+                temporary_value: "my-bucket-abc12345".to_string(),
+                can_rename: true, // name is updatable
+            }),
+        });
+
+        let result = interpreter.apply(&plan).await;
+        assert!(result.is_success());
+
+        // Verify order: create (with temp name) → delete (old) → update (rename back)
+        let ops = ops.lock().unwrap();
+        assert_eq!(*ops, vec!["create", "delete", "update"]);
+    }
+
+    #[tokio::test]
+    async fn replace_create_before_destroy_with_temporary_name_no_rename() {
+        use crate::effect::TemporaryName;
+        use crate::resource::Value;
+        use std::collections::HashMap;
+
+        let ops = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = OrderTrackingProvider { ops: ops.clone() };
+        let interpreter = Interpreter::new(provider);
+
+        let mut plan = Plan::new();
+        plan.add(Effect::Replace {
+            id: ResourceId::new("s3.bucket", "my-bucket"),
+            from: Box::new(
+                State::existing(
+                    ResourceId::new("s3.bucket", "my-bucket"),
+                    HashMap::from([
+                        (
+                            "bucket_name".to_string(),
+                            Value::String("my-bucket".to_string()),
+                        ),
+                        ("object_lock_enabled".to_string(), Value::Bool(false)),
+                    ]),
+                )
+                .with_identifier("my-bucket"),
+            ),
+            to: Resource::new("s3.bucket", "my-bucket")
+                .with_attribute(
+                    "bucket_name",
+                    Value::String("my-bucket-abc12345".to_string()),
+                )
+                .with_attribute("object_lock_enabled", Value::Bool(true)),
+            lifecycle: LifecycleConfig {
+                force_delete: false,
+                create_before_destroy: true,
+            },
+            changed_create_only: vec!["object_lock_enabled".to_string()],
+            cascading_updates: vec![],
+            temporary_name: Some(TemporaryName {
+                attribute: "bucket_name".to_string(),
+                original_value: "my-bucket".to_string(),
+                temporary_value: "my-bucket-abc12345".to_string(),
+                can_rename: false, // name is create-only, cannot rename
+            }),
+        });
+
+        let result = interpreter.apply(&plan).await;
+        assert!(result.is_success());
+
+        // Verify order: create (with temp name) → delete (old) — no rename step
+        let ops = ops.lock().unwrap();
+        assert_eq!(*ops, vec!["create", "delete"]);
     }
 }

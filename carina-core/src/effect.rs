@@ -7,6 +7,22 @@ use serde::{Deserialize, Serialize};
 
 use crate::resource::{LifecycleConfig, Resource, ResourceId, State};
 
+/// Temporary name used during create-before-destroy replacement.
+///
+/// When a resource with a unique name constraint is replaced with create-before-destroy,
+/// the new resource is created with a temporary name to avoid conflicts with the old resource.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TemporaryName {
+    /// The attribute that holds the name (e.g., "bucket_name")
+    pub attribute: String,
+    /// The original (desired) name value (e.g., "my-bucket")
+    pub original_value: String,
+    /// The generated temporary name (e.g., "my-bucket-a1b2c3d4")
+    pub temporary_value: String,
+    /// Whether the name attribute can be updated after creation (not create-only)
+    pub can_rename: bool,
+}
+
 /// A dependent resource that must be updated during a create_before_destroy replacement.
 ///
 /// When a resource is replaced with create_before_destroy, dependent resources that
@@ -49,6 +65,9 @@ pub enum Effect {
         /// Dependent resources to update between create and delete (create_before_destroy only)
         #[serde(default)]
         cascading_updates: Vec<CascadingUpdate>,
+        /// Temporary name for create-before-destroy when the resource has a unique name constraint
+        #[serde(default)]
+        temporary_name: Option<TemporaryName>,
     },
 
     /// Delete a resource
@@ -210,6 +229,7 @@ mod tests {
                 lifecycle: LifecycleConfig::default(),
                 changed_create_only: vec!["cidr_block".to_string()],
                 cascading_updates: vec![],
+                temporary_name: None,
             },
             Effect::Delete {
                 id: ResourceId::new("s3.bucket", "old-bucket"),

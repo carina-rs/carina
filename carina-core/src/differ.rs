@@ -6,7 +6,8 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::deps::get_resource_dependencies;
-use crate::effect::{CascadingUpdate, Effect};
+use crate::effect::{CascadingUpdate, Effect, TemporaryName};
+use crate::identifier::generate_random_suffix;
 use crate::plan::Plan;
 use crate::resource::{LifecycleConfig, Resource, ResourceId, State, Value, merge_with_saved};
 use crate::schema::ResourceSchema;
@@ -65,17 +66,7 @@ fn find_changed_create_only(
     changed_attributes: &[String],
     schemas: &HashMap<String, ResourceSchema>,
 ) -> Vec<String> {
-    // Try to find the schema — look up by resource_type directly,
-    // then try with provider prefix
-    let schema = schemas.get(resource_type).or_else(|| {
-        if !provider.is_empty() {
-            schemas.get(&format!("{}.{}", provider, resource_type))
-        } else {
-            None
-        }
-    });
-
-    let Some(schema) = schema else {
+    let Some(schema) = find_schema(provider, resource_type, schemas) else {
         return Vec::new();
     };
 
@@ -123,6 +114,60 @@ fn find_changed_attributes(
     }
 
     changed
+}
+
+/// Look up the schema for a resource, trying both direct and provider-prefixed keys.
+fn find_schema<'a>(
+    provider: &str,
+    resource_type: &str,
+    schemas: &'a HashMap<String, ResourceSchema>,
+) -> Option<&'a ResourceSchema> {
+    schemas.get(resource_type).or_else(|| {
+        if !provider.is_empty() {
+            schemas.get(&format!("{}.{}", provider, resource_type))
+        } else {
+            None
+        }
+    })
+}
+
+/// Generate a temporary name for create-before-destroy replacement.
+///
+/// When a resource has a `name_attribute` with a unique constraint and uses
+/// `create_before_destroy`, we need a temporary name for the new resource to
+/// avoid conflicts with the old resource that still exists.
+///
+/// Returns `None` if no temporary name is needed (no name_attribute, or
+/// the resource already uses name_prefix for that attribute).
+fn generate_temporary_name(resource: &Resource, schema: &ResourceSchema) -> Option<TemporaryName> {
+    let name_attr = schema.name_attribute.as_ref()?;
+
+    // Skip if the resource uses name_prefix for this attribute
+    if resource.prefixes.contains_key(name_attr) {
+        return None;
+    }
+
+    // Get the current value of the name attribute
+    let original_value = match resource.attributes.get(name_attr) {
+        Some(Value::String(s)) => s.clone(),
+        _ => return None,
+    };
+
+    // Check if the name attribute is create-only (cannot be renamed after creation)
+    let can_rename = schema
+        .attributes
+        .get(name_attr)
+        .map(|attr| !attr.create_only)
+        .unwrap_or(false);
+
+    let temporary_value = format!("{}-{}", original_value, generate_random_suffix());
+
+    Some(TemporaryName {
+        attribute: name_attr.clone(),
+        original_value,
+        temporary_value,
+        can_rename,
+    })
 }
 
 /// Compute Diff for multiple resources and generate a Plan
@@ -182,13 +227,34 @@ pub fn create_plan(
                 if changed_create_only.is_empty() {
                     plan.add(Effect::Update { id, from, to });
                 } else {
+                    let lifecycle = resource.lifecycle.clone();
+                    let temporary_name = if lifecycle.create_before_destroy {
+                        find_schema(&resource.id.provider, &resource.id.resource_type, schemas)
+                            .and_then(|schema| generate_temporary_name(&to, schema))
+                    } else {
+                        None
+                    };
+
+                    // If a temporary name is generated, modify the `to` resource
+                    let to = if let Some(ref temp) = temporary_name {
+                        let mut modified = to;
+                        modified.attributes.insert(
+                            temp.attribute.clone(),
+                            Value::String(temp.temporary_value.clone()),
+                        );
+                        modified
+                    } else {
+                        to
+                    };
+
                     plan.add(Effect::Replace {
                         id,
                         from,
                         to,
-                        lifecycle: resource.lifecycle.clone(),
+                        lifecycle,
                         changed_create_only,
                         cascading_updates: vec![],
+                        temporary_name,
                     });
                 }
             }
@@ -1169,6 +1235,7 @@ mod tests {
             },
             changed_create_only: vec!["cidr_block".to_string()],
             cascading_updates: vec![],
+            temporary_name: None,
         });
 
         // Apply cascade
@@ -1256,6 +1323,7 @@ mod tests {
             },
             changed_create_only: vec!["cidr_block".to_string()],
             cascading_updates: vec![],
+            temporary_name: None,
         });
         plan.add(Effect::Update {
             id: subnet_id.clone(),
@@ -1320,6 +1388,7 @@ mod tests {
             lifecycle: LifecycleConfig::default(), // create_before_destroy = false
             changed_create_only: vec!["cidr_block".to_string()],
             cascading_updates: vec![],
+            temporary_name: None,
         });
 
         cascade_dependent_updates(&mut plan, &unresolved_resources, &current_states);
@@ -1409,6 +1478,7 @@ mod tests {
             },
             changed_create_only: vec!["cidr_block".to_string()],
             cascading_updates: vec![],
+            temporary_name: None,
         });
 
         cascade_dependent_updates(&mut plan, &unresolved_resources, &current_states);
@@ -1479,6 +1549,7 @@ mod tests {
             },
             changed_create_only: vec!["cidr_block".to_string()],
             cascading_updates: vec![],
+            temporary_name: None,
         });
 
         cascade_dependent_updates(&mut plan, &unresolved_resources, &current_states);
@@ -1495,6 +1566,299 @@ mod tests {
             assert_eq!(cascading_updates[0].id, subnet_id);
         } else {
             panic!("Expected Replace effect");
+        }
+    }
+
+    #[test]
+    fn create_before_destroy_generates_temporary_name_for_name_attribute() {
+        use crate::schema::{AttributeSchema, AttributeType};
+
+        let mut resource = Resource::new("s3.bucket", "my-bucket")
+            .with_attribute("bucket_name", Value::String("my-bucket".to_string()))
+            .with_attribute("object_lock_enabled", Value::Bool(true));
+        resource.lifecycle.create_before_destroy = true;
+
+        let resources = vec![resource];
+
+        let mut current_states = HashMap::new();
+        let mut attrs = HashMap::new();
+        attrs.insert(
+            "bucket_name".to_string(),
+            Value::String("my-bucket".to_string()),
+        );
+        attrs.insert("object_lock_enabled".to_string(), Value::Bool(false));
+        current_states.insert(
+            ResourceId::new("s3.bucket", "my-bucket"),
+            State::existing(ResourceId::new("s3.bucket", "my-bucket"), attrs),
+        );
+
+        let mut schemas = HashMap::new();
+        schemas.insert(
+            "s3.bucket".to_string(),
+            ResourceSchema::new("s3.bucket")
+                .attribute(AttributeSchema::new("bucket_name", AttributeType::String).create_only())
+                .attribute(
+                    AttributeSchema::new("object_lock_enabled", AttributeType::Bool).create_only(),
+                )
+                .with_name_attribute("bucket_name"),
+        );
+
+        let plan = create_plan(
+            &resources,
+            &current_states,
+            &HashMap::new(),
+            &schemas,
+            &HashMap::new(),
+        );
+
+        assert_eq!(plan.effects().len(), 1);
+        match &plan.effects()[0] {
+            Effect::Replace {
+                temporary_name, to, ..
+            } => {
+                let temp = temporary_name.as_ref().expect(
+                    "Should have temporary_name for create_before_destroy with name_attribute",
+                );
+                assert_eq!(temp.attribute, "bucket_name");
+                assert_eq!(temp.original_value, "my-bucket");
+                assert!(
+                    temp.temporary_value.starts_with("my-bucket-"),
+                    "Temporary value '{}' should start with 'my-bucket-'",
+                    temp.temporary_value
+                );
+                assert_eq!(temp.temporary_value.len(), "my-bucket-".len() + 8);
+                // bucket_name is create-only, so can_rename should be false
+                assert!(!temp.can_rename);
+                // The `to` resource should have the temporary name
+                assert_eq!(
+                    to.attributes.get("bucket_name"),
+                    Some(&Value::String(temp.temporary_value.clone()))
+                );
+            }
+            other => panic!("Expected Replace, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn create_before_destroy_generates_temporary_name_with_can_rename() {
+        use crate::schema::{AttributeSchema, AttributeType};
+
+        let mut resource = Resource::new("logs.log_group", "my-log-group")
+            .with_attribute(
+                "log_group_name".to_string(),
+                Value::String("my-log-group".to_string()),
+            )
+            .with_attribute("kms_key_id", Value::String("new-key".to_string()));
+        resource.lifecycle.create_before_destroy = true;
+
+        let resources = vec![resource];
+
+        let mut current_states = HashMap::new();
+        let mut attrs = HashMap::new();
+        attrs.insert(
+            "log_group_name".to_string(),
+            Value::String("my-log-group".to_string()),
+        );
+        attrs.insert(
+            "kms_key_id".to_string(),
+            Value::String("old-key".to_string()),
+        );
+        current_states.insert(
+            ResourceId::new("logs.log_group", "my-log-group"),
+            State::existing(ResourceId::new("logs.log_group", "my-log-group"), attrs),
+        );
+
+        let mut schemas = HashMap::new();
+        schemas.insert(
+            "logs.log_group".to_string(),
+            ResourceSchema::new("logs.log_group")
+                .attribute(
+                    // log_group_name is NOT create-only in this test (can be renamed)
+                    AttributeSchema::new("log_group_name", AttributeType::String),
+                )
+                .attribute(AttributeSchema::new("kms_key_id", AttributeType::String).create_only())
+                .with_name_attribute("log_group_name"),
+        );
+
+        let plan = create_plan(
+            &resources,
+            &current_states,
+            &HashMap::new(),
+            &schemas,
+            &HashMap::new(),
+        );
+
+        assert_eq!(plan.effects().len(), 1);
+        match &plan.effects()[0] {
+            Effect::Replace { temporary_name, .. } => {
+                let temp = temporary_name.as_ref().expect("Should have temporary_name");
+                assert_eq!(temp.attribute, "log_group_name");
+                assert_eq!(temp.original_value, "my-log-group");
+                // log_group_name is not create-only, so can_rename should be true
+                assert!(temp.can_rename);
+            }
+            other => panic!("Expected Replace, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn no_temporary_name_without_create_before_destroy() {
+        use crate::schema::{AttributeSchema, AttributeType};
+
+        // Default lifecycle (create_before_destroy = false)
+        let resources = vec![
+            Resource::new("s3.bucket", "my-bucket")
+                .with_attribute("bucket_name", Value::String("my-bucket".to_string()))
+                .with_attribute("object_lock_enabled", Value::Bool(true)),
+        ];
+
+        let mut current_states = HashMap::new();
+        let mut attrs = HashMap::new();
+        attrs.insert(
+            "bucket_name".to_string(),
+            Value::String("my-bucket".to_string()),
+        );
+        attrs.insert("object_lock_enabled".to_string(), Value::Bool(false));
+        current_states.insert(
+            ResourceId::new("s3.bucket", "my-bucket"),
+            State::existing(ResourceId::new("s3.bucket", "my-bucket"), attrs),
+        );
+
+        let mut schemas = HashMap::new();
+        schemas.insert(
+            "s3.bucket".to_string(),
+            ResourceSchema::new("s3.bucket")
+                .attribute(AttributeSchema::new("bucket_name", AttributeType::String).create_only())
+                .attribute(
+                    AttributeSchema::new("object_lock_enabled", AttributeType::Bool).create_only(),
+                )
+                .with_name_attribute("bucket_name"),
+        );
+
+        let plan = create_plan(
+            &resources,
+            &current_states,
+            &HashMap::new(),
+            &schemas,
+            &HashMap::new(),
+        );
+
+        assert_eq!(plan.effects().len(), 1);
+        match &plan.effects()[0] {
+            Effect::Replace { temporary_name, .. } => {
+                assert!(
+                    temporary_name.is_none(),
+                    "Should not have temporary_name without create_before_destroy"
+                );
+            }
+            other => panic!("Expected Replace, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn no_temporary_name_when_name_prefix_is_used() {
+        use crate::schema::{AttributeSchema, AttributeType};
+
+        let mut resource = Resource::new("s3.bucket", "my-bucket")
+            .with_attribute("bucket_name", Value::String("my-app-abc12345".to_string()))
+            .with_attribute("object_lock_enabled", Value::Bool(true));
+        resource.lifecycle.create_before_destroy = true;
+        // Simulate that name_prefix was used
+        resource
+            .prefixes
+            .insert("bucket_name".to_string(), "my-app-".to_string());
+
+        let resources = vec![resource];
+
+        let mut current_states = HashMap::new();
+        let mut attrs = HashMap::new();
+        attrs.insert(
+            "bucket_name".to_string(),
+            Value::String("my-app-abc12345".to_string()),
+        );
+        attrs.insert("object_lock_enabled".to_string(), Value::Bool(false));
+        current_states.insert(
+            ResourceId::new("s3.bucket", "my-bucket"),
+            State::existing(ResourceId::new("s3.bucket", "my-bucket"), attrs),
+        );
+
+        let mut schemas = HashMap::new();
+        schemas.insert(
+            "s3.bucket".to_string(),
+            ResourceSchema::new("s3.bucket")
+                .attribute(AttributeSchema::new("bucket_name", AttributeType::String).create_only())
+                .attribute(
+                    AttributeSchema::new("object_lock_enabled", AttributeType::Bool).create_only(),
+                )
+                .with_name_attribute("bucket_name"),
+        );
+
+        let plan = create_plan(
+            &resources,
+            &current_states,
+            &HashMap::new(),
+            &schemas,
+            &HashMap::new(),
+        );
+
+        assert_eq!(plan.effects().len(), 1);
+        match &plan.effects()[0] {
+            Effect::Replace { temporary_name, .. } => {
+                assert!(
+                    temporary_name.is_none(),
+                    "Should not generate temporary_name when name_prefix is used"
+                );
+            }
+            other => panic!("Expected Replace, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn no_temporary_name_without_name_attribute_in_schema() {
+        use crate::schema::{AttributeSchema, AttributeType};
+
+        let mut resource = Resource::new("ec2.vpc", "my-vpc")
+            .with_attribute("cidr_block", Value::String("10.1.0.0/16".to_string()));
+        resource.lifecycle.create_before_destroy = true;
+
+        let resources = vec![resource];
+
+        let mut current_states = HashMap::new();
+        let mut attrs = HashMap::new();
+        attrs.insert(
+            "cidr_block".to_string(),
+            Value::String("10.0.0.0/16".to_string()),
+        );
+        current_states.insert(
+            ResourceId::new("ec2.vpc", "my-vpc"),
+            State::existing(ResourceId::new("ec2.vpc", "my-vpc"), attrs),
+        );
+
+        let mut schemas = HashMap::new();
+        schemas.insert(
+            "ec2.vpc".to_string(),
+            ResourceSchema::new("ec2.vpc")
+                .attribute(AttributeSchema::new("cidr_block", AttributeType::String).create_only()),
+            // No name_attribute set
+        );
+
+        let plan = create_plan(
+            &resources,
+            &current_states,
+            &HashMap::new(),
+            &schemas,
+            &HashMap::new(),
+        );
+
+        assert_eq!(plan.effects().len(), 1);
+        match &plan.effects()[0] {
+            Effect::Replace { temporary_name, .. } => {
+                assert!(
+                    temporary_name.is_none(),
+                    "Should not generate temporary_name without name_attribute in schema"
+                );
+            }
+            other => panic!("Expected Replace, got {:?}", other),
         }
     }
 }
