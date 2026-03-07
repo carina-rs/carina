@@ -394,7 +394,7 @@ async fn run_plan(path: &PathBuf, out: Option<&PathBuf>) -> Result<bool, String>
             let has_bucket_resource = parsed.resources.iter().any(|r| {
                 r.id.resource_type == backend_resource_type
                     && r.attributes
-                        .get("name")
+                        .get("bucket")
                         .is_some_and(|v| matches!(v, Value::String(s) if s == &bucket_name))
             });
 
@@ -2147,7 +2147,7 @@ async fn run_destroy(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
             if let Some(backend_rt) = backend.resource_type()
                 && r.id.resource_type == backend_rt
                 && let Some(ref bucket_name) = protected_bucket
-                && let Some(Value::String(name)) = r.attributes.get("name")
+                && let Some(Value::String(name)) = r.attributes.get("bucket")
                 && name == bucket_name
             {
                 protected_resources.push(r);
