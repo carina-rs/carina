@@ -295,22 +295,29 @@ impl AwsProvider {
     /// Read s3.bucket GetBucketVersioning (generated)
     pub(crate) async fn read_s3_bucket_versioning(
         &self,
+        id: &ResourceId,
         identifier: &str,
         attributes: &mut HashMap<String, Value>,
-    ) {
-        if let Ok(output) = self
+    ) -> ProviderResult<()> {
+        let output = self
             .s3_client
             .get_bucket_versioning()
             .bucket(identifier)
             .send()
             .await
-        {
-            let value = output
-                .status()
-                .map(|v| v.as_str().to_string())
-                .unwrap_or_else(|| "Suspended".to_string());
-            attributes.insert("versioning_status".to_string(), Value::String(value));
-        }
+            .map_err(|e| {
+                ProviderError::new(format!(
+                    "Failed to read s3.bucket GetBucketVersioning: {}",
+                    e
+                ))
+                .for_resource(id.clone())
+            })?;
+        let value = output
+            .status()
+            .map(|v| v.as_str().to_string())
+            .unwrap_or_else(|| "Suspended".to_string());
+        attributes.insert("versioning_status".to_string(), Value::String(value));
+        Ok(())
     }
 
     /// Write s3.bucket PutBucketVersioning (generated)
