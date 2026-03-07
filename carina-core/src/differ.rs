@@ -139,7 +139,11 @@ fn find_schema<'a>(
 ///
 /// Returns `None` if no temporary name is needed (no name_attribute, or
 /// the resource already uses name_prefix for that attribute).
-fn generate_temporary_name(resource: &Resource, schema: &ResourceSchema) -> Option<TemporaryName> {
+fn generate_temporary_name(
+    resource: &Resource,
+    from: &State,
+    schema: &ResourceSchema,
+) -> Option<TemporaryName> {
     let name_attr = schema.name_attribute.as_ref()?;
 
     // Skip if the resource uses name_prefix for this attribute
@@ -152,6 +156,13 @@ fn generate_temporary_name(resource: &Resource, schema: &ResourceSchema) -> Opti
         Some(Value::String(s)) => s.clone(),
         _ => return None,
     };
+
+    // Skip if the name_attribute value changed (new name is already different from old)
+    if let Some(Value::String(from_name)) = from.attributes.get(name_attr)
+        && *from_name != original_value
+    {
+        return None;
+    }
 
     // Check if the name attribute is create-only (cannot be renamed after creation)
     let can_rename = schema
@@ -230,7 +241,7 @@ pub fn create_plan(
                     let lifecycle = resource.lifecycle.clone();
                     let temporary_name = if lifecycle.create_before_destroy {
                         find_schema(&resource.id.provider, &resource.id.resource_type, schemas)
-                            .and_then(|schema| generate_temporary_name(&to, schema))
+                            .and_then(|schema| generate_temporary_name(&to, &from, schema))
                     } else {
                         None
                     };
@@ -1856,6 +1867,62 @@ mod tests {
                 assert!(
                     temporary_name.is_none(),
                     "Should not generate temporary_name without name_attribute in schema"
+                );
+            }
+            other => panic!("Expected Replace, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn no_temporary_name_when_name_attribute_changes() {
+        use crate::schema::{AttributeSchema, AttributeType};
+
+        // name_attribute itself changed: old-bucket → new-bucket
+        // No temporary name needed since names are already different
+        let mut resource = Resource::new("s3.bucket", "my-bucket")
+            .with_attribute("bucket_name", Value::String("new-bucket".to_string()))
+            .with_attribute("object_lock_enabled", Value::Bool(true));
+        resource.lifecycle.create_before_destroy = true;
+
+        let resources = vec![resource];
+
+        let mut current_states = HashMap::new();
+        let mut attrs = HashMap::new();
+        attrs.insert(
+            "bucket_name".to_string(),
+            Value::String("old-bucket".to_string()),
+        );
+        attrs.insert("object_lock_enabled".to_string(), Value::Bool(true));
+        current_states.insert(
+            ResourceId::new("s3.bucket", "my-bucket"),
+            State::existing(ResourceId::new("s3.bucket", "my-bucket"), attrs),
+        );
+
+        let mut schemas = HashMap::new();
+        schemas.insert(
+            "s3.bucket".to_string(),
+            ResourceSchema::new("s3.bucket")
+                .attribute(AttributeSchema::new("bucket_name", AttributeType::String).create_only())
+                .attribute(
+                    AttributeSchema::new("object_lock_enabled", AttributeType::Bool).create_only(),
+                )
+                .with_name_attribute("bucket_name"),
+        );
+
+        let plan = create_plan(
+            &resources,
+            &current_states,
+            &HashMap::new(),
+            &schemas,
+            &HashMap::new(),
+        );
+
+        assert_eq!(plan.effects().len(), 1);
+        match &plan.effects()[0] {
+            Effect::Replace { temporary_name, .. } => {
+                assert!(
+                    temporary_name.is_none(),
+                    "Should not generate temporary_name when name_attribute value changes"
                 );
             }
             other => panic!("Expected Replace, got {:?}", other),
