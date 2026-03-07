@@ -118,6 +118,19 @@ impl StateFile {
         result
     }
 
+    /// Build a map of ResourceId -> name overrides from this state file.
+    /// Name overrides come from create_before_destroy with non-renameable attributes.
+    pub fn build_name_overrides(&self) -> HashMap<ResourceId, HashMap<String, String>> {
+        let mut result = HashMap::new();
+        for rs in &self.resources {
+            if !rs.name_overrides.is_empty() {
+                let id = ResourceId::with_provider(&rs.provider, &rs.resource_type, &rs.name);
+                result.insert(id, rs.name_overrides.clone());
+            }
+        }
+        result
+    }
+
     /// Remove a resource from the state
     pub fn remove_resource(&mut self, resource_type: &str, name: &str) -> Option<ResourceState> {
         if let Some(pos) = self
@@ -162,6 +175,10 @@ pub struct ResourceState {
     /// Attribute prefixes used to generate names (e.g., {"bucket_name": "my-app-"})
     #[serde(default)]
     pub prefixes: HashMap<String, String>,
+    /// Permanent name overrides from create_before_destroy with non-renameable attributes.
+    /// Maps attribute name to the permanent temporary name (e.g., {"role_name": "my-role-abc123"}).
+    #[serde(default)]
+    pub name_overrides: HashMap<String, String>,
 }
 
 impl ResourceState {
@@ -180,6 +197,7 @@ impl ResourceState {
             protected: false,
             lifecycle: LifecycleConfig::default(),
             prefixes: HashMap::new(),
+            name_overrides: HashMap::new(),
         }
     }
 
@@ -220,6 +238,7 @@ impl ResourceState {
         }
         if let Some(existing) = existing {
             rs.protected = existing.protected;
+            rs.name_overrides = existing.name_overrides.clone();
         }
         rs.lifecycle = resource.lifecycle.clone();
         rs.prefixes = resource.prefixes.clone();

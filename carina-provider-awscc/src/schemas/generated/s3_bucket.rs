@@ -1234,6 +1234,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                 .with_description(" (read-only)")
                 .with_provider_name("WebsiteURL"),
         )
+        .with_name_attribute("bucket_name")
     }
 }
 

@@ -1203,6 +1203,32 @@ pub fn {}() -> AwsccSchemaConfig {{
         code.push_str(&attr_code);
     }
 
+    // Determine name_attribute from primaryIdentifier:
+    // If the primary identifier points to a single user-settable (non-read-only) string property,
+    // it's the name attribute used for unique name generation during create-before-destroy.
+    if let Some(primary_ids) = &schema.primary_identifier
+        && primary_ids.len() == 1
+    {
+        let prop_path = primary_ids[0].trim_start_matches("/properties/");
+        if !read_only.contains(prop_path)
+            && let Some(prop) = schema.properties.get(prop_path)
+        {
+            let is_string = prop
+                .prop_type
+                .as_ref()
+                .and_then(|t| t.as_str())
+                .map(|t| t == "string")
+                .unwrap_or(false);
+            if is_string {
+                let attr_name = prop_path.to_snake_case();
+                code.push_str(&format!(
+                    "        .with_name_attribute(\"{}\")\n",
+                    attr_name
+                ));
+            }
+        }
+    }
+
     // Close the schema (ResourceSchema) and the AwsccSchemaConfig struct
     code.push_str("    }\n}\n");
 

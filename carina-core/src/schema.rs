@@ -488,6 +488,10 @@ pub struct ResourceSchema {
     pub validator: Option<ResourceValidator>,
     /// If true, this resource type is a data source and must be used with `read`
     pub data_source: bool,
+    /// The attribute that serves as the unique name for this resource type.
+    /// Used for automatic unique name generation during create-before-destroy replacement.
+    /// (e.g., "bucket_name" for s3.bucket, "log_group_name" for logs.log_group)
+    pub name_attribute: Option<String>,
 }
 
 impl ResourceSchema {
@@ -498,6 +502,7 @@ impl ResourceSchema {
             description: None,
             validator: None,
             data_source: false,
+            name_attribute: None,
         }
     }
 
@@ -518,6 +523,11 @@ impl ResourceSchema {
 
     pub fn as_data_source(mut self) -> Self {
         self.data_source = true;
+        self
+    }
+
+    pub fn with_name_attribute(mut self, attr: impl Into<String>) -> Self {
+        self.name_attribute = Some(attr.into());
         self
     }
 

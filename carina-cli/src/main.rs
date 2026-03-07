@@ -456,6 +456,7 @@ async fn run_plan(path: &PathBuf, out: Option<&PathBuf>) -> Result<bool, String>
     }
 
     reconcile_prefixed_names(&mut parsed.resources, &state_file);
+    apply_name_overrides(&mut parsed.resources, &state_file);
 
     let ctx = create_plan_from_parsed(&parsed, &state_file).await?;
     let has_changes = ctx.plan.mutation_count() > 0;
@@ -512,6 +513,33 @@ async fn run_plan(path: &PathBuf, out: Option<&PathBuf>) -> Result<bool, String>
     }
 
     Ok(has_changes)
+}
+
+/// Apply permanent name overrides from state to desired resources.
+///
+/// When a create_before_destroy replacement produces a non-renameable temporary name
+/// (can_rename=false), the state stores the permanent name. This function applies
+/// those overrides so the plan doesn't detect a false diff.
+fn apply_name_overrides(resources: &mut [Resource], state_file: &Option<StateFile>) {
+    let state_file = match state_file {
+        Some(sf) => sf,
+        None => return,
+    };
+
+    let overrides = state_file.build_name_overrides();
+    if overrides.is_empty() {
+        return;
+    }
+
+    for resource in resources.iter_mut() {
+        if let Some(name_overrides) = overrides.get(&resource.id) {
+            for (attr, value) in name_overrides {
+                resource
+                    .attributes
+                    .insert(attr.clone(), Value::String(value.clone()));
+            }
+        }
+    }
 }
 
 async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
@@ -776,6 +804,7 @@ async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
     }
 
     reconcile_prefixed_names(&mut parsed.resources, &state_file);
+    apply_name_overrides(&mut parsed.resources, &state_file);
 
     // Sort resources by dependencies
     let sorted_resources = sort_resources_by_dependencies(&parsed.resources);
@@ -904,6 +933,7 @@ async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
     let mut applied_states: HashMap<ResourceId, State> = HashMap::new();
     let mut failed_bindings: HashSet<String> = HashSet::new();
     let mut successfully_deleted: HashSet<ResourceId> = HashSet::new();
+    let mut permanent_name_overrides: HashMap<ResourceId, HashMap<String, String>> = HashMap::new();
 
     // Apply each effect in order, resolving references dynamically
     for effect in plan.effects() {
@@ -1004,6 +1034,7 @@ async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
                 to,
                 lifecycle,
                 cascading_updates,
+                temporary_name,
                 ..
             } => {
                 if lifecycle.create_before_destroy {
@@ -1090,10 +1121,63 @@ async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
                                 let identifier = from.identifier.as_deref().unwrap_or("");
                                 match provider.delete(id, identifier, lifecycle).await {
                                     Ok(()) => {
+                                        // If a temporary name was used and the name is updatable,
+                                        // rename the resource back to the desired name
+                                        let final_state = if let Some(temp) = temporary_name
+                                            && temp.can_rename
+                                        {
+                                            let new_identifier =
+                                                state.identifier.as_deref().unwrap_or("");
+                                            let mut rename_to = to.clone();
+                                            rename_to.attributes.insert(
+                                                temp.attribute.clone(),
+                                                Value::String(temp.original_value.clone()),
+                                            );
+                                            match provider
+                                                .update(id, new_identifier, &state, &rename_to)
+                                                .await
+                                            {
+                                                Ok(renamed_state) => {
+                                                    println!(
+                                                        "  {} Rename {} \"{}\" → \"{}\"",
+                                                        "✓".green(),
+                                                        id,
+                                                        temp.temporary_value,
+                                                        temp.original_value
+                                                    );
+                                                    renamed_state
+                                                }
+                                                Err(e) => {
+                                                    println!(
+                                                        "  {} Rename {} - {}",
+                                                        "✗".red(),
+                                                        id,
+                                                        e
+                                                    );
+                                                    // Use the state with temp name
+                                                    state.clone()
+                                                }
+                                            }
+                                        } else {
+                                            // Track permanent name override for can_rename=false
+                                            if let Some(temp) = temporary_name
+                                                && !temp.can_rename
+                                            {
+                                                let mut overrides = HashMap::new();
+                                                overrides.insert(
+                                                    temp.attribute.clone(),
+                                                    temp.temporary_value.clone(),
+                                                );
+                                                permanent_name_overrides
+                                                    .insert(to.id.clone(), overrides);
+                                            }
+                                            state.clone()
+                                        };
+
                                         println!("  {} {}", "✓".green(), format_effect(effect));
                                         success_count += 1;
 
-                                        applied_states.insert(to.id.clone(), state.clone());
+                                        applied_states.insert(to.id.clone(), final_state);
                                     }
                                     Err(e) => {
                                         println!(
@@ -1198,8 +1282,12 @@ async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
     for resource in &sorted_resources {
         let existing = state.find_resource(&resource.id.resource_type, &resource.id.name);
         if let Some(applied_state) = applied_states.get(&resource.id) {
-            let resource_state =
+            let mut resource_state =
                 ResourceState::from_provider_state(resource, applied_state, existing);
+            // Store permanent name overrides for create_before_destroy with can_rename=false
+            if let Some(overrides) = permanent_name_overrides.get(&resource.id) {
+                resource_state.name_overrides = overrides.clone();
+            }
             state.upsert_resource(resource_state);
         } else if let Some(current_state) = current_states.get(&resource.id)
             && current_state.exists
@@ -1549,6 +1637,7 @@ async fn run_apply_from_plan(plan_path: &PathBuf, auto_approve: bool) -> Result<
     let mut applied_states: HashMap<ResourceId, State> = HashMap::new();
     let mut failed_bindings: HashSet<String> = HashSet::new();
     let mut successfully_deleted: HashSet<ResourceId> = HashSet::new();
+    let mut permanent_name_overrides: HashMap<ResourceId, HashMap<String, String>> = HashMap::new();
 
     // Apply each effect in order, resolving references dynamically
     for effect in plan.effects() {
@@ -1640,6 +1729,7 @@ async fn run_apply_from_plan(plan_path: &PathBuf, auto_approve: bool) -> Result<
                 to,
                 lifecycle,
                 cascading_updates,
+                temporary_name,
                 ..
             } => {
                 if lifecycle.create_before_destroy {
@@ -1725,9 +1815,62 @@ async fn run_apply_from_plan(plan_path: &PathBuf, auto_approve: bool) -> Result<
                                 let identifier = from.identifier.as_deref().unwrap_or("");
                                 match provider.delete(id, identifier, lifecycle).await {
                                     Ok(()) => {
+                                        // If a temporary name was used and the name is updatable,
+                                        // rename the resource back to the desired name
+                                        let final_state = if let Some(temp) = temporary_name
+                                            && temp.can_rename
+                                        {
+                                            let new_identifier =
+                                                state.identifier.as_deref().unwrap_or("");
+                                            let mut rename_to = to.clone();
+                                            rename_to.attributes.insert(
+                                                temp.attribute.clone(),
+                                                Value::String(temp.original_value.clone()),
+                                            );
+                                            match provider
+                                                .update(id, new_identifier, &state, &rename_to)
+                                                .await
+                                            {
+                                                Ok(renamed_state) => {
+                                                    println!(
+                                                        "  {} Rename {} \"{}\" → \"{}\"",
+                                                        "✓".green(),
+                                                        id,
+                                                        temp.temporary_value,
+                                                        temp.original_value
+                                                    );
+                                                    renamed_state
+                                                }
+                                                Err(e) => {
+                                                    println!(
+                                                        "  {} Rename {} - {}",
+                                                        "✗".red(),
+                                                        id,
+                                                        e
+                                                    );
+                                                    // Use the state with temp name
+                                                    state.clone()
+                                                }
+                                            }
+                                        } else {
+                                            // Track permanent name override for can_rename=false
+                                            if let Some(temp) = temporary_name
+                                                && !temp.can_rename
+                                            {
+                                                let mut overrides = HashMap::new();
+                                                overrides.insert(
+                                                    temp.attribute.clone(),
+                                                    temp.temporary_value.clone(),
+                                                );
+                                                permanent_name_overrides
+                                                    .insert(to.id.clone(), overrides);
+                                            }
+                                            state.clone()
+                                        };
+
                                         println!("  {} {}", "✓".green(), format_effect(effect));
                                         success_count += 1;
-                                        applied_states.insert(to.id.clone(), state.clone());
+                                        applied_states.insert(to.id.clone(), final_state);
                                     }
                                     Err(e) => {
                                         println!(
@@ -1826,8 +1969,11 @@ async fn run_apply_from_plan(plan_path: &PathBuf, auto_approve: bool) -> Result<
     for resource in sorted_resources {
         let existing = state.find_resource(&resource.id.resource_type, &resource.id.name);
         if let Some(applied_state) = applied_states.get(&resource.id) {
-            let resource_state =
+            let mut resource_state =
                 ResourceState::from_provider_state(resource, applied_state, existing);
+            if let Some(overrides) = permanent_name_overrides.get(&resource.id) {
+                resource_state.name_overrides = overrides.clone();
+            }
             state.upsert_resource(resource_state);
         } else if let Some(current_state) = current_states.get(&resource.id)
             && current_state.exists
@@ -1954,6 +2100,7 @@ async fn run_destroy(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
         .map_err(|e| format!("Failed to read state: {}", e))?;
 
     reconcile_prefixed_names(&mut parsed.resources, &state_file);
+    apply_name_overrides(&mut parsed.resources, &state_file);
 
     // Sort resources by dependencies (for creation order)
     let sorted_resources = sort_resources_by_dependencies(&parsed.resources);
@@ -2575,6 +2722,7 @@ async fn run_state_refresh(path: &PathBuf) -> Result<(), String> {
     }
 
     reconcile_prefixed_names(&mut parsed.resources, &state_file);
+    apply_name_overrides(&mut parsed.resources, &state_file);
 
     let sorted_resources = sort_resources_by_dependencies(&parsed.resources);
 

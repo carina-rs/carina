@@ -215,6 +215,7 @@ pub fn print_plan(plan: &Plan) {
                 changed_create_only,
                 lifecycle,
                 cascading_updates,
+                temporary_name,
                 ..
             } => {
                 let replace_note = if lifecycle.create_before_destroy {
@@ -286,6 +287,25 @@ pub fn print_plan(plan: &Plan) {
                                 );
                             }
                         }
+                    }
+                }
+                if let Some(temp) = temporary_name {
+                    if temp.can_rename {
+                        println!(
+                            "{}  {} via temporary name \"{}\", will rename back to \"{}\" after old resource is deleted",
+                            attr_prefix,
+                            "note:".magenta().bold(),
+                            temp.temporary_value.magenta(),
+                            temp.original_value.green()
+                        );
+                    } else {
+                        println!(
+                            "{}  {} name will be \"{}\" (cannot rename create-only attribute \"{}\")",
+                            attr_prefix,
+                            "note:".magenta().bold(),
+                            temp.temporary_value.magenta(),
+                            temp.attribute.magenta()
+                        );
                     }
                 }
                 if !cascading_updates.is_empty() {

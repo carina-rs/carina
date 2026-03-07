@@ -96,6 +96,7 @@ pub fn logs_log_group_config() -> AwsccSchemaConfig {
                 .with_description("An array of key-value pairs to apply to the log group. For more information, see [Tag](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/...")
                 .with_provider_name("Tags"),
         )
+        .with_name_attribute("log_group_name")
     }
 }
 
