@@ -16,7 +16,7 @@ let sg = awscc.ec2.security_group {
   group_description = "Example security group"
 }
 
-let ingress = awscc.ec2.security_group_ingress {
+awscc.ec2.security_group_ingress {
   group_id    = sg.group_id
   description = "Allow HTTPS from VPC"
   ip_protocol = "tcp"

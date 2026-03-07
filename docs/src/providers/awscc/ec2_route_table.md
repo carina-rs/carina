@@ -38,7 +38,7 @@ let vpc = awscc.ec2.vpc {
   enable_dns_hostnames = true
 }
 
-let rt = awscc.ec2.route_table {
+awscc.ec2.route_table {
   vpc_id = vpc.vpc_id
 
   tags = {

@@ -24,7 +24,7 @@ Any tags to assign to the internet gateway.
 ## Example
 
 ```crn
-let igw = awscc.ec2.internet_gateway {
+awscc.ec2.internet_gateway {
   tags = {
     Environment = "example"
   }
