@@ -83,6 +83,13 @@ The ID of the local gateway.
 
 The ID of a network interface.
 
+### `route_table_id`
+
+- **Type:** route_table_id
+- **Required:** Yes
+
+The ID of the route table for the route.
+
 ### `transit_gateway_id`
 
 - **Type:** transit_gateway_id

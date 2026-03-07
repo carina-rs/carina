@@ -172,10 +172,15 @@ pub struct ParsedFile {
 
 impl ParsedFile {
     /// Find a resource by resource type and name attribute value
-    pub fn find_resource_by_name(&self, resource_type: &str, name: &str) -> Option<&Resource> {
+    pub fn find_resource_by_attr(
+        &self,
+        resource_type: &str,
+        attr_name: &str,
+        attr_value: &str,
+    ) -> Option<&Resource> {
         self.resources.iter().find(|r| {
             r.id.resource_type == resource_type
-                && matches!(r.attributes.get("name"), Some(Value::String(n)) if n == name)
+                && matches!(r.attributes.get(attr_name), Some(Value::String(n)) if n == attr_value)
         })
     }
 }
@@ -2157,35 +2162,35 @@ mod tests {
     }
 
     #[test]
-    fn test_find_resource_by_name() {
+    fn test_find_resource_by_attr() {
         let input = r#"
             aws.s3.bucket {
-                name = "my-bucket"
+                bucket = "my-bucket"
             }
             aws.s3.bucket {
-                name = "other-bucket"
+                bucket = "other-bucket"
             }
         "#;
         let parsed = parse(input).unwrap();
 
         assert!(
             parsed
-                .find_resource_by_name("s3.bucket", "my-bucket")
+                .find_resource_by_attr("s3.bucket", "bucket", "my-bucket")
                 .is_some()
         );
         assert!(
             parsed
-                .find_resource_by_name("s3.bucket", "other-bucket")
+                .find_resource_by_attr("s3.bucket", "bucket", "other-bucket")
                 .is_some()
         );
         assert!(
             parsed
-                .find_resource_by_name("s3.bucket", "no-such")
+                .find_resource_by_attr("s3.bucket", "bucket", "no-such")
                 .is_none()
         );
         assert!(
             parsed
-                .find_resource_by_name("ec2.vpc", "my-bucket")
+                .find_resource_by_attr("ec2.vpc", "bucket", "my-bucket")
                 .is_none()
         );
     }

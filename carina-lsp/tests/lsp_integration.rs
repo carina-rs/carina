@@ -386,8 +386,8 @@ async fn test_resource_attribute_completion() {
         .collect();
 
     assert!(
-        labels.contains(&"name"),
-        "Should have 'name' attribute completion. Got: {:?}",
+        labels.contains(&"bucket"),
+        "Should have 'bucket' attribute completion. Got: {:?}",
         labels
     );
     assert!(

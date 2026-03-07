@@ -52,10 +52,6 @@ pub fn ec2_vpc_config() -> AwsSchemaConfig {
         schema: ResourceSchema::new("aws.ec2.vpc")
         .with_description("Describes a VPC.")
         .attribute(
-            AttributeSchema::new("name", AttributeType::String)
-                .with_description("Resource name"),
-        )
-        .attribute(
             AttributeSchema::new("region", super::aws_region())
                 .with_description("The AWS region (inherited from provider if not specified)"),
         )

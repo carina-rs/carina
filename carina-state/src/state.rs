@@ -80,15 +80,12 @@ impl StateFile {
         }
     }
 
-    /// Get the identifier for a resource from state, falling back to the name attribute.
+    /// Get the identifier for a resource from state.
     pub fn get_identifier_for_resource(&self, resource: &Resource) -> Option<String> {
         if let Some(resource_state) =
             self.find_resource(&resource.id.resource_type, &resource.id.name)
         {
             return resource_state.identifier.clone();
-        }
-        if let Some(Value::String(name)) = resource.attributes.get("name") {
-            return Some(name.clone());
         }
         None
     }
@@ -364,23 +361,6 @@ mod tests {
         assert_eq!(
             state.get_identifier_for_resource(&resource),
             Some("my-bucket-abcd1234".to_string())
-        );
-    }
-
-    #[test]
-    fn test_get_identifier_for_resource_fallback_to_name_attr() {
-        use carina_core::resource::{Resource, Value};
-
-        let state = StateFile::new();
-
-        let mut resource = Resource::with_provider("awscc", "s3.bucket", "my-bucket");
-        resource.attributes.insert(
-            "name".to_string(),
-            Value::String("my-bucket-name".to_string()),
-        );
-        assert_eq!(
-            state.get_identifier_for_resource(&resource),
-            Some("my-bucket-name".to_string())
         );
     }
 

@@ -82,10 +82,6 @@ pub fn s3_bucket_config() -> AwsSchemaConfig {
         data_source: false,
         schema: ResourceSchema::new("aws.s3.bucket")
         .attribute(
-            AttributeSchema::new("name", AttributeType::String)
-                .with_description("Resource name"),
-        )
-        .attribute(
             AttributeSchema::new("region", super::aws_region())
                 .with_description("The AWS region (inherited from provider if not specified)"),
         )
@@ -100,6 +96,13 @@ pub fn s3_bucket_config() -> AwsSchemaConfig {
                 .with_description("The canned ACL to apply to the bucket. This functionality is not supported for directory buckets.")
                 .with_provider_name("ACL")
                 .with_completions(vec![CompletionValue::new("aws.s3.bucket.ACL.authenticated_read", "authenticated-read"), CompletionValue::new("aws.s3.bucket.ACL.private", "private"), CompletionValue::new("aws.s3.bucket.ACL.public_read", "public-read"), CompletionValue::new("aws.s3.bucket.ACL.public_read_write", "public-read-write")]),
+        )
+        .attribute(
+            AttributeSchema::new("bucket", AttributeType::String)
+                .required()
+                .create_only()
+                .with_description("The name of the bucket to create. General purpose buckets - For information about bucket naming restrictions, see Bucket naming rules in the Amazon S3...")
+                .with_provider_name("Bucket"),
         )
         .attribute(
             AttributeSchema::new("grant_full_control", AttributeType::String)
