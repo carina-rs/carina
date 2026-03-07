@@ -4,6 +4,38 @@ CloudFormation Type: `AWS::EC2::IPAMPool`
 
 Resource Schema of AWS::EC2::IPAMPool Type
 
+## Example
+
+```crn
+let ipam = awscc.ec2.ipam {
+  description = "Example IPAM"
+  tier        = free
+
+  operating_regions = [
+    {
+      region_name = "ap-northeast-1"
+    }
+  ]
+}
+
+awscc.ec2.ipam_pool {
+  ipam_scope_id  = ipam.private_default_scope_id
+  address_family = "IPv4"
+  locale         = "ap-northeast-1"
+  description    = "Example IPv4 IPAM Pool"
+
+  provisioned_cidrs = [
+    {
+      cidr = "10.0.0.0/8"
+    }
+  ]
+
+  tags = {
+    Environment = "example"
+  }
+}
+```
+
 ## Argument Reference
 
 ### `address_family`
@@ -217,35 +249,3 @@ Shorthand formats: `create_in_progress` or `State.create_in_progress`
 - **Type:** String
 
 
-
-## Example
-
-```crn
-let ipam = awscc.ec2.ipam {
-  description = "Example IPAM"
-  tier        = free
-
-  operating_regions = [
-    {
-      region_name = "ap-northeast-1"
-    }
-  ]
-}
-
-awscc.ec2.ipam_pool {
-  ipam_scope_id  = ipam.private_default_scope_id
-  address_family = "IPv4"
-  locale         = "ap-northeast-1"
-  description    = "Example IPv4 IPAM Pool"
-
-  provisioned_cidrs = [
-    {
-      cidr = "10.0.0.0/8"
-    }
-  ]
-
-  tags = {
-    Environment = "example"
-  }
-}
-```

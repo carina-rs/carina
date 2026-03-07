@@ -28,7 +28,7 @@ cargo run --bin smithy-codegen -- \
   --output-dir "$DOCS_DIR" \
   --format markdown
 
-# Append examples to generated docs
+# Insert examples into generated docs (after description, before Argument Reference)
 for DOC_FILE in "$DOCS_DIR"/*.md; do
     RESOURCE_NAME=$(basename "$DOC_FILE" .md)
     # Skip non-resource files like index.md
@@ -37,15 +37,28 @@ for DOC_FILE in "$DOCS_DIR"/*.md; do
     fi
     EXAMPLE_FILE="$EXAMPLES_DIR/${RESOURCE_NAME}/main.crn"
     if [ -f "$EXAMPLE_FILE" ]; then
-        echo "" >> "$DOC_FILE"
-        echo "## Example" >> "$DOC_FILE"
-        echo "" >> "$DOC_FILE"
-        echo '```crn' >> "$DOC_FILE"
-        # Strip provider block, leading comments, and leading blank lines
-        sed -n '/^provider /,/^}/!p' "$EXAMPLE_FILE" | \
-            sed '/^#/d' | \
-            sed '/./,$!d' >> "$DOC_FILE"
-        echo '```' >> "$DOC_FILE"
+        EXAMPLE_TMPFILE=$(mktemp)
+        {
+            echo "## Example"
+            echo ""
+            echo '```crn'
+            # Strip provider block, leading comments, and leading blank lines
+            sed -n '/^provider /,/^}/!p' "$EXAMPLE_FILE" | \
+                sed '/^#/d' | \
+                sed '/./,$!d'
+            echo '```'
+            echo ""
+        } > "$EXAMPLE_TMPFILE"
+        # Insert the example block before "## Argument Reference"
+        MERGED_TMPFILE=$(mktemp)
+        while IFS= read -r line || [ -n "$line" ]; do
+            if [ "$line" = "## Argument Reference" ]; then
+                cat "$EXAMPLE_TMPFILE"
+            fi
+            printf '%s\n' "$line"
+        done < "$DOC_FILE" > "$MERGED_TMPFILE"
+        mv "$MERGED_TMPFILE" "$DOC_FILE"
+        rm -f "$EXAMPLE_TMPFILE"
     fi
 done
 

@@ -5,6 +5,18 @@ CloudFormation Type: `AWS::EC2::VPNGateway`
 Specifies a virtual private gateway. A virtual private gateway is the endpoint on the VPC side of your VPN connection. You can create a virtual private gateway before creating the VPC itself.
  For more information, see [](https://docs.aws.amazon.com/vpn/latest/s2svpn/VPC_VPN.html) in the *User Guide*.
 
+## Example
+
+```crn
+awscc.ec2.vpn_gateway {
+  type = "ipsec.1"
+
+  tags = {
+    Environment = "example"
+  }
+}
+```
+
 ## Argument Reference
 
 ### `amazon_side_asn`
@@ -35,15 +47,3 @@ The type of VPN connection the virtual private gateway supports.
 - **Type:** VpnGatewayId
 
 
-
-## Example
-
-```crn
-awscc.ec2.vpn_gateway {
-  type = "ipsec.1"
-
-  tags = {
-    Environment = "example"
-  }
-}
-```

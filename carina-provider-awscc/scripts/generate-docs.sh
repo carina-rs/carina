@@ -103,18 +103,31 @@ for TYPE_NAME in "${RESOURCE_TYPES[@]}"; do
         continue
     fi
 
-    # Append example from hand-written example file
+    # Insert example from hand-written example file (after description, before Argument Reference)
     EXAMPLE_FILE="$EXAMPLES_DIR/${FULL_RESOURCE}/main.crn"
     if [ -f "$EXAMPLE_FILE" ]; then
-        echo "" >> "$OUTPUT_FILE"
-        echo "## Example" >> "$OUTPUT_FILE"
-        echo "" >> "$OUTPUT_FILE"
-        echo '```crn' >> "$OUTPUT_FILE"
-        # Strip provider block, leading comments, and leading blank lines
-        sed -n '/^provider /,/^}/!p' "$EXAMPLE_FILE" | \
-            sed '/^#/d' | \
-            sed '/./,$!d' >> "$OUTPUT_FILE"
-        echo '```' >> "$OUTPUT_FILE"
+        EXAMPLE_TMPFILE=$(mktemp)
+        {
+            echo "## Example"
+            echo ""
+            echo '```crn'
+            # Strip provider block, leading comments, and leading blank lines
+            sed -n '/^provider /,/^}/!p' "$EXAMPLE_FILE" | \
+                sed '/^#/d' | \
+                sed '/./,$!d'
+            echo '```'
+            echo ""
+        } > "$EXAMPLE_TMPFILE"
+        # Insert the example block before "## Argument Reference"
+        MERGED_TMPFILE=$(mktemp)
+        while IFS= read -r line || [ -n "$line" ]; do
+            if [ "$line" = "## Argument Reference" ]; then
+                cat "$EXAMPLE_TMPFILE"
+            fi
+            printf '%s\n' "$line"
+        done < "$OUTPUT_FILE" > "$MERGED_TMPFILE"
+        mv "$MERGED_TMPFILE" "$OUTPUT_FILE"
+        rm -f "$EXAMPLE_TMPFILE"
     fi
 done
 

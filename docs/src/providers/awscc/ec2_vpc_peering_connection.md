@@ -4,6 +4,27 @@ CloudFormation Type: `AWS::EC2::VPCPeeringConnection`
 
 Resource Type definition for AWS::EC2::VPCPeeringConnection
 
+## Example
+
+```crn
+let vpc1 = awscc.ec2.vpc {
+  cidr_block = "10.0.0.0/16"
+}
+
+let vpc2 = awscc.ec2.vpc {
+  cidr_block = "10.1.0.0/16"
+}
+
+awscc.ec2.vpc_peering_connection {
+  vpc_id      = vpc1.vpc_id
+  peer_vpc_id = vpc2.vpc_id
+
+  tags = {
+    Environment = "example"
+  }
+}
+```
+
 ## Argument Reference
 
 ### `peer_owner_id`
@@ -53,24 +74,3 @@ The ID of the VPC.
 - **Type:** String
 
 
-
-## Example
-
-```crn
-let vpc1 = awscc.ec2.vpc {
-  cidr_block = "10.0.0.0/16"
-}
-
-let vpc2 = awscc.ec2.vpc {
-  cidr_block = "10.1.0.0/16"
-}
-
-awscc.ec2.vpc_peering_connection {
-  vpc_id      = vpc1.vpc_id
-  peer_vpc_id = vpc2.vpc_id
-
-  tags = {
-    Environment = "example"
-  }
-}
-```
