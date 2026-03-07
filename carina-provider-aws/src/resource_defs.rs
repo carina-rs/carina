@@ -484,7 +484,6 @@ pub fn s3_resources() -> Vec<ResourceDef> {
                 "GrantWrite",
                 "GrantWriteACP",
                 "CreateBucketConfiguration",
-                "ObjectLockEnabledForBucket",
                 "ContentMD5",
                 "ChecksumAlgorithm",
                 "MFA",

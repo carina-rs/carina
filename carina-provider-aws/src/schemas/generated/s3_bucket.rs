@@ -62,64 +62,48 @@ pub fn s3_bucket_config() -> AwsSchemaConfig {
         has_tags: true,
         data_source: false,
         schema: ResourceSchema::new("aws.s3.bucket")
-            .attribute(
-                AttributeSchema::new("name", AttributeType::String)
-                    .with_description("Resource name"),
-            )
-            .attribute(
-                AttributeSchema::new("region", super::aws_region())
-                    .with_description("The AWS region (inherited from provider if not specified)"),
-            )
-            .attribute(
-                AttributeSchema::new(
-                    "object_ownership",
-                    AttributeType::Custom {
-                        name: "ObjectOwnership".to_string(),
-                        base: Box::new(AttributeType::String),
-                        validate: validate_object_ownership,
-                        namespace: Some("aws.s3.bucket".to_string()),
-                        to_dsl: None,
-                    },
-                )
+        .attribute(
+            AttributeSchema::new("name", AttributeType::String)
+                .with_description("Resource name"),
+        )
+        .attribute(
+            AttributeSchema::new("region", super::aws_region())
+                .with_description("The AWS region (inherited from provider if not specified)"),
+        )
+        .attribute(
+            AttributeSchema::new("object_lock_enabled_for_bucket", AttributeType::Bool)
+                .create_only()
+                .with_description("Specifies whether you want S3 Object Lock to be enabled for the new bucket. This functionality is not supported for directory buckets.")
+                .with_provider_name("ObjectLockEnabledForBucket"),
+        )
+        .attribute(
+            AttributeSchema::new("object_ownership", AttributeType::Custom {
+                name: "ObjectOwnership".to_string(),
+                base: Box::new(AttributeType::String),
+                validate: validate_object_ownership,
+                namespace: Some("aws.s3.bucket".to_string()),
+                to_dsl: None,
+            })
                 .with_provider_name("ObjectOwnership")
-                .with_completions(vec![
-                    CompletionValue::new(
-                        "aws.s3.bucket.ObjectOwnership.BucketOwnerEnforced",
-                        "BucketOwnerEnforced",
-                    ),
-                    CompletionValue::new(
-                        "aws.s3.bucket.ObjectOwnership.BucketOwnerPreferred",
-                        "BucketOwnerPreferred",
-                    ),
-                    CompletionValue::new(
-                        "aws.s3.bucket.ObjectOwnership.ObjectWriter",
-                        "ObjectWriter",
-                    ),
-                ]),
-            )
-            .attribute(
-                AttributeSchema::new(
-                    "versioning_status",
-                    AttributeType::Custom {
-                        name: "VersioningStatus".to_string(),
-                        base: Box::new(AttributeType::String),
-                        validate: validate_versioning_status,
-                        namespace: Some("aws.s3.bucket".to_string()),
-                        to_dsl: None,
-                    },
-                )
+                .with_completions(vec![CompletionValue::new("aws.s3.bucket.ObjectOwnership.BucketOwnerEnforced", "BucketOwnerEnforced"), CompletionValue::new("aws.s3.bucket.ObjectOwnership.BucketOwnerPreferred", "BucketOwnerPreferred"), CompletionValue::new("aws.s3.bucket.ObjectOwnership.ObjectWriter", "ObjectWriter")]),
+        )
+        .attribute(
+            AttributeSchema::new("versioning_status", AttributeType::Custom {
+                name: "VersioningStatus".to_string(),
+                base: Box::new(AttributeType::String),
+                validate: validate_versioning_status,
+                namespace: Some("aws.s3.bucket".to_string()),
+                to_dsl: None,
+            })
                 .with_description("The versioning state of the bucket.")
                 .with_provider_name("VersioningStatus")
-                .with_completions(vec![
-                    CompletionValue::new("aws.s3.bucket.VersioningStatus.Enabled", "Enabled"),
-                    CompletionValue::new("aws.s3.bucket.VersioningStatus.Suspended", "Suspended"),
-                ]),
-            )
-            .attribute(
-                AttributeSchema::new("tags", tags_type())
-                    .with_description("The tags for the resource.")
-                    .with_provider_name("Tags"),
-            ),
+                .with_completions(vec![CompletionValue::new("aws.s3.bucket.VersioningStatus.Enabled", "Enabled"), CompletionValue::new("aws.s3.bucket.VersioningStatus.Suspended", "Suspended")]),
+        )
+        .attribute(
+            AttributeSchema::new("tags", tags_type())
+                .with_description("The tags for the resource.")
+                .with_provider_name("Tags"),
+        )
     }
 }
 
