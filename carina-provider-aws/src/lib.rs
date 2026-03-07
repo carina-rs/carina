@@ -254,11 +254,11 @@ impl AwsProvider {
             req = req.object_ownership(ObjectOwnership::from(normalized));
         }
 
-        // Set ACL on create
+        // Set ACL on create (convert_enum_value converts underscores back to hyphens)
         if let Some(Value::String(val)) = resource.attributes.get("acl") {
             use aws_sdk_s3::types::BucketCannedAcl;
-            let normalized = extract_enum_value(val);
-            req = req.acl(BucketCannedAcl::from(normalized));
+            let normalized = convert_enum_value(val);
+            req = req.acl(BucketCannedAcl::from(normalized.as_str()));
         }
         if let Some(Value::String(val)) = resource.attributes.get("grant_full_control") {
             req = req.grant_full_control(val);
@@ -472,33 +472,35 @@ impl AwsProvider {
         let canned_acl = infer_canned_acl(&full_control, &read, &read_acp, &write, &write_acp);
 
         if let Some(acl) = canned_acl {
+            // When a canned ACL is inferred, only set `acl` — the grant fields
+            // are the expansion of the canned ACL and would cause false diffs.
             attributes.insert("acl".to_string(), Value::String(acl.to_string()));
-        }
-
-        // Set grant fields if non-empty
-        if !full_control.is_empty() {
-            attributes.insert(
-                "grant_full_control".to_string(),
-                Value::String(full_control.join(", ")),
-            );
-        }
-        if !read.is_empty() {
-            attributes.insert("grant_read".to_string(), Value::String(read.join(", ")));
-        }
-        if !read_acp.is_empty() {
-            attributes.insert(
-                "grant_read_acp".to_string(),
-                Value::String(read_acp.join(", ")),
-            );
-        }
-        if !write.is_empty() {
-            attributes.insert("grant_write".to_string(), Value::String(write.join(", ")));
-        }
-        if !write_acp.is_empty() {
-            attributes.insert(
-                "grant_write_acp".to_string(),
-                Value::String(write_acp.join(", ")),
-            );
+        } else {
+            // No canned ACL matched — set individual grant fields
+            if !full_control.is_empty() {
+                attributes.insert(
+                    "grant_full_control".to_string(),
+                    Value::String(full_control.join(", ")),
+                );
+            }
+            if !read.is_empty() {
+                attributes.insert("grant_read".to_string(), Value::String(read.join(", ")));
+            }
+            if !read_acp.is_empty() {
+                attributes.insert(
+                    "grant_read_acp".to_string(),
+                    Value::String(read_acp.join(", ")),
+                );
+            }
+            if !write.is_empty() {
+                attributes.insert("grant_write".to_string(), Value::String(write.join(", ")));
+            }
+            if !write_acp.is_empty() {
+                attributes.insert(
+                    "grant_write_acp".to_string(),
+                    Value::String(write_acp.join(", ")),
+                );
+            }
         }
     }
 
@@ -531,8 +533,8 @@ impl AwsProvider {
         let mut req = self.s3_client.put_bucket_acl().bucket(identifier);
 
         if let Some(val) = acl {
-            let normalized = extract_enum_value(val);
-            req = req.acl(BucketCannedAcl::from(normalized));
+            let normalized = convert_enum_value(val);
+            req = req.acl(BucketCannedAcl::from(normalized.as_str()));
         }
         if let Some(val) = grant_full_control {
             req = req.grant_full_control(val);
