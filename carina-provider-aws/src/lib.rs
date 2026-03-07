@@ -171,6 +171,9 @@ impl AwsProvider {
                 self.read_s3_bucket_ownership_controls(name, &mut attributes)
                     .await;
 
+                // Get Object Lock status
+                self.read_s3_bucket_object_lock(name, &mut attributes).await;
+
                 // S3 bucket identifier is the bucket name
                 Ok(State::existing(id.clone(), attributes).with_identifier(name))
             }
@@ -234,6 +237,11 @@ impl AwsProvider {
                 .location_constraint(constraint)
                 .build();
             req = req.create_bucket_configuration(config);
+        }
+
+        // Set ObjectLockEnabledForBucket on create
+        if let Some(Value::Bool(val)) = resource.attributes.get("object_lock_enabled_for_bucket") {
+            req = req.object_lock_enabled_for_bucket(*val);
         }
 
         // Set ObjectOwnership on create
@@ -332,6 +340,39 @@ impl AwsProvider {
                 })?;
         }
         Ok(())
+    }
+
+    /// Read S3 bucket Object Lock status
+    async fn read_s3_bucket_object_lock(
+        &self,
+        identifier: &str,
+        attributes: &mut HashMap<String, Value>,
+    ) {
+        match self
+            .s3_client
+            .get_object_lock_configuration()
+            .bucket(identifier)
+            .send()
+            .await
+        {
+            Ok(output) => {
+                let enabled = output
+                    .object_lock_configuration()
+                    .and_then(|config| config.object_lock_enabled())
+                    .is_some();
+                attributes.insert(
+                    "object_lock_enabled_for_bucket".to_string(),
+                    Value::Bool(enabled),
+                );
+            }
+            Err(_) => {
+                // ObjectLockConfigurationNotFoundError means Object Lock is not enabled
+                attributes.insert(
+                    "object_lock_enabled_for_bucket".to_string(),
+                    Value::Bool(false),
+                );
+            }
+        }
     }
 
     // ========== EC2 VPC Operations ==========
