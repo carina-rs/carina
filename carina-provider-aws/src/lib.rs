@@ -2139,21 +2139,25 @@ fn resolve_enum_identifiers_impl(resources: &mut [Resource]) {
                 && let AttributeType::Custom {
                     name: type_name,
                     namespace: Some(ns),
+                    to_dsl,
                     ..
                 } = &attr_schema.attr_type
             {
                 let resolved = match value {
                     Value::UnresolvedIdent(ident, None) => {
                         // bare identifier: Enabled → aws.s3.bucket.VersioningStatus.Enabled
-                        Value::String(format!("{}.{}.{}", ns, type_name, ident))
+                        let dsl_val = to_dsl.map_or_else(|| ident.clone(), |f| f(ident));
+                        Value::String(format!("{}.{}.{}", ns, type_name, dsl_val))
                     }
                     Value::UnresolvedIdent(ident, Some(member)) if ident == type_name => {
                         // TypeName.value: VersioningStatus.Enabled → aws.s3.bucket.VersioningStatus.Enabled
-                        Value::String(format!("{}.{}.{}", ns, type_name, member))
+                        let dsl_val = to_dsl.map_or_else(|| member.clone(), |f| f(member));
+                        Value::String(format!("{}.{}.{}", ns, type_name, dsl_val))
                     }
                     Value::String(s) if !s.contains('.') => {
                         // plain string without dots: "Enabled" → aws.s3.bucket.VersioningStatus.Enabled
-                        Value::String(format!("{}.{}.{}", ns, type_name, s))
+                        let dsl_val = to_dsl.map_or_else(|| s.clone(), |f| f(s));
+                        Value::String(format!("{}.{}.{}", ns, type_name, dsl_val))
                     }
                     _ => value.clone(),
                 };
@@ -2192,12 +2196,14 @@ fn normalize_state_enums(resource_type: &str, attributes: &mut HashMap<String, V
             && let AttributeType::Custom {
                 name: type_name,
                 namespace: Some(ns),
+                to_dsl,
                 ..
             } = &attr_schema.attr_type
             && let Value::String(s) = value
             && !s.contains('.')
         {
-            let namespaced = format!("{}.{}.{}", ns, type_name, s);
+            let dsl_val = to_dsl.map_or_else(|| s.clone(), |f| f(s));
+            let namespaced = format!("{}.{}.{}", ns, type_name, dsl_val);
             resolved.insert(key.clone(), Value::String(namespaced));
         }
     }
@@ -2327,6 +2333,40 @@ mod tests {
         assert_eq!(
             resources[0].attributes.get("versioning_status"),
             Some(&Value::String("Enabled".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_resolve_enum_identifiers_with_to_dsl() {
+        // ip_protocol has to_dsl that maps "-1" → "all"
+        let mut resource = Resource::new("ec2.security_group_ingress", "test-rule");
+        resource
+            .attributes
+            .insert("_provider".to_string(), Value::String("aws".to_string()));
+        resource
+            .attributes
+            .insert("ip_protocol".to_string(), Value::String("-1".to_string()));
+        let mut resources = vec![resource];
+        resolve_enum_identifiers_impl(&mut resources);
+        assert_eq!(
+            resources[0].attributes.get("ip_protocol"),
+            Some(&Value::String(
+                "aws.ec2.security_group_ingress.IpProtocol.all".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn test_normalize_state_enums_with_to_dsl() {
+        // Read returns "-1" for ip_protocol, should be normalized to "all" via to_dsl
+        let mut attributes =
+            HashMap::from([("ip_protocol".to_string(), Value::String("-1".to_string()))]);
+        normalize_state_enums("ec2.security_group_ingress", &mut attributes);
+        assert_eq!(
+            attributes.get("ip_protocol"),
+            Some(&Value::String(
+                "aws.ec2.security_group_ingress.IpProtocol.all".to_string()
+            ))
         );
     }
 
