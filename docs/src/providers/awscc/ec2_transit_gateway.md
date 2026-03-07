@@ -169,7 +169,7 @@ Shorthand formats: `enable` or `VpnEcmpSupport.enable`
 ## Example
 
 ```crn
-let tgw = awscc.ec2.transit_gateway {
+awscc.ec2.transit_gateway {
   description = "Example Transit Gateway"
 
   tags = {

@@ -47,7 +47,7 @@ let rt = awscc.ec2.route_table {
   vpc_id = vpc.vpc_id
 }
 
-let rt_assoc = awscc.ec2.subnet_route_table_association {
+awscc.ec2.subnet_route_table_association {
   subnet_id      = subnet.subnet_id
   route_table_id = rt.route_table_id
 }

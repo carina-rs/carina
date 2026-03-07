@@ -142,7 +142,7 @@ let rt = awscc.ec2.route_table {
   vpc_id = vpc.vpc_id
 }
 
-let route = awscc.ec2.route {
+awscc.ec2.route {
   route_table_id         = rt.route_table_id
   destination_cidr_block = "0.0.0.0/0"
   gateway_id             = igw_attachment.internet_gateway_id

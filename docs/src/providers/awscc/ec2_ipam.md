@@ -126,7 +126,7 @@ Shorthand formats: `free` or `Tier.free`
 ## Example
 
 ```crn
-let ipam = awscc.ec2.ipam {
+awscc.ec2.ipam {
   description = "Example IPAM"
   tier        = free
 
