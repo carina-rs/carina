@@ -57,6 +57,260 @@ pub struct AwsccProvider {
     aws_config: aws_config::SdkConfig,
 }
 
+// =========================================================================
+// Value Conversion Helpers
+// =========================================================================
+
+/// Convert AWS value to DSL value
+fn aws_value_to_dsl(
+    dsl_name: &str,
+    value: &serde_json::Value,
+    attr_type: &AttributeType,
+    resource_type: &str,
+) -> Option<Value> {
+    // For Custom enum types with namespace, convert to DSL namespaced format
+    if let AttributeType::Custom {
+        name: type_name,
+        namespace: Some(ns),
+        to_dsl,
+        ..
+    } = attr_type
+        && let Some(s) = value.as_str()
+    {
+        // Canonicalize case using valid values registry
+        let canonical = if let Some(valid_values) = get_enum_valid_values(resource_type, dsl_name) {
+            canonicalize_enum_value(s, valid_values)
+        } else {
+            s.to_string()
+        };
+        // Apply to_dsl transformation if present (e.g., hyphens → underscores for AZs)
+        let dsl_val = to_dsl.map_or_else(|| canonical.clone(), |f| f(&canonical));
+        let namespaced = format!("{}.{}.{}", ns, type_name, dsl_val);
+        return Some(Value::String(namespaced));
+    }
+
+    // For List(Struct{fields}), recurse into struct fields for type-aware conversion
+    if let AttributeType::List(inner) = attr_type
+        && let AttributeType::Struct { fields, .. } = inner.as_ref()
+        && let Some(arr) = value.as_array()
+    {
+        let items: Vec<Value> = arr
+            .iter()
+            .filter_map(|item| {
+                if let Some(obj) = item.as_object() {
+                    let map: HashMap<String, Value> = fields
+                        .iter()
+                        .filter_map(|field| {
+                            let provider_key =
+                                field.provider_name.as_deref().unwrap_or(&field.name);
+                            let json_val = obj.get(provider_key)?;
+                            let dsl_val = aws_value_to_dsl(
+                                &field.name,
+                                json_val,
+                                &field.field_type,
+                                resource_type,
+                            );
+                            dsl_val.map(|v| (field.name.clone(), v))
+                        })
+                        .collect();
+                    if map.is_empty() {
+                        None
+                    } else {
+                        Some(Value::Map(map))
+                    }
+                } else {
+                    json_to_value(item)
+                }
+            })
+            .collect();
+        return Some(Value::List(items));
+    }
+
+    // For bare Struct{fields}, recurse into fields
+    if let AttributeType::Struct { fields, .. } = attr_type
+        && let Some(obj) = value.as_object()
+    {
+        let map: HashMap<String, Value> = fields
+            .iter()
+            .filter_map(|field| {
+                let provider_key = field.provider_name.as_deref().unwrap_or(&field.name);
+                let json_val = obj.get(provider_key)?;
+                let dsl_val =
+                    aws_value_to_dsl(&field.name, json_val, &field.field_type, resource_type);
+                dsl_val.map(|v| (field.name.clone(), v))
+            })
+            .collect();
+        if !map.is_empty() {
+            return Some(Value::Map(map));
+        }
+    }
+
+    json_to_value(value)
+}
+
+/// Convert JSON value to DSL Value
+fn json_to_value(value: &serde_json::Value) -> Option<Value> {
+    match value {
+        serde_json::Value::String(s) => Some(Value::String(s.clone())),
+        serde_json::Value::Bool(b) => Some(Value::Bool(*b)),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                Some(Value::Int(i))
+            } else {
+                n.as_f64().map(Value::Float)
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            let items: Vec<Value> = arr.iter().filter_map(json_to_value).collect();
+            Some(Value::List(items))
+        }
+        serde_json::Value::Object(obj) => {
+            let map: HashMap<String, Value> = obj
+                .iter()
+                .filter_map(|(k, v)| json_to_value(v).map(|val| (k.to_snake_case(), val)))
+                .collect();
+            Some(Value::Map(map))
+        }
+        _ => None,
+    }
+}
+
+/// Convert DSL value to AWS JSON value
+fn dsl_value_to_aws(
+    value: &Value,
+    attr_type: &AttributeType,
+    resource_type: &str,
+    attr_name: &str,
+) -> Option<serde_json::Value> {
+    // For Custom (enum) types, convert enum values
+    if matches!(attr_type, AttributeType::Custom { .. }) {
+        match value {
+            Value::String(s) => {
+                let raw = convert_enum_value(s);
+                // Apply alias reverse mapping (e.g., "all" -> "-1")
+                let resolved = match get_enum_alias_reverse(resource_type, attr_name, &raw) {
+                    Some(canonical) => canonical.to_string(),
+                    None => raw,
+                };
+                Some(json!(resolved))
+            }
+            Value::UnresolvedIdent(ident, member) => {
+                let raw = if let Some(m) = member {
+                    m.clone()
+                } else {
+                    ident.clone()
+                };
+                let converted = raw.replace('_', "-");
+                // Apply alias reverse mapping (e.g., "all" -> "-1")
+                let resolved = match get_enum_alias_reverse(resource_type, attr_name, &converted) {
+                    Some(canonical) => canonical.to_string(),
+                    None => converted,
+                };
+                Some(json!(resolved))
+            }
+            _ => value_to_json(value),
+        }
+    } else if let AttributeType::List(inner) = attr_type
+        && let AttributeType::Struct { fields, .. } = inner.as_ref()
+        && let Value::List(items) = value
+    {
+        // Recurse into struct fields for type-aware conversion
+        let arr: Vec<serde_json::Value> = items
+            .iter()
+            .filter_map(|item| {
+                if let Value::Map(map) = item {
+                    let obj: serde_json::Map<String, serde_json::Value> = fields
+                        .iter()
+                        .filter_map(|field| {
+                            let dsl_val = map.get(&field.name)?;
+                            let provider_key = field
+                                .provider_name
+                                .as_deref()
+                                .unwrap_or(&field.name)
+                                .to_string();
+                            let json_val = dsl_value_to_aws(
+                                dsl_val,
+                                &field.field_type,
+                                resource_type,
+                                &field.name,
+                            );
+                            json_val.map(|v| (provider_key, v))
+                        })
+                        .collect();
+                    Some(serde_json::Value::Object(obj))
+                } else {
+                    value_to_json(item)
+                }
+            })
+            .collect();
+        Some(serde_json::Value::Array(arr))
+    } else if let AttributeType::Struct { fields, .. } = attr_type
+        && let Value::Map(map) = value
+    {
+        // Recurse into bare struct fields for type-aware conversion (map assignment syntax)
+        let obj: serde_json::Map<String, serde_json::Value> = fields
+            .iter()
+            .filter_map(|field| {
+                let dsl_val = map.get(&field.name)?;
+                let provider_key = field
+                    .provider_name
+                    .as_deref()
+                    .unwrap_or(&field.name)
+                    .to_string();
+                let json_val =
+                    dsl_value_to_aws(dsl_val, &field.field_type, resource_type, &field.name);
+                json_val.map(|v| (provider_key, v))
+            })
+            .collect();
+        Some(serde_json::Value::Object(obj))
+    } else if let AttributeType::Struct { fields, .. } = attr_type
+        && let Value::List(items) = value
+        && items.len() == 1
+        && let Value::Map(map) = &items[0]
+    {
+        // Recurse into bare struct fields for type-aware conversion (block syntax)
+        let obj: serde_json::Map<String, serde_json::Value> = fields
+            .iter()
+            .filter_map(|field| {
+                let dsl_val = map.get(&field.name)?;
+                let provider_key = field
+                    .provider_name
+                    .as_deref()
+                    .unwrap_or(&field.name)
+                    .to_string();
+                let json_val =
+                    dsl_value_to_aws(dsl_val, &field.field_type, resource_type, &field.name);
+                json_val.map(|v| (provider_key, v))
+            })
+            .collect();
+        Some(serde_json::Value::Object(obj))
+    } else {
+        value_to_json(value)
+    }
+}
+
+/// Convert DSL Value to JSON value
+fn value_to_json(value: &Value) -> Option<serde_json::Value> {
+    match value {
+        Value::String(s) => Some(json!(s)),
+        Value::Bool(b) => Some(json!(b)),
+        Value::Int(i) => Some(json!(i)),
+        Value::Float(f) => Some(json!(f)),
+        Value::List(items) => {
+            let arr: Vec<serde_json::Value> = items.iter().filter_map(value_to_json).collect();
+            Some(serde_json::Value::Array(arr))
+        }
+        Value::Map(map) => {
+            let obj: serde_json::Map<String, serde_json::Value> = map
+                .iter()
+                .filter_map(|(k, v)| value_to_json(v).map(|val| (k.to_pascal_case(), val)))
+                .collect();
+            Some(serde_json::Value::Object(obj))
+        }
+        _ => None,
+    }
+}
+
 impl AwsccProvider {
     /// Create a new AwsccProvider for the specified region
     pub async fn new(region: &str) -> Self {
@@ -65,25 +319,6 @@ impl AwsccProvider {
             .load()
             .await;
 
-        Self {
-            cloudcontrol_client: CloudControlClient::new(&config),
-            aws_config: config,
-        }
-    }
-
-    /// Create a lightweight provider for unit tests that don't make network calls.
-    /// Uses a no-op HTTP client to avoid TLS initialization, which panics
-    /// in environments without root certificates.
-    #[cfg(test)]
-    fn new_for_test(region: &str) -> Self {
-        use aws_smithy_runtime::client::http::test_util::StaticReplayClient;
-
-        let http_client = StaticReplayClient::new(vec![]);
-        let config = aws_config::SdkConfig::builder()
-            .behavior_version(aws_config::BehaviorVersion::latest())
-            .region(Region::new(region.to_string()))
-            .http_client(http_client)
-            .build();
         Self {
             cloudcontrol_client: CloudControlClient::new(&config),
             aws_config: config,
@@ -527,7 +762,7 @@ impl AwsccProvider {
                 && let Some(value) = props.get(aws_name.as_str())
             {
                 let dsl_value =
-                    self.aws_value_to_dsl(dsl_name, value, &attr_schema.attr_type, resource_type);
+                    aws_value_to_dsl(dsl_name, value, &attr_schema.attr_type, resource_type);
                 if let Some(v) = dsl_value {
                     attributes.insert(dsl_name.to_string(), v);
                 }
@@ -571,7 +806,7 @@ impl AwsccProvider {
             if let Some(aws_name) = &attr_schema.provider_name
                 && let Some(value) = resource.attributes.get(dsl_name.as_str())
             {
-                let aws_value = self.dsl_value_to_aws(
+                let aws_value = dsl_value_to_aws(
                     value,
                     &attr_schema.attr_type,
                     &resource.id.resource_type,
@@ -659,12 +894,8 @@ impl AwsccProvider {
             }
             if let Some(aws_name) = &attr_schema.provider_name
                 && let Some(value) = to.attributes.get(dsl_name.as_str())
-                && let Some(aws_value) = self.dsl_value_to_aws(
-                    value,
-                    &attr_schema.attr_type,
-                    &id.resource_type,
-                    dsl_name,
-                )
+                && let Some(aws_value) =
+                    dsl_value_to_aws(value, &attr_schema.attr_type, &id.resource_type, dsl_name)
             {
                 patch_ops.push(json!({
                     "op": "replace",
@@ -737,277 +968,6 @@ impl AwsccProvider {
         self.cc_delete_resource(config.aws_type_name, identifier)
             .await
             .map_err(|e| e.for_resource(id.clone()))
-    }
-
-    // =========================================================================
-    // Value Conversion Helpers
-    // =========================================================================
-
-    /// Convert AWS value to DSL value
-    fn aws_value_to_dsl(
-        &self,
-        dsl_name: &str,
-        value: &serde_json::Value,
-        attr_type: &AttributeType,
-        resource_type: &str,
-    ) -> Option<Value> {
-        // For Custom enum types with namespace, convert to DSL namespaced format
-        if let AttributeType::Custom {
-            name: type_name,
-            namespace: Some(ns),
-            to_dsl,
-            ..
-        } = attr_type
-            && let Some(s) = value.as_str()
-        {
-            // Canonicalize case using valid values registry
-            let canonical =
-                if let Some(valid_values) = get_enum_valid_values(resource_type, dsl_name) {
-                    canonicalize_enum_value(s, valid_values)
-                } else {
-                    s.to_string()
-                };
-            // Apply to_dsl transformation if present (e.g., hyphens → underscores for AZs)
-            let dsl_val = to_dsl.map_or_else(|| canonical.clone(), |f| f(&canonical));
-            let namespaced = format!("{}.{}.{}", ns, type_name, dsl_val);
-            return Some(Value::String(namespaced));
-        }
-
-        // For List(Struct{fields}), recurse into struct fields for type-aware conversion
-        if let AttributeType::List(inner) = attr_type
-            && let AttributeType::Struct { fields, .. } = inner.as_ref()
-            && let Some(arr) = value.as_array()
-        {
-            let items: Vec<Value> = arr
-                .iter()
-                .filter_map(|item| {
-                    if let Some(obj) = item.as_object() {
-                        let map: HashMap<String, Value> = fields
-                            .iter()
-                            .filter_map(|field| {
-                                let provider_key =
-                                    field.provider_name.as_deref().unwrap_or(&field.name);
-                                let json_val = obj.get(provider_key)?;
-                                let dsl_val = self.aws_value_to_dsl(
-                                    &field.name,
-                                    json_val,
-                                    &field.field_type,
-                                    resource_type,
-                                );
-                                dsl_val.map(|v| (field.name.clone(), v))
-                            })
-                            .collect();
-                        if map.is_empty() {
-                            None
-                        } else {
-                            Some(Value::Map(map))
-                        }
-                    } else {
-                        self.json_to_value(item)
-                    }
-                })
-                .collect();
-            return Some(Value::List(items));
-        }
-
-        // For bare Struct{fields}, recurse into fields
-        if let AttributeType::Struct { fields, .. } = attr_type
-            && let Some(obj) = value.as_object()
-        {
-            let map: HashMap<String, Value> = fields
-                .iter()
-                .filter_map(|field| {
-                    let provider_key = field.provider_name.as_deref().unwrap_or(&field.name);
-                    let json_val = obj.get(provider_key)?;
-                    let dsl_val = self.aws_value_to_dsl(
-                        &field.name,
-                        json_val,
-                        &field.field_type,
-                        resource_type,
-                    );
-                    dsl_val.map(|v| (field.name.clone(), v))
-                })
-                .collect();
-            if !map.is_empty() {
-                return Some(Value::Map(map));
-            }
-        }
-
-        self.json_to_value(value)
-    }
-
-    /// Convert JSON value to DSL Value
-    fn json_to_value(&self, value: &serde_json::Value) -> Option<Value> {
-        match value {
-            serde_json::Value::String(s) => Some(Value::String(s.clone())),
-            serde_json::Value::Bool(b) => Some(Value::Bool(*b)),
-            serde_json::Value::Number(n) => {
-                if let Some(i) = n.as_i64() {
-                    Some(Value::Int(i))
-                } else {
-                    n.as_f64().map(Value::Float)
-                }
-            }
-            serde_json::Value::Array(arr) => {
-                let items: Vec<Value> = arr.iter().filter_map(|v| self.json_to_value(v)).collect();
-                Some(Value::List(items))
-            }
-            serde_json::Value::Object(obj) => {
-                let map: HashMap<String, Value> = obj
-                    .iter()
-                    .filter_map(|(k, v)| self.json_to_value(v).map(|val| (k.to_snake_case(), val)))
-                    .collect();
-                Some(Value::Map(map))
-            }
-            _ => None,
-        }
-    }
-
-    /// Convert DSL value to AWS JSON value
-    fn dsl_value_to_aws(
-        &self,
-        value: &Value,
-        attr_type: &AttributeType,
-        resource_type: &str,
-        attr_name: &str,
-    ) -> Option<serde_json::Value> {
-        // For Custom (enum) types, convert enum values
-        if matches!(attr_type, AttributeType::Custom { .. }) {
-            match value {
-                Value::String(s) => {
-                    let raw = convert_enum_value(s);
-                    // Apply alias reverse mapping (e.g., "all" -> "-1")
-                    let resolved = match get_enum_alias_reverse(resource_type, attr_name, &raw) {
-                        Some(canonical) => canonical.to_string(),
-                        None => raw,
-                    };
-                    Some(json!(resolved))
-                }
-                Value::UnresolvedIdent(ident, member) => {
-                    let raw = if let Some(m) = member {
-                        m.clone()
-                    } else {
-                        ident.clone()
-                    };
-                    let converted = raw.replace('_', "-");
-                    // Apply alias reverse mapping (e.g., "all" -> "-1")
-                    let resolved =
-                        match get_enum_alias_reverse(resource_type, attr_name, &converted) {
-                            Some(canonical) => canonical.to_string(),
-                            None => converted,
-                        };
-                    Some(json!(resolved))
-                }
-                _ => self.value_to_json(value),
-            }
-        } else if let AttributeType::List(inner) = attr_type
-            && let AttributeType::Struct { fields, .. } = inner.as_ref()
-            && let Value::List(items) = value
-        {
-            // Recurse into struct fields for type-aware conversion
-            let arr: Vec<serde_json::Value> = items
-                .iter()
-                .filter_map(|item| {
-                    if let Value::Map(map) = item {
-                        let obj: serde_json::Map<String, serde_json::Value> = fields
-                            .iter()
-                            .filter_map(|field| {
-                                let dsl_val = map.get(&field.name)?;
-                                let provider_key = field
-                                    .provider_name
-                                    .as_deref()
-                                    .unwrap_or(&field.name)
-                                    .to_string();
-                                let json_val = self.dsl_value_to_aws(
-                                    dsl_val,
-                                    &field.field_type,
-                                    resource_type,
-                                    &field.name,
-                                );
-                                json_val.map(|v| (provider_key, v))
-                            })
-                            .collect();
-                        Some(serde_json::Value::Object(obj))
-                    } else {
-                        self.value_to_json(item)
-                    }
-                })
-                .collect();
-            Some(serde_json::Value::Array(arr))
-        } else if let AttributeType::Struct { fields, .. } = attr_type
-            && let Value::Map(map) = value
-        {
-            // Recurse into bare struct fields for type-aware conversion (map assignment syntax)
-            let obj: serde_json::Map<String, serde_json::Value> = fields
-                .iter()
-                .filter_map(|field| {
-                    let dsl_val = map.get(&field.name)?;
-                    let provider_key = field
-                        .provider_name
-                        .as_deref()
-                        .unwrap_or(&field.name)
-                        .to_string();
-                    let json_val = self.dsl_value_to_aws(
-                        dsl_val,
-                        &field.field_type,
-                        resource_type,
-                        &field.name,
-                    );
-                    json_val.map(|v| (provider_key, v))
-                })
-                .collect();
-            Some(serde_json::Value::Object(obj))
-        } else if let AttributeType::Struct { fields, .. } = attr_type
-            && let Value::List(items) = value
-            && items.len() == 1
-            && let Value::Map(map) = &items[0]
-        {
-            // Recurse into bare struct fields for type-aware conversion (block syntax)
-            let obj: serde_json::Map<String, serde_json::Value> = fields
-                .iter()
-                .filter_map(|field| {
-                    let dsl_val = map.get(&field.name)?;
-                    let provider_key = field
-                        .provider_name
-                        .as_deref()
-                        .unwrap_or(&field.name)
-                        .to_string();
-                    let json_val = self.dsl_value_to_aws(
-                        dsl_val,
-                        &field.field_type,
-                        resource_type,
-                        &field.name,
-                    );
-                    json_val.map(|v| (provider_key, v))
-                })
-                .collect();
-            Some(serde_json::Value::Object(obj))
-        } else {
-            self.value_to_json(value)
-        }
-    }
-
-    /// Convert DSL Value to JSON value
-    fn value_to_json(&self, value: &Value) -> Option<serde_json::Value> {
-        match value {
-            Value::String(s) => Some(json!(s)),
-            Value::Bool(b) => Some(json!(b)),
-            Value::Int(i) => Some(json!(i)),
-            Value::Float(f) => Some(json!(f)),
-            Value::List(items) => {
-                let arr: Vec<serde_json::Value> =
-                    items.iter().filter_map(|v| self.value_to_json(v)).collect();
-                Some(serde_json::Value::Array(arr))
-            }
-            Value::Map(map) => {
-                let obj: serde_json::Map<String, serde_json::Value> = map
-                    .iter()
-                    .filter_map(|(k, v)| self.value_to_json(v).map(|val| (k.to_pascal_case(), val)))
-                    .collect();
-                Some(serde_json::Value::Object(obj))
-            }
-            _ => None,
-        }
     }
 
     // =========================================================================
@@ -1785,7 +1745,6 @@ mod tests {
 
     #[test]
     fn test_aws_value_to_dsl_bare_struct_returns_map() {
-        let provider = AwsccProvider::new_for_test("us-east-1");
         let fields = vec![
             StructField::new("status", AttributeType::String).with_provider_name("Status"),
             StructField::new("mfa_delete", AttributeType::String).with_provider_name("MfaDelete"),
@@ -1798,7 +1757,7 @@ mod tests {
             "Status": "Enabled",
         });
 
-        let result = provider.aws_value_to_dsl(
+        let result = aws_value_to_dsl(
             "versioning_configuration",
             &json_val,
             &attr_type,
@@ -1819,7 +1778,6 @@ mod tests {
 
     #[test]
     fn test_dsl_value_to_aws_map_for_bare_struct() {
-        let provider = AwsccProvider::new_for_test("us-east-1");
         let fields = vec![
             StructField::new("status", AttributeType::String).with_provider_name("Status"),
             StructField::new("mfa_delete", AttributeType::String).with_provider_name("MfaDelete"),
@@ -1834,7 +1792,7 @@ mod tests {
         map.insert("status".to_string(), Value::String("Enabled".to_string()));
         let dsl_value = Value::Map(map);
 
-        let result = provider.dsl_value_to_aws(
+        let result = dsl_value_to_aws(
             &dsl_value,
             &attr_type,
             "AWS::S3::Bucket",
@@ -1852,7 +1810,6 @@ mod tests {
 
     #[test]
     fn test_dsl_value_to_aws_list_for_bare_struct() {
-        let provider = AwsccProvider::new_for_test("us-east-1");
         let fields = vec![
             StructField::new("status", AttributeType::String).with_provider_name("Status"),
             StructField::new("mfa_delete", AttributeType::String).with_provider_name("MfaDelete"),
@@ -1867,7 +1824,7 @@ mod tests {
         map.insert("status".to_string(), Value::String("Enabled".to_string()));
         let dsl_value = Value::List(vec![Value::Map(map)]);
 
-        let result = provider.dsl_value_to_aws(
+        let result = dsl_value_to_aws(
             &dsl_value,
             &attr_type,
             "AWS::S3::Bucket",
@@ -1885,7 +1842,6 @@ mod tests {
 
     #[test]
     fn test_bare_struct_roundtrip_no_spurious_diff() {
-        let provider = AwsccProvider::new_for_test("us-east-1");
         let fields =
             vec![StructField::new("status", AttributeType::String).with_provider_name("Status")];
         let attr_type = AttributeType::Struct {
@@ -1897,14 +1853,13 @@ mod tests {
         let aws_json = serde_json::json!({ "Status": "Enabled" });
 
         // Read path: convert AWS JSON to DSL value
-        let dsl_value = provider
-            .aws_value_to_dsl(
-                "versioning_configuration",
-                &aws_json,
-                &attr_type,
-                "AWS::S3::Bucket",
-            )
-            .expect("read should succeed");
+        let dsl_value = aws_value_to_dsl(
+            "versioning_configuration",
+            &aws_json,
+            &attr_type,
+            "AWS::S3::Bucket",
+        )
+        .expect("read should succeed");
 
         // Simulate parser output (what the user wrote in .crn with map assignment syntax)
         let mut parser_map = HashMap::new();
@@ -1918,14 +1873,13 @@ mod tests {
         );
 
         // Write path: convert DSL value back to AWS JSON
-        let written_json = provider
-            .dsl_value_to_aws(
-                &dsl_value,
-                &attr_type,
-                "AWS::S3::Bucket",
-                "versioning_configuration",
-            )
-            .expect("write should succeed");
+        let written_json = dsl_value_to_aws(
+            &dsl_value,
+            &attr_type,
+            "AWS::S3::Bucket",
+            "versioning_configuration",
+        )
+        .expect("write should succeed");
 
         assert_eq!(
             written_json, aws_json,
@@ -1966,16 +1920,14 @@ mod tests {
         );
 
         // 2. AWS read-back side: aws_value_to_dsl converts "Gateway" string
-        let provider = AwsccProvider::new_for_test("ap-northeast-1");
         let aws_json = serde_json::json!("Gateway");
-        let aws_dsl = provider
-            .aws_value_to_dsl(
-                "vpc_endpoint_type",
-                &aws_json,
-                &attr_schema.attr_type,
-                "ec2.vpc_endpoint",
-            )
-            .expect("aws_value_to_dsl should return Some");
+        let aws_dsl = aws_value_to_dsl(
+            "vpc_endpoint_type",
+            &aws_json,
+            &attr_schema.attr_type,
+            "ec2.vpc_endpoint",
+        )
+        .expect("aws_value_to_dsl should return Some");
 
         assert_eq!(
             aws_dsl,

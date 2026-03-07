@@ -22,5 +22,3 @@ regex = "1.0"
 anyhow = "1.0"
 clap = { version = "4.0", features = ["derive"] }
 
-[dev-dependencies]
-aws-smithy-runtime = { version = "1", features = ["test-util"] }
