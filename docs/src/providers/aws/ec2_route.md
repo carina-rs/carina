@@ -53,7 +53,7 @@ The ID of a prefix list used for the destination match.
 - **Type:** AwsResourceId
 - **Required:** No
 
-The ID of an internet gateway or virtual private gateway attached to your 			VPC.
+The ID of an internet gateway or virtual private gateway attached to your VPC.
 
 ### `instance_id`
 

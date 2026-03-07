@@ -1918,7 +1918,7 @@ fn generate_markdown_resource(res: &ResourceDef, model: &SmithyModel) -> Result<
     if let Some(traits) = desc_traits
         && let Some(desc) = SmithyModel::documentation(traits)
     {
-        let cleaned = collapse_whitespace(&strip_html_tags(desc).replace('\n', " "));
+        let cleaned = collapse_whitespace(&strip_html_tags(desc).replace(['\n', '\t'], " "));
         md.push_str(&format!("{}\n\n", cleaned.trim()));
     }
 
@@ -1937,7 +1937,7 @@ fn generate_markdown_resource(res: &ResourceDef, model: &SmithyModel) -> Result<
         md.push('\n');
 
         if let Some(ref desc) = attr.description {
-            let cleaned = collapse_whitespace(&strip_html_tags(desc).replace('\n', " "));
+            let cleaned = collapse_whitespace(&strip_html_tags(desc).replace(['\n', '\t'], " "));
             md.push_str(&format!("{}\n\n", cleaned.trim()));
         }
     }
@@ -2024,7 +2024,8 @@ fn generate_markdown_resource(res: &ResourceDef, model: &SmithyModel) -> Result<
                 );
                 let desc = SmithyModel::documentation(&member_ref.traits)
                     .map(|s| {
-                        let cleaned = collapse_whitespace(&strip_html_tags(s).replace('\n', " "));
+                        let cleaned =
+                            collapse_whitespace(&strip_html_tags(s).replace(['\n', '\t'], " "));
                         let trimmed = cleaned.trim().to_string();
                         if trimmed.len() > 100 {
                             // Find a safe UTF-8 boundary
