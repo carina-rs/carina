@@ -136,6 +136,11 @@ while IFS= read -r -d '' file; do
     if ! matches_any_filter "$REL_PATH"; then
         continue
     fi
+    # Skip .crn files in directories with a custom run.sh (multi-step tests)
+    DIR_OF_FILE="$(dirname "$file")"
+    if [ -f "$DIR_OF_FILE/run.sh" ]; then
+        continue
+    fi
     TESTS+=("$file")
 done < <(find "$SCRIPT_DIR" -name "*.crn" -print0 | sort -z)
 
