@@ -220,17 +220,18 @@ impl AwsProvider {
                 self.read_s3_bucket_versioning(name, &mut attributes).await;
 
                 // Get object ownership
-                self.read_s3_bucket_ownership_controls(name, &mut attributes)
-                    .await;
+                self.read_s3_bucket_ownership_controls(id, name, &mut attributes)
+                    .await?;
 
                 // Get Object Lock status
-                self.read_s3_bucket_object_lock(name, &mut attributes).await;
+                self.read_s3_bucket_object_lock(id, name, &mut attributes)
+                    .await?;
 
                 // Get ACL
-                self.read_s3_bucket_acl(name, &mut attributes).await;
+                self.read_s3_bucket_acl(id, name, &mut attributes).await?;
 
                 // Get tags
-                self.read_s3_bucket_tags(name, &mut attributes).await;
+                self.read_s3_bucket_tags(id, name, &mut attributes).await?;
 
                 // S3 bucket identifier is the bucket name
                 Ok(State::existing(id.clone(), attributes).with_identifier(name))
@@ -379,21 +380,36 @@ impl AwsProvider {
     /// Read S3 bucket ownership controls
     async fn read_s3_bucket_ownership_controls(
         &self,
+        id: &ResourceId,
         identifier: &str,
         attributes: &mut HashMap<String, Value>,
-    ) {
-        if let Ok(output) = self
+    ) -> ProviderResult<()> {
+        match self
             .s3_client
             .get_bucket_ownership_controls()
             .bucket(identifier)
             .send()
             .await
-            && let Some(controls) = output.ownership_controls()
-            && let Some(rule) = controls.rules().first()
         {
-            let value = rule.object_ownership().as_str().to_string();
-            attributes.insert("object_ownership".to_string(), Value::String(value));
+            Ok(output) => {
+                if let Some(controls) = output.ownership_controls()
+                    && let Some(rule) = controls.rules().first()
+                {
+                    let value = rule.object_ownership().as_str().to_string();
+                    attributes.insert("object_ownership".to_string(), Value::String(value));
+                }
+            }
+            Err(err) => {
+                if !is_s3_not_configured_error(&err, "OwnershipControlsNotFoundError") {
+                    return Err(ProviderError::new(format!(
+                        "Failed to read bucket ownership controls: {}",
+                        err
+                    ))
+                    .for_resource(id.clone()));
+                }
+            }
         }
+        Ok(())
     }
 
     /// Write S3 bucket ownership controls
@@ -437,9 +453,10 @@ impl AwsProvider {
     /// Read S3 bucket Object Lock status
     async fn read_s3_bucket_object_lock(
         &self,
+        id: &ResourceId,
         identifier: &str,
         attributes: &mut HashMap<String, Value>,
-    ) {
+    ) -> ProviderResult<()> {
         match self
             .s3_client
             .get_object_lock_configuration()
@@ -457,27 +474,41 @@ impl AwsProvider {
                     Value::Bool(enabled),
                 );
             }
-            Err(_) => {
-                // ObjectLockConfigurationNotFoundError means Object Lock is not enabled
-                attributes.insert(
-                    "object_lock_enabled_for_bucket".to_string(),
-                    Value::Bool(false),
-                );
+            Err(err) => {
+                if is_s3_not_configured_error(&err, "ObjectLockConfigurationNotFoundError") {
+                    attributes.insert(
+                        "object_lock_enabled_for_bucket".to_string(),
+                        Value::Bool(false),
+                    );
+                } else {
+                    return Err(ProviderError::new(format!(
+                        "Failed to read object lock configuration: {}",
+                        err
+                    ))
+                    .for_resource(id.clone()));
+                }
             }
         }
+        Ok(())
     }
 
     /// Read S3 bucket ACL
-    async fn read_s3_bucket_acl(&self, identifier: &str, attributes: &mut HashMap<String, Value>) {
-        let Ok(output) = self
+    async fn read_s3_bucket_acl(
+        &self,
+        id: &ResourceId,
+        identifier: &str,
+        attributes: &mut HashMap<String, Value>,
+    ) -> ProviderResult<()> {
+        let output = self
             .s3_client
             .get_bucket_acl()
             .bucket(identifier)
             .send()
             .await
-        else {
-            return;
-        };
+            .map_err(|e| {
+                ProviderError::new(format!("Failed to read bucket ACL: {}", e))
+                    .for_resource(id.clone())
+            })?;
 
         let owner_id = output
             .owner()
@@ -565,6 +596,7 @@ impl AwsProvider {
                 );
             }
         }
+        Ok(())
     }
 
     /// Write S3 bucket ACL
@@ -623,25 +655,42 @@ impl AwsProvider {
     }
 
     /// Read S3 bucket tags
-    async fn read_s3_bucket_tags(&self, identifier: &str, attributes: &mut HashMap<String, Value>) {
-        if let Ok(output) = self
+    async fn read_s3_bucket_tags(
+        &self,
+        id: &ResourceId,
+        identifier: &str,
+        attributes: &mut HashMap<String, Value>,
+    ) -> ProviderResult<()> {
+        match self
             .s3_client
             .get_bucket_tagging()
             .bucket(identifier)
             .send()
             .await
         {
-            let mut tag_map = HashMap::new();
-            for tag in output.tag_set() {
-                tag_map.insert(
-                    tag.key().to_string(),
-                    Value::String(tag.value().to_string()),
-                );
+            Ok(output) => {
+                let mut tag_map = HashMap::new();
+                for tag in output.tag_set() {
+                    tag_map.insert(
+                        tag.key().to_string(),
+                        Value::String(tag.value().to_string()),
+                    );
+                }
+                if !tag_map.is_empty() {
+                    attributes.insert("tags".to_string(), Value::Map(tag_map));
+                }
             }
-            if !tag_map.is_empty() {
-                attributes.insert("tags".to_string(), Value::Map(tag_map));
+            Err(err) => {
+                if !is_s3_not_configured_error(&err, "NoSuchTagSet") {
+                    return Err(ProviderError::new(format!(
+                        "Failed to read bucket tagging: {}",
+                        err
+                    ))
+                    .for_resource(id.clone()));
+                }
             }
         }
+        Ok(())
     }
 
     /// Write S3 bucket tags
@@ -2294,6 +2343,23 @@ fn normalize_state_enums(resource_type: &str, attributes: &mut HashMap<String, V
 
     for (key, value) in resolved {
         attributes.insert(key, value);
+    }
+}
+
+/// Check if an S3 SDK error is a "not configured" error that should be silently ignored.
+///
+/// S3 returns specific error codes when a feature is not configured on a bucket
+/// (e.g., `NoSuchTagSet` when no tags exist). These are expected and should not
+/// be treated as failures. Real errors (e.g., `AccessDenied`, throttling) should
+/// be propagated.
+fn is_s3_not_configured_error<E: aws_sdk_s3::error::ProvideErrorMetadata>(
+    err: &aws_sdk_s3::error::SdkError<E>,
+    expected_code: &str,
+) -> bool {
+    use aws_sdk_s3::error::SdkError;
+    match err {
+        SdkError::ServiceError(service_err) => service_err.err().code() == Some(expected_code),
+        _ => false,
     }
 }
 
