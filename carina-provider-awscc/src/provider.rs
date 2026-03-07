@@ -72,12 +72,17 @@ impl AwsccProvider {
     }
 
     /// Create a lightweight provider for unit tests that don't make network calls.
-    /// Avoids TLS initialization which can fail in environments without root certificates.
+    /// Uses a no-op HTTP client to avoid TLS initialization, which panics
+    /// in environments without root certificates.
     #[cfg(test)]
     fn new_for_test(region: &str) -> Self {
+        use aws_smithy_runtime::client::http::test_util::StaticReplayClient;
+
+        let http_client = StaticReplayClient::new(vec![]);
         let config = aws_config::SdkConfig::builder()
             .behavior_version(aws_config::BehaviorVersion::latest())
             .region(Region::new(region.to_string()))
+            .http_client(http_client)
             .build();
         Self {
             cloudcontrol_client: CloudControlClient::new(&config),
