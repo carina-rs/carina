@@ -6,15 +6,77 @@ set -e
 
 echo "Running pre-commit checks..."
 
-# Check formatting
-echo "Checking formatting..."
-cargo fmt --all -- --check
-echo "Formatting OK"
+# Determine which crates have staged changes
+changed_crates=()
+staged_files=$(git diff --cached --name-only --diff-filter=ACMR)
 
-# Run clippy
-echo "Running clippy..."
-cargo clippy --all-targets --all-features -- -D warnings
-echo "Clippy OK"
+if [ -z "$staged_files" ]; then
+    echo "No staged files, skipping checks."
+    exit 0
+fi
 
-echo ""
+for crate_dir in carina-*/; do
+    crate_name="${crate_dir%/}"
+    if echo "$staged_files" | grep -q "^${crate_name}/"; then
+        changed_crates+=("-p" "$crate_name")
+    fi
+done
+
+# Also check for top-level files (Cargo.toml, etc.)
+has_root_changes=$(echo "$staged_files" | grep -v "^carina-" || true)
+
+# If only non-crate files changed (e.g., scripts, docs), run on all crates
+if [ ${#changed_crates[@]} -eq 0 ] && [ -n "$has_root_changes" ]; then
+    fmt_scope="--all"
+    clippy_scope="--all-targets --all-features"
+elif [ ${#changed_crates[@]} -eq 0 ]; then
+    echo "No Rust crate changes detected, skipping checks."
+    exit 0
+else
+    fmt_scope="${changed_crates[*]}"
+    clippy_scope="${changed_crates[*]} --all-targets --all-features"
+fi
+
+# Run fmt and clippy in parallel
+fmt_log=$(mktemp)
+clippy_log=$(mktemp)
+trap 'rm -f "$fmt_log" "$clippy_log"' EXIT
+
+if [ "$fmt_scope" = "--all" ]; then
+    cargo fmt --all -- --check >"$fmt_log" 2>&1 &
+else
+    cargo fmt ${fmt_scope} -- --check >"$fmt_log" 2>&1 &
+fi
+fmt_pid=$!
+
+if [ "$fmt_scope" = "--all" ]; then
+    cargo clippy --all-targets --all-features -- -D warnings >"$clippy_log" 2>&1 &
+else
+    cargo clippy ${clippy_scope} -- -D warnings >"$clippy_log" 2>&1 &
+fi
+clippy_pid=$!
+
+# Wait for both and collect exit codes
+fmt_exit=0
+clippy_exit=0
+wait $fmt_pid || fmt_exit=$?
+wait $clippy_pid || clippy_exit=$?
+
+# Report results
+if [ $fmt_exit -ne 0 ]; then
+    echo "Formatting check FAILED:"
+    cat "$fmt_log"
+    echo ""
+fi
+
+if [ $clippy_exit -ne 0 ]; then
+    echo "Clippy check FAILED:"
+    cat "$clippy_log"
+    echo ""
+fi
+
+if [ $fmt_exit -ne 0 ] || [ $clippy_exit -ne 0 ]; then
+    exit 1
+fi
+
 echo "All pre-commit checks passed!"
