@@ -460,13 +460,19 @@ pub fn s3_resources() -> Vec<ResourceDef> {
                 defaults: vec![("VersioningStatus", "Suspended")],
             }],
             delete_op: "DeleteBucket",
-            update_ops: vec![UpdateOp {
-                operation: "PutBucketVersioning",
-                fields: FieldLayout::InsideStruct {
-                    name: "VersioningConfiguration",
-                    fields: vec!["VersioningStatus"],
+            update_ops: vec![
+                UpdateOp {
+                    operation: "PutBucketVersioning",
+                    fields: FieldLayout::InsideStruct {
+                        name: "VersioningConfiguration",
+                        fields: vec!["VersioningStatus"],
+                    },
                 },
-            }],
+                UpdateOp {
+                    operation: "PutBucketOwnershipControls",
+                    fields: FieldLayout::Flat(vec!["ObjectOwnership"]),
+                },
+            ],
             identifier: "Bucket",
             has_tags: true,
             type_overrides: vec![],
@@ -479,7 +485,6 @@ pub fn s3_resources() -> Vec<ResourceDef> {
                 "GrantWriteACP",
                 "CreateBucketConfiguration",
                 "ObjectLockEnabledForBucket",
-                "ObjectOwnership",
                 "ContentMD5",
                 "ChecksumAlgorithm",
                 "MFA",
