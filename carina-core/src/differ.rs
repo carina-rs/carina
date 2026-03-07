@@ -137,8 +137,9 @@ fn find_schema<'a>(
 /// `create_before_destroy`, we need a temporary name for the new resource to
 /// avoid conflicts with the old resource that still exists.
 ///
-/// Returns `None` if no temporary name is needed (no name_attribute, or
-/// the resource already uses name_prefix for that attribute).
+/// Returns `None` if no temporary name is needed (no name_attribute,
+/// the resource already uses name_prefix for that attribute, or
+/// the name_attribute value changed between `from` and `to`).
 fn generate_temporary_name(
     resource: &Resource,
     from: &State,
