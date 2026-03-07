@@ -120,7 +120,7 @@ for TYPE_NAME in "${RESOURCE_TYPES[@]}"; do
         } > "$EXAMPLE_TMPFILE"
         # Insert the example block before "## Argument Reference"
         MERGED_TMPFILE=$(mktemp)
-        while IFS= read -r line; do
+        while IFS= read -r line || [ -n "$line" ]; do
             if [ "$line" = "## Argument Reference" ]; then
                 cat "$EXAMPLE_TMPFILE"
             fi
