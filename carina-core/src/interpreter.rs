@@ -144,12 +144,13 @@ impl<P: Provider> Interpreter<P> {
                     let identifier = from.identifier.as_deref().unwrap_or("");
                     self.provider.delete(id, identifier, lifecycle).await?;
                     // If a temporary name was used and the name is updatable,
-                    // rename the new resource back to the desired name
+                    // rename the new resource back to the desired name.
+                    // Rename failure is non-fatal: the old resource is already deleted,
+                    // so the replace succeeded — just with the temporary name.
                     let state = if let Some(temp) = temporary_name
                         && temp.can_rename
                     {
                         let new_identifier = state.identifier.as_deref().unwrap_or("");
-                        // Build a rename resource with the original name
                         let mut rename_to = to.clone();
                         rename_to.attributes.insert(
                             temp.attribute.clone(),
@@ -157,7 +158,8 @@ impl<P: Provider> Interpreter<P> {
                         );
                         self.provider
                             .update(id, new_identifier, &state, &rename_to)
-                            .await?
+                            .await
+                            .unwrap_or(state)
                     } else {
                         state
                     };
