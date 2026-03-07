@@ -4,6 +4,11 @@ CloudFormation Type: `AWS::S3::Bucket`
 
 ## Argument Reference
 
+### `object_ownership`
+
+- **Type:** [Enum (ObjectOwnership)](#object_ownership-objectownership)
+- **Required:** No
+
 ### `versioning_status`
 
 - **Type:** [Enum (VersioningStatus)](#versioning_status-versioningstatus)
@@ -19,6 +24,16 @@ The versioning state of the bucket.
 The tags for the resource.
 
 ## Enum Values
+
+### object_ownership (ObjectOwnership)
+
+| Value | DSL Identifier |
+|-------|----------------|
+| `BucketOwnerEnforced` | `aws.s3.bucket.ObjectOwnership.BucketOwnerEnforced` |
+| `BucketOwnerPreferred` | `aws.s3.bucket.ObjectOwnership.BucketOwnerPreferred` |
+| `ObjectWriter` | `aws.s3.bucket.ObjectOwnership.ObjectWriter` |
+
+Shorthand formats: `BucketOwnerEnforced` or `ObjectOwnership.BucketOwnerEnforced`
 
 ### versioning_status (VersioningStatus)
 

@@ -11,6 +11,30 @@ use carina_core::resource::Value;
 use carina_core::schema::{AttributeSchema, AttributeType, CompletionValue, ResourceSchema};
 
 #[allow(dead_code)]
+const VALID_OBJECT_OWNERSHIP: &[&str] = &[
+    "BucketOwnerEnforced",
+    "BucketOwnerPreferred",
+    "ObjectWriter",
+];
+
+#[allow(dead_code)]
+fn validate_object_ownership(value: &Value) -> Result<(), String> {
+    validate_namespaced_enum(
+        value,
+        "ObjectOwnership",
+        "aws.s3.bucket",
+        VALID_OBJECT_OWNERSHIP,
+    )
+    .map_err(|reason| {
+        if let Value::String(s) = value {
+            format!("Invalid ObjectOwnership '{}': {}", s, reason)
+        } else {
+            reason
+        }
+    })
+}
+
+#[allow(dead_code)]
 const VALID_VERSIONING_STATUS: &[&str] = &["Enabled", "Suspended"];
 
 #[allow(dead_code)]
@@ -48,6 +72,33 @@ pub fn s3_bucket_config() -> AwsSchemaConfig {
             )
             .attribute(
                 AttributeSchema::new(
+                    "object_ownership",
+                    AttributeType::Custom {
+                        name: "ObjectOwnership".to_string(),
+                        base: Box::new(AttributeType::String),
+                        validate: validate_object_ownership,
+                        namespace: Some("aws.s3.bucket".to_string()),
+                        to_dsl: None,
+                    },
+                )
+                .with_provider_name("ObjectOwnership")
+                .with_completions(vec![
+                    CompletionValue::new(
+                        "aws.s3.bucket.ObjectOwnership.BucketOwnerEnforced",
+                        "BucketOwnerEnforced",
+                    ),
+                    CompletionValue::new(
+                        "aws.s3.bucket.ObjectOwnership.BucketOwnerPreferred",
+                        "BucketOwnerPreferred",
+                    ),
+                    CompletionValue::new(
+                        "aws.s3.bucket.ObjectOwnership.ObjectWriter",
+                        "ObjectWriter",
+                    ),
+                ]),
+            )
+            .attribute(
+                AttributeSchema::new(
                     "versioning_status",
                     AttributeType::Custom {
                         name: "VersioningStatus".to_string(),
@@ -79,7 +130,10 @@ pub fn enum_valid_values() -> (
 ) {
     (
         "s3.bucket",
-        &[("versioning_status", VALID_VERSIONING_STATUS)],
+        &[
+            ("object_ownership", VALID_OBJECT_OWNERSHIP),
+            ("versioning_status", VALID_VERSIONING_STATUS),
+        ],
     )
 }
 

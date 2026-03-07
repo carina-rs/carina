@@ -166,6 +166,10 @@ impl AwsProvider {
                 // Get versioning status
                 self.read_s3_bucket_versioning(name, &mut attributes).await;
 
+                // Get object ownership
+                self.read_s3_bucket_ownership_controls(name, &mut attributes)
+                    .await;
+
                 // S3 bucket identifier is the bucket name
                 Ok(State::existing(id.clone(), attributes).with_identifier(name))
             }
@@ -231,6 +235,13 @@ impl AwsProvider {
             req = req.create_bucket_configuration(config);
         }
 
+        // Set ObjectOwnership on create
+        if let Some(Value::String(val)) = resource.attributes.get("object_ownership") {
+            use aws_sdk_s3::types::ObjectOwnership;
+            let normalized = extract_enum_value(val);
+            req = req.object_ownership(ObjectOwnership::from(normalized));
+        }
+
         req.send().await.map_err(|e| {
             ProviderError::new(format!("Failed to create bucket: {:?}", e))
                 .for_resource(resource.id.clone())
@@ -257,7 +268,69 @@ impl AwsProvider {
         self.write_s3_bucket_versioning(&id, &bucket_name, &to.attributes)
             .await?;
 
+        // Update object ownership
+        self.write_s3_bucket_ownership_controls(&id, &bucket_name, &to.attributes)
+            .await?;
+
         self.read_s3_bucket(&id, Some(&bucket_name)).await
+    }
+
+    /// Read S3 bucket ownership controls
+    async fn read_s3_bucket_ownership_controls(
+        &self,
+        identifier: &str,
+        attributes: &mut HashMap<String, Value>,
+    ) {
+        if let Ok(output) = self
+            .s3_client
+            .get_bucket_ownership_controls()
+            .bucket(identifier)
+            .send()
+            .await
+            && let Some(controls) = output.ownership_controls()
+            && let Some(rule) = controls.rules().first()
+        {
+            let value = rule.object_ownership().as_str().to_string();
+            attributes.insert("object_ownership".to_string(), Value::String(value));
+        }
+    }
+
+    /// Write S3 bucket ownership controls
+    async fn write_s3_bucket_ownership_controls(
+        &self,
+        id: &ResourceId,
+        identifier: &str,
+        attributes: &HashMap<String, Value>,
+    ) -> ProviderResult<()> {
+        if let Some(Value::String(val)) = attributes.get("object_ownership") {
+            use aws_sdk_s3::types::{ObjectOwnership, OwnershipControls, OwnershipControlsRule};
+            let normalized = extract_enum_value(val);
+            let rule = OwnershipControlsRule::builder()
+                .object_ownership(ObjectOwnership::from(normalized))
+                .build()
+                .map_err(|e| {
+                    ProviderError::new(format!("Failed to build ownership controls rule: {}", e))
+                        .for_resource(id.clone())
+                })?;
+            let controls = OwnershipControls::builder()
+                .rules(rule)
+                .build()
+                .map_err(|e| {
+                    ProviderError::new(format!("Failed to build ownership controls: {}", e))
+                        .for_resource(id.clone())
+                })?;
+            self.s3_client
+                .put_bucket_ownership_controls()
+                .bucket(identifier)
+                .ownership_controls(controls)
+                .send()
+                .await
+                .map_err(|e| {
+                    ProviderError::new(format!("Failed to put bucket ownership controls: {}", e))
+                        .for_resource(id.clone())
+                })?;
+        }
+        Ok(())
     }
 
     // ========== EC2 VPC Operations ==========
