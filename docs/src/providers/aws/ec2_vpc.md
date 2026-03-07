@@ -11,14 +11,14 @@ Describes a VPC.
 - **Type:** Ipv4Cidr
 - **Required:** No
 
-The IPv4 network range for the VPC, in CIDR notation. For example, 		    10.0.0.0/16. We modify the specified CIDR block to its canonical form; for example, if you specify 100.68.0.18/18, we modify it to 100.68.0.0/18.
+The IPv4 network range for the VPC, in CIDR notation. For example, 		 10.0.0.0/16. We modify the specified CIDR block to its canonical form; for example, if you specify 100.68.0.18/18, we modify it to 100.68.0.0/18.
 
 ### `instance_tenancy`
 
 - **Type:** [Enum (InstanceTenancy)](#instance_tenancy-instancetenancy)
 - **Required:** No
 
-The tenancy options for instances launched into the VPC. For default, instances    are launched with shared tenancy by default. You can launch instances with any tenancy into a    shared tenancy VPC. For dedicated, instances are launched as dedicated tenancy    instances by default. You can only launch instances with a tenancy of dedicated    or host into a dedicated tenancy VPC.            Important: The host value cannot be used with this parameter. Use the default or dedicated values only.     Default: default
+The tenancy options for instances launched into the VPC. For default, instances are launched with shared tenancy by default. You can launch instances with any tenancy into a shared tenancy VPC. For dedicated, instances are launched as dedicated tenancy instances by default. You can only launch instances with a tenancy of dedicated or host into a dedicated tenancy VPC. Important: The host value cannot be used with this parameter. Use the default or dedicated values only. Default: default
 
 ### `ipv4_ipam_pool_id`
 

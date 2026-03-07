@@ -11,14 +11,14 @@ Describes a subnet.
 - **Type:** Bool
 - **Required:** No
 
-Indicates whether a network interface created in this subnet (including a network       interface created by RunInstances) receives an IPv6 address.
+Indicates whether a network interface created in this subnet (including a network interface created by RunInstances) receives an IPv6 address.
 
 ### `availability_zone`
 
 - **Type:** AvailabilityZone
 - **Required:** No
 
-The Availability Zone or Local Zone for the subnet.     Default: Amazon Web Services selects one for you. If you create more than one subnet in your VPC, we      do not necessarily select a different zone for each subnet.     To create a subnet in a Local Zone, set this value to the Local Zone ID, for example      us-west-2-lax-1a. For information about the Regions that support Local Zones,       see Available Local Zones.     To create a subnet in an Outpost, set this value to the Availability Zone for the      Outpost and specify the Outpost ARN.
+The Availability Zone or Local Zone for the subnet. Default: Amazon Web Services selects one for you. If you create more than one subnet in your VPC, we do not necessarily select a different zone for each subnet. To create a subnet in a Local Zone, set this value to the Local Zone ID, for example us-west-2-lax-1a. For information about the Regions that support Local Zones, see Available Local Zones. To create a subnet in an Outpost, set this value to the Availability Zone for the Outpost and specify the Outpost ARN.
 
 ### `availability_zone_id`
 
@@ -32,21 +32,21 @@ The AZ ID or the Local Zone ID of the subnet.
 - **Type:** Ipv4Cidr
 - **Required:** No
 
-The IPv4 network range for the subnet, in CIDR notation. For example, 10.0.0.0/24.       We modify the specified CIDR block to its canonical form; for example, if you specify       100.68.0.18/18, we modify it to 100.68.0.0/18.     This parameter is not supported for an IPv6 only subnet.
+The IPv4 network range for the subnet, in CIDR notation. For example, 10.0.0.0/24. We modify the specified CIDR block to its canonical form; for example, if you specify 100.68.0.18/18, we modify it to 100.68.0.0/18. This parameter is not supported for an IPv6 only subnet.
 
 ### `enable_dns64`
 
 - **Type:** Bool
 - **Required:** No
 
-Indicates whether DNS queries made to the Amazon-provided DNS Resolver in this subnet       should return synthetic IPv6 addresses for IPv4-only destinations.
+Indicates whether DNS queries made to the Amazon-provided DNS Resolver in this subnet should return synthetic IPv6 addresses for IPv4-only destinations.
 
 ### `enable_lni_at_device_index`
 
 - **Type:** Int
 - **Required:** No
 
-Indicates the device position for local network interfaces in this subnet. For example,       1 indicates local network interfaces in this subnet are the secondary       network interface (eth1).
+Indicates the device position for local network interfaces in this subnet. For example, 1 indicates local network interfaces in this subnet are the secondary network interface (eth1).
 
 ### `ipv4_ipam_pool_id`
 
@@ -67,7 +67,7 @@ An IPv4 netmask length for the subnet.
 - **Type:** Ipv6Cidr
 - **Required:** No
 
-The IPv6 network range for the subnet, in CIDR notation. This parameter is required       for an IPv6 only subnet.
+The IPv6 network range for the subnet, in CIDR notation. This parameter is required for an IPv6 only subnet.
 
 ### `ipv6_ipam_pool_id`
 
@@ -95,21 +95,21 @@ An IPv6 netmask length for the subnet.
 - **Type:** Bool
 - **Required:** No
 
-Indicates whether instances launched in this subnet receive a public IPv4 address.     Amazon Web Services charges for all public IPv4 addresses, including public IPv4 addresses associated with running instances and Elastic IP addresses. For more information, see the Public IPv4 Address tab on the Amazon VPC pricing page.
+Indicates whether instances launched in this subnet receive a public IPv4 address. Amazon Web Services charges for all public IPv4 addresses, including public IPv4 addresses associated with running instances and Elastic IP addresses. For more information, see the Public IPv4 Address tab on the Amazon VPC pricing page.
 
 ### `outpost_arn`
 
 - **Type:** Arn
 - **Required:** No
 
-The Amazon Resource Name (ARN) of the Outpost. If you specify an Outpost ARN, you must also     specify the Availability Zone of the Outpost subnet.
+The Amazon Resource Name (ARN) of the Outpost. If you specify an Outpost ARN, you must also specify the Availability Zone of the Outpost subnet.
 
 ### `private_dns_name_options_on_launch`
 
 - **Type:** [Struct(PrivateDnsNameOptionsOnLaunch)](#privatednsnameoptionsonlaunch)
 - **Required:** No
 
-The type of hostnames to assign to instances in the subnet at launch. An instance hostname       is based on the IPv4 address or ID of the instance.
+The type of hostnames to assign to instances in the subnet at launch. An instance hostname is based on the IPv4 address or ID of the instance.
 
 ### `vpc_id`
 
@@ -131,9 +131,9 @@ The tags for the resource.
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `enable_resource_name_dns_aaaa_record` | Bool | No | Indicates whether to respond to DNS queries for instance hostname with DNS AAAA       records. |
-| `enable_resource_name_dns_a_record` | Bool | No | Indicates whether to respond to DNS queries for instance hostnames with DNS A       records. |
-| `hostname_type` | [Enum (HostnameType)](#hostname_type-hostnametype) | No | The type of hostname for EC2 instances. For IPv4 only subnets, an instance DNS name       must be ba... |
+| `enable_resource_name_dns_aaaa_record` | Bool | No | Indicates whether to respond to DNS queries for instance hostname with DNS AAAA records. |
+| `enable_resource_name_dns_a_record` | Bool | No | Indicates whether to respond to DNS queries for instance hostnames with DNS A records. |
+| `hostname_type` | [Enum (HostnameType)](#hostname_type-hostnametype) | No | The type of hostname for EC2 instances. For IPv4 only subnets, an instance DNS name must be based on... |
 
 ## Attribute Reference
 
