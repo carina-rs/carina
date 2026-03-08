@@ -1360,23 +1360,42 @@ fn generate_provider_code(
         ));
     }
 
-    // No-op update methods
+    // No-op update methods (with optional tag handling)
     for res in all_resources.iter().filter(|r| r.noop_update) {
         let method_name = format!("update_{}", res.name.replace('.', "_"));
         let read_method = format!("read_{}", res.name.replace('.', "_"));
 
-        code.push_str(&format!(
-            "\x20   /// Update {} (no-op, just read back current state) (generated)\n\
-             \x20   pub(crate) async fn {}(\n\
-             \x20       &self,\n\
-             \x20       id: ResourceId,\n\
-             \x20       identifier: &str,\n\
-             \x20       _to: Resource,\n\
-             \x20   ) -> ProviderResult<State> {{\n\
-             \x20       self.{}(&id, Some(identifier)).await\n\
-             \x20   }}\n\n",
-            res.name, method_name, read_method,
-        ));
+        if res.has_tags {
+            // Tag-enabled noop update: apply tags then read back
+            code.push_str(&format!(
+                "\x20   /// Update {}: apply tag changes and read back (generated)\n\
+                 \x20   pub(crate) async fn {}(\n\
+                 \x20       &self,\n\
+                 \x20       id: ResourceId,\n\
+                 \x20       identifier: &str,\n\
+                 \x20       from: &State,\n\
+                 \x20       to: Resource,\n\
+                 \x20   ) -> ProviderResult<State> {{\n\
+                 \x20       self.apply_ec2_tags(&id, identifier, &to.attributes, Some(&from.attributes))\n\
+                 \x20           .await?;\n\
+                 \x20       self.{}(&id, Some(identifier)).await\n\
+                 \x20   }}\n\n",
+                res.name, method_name, read_method,
+            ));
+        } else {
+            code.push_str(&format!(
+                "\x20   /// Update {} (no-op, just read back current state) (generated)\n\
+                 \x20   pub(crate) async fn {}(\n\
+                 \x20       &self,\n\
+                 \x20       id: ResourceId,\n\
+                 \x20       identifier: &str,\n\
+                 \x20       _to: Resource,\n\
+                 \x20   ) -> ProviderResult<State> {{\n\
+                 \x20       self.{}(&id, Some(identifier)).await\n\
+                 \x20   }}\n\n",
+                res.name, method_name, read_method,
+            ));
+        }
     }
 
     // Read helpers for read_ops (non-data-source resources only)
@@ -1631,6 +1650,167 @@ fn generate_provider_code(
             code.push_str("\x20       Ok(())\n");
             code.push_str("\x20   }\n\n");
         }
+    }
+
+    // Read attribute extraction methods for resources with read_structure
+    for res in all_resources.iter().filter(|r| r.read_structure.is_some()) {
+        let model = match models.get(res.service_namespace) {
+            Some(m) => m,
+            None => continue,
+        };
+        let ns = res.service_namespace;
+        let read_struct_name = res.read_structure.unwrap();
+        let read_struct_id = format!("{}#{}", ns, read_struct_name);
+        let read_struct = match model.get_structure(&read_struct_id) {
+            Some(s) => s,
+            None => continue,
+        };
+
+        let resource_name = res.name.replace('.', "_");
+        let sdk_crate = sdk_crate_name(ns);
+
+        // Build exclude set
+        let exclude: HashSet<&str> = res.exclude_fields.iter().copied().collect();
+
+        // Get create input members
+        let create_input = if !res.create_op.is_empty() {
+            let create_op_id = format!("{}#{}", ns, res.create_op);
+            model.operation_input(&create_op_id)
+        } else {
+            None
+        };
+
+        // Compute updatable field names
+        let updatable_fields: HashSet<&str> = res
+            .update_ops
+            .iter()
+            .flat_map(|op| op.fields.field_names().iter())
+            .copied()
+            .collect();
+
+        let extra_read_only: HashSet<&str> = res.extra_read_only.iter().copied().collect();
+
+        // Collect fields to extract: (attr_snake_name, accessor_snake_name, member_ref)
+        let mut fields_to_extract: Vec<(String, String, &carina_smithy::ShapeRef)> = Vec::new();
+
+        for (member_name, member_ref) in &read_struct.members {
+            if exclude.contains(member_name.as_str()) || member_name == "Tags" {
+                continue;
+            }
+
+            let is_schema_attr = member_name == res.identifier
+                || extra_read_only.contains(member_name.as_str())
+                || updatable_fields.contains(member_name.as_str())
+                || create_input.is_some_and(|ci| ci.members.contains_key(member_name));
+
+            if !is_schema_attr {
+                continue;
+            }
+
+            let snake_name = member_name.to_snake_case();
+            fields_to_extract.push((snake_name.clone(), snake_name, member_ref));
+        }
+
+        // Add extra_writable fields with read_source (different attr name vs accessor)
+        for extra in &res.extra_writable {
+            if let Some(read_source) = extra.read_source
+                && let Some(member_ref) = read_struct.members.get(read_source)
+            {
+                let attr_name = extra.name.to_snake_case();
+                let accessor_name = read_source.to_snake_case();
+                // Avoid duplicates (if already extracted under the same accessor)
+                if !fields_to_extract.iter().any(|(a, _, _)| a == &attr_name) {
+                    fields_to_extract.push((attr_name, accessor_name, member_ref));
+                }
+            }
+        }
+
+        // Sort fields for deterministic output
+        fields_to_extract.sort_by(|a, b| a.0.cmp(&b.0));
+
+        // Generate method
+        code.push_str(&format!(
+            "\x20   /// Extract {} attributes from SDK response type (generated)\n",
+            res.name
+        ));
+        code.push_str(&format!(
+            "\x20   pub(crate) fn extract_{}_attributes(\n",
+            resource_name
+        ));
+        code.push_str(&format!(
+            "\x20       obj: &{}::types::{},\n",
+            sdk_crate, read_struct_name
+        ));
+        code.push_str("\x20       attributes: &mut HashMap<String, Value>,\n");
+        code.push_str("\x20   ) -> Option<String> {\n");
+
+        for (attr_name, accessor_name, member_ref) in &fields_to_extract {
+            let kind = model.shape_kind(&member_ref.target);
+
+            match kind {
+                Some(ShapeKind::Enum) => {
+                    code.push_str(&format!(
+                        "\x20       if let Some(v) = obj.{}() {{\n",
+                        accessor_name
+                    ));
+                    code.push_str(&format!(
+                        "\x20           attributes.insert(\"{}\".to_string(), Value::String(v.as_str().to_string()));\n",
+                        attr_name
+                    ));
+                    code.push_str("\x20       }\n");
+                }
+                Some(ShapeKind::Boolean) => {
+                    code.push_str(&format!(
+                        "\x20       if let Some(v) = obj.{}() {{\n",
+                        accessor_name
+                    ));
+                    code.push_str(&format!(
+                        "\x20           attributes.insert(\"{}\".to_string(), Value::Bool(v));\n",
+                        attr_name
+                    ));
+                    code.push_str("\x20       }\n");
+                }
+                Some(ShapeKind::Integer) | Some(ShapeKind::Long) => {
+                    code.push_str(&format!(
+                        "\x20       if let Some(v) = obj.{}() {{\n",
+                        accessor_name
+                    ));
+                    code.push_str(&format!(
+                        "\x20           attributes.insert(\"{}\".to_string(), Value::Int(v as i64));\n",
+                        attr_name
+                    ));
+                    code.push_str("\x20       }\n");
+                }
+                Some(ShapeKind::String) => {
+                    code.push_str(&format!(
+                        "\x20       if let Some(v) = obj.{}() {{\n",
+                        accessor_name
+                    ));
+                    code.push_str(&format!(
+                        "\x20           attributes.insert(\"{}\".to_string(), Value::String(v.to_string()));\n",
+                        attr_name
+                    ));
+                    code.push_str("\x20       }\n");
+                }
+                _ => {
+                    // Skip complex types (structures, lists, maps) that need
+                    // custom handling in hand-written code
+                }
+            }
+        }
+
+        // Return identifier value (only if identifier exists in read_structure)
+        if !res.identifier.is_empty() && read_struct.members.contains_key(res.identifier) {
+            let id_snake = res.identifier.to_snake_case();
+            code.push_str(&format!(
+                "\x20       obj.{}().map(String::from)\n",
+                id_snake
+            ));
+        } else {
+            code.push_str("\x20       None\n");
+        }
+
+        code.push_str("\x20   }\n\n");
     }
 
     code.push_str("}\n");
