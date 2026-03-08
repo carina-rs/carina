@@ -659,16 +659,9 @@ async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
                         .map_err(|e| format!("Failed to create bucket: {}", e))?;
                     println!("  {} Created state bucket", "✓".green());
 
-                    // Get region from backend config using factory
                     let backend_provider_name = backend
                         .provider_name()
                         .ok_or("Backend does not specify a provider name")?;
-                    let factories = provider_factories();
-                    let factory = provider_mod::find_factory(&factories, backend_provider_name)
-                        .ok_or_else(|| {
-                            format!("No provider factory found for '{}'", backend_provider_name)
-                        })?;
-                    let region = factory.extract_region(&config.attributes);
 
                     // Append resource definition to backend file
                     let target_file = backend_file.clone().unwrap_or_else(|| path.clone());
@@ -705,7 +698,6 @@ async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
                         backend_provider_name,
                     )
                     .with_attribute("bucket".to_string(), serde_json::json!(bucket_name))
-                    .with_attribute("region".to_string(), serde_json::json!(region))
                     .with_attribute(
                         "versioning_status".to_string(),
                         serde_json::json!("Enabled"),
