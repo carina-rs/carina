@@ -174,12 +174,44 @@ impl AwsProvider {
     }
 
     /// Apply tags to an EC2 resource
+    ///
+    /// When `from_attributes` is provided, tags that exist in `from` but not in `to`
+    /// will be deleted from the resource.
     async fn apply_ec2_tags(
         &self,
         resource_id: &ResourceId,
         ec2_resource_id: &str,
         attributes: &HashMap<String, Value>,
+        from_attributes: Option<&HashMap<String, Value>>,
     ) -> ProviderResult<()> {
+        // Delete tags that were removed (present in from but not in to)
+        if let Some(from_attrs) = from_attributes {
+            let old_keys: std::collections::HashSet<&String> =
+                if let Some(Value::Map(old_map)) = from_attrs.get("tags") {
+                    old_map.keys().collect()
+                } else {
+                    std::collections::HashSet::new()
+                };
+            let new_keys: std::collections::HashSet<&String> =
+                if let Some(Value::Map(new_map)) = attributes.get("tags") {
+                    new_map.keys().collect()
+                } else {
+                    std::collections::HashSet::new()
+                };
+            let removed_keys: Vec<&String> = old_keys.difference(&new_keys).copied().collect();
+            if !removed_keys.is_empty() {
+                let mut req = self.ec2_client.delete_tags().resources(ec2_resource_id);
+                for key in removed_keys {
+                    req = req.tags(aws_sdk_ec2::types::Tag::builder().key(key.as_str()).build());
+                }
+                req.send().await.map_err(|e| {
+                    ProviderError::new(format!("Failed to delete tags: {:?}", e))
+                        .for_resource(resource_id.clone())
+                })?;
+            }
+        }
+
+        // Add/update tags
         if let Some(tag_value) = attributes.get("tags") {
             let tags = Self::value_to_ec2_tags(tag_value);
             if !tags.is_empty() {
@@ -354,6 +386,7 @@ impl AwsProvider {
         &self,
         id: ResourceId,
         identifier: &str,
+        from: &State,
         to: Resource,
     ) -> ProviderResult<State> {
         let bucket_name = identifier.to_string();
@@ -370,9 +403,21 @@ impl AwsProvider {
         self.write_s3_bucket_acl(&id, &bucket_name, &to.attributes)
             .await?;
 
-        // Update tags
-        self.write_s3_bucket_tags(&id, &bucket_name, &to.attributes)
-            .await?;
+        // Update tags: if tags were removed entirely, delete all tags
+        if from.attributes.contains_key("tags") && !to.attributes.contains_key("tags") {
+            self.s3_client
+                .delete_bucket_tagging()
+                .bucket(&bucket_name)
+                .send()
+                .await
+                .map_err(|e| {
+                    ProviderError::new(format!("Failed to delete bucket tags: {:?}", e))
+                        .for_resource(id.clone())
+                })?;
+        } else {
+            self.write_s3_bucket_tags(&id, &bucket_name, &to.attributes)
+                .await?;
+        }
 
         self.read_s3_bucket(&id, Some(&bucket_name)).await
     }
@@ -874,7 +919,7 @@ impl AwsProvider {
         })?;
 
         // Apply tags
-        self.apply_ec2_tags(&resource.id, vpc_id, &resource.attributes)
+        self.apply_ec2_tags(&resource.id, vpc_id, &resource.attributes, None)
             .await?;
 
         // Configure DNS support
@@ -922,6 +967,7 @@ impl AwsProvider {
         &self,
         id: ResourceId,
         identifier: &str,
+        from: &State,
         to: Resource,
     ) -> ProviderResult<State> {
         // identifier is the VPC ID (e.g., vpc-12345678)
@@ -964,7 +1010,8 @@ impl AwsProvider {
         }
 
         // Update tags
-        self.apply_ec2_tags(&id, &vpc_id, &to.attributes).await?;
+        self.apply_ec2_tags(&id, &vpc_id, &to.attributes, Some(&from.attributes))
+            .await?;
 
         self.read_ec2_vpc(&id, Some(identifier)).await
     }
@@ -1078,7 +1125,7 @@ impl AwsProvider {
         })?;
 
         // Apply tags
-        self.apply_ec2_tags(&resource.id, subnet_id, &resource.attributes)
+        self.apply_ec2_tags(&resource.id, subnet_id, &resource.attributes, None)
             .await?;
 
         // Read back using subnet ID (reliable identifier)
@@ -1167,7 +1214,7 @@ impl AwsProvider {
             })?;
 
         // Apply tags
-        self.apply_ec2_tags(&resource.id, igw_id, &resource.attributes)
+        self.apply_ec2_tags(&resource.id, igw_id, &resource.attributes, None)
             .await?;
 
         // Attach to VPC if specified
@@ -1347,7 +1394,7 @@ impl AwsProvider {
             })?;
 
         // Apply tags
-        self.apply_ec2_tags(&resource.id, rt_id, &resource.attributes)
+        self.apply_ec2_tags(&resource.id, rt_id, &resource.attributes, None)
             .await?;
 
         // Add routes
@@ -1666,7 +1713,7 @@ impl AwsProvider {
         })?;
 
         // Apply tags
-        self.apply_ec2_tags(&resource.id, sg_id, &resource.attributes)
+        self.apply_ec2_tags(&resource.id, sg_id, &resource.attributes, None)
             .await?;
 
         // Read back using security group ID (reliable identifier)
@@ -2157,16 +2204,17 @@ impl Provider for AwsProvider {
         &self,
         id: &ResourceId,
         identifier: &str,
-        _from: &State,
+        from: &State,
         to: &Resource,
     ) -> BoxFuture<'_, ProviderResult<State>> {
         let id = id.clone();
         let identifier = identifier.to_string();
+        let from = from.clone();
         let to = to.clone();
         Box::pin(async move {
             match id.resource_type.as_str() {
-                "s3.bucket" => self.update_s3_bucket(id, &identifier, to).await,
-                "ec2.vpc" => self.update_ec2_vpc(id, &identifier, to).await,
+                "s3.bucket" => self.update_s3_bucket(id, &identifier, &from, to).await,
+                "ec2.vpc" => self.update_ec2_vpc(id, &identifier, &from, to).await,
                 "ec2.subnet" => self.update_ec2_subnet(id, &identifier, to).await,
                 "ec2.internet_gateway" => {
                     self.update_ec2_internet_gateway(id, &identifier, to).await
