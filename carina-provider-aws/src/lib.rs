@@ -3,7 +3,6 @@
 //! AWS Provider implementation
 
 pub mod provider_generated;
-pub mod resource_defs;
 pub mod schemas;
 
 use std::collections::HashMap;

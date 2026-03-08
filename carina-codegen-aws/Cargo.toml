@@ -1,0 +1,15 @@
+[package]
+name = "carina-codegen-aws"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[[bin]]
+name = "smithy-codegen"
+path = "src/main.rs"
+
+[dependencies]
+carina-smithy = { path = "../carina-smithy" }
+anyhow = "1.0"
+clap = { version = "4.0", features = ["derive"] }
+heck = "0.5"
