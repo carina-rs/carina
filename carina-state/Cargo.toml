@@ -5,6 +5,9 @@ edition = "2024"
 license = "MIT"
 description = "State management for Carina infrastructure tool"
 
+[lib]
+doctest = false
+
 [dependencies]
 carina-core = { path = "../carina-core" }
 aws-config = "1"
