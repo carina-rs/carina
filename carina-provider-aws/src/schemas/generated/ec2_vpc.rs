@@ -53,7 +53,8 @@ pub fn ec2_vpc_config() -> AwsSchemaConfig {
         .with_description("Describes a VPC.")
         .attribute(
             AttributeSchema::new("region", super::aws_region())
-                .with_description("The AWS region (inherited from provider if not specified)"),
+                .with_description("The AWS region (inherited from provider if not specified)")
+                .non_removable(),
         )
         .attribute(
             AttributeSchema::new("cidr_block", types::ipv4_cidr())

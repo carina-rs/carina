@@ -83,7 +83,8 @@ pub fn s3_bucket_config() -> AwsSchemaConfig {
         schema: ResourceSchema::new("aws.s3.bucket")
         .attribute(
             AttributeSchema::new("region", super::aws_region())
-                .with_description("The AWS region (inherited from provider if not specified)"),
+                .with_description("The AWS region (inherited from provider if not specified)")
+                .non_removable(),
         )
         .attribute(
             AttributeSchema::new("acl", AttributeType::Custom {

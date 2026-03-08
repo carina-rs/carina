@@ -18,7 +18,8 @@ pub fn ec2_route_config() -> AwsSchemaConfig {
         .with_description("Describes a route in a route table.")
         .attribute(
             AttributeSchema::new("region", super::aws_region())
-                .with_description("The AWS region (inherited from provider if not specified)"),
+                .with_description("The AWS region (inherited from provider if not specified)")
+                .non_removable(),
         )
         .attribute(
             AttributeSchema::new("carrier_gateway_id", super::aws_resource_id())

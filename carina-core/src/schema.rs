@@ -422,6 +422,11 @@ pub struct AttributeSchema {
     pub provider_name: Option<String>,
     /// Whether this attribute is create-only (immutable after creation)
     pub create_only: bool,
+    /// Override for removability detection.
+    /// `None` = auto-detect: removable if `!required && !create_only`.
+    /// `Some(false)` = explicitly non-removable (e.g., region inherited from provider).
+    /// Only removable attributes trigger removal detection in the differ.
+    pub removable: Option<bool>,
     /// Alternative block name for repeated block syntax (e.g., "operating_region" for "operating_regions")
     pub block_name: Option<String>,
 }
@@ -437,6 +442,7 @@ impl AttributeSchema {
             completions: None,
             provider_name: None,
             create_only: false,
+            removable: None,
             block_name: None,
         }
     }
@@ -449,6 +455,24 @@ impl AttributeSchema {
     pub fn create_only(mut self) -> Self {
         self.create_only = true;
         self
+    }
+
+    pub fn removable(mut self) -> Self {
+        self.removable = Some(true);
+        self
+    }
+
+    pub fn non_removable(mut self) -> Self {
+        self.removable = Some(false);
+        self
+    }
+
+    /// Whether this attribute can be removed from infrastructure.
+    /// Auto-detected: optional (not required) and mutable (not create-only) attributes
+    /// are removable by default. Can be overridden with `.removable()` or `.non_removable()`.
+    pub fn is_removable(&self) -> bool {
+        self.removable
+            .unwrap_or(!self.required && !self.create_only)
     }
 
     pub fn with_default(mut self, value: Value) -> Self {
@@ -550,6 +574,16 @@ impl ResourceSchema {
         self.attributes
             .iter()
             .filter(|(_, schema)| schema.create_only)
+            .map(|(name, _)| name.as_str())
+            .collect()
+    }
+
+    /// Returns the names of removable attributes.
+    /// By default, optional and mutable attributes are removable.
+    pub fn removable_attributes(&self) -> Vec<&str> {
+        self.attributes
+            .iter()
+            .filter(|(_, schema)| schema.is_removable())
             .map(|(name, _)| name.as_str())
             .collect()
     }

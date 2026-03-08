@@ -671,7 +671,8 @@ fn generate_resource(res: &ResourceDef, model: &SmithyModel) -> Result<String> {
         code.push_str(
             "\x20       .attribute(\n\
              \x20           AttributeSchema::new(\"region\", super::aws_region())\n\
-             \x20               .with_description(\"The AWS region (inherited from provider if not specified)\"),\n\
+             \x20               .with_description(\"The AWS region (inherited from provider if not specified)\")\n\
+             \x20               .non_removable(),\n\
              \x20       )\n",
         );
     }
