@@ -165,7 +165,8 @@ pub fn ec2_nat_gateway_config() -> AwsccSchemaConfig {
         .attribute(
             AttributeSchema::new("tags", tags_type())
                 .with_description("The tags for the NAT gateway.")
-                .with_provider_name("Tags"),
+                .with_provider_name("Tags")
+                .removable(),
         )
         .attribute(
             AttributeSchema::new("vpc_id", super::vpc_id())

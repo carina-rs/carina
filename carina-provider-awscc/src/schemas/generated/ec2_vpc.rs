@@ -119,7 +119,8 @@ pub fn ec2_vpc_config() -> AwsccSchemaConfig {
         .attribute(
             AttributeSchema::new("tags", tags_type())
                 .with_description("The tags for the VPC.")
-                .with_provider_name("Tags"),
+                .with_provider_name("Tags")
+                .removable(),
         )
         .attribute(
             AttributeSchema::new("vpc_id", super::vpc_id())

@@ -160,7 +160,8 @@ pub fn ec2_security_group_config() -> AwsccSchemaConfig {
         .attribute(
             AttributeSchema::new("tags", tags_type())
                 .with_description("Any tags assigned to the security group.")
-                .with_provider_name("Tags"),
+                .with_provider_name("Tags")
+                .removable(),
         )
         .attribute(
             AttributeSchema::new("vpc_id", super::vpc_id())

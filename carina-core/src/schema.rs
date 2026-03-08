@@ -422,6 +422,9 @@ pub struct AttributeSchema {
     pub provider_name: Option<String>,
     /// Whether this attribute is create-only (immutable after creation)
     pub create_only: bool,
+    /// Whether this attribute can be removed from infrastructure (e.g., tags).
+    /// Only removable attributes trigger removal detection in the differ.
+    pub removable: bool,
     /// Alternative block name for repeated block syntax (e.g., "operating_region" for "operating_regions")
     pub block_name: Option<String>,
 }
@@ -437,6 +440,7 @@ impl AttributeSchema {
             completions: None,
             provider_name: None,
             create_only: false,
+            removable: false,
             block_name: None,
         }
     }
@@ -448,6 +452,11 @@ impl AttributeSchema {
 
     pub fn create_only(mut self) -> Self {
         self.create_only = true;
+        self
+    }
+
+    pub fn removable(mut self) -> Self {
+        self.removable = true;
         self
     }
 
@@ -550,6 +559,15 @@ impl ResourceSchema {
         self.attributes
             .iter()
             .filter(|(_, schema)| schema.create_only)
+            .map(|(name, _)| name.as_str())
+            .collect()
+    }
+
+    /// Returns the names of removable attributes (e.g., tags)
+    pub fn removable_attributes(&self) -> Vec<&str> {
+        self.attributes
+            .iter()
+            .filter(|(_, schema)| schema.removable)
             .map(|(name, _)| name.as_str())
             .collect()
     }

@@ -41,7 +41,8 @@ pub fn ec2_transit_gateway_attachment_config() -> AwsccSchemaConfig {
         )
         .attribute(
             AttributeSchema::new("tags", tags_type())
-                .with_provider_name("Tags"),
+                .with_provider_name("Tags")
+                .removable(),
         )
         .attribute(
             AttributeSchema::new("transit_gateway_id", super::transit_gateway_id())

@@ -370,7 +370,11 @@ pub fn ec2_transit_gateway_config() -> AwsccSchemaConfig {
                     ),
                 ]),
             )
-            .attribute(AttributeSchema::new("tags", tags_type()).with_provider_name("Tags"))
+            .attribute(
+                AttributeSchema::new("tags", tags_type())
+                    .with_provider_name("Tags")
+                    .removable(),
+            )
             .attribute(
                 AttributeSchema::new("transit_gateway_arn", super::arn())
                     .with_description("(read-only)")

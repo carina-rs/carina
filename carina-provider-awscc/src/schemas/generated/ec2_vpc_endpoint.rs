@@ -256,7 +256,8 @@ pub fn ec2_vpc_endpoint_config() -> AwsccSchemaConfig {
         .attribute(
             AttributeSchema::new("tags", tags_type())
                 .with_description("The tags to associate with the endpoint.")
-                .with_provider_name("Tags"),
+                .with_provider_name("Tags")
+                .removable(),
         )
         .attribute(
             AttributeSchema::new("vpc_endpoint_type", AttributeType::Custom {

@@ -161,7 +161,8 @@ pub fn s3_bucket_config() -> AwsSchemaConfig {
         .attribute(
             AttributeSchema::new("tags", tags_type())
                 .with_description("The tags for the resource.")
-                .with_provider_name("Tags"),
+                .with_provider_name("Tags")
+                .removable(),
         )
     }
 }

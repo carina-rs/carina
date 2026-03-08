@@ -799,7 +799,8 @@ fn generate_resource(res: &ResourceDef, model: &SmithyModel) -> Result<String> {
             "\x20       .attribute(\n\
              \x20           AttributeSchema::new(\"tags\", tags_type())\n\
              \x20               .with_description(\"The tags for the resource.\")\n\
-             \x20               .with_provider_name(\"Tags\"),\n\
+             \x20               .with_provider_name(\"Tags\")\n\
+             \x20               .removable(),\n\
              \x20       )\n",
         );
     }

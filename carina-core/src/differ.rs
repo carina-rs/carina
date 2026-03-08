@@ -90,6 +90,37 @@ fn find_changed_create_only(
         .collect()
 }
 
+/// Filter out non-removable attribute removals from the changed list.
+/// A "removal" is an attribute that appears in `changed_attributes` but not in `to`.
+/// Only attributes marked as `removable` in the schema should be kept as removals.
+/// Non-removal changes (attribute present in `to`) are always kept.
+fn filter_non_removable_removals(
+    provider: &str,
+    resource_type: &str,
+    to: &Resource,
+    changed_attributes: Vec<String>,
+    schemas: &HashMap<String, ResourceSchema>,
+) -> Vec<String> {
+    let Some(schema) = find_schema(provider, resource_type, schemas) else {
+        // No schema available — keep all changes (conservative)
+        return changed_attributes;
+    };
+
+    let removable_attrs = schema.removable_attributes();
+
+    changed_attributes
+        .into_iter()
+        .filter(|attr| {
+            // Keep if the attribute is still in desired (it's a change, not a removal)
+            if to.attributes.contains_key(attr) {
+                return true;
+            }
+            // It's a removal — only keep if the attribute is removable
+            removable_attrs.contains(&attr.as_str())
+        })
+        .collect()
+}
+
 /// Find changed attributes between desired and current state.
 /// If `saved` is provided, each desired value is merged with the saved value
 /// before comparison, filling in unmanaged nested fields.
@@ -269,6 +300,22 @@ pub fn create_plan(
                 to,
                 changed_attributes,
             } => {
+                // Filter out non-removable attribute removals.
+                // A "removal" is an attribute in changed_attributes that is not in `to`.
+                // Only attributes marked as `removable` in the schema should trigger removal.
+                let changed_attributes = filter_non_removable_removals(
+                    &resource.id.provider,
+                    &resource.id.resource_type,
+                    &to,
+                    changed_attributes,
+                    schemas,
+                );
+
+                if changed_attributes.is_empty() {
+                    // All changes were spurious non-removable removals
+                    continue;
+                }
+
                 // Check if any changed attributes are create-only
                 let changed_create_only = find_changed_create_only(
                     &resource.id.provider,
@@ -2143,6 +2190,135 @@ mod tests {
             matches!(&plan.effects()[0], Effect::Update { .. }),
             "Expected Update effect for attribute removal, got {:?}",
             plan.effects()[0]
+        );
+    }
+
+    #[test]
+    fn create_plan_filters_non_removable_attribute_removal() {
+        use crate::schema::{AttributeSchema, AttributeType};
+        // When schema is available, only removable attributes should trigger removal.
+        // "region" is not removable, "tags" is removable.
+        let resources = vec![
+            Resource::new("s3.bucket", "test")
+                .with_attribute("region", Value::String("ap-northeast-1".to_string())),
+        ];
+
+        let mut current_states = HashMap::new();
+        let mut attrs = HashMap::new();
+        attrs.insert(
+            "region".to_string(),
+            Value::String("ap-northeast-1".to_string()),
+        );
+        attrs.insert(
+            "tags".to_string(),
+            Value::Map(HashMap::from([(
+                "Name".to_string(),
+                Value::String("test".to_string()),
+            )])),
+        );
+        current_states.insert(
+            ResourceId::new("s3.bucket", "test"),
+            State::existing(ResourceId::new("s3.bucket", "test"), attrs),
+        );
+
+        let mut prev_desired_keys = HashMap::new();
+        prev_desired_keys.insert(
+            ResourceId::new("s3.bucket", "test"),
+            vec!["region".to_string(), "tags".to_string()],
+        );
+
+        // Schema with tags marked as removable, region not removable
+        let mut schemas = HashMap::new();
+        schemas.insert(
+            "s3.bucket".to_string(),
+            ResourceSchema::new("s3.bucket")
+                .attribute(AttributeSchema::new("region", AttributeType::String))
+                .attribute(
+                    AttributeSchema::new(
+                        "tags",
+                        AttributeType::Map(Box::new(AttributeType::String)),
+                    )
+                    .removable(),
+                ),
+        );
+
+        let plan = create_plan(
+            &resources,
+            &current_states,
+            &HashMap::new(),
+            &schemas,
+            &HashMap::new(),
+            &prev_desired_keys,
+        );
+
+        assert_eq!(plan.effects().len(), 1);
+        match &plan.effects()[0] {
+            Effect::Update {
+                changed_attributes, ..
+            } => {
+                assert!(
+                    changed_attributes.contains(&"tags".to_string()),
+                    "Should detect removable 'tags' removal"
+                );
+                assert!(
+                    !changed_attributes.contains(&"region".to_string()),
+                    "Should NOT detect non-removable 'region' removal"
+                );
+            }
+            _ => panic!("Expected Update effect"),
+        }
+    }
+
+    #[test]
+    fn create_plan_skips_update_when_only_non_removable_removal() {
+        use crate::schema::{AttributeSchema, AttributeType};
+        // When the only "change" is a non-removable attribute removal,
+        // the plan should have no effects (no spurious Update).
+        let resources = vec![
+            Resource::new("s3.bucket", "test")
+                .with_attribute("bucket", Value::String("my-bucket".to_string())),
+        ];
+
+        let mut current_states = HashMap::new();
+        let mut attrs = HashMap::new();
+        attrs.insert("bucket".to_string(), Value::String("my-bucket".to_string()));
+        attrs.insert(
+            "region".to_string(),
+            Value::String("ap-northeast-1".to_string()),
+        );
+        current_states.insert(
+            ResourceId::new("s3.bucket", "test"),
+            State::existing(ResourceId::new("s3.bucket", "test"), attrs),
+        );
+
+        let mut prev_desired_keys = HashMap::new();
+        prev_desired_keys.insert(
+            ResourceId::new("s3.bucket", "test"),
+            vec!["bucket".to_string(), "region".to_string()],
+        );
+
+        // Schema where region is NOT removable
+        let mut schemas = HashMap::new();
+        schemas.insert(
+            "s3.bucket".to_string(),
+            ResourceSchema::new("s3.bucket")
+                .attribute(AttributeSchema::new("bucket", AttributeType::String))
+                .attribute(AttributeSchema::new("region", AttributeType::String)),
+        );
+
+        let plan = create_plan(
+            &resources,
+            &current_states,
+            &HashMap::new(),
+            &schemas,
+            &HashMap::new(),
+            &prev_desired_keys,
+        );
+
+        assert!(
+            plan.effects().is_empty(),
+            "Should not generate spurious Update for non-removable attribute removal, got {:?}",
+            plan.effects()
         );
     }
 

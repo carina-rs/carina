@@ -1154,6 +1154,11 @@ pub fn {}() -> AwsccSchemaConfig {{
             prop_name
         ));
 
+        // Tags are removable (can be deleted from infrastructure)
+        if attr_name == "tags" {
+            attr_code.push_str("\n                .removable()");
+        }
+
         // Add block_name for List(Struct) attributes with a natural singular form
         if attr_type.starts_with("AttributeType::List(Box::new(AttributeType::Struct")
             && let Some(singular) = compute_block_name(&attr_name)
