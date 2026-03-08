@@ -252,43 +252,55 @@ impl AwsProvider {
         Ok(())
     }
 
-    /// Update ec2.subnet (no-op, just read back current state) (generated)
+    /// Update ec2.subnet: apply tag changes and read back (generated)
     pub(crate) async fn update_ec2_subnet(
         &self,
         id: ResourceId,
         identifier: &str,
-        _to: Resource,
+        from: &State,
+        to: Resource,
     ) -> ProviderResult<State> {
+        self.apply_ec2_tags(&id, identifier, &to.attributes, Some(&from.attributes))
+            .await?;
         self.read_ec2_subnet(&id, Some(identifier)).await
     }
 
-    /// Update ec2.internet_gateway (no-op, just read back current state) (generated)
+    /// Update ec2.internet_gateway: apply tag changes and read back (generated)
     pub(crate) async fn update_ec2_internet_gateway(
         &self,
         id: ResourceId,
         identifier: &str,
-        _to: Resource,
+        from: &State,
+        to: Resource,
     ) -> ProviderResult<State> {
+        self.apply_ec2_tags(&id, identifier, &to.attributes, Some(&from.attributes))
+            .await?;
         self.read_ec2_internet_gateway(&id, Some(identifier)).await
     }
 
-    /// Update ec2.route_table (no-op, just read back current state) (generated)
+    /// Update ec2.route_table: apply tag changes and read back (generated)
     pub(crate) async fn update_ec2_route_table(
         &self,
         id: ResourceId,
         identifier: &str,
-        _to: Resource,
+        from: &State,
+        to: Resource,
     ) -> ProviderResult<State> {
+        self.apply_ec2_tags(&id, identifier, &to.attributes, Some(&from.attributes))
+            .await?;
         self.read_ec2_route_table(&id, Some(identifier)).await
     }
 
-    /// Update ec2.security_group (no-op, just read back current state) (generated)
+    /// Update ec2.security_group: apply tag changes and read back (generated)
     pub(crate) async fn update_ec2_security_group(
         &self,
         id: ResourceId,
         identifier: &str,
-        _to: Resource,
+        from: &State,
+        to: Resource,
     ) -> ProviderResult<State> {
+        self.apply_ec2_tags(&id, identifier, &to.attributes, Some(&from.attributes))
+            .await?;
         self.read_ec2_security_group(&id, Some(identifier)).await
     }
 

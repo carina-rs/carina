@@ -1055,6 +1055,11 @@ impl AwsProvider {
                 attributes.insert("vpc_id".to_string(), Value::String(vpc_id.to_string()));
             }
 
+            // Extract user-defined tags
+            if let Some(tags_value) = Self::ec2_tags_to_value(subnet.tags()) {
+                attributes.insert("tags".to_string(), tags_value);
+            }
+
             let state = State::existing(id.clone(), attributes);
             Ok(if let Some(subnet_id) = subnet_id_str {
                 state.with_identifier(subnet_id)
@@ -1158,6 +1163,11 @@ impl AwsProvider {
                 && let Some(vpc_id) = attachment.vpc_id()
             {
                 attributes.insert("vpc_id".to_string(), Value::String(vpc_id.to_string()));
+            }
+
+            // Extract user-defined tags
+            if let Some(tags_value) = Self::ec2_tags_to_value(igw.tags()) {
+                attributes.insert("tags".to_string(), tags_value);
             }
 
             let state = State::existing(id.clone(), attributes);
@@ -1325,6 +1335,11 @@ impl AwsProvider {
             }
             if !routes_list.is_empty() {
                 attributes.insert("routes".to_string(), Value::List(routes_list));
+            }
+
+            // Extract user-defined tags
+            if let Some(tags_value) = Self::ec2_tags_to_value(rt.tags()) {
+                attributes.insert("tags".to_string(), tags_value);
             }
 
             let state = State::existing(id.clone(), attributes);
@@ -1628,6 +1643,11 @@ impl AwsProvider {
             // Store VPC ID
             if let Some(vpc_id) = sg.vpc_id() {
                 attributes.insert("vpc_id".to_string(), Value::String(vpc_id.to_string()));
+            }
+
+            // Extract user-defined tags
+            if let Some(tags_value) = Self::ec2_tags_to_value(sg.tags()) {
+                attributes.insert("tags".to_string(), tags_value);
             }
 
             let state = State::existing(id.clone(), attributes);
@@ -2182,13 +2202,20 @@ impl Provider for AwsProvider {
             match id.resource_type.as_str() {
                 "s3.bucket" => self.update_s3_bucket(id, &identifier, &from, to).await,
                 "ec2.vpc" => self.update_ec2_vpc(id, &identifier, &from, to).await,
-                "ec2.subnet" => self.update_ec2_subnet(id, &identifier, to).await,
+                "ec2.subnet" => self.update_ec2_subnet(id, &identifier, &from, to).await,
                 "ec2.internet_gateway" => {
-                    self.update_ec2_internet_gateway(id, &identifier, to).await
+                    self.update_ec2_internet_gateway(id, &identifier, &from, to)
+                        .await
                 }
-                "ec2.route_table" => self.update_ec2_route_table(id, &identifier, to).await,
+                "ec2.route_table" => {
+                    self.update_ec2_route_table(id, &identifier, &from, to)
+                        .await
+                }
                 "ec2.route" => self.update_ec2_route(id, &identifier, to).await,
-                "ec2.security_group" => self.update_ec2_security_group(id, &identifier, to).await,
+                "ec2.security_group" => {
+                    self.update_ec2_security_group(id, &identifier, &from, to)
+                        .await
+                }
                 "ec2.security_group_ingress" => {
                     self.update_ec2_security_group_rule(id, &identifier, to, true)
                         .await
