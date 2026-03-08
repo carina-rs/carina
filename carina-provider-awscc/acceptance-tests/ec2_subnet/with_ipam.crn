@@ -57,14 +57,12 @@ let vpc_pool = awscc.ec2.ipam_pool {
   locale             = "ap-northeast-1"
   source_ipam_pool_id = top_pool.ipam_pool_id
 
-  source_resource = [
-    {
-      resource_id     = vpc.vpc_id
-      resource_owner  = identity.account_id
-      resource_region = "ap-northeast-1"
-      resource_type   = "vpc"
-    }
-  ]
+  source_resource = {
+    resource_id     = vpc.vpc_id
+    resource_owner  = identity.account_id
+    resource_region = "ap-northeast-1"
+    resource_type   = "vpc"
+  }
 
   provisioned_cidrs = [
     {
