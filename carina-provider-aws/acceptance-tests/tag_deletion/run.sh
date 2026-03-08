@@ -5,8 +5,10 @@
 #   aws-vault exec <profile> -- ./run.sh [filter]
 #
 # Tests:
-#   ec2_vpc    - Remove a tag from VPC (EC2 delete_tags API)
-#   s3_bucket  - Remove a tag from S3 bucket (put_bucket_tagging API)
+#   ec2_vpc              - Remove a tag from VPC (EC2 delete_tags API)
+#   s3_bucket            - Remove a tag from S3 bucket (put_bucket_tagging API)
+#   ec2_vpc_all_tags     - Remove entire tags block from VPC (issue #447)
+#   s3_bucket_all_tags   - Remove entire tags block from S3 bucket (issue #447)
 #
 # Filter (optional): substring to match test names (e.g. "ec2_vpc", "s3_bucket")
 
@@ -154,6 +156,18 @@ run_test "s3_bucket" \
     "$SCRIPT_DIR/s3_bucket_step1.crn" \
     "$SCRIPT_DIR/s3_bucket_step2.crn" \
     "Test 2: S3 Bucket (put_bucket_tagging replaces tag set)"
+
+# Test 3: EC2 VPC - entire tags block removal (issue #447)
+run_test "ec2_vpc_all_tags" \
+    "$SCRIPT_DIR/ec2_vpc_step1.crn" \
+    "$SCRIPT_DIR/ec2_vpc_step3.crn" \
+    "Test 3: EC2 VPC (remove entire tags block)"
+
+# Test 4: S3 Bucket - entire tags block removal (issue #447)
+run_test "s3_bucket_all_tags" \
+    "$SCRIPT_DIR/s3_bucket_step1.crn" \
+    "$SCRIPT_DIR/s3_bucket_step3.crn" \
+    "Test 4: S3 Bucket (remove entire tags block)"
 
 echo "════════════════════════════════════════"
 echo "Total: $TOTAL_PASSED passed, $TOTAL_FAILED failed"
