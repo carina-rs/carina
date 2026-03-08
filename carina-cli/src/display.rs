@@ -158,7 +158,12 @@ pub fn print_plan(plan: &Plan) {
                     }
                 }
             }
-            Effect::Update { id, from, to, .. } => {
+            Effect::Update {
+                id,
+                from,
+                to,
+                changed_attributes,
+            } => {
                 println!(
                     "{}{}{} {} \"{}\"",
                     base_indent,
@@ -205,6 +210,23 @@ pub fn print_plan(plan: &Plan) {
                                 format_value_with_key(new_value, Some(key)).green()
                             );
                         }
+                    }
+                }
+                // Show removed attributes (in changed_attributes but not in to)
+                let mut removed_keys: Vec<_> = changed_attributes
+                    .iter()
+                    .filter(|k| !to.attributes.contains_key(k.as_str()))
+                    .collect();
+                removed_keys.sort();
+                for key in removed_keys {
+                    if let Some(old_value) = from.attributes.get(key.as_str()) {
+                        println!(
+                            "{}{}: {} → {}",
+                            attr_prefix,
+                            key,
+                            format_value_with_key(old_value, Some(key)).red(),
+                            "(removed)".red()
+                        );
                     }
                 }
             }

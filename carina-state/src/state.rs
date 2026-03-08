@@ -115,6 +115,18 @@ impl StateFile {
         result
     }
 
+    /// Build a map of desired attribute keys (user-specified in .crn) from this state file.
+    pub fn build_desired_keys(&self) -> HashMap<ResourceId, Vec<String>> {
+        let mut result = HashMap::new();
+        for rs in &self.resources {
+            if !rs.desired_keys.is_empty() {
+                let id = ResourceId::with_provider(&rs.provider, &rs.resource_type, &rs.name);
+                result.insert(id, rs.desired_keys.clone());
+            }
+        }
+        result
+    }
+
     /// Build a map of ResourceId -> name overrides from this state file.
     /// Name overrides come from create_before_destroy with non-renameable attributes.
     pub fn build_name_overrides(&self) -> HashMap<ResourceId, HashMap<String, String>> {
@@ -176,6 +188,11 @@ pub struct ResourceState {
     /// Maps attribute name to the permanent temporary name (e.g., {"role_name": "my-role-abc123"}).
     #[serde(default)]
     pub name_overrides: HashMap<String, String>,
+    /// Attribute keys that were explicitly specified by the user in the .crn file.
+    /// Used to detect attribute removal: if a key was in desired_keys but is now absent
+    /// from the desired state, it means the user intentionally removed it.
+    #[serde(default)]
+    pub desired_keys: Vec<String>,
 }
 
 impl ResourceState {
@@ -195,6 +212,7 @@ impl ResourceState {
             lifecycle: LifecycleConfig::default(),
             prefixes: HashMap::new(),
             name_overrides: HashMap::new(),
+            desired_keys: Vec::new(),
         }
     }
 
@@ -239,6 +257,14 @@ impl ResourceState {
         }
         rs.lifecycle = resource.lifecycle.clone();
         rs.prefixes = resource.prefixes.clone();
+        // Record which attributes the user explicitly specified in their .crn file
+        rs.desired_keys = resource
+            .attributes
+            .keys()
+            .filter(|k| !k.starts_with('_'))
+            .cloned()
+            .collect();
+        rs.desired_keys.sort();
         rs
     }
 }

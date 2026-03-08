@@ -861,12 +861,17 @@ async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
         .map(|sf| sf.build_lifecycles())
         .unwrap_or_default();
     let schemas = get_schemas();
+    let prev_desired_keys = state_file
+        .as_ref()
+        .map(|sf| sf.build_desired_keys())
+        .unwrap_or_default();
     let mut plan = create_plan(
         &resources_for_plan,
         &current_states,
         &lifecycles,
         &schemas,
         &saved_attrs,
+        &prev_desired_keys,
     );
 
     // Populate cascading updates for create_before_destroy Replace effects.
@@ -991,7 +996,7 @@ async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
                     }
                 }
             }
-            Effect::Update { id, from, to } => {
+            Effect::Update { id, from, to, .. } => {
                 // Re-resolve references
                 let mut resolved_to = to.clone();
                 for (key, value) in &to.attributes {
@@ -1691,7 +1696,7 @@ async fn run_apply_from_plan(plan_path: &PathBuf, auto_approve: bool) -> Result<
                     }
                 }
             }
-            Effect::Update { id, from, to } => {
+            Effect::Update { id, from, to, .. } => {
                 let mut resolved_to = to.clone();
                 for (key, value) in &to.attributes {
                     resolved_to

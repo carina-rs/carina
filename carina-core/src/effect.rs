@@ -51,6 +51,8 @@ pub enum Effect {
         id: ResourceId,
         from: Box<State>,
         to: Resource,
+        /// Attribute names that changed (including removed attributes)
+        changed_attributes: Vec<String>,
     },
 
     /// Replace a resource (delete then create) due to create-only property changes
@@ -214,6 +216,7 @@ mod tests {
                 )),
                 to: Resource::new("s3.bucket", "my-bucket")
                     .with_attribute("versioning", Value::String("Enabled".to_string())),
+                changed_attributes: vec!["versioning".to_string()],
             },
             Effect::Replace {
                 id: ResourceId::new("ec2.vpc", "my-vpc"),
