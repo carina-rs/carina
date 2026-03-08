@@ -52,11 +52,6 @@ pub fn ec2_vpc_config() -> AwsSchemaConfig {
         schema: ResourceSchema::new("aws.ec2.vpc")
         .with_description("Describes a VPC.")
         .attribute(
-            AttributeSchema::new("region", super::aws_region())
-                .with_description("The AWS region (inherited from provider if not specified)")
-                .non_removable(),
-        )
-        .attribute(
             AttributeSchema::new("cidr_block", types::ipv4_cidr())
                 .create_only()
                 .with_description("The IPv4 network range for the VPC, in CIDR notation. For example, 10.0.0.0/16. We modify the specified CIDR block to its canonical form; for example,...")

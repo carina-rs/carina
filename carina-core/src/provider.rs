@@ -172,10 +172,6 @@ pub trait ProviderFactory: Send + Sync {
     /// Returns a default region if none is configured.
     fn extract_region(&self, attributes: &HashMap<String, Value>) -> String;
 
-    /// Extract raw region from config in DSL format (e.g., "aws.Region.ap_northeast_1").
-    /// Returns None if no region is configured.
-    fn extract_region_dsl(&self, attributes: &HashMap<String, Value>) -> Option<String>;
-
     /// Create a provider instance from configuration attributes.
     fn create_provider(
         &self,

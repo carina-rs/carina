@@ -18,11 +18,6 @@ pub fn ec2_route_table_config() -> AwsSchemaConfig {
         schema: ResourceSchema::new("aws.ec2.route_table")
             .with_description("Describes a route table.")
             .attribute(
-                AttributeSchema::new("region", super::aws_region())
-                    .with_description("The AWS region (inherited from provider if not specified)")
-                    .non_removable(),
-            )
-            .attribute(
                 AttributeSchema::new("vpc_id", super::vpc_id())
                     .required()
                     .create_only()

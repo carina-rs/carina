@@ -18,11 +18,6 @@ pub fn ec2_internet_gateway_config() -> AwsSchemaConfig {
         schema: ResourceSchema::new("aws.ec2.internet_gateway")
             .with_description("Describes an internet gateway.")
             .attribute(
-                AttributeSchema::new("region", super::aws_region())
-                    .with_description("The AWS region (inherited from provider if not specified)")
-                    .non_removable(),
-            )
-            .attribute(
                 AttributeSchema::new("internet_gateway_id", super::internet_gateway_id())
                     .with_description("The ID of the internet gateway. (read-only)")
                     .with_provider_name("InternetGatewayId"),

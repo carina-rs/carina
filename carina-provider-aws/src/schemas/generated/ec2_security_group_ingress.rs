@@ -63,11 +63,6 @@ pub fn ec2_security_group_ingress_config() -> AwsSchemaConfig {
         schema: ResourceSchema::new("aws.ec2.security_group_ingress")
         .with_description("Describes a security group rule.")
         .attribute(
-            AttributeSchema::new("region", super::aws_region())
-                .with_description("The AWS region (inherited from provider if not specified)")
-                .non_removable(),
-        )
-        .attribute(
             AttributeSchema::new("cidr_ip", types::ipv4_cidr())
                 .create_only()
                 .with_description("The IPv4 address range, in CIDR format. Amazon Web Services canonicalizes IPv4 and IPv6 CIDRs. For example, if you specify 100.68.0.18/18 for the CIDR...")

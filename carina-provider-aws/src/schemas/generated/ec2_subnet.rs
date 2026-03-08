@@ -60,11 +60,6 @@ pub fn ec2_subnet_config() -> AwsSchemaConfig {
         schema: ResourceSchema::new("aws.ec2.subnet")
         .with_description("Describes a subnet.")
         .attribute(
-            AttributeSchema::new("region", super::aws_region())
-                .with_description("The AWS region (inherited from provider if not specified)")
-                .non_removable(),
-        )
-        .attribute(
             AttributeSchema::new("assign_ipv6_address_on_creation", AttributeType::Bool)
                 .with_description("Indicates whether a network interface created in this subnet (including a network interface created by RunInstances) receives an IPv6 address.")
                 .with_provider_name("AssignIpv6AddressOnCreation"),
