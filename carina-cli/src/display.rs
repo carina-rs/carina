@@ -207,6 +207,23 @@ pub fn print_plan(plan: &Plan) {
                         }
                     }
                 }
+                // Show removed attributes (in from but not in to)
+                let mut removed_keys: Vec<_> = from
+                    .attributes
+                    .keys()
+                    .filter(|k| !k.starts_with('_') && !to.attributes.contains_key(*k))
+                    .collect();
+                removed_keys.sort();
+                for key in removed_keys {
+                    let old_value = &from.attributes[key];
+                    println!(
+                        "{}{}: {} → {}",
+                        attr_prefix,
+                        key,
+                        format_value_with_key(old_value, Some(key)).red(),
+                        "(removed)".red()
+                    );
+                }
             }
             Effect::Replace {
                 id,
