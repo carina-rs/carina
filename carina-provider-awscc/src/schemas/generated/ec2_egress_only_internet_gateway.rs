@@ -26,8 +26,7 @@ pub fn ec2_egress_only_internet_gateway_config() -> AwsccSchemaConfig {
             .attribute(
                 AttributeSchema::new("tags", tags_type())
                     .with_description("Any tags assigned to the egress only internet gateway.")
-                    .with_provider_name("Tags")
-                    .removable(),
+                    .with_provider_name("Tags"),
             )
             .attribute(
                 AttributeSchema::new("vpc_id", super::vpc_id())

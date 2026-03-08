@@ -177,8 +177,7 @@ pub fn ec2_flow_log_config() -> AwsccSchemaConfig {
         .attribute(
             AttributeSchema::new("tags", tags_type())
                 .with_description("The tags to apply to the flow logs.")
-                .with_provider_name("Tags")
-                .removable(),
+                .with_provider_name("Tags"),
         )
         .attribute(
             AttributeSchema::new("traffic_type", AttributeType::Custom {

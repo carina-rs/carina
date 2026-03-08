@@ -2227,19 +2227,17 @@ mod tests {
             vec!["region".to_string(), "tags".to_string()],
         );
 
-        // Schema with tags marked as removable, region not removable
+        // Schema: tags is auto-removable (optional, not create-only),
+        // region is explicitly non-removable (provider-inherited)
         let mut schemas = HashMap::new();
         schemas.insert(
             "s3.bucket".to_string(),
             ResourceSchema::new("s3.bucket")
-                .attribute(AttributeSchema::new("region", AttributeType::String))
-                .attribute(
-                    AttributeSchema::new(
-                        "tags",
-                        AttributeType::Map(Box::new(AttributeType::String)),
-                    )
-                    .removable(),
-                ),
+                .attribute(AttributeSchema::new("region", AttributeType::String).non_removable())
+                .attribute(AttributeSchema::new(
+                    "tags",
+                    AttributeType::Map(Box::new(AttributeType::String)),
+                )),
         );
 
         let plan = create_plan(
@@ -2297,13 +2295,13 @@ mod tests {
             vec!["bucket".to_string(), "region".to_string()],
         );
 
-        // Schema where region is NOT removable
+        // Schema: region is explicitly non-removable, bucket is required
         let mut schemas = HashMap::new();
         schemas.insert(
             "s3.bucket".to_string(),
             ResourceSchema::new("s3.bucket")
-                .attribute(AttributeSchema::new("bucket", AttributeType::String))
-                .attribute(AttributeSchema::new("region", AttributeType::String)),
+                .attribute(AttributeSchema::new("bucket", AttributeType::String).required())
+                .attribute(AttributeSchema::new("region", AttributeType::String).non_removable()),
         );
 
         let plan = create_plan(

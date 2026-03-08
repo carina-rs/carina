@@ -1153,8 +1153,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
         .attribute(
             AttributeSchema::new("tags", tags_type())
                 .with_description("An arbitrary set of tags (key-value pairs) for this S3 bucket.")
-                .with_provider_name("Tags")
-                .removable(),
+                .with_provider_name("Tags"),
         )
         .attribute(
             AttributeSchema::new("versioning_configuration", AttributeType::Struct {

@@ -25,8 +25,7 @@ pub fn ec2_vpn_gateway_config() -> AwsccSchemaConfig {
         .attribute(
             AttributeSchema::new("tags", tags_type())
                 .with_description("Any tags assigned to the virtual private gateway.")
-                .with_provider_name("Tags")
-                .removable(),
+                .with_provider_name("Tags"),
         )
         .attribute(
             AttributeSchema::new("type", AttributeType::String)

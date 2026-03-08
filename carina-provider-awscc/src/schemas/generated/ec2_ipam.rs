@@ -140,8 +140,7 @@ pub fn ec2_ipam_config() -> AwsccSchemaConfig {
         .attribute(
             AttributeSchema::new("tags", tags_type())
                 .with_description("An array of key-value pairs to apply to this resource.")
-                .with_provider_name("Tags")
-                .removable(),
+                .with_provider_name("Tags"),
         )
         .attribute(
             AttributeSchema::new("tier", AttributeType::Custom {

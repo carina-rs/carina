@@ -24,8 +24,7 @@ pub fn ec2_route_table_config() -> AwsccSchemaConfig {
         .attribute(
             AttributeSchema::new("tags", tags_type())
                 .with_description("Any tags assigned to the route table.")
-                .with_provider_name("Tags")
-                .removable(),
+                .with_provider_name("Tags"),
         )
         .attribute(
             AttributeSchema::new("vpc_id", super::vpc_id())

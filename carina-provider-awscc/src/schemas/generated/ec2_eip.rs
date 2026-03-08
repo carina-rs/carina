@@ -85,8 +85,7 @@ pub fn ec2_eip_config() -> AwsccSchemaConfig {
         .attribute(
             AttributeSchema::new("tags", tags_type())
                 .with_description("Any tags assigned to the Elastic IP address. Updates to the ``Tags`` property may require *some interruptions*. Updates on an EIP reassociates the add...")
-                .with_provider_name("Tags")
-                .removable(),
+                .with_provider_name("Tags"),
         )
         .attribute(
             AttributeSchema::new("transfer_address", AttributeType::String)

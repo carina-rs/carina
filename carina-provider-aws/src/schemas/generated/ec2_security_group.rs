@@ -19,7 +19,8 @@ pub fn ec2_security_group_config() -> AwsSchemaConfig {
         .with_description("Describes a security group.")
         .attribute(
             AttributeSchema::new("region", super::aws_region())
-                .with_description("The AWS region (inherited from provider if not specified)"),
+                .with_description("The AWS region (inherited from provider if not specified)")
+                .non_removable(),
         )
         .attribute(
             AttributeSchema::new("description", AttributeType::String)
@@ -49,8 +50,7 @@ pub fn ec2_security_group_config() -> AwsSchemaConfig {
         .attribute(
             AttributeSchema::new("tags", tags_type())
                 .with_description("The tags for the resource.")
-                .with_provider_name("Tags")
-                .removable(),
+                .with_provider_name("Tags"),
         )
     }
 }

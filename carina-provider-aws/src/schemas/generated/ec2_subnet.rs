@@ -61,7 +61,8 @@ pub fn ec2_subnet_config() -> AwsSchemaConfig {
         .with_description("Describes a subnet.")
         .attribute(
             AttributeSchema::new("region", super::aws_region())
-                .with_description("The AWS region (inherited from provider if not specified)"),
+                .with_description("The AWS region (inherited from provider if not specified)")
+                .non_removable(),
         )
         .attribute(
             AttributeSchema::new("assign_ipv6_address_on_creation", AttributeType::Bool)
@@ -188,8 +189,7 @@ pub fn ec2_subnet_config() -> AwsSchemaConfig {
         .attribute(
             AttributeSchema::new("tags", tags_type())
                 .with_description("The tags for the resource.")
-                .with_provider_name("Tags")
-                .removable(),
+                .with_provider_name("Tags"),
         )
     }
 }
