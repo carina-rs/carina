@@ -800,30 +800,15 @@ impl AwsProvider {
         if let Some(vpc) = result.vpcs().first() {
             let mut attributes = HashMap::new();
 
-            if let Some(cidr) = vpc.cidr_block() {
-                attributes.insert("cidr_block".to_string(), Value::String(cidr.to_string()));
-            }
-
-            // Store VPC ID
-            let vpc_id_str = vpc.vpc_id().map(String::from);
-            if let Some(ref vpc_id) = vpc_id_str {
-                attributes.insert("vpc_id".to_string(), Value::String(vpc_id.clone()));
-            }
-
-            // Instance tenancy - return plain value, normalize_state_enums handles namespacing
-            if let Some(tenancy) = vpc.instance_tenancy() {
-                attributes.insert(
-                    "instance_tenancy".to_string(),
-                    Value::String(tenancy.as_str().to_string()),
-                );
-            }
+            // Auto-generated attribute extraction
+            let identifier_value = Self::extract_ec2_vpc_attributes(vpc, &mut attributes);
 
             // Extract user-defined tags (excluding Name)
             if let Some(tags_value) = Self::ec2_tags_to_value(vpc.tags()) {
                 attributes.insert("tags".to_string(), tags_value);
             }
 
-            // Get VPC attributes for DNS settings
+            // Get VPC attributes for DNS settings (not in Vpc struct)
             if let Some(vpc_id) = vpc.vpc_id() {
                 if let Ok(dns_support) = self
                     .ec2_client
@@ -857,8 +842,8 @@ impl AwsProvider {
             }
 
             let state = State::existing(id.clone(), attributes);
-            Ok(if let Some(vpc_id) = vpc_id_str {
-                state.with_identifier(vpc_id)
+            Ok(if let Some(id_val) = identifier_value {
+                state.with_identifier(id_val)
             } else {
                 state
             })
@@ -1034,25 +1019,13 @@ impl AwsProvider {
         if let Some(subnet) = result.subnets().first() {
             let mut attributes = HashMap::new();
 
-            if let Some(cidr) = subnet.cidr_block() {
-                attributes.insert("cidr_block".to_string(), Value::String(cidr.to_string()));
-            }
+            // Auto-generated attribute extraction
+            let identifier_value = Self::extract_ec2_subnet_attributes(subnet, &mut attributes);
 
+            // Override availability_zone with DSL format
             if let Some(az) = subnet.availability_zone() {
-                // Return availability_zone in DSL format
                 let az_dsl = format!("aws.AvailabilityZone.{}", az.replace('-', "_"));
                 attributes.insert("availability_zone".to_string(), Value::String(az_dsl));
-            }
-
-            // Store subnet ID
-            let subnet_id_str = subnet.subnet_id().map(String::from);
-            if let Some(ref subnet_id) = subnet_id_str {
-                attributes.insert("subnet_id".to_string(), Value::String(subnet_id.clone()));
-            }
-
-            // Store VPC ID
-            if let Some(vpc_id) = subnet.vpc_id() {
-                attributes.insert("vpc_id".to_string(), Value::String(vpc_id.to_string()));
             }
 
             // Extract user-defined tags
@@ -1061,8 +1034,8 @@ impl AwsProvider {
             }
 
             let state = State::existing(id.clone(), attributes);
-            Ok(if let Some(subnet_id) = subnet_id_str {
-                state.with_identifier(subnet_id)
+            Ok(if let Some(id_val) = identifier_value {
+                state.with_identifier(id_val)
             } else {
                 state
             })
@@ -1152,16 +1125,11 @@ impl AwsProvider {
         if let Some(igw) = result.internet_gateways().first() {
             let mut attributes = HashMap::new();
 
-            // Store IGW ID
-            let igw_id_str = igw.internet_gateway_id().map(String::from);
-            if let Some(ref igw_id) = igw_id_str {
-                attributes.insert(
-                    "internet_gateway_id".to_string(),
-                    Value::String(igw_id.clone()),
-                );
-            }
+            // Auto-generated attribute extraction
+            let identifier_value =
+                Self::extract_ec2_internet_gateway_attributes(igw, &mut attributes);
 
-            // Store attached VPC ID
+            // Store attached VPC ID (from Attachments, not a direct member)
             if let Some(attachment) = igw.attachments().first()
                 && let Some(vpc_id) = attachment.vpc_id()
             {
@@ -1174,8 +1142,8 @@ impl AwsProvider {
             }
 
             let state = State::existing(id.clone(), attributes);
-            Ok(if let Some(igw_id) = igw_id_str {
-                state.with_identifier(igw_id)
+            Ok(if let Some(id_val) = identifier_value {
+                state.with_identifier(id_val)
             } else {
                 state
             })
@@ -1311,18 +1279,10 @@ impl AwsProvider {
         if let Some(rt) = result.route_tables().first() {
             let mut attributes = HashMap::new();
 
-            // Store route table ID
-            let rt_id_str = rt.route_table_id().map(String::from);
-            if let Some(ref rt_id) = rt_id_str {
-                attributes.insert("route_table_id".to_string(), Value::String(rt_id.clone()));
-            }
+            // Auto-generated attribute extraction
+            let identifier_value = Self::extract_ec2_route_table_attributes(rt, &mut attributes);
 
-            // Store VPC ID
-            if let Some(vpc_id) = rt.vpc_id() {
-                attributes.insert("vpc_id".to_string(), Value::String(vpc_id.to_string()));
-            }
-
-            // Convert routes to list
+            // Convert routes to list (complex nested structure)
             let mut routes_list = Vec::new();
             for route in rt.routes() {
                 let mut route_map = HashMap::new();
@@ -1346,8 +1306,8 @@ impl AwsProvider {
             }
 
             let state = State::existing(id.clone(), attributes);
-            Ok(if let Some(rt_id) = rt_id_str {
-                state.with_identifier(rt_id)
+            Ok(if let Some(id_val) = identifier_value {
+                state.with_identifier(id_val)
             } else {
                 state
             })
@@ -1470,25 +1430,15 @@ impl AwsProvider {
             for route in rt.routes() {
                 if route.destination_cidr_block() == Some(destination_cidr_block) {
                     let mut attributes = HashMap::new();
+
+                    // Auto-generated attribute extraction
+                    Self::extract_ec2_route_attributes(route, &mut attributes);
+
+                    // route_table_id is not in the Route struct, add from parameter
                     attributes.insert(
                         "route_table_id".to_string(),
                         Value::String(route_table_id.to_string()),
                     );
-                    attributes.insert(
-                        "destination_cidr_block".to_string(),
-                        Value::String(destination_cidr_block.to_string()),
-                    );
-
-                    if let Some(gw_id) = route.gateway_id() {
-                        attributes
-                            .insert("gateway_id".to_string(), Value::String(gw_id.to_string()));
-                    }
-                    if let Some(nat_gw_id) = route.nat_gateway_id() {
-                        attributes.insert(
-                            "nat_gateway_id".to_string(),
-                            Value::String(nat_gw_id.to_string()),
-                        );
-                    }
 
                     // Route identifier is route_table_id|destination_cidr_block
                     let identifier = format!("{}|{}", route_table_id, destination_cidr_block);
@@ -1626,27 +1576,8 @@ impl AwsProvider {
         if let Some(sg) = result.security_groups().first() {
             let mut attributes = HashMap::new();
 
-            if let Some(group_name) = sg.group_name() {
-                attributes.insert(
-                    "group_name".to_string(),
-                    Value::String(group_name.to_string()),
-                );
-            }
-
-            if let Some(desc) = sg.description() {
-                attributes.insert("description".to_string(), Value::String(desc.to_string()));
-            }
-
-            // Store security group ID
-            let sg_id_str = sg.group_id().map(String::from);
-            if let Some(ref sg_id) = sg_id_str {
-                attributes.insert("group_id".to_string(), Value::String(sg_id.clone()));
-            }
-
-            // Store VPC ID
-            if let Some(vpc_id) = sg.vpc_id() {
-                attributes.insert("vpc_id".to_string(), Value::String(vpc_id.to_string()));
-            }
+            // Auto-generated attribute extraction
+            let identifier_value = Self::extract_ec2_security_group_attributes(sg, &mut attributes);
 
             // Extract user-defined tags
             if let Some(tags_value) = Self::ec2_tags_to_value(sg.tags()) {
@@ -1654,8 +1585,8 @@ impl AwsProvider {
             }
 
             let state = State::existing(id.clone(), attributes);
-            Ok(if let Some(sg_id) = sg_id_str {
-                state.with_identifier(sg_id)
+            Ok(if let Some(id_val) = identifier_value {
+                state.with_identifier(id_val)
             } else {
                 state
             })
@@ -1783,7 +1714,14 @@ impl AwsProvider {
         let first_rule = &rules[0];
         let mut attributes = HashMap::new();
 
-        // Store rule IDs (comma-separated if multiple)
+        // Auto-generated attribute extraction (common fields)
+        if is_ingress {
+            Self::extract_ec2_security_group_ingress_attributes(first_rule, &mut attributes);
+        } else {
+            Self::extract_ec2_security_group_egress_attributes(first_rule, &mut attributes);
+        }
+
+        // Override rule IDs with comma-separated values (multi-rule support)
         let rule_ids: Vec<String> = rules
             .iter()
             .filter_map(|r| r.security_group_rule_id().map(String::from))
@@ -1798,62 +1736,12 @@ impl AwsProvider {
             None
         };
 
-        // Store security group ID
-        if let Some(sg_id) = first_rule.group_id() {
-            attributes.insert("group_id".to_string(), Value::String(sg_id.to_string()));
-        }
-
-        if let Some(protocol) = first_rule.ip_protocol() {
-            // Keep protocol as raw string for comparison (tcp, udp, icmp, -1)
-            attributes.insert(
-                "ip_protocol".to_string(),
-                Value::String(protocol.to_string()),
-            );
-        }
-
-        if let Some(from_port) = first_rule.from_port() {
-            attributes.insert("from_port".to_string(), Value::Int(from_port as i64));
-        }
-
-        if let Some(to_port) = first_rule.to_port() {
-            attributes.insert("to_port".to_string(), Value::Int(to_port as i64));
-        }
-
-        // IPv4 CIDR
+        // IPv4 CIDR (CidrIp in schema maps to CidrIpv4 in SDK)
         if let Some(cidr_ip) = first_rule.cidr_ipv4() {
             attributes.insert("cidr_ip".to_string(), Value::String(cidr_ip.to_string()));
         }
 
-        // IPv6 CIDR
-        if let Some(cidr_ipv6) = first_rule.cidr_ipv6() {
-            attributes.insert(
-                "cidr_ipv6".to_string(),
-                Value::String(cidr_ipv6.to_string()),
-            );
-        }
-
-        // Description
-        if let Some(description) = first_rule.description() {
-            attributes.insert(
-                "description".to_string(),
-                Value::String(description.to_string()),
-            );
-        }
-
-        // Prefix list ID (source for ingress, destination for egress)
-        if let Some(prefix_list_id) = first_rule.prefix_list_id() {
-            let attr_name = if is_ingress {
-                "source_prefix_list_id"
-            } else {
-                "destination_prefix_list_id"
-            };
-            attributes.insert(
-                attr_name.to_string(),
-                Value::String(prefix_list_id.to_string()),
-            );
-        }
-
-        // Referenced security group ID (source for ingress, destination for egress)
+        // Referenced security group ID (nested struct, not auto-extracted)
         if let Some(ref_group) = first_rule.referenced_group_info()
             && let Some(group_id) = ref_group.group_id()
         {
