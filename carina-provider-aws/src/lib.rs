@@ -808,6 +808,7 @@ impl AwsProvider {
             let vpc_id_str = vpc.vpc_id().map(String::from);
             if let Some(ref vpc_id) = vpc_id_str {
                 attributes.insert("id".to_string(), Value::String(vpc_id.clone()));
+                attributes.insert("vpc_id".to_string(), Value::String(vpc_id.clone()));
             }
 
             // Instance tenancy - return plain value, normalize_state_enums handles namespacing
@@ -1048,6 +1049,7 @@ impl AwsProvider {
             let subnet_id_str = subnet.subnet_id().map(String::from);
             if let Some(ref subnet_id) = subnet_id_str {
                 attributes.insert("id".to_string(), Value::String(subnet_id.clone()));
+                attributes.insert("subnet_id".to_string(), Value::String(subnet_id.clone()));
             }
 
             // Store VPC ID
@@ -1156,6 +1158,10 @@ impl AwsProvider {
             let igw_id_str = igw.internet_gateway_id().map(String::from);
             if let Some(ref igw_id) = igw_id_str {
                 attributes.insert("id".to_string(), Value::String(igw_id.clone()));
+                attributes.insert(
+                    "internet_gateway_id".to_string(),
+                    Value::String(igw_id.clone()),
+                );
             }
 
             // Store attached VPC ID
@@ -1312,6 +1318,7 @@ impl AwsProvider {
             let rt_id_str = rt.route_table_id().map(String::from);
             if let Some(ref rt_id) = rt_id_str {
                 attributes.insert("id".to_string(), Value::String(rt_id.clone()));
+                attributes.insert("route_table_id".to_string(), Value::String(rt_id.clone()));
             }
 
             // Store VPC ID
@@ -1638,6 +1645,7 @@ impl AwsProvider {
             let sg_id_str = sg.group_id().map(String::from);
             if let Some(ref sg_id) = sg_id_str {
                 attributes.insert("id".to_string(), Value::String(sg_id.clone()));
+                attributes.insert("group_id".to_string(), Value::String(sg_id.clone()));
             }
 
             // Store VPC ID
