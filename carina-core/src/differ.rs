@@ -40,12 +40,19 @@ impl Diff {
 /// Compare desired state with current state to compute a Diff.
 /// If `saved` is provided, unmanaged nested fields from the saved state are merged
 /// into desired before comparison, preventing false diffs when AWS returns extra fields.
-pub fn diff(desired: &Resource, current: &State, saved: Option<&HashMap<String, Value>>) -> Diff {
+/// If `schema` is provided, attributes present in current but absent from desired
+/// are detected as removals (only for schema-defined attributes).
+pub fn diff(
+    desired: &Resource,
+    current: &State,
+    saved: Option<&HashMap<String, Value>>,
+    schema: Option<&ResourceSchema>,
+) -> Diff {
     if !current.exists {
         return Diff::Create(desired.clone());
     }
 
-    let changed = find_changed_attributes(&desired.attributes, &current.attributes, saved);
+    let changed = find_changed_attributes(&desired.attributes, &current.attributes, saved, schema);
 
     if changed.is_empty() {
         Diff::NoChange(desired.id.clone())
@@ -81,10 +88,13 @@ fn find_changed_create_only(
 /// Find changed attributes between desired and current state.
 /// If `saved` is provided, each desired value is merged with the saved value
 /// before comparison, filling in unmanaged nested fields.
+/// If `schema` is provided, attributes present in current but absent from desired
+/// are detected as removals (only for attributes defined in the schema).
 fn find_changed_attributes(
     desired: &HashMap<String, Value>,
     current: &HashMap<String, Value>,
     saved: Option<&HashMap<String, Value>>,
+    schema: Option<&ResourceSchema>,
 ) -> Vec<String> {
     let mut changed = Vec::new();
 
@@ -110,6 +120,22 @@ fn find_changed_attributes(
 
         if !is_equal {
             changed.push(key.clone());
+        }
+    }
+
+    // Detect attributes removed from desired but still present in current.
+    // Only consider attributes defined in the schema (user-managed attributes).
+    if let Some(schema) = schema {
+        for key in current.keys() {
+            if key.starts_with('_') {
+                continue;
+            }
+            if desired.contains_key(key) {
+                continue;
+            }
+            if schema.attributes.contains_key(key) {
+                changed.push(key.clone());
+            }
         }
     }
 
@@ -218,7 +244,8 @@ pub fn create_plan(
             .unwrap_or_else(|| State::not_found(resource.id.clone()));
 
         let saved = saved_attrs.get(&resource.id);
-        let d = diff(resource, &current, saved);
+        let schema = find_schema(&resource.id.provider, &resource.id.resource_type, schemas);
+        let d = diff(resource, &current, saved, schema);
 
         match d {
             Diff::Create(r) => plan.add(Effect::Create(r)),
@@ -429,7 +456,7 @@ mod tests {
         let desired = Resource::new("bucket", "test");
         let current = State::not_found(ResourceId::new("bucket", "test"));
 
-        let result = diff(&desired, &current, None);
+        let result = diff(&desired, &current, None, None);
         assert!(matches!(result, Diff::Create(_)));
     }
 
@@ -445,7 +472,7 @@ mod tests {
         );
         let current = State::existing(ResourceId::new("bucket", "test"), attrs);
 
-        let result = diff(&desired, &current, None);
+        let result = diff(&desired, &current, None, None);
         assert!(matches!(result, Diff::NoChange(_)));
     }
 
@@ -461,7 +488,7 @@ mod tests {
         );
         let current = State::existing(ResourceId::new("bucket", "test"), attrs);
 
-        let result = diff(&desired, &current, None);
+        let result = diff(&desired, &current, None, None);
         match result {
             Diff::Update {
                 changed_attributes, ..
@@ -552,7 +579,7 @@ mod tests {
             current_attrs,
         );
 
-        let result = diff(&desired, &current, None);
+        let result = diff(&desired, &current, None, None);
         match result {
             Diff::Update {
                 changed_attributes, ..
@@ -663,7 +690,7 @@ mod tests {
         );
         let current = State::existing(ResourceId::new("ec2.vpc", "vpc"), attrs);
 
-        let result = diff(&desired, &current, None);
+        let result = diff(&desired, &current, None, None);
         assert!(
             matches!(result, Diff::NoChange(_)),
             "Expected NoChange when neither side has 'name', got {:?}",
@@ -896,7 +923,7 @@ mod tests {
             current_attrs,
         );
 
-        let result = diff(&desired, &current, None);
+        let result = diff(&desired, &current, None, None);
         assert!(
             matches!(result, Diff::NoChange(_)),
             "Expected NoChange when list-of-maps has same content in different order, got {:?}",
@@ -1009,7 +1036,7 @@ mod tests {
             Value::Map(saved),
         )]);
 
-        let result = diff(&desired, &current, Some(&saved_map));
+        let result = diff(&desired, &current, Some(&saved_map), None);
         assert!(
             matches!(result, Diff::NoChange(_)),
             "Expected NoChange when saved fills extra struct fields, got {:?}",
@@ -1073,7 +1100,7 @@ mod tests {
             Value::Map(saved),
         )]);
 
-        let result = diff(&desired, &current, Some(&saved_map));
+        let result = diff(&desired, &current, Some(&saved_map), None);
         assert!(
             matches!(result, Diff::Update { .. }),
             "Expected Update when unmanaged field drifted, got {:?}",
@@ -1139,7 +1166,7 @@ mod tests {
             ])),
         )]);
 
-        let result = diff(&desired, &current, Some(&saved_map));
+        let result = diff(&desired, &current, Some(&saved_map), None);
         assert!(
             matches!(result, Diff::NoChange(_)),
             "Expected NoChange for bare struct with extra fields from saved, got {:?}",
@@ -1174,7 +1201,7 @@ mod tests {
         // Without saved state, the map comparison uses semantically_equal which
         // checks both key count AND values. Since desired map has 2 keys and current
         // has 3, this will show as Update (which is the existing behavior).
-        let result = diff(&desired, &current, None);
+        let result = diff(&desired, &current, None, None);
         assert!(
             matches!(result, Diff::Update { .. }),
             "Expected Update without saved state when maps have different sizes, got {:?}",
@@ -1928,5 +1955,194 @@ mod tests {
             }
             other => panic!("Expected Replace, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn diff_detects_attribute_removal_with_schema() {
+        use crate::schema::{AttributeSchema, AttributeType};
+
+        // Desired state has only "region", but current state has both "region" and "tags"
+        let desired = Resource::new("s3.bucket", "test")
+            .with_attribute("region", Value::String("ap-northeast-1".to_string()));
+
+        let mut current_attrs = HashMap::new();
+        current_attrs.insert(
+            "region".to_string(),
+            Value::String("ap-northeast-1".to_string()),
+        );
+        current_attrs.insert(
+            "tags".to_string(),
+            Value::Map(HashMap::from([(
+                "Name".to_string(),
+                Value::String("test".to_string()),
+            )])),
+        );
+        let current = State::existing(ResourceId::new("s3.bucket", "test"), current_attrs);
+
+        // Schema defines both "region" and "tags" as user-managed attributes
+        let schema = ResourceSchema::new("s3.bucket")
+            .attribute(AttributeSchema::new("region", AttributeType::String))
+            .attribute(AttributeSchema::new(
+                "tags",
+                AttributeType::Map(Box::new(AttributeType::String)),
+            ));
+
+        let result = diff(&desired, &current, None, Some(&schema));
+        match result {
+            Diff::Update {
+                changed_attributes, ..
+            } => {
+                assert!(
+                    changed_attributes.contains(&"tags".to_string()),
+                    "Should detect 'tags' removal, got: {:?}",
+                    changed_attributes
+                );
+            }
+            _ => panic!("Expected Update, got {:?}", result),
+        }
+    }
+
+    #[test]
+    fn diff_ignores_non_schema_attributes_in_current() {
+        use crate::schema::{AttributeSchema, AttributeType};
+
+        // Current state has "arn" which is not in the schema (provider-returned-only)
+        let desired = Resource::new("s3.bucket", "test")
+            .with_attribute("region", Value::String("ap-northeast-1".to_string()));
+
+        let mut current_attrs = HashMap::new();
+        current_attrs.insert(
+            "region".to_string(),
+            Value::String("ap-northeast-1".to_string()),
+        );
+        current_attrs.insert(
+            "arn".to_string(),
+            Value::String("arn:aws:s3:::test".to_string()),
+        );
+        let current = State::existing(ResourceId::new("s3.bucket", "test"), current_attrs);
+
+        // Schema only defines "region", not "arn"
+        let schema = ResourceSchema::new("s3.bucket")
+            .attribute(AttributeSchema::new("region", AttributeType::String));
+
+        let result = diff(&desired, &current, None, Some(&schema));
+        assert!(
+            matches!(result, Diff::NoChange(_)),
+            "Should not detect 'arn' as a removal since it's not in the schema, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn diff_no_change_without_schema_even_with_extra_current_attrs() {
+        // Without schema, removed attributes should NOT be detected (backward compat)
+        let desired = Resource::new("s3.bucket", "test")
+            .with_attribute("region", Value::String("ap-northeast-1".to_string()));
+
+        let mut current_attrs = HashMap::new();
+        current_attrs.insert(
+            "region".to_string(),
+            Value::String("ap-northeast-1".to_string()),
+        );
+        current_attrs.insert(
+            "tags".to_string(),
+            Value::Map(HashMap::from([(
+                "Name".to_string(),
+                Value::String("test".to_string()),
+            )])),
+        );
+        let current = State::existing(ResourceId::new("s3.bucket", "test"), current_attrs);
+
+        let result = diff(&desired, &current, None, None);
+        assert!(
+            matches!(result, Diff::NoChange(_)),
+            "Without schema, extra attributes in current should not trigger Update, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn create_plan_detects_attribute_removal() {
+        use crate::schema::{AttributeSchema, AttributeType};
+
+        // Resource in .crn has no "tags", but current state (from AWS) has tags
+        let resources = vec![
+            Resource::new("s3.bucket", "test")
+                .with_attribute("region", Value::String("ap-northeast-1".to_string())),
+        ];
+
+        let mut current_states = HashMap::new();
+        let mut attrs = HashMap::new();
+        attrs.insert(
+            "region".to_string(),
+            Value::String("ap-northeast-1".to_string()),
+        );
+        attrs.insert(
+            "tags".to_string(),
+            Value::Map(HashMap::from([(
+                "Name".to_string(),
+                Value::String("test".to_string()),
+            )])),
+        );
+        current_states.insert(
+            ResourceId::new("s3.bucket", "test"),
+            State::existing(ResourceId::new("s3.bucket", "test"), attrs),
+        );
+
+        let mut schemas = HashMap::new();
+        schemas.insert(
+            "s3.bucket".to_string(),
+            ResourceSchema::new("s3.bucket")
+                .attribute(AttributeSchema::new("region", AttributeType::String))
+                .attribute(AttributeSchema::new(
+                    "tags",
+                    AttributeType::Map(Box::new(AttributeType::String)),
+                )),
+        );
+
+        let plan = create_plan(
+            &resources,
+            &current_states,
+            &HashMap::new(),
+            &schemas,
+            &HashMap::new(),
+        );
+
+        assert_eq!(plan.effects().len(), 1);
+        assert!(
+            matches!(&plan.effects()[0], Effect::Update { .. }),
+            "Expected Update effect for attribute removal, got {:?}",
+            plan.effects()[0]
+        );
+    }
+
+    #[test]
+    fn diff_skips_internal_attributes_in_removal_detection() {
+        use crate::schema::{AttributeSchema, AttributeType};
+
+        // Current has "_binding" which starts with '_', should be skipped
+        let desired = Resource::new("s3.bucket", "test")
+            .with_attribute("region", Value::String("ap-northeast-1".to_string()));
+
+        let mut current_attrs = HashMap::new();
+        current_attrs.insert(
+            "region".to_string(),
+            Value::String("ap-northeast-1".to_string()),
+        );
+        current_attrs.insert(
+            "_internal".to_string(),
+            Value::String("something".to_string()),
+        );
+        let current = State::existing(ResourceId::new("s3.bucket", "test"), current_attrs);
+
+        let schema = ResourceSchema::new("s3.bucket")
+            .attribute(AttributeSchema::new("region", AttributeType::String));
+
+        let result = diff(&desired, &current, None, Some(&schema));
+        assert!(
+            matches!(result, Diff::NoChange(_)),
+            "Should skip internal attributes starting with '_', got {:?}",
+            result
+        );
     }
 }
