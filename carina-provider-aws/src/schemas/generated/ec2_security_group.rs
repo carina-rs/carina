@@ -18,11 +18,6 @@ pub fn ec2_security_group_config() -> AwsSchemaConfig {
         schema: ResourceSchema::new("aws.ec2.security_group")
         .with_description("Describes a security group.")
         .attribute(
-            AttributeSchema::new("region", super::aws_region())
-                .with_description("The AWS region (inherited from provider if not specified)")
-                .non_removable(),
-        )
-        .attribute(
             AttributeSchema::new("description", AttributeType::String)
                 .required()
                 .create_only()

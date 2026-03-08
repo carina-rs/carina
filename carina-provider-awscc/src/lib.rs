@@ -57,14 +57,6 @@ impl ProviderFactory for AwsccProviderFactory {
         "ap-northeast-1".to_string()
     }
 
-    fn extract_region_dsl(&self, attributes: &HashMap<String, Value>) -> Option<String> {
-        if let Some(Value::String(region)) = attributes.get("region") {
-            Some(region.clone())
-        } else {
-            None
-        }
-    }
-
     fn create_provider(
         &self,
         attributes: &HashMap<String, Value>,

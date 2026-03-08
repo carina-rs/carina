@@ -50,14 +50,6 @@ impl ProviderFactory for AwsProviderFactory {
         "ap-northeast-1".to_string()
     }
 
-    fn extract_region_dsl(&self, attributes: &HashMap<String, Value>) -> Option<String> {
-        if let Some(Value::String(region)) = attributes.get("region") {
-            Some(region.clone())
-        } else {
-            None
-        }
-    }
-
     fn create_provider(
         &self,
         attributes: &HashMap<String, Value>,
@@ -243,9 +235,6 @@ impl AwsProvider {
             Ok(_) => {
                 let mut attributes = HashMap::new();
                 attributes.insert("bucket".to_string(), Value::String(name.to_string()));
-                // Return region in DSL format
-                let region_dsl = format!("aws.Region.{}", self.region.replace('-', "_"));
-                attributes.insert("region".to_string(), Value::String(region_dsl));
 
                 // Get versioning status
                 self.read_s3_bucket_versioning(id, name, &mut attributes)
@@ -811,10 +800,6 @@ impl AwsProvider {
         if let Some(vpc) = result.vpcs().first() {
             let mut attributes = HashMap::new();
 
-            // Return region in DSL format
-            let region_dsl = format!("aws.Region.{}", self.region.replace('-', "_"));
-            attributes.insert("region".to_string(), Value::String(region_dsl));
-
             if let Some(cidr) = vpc.cidr_block() {
                 attributes.insert("cidr_block".to_string(), Value::String(cidr.to_string()));
             }
@@ -1049,9 +1034,6 @@ impl AwsProvider {
         if let Some(subnet) = result.subnets().first() {
             let mut attributes = HashMap::new();
 
-            let region_dsl = format!("aws.Region.{}", self.region.replace('-', "_"));
-            attributes.insert("region".to_string(), Value::String(region_dsl));
-
             if let Some(cidr) = subnet.cidr_block() {
                 attributes.insert("cidr_block".to_string(), Value::String(cidr.to_string()));
             }
@@ -1164,9 +1146,6 @@ impl AwsProvider {
 
         if let Some(igw) = result.internet_gateways().first() {
             let mut attributes = HashMap::new();
-
-            let region_dsl = format!("aws.Region.{}", self.region.replace('-', "_"));
-            attributes.insert("region".to_string(), Value::String(region_dsl));
 
             // Store IGW ID
             let igw_id_str = igw.internet_gateway_id().map(String::from);
@@ -1318,9 +1297,6 @@ impl AwsProvider {
 
         if let Some(rt) = result.route_tables().first() {
             let mut attributes = HashMap::new();
-
-            let region_dsl = format!("aws.Region.{}", self.region.replace('-', "_"));
-            attributes.insert("region".to_string(), Value::String(region_dsl));
 
             // Store route table ID
             let rt_id_str = rt.route_table_id().map(String::from);
@@ -1485,9 +1461,6 @@ impl AwsProvider {
                         Value::String(destination_cidr_block.to_string()),
                     );
 
-                    let region_dsl = format!("aws.Region.{}", self.region.replace('-', "_"));
-                    attributes.insert("region".to_string(), Value::String(region_dsl));
-
                     if let Some(gw_id) = route.gateway_id() {
                         attributes
                             .insert("gateway_id".to_string(), Value::String(gw_id.to_string()));
@@ -1634,9 +1607,6 @@ impl AwsProvider {
 
         if let Some(sg) = result.security_groups().first() {
             let mut attributes = HashMap::new();
-
-            let region_dsl = format!("aws.Region.{}", self.region.replace('-', "_"));
-            attributes.insert("region".to_string(), Value::String(region_dsl));
 
             if let Some(group_name) = sg.group_name() {
                 attributes.insert(
@@ -1789,9 +1759,6 @@ impl AwsProvider {
         // Use the first rule for common attributes
         let first_rule = &rules[0];
         let mut attributes = HashMap::new();
-
-        let region_dsl = format!("aws.Region.{}", self.region.replace('-', "_"));
-        attributes.insert("region".to_string(), Value::String(region_dsl));
 
         // Store rule IDs (comma-separated if multiple)
         let rule_ids: Vec<String> = rules

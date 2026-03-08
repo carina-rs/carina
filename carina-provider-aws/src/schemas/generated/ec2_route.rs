@@ -17,11 +17,6 @@ pub fn ec2_route_config() -> AwsSchemaConfig {
         schema: ResourceSchema::new("aws.ec2.route")
         .with_description("Describes a route in a route table.")
         .attribute(
-            AttributeSchema::new("region", super::aws_region())
-                .with_description("The AWS region (inherited from provider if not specified)")
-                .non_removable(),
-        )
-        .attribute(
             AttributeSchema::new("carrier_gateway_id", super::aws_resource_id())
                 .with_description("The ID of the carrier gateway. You can only use this option when the VPC contains a subnet which is associated with a Wavelength Zone.")
                 .with_provider_name("CarrierGatewayId"),

@@ -666,17 +666,6 @@ fn generate_resource(res: &ResourceDef, model: &SmithyModel) -> Result<String> {
         code.push_str("\x20       .as_data_source()\n");
     }
 
-    // Inject carina-specific attributes (region) — skip for data sources
-    if !is_data_source {
-        code.push_str(
-            "\x20       .attribute(\n\
-             \x20           AttributeSchema::new(\"region\", super::aws_region())\n\
-             \x20               .with_description(\"The AWS region (inherited from provider if not specified)\")\n\
-             \x20               .non_removable(),\n\
-             \x20       )\n",
-        );
-    }
-
     // Generate attributes
     for attr in &attrs {
         let type_code = if let Some(ref ei) = attr.enum_info {
