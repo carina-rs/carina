@@ -804,10 +804,9 @@ impl AwsProvider {
                 attributes.insert("cidr_block".to_string(), Value::String(cidr.to_string()));
             }
 
-            // Store VPC ID as public attribute and as identifier
+            // Store VPC ID
             let vpc_id_str = vpc.vpc_id().map(String::from);
             if let Some(ref vpc_id) = vpc_id_str {
-                attributes.insert("id".to_string(), Value::String(vpc_id.clone()));
                 attributes.insert("vpc_id".to_string(), Value::String(vpc_id.clone()));
             }
 
@@ -1048,7 +1047,6 @@ impl AwsProvider {
             // Store subnet ID
             let subnet_id_str = subnet.subnet_id().map(String::from);
             if let Some(ref subnet_id) = subnet_id_str {
-                attributes.insert("id".to_string(), Value::String(subnet_id.clone()));
                 attributes.insert("subnet_id".to_string(), Value::String(subnet_id.clone()));
             }
 
@@ -1157,7 +1155,6 @@ impl AwsProvider {
             // Store IGW ID
             let igw_id_str = igw.internet_gateway_id().map(String::from);
             if let Some(ref igw_id) = igw_id_str {
-                attributes.insert("id".to_string(), Value::String(igw_id.clone()));
                 attributes.insert(
                     "internet_gateway_id".to_string(),
                     Value::String(igw_id.clone()),
@@ -1317,7 +1314,6 @@ impl AwsProvider {
             // Store route table ID
             let rt_id_str = rt.route_table_id().map(String::from);
             if let Some(ref rt_id) = rt_id_str {
-                attributes.insert("id".to_string(), Value::String(rt_id.clone()));
                 attributes.insert("route_table_id".to_string(), Value::String(rt_id.clone()));
             }
 
@@ -1644,7 +1640,6 @@ impl AwsProvider {
             // Store security group ID
             let sg_id_str = sg.group_id().map(String::from);
             if let Some(ref sg_id) = sg_id_str {
-                attributes.insert("id".to_string(), Value::String(sg_id.clone()));
                 attributes.insert("group_id".to_string(), Value::String(sg_id.clone()));
             }
 
@@ -1794,7 +1789,10 @@ impl AwsProvider {
             .filter_map(|r| r.security_group_rule_id().map(String::from))
             .collect();
         let rule_identifier = if !rule_ids.is_empty() {
-            attributes.insert("id".to_string(), Value::String(rule_ids.join(",")));
+            attributes.insert(
+                "security_group_rule_id".to_string(),
+                Value::String(rule_ids.join(",")),
+            );
             Some(rule_ids.join(","))
         } else {
             None
