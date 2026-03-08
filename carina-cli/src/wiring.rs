@@ -204,12 +204,17 @@ pub async fn create_plan_from_parsed(
         .unwrap_or_default();
 
     let schemas = get_schemas();
+    let prev_desired_keys = state_file
+        .as_ref()
+        .map(|sf| sf.build_desired_keys())
+        .unwrap_or_default();
     let mut plan = create_plan(
         &resources,
         &current_states,
         &lifecycles,
         &schemas,
         &saved_attrs,
+        &prev_desired_keys,
     );
 
     // Populate cascading updates for Replace effects with create_before_destroy.

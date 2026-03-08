@@ -115,7 +115,7 @@ impl<P: Provider> Interpreter<P> {
                 let state = self.provider.create(resource).await?;
                 Ok(EffectOutcome::Created { state })
             }
-            Effect::Update { id, from, to } => {
+            Effect::Update { id, from, to, .. } => {
                 // Use identifier from current state if available
                 let identifier = from.identifier.as_deref().unwrap_or("");
                 let state = self.provider.update(id, identifier, from, to).await?;

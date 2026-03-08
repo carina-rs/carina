@@ -40,19 +40,24 @@ impl Diff {
 /// Compare desired state with current state to compute a Diff.
 /// If `saved` is provided, unmanaged nested fields from the saved state are merged
 /// into desired before comparison, preventing false diffs when AWS returns extra fields.
-/// If `schema` is provided, attributes present in current but absent from desired
-/// are detected as removals (only for schema-defined attributes).
+/// If `prev_desired_keys` is provided, attributes that were previously in the user's
+/// desired state but are now absent are detected as removals.
 pub fn diff(
     desired: &Resource,
     current: &State,
     saved: Option<&HashMap<String, Value>>,
-    schema: Option<&ResourceSchema>,
+    prev_desired_keys: Option<&[String]>,
 ) -> Diff {
     if !current.exists {
         return Diff::Create(desired.clone());
     }
 
-    let changed = find_changed_attributes(&desired.attributes, &current.attributes, saved, schema);
+    let changed = find_changed_attributes(
+        &desired.attributes,
+        &current.attributes,
+        saved,
+        prev_desired_keys,
+    );
 
     if changed.is_empty() {
         Diff::NoChange(desired.id.clone())
@@ -88,13 +93,14 @@ fn find_changed_create_only(
 /// Find changed attributes between desired and current state.
 /// If `saved` is provided, each desired value is merged with the saved value
 /// before comparison, filling in unmanaged nested fields.
-/// If `schema` is provided, attributes present in current but absent from desired
-/// are detected as removals (only for attributes defined in the schema).
+/// If `prev_desired_keys` is provided, attributes that were previously in the user's
+/// desired state but are now absent from desired (while still present in current)
+/// are detected as removals.
 fn find_changed_attributes(
     desired: &HashMap<String, Value>,
     current: &HashMap<String, Value>,
     saved: Option<&HashMap<String, Value>>,
-    schema: Option<&ResourceSchema>,
+    prev_desired_keys: Option<&[String]>,
 ) -> Vec<String> {
     let mut changed = Vec::new();
 
@@ -124,16 +130,18 @@ fn find_changed_attributes(
     }
 
     // Detect attributes removed from desired but still present in current.
-    // Only consider attributes defined in the schema (user-managed attributes).
-    if let Some(schema) = schema {
-        for key in current.keys() {
+    // Only flag attributes that were previously in the user's desired state
+    // (from the state file's desired_keys). This prevents false removals for
+    // computed/provider-returned attributes the user never specified.
+    if let Some(prev_keys) = prev_desired_keys {
+        for key in prev_keys {
             if key.starts_with('_') {
                 continue;
             }
             if desired.contains_key(key) {
                 continue;
             }
-            if schema.attributes.contains_key(key) {
+            if current.contains_key(key) {
                 changed.push(key.clone());
             }
         }
@@ -217,12 +225,18 @@ fn generate_temporary_name(
 /// The `saved_attrs` map provides the last-known attribute values from the state file.
 /// This is used to merge unmanaged nested fields into desired values before comparison,
 /// preventing false diffs when AWS returns extra fields not specified in the .crn file.
+///
+/// The `prev_desired_keys` map provides the attribute keys that the user explicitly
+/// specified in their .crn file during the last apply. This is used to detect
+/// attribute removal: if a key was previously in the user's desired state but is
+/// now absent, it means the user intentionally removed it.
 pub fn create_plan(
     desired: &[Resource],
     current_states: &HashMap<ResourceId, State>,
     lifecycles: &HashMap<ResourceId, LifecycleConfig>,
     schemas: &HashMap<String, ResourceSchema>,
     saved_attrs: &HashMap<ResourceId, HashMap<String, Value>>,
+    prev_desired_keys: &HashMap<ResourceId, Vec<String>>,
 ) -> Plan {
     let mut plan = Plan::new();
 
@@ -244,8 +258,8 @@ pub fn create_plan(
             .unwrap_or_else(|| State::not_found(resource.id.clone()));
 
         let saved = saved_attrs.get(&resource.id);
-        let schema = find_schema(&resource.id.provider, &resource.id.resource_type, schemas);
-        let d = diff(resource, &current, saved, schema);
+        let prev_keys = prev_desired_keys.get(&resource.id);
+        let d = diff(resource, &current, saved, prev_keys.map(|v| v.as_slice()));
 
         match d {
             Diff::Create(r) => plan.add(Effect::Create(r)),
@@ -264,7 +278,12 @@ pub fn create_plan(
                 );
 
                 if changed_create_only.is_empty() {
-                    plan.add(Effect::Update { id, from, to });
+                    plan.add(Effect::Update {
+                        id,
+                        from,
+                        to,
+                        changed_attributes,
+                    });
                 } else {
                     let lifecycle = resource.lifecycle.clone();
                     let temporary_name = if lifecycle.create_before_destroy {
@@ -521,6 +540,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
+            &HashMap::new(),
         );
 
         assert_eq!(plan.effects().len(), 2);
@@ -541,6 +561,7 @@ mod tests {
         let plan = create_plan(
             &resources,
             &current_states,
+            &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
@@ -622,6 +643,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
+            &HashMap::new(),
         );
 
         // Should have 1 effect: Delete for orphaned-bucket
@@ -663,6 +685,7 @@ mod tests {
         let plan = create_plan(
             &resources,
             &current_states,
+            &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
@@ -732,6 +755,7 @@ mod tests {
             &HashMap::new(),
             &schemas,
             &HashMap::new(),
+            &HashMap::new(),
         );
 
         assert_eq!(plan.effects().len(), 1);
@@ -780,6 +804,7 @@ mod tests {
             &current_states,
             &HashMap::new(),
             &schemas,
+            &HashMap::new(),
             &HashMap::new(),
         );
 
@@ -830,6 +855,7 @@ mod tests {
             &HashMap::new(),
             &schemas,
             &HashMap::new(),
+            &HashMap::new(),
         );
 
         assert_eq!(plan.effects().len(), 1);
@@ -877,6 +903,7 @@ mod tests {
             &current_states,
             &HashMap::new(),
             &schemas,
+            &HashMap::new(),
             &HashMap::new(),
         );
 
@@ -969,6 +996,7 @@ mod tests {
             &current_states,
             &HashMap::new(),
             &schemas,
+            &HashMap::new(),
             &HashMap::new(),
         );
 
@@ -1368,6 +1396,7 @@ mod tests {
             id: subnet_id.clone(),
             from: Box::new(current_states.get(&subnet_id).unwrap().clone()),
             to: subnet.clone(),
+            changed_attributes: vec!["cidr_block".to_string()],
         });
 
         cascade_dependent_updates(&mut plan, &unresolved_resources, &current_states);
@@ -1648,6 +1677,7 @@ mod tests {
             &HashMap::new(),
             &schemas,
             &HashMap::new(),
+            &HashMap::new(),
         );
 
         assert_eq!(plan.effects().len(), 1);
@@ -1725,6 +1755,7 @@ mod tests {
             &HashMap::new(),
             &schemas,
             &HashMap::new(),
+            &HashMap::new(),
         );
 
         assert_eq!(plan.effects().len(), 1);
@@ -1779,6 +1810,7 @@ mod tests {
             &current_states,
             &HashMap::new(),
             &schemas,
+            &HashMap::new(),
             &HashMap::new(),
         );
 
@@ -1838,6 +1870,7 @@ mod tests {
             &HashMap::new(),
             &schemas,
             &HashMap::new(),
+            &HashMap::new(),
         );
 
         assert_eq!(plan.effects().len(), 1);
@@ -1886,6 +1919,7 @@ mod tests {
             &current_states,
             &HashMap::new(),
             &schemas,
+            &HashMap::new(),
             &HashMap::new(),
         );
 
@@ -1943,6 +1977,7 @@ mod tests {
             &HashMap::new(),
             &schemas,
             &HashMap::new(),
+            &HashMap::new(),
         );
 
         assert_eq!(plan.effects().len(), 1);
@@ -1958,10 +1993,8 @@ mod tests {
     }
 
     #[test]
-    fn diff_detects_attribute_removal_with_schema() {
-        use crate::schema::{AttributeSchema, AttributeType};
-
-        // Desired state has only "region", but current state has both "region" and "tags"
+    fn diff_detects_attribute_removal_with_prev_desired_keys() {
+        // User previously had "region" and "tags" in .crn, now only has "region"
         let desired = Resource::new("s3.bucket", "test")
             .with_attribute("region", Value::String("ap-northeast-1".to_string()));
 
@@ -1979,15 +2012,10 @@ mod tests {
         );
         let current = State::existing(ResourceId::new("s3.bucket", "test"), current_attrs);
 
-        // Schema defines both "region" and "tags" as user-managed attributes
-        let schema = ResourceSchema::new("s3.bucket")
-            .attribute(AttributeSchema::new("region", AttributeType::String))
-            .attribute(AttributeSchema::new(
-                "tags",
-                AttributeType::Map(Box::new(AttributeType::String)),
-            ));
+        // Previous desired state had both "region" and "tags"
+        let prev_keys = vec!["region".to_string(), "tags".to_string()];
 
-        let result = diff(&desired, &current, None, Some(&schema));
+        let result = diff(&desired, &current, None, Some(&prev_keys));
         match result {
             Diff::Update {
                 changed_attributes, ..
@@ -2003,12 +2031,10 @@ mod tests {
     }
 
     #[test]
-    fn diff_ignores_non_schema_attributes_in_current() {
-        use crate::schema::{AttributeSchema, AttributeType};
-
-        // Current state has "arn" which is not in the schema (provider-returned-only)
-        let desired = Resource::new("s3.bucket", "test")
-            .with_attribute("region", Value::String("ap-northeast-1".to_string()));
+    fn diff_ignores_attributes_not_in_prev_desired_keys() {
+        // Current state has "arn" and "region" from provider, but user only ever
+        // specified "region" — "arn" was never in prev_desired_keys
+        let desired = Resource::new("s3.bucket", "test");
 
         let mut current_attrs = HashMap::new();
         current_attrs.insert(
@@ -2021,21 +2047,30 @@ mod tests {
         );
         let current = State::existing(ResourceId::new("s3.bucket", "test"), current_attrs);
 
-        // Schema only defines "region", not "arn"
-        let schema = ResourceSchema::new("s3.bucket")
-            .attribute(AttributeSchema::new("region", AttributeType::String));
+        // User previously only specified "region", not "arn"
+        let prev_keys = vec!["region".to_string()];
 
-        let result = diff(&desired, &current, None, Some(&schema));
-        assert!(
-            matches!(result, Diff::NoChange(_)),
-            "Should not detect 'arn' as a removal since it's not in the schema, got {:?}",
-            result
-        );
+        let result = diff(&desired, &current, None, Some(&prev_keys));
+        match result {
+            Diff::Update {
+                changed_attributes, ..
+            } => {
+                assert!(
+                    changed_attributes.contains(&"region".to_string()),
+                    "Should detect 'region' removal"
+                );
+                assert!(
+                    !changed_attributes.contains(&"arn".to_string()),
+                    "Should NOT detect 'arn' removal since it was never in desired"
+                );
+            }
+            _ => panic!("Expected Update, got {:?}", result),
+        }
     }
 
     #[test]
-    fn diff_no_change_without_schema_even_with_extra_current_attrs() {
-        // Without schema, removed attributes should NOT be detected (backward compat)
+    fn diff_no_change_without_prev_desired_keys() {
+        // Without prev_desired_keys, removed attributes should NOT be detected
         let desired = Resource::new("s3.bucket", "test")
             .with_attribute("region", Value::String("ap-northeast-1".to_string()));
 
@@ -2056,16 +2091,15 @@ mod tests {
         let result = diff(&desired, &current, None, None);
         assert!(
             matches!(result, Diff::NoChange(_)),
-            "Without schema, extra attributes in current should not trigger Update, got {:?}",
+            "Without prev_desired_keys, extra attributes in current should not trigger Update, got {:?}",
             result
         );
     }
 
     #[test]
     fn create_plan_detects_attribute_removal() {
-        use crate::schema::{AttributeSchema, AttributeType};
-
-        // Resource in .crn has no "tags", but current state (from AWS) has tags
+        // Resource in .crn has no "tags", but current state (from AWS) has tags.
+        // prev_desired_keys indicates user previously had "region" and "tags".
         let resources = vec![
             Resource::new("s3.bucket", "test")
                 .with_attribute("region", Value::String("ap-northeast-1".to_string())),
@@ -2089,23 +2123,19 @@ mod tests {
             State::existing(ResourceId::new("s3.bucket", "test"), attrs),
         );
 
-        let mut schemas = HashMap::new();
-        schemas.insert(
-            "s3.bucket".to_string(),
-            ResourceSchema::new("s3.bucket")
-                .attribute(AttributeSchema::new("region", AttributeType::String))
-                .attribute(AttributeSchema::new(
-                    "tags",
-                    AttributeType::Map(Box::new(AttributeType::String)),
-                )),
+        let mut prev_desired_keys = HashMap::new();
+        prev_desired_keys.insert(
+            ResourceId::new("s3.bucket", "test"),
+            vec!["region".to_string(), "tags".to_string()],
         );
 
         let plan = create_plan(
             &resources,
             &current_states,
             &HashMap::new(),
-            &schemas,
             &HashMap::new(),
+            &HashMap::new(),
+            &prev_desired_keys,
         );
 
         assert_eq!(plan.effects().len(), 1);
@@ -2118,9 +2148,7 @@ mod tests {
 
     #[test]
     fn diff_skips_internal_attributes_in_removal_detection() {
-        use crate::schema::{AttributeSchema, AttributeType};
-
-        // Current has "_binding" which starts with '_', should be skipped
+        // prev_desired_keys includes "_internal" but it should be skipped
         let desired = Resource::new("s3.bucket", "test")
             .with_attribute("region", Value::String("ap-northeast-1".to_string()));
 
@@ -2135,10 +2163,9 @@ mod tests {
         );
         let current = State::existing(ResourceId::new("s3.bucket", "test"), current_attrs);
 
-        let schema = ResourceSchema::new("s3.bucket")
-            .attribute(AttributeSchema::new("region", AttributeType::String));
+        let prev_keys = vec!["region".to_string(), "_internal".to_string()];
 
-        let result = diff(&desired, &current, None, Some(&schema));
+        let result = diff(&desired, &current, None, Some(&prev_keys));
         assert!(
             matches!(result, Diff::NoChange(_)),
             "Should skip internal attributes starting with '_', got {:?}",
