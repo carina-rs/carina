@@ -1,0 +1,19 @@
+# S3 Bucket - Tag deletion test (Step 1: Initial with two tags)
+#
+# Creates an S3 bucket with two tags. Step 2 removes one tag to test
+# that put_bucket_tagging replaces the tag set correctly.
+
+provider aws {
+  region = aws.Region.ap_northeast_1
+}
+
+let bucket = aws.s3.bucket {
+  bucket = "carina-acc-test-aws-tag-del"
+
+  versioning_status = aws.s3.bucket.VersioningStatus.Enabled
+
+  tags = {
+    Environment = "acceptance-test"
+    ToBeRemoved = "this-tag-will-be-deleted"
+  }
+}
