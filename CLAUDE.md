@@ -27,6 +27,26 @@ cargo run -- apply example.crn
 aws-vault exec <profile> -- cargo run -- plan example.crn
 ```
 
+### Incremental Build Strategy
+
+When working on a specific crate, always use crate-specific commands to avoid unnecessary compilation:
+
+```bash
+# Prefer crate-specific builds over full workspace builds
+cargo build -p carina-core          # Instead of `cargo build`
+cargo test -p carina-core           # Instead of `cargo test`
+
+# Only use full workspace build/test when changes span multiple crates
+cargo build
+cargo test
+```
+
+Key rules:
+- After modifying a single crate, build/test only that crate with `-p <crate-name>`
+- After modifying codegen, build only the affected provider crate (e.g., `cargo build -p carina-provider-awscc`)
+- Use full workspace `cargo build` / `cargo test` only when changes affect multiple crates or before creating a PR
+- For `cargo check`, prefer `cargo check -p <crate-name>` as well
+
 ## Architecture
 
 Carina is a functional infrastructure management tool that treats side effects as values (Effects) rather than immediately executing them.
