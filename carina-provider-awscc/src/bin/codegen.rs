@@ -950,12 +950,30 @@ use super::AwsccSchemaConfig;
     code.push('\n');
 
     // Generate enum constants and validation functions
+    //
+    // Constants are always emitted (referenced by enum_valid_values()).
+    // Validation functions are only emitted if the enum is used as a top-level property
+    // or in a struct that actually gets expanded. Enums from struct definitions whose
+    // parent struct isn't expanded (e.g., due to unsupported oneOf) would produce
+    // unused validation functions.
     let aliases = known_enum_aliases();
+    let top_level_props: HashSet<&String> = schema.properties.keys().collect();
+    // Collect enum names that are used in expanded struct fields
+    let struct_used_enums: HashSet<String> = if let Some(_definitions) = &schema.definitions {
+        let mut used = HashSet::new();
+        // Check which definitions are reachable from top-level properties
+        for prop in schema.properties.values() {
+            collect_reachable_enum_fields(prop, schema, &enums, &mut used, &mut HashSet::new());
+        }
+        used
+    } else {
+        HashSet::new()
+    };
     for (prop_name, enum_info) in &enums {
         let const_name = format!("VALID_{}", prop_name.to_snake_case().to_uppercase());
         let fn_name = format!("validate_{}", prop_name.to_snake_case());
 
-        // Generate constant (including alias values)
+        // Generate constant (including alias values) - always emitted
         let mut all_values: Vec<String> = enum_info
             .values
             .iter()
@@ -968,14 +986,15 @@ use super::AwsccSchemaConfig;
         }
         let values_str = all_values.join(", ");
         code.push_str(&format!(
-            "#[allow(dead_code)]\nconst {}: &[&str] = &[{}];\n\n",
+            "const {}: &[&str] = &[{}];\n\n",
             const_name, values_str
         ));
 
-        // Generate validation function
-        code.push_str(&format!(
-            r#"#[allow(dead_code)]
-fn {}(value: &Value) -> Result<(), String> {{
+        // Only emit validation function if actually referenced
+        let is_used = top_level_props.contains(prop_name) || struct_used_enums.contains(prop_name);
+        if is_used {
+            code.push_str(&format!(
+                r#"fn {}(value: &Value) -> Result<(), String> {{
     validate_namespaced_enum(value, "{}", "{}", {})
         .map_err(|reason| {{
             if let Value::String(s) = value {{
@@ -987,8 +1006,9 @@ fn {}(value: &Value) -> Result<(), String> {{
 }}
 
 "#,
-            fn_name, enum_info.type_name, namespace, const_name, enum_info.type_name
-        ));
+                fn_name, enum_info.type_name, namespace, const_name, enum_info.type_name
+            ));
+        }
     }
 
     // Generate range validation functions for integer properties
@@ -1430,6 +1450,58 @@ fn deduplicate_enum_values(values: Vec<String>) -> Option<Vec<String>> {
         Some(unique)
     } else {
         None
+    }
+}
+
+/// Walk a property tree starting from a CfnProperty, following $ref links,
+/// and collect the names of enum fields that are reachable through expanded structs.
+/// This determines which enum validation functions will actually be referenced.
+fn collect_reachable_enum_fields(
+    prop: &CfnProperty,
+    schema: &CfnSchema,
+    enums: &BTreeMap<String, EnumInfo>,
+    used: &mut HashSet<String>,
+    visited: &mut HashSet<String>,
+) {
+    // Follow $ref to definition
+    if let Some(ref_path) = &prop.ref_path {
+        if ref_path.contains("/Tag") {
+            return;
+        }
+        if let Some(def_name) = ref_path.strip_prefix("#/definitions/") {
+            if !visited.insert(def_name.to_string()) {
+                return; // avoid cycles
+            }
+            if let Some(def) = schema.definitions.as_ref().and_then(|d| d.get(def_name))
+                && let Some(props) = &def.properties
+                && !props.is_empty()
+            {
+                // This struct will be expanded - check its fields
+                for (field_name, field_prop) in props {
+                    if enums.contains_key(field_name) {
+                        used.insert(field_name.clone());
+                    }
+                    // Recurse into nested $ref fields
+                    collect_reachable_enum_fields(field_prop, schema, enums, used, visited);
+                }
+            }
+        }
+        return;
+    }
+
+    // Follow items (for arrays) - recurse into item type
+    if let Some(items) = &prop.items {
+        collect_reachable_enum_fields(items, schema, enums, used, visited);
+    }
+
+    // Follow inline properties (for nested objects without $ref)
+    if let Some(props) = &prop.properties {
+        for (field_name, field_prop) in props {
+            if enums.contains_key(field_name) {
+                used.insert(field_name.clone());
+            }
+            collect_reachable_enum_fields(field_prop, schema, enums, used, visited);
+        }
     }
 }
 

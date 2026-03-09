@@ -12,10 +12,8 @@ use carina_core::schema::{
     AttributeSchema, AttributeType, CompletionValue, ResourceSchema, StructField,
 };
 
-#[allow(dead_code)]
 const VALID_METERED_ACCOUNT: &[&str] = &["ipam-owner", "resource-owner"];
 
-#[allow(dead_code)]
 fn validate_metered_account(value: &Value) -> Result<(), String> {
     validate_namespaced_enum(
         value,
@@ -32,10 +30,8 @@ fn validate_metered_account(value: &Value) -> Result<(), String> {
     })
 }
 
-#[allow(dead_code)]
 const VALID_TIER: &[&str] = &["free", "advanced"];
 
-#[allow(dead_code)]
 fn validate_tier(value: &Value) -> Result<(), String> {
     validate_namespaced_enum(value, "Tier", "awscc.ec2.ipam", VALID_TIER).map_err(|reason| {
         if let Value::String(s) = value {

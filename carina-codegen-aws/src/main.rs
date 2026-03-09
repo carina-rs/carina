@@ -596,14 +596,13 @@ fn generate_resource(res: &ResourceDef, model: &SmithyModel) -> Result<String> {
         }
         let values_str = all_values.join(", ");
         code.push_str(&format!(
-            "#[allow(dead_code)]\nconst {}: &[&str] = &[{}];\n\n",
+            "const {}: &[&str] = &[{}];\n\n",
             const_name, values_str
         ));
 
         // Generate validation function
         code.push_str(&format!(
-            "#[allow(dead_code)]\n\
-             fn {}(value: &Value) -> Result<(), String> {{\n\
+            "fn {}(value: &Value) -> Result<(), String> {{\n\
              \x20   validate_namespaced_enum(value, \"{}\", \"{}\", {})\n\
              \x20   .map_err(|reason| {{\n\
              \x20       if let Value::String(s) = value {{\n\

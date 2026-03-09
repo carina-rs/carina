@@ -10,10 +10,8 @@ use super::validate_namespaced_enum;
 use carina_core::resource::Value;
 use carina_core::schema::{AttributeSchema, AttributeType, CompletionValue, ResourceSchema, types};
 
-#[allow(dead_code)]
 const VALID_AUTO_ACCEPT_SHARED_ATTACHMENTS: &[&str] = &["enable", "disable"];
 
-#[allow(dead_code)]
 fn validate_auto_accept_shared_attachments(value: &Value) -> Result<(), String> {
     validate_namespaced_enum(
         value,
@@ -30,10 +28,8 @@ fn validate_auto_accept_shared_attachments(value: &Value) -> Result<(), String> 
     })
 }
 
-#[allow(dead_code)]
 const VALID_DEFAULT_ROUTE_TABLE_ASSOCIATION: &[&str] = &["enable", "disable"];
 
-#[allow(dead_code)]
 fn validate_default_route_table_association(value: &Value) -> Result<(), String> {
     validate_namespaced_enum(
         value,
@@ -50,10 +46,8 @@ fn validate_default_route_table_association(value: &Value) -> Result<(), String>
     })
 }
 
-#[allow(dead_code)]
 const VALID_DEFAULT_ROUTE_TABLE_PROPAGATION: &[&str] = &["enable", "disable"];
 
-#[allow(dead_code)]
 fn validate_default_route_table_propagation(value: &Value) -> Result<(), String> {
     validate_namespaced_enum(
         value,
@@ -70,10 +64,8 @@ fn validate_default_route_table_propagation(value: &Value) -> Result<(), String>
     })
 }
 
-#[allow(dead_code)]
 const VALID_DNS_SUPPORT: &[&str] = &["enable", "disable"];
 
-#[allow(dead_code)]
 fn validate_dns_support(value: &Value) -> Result<(), String> {
     validate_namespaced_enum(
         value,
@@ -90,10 +82,8 @@ fn validate_dns_support(value: &Value) -> Result<(), String> {
     })
 }
 
-#[allow(dead_code)]
 const VALID_ENCRYPTION_SUPPORT: &[&str] = &["disable", "enable"];
 
-#[allow(dead_code)]
 fn validate_encryption_support(value: &Value) -> Result<(), String> {
     validate_namespaced_enum(
         value,
@@ -110,10 +100,8 @@ fn validate_encryption_support(value: &Value) -> Result<(), String> {
     })
 }
 
-#[allow(dead_code)]
 const VALID_MULTICAST_SUPPORT: &[&str] = &["enable", "disable"];
 
-#[allow(dead_code)]
 fn validate_multicast_support(value: &Value) -> Result<(), String> {
     validate_namespaced_enum(
         value,
@@ -130,10 +118,8 @@ fn validate_multicast_support(value: &Value) -> Result<(), String> {
     })
 }
 
-#[allow(dead_code)]
 const VALID_SECURITY_GROUP_REFERENCING_SUPPORT: &[&str] = &["enable", "disable"];
 
-#[allow(dead_code)]
 fn validate_security_group_referencing_support(value: &Value) -> Result<(), String> {
     validate_namespaced_enum(
         value,
@@ -153,10 +139,8 @@ fn validate_security_group_referencing_support(value: &Value) -> Result<(), Stri
     })
 }
 
-#[allow(dead_code)]
 const VALID_VPN_ECMP_SUPPORT: &[&str] = &["enable", "disable"];
 
-#[allow(dead_code)]
 fn validate_vpn_ecmp_support(value: &Value) -> Result<(), String> {
     validate_namespaced_enum(
         value,

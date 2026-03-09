@@ -10,7 +10,6 @@ use super::validate_namespaced_enum;
 use carina_core::resource::Value;
 use carina_core::schema::{AttributeSchema, AttributeType, CompletionValue, ResourceSchema};
 
-#[allow(dead_code)]
 const VALID_ACL: &[&str] = &[
     "authenticated-read",
     "private",
@@ -18,7 +17,6 @@ const VALID_ACL: &[&str] = &[
     "public-read-write",
 ];
 
-#[allow(dead_code)]
 fn validate_acl(value: &Value) -> Result<(), String> {
     validate_namespaced_enum(value, "ACL", "aws.s3.bucket", VALID_ACL).map_err(|reason| {
         if let Value::String(s) = value {
@@ -29,14 +27,12 @@ fn validate_acl(value: &Value) -> Result<(), String> {
     })
 }
 
-#[allow(dead_code)]
 const VALID_OBJECT_OWNERSHIP: &[&str] = &[
     "BucketOwnerEnforced",
     "BucketOwnerPreferred",
     "ObjectWriter",
 ];
 
-#[allow(dead_code)]
 fn validate_object_ownership(value: &Value) -> Result<(), String> {
     validate_namespaced_enum(
         value,
@@ -53,10 +49,8 @@ fn validate_object_ownership(value: &Value) -> Result<(), String> {
     })
 }
 
-#[allow(dead_code)]
 const VALID_VERSIONING_STATUS: &[&str] = &["Enabled", "Suspended"];
 
-#[allow(dead_code)]
 fn validate_versioning_status(value: &Value) -> Result<(), String> {
     validate_namespaced_enum(
         value,

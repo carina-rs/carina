@@ -12,10 +12,8 @@ use carina_core::schema::{
     AttributeSchema, AttributeType, CompletionValue, ResourceSchema, StructField,
 };
 
-#[allow(dead_code)]
 const VALID_ADDRESS_FAMILY: &[&str] = &["IPv4", "IPv6"];
 
-#[allow(dead_code)]
 fn validate_address_family(value: &Value) -> Result<(), String> {
     validate_namespaced_enum(
         value,
@@ -32,10 +30,8 @@ fn validate_address_family(value: &Value) -> Result<(), String> {
     })
 }
 
-#[allow(dead_code)]
 const VALID_AWS_SERVICE: &[&str] = &["ec2", "global-services"];
 
-#[allow(dead_code)]
 fn validate_aws_service(value: &Value) -> Result<(), String> {
     validate_namespaced_enum(
         value,
@@ -52,10 +48,8 @@ fn validate_aws_service(value: &Value) -> Result<(), String> {
     })
 }
 
-#[allow(dead_code)]
 const VALID_IPAM_SCOPE_TYPE: &[&str] = &["public", "private"];
 
-#[allow(dead_code)]
 fn validate_ipam_scope_type(value: &Value) -> Result<(), String> {
     validate_namespaced_enum(
         value,
@@ -72,10 +66,8 @@ fn validate_ipam_scope_type(value: &Value) -> Result<(), String> {
     })
 }
 
-#[allow(dead_code)]
 const VALID_PUBLIC_IP_SOURCE: &[&str] = &["byoip", "amazon"];
 
-#[allow(dead_code)]
 fn validate_public_ip_source(value: &Value) -> Result<(), String> {
     validate_namespaced_enum(
         value,
@@ -92,7 +84,6 @@ fn validate_public_ip_source(value: &Value) -> Result<(), String> {
     })
 }
 
-#[allow(dead_code)]
 const VALID_STATE: &[&str] = &[
     "create-in-progress",
     "create-complete",
@@ -102,7 +93,6 @@ const VALID_STATE: &[&str] = &[
     "delete-complete",
 ];
 
-#[allow(dead_code)]
 fn validate_state(value: &Value) -> Result<(), String> {
     validate_namespaced_enum(value, "State", "awscc.ec2.ipam_pool", VALID_STATE).map_err(|reason| {
         if let Value::String(s) = value {

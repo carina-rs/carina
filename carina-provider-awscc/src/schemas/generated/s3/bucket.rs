@@ -12,10 +12,8 @@ use carina_core::schema::{
     AttributeSchema, AttributeType, CompletionValue, ResourceSchema, StructField,
 };
 
-#[allow(dead_code)]
 const VALID_ABAC_STATUS: &[&str] = &["Enabled", "Disabled"];
 
-#[allow(dead_code)]
 fn validate_abac_status(value: &Value) -> Result<(), String> {
     validate_namespaced_enum(value, "AbacStatus", "awscc.s3.bucket", VALID_ABAC_STATUS).map_err(
         |reason| {
@@ -28,10 +26,8 @@ fn validate_abac_status(value: &Value) -> Result<(), String> {
     )
 }
 
-#[allow(dead_code)]
 const VALID_ACCELERATION_STATUS: &[&str] = &["Enabled", "Suspended"];
 
-#[allow(dead_code)]
 fn validate_acceleration_status(value: &Value) -> Result<(), String> {
     validate_namespaced_enum(
         value,
@@ -48,7 +44,6 @@ fn validate_acceleration_status(value: &Value) -> Result<(), String> {
     })
 }
 
-#[allow(dead_code)]
 const VALID_ACCESS_CONTROL: &[&str] = &[
     "AuthenticatedRead",
     "AwsExecRead",
@@ -60,7 +55,6 @@ const VALID_ACCESS_CONTROL: &[&str] = &[
     "PublicReadWrite",
 ];
 
-#[allow(dead_code)]
 fn validate_access_control(value: &Value) -> Result<(), String> {
     validate_namespaced_enum(
         value,
@@ -77,10 +71,8 @@ fn validate_access_control(value: &Value) -> Result<(), String> {
     })
 }
 
-#[allow(dead_code)]
 const VALID_ACCESS_TIER: &[&str] = &["ARCHIVE_ACCESS", "DEEP_ARCHIVE_ACCESS"];
 
-#[allow(dead_code)]
 fn validate_access_tier(value: &Value) -> Result<(), String> {
     validate_namespaced_enum(value, "AccessTier", "awscc.s3.bucket", VALID_ACCESS_TIER).map_err(
         |reason| {
@@ -93,10 +85,8 @@ fn validate_access_tier(value: &Value) -> Result<(), String> {
     )
 }
 
-#[allow(dead_code)]
 const VALID_CONFIGURATION_STATE: &[&str] = &["ENABLED", "DISABLED"];
 
-#[allow(dead_code)]
 fn validate_configuration_state(value: &Value) -> Result<(), String> {
     validate_namespaced_enum(
         value,
@@ -113,10 +103,8 @@ fn validate_configuration_state(value: &Value) -> Result<(), String> {
     })
 }
 
-#[allow(dead_code)]
 const VALID_EXPIRATION: &[&str] = &["ENABLED", "DISABLED"];
 
-#[allow(dead_code)]
 fn validate_expiration(value: &Value) -> Result<(), String> {
     validate_namespaced_enum(value, "Expiration", "awscc.s3.bucket", VALID_EXPIRATION).map_err(
         |reason| {
@@ -129,10 +117,8 @@ fn validate_expiration(value: &Value) -> Result<(), String> {
     )
 }
 
-#[allow(dead_code)]
 const VALID_FORMAT: &[&str] = &["CSV", "ORC", "Parquet"];
 
-#[allow(dead_code)]
 fn validate_format(value: &Value) -> Result<(), String> {
     validate_namespaced_enum(value, "Format", "awscc.s3.bucket", VALID_FORMAT).map_err(|reason| {
         if let Value::String(s) = value {
@@ -143,10 +129,8 @@ fn validate_format(value: &Value) -> Result<(), String> {
     })
 }
 
-#[allow(dead_code)]
 const VALID_INCLUDED_OBJECT_VERSIONS: &[&str] = &["All", "Current"];
 
-#[allow(dead_code)]
 fn validate_included_object_versions(value: &Value) -> Result<(), String> {
     validate_namespaced_enum(
         value,
@@ -163,10 +147,8 @@ fn validate_included_object_versions(value: &Value) -> Result<(), String> {
     })
 }
 
-#[allow(dead_code)]
 const VALID_MODE: &[&str] = &["COMPLIANCE", "GOVERNANCE"];
 
-#[allow(dead_code)]
 fn validate_mode(value: &Value) -> Result<(), String> {
     validate_namespaced_enum(value, "Mode", "awscc.s3.bucket", VALID_MODE).map_err(|reason| {
         if let Value::String(s) = value {
@@ -177,14 +159,12 @@ fn validate_mode(value: &Value) -> Result<(), String> {
     })
 }
 
-#[allow(dead_code)]
 const VALID_OBJECT_OWNERSHIP: &[&str] = &[
     "ObjectWriter",
     "BucketOwnerPreferred",
     "BucketOwnerEnforced",
 ];
 
-#[allow(dead_code)]
 fn validate_object_ownership(value: &Value) -> Result<(), String> {
     validate_namespaced_enum(
         value,
@@ -201,30 +181,10 @@ fn validate_object_ownership(value: &Value) -> Result<(), String> {
     })
 }
 
-#[allow(dead_code)]
 const VALID_PARTITION_DATE_SOURCE: &[&str] = &["EventTime", "DeliveryTime"];
 
-#[allow(dead_code)]
-fn validate_partition_date_source(value: &Value) -> Result<(), String> {
-    validate_namespaced_enum(
-        value,
-        "PartitionDateSource",
-        "awscc.s3.bucket",
-        VALID_PARTITION_DATE_SOURCE,
-    )
-    .map_err(|reason| {
-        if let Value::String(s) = value {
-            format!("Invalid PartitionDateSource '{}': {}", s, reason)
-        } else {
-            reason
-        }
-    })
-}
-
-#[allow(dead_code)]
 const VALID_PROTOCOL: &[&str] = &["http", "https"];
 
-#[allow(dead_code)]
 fn validate_protocol(value: &Value) -> Result<(), String> {
     validate_namespaced_enum(value, "Protocol", "awscc.s3.bucket", VALID_PROTOCOL).map_err(
         |reason| {
@@ -237,10 +197,8 @@ fn validate_protocol(value: &Value) -> Result<(), String> {
     )
 }
 
-#[allow(dead_code)]
 const VALID_REPLACE_KEY_PREFIX_WITH: &[&str] = &["docs/", "documents/", "/documents"];
 
-#[allow(dead_code)]
 fn validate_replace_key_prefix_with(value: &Value) -> Result<(), String> {
     validate_namespaced_enum(
         value,
@@ -257,10 +215,8 @@ fn validate_replace_key_prefix_with(value: &Value) -> Result<(), String> {
     })
 }
 
-#[allow(dead_code)]
 const VALID_SCHEDULE_FREQUENCY: &[&str] = &["Daily", "Weekly"];
 
-#[allow(dead_code)]
 fn validate_schedule_frequency(value: &Value) -> Result<(), String> {
     validate_namespaced_enum(
         value,
@@ -277,10 +233,8 @@ fn validate_schedule_frequency(value: &Value) -> Result<(), String> {
     })
 }
 
-#[allow(dead_code)]
 const VALID_SSE_ALGORITHM: &[&str] = &["aws:kms", "AES256"];
 
-#[allow(dead_code)]
 fn validate_sse_algorithm(value: &Value) -> Result<(), String> {
     validate_namespaced_enum(
         value,
@@ -297,10 +251,8 @@ fn validate_sse_algorithm(value: &Value) -> Result<(), String> {
     })
 }
 
-#[allow(dead_code)]
 const VALID_STATUS: &[&str] = &["Disabled", "Enabled"];
 
-#[allow(dead_code)]
 fn validate_status(value: &Value) -> Result<(), String> {
     validate_namespaced_enum(value, "Status", "awscc.s3.bucket", VALID_STATUS).map_err(|reason| {
         if let Value::String(s) = value {
@@ -311,7 +263,6 @@ fn validate_status(value: &Value) -> Result<(), String> {
     })
 }
 
-#[allow(dead_code)]
 const VALID_STORAGE_CLASS: &[&str] = &[
     "DEEP_ARCHIVE",
     "GLACIER",
@@ -322,7 +273,6 @@ const VALID_STORAGE_CLASS: &[&str] = &[
     "STANDARD_IA",
 ];
 
-#[allow(dead_code)]
 fn validate_storage_class(value: &Value) -> Result<(), String> {
     validate_namespaced_enum(
         value,
@@ -339,10 +289,8 @@ fn validate_storage_class(value: &Value) -> Result<(), String> {
     })
 }
 
-#[allow(dead_code)]
 const VALID_TABLE_BUCKET_TYPE: &[&str] = &["aws", "customer"];
 
-#[allow(dead_code)]
 fn validate_table_bucket_type(value: &Value) -> Result<(), String> {
     validate_namespaced_enum(
         value,
@@ -359,11 +307,9 @@ fn validate_table_bucket_type(value: &Value) -> Result<(), String> {
     })
 }
 
-#[allow(dead_code)]
 const VALID_TRANSITION_DEFAULT_MINIMUM_OBJECT_SIZE: &[&str] =
     &["varies_by_storage_class", "all_storage_classes_128K"];
 
-#[allow(dead_code)]
 fn validate_transition_default_minimum_object_size(value: &Value) -> Result<(), String> {
     validate_namespaced_enum(
         value,

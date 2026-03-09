@@ -12,10 +12,8 @@ use carina_core::schema::{
     AttributeSchema, AttributeType, CompletionValue, ResourceSchema, StructField, types,
 };
 
-#[allow(dead_code)]
 const VALID_AVAILABILITY_MODE: &[&str] = &["zonal", "regional"];
 
-#[allow(dead_code)]
 fn validate_availability_mode(value: &Value) -> Result<(), String> {
     validate_namespaced_enum(
         value,
@@ -32,10 +30,8 @@ fn validate_availability_mode(value: &Value) -> Result<(), String> {
     })
 }
 
-#[allow(dead_code)]
 const VALID_CONNECTIVITY_TYPE: &[&str] = &["public", "private"];
 
-#[allow(dead_code)]
 fn validate_connectivity_type(value: &Value) -> Result<(), String> {
     validate_namespaced_enum(
         value,
