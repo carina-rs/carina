@@ -558,7 +558,6 @@ fn generate_resource(res: &ResourceDef, model: &SmithyModel) -> Result<String> {
          //! Auto-generated from Smithy model: {}\n\
          //!\n\
          //! DO NOT EDIT MANUALLY - regenerate with smithy-codegen\n\n\
-         #![allow(dead_code)]\n\n\
          use super::AwsSchemaConfig;\n",
         resource_short, ns
     ));

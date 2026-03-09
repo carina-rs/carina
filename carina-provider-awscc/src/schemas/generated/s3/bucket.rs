@@ -4,8 +4,6 @@
 //!
 //! DO NOT EDIT MANUALLY - regenerate with carina-codegen
 
-#![allow(dead_code)]
-
 use super::AwsccSchemaConfig;
 use super::tags_type;
 use super::validate_namespaced_enum;
@@ -184,22 +182,6 @@ fn validate_object_ownership(value: &Value) -> Result<(), String> {
 }
 
 const VALID_PARTITION_DATE_SOURCE: &[&str] = &["EventTime", "DeliveryTime"];
-
-fn validate_partition_date_source(value: &Value) -> Result<(), String> {
-    validate_namespaced_enum(
-        value,
-        "PartitionDateSource",
-        "awscc.s3.bucket",
-        VALID_PARTITION_DATE_SOURCE,
-    )
-    .map_err(|reason| {
-        if let Value::String(s) = value {
-            format!("Invalid PartitionDateSource '{}': {}", s, reason)
-        } else {
-            reason
-        }
-    })
-}
 
 const VALID_PROTOCOL: &[&str] = &["http", "https"];
 

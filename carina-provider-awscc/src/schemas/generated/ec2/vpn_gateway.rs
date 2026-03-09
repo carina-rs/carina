@@ -4,8 +4,6 @@
 //!
 //! DO NOT EDIT MANUALLY - regenerate with carina-codegen
 
-#![allow(dead_code)]
-
 use super::AwsccSchemaConfig;
 use super::tags_type;
 use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};

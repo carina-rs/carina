@@ -4,8 +4,6 @@
 //!
 //! DO NOT EDIT MANUALLY - regenerate with smithy-codegen
 
-#![allow(dead_code)]
-
 use super::AwsSchemaConfig;
 use super::validate_namespaced_enum;
 use carina_core::resource::Value;
