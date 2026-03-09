@@ -81,6 +81,12 @@ fn module_name(name: &str) -> String {
     name.replace('.', "_")
 }
 
+/// Split a DSL resource name into (service, resource).
+/// e.g., "ec2.vpc" -> ("ec2", "vpc"), "s3.bucket" -> ("s3", "bucket")
+fn split_service_resource(name: &str) -> (&str, &str) {
+    name.split_once('.').expect("DSL name must contain '.'")
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
 
@@ -120,21 +126,27 @@ fn main() -> Result<()> {
 
     match args.format.as_str() {
         "rust" => {
-            // Generate each resource
+            // Generate each resource into service/resource directory structure
             let mut generated_modules: Vec<&str> = Vec::new();
             for res in &resources {
                 let model = models.get(res.service_namespace).unwrap();
                 let code = generate_resource(res, model)?;
 
-                let mod_name = module_name(res.name);
-                let output_path = args.output_dir.join(format!("{}.rs", mod_name));
+                let (service, resource) = split_service_resource(res.name);
+                let service_dir = args.output_dir.join(service);
+                std::fs::create_dir_all(&service_dir)?;
+
+                let output_path = service_dir.join(format!("{}.rs", resource));
                 std::fs::write(&output_path, &code)
                     .with_context(|| format!("Failed to write {}", output_path.display()))?;
                 eprintln!("Generated: {}", output_path.display());
                 generated_modules.push(res.name);
             }
 
-            // Generate mod.rs
+            // Generate per-service mod.rs files
+            generate_service_mod_files(&args.output_dir, &generated_modules)?;
+
+            // Generate top-level mod.rs
             let mod_rs = generate_mod_rs(&generated_modules);
             let mod_path = args.output_dir.join("mod.rs");
             std::fs::write(&mod_path, &mod_rs)
@@ -1178,6 +1190,42 @@ fn get_int_range(model: &SmithyModel, target: &str, field_name: &str) -> Option<
         .map(|&(min, max)| IntRange { min, max })
 }
 
+/// Generate per-service mod.rs files that declare resource modules.
+fn generate_service_mod_files(output_dir: &std::path::Path, dsl_names: &[&str]) -> Result<()> {
+    // Group resources by service
+    let mut services: std::collections::BTreeMap<&str, Vec<&str>> =
+        std::collections::BTreeMap::new();
+    for name in dsl_names {
+        let (service, resource) = split_service_resource(name);
+        services.entry(service).or_default().push(resource);
+    }
+
+    for (service, resources) in &services {
+        let mut code = String::new();
+        code.push_str(
+            "//! Auto-generated — DO NOT EDIT MANUALLY\n\
+             //!\n\
+             //! Regenerate with:\n\
+             //!   ./carina-provider-aws/scripts/generate-schemas-smithy.sh\n\n\
+             // Re-export parent types so resource modules can use `super::` to access them.\n\
+             pub use super::*;\n\n",
+        );
+
+        let mut sorted_resources: Vec<&&str> = resources.iter().collect();
+        sorted_resources.sort();
+        for resource in sorted_resources {
+            code.push_str(&format!("pub mod {};\n", resource));
+        }
+
+        let mod_path = output_dir.join(service).join("mod.rs");
+        std::fs::write(&mod_path, &code)
+            .with_context(|| format!("Failed to write {}", mod_path.display()))?;
+        eprintln!("Generated: {}", mod_path.display());
+    }
+
+    Ok(())
+}
+
 /// Generate mod.rs that includes all generated modules.
 fn generate_mod_rs(dsl_names: &[&str]) -> String {
     let mut code = String::new();
@@ -1192,13 +1240,17 @@ fn generate_mod_rs(dsl_names: &[&str]) -> String {
          pub use super::types::*;\n\n",
     );
 
-    // Sort by module name for deterministic output
+    // Sort by DSL name for deterministic output
     let mut sorted: Vec<&str> = dsl_names.to_vec();
-    sorted.sort_by_key(|n| module_name(n));
+    sorted.sort();
 
-    // Module declarations
-    for name in &sorted {
-        code.push_str(&format!("pub mod {};\n", module_name(name)));
+    // Collect unique services (sorted)
+    let mut services: Vec<&str> = sorted.iter().map(|n| split_service_resource(n).0).collect();
+    services.dedup();
+
+    // Service module declarations
+    for service in &services {
+        code.push_str(&format!("pub mod {};\n", service));
     }
 
     // configs() function
@@ -1208,8 +1260,12 @@ fn generate_mod_rs(dsl_names: &[&str]) -> String {
          \x20   vec![\n",
     );
     for name in &sorted {
+        let (service, resource) = split_service_resource(name);
         let mn = module_name(name);
-        code.push_str(&format!("\x20       {}::{}_config(),\n", mn, mn));
+        code.push_str(&format!(
+            "\x20       {}::{}::{}_config(),\n",
+            service, resource, mn
+        ));
     }
     code.push_str(
         "\x20   ]\n\
@@ -1227,9 +1283,10 @@ fn generate_mod_rs(dsl_names: &[&str]) -> String {
          \x20   let modules: &[(&str, &[(&str, &[&str])])] = &[\n",
     );
     for name in &sorted {
+        let (service, resource) = split_service_resource(name);
         code.push_str(&format!(
-            "\x20       {}::enum_valid_values(),\n",
-            module_name(name)
+            "\x20       {}::{}::enum_valid_values(),\n",
+            service, resource
         ));
     }
     code.push_str(
@@ -1255,12 +1312,12 @@ fn generate_mod_rs(dsl_names: &[&str]) -> String {
          pub fn get_enum_alias_reverse(resource_type: &str, attr_name: &str, value: &str) -> Option<&'static str> {\n",
     );
     for name in &sorted {
-        let mn = module_name(name);
+        let (service, resource) = split_service_resource(name);
         code.push_str(&format!(
             "\x20   if resource_type == \"{}\" {{\n\
-             \x20       return {}::enum_alias_reverse(attr_name, value);\n\
+             \x20       return {}::{}::enum_alias_reverse(attr_name, value);\n\
              \x20   }}\n",
-            name, mn
+            name, service, resource
         ));
     }
     code.push_str("    None\n}\n");
