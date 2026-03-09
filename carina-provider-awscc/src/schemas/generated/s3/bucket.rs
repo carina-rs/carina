@@ -183,6 +183,22 @@ fn validate_object_ownership(value: &Value) -> Result<(), String> {
 
 const VALID_PARTITION_DATE_SOURCE: &[&str] = &["EventTime", "DeliveryTime"];
 
+fn validate_partition_date_source(value: &Value) -> Result<(), String> {
+    validate_namespaced_enum(
+        value,
+        "PartitionDateSource",
+        "awscc.s3.bucket",
+        VALID_PARTITION_DATE_SOURCE,
+    )
+    .map_err(|reason| {
+        if let Value::String(s) = value {
+            format!("Invalid PartitionDateSource '{}': {}", s, reason)
+        } else {
+            reason
+        }
+    })
+}
+
 const VALID_PROTOCOL: &[&str] = &["http", "https"];
 
 fn validate_protocol(value: &Value) -> Result<(), String> {
@@ -673,7 +689,24 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                     fields: vec![
                     StructField::new("destination_bucket_name", AttributeType::String).with_description("The name of the bucket where Amazon S3 should store server access log files. You can store log files in any bucket that you own. By default, logs are ...").with_provider_name("DestinationBucketName"),
                     StructField::new("log_file_prefix", AttributeType::String).with_description("A prefix for all log object keys. If you store log files from multiple Amazon S3 buckets in a single bucket, you can use a prefix to distinguish which...").with_provider_name("LogFilePrefix"),
-                    StructField::new("target_object_key_format", AttributeType::String).with_description("Amazon S3 key format for log objects. Only one format, either PartitionedPrefix or SimplePrefix, is allowed.").with_provider_name("TargetObjectKeyFormat")
+                    StructField::new("target_object_key_format", AttributeType::Struct {
+                    name: "TargetObjectKeyFormat".to_string(),
+                    fields: vec![
+                    StructField::new("partitioned_prefix", AttributeType::Struct {
+                    name: "PartitionedPrefix".to_string(),
+                    fields: vec![
+                    StructField::new("partition_date_source", AttributeType::Custom {
+                name: "PartitionDateSource".to_string(),
+                base: Box::new(AttributeType::String),
+                validate: validate_partition_date_source,
+                namespace: Some("awscc.s3.bucket".to_string()),
+                to_dsl: None,
+            }).with_description("Specifies the partition date source for the partitioned prefix. ``PartitionDateSource`` can be ``EventTime`` or ``DeliveryTime``. For ``DeliveryTime``...").with_provider_name("PartitionDateSource")
+                    ],
+                }).with_provider_name("PartitionedPrefix"),
+                    StructField::new("simple_prefix", AttributeType::Map(Box::new(AttributeType::String))).with_description("This format defaults the prefix to the given log file prefix for delivering server access log file.").with_provider_name("SimplePrefix")
+                    ],
+                }).with_description("Amazon S3 key format for log objects. Only one format, either PartitionedPrefix or SimplePrefix, is allowed.").with_provider_name("TargetObjectKeyFormat")
                     ],
                 })
                 .with_description("Settings that define where logs are stored.")
