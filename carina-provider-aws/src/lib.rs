@@ -2318,8 +2318,8 @@ fn infer_canned_acl(
     write: &[String],
     write_acp: &[String],
 ) -> Option<&'static str> {
-    let all_users_read = format!("uri=\"{}\"", ALL_USERS_URI);
-    let all_users_write = format!("uri=\"{}\"", ALL_USERS_URI);
+    // AllUsers URI is used for both READ and WRITE permission checks
+    let all_users = format!("uri=\"{}\"", ALL_USERS_URI);
     let auth_users_read = format!("uri=\"{}\"", AUTH_USERS_URI);
 
     // private: no non-owner grants
@@ -2335,7 +2335,7 @@ fn infer_canned_acl(
     // public-read: AllUsers READ, nothing else
     if full_control.is_empty()
         && read.len() == 1
-        && read[0] == all_users_read
+        && read[0] == all_users
         && read_acp.is_empty()
         && write.is_empty()
         && write_acp.is_empty()
@@ -2346,10 +2346,10 @@ fn infer_canned_acl(
     // public-read-write: AllUsers READ + WRITE, nothing else
     if full_control.is_empty()
         && read.len() == 1
-        && read[0] == all_users_read
+        && read[0] == all_users
         && read_acp.is_empty()
         && write.len() == 1
-        && write[0] == all_users_write
+        && write[0] == all_users
         && write_acp.is_empty()
     {
         return Some("public-read-write");
@@ -2583,16 +2583,16 @@ mod tests {
 
     #[test]
     fn test_infer_canned_acl_public_read() {
-        let all_users_read = format!("uri=\"{}\"", ALL_USERS_URI);
-        let result = infer_canned_acl(&[], &[all_users_read], &[], &[], &[]);
+        let all_users = format!("uri=\"{}\"", ALL_USERS_URI);
+        let result = infer_canned_acl(&[], &[all_users], &[], &[], &[]);
         assert_eq!(result, Some("public-read"));
     }
 
     #[test]
     fn test_infer_canned_acl_public_read_write() {
-        let all_users_read = format!("uri=\"{}\"", ALL_USERS_URI);
-        let all_users_write = format!("uri=\"{}\"", ALL_USERS_URI);
-        let result = infer_canned_acl(&[], &[all_users_read], &[], &[all_users_write], &[]);
+        let all_users_for_read = format!("uri=\"{}\"", ALL_USERS_URI);
+        let all_users_for_write = format!("uri=\"{}\"", ALL_USERS_URI);
+        let result = infer_canned_acl(&[], &[all_users_for_read], &[], &[all_users_for_write], &[]);
         assert_eq!(result, Some("public-read-write"));
     }
 
