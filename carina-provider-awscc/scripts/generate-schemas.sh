@@ -26,7 +26,6 @@ done
 CACHE_DIR="carina-provider-awscc/cfn-schema-cache"
 OUTPUT_DIR="carina-provider-awscc/src/schemas/generated"
 mkdir -p "$CACHE_DIR"
-mkdir -p "$OUTPUT_DIR"
 
 # List of resource types to generate
 RESOURCE_TYPES=(
@@ -76,10 +75,42 @@ if [ ! -f "$CODEGEN_BIN" ]; then
     fi
 fi
 
+# Helper: extract service name from CloudFormation type (e.g., AWS::EC2::VPC -> ec2)
+service_name() {
+    echo "$1" | awk -F'::' '{print tolower($2)}'
+}
+
+# Helper: extract resource module name (e.g., AWS::EC2::VPC -> vpc)
+resource_module_name() {
+    "$CODEGEN_BIN" --type-name "$1" --print-module-name
+}
+
+# Remove old flat-structure files (migration from flat to service/resource layout)
 for TYPE_NAME in "${RESOURCE_TYPES[@]}"; do
-    # Use codegen to compute the module name (e.g., ec2_security_group_egress)
-    MODNAME=$("$CODEGEN_BIN" --type-name "$TYPE_NAME" --print-full-resource-name)
-    OUTPUT_FILE="$OUTPUT_DIR/${MODNAME}.rs"
+    FLAT_NAME=$("$CODEGEN_BIN" --type-name "$TYPE_NAME" --print-full-resource-name)
+    OLD_FILE="$OUTPUT_DIR/${FLAT_NAME}.rs"
+    if [ -f "$OLD_FILE" ]; then
+        rm -f "$OLD_FILE"
+    fi
+done
+
+# Collect unique services and create directories
+SERVICES=""
+for TYPE_NAME in "${RESOURCE_TYPES[@]}"; do
+    SVC=$(service_name "$TYPE_NAME")
+    # Add to list if not already present
+    case " $SERVICES " in
+        *" $SVC "*) ;;
+        *) SERVICES="$SERVICES $SVC" ;;
+    esac
+    mkdir -p "$OUTPUT_DIR/$SVC"
+done
+SERVICES=$(echo "$SERVICES" | tr ' ' '\n' | sort | tr '\n' ' ')
+
+for TYPE_NAME in "${RESOURCE_TYPES[@]}"; do
+    SVC=$(service_name "$TYPE_NAME")
+    RESOURCE=$(resource_module_name "$TYPE_NAME")
+    OUTPUT_FILE="$OUTPUT_DIR/$SVC/${RESOURCE}.rs"
 
     echo "Generating $TYPE_NAME -> $OUTPUT_FILE"
 
@@ -103,7 +134,33 @@ for TYPE_NAME in "${RESOURCE_TYPES[@]}"; do
     fi
 done
 
-# Generate mod.rs
+# Generate per-service mod.rs files
+for SVC in $SERVICES; do
+    SVC_MOD="$OUTPUT_DIR/$SVC/mod.rs"
+    echo "Generating $SVC_MOD"
+
+    cat > "$SVC_MOD" << 'EOF'
+//! Auto-generated — DO NOT EDIT MANUALLY
+//!
+//! Regenerate with:
+//!   aws-vault exec <profile> -- ./carina-provider-awscc/scripts/generate-schemas.sh
+
+// Re-export parent types so resource modules can use `super::` to access them.
+pub use super::*;
+
+EOF
+
+    # Add module declarations for resources in this service
+    for TYPE_NAME in "${RESOURCE_TYPES[@]}"; do
+        TYPE_SVC=$(service_name "$TYPE_NAME")
+        if [ "$TYPE_SVC" = "$SVC" ]; then
+            RESOURCE=$(resource_module_name "$TYPE_NAME")
+            echo "pub mod ${RESOURCE};" >> "$SVC_MOD"
+        fi
+    done
+done
+
+# Generate top-level mod.rs
 echo ""
 echo "Generating $OUTPUT_DIR/mod.rs"
 
@@ -119,10 +176,9 @@ pub use super::awscc_types::*;
 
 EOF
 
-# Add module declarations
-for TYPE_NAME in "${RESOURCE_TYPES[@]}"; do
-    MODNAME=$("$CODEGEN_BIN" --type-name "$TYPE_NAME" --print-full-resource-name)
-    echo "pub mod ${MODNAME};" >> "$OUTPUT_DIR/mod.rs"
+# Add service module declarations
+for SVC in $SERVICES; do
+    echo "pub mod ${SVC};" >> "$OUTPUT_DIR/mod.rs"
 done
 
 # Add configs() function
@@ -135,10 +191,12 @@ EOF
 
 # Add config function calls dynamically
 for TYPE_NAME in "${RESOURCE_TYPES[@]}"; do
-    MODNAME=$("$CODEGEN_BIN" --type-name "$TYPE_NAME" --print-full-resource-name)
-    FUNC_NAME="${MODNAME}_config"
+    SVC=$(service_name "$TYPE_NAME")
+    RESOURCE=$(resource_module_name "$TYPE_NAME")
+    FULL_NAME=$("$CODEGEN_BIN" --type-name "$TYPE_NAME" --print-full-resource-name)
+    FUNC_NAME="${FULL_NAME}_config"
 
-    echo "        ${MODNAME}::${FUNC_NAME}()," >> "$OUTPUT_DIR/mod.rs"
+    echo "        ${SVC}::${RESOURCE}::${FUNC_NAME}()," >> "$OUTPUT_DIR/mod.rs"
 done
 
 cat >> "$OUTPUT_DIR/mod.rs" << 'EOF'
@@ -156,8 +214,9 @@ EOF
 
 # Add enum_valid_values() calls dynamically
 for TYPE_NAME in "${RESOURCE_TYPES[@]}"; do
-    MODNAME=$("$CODEGEN_BIN" --type-name "$TYPE_NAME" --print-full-resource-name)
-    echo "        ${MODNAME}::enum_valid_values()," >> "$OUTPUT_DIR/mod.rs"
+    SVC=$(service_name "$TYPE_NAME")
+    RESOURCE=$(resource_module_name "$TYPE_NAME")
+    echo "        ${SVC}::${RESOURCE}::enum_valid_values()," >> "$OUTPUT_DIR/mod.rs"
 done
 
 cat >> "$OUTPUT_DIR/mod.rs" << 'EOF'
@@ -182,11 +241,12 @@ EOF
 
 # Add enum_alias_reverse() dispatches dynamically
 for TYPE_NAME in "${RESOURCE_TYPES[@]}"; do
-    MODNAME=$("$CODEGEN_BIN" --type-name "$TYPE_NAME" --print-full-resource-name)
+    SVC=$(service_name "$TYPE_NAME")
+    RESOURCE=$(resource_module_name "$TYPE_NAME")
     DSL_NAME=$("$CODEGEN_BIN" --type-name "$TYPE_NAME" --print-dsl-resource-name)
     cat >> "$OUTPUT_DIR/mod.rs" << INNEREOF
     if resource_type == "${DSL_NAME}" {
-        return ${MODNAME}::enum_alias_reverse(attr_name, value);
+        return ${SVC}::${RESOURCE}::enum_alias_reverse(attr_name, value);
     }
 INNEREOF
 done

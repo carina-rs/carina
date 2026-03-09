@@ -1893,7 +1893,7 @@ mod tests {
         // DSL uses bare `Gateway`, AWS returns "Gateway" as string.
         // Both must normalize to the same namespaced value.
 
-        let config = crate::schemas::generated::ec2_vpc_endpoint::ec2_vpc_endpoint_config();
+        let config = crate::schemas::generated::ec2::vpc_endpoint::ec2_vpc_endpoint_config();
         let attr_schema = config.schema.attributes.get("vpc_endpoint_type").unwrap();
 
         // 1. DSL side: resolve_enum_identifiers_impl converts bare `Gateway` ident
