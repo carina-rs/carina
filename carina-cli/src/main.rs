@@ -41,7 +41,7 @@ use display::{format_effect, print_plan};
 #[cfg(test)]
 use wiring::resolve_attr_prefixes;
 use wiring::{
-    compute_anonymous_identifiers, create_plan_from_parsed, create_provider_from_config,
+    compute_anonymous_identifiers, create_plan_from_parsed, create_providers_from_configs,
     get_provider, get_schemas, provider_factories, reconcile_prefixed_names, resolve_names,
     validate_module_calls, validate_provider_region, validate_resource_ref_types,
     validate_resources,
@@ -195,8 +195,8 @@ struct PlanFile {
     state_lineage: Option<String>,
     /// State serial for drift detection
     state_serial: Option<u64>,
-    /// Provider configuration
-    provider_config: ProviderConfig,
+    /// Provider configurations
+    provider_configs: Vec<ProviderConfig>,
     /// Backend configuration
     backend_config: Option<BackendConfig>,
     /// The plan (effects)
@@ -464,15 +464,6 @@ async fn run_plan(path: &PathBuf, out: Option<&PathBuf>) -> Result<bool, String>
 
     // Save plan to file if --out was specified
     if let Some(out_path) = out {
-        let provider_config = parsed
-            .providers
-            .first()
-            .cloned()
-            .unwrap_or_else(|| ProviderConfig {
-                name: "unknown".to_string(),
-                attributes: HashMap::new(),
-            });
-
         let plan_file = PlanFile {
             version: 1,
             carina_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -480,7 +471,7 @@ async fn run_plan(path: &PathBuf, out: Option<&PathBuf>) -> Result<bool, String>
             source_path: path.display().to_string(),
             state_lineage: state_file.as_ref().map(|s| s.lineage.clone()),
             state_serial: state_file.as_ref().map(|s| s.serial),
-            provider_config,
+            provider_configs: parsed.providers.clone(),
             backend_config: parsed.backend.clone(),
             plan: ctx.plan,
             sorted_resources: ctx.sorted_resources,
@@ -1454,7 +1445,8 @@ async fn run_apply_from_plan(plan_path: &PathBuf, auto_approve: bool) -> Result<
         .collect();
 
     // Create provider early for drift detection
-    let provider: Box<dyn Provider> = create_provider_from_config(&plan_file.provider_config).await;
+    let provider: Box<dyn Provider> =
+        create_providers_from_configs(&plan_file.provider_configs).await;
 
     // Drift detection: re-read actual infrastructure state and compare against planned states
     println!("{}", "Checking for infrastructure drift...".cyan());
@@ -3109,13 +3101,13 @@ mod tests {
             source_path: "example.crn".to_string(),
             state_lineage: Some("test-lineage".to_string()),
             state_serial: Some(1),
-            provider_config: ProviderConfig {
+            provider_configs: vec![ProviderConfig {
                 name: "aws".to_string(),
                 attributes: HashMap::from([(
                     "region".to_string(),
                     Value::String("aws.Region.ap_northeast_1".to_string()),
                 )]),
-            },
+            }],
             backend_config: Some(BackendConfig {
                 backend_type: "s3".to_string(),
                 attributes: HashMap::from([
@@ -3139,7 +3131,8 @@ mod tests {
         assert_eq!(deserialized.source_path, "example.crn");
         assert_eq!(deserialized.state_lineage, Some("test-lineage".to_string()));
         assert_eq!(deserialized.state_serial, Some(1));
-        assert_eq!(deserialized.provider_config.name, "aws");
+        assert_eq!(deserialized.provider_configs.len(), 1);
+        assert_eq!(deserialized.provider_configs[0].name, "aws");
         assert!(deserialized.backend_config.is_some());
         assert_eq!(deserialized.plan.effects().len(), 2);
         assert_eq!(deserialized.sorted_resources.len(), 1);

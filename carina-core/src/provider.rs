@@ -152,6 +152,123 @@ pub trait Provider: Send + Sync {
     }
 }
 
+/// A provider that routes operations to the correct sub-provider
+/// based on the resource's provider name (`ResourceId.provider`).
+pub struct ProviderRouter {
+    providers: HashMap<String, Box<dyn Provider>>,
+}
+
+impl Default for ProviderRouter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ProviderRouter {
+    pub fn new() -> Self {
+        Self {
+            providers: HashMap::new(),
+        }
+    }
+
+    pub fn add_provider(&mut self, name: String, provider: Box<dyn Provider>) {
+        self.providers.insert(name, provider);
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.providers.is_empty()
+    }
+
+    fn get_provider_or_error(&self, provider_name: &str) -> ProviderResult<&dyn Provider> {
+        self.providers
+            .get(provider_name)
+            .map(|p| p.as_ref())
+            .ok_or_else(|| ProviderError::new(format!("Unknown provider: {}", provider_name)))
+    }
+}
+
+impl Provider for ProviderRouter {
+    fn name(&self) -> &'static str {
+        "router"
+    }
+
+    fn resource_types(&self) -> Vec<Box<dyn ResourceType>> {
+        self.providers
+            .values()
+            .flat_map(|p| p.resource_types())
+            .collect()
+    }
+
+    fn read(
+        &self,
+        id: &ResourceId,
+        identifier: Option<&str>,
+    ) -> BoxFuture<'_, ProviderResult<State>> {
+        let id = id.clone();
+        let identifier = identifier.map(|s| s.to_string());
+        Box::pin(async move {
+            let provider = self.get_provider_or_error(&id.provider)?;
+            provider.read(&id, identifier.as_deref()).await
+        })
+    }
+
+    fn create(&self, resource: &Resource) -> BoxFuture<'_, ProviderResult<State>> {
+        let resource = resource.clone();
+        Box::pin(async move {
+            let provider = self.get_provider_or_error(&resource.id.provider)?;
+            provider.create(&resource).await
+        })
+    }
+
+    fn update(
+        &self,
+        id: &ResourceId,
+        identifier: &str,
+        from: &State,
+        to: &Resource,
+    ) -> BoxFuture<'_, ProviderResult<State>> {
+        let id = id.clone();
+        let identifier = identifier.to_string();
+        let from = from.clone();
+        let to = to.clone();
+        Box::pin(async move {
+            let provider = self.get_provider_or_error(&id.provider)?;
+            provider.update(&id, &identifier, &from, &to).await
+        })
+    }
+
+    fn delete(
+        &self,
+        id: &ResourceId,
+        identifier: &str,
+        lifecycle: &LifecycleConfig,
+    ) -> BoxFuture<'_, ProviderResult<()>> {
+        let id = id.clone();
+        let identifier = identifier.to_string();
+        let lifecycle = lifecycle.clone();
+        Box::pin(async move {
+            let provider = self.get_provider_or_error(&id.provider)?;
+            provider.delete(&id, &identifier, &lifecycle).await
+        })
+    }
+
+    fn resolve_enum_identifiers(&self, resources: &mut [Resource]) {
+        for provider in self.providers.values() {
+            provider.resolve_enum_identifiers(resources);
+        }
+    }
+
+    fn restore_unreturned_attrs(
+        &self,
+        current_states: &mut HashMap<ResourceId, State>,
+        saved_attrs: &HashMap<ResourceId, HashMap<String, Value>>,
+    ) {
+        for provider in self.providers.values() {
+            provider.restore_unreturned_attrs(current_states, saved_attrs);
+        }
+    }
+}
+
 /// Factory for creating and configuring a Provider.
 ///
 /// Each provider crate implements this trait to encapsulate provider-specific
@@ -367,5 +484,40 @@ mod tests {
         let state = provider.create(&resource).await.unwrap();
         assert!(state.exists);
         assert_eq!(state.identifier, Some("mock-id-123".to_string()));
+    }
+
+    #[tokio::test]
+    async fn provider_router_dispatches_read_by_provider_name() {
+        let mut router = ProviderRouter::new();
+        router.add_provider("mock".to_string(), Box::new(MockProvider));
+
+        let id = ResourceId::with_provider("mock", "test", "example");
+        let state = router.read(&id, None).await.unwrap();
+        assert!(!state.exists);
+    }
+
+    #[tokio::test]
+    async fn provider_router_dispatches_create_by_provider_name() {
+        let mut router = ProviderRouter::new();
+        router.add_provider("mock".to_string(), Box::new(MockProvider));
+
+        let resource = Resource::with_provider("mock", "test", "example");
+        let state = router.create(&resource).await.unwrap();
+        assert!(state.exists);
+        assert_eq!(state.identifier, Some("mock-id-123".to_string()));
+    }
+
+    #[tokio::test]
+    async fn provider_router_returns_error_for_unknown_provider() {
+        let router = ProviderRouter::new();
+        let id = ResourceId::with_provider("nonexistent", "test", "example");
+        let result = router.read(&id, None).await;
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .message
+                .contains("Unknown provider: nonexistent")
+        );
     }
 }
