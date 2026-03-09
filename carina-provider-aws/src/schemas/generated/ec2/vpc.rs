@@ -4,16 +4,16 @@
 //!
 //! DO NOT EDIT MANUALLY - regenerate with smithy-codegen
 
+#![allow(dead_code)]
+
 use super::AwsSchemaConfig;
 use super::tags_type;
 use super::validate_namespaced_enum;
 use carina_core::resource::Value;
 use carina_core::schema::{AttributeSchema, AttributeType, CompletionValue, ResourceSchema, types};
 
-#[allow(dead_code)]
 const VALID_INSTANCE_TENANCY: &[&str] = &["dedicated", "default", "host"];
 
-#[allow(dead_code)]
 fn validate_instance_tenancy(value: &Value) -> Result<(), String> {
     validate_namespaced_enum(
         value,

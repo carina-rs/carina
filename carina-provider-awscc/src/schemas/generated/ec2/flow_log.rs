@@ -4,6 +4,8 @@
 //!
 //! DO NOT EDIT MANUALLY - regenerate with carina-codegen
 
+#![allow(dead_code)]
+
 use super::AwsccSchemaConfig;
 use super::tags_type;
 use super::validate_namespaced_enum;
@@ -12,10 +14,8 @@ use carina_core::schema::{
     AttributeSchema, AttributeType, CompletionValue, ResourceSchema, StructField,
 };
 
-#[allow(dead_code)]
 const VALID_LOG_DESTINATION_TYPE: &[&str] = &["cloud-watch-logs", "s3", "kinesis-data-firehose"];
 
-#[allow(dead_code)]
 fn validate_log_destination_type(value: &Value) -> Result<(), String> {
     validate_namespaced_enum(
         value,
@@ -32,7 +32,6 @@ fn validate_log_destination_type(value: &Value) -> Result<(), String> {
     })
 }
 
-#[allow(dead_code)]
 const VALID_RESOURCE_TYPE: &[&str] = &[
     "NetworkInterface",
     "Subnet",
@@ -42,7 +41,6 @@ const VALID_RESOURCE_TYPE: &[&str] = &[
     "RegionalNatGateway",
 ];
 
-#[allow(dead_code)]
 fn validate_resource_type(value: &Value) -> Result<(), String> {
     validate_namespaced_enum(
         value,
@@ -59,10 +57,8 @@ fn validate_resource_type(value: &Value) -> Result<(), String> {
     })
 }
 
-#[allow(dead_code)]
 const VALID_TRAFFIC_TYPE: &[&str] = &["ACCEPT", "ALL", "REJECT"];
 
-#[allow(dead_code)]
 fn validate_traffic_type(value: &Value) -> Result<(), String> {
     validate_namespaced_enum(
         value,

@@ -4,16 +4,16 @@
 //!
 //! DO NOT EDIT MANUALLY - regenerate with carina-codegen
 
+#![allow(dead_code)]
+
 use super::AwsccSchemaConfig;
 use super::tags_type;
 use super::validate_namespaced_enum;
 use carina_core::resource::Value;
 use carina_core::schema::{AttributeSchema, AttributeType, CompletionValue, ResourceSchema};
 
-#[allow(dead_code)]
 const VALID_LOG_GROUP_CLASS: &[&str] = &["STANDARD", "INFREQUENT_ACCESS", "DELIVERY"];
 
-#[allow(dead_code)]
 fn validate_log_group_class(value: &Value) -> Result<(), String> {
     validate_namespaced_enum(
         value,

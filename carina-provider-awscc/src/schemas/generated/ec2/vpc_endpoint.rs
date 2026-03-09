@@ -4,6 +4,8 @@
 //!
 //! DO NOT EDIT MANUALLY - regenerate with carina-codegen
 
+#![allow(dead_code)]
+
 use super::AwsccSchemaConfig;
 use super::tags_type;
 use super::validate_namespaced_enum;
@@ -12,7 +14,6 @@ use carina_core::schema::{
     AttributeSchema, AttributeType, CompletionValue, ResourceSchema, StructField,
 };
 
-#[allow(dead_code)]
 const VALID_DNS_RECORD_IP_TYPE: &[&str] = &[
     "ipv4",
     "ipv6",
@@ -21,7 +22,6 @@ const VALID_DNS_RECORD_IP_TYPE: &[&str] = &[
     "not-specified",
 ];
 
-#[allow(dead_code)]
 fn validate_dns_record_ip_type(value: &Value) -> Result<(), String> {
     validate_namespaced_enum(
         value,
@@ -38,10 +38,8 @@ fn validate_dns_record_ip_type(value: &Value) -> Result<(), String> {
     })
 }
 
-#[allow(dead_code)]
 const VALID_IP_ADDRESS_TYPE: &[&str] = &["ipv4", "ipv6", "dualstack", "not-specified"];
 
-#[allow(dead_code)]
 fn validate_ip_address_type(value: &Value) -> Result<(), String> {
     validate_namespaced_enum(
         value,
@@ -58,11 +56,9 @@ fn validate_ip_address_type(value: &Value) -> Result<(), String> {
     })
 }
 
-#[allow(dead_code)]
 const VALID_PRIVATE_DNS_ONLY_FOR_INBOUND_RESOLVER_ENDPOINT: &[&str] =
     &["OnlyInboundResolver", "AllResolvers", "NotSpecified"];
 
-#[allow(dead_code)]
 fn validate_private_dns_only_for_inbound_resolver_endpoint(value: &Value) -> Result<(), String> {
     validate_namespaced_enum(
         value,
@@ -82,7 +78,6 @@ fn validate_private_dns_only_for_inbound_resolver_endpoint(value: &Value) -> Res
     })
 }
 
-#[allow(dead_code)]
 const VALID_PRIVATE_DNS_PREFERENCE: &[&str] = &[
     "VERIFIED_DOMAINS_ONLY",
     "ALL_DOMAINS",
@@ -90,7 +85,6 @@ const VALID_PRIVATE_DNS_PREFERENCE: &[&str] = &[
     "SPECIFIED_DOMAINS_ONLY",
 ];
 
-#[allow(dead_code)]
 fn validate_private_dns_preference(value: &Value) -> Result<(), String> {
     validate_namespaced_enum(
         value,
@@ -107,7 +101,6 @@ fn validate_private_dns_preference(value: &Value) -> Result<(), String> {
     })
 }
 
-#[allow(dead_code)]
 const VALID_VPC_ENDPOINT_TYPE: &[&str] = &[
     "Interface",
     "Gateway",
@@ -116,7 +109,6 @@ const VALID_VPC_ENDPOINT_TYPE: &[&str] = &[
     "Resource",
 ];
 
-#[allow(dead_code)]
 fn validate_vpc_endpoint_type(value: &Value) -> Result<(), String> {
     validate_namespaced_enum(
         value,

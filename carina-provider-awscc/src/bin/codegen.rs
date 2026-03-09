@@ -932,6 +932,8 @@ fn generate_schema_code(schema: &CfnSchema, type_name: &str) -> Result<String> {
 //!
 //! DO NOT EDIT MANUALLY - regenerate with carina-codegen
 
+#![allow(dead_code)]
+
 use carina_core::schema::{{{}}};
 use super::AwsccSchemaConfig;
 "#,
@@ -968,14 +970,13 @@ use super::AwsccSchemaConfig;
         }
         let values_str = all_values.join(", ");
         code.push_str(&format!(
-            "#[allow(dead_code)]\nconst {}: &[&str] = &[{}];\n\n",
+            "const {}: &[&str] = &[{}];\n\n",
             const_name, values_str
         ));
 
         // Generate validation function
         code.push_str(&format!(
-            r#"#[allow(dead_code)]
-fn {}(value: &Value) -> Result<(), String> {{
+            r#"fn {}(value: &Value) -> Result<(), String> {{
     validate_namespaced_enum(value, "{}", "{}", {})
         .map_err(|reason| {{
             if let Value::String(s) = value {{

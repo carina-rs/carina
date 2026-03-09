@@ -4,16 +4,16 @@
 //!
 //! DO NOT EDIT MANUALLY - regenerate with carina-codegen
 
+#![allow(dead_code)]
+
 use super::AwsccSchemaConfig;
 use super::tags_type;
 use super::validate_namespaced_enum;
 use carina_core::resource::Value;
 use carina_core::schema::{AttributeSchema, AttributeType, CompletionValue, ResourceSchema, types};
 
-#[allow(dead_code)]
 const VALID_DOMAIN: &[&str] = &["vpc", "standard"];
 
-#[allow(dead_code)]
 fn validate_domain(value: &Value) -> Result<(), String> {
     validate_namespaced_enum(value, "Domain", "awscc.ec2.eip", VALID_DOMAIN).map_err(|reason| {
         if let Value::String(s) = value {

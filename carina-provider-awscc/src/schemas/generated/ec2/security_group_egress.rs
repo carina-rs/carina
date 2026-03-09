@@ -4,15 +4,15 @@
 //!
 //! DO NOT EDIT MANUALLY - regenerate with carina-codegen
 
+#![allow(dead_code)]
+
 use super::AwsccSchemaConfig;
 use super::validate_namespaced_enum;
 use carina_core::resource::Value;
 use carina_core::schema::{AttributeSchema, AttributeType, CompletionValue, ResourceSchema, types};
 
-#[allow(dead_code)]
 const VALID_IP_PROTOCOL: &[&str] = &["tcp", "udp", "icmp", "icmpv6", "-1", "all"];
 
-#[allow(dead_code)]
 fn validate_ip_protocol(value: &Value) -> Result<(), String> {
     validate_namespaced_enum(
         value,

@@ -4,16 +4,16 @@
 //!
 //! DO NOT EDIT MANUALLY - regenerate with smithy-codegen
 
+#![allow(dead_code)]
+
 use super::AwsSchemaConfig;
 use super::tags_type;
 use super::validate_namespaced_enum;
 use carina_core::resource::Value;
 use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField, types};
 
-#[allow(dead_code)]
 const VALID_HOSTNAME_TYPE: &[&str] = &["ip-name", "resource-name"];
 
-#[allow(dead_code)]
 fn validate_hostname_type(value: &Value) -> Result<(), String> {
     validate_namespaced_enum(value, "HostnameType", "aws.ec2.subnet", VALID_HOSTNAME_TYPE).map_err(
         |reason| {
