@@ -162,6 +162,21 @@ Directory-based modules (e.g., `modules/web_tier/`) require special handling:
 
 ## Git Workflow
 
+### Worktree-Based Development
+
+Always create a git worktree before starting a new task. This isolates work from the current branch and avoids conflicts:
+
+```bash
+git worktree add ../<worktree-dir> -b <branch-name> main
+```
+
+After the PR is merged, clean up the worktree:
+```bash
+git worktree remove ../<worktree-dir>
+```
+
+### Branch Cleanup
+
 After merging a PR, clean up branches:
 ```bash
 git checkout main
