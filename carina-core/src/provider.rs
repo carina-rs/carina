@@ -152,19 +152,19 @@ pub trait Provider: Send + Sync {
     }
 }
 
-/// A provider that dispatches operations to the correct sub-provider
+/// A provider that routes operations to the correct sub-provider
 /// based on the resource's provider name (`ResourceId.provider`).
-pub struct MultiProvider {
+pub struct ProviderRouter {
     providers: HashMap<String, Box<dyn Provider>>,
 }
 
-impl Default for MultiProvider {
+impl Default for ProviderRouter {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl MultiProvider {
+impl ProviderRouter {
     pub fn new() -> Self {
         Self {
             providers: HashMap::new(),
@@ -187,9 +187,9 @@ impl MultiProvider {
     }
 }
 
-impl Provider for MultiProvider {
+impl Provider for ProviderRouter {
     fn name(&self) -> &'static str {
-        "multi"
+        "router"
     }
 
     fn resource_types(&self) -> Vec<Box<dyn ResourceType>> {
@@ -487,31 +487,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn multi_provider_dispatches_read_by_provider_name() {
-        let mut multi = MultiProvider::new();
-        multi.add_provider("mock".to_string(), Box::new(MockProvider));
+    async fn provider_router_dispatches_read_by_provider_name() {
+        let mut router = ProviderRouter::new();
+        router.add_provider("mock".to_string(), Box::new(MockProvider));
 
         let id = ResourceId::with_provider("mock", "test", "example");
-        let state = multi.read(&id, None).await.unwrap();
+        let state = router.read(&id, None).await.unwrap();
         assert!(!state.exists);
     }
 
     #[tokio::test]
-    async fn multi_provider_dispatches_create_by_provider_name() {
-        let mut multi = MultiProvider::new();
-        multi.add_provider("mock".to_string(), Box::new(MockProvider));
+    async fn provider_router_dispatches_create_by_provider_name() {
+        let mut router = ProviderRouter::new();
+        router.add_provider("mock".to_string(), Box::new(MockProvider));
 
         let resource = Resource::with_provider("mock", "test", "example");
-        let state = multi.create(&resource).await.unwrap();
+        let state = router.create(&resource).await.unwrap();
         assert!(state.exists);
         assert_eq!(state.identifier, Some("mock-id-123".to_string()));
     }
 
     #[tokio::test]
-    async fn multi_provider_returns_error_for_unknown_provider() {
-        let multi = MultiProvider::new();
+    async fn provider_router_returns_error_for_unknown_provider() {
+        let router = ProviderRouter::new();
         let id = ResourceId::with_provider("nonexistent", "test", "example");
-        let result = multi.read(&id, None).await;
+        let result = router.read(&id, None).await;
         assert!(result.is_err());
         assert!(
             result

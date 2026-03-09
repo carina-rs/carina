@@ -9,7 +9,7 @@ use carina_core::identifier::{self, PrefixStateInfo};
 use carina_core::module_resolver;
 use carina_core::parser::{ParsedFile, ProviderConfig};
 use carina_core::plan::Plan;
-use carina_core::provider::{self as provider_mod, MultiProvider, Provider, ProviderFactory};
+use carina_core::provider::{self as provider_mod, Provider, ProviderFactory, ProviderRouter};
 use carina_core::resolver::resolve_refs_with_state;
 use carina_core::resource::{Resource, ResourceId, State};
 use carina_core::schema::{ResourceSchema, resolve_block_names};
@@ -131,7 +131,7 @@ pub fn validate_module_calls(parsed: &ParsedFile, base_dir: &Path) -> Result<(),
 
 pub async fn get_provider(parsed: &ParsedFile) -> Box<dyn Provider> {
     let factories = provider_factories();
-    let mut multi = MultiProvider::new();
+    let mut router = ProviderRouter::new();
 
     for provider_config in &parsed.providers {
         if let Some(factory) = provider_mod::find_factory(&factories, &provider_config.name) {
@@ -141,22 +141,22 @@ pub async fn get_provider(parsed: &ParsedFile) -> Box<dyn Provider> {
                 format!("Using {} (region: {})", factory.display_name(), region).cyan()
             );
             let provider = factory.create_provider(&provider_config.attributes).await;
-            multi.add_provider(provider_config.name.clone(), provider);
+            router.add_provider(provider_config.name.clone(), provider);
         }
     }
 
-    if multi.is_empty() {
+    if router.is_empty() {
         // Use mock provider for other cases
         println!("{}", "Using mock provider".cyan());
         Box::new(MockProvider::new())
     } else {
-        Box::new(multi)
+        Box::new(router)
     }
 }
 
 pub async fn create_providers_from_configs(configs: &[ProviderConfig]) -> Box<dyn Provider> {
     let factories = provider_factories();
-    let mut multi = MultiProvider::new();
+    let mut router = ProviderRouter::new();
 
     for config in configs {
         if let Some(factory) = provider_mod::find_factory(&factories, &config.name) {
@@ -166,15 +166,15 @@ pub async fn create_providers_from_configs(configs: &[ProviderConfig]) -> Box<dy
                 format!("Using {} (region: {})", factory.display_name(), region).cyan()
             );
             let provider = factory.create_provider(&config.attributes).await;
-            multi.add_provider(config.name.clone(), provider);
+            router.add_provider(config.name.clone(), provider);
         }
     }
 
-    if multi.is_empty() {
+    if router.is_empty() {
         println!("{}", "Using mock provider".cyan());
         Box::new(MockProvider::new())
     } else {
-        Box::new(multi)
+        Box::new(router)
     }
 }
 
