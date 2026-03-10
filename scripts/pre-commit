@@ -5,104 +5,160 @@
 # Environment variables:
 #   SKIP_CLIPPY=1  - Skip clippy check (useful for WIP commits)
 
-set -e
-
-echo "Running pre-commit checks..."
-
-# Determine which crates have staged changes
 changed_crates=()
-staged_files=$(git diff --cached --name-only --diff-filter=ACMR)
+fmt_scope=()
+clippy_scope=()
+check_mode=""
 
-if [ -z "$staged_files" ]; then
-    echo "No staged files, skipping checks."
-    exit 0
-fi
+path_requires_workspace_rust_checks() {
+    case "$1" in
+        Cargo.toml | Cargo.lock | rust-toolchain | rust-toolchain.toml | rustfmt.toml | clippy.toml)
+            return 0
+            ;;
+        .cargo/* | scripts/pre-commit | scripts/setup-hooks.sh)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
 
-for crate_dir in carina-*/; do
-    crate_name="${crate_dir%/}"
-    if echo "$staged_files" | grep -q "^${crate_name}/"; then
-        changed_crates+=("-p" "$crate_name")
-    fi
-done
+collect_changed_crates() {
+    local staged_files="$1"
+    local crate_name
 
-# Also check for top-level files (Cargo.toml, etc.)
-has_root_changes=$(echo "$staged_files" | grep -v "^carina-" || true)
+    changed_crates=()
+    for crate_dir in carina-*/; do
+        crate_name="${crate_dir%/}"
+        if echo "$staged_files" | grep -q "^${crate_name}/"; then
+            changed_crates+=("-p" "$crate_name")
+        fi
+    done
+}
 
-# If only non-crate files changed (e.g., scripts, docs), run on all crates
-if [ ${#changed_crates[@]} -eq 0 ] && [ -n "$has_root_changes" ]; then
-    fmt_scope="--all"
-    clippy_scope="--all-targets --all-features"
-elif [ ${#changed_crates[@]} -eq 0 ]; then
-    echo "No Rust crate changes detected, skipping checks."
-    exit 0
-else
-    fmt_scope="${changed_crates[*]}"
-    clippy_scope="${changed_crates[*]} --all-targets --all-features"
-fi
+has_workspace_rust_changes() {
+    local staged_files="$1"
+    local staged_file
 
-# Ensure incremental compilation for faster checks
-export CARGO_INCREMENTAL=1
+    while IFS= read -r staged_file; do
+        [ -z "$staged_file" ] && continue
+        if path_requires_workspace_rust_checks "$staged_file"; then
+            return 0
+        fi
+    done <<<"$staged_files"
 
-# Run fmt and clippy in parallel
-fmt_log=$(mktemp)
-clippy_log=$(mktemp)
-trap 'rm -f "$fmt_log" "$clippy_log"' EXIT
+    return 1
+}
 
-fmt_start=$(date +%s)
-if [ "$fmt_scope" = "--all" ]; then
-    cargo fmt --all -- --check >"$fmt_log" 2>&1 &
-else
-    cargo fmt ${fmt_scope} -- --check >"$fmt_log" 2>&1 &
-fi
-fmt_pid=$!
+set_check_scopes() {
+    local staged_files="$1"
 
-if [ "${SKIP_CLIPPY:-0}" = "1" ]; then
-    echo "Skipping clippy (SKIP_CLIPPY=1)"
-    clippy_pid=""
-else
-    clippy_start=$(date +%s)
-    if [ "$fmt_scope" = "--all" ]; then
-        cargo clippy --all-targets --all-features --no-deps -- -D warnings >"$clippy_log" 2>&1 &
+    collect_changed_crates "$staged_files"
+
+    if has_workspace_rust_changes "$staged_files"; then
+        check_mode="workspace"
+        fmt_scope=(--all)
+        clippy_scope=(--all-targets --all-features)
+    elif [ ${#changed_crates[@]} -gt 0 ]; then
+        check_mode="crate"
+        fmt_scope=("${changed_crates[@]}")
+        clippy_scope=("${changed_crates[@]}" --all-targets --all-features)
     else
-        cargo clippy ${clippy_scope} --no-deps -- -D warnings >"$clippy_log" 2>&1 &
+        check_mode="skip"
+        fmt_scope=()
+        clippy_scope=()
     fi
-    clippy_pid=$!
-fi
+}
 
-# Wait for both and collect exit codes
-fmt_exit=0
-clippy_exit=0
-wait $fmt_pid || fmt_exit=$?
-fmt_end=$(date +%s)
-fmt_elapsed=$((fmt_end - fmt_start))
+main() {
+    local staged_files
+    local fmt_log
+    local clippy_log
+    local fmt_start
+    local fmt_pid
+    local clippy_start
+    local clippy_pid
+    local fmt_exit
+    local clippy_exit
+    local fmt_end
+    local fmt_elapsed
+    local clippy_end
+    local clippy_elapsed
 
-if [ -n "$clippy_pid" ]; then
-    wait $clippy_pid || clippy_exit=$?
-    clippy_end=$(date +%s)
-    clippy_elapsed=$((clippy_end - clippy_start))
-fi
+    set -e
 
-# Report results
-if [ $fmt_exit -ne 0 ]; then
-    echo "Formatting check FAILED (${fmt_elapsed}s):"
-    cat "$fmt_log"
-    echo ""
-else
-    echo "Formatting check passed (${fmt_elapsed}s)"
-fi
+    echo "Running pre-commit checks..."
 
-if [ -n "$clippy_pid" ]; then
-    if [ $clippy_exit -ne 0 ]; then
-        echo "Clippy check FAILED (${clippy_elapsed}s):"
-        cat "$clippy_log"
+    staged_files=$(git diff --cached --name-only --diff-filter=ACMR)
+    if [ -z "$staged_files" ]; then
+        echo "No staged files, skipping checks."
+        exit 0
+    fi
+
+    set_check_scopes "$staged_files"
+    if [ "$check_mode" = "skip" ]; then
+        echo "No Rust-affecting changes detected, skipping checks."
+        exit 0
+    fi
+
+    # Ensure incremental compilation for faster checks.
+    export CARGO_INCREMENTAL=1
+
+    fmt_log=$(mktemp)
+    clippy_log=$(mktemp)
+    trap 'rm -f "$fmt_log" "$clippy_log"' EXIT
+
+    fmt_start=$(date +%s)
+    cargo fmt "${fmt_scope[@]}" -- --check >"$fmt_log" 2>&1 &
+    fmt_pid=$!
+
+    if [ "${SKIP_CLIPPY:-0}" = "1" ]; then
+        echo "Skipping clippy (SKIP_CLIPPY=1)"
+        clippy_pid=""
+    else
+        clippy_start=$(date +%s)
+        cargo clippy "${clippy_scope[@]}" --no-deps -- -D warnings >"$clippy_log" 2>&1 &
+        clippy_pid=$!
+    fi
+
+    fmt_exit=0
+    clippy_exit=0
+    wait $fmt_pid || fmt_exit=$?
+    fmt_end=$(date +%s)
+    fmt_elapsed=$((fmt_end - fmt_start))
+
+    if [ -n "$clippy_pid" ]; then
+        wait $clippy_pid || clippy_exit=$?
+        clippy_end=$(date +%s)
+        clippy_elapsed=$((clippy_end - clippy_start))
+    fi
+
+    if [ $fmt_exit -ne 0 ]; then
+        echo "Formatting check FAILED (${fmt_elapsed}s):"
+        cat "$fmt_log"
         echo ""
     else
-        echo "Clippy check passed (${clippy_elapsed}s)"
+        echo "Formatting check passed (${fmt_elapsed}s)"
     fi
-fi
 
-if [ $fmt_exit -ne 0 ] || [ $clippy_exit -ne 0 ]; then
-    exit 1
-fi
+    if [ -n "$clippy_pid" ]; then
+        if [ $clippy_exit -ne 0 ]; then
+            echo "Clippy check FAILED (${clippy_elapsed}s):"
+            cat "$clippy_log"
+            echo ""
+        else
+            echo "Clippy check passed (${clippy_elapsed}s)"
+        fi
+    fi
 
-echo "All pre-commit checks passed!"
+    if [ $fmt_exit -ne 0 ] || [ $clippy_exit -ne 0 ]; then
+        exit 1
+    fi
+
+    echo "All pre-commit checks passed!"
+}
+
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+    main "$@"
+fi
