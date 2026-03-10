@@ -160,12 +160,24 @@ struct CfnProperty {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[allow(dead_code)]
+struct CfnOneOfVariant {
+    properties: Option<BTreeMap<String, CfnProperty>>,
+    #[serde(default)]
+    required: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
 struct CfnDefinition {
     #[serde(rename = "type")]
     def_type: Option<String>,
     properties: Option<BTreeMap<String, CfnProperty>>,
     #[serde(default)]
     required: Vec<String>,
+    /// oneOf variants (union types)
+    #[serde(default, rename = "oneOf")]
+    one_of: Vec<CfnOneOfVariant>,
 }
 
 /// Compute module name from CloudFormation type name
@@ -394,6 +406,12 @@ fn type_display_string(
                 .unwrap_or(false)
         {
             format!("[Struct({})](#{})", def_name, def_name.to_lowercase())
+        } else if let Some(def_name) = ref_def_name(ref_path)
+            && resolve_ref(schema, ref_path)
+                .map(|d| !d.one_of.is_empty())
+                .unwrap_or(false)
+        {
+            format!("[Struct({})](#{})", def_name, def_name.to_lowercase())
         } else {
             // Apply name-based heuristics for unresolvable $ref
             infer_string_type_display(prop_name, &schema.type_name)
@@ -602,60 +620,12 @@ fn generate_markdown(schema: &CfnSchema, type_name: &str) -> Result<String> {
             for (field_name, field_prop) in &def_info.properties {
                 let snake_name = field_name.to_snake_case();
                 let is_req = required_set.contains(field_name.as_str());
-                let field_type_display: String = if overrides.contains_key(field_name.as_str()) {
+                let field_type_display: String = if overrides.contains_key(field_name.as_str())
+                    || field_prop.enum_values.is_some()
+                {
                     "Enum".to_string()
                 } else {
-                    match field_prop.prop_type.as_ref().and_then(|t| t.as_str()) {
-                        Some("string") => {
-                            if field_name.ends_with("PolicyDocument") {
-                                "IamPolicyDocument".to_string()
-                            } else {
-                                infer_string_type_display(field_name, &schema.type_name)
-                            }
-                        }
-                        Some("boolean") => "Bool".to_string(),
-                        Some("integer") => {
-                            let range = if let (Some(min), Some(max)) =
-                                (field_prop.minimum, field_prop.maximum)
-                            {
-                                Some((min, max))
-                            } else {
-                                known_int_range_overrides()
-                                    .get(field_name.as_str())
-                                    .copied()
-                            };
-                            if let Some((min, max)) = range {
-                                format!("Int({}..={})", min, max)
-                            } else {
-                                "Int".to_string()
-                            }
-                        }
-                        Some("number") => {
-                            let range = if let (Some(min), Some(max)) =
-                                (field_prop.minimum, field_prop.maximum)
-                            {
-                                Some((min, max))
-                            } else {
-                                known_int_range_overrides()
-                                    .get(field_name.as_str())
-                                    .copied()
-                            };
-                            if let Some((min, max)) = range {
-                                format!("Float({}..={})", min, max)
-                            } else {
-                                "Float".to_string()
-                            }
-                        }
-                        Some("array") => {
-                            if let Some(items) = &field_prop.items {
-                                list_element_type_display(items, field_name, &schema.type_name)
-                            } else {
-                                "`List<String>`".to_string()
-                            }
-                        }
-                        Some("object") => "Map".to_string(),
-                        _ => infer_string_type_display(field_name, &schema.type_name),
-                    }
+                    type_display_string(field_name, field_prop, schema, &enums)
                 };
                 let desc = collapse_whitespace(
                     &field_prop
@@ -717,16 +687,41 @@ fn collect_struct_defs(
         && !ref_path.contains("/Tag")
         && let Some(def_name) = ref_def_name(ref_path)
         && let Some(def) = resolve_ref(schema, ref_path)
-        && let Some(props) = &def.properties
-        && !props.is_empty()
     {
-        struct_defs
-            .entry(def_name.to_string())
-            .or_insert_with(|| StructDefInfo {
-                def_name: def_name.to_string(),
-                properties: props.clone(),
-                required: def.required.clone(),
-            });
+        if let Some(props) = &def.properties
+            && !props.is_empty()
+        {
+            struct_defs
+                .entry(def_name.to_string())
+                .or_insert_with(|| StructDefInfo {
+                    def_name: def_name.to_string(),
+                    properties: props.clone(),
+                    required: def.required.clone(),
+                });
+        } else if !def.one_of.is_empty() {
+            // Merge oneOf variant properties into a single struct
+            let mut merged_props = BTreeMap::new();
+            for variant in &def.one_of {
+                if let Some(props) = &variant.properties {
+                    for (k, v) in props {
+                        merged_props.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+            if !merged_props.is_empty() {
+                // Recursively collect struct defs from merged properties
+                for (field_name, field_prop) in &merged_props {
+                    collect_struct_defs(field_prop, field_name, schema, struct_defs);
+                }
+                struct_defs
+                    .entry(def_name.to_string())
+                    .or_insert_with(|| StructDefInfo {
+                        def_name: def_name.to_string(),
+                        properties: merged_props,
+                        required: vec![], // oneOf variants are mutually exclusive
+                    });
+            }
+        }
     }
     // Handle array items with $ref
     if let Some(items) = &prop.items
@@ -953,9 +948,7 @@ use super::AwsccSchemaConfig;
     //
     // Constants are always emitted (referenced by enum_valid_values()).
     // Validation functions are only emitted if the enum is used as a top-level property
-    // or in a struct that actually gets expanded. Enums from struct definitions whose
-    // parent struct isn't expanded (e.g., due to unsupported oneOf) would produce
-    // unused validation functions.
+    // or in a struct that actually gets expanded.
     let aliases = known_enum_aliases();
     let top_level_props: HashSet<&String> = schema.properties.keys().collect();
     // Collect enum names that are used in expanded struct fields
@@ -1472,17 +1465,28 @@ fn collect_reachable_enum_fields(
             if !visited.insert(def_name.to_string()) {
                 return; // avoid cycles
             }
-            if let Some(def) = schema.definitions.as_ref().and_then(|d| d.get(def_name))
-                && let Some(props) = &def.properties
-                && !props.is_empty()
-            {
-                // This struct will be expanded - check its fields
-                for (field_name, field_prop) in props {
-                    if enums.contains_key(field_name) {
-                        used.insert(field_name.clone());
+            if let Some(def) = schema.definitions.as_ref().and_then(|d| d.get(def_name)) {
+                if let Some(props) = &def.properties
+                    && !props.is_empty()
+                {
+                    // This struct will be expanded - check its fields
+                    for (field_name, field_prop) in props {
+                        if enums.contains_key(field_name) {
+                            used.insert(field_name.clone());
+                        }
+                        collect_reachable_enum_fields(field_prop, schema, enums, used, visited);
                     }
-                    // Recurse into nested $ref fields
-                    collect_reachable_enum_fields(field_prop, schema, enums, used, visited);
+                }
+                // Also follow oneOf variants
+                for variant in &def.one_of {
+                    if let Some(props) = &variant.properties {
+                        for (field_name, field_prop) in props {
+                            if enums.contains_key(field_name) {
+                                used.insert(field_name.clone());
+                            }
+                            collect_reachable_enum_fields(field_prop, schema, enums, used, visited);
+                        }
+                    }
                 }
             }
         }
@@ -1906,15 +1910,42 @@ fn cfn_type_to_carina_type_with_enum(
             return ("tags_type()".to_string(), None);
         }
         // Try to resolve the $ref to a definition and generate Struct type
-        if let Some(def) = resolve_ref(schema, ref_path)
-            && let Some(props) = &def.properties
-            && !props.is_empty()
-        {
-            let def_name = ref_def_name(ref_path).unwrap_or(prop_name);
-            return (
-                generate_struct_type(def_name, props, &def.required, schema, namespace, enums),
-                None,
-            );
+        if let Some(def) = resolve_ref(schema, ref_path) {
+            if let Some(props) = &def.properties
+                && !props.is_empty()
+            {
+                let def_name = ref_def_name(ref_path).unwrap_or(prop_name);
+                return (
+                    generate_struct_type(def_name, props, &def.required, schema, namespace, enums),
+                    None,
+                );
+            }
+            // Handle oneOf: merge all variant properties into a single struct
+            if !def.one_of.is_empty() {
+                let mut merged_props = BTreeMap::new();
+                // oneOf variants are mutually exclusive, so no field is required
+                for variant in &def.one_of {
+                    if let Some(props) = &variant.properties {
+                        for (k, v) in props {
+                            merged_props.insert(k.clone(), v.clone());
+                        }
+                    }
+                }
+                if !merged_props.is_empty() {
+                    let def_name = ref_def_name(ref_path).unwrap_or(prop_name);
+                    return (
+                        generate_struct_type(
+                            def_name,
+                            &merged_props,
+                            &[], // no required fields - variants are mutually exclusive
+                            schema,
+                            namespace,
+                            enums,
+                        ),
+                        None,
+                    );
+                }
+            }
         }
         // Apply name-based heuristics for unresolvable $ref
         if let Some(inferred) = infer_string_type(prop_name, &schema.type_name) {
