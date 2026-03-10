@@ -25,6 +25,7 @@
 
 - For review requests, prioritize correctness risks in state persistence, locking, provider error handling, and apply/destroy recovery paths.
 - When creating a GitHub issue or PR, search existing issues/PRs first to avoid duplicates.
+- Write all GitHub issues and pull requests in English, including titles and bodies.
 - Prefer `gh issue create --body-file <file>` or `gh pr create --body-file <file>` over inline multi-line shell quoting.
 
 ## High-Risk Areas
