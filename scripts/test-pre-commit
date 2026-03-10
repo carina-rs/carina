@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/pre-commit"
+
+assert_equals() {
+    local expected="$1"
+    local actual="$2"
+    local message="$3"
+
+    if [ "$expected" != "$actual" ]; then
+        echo "Assertion failed: $message"
+        echo "Expected: $expected"
+        echo "Actual:   $actual"
+        exit 1
+    fi
+}
+
+assert_array_equals() {
+    local expected="$1"
+    shift
+
+    local actual="$*"
+    if [ "$expected" != "$actual" ]; then
+        echo "Assertion failed: unexpected scope arguments"
+        echo "Expected: $expected"
+        echo "Actual:   $actual"
+        exit 1
+    fi
+}
+
+assert_scope() {
+    local staged_files="$1"
+    local expected_mode="$2"
+    local expected_fmt="$3"
+    local expected_clippy="$4"
+
+    set_check_scopes "$staged_files"
+
+    assert_equals "$expected_mode" "$check_mode" "unexpected check mode for staged files: $staged_files"
+    assert_array_equals "$expected_fmt" "${fmt_scope[@]-}"
+    assert_array_equals "$expected_clippy" "${clippy_scope[@]-}"
+}
+
+assert_scope $'README.md\nAGENTS.md\ndocs/book.toml' "skip" "" ""
+assert_scope "Cargo.toml" "workspace" "--all" "--all-targets --all-features"
+assert_scope "scripts/pre-commit" "workspace" "--all" "--all-targets --all-features"
+assert_scope "carina-cli/src/main.rs" "crate" "-p carina-cli" "-p carina-cli --all-targets --all-features"
+assert_scope $'carina-cli/src/main.rs\ncarina-state/src/lib.rs' "crate" "-p carina-cli -p carina-state" "-p carina-cli -p carina-state --all-targets --all-features"
+assert_scope $'README.md\nCargo.lock' "workspace" "--all" "--all-targets --all-features"
+
+echo "pre-commit scope tests passed"
