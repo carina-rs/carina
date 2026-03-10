@@ -304,7 +304,9 @@ impl StateBackend for S3Backend {
             Ok(_) => Ok(true),
             Err(err) => {
                 if err.as_service_error().is_some_and(is_head_bucket_not_found)
-                    || err.raw_response().is_some_and(|r| r.status().as_u16() == 404)
+                    || err
+                        .raw_response()
+                        .is_some_and(|r| r.status().as_u16() == 404)
                 {
                     Ok(false)
                 } else {
