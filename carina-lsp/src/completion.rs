@@ -99,8 +99,10 @@ impl CompletionProvider {
             }
         }
 
-        // Check if we're typing after "ref("
-        if prefix.ends_with("ref(") || prefix.contains("ref(") && !prefix.contains(')') {
+        // Check if we're typing after an unclosed "ref(" on this line.
+        if let Some(ref_pos) = prefix.rfind("ref(")
+            && !prefix[ref_pos..].contains(')')
+        {
             return CompletionContext::AfterRefType;
         }
 
@@ -1579,6 +1581,24 @@ simple {
                 } if resource_type == "awscc.ec2.security_group" && attr_path == &["security_group_ingress".to_string()]
             ),
             "Should detect InsideStructBlock context, got: {:?}",
+            context
+        );
+    }
+
+    #[test]
+    fn context_detection_uses_last_ref_on_line() {
+        let provider = test_provider();
+        let text = r#"value = ref(aws.ec2.vpc) other = ref("#;
+        let context = provider.get_completion_context(
+            text,
+            Position {
+                line: 0,
+                character: text.len() as u32,
+            },
+        );
+        assert!(
+            matches!(context, CompletionContext::AfterRefType),
+            "Should detect AfterRefType for the last unclosed ref(), got: {:?}",
             context
         );
     }
