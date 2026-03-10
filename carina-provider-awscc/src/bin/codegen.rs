@@ -406,6 +406,12 @@ fn type_display_string(
                 .unwrap_or(false)
         {
             format!("[Struct({})](#{})", def_name, def_name.to_lowercase())
+        } else if let Some(def_name) = ref_def_name(ref_path)
+            && resolve_ref(schema, ref_path)
+                .map(|d| !d.one_of.is_empty())
+                .unwrap_or(false)
+        {
+            format!("[Struct({})](#{})", def_name, def_name.to_lowercase())
         } else {
             // Apply name-based heuristics for unresolvable $ref
             infer_string_type_display(prop_name, &schema.type_name)
@@ -614,60 +620,12 @@ fn generate_markdown(schema: &CfnSchema, type_name: &str) -> Result<String> {
             for (field_name, field_prop) in &def_info.properties {
                 let snake_name = field_name.to_snake_case();
                 let is_req = required_set.contains(field_name.as_str());
-                let field_type_display: String = if overrides.contains_key(field_name.as_str()) {
+                let field_type_display: String = if overrides.contains_key(field_name.as_str())
+                    || field_prop.enum_values.is_some()
+                {
                     "Enum".to_string()
                 } else {
-                    match field_prop.prop_type.as_ref().and_then(|t| t.as_str()) {
-                        Some("string") => {
-                            if field_name.ends_with("PolicyDocument") {
-                                "IamPolicyDocument".to_string()
-                            } else {
-                                infer_string_type_display(field_name, &schema.type_name)
-                            }
-                        }
-                        Some("boolean") => "Bool".to_string(),
-                        Some("integer") => {
-                            let range = if let (Some(min), Some(max)) =
-                                (field_prop.minimum, field_prop.maximum)
-                            {
-                                Some((min, max))
-                            } else {
-                                known_int_range_overrides()
-                                    .get(field_name.as_str())
-                                    .copied()
-                            };
-                            if let Some((min, max)) = range {
-                                format!("Int({}..={})", min, max)
-                            } else {
-                                "Int".to_string()
-                            }
-                        }
-                        Some("number") => {
-                            let range = if let (Some(min), Some(max)) =
-                                (field_prop.minimum, field_prop.maximum)
-                            {
-                                Some((min, max))
-                            } else {
-                                known_int_range_overrides()
-                                    .get(field_name.as_str())
-                                    .copied()
-                            };
-                            if let Some((min, max)) = range {
-                                format!("Float({}..={})", min, max)
-                            } else {
-                                "Float".to_string()
-                            }
-                        }
-                        Some("array") => {
-                            if let Some(items) = &field_prop.items {
-                                list_element_type_display(items, field_name, &schema.type_name)
-                            } else {
-                                "`List<String>`".to_string()
-                            }
-                        }
-                        Some("object") => "Map".to_string(),
-                        _ => infer_string_type_display(field_name, &schema.type_name),
-                    }
+                    type_display_string(field_name, field_prop, schema, &enums)
                 };
                 let desc = collapse_whitespace(
                     &field_prop
@@ -729,16 +687,41 @@ fn collect_struct_defs(
         && !ref_path.contains("/Tag")
         && let Some(def_name) = ref_def_name(ref_path)
         && let Some(def) = resolve_ref(schema, ref_path)
-        && let Some(props) = &def.properties
-        && !props.is_empty()
     {
-        struct_defs
-            .entry(def_name.to_string())
-            .or_insert_with(|| StructDefInfo {
-                def_name: def_name.to_string(),
-                properties: props.clone(),
-                required: def.required.clone(),
-            });
+        if let Some(props) = &def.properties
+            && !props.is_empty()
+        {
+            struct_defs
+                .entry(def_name.to_string())
+                .or_insert_with(|| StructDefInfo {
+                    def_name: def_name.to_string(),
+                    properties: props.clone(),
+                    required: def.required.clone(),
+                });
+        } else if !def.one_of.is_empty() {
+            // Merge oneOf variant properties into a single struct
+            let mut merged_props = BTreeMap::new();
+            for variant in &def.one_of {
+                if let Some(props) = &variant.properties {
+                    for (k, v) in props {
+                        merged_props.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+            if !merged_props.is_empty() {
+                // Recursively collect struct defs from merged properties
+                for (field_name, field_prop) in &merged_props {
+                    collect_struct_defs(field_prop, field_name, schema, struct_defs);
+                }
+                struct_defs
+                    .entry(def_name.to_string())
+                    .or_insert_with(|| StructDefInfo {
+                        def_name: def_name.to_string(),
+                        properties: merged_props,
+                        required: vec![], // oneOf variants are mutually exclusive
+                    });
+            }
+        }
     }
     // Handle array items with $ref
     if let Some(items) = &prop.items

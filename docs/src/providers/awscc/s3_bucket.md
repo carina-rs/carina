@@ -201,7 +201,7 @@ Shorthand formats: `AuthenticatedRead` or `AccessControl.AuthenticatedRead`
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `acceleration_status` | String | Yes | Specifies the transfer acceleration status of the bucket. |
+| `acceleration_status` | Enum | Yes | Specifies the transfer acceleration status of the bucket. |
 
 ### AnalyticsConfiguration
 
@@ -209,20 +209,20 @@ Shorthand formats: `AuthenticatedRead` or `AccessControl.AuthenticatedRead`
 |-------|------|----------|-------------|
 | `id` | String | Yes | The ID that identifies the analytics configuration. |
 | `prefix` | String | No | The prefix that an object must have to be included in the analytics results. |
-| `storage_class_analysis` | String | Yes | Contains data related to access patterns to be collected and made available to analyze the tradeoffs... |
-| `tag_filters` | `List<String>` | No | The tags to use when evaluating an analytics filter. The analytics only includes objects that meet t... |
+| `storage_class_analysis` | [Struct(StorageClassAnalysis)](#storageclassanalysis) | Yes | Contains data related to access patterns to be collected and made available to analyze the tradeoffs... |
+| `tag_filters` | `List<Map>` | No | The tags to use when evaluating an analytics filter. The analytics only includes objects that meet t... |
 
 ### BucketEncryption
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `server_side_encryption_configuration` | `List<String>` | Yes | Specifies the default server-side-encryption configuration. |
+| `server_side_encryption_configuration` | [List\<ServerSideEncryptionRule\>](#serversideencryptionrule) | Yes | Specifies the default server-side-encryption configuration. |
 
 ### CorsConfiguration
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `cors_rules` | `List<String>` | Yes | A set of origins and methods (cross-origin access that you want to allow). You can add up to 100 rul... |
+| `cors_rules` | [List\<CorsRule\>](#corsrule) | Yes | A set of origins and methods (cross-origin access that you want to allow). You can add up to 100 rul... |
 
 ### IntelligentTieringConfiguration
 
@@ -230,28 +230,28 @@ Shorthand formats: `AuthenticatedRead` or `AccessControl.AuthenticatedRead`
 |-------|------|----------|-------------|
 | `id` | String | Yes | The ID used to identify the S3 Intelligent-Tiering configuration. |
 | `prefix` | String | No | An object key name prefix that identifies the subset of objects to which the rule applies. |
-| `status` | String | Yes | Specifies the status of the configuration. |
-| `tag_filters` | `List<String>` | No | A container for a key-value pair. |
-| `tierings` | `List<String>` | Yes | Specifies a list of S3 Intelligent-Tiering storage class tiers in the configuration. At least one ti... |
+| `status` | Enum | Yes | Specifies the status of the configuration. |
+| `tag_filters` | `List<Map>` | No | A container for a key-value pair. |
+| `tierings` | [List\<Tiering\>](#tiering) | Yes | Specifies a list of S3 Intelligent-Tiering storage class tiers in the configuration. At least one ti... |
 
 ### InventoryConfiguration
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `destination` | String | Yes | Contains information about where to publish the inventory results. |
+| `destination` | [Struct(Destination)](#destination) | Yes | Contains information about where to publish the inventory results. |
 | `enabled` | Bool | Yes | Specifies whether the inventory is enabled or disabled. If set to ``True``, an inventory list is gen... |
 | `id` | String | Yes | The ID used to identify the inventory configuration. |
-| `included_object_versions` | String | Yes | Object versions to include in the inventory list. If set to ``All``, the list includes all the objec... |
+| `included_object_versions` | Enum | Yes | Object versions to include in the inventory list. If set to ``All``, the list includes all the objec... |
 | `optional_fields` | `List<String>` | No | Contains the optional fields that are included in the inventory results. |
 | `prefix` | String | No | Specifies the inventory filter prefix. |
-| `schedule_frequency` | String | Yes | Specifies the schedule for generating inventory results. |
+| `schedule_frequency` | Enum | Yes | Specifies the schedule for generating inventory results. |
 
 ### LifecycleConfiguration
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `rules` | `List<String>` | Yes | A lifecycle rule for individual objects in an Amazon S3 bucket. |
-| `transition_default_minimum_object_size` | String | No | Indicates which default minimum object size behavior is applied to the lifecycle configuration. This... |
+| `rules` | [List\<Rule\>](#rule) | Yes | A lifecycle rule for individual objects in an Amazon S3 bucket. |
+| `transition_default_minimum_object_size` | Enum | No | Indicates which default minimum object size behavior is applied to the lifecycle configuration. This... |
 
 ### LoggingConfiguration
 
@@ -259,21 +259,21 @@ Shorthand formats: `AuthenticatedRead` or `AccessControl.AuthenticatedRead`
 |-------|------|----------|-------------|
 | `destination_bucket_name` | String | No | The name of the bucket where Amazon S3 should store server access log files. You can store log files... |
 | `log_file_prefix` | String | No | A prefix for all log object keys. If you store log files from multiple Amazon S3 buckets in a single... |
-| `target_object_key_format` | String | No | Amazon S3 key format for log objects. Only one format, either PartitionedPrefix or SimplePrefix, is ... |
+| `target_object_key_format` | [Struct(TargetObjectKeyFormat)](#targetobjectkeyformat) | No | Amazon S3 key format for log objects. Only one format, either PartitionedPrefix or SimplePrefix, is ... |
 
 ### MetadataConfiguration
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `destination` | String | No | The destination information for the S3 Metadata configuration. |
-| `inventory_table_configuration` | String | No | The inventory table configuration for a metadata configuration. |
-| `journal_table_configuration` | String | Yes | The journal table configuration for a metadata configuration. |
+| `destination` | [Struct(MetadataDestination)](#metadatadestination) | No | The destination information for the S3 Metadata configuration. |
+| `inventory_table_configuration` | [Struct(InventoryTableConfiguration)](#inventorytableconfiguration) | No | The inventory table configuration for a metadata configuration. |
+| `journal_table_configuration` | [Struct(JournalTableConfiguration)](#journaltableconfiguration) | Yes | The journal table configuration for a metadata configuration. |
 
 ### MetadataTableConfiguration
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `s3_tables_destination` | String | Yes | The destination information for the metadata table configuration. The destination table bucket must ... |
+| `s3_tables_destination` | [Struct(S3TablesDestination)](#s3tablesdestination) | Yes | The destination information for the metadata table configuration. The destination table bucket must ... |
 
 ### MetricsConfiguration
 
@@ -282,29 +282,29 @@ Shorthand formats: `AuthenticatedRead` or `AccessControl.AuthenticatedRead`
 | `access_point_arn` | Arn | No | The access point that was used while performing operations on the object. The metrics configuration ... |
 | `id` | String | Yes | The ID used to identify the metrics configuration. This can be any value you choose that helps you i... |
 | `prefix` | String | No | The prefix that an object must have to be included in the metrics results. |
-| `tag_filters` | `List<String>` | No | Specifies a list of tag filters to use as a metrics configuration filter. The metrics configuration ... |
+| `tag_filters` | `List<Map>` | No | Specifies a list of tag filters to use as a metrics configuration filter. The metrics configuration ... |
 
 ### NotificationConfiguration
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `event_bridge_configuration` | String | No | Enables delivery of events to Amazon EventBridge. |
-| `lambda_configurations` | `List<String>` | No | Describes the LAMlong functions to invoke and the events for which to invoke them. |
-| `queue_configurations` | `List<String>` | No | The Amazon Simple Queue Service queues to publish messages to and the events for which to publish me... |
-| `topic_configurations` | `List<String>` | No | The topic to which notifications are sent and the events for which notifications are generated. |
+| `event_bridge_configuration` | [Struct(EventBridgeConfiguration)](#eventbridgeconfiguration) | No | Enables delivery of events to Amazon EventBridge. |
+| `lambda_configurations` | [List\<LambdaConfiguration\>](#lambdaconfiguration) | No | Describes the LAMlong functions to invoke and the events for which to invoke them. |
+| `queue_configurations` | [List\<QueueConfiguration\>](#queueconfiguration) | No | The Amazon Simple Queue Service queues to publish messages to and the events for which to publish me... |
+| `topic_configurations` | [List\<TopicConfiguration\>](#topicconfiguration) | No | The topic to which notifications are sent and the events for which notifications are generated. |
 
 ### ObjectLockConfiguration
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `object_lock_enabled` | String | No | Indicates whether this bucket has an Object Lock configuration enabled. Enable ``ObjectLockEnabled``... |
-| `rule` | String | No | Specifies the Object Lock rule for the specified object. Enable this rule when you apply ``ObjectLoc... |
+| `rule` | [Struct(ObjectLockRule)](#objectlockrule) | No | Specifies the Object Lock rule for the specified object. Enable this rule when you apply ``ObjectLoc... |
 
 ### OwnershipControls
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `rules` | `List<String>` | Yes | Specifies the container element for Object Ownership rules. |
+| `rules` | [List\<OwnershipControlsRule\>](#ownershipcontrolsrule) | Yes | Specifies the container element for Object Ownership rules. |
 
 ### PublicAccessBlockConfiguration
 
@@ -320,13 +320,13 @@ Shorthand formats: `AuthenticatedRead` or `AccessControl.AuthenticatedRead`
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `role` | String | Yes | The Amazon Resource Name (ARN) of the IAMlong (IAM) role that Amazon S3 assumes when replicating obj... |
-| `rules` | `List<String>` | Yes | A container for one or more replication rules. A replication configuration must have at least one ru... |
+| `rules` | [List\<ReplicationRule\>](#replicationrule) | Yes | A container for one or more replication rules. A replication configuration must have at least one ru... |
 
 ### VersioningConfiguration
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `status` | String | Yes | The versioning state of the bucket. |
+| `status` | Enum | Yes | The versioning state of the bucket. |
 
 ### WebsiteConfiguration
 
@@ -334,8 +334,8 @@ Shorthand formats: `AuthenticatedRead` or `AccessControl.AuthenticatedRead`
 |-------|------|----------|-------------|
 | `error_document` | String | No | The name of the error document for the website. |
 | `index_document` | String | No | The name of the index document for the website. |
-| `redirect_all_requests_to` | String | No | The redirect behavior for every request to this bucket's website endpoint. If you specify this prope... |
-| `routing_rules` | `List<String>` | No | Rules that define when a redirect is applied and the redirect behavior. |
+| `redirect_all_requests_to` | [Struct(RedirectAllRequestsTo)](#redirectallrequeststo) | No | The redirect behavior for every request to this bucket's website endpoint. If you specify this prope... |
+| `routing_rules` | [List\<RoutingRule\>](#routingrule) | No | Rules that define when a redirect is applied and the redirect behavior. |
 
 ## Attribute Reference
 
