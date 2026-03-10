@@ -303,11 +303,7 @@ impl StateBackend for S3Backend {
         match result {
             Ok(_) => Ok(true),
             Err(err) => {
-                if err.as_service_error().is_some_and(is_head_bucket_not_found)
-                    || err
-                        .raw_response()
-                        .is_some_and(|r| r.status().as_u16() == 404)
-                {
+                if is_missing_head_bucket_response(&err) {
                     Ok(false)
                 } else {
                     Err(BackendError::Aws(err.to_string()))
@@ -409,10 +405,16 @@ fn is_head_bucket_not_found(err: &HeadBucketError) -> bool {
     err.is_not_found()
 }
 
+fn is_missing_head_bucket_response<R>(
+    err: &aws_sdk_s3::error::SdkError<HeadBucketError, R>,
+) -> bool {
+    err.as_service_error().is_some_and(is_head_bucket_not_found)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aws_sdk_s3::error::ErrorMetadata;
+    use aws_sdk_s3::error::{ErrorMetadata, SdkError};
 
     #[test]
     fn test_convert_region_value() {
@@ -462,5 +464,20 @@ mod tests {
     fn test_is_head_bucket_not_found_rejects_other_service_errors() {
         let err = HeadBucketError::generic(ErrorMetadata::builder().code("AccessDenied").build());
         assert!(!is_head_bucket_not_found(&err));
+    }
+
+    #[test]
+    fn test_is_missing_head_bucket_response_for_not_found_service_error() {
+        let err = SdkError::service_error(
+            HeadBucketError::NotFound(aws_sdk_s3::types::error::NotFound::builder().build()),
+            (),
+        );
+        assert!(is_missing_head_bucket_response(&err));
+    }
+
+    #[test]
+    fn test_is_missing_head_bucket_response_rejects_non_service_404s() {
+        let err = SdkError::response_error("not found response", ());
+        assert!(!is_missing_head_bucket_response(&err));
     }
 }
