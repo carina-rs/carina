@@ -375,7 +375,6 @@ pub(crate) fn gateway_id() -> AttributeType {
 }
 
 /// Egress Only Internet Gateway ID type (e.g., "eigw-12345678")
-#[allow(dead_code)] // TODO: codegen should use this instead of internet_gateway_id() for eigw attributes
 pub(crate) fn egress_only_internet_gateway_id() -> AttributeType {
     AttributeType::Custom {
         name: "EgressOnlyInternetGatewayId".to_string(),
