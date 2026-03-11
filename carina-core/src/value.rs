@@ -5,7 +5,12 @@ use std::collections::HashMap;
 use crate::resource::Value;
 use crate::utils::is_dsl_enum_format;
 
-/// Convert `Value` to `serde_json::Value`
+/// Convert `Value` to `serde_json::Value`.
+///
+/// # Panics
+///
+/// Panics if `value` contains a non-finite float because JSON cannot represent
+/// `NaN` or infinity.
 pub fn value_to_json(value: &Value) -> serde_json::Value {
     match value {
         Value::String(s) => serde_json::Value::String(s.clone()),
