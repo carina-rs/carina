@@ -17,9 +17,11 @@ use serde_json::json;
 use carina_core::schema::{AttributeType, StructField};
 
 use crate::schemas::generated::{
-    AwsccSchemaConfig, canonicalize_enum_value, get_enum_alias_reverse, get_enum_valid_values,
+    AwsccSchemaConfig, canonicalize_enum_value, get_enum_alias_reverse,
 };
 use carina_core::utils::convert_enum_value;
+
+type NamespacedEnumParts<'a> = (&'a str, &'a str, Option<fn(&str) -> String>);
 
 /// Get the AwsccSchemaConfig for a resource type
 fn get_schema_config(resource_type: &str) -> Option<AwsccSchemaConfig> {
@@ -63,25 +65,25 @@ pub struct AwsccProvider {
 
 /// Convert AWS value to DSL value
 fn aws_value_to_dsl(
-    dsl_name: &str,
+    _dsl_name: &str,
     value: &serde_json::Value,
     attr_type: &AttributeType,
     resource_type: &str,
 ) -> Option<Value> {
-    // For Custom enum types with namespace, convert to DSL namespaced format
-    if let AttributeType::Custom {
-        name: type_name,
-        namespace: Some(ns),
-        to_dsl,
-        ..
-    } = attr_type
+    // For schema-level string enums with namespace, convert to DSL namespaced format.
+    if let Some((type_name, ns, to_dsl)) = namespaced_enum_parts(attr_type)
         && let Some(s) = value.as_str()
     {
-        // Canonicalize case using valid values registry
-        let canonical = if let Some(valid_values) = get_enum_valid_values(resource_type, dsl_name) {
-            canonicalize_enum_value(s, valid_values)
+        let canonical = if let Some((_, values, _, _)) = attr_type.string_enum_parts() {
+            let valid_values: Vec<&str> = values.iter().map(String::as_str).collect();
+            canonicalize_enum_value(s, &valid_values)
         } else {
-            s.to_string()
+            use crate::schemas::generated::get_enum_valid_values;
+            if let Some(valid_values) = get_enum_valid_values(resource_type, _dsl_name) {
+                canonicalize_enum_value(s, valid_values)
+            } else {
+                s.to_string()
+            }
         };
         // Apply to_dsl transformation if present (e.g., hyphens → underscores for AZs)
         let dsl_val = to_dsl.map_or_else(|| canonical.clone(), |f| f(&canonical));
@@ -182,8 +184,8 @@ fn dsl_value_to_aws(
     resource_type: &str,
     attr_name: &str,
 ) -> Option<serde_json::Value> {
-    // For Custom (enum) types, convert enum values
-    if matches!(attr_type, AttributeType::Custom { .. }) {
+    // For schema-level string enums, convert namespaced DSL values back to provider values.
+    if namespaced_enum_parts(attr_type).is_some() {
         match value {
             Value::String(s) => {
                 let raw = convert_enum_value(s);
@@ -1127,12 +1129,7 @@ pub fn resolve_enum_identifiers_impl(resources: &mut [Resource]) {
         let mut resolved_attrs = HashMap::new();
         for (key, value) in &resource.attributes {
             if let Some(attr_schema) = config.schema.attributes.get(key.as_str())
-                && let AttributeType::Custom {
-                    name: type_name,
-                    namespace: Some(ns),
-                    to_dsl,
-                    ..
-                } = &attr_schema.attr_type
+                && let Some((type_name, ns, to_dsl)) = namespaced_enum_parts(&attr_schema.attr_type)
             {
                 let resolved = match value {
                     Value::UnresolvedIdent(ident, None) => {
@@ -1156,7 +1153,7 @@ pub fn resolve_enum_identifiers_impl(resources: &mut [Resource]) {
                 continue;
             }
 
-            // Handle struct fields containing Custom enum types
+            // Handle struct fields containing schema-level string enums.
             if let Some(attr_schema) = config.schema.attributes.get(key.as_str()) {
                 let struct_fields = match &attr_schema.attr_type {
                     AttributeType::List(inner) => {
@@ -1185,7 +1182,7 @@ pub fn resolve_enum_identifiers_impl(resources: &mut [Resource]) {
 
 /// Resolve enum identifiers within struct field values.
 /// Recurses into List and Map values, resolving UnresolvedIdent values
-/// for struct fields that have Custom type with namespace.
+/// for struct fields that have StringEnum type with namespace.
 fn resolve_struct_enum_values(value: &Value, fields: &[StructField]) -> Value {
     match value {
         Value::List(items) => {
@@ -1199,12 +1196,7 @@ fn resolve_struct_enum_values(value: &Value, fields: &[StructField]) -> Value {
             let mut resolved_map = HashMap::new();
             for (field_key, field_value) in map {
                 if let Some(field) = fields.iter().find(|f| f.name == *field_key)
-                    && let AttributeType::Custom {
-                        name: type_name,
-                        namespace: Some(ns),
-                        to_dsl,
-                        ..
-                    } = &field.field_type
+                    && let Some((type_name, ns, to_dsl)) = namespaced_enum_parts(&field.field_type)
                 {
                     let resolved = match field_value {
                         Value::UnresolvedIdent(ident, None) => {
@@ -1229,6 +1221,24 @@ fn resolve_struct_enum_values(value: &Value, fields: &[StructField]) -> Value {
             Value::Map(resolved_map)
         }
         _ => value.clone(),
+    }
+}
+
+fn namespaced_enum_parts(attr_type: &AttributeType) -> Option<NamespacedEnumParts<'_>> {
+    match attr_type {
+        AttributeType::StringEnum {
+            name,
+            namespace: Some(ns),
+            to_dsl,
+            ..
+        }
+        | AttributeType::Custom {
+            name,
+            namespace: Some(ns),
+            to_dsl,
+            ..
+        } => Some((name, ns, *to_dsl)),
+        _ => None,
     }
 }
 
