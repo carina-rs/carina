@@ -2699,6 +2699,13 @@ mod tests {
     fn generate_resource_uses_string_enum_for_namespaced_enums() {
         let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../carina-provider-aws/tests/fixtures/smithy/s3.json");
+        if !fixture.exists() {
+            eprintln!(
+                "Skipping: Smithy fixture not found: {}\nRun scripts/download-smithy-models.sh to enable this test",
+                fixture.display()
+            );
+            return;
+        }
         let file = std::fs::File::open(&fixture).expect("failed to open Smithy fixture");
         let model = carina_smithy::parse_reader(std::io::BufReader::new(file))
             .expect("failed to parse Smithy fixture");
