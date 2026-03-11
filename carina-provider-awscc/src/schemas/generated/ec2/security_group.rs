@@ -6,27 +6,10 @@
 
 use super::AwsccSchemaConfig;
 use super::tags_type;
-use super::validate_namespaced_enum;
 use carina_core::resource::Value;
 use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField, types};
 
 const VALID_IP_PROTOCOL: &[&str] = &["tcp", "udp", "icmp", "icmpv6", "-1", "all"];
-
-fn validate_ip_protocol(value: &Value) -> Result<(), String> {
-    validate_namespaced_enum(
-        value,
-        "IpProtocol",
-        "awscc.ec2.security_group",
-        VALID_IP_PROTOCOL,
-    )
-    .map_err(|reason| {
-        if let Value::String(s) = value {
-            format!("Invalid IpProtocol '{}': {}", s, reason)
-        } else {
-            reason
-        }
-    })
-}
 
 fn validate_from_port_range(value: &Value) -> Result<(), String> {
     if let Value::Int(n) = value {
@@ -99,10 +82,9 @@ pub fn ec2_security_group_config() -> AwsccSchemaConfig {
                 namespace: None,
                 to_dsl: None,
             }).with_provider_name("FromPort"),
-                    StructField::new("ip_protocol", AttributeType::Custom {
+                    StructField::new("ip_protocol", AttributeType::StringEnum {
                 name: "IpProtocol".to_string(),
-                base: Box::new(AttributeType::String),
-                validate: validate_ip_protocol,
+                values: vec!["tcp".to_string(), "udp".to_string(), "icmp".to_string(), "icmpv6".to_string(), "-1".to_string()],
                 namespace: Some("awscc.ec2.security_group".to_string()),
                 to_dsl: Some(|s: &str| match s { "-1" => "all".to_string(), _ => s.replace('-', "_") }),
             }).required().with_provider_name("IpProtocol"),
@@ -132,10 +114,9 @@ pub fn ec2_security_group_config() -> AwsccSchemaConfig {
                 namespace: None,
                 to_dsl: None,
             }).with_provider_name("FromPort"),
-                    StructField::new("ip_protocol", AttributeType::Custom {
+                    StructField::new("ip_protocol", AttributeType::StringEnum {
                 name: "IpProtocol".to_string(),
-                base: Box::new(AttributeType::String),
-                validate: validate_ip_protocol,
+                values: vec!["tcp".to_string(), "udp".to_string(), "icmp".to_string(), "icmpv6".to_string(), "-1".to_string()],
                 namespace: Some("awscc.ec2.security_group".to_string()),
                 to_dsl: Some(|s: &str| match s { "-1" => "all".to_string(), _ => s.replace('-', "_") }),
             }).required().with_provider_name("IpProtocol"),

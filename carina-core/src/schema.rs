@@ -17,6 +17,7 @@ pub type StringEnumParts<'a> = (
     Option<&'a str>,
     Option<fn(&str) -> String>,
 );
+pub type NamespacedEnumParts<'a> = (&'a str, &'a str, Option<fn(&str) -> String>);
 
 /// A field within a Struct type
 #[derive(Debug, Clone)]
@@ -143,6 +144,24 @@ impl AttributeType {
         }
     }
 
+    pub fn namespaced_enum_parts(&self) -> Option<NamespacedEnumParts<'_>> {
+        match self {
+            AttributeType::StringEnum {
+                name,
+                namespace: Some(namespace),
+                to_dsl,
+                ..
+            }
+            | AttributeType::Custom {
+                name,
+                namespace: Some(namespace),
+                to_dsl,
+                ..
+            } => Some((name, namespace, *to_dsl)),
+            _ => None,
+        }
+    }
+
     /// Check if a value conforms to this type
     pub fn validate(&self, value: &Value) -> Result<(), TypeError> {
         match (self, value) {
@@ -155,10 +174,7 @@ impl AttributeType {
 
             (AttributeType::Enum(variants), Value::String(s)) => {
                 let variant = extract_enum_value(s);
-                if variants
-                    .iter()
-                    .any(|v| enum_value_matches(variant, v) || enum_value_matches(s, v))
-                {
+                if variants.iter().any(|v| v == variant || s == v) {
                     Ok(())
                 } else {
                     Err(TypeError::InvalidEnumVariant {
@@ -191,7 +207,7 @@ impl AttributeType {
                     }
 
                     let variant = extract_enum_value(s);
-                    if values.iter().any(|v| enum_value_matches(variant, v)) {
+                    if values.iter().any(|v| string_enum_value_matches(variant, v)) {
                         Ok(())
                     } else {
                         Err(TypeError::InvalidEnumVariant {
@@ -347,7 +363,7 @@ impl fmt::Display for AttributeType {
     }
 }
 
-fn enum_value_matches(input: &str, expected: &str) -> bool {
+fn string_enum_value_matches(input: &str, expected: &str) -> bool {
     input == expected
         || input.eq_ignore_ascii_case(expected)
         || input.replace('_', "-").eq_ignore_ascii_case(expected)
@@ -1073,6 +1089,13 @@ mod tests {
         assert!(t.validate(&Value::String("a".to_string())).is_ok());
         assert!(t.validate(&Value::String("Type.a".to_string())).is_ok());
         assert!(t.validate(&Value::String("c".to_string())).is_err());
+    }
+
+    #[test]
+    fn validate_enum_type_remains_case_sensitive() {
+        let t = AttributeType::Enum(vec!["Enabled".to_string()]);
+        assert!(t.validate(&Value::String("Enabled".to_string())).is_ok());
+        assert!(t.validate(&Value::String("enabled".to_string())).is_err());
     }
 
     #[test]

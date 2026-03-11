@@ -6,47 +6,11 @@
 
 use super::AwsccSchemaConfig;
 use super::tags_type;
-use super::validate_namespaced_enum;
-use carina_core::resource::Value;
-use carina_core::schema::{
-    AttributeSchema, AttributeType, CompletionValue, ResourceSchema, StructField, types,
-};
+use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField, types};
 
 const VALID_AVAILABILITY_MODE: &[&str] = &["zonal", "regional"];
 
-fn validate_availability_mode(value: &Value) -> Result<(), String> {
-    validate_namespaced_enum(
-        value,
-        "AvailabilityMode",
-        "awscc.ec2.nat_gateway",
-        VALID_AVAILABILITY_MODE,
-    )
-    .map_err(|reason| {
-        if let Value::String(s) = value {
-            format!("Invalid AvailabilityMode '{}': {}", s, reason)
-        } else {
-            reason
-        }
-    })
-}
-
 const VALID_CONNECTIVITY_TYPE: &[&str] = &["public", "private"];
-
-fn validate_connectivity_type(value: &Value) -> Result<(), String> {
-    validate_namespaced_enum(
-        value,
-        "ConnectivityType",
-        "awscc.ec2.nat_gateway",
-        VALID_CONNECTIVITY_TYPE,
-    )
-    .map_err(|reason| {
-        if let Value::String(s) = value {
-            format!("Invalid ConnectivityType '{}': {}", s, reason)
-        } else {
-            reason
-        }
-    })
-}
 
 /// Returns the schema config for ec2_nat_gateway (AWS::EC2::NatGateway)
 pub fn ec2_nat_gateway_config() -> AwsccSchemaConfig {
@@ -73,17 +37,15 @@ pub fn ec2_nat_gateway_config() -> AwsccSchemaConfig {
                 .with_provider_name("AutoScalingIps"),
         )
         .attribute(
-            AttributeSchema::new("availability_mode", AttributeType::Custom {
+            AttributeSchema::new("availability_mode", AttributeType::StringEnum {
                 name: "AvailabilityMode".to_string(),
-                base: Box::new(AttributeType::String),
-                validate: validate_availability_mode,
+                values: vec!["zonal".to_string(), "regional".to_string()],
                 namespace: Some("awscc.ec2.nat_gateway".to_string()),
                 to_dsl: None,
             })
                 .create_only()
                 .with_description("Indicates whether this is a zonal (single-AZ) or regional (multi-AZ) NAT gateway. A zonal NAT gateway is a NAT Gateway that provides redundancy and sc...")
-                .with_provider_name("AvailabilityMode")
-                .with_completions(vec![CompletionValue::new("awscc.ec2.nat_gateway.AvailabilityMode.zonal", "zonal"), CompletionValue::new("awscc.ec2.nat_gateway.AvailabilityMode.regional", "regional")]),
+                .with_provider_name("AvailabilityMode"),
         )
         .attribute(
             AttributeSchema::new("availability_zone_addresses", AttributeType::List(Box::new(AttributeType::Struct {
@@ -99,17 +61,15 @@ pub fn ec2_nat_gateway_config() -> AwsccSchemaConfig {
                 .with_block_name("availability_zone_address"),
         )
         .attribute(
-            AttributeSchema::new("connectivity_type", AttributeType::Custom {
+            AttributeSchema::new("connectivity_type", AttributeType::StringEnum {
                 name: "ConnectivityType".to_string(),
-                base: Box::new(AttributeType::String),
-                validate: validate_connectivity_type,
+                values: vec!["public".to_string(), "private".to_string()],
                 namespace: Some("awscc.ec2.nat_gateway".to_string()),
                 to_dsl: None,
             })
                 .create_only()
                 .with_description("Indicates whether the NAT gateway supports public or private connectivity. The default is public connectivity.")
-                .with_provider_name("ConnectivityType")
-                .with_completions(vec![CompletionValue::new("awscc.ec2.nat_gateway.ConnectivityType.public", "public"), CompletionValue::new("awscc.ec2.nat_gateway.ConnectivityType.private", "private")]),
+                .with_provider_name("ConnectivityType"),
         )
         .attribute(
             AttributeSchema::new("eni_id", super::aws_resource_id())

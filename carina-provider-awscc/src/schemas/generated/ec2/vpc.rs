@@ -6,27 +6,10 @@
 
 use super::AwsccSchemaConfig;
 use super::tags_type;
-use super::validate_namespaced_enum;
 use carina_core::resource::Value;
-use carina_core::schema::{AttributeSchema, AttributeType, CompletionValue, ResourceSchema, types};
+use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, types};
 
 const VALID_INSTANCE_TENANCY: &[&str] = &["default", "dedicated", "host"];
-
-fn validate_instance_tenancy(value: &Value) -> Result<(), String> {
-    validate_namespaced_enum(
-        value,
-        "InstanceTenancy",
-        "awscc.ec2.vpc",
-        VALID_INSTANCE_TENANCY,
-    )
-    .map_err(|reason| {
-        if let Value::String(s) = value {
-            format!("Invalid InstanceTenancy '{}': {}", s, reason)
-        } else {
-            reason
-        }
-    })
-}
 
 fn validate_ipv4_netmask_length_range(value: &Value) -> Result<(), String> {
     if let Value::Int(n) = value {
@@ -80,16 +63,14 @@ pub fn ec2_vpc_config() -> AwsccSchemaConfig {
                 .with_provider_name("EnableDnsSupport"),
         )
         .attribute(
-            AttributeSchema::new("instance_tenancy", AttributeType::Custom {
+            AttributeSchema::new("instance_tenancy", AttributeType::StringEnum {
                 name: "InstanceTenancy".to_string(),
-                base: Box::new(AttributeType::String),
-                validate: validate_instance_tenancy,
+                values: vec!["default".to_string(), "dedicated".to_string(), "host".to_string()],
                 namespace: Some("awscc.ec2.vpc".to_string()),
                 to_dsl: None,
             })
                 .with_description("The allowed tenancy of instances launched into the VPC. + ``default``: An instance launched into the VPC runs on shared hardware by default, unless yo...")
-                .with_provider_name("InstanceTenancy")
-                .with_completions(vec![CompletionValue::new("awscc.ec2.vpc.InstanceTenancy.default", "default"), CompletionValue::new("awscc.ec2.vpc.InstanceTenancy.dedicated", "dedicated"), CompletionValue::new("awscc.ec2.vpc.InstanceTenancy.host", "host")]),
+                .with_provider_name("InstanceTenancy"),
         )
         .attribute(
             AttributeSchema::new("ipv4_ipam_pool_id", super::ipam_pool_id())

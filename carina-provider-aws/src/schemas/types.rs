@@ -65,29 +65,6 @@ pub(crate) fn canonicalize_enum_value(raw: &str, valid_values: &[&str]) -> Strin
         .to_string()
 }
 
-/// Validate a namespaced enum value.
-/// Returns Ok(()) if valid, Err with bare reason string if invalid.
-/// Callers are responsible for adding context (e.g., what value was provided).
-pub(crate) fn validate_namespaced_enum(
-    value: &Value,
-    type_name: &str,
-    namespace: &str,
-    valid_values: &[&str],
-) -> Result<(), String> {
-    if let Value::String(s) = value {
-        validate_enum_namespace(s, type_name, namespace)?;
-
-        let normalized = extract_enum_value(s);
-        if find_matching_enum_value(normalized, valid_values).is_some() {
-            Ok(())
-        } else {
-            Err(format!("expected one of: {}", valid_values.join(", ")))
-        }
-    } else {
-        Err("Expected string".to_string())
-    }
-}
-
 /// Valid AWS regions (in AWS format with hyphens)
 const VALID_REGIONS: &[&str] = &[
     "ap-northeast-1",

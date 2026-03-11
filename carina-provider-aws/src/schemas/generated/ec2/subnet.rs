@@ -6,23 +6,10 @@
 
 use super::AwsSchemaConfig;
 use super::tags_type;
-use super::validate_namespaced_enum;
 use carina_core::resource::Value;
 use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField, types};
 
 const VALID_HOSTNAME_TYPE: &[&str] = &["ip-name", "resource-name"];
-
-fn validate_hostname_type(value: &Value) -> Result<(), String> {
-    validate_namespaced_enum(value, "HostnameType", "aws.ec2.subnet", VALID_HOSTNAME_TYPE).map_err(
-        |reason| {
-            if let Value::String(s) = value {
-                format!("Invalid HostnameType '{}': {}", s, reason)
-            } else {
-                reason
-            }
-        },
-    )
-}
 
 fn validate_ipv4_netmask_length_range(value: &Value) -> Result<(), String> {
     if let Value::Int(n) = value {
@@ -155,10 +142,9 @@ pub fn ec2_subnet_config() -> AwsSchemaConfig {
                     fields: vec![
                     StructField::new("enable_resource_name_dns_aaaa_record", AttributeType::Bool).with_description("Indicates whether to respond to DNS queries for instance hostname with DNS AAAA records.").with_provider_name("EnableResourceNameDnsAAAARecord"),
                     StructField::new("enable_resource_name_dns_a_record", AttributeType::Bool).with_description("Indicates whether to respond to DNS queries for instance hostnames with DNS A records.").with_provider_name("EnableResourceNameDnsARecord"),
-                    StructField::new("hostname_type", AttributeType::Custom {
+                    StructField::new("hostname_type", AttributeType::StringEnum {
                 name: "HostnameType".to_string(),
-                base: Box::new(AttributeType::String),
-                validate: validate_hostname_type,
+                values: vec!["ip-name".to_string(), "resource-name".to_string()],
                 namespace: Some("aws.ec2.subnet".to_string()),
                 to_dsl: Some(|s: &str| s.replace('-', "_")),
             }).with_description("The type of hostname for EC2 instances. For IPv4 only subnets, an instance DNS name must be based on the instance IPv4 address. For IPv6 only subnets,...").with_provider_name("HostnameType")

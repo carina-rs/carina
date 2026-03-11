@@ -16,10 +16,7 @@ use carina_core::provider::{
     BoxFuture, Provider, ProviderError, ProviderFactory, ProviderResult, ResourceType,
 };
 use carina_core::resource::{LifecycleConfig, Resource, ResourceId, State, Value};
-use carina_core::schema::AttributeType;
 use carina_core::utils::convert_enum_value;
-
-type NamespacedEnumParts<'a> = (&'a str, &'a str, Option<fn(&str) -> String>);
 
 /// Factory for creating and configuring the AWS Provider
 pub struct AwsProviderFactory;
@@ -750,7 +747,7 @@ fn resolve_enum_identifiers_impl(resources: &mut [Resource]) {
         let mut resolved_attrs = HashMap::new();
         for (key, value) in &resource.attributes {
             if let Some(attr_schema) = config.schema.attributes.get(key.as_str())
-                && let Some((type_name, ns, to_dsl)) = namespaced_enum_parts(&attr_schema.attr_type)
+                && let Some((type_name, ns, to_dsl)) = attr_schema.attr_type.namespaced_enum_parts()
             {
                 let resolved = match value {
                     Value::UnresolvedIdent(ident, None) => {
@@ -802,7 +799,7 @@ fn normalize_state_enums(resource_type: &str, attributes: &mut HashMap<String, V
     let mut resolved = HashMap::new();
     for (key, value) in attributes.iter() {
         if let Some(attr_schema) = config.schema.attributes.get(key.as_str())
-            && let Some((type_name, ns, to_dsl)) = namespaced_enum_parts(&attr_schema.attr_type)
+            && let Some((type_name, ns, to_dsl)) = attr_schema.attr_type.namespaced_enum_parts()
             && let Value::String(s) = value
             && !s.contains('.')
         {
@@ -814,24 +811,6 @@ fn normalize_state_enums(resource_type: &str, attributes: &mut HashMap<String, V
 
     for (key, value) in resolved {
         attributes.insert(key, value);
-    }
-}
-
-fn namespaced_enum_parts(attr_type: &AttributeType) -> Option<NamespacedEnumParts<'_>> {
-    match attr_type {
-        AttributeType::StringEnum {
-            name,
-            namespace: Some(ns),
-            to_dsl,
-            ..
-        }
-        | AttributeType::Custom {
-            name,
-            namespace: Some(ns),
-            to_dsl,
-            ..
-        } => Some((name, ns, *to_dsl)),
-        _ => None,
     }
 }
 
