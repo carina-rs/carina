@@ -575,16 +575,28 @@ async fn refresh_pending_states(
     failed_refreshes
 }
 
-fn build_state_after_apply(
+struct ApplyStateSave<'a> {
     state_file: Option<StateFile>,
-    sorted_resources: &[Resource],
-    current_states: &HashMap<ResourceId, State>,
-    applied_states: &HashMap<ResourceId, State>,
-    permanent_name_overrides: &HashMap<ResourceId, HashMap<String, String>>,
-    plan: &Plan,
-    successfully_deleted: &HashSet<ResourceId>,
-    failed_refreshes: &HashSet<ResourceId>,
-) -> StateFile {
+    sorted_resources: &'a [Resource],
+    current_states: &'a HashMap<ResourceId, State>,
+    applied_states: &'a HashMap<ResourceId, State>,
+    permanent_name_overrides: &'a HashMap<ResourceId, HashMap<String, String>>,
+    plan: &'a Plan,
+    successfully_deleted: &'a HashSet<ResourceId>,
+    failed_refreshes: &'a HashSet<ResourceId>,
+}
+
+fn build_state_after_apply(save: ApplyStateSave<'_>) -> StateFile {
+    let ApplyStateSave {
+        state_file,
+        sorted_resources,
+        current_states,
+        applied_states,
+        permanent_name_overrides,
+        plan,
+        successfully_deleted,
+        failed_refreshes,
+    } = save;
     let mut state = state_file.unwrap_or_default();
 
     for resource in sorted_resources {
@@ -1377,16 +1389,16 @@ async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
     println!();
     println!("{}", "Saving state...".cyan());
 
-    let mut state = build_state_after_apply(
+    let mut state = build_state_after_apply(ApplyStateSave {
         state_file,
-        &sorted_resources,
-        &current_states,
-        &applied_states,
-        &permanent_name_overrides,
-        &plan,
-        &successfully_deleted,
-        &failed_refreshes,
-    );
+        sorted_resources: &sorted_resources,
+        current_states: &current_states,
+        applied_states: &applied_states,
+        permanent_name_overrides: &permanent_name_overrides,
+        plan: &plan,
+        successfully_deleted: &successfully_deleted,
+        failed_refreshes: &failed_refreshes,
+    });
 
     // Increment serial and save
     state.increment_serial();
@@ -2073,16 +2085,16 @@ async fn run_apply_from_plan(plan_path: &PathBuf, auto_approve: bool) -> Result<
     println!();
     println!("{}", "Saving state...".cyan());
 
-    let mut state = build_state_after_apply(
+    let mut state = build_state_after_apply(ApplyStateSave {
         state_file,
         sorted_resources,
-        &current_states,
-        &applied_states,
-        &permanent_name_overrides,
+        current_states: &current_states,
+        applied_states: &applied_states,
+        permanent_name_overrides: &permanent_name_overrides,
         plan,
-        &successfully_deleted,
-        &failed_refreshes,
-    );
+        successfully_deleted: &successfully_deleted,
+        failed_refreshes: &failed_refreshes,
+    });
 
     // Increment serial and save
     state.increment_serial();
@@ -3280,16 +3292,16 @@ mod tests {
                 .with_attribute("status", json!("before")),
         );
 
-        let saved = build_state_after_apply(
-            Some(existing_state),
-            &[resource],
-            &current_states,
-            &HashMap::new(),
-            &HashMap::new(),
-            &Plan::new(),
-            &HashSet::new(),
-            &failed_refreshes,
-        );
+        let saved = build_state_after_apply(ApplyStateSave {
+            state_file: Some(existing_state),
+            sorted_resources: &[resource],
+            current_states: &current_states,
+            applied_states: &HashMap::new(),
+            permanent_name_overrides: &HashMap::new(),
+            plan: &Plan::new(),
+            successfully_deleted: &HashSet::new(),
+            failed_refreshes: &failed_refreshes,
+        });
 
         let saved_resource = saved.find_resource("s3.bucket", "bucket").unwrap();
         assert_eq!(
@@ -3326,16 +3338,16 @@ mod tests {
                 .with_attribute("status", json!("before")),
         );
 
-        let saved = build_state_after_apply(
-            Some(existing_state),
-            &[resource],
-            &current_states,
-            &HashMap::new(),
-            &HashMap::new(),
-            &Plan::new(),
-            &HashSet::new(),
-            &failed_refreshes,
-        );
+        let saved = build_state_after_apply(ApplyStateSave {
+            state_file: Some(existing_state),
+            sorted_resources: &[resource],
+            current_states: &current_states,
+            applied_states: &HashMap::new(),
+            permanent_name_overrides: &HashMap::new(),
+            plan: &Plan::new(),
+            successfully_deleted: &HashSet::new(),
+            failed_refreshes: &failed_refreshes,
+        });
 
         assert!(saved.find_resource("s3.bucket", "bucket").is_none());
     }
@@ -3371,16 +3383,16 @@ mod tests {
                 .with_attribute("status", json!("saved")),
         );
 
-        let saved = build_state_after_apply(
-            Some(existing_state),
-            &[resource],
-            &current_states,
-            &HashMap::new(),
-            &HashMap::new(),
-            &Plan::new(),
-            &HashSet::new(),
-            &failed_refreshes,
-        );
+        let saved = build_state_after_apply(ApplyStateSave {
+            state_file: Some(existing_state),
+            sorted_resources: &[resource],
+            current_states: &current_states,
+            applied_states: &HashMap::new(),
+            permanent_name_overrides: &HashMap::new(),
+            plan: &Plan::new(),
+            successfully_deleted: &HashSet::new(),
+            failed_refreshes: &failed_refreshes,
+        });
 
         let saved_resource = saved.find_resource("s3.bucket", "bucket").unwrap();
         assert_eq!(
