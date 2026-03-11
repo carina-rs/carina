@@ -547,9 +547,9 @@ async fn refresh_pending_states(
     provider: &impl Provider,
     current_states: &mut HashMap<ResourceId, State>,
     pending_refreshes: &HashMap<ResourceId, String>,
-) {
+) -> HashSet<ResourceId> {
     if pending_refreshes.is_empty() {
-        return;
+        return HashSet::new();
     }
 
     println!();
@@ -557,6 +557,7 @@ async fn refresh_pending_states(
 
     let mut refreshes: Vec<_> = pending_refreshes.iter().collect();
     refreshes.sort_by(|(left_id, _), (right_id, _)| left_id.to_string().cmp(&right_id.to_string()));
+    let mut failed_refreshes = HashSet::new();
 
     for (id, identifier) in refreshes {
         match provider.read(id, Some(identifier)).await {
@@ -566,9 +567,12 @@ async fn refresh_pending_states(
             }
             Err(error) => {
                 println!("  {} Refresh {} - {}", "!".yellow(), id, error);
+                failed_refreshes.insert(id.clone());
             }
         }
     }
+
+    failed_refreshes
 }
 
 fn build_state_after_apply(
@@ -579,6 +583,7 @@ fn build_state_after_apply(
     permanent_name_overrides: &HashMap<ResourceId, HashMap<String, String>>,
     plan: &Plan,
     successfully_deleted: &HashSet<ResourceId>,
+    failed_refreshes: &HashSet<ResourceId>,
 ) -> StateFile {
     let mut state = state_file.unwrap_or_default();
 
@@ -591,6 +596,8 @@ fn build_state_after_apply(
                 resource_state.name_overrides = overrides.clone();
             }
             state.upsert_resource(resource_state);
+        } else if failed_refreshes.contains(&resource.id) {
+            continue;
         } else if let Some(current_state) = current_states.get(&resource.id) {
             if current_state.exists {
                 let resource_state =
@@ -1363,7 +1370,8 @@ async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
         }
     }
 
-    refresh_pending_states(&provider, &mut current_states, &pending_refreshes).await;
+    let failed_refreshes =
+        refresh_pending_states(&provider, &mut current_states, &pending_refreshes).await;
 
     // Save state
     println!();
@@ -1377,6 +1385,7 @@ async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
         &permanent_name_overrides,
         &plan,
         &successfully_deleted,
+        &failed_refreshes,
     );
 
     // Increment serial and save
@@ -2057,7 +2066,8 @@ async fn run_apply_from_plan(plan_path: &PathBuf, auto_approve: bool) -> Result<
         }
     }
 
-    refresh_pending_states(&provider, &mut current_states, &pending_refreshes).await;
+    let failed_refreshes =
+        refresh_pending_states(&provider, &mut current_states, &pending_refreshes).await;
 
     // Save state
     println!();
@@ -2071,6 +2081,7 @@ async fn run_apply_from_plan(plan_path: &PathBuf, auto_approve: bool) -> Result<
         &permanent_name_overrides,
         plan,
         &successfully_deleted,
+        &failed_refreshes,
     );
 
     // Increment serial and save
@@ -3163,14 +3174,26 @@ mod tests {
     use serde_json::json;
 
     struct TestProvider {
-        read_states: HashMap<(String, String), State>,
+        read_results: HashMap<(String, String), Result<State, String>>,
     }
 
     impl TestProvider {
         fn with_read_state(id: &ResourceId, identifier: &str, state: State) -> Self {
-            let mut read_states = HashMap::new();
-            read_states.insert((id.to_string(), identifier.to_string()), state);
-            Self { read_states }
+            Self::with_read_result(id, identifier, Ok(state))
+        }
+
+        fn with_read_error(id: &ResourceId, identifier: &str, error: impl Into<String>) -> Self {
+            Self::with_read_result(id, identifier, Err(error.into()))
+        }
+
+        fn with_read_result(
+            id: &ResourceId,
+            identifier: &str,
+            result: Result<State, String>,
+        ) -> Self {
+            let mut read_results = HashMap::new();
+            read_results.insert((id.to_string(), identifier.to_string()), result);
+            Self { read_results }
         }
     }
 
@@ -3189,12 +3212,12 @@ mod tests {
             identifier: Option<&str>,
         ) -> BoxFuture<'_, ProviderResult<State>> {
             let key = (id.to_string(), identifier.unwrap_or_default().to_string());
-            let state = self
-                .read_states
+            let result = self
+                .read_results
                 .get(&key)
                 .cloned()
                 .unwrap_or_else(|| panic!("missing read state for {:?}", key));
-            Box::pin(async move { Ok(state) })
+            Box::pin(async move { result.map_err(ProviderError::new) })
         }
 
         fn create(&self, _resource: &Resource) -> BoxFuture<'_, ProviderResult<State>> {
@@ -3247,7 +3270,8 @@ mod tests {
 
         let mut pending_refreshes = HashMap::new();
         queue_state_refresh(&mut pending_refreshes, &id, Some(identifier));
-        refresh_pending_states(&provider, &mut current_states, &pending_refreshes).await;
+        let failed_refreshes =
+            refresh_pending_states(&provider, &mut current_states, &pending_refreshes).await;
 
         let mut existing_state = StateFile::new();
         existing_state.upsert_resource(
@@ -3264,6 +3288,7 @@ mod tests {
             &HashMap::new(),
             &Plan::new(),
             &HashSet::new(),
+            &failed_refreshes,
         );
 
         let saved_resource = saved.find_resource("s3.bucket", "bucket").unwrap();
@@ -3291,7 +3316,8 @@ mod tests {
 
         let mut pending_refreshes = HashMap::new();
         queue_state_refresh(&mut pending_refreshes, &id, Some(identifier));
-        refresh_pending_states(&provider, &mut current_states, &pending_refreshes).await;
+        let failed_refreshes =
+            refresh_pending_states(&provider, &mut current_states, &pending_refreshes).await;
 
         let mut existing_state = StateFile::new();
         existing_state.upsert_resource(
@@ -3308,9 +3334,59 @@ mod tests {
             &HashMap::new(),
             &Plan::new(),
             &HashSet::new(),
+            &failed_refreshes,
         );
 
         assert!(saved.find_resource("s3.bucket", "bucket").is_none());
+    }
+
+    #[tokio::test]
+    async fn refresh_pending_states_does_not_overwrite_with_stale_snapshot_when_refresh_fails() {
+        let resource = Resource::with_provider("aws", "s3.bucket", "bucket");
+        let id = resource.id.clone();
+        let identifier = "bucket-123";
+
+        let mut current_states = HashMap::from([(
+            id.clone(),
+            State::existing(
+                id.clone(),
+                HashMap::from([(
+                    "status".to_string(),
+                    Value::String("stale-current".to_string()),
+                )]),
+            )
+            .with_identifier(identifier),
+        )]);
+        let provider = TestProvider::with_read_error(&id, identifier, "read failed");
+
+        let mut pending_refreshes = HashMap::new();
+        queue_state_refresh(&mut pending_refreshes, &id, Some(identifier));
+        let failed_refreshes =
+            refresh_pending_states(&provider, &mut current_states, &pending_refreshes).await;
+
+        let mut existing_state = StateFile::new();
+        existing_state.upsert_resource(
+            ResourceState::new("s3.bucket", "bucket", "aws")
+                .with_identifier(identifier)
+                .with_attribute("status", json!("saved")),
+        );
+
+        let saved = build_state_after_apply(
+            Some(existing_state),
+            &[resource],
+            &current_states,
+            &HashMap::new(),
+            &HashMap::new(),
+            &Plan::new(),
+            &HashSet::new(),
+            &failed_refreshes,
+        );
+
+        let saved_resource = saved.find_resource("s3.bucket", "bucket").unwrap();
+        assert_eq!(
+            saved_resource.attributes.get("status"),
+            Some(&json!("saved"))
+        );
     }
 
     #[test]
