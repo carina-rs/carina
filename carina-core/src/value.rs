@@ -5,13 +5,19 @@ use std::collections::HashMap;
 use crate::resource::Value;
 use crate::utils::is_dsl_enum_format;
 
-/// Convert `Value` to `serde_json::Value`
+/// Convert `Value` to `serde_json::Value`.
+///
+/// # Panics
+///
+/// Panics if `value` contains a non-finite float because JSON cannot represent
+/// `NaN` or infinity.
 pub fn value_to_json(value: &Value) -> serde_json::Value {
     match value {
         Value::String(s) => serde_json::Value::String(s.clone()),
         Value::Int(n) => serde_json::Value::Number((*n).into()),
         Value::Float(f) => serde_json::Value::Number(
-            serde_json::Number::from_f64(*f).unwrap_or_else(|| serde_json::Number::from(0)),
+            serde_json::Number::from_f64(*f)
+                .unwrap_or_else(|| panic!("cannot convert non-finite float {f} to JSON")),
         ),
         Value::Bool(b) => serde_json::Value::Bool(*b),
         Value::List(items) => serde_json::Value::Array(items.iter().map(value_to_json).collect()),
@@ -154,6 +160,20 @@ mod tests {
     fn test_value_to_json_float() {
         let v = Value::Float(1.5);
         assert_eq!(value_to_json(&v), serde_json::json!(1.5));
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot convert non-finite float NaN to JSON")]
+    fn test_value_to_json_nan_panics() {
+        let v = Value::Float(f64::NAN);
+        let _ = value_to_json(&v);
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot convert non-finite float inf to JSON")]
+    fn test_value_to_json_infinity_panics() {
+        let v = Value::Float(f64::INFINITY);
+        let _ = value_to_json(&v);
     }
 
     #[test]
