@@ -7,6 +7,7 @@ use async_trait::async_trait;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use crate::backend::{BackendConfig, BackendError, BackendResult, StateBackend};
 use crate::lock::LockInfo;
@@ -21,6 +22,7 @@ pub struct LocalBackend {
 }
 
 const RECOVERY_CLAIM_TIMEOUT_SECS: i64 = 30;
+const LOCK_WRITE_GRACE_PERIOD: Duration = Duration::from_millis(100);
 
 struct RecoveryClaimGuard {
     path: PathBuf,
@@ -82,6 +84,47 @@ impl LocalBackend {
         Ok(())
     }
 
+    fn file_written_recently(path: &PathBuf) -> bool {
+        std::fs::metadata(path)
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|elapsed| elapsed < LOCK_WRITE_GRACE_PERIOD)
+    }
+
+    fn remove_lock_if_matches(&self, lock_id: &str) -> BackendResult<()> {
+        let content = match std::fs::read_to_string(&self.lock_path) {
+            Ok(content) => content,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(err) => {
+                return Err(BackendError::Io(format!(
+                    "Failed to read lock file: {}",
+                    err
+                )));
+            }
+        };
+
+        let existing_lock = match serde_json::from_str::<LockInfo>(&content) {
+            Ok(lock) => lock,
+            Err(_) => return Ok(()),
+        };
+
+        if existing_lock.id == lock_id {
+            match std::fs::remove_file(&self.lock_path) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    return Err(BackendError::Io(format!(
+                        "Failed to remove lock file: {}",
+                        err
+                    )));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     fn acquire_recovery_claim(&self) -> BackendResult<Option<RecoveryClaimGuard>> {
         let claim_path = self.recovery_path();
         let claim = LockInfo::with_timeout("recover", RECOVERY_CLAIM_TIMEOUT_SECS);
@@ -112,9 +155,14 @@ impl LocalBackend {
                 }
             };
 
-            let claim_is_stale = serde_json::from_str::<LockInfo>(&claim_content)
-                .map(|claim| claim.is_expired())
-                .unwrap_or(true);
+            let claim_is_stale = match serde_json::from_str::<LockInfo>(&claim_content) {
+                Ok(claim) => claim.is_expired(),
+                Err(_) if Self::file_written_recently(&claim_path) => {
+                    std::thread::sleep(Duration::from_millis(1));
+                    continue;
+                }
+                Err(_) => true,
+            };
 
             if claim_is_stale {
                 match std::fs::remove_file(&claim_path) {
@@ -146,9 +194,11 @@ impl LocalBackend {
             }
         };
 
-        let claim_is_active = serde_json::from_str::<LockInfo>(&claim_content)
-            .map(|claim| !claim.is_expired())
-            .unwrap_or(false);
+        let claim_is_active = match serde_json::from_str::<LockInfo>(&claim_content) {
+            Ok(claim) => !claim.is_expired(),
+            Err(_) if Self::file_written_recently(&claim_path) => return Ok(true),
+            Err(_) => false,
+        };
 
         if claim_is_active {
             return Ok(true);
@@ -210,7 +260,14 @@ impl StateBackend for LocalBackend {
             }
 
             match Self::create_lock_file(&self.lock_path, &content) {
-                Ok(()) => return Ok(lock),
+                Ok(()) => {
+                    if self.has_active_recovery_claim()? {
+                        self.remove_lock_if_matches(&lock.id)?;
+                        std::thread::sleep(Duration::from_millis(1));
+                        continue;
+                    }
+                    return Ok(lock);
+                }
                 Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
                 Err(err) => {
                     return Err(BackendError::Io(format!(
@@ -231,10 +288,15 @@ impl StateBackend for LocalBackend {
                 }
             };
 
-            if let Ok(existing_lock) = serde_json::from_str::<LockInfo>(&current_content)
-                && !existing_lock.is_expired()
-            {
-                return Err(BackendError::locked(&existing_lock));
+            match serde_json::from_str::<LockInfo>(&current_content) {
+                Ok(existing_lock) if !existing_lock.is_expired() => {
+                    return Err(BackendError::locked(&existing_lock));
+                }
+                Err(_) if Self::file_written_recently(&self.lock_path) => {
+                    std::thread::sleep(Duration::from_millis(1));
+                    continue;
+                }
+                _ => {}
             }
 
             let Some(_claim) = self.acquire_recovery_claim()? else {
@@ -253,10 +315,15 @@ impl StateBackend for LocalBackend {
                 }
             };
 
-            if let Ok(existing_lock) = serde_json::from_str::<LockInfo>(&current_content)
-                && !existing_lock.is_expired()
-            {
-                return Err(BackendError::locked(&existing_lock));
+            match serde_json::from_str::<LockInfo>(&current_content) {
+                Ok(existing_lock) if !existing_lock.is_expired() => {
+                    return Err(BackendError::locked(&existing_lock));
+                }
+                Err(_) if Self::file_written_recently(&self.lock_path) => {
+                    std::thread::sleep(Duration::from_millis(1));
+                    continue;
+                }
+                _ => {}
             }
 
             match std::fs::remove_file(&self.lock_path) {

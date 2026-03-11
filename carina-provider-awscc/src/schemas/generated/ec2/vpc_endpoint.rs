@@ -6,11 +6,7 @@
 
 use super::AwsccSchemaConfig;
 use super::tags_type;
-use super::validate_namespaced_enum;
-use carina_core::resource::Value;
-use carina_core::schema::{
-    AttributeSchema, AttributeType, CompletionValue, ResourceSchema, StructField,
-};
+use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
 
 const VALID_DNS_RECORD_IP_TYPE: &[&str] = &[
     "ipv4",
@@ -20,61 +16,10 @@ const VALID_DNS_RECORD_IP_TYPE: &[&str] = &[
     "not-specified",
 ];
 
-fn validate_dns_record_ip_type(value: &Value) -> Result<(), String> {
-    validate_namespaced_enum(
-        value,
-        "DnsRecordIpType",
-        "awscc.ec2.vpc_endpoint",
-        VALID_DNS_RECORD_IP_TYPE,
-    )
-    .map_err(|reason| {
-        if let Value::String(s) = value {
-            format!("Invalid DnsRecordIpType '{}': {}", s, reason)
-        } else {
-            reason
-        }
-    })
-}
-
 const VALID_IP_ADDRESS_TYPE: &[&str] = &["ipv4", "ipv6", "dualstack", "not-specified"];
-
-fn validate_ip_address_type(value: &Value) -> Result<(), String> {
-    validate_namespaced_enum(
-        value,
-        "IpAddressType",
-        "awscc.ec2.vpc_endpoint",
-        VALID_IP_ADDRESS_TYPE,
-    )
-    .map_err(|reason| {
-        if let Value::String(s) = value {
-            format!("Invalid IpAddressType '{}': {}", s, reason)
-        } else {
-            reason
-        }
-    })
-}
 
 const VALID_PRIVATE_DNS_ONLY_FOR_INBOUND_RESOLVER_ENDPOINT: &[&str] =
     &["OnlyInboundResolver", "AllResolvers", "NotSpecified"];
-
-fn validate_private_dns_only_for_inbound_resolver_endpoint(value: &Value) -> Result<(), String> {
-    validate_namespaced_enum(
-        value,
-        "PrivateDnsOnlyForInboundResolverEndpoint",
-        "awscc.ec2.vpc_endpoint",
-        VALID_PRIVATE_DNS_ONLY_FOR_INBOUND_RESOLVER_ENDPOINT,
-    )
-    .map_err(|reason| {
-        if let Value::String(s) = value {
-            format!(
-                "Invalid PrivateDnsOnlyForInboundResolverEndpoint '{}': {}",
-                s, reason
-            )
-        } else {
-            reason
-        }
-    })
-}
 
 const VALID_PRIVATE_DNS_PREFERENCE: &[&str] = &[
     "VERIFIED_DOMAINS_ONLY",
@@ -83,22 +28,6 @@ const VALID_PRIVATE_DNS_PREFERENCE: &[&str] = &[
     "SPECIFIED_DOMAINS_ONLY",
 ];
 
-fn validate_private_dns_preference(value: &Value) -> Result<(), String> {
-    validate_namespaced_enum(
-        value,
-        "PrivateDnsPreference",
-        "awscc.ec2.vpc_endpoint",
-        VALID_PRIVATE_DNS_PREFERENCE,
-    )
-    .map_err(|reason| {
-        if let Value::String(s) = value {
-            format!("Invalid PrivateDnsPreference '{}': {}", s, reason)
-        } else {
-            reason
-        }
-    })
-}
-
 const VALID_VPC_ENDPOINT_TYPE: &[&str] = &[
     "Interface",
     "Gateway",
@@ -106,22 +35,6 @@ const VALID_VPC_ENDPOINT_TYPE: &[&str] = &[
     "ServiceNetwork",
     "Resource",
 ];
-
-fn validate_vpc_endpoint_type(value: &Value) -> Result<(), String> {
-    validate_namespaced_enum(
-        value,
-        "VpcEndpointType",
-        "awscc.ec2.vpc_endpoint",
-        VALID_VPC_ENDPOINT_TYPE,
-    )
-    .map_err(|reason| {
-        if let Value::String(s) = value {
-            format!("Invalid VpcEndpointType '{}': {}", s, reason)
-        } else {
-            reason
-        }
-    })
-}
 
 /// Returns the schema config for ec2_vpc_endpoint (AWS::EC2::VPCEndpoint)
 pub fn ec2_vpc_endpoint_config() -> AwsccSchemaConfig {
@@ -145,24 +58,21 @@ pub fn ec2_vpc_endpoint_config() -> AwsccSchemaConfig {
             AttributeSchema::new("dns_options", AttributeType::Struct {
                     name: "DnsOptionsSpecification".to_string(),
                     fields: vec![
-                    StructField::new("dns_record_ip_type", AttributeType::Custom {
+                    StructField::new("dns_record_ip_type", AttributeType::StringEnum {
                 name: "DnsRecordIpType".to_string(),
-                base: Box::new(AttributeType::String),
-                validate: validate_dns_record_ip_type,
+                values: vec!["ipv4".to_string(), "ipv6".to_string(), "dualstack".to_string(), "service-defined".to_string(), "not-specified".to_string()],
                 namespace: Some("awscc.ec2.vpc_endpoint".to_string()),
                 to_dsl: Some(|s: &str| s.replace('-', "_")),
             }).with_description("The DNS records created for the endpoint.").with_provider_name("DnsRecordIpType"),
-                    StructField::new("private_dns_only_for_inbound_resolver_endpoint", AttributeType::Custom {
+                    StructField::new("private_dns_only_for_inbound_resolver_endpoint", AttributeType::StringEnum {
                 name: "PrivateDnsOnlyForInboundResolverEndpoint".to_string(),
-                base: Box::new(AttributeType::String),
-                validate: validate_private_dns_only_for_inbound_resolver_endpoint,
+                values: vec!["OnlyInboundResolver".to_string(), "AllResolvers".to_string(), "NotSpecified".to_string()],
                 namespace: Some("awscc.ec2.vpc_endpoint".to_string()),
                 to_dsl: None,
             }).with_description("Indicates whether to enable private DNS only for inbound endpoints. This option is available only for services that support both gateway and interface...").with_provider_name("PrivateDnsOnlyForInboundResolverEndpoint"),
-                    StructField::new("private_dns_preference", AttributeType::Custom {
+                    StructField::new("private_dns_preference", AttributeType::StringEnum {
                 name: "PrivateDnsPreference".to_string(),
-                base: Box::new(AttributeType::String),
-                validate: validate_private_dns_preference,
+                values: vec!["VERIFIED_DOMAINS_ONLY".to_string(), "ALL_DOMAINS".to_string(), "VERIFIED_DOMAINS_AND_SPECIFIED_DOMAINS".to_string(), "SPECIFIED_DOMAINS_ONLY".to_string()],
                 namespace: Some("awscc.ec2.vpc_endpoint".to_string()),
                 to_dsl: None,
             }).with_description("The preference for which private domains have a private hosted zone created for and associated with the specified VPC. Only supported when private DNS...").with_provider_name("PrivateDnsPreference"),
@@ -178,16 +88,14 @@ pub fn ec2_vpc_endpoint_config() -> AwsccSchemaConfig {
                 .with_provider_name("Id"),
         )
         .attribute(
-            AttributeSchema::new("ip_address_type", AttributeType::Custom {
+            AttributeSchema::new("ip_address_type", AttributeType::StringEnum {
                 name: "IpAddressType".to_string(),
-                base: Box::new(AttributeType::String),
-                validate: validate_ip_address_type,
+                values: vec!["ipv4".to_string(), "ipv6".to_string(), "dualstack".to_string(), "not-specified".to_string()],
                 namespace: Some("awscc.ec2.vpc_endpoint".to_string()),
                 to_dsl: Some(|s: &str| s.replace('-', "_")),
             })
                 .with_description("The supported IP address types.")
-                .with_provider_name("IpAddressType")
-                .with_completions(vec![CompletionValue::new("awscc.ec2.vpc_endpoint.IpAddressType.ipv4", "ipv4"), CompletionValue::new("awscc.ec2.vpc_endpoint.IpAddressType.ipv6", "ipv6"), CompletionValue::new("awscc.ec2.vpc_endpoint.IpAddressType.dualstack", "dualstack"), CompletionValue::new("awscc.ec2.vpc_endpoint.IpAddressType.not_specified", "not-specified")]),
+                .with_provider_name("IpAddressType"),
         )
         .attribute(
             AttributeSchema::new("network_interface_ids", AttributeType::List(Box::new(super::aws_resource_id())))
@@ -249,17 +157,15 @@ pub fn ec2_vpc_endpoint_config() -> AwsccSchemaConfig {
                 .with_provider_name("Tags"),
         )
         .attribute(
-            AttributeSchema::new("vpc_endpoint_type", AttributeType::Custom {
+            AttributeSchema::new("vpc_endpoint_type", AttributeType::StringEnum {
                 name: "VpcEndpointType".to_string(),
-                base: Box::new(AttributeType::String),
-                validate: validate_vpc_endpoint_type,
+                values: vec!["Interface".to_string(), "Gateway".to_string(), "GatewayLoadBalancer".to_string(), "ServiceNetwork".to_string(), "Resource".to_string()],
                 namespace: Some("awscc.ec2.vpc_endpoint".to_string()),
                 to_dsl: None,
             })
                 .create_only()
                 .with_description("The type of endpoint. Default: Gateway")
-                .with_provider_name("VpcEndpointType")
-                .with_completions(vec![CompletionValue::new("awscc.ec2.vpc_endpoint.VpcEndpointType.Interface", "Interface"), CompletionValue::new("awscc.ec2.vpc_endpoint.VpcEndpointType.Gateway", "Gateway"), CompletionValue::new("awscc.ec2.vpc_endpoint.VpcEndpointType.GatewayLoadBalancer", "GatewayLoadBalancer"), CompletionValue::new("awscc.ec2.vpc_endpoint.VpcEndpointType.ServiceNetwork", "ServiceNetwork"), CompletionValue::new("awscc.ec2.vpc_endpoint.VpcEndpointType.Resource", "Resource")]),
+                .with_provider_name("VpcEndpointType"),
         )
         .attribute(
             AttributeSchema::new("vpc_id", super::vpc_id())

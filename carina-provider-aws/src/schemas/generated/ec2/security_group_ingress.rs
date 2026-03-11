@@ -5,27 +5,10 @@
 //! DO NOT EDIT MANUALLY - regenerate with smithy-codegen
 
 use super::AwsSchemaConfig;
-use super::validate_namespaced_enum;
 use carina_core::resource::Value;
-use carina_core::schema::{AttributeSchema, AttributeType, CompletionValue, ResourceSchema, types};
+use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, types};
 
 const VALID_IP_PROTOCOL: &[&str] = &["tcp", "udp", "icmp", "icmpv6", "-1", "all"];
-
-fn validate_ip_protocol(value: &Value) -> Result<(), String> {
-    validate_namespaced_enum(
-        value,
-        "IpProtocol",
-        "aws.ec2.security_group_ingress",
-        VALID_IP_PROTOCOL,
-    )
-    .map_err(|reason| {
-        if let Value::String(s) = value {
-            format!("Invalid IpProtocol '{}': {}", s, reason)
-        } else {
-            reason
-        }
-    })
-}
 
 fn validate_from_port_range(value: &Value) -> Result<(), String> {
     if let Value::Int(n) = value {
@@ -103,18 +86,16 @@ pub fn ec2_security_group_ingress_config() -> AwsSchemaConfig {
                 .with_provider_name("GroupName"),
         )
         .attribute(
-            AttributeSchema::new("ip_protocol", AttributeType::Custom {
+            AttributeSchema::new("ip_protocol", AttributeType::StringEnum {
                 name: "IpProtocol".to_string(),
-                base: Box::new(AttributeType::String),
-                validate: validate_ip_protocol,
+                values: vec!["tcp".to_string(), "udp".to_string(), "icmp".to_string(), "icmpv6".to_string(), "-1".to_string()],
                 namespace: Some("aws.ec2.security_group_ingress".to_string()),
                 to_dsl: Some(|s: &str| match s { "-1" => "all".to_string(), _ => s.replace('-', "_") }),
             })
                 .required()
                 .create_only()
                 .with_description("The IP protocol name (tcp, udp, icmp) or number (see Protocol Numbers). To specify all protocols, use -1. To specify icmpv6, use IP permissions instea...")
-                .with_provider_name("IpProtocol")
-                .with_completions(vec![CompletionValue::new("aws.ec2.security_group_ingress.IpProtocol.tcp", "tcp"), CompletionValue::new("aws.ec2.security_group_ingress.IpProtocol.udp", "udp"), CompletionValue::new("aws.ec2.security_group_ingress.IpProtocol.icmp", "icmp"), CompletionValue::new("aws.ec2.security_group_ingress.IpProtocol.icmpv6", "icmpv6"), CompletionValue::new("aws.ec2.security_group_ingress.IpProtocol.all", "-1")]),
+                .with_provider_name("IpProtocol"),
         )
         .attribute(
             AttributeSchema::new("source_prefix_list_id", super::aws_resource_id())

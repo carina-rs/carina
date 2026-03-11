@@ -7,10 +7,17 @@ use std::collections::HashMap;
 use std::fmt;
 
 use crate::resource::{Resource, Value};
-use crate::utils::extract_enum_value;
+use crate::utils::{extract_enum_value, validate_enum_namespace};
 
 /// Type alias for resource validator functions
 pub type ResourceValidator = fn(&HashMap<String, Value>) -> Result<(), Vec<TypeError>>;
+pub type StringEnumParts<'a> = (
+    &'a str,
+    &'a [String],
+    Option<&'a str>,
+    Option<fn(&str) -> String>,
+);
+pub type NamespacedEnumParts<'a> = (&'a str, &'a str, Option<fn(&str) -> String>);
 
 /// A field within a Struct type
 #[derive(Debug, Clone)]
@@ -67,6 +74,13 @@ pub enum AttributeType {
     Bool,
     /// Enum (list of allowed values)
     Enum(Vec<String>),
+    /// String enum with optional namespace-aware DSL syntax support
+    StringEnum {
+        name: String,
+        values: Vec<String>,
+        namespace: Option<String>,
+        to_dsl: Option<fn(&str) -> String>,
+    },
     /// Custom type (with validation function)
     Custom {
         name: String,
@@ -94,6 +108,60 @@ pub enum AttributeType {
 }
 
 impl AttributeType {
+    fn resolve_enum_input(
+        name: &str,
+        namespace: Option<&str>,
+        value: &Value,
+    ) -> Result<Value, TypeError> {
+        if matches!(value, Value::ResourceRef { .. }) {
+            return Ok(value.clone());
+        }
+
+        match value {
+            Value::UnresolvedIdent(ident, member) => {
+                let expanded = match (namespace, member) {
+                    (Some(ns), Some(m)) if ident == name => format!("{}.{}.{}", ns, ident, m),
+                    (Some(_), Some(m)) => format!("{}.{}", ident, m),
+                    (Some(ns), None) => format!("{}.{}.{}", ns, name, ident),
+                    (None, Some(m)) => format!("{}.{}", ident, m),
+                    (None, None) => ident.clone(),
+                };
+                Ok(Value::String(expanded))
+            }
+            other => Ok(other.clone()),
+        }
+    }
+
+    pub fn string_enum_parts(&self) -> Option<StringEnumParts<'_>> {
+        match self {
+            AttributeType::StringEnum {
+                name,
+                values,
+                namespace,
+                to_dsl,
+            } => Some((name, values, namespace.as_deref(), *to_dsl)),
+            _ => None,
+        }
+    }
+
+    pub fn namespaced_enum_parts(&self) -> Option<NamespacedEnumParts<'_>> {
+        match self {
+            AttributeType::StringEnum {
+                name,
+                namespace: Some(namespace),
+                to_dsl,
+                ..
+            }
+            | AttributeType::Custom {
+                name,
+                namespace: Some(namespace),
+                to_dsl,
+                ..
+            } => Some((name, namespace, *to_dsl)),
+            _ => None,
+        }
+    }
+
     /// Check if a value conforms to this type
     pub fn validate(&self, value: &Value) -> Result<(), TypeError> {
         match (self, value) {
@@ -117,6 +185,45 @@ impl AttributeType {
             }
 
             (
+                AttributeType::StringEnum {
+                    name,
+                    values,
+                    namespace,
+                    ..
+                },
+                v,
+            ) => {
+                let resolved_value = Self::resolve_enum_input(name, namespace.as_deref(), v)?;
+                if matches!(resolved_value, Value::ResourceRef { .. }) {
+                    return Ok(());
+                }
+                if let Value::String(s) = &resolved_value {
+                    if let Some(ns) = namespace.as_deref() {
+                        validate_enum_namespace(s, name, ns).map_err(|message| {
+                            TypeError::ValidationFailed {
+                                message: format!("Invalid {} '{}': {}", name, s, message),
+                            }
+                        })?;
+                    }
+
+                    let variant = extract_enum_value(s);
+                    if values.iter().any(|v| string_enum_value_matches(variant, v)) {
+                        Ok(())
+                    } else {
+                        Err(TypeError::InvalidEnumVariant {
+                            value: s.clone(),
+                            expected: values.clone(),
+                        })
+                    }
+                } else {
+                    Err(TypeError::TypeMismatch {
+                        expected: self.type_name(),
+                        got: resolved_value.type_name(),
+                    })
+                }
+            }
+
+            (
                 AttributeType::Custom {
                     validate,
                     name,
@@ -129,31 +236,7 @@ impl AttributeType {
                 if matches!(v, Value::ResourceRef { .. }) {
                     return Ok(());
                 }
-                // Handle UnresolvedIdent by expanding to full namespace format
-                let resolved_value = match v {
-                    Value::UnresolvedIdent(ident, member) => {
-                        let expanded = match (namespace, member) {
-                            // TypeName.value -> namespace.TypeName.value
-                            (Some(ns), Some(m)) if ident == name => {
-                                format!("{}.{}.{}", ns, ident, m)
-                            }
-                            // SomeOther.value with namespace -> namespace.TypeName.SomeOther.value
-                            // This is an error case, but let validation handle it
-                            (Some(_ns), Some(m)) => {
-                                format!("{}.{}", ident, m)
-                            }
-                            // value -> namespace.TypeName.value
-                            (Some(ns), None) => {
-                                format!("{}.{}.{}", ns, name, ident)
-                            }
-                            // No namespace, keep as-is for validation
-                            (None, Some(m)) => format!("{}.{}", ident, m),
-                            (None, None) => ident.clone(),
-                        };
-                        Value::String(expanded)
-                    }
-                    _ => v.clone(),
-                };
+                let resolved_value = Self::resolve_enum_input(name, namespace.as_deref(), v)?;
                 validate(&resolved_value)
                     .map_err(|msg| TypeError::ValidationFailed { message: msg })
             }
@@ -251,6 +334,7 @@ impl AttributeType {
             AttributeType::Float => "Float".to_string(),
             AttributeType::Bool => "Bool".to_string(),
             AttributeType::Enum(variants) => format!("Enum({})", variants.join(" | ")),
+            AttributeType::StringEnum { name, .. } => name.clone(),
             AttributeType::Custom { name, .. } => name.clone(),
             AttributeType::List(inner) => format!("List<{}>", inner.type_name()),
             AttributeType::Map(inner) => format!("Map<{}>", inner.type_name()),
@@ -277,6 +361,12 @@ impl fmt::Display for AttributeType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.type_name())
     }
+}
+
+fn string_enum_value_matches(input: &str, expected: &str) -> bool {
+    input == expected
+        || input.eq_ignore_ascii_case(expected)
+        || input.replace('_', "-").eq_ignore_ascii_case(expected)
 }
 
 /// Type error
@@ -999,6 +1089,46 @@ mod tests {
         assert!(t.validate(&Value::String("a".to_string())).is_ok());
         assert!(t.validate(&Value::String("Type.a".to_string())).is_ok());
         assert!(t.validate(&Value::String("c".to_string())).is_err());
+    }
+
+    #[test]
+    fn validate_enum_type_remains_case_sensitive() {
+        let t = AttributeType::Enum(vec!["Enabled".to_string()]);
+        assert!(t.validate(&Value::String("Enabled".to_string())).is_ok());
+        assert!(t.validate(&Value::String("enabled".to_string())).is_err());
+    }
+
+    #[test]
+    fn validate_string_enum_type() {
+        let t = AttributeType::StringEnum {
+            name: "AddressFamily".to_string(),
+            values: vec!["IPv4".to_string(), "IPv6".to_string()],
+            namespace: Some("awscc.ec2.ipam_pool".to_string()),
+            to_dsl: None,
+        };
+        assert!(
+            t.validate(&Value::String(
+                "awscc.ec2.ipam_pool.AddressFamily.IPv4".to_string()
+            ))
+            .is_ok()
+        );
+        assert!(
+            t.validate(&Value::UnresolvedIdent("IPv6".to_string(), None))
+                .is_ok()
+        );
+        assert!(t.validate(&Value::String("ipv4".to_string())).is_ok());
+        assert!(t.validate(&Value::String("IPv5".to_string())).is_err());
+    }
+
+    #[test]
+    fn string_enum_type_name_uses_declared_name() {
+        let t = AttributeType::StringEnum {
+            name: "VersioningStatus".to_string(),
+            values: vec!["Enabled".to_string(), "Suspended".to_string()],
+            namespace: Some("aws.s3.bucket".to_string()),
+            to_dsl: None,
+        };
+        assert_eq!(t.type_name(), "VersioningStatus");
     }
 
     #[test]

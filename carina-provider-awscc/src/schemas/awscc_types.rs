@@ -66,6 +66,7 @@ pub(crate) fn canonicalize_enum_value(raw: &str, valid_values: &[&str]) -> Strin
 /// Validate a namespaced enum value.
 /// Returns Ok(()) if valid, Err with bare reason string if invalid.
 /// Callers are responsible for adding context (e.g., what value was provided).
+#[cfg(test)]
 pub(crate) fn validate_namespaced_enum(
     value: &Value,
     type_name: &str,

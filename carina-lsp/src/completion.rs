@@ -639,6 +639,12 @@ impl CompletionProvider {
                     })
                     .collect()
             }
+            AttributeType::StringEnum {
+                name,
+                values,
+                namespace,
+                to_dsl,
+            } => self.string_enum_completions(name, values, namespace.as_deref(), *to_dsl),
             AttributeType::Int => {
                 vec![] // No specific completions for integers
             }
@@ -1075,6 +1081,41 @@ impl CompletionProvider {
         completions.sort_by(|a, b| a.label.cmp(&b.label));
         completions
     }
+
+    fn string_enum_completions(
+        &self,
+        type_name: &str,
+        values: &[String],
+        namespace: Option<&str>,
+        to_dsl: Option<fn(&str) -> String>,
+    ) -> Vec<CompletionItem> {
+        match namespace {
+            Some(ns) => {
+                let prefix = format!("{}.{}", ns, type_name);
+                values
+                    .iter()
+                    .map(|value| {
+                        let dsl_value = to_dsl.map_or_else(|| value.clone(), |f| f(value));
+                        CompletionItem {
+                            label: format!("{}.{}", prefix, dsl_value),
+                            kind: Some(CompletionItemKind::ENUM_MEMBER),
+                            detail: Some(value.clone()),
+                            ..Default::default()
+                        }
+                    })
+                    .collect()
+            }
+            None => values
+                .iter()
+                .map(|value| CompletionItem {
+                    label: format!("\"{}\"", value),
+                    kind: Some(CompletionItemKind::ENUM_MEMBER),
+                    insert_text: Some(format!("\"{}\"", value)),
+                    ..Default::default()
+                })
+                .collect(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1407,6 +1448,64 @@ simple {
     // Note: instance_tenancy_completion_for_awscc_vpc test was removed
     // because generated schemas use AttributeType::String for instance_tenancy
     // instead of the custom InstanceTenancy type that provides completions.
+
+    #[test]
+    fn string_enum_completion_for_aws_s3_bucket_versioning_status() {
+        let provider = test_provider();
+        let doc = create_document(
+            r#"aws.s3.bucket {
+    versioning_status =
+}"#,
+        );
+        let position = Position {
+            line: 1,
+            character: 24,
+        };
+
+        let completions = provider.complete(&doc, position, None);
+
+        assert!(
+            completions
+                .iter()
+                .any(|c| c.label == "aws.s3.bucket.VersioningStatus.Enabled"),
+            "Should complete namespaced enum values from StringEnum schema metadata"
+        );
+        assert!(
+            completions
+                .iter()
+                .any(|c| c.label == "aws.s3.bucket.VersioningStatus.Suspended"),
+            "Should include all enum variants"
+        );
+    }
+
+    #[test]
+    fn string_enum_completion_for_awscc_ipam_pool_address_family() {
+        let provider = test_provider();
+        let doc = create_document(
+            r#"awscc.ec2.ipam_pool {
+    address_family =
+}"#,
+        );
+        let position = Position {
+            line: 1,
+            character: 21,
+        };
+
+        let completions = provider.complete(&doc, position, None);
+
+        assert!(
+            completions
+                .iter()
+                .any(|c| c.label == "awscc.ec2.ipam_pool.AddressFamily.IPv4"),
+            "Should complete awscc enum values from StringEnum schema metadata"
+        );
+        assert!(
+            completions
+                .iter()
+                .any(|c| c.label == "awscc.ec2.ipam_pool.AddressFamily.IPv6"),
+            "Should include all enum variants"
+        );
+    }
 
     #[test]
     fn versioning_status_completion_for_s3_bucket() {

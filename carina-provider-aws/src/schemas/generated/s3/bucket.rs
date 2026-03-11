@@ -6,9 +6,7 @@
 
 use super::AwsSchemaConfig;
 use super::tags_type;
-use super::validate_namespaced_enum;
-use carina_core::resource::Value;
-use carina_core::schema::{AttributeSchema, AttributeType, CompletionValue, ResourceSchema};
+use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
 const VALID_ACL: &[&str] = &[
     "authenticated-read",
@@ -17,55 +15,13 @@ const VALID_ACL: &[&str] = &[
     "public-read-write",
 ];
 
-fn validate_acl(value: &Value) -> Result<(), String> {
-    validate_namespaced_enum(value, "ACL", "aws.s3.bucket", VALID_ACL).map_err(|reason| {
-        if let Value::String(s) = value {
-            format!("Invalid ACL '{}': {}", s, reason)
-        } else {
-            reason
-        }
-    })
-}
-
 const VALID_OBJECT_OWNERSHIP: &[&str] = &[
     "BucketOwnerEnforced",
     "BucketOwnerPreferred",
     "ObjectWriter",
 ];
 
-fn validate_object_ownership(value: &Value) -> Result<(), String> {
-    validate_namespaced_enum(
-        value,
-        "ObjectOwnership",
-        "aws.s3.bucket",
-        VALID_OBJECT_OWNERSHIP,
-    )
-    .map_err(|reason| {
-        if let Value::String(s) = value {
-            format!("Invalid ObjectOwnership '{}': {}", s, reason)
-        } else {
-            reason
-        }
-    })
-}
-
 const VALID_VERSIONING_STATUS: &[&str] = &["Enabled", "Suspended"];
-
-fn validate_versioning_status(value: &Value) -> Result<(), String> {
-    validate_namespaced_enum(
-        value,
-        "VersioningStatus",
-        "aws.s3.bucket",
-        VALID_VERSIONING_STATUS,
-    )
-    .map_err(|reason| {
-        if let Value::String(s) = value {
-            format!("Invalid VersioningStatus '{}': {}", s, reason)
-        } else {
-            reason
-        }
-    })
-}
 
 /// Returns the schema config for s3.bucket (Smithy: com.amazonaws.s3)
 pub fn s3_bucket_config() -> AwsSchemaConfig {
@@ -76,16 +32,14 @@ pub fn s3_bucket_config() -> AwsSchemaConfig {
         data_source: false,
         schema: ResourceSchema::new("aws.s3.bucket")
         .attribute(
-            AttributeSchema::new("acl", AttributeType::Custom {
+            AttributeSchema::new("acl", AttributeType::StringEnum {
                 name: "ACL".to_string(),
-                base: Box::new(AttributeType::String),
-                validate: validate_acl,
+                values: vec!["authenticated-read".to_string(), "private".to_string(), "public-read".to_string(), "public-read-write".to_string()],
                 namespace: Some("aws.s3.bucket".to_string()),
                 to_dsl: Some(|s: &str| s.replace('-', "_")),
             })
                 .with_description("The canned ACL to apply to the bucket. This functionality is not supported for directory buckets.")
-                .with_provider_name("ACL")
-                .with_completions(vec![CompletionValue::new("aws.s3.bucket.ACL.authenticated_read", "authenticated-read"), CompletionValue::new("aws.s3.bucket.ACL.private", "private"), CompletionValue::new("aws.s3.bucket.ACL.public_read", "public-read"), CompletionValue::new("aws.s3.bucket.ACL.public_read_write", "public-read-write")]),
+                .with_provider_name("ACL"),
         )
         .attribute(
             AttributeSchema::new("bucket", AttributeType::String)
@@ -126,27 +80,23 @@ pub fn s3_bucket_config() -> AwsSchemaConfig {
                 .with_provider_name("ObjectLockEnabledForBucket"),
         )
         .attribute(
-            AttributeSchema::new("object_ownership", AttributeType::Custom {
+            AttributeSchema::new("object_ownership", AttributeType::StringEnum {
                 name: "ObjectOwnership".to_string(),
-                base: Box::new(AttributeType::String),
-                validate: validate_object_ownership,
+                values: vec!["BucketOwnerEnforced".to_string(), "BucketOwnerPreferred".to_string(), "ObjectWriter".to_string()],
                 namespace: Some("aws.s3.bucket".to_string()),
                 to_dsl: None,
             })
-                .with_provider_name("ObjectOwnership")
-                .with_completions(vec![CompletionValue::new("aws.s3.bucket.ObjectOwnership.BucketOwnerEnforced", "BucketOwnerEnforced"), CompletionValue::new("aws.s3.bucket.ObjectOwnership.BucketOwnerPreferred", "BucketOwnerPreferred"), CompletionValue::new("aws.s3.bucket.ObjectOwnership.ObjectWriter", "ObjectWriter")]),
+                .with_provider_name("ObjectOwnership"),
         )
         .attribute(
-            AttributeSchema::new("versioning_status", AttributeType::Custom {
+            AttributeSchema::new("versioning_status", AttributeType::StringEnum {
                 name: "VersioningStatus".to_string(),
-                base: Box::new(AttributeType::String),
-                validate: validate_versioning_status,
+                values: vec!["Enabled".to_string(), "Suspended".to_string()],
                 namespace: Some("aws.s3.bucket".to_string()),
                 to_dsl: None,
             })
                 .with_description("The versioning state of the bucket.")
-                .with_provider_name("VersioningStatus")
-                .with_completions(vec![CompletionValue::new("aws.s3.bucket.VersioningStatus.Enabled", "Enabled"), CompletionValue::new("aws.s3.bucket.VersioningStatus.Suspended", "Suspended")]),
+                .with_provider_name("VersioningStatus"),
         )
         .attribute(
             AttributeSchema::new("tags", tags_type())

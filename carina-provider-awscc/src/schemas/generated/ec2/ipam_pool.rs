@@ -6,83 +6,15 @@
 
 use super::AwsccSchemaConfig;
 use super::tags_type;
-use super::validate_namespaced_enum;
-use carina_core::resource::Value;
-use carina_core::schema::{
-    AttributeSchema, AttributeType, CompletionValue, ResourceSchema, StructField,
-};
+use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
 
 const VALID_ADDRESS_FAMILY: &[&str] = &["IPv4", "IPv6"];
 
-fn validate_address_family(value: &Value) -> Result<(), String> {
-    validate_namespaced_enum(
-        value,
-        "AddressFamily",
-        "awscc.ec2.ipam_pool",
-        VALID_ADDRESS_FAMILY,
-    )
-    .map_err(|reason| {
-        if let Value::String(s) = value {
-            format!("Invalid AddressFamily '{}': {}", s, reason)
-        } else {
-            reason
-        }
-    })
-}
-
 const VALID_AWS_SERVICE: &[&str] = &["ec2", "global-services"];
-
-fn validate_aws_service(value: &Value) -> Result<(), String> {
-    validate_namespaced_enum(
-        value,
-        "AwsService",
-        "awscc.ec2.ipam_pool",
-        VALID_AWS_SERVICE,
-    )
-    .map_err(|reason| {
-        if let Value::String(s) = value {
-            format!("Invalid AwsService '{}': {}", s, reason)
-        } else {
-            reason
-        }
-    })
-}
 
 const VALID_IPAM_SCOPE_TYPE: &[&str] = &["public", "private"];
 
-fn validate_ipam_scope_type(value: &Value) -> Result<(), String> {
-    validate_namespaced_enum(
-        value,
-        "IpamScopeType",
-        "awscc.ec2.ipam_pool",
-        VALID_IPAM_SCOPE_TYPE,
-    )
-    .map_err(|reason| {
-        if let Value::String(s) = value {
-            format!("Invalid IpamScopeType '{}': {}", s, reason)
-        } else {
-            reason
-        }
-    })
-}
-
 const VALID_PUBLIC_IP_SOURCE: &[&str] = &["byoip", "amazon"];
-
-fn validate_public_ip_source(value: &Value) -> Result<(), String> {
-    validate_namespaced_enum(
-        value,
-        "PublicIpSource",
-        "awscc.ec2.ipam_pool",
-        VALID_PUBLIC_IP_SOURCE,
-    )
-    .map_err(|reason| {
-        if let Value::String(s) = value {
-            format!("Invalid PublicIpSource '{}': {}", s, reason)
-        } else {
-            reason
-        }
-    })
-}
 
 const VALID_STATE: &[&str] = &[
     "create-in-progress",
@@ -93,16 +25,6 @@ const VALID_STATE: &[&str] = &[
     "delete-complete",
 ];
 
-fn validate_state(value: &Value) -> Result<(), String> {
-    validate_namespaced_enum(value, "State", "awscc.ec2.ipam_pool", VALID_STATE).map_err(|reason| {
-        if let Value::String(s) = value {
-            format!("Invalid State '{}': {}", s, reason)
-        } else {
-            reason
-        }
-    })
-}
-
 /// Returns the schema config for ec2_ipam_pool (AWS::EC2::IPAMPool)
 pub fn ec2_ipam_pool_config() -> AwsccSchemaConfig {
     AwsccSchemaConfig {
@@ -112,18 +34,16 @@ pub fn ec2_ipam_pool_config() -> AwsccSchemaConfig {
         schema: ResourceSchema::new("awscc.ec2.ipam_pool")
         .with_description("Resource Schema of AWS::EC2::IPAMPool Type")
         .attribute(
-            AttributeSchema::new("address_family", AttributeType::Custom {
+            AttributeSchema::new("address_family", AttributeType::StringEnum {
                 name: "AddressFamily".to_string(),
-                base: Box::new(AttributeType::String),
-                validate: validate_address_family,
+                values: vec!["IPv4".to_string(), "IPv6".to_string()],
                 namespace: Some("awscc.ec2.ipam_pool".to_string()),
                 to_dsl: None,
             })
                 .required()
                 .create_only()
                 .with_description("The address family of the address space in this pool. Either IPv4 or IPv6.")
-                .with_provider_name("AddressFamily")
-                .with_completions(vec![CompletionValue::new("awscc.ec2.ipam_pool.AddressFamily.IPv4", "IPv4"), CompletionValue::new("awscc.ec2.ipam_pool.AddressFamily.IPv6", "IPv6")]),
+                .with_provider_name("AddressFamily"),
         )
         .attribute(
             AttributeSchema::new("allocation_default_netmask_length", AttributeType::Int)
@@ -156,17 +76,15 @@ pub fn ec2_ipam_pool_config() -> AwsccSchemaConfig {
                 .with_provider_name("AutoImport"),
         )
         .attribute(
-            AttributeSchema::new("aws_service", AttributeType::Custom {
+            AttributeSchema::new("aws_service", AttributeType::StringEnum {
                 name: "AwsService".to_string(),
-                base: Box::new(AttributeType::String),
-                validate: validate_aws_service,
+                values: vec!["ec2".to_string(), "global-services".to_string()],
                 namespace: Some("awscc.ec2.ipam_pool".to_string()),
                 to_dsl: Some(|s: &str| s.replace('-', "_")),
             })
                 .create_only()
                 .with_description("Limits which service in Amazon Web Services that the pool can be used in.")
-                .with_provider_name("AwsService")
-                .with_completions(vec![CompletionValue::new("awscc.ec2.ipam_pool.AwsService.ec2", "ec2"), CompletionValue::new("awscc.ec2.ipam_pool.AwsService.global_services", "global-services")]),
+                .with_provider_name("AwsService"),
         )
         .attribute(
             AttributeSchema::new("description", AttributeType::String)
@@ -195,16 +113,14 @@ pub fn ec2_ipam_pool_config() -> AwsccSchemaConfig {
                 .with_provider_name("IpamScopeId"),
         )
         .attribute(
-            AttributeSchema::new("ipam_scope_type", AttributeType::Custom {
+            AttributeSchema::new("ipam_scope_type", AttributeType::StringEnum {
                 name: "IpamScopeType".to_string(),
-                base: Box::new(AttributeType::String),
-                validate: validate_ipam_scope_type,
+                values: vec!["public".to_string(), "private".to_string()],
                 namespace: Some("awscc.ec2.ipam_pool".to_string()),
                 to_dsl: None,
             })
                 .with_description("Determines whether this scope contains publicly routable space or space for a private network (read-only)")
-                .with_provider_name("IpamScopeType")
-                .with_completions(vec![CompletionValue::new("awscc.ec2.ipam_pool.IpamScopeType.public", "public"), CompletionValue::new("awscc.ec2.ipam_pool.IpamScopeType.private", "private")]),
+                .with_provider_name("IpamScopeType"),
         )
         .attribute(
             AttributeSchema::new("locale", AttributeType::String)
@@ -229,17 +145,15 @@ pub fn ec2_ipam_pool_config() -> AwsccSchemaConfig {
                 .with_block_name("provisioned_cidr"),
         )
         .attribute(
-            AttributeSchema::new("public_ip_source", AttributeType::Custom {
+            AttributeSchema::new("public_ip_source", AttributeType::StringEnum {
                 name: "PublicIpSource".to_string(),
-                base: Box::new(AttributeType::String),
-                validate: validate_public_ip_source,
+                values: vec!["byoip".to_string(), "amazon".to_string()],
                 namespace: Some("awscc.ec2.ipam_pool".to_string()),
                 to_dsl: None,
             })
                 .create_only()
                 .with_description("The IP address source for pools in the public scope. Only used for provisioning IP address CIDRs to pools in the public scope. Default is `byoip`.")
-                .with_provider_name("PublicIpSource")
-                .with_completions(vec![CompletionValue::new("awscc.ec2.ipam_pool.PublicIpSource.byoip", "byoip"), CompletionValue::new("awscc.ec2.ipam_pool.PublicIpSource.amazon", "amazon")]),
+                .with_provider_name("PublicIpSource"),
         )
         .attribute(
             AttributeSchema::new("publicly_advertisable", AttributeType::Bool)
@@ -267,16 +181,14 @@ pub fn ec2_ipam_pool_config() -> AwsccSchemaConfig {
                 .with_provider_name("SourceResource"),
         )
         .attribute(
-            AttributeSchema::new("state", AttributeType::Custom {
+            AttributeSchema::new("state", AttributeType::StringEnum {
                 name: "State".to_string(),
-                base: Box::new(AttributeType::String),
-                validate: validate_state,
+                values: vec!["create-in-progress".to_string(), "create-complete".to_string(), "modify-in-progress".to_string(), "modify-complete".to_string(), "delete-in-progress".to_string(), "delete-complete".to_string()],
                 namespace: Some("awscc.ec2.ipam_pool".to_string()),
                 to_dsl: Some(|s: &str| s.replace('-', "_")),
             })
                 .with_description("The state of this pool. This can be one of the following values: \"create-in-progress\", \"create-complete\", \"modify-in-progress\", \"modify-complet... (read-only)")
-                .with_provider_name("State")
-                .with_completions(vec![CompletionValue::new("awscc.ec2.ipam_pool.State.create_in_progress", "create-in-progress"), CompletionValue::new("awscc.ec2.ipam_pool.State.create_complete", "create-complete"), CompletionValue::new("awscc.ec2.ipam_pool.State.modify_in_progress", "modify-in-progress"), CompletionValue::new("awscc.ec2.ipam_pool.State.modify_complete", "modify-complete"), CompletionValue::new("awscc.ec2.ipam_pool.State.delete_in_progress", "delete-in-progress"), CompletionValue::new("awscc.ec2.ipam_pool.State.delete_complete", "delete-complete")]),
+                .with_provider_name("State"),
         )
         .attribute(
             AttributeSchema::new("state_message", AttributeType::String)

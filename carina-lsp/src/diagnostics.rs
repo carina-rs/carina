@@ -312,6 +312,45 @@ impl DiagnosticEngine {
                                 }
                                 // ResourceRef type check for Custom types
                                 (
+                                    carina_core::schema::AttributeType::StringEnum {
+                                        name: expected_name,
+                                        ..
+                                    },
+                                    Value::ResourceRef {
+                                        binding_name: ref_binding,
+                                        attribute_name: ref_attr,
+                                        ..
+                                    },
+                                ) => {
+                                    if let Some(ref_schema) =
+                                        binding_schema_map.get(ref_binding.as_str())
+                                    {
+                                        if let Some(ref_attr_schema) =
+                                            ref_schema.attributes.get(ref_attr.as_str())
+                                        {
+                                            let ref_type_name =
+                                                ref_attr_schema.attr_type.type_name();
+                                            if ref_type_name != *expected_name
+                                                && ref_type_name != "String"
+                                            {
+                                                Some(format!(
+                                                    "Type mismatch: expected {}, got {} (from {}.{})",
+                                                    expected_name,
+                                                    ref_type_name,
+                                                    ref_binding,
+                                                    ref_attr
+                                                ))
+                                            } else {
+                                                None
+                                            }
+                                        } else {
+                                            None
+                                        }
+                                    } else {
+                                        None
+                                    }
+                                }
+                                (
                                     carina_core::schema::AttributeType::Custom {
                                         name: expected_name,
                                         ..
@@ -351,6 +390,13 @@ impl DiagnosticEngine {
                                     }
                                 }
                                 // Custom type validation (all Custom types use their validate fn)
+                                (carina_core::schema::AttributeType::StringEnum { .. }, value) => {
+                                    attr_schema
+                                        .attr_type
+                                        .validate(value)
+                                        .err()
+                                        .map(|e| e.to_string())
+                                }
                                 (
                                     carina_core::schema::AttributeType::Custom {
                                         name,

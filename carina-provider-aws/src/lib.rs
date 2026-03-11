@@ -16,7 +16,6 @@ use carina_core::provider::{
     BoxFuture, Provider, ProviderError, ProviderFactory, ProviderResult, ResourceType,
 };
 use carina_core::resource::{LifecycleConfig, Resource, ResourceId, State, Value};
-use carina_core::schema::AttributeType;
 use carina_core::utils::convert_enum_value;
 
 /// Factory for creating and configuring the AWS Provider
@@ -748,12 +747,7 @@ fn resolve_enum_identifiers_impl(resources: &mut [Resource]) {
         let mut resolved_attrs = HashMap::new();
         for (key, value) in &resource.attributes {
             if let Some(attr_schema) = config.schema.attributes.get(key.as_str())
-                && let AttributeType::Custom {
-                    name: type_name,
-                    namespace: Some(ns),
-                    to_dsl,
-                    ..
-                } = &attr_schema.attr_type
+                && let Some((type_name, ns, to_dsl)) = attr_schema.attr_type.namespaced_enum_parts()
             {
                 let resolved = match value {
                     Value::UnresolvedIdent(ident, None) => {
@@ -805,12 +799,7 @@ fn normalize_state_enums(resource_type: &str, attributes: &mut HashMap<String, V
     let mut resolved = HashMap::new();
     for (key, value) in attributes.iter() {
         if let Some(attr_schema) = config.schema.attributes.get(key.as_str())
-            && let AttributeType::Custom {
-                name: type_name,
-                namespace: Some(ns),
-                to_dsl,
-                ..
-            } = &attr_schema.attr_type
+            && let Some((type_name, ns, to_dsl)) = attr_schema.attr_type.namespaced_enum_parts()
             && let Value::String(s) = value
             && !s.contains('.')
         {

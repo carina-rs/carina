@@ -505,7 +505,6 @@ fn generate_resource(res: &ResourceDef, model: &SmithyModel) -> Result<String> {
     }
 
     // Determine needed imports
-    let has_enums = !all_enums.is_empty();
     let has_ranged_ints = !all_ranged_ints.is_empty();
     let code_str = attrs
         .iter()
@@ -541,9 +540,6 @@ fn generate_resource(res: &ResourceDef, model: &SmithyModel) -> Result<String> {
     if needs_attribute_type {
         schema_imports.insert(1, "AttributeType");
     }
-    if attrs.iter().any(|a| a.enum_info.is_some()) {
-        schema_imports.push("CompletionValue");
-    }
     if needs_struct_field {
         schema_imports.push("StructField");
     }
@@ -565,10 +561,7 @@ fn generate_resource(res: &ResourceDef, model: &SmithyModel) -> Result<String> {
     if needs_tags_type {
         code.push_str("use super::tags_type;\n");
     }
-    if has_enums {
-        code.push_str("use super::validate_namespaced_enum;\n");
-    }
-    if has_enums || has_ranged_ints {
+    if has_ranged_ints {
         code.push_str("use carina_core::resource::Value;\n");
     }
     code.push_str(&format!(
@@ -576,10 +569,9 @@ fn generate_resource(res: &ResourceDef, model: &SmithyModel) -> Result<String> {
         schema_imports_str
     ));
 
-    // Generate enum constants and validation functions
+    // Generate enum constants.
     for (prop_name, enum_info) in &all_enums {
         let const_name = format!("VALID_{}", prop_name.to_snake_case().to_uppercase());
-        let fn_name = format!("validate_{}", prop_name.to_snake_case());
 
         // Generate constant
         let mut all_values: Vec<String> = enum_info
@@ -598,21 +590,6 @@ fn generate_resource(res: &ResourceDef, model: &SmithyModel) -> Result<String> {
         code.push_str(&format!(
             "const {}: &[&str] = &[{}];\n\n",
             const_name, values_str
-        ));
-
-        // Generate validation function
-        code.push_str(&format!(
-            "fn {}(value: &Value) -> Result<(), String> {{\n\
-             \x20   validate_namespaced_enum(value, \"{}\", \"{}\", {})\n\
-             \x20   .map_err(|reason| {{\n\
-             \x20       if let Value::String(s) = value {{\n\
-             \x20           format!(\"Invalid {} '{{}}': {{}}\", s, reason)\n\
-             \x20       }} else {{\n\
-             \x20           reason\n\
-             \x20       }}\n\
-             \x20   }})\n\
-             }}\n\n",
-            fn_name, enum_info.type_name, namespace, const_name, enum_info.type_name
         ));
     }
 
@@ -680,8 +657,7 @@ fn generate_resource(res: &ResourceDef, model: &SmithyModel) -> Result<String> {
     // Generate attributes
     for attr in &attrs {
         let type_code = if let Some(ref ei) = attr.enum_info {
-            // Use Custom type for enums
-            let validate_fn = format!("validate_{}", attr.provider_name.to_snake_case());
+            // Use shared schema enum type for constrained strings.
             let to_dsl_code =
                 if let Some(override_code) = to_dsl_overrides.get(attr.snake_name.as_str()) {
                     override_code.to_string()
@@ -708,15 +684,20 @@ fn generate_resource(res: &ResourceDef, model: &SmithyModel) -> Result<String> {
                         "None".to_string()
                     }
                 };
+            let values_str = ei
+                .values
+                .iter()
+                .map(|v| format!("\"{}\".to_string()", v))
+                .collect::<Vec<_>>()
+                .join(", ");
             format!(
-                "AttributeType::Custom {{\n\
+                "AttributeType::StringEnum {{\n\
                  \x20               name: \"{}\".to_string(),\n\
-                 \x20               base: Box::new(AttributeType::String),\n\
-                 \x20               validate: {},\n\
+                 \x20               values: vec![{}],\n\
                  \x20               namespace: Some(\"{}\".to_string()),\n\
                  \x20               to_dsl: {},\n\
                  \x20           }}",
-                ei.type_name, validate_fn, namespace, to_dsl_code
+                ei.type_name, values_str, namespace, to_dsl_code
             )
         } else {
             attr.type_code.clone()
@@ -755,40 +736,6 @@ fn generate_resource(res: &ResourceDef, model: &SmithyModel) -> Result<String> {
             "\n\x20               .with_provider_name(\"{}\")",
             attr.provider_name
         ));
-
-        // Generate .with_completions() for enum attributes
-        if let Some(ref ei) = attr.enum_info {
-            let has_hyphens = ei.values.iter().any(|v| v.contains('-'));
-            let snake = attr.provider_name.to_snake_case();
-            let prop_aliases = enum_alias_map.get(snake.as_str());
-            let completion_entries: Vec<String> = ei
-                .values
-                .iter()
-                .map(|value| {
-                    let dsl_value = if let Some(alias_list) = prop_aliases {
-                        if let Some((_, alias)) =
-                            alias_list.iter().find(|(c, _)| *c == value.as_str())
-                        {
-                            alias.to_string()
-                        } else if has_hyphens {
-                            value.replace('-', "_")
-                        } else {
-                            value.clone()
-                        }
-                    } else if has_hyphens {
-                        value.replace('-', "_")
-                    } else {
-                        value.clone()
-                    };
-                    let dsl_id = format!("{}.{}.{}", namespace, ei.type_name, dsl_value);
-                    format!("CompletionValue::new(\"{}\", \"{}\")", dsl_id, value)
-                })
-                .collect();
-            attr_code.push_str(&format!(
-                "\n\x20               .with_completions(vec![{}])",
-                completion_entries.join(", ")
-            ));
-        }
 
         attr_code.push_str(",\n\x20       )\n");
         code.push_str(&attr_code);
@@ -1093,9 +1040,8 @@ fn generate_struct_type(
             all_ranged_ints,
         );
 
-        // If enum detected, use Custom type with validator
+        // If enum detected, use shared schema enum type.
         let field_type = if let Some(ei) = enum_info {
-            let validate_fn = format!("validate_{}", field_name.to_snake_case());
             let to_dsl_code = if let Some(override_code) = to_dsl_overrides.get(snake_name.as_str())
             {
                 override_code.to_string()
@@ -1121,15 +1067,20 @@ fn generate_struct_type(
                     "None".to_string()
                 }
             };
+            let values_str = ei
+                .values
+                .iter()
+                .map(|v| format!("\"{}\".to_string()", v))
+                .collect::<Vec<_>>()
+                .join(", ");
             format!(
-                "AttributeType::Custom {{\n\
+                "AttributeType::StringEnum {{\n\
                  \x20               name: \"{}\".to_string(),\n\
-                 \x20               base: Box::new(AttributeType::String),\n\
-                 \x20               validate: {},\n\
+                 \x20               values: vec![{}],\n\
                  \x20               namespace: Some(\"{}\".to_string()),\n\
                  \x20               to_dsl: {},\n\
                  \x20           }}",
-                ei.type_name, validate_fn, namespace, to_dsl_code
+                ei.type_name, values_str, namespace, to_dsl_code
             )
         } else {
             field_type
@@ -2737,5 +2688,41 @@ fn truncate_str(s: &str, max_len: usize) -> String {
         format!("{}...", &s[..boundary])
     } else {
         s.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generate_resource_uses_string_enum_for_namespaced_enums() {
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../carina-provider-aws/tests/fixtures/smithy/s3.json");
+        if !fixture.exists() {
+            eprintln!(
+                "Skipping: Smithy fixture not found: {}\nRun scripts/download-smithy-models.sh to enable this test",
+                fixture.display()
+            );
+            return;
+        }
+        let file = std::fs::File::open(&fixture).expect("failed to open Smithy fixture");
+        let model = carina_smithy::parse_reader(std::io::BufReader::new(file))
+            .expect("failed to parse Smithy fixture");
+        let resource = resource_defs::s3_resources()
+            .into_iter()
+            .find(|res| res.name == "s3.bucket")
+            .expect("missing s3.bucket resource def");
+
+        let generated = generate_resource(&resource, &model).expect("failed to generate resource");
+
+        assert!(
+            generated.contains("AttributeType::StringEnum {"),
+            "enum-like strings should be emitted as StringEnum: {generated}"
+        );
+        assert!(
+            !generated.contains(".with_completions("),
+            "enum completions should come from schema type metadata: {generated}"
+        );
     }
 }

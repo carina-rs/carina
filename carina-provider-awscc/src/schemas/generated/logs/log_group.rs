@@ -6,27 +6,9 @@
 
 use super::AwsccSchemaConfig;
 use super::tags_type;
-use super::validate_namespaced_enum;
-use carina_core::resource::Value;
-use carina_core::schema::{AttributeSchema, AttributeType, CompletionValue, ResourceSchema};
+use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
 const VALID_LOG_GROUP_CLASS: &[&str] = &["STANDARD", "INFREQUENT_ACCESS", "DELIVERY"];
-
-fn validate_log_group_class(value: &Value) -> Result<(), String> {
-    validate_namespaced_enum(
-        value,
-        "LogGroupClass",
-        "awscc.logs.log_group",
-        VALID_LOG_GROUP_CLASS,
-    )
-    .map_err(|reason| {
-        if let Value::String(s) = value {
-            format!("Invalid LogGroupClass '{}': {}", s, reason)
-        } else {
-            reason
-        }
-    })
-}
 
 /// Returns the schema config for logs_log_group (AWS::Logs::LogGroup)
 pub fn logs_log_group_config() -> AwsccSchemaConfig {
@@ -62,16 +44,14 @@ pub fn logs_log_group_config() -> AwsccSchemaConfig {
                 .with_provider_name("KmsKeyId"),
         )
         .attribute(
-            AttributeSchema::new("log_group_class", AttributeType::Custom {
+            AttributeSchema::new("log_group_class", AttributeType::StringEnum {
                 name: "LogGroupClass".to_string(),
-                base: Box::new(AttributeType::String),
-                validate: validate_log_group_class,
+                values: vec!["STANDARD".to_string(), "INFREQUENT_ACCESS".to_string(), "DELIVERY".to_string()],
                 namespace: Some("awscc.logs.log_group".to_string()),
                 to_dsl: None,
             })
                 .with_description("Specifies the log group class for this log group. There are two classes: + The ``Standard`` log class supports all CWL features. + The ``Infrequent Ac...")
-                .with_provider_name("LogGroupClass")
-                .with_completions(vec![CompletionValue::new("awscc.logs.log_group.LogGroupClass.STANDARD", "STANDARD"), CompletionValue::new("awscc.logs.log_group.LogGroupClass.INFREQUENT_ACCESS", "INFREQUENT_ACCESS"), CompletionValue::new("awscc.logs.log_group.LogGroupClass.DELIVERY", "DELIVERY")]),
+                .with_provider_name("LogGroupClass"),
         )
         .attribute(
             AttributeSchema::new("log_group_name", AttributeType::String)

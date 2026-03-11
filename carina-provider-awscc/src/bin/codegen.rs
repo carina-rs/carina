@@ -910,9 +910,6 @@ fn generate_schema_code(schema: &CfnSchema, type_name: &str) -> Result<String> {
     if needs_attribute_type {
         schema_imports.insert(1, "AttributeType");
     }
-    if schema.properties.keys().any(|k| enums.contains_key(k)) {
-        schema_imports.push("CompletionValue");
-    }
     if needs_struct_field {
         schema_imports.push("StructField");
     }
@@ -933,38 +930,19 @@ use super::AwsccSchemaConfig;
         resource, type_name, schema_imports_str
     ));
 
-    if has_enums || has_ranged_ints || has_ranged_floats {
+    if has_ranged_ints || has_ranged_floats {
         code.push_str("use carina_core::resource::Value;\n");
     }
     if needs_tags_type {
         code.push_str("use super::tags_type;\n");
     }
-    if has_enums {
-        code.push_str("use super::validate_namespaced_enum;\n");
-    }
     code.push('\n');
 
-    // Generate enum constants and validation functions
-    //
+    // Generate enum constants.
     // Constants are always emitted (referenced by enum_valid_values()).
-    // Validation functions are only emitted if the enum is used as a top-level property
-    // or in a struct that actually gets expanded.
     let aliases = known_enum_aliases();
-    let top_level_props: HashSet<&String> = schema.properties.keys().collect();
-    // Collect enum names that are used in expanded struct fields
-    let struct_used_enums: HashSet<String> = if let Some(_definitions) = &schema.definitions {
-        let mut used = HashSet::new();
-        // Check which definitions are reachable from top-level properties
-        for prop in schema.properties.values() {
-            collect_reachable_enum_fields(prop, schema, &enums, &mut used, &mut HashSet::new());
-        }
-        used
-    } else {
-        HashSet::new()
-    };
     for (prop_name, enum_info) in &enums {
         let const_name = format!("VALID_{}", prop_name.to_snake_case().to_uppercase());
-        let fn_name = format!("validate_{}", prop_name.to_snake_case());
 
         // Generate constant (including alias values) - always emitted
         let mut all_values: Vec<String> = enum_info
@@ -982,26 +960,6 @@ use super::AwsccSchemaConfig;
             "const {}: &[&str] = &[{}];\n\n",
             const_name, values_str
         ));
-
-        // Only emit validation function if actually referenced
-        let is_used = top_level_props.contains(prop_name) || struct_used_enums.contains(prop_name);
-        if is_used {
-            code.push_str(&format!(
-                r#"fn {}(value: &Value) -> Result<(), String> {{
-    validate_namespaced_enum(value, "{}", "{}", {})
-        .map_err(|reason| {{
-            if let Value::String(s) = value {{
-                format!("Invalid {} '{{}}': {{}}", s, reason)
-            }} else {{
-                reason
-            }}
-        }})
-}}
-
-"#,
-                fn_name, enum_info.type_name, namespace, const_name, enum_info.type_name
-            ));
-        }
     }
 
     // Generate range validation functions for integer properties
@@ -1090,8 +1048,7 @@ pub fn {}() -> AwsccSchemaConfig {{
         let is_create_only = create_only.contains(prop_name);
 
         let attr_type = if let Some(enum_info) = enums.get(prop_name) {
-            // Use AttributeType::Custom for enums
-            let validate_fn = format!("validate_{}", prop_name.to_snake_case());
+            // Use shared schema enum type for constrained strings.
             // Build to_dsl closure: handles aliases and hyphen-to-underscore conversion
             let prop_aliases = aliases.get(prop_name.as_str());
             let has_hyphens = enum_info.values.iter().any(|v| v.contains('-'));
@@ -1116,15 +1073,20 @@ pub fn {}() -> AwsccSchemaConfig {{
             } else {
                 "None".to_string()
             };
+            let values_str = enum_info
+                .values
+                .iter()
+                .map(|v| format!("\"{}\".to_string()", v))
+                .collect::<Vec<_>>()
+                .join(", ");
             format!(
-                r#"AttributeType::Custom {{
+                r#"AttributeType::StringEnum {{
                 name: "{}".to_string(),
-                base: Box::new(AttributeType::String),
-                validate: {},
+                values: vec![{}],
                 namespace: Some("{}".to_string()),
                 to_dsl: {},
             }}"#,
-                enum_info.type_name, validate_fn, namespace, to_dsl_code
+                enum_info.type_name, values_str, namespace, to_dsl_code
             )
         } else {
             let (attr_type, _) =
@@ -1175,38 +1137,6 @@ pub fn {}() -> AwsccSchemaConfig {{
             attr_code.push_str(&format!(
                 "\n                .with_block_name(\"{}\")",
                 singular
-            ));
-        }
-
-        // Generate .with_completions() for enum attributes
-        if let Some(enum_info) = enums.get(prop_name) {
-            let has_hyphens = enum_info.values.iter().any(|v| v.contains('-'));
-            let aliases = known_enum_aliases();
-            let prop_aliases = aliases.get(prop_name.as_str());
-            let completion_entries: Vec<String> = enum_info
-                .values
-                .iter()
-                .map(|value| {
-                    let dsl_value = if let Some(alias_list) = prop_aliases {
-                        if let Some((_, alias)) = alias_list.iter().find(|(c, _)| c == value) {
-                            alias.to_string()
-                        } else if has_hyphens {
-                            value.replace('-', "_")
-                        } else {
-                            value.clone()
-                        }
-                    } else if has_hyphens {
-                        value.replace('-', "_")
-                    } else {
-                        value.clone()
-                    };
-                    let dsl_id = format!("{}.{}.{}", namespace, enum_info.type_name, dsl_value);
-                    format!("CompletionValue::new(\"{}\", \"{}\")", dsl_id, value)
-                })
-                .collect();
-            attr_code.push_str(&format!(
-                "\n                .with_completions(vec![{}])",
-                completion_entries.join(", ")
             ));
         }
 
@@ -1446,69 +1376,6 @@ fn deduplicate_enum_values(values: Vec<String>) -> Option<Vec<String>> {
     }
 }
 
-/// Walk a property tree starting from a CfnProperty, following $ref links,
-/// and collect the names of enum fields that are reachable through expanded structs.
-/// This determines which enum validation functions will actually be referenced.
-fn collect_reachable_enum_fields(
-    prop: &CfnProperty,
-    schema: &CfnSchema,
-    enums: &BTreeMap<String, EnumInfo>,
-    used: &mut HashSet<String>,
-    visited: &mut HashSet<String>,
-) {
-    // Follow $ref to definition
-    if let Some(ref_path) = &prop.ref_path {
-        if ref_path.contains("/Tag") {
-            return;
-        }
-        if let Some(def_name) = ref_path.strip_prefix("#/definitions/") {
-            if !visited.insert(def_name.to_string()) {
-                return; // avoid cycles
-            }
-            if let Some(def) = schema.definitions.as_ref().and_then(|d| d.get(def_name)) {
-                if let Some(props) = &def.properties
-                    && !props.is_empty()
-                {
-                    // This struct will be expanded - check its fields
-                    for (field_name, field_prop) in props {
-                        if enums.contains_key(field_name) {
-                            used.insert(field_name.clone());
-                        }
-                        collect_reachable_enum_fields(field_prop, schema, enums, used, visited);
-                    }
-                }
-                // Also follow oneOf variants
-                for variant in &def.one_of {
-                    if let Some(props) = &variant.properties {
-                        for (field_name, field_prop) in props {
-                            if enums.contains_key(field_name) {
-                                used.insert(field_name.clone());
-                            }
-                            collect_reachable_enum_fields(field_prop, schema, enums, used, visited);
-                        }
-                    }
-                }
-            }
-        }
-        return;
-    }
-
-    // Follow items (for arrays) - recurse into item type
-    if let Some(items) = &prop.items {
-        collect_reachable_enum_fields(items, schema, enums, used, visited);
-    }
-
-    // Follow inline properties (for nested objects without $ref)
-    if let Some(props) = &prop.properties {
-        for (field_name, field_prop) in props {
-            if enums.contains_key(field_name) {
-                used.insert(field_name.clone());
-            }
-            collect_reachable_enum_fields(field_prop, schema, enums, used, visited);
-        }
-    }
-}
-
 /// Resolve a $ref path to a CfnDefinition
 /// e.g., "#/definitions/Ingress" -> Some(&CfnDefinition)
 fn resolve_ref<'a>(schema: &'a CfnSchema, ref_path: &str) -> Option<&'a CfnDefinition> {
@@ -1540,11 +1407,9 @@ fn generate_struct_type(
             let snake_name = field_name.to_snake_case();
             let (field_type, enum_info) =
                 cfn_type_to_carina_type_with_enum(field_prop, field_name, schema, namespace, enums);
-            // If enum detected in struct field and it's in the enums map, use Custom type
+            // If enum detected in struct field and it's in the enums map, use shared string enum type.
             let field_type = if let Some(local_enum_info) = enum_info {
                 if let Some(enum_info) = enums.get(field_name) {
-                    // Generate Custom type (same as top-level enum handling)
-                    let validate_fn = format!("validate_{}", field_name.to_snake_case());
                     let prop_aliases = aliases.get(field_name.as_str());
                     let has_hyphens = enum_info.values.iter().any(|v| v.contains('-'));
                     let to_dsl_code = if let Some(alias_list) = prop_aliases {
@@ -1566,15 +1431,20 @@ fn generate_struct_type(
                     } else {
                         "None".to_string()
                     };
+                    let values_str = enum_info
+                        .values
+                        .iter()
+                        .map(|v| format!("\"{}\".to_string()", v))
+                        .collect::<Vec<_>>()
+                        .join(", ");
                     format!(
-                        r#"AttributeType::Custom {{
+                        r#"AttributeType::StringEnum {{
                 name: "{}".to_string(),
-                base: Box::new(AttributeType::String),
-                validate: {},
+                values: vec![{}],
                 namespace: Some("{}".to_string()),
                 to_dsl: {},
             }}"#,
-                        enum_info.type_name, validate_fn, namespace, to_dsl_code
+                        enum_info.type_name, values_str, namespace, to_dsl_code
                     )
                 } else {
                     // Fallback: use Enum variant directly
@@ -3935,5 +3805,56 @@ mod tests {
         assert_eq!(compute_block_name("name"), None);
         assert_eq!(compute_block_name("status"), None);
         assert_eq!(compute_block_name("access"), None);
+    }
+
+    #[test]
+    fn test_generate_schema_code_uses_string_enum_for_enum_like_strings() {
+        let mut properties = BTreeMap::new();
+        properties.insert(
+            "AddressFamily".to_string(),
+            CfnProperty {
+                prop_type: Some(TypeValue::Single("string".to_string())),
+                description: Some("The address family. Either IPv4 or IPv6.".to_string()),
+                enum_values: Some(vec![
+                    EnumValue::Str("IPv4".to_string()),
+                    EnumValue::Str("IPv6".to_string()),
+                ]),
+                items: None,
+                ref_path: None,
+                insertion_order: None,
+                properties: None,
+                required: vec![],
+                minimum: None,
+                maximum: None,
+            },
+        );
+
+        let schema = CfnSchema {
+            type_name: "AWS::EC2::IPAMPool".to_string(),
+            description: None,
+            properties,
+            required: vec!["AddressFamily".to_string()],
+            read_only_properties: vec![],
+            create_only_properties: vec!["AddressFamily".to_string()],
+            write_only_properties: vec![],
+            primary_identifier: None,
+            definitions: None,
+            tagging: None,
+        };
+
+        let generated = generate_schema_code(&schema, "AWS::EC2::IPAMPool").unwrap();
+
+        assert!(
+            generated.contains("AttributeType::StringEnum {"),
+            "enum-like strings should be emitted as StringEnum: {generated}"
+        );
+        assert!(
+            !generated.contains("validate_address_family"),
+            "StringEnum generation should not fall back to per-attribute validators: {generated}"
+        );
+        assert!(
+            !generated.contains(".with_completions("),
+            "enum completions should come from schema type metadata: {generated}"
+        );
     }
 }
