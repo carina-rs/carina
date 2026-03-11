@@ -20,6 +20,8 @@ pub struct LocalBackend {
     lock_path: PathBuf,
 }
 
+const RECOVERY_CLAIM_TIMEOUT_SECS: i64 = 30;
+
 struct RecoveryClaimGuard {
     path: PathBuf,
 }
@@ -81,34 +83,82 @@ impl LocalBackend {
     }
 
     fn acquire_recovery_claim(&self) -> BackendResult<Option<RecoveryClaimGuard>> {
-        match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(self.recovery_path())
-        {
-            Ok(mut file) => {
-                let guard = RecoveryClaimGuard {
-                    path: self.recovery_path(),
-                };
-                if let Err(e) = file.write_all(b"recovering") {
-                    drop(guard);
+        let claim_path = self.recovery_path();
+        let claim = LockInfo::with_timeout("recover", RECOVERY_CLAIM_TIMEOUT_SECS);
+        let content = serde_json::to_string_pretty(&claim).map_err(|e| {
+            BackendError::Serialization(format!("Failed to serialize recovery claim: {}", e))
+        })?;
+
+        loop {
+            match Self::create_lock_file(&claim_path, &content) {
+                Ok(()) => return Ok(Some(RecoveryClaimGuard { path: claim_path })),
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(err) => {
                     return Err(BackendError::Io(format!(
-                        "Failed to write recovery claim: {}",
-                        e
+                        "Failed to create recovery claim: {}",
+                        err
                     )));
                 }
-                if let Err(e) = file.sync_all() {
-                    drop(guard);
-                    return Err(BackendError::Io(format!(
-                        "Failed to sync recovery claim: {}",
-                        e
-                    )));
-                }
-                Ok(Some(guard))
             }
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Ok(None),
+
+            let claim_content = match std::fs::read_to_string(&claim_path) {
+                Ok(content) => content,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(err) => {
+                    return Err(BackendError::Io(format!(
+                        "Failed to read recovery claim: {}",
+                        err
+                    )));
+                }
+            };
+
+            let claim_is_stale = serde_json::from_str::<LockInfo>(&claim_content)
+                .map(|claim| claim.is_expired())
+                .unwrap_or(true);
+
+            if claim_is_stale {
+                match std::fs::remove_file(&claim_path) {
+                    Ok(()) => continue,
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(err) => {
+                        return Err(BackendError::Io(format!(
+                            "Failed to remove stale recovery claim: {}",
+                            err
+                        )));
+                    }
+                }
+            }
+
+            return Ok(None);
+        }
+    }
+
+    fn has_active_recovery_claim(&self) -> BackendResult<bool> {
+        let claim_path = self.recovery_path();
+        let claim_content = match std::fs::read_to_string(&claim_path) {
+            Ok(content) => content,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(err) => {
+                return Err(BackendError::Io(format!(
+                    "Failed to read recovery claim: {}",
+                    err
+                )));
+            }
+        };
+
+        let claim_is_active = serde_json::from_str::<LockInfo>(&claim_content)
+            .map(|claim| !claim.is_expired())
+            .unwrap_or(false);
+
+        if claim_is_active {
+            return Ok(true);
+        }
+
+        match std::fs::remove_file(&claim_path) {
+            Ok(()) => Ok(false),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
             Err(err) => Err(BackendError::Io(format!(
-                "Failed to create recovery claim: {}",
+                "Failed to remove stale recovery claim: {}",
                 err
             ))),
         }
@@ -154,6 +204,11 @@ impl StateBackend for LocalBackend {
         let content = serde_json::to_string_pretty(&lock)
             .map_err(|e| BackendError::Serialization(format!("Failed to serialize lock: {}", e)))?;
         loop {
+            if self.has_active_recovery_claim()? {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                continue;
+            }
+
             match Self::create_lock_file(&self.lock_path, &content) {
                 Ok(()) => return Ok(lock),
                 Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
@@ -183,6 +238,7 @@ impl StateBackend for LocalBackend {
             }
 
             let Some(_claim) = self.acquire_recovery_claim()? else {
+                std::thread::sleep(std::time::Duration::from_millis(1));
                 continue;
             };
 
@@ -420,6 +476,28 @@ mod tests {
         assert_eq!(failures, 3);
 
         backend.release_lock(&successes[0]).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_local_backend_ignores_stale_recovery_claim() {
+        let dir = tempdir().unwrap();
+        let state_path = dir.path().join("test.state.json");
+        let backend = LocalBackend::with_path(state_path.clone());
+
+        let expired_lock = LockInfo::with_timeout("apply", -60);
+        let expired_content = serde_json::to_string_pretty(&expired_lock).unwrap();
+        std::fs::write(state_path.with_extension("lock"), expired_content).unwrap();
+
+        let stale_claim = LockInfo::with_timeout("recover", -60);
+        let stale_claim_content = serde_json::to_string_pretty(&stale_claim).unwrap();
+        std::fs::write(
+            state_path.with_extension("lock.recover"),
+            stale_claim_content,
+        )
+        .unwrap();
+
+        let lock = backend.acquire_lock("apply").await.unwrap();
+        backend.release_lock(&lock).await.unwrap();
     }
 
     #[tokio::test]
