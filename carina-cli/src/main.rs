@@ -533,6 +533,86 @@ fn apply_name_overrides(resources: &mut [Resource], state_file: &Option<StateFil
     }
 }
 
+fn queue_state_refresh(
+    pending_refreshes: &mut HashMap<ResourceId, String>,
+    id: &ResourceId,
+    identifier: Option<&str>,
+) {
+    if let Some(identifier) = identifier.filter(|identifier| !identifier.is_empty()) {
+        pending_refreshes.insert(id.clone(), identifier.to_string());
+    }
+}
+
+async fn refresh_pending_states(
+    provider: &impl Provider,
+    current_states: &mut HashMap<ResourceId, State>,
+    pending_refreshes: &HashMap<ResourceId, String>,
+) {
+    if pending_refreshes.is_empty() {
+        return;
+    }
+
+    println!();
+    println!("{}", "Refreshing uncertain resource states...".cyan());
+
+    let mut refreshes: Vec<_> = pending_refreshes.iter().collect();
+    refreshes.sort_by(|(left_id, _), (right_id, _)| left_id.to_string().cmp(&right_id.to_string()));
+
+    for (id, identifier) in refreshes {
+        match provider.read(id, Some(identifier)).await {
+            Ok(state) => {
+                println!("  {} Refresh {}", "✓".green(), id);
+                current_states.insert(id.clone(), state);
+            }
+            Err(error) => {
+                println!("  {} Refresh {} - {}", "!".yellow(), id, error);
+            }
+        }
+    }
+}
+
+fn build_state_after_apply(
+    state_file: Option<StateFile>,
+    sorted_resources: &[Resource],
+    current_states: &HashMap<ResourceId, State>,
+    applied_states: &HashMap<ResourceId, State>,
+    permanent_name_overrides: &HashMap<ResourceId, HashMap<String, String>>,
+    plan: &Plan,
+    successfully_deleted: &HashSet<ResourceId>,
+) -> StateFile {
+    let mut state = state_file.unwrap_or_default();
+
+    for resource in sorted_resources {
+        let existing = state.find_resource(&resource.id.resource_type, &resource.id.name);
+        if let Some(applied_state) = applied_states.get(&resource.id) {
+            let mut resource_state =
+                ResourceState::from_provider_state(resource, applied_state, existing);
+            if let Some(overrides) = permanent_name_overrides.get(&resource.id) {
+                resource_state.name_overrides = overrides.clone();
+            }
+            state.upsert_resource(resource_state);
+        } else if let Some(current_state) = current_states.get(&resource.id) {
+            if current_state.exists {
+                let resource_state =
+                    ResourceState::from_provider_state(resource, current_state, existing);
+                state.upsert_resource(resource_state);
+            } else {
+                state.remove_resource(&resource.id.resource_type, &resource.id.name);
+            }
+        }
+    }
+
+    for effect in plan.effects() {
+        if let Effect::Delete { id, .. } = effect
+            && successfully_deleted.contains(id)
+        {
+            state.remove_resource(&id.resource_type, &id.name);
+        }
+    }
+
+    state
+}
+
 async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
     let loaded = load_configuration(path)?;
     let mut parsed = loaded.parsed;
@@ -922,6 +1002,7 @@ async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
     let mut failed_bindings: HashSet<String> = HashSet::new();
     let mut successfully_deleted: HashSet<ResourceId> = HashSet::new();
     let mut permanent_name_overrides: HashMap<ResourceId, HashMap<String, String>> = HashMap::new();
+    let mut pending_refreshes: HashMap<ResourceId, String> = HashMap::new();
 
     // Apply each effect in order, resolving references dynamically
     for effect in plan.effects() {
@@ -1010,6 +1091,7 @@ async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
                     Err(e) => {
                         println!("  {} {} - {}", "✗".red(), format_effect(effect), e);
                         failure_count += 1;
+                        queue_state_refresh(&mut pending_refreshes, id, Some(identifier));
                         if let Some(binding) = effect.binding_name() {
                             failed_bindings.insert(binding);
                         }
@@ -1092,6 +1174,11 @@ async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
                                             cascade.id,
                                             e
                                         );
+                                        queue_state_refresh(
+                                            &mut pending_refreshes,
+                                            &cascade.id,
+                                            Some(cascade_identifier),
+                                        );
                                         cascade_failed = true;
                                         failure_count += 1;
                                         break;
@@ -1100,6 +1187,11 @@ async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
                             }
 
                             if cascade_failed {
+                                queue_state_refresh(
+                                    &mut pending_refreshes,
+                                    &to.id,
+                                    state.identifier.as_deref(),
+                                );
                                 // Don't delete old resource if cascade failed
                                 if let Some(binding) = effect.binding_name() {
                                     failed_bindings.insert(binding);
@@ -1175,6 +1267,11 @@ async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
                                             e
                                         );
                                         failure_count += 1;
+                                        queue_state_refresh(
+                                            &mut pending_refreshes,
+                                            &to.id,
+                                            state.identifier.as_deref(),
+                                        );
                                         if let Some(binding) = effect.binding_name() {
                                             failed_bindings.insert(binding);
                                         }
@@ -1224,6 +1321,11 @@ async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
                                 Err(e) => {
                                     println!("  {} {} - {}", "✗".red(), format_effect(effect), e);
                                     failure_count += 1;
+                                    queue_state_refresh(
+                                        &mut pending_refreshes,
+                                        &to.id,
+                                        Some(identifier),
+                                    );
                                     if let Some(binding) = effect.binding_name() {
                                         failed_bindings.insert(binding);
                                     }
@@ -1233,6 +1335,7 @@ async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
                         Err(e) => {
                             println!("  {} {} - {}", "✗".red(), format_effect(effect), e);
                             failure_count += 1;
+                            queue_state_refresh(&mut pending_refreshes, id, Some(identifier));
                             if let Some(binding) = effect.binding_name() {
                                 failed_bindings.insert(binding);
                             }
@@ -1253,47 +1356,28 @@ async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
                 Err(e) => {
                     println!("  {} {} - {}", "✗".red(), format_effect(effect), e);
                     failure_count += 1;
+                    queue_state_refresh(&mut pending_refreshes, id, Some(identifier));
                 }
             },
             Effect::Read { .. } => {}
         }
     }
 
+    refresh_pending_states(&provider, &mut current_states, &pending_refreshes).await;
+
     // Save state
     println!();
     println!("{}", "Saving state...".cyan());
 
-    // Get or create state file
-    let mut state = state_file.unwrap_or_default();
-
-    // Update state with current resources
-    for resource in &sorted_resources {
-        let existing = state.find_resource(&resource.id.resource_type, &resource.id.name);
-        if let Some(applied_state) = applied_states.get(&resource.id) {
-            let mut resource_state =
-                ResourceState::from_provider_state(resource, applied_state, existing);
-            // Store permanent name overrides for create_before_destroy with can_rename=false
-            if let Some(overrides) = permanent_name_overrides.get(&resource.id) {
-                resource_state.name_overrides = overrides.clone();
-            }
-            state.upsert_resource(resource_state);
-        } else if let Some(current_state) = current_states.get(&resource.id)
-            && current_state.exists
-        {
-            let resource_state =
-                ResourceState::from_provider_state(resource, current_state, existing);
-            state.upsert_resource(resource_state);
-        }
-    }
-
-    // Remove only successfully deleted resources from state
-    for effect in plan.effects() {
-        if let Effect::Delete { id, .. } = effect
-            && successfully_deleted.contains(id)
-        {
-            state.remove_resource(&id.resource_type, &id.name);
-        }
-    }
+    let mut state = build_state_after_apply(
+        state_file,
+        &sorted_resources,
+        &current_states,
+        &applied_states,
+        &permanent_name_overrides,
+        &plan,
+        &successfully_deleted,
+    );
 
     // Increment serial and save
     state.increment_serial();
@@ -1556,7 +1640,7 @@ async fn run_apply_from_plan(plan_path: &PathBuf, auto_approve: bool) -> Result<
     println!("  {} No drift detected.", "✓".green());
 
     // Use the actual states (freshly read) as current_states for apply
-    let current_states = planned_states;
+    let mut current_states = planned_states;
 
     if plan.is_empty() {
         println!("{}", "No changes needed.".green());
@@ -1627,6 +1711,7 @@ async fn run_apply_from_plan(plan_path: &PathBuf, auto_approve: bool) -> Result<
     let mut failed_bindings: HashSet<String> = HashSet::new();
     let mut successfully_deleted: HashSet<ResourceId> = HashSet::new();
     let mut permanent_name_overrides: HashMap<ResourceId, HashMap<String, String>> = HashMap::new();
+    let mut pending_refreshes: HashMap<ResourceId, String> = HashMap::new();
 
     // Apply each effect in order, resolving references dynamically
     for effect in plan.effects() {
@@ -1706,6 +1791,7 @@ async fn run_apply_from_plan(plan_path: &PathBuf, auto_approve: bool) -> Result<
                     Err(e) => {
                         println!("  {} {} - {}", "✗".red(), format_effect(effect), e);
                         failure_count += 1;
+                        queue_state_refresh(&mut pending_refreshes, id, Some(identifier));
                         if let Some(binding) = effect.binding_name() {
                             failed_bindings.insert(binding);
                         }
@@ -1788,6 +1874,11 @@ async fn run_apply_from_plan(plan_path: &PathBuf, auto_approve: bool) -> Result<
                                             cascade.id,
                                             e
                                         );
+                                        queue_state_refresh(
+                                            &mut pending_refreshes,
+                                            &cascade.id,
+                                            Some(cascade_identifier),
+                                        );
                                         cascade_failed = true;
                                         failure_count += 1;
                                         break;
@@ -1796,6 +1887,11 @@ async fn run_apply_from_plan(plan_path: &PathBuf, auto_approve: bool) -> Result<
                             }
 
                             if cascade_failed {
+                                queue_state_refresh(
+                                    &mut pending_refreshes,
+                                    &to.id,
+                                    state.identifier.as_deref(),
+                                );
                                 if let Some(binding) = effect.binding_name() {
                                     failed_bindings.insert(binding);
                                 }
@@ -1869,6 +1965,11 @@ async fn run_apply_from_plan(plan_path: &PathBuf, auto_approve: bool) -> Result<
                                             e
                                         );
                                         failure_count += 1;
+                                        queue_state_refresh(
+                                            &mut pending_refreshes,
+                                            &to.id,
+                                            state.identifier.as_deref(),
+                                        );
                                         if let Some(binding) = effect.binding_name() {
                                             failed_bindings.insert(binding);
                                         }
@@ -1914,6 +2015,11 @@ async fn run_apply_from_plan(plan_path: &PathBuf, auto_approve: bool) -> Result<
                                 Err(e) => {
                                     println!("  {} {} - {}", "✗".red(), format_effect(effect), e);
                                     failure_count += 1;
+                                    queue_state_refresh(
+                                        &mut pending_refreshes,
+                                        &to.id,
+                                        Some(identifier),
+                                    );
                                     if let Some(binding) = effect.binding_name() {
                                         failed_bindings.insert(binding);
                                     }
@@ -1923,6 +2029,7 @@ async fn run_apply_from_plan(plan_path: &PathBuf, auto_approve: bool) -> Result<
                         Err(e) => {
                             println!("  {} {} - {}", "✗".red(), format_effect(effect), e);
                             failure_count += 1;
+                            queue_state_refresh(&mut pending_refreshes, id, Some(identifier));
                             if let Some(binding) = effect.binding_name() {
                                 failed_bindings.insert(binding);
                             }
@@ -1943,44 +2050,28 @@ async fn run_apply_from_plan(plan_path: &PathBuf, auto_approve: bool) -> Result<
                 Err(e) => {
                     println!("  {} {} - {}", "✗".red(), format_effect(effect), e);
                     failure_count += 1;
+                    queue_state_refresh(&mut pending_refreshes, id, Some(identifier));
                 }
             },
             Effect::Read { .. } => {}
         }
     }
 
+    refresh_pending_states(&provider, &mut current_states, &pending_refreshes).await;
+
     // Save state
     println!();
     println!("{}", "Saving state...".cyan());
 
-    let mut state = state_file.unwrap_or_default();
-
-    for resource in sorted_resources {
-        let existing = state.find_resource(&resource.id.resource_type, &resource.id.name);
-        if let Some(applied_state) = applied_states.get(&resource.id) {
-            let mut resource_state =
-                ResourceState::from_provider_state(resource, applied_state, existing);
-            if let Some(overrides) = permanent_name_overrides.get(&resource.id) {
-                resource_state.name_overrides = overrides.clone();
-            }
-            state.upsert_resource(resource_state);
-        } else if let Some(current_state) = current_states.get(&resource.id)
-            && current_state.exists
-        {
-            let resource_state =
-                ResourceState::from_provider_state(resource, current_state, existing);
-            state.upsert_resource(resource_state);
-        }
-    }
-
-    // Remove only successfully deleted resources from state
-    for effect in plan.effects() {
-        if let Effect::Delete { id, .. } = effect
-            && successfully_deleted.contains(id)
-        {
-            state.remove_resource(&id.resource_type, &id.name);
-        }
-    }
+    let mut state = build_state_after_apply(
+        state_file,
+        sorted_resources,
+        &current_states,
+        &applied_states,
+        &permanent_name_overrides,
+        plan,
+        &successfully_deleted,
+    );
 
     // Increment serial and save
     state.increment_serial();
@@ -3068,6 +3159,159 @@ fn run_lint(path: &PathBuf) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use carina_core::provider::{BoxFuture, ProviderError, ProviderResult, ResourceType};
+    use serde_json::json;
+
+    struct TestProvider {
+        read_states: HashMap<(String, String), State>,
+    }
+
+    impl TestProvider {
+        fn with_read_state(id: &ResourceId, identifier: &str, state: State) -> Self {
+            let mut read_states = HashMap::new();
+            read_states.insert((id.to_string(), identifier.to_string()), state);
+            Self { read_states }
+        }
+    }
+
+    impl Provider for TestProvider {
+        fn name(&self) -> &'static str {
+            "test"
+        }
+
+        fn resource_types(&self) -> Vec<Box<dyn ResourceType>> {
+            vec![]
+        }
+
+        fn read(
+            &self,
+            id: &ResourceId,
+            identifier: Option<&str>,
+        ) -> BoxFuture<'_, ProviderResult<State>> {
+            let key = (id.to_string(), identifier.unwrap_or_default().to_string());
+            let state = self
+                .read_states
+                .get(&key)
+                .cloned()
+                .unwrap_or_else(|| panic!("missing read state for {:?}", key));
+            Box::pin(async move { Ok(state) })
+        }
+
+        fn create(&self, _resource: &Resource) -> BoxFuture<'_, ProviderResult<State>> {
+            Box::pin(async { Err(ProviderError::new("unexpected create")) })
+        }
+
+        fn update(
+            &self,
+            _id: &ResourceId,
+            _identifier: &str,
+            _from: &State,
+            _to: &Resource,
+        ) -> BoxFuture<'_, ProviderResult<State>> {
+            Box::pin(async { Err(ProviderError::new("unexpected update")) })
+        }
+
+        fn delete(
+            &self,
+            _id: &ResourceId,
+            _identifier: &str,
+            _lifecycle: &LifecycleConfig,
+        ) -> BoxFuture<'_, ProviderResult<()>> {
+            Box::pin(async { Err(ProviderError::new("unexpected delete")) })
+        }
+    }
+
+    #[tokio::test]
+    async fn refresh_pending_states_updates_saved_state_from_provider_read() {
+        let resource = Resource::with_provider("aws", "s3.bucket", "bucket");
+        let id = resource.id.clone();
+        let identifier = "bucket-123";
+
+        let mut current_states = HashMap::from([(
+            id.clone(),
+            State::existing(
+                id.clone(),
+                HashMap::from([("status".to_string(), Value::String("before".to_string()))]),
+            )
+            .with_identifier(identifier),
+        )]);
+        let provider = TestProvider::with_read_state(
+            &id,
+            identifier,
+            State::existing(
+                id.clone(),
+                HashMap::from([("status".to_string(), Value::String("after".to_string()))]),
+            )
+            .with_identifier(identifier),
+        );
+
+        let mut pending_refreshes = HashMap::new();
+        queue_state_refresh(&mut pending_refreshes, &id, Some(identifier));
+        refresh_pending_states(&provider, &mut current_states, &pending_refreshes).await;
+
+        let mut existing_state = StateFile::new();
+        existing_state.upsert_resource(
+            ResourceState::new("s3.bucket", "bucket", "aws")
+                .with_identifier(identifier)
+                .with_attribute("status", json!("before")),
+        );
+
+        let saved = build_state_after_apply(
+            Some(existing_state),
+            &[resource],
+            &current_states,
+            &HashMap::new(),
+            &HashMap::new(),
+            &Plan::new(),
+            &HashSet::new(),
+        );
+
+        let saved_resource = saved.find_resource("s3.bucket", "bucket").unwrap();
+        assert_eq!(
+            saved_resource.attributes.get("status"),
+            Some(&json!("after"))
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_pending_states_removes_not_found_resource_from_saved_state() {
+        let resource = Resource::with_provider("aws", "s3.bucket", "bucket");
+        let id = resource.id.clone();
+        let identifier = "bucket-123";
+
+        let mut current_states = HashMap::from([(
+            id.clone(),
+            State::existing(
+                id.clone(),
+                HashMap::from([("status".to_string(), Value::String("before".to_string()))]),
+            )
+            .with_identifier(identifier),
+        )]);
+        let provider = TestProvider::with_read_state(&id, identifier, State::not_found(id.clone()));
+
+        let mut pending_refreshes = HashMap::new();
+        queue_state_refresh(&mut pending_refreshes, &id, Some(identifier));
+        refresh_pending_states(&provider, &mut current_states, &pending_refreshes).await;
+
+        let mut existing_state = StateFile::new();
+        existing_state.upsert_resource(
+            ResourceState::new("s3.bucket", "bucket", "aws")
+                .with_identifier(identifier)
+                .with_attribute("status", json!("before")),
+        );
+
+        let saved = build_state_after_apply(
+            Some(existing_state),
+            &[resource],
+            &current_states,
+            &HashMap::new(),
+            &HashMap::new(),
+            &Plan::new(),
+            &HashSet::new(),
+        );
+
+        assert!(saved.find_resource("s3.bucket", "bucket").is_none());
+    }
 
     #[test]
     fn plan_file_serde_round_trip() {
