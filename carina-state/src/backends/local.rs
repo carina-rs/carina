@@ -4,6 +4,8 @@
 //! It uses a .lock file for simple locking mechanism.
 
 use async_trait::async_trait;
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::PathBuf;
 
 use crate::backend::{BackendConfig, BackendError, BackendResult, StateBackend};
@@ -16,6 +18,18 @@ pub struct LocalBackend {
     state_path: PathBuf,
     /// Path to the lock file
     lock_path: PathBuf,
+}
+
+const RECOVERY_CLAIM_TIMEOUT_SECS: i64 = 30;
+
+struct RecoveryClaimGuard {
+    path: PathBuf,
+}
+
+impl Drop for RecoveryClaimGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
 }
 
 impl LocalBackend {
@@ -49,6 +63,105 @@ impl LocalBackend {
     /// Get the state file path
     pub fn state_path(&self) -> &PathBuf {
         &self.state_path
+    }
+
+    fn recovery_path(&self) -> PathBuf {
+        self.lock_path.with_extension("lock.recover")
+    }
+
+    fn create_lock_file(path: &PathBuf, content: &str) -> std::io::Result<()> {
+        let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
+        if let Err(err) = file.write_all(content.as_bytes()) {
+            let _ = std::fs::remove_file(path);
+            return Err(err);
+        }
+        if let Err(err) = file.sync_all() {
+            let _ = std::fs::remove_file(path);
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    fn acquire_recovery_claim(&self) -> BackendResult<Option<RecoveryClaimGuard>> {
+        let claim_path = self.recovery_path();
+        let claim = LockInfo::with_timeout("recover", RECOVERY_CLAIM_TIMEOUT_SECS);
+        let content = serde_json::to_string_pretty(&claim).map_err(|e| {
+            BackendError::Serialization(format!("Failed to serialize recovery claim: {}", e))
+        })?;
+
+        loop {
+            match Self::create_lock_file(&claim_path, &content) {
+                Ok(()) => return Ok(Some(RecoveryClaimGuard { path: claim_path })),
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(err) => {
+                    return Err(BackendError::Io(format!(
+                        "Failed to create recovery claim: {}",
+                        err
+                    )));
+                }
+            }
+
+            let claim_content = match std::fs::read_to_string(&claim_path) {
+                Ok(content) => content,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(err) => {
+                    return Err(BackendError::Io(format!(
+                        "Failed to read recovery claim: {}",
+                        err
+                    )));
+                }
+            };
+
+            let claim_is_stale = serde_json::from_str::<LockInfo>(&claim_content)
+                .map(|claim| claim.is_expired())
+                .unwrap_or(true);
+
+            if claim_is_stale {
+                match std::fs::remove_file(&claim_path) {
+                    Ok(()) => continue,
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(err) => {
+                        return Err(BackendError::Io(format!(
+                            "Failed to remove stale recovery claim: {}",
+                            err
+                        )));
+                    }
+                }
+            }
+
+            return Ok(None);
+        }
+    }
+
+    fn has_active_recovery_claim(&self) -> BackendResult<bool> {
+        let claim_path = self.recovery_path();
+        let claim_content = match std::fs::read_to_string(&claim_path) {
+            Ok(content) => content,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(err) => {
+                return Err(BackendError::Io(format!(
+                    "Failed to read recovery claim: {}",
+                    err
+                )));
+            }
+        };
+
+        let claim_is_active = serde_json::from_str::<LockInfo>(&claim_content)
+            .map(|claim| !claim.is_expired())
+            .unwrap_or(false);
+
+        if claim_is_active {
+            return Ok(true);
+        }
+
+        match std::fs::remove_file(&claim_path) {
+            Ok(()) => Ok(false),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(err) => Err(BackendError::Io(format!(
+                "Failed to remove stale recovery claim: {}",
+                err
+            ))),
+        }
     }
 }
 
@@ -87,28 +200,87 @@ impl StateBackend for LocalBackend {
     }
 
     async fn acquire_lock(&self, operation: &str) -> BackendResult<LockInfo> {
-        // Check if lock file exists and read it
-        if self.lock_path.exists() {
-            let content = std::fs::read_to_string(&self.lock_path)
-                .map_err(|e| BackendError::Io(format!("Failed to read lock file: {}", e)))?;
-
-            if let Ok(existing_lock) = serde_json::from_str::<LockInfo>(&content) {
-                // Check if lock is expired
-                if !existing_lock.is_expired() {
-                    return Err(BackendError::locked(&existing_lock));
-                }
-            }
-        }
-
-        // Create new lock
         let lock = LockInfo::new(operation);
         let content = serde_json::to_string_pretty(&lock)
             .map_err(|e| BackendError::Serialization(format!("Failed to serialize lock: {}", e)))?;
+        loop {
+            if self.has_active_recovery_claim()? {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                continue;
+            }
 
-        std::fs::write(&self.lock_path, content)
-            .map_err(|e| BackendError::Io(format!("Failed to write lock file: {}", e)))?;
+            match Self::create_lock_file(&self.lock_path, &content) {
+                Ok(()) => return Ok(lock),
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(err) => {
+                    return Err(BackendError::Io(format!(
+                        "Failed to write lock file: {}",
+                        err
+                    )));
+                }
+            }
 
-        Ok(lock)
+            let current_content = match std::fs::read_to_string(&self.lock_path) {
+                Ok(content) => content,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(err) => {
+                    return Err(BackendError::Io(format!(
+                        "Failed to read lock file: {}",
+                        err
+                    )));
+                }
+            };
+
+            if let Ok(existing_lock) = serde_json::from_str::<LockInfo>(&current_content)
+                && !existing_lock.is_expired()
+            {
+                return Err(BackendError::locked(&existing_lock));
+            }
+
+            let Some(_claim) = self.acquire_recovery_claim()? else {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                continue;
+            };
+
+            let current_content = match std::fs::read_to_string(&self.lock_path) {
+                Ok(content) => content,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(err) => {
+                    return Err(BackendError::Io(format!(
+                        "Failed to read lock file: {}",
+                        err
+                    )));
+                }
+            };
+
+            if let Ok(existing_lock) = serde_json::from_str::<LockInfo>(&current_content)
+                && !existing_lock.is_expired()
+            {
+                return Err(BackendError::locked(&existing_lock));
+            }
+
+            match std::fs::remove_file(&self.lock_path) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(err) => {
+                    return Err(BackendError::Io(format!(
+                        "Failed to remove stale lock file: {}",
+                        err
+                    )));
+                }
+            }
+
+            match Self::create_lock_file(&self.lock_path, &content) {
+                Ok(()) => return Ok(lock),
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(err) => {
+                    return Err(BackendError::Io(format!(
+                        "Failed to write lock file: {}",
+                        err
+                    )));
+                }
+            }
+        }
     }
 
     async fn release_lock(&self, lock: &LockInfo) -> BackendResult<()> {
@@ -179,6 +351,7 @@ impl StateBackend for LocalBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Barrier};
     use tempfile::tempdir;
 
     #[tokio::test]
@@ -224,6 +397,107 @@ mod tests {
         let lock2 = backend.acquire_lock("destroy").await.unwrap();
         assert_eq!(lock2.operation, "destroy");
         backend.release_lock(&lock2).await.unwrap();
+    }
+
+    #[test]
+    fn test_local_backend_lock_acquisition_is_atomic() {
+        let dir = tempdir().unwrap();
+        let state_path = dir.path().join("test.state.json");
+        let backend = Arc::new(LocalBackend::with_path(state_path));
+        let barrier = Arc::new(Barrier::new(8));
+
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let backend = Arc::clone(&backend);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    let runtime = tokio::runtime::Runtime::new().unwrap();
+                    barrier.wait();
+                    runtime.block_on(backend.acquire_lock("apply"))
+                })
+            })
+            .collect();
+
+        let mut successes = Vec::new();
+        let mut failures = 0;
+
+        for handle in handles {
+            match handle.join().unwrap() {
+                Ok(lock) => successes.push(lock),
+                Err(BackendError::Locked { .. }) => failures += 1,
+                Err(other) => panic!("unexpected error: {other}"),
+            }
+        }
+
+        assert_eq!(successes.len(), 1);
+        assert_eq!(failures, 7);
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime
+            .block_on(backend.release_lock(&successes[0]))
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_local_backend_replaces_expired_lock_once() {
+        let dir = tempdir().unwrap();
+        let state_path = dir.path().join("test.state.json");
+        let backend = Arc::new(LocalBackend::with_path(state_path.clone()));
+
+        let expired_lock = LockInfo::with_timeout("apply", -60);
+        let expired_content = serde_json::to_string_pretty(&expired_lock).unwrap();
+        std::fs::write(state_path.with_extension("lock"), expired_content).unwrap();
+
+        let barrier = Arc::new(Barrier::new(4));
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                let backend = Arc::clone(&backend);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    let runtime = tokio::runtime::Runtime::new().unwrap();
+                    barrier.wait();
+                    runtime.block_on(backend.acquire_lock("apply"))
+                })
+            })
+            .collect();
+
+        let mut successes = Vec::new();
+        let mut failures = 0;
+
+        for handle in handles {
+            match handle.join().unwrap() {
+                Ok(lock) => successes.push(lock),
+                Err(BackendError::Locked { .. }) => failures += 1,
+                Err(other) => panic!("unexpected error: {other}"),
+            }
+        }
+
+        assert_eq!(successes.len(), 1);
+        assert_eq!(failures, 3);
+
+        backend.release_lock(&successes[0]).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_local_backend_ignores_stale_recovery_claim() {
+        let dir = tempdir().unwrap();
+        let state_path = dir.path().join("test.state.json");
+        let backend = LocalBackend::with_path(state_path.clone());
+
+        let expired_lock = LockInfo::with_timeout("apply", -60);
+        let expired_content = serde_json::to_string_pretty(&expired_lock).unwrap();
+        std::fs::write(state_path.with_extension("lock"), expired_content).unwrap();
+
+        let stale_claim = LockInfo::with_timeout("recover", -60);
+        let stale_claim_content = serde_json::to_string_pretty(&stale_claim).unwrap();
+        std::fs::write(
+            state_path.with_extension("lock.recover"),
+            stale_claim_content,
+        )
+        .unwrap();
+
+        let lock = backend.acquire_lock("apply").await.unwrap();
+        backend.release_lock(&lock).await.unwrap();
     }
 
     #[tokio::test]

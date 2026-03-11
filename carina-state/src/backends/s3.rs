@@ -2,6 +2,7 @@
 
 use async_trait::async_trait;
 use aws_sdk_s3::Client;
+use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::operation::head_bucket::HeadBucketError;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{
@@ -76,7 +77,7 @@ impl S3Backend {
     }
 
     /// Read the lock file from S3
-    async fn read_lock(&self) -> BackendResult<Option<LockInfo>> {
+    async fn read_lock_with_etag(&self) -> BackendResult<Option<(LockInfo, String)>> {
         let result = self
             .client
             .get_object()
@@ -87,6 +88,10 @@ impl S3Backend {
 
         match result {
             Ok(output) => {
+                let etag = output
+                    .e_tag()
+                    .map(ToOwned::to_owned)
+                    .ok_or_else(|| BackendError::Aws("Lock object missing ETag".to_string()))?;
                 let body = output
                     .body
                     .collect()
@@ -95,7 +100,7 @@ impl S3Backend {
                 let bytes = body.into_bytes();
                 let lock: LockInfo = serde_json::from_slice(&bytes)
                     .map_err(|e| BackendError::Serialization(e.to_string()))?;
-                Ok(Some(lock))
+                Ok(Some((lock, etag)))
             }
             Err(err) => {
                 // Check if it's a NoSuchKey error
@@ -108,10 +113,30 @@ impl S3Backend {
         }
     }
 
-    /// Write a lock file to S3
-    async fn write_lock(&self, lock: &LockInfo) -> BackendResult<()> {
-        let body = serde_json::to_vec_pretty(lock)
-            .map_err(|e| BackendError::Serialization(e.to_string()))?;
+    async fn read_lock(&self) -> BackendResult<Option<LockInfo>> {
+        Ok(self.read_lock_with_etag().await?.map(|(lock, _)| lock))
+    }
+
+    fn lock_body(lock: &LockInfo) -> BackendResult<Vec<u8>> {
+        serde_json::to_vec_pretty(lock).map_err(|e| BackendError::Serialization(e.to_string()))
+    }
+
+    async fn write_lock_if_absent(&self, lock: &LockInfo) -> BackendResult<bool> {
+        self.write_lock(lock, Some("*"), None).await
+    }
+
+    async fn replace_lock_if_match(&self, lock: &LockInfo, etag: &str) -> BackendResult<bool> {
+        self.write_lock(lock, None, Some(etag)).await
+    }
+
+    /// Write a lock file to S3 using conditional headers for atomic acquisition.
+    async fn write_lock(
+        &self,
+        lock: &LockInfo,
+        if_none_match: Option<&str>,
+        if_match: Option<&str>,
+    ) -> BackendResult<bool> {
+        let body = Self::lock_body(lock)?;
 
         let mut request = self
             .client
@@ -125,12 +150,19 @@ impl S3Backend {
             request = request.server_side_encryption(ServerSideEncryption::Aes256);
         }
 
-        request
-            .send()
-            .await
-            .map_err(|e| BackendError::Aws(e.to_string()))?;
+        if let Some(value) = if_none_match {
+            request = request.if_none_match(value);
+        }
 
-        Ok(())
+        if let Some(value) = if_match {
+            request = request.if_match(value);
+        }
+
+        match request.send().await {
+            Ok(_) => Ok(true),
+            Err(err) if is_conditional_write_conflict(&err) => Ok(false),
+            Err(err) => Err(BackendError::Aws(err.to_string())),
+        }
     }
 
     /// Delete the lock file from S3
@@ -215,35 +247,24 @@ impl StateBackend for S3Backend {
     }
 
     async fn acquire_lock(&self, operation: &str) -> BackendResult<LockInfo> {
-        // Check for existing lock
-        if let Some(existing_lock) = self.read_lock().await? {
-            // If the lock has expired, we can take it
-            if existing_lock.is_expired() {
-                // Expired lock - delete it and proceed
-                self.delete_lock().await?;
-            } else {
-                // Lock is still valid
+        let lock = LockInfo::new(operation);
+        loop {
+            if self.write_lock_if_absent(&lock).await? {
+                return Ok(lock);
+            }
+
+            let Some((existing_lock, etag)) = self.read_lock_with_etag().await? else {
+                continue;
+            };
+
+            if !existing_lock.is_expired() {
                 return Err(BackendError::locked(&existing_lock));
             }
-        }
 
-        // Create and write new lock
-        let lock = LockInfo::new(operation);
-        self.write_lock(&lock).await?;
-
-        // Verify we got the lock (in case of race condition)
-        // Read it back and check it's ours
-        if let Some(written_lock) = self.read_lock().await? {
-            if written_lock.id == lock.id {
+            if self.replace_lock_if_match(&lock, &etag).await? {
                 return Ok(lock);
-            } else {
-                // Someone else got the lock
-                return Err(BackendError::locked(&written_lock));
             }
         }
-
-        // This shouldn't happen, but just in case
-        Ok(lock)
     }
 
     async fn release_lock(&self, lock: &LockInfo) -> BackendResult<()> {
@@ -401,6 +422,25 @@ fn is_not_found_error<E: std::fmt::Debug>(err: &aws_sdk_s3::error::SdkError<E>) 
     false
 }
 
+fn is_conditional_write_conflict_code(code: Option<&str>) -> bool {
+    matches!(
+        code,
+        Some("ConditionalRequestConflict" | "PreconditionFailed")
+    )
+}
+
+fn is_conditional_write_conflict<E>(err: &aws_sdk_s3::error::SdkError<E>) -> bool
+where
+    E: std::fmt::Debug + ProvideErrorMetadata,
+{
+    if let Some(raw) = err.raw_response() {
+        return matches!(raw.status().as_u16(), 409 | 412);
+    }
+
+    err.as_service_error()
+        .is_some_and(|service_err| is_conditional_write_conflict_code(service_err.code()))
+}
+
 fn is_head_bucket_not_found(err: &HeadBucketError) -> bool {
     err.is_not_found()
 }
@@ -479,5 +519,17 @@ mod tests {
     fn test_is_missing_head_bucket_response_rejects_non_service_404s() {
         let err = SdkError::response_error("not found response", ());
         assert!(!is_missing_head_bucket_response(&err));
+    }
+
+    #[test]
+    fn test_is_conditional_write_conflict_code() {
+        assert!(is_conditional_write_conflict_code(Some(
+            "ConditionalRequestConflict"
+        )));
+        assert!(is_conditional_write_conflict_code(Some(
+            "PreconditionFailed"
+        )));
+        assert!(!is_conditional_write_conflict_code(Some("AccessDenied")));
+        assert!(!is_conditional_write_conflict_code(None));
     }
 }
