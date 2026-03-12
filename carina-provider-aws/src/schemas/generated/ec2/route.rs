@@ -17,7 +17,7 @@ pub fn ec2_route_config() -> AwsSchemaConfig {
         schema: ResourceSchema::new("aws.ec2.route")
         .with_description("Describes a route in a route table.")
         .attribute(
-            AttributeSchema::new("carrier_gateway_id", super::aws_resource_id())
+            AttributeSchema::new("carrier_gateway_id", super::carrier_gateway_id())
                 .with_description("The ID of the carrier gateway. You can only use this option when the VPC contains a subnet which is associated with a Wavelength Zone.")
                 .with_provider_name("CarrierGatewayId"),
         )
@@ -39,7 +39,7 @@ pub fn ec2_route_config() -> AwsSchemaConfig {
                 .with_provider_name("DestinationIpv6CidrBlock"),
         )
         .attribute(
-            AttributeSchema::new("destination_prefix_list_id", super::aws_resource_id())
+            AttributeSchema::new("destination_prefix_list_id", super::prefix_list_id())
                 .create_only()
                 .with_description("The ID of a prefix list used for the destination match.")
                 .with_provider_name("DestinationPrefixListId"),
@@ -55,12 +55,12 @@ pub fn ec2_route_config() -> AwsSchemaConfig {
                 .with_provider_name("GatewayId"),
         )
         .attribute(
-            AttributeSchema::new("instance_id", super::aws_resource_id())
+            AttributeSchema::new("instance_id", super::instance_id())
                 .with_description("The ID of a NAT instance in your VPC. The operation fails if you specify an instance ID unless exactly one network interface is attached.")
                 .with_provider_name("InstanceId"),
         )
         .attribute(
-            AttributeSchema::new("local_gateway_id", super::aws_resource_id())
+            AttributeSchema::new("local_gateway_id", super::local_gateway_id())
                 .with_description("The ID of the local gateway.")
                 .with_provider_name("LocalGatewayId"),
         )
@@ -70,7 +70,7 @@ pub fn ec2_route_config() -> AwsSchemaConfig {
                 .with_provider_name("NatGatewayId"),
         )
         .attribute(
-            AttributeSchema::new("network_interface_id", super::aws_resource_id())
+            AttributeSchema::new("network_interface_id", super::network_interface_id())
                 .with_description("The ID of a network interface.")
                 .with_provider_name("NetworkInterfaceId"),
         )

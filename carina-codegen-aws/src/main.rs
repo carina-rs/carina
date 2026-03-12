@@ -845,52 +845,9 @@ fn resolve_type(
 
     match kind {
         Some(ShapeKind::String) => {
-            // Check name-based type inference
+            // Check name-based type inference (handles CIDR, IP, AZ, ARN, resource IDs, etc.)
             if let Some(inferred) = infer_string_type(field_name) {
                 return (inferred, None);
-            }
-
-            // Check for CIDR patterns
-            let lower = field_name.to_lowercase();
-            if lower.contains("cidr") {
-                if lower.contains("ipv6") {
-                    return ("types::ipv6_cidr()".to_string(), None);
-                }
-                return ("types::ipv4_cidr()".to_string(), None);
-            }
-
-            // Check for IP address patterns
-            if (lower.contains("ipaddress")
-                || lower.ends_with("ip")
-                || lower.contains("ipaddresses"))
-                && !lower.contains("cidr")
-                && !lower.contains("count")
-                && !lower.contains("type")
-            {
-                if lower.contains("ipv6") {
-                    return ("types::ipv6_address()".to_string(), None);
-                }
-                return ("types::ipv4_address()".to_string(), None);
-            }
-
-            // IPAM Pool IDs
-            if is_ipam_pool_id_property(field_name) {
-                return ("super::ipam_pool_id()".to_string(), None);
-            }
-
-            // Resource IDs
-            if is_aws_resource_id_property(field_name) {
-                return (get_resource_id_type(field_name).to_string(), None);
-            }
-
-            // ARN patterns
-            if lower.ends_with("arn") || lower.ends_with("arns") || lower.contains("_arn") {
-                return ("super::arn()".to_string(), None);
-            }
-
-            // Availability zone
-            if lower == "availabilityzone" {
-                return ("super::availability_zone()".to_string(), None);
             }
 
             ("AttributeType::String".to_string(), None)
@@ -2293,39 +2250,6 @@ fn type_display_string_md<'a>(
             if let Some(inferred) = infer_string_type(field_name) {
                 return type_code_to_display(&inferred);
             }
-            let lower = field_name.to_lowercase();
-            if lower.contains("cidr") {
-                return if lower.contains("ipv6") {
-                    "Ipv6Cidr".to_string()
-                } else {
-                    "Ipv4Cidr".to_string()
-                };
-            }
-            if (lower.contains("ipaddress")
-                || lower.ends_with("ip")
-                || lower.contains("ipaddresses"))
-                && !lower.contains("cidr")
-                && !lower.contains("count")
-                && !lower.contains("type")
-            {
-                return if lower.contains("ipv6") {
-                    "Ipv6Address".to_string()
-                } else {
-                    "Ipv4Address".to_string()
-                };
-            }
-            if is_ipam_pool_id_property(field_name) {
-                return "IpamPoolId".to_string();
-            }
-            if is_aws_resource_id_property(field_name) {
-                return resource_id_display(field_name);
-            }
-            if lower.ends_with("arn") || lower.ends_with("arns") || lower.contains("_arn") {
-                return "Arn".to_string();
-            }
-            if lower == "availabilityzone" {
-                return "AvailabilityZone".to_string();
-            }
             "String".to_string()
         }
         Some(ShapeKind::Boolean) => "Bool".to_string(),
@@ -2426,7 +2350,16 @@ fn type_code_to_display(type_code: &str) -> String {
         s if s.contains("subnet_id") => "SubnetId".to_string(),
         s if s.contains("security_group_id") => "SecurityGroupId".to_string(),
         s if s.contains("ipam_pool_id") => "IpamPoolId".to_string(),
+        s if s.contains("instance_id") => "InstanceId".to_string(),
+        s if s.contains("network_interface_id") => "NetworkInterfaceId".to_string(),
+        s if s.contains("allocation_id") => "AllocationId".to_string(),
+        s if s.contains("prefix_list_id") => "PrefixListId".to_string(),
+        s if s.contains("carrier_gateway_id") => "CarrierGatewayId".to_string(),
+        s if s.contains("local_gateway_id") => "LocalGatewayId".to_string(),
+        s if s.contains("network_acl_id") => "NetworkAclId".to_string(),
+        "super::gateway_id()" => "GatewayId".to_string(),
         s if s.contains("arn()") => "Arn".to_string(),
+        s if s.contains("aws_account_id") => "AwsAccountId".to_string(),
         s if s.contains("aws_resource_id") => "AwsResourceId".to_string(),
         s if s.contains("availability_zone") => "AvailabilityZone".to_string(),
         _ => type_code
@@ -2450,6 +2383,13 @@ fn resource_id_display(prop_name: &str) -> String {
         ResourceIdKind::TransitGatewayId => "TransitGatewayId".to_string(),
         ResourceIdKind::VpnGatewayId => "VpnGatewayId".to_string(),
         ResourceIdKind::VpcEndpointId => "VpcEndpointId".to_string(),
+        ResourceIdKind::InstanceId => "InstanceId".to_string(),
+        ResourceIdKind::NetworkInterfaceId => "NetworkInterfaceId".to_string(),
+        ResourceIdKind::AllocationId => "AllocationId".to_string(),
+        ResourceIdKind::PrefixListId => "PrefixListId".to_string(),
+        ResourceIdKind::CarrierGatewayId => "CarrierGatewayId".to_string(),
+        ResourceIdKind::LocalGatewayId => "LocalGatewayId".to_string(),
+        ResourceIdKind::NetworkAclId => "NetworkAclId".to_string(),
         ResourceIdKind::Generic => "AwsResourceId".to_string(),
     }
 }
@@ -2460,7 +2400,9 @@ fn known_string_type_overrides() -> &'static HashMap<&'static str, &'static str>
     static OVERRIDES: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| {
         let mut m = HashMap::new();
         m.insert("DefaultSecurityGroup", "super::security_group_id()");
-        m.insert("DefaultNetworkAcl", "super::aws_resource_id()");
+        m.insert("DefaultNetworkAcl", "super::network_acl_id()");
+        m.insert("AccountId", "super::aws_account_id()");
+        m.insert("GatewayId", "super::gateway_id()");
         m.insert("DeliverCrossAccountRole", "super::iam_role_arn()");
         m.insert("DeliverLogsPermissionArn", "super::iam_role_arn()");
         m.insert("PeerRoleArn", "super::iam_role_arn()");
@@ -2502,15 +2444,71 @@ fn infer_string_type(prop_name: &str) -> Option<String> {
     if let Some(&override_type) = known_string_type_overrides().get(prop_name) {
         return Some(override_type.to_string());
     }
+
+    // Normalize plural forms for type inference
+    let singular_name = if prop_name.ends_with("Ids")
+        || prop_name.ends_with("ids")
+        || prop_name.ends_with("Arns")
+        || prop_name.ends_with("arns")
+    {
+        &prop_name[..prop_name.len() - 1]
+    } else {
+        prop_name
+    };
+
+    // Check overrides for singular form too (e.g., list items)
+    if let Some(&override_type) = known_string_type_overrides().get(singular_name) {
+        return Some(override_type.to_string());
+    }
+
+    let prop_lower = singular_name.to_lowercase();
+
+    // CIDR types - differentiate IPv4 vs IPv6 based on property name
+    if prop_lower.contains("cidr") {
+        if prop_lower.contains("ipv6") {
+            return Some("types::ipv6_cidr()".to_string());
+        }
+        return Some("types::ipv4_cidr()".to_string());
+    }
+
+    // IP address types (not CIDR) - e.g., PrivateIpAddress, PublicIp
+    if (prop_lower.contains("ipaddress")
+        || prop_lower.ends_with("ip")
+        || prop_lower.contains("ipaddresses"))
+        && !prop_lower.contains("count")
+        && !prop_lower.contains("type")
+    {
+        if prop_lower.contains("ipv6") {
+            return Some("types::ipv6_address()".to_string());
+        }
+        return Some("types::ipv4_address()".to_string());
+    }
+
+    // Availability zone (but not AvailabilityZoneId which uses AZ ID format like "use1-az1")
+    if prop_lower == "availabilityzone" || prop_lower == "availabilityzones" {
+        return Some("super::availability_zone()".to_string());
+    }
+
     // Check ARN pattern
-    let prop_lower = prop_name.to_lowercase();
     if prop_lower.ends_with("arn") || prop_lower.ends_with("arns") || prop_lower.contains("_arn") {
         return Some("super::arn()".to_string());
     }
-    // Check resource ID pattern
-    if is_aws_resource_id_property(prop_name) {
-        return Some(get_resource_id_type(prop_name).to_string());
+
+    // IPAM Pool IDs
+    if is_ipam_pool_id_property(singular_name) {
+        return Some("super::ipam_pool_id()".to_string());
     }
+
+    // Check resource ID pattern
+    if is_aws_resource_id_property(singular_name) {
+        return Some(get_resource_id_type(singular_name).to_string());
+    }
+
+    // AWS Account ID (owner IDs are 12-digit account IDs)
+    if prop_lower.ends_with("ownerid") {
+        return Some("super::aws_account_id()".to_string());
+    }
+
     None
 }
 
@@ -2564,6 +2562,13 @@ enum ResourceIdKind {
     TransitGatewayId,
     VpnGatewayId,
     VpcEndpointId,
+    InstanceId,
+    NetworkInterfaceId,
+    AllocationId,
+    PrefixListId,
+    CarrierGatewayId,
+    LocalGatewayId,
+    NetworkAclId,
     Generic,
 }
 
@@ -2602,6 +2607,34 @@ fn classify_resource_id(prop_name: &str) -> ResourceIdKind {
     if lower.contains("vpcendpoint") && lower.ends_with("id") {
         return ResourceIdKind::VpcEndpointId;
     }
+    // Instance IDs (e.g., InstanceId)
+    if lower.ends_with("instanceid") {
+        return ResourceIdKind::InstanceId;
+    }
+    // Network Interface IDs (e.g., NetworkInterfaceId, EniId)
+    if lower.ends_with("networkinterfaceid") || lower.ends_with("eniid") {
+        return ResourceIdKind::NetworkInterfaceId;
+    }
+    // Allocation IDs (e.g., AllocationId)
+    if lower.ends_with("allocationid") {
+        return ResourceIdKind::AllocationId;
+    }
+    // Prefix List IDs (e.g., PrefixListId, DestinationPrefixListId)
+    if lower.ends_with("prefixlistid") {
+        return ResourceIdKind::PrefixListId;
+    }
+    // Carrier Gateway IDs (e.g., CarrierGatewayId)
+    if lower.contains("carriergateway") && lower.ends_with("id") {
+        return ResourceIdKind::CarrierGatewayId;
+    }
+    // Local Gateway IDs (e.g., LocalGatewayId)
+    if lower.contains("localgateway") && lower.ends_with("id") {
+        return ResourceIdKind::LocalGatewayId;
+    }
+    // Network ACL IDs (e.g., NetworkAclId)
+    if lower.contains("networkacl") && lower.ends_with("id") {
+        return ResourceIdKind::NetworkAclId;
+    }
     ResourceIdKind::Generic
 }
 
@@ -2618,6 +2651,13 @@ fn get_resource_id_type(prop_name: &str) -> &'static str {
         ResourceIdKind::TransitGatewayId => "super::transit_gateway_id()",
         ResourceIdKind::VpnGatewayId => "super::vpn_gateway_id()",
         ResourceIdKind::VpcEndpointId => "super::vpc_endpoint_id()",
+        ResourceIdKind::InstanceId => "super::instance_id()",
+        ResourceIdKind::NetworkInterfaceId => "super::network_interface_id()",
+        ResourceIdKind::AllocationId => "super::allocation_id()",
+        ResourceIdKind::PrefixListId => "super::prefix_list_id()",
+        ResourceIdKind::CarrierGatewayId => "super::carrier_gateway_id()",
+        ResourceIdKind::LocalGatewayId => "super::local_gateway_id()",
+        ResourceIdKind::NetworkAclId => "super::network_acl_id()",
         ResourceIdKind::Generic => "super::aws_resource_id()",
     }
 }

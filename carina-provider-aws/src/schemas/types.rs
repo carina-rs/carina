@@ -158,6 +158,7 @@ fn validate_aws_resource_id(id: &str) -> Result<(), String> {
 }
 
 /// AWS resource ID type (e.g., "vpc-1a2b3c4d", "subnet-0123456789abcdef0")
+#[allow(dead_code)]
 pub(crate) fn aws_resource_id() -> AttributeType {
     AttributeType::Custom {
         name: "AwsResourceId".to_string(),
@@ -376,6 +377,165 @@ pub(crate) fn vpc_endpoint_id() -> AttributeType {
         namespace: None,
         to_dsl: None,
     }
+}
+
+/// Instance ID type (e.g., "i-0123456789abcdef0")
+pub(crate) fn instance_id() -> AttributeType {
+    AttributeType::Custom {
+        name: "InstanceId".to_string(),
+        base: Box::new(AttributeType::String),
+        validate: |value| {
+            if let Value::String(s) = value {
+                validate_prefixed_resource_id(s, "i")
+                    .map_err(|reason| format!("Invalid Instance ID '{}': {}", s, reason))
+            } else {
+                Err("Expected string".to_string())
+            }
+        },
+        namespace: None,
+        to_dsl: None,
+    }
+}
+
+/// Network Interface ID type (e.g., "eni-0123456789abcdef0")
+pub(crate) fn network_interface_id() -> AttributeType {
+    AttributeType::Custom {
+        name: "NetworkInterfaceId".to_string(),
+        base: Box::new(AttributeType::String),
+        validate: |value| {
+            if let Value::String(s) = value {
+                validate_prefixed_resource_id(s, "eni")
+                    .map_err(|reason| format!("Invalid Network Interface ID '{}': {}", s, reason))
+            } else {
+                Err("Expected string".to_string())
+            }
+        },
+        namespace: None,
+        to_dsl: None,
+    }
+}
+
+/// EIP Allocation ID type (e.g., "eipalloc-0123456789abcdef0")
+#[allow(dead_code)]
+pub(crate) fn allocation_id() -> AttributeType {
+    AttributeType::Custom {
+        name: "AllocationId".to_string(),
+        base: Box::new(AttributeType::String),
+        validate: |value| {
+            if let Value::String(s) = value {
+                validate_prefixed_resource_id(s, "eipalloc")
+                    .map_err(|reason| format!("Invalid Allocation ID '{}': {}", s, reason))
+            } else {
+                Err("Expected string".to_string())
+            }
+        },
+        namespace: None,
+        to_dsl: None,
+    }
+}
+
+/// Prefix List ID type (e.g., "pl-0123456789abcdef0")
+pub(crate) fn prefix_list_id() -> AttributeType {
+    AttributeType::Custom {
+        name: "PrefixListId".to_string(),
+        base: Box::new(AttributeType::String),
+        validate: |value| {
+            if let Value::String(s) = value {
+                validate_prefixed_resource_id(s, "pl")
+                    .map_err(|reason| format!("Invalid Prefix List ID '{}': {}", s, reason))
+            } else {
+                Err("Expected string".to_string())
+            }
+        },
+        namespace: None,
+        to_dsl: None,
+    }
+}
+
+/// Carrier Gateway ID type (e.g., "cagw-0123456789abcdef0")
+pub(crate) fn carrier_gateway_id() -> AttributeType {
+    AttributeType::Custom {
+        name: "CarrierGatewayId".to_string(),
+        base: Box::new(AttributeType::String),
+        validate: |value| {
+            if let Value::String(s) = value {
+                validate_prefixed_resource_id(s, "cagw")
+                    .map_err(|reason| format!("Invalid Carrier Gateway ID '{}': {}", s, reason))
+            } else {
+                Err("Expected string".to_string())
+            }
+        },
+        namespace: None,
+        to_dsl: None,
+    }
+}
+
+/// Local Gateway ID type (e.g., "lgw-0123456789abcdef0")
+pub(crate) fn local_gateway_id() -> AttributeType {
+    AttributeType::Custom {
+        name: "LocalGatewayId".to_string(),
+        base: Box::new(AttributeType::String),
+        validate: |value| {
+            if let Value::String(s) = value {
+                validate_prefixed_resource_id(s, "lgw")
+                    .map_err(|reason| format!("Invalid Local Gateway ID '{}': {}", s, reason))
+            } else {
+                Err("Expected string".to_string())
+            }
+        },
+        namespace: None,
+        to_dsl: None,
+    }
+}
+
+/// Network ACL ID type (e.g., "acl-0123456789abcdef0")
+#[allow(dead_code)]
+pub(crate) fn network_acl_id() -> AttributeType {
+    AttributeType::Custom {
+        name: "NetworkAclId".to_string(),
+        base: Box::new(AttributeType::String),
+        validate: |value| {
+            if let Value::String(s) = value {
+                validate_prefixed_resource_id(s, "acl")
+                    .map_err(|reason| format!("Invalid Network ACL ID '{}': {}", s, reason))
+            } else {
+                Err("Expected string".to_string())
+            }
+        },
+        namespace: None,
+        to_dsl: None,
+    }
+}
+
+/// AWS Account ID type (12-digit numeric string, e.g., "123456789012")
+pub(crate) fn aws_account_id() -> AttributeType {
+    AttributeType::Custom {
+        name: "AwsAccountId".to_string(),
+        base: Box::new(AttributeType::String),
+        validate: |value| {
+            if let Value::String(s) = value {
+                validate_aws_account_id(s)
+                    .map_err(|reason| format!("Invalid AWS Account ID '{}': {}", s, reason))
+            } else {
+                Err("Expected string".to_string())
+            }
+        },
+        namespace: None,
+        to_dsl: None,
+    }
+}
+
+fn validate_aws_account_id(id: &str) -> Result<(), String> {
+    if id.len() != 12 {
+        return Err(format!(
+            "must be exactly 12 digits, got {} characters",
+            id.len()
+        ));
+    }
+    if !id.chars().all(|c| c.is_ascii_digit()) {
+        return Err("must contain only digits".to_string());
+    }
+    Ok(())
 }
 
 /// Gateway ID type — union of InternetGatewayId and VpnGatewayId.
