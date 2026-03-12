@@ -1,6 +1,9 @@
 # EC2 Security Group Egress - Basic test
 #
-# Tests: group_id, ip_protocol, cidr_ip, description
+# Tests: group_id, ip_protocol, from_port, to_port, cidr_ip, description
+#
+# Note: Avoid using ip_protocol=all with cidr_ip="0.0.0.0/0" as AWS creates
+# that rule by default for new security groups, causing a duplicate error.
 
 provider aws {
   region = aws.Region.ap_northeast_1
@@ -26,7 +29,9 @@ let sg = aws.ec2.security_group {
 
 let egress = aws.ec2.security_group_egress {
   group_id    = sg.group_id
-  description = "Allow all outbound"
-  ip_protocol = all
+  description = "Allow HTTPS outbound"
+  ip_protocol = tcp
+  from_port   = 443
+  to_port     = 443
   cidr_ip     = "0.0.0.0/0"
 }
