@@ -50,7 +50,7 @@ pub fn ec2_route_config() -> AwsSchemaConfig {
                 .with_provider_name("EgressOnlyInternetGatewayId"),
         )
         .attribute(
-            AttributeSchema::new("gateway_id", super::aws_resource_id())
+            AttributeSchema::new("gateway_id", super::gateway_id())
                 .with_description("The ID of an internet gateway or virtual private gateway attached to your VPC.")
                 .with_provider_name("GatewayId"),
         )
