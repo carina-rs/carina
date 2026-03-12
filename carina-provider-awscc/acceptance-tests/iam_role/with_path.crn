@@ -1,0 +1,26 @@
+# IAM Role - path and tags test
+#
+# Tests: role_name_prefix, assume_role_policy_document, path (create_only), tags
+
+provider awscc {
+  region = awscc.Region.ap_northeast_1
+}
+
+let role = awscc.iam.role {
+  role_name_prefix = "carina-acc-test-"
+  path             = "/carina/acceptance-test/"
+
+  assume_role_policy_document = {
+    version = "2012-10-17"
+    statement {
+      effect    = "Allow"
+      principal = { service = "lambda.amazonaws.com" }
+      action    = "sts:AssumeRole"
+    }
+  }
+
+  tags = {
+    Environment = "acceptance-test"
+    ManagedBy   = "carina"
+  }
+}

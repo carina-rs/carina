@@ -1,0 +1,35 @@
+# IAM Role - inline policy test
+#
+# Tests: role_name_prefix, assume_role_policy_document, description,
+#        max_session_duration, inline policy block
+
+provider awscc {
+  region = awscc.Region.ap_northeast_1
+}
+
+let role = awscc.iam.role {
+  role_name_prefix = "carina-acc-test-"
+  description          = "Carina acceptance test role with inline policy"
+  max_session_duration = 7200
+
+  assume_role_policy_document = {
+    version = "2012-10-17"
+    statement {
+      effect    = "Allow"
+      principal = { service = "lambda.amazonaws.com" }
+      action    = "sts:AssumeRole"
+    }
+  }
+
+  policy {
+    policy_name = "test-policy"
+    policy_document = {
+      version = "2012-10-17"
+      statement {
+        effect   = "Allow"
+        action   = "logs:CreateLogGroup"
+        resource = "*"
+      }
+    }
+  }
+}
