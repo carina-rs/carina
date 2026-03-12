@@ -321,7 +321,6 @@ pub(crate) fn transit_gateway_id() -> AttributeType {
 }
 
 /// VPN Gateway ID type (e.g., "vgw-12345678")
-#[allow(dead_code)]
 pub(crate) fn vpn_gateway_id() -> AttributeType {
     AttributeType::Custom {
         name: "VpnGatewayId".to_string(),
@@ -377,6 +376,12 @@ pub(crate) fn vpc_endpoint_id() -> AttributeType {
         namespace: None,
         to_dsl: None,
     }
+}
+
+/// Gateway ID type — union of InternetGatewayId and VpnGatewayId.
+/// Used for attributes like ec2_route.gateway_id that accept both igw-* and vgw-* IDs.
+pub(crate) fn gateway_id() -> AttributeType {
+    AttributeType::Union(vec![internet_gateway_id(), vpn_gateway_id()])
 }
 
 // ========== ARN validators ==========

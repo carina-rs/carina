@@ -1,0 +1,32 @@
+# EC2 Security Group Egress - Basic test
+#
+# Tests: group_id, ip_protocol, cidr_ip, description
+
+provider aws {
+  region = aws.Region.ap_northeast_1
+}
+
+let vpc = aws.ec2.vpc {
+  cidr_block = "10.0.0.0/16"
+
+  tags = {
+    Environment = "acceptance-test"
+  }
+}
+
+let sg = aws.ec2.security_group {
+  group_name  = "carina-acc-test-aws-sg-egress"
+  description = "SG for egress rule test"
+  vpc_id      = vpc.vpc_id
+
+  tags = {
+    Environment = "acceptance-test"
+  }
+}
+
+let egress = aws.ec2.security_group_egress {
+  group_id    = sg.group_id
+  description = "Allow all outbound"
+  ip_protocol = all
+  cidr_ip     = "0.0.0.0/0"
+}
