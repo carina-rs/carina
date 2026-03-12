@@ -189,7 +189,7 @@ impl AttributeType {
                     name,
                     values,
                     namespace,
-                    ..
+                    to_dsl,
                 },
                 v,
             ) => {
@@ -207,12 +207,28 @@ impl AttributeType {
                     }
 
                     let variant = extract_enum_value(s);
-                    if values.iter().any(|v| string_enum_value_matches(variant, v)) {
+                    let matches_canonical =
+                        values.iter().any(|v| string_enum_value_matches(variant, v));
+                    let matches_alias = to_dsl.is_some_and(|f| {
+                        values
+                            .iter()
+                            .any(|v| string_enum_value_matches(variant, &f(v)))
+                    });
+                    if matches_canonical || matches_alias {
                         Ok(())
                     } else {
+                        let mut expected = values.clone();
+                        if let Some(f) = to_dsl {
+                            for v in values {
+                                let alias = f(v);
+                                if alias != *v && !expected.contains(&alias) {
+                                    expected.push(alias);
+                                }
+                            }
+                        }
                         Err(TypeError::InvalidEnumVariant {
                             value: s.clone(),
-                            expected: values.clone(),
+                            expected,
                         })
                     }
                 } else {
@@ -1129,6 +1145,38 @@ mod tests {
             to_dsl: None,
         };
         assert_eq!(t.type_name(), "VersioningStatus");
+    }
+
+    #[test]
+    fn validate_string_enum_accepts_to_dsl_alias() {
+        let t = AttributeType::StringEnum {
+            name: "IpProtocol".to_string(),
+            values: vec![
+                "tcp".to_string(),
+                "udp".to_string(),
+                "icmp".to_string(),
+                "icmpv6".to_string(),
+                "-1".to_string(),
+            ],
+            namespace: Some("awscc.ec2.security_group".to_string()),
+            to_dsl: Some(|s: &str| match s {
+                "-1" => "all".to_string(),
+                _ => s.replace('-', "_"),
+            }),
+        };
+        // Canonical value "-1" should be accepted
+        assert!(t.validate(&Value::String("-1".to_string())).is_ok());
+        // DSL alias "all" should be accepted
+        assert!(
+            t.validate(&Value::String(
+                "awscc.ec2.security_group.IpProtocol.all".to_string()
+            ))
+            .is_ok()
+        );
+        // Other canonical values should still work
+        assert!(t.validate(&Value::String("tcp".to_string())).is_ok());
+        // Invalid values should still be rejected
+        assert!(t.validate(&Value::String("invalid".to_string())).is_err());
     }
 
     #[test]
