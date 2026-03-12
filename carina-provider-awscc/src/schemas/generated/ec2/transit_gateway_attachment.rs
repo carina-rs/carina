@@ -35,7 +35,7 @@ pub fn ec2_transit_gateway_attachment_config() -> AwsccSchemaConfig {
                 .with_provider_name("Options"),
         )
         .attribute(
-            AttributeSchema::new("subnet_ids", AttributeType::List(Box::new(super::aws_resource_id())))
+            AttributeSchema::new("subnet_ids", AttributeType::List(Box::new(super::subnet_id())))
                 .required()
                 .with_provider_name("SubnetIds"),
         )

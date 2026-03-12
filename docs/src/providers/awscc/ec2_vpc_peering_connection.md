@@ -29,7 +29,7 @@ awscc.ec2.vpc_peering_connection {
 
 ### `peer_owner_id`
 
-- **Type:** String
+- **Type:** AwsAccountId
 - **Required:** No
 
 The AWS account ID of the owner of the accepter VPC.

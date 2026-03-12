@@ -41,7 +41,7 @@ awscc.ec2.nat_gateway {
 
 ### `allocation_id`
 
-- **Type:** AwsResourceId
+- **Type:** AllocationId
 - **Required:** No
 
 [Public NAT gateway only] The allocation ID of the Elastic IP address that's associated with the NAT gateway. This property is required for a public NAT gateway and cannot be specified with a private NAT gateway.
@@ -83,7 +83,7 @@ The private IPv4 address to assign to the NAT gateway. If you don't provide an a
 
 ### `secondary_allocation_ids`
 
-- **Type:** `List<AwsResourceId>`
+- **Type:** `List<AllocationId>`
 - **Required:** No
 
 Secondary EIP allocation IDs. For more information, see [Create a NAT gateway](https://docs.aws.amazon.com/vpc/latest/userguide/nat-gateway-working-with.html) in the *Amazon VPC User Guide*.
@@ -149,7 +149,7 @@ Shorthand formats: `public` or `ConnectivityType.public`
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `allocation_ids` | `List<AwsResourceId>` | Yes | The allocation IDs of the Elastic IP addresses (EIPs) to be used for handling outbound NAT traffic i... |
+| `allocation_ids` | `List<AllocationId>` | Yes | The allocation IDs of the Elastic IP addresses (EIPs) to be used for handling outbound NAT traffic i... |
 | `availability_zone` | AvailabilityZone | No | For regional NAT gateways only: The Availability Zone where this specific NAT gateway configuration ... |
 | `availability_zone_id` | String | No | For regional NAT gateways only: The ID of the Availability Zone where this specific NAT gateway conf... |
 
@@ -165,7 +165,7 @@ Shorthand formats: `public` or `ConnectivityType.public`
 
 ### `eni_id`
 
-- **Type:** AwsResourceId
+- **Type:** NetworkInterfaceId
 
 ### `nat_gateway_id`
 

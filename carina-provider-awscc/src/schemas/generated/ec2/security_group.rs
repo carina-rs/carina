@@ -73,7 +73,7 @@ pub fn ec2_security_group_config() -> AwsccSchemaConfig {
                     StructField::new("cidr_ip", types::ipv4_cidr()).with_provider_name("CidrIp"),
                     StructField::new("cidr_ipv6", types::ipv6_cidr()).with_provider_name("CidrIpv6"),
                     StructField::new("description", AttributeType::String).with_provider_name("Description"),
-                    StructField::new("destination_prefix_list_id", super::aws_resource_id()).with_provider_name("DestinationPrefixListId"),
+                    StructField::new("destination_prefix_list_id", super::prefix_list_id()).with_provider_name("DestinationPrefixListId"),
                     StructField::new("destination_security_group_id", super::security_group_id()).with_provider_name("DestinationSecurityGroupId"),
                     StructField::new("from_port", AttributeType::Custom {
                 name: "Int(-1..=65535)".to_string(),
@@ -120,10 +120,10 @@ pub fn ec2_security_group_config() -> AwsccSchemaConfig {
                 namespace: Some("awscc.ec2.security_group".to_string()),
                 to_dsl: Some(|s: &str| match s { "-1" => "all".to_string(), _ => s.replace('-', "_") }),
             }).required().with_provider_name("IpProtocol"),
-                    StructField::new("source_prefix_list_id", super::aws_resource_id()).with_provider_name("SourcePrefixListId"),
+                    StructField::new("source_prefix_list_id", super::prefix_list_id()).with_provider_name("SourcePrefixListId"),
                     StructField::new("source_security_group_id", super::security_group_id()).with_provider_name("SourceSecurityGroupId"),
                     StructField::new("source_security_group_name", AttributeType::String).with_provider_name("SourceSecurityGroupName"),
-                    StructField::new("source_security_group_owner_id", AttributeType::String).with_provider_name("SourceSecurityGroupOwnerId"),
+                    StructField::new("source_security_group_owner_id", super::aws_account_id()).with_provider_name("SourceSecurityGroupOwnerId"),
                     StructField::new("to_port", AttributeType::Custom {
                 name: "Int(-1..=65535)".to_string(),
                 base: Box::new(AttributeType::Int),

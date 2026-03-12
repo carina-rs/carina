@@ -36,7 +36,7 @@ The network (``vpc``). If you define an Elastic IP address and associate it with
 
 ### `instance_id`
 
-- **Type:** AwsResourceId
+- **Type:** InstanceId
 - **Required:** No
 
 The ID of the instance. Updates to the ``InstanceId`` property may require *some interruptions*. Updates on an EIP reassociates the address on its associated resource.
@@ -91,7 +91,7 @@ Shorthand formats: `vpc` or `Domain.vpc`
 
 ### `allocation_id`
 
-- **Type:** AwsResourceId
+- **Type:** AllocationId
 
 ### `public_ip`
 

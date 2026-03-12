@@ -79,7 +79,7 @@ The IP protocol name (tcp, udp, icmp, icmpv6) or number (see Protocol Numbers). 
 
 ### `source_prefix_list_id`
 
-- **Type:** AwsResourceId
+- **Type:** PrefixListId
 - **Required:** No
 
 [EC2-VPC only] The ID of a prefix list. 
@@ -100,7 +100,7 @@ The ID of the security group. You must specify either the security group ID or t
 
 ### `source_security_group_owner_id`
 
-- **Type:** String
+- **Type:** AwsAccountId
 - **Required:** No
 
 [nondefault VPC] The AWS account ID that owns the source security group. You can't specify this property with an IP address range. If you specify SourceSecurityGroupName or SourceSecurityGroupId and that security group is owned by a different account than the account creating the stack, you must specify the SourceSecurityGroupOwnerId; otherwise, this property is optional.

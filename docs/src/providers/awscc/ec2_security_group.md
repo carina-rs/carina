@@ -88,7 +88,7 @@ The ID of the VPC for the security group.
 | `cidr_ip` | Ipv4Cidr | No |  |
 | `cidr_ipv6` | Ipv6Cidr | No |  |
 | `description` | String | No |  |
-| `destination_prefix_list_id` | AwsResourceId | No |  |
+| `destination_prefix_list_id` | PrefixListId | No |  |
 | `destination_security_group_id` | SecurityGroupId | No |  |
 | `from_port` | Int(-1..=65535) | No |  |
 | `ip_protocol` | Enum | Yes |  |
@@ -103,10 +103,10 @@ The ID of the VPC for the security group.
 | `description` | String | No |  |
 | `from_port` | Int(-1..=65535) | No |  |
 | `ip_protocol` | Enum | Yes |  |
-| `source_prefix_list_id` | AwsResourceId | No |  |
+| `source_prefix_list_id` | PrefixListId | No |  |
 | `source_security_group_id` | SecurityGroupId | No |  |
 | `source_security_group_name` | String | No |  |
-| `source_security_group_owner_id` | String | No |  |
+| `source_security_group_owner_id` | AwsAccountId | No |  |
 | `to_port` | Int(-1..=65535) | No |  |
 
 ## Attribute Reference

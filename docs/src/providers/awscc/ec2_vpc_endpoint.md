@@ -198,6 +198,6 @@ Shorthand formats: `Interface` or `VpcEndpointType.Interface`
 
 ### `network_interface_ids`
 
-- **Type:** `List<AwsResourceId>`
+- **Type:** `List<NetworkInterfaceId>`
 
 

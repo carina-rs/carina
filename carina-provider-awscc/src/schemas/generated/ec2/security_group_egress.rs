@@ -60,7 +60,7 @@ pub fn ec2_security_group_egress_config() -> AwsccSchemaConfig {
                 .with_provider_name("Description"),
         )
         .attribute(
-            AttributeSchema::new("destination_prefix_list_id", super::aws_resource_id())
+            AttributeSchema::new("destination_prefix_list_id", super::prefix_list_id())
                 .create_only()
                 .with_description("The prefix list IDs for an AWS service. This is the AWS service to access through a VPC endpoint from instances associated with the security group. Yo...")
                 .with_provider_name("DestinationPrefixListId"),

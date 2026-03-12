@@ -43,7 +43,7 @@ pub fn ec2_vpc_config() -> AwsccSchemaConfig {
                 .with_provider_name("CidrBlockAssociations"),
         )
         .attribute(
-            AttributeSchema::new("default_network_acl", super::aws_resource_id())
+            AttributeSchema::new("default_network_acl", super::network_acl_id())
                 .with_description(" (read-only)")
                 .with_provider_name("DefaultNetworkAcl"),
         )

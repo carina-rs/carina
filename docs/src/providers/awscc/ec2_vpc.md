@@ -92,7 +92,7 @@ Shorthand formats: `default` or `InstanceTenancy.default`
 
 ### `default_network_acl`
 
-- **Type:** AwsResourceId
+- **Type:** NetworkAclId
 
 ### `default_security_group`
 
