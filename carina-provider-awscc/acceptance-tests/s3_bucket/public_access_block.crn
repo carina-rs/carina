@@ -1,0 +1,24 @@
+# S3 Bucket - public_access_block_configuration test
+#
+# Tests: public_access_block_configuration with all four settings enabled,
+#        plan-verify confirms public access block state is reconciled,
+#        destroy cleans up the bucket.
+
+provider awscc {
+  region = awscc.Region.ap_northeast_1
+}
+
+let bucket = awscc.s3.bucket {
+  bucket_name_prefix = "carina-acc-test-"
+
+  public_access_block_configuration = {
+    block_public_acls       = true
+    block_public_policy     = true
+    ignore_public_acls      = true
+    restrict_public_buckets = true
+  }
+
+  lifecycle {
+    force_delete = true
+  }
+}
