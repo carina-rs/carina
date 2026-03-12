@@ -10,21 +10,16 @@ impl AwsProvider {
     pub(crate) async fn read_ec2_route(
         &self,
         id: &ResourceId,
-        _identifier: Option<&str>,
+        identifier: Option<&str>,
     ) -> ProviderResult<State> {
-        // Routes are identified by route_table_id + destination_cidr_block
-        // For read, we return not_found since we can't look up by identifier alone
-        Ok(State::not_found(id.clone()))
-    }
+        // Parse composite identifier: route_table_id|destination_cidr_block
+        let Some(identifier) = identifier else {
+            return Ok(State::not_found(id.clone()));
+        };
 
-    /// Read an EC2 Route by route_table_id and destination_cidr_block
-    pub async fn read_ec2_route_by_key(
-        &self,
-        name: &str,
-        route_table_id: &str,
-        destination_cidr_block: &str,
-    ) -> ProviderResult<State> {
-        let id = ResourceId::with_provider("aws", "ec2.route", name);
+        let Some((route_table_id, destination_cidr_block)) = identifier.split_once('|') else {
+            return Ok(State::not_found(id.clone()));
+        };
 
         // Describe the route table to get its routes
         let result = self
@@ -54,13 +49,13 @@ impl AwsProvider {
                     );
 
                     // Route identifier is route_table_id|destination_cidr_block
-                    let identifier = format!("{}|{}", route_table_id, destination_cidr_block);
-                    return Ok(State::existing(id, attributes).with_identifier(identifier));
+                    let composite = format!("{}|{}", route_table_id, destination_cidr_block);
+                    return Ok(State::existing(id.clone(), attributes).with_identifier(composite));
                 }
             }
         }
 
-        Ok(State::not_found(id))
+        Ok(State::not_found(id.clone()))
     }
 
     /// Create an EC2 Route
@@ -154,5 +149,32 @@ impl AwsProvider {
         // Route identifier is route_table_id|destination_cidr_block
         let identifier = format!("{}|{}", route_table_id, destination_cidr);
         Ok(State::existing(id, to.attributes.clone()).with_identifier(identifier))
+    }
+
+    /// Delete an EC2 Route
+    pub(crate) async fn delete_ec2_route(
+        &self,
+        id: ResourceId,
+        identifier: &str,
+    ) -> ProviderResult<()> {
+        // Parse composite identifier: route_table_id|destination_cidr_block
+        let Some((route_table_id, destination_cidr_block)) = identifier.split_once('|') else {
+            return Err(
+                ProviderError::new(format!("Invalid route identifier: {}", identifier))
+                    .for_resource(id),
+            );
+        };
+
+        self.ec2_client
+            .delete_route()
+            .route_table_id(route_table_id)
+            .destination_cidr_block(destination_cidr_block)
+            .send()
+            .await
+            .map_err(|e| {
+                ProviderError::new(format!("Failed to delete route: {:?}", e)).for_resource(id)
+            })?;
+
+        Ok(())
     }
 }

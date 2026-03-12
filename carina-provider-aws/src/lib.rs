@@ -689,12 +689,7 @@ impl Provider for AwsProvider {
                 "ec2.subnet" => self.delete_ec2_subnet(id, &identifier).await,
                 "ec2.internet_gateway" => self.delete_ec2_internet_gateway(id, &identifier).await,
                 "ec2.route_table" => self.delete_ec2_route_table(id, &identifier).await,
-                "ec2.route" => {
-                    // Route deletion requires route_table_id and destination_cidr_block
-                    // which are not available from ResourceId alone.
-                    // Routes are typically deleted when the route table is deleted.
-                    Ok(())
-                }
+                "ec2.route" => self.delete_ec2_route(id, &identifier).await,
                 "ec2.security_group" => self.delete_ec2_security_group(id, &identifier).await,
                 "ec2.security_group_ingress" => {
                     self.delete_ec2_security_group_ingress(id, &identifier)
