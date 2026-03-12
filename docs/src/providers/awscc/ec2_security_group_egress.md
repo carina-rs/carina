@@ -53,7 +53,7 @@ The description of an egress (outbound) security group rule. Constraints: Up to 
 
 ### `destination_prefix_list_id`
 
-- **Type:** AwsResourceId
+- **Type:** PrefixListId
 - **Required:** No
 
 The prefix list IDs for an AWS service. This is the AWS service to access through a VPC endpoint from instances associated with the security group. You must specify exactly one of the following: ``CidrIp``, ``CidrIpv6``, ``DestinationPrefixListId``, or ``DestinationSecurityGroupId``.

@@ -151,6 +151,10 @@ pub fn validate_arn(arn: &str) -> Result<(), String> {
 
 /// AWS resource ID type (e.g., "vpc-1a2b3c4d", "subnet-0123456789abcdef0")
 /// Validates format: {prefix}-{hex} where hex is 8+ hex digits
+///
+/// Used as the generic fallback in codegen (`ResourceIdKind::Generic`)
+/// for resource ID properties that don't match a specific type.
+#[allow(dead_code)] // codegen fallback: no current schemas use it, but future resources may
 pub(crate) fn aws_resource_id() -> AttributeType {
     AttributeType::Custom {
         name: "AwsResourceId".to_string(),
@@ -412,6 +416,160 @@ pub(crate) fn vpc_endpoint_id() -> AttributeType {
         namespace: None,
         to_dsl: None,
     }
+}
+
+/// EC2 Instance ID type (e.g., "i-0123456789abcdef0")
+pub(crate) fn instance_id() -> AttributeType {
+    AttributeType::Custom {
+        name: "InstanceId".to_string(),
+        base: Box::new(AttributeType::String),
+        validate: |value| {
+            if let Value::String(s) = value {
+                validate_prefixed_resource_id(s, "i")
+                    .map_err(|reason| format!("Invalid Instance ID '{}': {}", s, reason))
+            } else {
+                Err("Expected string".to_string())
+            }
+        },
+        namespace: None,
+        to_dsl: None,
+    }
+}
+
+/// Network Interface ID type (e.g., "eni-0123456789abcdef0")
+pub(crate) fn network_interface_id() -> AttributeType {
+    AttributeType::Custom {
+        name: "NetworkInterfaceId".to_string(),
+        base: Box::new(AttributeType::String),
+        validate: |value| {
+            if let Value::String(s) = value {
+                validate_prefixed_resource_id(s, "eni")
+                    .map_err(|reason| format!("Invalid Network Interface ID '{}': {}", s, reason))
+            } else {
+                Err("Expected string".to_string())
+            }
+        },
+        namespace: None,
+        to_dsl: None,
+    }
+}
+
+/// EIP Allocation ID type (e.g., "eipalloc-0123456789abcdef0")
+pub(crate) fn allocation_id() -> AttributeType {
+    AttributeType::Custom {
+        name: "AllocationId".to_string(),
+        base: Box::new(AttributeType::String),
+        validate: |value| {
+            if let Value::String(s) = value {
+                validate_prefixed_resource_id(s, "eipalloc")
+                    .map_err(|reason| format!("Invalid Allocation ID '{}': {}", s, reason))
+            } else {
+                Err("Expected string".to_string())
+            }
+        },
+        namespace: None,
+        to_dsl: None,
+    }
+}
+
+/// Prefix List ID type (e.g., "pl-0123456789abcdef0")
+pub(crate) fn prefix_list_id() -> AttributeType {
+    AttributeType::Custom {
+        name: "PrefixListId".to_string(),
+        base: Box::new(AttributeType::String),
+        validate: |value| {
+            if let Value::String(s) = value {
+                validate_prefixed_resource_id(s, "pl")
+                    .map_err(|reason| format!("Invalid Prefix List ID '{}': {}", s, reason))
+            } else {
+                Err("Expected string".to_string())
+            }
+        },
+        namespace: None,
+        to_dsl: None,
+    }
+}
+
+/// Carrier Gateway ID type (e.g., "cagw-0123456789abcdef0")
+pub(crate) fn carrier_gateway_id() -> AttributeType {
+    AttributeType::Custom {
+        name: "CarrierGatewayId".to_string(),
+        base: Box::new(AttributeType::String),
+        validate: |value| {
+            if let Value::String(s) = value {
+                validate_prefixed_resource_id(s, "cagw")
+                    .map_err(|reason| format!("Invalid Carrier Gateway ID '{}': {}", s, reason))
+            } else {
+                Err("Expected string".to_string())
+            }
+        },
+        namespace: None,
+        to_dsl: None,
+    }
+}
+
+/// Local Gateway ID type (e.g., "lgw-0123456789abcdef0")
+pub(crate) fn local_gateway_id() -> AttributeType {
+    AttributeType::Custom {
+        name: "LocalGatewayId".to_string(),
+        base: Box::new(AttributeType::String),
+        validate: |value| {
+            if let Value::String(s) = value {
+                validate_prefixed_resource_id(s, "lgw")
+                    .map_err(|reason| format!("Invalid Local Gateway ID '{}': {}", s, reason))
+            } else {
+                Err("Expected string".to_string())
+            }
+        },
+        namespace: None,
+        to_dsl: None,
+    }
+}
+
+/// Network ACL ID type (e.g., "acl-0123456789abcdef0")
+pub(crate) fn network_acl_id() -> AttributeType {
+    AttributeType::Custom {
+        name: "NetworkAclId".to_string(),
+        base: Box::new(AttributeType::String),
+        validate: |value| {
+            if let Value::String(s) = value {
+                validate_prefixed_resource_id(s, "acl")
+                    .map_err(|reason| format!("Invalid Network ACL ID '{}': {}", s, reason))
+            } else {
+                Err("Expected string".to_string())
+            }
+        },
+        namespace: None,
+        to_dsl: None,
+    }
+}
+
+/// AWS Account ID type (12-digit numeric string, e.g., "123456789012")
+pub(crate) fn aws_account_id() -> AttributeType {
+    AttributeType::Custom {
+        name: "AwsAccountId".to_string(),
+        base: Box::new(AttributeType::String),
+        validate: |value| {
+            if let Value::String(s) = value {
+                validate_aws_account_id(s)
+                    .map_err(|reason| format!("Invalid AWS Account ID '{}': {}", s, reason))
+            } else {
+                Err("Expected string".to_string())
+            }
+        },
+        namespace: None,
+        to_dsl: None,
+    }
+}
+
+fn validate_aws_account_id(id: &str) -> Result<(), String> {
+    if id.len() != 12 {
+        return Err("must be exactly 12 digits".to_string());
+    }
+    if !id.chars().all(|c| c.is_ascii_digit()) {
+        return Err("must contain only digits".to_string());
+    }
+    Ok(())
 }
 
 /// Valid AWS regions (in AWS format with hyphens)
@@ -2020,5 +2178,157 @@ mod tests {
             "VALID_IP_PROTOCOL should still include '-1', got: {:?}",
             values
         );
+    }
+
+    #[test]
+    fn validate_instance_id() {
+        let t = instance_id();
+        assert!(
+            t.validate(&Value::String("i-0123456789abcdef0".to_string()))
+                .is_ok()
+        );
+        assert!(t.validate(&Value::String("i-abcdef12".to_string())).is_ok());
+        assert!(
+            t.validate(&Value::String("vpc-12345678".to_string()))
+                .is_err()
+        );
+        assert!(t.validate(&Value::String("invalid".to_string())).is_err());
+    }
+
+    #[test]
+    fn validate_network_interface_id() {
+        let t = network_interface_id();
+        assert!(
+            t.validate(&Value::String("eni-0123456789abcdef0".to_string()))
+                .is_ok()
+        );
+        assert!(
+            t.validate(&Value::String("eni-abcdef12".to_string()))
+                .is_ok()
+        );
+        assert!(
+            t.validate(&Value::String("vpc-12345678".to_string()))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn validate_allocation_id() {
+        let t = allocation_id();
+        assert!(
+            t.validate(&Value::String("eipalloc-0123456789abcdef0".to_string()))
+                .is_ok()
+        );
+        assert!(
+            t.validate(&Value::String("eipalloc-abcdef12".to_string()))
+                .is_ok()
+        );
+        assert!(
+            t.validate(&Value::String("vpc-12345678".to_string()))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn validate_prefix_list_id() {
+        let t = prefix_list_id();
+        assert!(
+            t.validate(&Value::String("pl-0123456789abcdef0".to_string()))
+                .is_ok()
+        );
+        assert!(
+            t.validate(&Value::String("pl-abcdef12".to_string()))
+                .is_ok()
+        );
+        assert!(
+            t.validate(&Value::String("vpc-12345678".to_string()))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn validate_carrier_gateway_id() {
+        let t = carrier_gateway_id();
+        assert!(
+            t.validate(&Value::String("cagw-0123456789abcdef0".to_string()))
+                .is_ok()
+        );
+        assert!(
+            t.validate(&Value::String("cagw-abcdef12".to_string()))
+                .is_ok()
+        );
+        assert!(
+            t.validate(&Value::String("igw-12345678".to_string()))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn validate_local_gateway_id() {
+        let t = local_gateway_id();
+        assert!(
+            t.validate(&Value::String("lgw-0123456789abcdef0".to_string()))
+                .is_ok()
+        );
+        assert!(
+            t.validate(&Value::String("lgw-abcdef12".to_string()))
+                .is_ok()
+        );
+        assert!(
+            t.validate(&Value::String("igw-12345678".to_string()))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn validate_network_acl_id() {
+        let t = network_acl_id();
+        assert!(
+            t.validate(&Value::String("acl-0123456789abcdef0".to_string()))
+                .is_ok()
+        );
+        assert!(
+            t.validate(&Value::String("acl-abcdef12".to_string()))
+                .is_ok()
+        );
+        assert!(
+            t.validate(&Value::String("vpc-12345678".to_string()))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn validate_aws_account_id_valid() {
+        let t = aws_account_id();
+        assert!(
+            t.validate(&Value::String("123456789012".to_string()))
+                .is_ok()
+        );
+        assert!(
+            t.validate(&Value::String("000000000000".to_string()))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn validate_aws_account_id_invalid() {
+        let t = aws_account_id();
+        // Too short
+        assert!(
+            t.validate(&Value::String("12345678901".to_string()))
+                .is_err()
+        );
+        // Too long
+        assert!(
+            t.validate(&Value::String("1234567890123".to_string()))
+                .is_err()
+        );
+        // Non-digits
+        assert!(
+            t.validate(&Value::String("12345678901a".to_string()))
+                .is_err()
+        );
+        // Empty
+        assert!(t.validate(&Value::String("".to_string())).is_err());
     }
 }

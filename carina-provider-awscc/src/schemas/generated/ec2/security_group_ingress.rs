@@ -101,7 +101,7 @@ pub fn ec2_security_group_ingress_config() -> AwsccSchemaConfig {
                 .with_provider_name("IpProtocol"),
         )
         .attribute(
-            AttributeSchema::new("source_prefix_list_id", super::aws_resource_id())
+            AttributeSchema::new("source_prefix_list_id", super::prefix_list_id())
                 .create_only()
                 .with_description("[EC2-VPC only] The ID of a prefix list. ")
                 .with_provider_name("SourcePrefixListId"),
@@ -119,7 +119,7 @@ pub fn ec2_security_group_ingress_config() -> AwsccSchemaConfig {
                 .with_provider_name("SourceSecurityGroupName"),
         )
         .attribute(
-            AttributeSchema::new("source_security_group_owner_id", AttributeType::String)
+            AttributeSchema::new("source_security_group_owner_id", super::aws_account_id())
                 .create_only()
                 .with_description("[nondefault VPC] The AWS account ID that owns the source security group. You can't specify this property with an IP address range. If you specify Sour...")
                 .with_provider_name("SourceSecurityGroupOwnerId"),

@@ -22,7 +22,7 @@ pub fn ec2_vpc_peering_connection_config() -> AwsccSchemaConfig {
                 .with_provider_name("Id"),
         )
         .attribute(
-            AttributeSchema::new("peer_owner_id", AttributeType::String)
+            AttributeSchema::new("peer_owner_id", super::aws_account_id())
                 .create_only()
                 .with_description("The AWS account ID of the owner of the accepter VPC.")
                 .with_provider_name("PeerOwnerId"),

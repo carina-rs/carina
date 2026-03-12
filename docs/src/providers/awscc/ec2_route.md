@@ -38,7 +38,7 @@ awscc.ec2.route {
 
 ### `carrier_gateway_id`
 
-- **Type:** AwsResourceId
+- **Type:** CarrierGatewayId
 - **Required:** No
 
 The ID of the carrier gateway. You can only use this option when the VPC contains a subnet which is associated with a Wavelength Zone.
@@ -66,7 +66,7 @@ The IPv6 CIDR block used for the destination match. Routing decisions are based 
 
 ### `destination_prefix_list_id`
 
-- **Type:** AwsResourceId
+- **Type:** PrefixListId
 - **Required:** No
 
 The ID of a prefix list used for the destination match.
@@ -87,14 +87,14 @@ The ID of an internet gateway or virtual private gateway attached to your VPC.
 
 ### `instance_id`
 
-- **Type:** AwsResourceId
+- **Type:** InstanceId
 - **Required:** No
 
 The ID of a NAT instance in your VPC. The operation fails if you specify an instance ID unless exactly one network interface is attached.
 
 ### `local_gateway_id`
 
-- **Type:** AwsResourceId
+- **Type:** LocalGatewayId
 - **Required:** No
 
 The ID of the local gateway.
@@ -108,7 +108,7 @@ The ID of the local gateway.
 
 ### `network_interface_id`
 
-- **Type:** AwsResourceId
+- **Type:** NetworkInterfaceId
 - **Required:** No
 
 The ID of a network interface.
