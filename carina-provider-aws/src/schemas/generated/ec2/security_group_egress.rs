@@ -62,7 +62,7 @@ pub fn ec2_security_group_egress_config() -> AwsSchemaConfig {
                     .with_provider_name("Description"),
             )
             .attribute(
-                AttributeSchema::new("destination_prefix_list_id", super::aws_resource_id())
+                AttributeSchema::new("destination_prefix_list_id", super::prefix_list_id())
                     .create_only()
                     .with_description("The ID of the destination prefix list.")
                     .with_provider_name("DestinationPrefixListId"),
@@ -120,7 +120,7 @@ pub fn ec2_security_group_egress_config() -> AwsSchemaConfig {
                     .with_provider_name("SourceSecurityGroupName"),
             )
             .attribute(
-                AttributeSchema::new("source_security_group_owner_id", AttributeType::String)
+                AttributeSchema::new("source_security_group_owner_id", super::aws_account_id())
                     .create_only()
                     .with_description("Not supported. Use IP permissions instead.")
                     .with_provider_name("SourceSecurityGroupOwnerId"),

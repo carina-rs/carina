@@ -29,7 +29,7 @@ The security group rule description.
 
 ### `destination_prefix_list_id`
 
-- **Type:** AwsResourceId
+- **Type:** PrefixListId
 - **Required:** No
 
 The ID of the destination prefix list.
@@ -64,7 +64,7 @@ Not supported. Use IP permissions instead.
 
 ### `source_security_group_owner_id`
 
-- **Type:** String
+- **Type:** AwsAccountId
 - **Required:** No
 
 Not supported. Use IP permissions instead.

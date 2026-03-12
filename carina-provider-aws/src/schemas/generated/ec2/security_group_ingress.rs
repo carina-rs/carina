@@ -98,7 +98,7 @@ pub fn ec2_security_group_ingress_config() -> AwsSchemaConfig {
                 .with_provider_name("IpProtocol"),
         )
         .attribute(
-            AttributeSchema::new("source_prefix_list_id", super::aws_resource_id())
+            AttributeSchema::new("source_prefix_list_id", super::prefix_list_id())
                 .create_only()
                 .with_description("The ID of the source prefix list.")
                 .with_provider_name("SourcePrefixListId"),
@@ -110,7 +110,7 @@ pub fn ec2_security_group_ingress_config() -> AwsSchemaConfig {
                 .with_provider_name("SourceSecurityGroupName"),
         )
         .attribute(
-            AttributeSchema::new("source_security_group_owner_id", AttributeType::String)
+            AttributeSchema::new("source_security_group_owner_id", super::aws_account_id())
                 .create_only()
                 .with_description("The Amazon Web Services account ID for the source security group, if the source security group is in a different account. The rule grants full ICMP, U...")
                 .with_provider_name("SourceSecurityGroupOwnerId"),

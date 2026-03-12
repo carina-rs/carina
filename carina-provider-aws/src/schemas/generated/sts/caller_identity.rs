@@ -17,7 +17,7 @@ pub fn sts_caller_identity_config() -> AwsSchemaConfig {
         schema: ResourceSchema::new("aws.sts.caller_identity")
         .as_data_source()
         .attribute(
-            AttributeSchema::new("account_id", AttributeType::String)
+            AttributeSchema::new("account_id", super::aws_account_id())
                 .with_description("The Amazon Web Services account ID number of the account that owns or contains the calling entity. (read-only)")
                 .with_provider_name("AccountId"),
         )

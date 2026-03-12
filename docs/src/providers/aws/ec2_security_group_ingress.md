@@ -57,7 +57,7 @@ The IP protocol name (tcp, udp, icmp) or number (see Protocol Numbers). To speci
 
 ### `source_prefix_list_id`
 
-- **Type:** AwsResourceId
+- **Type:** PrefixListId
 - **Required:** No
 
 The ID of the source prefix list.
@@ -71,7 +71,7 @@ The ID of the source prefix list.
 
 ### `source_security_group_owner_id`
 
-- **Type:** String
+- **Type:** AwsAccountId
 - **Required:** No
 
 The Amazon Web Services account ID for the source security group, if the source security group is in a different account. The rule grants full ICMP, UDP, and TCP access. To create a rule with a specific protocol and port range, use IP permissions instead.

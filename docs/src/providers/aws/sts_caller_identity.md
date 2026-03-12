@@ -6,7 +6,7 @@ CloudFormation Type: `AWS::STS::CallerIdentity`
 
 ### `account_id`
 
-- **Type:** String
+- **Type:** AwsAccountId
 
 ### `arn`
 
