@@ -1,0 +1,16 @@
+# CloudWatch Logs Log Group - retention and tags test
+#
+# Tests: log_group_name_prefix, retention_in_days, tags
+
+provider awscc {
+  region = awscc.Region.ap_northeast_1
+}
+
+let log_group = awscc.logs.log_group {
+  log_group_name_prefix = "/carina/acc-test-"
+  retention_in_days     = 7
+
+  tags = {
+    Environment = "acceptance-test"
+  }
+}
