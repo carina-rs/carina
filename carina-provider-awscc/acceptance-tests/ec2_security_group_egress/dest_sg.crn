@@ -20,7 +20,7 @@ let dest_sg = awscc.ec2.security_group {
   group_description = "Destination security group"
 }
 
-let egress = awscc.ec2.security_group_egress {
+awscc.ec2.security_group_egress {
   group_id                     = source_sg.group_id
   description                  = "Allow HTTPS to destination SG"
   ip_protocol                  = "tcp"
