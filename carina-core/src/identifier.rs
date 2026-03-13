@@ -196,11 +196,23 @@ pub fn compute_anonymous_identifiers(
             }
         }
 
-        // Collect create-only values in sorted order for deterministic hashing
+        // Collect values for hashing.
+        // If the schema has a name_attribute, use ONLY that for hashing.
+        // This keeps the identifier stable when other create-only properties change
+        // (triggering replacement via create_before_destroy).
+        // Otherwise, use all create-only values.
         let mut create_only_values: BTreeMap<&str, String> = BTreeMap::new();
-        for attr_name in &create_only_attrs {
-            if let Some(value) = resource.attributes.get(*attr_name) {
-                create_only_values.insert(attr_name, format!("{:?}", value));
+        if let Some(name_attr) = &schema.name_attribute
+            && let Some(value) = resource.attributes.get(name_attr.as_str())
+        {
+            create_only_values.insert(name_attr.as_str(), format!("{:?}", value));
+        }
+        if create_only_values.is_empty() {
+            // No name_attribute or no value for it: fall back to all create-only values
+            for attr_name in &create_only_attrs {
+                if let Some(value) = resource.attributes.get(*attr_name) {
+                    create_only_values.insert(attr_name, format!("{:?}", value));
+                }
             }
         }
 
@@ -468,5 +480,181 @@ mod tests {
             resources[0].attributes.get("bucket_name"),
             Some(&Value::String("my-app-abcd1234".to_string()))
         );
+    }
+
+    #[test]
+    fn test_anonymous_id_stable_when_non_name_create_only_changes() {
+        // Simulates IAM role: role_name and path are both create-only,
+        // but role_name is the name_attribute. Changing path should NOT
+        // change the anonymous identifier.
+        let schema = ResourceSchema::new("awscc.iam.role")
+            .attribute(AttributeSchema::new("role_name", AttributeType::String).create_only())
+            .attribute(AttributeSchema::new("path", AttributeType::String).create_only())
+            .with_name_attribute("role_name");
+        let schemas: HashMap<String, ResourceSchema> = vec![("awscc.iam.role".to_string(), schema)]
+            .into_iter()
+            .collect();
+        let providers = vec![ProviderConfig {
+            name: "awscc".to_string(),
+            attributes: HashMap::new(),
+        }];
+
+        // Resource with path="/"
+        let mut r1 = Resource::with_provider("awscc", "iam.role", "");
+        r1.attributes
+            .insert("_provider".to_string(), Value::String("awscc".to_string()));
+        r1.attributes.insert(
+            "role_name".to_string(),
+            Value::String("my-role".to_string()),
+        );
+        r1.attributes
+            .insert("path".to_string(), Value::String("/".to_string()));
+
+        // Resource with path="/carina/" (create-only change)
+        let mut r2 = Resource::with_provider("awscc", "iam.role", "");
+        r2.attributes
+            .insert("_provider".to_string(), Value::String("awscc".to_string()));
+        r2.attributes.insert(
+            "role_name".to_string(),
+            Value::String("my-role".to_string()),
+        );
+        r2.attributes
+            .insert("path".to_string(), Value::String("/carina/".to_string()));
+
+        let identity_fn = |_: &str| -> Vec<String> { vec![] };
+
+        let mut resources1 = vec![r1];
+        compute_anonymous_identifiers(
+            &mut resources1,
+            &providers,
+            &schemas,
+            &schema_key_fn,
+            &identity_fn,
+        )
+        .unwrap();
+
+        let mut resources2 = vec![r2];
+        compute_anonymous_identifiers(
+            &mut resources2,
+            &providers,
+            &schemas,
+            &schema_key_fn,
+            &identity_fn,
+        )
+        .unwrap();
+
+        // Both should get the same identifier
+        assert_eq!(resources1[0].id.name, resources2[0].id.name);
+    }
+
+    #[test]
+    fn test_anonymous_id_differs_when_name_attribute_changes() {
+        let schema = ResourceSchema::new("awscc.iam.role")
+            .attribute(AttributeSchema::new("role_name", AttributeType::String).create_only())
+            .attribute(AttributeSchema::new("path", AttributeType::String).create_only())
+            .with_name_attribute("role_name");
+        let schemas: HashMap<String, ResourceSchema> = vec![("awscc.iam.role".to_string(), schema)]
+            .into_iter()
+            .collect();
+        let providers = vec![ProviderConfig {
+            name: "awscc".to_string(),
+            attributes: HashMap::new(),
+        }];
+
+        let mut r1 = Resource::with_provider("awscc", "iam.role", "");
+        r1.attributes
+            .insert("_provider".to_string(), Value::String("awscc".to_string()));
+        r1.attributes
+            .insert("role_name".to_string(), Value::String("role-a".to_string()));
+
+        let mut r2 = Resource::with_provider("awscc", "iam.role", "");
+        r2.attributes
+            .insert("_provider".to_string(), Value::String("awscc".to_string()));
+        r2.attributes
+            .insert("role_name".to_string(), Value::String("role-b".to_string()));
+
+        let identity_fn = |_: &str| -> Vec<String> { vec![] };
+
+        let mut resources1 = vec![r1];
+        compute_anonymous_identifiers(
+            &mut resources1,
+            &providers,
+            &schemas,
+            &schema_key_fn,
+            &identity_fn,
+        )
+        .unwrap();
+
+        let mut resources2 = vec![r2];
+        compute_anonymous_identifiers(
+            &mut resources2,
+            &providers,
+            &schemas,
+            &schema_key_fn,
+            &identity_fn,
+        )
+        .unwrap();
+
+        // Different name_attribute values should produce different identifiers
+        assert_ne!(resources1[0].id.name, resources2[0].id.name);
+    }
+
+    #[test]
+    fn test_anonymous_id_uses_all_create_only_when_no_name_attribute() {
+        // Resource without name_attribute (like ec2.vpc) should still use all create-only values
+        let schema = ResourceSchema::new("awscc.ec2.vpc")
+            .attribute(AttributeSchema::new("cidr_block", AttributeType::String).create_only())
+            .attribute(
+                AttributeSchema::new("instance_tenancy", AttributeType::String).create_only(),
+            );
+        // No .with_name_attribute()
+        let schemas: HashMap<String, ResourceSchema> = vec![("awscc.ec2.vpc".to_string(), schema)]
+            .into_iter()
+            .collect();
+        let providers = vec![ProviderConfig {
+            name: "awscc".to_string(),
+            attributes: HashMap::new(),
+        }];
+
+        let mut r1 = Resource::with_provider("awscc", "ec2.vpc", "");
+        r1.attributes
+            .insert("_provider".to_string(), Value::String("awscc".to_string()));
+        r1.attributes.insert(
+            "cidr_block".to_string(),
+            Value::String("10.0.0.0/16".to_string()),
+        );
+
+        let mut r2 = Resource::with_provider("awscc", "ec2.vpc", "");
+        r2.attributes
+            .insert("_provider".to_string(), Value::String("awscc".to_string()));
+        r2.attributes.insert(
+            "cidr_block".to_string(),
+            Value::String("10.1.0.0/16".to_string()),
+        );
+
+        let identity_fn = |_: &str| -> Vec<String> { vec![] };
+
+        let mut resources1 = vec![r1];
+        compute_anonymous_identifiers(
+            &mut resources1,
+            &providers,
+            &schemas,
+            &schema_key_fn,
+            &identity_fn,
+        )
+        .unwrap();
+
+        let mut resources2 = vec![r2];
+        compute_anonymous_identifiers(
+            &mut resources2,
+            &providers,
+            &schemas,
+            &schema_key_fn,
+            &identity_fn,
+        )
+        .unwrap();
+
+        // Different cidr_block should produce different identifiers
+        assert_ne!(resources1[0].id.name, resources2[0].id.name);
     }
 }
