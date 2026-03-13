@@ -541,6 +541,9 @@ impl DiagnosticEngine {
                     ));
                 }
             }
+
+            // Check for unused let bindings
+            diagnostics.extend(self.check_unused_bindings(doc, parsed));
         }
 
         diagnostics
@@ -1152,6 +1155,68 @@ impl DiagnosticEngine {
 
                 if trimmed == "}" {
                     in_module_call = false;
+                }
+            }
+        }
+        None
+    }
+
+    /// Check for unused `let` bindings and emit warnings.
+    fn check_unused_bindings(&self, doc: &Document, parsed: &ParsedFile) -> Vec<Diagnostic> {
+        let warnings = carina_core::validation::check_unused_bindings(parsed);
+        if warnings.is_empty() {
+            return Vec::new();
+        }
+
+        let text = doc.text();
+        let mut diagnostics = Vec::new();
+
+        for warning in &warnings {
+            // Extract binding name from warning message
+            let binding_name = warning
+                .strip_prefix("Unused let binding '")
+                .and_then(|s| s.split('\'').next());
+            let Some(binding_name) = binding_name else {
+                continue;
+            };
+
+            // Find the `let <binding>` line in the source text
+            if let Some((line, col)) = self.find_let_binding_position(&text, binding_name) {
+                diagnostics.push(Diagnostic {
+                    range: Range {
+                        start: Position {
+                            line,
+                            character: col,
+                        },
+                        end: Position {
+                            line,
+                            character: col + binding_name.len() as u32,
+                        },
+                    },
+                    severity: Some(DiagnosticSeverity::WARNING),
+                    source: Some("carina".to_string()),
+                    message: warning.clone(),
+                    ..Default::default()
+                });
+            }
+        }
+
+        diagnostics
+    }
+
+    /// Find the position of a `let` binding name in the source text.
+    fn find_let_binding_position(&self, text: &str, binding_name: &str) -> Option<(u32, u32)> {
+        for (line_idx, line) in text.lines().enumerate() {
+            let trimmed = line.trim();
+            if let Some(rest) = trimmed.strip_prefix("let ")
+                && let Some(eq_pos) = rest.find('=')
+            {
+                let name = rest[..eq_pos].trim();
+                if name == binding_name {
+                    // Find the column of the binding name in the original line
+                    let let_pos = line.find("let ").unwrap();
+                    let name_col = let_pos + 4; // "let " is 4 chars
+                    return Some((line_idx as u32, name_col as u32));
                 }
             }
         }

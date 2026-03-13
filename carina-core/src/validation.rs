@@ -1,6 +1,6 @@
 //! Validation utilities for resources and modules
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::parser::{ModuleCall, ParsedFile, TypeExpr};
 use crate::provider::ProviderFactory;
@@ -191,6 +191,73 @@ pub fn validate_module_calls(
     }
 }
 
+/// Check for unused `let` bindings and return warnings.
+///
+/// A binding is unused if its name never appears as a `ResourceRef.binding_name`
+/// in any resource attribute or module call argument.
+pub fn check_unused_bindings(parsed: &ParsedFile) -> Vec<String> {
+    // Collect all defined binding names
+    let mut defined_bindings: Vec<String> = Vec::new();
+    for resource in &parsed.resources {
+        if let Some(Value::String(binding_name)) = resource.attributes.get("_binding") {
+            defined_bindings.push(binding_name.clone());
+        }
+    }
+
+    if defined_bindings.is_empty() {
+        return Vec::new();
+    }
+
+    // Collect all referenced binding names
+    let mut referenced: HashSet<String> = HashSet::new();
+    for resource in &parsed.resources {
+        for (attr_name, value) in &resource.attributes {
+            if attr_name.starts_with('_') {
+                continue;
+            }
+            collect_resource_refs(value, &mut referenced);
+        }
+    }
+    for call in &parsed.module_calls {
+        for value in call.arguments.values() {
+            collect_resource_refs(value, &mut referenced);
+        }
+    }
+
+    // Report unused bindings
+    let mut warnings = Vec::new();
+    for binding in &defined_bindings {
+        if !referenced.contains(binding) {
+            warnings.push(format!(
+                "Unused let binding '{}'. Consider using an anonymous resource instead.",
+                binding
+            ));
+        }
+    }
+
+    warnings
+}
+
+/// Recursively collect all `ResourceRef` binding names from a value tree.
+fn collect_resource_refs(value: &Value, refs: &mut HashSet<String>) {
+    match value {
+        Value::ResourceRef { binding_name, .. } => {
+            refs.insert(binding_name.clone());
+        }
+        Value::List(items) => {
+            for item in items {
+                collect_resource_refs(item, refs);
+            }
+        }
+        Value::Map(map) => {
+            for v in map.values() {
+                collect_resource_refs(v, refs);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Validate a module argument value against its expected type.
 pub fn validate_module_arg_type(type_expr: &TypeExpr, value: &Value) -> Option<String> {
     match (type_expr, value) {
@@ -215,5 +282,156 @@ pub fn validate_module_arg_type(type_expr: &TypeExpr, value: &Value) -> Option<S
         )),
         (TypeExpr::Int, Value::String(s)) => Some(format!("expected int, got string \"{}\".", s)),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parser::ParsedFile;
+    use crate::resource::Resource;
+
+    fn empty_parsed() -> ParsedFile {
+        ParsedFile {
+            providers: Vec::new(),
+            resources: Vec::new(),
+            variables: HashMap::new(),
+            imports: Vec::new(),
+            module_calls: Vec::new(),
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            backend: None,
+        }
+    }
+
+    #[test]
+    fn no_bindings_no_warnings() {
+        let parsed = empty_parsed();
+        assert!(check_unused_bindings(&parsed).is_empty());
+    }
+
+    #[test]
+    fn used_binding_no_warning() {
+        let mut parsed = empty_parsed();
+
+        // Resource with a binding
+        let vpc = Resource::with_provider("awscc", "ec2.vpc", "main-vpc")
+            .with_attribute("_binding", Value::String("vpc".to_string()))
+            .with_attribute("cidr_block", Value::String("10.0.0.0/16".to_string()));
+        parsed.resources.push(vpc);
+
+        // Resource that references the binding
+        let subnet = Resource::with_provider("awscc", "ec2.subnet", "web-subnet").with_attribute(
+            "vpc_id",
+            Value::ResourceRef {
+                binding_name: "vpc".to_string(),
+                attribute_name: "vpc_id".to_string(),
+            },
+        );
+        parsed.resources.push(subnet);
+
+        assert!(check_unused_bindings(&parsed).is_empty());
+    }
+
+    #[test]
+    fn unused_binding_warns() {
+        let mut parsed = empty_parsed();
+
+        let vpc = Resource::with_provider("awscc", "ec2.vpc", "main-vpc")
+            .with_attribute("_binding", Value::String("vpc".to_string()))
+            .with_attribute("cidr_block", Value::String("10.0.0.0/16".to_string()));
+        parsed.resources.push(vpc);
+
+        let warnings = check_unused_bindings(&parsed);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("'vpc'"));
+    }
+
+    #[test]
+    fn anonymous_resource_no_warning() {
+        let mut parsed = empty_parsed();
+
+        // Anonymous resource (no _binding attribute)
+        let bucket = Resource::with_provider("awscc", "s3.bucket", "my-bucket")
+            .with_attribute("bucket_name", Value::String("my-bucket".to_string()));
+        parsed.resources.push(bucket);
+
+        assert!(check_unused_bindings(&parsed).is_empty());
+    }
+
+    #[test]
+    fn binding_referenced_in_nested_value() {
+        let mut parsed = empty_parsed();
+
+        let vpc = Resource::with_provider("awscc", "ec2.vpc", "main-vpc")
+            .with_attribute("_binding", Value::String("vpc".to_string()));
+        parsed.resources.push(vpc);
+
+        // Reference inside a Map inside a List
+        let mut map = HashMap::new();
+        map.insert(
+            "vpc_id".to_string(),
+            Value::ResourceRef {
+                binding_name: "vpc".to_string(),
+                attribute_name: "vpc_id".to_string(),
+            },
+        );
+        let sg = Resource::with_provider("awscc", "ec2.security_group", "web-sg")
+            .with_attribute("tags", Value::List(vec![Value::Map(map)]));
+        parsed.resources.push(sg);
+
+        assert!(check_unused_bindings(&parsed).is_empty());
+    }
+
+    #[test]
+    fn binding_referenced_in_module_call() {
+        let mut parsed = empty_parsed();
+
+        let vpc = Resource::with_provider("awscc", "ec2.vpc", "main-vpc")
+            .with_attribute("_binding", Value::String("vpc".to_string()));
+        parsed.resources.push(vpc);
+
+        let mut args = HashMap::new();
+        args.insert(
+            "vpc_id".to_string(),
+            Value::ResourceRef {
+                binding_name: "vpc".to_string(),
+                attribute_name: "vpc_id".to_string(),
+            },
+        );
+        parsed.module_calls.push(ModuleCall {
+            module_name: "web_tier".to_string(),
+            binding_name: None,
+            arguments: args,
+        });
+
+        assert!(check_unused_bindings(&parsed).is_empty());
+    }
+
+    #[test]
+    fn multiple_bindings_some_unused() {
+        let mut parsed = empty_parsed();
+
+        let vpc = Resource::with_provider("awscc", "ec2.vpc", "main-vpc")
+            .with_attribute("_binding", Value::String("vpc".to_string()));
+        parsed.resources.push(vpc);
+
+        let sg = Resource::with_provider("awscc", "ec2.security_group", "web-sg")
+            .with_attribute("_binding", Value::String("web_sg".to_string()));
+        parsed.resources.push(sg);
+
+        // Only vpc is referenced
+        let subnet = Resource::with_provider("awscc", "ec2.subnet", "web-subnet").with_attribute(
+            "vpc_id",
+            Value::ResourceRef {
+                binding_name: "vpc".to_string(),
+                attribute_name: "vpc_id".to_string(),
+            },
+        );
+        parsed.resources.push(subnet);
+
+        let warnings = check_unused_bindings(&parsed);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("'web_sg'"));
     }
 }

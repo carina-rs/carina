@@ -41,10 +41,10 @@ use display::{format_effect, print_plan};
 #[cfg(test)]
 use wiring::resolve_attr_prefixes;
 use wiring::{
-    compute_anonymous_identifiers, create_plan_from_parsed, create_providers_from_configs,
-    get_provider, get_schemas, provider_factories, reconcile_prefixed_names, resolve_names,
-    validate_module_calls, validate_provider_region, validate_resource_ref_types,
-    validate_resources,
+    check_unused_bindings, compute_anonymous_identifiers, create_plan_from_parsed,
+    create_providers_from_configs, get_provider, get_schemas, provider_factories,
+    reconcile_prefixed_names, resolve_names, validate_module_calls, validate_provider_region,
+    validate_resource_ref_types, validate_resources,
 };
 
 #[derive(Parser)]
@@ -321,6 +321,9 @@ fn run_validate(path: &PathBuf) -> Result<(), String> {
     validate_resource_ref_types(&parsed.resources)?;
     compute_anonymous_identifiers(&mut parsed.resources, &parsed.providers)?;
 
+    // Check for unused let bindings (warnings, not errors)
+    let unused_warnings = check_unused_bindings(&parsed);
+
     println!(
         "{}",
         format!(
@@ -333,6 +336,10 @@ fn run_validate(path: &PathBuf) -> Result<(), String> {
 
     for resource in &parsed.resources {
         println!("  • {}", resource.id);
+    }
+
+    for warning in &unused_warnings {
+        println!("{}", format!("⚠ {}", warning).yellow());
     }
 
     Ok(())
