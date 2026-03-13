@@ -60,6 +60,14 @@ impl StateFile {
             .find(|r| r.resource_type == resource_type && r.name == name)
     }
 
+    /// Find all resources matching a provider and resource type
+    pub fn resources_by_type(&self, provider: &str, resource_type: &str) -> Vec<&ResourceState> {
+        self.resources
+            .iter()
+            .filter(|r| r.provider == provider && r.resource_type == resource_type)
+            .collect()
+    }
+
     /// Find a resource mutably by type and name
     pub fn find_resource_mut(
         &mut self,

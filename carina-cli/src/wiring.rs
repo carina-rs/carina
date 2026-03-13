@@ -5,7 +5,7 @@ use colored::Colorize;
 
 use carina_core::deps::sort_resources_by_dependencies;
 use carina_core::differ::{cascade_dependent_updates, create_plan};
-use carina_core::identifier::{self, PrefixStateInfo};
+use carina_core::identifier::{self, AnonymousIdStateInfo, PrefixStateInfo};
 use carina_core::module_resolver;
 use carina_core::parser::{ParsedFile, ProviderConfig};
 use carina_core::plan::Plan;
@@ -85,6 +85,49 @@ pub fn reconcile_prefixed_names(resources: &mut [Resource], state_file: &Option<
                 .collect(),
         })
     });
+}
+
+pub fn reconcile_anonymous_identifiers(resources: &mut [Resource], state_file: &Option<StateFile>) {
+    let state_file = match state_file {
+        Some(sf) => sf,
+        None => return,
+    };
+
+    let factories = provider_factories();
+    let schemas = get_schemas();
+    identifier::reconcile_anonymous_identifiers(
+        resources,
+        &schemas,
+        &|r| provider_mod::schema_key_for_resource(&factories, r),
+        &|provider, resource_type| {
+            // Look up schema to get create-only attribute names
+            let schema_key = format!("{}.{}", provider, resource_type);
+            let create_only_attrs = schemas
+                .get(&schema_key)
+                .map(|s| s.create_only_attributes())
+                .unwrap_or_default();
+
+            state_file
+                .resources_by_type(provider, resource_type)
+                .into_iter()
+                .map(|sr| {
+                    let create_only_values = create_only_attrs
+                        .iter()
+                        .filter_map(|attr| {
+                            sr.attributes
+                                .get(*attr)
+                                .and_then(|v| v.as_str())
+                                .map(|s| (attr.to_string(), s.to_string()))
+                        })
+                        .collect();
+                    AnonymousIdStateInfo {
+                        name: sr.name.clone(),
+                        create_only_values,
+                    }
+                })
+                .collect()
+        },
+    );
 }
 
 pub fn compute_anonymous_identifiers(
