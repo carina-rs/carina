@@ -41,10 +41,10 @@ use display::{format_effect, print_plan};
 #[cfg(test)]
 use wiring::resolve_attr_prefixes;
 use wiring::{
-    compute_anonymous_identifiers, create_plan_from_parsed, create_providers_from_configs,
-    get_provider, get_schemas, provider_factories, reconcile_prefixed_names, resolve_names,
-    validate_module_calls, validate_provider_region, validate_resource_ref_types,
-    validate_resources,
+    check_unused_bindings, compute_anonymous_identifiers, create_plan_from_parsed,
+    create_providers_from_configs, get_provider, get_schemas, provider_factories,
+    reconcile_prefixed_names, resolve_names, validate_module_calls, validate_provider_region,
+    validate_resource_ref_types, validate_resources,
 };
 
 #[derive(Parser)]
@@ -300,7 +300,8 @@ fn run_module_info(path: &Path) -> Result<(), String> {
 }
 
 fn run_validate(path: &PathBuf) -> Result<(), String> {
-    let mut parsed = load_configuration(path)?.parsed;
+    let loaded = load_configuration(path)?;
+    let mut parsed = loaded.parsed;
 
     let base_dir = get_base_dir(path);
 
@@ -321,6 +322,12 @@ fn run_validate(path: &PathBuf) -> Result<(), String> {
     validate_resource_ref_types(&parsed.resources)?;
     compute_anonymous_identifiers(&mut parsed.resources, &parsed.providers)?;
 
+    // Check for unused let bindings (warnings, not errors)
+    // Use unresolved_parsed because resolve_resource_refs resolves intermediate
+    // ResourceRef values away (e.g., igw_attachment.id -> igw.id), making
+    // intermediate bindings appear unused even though they are structurally needed.
+    let unused_warnings = check_unused_bindings(&loaded.unresolved_parsed);
+
     println!(
         "{}",
         format!(
@@ -333,6 +340,17 @@ fn run_validate(path: &PathBuf) -> Result<(), String> {
 
     for resource in &parsed.resources {
         println!("  • {}", resource.id);
+    }
+
+    for binding in &unused_warnings {
+        println!(
+            "{}",
+            format!(
+                "⚠ Unused let binding '{}'. Consider using an anonymous resource instead.",
+                binding
+            )
+            .yellow()
+        );
     }
 
     Ok(())

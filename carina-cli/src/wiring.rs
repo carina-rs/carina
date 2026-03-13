@@ -111,6 +111,10 @@ pub fn compute_anonymous_identifiers(
     )
 }
 
+pub fn check_unused_bindings(parsed: &ParsedFile) -> Vec<String> {
+    validation::check_unused_bindings(parsed)
+}
+
 pub fn validate_provider_region(parsed: &ParsedFile) -> Result<(), String> {
     let factories = provider_factories();
     validation::validate_provider_config(parsed, &factories)
