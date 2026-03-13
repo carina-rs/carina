@@ -300,7 +300,8 @@ fn run_module_info(path: &Path) -> Result<(), String> {
 }
 
 fn run_validate(path: &PathBuf) -> Result<(), String> {
-    let mut parsed = load_configuration(path)?.parsed;
+    let loaded = load_configuration(path)?;
+    let mut parsed = loaded.parsed;
 
     let base_dir = get_base_dir(path);
 
@@ -322,7 +323,10 @@ fn run_validate(path: &PathBuf) -> Result<(), String> {
     compute_anonymous_identifiers(&mut parsed.resources, &parsed.providers)?;
 
     // Check for unused let bindings (warnings, not errors)
-    let unused_warnings = check_unused_bindings(&parsed);
+    // Use unresolved_parsed because resolve_resource_refs resolves intermediate
+    // ResourceRef values away (e.g., igw_attachment.id -> igw.id), making
+    // intermediate bindings appear unused even though they are structurally needed.
+    let unused_warnings = check_unused_bindings(&loaded.unresolved_parsed);
 
     println!(
         "{}",

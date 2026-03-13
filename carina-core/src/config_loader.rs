@@ -9,6 +9,10 @@ use crate::parser::{self, ParsedFile};
 /// Result of loading configuration, includes the file path containing backend block
 pub struct LoadedConfig {
     pub parsed: ParsedFile,
+    /// Resources before reference resolution, for unused binding detection.
+    /// After `resolve_resource_refs`, intermediate `ResourceRef` values are resolved away,
+    /// so this preserves the original references for accurate unused binding analysis.
+    pub unresolved_parsed: ParsedFile,
     pub backend_file: Option<PathBuf>,
 }
 
@@ -18,8 +22,9 @@ pub fn load_configuration(path: &PathBuf) -> Result<LoadedConfig, String> {
         // Single file mode (existing behavior)
         let content = fs::read_to_string(path)
             .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
-        let parsed =
-            parser::parse_and_resolve(&content).map_err(|e| format!("Parse error: {}", e))?;
+        let mut parsed = parser::parse(&content).map_err(|e| format!("Parse error: {}", e))?;
+        let unresolved_parsed = parsed.clone();
+        parser::resolve_resource_refs(&mut parsed).map_err(|e| format!("Parse error: {}", e))?;
         let backend_file = if parsed.backend.is_some() {
             Some(path.clone())
         } else {
@@ -27,6 +32,7 @@ pub fn load_configuration(path: &PathBuf) -> Result<LoadedConfig, String> {
         };
         Ok(LoadedConfig {
             parsed,
+            unresolved_parsed,
             backend_file,
         })
     } else if path.is_dir() {
@@ -36,7 +42,7 @@ pub fn load_configuration(path: &PathBuf) -> Result<LoadedConfig, String> {
             return Err(format!("No .crn files found in {}", path.display()));
         }
 
-        let mut merged = ParsedFile {
+        let empty_parsed = || ParsedFile {
             providers: vec![],
             resources: vec![],
             variables: HashMap::new(),
@@ -46,14 +52,34 @@ pub fn load_configuration(path: &PathBuf) -> Result<LoadedConfig, String> {
             outputs: vec![],
             backend: None,
         };
+        let mut merged = empty_parsed();
+        let mut unresolved_merged = empty_parsed();
         let mut parse_errors = Vec::new();
         let mut backend_file: Option<PathBuf> = None;
 
         for file in &files {
             let content = fs::read_to_string(file)
                 .map_err(|e| format!("Failed to read {}: {}", file.display(), e))?;
-            match parser::parse_and_resolve(&content) {
-                Ok(parsed) => {
+            match parser::parse(&content) {
+                Ok(mut parsed) => {
+                    let unresolved = parsed.clone();
+                    if let Err(e) = parser::resolve_resource_refs(&mut parsed) {
+                        parse_errors.push(format!("{}: {}", file.display(), e));
+                        continue;
+                    }
+
+                    // Merge unresolved
+                    unresolved_merged.providers.extend(unresolved.providers);
+                    unresolved_merged.resources.extend(unresolved.resources);
+                    unresolved_merged.variables.extend(unresolved.variables);
+                    unresolved_merged.imports.extend(unresolved.imports);
+                    unresolved_merged
+                        .module_calls
+                        .extend(unresolved.module_calls);
+                    unresolved_merged.inputs.extend(unresolved.inputs);
+                    unresolved_merged.outputs.extend(unresolved.outputs);
+
+                    // Merge resolved
                     merged.providers.extend(parsed.providers);
                     merged.resources.extend(parsed.resources);
                     merged.variables.extend(parsed.variables);
@@ -85,6 +111,7 @@ pub fn load_configuration(path: &PathBuf) -> Result<LoadedConfig, String> {
         }
         Ok(LoadedConfig {
             parsed: merged,
+            unresolved_parsed: unresolved_merged,
             backend_file,
         })
     } else {

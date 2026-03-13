@@ -450,4 +450,63 @@ mod tests {
 
         assert!(check_unused_bindings(&parsed).is_empty());
     }
+
+    #[test]
+    fn igw_route_crn_unused_detection() {
+        let input = r#"
+provider awscc {
+  region = awscc.Region.ap_northeast_1
+}
+
+let vpc = awscc.ec2.vpc {
+  cidr_block = "10.0.0.0/16"
+}
+
+let igw = awscc.ec2.internet_gateway {
+}
+
+let igw_attachment = awscc.ec2.vpc_gateway_attachment {
+  vpc_id              = vpc.vpc_id
+  internet_gateway_id = igw.internet_gateway_id
+}
+
+let rt = awscc.ec2.route_table {
+  vpc_id = vpc.vpc_id
+}
+
+let route = awscc.ec2.route {
+  route_table_id         = rt.route_table_id
+  destination_cidr_block = "0.0.0.0/0"
+  gateway_id             = igw_attachment.internet_gateway_id
+}
+"#;
+        let parsed = crate::parser::parse(input).unwrap();
+
+        // Check the route resource's gateway_id is a ResourceRef to igw_attachment
+        let route = parsed
+            .resources
+            .iter()
+            .find(|r| r.id.name == "route")
+            .unwrap();
+        let gateway_id = route.attributes.get("gateway_id").unwrap();
+        match gateway_id {
+            Value::ResourceRef {
+                binding_name,
+                attribute_name,
+            } => {
+                assert_eq!(binding_name, "igw_attachment");
+                assert_eq!(attribute_name, "internet_gateway_id");
+            }
+            other => panic!("Expected ResourceRef, got {:?}", other),
+        }
+
+        let unused = check_unused_bindings(&parsed);
+        // igw_attachment is referenced by route, so should NOT be unused
+        // route is the last resource and not referenced, so IS unused
+        assert!(
+            !unused.contains(&"igw_attachment".to_string()),
+            "igw_attachment should not be unused"
+        );
+        assert_eq!(unused, vec!["route"]);
+    }
 }
