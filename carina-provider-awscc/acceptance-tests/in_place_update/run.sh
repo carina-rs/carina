@@ -6,7 +6,7 @@
 #
 # Tests:
 #   logs_log_group - Change retention_in_days (7 -> 14)
-#   s3_bucket      - Toggle versioning (Enabled -> Suspended)
+#   s3_bucket      - Toggle versioning (Enabled -> Disabled)
 #
 # Filter (optional): substring to match test names (e.g. "logs_log_group", "s3_bucket")
 
@@ -149,11 +149,11 @@ run_test "logs_log_group" \
     "$SCRIPT_DIR/logs_log_group_step2.crn" \
     "Test 1: Logs Log Group (retention_in_days 7 -> 14)"
 
-# Test 2: S3 Bucket - toggle versioning (Enabled -> Suspended)
+# Test 2: S3 Bucket - toggle versioning (Enabled -> Disabled)
 run_test "s3_bucket" \
     "$SCRIPT_DIR/s3_bucket_step1.crn" \
     "$SCRIPT_DIR/s3_bucket_step2.crn" \
-    "Test 2: S3 Bucket (versioning Enabled -> Suspended)"
+    "Test 2: S3 Bucket (versioning Enabled -> Disabled)"
 
 echo "════════════════════════════════════════"
 echo "Total: $TOTAL_PASSED passed, $TOTAL_FAILED failed"
