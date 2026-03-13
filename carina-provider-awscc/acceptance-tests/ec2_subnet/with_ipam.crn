@@ -71,7 +71,7 @@ let vpc_pool = awscc.ec2.ipam_pool {
   ]
 }
 
-let subnet = awscc.ec2.subnet {
+awscc.ec2.subnet {
   vpc_id              = vpc.vpc_id
   ipv4_ipam_pool_id   = vpc_pool.ipam_pool_id
   ipv4_netmask_length = 24

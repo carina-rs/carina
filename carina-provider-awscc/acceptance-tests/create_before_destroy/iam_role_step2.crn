@@ -11,7 +11,7 @@ provider awscc {
   region = awscc.Region.ap_northeast_1
 }
 
-let role = awscc.iam.role {
+awscc.iam.role {
   role_name = "carina-acc-test-cbd-role"
   path      = "/carina/"
 

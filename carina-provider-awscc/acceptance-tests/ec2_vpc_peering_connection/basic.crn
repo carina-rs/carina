@@ -14,7 +14,7 @@ let vpc2 = awscc.ec2.vpc {
   cidr_block = "10.1.0.0/16"
 }
 
-let peering = awscc.ec2.vpc_peering_connection {
+awscc.ec2.vpc_peering_connection {
   vpc_id      = vpc1.vpc_id
   peer_vpc_id = vpc2.vpc_id
 

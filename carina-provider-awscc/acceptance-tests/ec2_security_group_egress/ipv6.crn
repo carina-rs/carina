@@ -15,7 +15,7 @@ let sg = awscc.ec2.security_group {
   group_description = "SG for IPv6 egress rule test"
 }
 
-let egress = awscc.ec2.security_group_egress {
+awscc.ec2.security_group_egress {
   group_id    = sg.group_id
   description = "Allow all IPv6 outbound"
   ip_protocol = all

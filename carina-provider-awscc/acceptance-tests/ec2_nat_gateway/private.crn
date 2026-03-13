@@ -16,7 +16,7 @@ let private_subnet = awscc.ec2.subnet {
   availability_zone = "ap-northeast-1a"
 }
 
-let nat_gw = awscc.ec2.nat_gateway {
+awscc.ec2.nat_gateway {
   subnet_id          = private_subnet.subnet_id
   connectivity_type  = private
   private_ip_address = "10.0.1.100"

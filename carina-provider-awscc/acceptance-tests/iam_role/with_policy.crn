@@ -7,7 +7,7 @@ provider awscc {
   region = awscc.Region.ap_northeast_1
 }
 
-let role = awscc.iam.role {
+awscc.iam.role {
   role_name_prefix = "carina-acc-test-"
   description          = "Carina acceptance test role with inline policy"
   max_session_duration = 7200
