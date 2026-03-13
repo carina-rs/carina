@@ -13,6 +13,7 @@ path = "src/bin/codegen.rs"
 
 [dependencies]
 carina-core = { path = "../carina-core" }
+carina-aws-types = { path = "../carina-aws-types" }
 aws-config = "1"
 aws-sdk-cloudcontrol = "1"
 aws-sdk-s3 = "1"

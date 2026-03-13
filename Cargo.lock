@@ -669,6 +669,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "carina-aws-types"
+version = "0.1.0"
+dependencies = [
+ "carina-core",
+]
+
+[[package]]
 name = "carina-cli"
 version = "0.1.0"
 dependencies = [
@@ -736,6 +743,7 @@ dependencies = [
  "aws-sdk-ec2",
  "aws-sdk-s3",
  "aws-sdk-sts",
+ "carina-aws-types",
  "carina-core",
  "heck",
  "serde",
@@ -752,6 +760,7 @@ dependencies = [
  "aws-config",
  "aws-sdk-cloudcontrol",
  "aws-sdk-s3",
+ "carina-aws-types",
  "carina-core",
  "clap",
  "heck",
