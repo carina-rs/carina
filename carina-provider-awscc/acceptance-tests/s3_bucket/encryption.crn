@@ -9,7 +9,7 @@ provider awscc {
   region = awscc.Region.ap_northeast_1
 }
 
-let bucket = awscc.s3.bucket {
+awscc.s3.bucket {
   bucket_name_prefix = "carina-acc-test-"
 
   bucket_encryption = {
