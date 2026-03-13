@@ -9,7 +9,9 @@ use super::tags_type;
 use carina_core::resource::Value;
 use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField, types};
 
-const VALID_IP_PROTOCOL: &[&str] = &["tcp", "udp", "icmp", "icmpv6", "-1", "all"];
+const VALID_EGRESS_IP_PROTOCOL: &[&str] = &["tcp", "udp", "icmp", "icmpv6", "-1", "all"];
+
+const VALID_INGRESS_IP_PROTOCOL: &[&str] = &["tcp", "udp", "icmp", "icmpv6", "-1", "all"];
 
 fn validate_from_port_range(value: &Value) -> Result<(), String> {
     if let Value::Int(n) = value {
@@ -155,7 +157,13 @@ pub fn enum_valid_values() -> (
     &'static str,
     &'static [(&'static str, &'static [&'static str])],
 ) {
-    ("ec2.security_group", &[("ip_protocol", VALID_IP_PROTOCOL)])
+    (
+        "ec2.security_group",
+        &[
+            ("ip_protocol", VALID_EGRESS_IP_PROTOCOL),
+            ("ip_protocol", VALID_INGRESS_IP_PROTOCOL),
+        ],
+    )
 }
 
 /// Maps DSL alias values back to canonical AWS values for this module.

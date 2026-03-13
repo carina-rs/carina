@@ -10,7 +10,7 @@ use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, Struct
 
 const VALID_ABAC_STATUS: &[&str] = &["Enabled", "Disabled"];
 
-const VALID_ACCELERATION_STATUS: &[&str] = &["Enabled", "Suspended"];
+const VALID_ACCELERATE_CONFIGURATION_ACCELERATION_STATUS: &[&str] = &["Enabled", "Suspended"];
 
 const VALID_ACCESS_CONTROL: &[&str] = &[
     "AuthenticatedRead",
@@ -23,37 +23,30 @@ const VALID_ACCESS_CONTROL: &[&str] = &[
     "PublicReadWrite",
 ];
 
-const VALID_ACCESS_TIER: &[&str] = &["ARCHIVE_ACCESS", "DEEP_ARCHIVE_ACCESS"];
+const VALID_DEFAULT_RETENTION_MODE: &[&str] = &["COMPLIANCE", "GOVERNANCE"];
 
-const VALID_CONFIGURATION_STATE: &[&str] = &["ENABLED", "DISABLED"];
+const VALID_DELETE_MARKER_REPLICATION_STATUS: &[&str] = &["Disabled", "Enabled"];
 
-const VALID_EXPIRATION: &[&str] = &["ENABLED", "DISABLED"];
+const VALID_DESTINATION_FORMAT: &[&str] = &["CSV", "ORC", "Parquet"];
 
-const VALID_FORMAT: &[&str] = &["CSV", "ORC", "Parquet"];
+const VALID_INTELLIGENT_TIERING_CONFIGURATION_STATUS: &[&str] = &["Disabled", "Enabled"];
 
-const VALID_INCLUDED_OBJECT_VERSIONS: &[&str] = &["All", "Current"];
+const VALID_INVENTORY_CONFIGURATION_INCLUDED_OBJECT_VERSIONS: &[&str] = &["All", "Current"];
 
-const VALID_MODE: &[&str] = &["COMPLIANCE", "GOVERNANCE"];
+const VALID_INVENTORY_CONFIGURATION_SCHEDULE_FREQUENCY: &[&str] = &["Daily", "Weekly"];
 
-const VALID_OBJECT_OWNERSHIP: &[&str] = &[
-    "ObjectWriter",
-    "BucketOwnerPreferred",
-    "BucketOwnerEnforced",
-];
+const VALID_INVENTORY_TABLE_CONFIGURATION_CONFIGURATION_STATE: &[&str] = &["ENABLED", "DISABLED"];
 
-const VALID_PARTITION_DATE_SOURCE: &[&str] = &["EventTime", "DeliveryTime"];
+const VALID_LIFECYCLE_CONFIGURATION_TRANSITION_DEFAULT_MINIMUM_OBJECT_SIZE: &[&str] =
+    &["varies_by_storage_class", "all_storage_classes_128K"];
 
-const VALID_PROTOCOL: &[&str] = &["http", "https"];
+const VALID_METADATA_DESTINATION_TABLE_BUCKET_TYPE: &[&str] = &["aws", "customer"];
 
-const VALID_REPLACE_KEY_PREFIX_WITH: &[&str] = &["docs/", "documents/", "/documents"];
+const VALID_METADATA_TABLE_ENCRYPTION_CONFIGURATION_SSE_ALGORITHM: &[&str] = &["aws:kms", "AES256"];
 
-const VALID_SCHEDULE_FREQUENCY: &[&str] = &["Daily", "Weekly"];
+const VALID_METRICS_STATUS: &[&str] = &["Disabled", "Enabled"];
 
-const VALID_SSE_ALGORITHM: &[&str] = &["aws:kms", "AES256"];
-
-const VALID_STATUS: &[&str] = &["Disabled", "Enabled"];
-
-const VALID_STORAGE_CLASS: &[&str] = &[
+const VALID_NONCURRENT_VERSION_TRANSITION_STORAGE_CLASS: &[&str] = &[
     "DEEP_ARCHIVE",
     "GLACIER",
     "Glacier",
@@ -63,10 +56,59 @@ const VALID_STORAGE_CLASS: &[&str] = &[
     "STANDARD_IA",
 ];
 
-const VALID_TABLE_BUCKET_TYPE: &[&str] = &["aws", "customer"];
+const VALID_OWNERSHIP_CONTROLS_RULE_OBJECT_OWNERSHIP: &[&str] = &[
+    "ObjectWriter",
+    "BucketOwnerPreferred",
+    "BucketOwnerEnforced",
+];
 
-const VALID_TRANSITION_DEFAULT_MINIMUM_OBJECT_SIZE: &[&str] =
-    &["varies_by_storage_class", "all_storage_classes_128K"];
+const VALID_PARTITIONED_PREFIX_PARTITION_DATE_SOURCE: &[&str] = &["EventTime", "DeliveryTime"];
+
+const VALID_RECORD_EXPIRATION_EXPIRATION: &[&str] = &["ENABLED", "DISABLED"];
+
+const VALID_REDIRECT_ALL_REQUESTS_TO_PROTOCOL: &[&str] = &["http", "https"];
+
+const VALID_REDIRECT_RULE_PROTOCOL: &[&str] = &["http", "https"];
+
+const VALID_REDIRECT_RULE_REPLACE_KEY_PREFIX_WITH: &[&str] = &["docs/", "documents/", "/documents"];
+
+const VALID_REPLICA_MODIFICATIONS_STATUS: &[&str] = &["Enabled", "Disabled"];
+
+const VALID_REPLICATION_DESTINATION_STORAGE_CLASS: &[&str] = &[
+    "DEEP_ARCHIVE",
+    "GLACIER",
+    "GLACIER_IR",
+    "INTELLIGENT_TIERING",
+    "ONEZONE_IA",
+    "REDUCED_REDUNDANCY",
+    "STANDARD",
+    "STANDARD_IA",
+];
+
+const VALID_REPLICATION_RULE_STATUS: &[&str] = &["Disabled", "Enabled"];
+
+const VALID_REPLICATION_TIME_STATUS: &[&str] = &["Disabled", "Enabled"];
+
+const VALID_RULE_STATUS: &[&str] = &["Enabled", "Disabled"];
+
+const VALID_SERVER_SIDE_ENCRYPTION_BY_DEFAULT_SSE_ALGORITHM: &[&str] =
+    &["aws:kms", "AES256", "aws:kms:dsse"];
+
+const VALID_SSE_KMS_ENCRYPTED_OBJECTS_STATUS: &[&str] = &["Disabled", "Enabled"];
+
+const VALID_TIERING_ACCESS_TIER: &[&str] = &["ARCHIVE_ACCESS", "DEEP_ARCHIVE_ACCESS"];
+
+const VALID_TRANSITION_STORAGE_CLASS: &[&str] = &[
+    "DEEP_ARCHIVE",
+    "GLACIER",
+    "Glacier",
+    "GLACIER_IR",
+    "INTELLIGENT_TIERING",
+    "ONEZONE_IA",
+    "STANDARD_IA",
+];
+
+const VALID_VERSIONING_CONFIGURATION_STATUS: &[&str] = &["Enabled", "Suspended"];
 
 /// Returns the schema config for s3_bucket (AWS::S3::Bucket)
 pub fn s3_bucket_config() -> AwsccSchemaConfig {
@@ -172,7 +214,12 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                     name: "ServerSideEncryptionByDefault".to_string(),
                     fields: vec![
                     StructField::new("kms_master_key_id", super::kms_key_id()).with_description("AWS Key Management Service (KMS) customer managed key ID to use for the default encryption. + *General purpose buckets* - This parameter is allowed if...").with_provider_name("KMSMasterKeyID"),
-                    StructField::new("sse_algorithm", AttributeType::Enum(vec!["aws:kms".to_string(), "AES256".to_string(), "aws:kms:dsse".to_string()])).required().with_description("Server-side encryption algorithm to use for the default encryption. For directory buckets, there are only two supported values for server-side encrypt...").with_provider_name("SSEAlgorithm")
+                    StructField::new("sse_algorithm", AttributeType::StringEnum {
+                name: "SseAlgorithm".to_string(),
+                values: vec!["aws:kms".to_string(), "AES256".to_string(), "aws:kms:dsse".to_string()],
+                namespace: Some("awscc.s3.bucket".to_string()),
+                to_dsl: None,
+            }).required().with_description("Server-side encryption algorithm to use for the default encryption. For directory buckets, there are only two supported values for server-side encrypt...").with_provider_name("SSEAlgorithm")
                     ],
                 }).with_description("Specifies the default server-side encryption to apply to new objects in the bucket. If a PUT Object request doesn't specify any server-side encryption...").with_provider_name("ServerSideEncryptionByDefault")
                     ],
@@ -345,7 +392,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                     StructField::new("prefix", AttributeType::String).with_description("Object key prefix that identifies one or more objects to which this rule applies. Replacement must be made for object keys containing special characte...").with_provider_name("Prefix"),
                     StructField::new("status", AttributeType::StringEnum {
                 name: "Status".to_string(),
-                values: vec!["Disabled".to_string(), "Enabled".to_string()],
+                values: vec!["Enabled".to_string(), "Disabled".to_string()],
                 namespace: Some("awscc.s3.bucket".to_string()),
                 to_dsl: None,
             }).required().with_description("If ``Enabled``, the rule is currently being applied. If ``Disabled``, the rule is not currently being applied.").with_provider_name("Status"),
@@ -757,7 +804,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                 }).with_description("A container specifying S3 Replication Time Control (S3 RTC), including whether S3 RTC is enabled and the time when all objects and operations on objec...").with_provider_name("ReplicationTime"),
                     StructField::new("storage_class", AttributeType::StringEnum {
                 name: "StorageClass".to_string(),
-                values: vec!["DEEP_ARCHIVE".to_string(), "GLACIER".to_string(), "Glacier".to_string(), "GLACIER_IR".to_string(), "INTELLIGENT_TIERING".to_string(), "ONEZONE_IA".to_string(), "STANDARD_IA".to_string()],
+                values: vec!["DEEP_ARCHIVE".to_string(), "GLACIER".to_string(), "GLACIER_IR".to_string(), "INTELLIGENT_TIERING".to_string(), "ONEZONE_IA".to_string(), "REDUCED_REDUNDANCY".to_string(), "STANDARD".to_string(), "STANDARD_IA".to_string()],
                 namespace: Some("awscc.s3.bucket".to_string()),
                 to_dsl: None,
             }).with_description("The storage class to use when replicating objects, such as S3 Standard or reduced redundancy. By default, Amazon S3 uses the storage class of the sour...").with_provider_name("StorageClass")
@@ -788,7 +835,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                     fields: vec![
                     StructField::new("status", AttributeType::StringEnum {
                 name: "Status".to_string(),
-                values: vec!["Disabled".to_string(), "Enabled".to_string()],
+                values: vec!["Enabled".to_string(), "Disabled".to_string()],
                 namespace: Some("awscc.s3.bucket".to_string()),
                 to_dsl: None,
             }).required().with_description("Specifies whether Amazon S3 replicates modifications on replicas. *Allowed values*: ``Enabled`` | ``Disabled``").with_provider_name("Status")
@@ -831,7 +878,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                     fields: vec![
                     StructField::new("status", AttributeType::StringEnum {
                 name: "Status".to_string(),
-                values: vec!["Disabled".to_string(), "Enabled".to_string()],
+                values: vec!["Enabled".to_string(), "Suspended".to_string()],
                 namespace: Some("awscc.s3.bucket".to_string()),
                 to_dsl: None,
             }).required().with_description("The versioning state of the bucket.").with_provider_name("Status")
@@ -913,27 +960,72 @@ pub fn enum_valid_values() -> (
         "s3.bucket",
         &[
             ("abac_status", VALID_ABAC_STATUS),
-            ("acceleration_status", VALID_ACCELERATION_STATUS),
+            (
+                "acceleration_status",
+                VALID_ACCELERATE_CONFIGURATION_ACCELERATION_STATUS,
+            ),
             ("access_control", VALID_ACCESS_CONTROL),
-            ("access_tier", VALID_ACCESS_TIER),
-            ("configuration_state", VALID_CONFIGURATION_STATE),
-            ("expiration", VALID_EXPIRATION),
-            ("format", VALID_FORMAT),
-            ("included_object_versions", VALID_INCLUDED_OBJECT_VERSIONS),
-            ("mode", VALID_MODE),
-            ("object_ownership", VALID_OBJECT_OWNERSHIP),
-            ("partition_date_source", VALID_PARTITION_DATE_SOURCE),
-            ("protocol", VALID_PROTOCOL),
-            ("replace_key_prefix_with", VALID_REPLACE_KEY_PREFIX_WITH),
-            ("schedule_frequency", VALID_SCHEDULE_FREQUENCY),
-            ("sse_algorithm", VALID_SSE_ALGORITHM),
-            ("status", VALID_STATUS),
-            ("storage_class", VALID_STORAGE_CLASS),
-            ("table_bucket_type", VALID_TABLE_BUCKET_TYPE),
+            ("mode", VALID_DEFAULT_RETENTION_MODE),
+            ("status", VALID_DELETE_MARKER_REPLICATION_STATUS),
+            ("format", VALID_DESTINATION_FORMAT),
+            ("status", VALID_INTELLIGENT_TIERING_CONFIGURATION_STATUS),
+            (
+                "included_object_versions",
+                VALID_INVENTORY_CONFIGURATION_INCLUDED_OBJECT_VERSIONS,
+            ),
+            (
+                "schedule_frequency",
+                VALID_INVENTORY_CONFIGURATION_SCHEDULE_FREQUENCY,
+            ),
+            (
+                "configuration_state",
+                VALID_INVENTORY_TABLE_CONFIGURATION_CONFIGURATION_STATE,
+            ),
             (
                 "transition_default_minimum_object_size",
-                VALID_TRANSITION_DEFAULT_MINIMUM_OBJECT_SIZE,
+                VALID_LIFECYCLE_CONFIGURATION_TRANSITION_DEFAULT_MINIMUM_OBJECT_SIZE,
             ),
+            (
+                "table_bucket_type",
+                VALID_METADATA_DESTINATION_TABLE_BUCKET_TYPE,
+            ),
+            (
+                "sse_algorithm",
+                VALID_METADATA_TABLE_ENCRYPTION_CONFIGURATION_SSE_ALGORITHM,
+            ),
+            ("status", VALID_METRICS_STATUS),
+            (
+                "storage_class",
+                VALID_NONCURRENT_VERSION_TRANSITION_STORAGE_CLASS,
+            ),
+            (
+                "object_ownership",
+                VALID_OWNERSHIP_CONTROLS_RULE_OBJECT_OWNERSHIP,
+            ),
+            (
+                "partition_date_source",
+                VALID_PARTITIONED_PREFIX_PARTITION_DATE_SOURCE,
+            ),
+            ("expiration", VALID_RECORD_EXPIRATION_EXPIRATION),
+            ("protocol", VALID_REDIRECT_ALL_REQUESTS_TO_PROTOCOL),
+            ("protocol", VALID_REDIRECT_RULE_PROTOCOL),
+            (
+                "replace_key_prefix_with",
+                VALID_REDIRECT_RULE_REPLACE_KEY_PREFIX_WITH,
+            ),
+            ("status", VALID_REPLICA_MODIFICATIONS_STATUS),
+            ("storage_class", VALID_REPLICATION_DESTINATION_STORAGE_CLASS),
+            ("status", VALID_REPLICATION_RULE_STATUS),
+            ("status", VALID_REPLICATION_TIME_STATUS),
+            ("status", VALID_RULE_STATUS),
+            (
+                "sse_algorithm",
+                VALID_SERVER_SIDE_ENCRYPTION_BY_DEFAULT_SSE_ALGORITHM,
+            ),
+            ("status", VALID_SSE_KMS_ENCRYPTED_OBJECTS_STATUS),
+            ("access_tier", VALID_TIERING_ACCESS_TIER),
+            ("storage_class", VALID_TRANSITION_STORAGE_CLASS),
+            ("status", VALID_VERSIONING_CONFIGURATION_STATUS),
         ],
     )
 }

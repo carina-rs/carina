@@ -8,7 +8,7 @@ use super::AwsccSchemaConfig;
 use super::tags_type;
 use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
 
-const VALID_DNS_RECORD_IP_TYPE: &[&str] = &[
+const VALID_DNS_OPTIONS_SPECIFICATION_DNS_RECORD_IP_TYPE: &[&str] = &[
     "ipv4",
     "ipv6",
     "dualstack",
@@ -16,17 +16,17 @@ const VALID_DNS_RECORD_IP_TYPE: &[&str] = &[
     "not-specified",
 ];
 
-const VALID_IP_ADDRESS_TYPE: &[&str] = &["ipv4", "ipv6", "dualstack", "not-specified"];
-
-const VALID_PRIVATE_DNS_ONLY_FOR_INBOUND_RESOLVER_ENDPOINT: &[&str] =
+const VALID_DNS_OPTIONS_SPECIFICATION_PRIVATE_DNS_ONLY_FOR_INBOUND_RESOLVER_ENDPOINT: &[&str] =
     &["OnlyInboundResolver", "AllResolvers", "NotSpecified"];
 
-const VALID_PRIVATE_DNS_PREFERENCE: &[&str] = &[
+const VALID_DNS_OPTIONS_SPECIFICATION_PRIVATE_DNS_PREFERENCE: &[&str] = &[
     "VERIFIED_DOMAINS_ONLY",
     "ALL_DOMAINS",
     "VERIFIED_DOMAINS_AND_SPECIFIED_DOMAINS",
     "SPECIFIED_DOMAINS_ONLY",
 ];
+
+const VALID_IP_ADDRESS_TYPE: &[&str] = &["ipv4", "ipv6", "dualstack", "not-specified"];
 
 const VALID_VPC_ENDPOINT_TYPE: &[&str] = &[
     "Interface",
@@ -185,13 +185,19 @@ pub fn enum_valid_values() -> (
     (
         "ec2.vpc_endpoint",
         &[
-            ("dns_record_ip_type", VALID_DNS_RECORD_IP_TYPE),
-            ("ip_address_type", VALID_IP_ADDRESS_TYPE),
+            (
+                "dns_record_ip_type",
+                VALID_DNS_OPTIONS_SPECIFICATION_DNS_RECORD_IP_TYPE,
+            ),
             (
                 "private_dns_only_for_inbound_resolver_endpoint",
-                VALID_PRIVATE_DNS_ONLY_FOR_INBOUND_RESOLVER_ENDPOINT,
+                VALID_DNS_OPTIONS_SPECIFICATION_PRIVATE_DNS_ONLY_FOR_INBOUND_RESOLVER_ENDPOINT,
             ),
-            ("private_dns_preference", VALID_PRIVATE_DNS_PREFERENCE),
+            (
+                "private_dns_preference",
+                VALID_DNS_OPTIONS_SPECIFICATION_PRIVATE_DNS_PREFERENCE,
+            ),
+            ("ip_address_type", VALID_IP_ADDRESS_TYPE),
             ("vpc_endpoint_type", VALID_VPC_ENDPOINT_TYPE),
         ],
     )
