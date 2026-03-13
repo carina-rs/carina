@@ -191,10 +191,10 @@ pub fn validate_module_calls(
     }
 }
 
-/// Check for unused `let` bindings and return warnings.
+/// Check for unused `let` bindings and return the unused binding names.
 ///
 /// A binding is unused if its name never appears as a `ResourceRef.binding_name`
-/// in any resource attribute or module call argument.
+/// in any resource attribute, module call argument, or output parameter value.
 pub fn check_unused_bindings(parsed: &ParsedFile) -> Vec<String> {
     // Collect all defined binding names
     let mut defined_bindings: Vec<String> = Vec::new();
@@ -223,19 +223,17 @@ pub fn check_unused_bindings(parsed: &ParsedFile) -> Vec<String> {
             collect_resource_refs(value, &mut referenced);
         }
     }
-
-    // Report unused bindings
-    let mut warnings = Vec::new();
-    for binding in &defined_bindings {
-        if !referenced.contains(binding) {
-            warnings.push(format!(
-                "Unused let binding '{}'. Consider using an anonymous resource instead.",
-                binding
-            ));
+    for output in &parsed.outputs {
+        if let Some(value) = &output.value {
+            collect_resource_refs(value, &mut referenced);
         }
     }
 
-    warnings
+    // Return unused binding names
+    defined_bindings
+        .into_iter()
+        .filter(|binding| !referenced.contains(binding))
+        .collect()
 }
 
 /// Recursively collect all `ResourceRef` binding names from a value tree.
@@ -342,9 +340,8 @@ mod tests {
             .with_attribute("cidr_block", Value::String("10.0.0.0/16".to_string()));
         parsed.resources.push(vpc);
 
-        let warnings = check_unused_bindings(&parsed);
-        assert_eq!(warnings.len(), 1);
-        assert!(warnings[0].contains("'vpc'"));
+        let unused = check_unused_bindings(&parsed);
+        assert_eq!(unused, vec!["vpc"]);
     }
 
     #[test]
@@ -430,8 +427,27 @@ mod tests {
         );
         parsed.resources.push(subnet);
 
-        let warnings = check_unused_bindings(&parsed);
-        assert_eq!(warnings.len(), 1);
-        assert!(warnings[0].contains("'web_sg'"));
+        let unused = check_unused_bindings(&parsed);
+        assert_eq!(unused, vec!["web_sg"]);
+    }
+
+    #[test]
+    fn binding_referenced_in_output_not_warned() {
+        let mut parsed = empty_parsed();
+
+        let vpc = Resource::with_provider("awscc", "ec2.vpc", "main-vpc")
+            .with_attribute("_binding", Value::String("vpc".to_string()));
+        parsed.resources.push(vpc);
+
+        parsed.outputs.push(crate::parser::OutputParameter {
+            name: "vpc_id".to_string(),
+            type_expr: TypeExpr::String,
+            value: Some(Value::ResourceRef {
+                binding_name: "vpc".to_string(),
+                attribute_name: "vpc_id".to_string(),
+            }),
+        });
+
+        assert!(check_unused_bindings(&parsed).is_empty());
     }
 }

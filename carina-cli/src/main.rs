@@ -338,8 +338,15 @@ fn run_validate(path: &PathBuf) -> Result<(), String> {
         println!("  • {}", resource.id);
     }
 
-    for warning in &unused_warnings {
-        println!("{}", format!("⚠ {}", warning).yellow());
+    for binding in &unused_warnings {
+        println!(
+            "{}",
+            format!(
+                "⚠ Unused let binding '{}'. Consider using an anonymous resource instead.",
+                binding
+            )
+            .yellow()
+        );
     }
 
     Ok(())

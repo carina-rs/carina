@@ -1163,24 +1163,15 @@ impl DiagnosticEngine {
 
     /// Check for unused `let` bindings and emit warnings.
     fn check_unused_bindings(&self, doc: &Document, parsed: &ParsedFile) -> Vec<Diagnostic> {
-        let warnings = carina_core::validation::check_unused_bindings(parsed);
-        if warnings.is_empty() {
+        let unused_bindings = carina_core::validation::check_unused_bindings(parsed);
+        if unused_bindings.is_empty() {
             return Vec::new();
         }
 
         let text = doc.text();
         let mut diagnostics = Vec::new();
 
-        for warning in &warnings {
-            // Extract binding name from warning message
-            let binding_name = warning
-                .strip_prefix("Unused let binding '")
-                .and_then(|s| s.split('\'').next());
-            let Some(binding_name) = binding_name else {
-                continue;
-            };
-
-            // Find the `let <binding>` line in the source text
+        for binding_name in &unused_bindings {
             if let Some((line, col)) = self.find_let_binding_position(&text, binding_name) {
                 diagnostics.push(Diagnostic {
                     range: Range {
@@ -1195,7 +1186,10 @@ impl DiagnosticEngine {
                     },
                     severity: Some(DiagnosticSeverity::WARNING),
                     source: Some("carina".to_string()),
-                    message: warning.clone(),
+                    message: format!(
+                        "Unused let binding '{}'. Consider using an anonymous resource instead.",
+                        binding_name
+                    ),
                     ..Default::default()
                 });
             }
