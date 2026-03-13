@@ -19,7 +19,7 @@ use carina_core::schema::{AttributeType, StructField};
 use crate::schemas::generated::{
     AwsccSchemaConfig, canonicalize_enum_value, get_enum_alias_reverse,
 };
-use carina_core::utils::convert_enum_value;
+use carina_core::utils::{convert_enum_value, extract_enum_value};
 
 /// Get the AwsccSchemaConfig for a resource type
 fn get_schema_config(resource_type: &str) -> Option<AwsccSchemaConfig> {
@@ -186,7 +186,16 @@ fn dsl_value_to_aws(
     if attr_type.namespaced_enum_parts().is_some() {
         match value {
             Value::String(s) => {
-                let raw = convert_enum_value(s);
+                // Extract the raw enum value (last part of namespace), then resolve
+                // against known valid values if available. This avoids incorrect
+                // underscore-to-hyphen conversion for values like INFREQUENT_ACCESS.
+                let raw_extracted = extract_enum_value(s);
+                let raw = if let Some((_, values, _, _)) = attr_type.string_enum_parts() {
+                    let valid: Vec<&str> = values.iter().map(String::as_str).collect();
+                    canonicalize_enum_value(raw_extracted, &valid)
+                } else {
+                    convert_enum_value(s)
+                };
                 // Apply alias reverse mapping (e.g., "all" -> "-1")
                 let resolved = match get_enum_alias_reverse(resource_type, attr_name, &raw) {
                     Some(canonical) => canonical.to_string(),
@@ -200,7 +209,13 @@ fn dsl_value_to_aws(
                 } else {
                     ident.clone()
                 };
-                let converted = raw.replace('_', "-");
+                // Use valid values when available for correct resolution
+                let converted = if let Some((_, values, _, _)) = attr_type.string_enum_parts() {
+                    let valid: Vec<&str> = values.iter().map(String::as_str).collect();
+                    canonicalize_enum_value(&raw, &valid)
+                } else {
+                    raw.replace('_', "-")
+                };
                 // Apply alias reverse mapping (e.g., "all" -> "-1")
                 let resolved = match get_enum_alias_reverse(resource_type, attr_name, &converted) {
                     Some(canonical) => canonical.to_string(),
@@ -2003,5 +2018,41 @@ mod tests {
         } else {
             panic!("Expected List for security_group_egress");
         }
+    }
+
+    #[test]
+    fn test_dsl_value_to_aws_preserves_underscores_in_enum_values() {
+        // Enum values like INFREQUENT_ACCESS should NOT have underscores
+        // converted to hyphens (issue #516)
+        let attr_type = AttributeType::StringEnum {
+            name: "LogGroupClass".to_string(),
+            values: vec![
+                "STANDARD".to_string(),
+                "INFREQUENT_ACCESS".to_string(),
+                "DELIVERY".to_string(),
+            ],
+            namespace: Some("awscc.logs.log_group".to_string()),
+            to_dsl: None,
+        };
+        let value =
+            Value::String("awscc.logs.log_group.LogGroupClass.INFREQUENT_ACCESS".to_string());
+        let result = dsl_value_to_aws(&value, &attr_type, "logs.log_group", "log_group_class");
+        assert_eq!(result, Some(json!("INFREQUENT_ACCESS")));
+    }
+
+    #[test]
+    fn test_dsl_value_to_aws_converts_underscores_for_region() {
+        // Region values like ap_northeast_1 SHOULD have underscores converted
+        // to hyphens since Region is a Custom type without valid values list
+        let attr_type = AttributeType::Custom {
+            name: "Region".to_string(),
+            base: Box::new(AttributeType::String),
+            validate: |_| Ok(()),
+            namespace: Some("awscc".to_string()),
+            to_dsl: None,
+        };
+        let value = Value::String("awscc.Region.ap_northeast_1".to_string());
+        let result = dsl_value_to_aws(&value, &attr_type, "logs.log_group", "region");
+        assert_eq!(result, Some(json!("ap-northeast-1")));
     }
 }
