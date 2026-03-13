@@ -570,9 +570,14 @@ fn generate_markdown(schema: &CfnSchema, type_name: &str) -> Result<String> {
         let aliases = known_enum_aliases();
         md.push_str("## Enum Values\n\n");
         for (prop_name, enum_info) in &enums {
-            let attr_name = prop_name.to_snake_case();
+            // For composite keys "DefName.FieldName", use just "FieldName" for display
+            let field_name = prop_name
+                .split('.')
+                .next_back()
+                .unwrap_or(prop_name.as_str());
+            let attr_name = field_name.to_snake_case();
             let has_hyphens = enum_info.values.iter().any(|v| v.contains('-'));
-            let prop_aliases = aliases.get(prop_name.as_str());
+            let prop_aliases = aliases.get(field_name);
             md.push_str(&format!("### {} ({})\n\n", attr_name, enum_info.type_name));
             md.push_str("| Value | DSL Identifier |\n");
             md.push_str("|-------|----------------|\n");
@@ -874,24 +879,27 @@ fn generate_schema_code(schema: &CfnSchema, type_name: &str) -> Result<String> {
     }
 
     // Also scan definitions for struct field enum properties
+    // Use composite key "DefName.FieldName" to avoid conflicts when different
+    // definitions have fields with the same name but different enum values
+    // (e.g., IntelligentTieringConfiguration.Status vs VersioningConfiguration.Status)
     if let Some(definitions) = &schema.definitions {
-        // Build set of existing snake_case names to avoid duplicates
+        // Build set of existing snake_case names from top-level properties
         // (e.g., "SSEAlgorithm" and "SseAlgorithm" both become "sse_algorithm")
         let existing_snake: HashSet<String> = enums.keys().map(|k| k.to_snake_case()).collect();
-        let mut seen_snake: HashSet<String> = existing_snake;
-        for def in definitions.values() {
+        for (def_name, def) in definitions {
             if let Some(props) = &def.properties {
                 for (field_name, field_prop) in props {
                     let snake = field_name.to_snake_case();
-                    if seen_snake.contains(&snake) {
+                    // Skip if a top-level property with the same snake_case name exists
+                    if existing_snake.contains(&snake) {
                         continue;
                     }
                     let (_, field_enum_info) = cfn_type_to_carina_type_with_enum(
                         field_prop, field_name, schema, &namespace, &enums,
                     );
                     if let Some(info) = field_enum_info {
-                        seen_snake.insert(snake);
-                        enums.insert(field_name.clone(), info);
+                        let composite_key = format!("{}.{}", def_name, field_name);
+                        enums.insert(composite_key, info);
                     }
                 }
             }
@@ -952,6 +960,11 @@ use super::AwsccSchemaConfig;
     // Constants are always emitted (referenced by enum_valid_values()).
     let aliases = known_enum_aliases();
     for (prop_name, enum_info) in &enums {
+        // For composite keys like "DefName.FieldName", extract just "FieldName" for alias lookup
+        let field_name = prop_name
+            .split('.')
+            .next_back()
+            .unwrap_or(prop_name.as_str());
         let const_name = format!("VALID_{}", prop_name.to_snake_case().to_uppercase());
 
         // Generate constant (including alias values) - always emitted
@@ -960,7 +973,7 @@ use super::AwsccSchemaConfig;
             .iter()
             .map(|v| format!("\"{}\"", v))
             .collect();
-        if let Some(prop_aliases) = aliases.get(prop_name.as_str()) {
+        if let Some(prop_aliases) = aliases.get(field_name) {
             for (_, alias) in prop_aliases {
                 all_values.push(format!("\"{}\"", alias));
             }
@@ -1195,8 +1208,15 @@ pub fn {}() -> AwsccSchemaConfig {{
             let entries: Vec<String> = enums
                 .keys()
                 .map(|prop_name| {
-                    let attr_name = prop_name.to_snake_case();
-                    let const_name = format!("VALID_{}", attr_name.to_uppercase());
+                    // For composite keys "DefName.FieldName", use just "FieldName" for attribute name
+                    let field_name = prop_name
+                        .split('.')
+                        .next_back()
+                        .unwrap_or(prop_name.as_str());
+                    let attr_name = field_name.to_snake_case();
+                    // Constant name uses the full composite key for uniqueness
+                    let const_name =
+                        format!("VALID_{}", prop_name.to_snake_case().to_uppercase());
                     format!("        (\"{}\", {}),", attr_name, const_name)
                 })
                 .collect();
@@ -1211,14 +1231,23 @@ pub fn {}() -> AwsccSchemaConfig {{
     // Generate enum_alias_reverse() function that maps DSL alias -> canonical AWS value
     {
         let mut match_arms: Vec<String> = Vec::new();
+        let mut seen_arms: HashSet<String> = HashSet::new();
         for prop_name in enums.keys() {
-            if let Some(prop_aliases) = aliases.get(prop_name.as_str()) {
-                let attr_name = prop_name.to_snake_case();
+            // For composite keys "DefName.FieldName", use just "FieldName" for alias lookup
+            let field_name = prop_name
+                .split('.')
+                .next_back()
+                .unwrap_or(prop_name.as_str());
+            if let Some(prop_aliases) = aliases.get(field_name) {
+                let attr_name = field_name.to_snake_case();
                 for (canonical, alias) in prop_aliases {
-                    match_arms.push(format!(
+                    let arm = format!(
                         "        (\"{}\", \"{}\") => Some(\"{}\")",
                         attr_name, alias, canonical
-                    ));
+                    );
+                    if seen_arms.insert(arm.clone()) {
+                        match_arms.push(arm);
+                    }
                 }
             }
         }
@@ -1418,8 +1447,12 @@ fn generate_struct_type(
             let (field_type, enum_info) =
                 cfn_type_to_carina_type_with_enum(field_prop, field_name, schema, namespace, enums);
             // If enum detected in struct field and it's in the enums map, use shared string enum type.
+            // Try composite key "DefName.FieldName" first (for definition-scoped enums),
+            // then fall back to plain "FieldName" (for top-level property enums).
             let field_type = if let Some(local_enum_info) = enum_info {
-                if let Some(enum_info) = enums.get(field_name) {
+                let composite_key = format!("{}.{}", def_name, field_name);
+                if let Some(enum_info) = enums.get(&composite_key).or_else(|| enums.get(field_name))
+                {
                     let prop_aliases = aliases.get(field_name.as_str());
                     let has_hyphens = enum_info.values.iter().any(|v| v.contains('-'));
                     let to_dsl_code = if let Some(alias_list) = prop_aliases {
