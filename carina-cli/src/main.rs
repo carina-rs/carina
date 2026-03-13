@@ -43,8 +43,9 @@ use wiring::resolve_attr_prefixes;
 use wiring::{
     check_unused_bindings, compute_anonymous_identifiers, create_plan_from_parsed,
     create_providers_from_configs, get_provider, get_schemas, provider_factories,
-    reconcile_prefixed_names, resolve_names, validate_module_calls, validate_provider_region,
-    validate_resource_ref_types, validate_resources,
+    reconcile_anonymous_identifiers, reconcile_prefixed_names, resolve_names,
+    validate_module_calls, validate_provider_region, validate_resource_ref_types,
+    validate_resources,
 };
 
 #[derive(Parser)]
@@ -474,6 +475,7 @@ async fn run_plan(path: &PathBuf, out: Option<&PathBuf>) -> Result<bool, String>
     }
 
     reconcile_prefixed_names(&mut parsed.resources, &state_file);
+    reconcile_anonymous_identifiers(&mut parsed.resources, &state_file);
     apply_name_overrides(&mut parsed.resources, &state_file);
 
     let ctx = create_plan_from_parsed(&parsed, &state_file).await?;
@@ -904,6 +906,7 @@ async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
     }
 
     reconcile_prefixed_names(&mut parsed.resources, &state_file);
+    reconcile_anonymous_identifiers(&mut parsed.resources, &state_file);
     apply_name_overrides(&mut parsed.resources, &state_file);
 
     // Sort resources by dependencies
@@ -2221,6 +2224,7 @@ async fn run_destroy(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
         .map_err(|e| format!("Failed to read state: {}", e))?;
 
     reconcile_prefixed_names(&mut parsed.resources, &state_file);
+    reconcile_anonymous_identifiers(&mut parsed.resources, &state_file);
     apply_name_overrides(&mut parsed.resources, &state_file);
 
     // Sort resources by dependencies (for creation order)
@@ -2843,6 +2847,7 @@ async fn run_state_refresh(path: &PathBuf) -> Result<(), String> {
     }
 
     reconcile_prefixed_names(&mut parsed.resources, &state_file);
+    reconcile_anonymous_identifiers(&mut parsed.resources, &state_file);
     apply_name_overrides(&mut parsed.resources, &state_file);
 
     let sorted_resources = sort_resources_by_dependencies(&parsed.resources);
