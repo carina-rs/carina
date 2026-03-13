@@ -100,16 +100,30 @@ pub fn reconcile_anonymous_identifiers(resources: &mut [Resource], state_file: &
         &schemas,
         &|r| provider_mod::schema_key_for_resource(&factories, r),
         &|provider, resource_type| {
+            // Look up schema to get create-only attribute names
+            let schema_key = format!("{}.{}", provider, resource_type);
+            let create_only_attrs = schemas
+                .get(&schema_key)
+                .map(|s| s.create_only_attributes())
+                .unwrap_or_default();
+
             state_file
                 .resources_by_type(provider, resource_type)
                 .into_iter()
-                .map(|sr| AnonymousIdStateInfo {
-                    name: sr.name.clone(),
-                    attribute_values: sr
-                        .attributes
+                .map(|sr| {
+                    let create_only_values = create_only_attrs
                         .iter()
-                        .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-                        .collect(),
+                        .filter_map(|attr| {
+                            sr.attributes
+                                .get(*attr)
+                                .and_then(|v| v.as_str())
+                                .map(|s| (attr.to_string(), s.to_string()))
+                        })
+                        .collect();
+                    AnonymousIdStateInfo {
+                        name: sr.name.clone(),
+                        create_only_values,
+                    }
                 })
                 .collect()
         },

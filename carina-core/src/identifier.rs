@@ -264,19 +264,20 @@ pub fn compute_anonymous_identifiers(
 pub struct AnonymousIdStateInfo {
     /// The resource name (anonymous identifier) stored in state
     pub name: String,
-    /// Attribute values from state, keyed by DSL attribute name
-    pub attribute_values: HashMap<String, String>,
+    /// Create-only attribute values from state, keyed by DSL attribute name
+    pub create_only_values: HashMap<String, String>,
 }
 
 /// Reconcile anonymous resource identifiers with existing state.
 ///
 /// When a create-only property changes on an anonymous resource, the computed
-/// hash-based identifier changes. This function detects such cases by matching
-/// on the `name_attribute` value and restores the original identifier from state,
-/// allowing the differ to generate a Replace effect instead of Create+Delete.
+/// hash-based identifier changes. This function detects such cases by comparing
+/// create-only property values and restores the original identifier from state
+/// when at least one create-only property matches (partial match), allowing the
+/// differ to generate a Replace effect instead of Create+Delete.
 ///
 /// `find_state_by_type` takes (provider, resource_type) and returns all state
-/// entries for that resource type.
+/// entries for that resource type with their create-only attribute values.
 pub fn reconcile_anonymous_identifiers(
     resources: &mut [Resource],
     schemas: &HashMap<String, ResourceSchema>,
@@ -284,8 +285,6 @@ pub fn reconcile_anonymous_identifiers(
     find_state_by_type: &dyn Fn(&str, &str) -> Vec<AnonymousIdStateInfo>,
 ) {
     for resource in resources.iter_mut() {
-        // Only process anonymous resources (those with computed identifiers)
-        // Anonymous identifiers contain '_' followed by hex (e.g., "iam_role_a1b2c3d4")
         if resource.id.name.is_empty() {
             continue;
         }
@@ -295,28 +294,45 @@ pub fn reconcile_anonymous_identifiers(
             continue;
         };
 
-        let Some(name_attr) = &schema.name_attribute else {
+        let create_only_attrs = schema.create_only_attributes();
+        if create_only_attrs.is_empty() {
             continue;
-        };
+        }
 
-        // Get the name_attribute value from the resource
-        let Some(Value::String(name_value)) = resource.attributes.get(name_attr.as_str()) else {
+        // Collect this resource's create-only values
+        let mut resource_co_values: HashMap<&str, String> = HashMap::new();
+        for attr_name in &create_only_attrs {
+            if let Some(Value::String(v)) = resource.attributes.get(*attr_name) {
+                resource_co_values.insert(attr_name, v.clone());
+            }
+        }
+        if resource_co_values.is_empty() {
             continue;
-        };
+        }
 
-        // Check if there's a state entry with the same name_attribute value
-        // but a different identifier
         let state_entries = find_state_by_type(&resource.id.provider, &resource.id.resource_type);
         for entry in &state_entries {
             if entry.name == resource.id.name {
                 // Same identifier, no reconciliation needed
                 continue;
             }
-            if let Some(state_name_value) = entry.attribute_values.get(name_attr.as_str())
-                && state_name_value == name_value
-            {
-                // Found a match: same name_attribute value, different identifier.
-                // Restore the state's identifier so the differ generates Replace.
+
+            // Compare create-only values: count matches and mismatches
+            let mut matched = 0;
+            let mut mismatched = 0;
+            for (attr, value) in &resource_co_values {
+                if let Some(state_value) = entry.create_only_values.get(*attr) {
+                    if state_value == value {
+                        matched += 1;
+                    } else {
+                        mismatched += 1;
+                    }
+                }
+            }
+
+            // Reconcile if at least one create-only property matches and
+            // at least one differs (partial match = same resource with changes)
+            if matched > 0 && mismatched > 0 {
                 resource.id = ResourceId::with_provider(
                     &resource.id.provider,
                     &resource.id.resource_type,
@@ -540,14 +556,12 @@ mod tests {
     }
 
     #[test]
-    fn test_reconcile_anonymous_id_restores_state_identifier() {
-        // When a create-only property changes on an anonymous resource,
-        // the computed hash changes. Reconciliation should restore the
-        // original identifier from state by matching on name_attribute.
+    fn test_reconcile_anonymous_id_partial_create_only_match() {
+        // When one create-only property changes but another stays the same,
+        // reconciliation should restore the state's identifier.
         let schema = ResourceSchema::new("awscc.iam.role")
             .attribute(AttributeSchema::new("role_name", AttributeType::String).create_only())
-            .attribute(AttributeSchema::new("path", AttributeType::String).create_only())
-            .with_name_attribute("role_name");
+            .attribute(AttributeSchema::new("path", AttributeType::String).create_only());
         let schemas: HashMap<String, ResourceSchema> = vec![("awscc.iam.role".to_string(), schema)]
             .into_iter()
             .collect();
@@ -602,12 +616,15 @@ mod tests {
         // Hash includes path, so identifiers differ
         assert_ne!(step1_id, step2_id);
 
-        // Reconcile with state from step1
+        // Reconcile: state has role_name="my-role" (match) and path="/" (mismatch)
         let state_entries = vec![AnonymousIdStateInfo {
             name: step1_id.clone(),
-            attribute_values: vec![("role_name".to_string(), "my-role".to_string())]
-                .into_iter()
-                .collect(),
+            create_only_values: vec![
+                ("role_name".to_string(), "my-role".to_string()),
+                ("path".to_string(), "/".to_string()),
+            ]
+            .into_iter()
+            .collect(),
         }];
         reconcile_anonymous_identifiers(
             &mut resources2,
@@ -621,11 +638,11 @@ mod tests {
     }
 
     #[test]
-    fn test_reconcile_anonymous_id_no_match_keeps_new_identifier() {
-        // When name_attribute values don't match, no reconciliation happens
+    fn test_reconcile_anonymous_id_no_match_when_all_differ() {
+        // When ALL create-only properties differ, no reconciliation (truly new resource)
         let schema = ResourceSchema::new("awscc.iam.role")
             .attribute(AttributeSchema::new("role_name", AttributeType::String).create_only())
-            .with_name_attribute("role_name");
+            .attribute(AttributeSchema::new("path", AttributeType::String).create_only());
         let schemas: HashMap<String, ResourceSchema> = vec![("awscc.iam.role".to_string(), schema)]
             .into_iter()
             .collect();
@@ -635,33 +652,85 @@ mod tests {
             "role_name".to_string(),
             Value::String("new-role".to_string()),
         );
+        resource
+            .attributes
+            .insert("path".to_string(), Value::String("/new/".to_string()));
 
         let original_id = resource.id.name.clone();
+        let mut resources = vec![resource];
 
-        // State has a different role_name
+        // State has completely different values
         let state_entries = vec![AnonymousIdStateInfo {
             name: "iam_role_11223344".to_string(),
-            attribute_values: vec![("role_name".to_string(), "old-role".to_string())]
-                .into_iter()
-                .collect(),
+            create_only_values: vec![
+                ("role_name".to_string(), "old-role".to_string()),
+                ("path".to_string(), "/old/".to_string()),
+            ]
+            .into_iter()
+            .collect(),
         }];
         reconcile_anonymous_identifiers(
-            &mut [resource.clone()],
+            &mut resources,
             &schemas,
             &schema_key_fn,
             &|_provider, _rt| state_entries.clone(),
         );
 
         // Identifier should remain unchanged
-        assert_eq!(resource.id.name, original_id);
+        assert_eq!(resources[0].id.name, original_id);
     }
 
     #[test]
-    fn test_reconcile_anonymous_id_skips_without_name_attribute() {
-        // Resources without name_attribute should not be reconciled
+    fn test_reconcile_anonymous_id_no_match_when_all_same() {
+        // When ALL create-only properties match, the hash should also match,
+        // so no reconciliation is needed (same identifier)
+        let schema = ResourceSchema::new("awscc.iam.role")
+            .attribute(AttributeSchema::new("role_name", AttributeType::String).create_only())
+            .attribute(AttributeSchema::new("path", AttributeType::String).create_only());
+        let schemas: HashMap<String, ResourceSchema> = vec![("awscc.iam.role".to_string(), schema)]
+            .into_iter()
+            .collect();
+
+        let mut resource = Resource::with_provider("awscc", "iam.role", "iam_role_aabbccdd");
+        resource.attributes.insert(
+            "role_name".to_string(),
+            Value::String("my-role".to_string()),
+        );
+        resource
+            .attributes
+            .insert("path".to_string(), Value::String("/".to_string()));
+
+        let original_id = resource.id.name.clone();
+        let mut resources = vec![resource];
+
+        // State has same values but different ID (shouldn't happen in practice,
+        // but reconciliation should NOT trigger since no mismatch)
+        let state_entries = vec![AnonymousIdStateInfo {
+            name: "iam_role_11223344".to_string(),
+            create_only_values: vec![
+                ("role_name".to_string(), "my-role".to_string()),
+                ("path".to_string(), "/".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+        }];
+        reconcile_anonymous_identifiers(
+            &mut resources,
+            &schemas,
+            &schema_key_fn,
+            &|_provider, _rt| state_entries.clone(),
+        );
+
+        // Identifier should remain unchanged (all values match = no partial match)
+        assert_eq!(resources[0].id.name, original_id);
+    }
+
+    #[test]
+    fn test_reconcile_anonymous_id_single_create_only_no_reconcile() {
+        // With only one create-only property, changing it means ALL changed,
+        // so no reconciliation (matched=0 or mismatched=0)
         let schema = ResourceSchema::new("awscc.ec2.vpc")
             .attribute(AttributeSchema::new("cidr_block", AttributeType::String).create_only());
-        // No .with_name_attribute()
         let schemas: HashMap<String, ResourceSchema> = vec![("awscc.ec2.vpc".to_string(), schema)]
             .into_iter()
             .collect();
@@ -669,27 +738,26 @@ mod tests {
         let mut resource = Resource::with_provider("awscc", "ec2.vpc", "ec2_vpc_aabbccdd");
         resource.attributes.insert(
             "cidr_block".to_string(),
-            Value::String("10.0.0.0/16".to_string()),
+            Value::String("10.1.0.0/16".to_string()),
         );
 
         let original_id = resource.id.name.clone();
         let mut resources = vec![resource];
 
+        let state_entries = vec![AnonymousIdStateInfo {
+            name: "ec2_vpc_11223344".to_string(),
+            create_only_values: vec![("cidr_block".to_string(), "10.0.0.0/16".to_string())]
+                .into_iter()
+                .collect(),
+        }];
         reconcile_anonymous_identifiers(
             &mut resources,
             &schemas,
             &schema_key_fn,
-            &|_provider, _rt| {
-                vec![AnonymousIdStateInfo {
-                    name: "ec2_vpc_11223344".to_string(),
-                    attribute_values: vec![("cidr_block".to_string(), "10.0.0.0/16".to_string())]
-                        .into_iter()
-                        .collect(),
-                }]
-            },
+            &|_provider, _rt| state_entries.clone(),
         );
 
-        // Identifier should remain unchanged (no name_attribute to match on)
+        // No reconciliation: only one create-only prop and it changed
         assert_eq!(resources[0].id.name, original_id);
     }
 }
