@@ -1,0 +1,19 @@
+# S3 Bucket - in-place update test (step 1)
+#
+# Tests: create bucket with versioning Enabled
+
+provider awscc {
+  region = awscc.Region.ap_northeast_1
+}
+
+let bucket = awscc.s3.bucket {
+  bucket_name_prefix = "carina-acc-test-update-"
+
+  versioning_configuration = {
+    status = awscc.s3.bucket.Status.Enabled
+  }
+
+  lifecycle {
+    force_delete = true
+  }
+}
