@@ -88,7 +88,7 @@ Shorthand formats: `default` or `InstanceTenancy.default`
 
 ### `cidr_block_associations`
 
-- **Type:** `List<Ipv4Cidr>`
+- **Type:** `List<VpcCidrBlockAssociationId>`
 
 ### `default_network_acl`
 

@@ -25,7 +25,7 @@ awscc.ec2.transit_gateway {
 
 ### `association_default_route_table_id`
 
-- **Type:** RouteTableId
+- **Type:** TgwRouteTableId
 - **Required:** No
 
 ### `auto_accept_shared_attachments`
@@ -65,7 +65,7 @@ awscc.ec2.transit_gateway {
 
 ### `propagation_default_route_table_id`
 
-- **Type:** RouteTableId
+- **Type:** TgwRouteTableId
 - **Required:** No
 
 ### `security_group_referencing_support`
@@ -80,7 +80,7 @@ awscc.ec2.transit_gateway {
 
 ### `transit_gateway_cidr_blocks`
 
-- **Type:** `List<Ipv4Cidr>`
+- **Type:** `List<Cidr>`
 - **Required:** No
 
 ### `vpn_ecmp_support`

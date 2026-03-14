@@ -42,7 +42,7 @@ pub fn ec2_transit_gateway_config() -> AwsccSchemaConfig {
             .attribute(
                 AttributeSchema::new(
                     "association_default_route_table_id",
-                    super::route_table_id(),
+                    super::tgw_route_table_id(),
                 )
                 .with_provider_name("AssociationDefaultRouteTableId"),
             )
@@ -144,7 +144,7 @@ pub fn ec2_transit_gateway_config() -> AwsccSchemaConfig {
             .attribute(
                 AttributeSchema::new(
                     "propagation_default_route_table_id",
-                    super::route_table_id(),
+                    super::tgw_route_table_id(),
                 )
                 .with_provider_name("PropagationDefaultRouteTableId"),
             )
@@ -169,7 +169,7 @@ pub fn ec2_transit_gateway_config() -> AwsccSchemaConfig {
             .attribute(
                 AttributeSchema::new(
                     "transit_gateway_cidr_blocks",
-                    AttributeType::List(Box::new(types::ipv4_cidr())),
+                    AttributeType::List(Box::new(types::cidr())),
                 )
                 .with_provider_name("TransitGatewayCidrBlocks"),
             )

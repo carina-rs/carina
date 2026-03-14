@@ -866,6 +866,11 @@ pub mod types {
             to_dsl: None,
         }
     }
+
+    /// CIDR block type that accepts both IPv4 and IPv6 (e.g., "10.0.0.0/16" or "2001:db8::/32")
+    pub fn cidr() -> AttributeType {
+        AttributeType::Union(vec![ipv4_cidr(), ipv6_cidr()])
+    }
 }
 
 /// Validate an IPv4 address (e.g., "10.0.1.5", "192.168.0.1")
@@ -1585,6 +1590,33 @@ mod tests {
         assert!(validate_ipv6_cidr("not-a-cidr").is_err());
         assert!(validate_ipv6_cidr("2001:db8::").is_err());
         assert!(validate_ipv6_cidr("/64").is_err());
+    }
+
+    #[test]
+    fn validate_cidr_accepts_both_ipv4_and_ipv6() {
+        let t = types::cidr();
+
+        // Valid IPv4 CIDRs
+        assert!(
+            t.validate(&Value::String("10.0.0.0/16".to_string()))
+                .is_ok()
+        );
+        assert!(t.validate(&Value::String("0.0.0.0/0".to_string())).is_ok());
+
+        // Valid IPv6 CIDRs
+        assert!(
+            t.validate(&Value::String("2001:db8::/32".to_string()))
+                .is_ok()
+        );
+        assert!(t.validate(&Value::String("::/0".to_string())).is_ok());
+
+        // Invalid
+        assert!(
+            t.validate(&Value::String("not-a-cidr".to_string()))
+                .is_err()
+        );
+        assert!(t.validate(&Value::String("10.0.0.0".to_string())).is_err()); // no prefix
+        assert!(t.validate(&Value::Int(42)).is_err());
     }
 
     #[test]
