@@ -406,6 +406,7 @@ fn override_type_to_display_name(override_type: &str) -> &str {
         "types::ipv4_address()" => "Ipv4Address",
         "super::arn()" => "Arn",
         "super::ipam_pool_id()" => "IpamPoolId",
+        "super::vpc_cidr_block_association_id()" => "VpcCidrBlockAssociationId",
         "super::tgw_route_table_id()" => "TgwRouteTableId",
         "types::cidr()" => "Cidr",
         "AttributeType::String" => "String",
@@ -1733,7 +1734,7 @@ fn resource_specific_type_overrides() -> &'static HashMap<(&'static str, &'stati
             // VPC CidrBlockAssociations are association IDs (vpc-cidr-assoc-xxx), not CIDRs
             m.insert(
                 ("AWS::EC2::VPC", "CidrBlockAssociations"),
-                "AttributeType::String",
+                "super::vpc_cidr_block_association_id()",
             );
             // Transit Gateway route table IDs use tgw-rtb- prefix, not rtb-
             m.insert(

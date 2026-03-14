@@ -38,7 +38,7 @@ pub fn ec2_vpc_config() -> AwsccSchemaConfig {
                 .with_provider_name("CidrBlock"),
         )
         .attribute(
-            AttributeSchema::new("cidr_block_associations", AttributeType::List(Box::new(AttributeType::String)))
+            AttributeSchema::new("cidr_block_associations", AttributeType::List(Box::new(super::vpc_cidr_block_association_id())))
                 .with_description(" (read-only)")
                 .with_provider_name("CidrBlockAssociations"),
         )

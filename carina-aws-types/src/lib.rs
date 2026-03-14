@@ -341,6 +341,25 @@ pub fn transit_gateway_id() -> AttributeType {
     }
 }
 
+/// VPC CIDR Block Association ID type (e.g., "vpc-cidr-assoc-12345678")
+pub fn vpc_cidr_block_association_id() -> AttributeType {
+    AttributeType::Custom {
+        name: "VpcCidrBlockAssociationId".to_string(),
+        base: Box::new(AttributeType::String),
+        validate: |value| {
+            if let Value::String(s) = value {
+                validate_prefixed_resource_id(s, "vpc-cidr-assoc").map_err(|reason| {
+                    format!("Invalid VPC CIDR Block Association ID '{}': {}", s, reason)
+                })
+            } else {
+                Err("Expected string".to_string())
+            }
+        },
+        namespace: None,
+        to_dsl: None,
+    }
+}
+
 /// Transit Gateway Route Table ID type (e.g., "tgw-rtb-12345678")
 pub fn tgw_route_table_id() -> AttributeType {
     AttributeType::Custom {
@@ -1189,6 +1208,31 @@ mod tests {
             })
             .is_ok()
         );
+    }
+
+    #[test]
+    fn validate_vpc_cidr_block_association_id_valid() {
+        let t = vpc_cidr_block_association_id();
+        assert!(
+            t.validate(&Value::String("vpc-cidr-assoc-12345678".to_string()))
+                .is_ok()
+        );
+        assert!(
+            t.validate(&Value::String(
+                "vpc-cidr-assoc-0123456789abcdef0".to_string()
+            ))
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn validate_vpc_cidr_block_association_id_invalid() {
+        let t = vpc_cidr_block_association_id();
+        assert!(
+            t.validate(&Value::String("vpc-12345678".to_string()))
+                .is_err()
+        );
+        assert!(t.validate(&Value::String("invalid".to_string())).is_err());
     }
 
     #[test]
