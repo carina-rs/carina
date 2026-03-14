@@ -45,7 +45,12 @@ pub fn ec2_flow_log_config() -> AwsccSchemaConfig {
             AttributeSchema::new("destination_options", AttributeType::Struct {
                     name: "DestinationOptions".to_string(),
                     fields: vec![
-                    StructField::new("file_format", AttributeType::Enum(vec!["plain-text".to_string(), "parquet".to_string()])).required().with_provider_name("FileFormat"),
+                    StructField::new("file_format", AttributeType::StringEnum {
+                name: "FileFormat".to_string(),
+                values: vec!["plain-text".to_string(), "parquet".to_string()],
+                namespace: Some("awscc.ec2.flow_log".to_string()),
+                to_dsl: Some(|s: &str| s.replace('-', "_")),
+            }).required().with_provider_name("FileFormat"),
                     StructField::new("hive_compatible_partitions", AttributeType::Bool).required().with_provider_name("HiveCompatiblePartitions"),
                     StructField::new("per_hour_partition", AttributeType::Bool).required().with_provider_name("PerHourPartition")
                     ],
