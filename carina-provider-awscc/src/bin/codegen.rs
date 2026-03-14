@@ -615,6 +615,8 @@ fn generate_markdown(schema: &CfnSchema, type_name: &str) -> Result<String> {
         }
     }
 
+    disambiguate_enum_type_names(&mut enums);
+
     // Title
     md.push_str(&format!("# awscc.{}\n\n", dsl_resource));
     md.push_str(&format!("CloudFormation Type: `{}`\n\n", type_name));
@@ -1067,6 +1069,8 @@ fn generate_schema_code(schema: &CfnSchema, type_name: &str) -> Result<String> {
             }
         }
     }
+
+    disambiguate_enum_type_names(&mut enums);
 
     let has_enums = !enums.is_empty();
     let has_ranged_ints = !ranged_ints.is_empty();
@@ -1617,6 +1621,40 @@ fn extract_enum_from_description(description: &str) -> Option<Vec<String>> {
     }
 
     None
+}
+
+/// Disambiguate enum type_names that collide (same type_name, different values).
+/// For struct field enums with composite keys "DefName.FieldName", prefixes the
+/// type_name with the parent struct name (e.g., "Status" -> "VersioningConfigurationStatus").
+/// Enums with the same type_name and identical values are left unchanged (they deduplicate later).
+fn disambiguate_enum_type_names(enums: &mut BTreeMap<String, EnumInfo>) {
+    let mut type_name_groups: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (key, info) in enums.iter() {
+        type_name_groups
+            .entry(info.type_name.clone())
+            .or_default()
+            .push(key.clone());
+    }
+    for keys in type_name_groups.values() {
+        let unique_value_sets: HashSet<Vec<String>> = keys
+            .iter()
+            .filter_map(|k| enums.get(k))
+            .map(|info| info.values.clone())
+            .collect();
+        if unique_value_sets.len() <= 1 {
+            continue; // No collision - all have identical values
+        }
+        // There's a collision: disambiguate by prefixing parent struct name
+        for key in keys {
+            if let Some(dot_pos) = key.find('.') {
+                let parent_struct = &key[..dot_pos];
+                if let Some(info) = enums.get_mut(key) {
+                    info.type_name = format!("{}{}", parent_struct, info.type_name);
+                }
+            }
+            // Top-level properties (no dot) keep their original type_name
+        }
+    }
 }
 
 /// Deduplicate enum values while preserving order.
@@ -5506,16 +5544,39 @@ mod tests {
         };
 
         let md = generate_markdown(&schema, "AWS::Test::Resource").unwrap();
-        let status_count = md.matches("### status (Status)").count();
-        assert_eq!(
-            status_count,
-            2,
-            "Expected 2 Status enum sections (different values), found {}.\nEnum Values section:\n{}",
-            status_count,
+
+        // With disambiguation, the two Status enums should have different type names
+        assert!(
+            md.contains("### status (ConfigAStatus)"),
+            "Expected ConfigAStatus heading.\nEnum Values section:\n{}",
             md.lines()
                 .filter(|l| l.contains("Status") || l.contains("status"))
                 .collect::<Vec<_>>()
                 .join("\n")
+        );
+        assert!(
+            md.contains("### status (ConfigBStatus)"),
+            "Expected ConfigBStatus heading.\nEnum Values section:\n{}",
+            md.lines()
+                .filter(|l| l.contains("Status") || l.contains("status"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+
+        // DSL identifiers should also be disambiguated
+        assert!(
+            md.contains("awscc.test.resource.ConfigAStatus.Disabled"),
+            "Expected disambiguated DSL identifier for ConfigA"
+        );
+        assert!(
+            md.contains("awscc.test.resource.ConfigBStatus.Suspended"),
+            "Expected disambiguated DSL identifier for ConfigB"
+        );
+
+        // Old ambiguous format should NOT appear
+        assert!(
+            !md.contains("### status (Status)"),
+            "Should not have ambiguous '### status (Status)' heading"
         );
     }
 }

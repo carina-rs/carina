@@ -204,14 +204,14 @@ Shorthand formats: `Enabled` or `AccelerationStatus.Enabled`
 
 Shorthand formats: `AuthenticatedRead` or `AccessControl.AuthenticatedRead`
 
-### status (Status)
+### status (IntelligentTieringConfigurationStatus)
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `Disabled` | `awscc.s3.bucket.Status.Disabled` |
-| `Enabled` | `awscc.s3.bucket.Status.Enabled` |
+| `Disabled` | `awscc.s3.bucket.IntelligentTieringConfigurationStatus.Disabled` |
+| `Enabled` | `awscc.s3.bucket.IntelligentTieringConfigurationStatus.Enabled` |
 
-Shorthand formats: `Disabled` or `Status.Disabled`
+Shorthand formats: `Disabled` or `IntelligentTieringConfigurationStatus.Disabled`
 
 ### included_object_versions (IncludedObjectVersions)
 
@@ -271,14 +271,14 @@ Shorthand formats: `varies_by_storage_class` or `TransitionDefaultMinimumObjectS
 
 Shorthand formats: `Enabled` or `ObjectLockEnabled.Enabled`
 
-### status (Status)
+### status (VersioningConfigurationStatus)
 
 | Value | DSL Identifier |
 |-------|----------------|
-| `Enabled` | `awscc.s3.bucket.Status.Enabled` |
-| `Suspended` | `awscc.s3.bucket.Status.Suspended` |
+| `Enabled` | `awscc.s3.bucket.VersioningConfigurationStatus.Enabled` |
+| `Suspended` | `awscc.s3.bucket.VersioningConfigurationStatus.Suspended` |
 
-Shorthand formats: `Enabled` or `Status.Enabled`
+Shorthand formats: `Enabled` or `VersioningConfigurationStatus.Enabled`
 
 ## Struct Definitions
 

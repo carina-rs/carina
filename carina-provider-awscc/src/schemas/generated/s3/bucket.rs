@@ -275,7 +275,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                     fields: vec![
                     StructField::new("kms_master_key_id", super::kms_key_id()).with_description("AWS Key Management Service (KMS) customer managed key ID to use for the default encryption. + *General purpose buckets* - This parameter is allowed if...").with_provider_name("KMSMasterKeyID"),
                     StructField::new("sse_algorithm", AttributeType::StringEnum {
-                name: "SseAlgorithm".to_string(),
+                name: "ServerSideEncryptionByDefaultSseAlgorithm".to_string(),
                 values: vec!["aws:kms".to_string(), "AES256".to_string(), "aws:kms:dsse".to_string()],
                 namespace: Some("awscc.s3.bucket".to_string()),
                 to_dsl: None,
@@ -343,7 +343,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                     StructField::new("id", AttributeType::String).required().with_description("The ID used to identify the S3 Intelligent-Tiering configuration.").with_provider_name("Id"),
                     StructField::new("prefix", AttributeType::String).with_description("An object key name prefix that identifies the subset of objects to which the rule applies.").with_provider_name("Prefix"),
                     StructField::new("status", AttributeType::StringEnum {
-                name: "Status".to_string(),
+                name: "IntelligentTieringConfigurationStatus".to_string(),
                 values: vec!["Disabled".to_string(), "Enabled".to_string()],
                 namespace: Some("awscc.s3.bucket".to_string()),
                 to_dsl: None,
@@ -448,7 +448,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                     fields: vec![
                     StructField::new("newer_noncurrent_versions", AttributeType::Int).with_description("Specifies how many noncurrent versions S3 will retain. If there are this many more recent noncurrent versions, S3 will take the associated action. For...").with_provider_name("NewerNoncurrentVersions"),
                     StructField::new("storage_class", AttributeType::StringEnum {
-                name: "StorageClass".to_string(),
+                name: "NoncurrentVersionTransitionStorageClass".to_string(),
                 values: vec!["DEEP_ARCHIVE".to_string(), "GLACIER".to_string(), "GLACIER_IR".to_string(), "INTELLIGENT_TIERING".to_string(), "ONEZONE_IA".to_string(), "STANDARD_IA".to_string()],
                 namespace: Some("awscc.s3.bucket".to_string()),
                 to_dsl: None,
@@ -461,7 +461,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                     fields: vec![
                     StructField::new("newer_noncurrent_versions", AttributeType::Int).with_description("Specifies how many noncurrent versions S3 will retain. If there are this many more recent noncurrent versions, S3 will take the associated action. For...").with_provider_name("NewerNoncurrentVersions"),
                     StructField::new("storage_class", AttributeType::StringEnum {
-                name: "StorageClass".to_string(),
+                name: "NoncurrentVersionTransitionStorageClass".to_string(),
                 values: vec!["DEEP_ARCHIVE".to_string(), "GLACIER".to_string(), "GLACIER_IR".to_string(), "INTELLIGENT_TIERING".to_string(), "ONEZONE_IA".to_string(), "STANDARD_IA".to_string()],
                 namespace: Some("awscc.s3.bucket".to_string()),
                 to_dsl: None,
@@ -473,7 +473,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                     StructField::new("object_size_less_than", AttributeType::String).with_description("Specifies the maximum object size in bytes for this rule to apply to. Objects must be smaller than this value in bytes. For more information about siz...").with_provider_name("ObjectSizeLessThan"),
                     StructField::new("prefix", AttributeType::String).with_description("Object key prefix that identifies one or more objects to which this rule applies. Replacement must be made for object keys containing special characte...").with_provider_name("Prefix"),
                     StructField::new("status", AttributeType::StringEnum {
-                name: "Status".to_string(),
+                name: "RuleStatus".to_string(),
                 values: vec!["Enabled".to_string(), "Disabled".to_string()],
                 namespace: Some("awscc.s3.bucket".to_string()),
                 to_dsl: None,
@@ -483,7 +483,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                     name: "Transition".to_string(),
                     fields: vec![
                     StructField::new("storage_class", AttributeType::StringEnum {
-                name: "StorageClass".to_string(),
+                name: "TransitionStorageClass".to_string(),
                 values: vec!["DEEP_ARCHIVE".to_string(), "GLACIER".to_string(), "GLACIER_IR".to_string(), "INTELLIGENT_TIERING".to_string(), "ONEZONE_IA".to_string(), "STANDARD_IA".to_string()],
                 namespace: Some("awscc.s3.bucket".to_string()),
                 to_dsl: None,
@@ -496,7 +496,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                     name: "Transition".to_string(),
                     fields: vec![
                     StructField::new("storage_class", AttributeType::StringEnum {
-                name: "StorageClass".to_string(),
+                name: "TransitionStorageClass".to_string(),
                 values: vec!["DEEP_ARCHIVE".to_string(), "GLACIER".to_string(), "GLACIER_IR".to_string(), "INTELLIGENT_TIERING".to_string(), "ONEZONE_IA".to_string(), "STANDARD_IA".to_string()],
                 namespace: Some("awscc.s3.bucket".to_string()),
                 to_dsl: None,
@@ -580,7 +580,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                     fields: vec![
                     StructField::new("kms_key_arn", super::kms_key_arn()).with_description("If server-side encryption with KMSlong (KMS) keys (SSE-KMS) is specified, you must also specify the KMS key Amazon Resource Name (ARN). You must speci...").with_provider_name("KmsKeyArn"),
                     StructField::new("sse_algorithm", AttributeType::StringEnum {
-                name: "SseAlgorithm".to_string(),
+                name: "MetadataTableEncryptionConfigurationSseAlgorithm".to_string(),
                 values: vec!["aws:kms".to_string(), "AES256".to_string()],
                 namespace: Some("awscc.s3.bucket".to_string()),
                 to_dsl: None,
@@ -599,7 +599,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                     fields: vec![
                     StructField::new("kms_key_arn", super::kms_key_arn()).with_description("If server-side encryption with KMSlong (KMS) keys (SSE-KMS) is specified, you must also specify the KMS key Amazon Resource Name (ARN). You must speci...").with_provider_name("KmsKeyArn"),
                     StructField::new("sse_algorithm", AttributeType::StringEnum {
-                name: "SseAlgorithm".to_string(),
+                name: "MetadataTableEncryptionConfigurationSseAlgorithm".to_string(),
                 values: vec!["aws:kms".to_string(), "AES256".to_string()],
                 namespace: Some("awscc.s3.bucket".to_string()),
                 to_dsl: None,
@@ -834,7 +834,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                     name: "DeleteMarkerReplication".to_string(),
                     fields: vec![
                     StructField::new("status", AttributeType::StringEnum {
-                name: "Status".to_string(),
+                name: "DeleteMarkerReplicationStatus".to_string(),
                 values: vec!["Disabled".to_string(), "Enabled".to_string()],
                 namespace: Some("awscc.s3.bucket".to_string()),
                 to_dsl: None,
@@ -873,7 +873,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                     ],
                 }).with_description("A container specifying the time threshold for emitting the ``s3:Replication:OperationMissedThreshold`` event.").with_provider_name("EventThreshold"),
                     StructField::new("status", AttributeType::StringEnum {
-                name: "Status".to_string(),
+                name: "MetricsStatus".to_string(),
                 values: vec!["Disabled".to_string(), "Enabled".to_string()],
                 namespace: Some("awscc.s3.bucket".to_string()),
                 to_dsl: None,
@@ -884,7 +884,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                     name: "ReplicationTime".to_string(),
                     fields: vec![
                     StructField::new("status", AttributeType::StringEnum {
-                name: "Status".to_string(),
+                name: "ReplicationTimeStatus".to_string(),
                 values: vec!["Disabled".to_string(), "Enabled".to_string()],
                 namespace: Some("awscc.s3.bucket".to_string()),
                 to_dsl: None,
@@ -898,7 +898,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                     ],
                 }).with_description("A container specifying S3 Replication Time Control (S3 RTC), including whether S3 RTC is enabled and the time when all objects and operations on objec...").with_provider_name("ReplicationTime"),
                     StructField::new("storage_class", AttributeType::StringEnum {
-                name: "StorageClass".to_string(),
+                name: "ReplicationDestinationStorageClass".to_string(),
                 values: vec!["DEEP_ARCHIVE".to_string(), "GLACIER".to_string(), "GLACIER_IR".to_string(), "INTELLIGENT_TIERING".to_string(), "ONEZONE_IA".to_string(), "REDUCED_REDUNDANCY".to_string(), "STANDARD".to_string(), "STANDARD_IA".to_string()],
                 namespace: Some("awscc.s3.bucket".to_string()),
                 to_dsl: None,
@@ -929,7 +929,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                     name: "ReplicaModifications".to_string(),
                     fields: vec![
                     StructField::new("status", AttributeType::StringEnum {
-                name: "Status".to_string(),
+                name: "ReplicaModificationsStatus".to_string(),
                 values: vec!["Enabled".to_string(), "Disabled".to_string()],
                 namespace: Some("awscc.s3.bucket".to_string()),
                 to_dsl: None,
@@ -940,7 +940,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                     name: "SseKmsEncryptedObjects".to_string(),
                     fields: vec![
                     StructField::new("status", AttributeType::StringEnum {
-                name: "Status".to_string(),
+                name: "SseKmsEncryptedObjectsStatus".to_string(),
                 values: vec!["Disabled".to_string(), "Enabled".to_string()],
                 namespace: Some("awscc.s3.bucket".to_string()),
                 to_dsl: None,
@@ -950,7 +950,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                     ],
                 }).with_description("A container that describes additional filters for identifying the source objects that you want to replicate. You can choose to enable or disable the r...").with_provider_name("SourceSelectionCriteria"),
                     StructField::new("status", AttributeType::StringEnum {
-                name: "Status".to_string(),
+                name: "ReplicationRuleStatus".to_string(),
                 values: vec!["Disabled".to_string(), "Enabled".to_string()],
                 namespace: Some("awscc.s3.bucket".to_string()),
                 to_dsl: None,
@@ -972,7 +972,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                     name: "VersioningConfiguration".to_string(),
                     fields: vec![
                     StructField::new("status", AttributeType::StringEnum {
-                name: "Status".to_string(),
+                name: "VersioningConfigurationStatus".to_string(),
                 values: vec!["Enabled".to_string(), "Suspended".to_string()],
                 namespace: Some("awscc.s3.bucket".to_string()),
                 to_dsl: None,
