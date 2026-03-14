@@ -84,11 +84,7 @@ pub fn availability_zone() -> AttributeType {
     }
 }
 
-/// IAM policy document type
-#[allow(dead_code)]
-pub fn iam_policy_document() -> AttributeType {
-    AttributeType::Map(Box::new(AttributeType::String))
-}
+// iam_policy_document() is provided by `pub use carina_aws_types::*` above
 
 #[cfg(test)]
 mod tests {

@@ -2,10 +2,10 @@
 //!
 //! This module contains type validators shared between `carina-provider-aws`
 //! and `carina-provider-awscc`. Provider-specific types (region with namespace,
-//! IAM policy document, schema config structs) remain in their respective crates.
+//! schema config structs) remain in their respective crates.
 
 use carina_core::resource::Value;
-use carina_core::schema::AttributeType;
+use carina_core::schema::{AttributeType, StructField};
 
 // ========== Enum helpers ==========
 
@@ -754,6 +754,135 @@ pub fn validate_availability_zone(az: &str) -> Result<(), String> {
     Ok(())
 }
 
+// ========== IAM Policy Document ==========
+
+/// String or list of strings type — for IAM policy fields like action, resource
+fn string_or_list_of_strings() -> AttributeType {
+    AttributeType::Union(vec![
+        AttributeType::String,
+        AttributeType::List(Box::new(AttributeType::String)),
+    ])
+}
+
+/// String or map type — for IAM policy principal fields
+fn string_or_map() -> AttributeType {
+    AttributeType::Union(vec![
+        AttributeType::String,
+        AttributeType::Map(Box::new(string_or_list_of_strings())),
+    ])
+}
+
+/// IAM Policy Effect enum type
+/// Only allows "Allow" or "Deny"
+fn iam_policy_effect() -> AttributeType {
+    AttributeType::Custom {
+        name: "IamPolicyEffect".to_string(),
+        base: Box::new(AttributeType::String),
+        validate: |value| {
+            if let Value::String(s) = value {
+                match s.as_str() {
+                    "Allow" | "Deny" => Ok(()),
+                    _ => Err(format!(
+                        "Invalid IAM policy effect: \"{}\". Must be \"Allow\" or \"Deny\"",
+                        s
+                    )),
+                }
+            } else {
+                Err(format!("Expected string, got {:?}", value))
+            }
+        },
+        namespace: None,
+        to_dsl: None,
+    }
+}
+
+/// IAM Policy Document Version enum type
+/// Only allows "2012-10-17" or "2008-10-17"
+fn iam_policy_version() -> AttributeType {
+    AttributeType::Custom {
+        name: "IamPolicyVersion".to_string(),
+        base: Box::new(AttributeType::String),
+        validate: |value| {
+            if let Value::String(s) = value {
+                match s.as_str() {
+                    "2012-10-17" | "2008-10-17" => Ok(()),
+                    _ => Err(format!(
+                        "Invalid IAM policy version: \"{}\". Must be \"2012-10-17\" or \"2008-10-17\"",
+                        s
+                    )),
+                }
+            } else {
+                Err(format!("Expected string, got {:?}", value))
+            }
+        },
+        namespace: None,
+        to_dsl: None,
+    }
+}
+
+/// IAM Policy Statement struct type
+fn iam_policy_statement() -> AttributeType {
+    AttributeType::Struct {
+        name: "IamPolicyStatement".to_string(),
+        fields: vec![
+            StructField::new("sid", AttributeType::String).with_provider_name("Sid"),
+            StructField::new("effect", iam_policy_effect()).with_provider_name("Effect"),
+            StructField::new("action", string_or_list_of_strings()).with_provider_name("Action"),
+            StructField::new("not_action", string_or_list_of_strings())
+                .with_provider_name("NotAction"),
+            StructField::new("resource", string_or_list_of_strings())
+                .with_provider_name("Resource"),
+            StructField::new("not_resource", string_or_list_of_strings())
+                .with_provider_name("NotResource"),
+            StructField::new("principal", string_or_map()).with_provider_name("Principal"),
+            StructField::new("not_principal", string_or_map()).with_provider_name("NotPrincipal"),
+            StructField::new(
+                "condition",
+                AttributeType::Map(Box::new(AttributeType::Map(Box::new(
+                    string_or_list_of_strings(),
+                )))),
+            )
+            .with_provider_name("Condition"),
+        ],
+    }
+}
+
+/// IAM Policy Document type
+/// Validates the structure of IAM policy documents (trust policies, inline policies, etc.)
+///
+/// Uses `Custom` wrapping (not bare `Struct`) because the DSL uses map assignment
+/// syntax (`assume_role_policy_document = { ... }`), which produces `Value::Map`.
+/// Bare `Struct` in `aws_value_to_dsl` wraps results in `Value::List`, causing
+/// a mismatch with the parser output and false updates on every plan.
+/// The `Custom` type falls through to `json_to_value`/`value_to_json` generic paths,
+/// which correctly produce `Value::Map` for both read and write.
+pub fn iam_policy_document() -> AttributeType {
+    AttributeType::Custom {
+        name: "IamPolicyDocument".to_string(),
+        base: Box::new(AttributeType::Map(Box::new(AttributeType::String))),
+        validate: |value| validate_iam_policy_document(value),
+        namespace: None,
+        to_dsl: None,
+    }
+}
+
+/// Validate IAM policy document structure
+pub fn validate_iam_policy_document(value: &Value) -> Result<(), String> {
+    let struct_type = AttributeType::Struct {
+        name: "IamPolicyDocument".to_string(),
+        fields: vec![
+            StructField::new("version", iam_policy_version()).with_provider_name("Version"),
+            StructField::new("id", AttributeType::String).with_provider_name("Id"),
+            StructField::new(
+                "statement",
+                AttributeType::List(Box::new(iam_policy_statement())),
+            )
+            .with_provider_name("Statement"),
+        ],
+    };
+    struct_type.validate(value).map_err(|e| e.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -991,5 +1120,95 @@ mod tests {
         assert!(!is_uuid("not-a-uuid"));
         assert!(!is_uuid("1234abcd-12ab-34cd-56ef"));
         assert!(!is_uuid(""));
+    }
+
+    // IAM Policy Document tests
+
+    #[test]
+    fn validate_iam_policy_document_basic() {
+        let doc = Value::Map(
+            vec![
+                (
+                    "version".to_string(),
+                    Value::String("2012-10-17".to_string()),
+                ),
+                (
+                    "statement".to_string(),
+                    Value::List(vec![Value::Map(
+                        vec![
+                            ("effect".to_string(), Value::String("Allow".to_string())),
+                            (
+                                "action".to_string(),
+                                Value::String("sts:AssumeRole".to_string()),
+                            ),
+                            ("resource".to_string(), Value::String("*".to_string())),
+                        ]
+                        .into_iter()
+                        .collect(),
+                    )]),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        assert!(validate_iam_policy_document(&doc).is_ok());
+    }
+
+    #[test]
+    fn validate_iam_policy_document_invalid_version() {
+        let doc = Value::Map(
+            vec![(
+                "version".to_string(),
+                Value::String("2020-01-01".to_string()),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        assert!(validate_iam_policy_document(&doc).is_err());
+    }
+
+    #[test]
+    fn validate_iam_policy_document_invalid_effect() {
+        let doc = Value::Map(
+            vec![(
+                "statement".to_string(),
+                Value::List(vec![Value::Map(
+                    vec![("effect".to_string(), Value::String("Grant".to_string()))]
+                        .into_iter()
+                        .collect(),
+                )]),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        assert!(validate_iam_policy_document(&doc).is_err());
+    }
+
+    #[test]
+    fn iam_policy_document_type_validates() {
+        let t = iam_policy_document();
+        let valid_doc = Value::Map(
+            vec![
+                (
+                    "version".to_string(),
+                    Value::String("2012-10-17".to_string()),
+                ),
+                (
+                    "statement".to_string(),
+                    Value::List(vec![Value::Map(
+                        vec![
+                            ("effect".to_string(), Value::String("Deny".to_string())),
+                            ("action".to_string(), Value::String("s3:*".to_string())),
+                            ("resource".to_string(), Value::String("*".to_string())),
+                        ]
+                        .into_iter()
+                        .collect(),
+                    )]),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        assert!(t.validate(&valid_doc).is_ok());
     }
 }
