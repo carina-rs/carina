@@ -327,7 +327,7 @@ Shorthand formats: `Enabled` or `Status.Enabled`
 | `enabled` | Bool | Yes | Specifies whether the inventory is enabled or disabled. If set to ``True``, an inventory list is gen... |
 | `id` | String | Yes | The ID used to identify the inventory configuration. |
 | `included_object_versions` | Enum | Yes | Object versions to include in the inventory list. If set to ``All``, the list includes all the objec... |
-| `optional_fields` | [Enum (OptionalFields)](#optional_fields-optionalfields) | No | Contains the optional fields that are included in the inventory results. |
+| `optional_fields` | List\<[Enum (OptionalFields)](#optional_fields-optionalfields)\> | No | Contains the optional fields that are included in the inventory results. |
 | `prefix` | String | No | Specifies the inventory filter prefix. |
 | `schedule_frequency` | Enum | Yes | Specifies the schedule for generating inventory results. |
 

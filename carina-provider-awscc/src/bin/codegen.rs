@@ -728,12 +728,23 @@ fn generate_markdown(schema: &CfnSchema, type_name: &str) -> Result<String> {
                     "Enum".to_string()
                 } else if enums.contains_key(&composite_key) {
                     let enum_info = &enums[&composite_key];
-                    format!(
+                    let enum_link = format!(
                         "[Enum ({})](#{}-{})",
                         enum_info.type_name,
                         snake_name,
                         enum_info.type_name.to_lowercase()
-                    )
+                    );
+                    let is_array = field_prop
+                        .prop_type
+                        .as_ref()
+                        .and_then(|t| t.as_str())
+                        .map(|t| t == "array")
+                        .unwrap_or(false);
+                    if is_array {
+                        format!("List\\<{}\\>", enum_link)
+                    } else {
+                        enum_link
+                    }
                 } else {
                     type_display_string(field_name, field_prop, schema, &enums)
                 };
