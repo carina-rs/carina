@@ -341,6 +341,24 @@ pub fn transit_gateway_id() -> AttributeType {
     }
 }
 
+/// Transit Gateway Route Table ID type (e.g., "tgw-rtb-12345678")
+pub fn tgw_route_table_id() -> AttributeType {
+    AttributeType::Custom {
+        name: "TgwRouteTableId".to_string(),
+        base: Box::new(AttributeType::String),
+        validate: |value| {
+            if let Value::String(s) = value {
+                validate_prefixed_resource_id(s, "tgw-rtb")
+                    .map_err(|reason| format!("Invalid TGW Route Table ID '{}': {}", s, reason))
+            } else {
+                Err("Expected string".to_string())
+            }
+        },
+        namespace: None,
+        to_dsl: None,
+    }
+}
+
 /// VPN Gateway ID type (e.g., "vgw-12345678")
 pub fn vpn_gateway_id() -> AttributeType {
     AttributeType::Custom {

@@ -866,6 +866,23 @@ pub mod types {
             to_dsl: None,
         }
     }
+
+    /// CIDR block type that accepts both IPv4 and IPv6 (e.g., "10.0.0.0/16" or "2001:db8::/32")
+    pub fn cidr() -> AttributeType {
+        AttributeType::Custom {
+            name: "Cidr".to_string(),
+            base: Box::new(AttributeType::String),
+            validate: |value| {
+                if let Value::String(s) = value {
+                    validate_ipv4_cidr(s).or_else(|_| validate_ipv6_cidr(s))
+                } else {
+                    Err("Expected string".to_string())
+                }
+            },
+            namespace: None,
+            to_dsl: None,
+        }
+    }
 }
 
 /// Validate an IPv4 address (e.g., "10.0.1.5", "192.168.0.1")

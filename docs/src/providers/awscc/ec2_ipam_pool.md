@@ -203,7 +203,7 @@ Shorthand formats: `create_in_progress` or `State.create_in_progress`
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `cidr` | Ipv4Cidr | Yes |  |
+| `cidr` | Cidr | Yes |  |
 
 ### SourceResource
 

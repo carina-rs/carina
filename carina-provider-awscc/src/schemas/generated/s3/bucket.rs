@@ -49,7 +49,6 @@ const VALID_METRICS_STATUS: &[&str] = &["Disabled", "Enabled"];
 const VALID_NONCURRENT_VERSION_TRANSITION_STORAGE_CLASS: &[&str] = &[
     "DEEP_ARCHIVE",
     "GLACIER",
-    "Glacier",
     "GLACIER_IR",
     "INTELLIGENT_TIERING",
     "ONEZONE_IA",
@@ -69,8 +68,6 @@ const VALID_RECORD_EXPIRATION_EXPIRATION: &[&str] = &["ENABLED", "DISABLED"];
 const VALID_REDIRECT_ALL_REQUESTS_TO_PROTOCOL: &[&str] = &["http", "https"];
 
 const VALID_REDIRECT_RULE_PROTOCOL: &[&str] = &["http", "https"];
-
-const VALID_REDIRECT_RULE_REPLACE_KEY_PREFIX_WITH: &[&str] = &["docs/", "documents/", "/documents"];
 
 const VALID_REPLICA_MODIFICATIONS_STATUS: &[&str] = &["Enabled", "Disabled"];
 
@@ -101,7 +98,6 @@ const VALID_TIERING_ACCESS_TIER: &[&str] = &["ARCHIVE_ACCESS", "DEEP_ARCHIVE_ACC
 const VALID_TRANSITION_STORAGE_CLASS: &[&str] = &[
     "DEEP_ARCHIVE",
     "GLACIER",
-    "Glacier",
     "GLACIER_IR",
     "INTELLIGENT_TIERING",
     "ONEZONE_IA",
@@ -206,7 +202,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                     StructField::new("blocked_encryption_types", AttributeType::Struct {
                     name: "BlockedEncryptionTypes".to_string(),
                     fields: vec![
-                    StructField::new("encryption_type", AttributeType::String).with_description("The object encryption type that you want to block or unblock for an Amazon S3 general purpose bucket. Currently, this parameter only supports blocking...").with_provider_name("EncryptionType")
+                    StructField::new("encryption_type", AttributeType::List(Box::new(AttributeType::String))).with_description("The object encryption type that you want to block or unblock for an Amazon S3 general purpose bucket. Currently, this parameter only supports blocking...").with_provider_name("EncryptionType")
                     ],
                 }).with_description("A bucket-level setting for Amazon S3 general purpose buckets used to prevent the upload of new objects encrypted with the specified server-side encryp...").with_provider_name("BlockedEncryptionTypes"),
                     StructField::new("bucket_key_enabled", AttributeType::Bool).with_description("Specifies whether Amazon S3 should use an S3 Bucket Key with server-side encryption using KMS (SSE-KMS) for new objects in the bucket. Existing object...").with_provider_name("BucketKeyEnabled"),
@@ -367,7 +363,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                     StructField::new("newer_noncurrent_versions", AttributeType::Int).with_description("Specifies how many noncurrent versions S3 will retain. If there are this many more recent noncurrent versions, S3 will take the associated action. For...").with_provider_name("NewerNoncurrentVersions"),
                     StructField::new("storage_class", AttributeType::StringEnum {
                 name: "StorageClass".to_string(),
-                values: vec!["DEEP_ARCHIVE".to_string(), "GLACIER".to_string(), "Glacier".to_string(), "GLACIER_IR".to_string(), "INTELLIGENT_TIERING".to_string(), "ONEZONE_IA".to_string(), "STANDARD_IA".to_string()],
+                values: vec!["DEEP_ARCHIVE".to_string(), "GLACIER".to_string(), "GLACIER_IR".to_string(), "INTELLIGENT_TIERING".to_string(), "ONEZONE_IA".to_string(), "STANDARD_IA".to_string()],
                 namespace: Some("awscc.s3.bucket".to_string()),
                 to_dsl: None,
             }).required().with_description("The class of storage used to store the object.").with_provider_name("StorageClass"),
@@ -380,7 +376,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                     StructField::new("newer_noncurrent_versions", AttributeType::Int).with_description("Specifies how many noncurrent versions S3 will retain. If there are this many more recent noncurrent versions, S3 will take the associated action. For...").with_provider_name("NewerNoncurrentVersions"),
                     StructField::new("storage_class", AttributeType::StringEnum {
                 name: "StorageClass".to_string(),
-                values: vec!["DEEP_ARCHIVE".to_string(), "GLACIER".to_string(), "Glacier".to_string(), "GLACIER_IR".to_string(), "INTELLIGENT_TIERING".to_string(), "ONEZONE_IA".to_string(), "STANDARD_IA".to_string()],
+                values: vec!["DEEP_ARCHIVE".to_string(), "GLACIER".to_string(), "GLACIER_IR".to_string(), "INTELLIGENT_TIERING".to_string(), "ONEZONE_IA".to_string(), "STANDARD_IA".to_string()],
                 namespace: Some("awscc.s3.bucket".to_string()),
                 to_dsl: None,
             }).required().with_description("The class of storage used to store the object.").with_provider_name("StorageClass"),
@@ -402,7 +398,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                     fields: vec![
                     StructField::new("storage_class", AttributeType::StringEnum {
                 name: "StorageClass".to_string(),
-                values: vec!["DEEP_ARCHIVE".to_string(), "GLACIER".to_string(), "Glacier".to_string(), "GLACIER_IR".to_string(), "INTELLIGENT_TIERING".to_string(), "ONEZONE_IA".to_string(), "STANDARD_IA".to_string()],
+                values: vec!["DEEP_ARCHIVE".to_string(), "GLACIER".to_string(), "GLACIER_IR".to_string(), "INTELLIGENT_TIERING".to_string(), "ONEZONE_IA".to_string(), "STANDARD_IA".to_string()],
                 namespace: Some("awscc.s3.bucket".to_string()),
                 to_dsl: None,
             }).required().with_description("The storage class to which you want the object to transition.").with_provider_name("StorageClass"),
@@ -415,7 +411,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                     fields: vec![
                     StructField::new("storage_class", AttributeType::StringEnum {
                 name: "StorageClass".to_string(),
-                values: vec!["DEEP_ARCHIVE".to_string(), "GLACIER".to_string(), "Glacier".to_string(), "GLACIER_IR".to_string(), "INTELLIGENT_TIERING".to_string(), "ONEZONE_IA".to_string(), "STANDARD_IA".to_string()],
+                values: vec!["DEEP_ARCHIVE".to_string(), "GLACIER".to_string(), "GLACIER_IR".to_string(), "INTELLIGENT_TIERING".to_string(), "ONEZONE_IA".to_string(), "STANDARD_IA".to_string()],
                 namespace: Some("awscc.s3.bucket".to_string()),
                 to_dsl: None,
             }).required().with_description("The storage class to which you want the object to transition.").with_provider_name("StorageClass"),
@@ -456,7 +452,10 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
             }).with_description("Specifies the partition date source for the partitioned prefix. ``PartitionDateSource`` can be ``EventTime`` or ``DeliveryTime``. For ``DeliveryTime``...").with_provider_name("PartitionDateSource")
                     ],
                 }).with_provider_name("PartitionedPrefix"),
-                    StructField::new("simple_prefix", AttributeType::Map(Box::new(AttributeType::String))).with_description("This format defaults the prefix to the given log file prefix for delivering server access log file.").with_provider_name("SimplePrefix")
+                    StructField::new("simple_prefix", AttributeType::Struct {
+                    name: "SimplePrefix".to_string(),
+                    fields: vec![],
+                }).with_description("This format defaults the prefix to the given log file prefix for delivering server access log file.").with_provider_name("SimplePrefix")
                     ],
                 }).with_description("Amazon S3 key format for log objects. Only one format, either PartitionedPrefix or SimplePrefix, is allowed.").with_provider_name("TargetObjectKeyFormat")
                     ],
@@ -919,12 +918,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                 namespace: Some("awscc.s3.bucket".to_string()),
                 to_dsl: None,
             }).with_description("Protocol to use when redirecting requests. The default is the protocol that is used in the original request.").with_provider_name("Protocol"),
-                    StructField::new("replace_key_prefix_with", AttributeType::StringEnum {
-                name: "ReplaceKeyPrefixWith".to_string(),
-                values: vec!["docs/".to_string(), "documents/".to_string(), "/documents".to_string()],
-                namespace: Some("awscc.s3.bucket".to_string()),
-                to_dsl: None,
-            }).with_description("The object key prefix to use in the redirect request. For example, to redirect requests for all pages with prefix ``docs/`` (objects in the ``docs/`` ...").with_provider_name("ReplaceKeyPrefixWith"),
+                    StructField::new("replace_key_prefix_with", AttributeType::String).with_description("The object key prefix to use in the redirect request. For example, to redirect requests for all pages with prefix ``docs/`` (objects in the ``docs/`` ...").with_provider_name("ReplaceKeyPrefixWith"),
                     StructField::new("replace_key_with", AttributeType::String).with_description("The specific object key to use in the redirect request. For example, redirect request to ``error.html``. Not required if one of the siblings is presen...").with_provider_name("ReplaceKeyWith")
                     ],
                 }).required().with_description("Container for redirect information. You can redirect requests to another host, to another page, or with another protocol. In the event of an error, yo...").with_provider_name("RedirectRule"),
@@ -1009,10 +1003,6 @@ pub fn enum_valid_values() -> (
             ("expiration", VALID_RECORD_EXPIRATION_EXPIRATION),
             ("protocol", VALID_REDIRECT_ALL_REQUESTS_TO_PROTOCOL),
             ("protocol", VALID_REDIRECT_RULE_PROTOCOL),
-            (
-                "replace_key_prefix_with",
-                VALID_REDIRECT_RULE_REPLACE_KEY_PREFIX_WITH,
-            ),
             ("status", VALID_REPLICA_MODIFICATIONS_STATUS),
             ("storage_class", VALID_REPLICATION_DESTINATION_STORAGE_CLASS),
             ("status", VALID_REPLICATION_RULE_STATUS),

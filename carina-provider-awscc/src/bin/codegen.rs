@@ -130,7 +130,7 @@ impl EnumValue {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[allow(dead_code)]
 struct CfnProperty {
@@ -155,6 +155,9 @@ struct CfnProperty {
     /// Maximum value constraint (for integer/number types)
     #[serde(default)]
     maximum: Option<i64>,
+    /// Whether additional properties are allowed (for object types)
+    #[serde(default)]
+    additional_properties: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -166,7 +169,7 @@ struct CfnOneOfVariant {
     required: Vec<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[allow(dead_code)]
 struct CfnDefinition {
@@ -178,6 +181,8 @@ struct CfnDefinition {
     /// oneOf variants (union types)
     #[serde(default, rename = "oneOf")]
     one_of: Vec<CfnOneOfVariant>,
+    /// Array item schema (for array-typed definitions)
+    items: Option<Box<CfnProperty>>,
 }
 
 /// Compute module name from CloudFormation type name
@@ -401,6 +406,9 @@ fn override_type_to_display_name(override_type: &str) -> &str {
         "types::ipv4_address()" => "Ipv4Address",
         "super::arn()" => "Arn",
         "super::ipam_pool_id()" => "IpamPoolId",
+        "super::tgw_route_table_id()" => "TgwRouteTableId",
+        "types::cidr()" => "Cidr",
+        "AttributeType::String" => "String",
         _ => "String",
     }
 }
@@ -1416,13 +1424,24 @@ fn extract_enum_from_description(description: &str) -> Option<Vec<String>> {
     None
 }
 
-/// Deduplicate enum values while preserving order
+/// Deduplicate enum values while preserving order.
+/// Performs case-insensitive deduplication, preferring uppercase variants
+/// (e.g., "GLACIER" over "Glacier") to normalize inconsistent CloudFormation schemas.
 fn deduplicate_enum_values(values: Vec<String>) -> Option<Vec<String>> {
-    let mut seen = HashSet::new();
-    let unique: Vec<String> = values
-        .into_iter()
-        .filter(|v| seen.insert(v.clone()))
-        .collect();
+    let mut seen_lower: HashMap<String, usize> = HashMap::new();
+    let mut unique: Vec<String> = Vec::new();
+    for v in values {
+        let lower = v.to_lowercase();
+        if let Some(&idx) = seen_lower.get(&lower) {
+            // Prefer the uppercase variant (e.g., "GLACIER" over "Glacier")
+            if v.chars().all(|c| !c.is_alphabetic() || c.is_uppercase()) {
+                unique[idx] = v;
+            }
+        } else {
+            seen_lower.insert(lower, unique.len());
+            unique.push(v);
+        }
+    }
     if unique.len() >= 2 {
         Some(unique)
     } else {
@@ -1711,6 +1730,32 @@ fn resource_specific_type_overrides() -> &'static HashMap<(&'static str, &'stati
             m.insert(("AWS::S3::Bucket", "Role"), "super::iam_role_arn()");
             // S3 Bucket replication destination account
             m.insert(("AWS::S3::Bucket", "Account"), "super::aws_account_id()");
+            // VPC CidrBlockAssociations are association IDs (vpc-cidr-assoc-xxx), not CIDRs
+            m.insert(
+                ("AWS::EC2::VPC", "CidrBlockAssociations"),
+                "AttributeType::String",
+            );
+            // Transit Gateway route table IDs use tgw-rtb- prefix, not rtb-
+            m.insert(
+                ("AWS::EC2::TransitGateway", "AssociationDefaultRouteTableId"),
+                "super::tgw_route_table_id()",
+            );
+            m.insert(
+                ("AWS::EC2::TransitGateway", "PropagationDefaultRouteTableId"),
+                "super::tgw_route_table_id()",
+            );
+            // Transit Gateway CIDR blocks support both IPv4 and IPv6
+            m.insert(
+                ("AWS::EC2::TransitGateway", "TransitGatewayCidrBlocks"),
+                "types::cidr()",
+            );
+            // IPAM Pool provisioned CIDRs support both IPv4 and IPv6
+            m.insert(("AWS::EC2::IPAMPool", "Cidr"), "types::cidr()");
+            // S3 ReplaceKeyPrefixWith is a free-form string, not an enum
+            m.insert(
+                ("AWS::S3::Bucket", "ReplaceKeyPrefixWith"),
+                "AttributeType::String",
+            );
             m
         });
     &OVERRIDES
@@ -2064,6 +2109,24 @@ fn cfn_type_to_carina_type_with_enum(
                     );
                 }
             }
+            // Handle array-typed $ref definitions (e.g., BlockedEncryptionTypeList)
+            if def.def_type.as_deref() == Some("array")
+                && let Some(items) = &def.items
+            {
+                let (item_type, item_enum) =
+                    cfn_type_to_carina_type_with_enum(items, prop_name, schema, namespace, enums);
+                // Don't propagate item_enum — enum handling is for scalar
+                // fields, not list items. The list type wraps the item type.
+                let effective_item_type = if item_enum.is_some() {
+                    "AttributeType::String".to_string()
+                } else {
+                    item_type
+                };
+                return (
+                    format!("AttributeType::List(Box::new({}))", effective_item_type),
+                    None,
+                );
+            }
         }
         // Apply name-based heuristics for unresolvable $ref
         if let Some(inferred) = infer_string_type(prop_name, &schema.type_name) {
@@ -2086,9 +2149,11 @@ fn cfn_type_to_carina_type_with_enum(
 
         let type_name = prop_name.to_pascal_case();
         let string_values: Vec<String> = enum_values.iter().map(|v| v.to_string_value()).collect();
+        // Deduplicate case-insensitive duplicates (e.g., "GLACIER" and "Glacier")
+        let deduped = deduplicate_enum_values(string_values.clone()).unwrap_or(string_values);
         let enum_info = EnumInfo {
             type_name,
-            values: string_values,
+            values: deduped,
         };
         // Return placeholder - actual type will be generated using enum_info
         return ("/* enum */".to_string(), Some(enum_info));
@@ -2265,6 +2330,21 @@ fn cfn_type_to_carina_type_with_enum(
             // Check if this is an IAM policy document
             if prop_name.ends_with("PolicyDocument") {
                 return ("super::iam_policy_document()".to_string(), None);
+            }
+            // Empty object with no or empty properties and additionalProperties: false
+            // -> empty Struct (e.g., SimplePrefix)
+            if prop.additional_properties == Some(false) {
+                let struct_name = prop_name.to_pascal_case();
+                return (
+                    format!(
+                        r#"AttributeType::Struct {{
+                    name: "{}".to_string(),
+                    fields: vec![],
+                }}"#,
+                        struct_name
+                    ),
+                    None,
+                );
             }
             (
                 "AttributeType::Map(Box::new(AttributeType::String))".to_string(),
@@ -2517,6 +2597,7 @@ mod tests {
             required: vec![],
             minimum: None,
             maximum: None,
+            additional_properties: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::SecurityGroupIngress".to_string(),
@@ -2585,6 +2666,7 @@ mod tests {
             required: vec![],
             minimum: None,
             maximum: None,
+            additional_properties: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::SecurityGroupIngress".to_string(),
@@ -2620,6 +2702,7 @@ mod tests {
             required: vec![],
             minimum: None,
             maximum: None,
+            additional_properties: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::SecurityGroupIngress".to_string(),
@@ -2655,6 +2738,7 @@ mod tests {
             required: vec![],
             minimum: None,
             maximum: None,
+            additional_properties: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::NatGateway".to_string(),
@@ -2695,6 +2779,7 @@ mod tests {
             required: vec![],
             minimum: None,
             maximum: None,
+            additional_properties: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::EIP".to_string(),
@@ -2730,6 +2815,7 @@ mod tests {
             required: vec![],
             minimum: None,
             maximum: None,
+            additional_properties: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::NatGateway".to_string(),
@@ -2769,6 +2855,7 @@ mod tests {
             required: vec![],
             minimum: None,
             maximum: None,
+            additional_properties: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::Subnet".to_string(),
@@ -2859,6 +2946,7 @@ mod tests {
             required: vec![],
             minimum: None,
             maximum: None,
+            additional_properties: None,
         };
         assert_eq!(
             list_element_type_display(&prop, "GenericProp", ""),
@@ -2877,6 +2965,7 @@ mod tests {
             required: vec![],
             minimum: None,
             maximum: None,
+            additional_properties: None,
         };
         assert_eq!(
             list_element_type_display(&prop, "GenericProp", ""),
@@ -2895,6 +2984,7 @@ mod tests {
             required: vec![],
             minimum: None,
             maximum: None,
+            additional_properties: None,
         };
         assert_eq!(
             list_element_type_display(&prop, "GenericProp", ""),
@@ -2913,6 +3003,7 @@ mod tests {
             required: vec![],
             minimum: None,
             maximum: None,
+            additional_properties: None,
         };
         assert_eq!(
             list_element_type_display(&prop, "GenericProp", ""),
@@ -2933,6 +3024,7 @@ mod tests {
             required: vec![],
             minimum: None,
             maximum: None,
+            additional_properties: None,
         };
         assert_eq!(
             list_element_type_display(&prop, "SubnetIds", ""),
@@ -2994,6 +3086,7 @@ mod tests {
                 required: vec![],
                 minimum: None,
                 maximum: None,
+                additional_properties: None,
             })),
             ref_path: None,
             insertion_order: None,
@@ -3001,6 +3094,7 @@ mod tests {
             required: vec![],
             minimum: None,
             maximum: None,
+            additional_properties: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::VPC".to_string(),
@@ -3039,6 +3133,7 @@ mod tests {
                 required: vec![],
                 minimum: None,
                 maximum: None,
+                additional_properties: None,
             })),
             ref_path: None,
             insertion_order: None,
@@ -3046,6 +3141,7 @@ mod tests {
             required: vec![],
             minimum: None,
             maximum: None,
+            additional_properties: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::VPC".to_string(),
@@ -3080,6 +3176,7 @@ mod tests {
             required: vec![],
             minimum: None,
             maximum: None,
+            additional_properties: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::VPC".to_string(),
@@ -3125,6 +3222,7 @@ mod tests {
                 required: vec![],
                 minimum: None,
                 maximum: None,
+                additional_properties: None,
             };
             let result = list_element_type_display(&prop, "GenericProp", "");
             assert!(
@@ -3166,6 +3264,7 @@ mod tests {
             required: vec![],
             minimum: None,
             maximum: None,
+            additional_properties: None,
         };
         let result = type_display_string("Prop1", &prop, &schema, &enums);
         assert_ne!(
@@ -3189,6 +3288,7 @@ mod tests {
                 required: vec![],
                 minimum: None,
                 maximum: None,
+                additional_properties: None,
             })),
             ref_path: None,
             insertion_order: None,
@@ -3196,6 +3296,7 @@ mod tests {
             required: vec![],
             minimum: None,
             maximum: None,
+            additional_properties: None,
         };
         let result = type_display_string("Prop2", &prop, &schema, &enums);
         assert_ne!(
@@ -3219,6 +3320,7 @@ mod tests {
                 required: vec![],
                 minimum: None,
                 maximum: None,
+                additional_properties: None,
             })),
             ref_path: None,
             insertion_order: None,
@@ -3226,6 +3328,7 @@ mod tests {
             required: vec![],
             minimum: None,
             maximum: None,
+            additional_properties: None,
         };
         let result = type_display_string("Prop3", &prop, &schema, &enums);
         assert_ne!(
@@ -3249,6 +3352,7 @@ mod tests {
                 required: vec![],
                 minimum: None,
                 maximum: None,
+                additional_properties: None,
             })),
             ref_path: None,
             insertion_order: None,
@@ -3256,6 +3360,7 @@ mod tests {
             required: vec![],
             minimum: None,
             maximum: None,
+            additional_properties: None,
         };
         let result = type_display_string("Prop4", &prop, &schema, &enums);
         assert_ne!(
@@ -3277,6 +3382,7 @@ mod tests {
             required: vec![],
             minimum: Some(0),
             maximum: Some(32),
+            additional_properties: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::VPC".to_string(),
@@ -3327,6 +3433,7 @@ mod tests {
             required: vec![],
             minimum: None,
             maximum: None,
+            additional_properties: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::VPC".to_string(),
@@ -3359,6 +3466,7 @@ mod tests {
             required: vec![],
             minimum: Some(0),
             maximum: None,
+            additional_properties: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::VPC".to_string(),
@@ -3390,6 +3498,7 @@ mod tests {
             required: vec![],
             minimum: Some(0),
             maximum: Some(32),
+            additional_properties: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::VPC".to_string(),
@@ -3459,6 +3568,7 @@ mod tests {
             required: vec![],
             minimum: None,
             maximum: None,
+            additional_properties: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::VPC".to_string(),
@@ -3496,6 +3606,7 @@ mod tests {
             required: vec![],
             minimum: None,
             maximum: None,
+            additional_properties: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::SecurityGroupIngress".to_string(),
@@ -3532,6 +3643,7 @@ mod tests {
             required: vec![],
             minimum: None,
             maximum: None,
+            additional_properties: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::S3::Bucket".to_string(),
@@ -3581,6 +3693,7 @@ mod tests {
             required: vec![],
             minimum: Some(0),
             maximum: Some(65535),
+            additional_properties: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::SecurityGroupIngress".to_string(),
@@ -4198,6 +4311,7 @@ mod tests {
                 required: vec![],
                 minimum: None,
                 maximum: None,
+                additional_properties: None,
             },
         );
 
@@ -4254,6 +4368,7 @@ mod tests {
                 required: vec![],
                 minimum: None,
                 maximum: None,
+                additional_properties: None,
             },
         );
 
@@ -4265,6 +4380,7 @@ mod tests {
                 properties: Some(def_props),
                 required: vec![],
                 one_of: vec![],
+                items: None,
             },
         );
 
@@ -4282,6 +4398,7 @@ mod tests {
                 required: vec![],
                 minimum: None,
                 maximum: None,
+                additional_properties: None,
             },
         );
 

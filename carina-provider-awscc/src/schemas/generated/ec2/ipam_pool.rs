@@ -137,7 +137,7 @@ pub fn ec2_ipam_pool_config() -> AwsccSchemaConfig {
             AttributeSchema::new("provisioned_cidrs", AttributeType::List(Box::new(AttributeType::Struct {
                     name: "ProvisionedCidr".to_string(),
                     fields: vec![
-                    StructField::new("cidr", types::ipv4_cidr()).required().with_provider_name("Cidr")
+                    StructField::new("cidr", types::cidr()).required().with_provider_name("Cidr")
                     ],
                 })))
                 .with_description("A list of cidrs representing the address space available for allocation in this pool.")
