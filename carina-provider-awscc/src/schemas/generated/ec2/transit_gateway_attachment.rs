@@ -25,10 +25,30 @@ pub fn ec2_transit_gateway_attachment_config() -> AwsccSchemaConfig {
             AttributeSchema::new("options", AttributeType::Struct {
                     name: "Options".to_string(),
                     fields: vec![
-                    StructField::new("appliance_mode_support", AttributeType::Enum(vec!["enable".to_string(), "disable".to_string()])).with_description("Indicates whether to enable Ipv6 Support for Vpc Attachment. Valid Values: enable | disable").with_provider_name("ApplianceModeSupport"),
-                    StructField::new("dns_support", AttributeType::Enum(vec!["enable".to_string(), "disable".to_string()])).with_description("Indicates whether to enable DNS Support for Vpc Attachment. Valid Values: enable | disable").with_provider_name("DnsSupport"),
-                    StructField::new("ipv6_support", AttributeType::Enum(vec!["enable".to_string(), "disable".to_string()])).with_description("Indicates whether to enable Ipv6 Support for Vpc Attachment. Valid Values: enable | disable").with_provider_name("Ipv6Support"),
-                    StructField::new("security_group_referencing_support", AttributeType::Enum(vec!["enable".to_string(), "disable".to_string()])).with_description("Indicates whether to enable Security Group referencing support for Vpc Attachment. Valid Values: enable | disable").with_provider_name("SecurityGroupReferencingSupport")
+                    StructField::new("appliance_mode_support", AttributeType::StringEnum {
+                name: "ApplianceModeSupport".to_string(),
+                values: vec!["enable".to_string(), "disable".to_string()],
+                namespace: Some("awscc.ec2.transit_gateway_attachment".to_string()),
+                to_dsl: None,
+            }).with_description("Indicates whether to enable Ipv6 Support for Vpc Attachment. Valid Values: enable | disable").with_provider_name("ApplianceModeSupport"),
+                    StructField::new("dns_support", AttributeType::StringEnum {
+                name: "DnsSupport".to_string(),
+                values: vec!["enable".to_string(), "disable".to_string()],
+                namespace: Some("awscc.ec2.transit_gateway_attachment".to_string()),
+                to_dsl: None,
+            }).with_description("Indicates whether to enable DNS Support for Vpc Attachment. Valid Values: enable | disable").with_provider_name("DnsSupport"),
+                    StructField::new("ipv6_support", AttributeType::StringEnum {
+                name: "Ipv6Support".to_string(),
+                values: vec!["enable".to_string(), "disable".to_string()],
+                namespace: Some("awscc.ec2.transit_gateway_attachment".to_string()),
+                to_dsl: None,
+            }).with_description("Indicates whether to enable Ipv6 Support for Vpc Attachment. Valid Values: enable | disable").with_provider_name("Ipv6Support"),
+                    StructField::new("security_group_referencing_support", AttributeType::StringEnum {
+                name: "SecurityGroupReferencingSupport".to_string(),
+                values: vec!["enable".to_string(), "disable".to_string()],
+                namespace: Some("awscc.ec2.transit_gateway_attachment".to_string()),
+                to_dsl: None,
+            }).with_description("Indicates whether to enable Security Group referencing support for Vpc Attachment. Valid Values: enable | disable").with_provider_name("SecurityGroupReferencingSupport")
                     ],
                 })
                 .with_description("The options for the transit gateway vpc attachment.")

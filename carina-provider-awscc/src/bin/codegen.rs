@@ -1490,14 +1490,45 @@ fn generate_struct_type(
                         enum_info.type_name, values_str, namespace, to_dsl_code
                     )
                 } else {
-                    // Fallback: use Enum variant directly
+                    // Fallback: emit StringEnum with namespace even when not in the
+                    // pre-scanned enums map (e.g., nested struct fields that were
+                    // skipped during scanning due to snake_case name conflicts).
+                    let prop_aliases = aliases.get(field_name.as_str());
+                    let has_hyphens = local_enum_info.values.iter().any(|v| v.contains('-'));
+                    let to_dsl_code = if let Some(alias_list) = prop_aliases {
+                        let mut match_arms: Vec<String> = alias_list
+                            .iter()
+                            .map(|(canonical, alias)| {
+                                format!("\"{}\" => \"{}\".to_string()", canonical, alias)
+                            })
+                            .collect();
+                        let fallback = if has_hyphens {
+                            "_ => s.replace('-', \"_\")"
+                        } else {
+                            "_ => s.to_string()"
+                        };
+                        match_arms.push(fallback.to_string());
+                        format!("Some(|s: &str| match s {{ {} }})", match_arms.join(", "))
+                    } else if has_hyphens {
+                        "Some(|s: &str| s.replace('-', \"_\"))".to_string()
+                    } else {
+                        "None".to_string()
+                    };
                     let values_str = local_enum_info
                         .values
                         .iter()
                         .map(|v| format!("\"{}\".to_string()", v))
                         .collect::<Vec<_>>()
                         .join(", ");
-                    format!("AttributeType::Enum(vec![{}])", values_str)
+                    format!(
+                        r#"AttributeType::StringEnum {{
+                name: "{}".to_string(),
+                values: vec![{}],
+                namespace: Some("{}".to_string()),
+                to_dsl: {},
+            }}"#,
+                        local_enum_info.type_name, values_str, namespace, to_dsl_code
+                    )
                 }
             } else {
                 field_type
@@ -4127,6 +4158,97 @@ mod tests {
         assert!(
             !generated.contains(".with_completions("),
             "enum completions should come from schema type metadata: {generated}"
+        );
+    }
+
+    #[test]
+    fn test_struct_field_enum_emits_string_enum_not_enum() {
+        // Simulate a resource with a struct property whose field has an enum.
+        // The struct comes from a $ref definition. If the definition's enum field
+        // was not picked up during pre-scanning (e.g., due to snake_case conflict),
+        // the fallback should still emit StringEnum, not Enum.
+        let mut def_props = BTreeMap::new();
+        def_props.insert(
+            "Mode".to_string(),
+            CfnProperty {
+                prop_type: Some(TypeValue::Single("string".to_string())),
+                description: Some("The mode setting".to_string()),
+                enum_values: Some(vec![
+                    EnumValue::Str("off".to_string()),
+                    EnumValue::Str("block-bidirectional".to_string()),
+                    EnumValue::Str("block-ingress".to_string()),
+                ]),
+                items: None,
+                ref_path: None,
+                insertion_order: None,
+                properties: None,
+                required: vec![],
+                minimum: None,
+                maximum: None,
+            },
+        );
+
+        let mut definitions = BTreeMap::new();
+        definitions.insert(
+            "BlockSettings".to_string(),
+            CfnDefinition {
+                def_type: None,
+                properties: Some(def_props),
+                required: vec![],
+                one_of: vec![],
+            },
+        );
+
+        let mut properties = BTreeMap::new();
+        properties.insert(
+            "BlockSettings".to_string(),
+            CfnProperty {
+                prop_type: None,
+                description: Some("Block settings".to_string()),
+                enum_values: None,
+                items: None,
+                ref_path: Some("#/definitions/BlockSettings".to_string()),
+                insertion_order: None,
+                properties: None,
+                required: vec![],
+                minimum: None,
+                maximum: None,
+            },
+        );
+
+        let schema = CfnSchema {
+            type_name: "AWS::EC2::TestResource".to_string(),
+            description: None,
+            properties,
+            required: vec![],
+            read_only_properties: vec![],
+            create_only_properties: vec![],
+            write_only_properties: vec![],
+            primary_identifier: None,
+            definitions: Some(definitions),
+            tagging: None,
+        };
+
+        let generated = generate_schema_code(&schema, "AWS::EC2::TestResource").unwrap();
+
+        // The struct field's enum should be StringEnum, not Enum
+        assert!(
+            !generated.contains("AttributeType::Enum("),
+            "struct field enums must use StringEnum, not Enum: {generated}"
+        );
+        assert!(
+            generated.contains("AttributeType::StringEnum {"),
+            "struct field enums should be emitted as StringEnum: {generated}"
+        );
+        // Should have namespace
+        assert!(
+            generated.contains("namespace: Some("),
+            "StringEnum should include namespace: {generated}"
+        );
+        // Should handle hyphens in values with to_dsl
+        assert!(
+            generated.contains("s.replace('-', \"_\")"),
+            "hyphenated enum values should generate to_dsl: {generated}"
         );
     }
 }
