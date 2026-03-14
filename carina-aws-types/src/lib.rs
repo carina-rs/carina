@@ -47,23 +47,52 @@ pub fn canonicalize_enum_value(raw: &str, valid_values: &[&str]) -> String {
 
 /// Valid AWS regions (in AWS format with hyphens)
 pub const VALID_REGIONS: &[&str] = &[
+    // Africa
+    "af-south-1",
+    // Asia Pacific
+    "ap-east-1",
     "ap-northeast-1",
     "ap-northeast-2",
     "ap-northeast-3",
+    "ap-south-1",
+    "ap-south-2",
     "ap-southeast-1",
     "ap-southeast-2",
-    "ap-south-1",
-    "us-east-1",
-    "us-east-2",
-    "us-west-1",
-    "us-west-2",
+    "ap-southeast-3",
+    "ap-southeast-4",
+    "ap-southeast-5",
+    "ap-southeast-7",
+    // Canada
+    "ca-central-1",
+    "ca-west-1",
+    // China
+    "cn-north-1",
+    "cn-northwest-1",
+    // Europe
+    "eu-central-1",
+    "eu-central-2",
+    "eu-north-1",
+    "eu-south-1",
+    "eu-south-2",
     "eu-west-1",
     "eu-west-2",
     "eu-west-3",
-    "eu-central-1",
-    "eu-north-1",
-    "ca-central-1",
+    // Israel
+    "il-central-1",
+    // Middle East
+    "me-central-1",
+    "me-south-1",
+    // Mexico
+    "mx-central-1",
+    // South America
     "sa-east-1",
+    // US
+    "us-east-1",
+    "us-east-2",
+    "us-gov-east-1",
+    "us-gov-west-1",
+    "us-west-1",
+    "us-west-2",
 ];
 
 // ========== Tags ==========
@@ -853,35 +882,51 @@ pub fn ipam_pool_id() -> AttributeType {
 
 // ========== Availability Zone ==========
 
-/// Validate availability zone format (e.g., "us-east-1a").
+/// Validate availability zone format.
+/// Accepts standard AZs (e.g., "us-east-1a"), Local Zones (e.g., "us-east-1-bos-1a"),
+/// and Wavelength Zones (e.g., "us-east-1-wl1-bos-wlz-1").
 pub fn validate_availability_zone(az: &str) -> Result<(), String> {
-    // Must end with a single lowercase letter (zone identifier)
-    let zone_letter = az.chars().last();
-    if !zone_letter.is_some_and(|c| c.is_ascii_lowercase()) {
-        return Err("must end with a zone letter (a-z)".to_string());
+    // Must end with a lowercase letter or digit
+    let last_char = az.chars().last();
+    if !last_char.is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit()) {
+        return Err("must end with a zone letter (a-z) or digit".to_string());
     }
 
-    // Region part is everything except the last character
-    let region = &az[..az.len() - 1];
-
-    // Region must match pattern: lowercase-lowercase-digit
-    // e.g., "us-east-1", "ap-northeast-1", "eu-west-2"
-    let parts: Vec<&str> = region.split('-').collect();
+    // Split into parts by hyphen
+    let parts: Vec<&str> = az.split('-').collect();
     if parts.len() < 3 {
         return Err("expected format like 'us-east-1a'".to_string());
     }
 
-    // Last part of region must be a number
-    let last = parts.last().unwrap();
-    if last.parse::<u8>().is_err() {
-        return Err("region must end with a number".to_string());
-    }
-
-    // All other parts must be lowercase alphabetic
-    for part in &parts[..parts.len() - 1] {
-        if part.is_empty() || !part.chars().all(|c| c.is_ascii_lowercase()) {
+    // All parts must be non-empty and contain only lowercase letters and digits
+    for part in &parts {
+        if part.is_empty()
+            || !part
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+        {
             return Err("expected format like 'us-east-1a'".to_string());
         }
+    }
+
+    // Must contain at least one part that starts with a digit (region number, possibly
+    // with a trailing zone letter like "1a")
+    let has_numeric = parts
+        .iter()
+        .any(|p| p.starts_with(|c: char| c.is_ascii_digit()));
+    if !has_numeric {
+        return Err("must contain a region number".to_string());
+    }
+
+    // A bare region like "us-east-1" (all parts are purely alphabetic or numeric,
+    // no part mixes digits and letters) must be rejected. An AZ must either have
+    // more parts than a basic region (Local/Wavelength zones) or have a zone letter
+    // appended to the numeric part (standard AZ like "1a").
+    let has_mixed_part = parts.iter().any(|p| {
+        p.chars().any(|c| c.is_ascii_digit()) && p.chars().any(|c| c.is_ascii_lowercase())
+    });
+    if !has_mixed_part && parts.len() <= 3 {
+        return Err("expected availability zone, not region (missing zone suffix)".to_string());
     }
 
     Ok(())
@@ -1110,10 +1155,25 @@ mod tests {
     }
 
     #[test]
+    fn validate_availability_zone_local_zone() {
+        // Local Zones: us-east-1-bos-1a, us-west-2-lax-1a
+        assert!(validate_availability_zone("us-east-1-bos-1a").is_ok());
+        assert!(validate_availability_zone("us-west-2-lax-1a").is_ok());
+        assert!(validate_availability_zone("ap-northeast-1-tpe-1a").is_ok());
+    }
+
+    #[test]
+    fn validate_availability_zone_wavelength_zone() {
+        // Wavelength Zones: us-east-1-wl1-bos-wlz-1
+        assert!(validate_availability_zone("us-east-1-wl1-bos-wlz-1").is_ok());
+        assert!(validate_availability_zone("us-west-2-wl1-las-wlz-1").is_ok());
+    }
+
+    #[test]
     fn validate_availability_zone_invalid() {
-        assert!(validate_availability_zone("us-east-1").is_err()); // no zone letter
         assert!(validate_availability_zone("a").is_err()); // too short
-        assert!(validate_availability_zone("invalid").is_err());
+        assert!(validate_availability_zone("invalid").is_err()); // no numeric part
+        assert!(validate_availability_zone("us-east").is_err()); // no numeric part
     }
 
     // Enum helpers
