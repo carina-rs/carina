@@ -79,6 +79,32 @@ Any tags assigned to the security group.
 
 The ID of the VPC for the security group.
 
+## Enum Values
+
+### ip_protocol (IpProtocol)
+
+| Value | DSL Identifier |
+|-------|----------------|
+| `tcp` | `awscc.ec2.security_group.IpProtocol.tcp` |
+| `udp` | `awscc.ec2.security_group.IpProtocol.udp` |
+| `icmp` | `awscc.ec2.security_group.IpProtocol.icmp` |
+| `icmpv6` | `awscc.ec2.security_group.IpProtocol.icmpv6` |
+| `-1` | `awscc.ec2.security_group.IpProtocol.all` |
+
+Shorthand formats: `tcp` or `IpProtocol.tcp`
+
+### ip_protocol (IpProtocol)
+
+| Value | DSL Identifier |
+|-------|----------------|
+| `tcp` | `awscc.ec2.security_group.IpProtocol.tcp` |
+| `udp` | `awscc.ec2.security_group.IpProtocol.udp` |
+| `icmp` | `awscc.ec2.security_group.IpProtocol.icmp` |
+| `icmpv6` | `awscc.ec2.security_group.IpProtocol.icmpv6` |
+| `-1` | `awscc.ec2.security_group.IpProtocol.all` |
+
+Shorthand formats: `tcp` or `IpProtocol.tcp`
+
 ## Struct Definitions
 
 ### Egress

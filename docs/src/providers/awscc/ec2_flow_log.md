@@ -110,6 +110,15 @@ The type of traffic to log. You can log traffic that the resource accepts or rej
 
 ## Enum Values
 
+### file_format (FileFormat)
+
+| Value | DSL Identifier |
+|-------|----------------|
+| `plain-text` | `awscc.ec2.flow_log.FileFormat.plain_text` |
+| `parquet` | `awscc.ec2.flow_log.FileFormat.parquet` |
+
+Shorthand formats: `plain_text` or `FileFormat.plain_text`
+
 ### log_destination_type (LogDestinationType)
 
 | Value | DSL Identifier |
