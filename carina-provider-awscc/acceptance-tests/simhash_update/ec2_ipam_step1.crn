@@ -1,4 +1,4 @@
-# EC2 Internet Gateway - SimHash reconciliation test (step 1)
+# EC2 IPAM - SimHash reconciliation test (step 1)
 #
 # Tests: anonymous resource (no create-only properties in schema) can be created
 # Case B: schema has no create-only properties at all
@@ -7,7 +7,10 @@ provider awscc {
   region = awscc.Region.ap_northeast_1
 }
 
-awscc.ec2.internet_gateway {
+awscc.ec2.ipam {
+  description = "simhash acceptance test"
+  tier        = awscc.ec2.ipam.Tier.free
+
   tags = {
     Environment = "acceptance-test"
     Purpose     = "simhash-test"

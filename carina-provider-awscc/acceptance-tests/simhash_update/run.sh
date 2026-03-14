@@ -9,8 +9,8 @@
 #   aws-vault exec <profile> -- ./run.sh [filter]
 #
 # Tests:
-#   ec2_eip              - Case A: schema has create-only props, but none set by user
-#   ec2_internet_gateway - Case B: schema has no create-only props at all
+#   ec2_eip  - Case A: schema has create-only props, but none set by user
+#   ec2_ipam - Case B: schema has no create-only props at all
 #
 # Filter (optional): substring to match test names
 
@@ -143,6 +143,44 @@ run_test() {
     echo ""
 }
 
+# Run a single-step test (apply + plan-verify + destroy, no update)
+# Args: test_name crn_file description
+run_test_single() {
+    local test_name="$1"
+    local crn_file="$2"
+    local desc="$3"
+
+    # Apply filter
+    if [ -n "$FILTER" ] && [[ "$test_name" != *"$FILTER"* ]]; then
+        return 0
+    fi
+
+    local work_dir
+    work_dir=$(mktemp -d)
+
+    echo "$desc"
+    echo ""
+
+    # Step 1: Apply
+    if ! run_step "$work_dir" "step1: apply" "apply" "$crn_file" "--auto-approve"; then
+        rm -rf "$work_dir"
+        return 1
+    fi
+
+    # Step 2: Plan-verify (idempotency check)
+    if ! run_plan_verify "$work_dir" "step2: plan-verify" "$crn_file"; then
+        cd "$work_dir" && "$CARINA_BIN" destroy --auto-approve "$crn_file" 2>&1 || true
+        rm -rf "$work_dir"
+        return 1
+    fi
+
+    # Step 3: Destroy
+    run_step "$work_dir" "step3: destroy" "destroy" "$crn_file" "--auto-approve"
+
+    rm -rf "$work_dir"
+    echo ""
+}
+
 echo "simhash_update multi-step acceptance tests"
 echo "════════════════════════════════════════"
 echo ""
@@ -154,12 +192,12 @@ run_test "ec2_eip" \
     "$SCRIPT_DIR/ec2_eip_step2.crn" \
     "Test 1: EC2 EIP (tag update, Case A: create-only props exist but not set)"
 
-# Test 2: EC2 Internet Gateway - Case B: schema has no create-only props at all
-# Change tag Environment (acceptance-test -> staging)
-run_test "ec2_internet_gateway" \
-    "$SCRIPT_DIR/ec2_internet_gateway_step1.crn" \
-    "$SCRIPT_DIR/ec2_internet_gateway_step2.crn" \
-    "Test 2: EC2 Internet Gateway (tag update, Case B: no create-only props)"
+# Test 2: EC2 IPAM - Case B: schema has no create-only props at all
+# Apply + plan-verify + destroy only (IPAM doesn't support Update via CloudControl, see #595)
+# This verifies SimHash produces deterministic identifiers for Case B resources.
+run_test_single "ec2_ipam" \
+    "$SCRIPT_DIR/ec2_ipam_step1.crn" \
+    "Test 2: EC2 IPAM (apply+verify+destroy, Case B: no create-only props)"
 
 echo "════════════════════════════════════════"
 echo "Total: $TOTAL_PASSED passed, $TOTAL_FAILED failed"
