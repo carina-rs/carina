@@ -27,13 +27,6 @@ awscc.ec2.vpc_peering_connection {
 
 ## Argument Reference
 
-### `assume_role_region`
-
-- **Type:** Region
-- **Required:** No
-
-The Region code to use when calling Security Token Service (STS) to assume the PeerRoleArn, if provided.
-
 ### `peer_owner_id`
 
 - **Type:** AwsAccountId

@@ -183,7 +183,7 @@ Shorthand formats: `ip_name` or `HostnameType.ip_name`
 |-------|------|----------|-------------|
 | `enable_resource_name_dns_aaaa_record` | Bool | No |  |
 | `enable_resource_name_dns_a_record` | Bool | No |  |
-| `hostname_type` | Enum | No |  |
+| `hostname_type` | [Enum (HostnameType)](#hostname_type-hostnametype) | No |  |
 
 ## Attribute Reference
 

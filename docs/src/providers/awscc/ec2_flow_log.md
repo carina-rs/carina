@@ -158,7 +158,7 @@ Shorthand formats: `ACCEPT` or `TrafficType.ACCEPT`
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `file_format` | Enum | Yes |  |
+| `file_format` | [Enum (FileFormat)](#file_format-fileformat) | Yes |  |
 | `hive_compatible_partitions` | Bool | Yes |  |
 | `per_hour_partition` | Bool | Yes |  |
 
