@@ -52,7 +52,7 @@ pub fn aws_region() -> AttributeType {
             }
         },
         namespace: Some("aws".to_string()),
-        to_dsl: None,
+        to_dsl: Some(|s: &str| s.replace('-', "_")),
     }
 }
 
