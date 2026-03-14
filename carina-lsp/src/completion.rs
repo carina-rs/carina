@@ -644,6 +644,8 @@ impl CompletionProvider {
             } if name == "AvailabilityZone" => {
                 self.availability_zone_completions(namespace.as_deref().unwrap_or(""), name)
             }
+            // List(non-Struct): delegate to inner type completions
+            AttributeType::List(inner) => self.completions_for_type(inner),
             AttributeType::Union(_) | AttributeType::String | AttributeType::Custom { .. } => {
                 vec![CompletionItem {
                     label: "env".to_string(),
@@ -1850,6 +1852,47 @@ simple {
             ),
             "Should detect AfterEqualsInStruct with nested path, got: {:?}",
             context
+        );
+    }
+
+    #[test]
+    fn list_string_enum_completions() {
+        use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
+        let list_enum = AttributeType::List(Box::new(AttributeType::StringEnum {
+            name: "Protocol".to_string(),
+            values: vec!["tcp".to_string(), "udp".to_string(), "icmp".to_string()],
+            namespace: None,
+            to_dsl: None,
+        }));
+
+        let schema = ResourceSchema::new("test.list.resource")
+            .attribute(AttributeSchema::new("protocols", list_enum));
+
+        let mut schemas = HashMap::new();
+        schemas.insert("test.list.resource".to_string(), schema);
+
+        let provider = CompletionProvider::new(Arc::new(schemas), vec!["test".to_string()], vec![]);
+
+        let completions = provider.completions_for_type(&AttributeType::List(Box::new(
+            AttributeType::StringEnum {
+                name: "Protocol".to_string(),
+                values: vec!["tcp".to_string(), "udp".to_string(), "icmp".to_string()],
+                namespace: None,
+                to_dsl: None,
+            },
+        )));
+
+        let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+        assert!(
+            labels.contains(&"\"tcp\""),
+            "Should offer tcp as completion for List(StringEnum). Got: {:?}",
+            labels
+        );
+        assert!(
+            labels.contains(&"\"udp\""),
+            "Should offer udp as completion for List(StringEnum). Got: {:?}",
+            labels
         );
     }
 

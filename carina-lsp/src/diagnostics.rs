@@ -452,6 +452,30 @@ impl DiagnosticEngine {
                                         None
                                     }
                                 }
+                                // Validate List item types (non-Struct items only;
+                                // List<Struct> is handled by validate_struct_value below)
+                                (
+                                    carina_core::schema::AttributeType::List(inner),
+                                    Value::List(_),
+                                ) if !matches!(
+                                    inner.as_ref(),
+                                    carina_core::schema::AttributeType::Struct { .. }
+                                ) =>
+                                {
+                                    attr_schema
+                                        .attr_type
+                                        .validate(attr_value)
+                                        .err()
+                                        .map(|e| e.to_string())
+                                }
+                                // Validate Map value types
+                                (carina_core::schema::AttributeType::Map(_), Value::Map(_)) => {
+                                    attr_schema
+                                        .attr_type
+                                        .validate(attr_value)
+                                        .err()
+                                        .map(|e| e.to_string())
+                                }
                                 _ => None,
                             };
 
@@ -505,11 +529,18 @@ impl DiagnosticEngine {
                     // Run resource-level validator (e.g., mutually exclusive required fields)
                     if let Err(errors) = schema.validate(&resource.attributes) {
                         for error in errors {
-                            // Skip BlockSyntaxNotAllowed errors here; they are already
-                            // reported with precise block positions in the attribute-level check above.
+                            // Skip errors that are already reported with precise positions
+                            // by the attribute-level checks above.
                             if matches!(
                                 error,
                                 carina_core::schema::TypeError::BlockSyntaxNotAllowed { .. }
+                                    | carina_core::schema::TypeError::TypeMismatch { .. }
+                                    | carina_core::schema::TypeError::InvalidEnumVariant { .. }
+                                    | carina_core::schema::TypeError::ValidationFailed { .. }
+                                    | carina_core::schema::TypeError::UnknownStructField { .. }
+                                    | carina_core::schema::TypeError::StructFieldError { .. }
+                                    | carina_core::schema::TypeError::ListItemError { .. }
+                                    | carina_core::schema::TypeError::MapValueError { .. }
                             ) {
                                 continue;
                             }
@@ -640,37 +671,11 @@ impl DiagnosticEngine {
 
                     // Type validation for known fields
                     if let Some(field) = field_map.get(key.as_str()) {
-                        let type_error = match (&field.field_type, val) {
-                            (carina_core::schema::AttributeType::Bool, Value::String(s)) => {
-                                Some(format!(
-                                    "Type mismatch: expected Bool, got String \"{}\". Use true or false.",
-                                    s
-                                ))
-                            }
-                            (carina_core::schema::AttributeType::Int, Value::String(s)) => Some(
-                                format!("Type mismatch: expected Int, got String \"{}\".", s),
-                            ),
-                            (carina_core::schema::AttributeType::Float, Value::String(s)) => Some(
-                                format!("Type mismatch: expected Float, got String \"{}\".", s),
-                            ),
-                            // Custom types with Int base (e.g., ranged integers)
-                            (
-                                carina_core::schema::AttributeType::Custom { base, .. },
-                                Value::String(s),
-                            ) if matches!(**base, carina_core::schema::AttributeType::Int) => Some(
-                                format!("Type mismatch: expected Int, got String \"{}\".", s),
-                            ),
-                            // Custom types with Float base (e.g., ranged floats)
-                            (
-                                carina_core::schema::AttributeType::Custom { base, .. },
-                                Value::String(s),
-                            ) if matches!(**base, carina_core::schema::AttributeType::Float) => {
-                                Some(format!(
-                                    "Type mismatch: expected Float, got String \"{}\".",
-                                    s
-                                ))
-                            }
-                            _ => None,
+                        // Skip validation for ResourceRef values (resolved at runtime)
+                        let type_error = if matches!(val, Value::ResourceRef { .. }) {
+                            None
+                        } else {
+                            field.field_type.validate(val).err().map(|e| e.to_string())
                         };
 
                         if let Some(message) = type_error {
@@ -1464,9 +1469,10 @@ let sg = awscc.ec2.security_group {
 
         let diagnostics = engine.analyze(&doc, None);
 
-        let type_mismatch = diagnostics
-            .iter()
-            .find(|d| d.message.contains("Type mismatch") && d.message.contains("Int"));
+        let type_mismatch = diagnostics.iter().find(|d| {
+            (d.message.contains("Type mismatch") && d.message.contains("Int"))
+                || d.message.contains("Expected integer")
+        });
         assert!(
             type_mismatch.is_some(),
             "Should warn about type mismatch for Int field. Got diagnostics: {:?}",
@@ -2068,6 +2074,193 @@ awscc.ec2.ipam {
             struct_diags.is_empty(),
             "Valid nested struct should have no field diagnostics. Got: {:?}",
             struct_diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn string_enum_invalid_value_top_level() {
+        let engine = test_engine();
+        let doc = create_document(
+            r#"provider awscc {
+    region = awscc.Region.ap_northeast_1
+}
+
+let vpc = awscc.ec2.vpc {
+    cidr_block = "10.0.0.0/16"
+    instance_tenancy = awscc.ec2.vpc.InstanceTenancy.invalid_value
+}"#,
+        );
+
+        let diagnostics = engine.analyze(&doc, None);
+
+        let enum_diag = diagnostics
+            .iter()
+            .find(|d| d.message.contains("invalid_value"));
+        assert!(
+            enum_diag.is_some(),
+            "Should warn about invalid StringEnum value. Got diagnostics: {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn string_enum_valid_value_top_level() {
+        let engine = test_engine();
+        let doc = create_document(
+            r#"provider awscc {
+    region = awscc.Region.ap_northeast_1
+}
+
+let vpc = awscc.ec2.vpc {
+    cidr_block = "10.0.0.0/16"
+    instance_tenancy = awscc.ec2.vpc.InstanceTenancy.default
+}"#,
+        );
+
+        let diagnostics = engine.analyze(&doc, None);
+
+        let enum_diag = diagnostics
+            .iter()
+            .find(|d| d.message.contains("instance_tenancy") && d.message.contains("invalid"));
+        assert!(
+            enum_diag.is_none(),
+            "Should NOT warn about valid StringEnum value. Got diagnostics: {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn string_enum_invalid_value_in_struct_field() {
+        let engine = test_engine();
+        let doc = create_document(
+            r#"provider awscc {
+    region = awscc.Region.ap_northeast_1
+}
+
+let sg = awscc.ec2.security_group {
+    group_description = "Test security group"
+    security_group_ingress {
+        ip_protocol = awscc.ec2.security_group.IpProtocol.invalid_proto
+        from_port = 80
+        to_port = 80
+        cidr_ip = "0.0.0.0/0"
+    }
+}"#,
+        );
+
+        let diagnostics = engine.analyze(&doc, None);
+
+        let enum_diag = diagnostics
+            .iter()
+            .find(|d| d.message.contains("invalid_proto"));
+        assert!(
+            enum_diag.is_some(),
+            "Should warn about invalid StringEnum value in struct field. Got diagnostics: {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn string_enum_valid_value_in_struct_field() {
+        let engine = test_engine();
+        let doc = create_document(
+            r#"provider awscc {
+    region = awscc.Region.ap_northeast_1
+}
+
+let sg = awscc.ec2.security_group {
+    group_description = "Test security group"
+    security_group_ingress {
+        ip_protocol = awscc.ec2.security_group.IpProtocol.tcp
+        from_port = 80
+        to_port = 80
+        cidr_ip = "0.0.0.0/0"
+    }
+}"#,
+        );
+
+        let diagnostics = engine.analyze(&doc, None);
+
+        let enum_diag = diagnostics
+            .iter()
+            .find(|d| d.message.contains("ip_protocol") && d.message.contains("invalid"));
+        assert!(
+            enum_diag.is_none(),
+            "Should NOT warn about valid StringEnum value in struct field. Got diagnostics: {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn custom_type_validation_in_struct_field() {
+        let engine = test_engine();
+        let doc = create_document(
+            r#"provider awscc {
+    region = awscc.Region.ap_northeast_1
+}
+
+let sg = awscc.ec2.security_group {
+    group_description = "Test security group"
+    security_group_ingress {
+        ip_protocol = awscc.ec2.security_group.IpProtocol.tcp
+        from_port = 99999
+        to_port = 80
+        cidr_ip = "0.0.0.0/0"
+    }
+}"#,
+        );
+
+        let diagnostics = engine.analyze(&doc, None);
+
+        let port_diag = diagnostics
+            .iter()
+            .find(|d| d.message.contains("from_port") || d.message.contains("99999"));
+        assert!(
+            port_diag.is_some(),
+            "Should warn about out-of-range port in struct field. Got diagnostics: {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn list_item_type_validation() {
+        // Use a test engine with a List(StringEnum) schema to test list item validation
+        use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
+        let list_enum = AttributeType::List(Box::new(AttributeType::StringEnum {
+            name: "Protocol".to_string(),
+            values: vec!["tcp".to_string(), "udp".to_string()],
+            namespace: None,
+            to_dsl: None,
+        }));
+
+        let schema = ResourceSchema::new("test.list.resource")
+            .attribute(AttributeSchema::new("protocols", list_enum));
+
+        let mut schemas = HashMap::new();
+        schemas.insert("test.list.resource".to_string(), schema);
+
+        let engine = DiagnosticEngine::new(
+            Arc::new(schemas),
+            vec!["test".to_string()],
+            Arc::new(vec![]),
+        );
+
+        let doc = create_document(
+            r#"let r = test.list.resource {
+    protocols = ["tcp", "invalid_protocol"]
+}"#,
+        );
+
+        let diagnostics = engine.analyze(&doc, None);
+
+        let item_diag = diagnostics
+            .iter()
+            .find(|d| d.message.contains("invalid_protocol"));
+        assert!(
+            item_diag.is_some(),
+            "Should warn about invalid item in List(StringEnum). Got diagnostics: {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
     }
 
