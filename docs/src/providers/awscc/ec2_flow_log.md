@@ -75,7 +75,7 @@ The name of a new or existing CloudWatch Logs log group where Amazon EC2 publish
 
 ### `max_aggregation_interval`
 
-- **Type:** Int
+- **Type:** IntEnum([60, 600])
 - **Required:** No
 
 The maximum interval of time during which a flow of packets is captured and aggregated into a flow log record. You can specify 60 seconds (1 minute) or 600 seconds (10 minutes).

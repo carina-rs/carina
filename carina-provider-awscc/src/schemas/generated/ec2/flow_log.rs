@@ -6,6 +6,7 @@
 
 use super::AwsccSchemaConfig;
 use super::tags_type;
+use carina_core::resource::Value;
 use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
 
 const VALID_LOG_DESTINATION_TYPE: &[&str] = &["cloud-watch-logs", "s3", "kinesis-data-firehose"];
@@ -20,6 +21,20 @@ const VALID_RESOURCE_TYPE: &[&str] = &[
 ];
 
 const VALID_TRAFFIC_TYPE: &[&str] = &["ACCEPT", "ALL", "REJECT"];
+
+const VALID_MAX_AGGREGATION_INTERVAL_VALUES: &[i64] = &[60, 600];
+
+fn validate_max_aggregation_interval_int_enum(value: &Value) -> Result<(), String> {
+    if let Value::Int(n) = value {
+        if VALID_MAX_AGGREGATION_INTERVAL_VALUES.contains(n) {
+            Ok(())
+        } else {
+            Err(format!("Value {} is not a valid value", n))
+        }
+    } else {
+        Err("Expected integer".to_string())
+    }
+}
 
 /// Returns the schema config for ec2_flow_log (AWS::EC2::FlowLog)
 pub fn ec2_flow_log_config() -> AwsccSchemaConfig {
@@ -93,7 +108,13 @@ pub fn ec2_flow_log_config() -> AwsccSchemaConfig {
                 .with_provider_name("LogGroupName"),
         )
         .attribute(
-            AttributeSchema::new("max_aggregation_interval", AttributeType::Int)
+            AttributeSchema::new("max_aggregation_interval", AttributeType::Custom {
+                name: "IntEnum([60, 600])".to_string(),
+                base: Box::new(AttributeType::Int),
+                validate: validate_max_aggregation_interval_int_enum,
+                namespace: None,
+                to_dsl: None,
+            })
                 .create_only()
                 .with_description("The maximum interval of time during which a flow of packets is captured and aggregated into a flow log record. You can specify 60 seconds (1 minute) o...")
                 .with_provider_name("MaxAggregationInterval"),

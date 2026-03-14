@@ -38,6 +38,22 @@ struct Args {
     format: String,
 }
 
+/// Unified type override for resource-scoped property overrides.
+/// Allows overriding string type, enum values, integer range, or integer enum
+/// for a specific (resource_type, property_name) pair.
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
+enum TypeOverride {
+    /// Override to a specific string type (e.g., "super::iam_role_arn()")
+    StringType(&'static str),
+    /// Override to an enum with specific values
+    Enum(Vec<&'static str>),
+    /// Override to an integer range (min, max)
+    IntRange(i64, i64),
+    /// Override to an integer enum with specific allowed values
+    IntEnum(Vec<i64>),
+}
+
 /// Information about a detected enum type
 #[derive(Debug, Clone)]
 struct EnumInfo {
@@ -2469,6 +2485,17 @@ fn known_int_range_overrides() -> &'static HashMap<&'static str, (i64, i64)> {
         m.insert("ToPort", (-1, 65535));
         m
     });
+    &OVERRIDES
+}
+
+/// Unified resource-specific property type overrides.
+/// Maps (Smithy resource name, property name) to a TypeOverride.
+/// Use this when a property needs resource-specific type treatment that differs
+/// from global overrides or pattern-based inference.
+#[allow(dead_code)]
+fn resource_type_overrides() -> &'static HashMap<(&'static str, &'static str), TypeOverride> {
+    static OVERRIDES: LazyLock<HashMap<(&'static str, &'static str), TypeOverride>> =
+        LazyLock::new(HashMap::new);
     &OVERRIDES
 }
 

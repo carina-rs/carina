@@ -21,6 +21,21 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{self, Read};
 use std::sync::LazyLock;
 
+/// Unified type override for resource-scoped property overrides.
+/// Allows overriding string type, enum values, integer range, or integer enum
+/// for a specific (resource_type, property_name) pair.
+#[derive(Debug, Clone, PartialEq)]
+enum TypeOverride {
+    /// Override to a specific string type (e.g., "super::iam_role_arn()")
+    StringType(&'static str),
+    /// Override to an enum with specific values
+    Enum(Vec<&'static str>),
+    /// Override to an integer range (min, max)
+    IntRange(i64, i64),
+    /// Override to an integer enum with specific allowed values
+    IntEnum(Vec<i64>),
+}
+
 /// Information about a detected enum type
 #[derive(Debug, Clone)]
 struct EnumInfo {
@@ -309,9 +324,9 @@ fn list_element_type_display(items: &CfnProperty, prop_name: &str, resource_type
 /// Used by both scalar `type_display_string()` and `list_element_type_display()`.
 /// Handles both singular (e.g., "SubnetId") and plural (e.g., "SubnetIds") property names.
 fn infer_string_type_display(prop_name: &str, resource_type: &str) -> String {
-    // Check resource-specific overrides first
-    if let Some(&override_type) =
-        resource_specific_type_overrides().get(&(resource_type, prop_name))
+    // Check resource-specific overrides first (StringType only for display)
+    if let Some(TypeOverride::StringType(override_type)) =
+        resource_type_overrides().get(&(resource_type, prop_name))
     {
         return override_type_to_display_name(override_type).to_string();
     }
@@ -485,7 +500,21 @@ fn type_display_string(
             }
             Some("boolean") => "Bool".to_string(),
             Some("integer") => {
-                // Check for integer enum values first
+                // Check resource-scoped overrides first
+                let res_override =
+                    resource_type_overrides().get(&(schema.type_name.as_str(), prop_name));
+                if let Some(TypeOverride::IntEnum(values)) = res_override {
+                    let values_str = values
+                        .iter()
+                        .map(|v| v.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    return format!("IntEnum([{}])", values_str);
+                }
+                if let Some(TypeOverride::IntRange(min, max)) = res_override {
+                    return format!("Int({})", range_display_string(Some(*min), Some(*max)));
+                }
+                // Check for integer enum values from schema
                 if let Some(enum_values) = &prop.enum_values {
                     let all_ints = enum_values.iter().all(|v| matches!(v, EnumValue::Int(_)));
                     if all_ints && !enum_values.is_empty() {
@@ -512,6 +541,12 @@ fn type_display_string(
                 }
             }
             Some("number") => {
+                // Check resource-scoped overrides first
+                let res_override =
+                    resource_type_overrides().get(&(schema.type_name.as_str(), prop_name));
+                if let Some(TypeOverride::IntRange(min, max)) = res_override {
+                    return format!("Float({})", range_display_string(Some(*min), Some(*max)));
+                }
                 let range: Option<(Option<i64>, Option<i64>)> =
                     if prop.minimum.is_some() || prop.maximum.is_some() {
                         Some((prop.minimum, prop.maximum))
@@ -944,18 +979,35 @@ fn generate_schema_code(schema: &CfnSchema, type_name: &str) -> Result<String> {
         if let Some(info) = enum_info {
             enums.insert(prop_name.clone(), info);
         }
+        // Check resource-scoped overrides for enum, int range, and int enum
+        let resource_override = resource_type_overrides().get(&(type_name, prop_name.as_str()));
+        if let Some(TypeOverride::Enum(values)) = resource_override {
+            enums.insert(
+                prop_name.clone(),
+                EnumInfo {
+                    type_name: prop_name.clone(),
+                    values: values.iter().map(|v| v.to_string()).collect(),
+                },
+            );
+        }
         // Collect ranged integer/number properties (including one-sided ranges)
         match prop.prop_type.as_ref().and_then(|t| t.as_str()) {
             Some("integer") => {
-                if prop.minimum.is_some() || prop.maximum.is_some() {
+                if let Some(TypeOverride::IntRange(min, max)) = resource_override {
+                    ranged_ints.insert(prop_name.clone(), (Some(*min), Some(*max)));
+                } else if let Some(TypeOverride::IntEnum(values)) = resource_override {
+                    int_enums.insert(prop_name.clone(), values.clone());
+                } else if prop.minimum.is_some() || prop.maximum.is_some() {
                     ranged_ints.insert(prop_name.clone(), (prop.minimum, prop.maximum));
                 } else if let Some(&(min, max)) =
                     known_int_range_overrides().get(prop_name.as_str())
                 {
                     ranged_ints.insert(prop_name.clone(), (Some(min), Some(max)));
                 }
-                // Collect integer enum values
-                if let Some(enum_values) = &prop.enum_values {
+                // Collect integer enum values (only if no resource-scoped override)
+                if resource_override.is_none()
+                    && let Some(enum_values) = &prop.enum_values
+                {
                     let values: Vec<i64> = enum_values
                         .iter()
                         .filter_map(|v| match v {
@@ -971,7 +1023,9 @@ fn generate_schema_code(schema: &CfnSchema, type_name: &str) -> Result<String> {
                 }
             }
             Some("number") => {
-                if prop.minimum.is_some() || prop.maximum.is_some() {
+                if let Some(TypeOverride::IntRange(min, max)) = resource_override {
+                    ranged_floats.insert(prop_name.clone(), (Some(*min), Some(*max)));
+                } else if prop.minimum.is_some() || prop.maximum.is_some() {
                     ranged_floats.insert(prop_name.clone(), (prop.minimum, prop.maximum));
                 } else if let Some(&(min, max)) =
                     known_int_range_overrides().get(prop_name.as_str())
@@ -1951,89 +2005,171 @@ fn known_string_type_overrides() -> &'static HashMap<&'static str, &'static str>
     &OVERRIDES
 }
 
-/// Resource-specific property type overrides.
-/// Maps (CloudFormation type name, property name) to a specific type.
-/// Use this when the same property name should have different types on different resources.
-fn resource_specific_type_overrides() -> &'static HashMap<(&'static str, &'static str), &'static str>
-{
-    static OVERRIDES: LazyLock<HashMap<(&'static str, &'static str), &'static str>> =
+/// Unified resource-specific property type overrides.
+/// Maps (CloudFormation type name, property name) to a TypeOverride.
+/// Use this when a property needs resource-specific type treatment that differs
+/// from global overrides or pattern-based inference.
+///
+/// Two-layer system: global overrides (known_*_overrides) apply by property name,
+/// resource-specific overrides here take precedence.
+fn resource_type_overrides() -> &'static HashMap<(&'static str, &'static str), TypeOverride> {
+    static OVERRIDES: LazyLock<HashMap<(&'static str, &'static str), TypeOverride>> =
         LazyLock::new(|| {
             let mut m = HashMap::new();
+
+            // === StringType overrides ===
+
             // IAM Role's Arn is always an IAM Role ARN
-            m.insert(("AWS::IAM::Role", "Arn"), "super::iam_role_arn()");
+            m.insert(
+                ("AWS::IAM::Role", "Arn"),
+                TypeOverride::StringType("super::iam_role_arn()"),
+            );
             // IAM Role's RoleId uses AROA prefix pattern
-            m.insert(("AWS::IAM::Role", "RoleId"), "super::iam_role_id()");
+            m.insert(
+                ("AWS::IAM::Role", "RoleId"),
+                TypeOverride::StringType("super::iam_role_id()"),
+            );
             // EC2 Route's GatewayId accepts both igw-* and vgw-*
-            m.insert(("AWS::EC2::Route", "GatewayId"), "super::gateway_id()");
+            m.insert(
+                ("AWS::EC2::Route", "GatewayId"),
+                TypeOverride::StringType("super::gateway_id()"),
+            );
             // Generic "Id" attributes on resources where the specific ID type is known
             m.insert(
                 ("AWS::EC2::EgressOnlyInternetGateway", "Id"),
-                "super::egress_only_internet_gateway_id()",
+                TypeOverride::StringType("super::egress_only_internet_gateway_id()"),
             );
             m.insert(
                 ("AWS::EC2::TransitGateway", "Id"),
-                "super::transit_gateway_id()",
+                TypeOverride::StringType("super::transit_gateway_id()"),
             );
             m.insert(
                 ("AWS::EC2::VPCPeeringConnection", "Id"),
-                "super::vpc_peering_connection_id()",
+                TypeOverride::StringType("super::vpc_peering_connection_id()"),
             );
-            m.insert(("AWS::EC2::VPCEndpoint", "Id"), "super::vpc_endpoint_id()");
+            m.insert(
+                ("AWS::EC2::VPCEndpoint", "Id"),
+                TypeOverride::StringType("super::vpc_endpoint_id()"),
+            );
             m.insert(
                 ("AWS::EC2::SecurityGroup", "Id"),
-                "super::security_group_id()",
+                TypeOverride::StringType("super::security_group_id()"),
             );
             m.insert(
                 ("AWS::EC2::TransitGatewayAttachment", "Id"),
-                "super::transit_gateway_attachment_id()",
+                TypeOverride::StringType("super::transit_gateway_attachment_id()"),
             );
-            m.insert(("AWS::EC2::FlowLog", "Id"), "super::flow_log_id()");
+            m.insert(
+                ("AWS::EC2::FlowLog", "Id"),
+                TypeOverride::StringType("super::flow_log_id()"),
+            );
             m.insert(
                 ("AWS::EC2::SubnetRouteTableAssociation", "Id"),
-                "super::subnet_route_table_association_id()",
+                TypeOverride::StringType("super::subnet_route_table_association_id()"),
             );
             // EIP Address and TransferAddress are IPv4 addresses
-            m.insert(("AWS::EC2::EIP", "Address"), "types::ipv4_address()");
+            m.insert(
+                ("AWS::EC2::EIP", "Address"),
+                TypeOverride::StringType("types::ipv4_address()"),
+            );
             m.insert(
                 ("AWS::EC2::EIP", "TransferAddress"),
-                "types::ipv4_address()",
+                TypeOverride::StringType("types::ipv4_address()"),
             );
             // FlowLog LogDestination is an ARN (S3 bucket, CloudWatch log group, or Firehose)
-            m.insert(("AWS::EC2::FlowLog", "LogDestination"), "super::arn()");
+            m.insert(
+                ("AWS::EC2::FlowLog", "LogDestination"),
+                TypeOverride::StringType("super::arn()"),
+            );
             // S3 Bucket notification ARNs
-            m.insert(("AWS::S3::Bucket", "Function"), "super::arn()");
-            m.insert(("AWS::S3::Bucket", "Queue"), "super::arn()");
-            m.insert(("AWS::S3::Bucket", "Topic"), "super::arn()");
+            m.insert(
+                ("AWS::S3::Bucket", "Function"),
+                TypeOverride::StringType("super::arn()"),
+            );
+            m.insert(
+                ("AWS::S3::Bucket", "Queue"),
+                TypeOverride::StringType("super::arn()"),
+            );
+            m.insert(
+                ("AWS::S3::Bucket", "Topic"),
+                TypeOverride::StringType("super::arn()"),
+            );
             // S3 Bucket replication role is an IAM Role ARN
-            m.insert(("AWS::S3::Bucket", "Role"), "super::iam_role_arn()");
+            m.insert(
+                ("AWS::S3::Bucket", "Role"),
+                TypeOverride::StringType("super::iam_role_arn()"),
+            );
             // S3 Bucket replication destination account
-            m.insert(("AWS::S3::Bucket", "Account"), "super::aws_account_id()");
+            m.insert(
+                ("AWS::S3::Bucket", "Account"),
+                TypeOverride::StringType("super::aws_account_id()"),
+            );
             // VPC CidrBlockAssociations are association IDs (vpc-cidr-assoc-xxx), not CIDRs
             m.insert(
                 ("AWS::EC2::VPC", "CidrBlockAssociations"),
-                "super::vpc_cidr_block_association_id()",
+                TypeOverride::StringType("super::vpc_cidr_block_association_id()"),
             );
             // Transit Gateway route table IDs use tgw-rtb- prefix, not rtb-
             m.insert(
                 ("AWS::EC2::TransitGateway", "AssociationDefaultRouteTableId"),
-                "super::tgw_route_table_id()",
+                TypeOverride::StringType("super::tgw_route_table_id()"),
             );
             m.insert(
                 ("AWS::EC2::TransitGateway", "PropagationDefaultRouteTableId"),
-                "super::tgw_route_table_id()",
+                TypeOverride::StringType("super::tgw_route_table_id()"),
             );
             // Transit Gateway CIDR blocks support both IPv4 and IPv6
             m.insert(
                 ("AWS::EC2::TransitGateway", "TransitGatewayCidrBlocks"),
-                "types::cidr()",
+                TypeOverride::StringType("types::cidr()"),
             );
             // IPAM Pool provisioned CIDRs support both IPv4 and IPv6
-            m.insert(("AWS::EC2::IPAMPool", "Cidr"), "types::cidr()");
+            m.insert(
+                ("AWS::EC2::IPAMPool", "Cidr"),
+                TypeOverride::StringType("types::cidr()"),
+            );
             // S3 ReplaceKeyPrefixWith is a free-form string, not an enum
             m.insert(
                 ("AWS::S3::Bucket", "ReplaceKeyPrefixWith"),
-                "AttributeType::String",
+                TypeOverride::StringType("AttributeType::String"),
             );
+
+            // === Enum overrides ===
+
+            // VPN Gateway Type only accepts "ipsec.1"
+            m.insert(
+                ("AWS::EC2::VPNGateway", "Type"),
+                TypeOverride::Enum(vec!["ipsec.1"]),
+            );
+
+            // === IntRange overrides ===
+
+            // VPN Gateway and Transit Gateway ASN range
+            m.insert(
+                ("AWS::EC2::VPNGateway", "AmazonSideAsn"),
+                TypeOverride::IntRange(1, 4294967294),
+            );
+            m.insert(
+                ("AWS::EC2::TransitGateway", "AmazonSideAsn"),
+                TypeOverride::IntRange(1, 4294967294),
+            );
+
+            // === IntEnum overrides ===
+
+            // FlowLog max aggregation interval: 60 or 600 seconds
+            m.insert(
+                ("AWS::EC2::FlowLog", "MaxAggregationInterval"),
+                TypeOverride::IntEnum(vec![60, 600]),
+            );
+            // CloudWatch Logs retention: specific allowed day counts
+            m.insert(
+                ("AWS::Logs::LogGroup", "RetentionInDays"),
+                TypeOverride::IntEnum(vec![
+                    1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1096, 1827,
+                    2192, 2557, 2922, 3288, 3653,
+                ]),
+            );
+
             m
         });
     &OVERRIDES
@@ -2044,9 +2180,9 @@ fn resource_specific_type_overrides() -> &'static HashMap<(&'static str, &'stati
 /// and resource ID patterns.
 /// Returns None if no heuristic matches (caller should default to String).
 fn infer_string_type(prop_name: &str, resource_type: &str) -> Option<String> {
-    // Check resource-specific overrides first
-    if let Some(&override_type) =
-        resource_specific_type_overrides().get(&(resource_type, prop_name))
+    // Check resource-specific overrides first (StringType only for string inference)
+    if let Some(TypeOverride::StringType(override_type)) =
+        resource_type_overrides().get(&(resource_type, prop_name))
     {
         return Some(override_type.to_string());
     }
@@ -2542,6 +2678,47 @@ fn cfn_type_to_carina_type_with_enum(
         }
         Some("boolean") => ("AttributeType::Bool".to_string(), None),
         Some("integer") => {
+            // Check resource-scoped overrides first
+            let res_override =
+                resource_type_overrides().get(&(schema.type_name.as_str(), prop_name));
+            if let Some(TypeOverride::IntRange(min, max)) = res_override {
+                let validate_fn = format!("validate_{}_range", prop_name.to_snake_case());
+                let display = range_display_string(Some(*min), Some(*max));
+                return (
+                    format!(
+                        r#"AttributeType::Custom {{
+                name: "Int({})".to_string(),
+                base: Box::new(AttributeType::Int),
+                validate: {},
+                namespace: None,
+                to_dsl: None,
+            }}"#,
+                        display, validate_fn
+                    ),
+                    None,
+                );
+            }
+            if let Some(TypeOverride::IntEnum(values)) = res_override {
+                let validate_fn = format!("validate_{}_int_enum", prop_name.to_snake_case());
+                let values_str = values
+                    .iter()
+                    .map(|v| v.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return (
+                    format!(
+                        r#"AttributeType::Custom {{
+                name: "IntEnum([{}])".to_string(),
+                base: Box::new(AttributeType::Int),
+                validate: {},
+                namespace: None,
+                to_dsl: None,
+            }}"#,
+                        values_str, validate_fn
+                    ),
+                    None,
+                );
+            }
             // Use CF min/max if available (including one-sided), otherwise check known overrides
             let range: Option<(Option<i64>, Option<i64>)> =
                 if prop.minimum.is_some() || prop.maximum.is_some() {
@@ -2573,6 +2750,26 @@ fn cfn_type_to_carina_type_with_enum(
             }
         }
         Some("number") => {
+            // Check resource-scoped overrides first
+            let res_override =
+                resource_type_overrides().get(&(schema.type_name.as_str(), prop_name));
+            if let Some(TypeOverride::IntRange(min, max)) = res_override {
+                let validate_fn = format!("validate_{}_range", prop_name.to_snake_case());
+                let display = range_display_string(Some(*min), Some(*max));
+                return (
+                    format!(
+                        r#"AttributeType::Custom {{
+                name: "Float({})".to_string(),
+                base: Box::new(AttributeType::Float),
+                validate: {},
+                namespace: None,
+                to_dsl: None,
+            }}"#,
+                        display, validate_fn
+                    ),
+                    None,
+                );
+            }
             // Use CF min/max if available (including one-sided), otherwise check known overrides
             let range: Option<(Option<i64>, Option<i64>)> =
                 if prop.minimum.is_some() || prop.maximum.is_some() {
@@ -3996,6 +4193,45 @@ mod tests {
 
     #[test]
     fn test_type_display_string_int_enum() {
+        // Use a property/resource pair that has no resource-scoped override
+        let prop = CfnProperty {
+            prop_type: Some(TypeValue::Single("integer".to_string())),
+            description: Some("Priority values.".to_string()),
+            enum_values: Some(vec![
+                EnumValue::Int(1),
+                EnumValue::Int(3),
+                EnumValue::Int(5),
+            ]),
+            items: None,
+            ref_path: None,
+            insertion_order: None,
+            properties: None,
+            required: vec![],
+            minimum: None,
+            maximum: None,
+            additional_properties: None,
+            const_value: None,
+        };
+        let schema = CfnSchema {
+            type_name: "AWS::SomeService::Resource".to_string(),
+            description: None,
+            properties: BTreeMap::new(),
+            required: vec![],
+            read_only_properties: vec![],
+            create_only_properties: vec![],
+            write_only_properties: vec![],
+            primary_identifier: None,
+            definitions: None,
+            tagging: None,
+        };
+        let enums = BTreeMap::new();
+        let result = type_display_string("Priority", &prop, &schema, &enums);
+        assert_eq!(result, "IntEnum([1, 3, 5])");
+    }
+
+    #[test]
+    fn test_type_display_string_int_enum_resource_override() {
+        // RetentionInDays on AWS::Logs::LogGroup has a resource-scoped IntEnum override
         let prop = CfnProperty {
             prop_type: Some(TypeValue::Single("integer".to_string())),
             description: Some("Retention in days.".to_string()),
@@ -4027,8 +4263,12 @@ mod tests {
             tagging: None,
         };
         let enums = BTreeMap::new();
+        // Resource-scoped override takes precedence over schema enum values
         let result = type_display_string("RetentionInDays", &prop, &schema, &enums);
-        assert_eq!(result, "IntEnum([1, 3, 5])");
+        assert_eq!(
+            result,
+            "IntEnum([1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1096, 1827, 2192, 2557, 2922, 3288, 3653])"
+        );
     }
 
     #[test]
@@ -4618,7 +4858,7 @@ mod tests {
     }
 
     #[test]
-    fn test_resource_specific_type_overrides() {
+    fn test_resource_type_overrides_string_type() {
         // IAM Role's Arn should use iam_role_arn, not generic arn
         assert_eq!(
             infer_string_type("Arn", "AWS::IAM::Role"),
@@ -4647,7 +4887,7 @@ mod tests {
     }
 
     #[test]
-    fn test_resource_specific_type_overrides_display() {
+    fn test_resource_type_overrides_string_type_display() {
         // IAM Role's Arn should display as IamRoleArn
         assert_eq!(
             infer_string_type_display("Arn", "AWS::IAM::Role"),
@@ -4664,6 +4904,44 @@ mod tests {
         assert_eq!(
             infer_string_type_display("GatewayId", "AWS::EC2::VPNGatewayRoutePropagation"),
             "AwsResourceId"
+        );
+    }
+
+    #[test]
+    fn test_resource_type_overrides_enum() {
+        let overrides = resource_type_overrides();
+        assert_eq!(
+            overrides.get(&("AWS::EC2::VPNGateway", "Type")),
+            Some(&TypeOverride::Enum(vec!["ipsec.1"]))
+        );
+    }
+
+    #[test]
+    fn test_resource_type_overrides_int_range() {
+        let overrides = resource_type_overrides();
+        assert_eq!(
+            overrides.get(&("AWS::EC2::VPNGateway", "AmazonSideAsn")),
+            Some(&TypeOverride::IntRange(1, 4294967294))
+        );
+        assert_eq!(
+            overrides.get(&("AWS::EC2::TransitGateway", "AmazonSideAsn")),
+            Some(&TypeOverride::IntRange(1, 4294967294))
+        );
+    }
+
+    #[test]
+    fn test_resource_type_overrides_int_enum() {
+        let overrides = resource_type_overrides();
+        assert_eq!(
+            overrides.get(&("AWS::EC2::FlowLog", "MaxAggregationInterval")),
+            Some(&TypeOverride::IntEnum(vec![60, 600]))
+        );
+        assert_eq!(
+            overrides.get(&("AWS::Logs::LogGroup", "RetentionInDays")),
+            Some(&TypeOverride::IntEnum(vec![
+                1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1096, 1827, 2192,
+                2557, 2922, 3288, 3653
+            ]))
         );
     }
 

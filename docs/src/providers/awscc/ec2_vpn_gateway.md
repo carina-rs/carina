@@ -21,7 +21,7 @@ awscc.ec2.vpn_gateway {
 
 ### `amazon_side_asn`
 
-- **Type:** Int
+- **Type:** Int(1..=4294967294)
 - **Required:** No
 
 The private Autonomous System Number (ASN) for the Amazon side of a BGP session.
