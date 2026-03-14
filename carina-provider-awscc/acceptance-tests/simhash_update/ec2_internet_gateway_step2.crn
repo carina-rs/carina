@@ -1,0 +1,15 @@
+# EC2 Internet Gateway - SimHash reconciliation test (step 2)
+#
+# Tests: changing a tag on anonymous resource triggers in-place update
+# (not delete+create) via SimHash Hamming distance reconciliation
+
+provider awscc {
+  region = awscc.Region.ap_northeast_1
+}
+
+awscc.ec2.internet_gateway {
+  tags = {
+    Environment = "staging"
+    Purpose     = "simhash-test"
+  }
+}
