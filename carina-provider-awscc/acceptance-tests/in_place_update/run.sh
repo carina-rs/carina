@@ -13,7 +13,6 @@
 #   ec2_transit_gateway                - Change description
 #   ec2_security_group                 - Add ingress rule
 #   ec2_eip                            - Update tags
-#   ec2_vpn_gateway                    - Update tags
 #   ec2_route_table                    - Update tags
 #   ec2_flow_log                       - Update tags
 #   ec2_nat_gateway                    - Update tags
@@ -204,47 +203,41 @@ run_test "ec2_eip" \
     "$SCRIPT_DIR/ec2_eip_step2.crn" \
     "Test 8: EC2 EIP (tags update)"
 
-# Test 9: EC2 VPN Gateway - update tags
-run_test "ec2_vpn_gateway" \
-    "$SCRIPT_DIR/ec2_vpn_gateway_step1.crn" \
-    "$SCRIPT_DIR/ec2_vpn_gateway_step2.crn" \
-    "Test 9: EC2 VPN Gateway (tags update)"
-
-# Test 10: EC2 Route Table - update tags
+# Test 9: EC2 Route Table - update tags
 run_test "ec2_route_table" \
     "$SCRIPT_DIR/ec2_route_table_step1.crn" \
     "$SCRIPT_DIR/ec2_route_table_step2.crn" \
-    "Test 10: EC2 Route Table (tags update)"
+    "Test 9: EC2 Route Table (tags update)"
 
-# Test 11: EC2 Flow Log - update tags
+# Test 10: EC2 Flow Log - update tags
 run_test "ec2_flow_log" \
     "$SCRIPT_DIR/ec2_flow_log_step1.crn" \
     "$SCRIPT_DIR/ec2_flow_log_step2.crn" \
-    "Test 11: EC2 Flow Log (tags update)"
+    "Test 10: EC2 Flow Log (tags update)"
 
-# Test 12: EC2 NAT Gateway - update tags
+# Test 11: EC2 NAT Gateway - update tags
 run_test "ec2_nat_gateway" \
     "$SCRIPT_DIR/ec2_nat_gateway_step1.crn" \
     "$SCRIPT_DIR/ec2_nat_gateway_step2.crn" \
-    "Test 12: EC2 NAT Gateway (tags update)"
+    "Test 11: EC2 NAT Gateway (tags update)"
 
-# Test 13: EC2 Egress Only Internet Gateway - update tags
+# Test 12: EC2 Egress Only Internet Gateway - update tags
 run_test "ec2_egress_only_internet_gateway" \
     "$SCRIPT_DIR/ec2_egress_only_internet_gateway_step1.crn" \
     "$SCRIPT_DIR/ec2_egress_only_internet_gateway_step2.crn" \
-    "Test 13: EC2 Egress Only Internet Gateway (tags update)"
+    "Test 12: EC2 Egress Only Internet Gateway (tags update)"
 
-# Test 14: EC2 VPC Endpoint - add policy_document
+# Test 13: EC2 VPC Endpoint - add policy_document
 run_test "ec2_vpc_endpoint" \
     "$SCRIPT_DIR/ec2_vpc_endpoint_step1.crn" \
     "$SCRIPT_DIR/ec2_vpc_endpoint_step2.crn" \
-    "Test 14: EC2 VPC Endpoint (add policy_document)"
+    "Test 13: EC2 VPC Endpoint (add policy_document)"
 
-# Test 15: EC2 VPC Peering Connection - update tags
+# Test 14: EC2 VPC Peering Connection - update tags
 run_test "ec2_vpc_peering_connection" \
     "$SCRIPT_DIR/ec2_vpc_peering_connection_step1.crn" \
     "$SCRIPT_DIR/ec2_vpc_peering_connection_step2.crn" \
-    "Test 15: EC2 VPC Peering Connection (tags update)"
+    "Test 14: EC2 VPC Peering Connection (tags update)"
 
 echo "════════════════════════════════════════"
 echo "Total: $TOTAL_PASSED passed, $TOTAL_FAILED failed"

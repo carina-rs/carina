@@ -6,7 +6,7 @@ provider awscc {
   region = awscc.Region.ap_northeast_1
 }
 
-awscc.iam.role {
+let role = awscc.iam.role {
   role_name_prefix = "carina-acc-test-update-"
 
   assume_role_policy_document = {
