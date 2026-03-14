@@ -56,7 +56,7 @@ pub fn ec2_ipam_config() -> AwsccSchemaConfig {
                 .with_provider_name("EnablePrivateGua"),
         )
         .attribute(
-            AttributeSchema::new("ipam_id", AttributeType::String)
+            AttributeSchema::new("ipam_id", super::ipam_id())
                 .with_description("Id of the IPAM. (read-only)")
                 .with_provider_name("IpamId"),
         )

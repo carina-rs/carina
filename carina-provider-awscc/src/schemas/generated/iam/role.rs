@@ -85,7 +85,7 @@ pub fn iam_role_config() -> AwsccSchemaConfig {
                 .with_block_name("policy"),
         )
         .attribute(
-            AttributeSchema::new("role_id", AttributeType::String)
+            AttributeSchema::new("role_id", super::iam_role_id())
                 .with_description(" (read-only)")
                 .with_provider_name("RoleId"),
         )

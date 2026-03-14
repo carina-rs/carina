@@ -2410,6 +2410,7 @@ fn known_string_type_overrides() -> &'static HashMap<&'static str, &'static str>
         m.insert("KMSMasterKeyID", "super::kms_key_id()");
         m.insert("ReplicaKmsKeyID", "super::kms_key_id()");
         m.insert("KmsKeyArn", "super::kms_key_arn()");
+        m.insert("SecurityGroupRuleId", "super::security_group_rule_id()");
         m
     });
     &OVERRIDES

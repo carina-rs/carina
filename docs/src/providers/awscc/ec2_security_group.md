@@ -117,6 +117,6 @@ The ID of the VPC for the security group.
 
 ### `id`
 
-- **Type:** String
+- **Type:** SecurityGroupId
 
 

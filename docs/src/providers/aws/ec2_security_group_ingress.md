@@ -108,5 +108,5 @@ Shorthand formats: `tcp` or `IpProtocol.tcp`
 
 ### `security_group_rule_id`
 
-- **Type:** String
+- **Type:** security_group_rule_id
 

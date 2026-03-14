@@ -83,7 +83,7 @@ pub fn ec2_vpc_endpoint_config() -> AwsccSchemaConfig {
                 .with_provider_name("DnsOptions"),
         )
         .attribute(
-            AttributeSchema::new("id", AttributeType::String)
+            AttributeSchema::new("id", super::vpc_endpoint_id())
                 .with_description(" (read-only)")
                 .with_provider_name("Id"),
         )

@@ -133,7 +133,7 @@ pub fn ec2_security_group_ingress_config() -> AwsSchemaConfig {
                 .with_provider_name("SourceSecurityGroupId"),
         )
         .attribute(
-            AttributeSchema::new("security_group_rule_id", AttributeType::String)
+            AttributeSchema::new("security_group_rule_id", super::security_group_rule_id())
                 .with_description("The ID of the security group rule. (read-only)")
                 .with_provider_name("SecurityGroupRuleId"),
         )

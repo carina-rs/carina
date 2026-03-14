@@ -17,7 +17,7 @@ pub fn ec2_vpc_peering_connection_config() -> AwsccSchemaConfig {
         schema: ResourceSchema::new("awscc.ec2.vpc_peering_connection")
         .with_description("Resource Type definition for AWS::EC2::VPCPeeringConnection")
         .attribute(
-            AttributeSchema::new("id", AttributeType::String)
+            AttributeSchema::new("id", super::vpc_peering_connection_id())
                 .with_description("(read-only)")
                 .with_provider_name("Id"),
         )
