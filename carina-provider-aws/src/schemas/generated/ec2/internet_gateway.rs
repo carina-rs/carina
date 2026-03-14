@@ -14,7 +14,6 @@ pub fn ec2_internet_gateway_config() -> AwsSchemaConfig {
         aws_type_name: "AWS::EC2::InternetGateway",
         resource_type_name: "ec2.internet_gateway",
         has_tags: true,
-        data_source: false,
         schema: ResourceSchema::new("aws.ec2.internet_gateway")
             .with_description("Describes an internet gateway.")
             .attribute(
