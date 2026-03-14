@@ -101,7 +101,7 @@ The Id of the scope this pool is a part of.
 
 ### `locale`
 
-- **Type:** String
+- **Type:** Region
 - **Required:** No
 
 The region of this pool. If not set, this will default to "None" which will disable non-custom allocations. If the locale has been specified for the source pool, this value must match.
@@ -211,7 +211,7 @@ Shorthand formats: `create_in_progress` or `State.create_in_progress`
 |-------|------|----------|-------------|
 | `resource_id` | String | Yes |  |
 | `resource_owner` | String | Yes |  |
-| `resource_region` | String | Yes |  |
+| `resource_region` | Region | Yes |  |
 | `resource_type` | String | Yes |  |
 
 ## Attribute Reference

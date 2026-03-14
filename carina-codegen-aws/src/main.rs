@@ -2412,6 +2412,8 @@ fn known_string_type_overrides() -> &'static HashMap<&'static str, &'static str>
         m.insert("ReplicaKmsKeyID", "super::kms_key_id()");
         m.insert("KmsKeyArn", "super::kms_key_arn()");
         m.insert("SecurityGroupRuleId", "super::security_group_rule_id()");
+        m.insert("Locale", "super::aws_region()");
+        m.insert("BucketAccountId", "super::aws_account_id()");
         m
     });
     &OVERRIDES
@@ -2489,6 +2491,11 @@ fn infer_string_type(prop_name: &str) -> Option<String> {
         return Some("super::availability_zone()".to_string());
     }
 
+    // Region types (e.g., PeerRegion, ServiceRegion, RegionName, ResourceRegion)
+    if prop_lower.ends_with("region") || prop_lower == "regionname" {
+        return Some("super::aws_region()".to_string());
+    }
+
     // Check ARN pattern
     if prop_lower.ends_with("arn") || prop_lower.ends_with("arns") || prop_lower.contains("_arn") {
         return Some("super::arn()".to_string());
@@ -2504,8 +2511,8 @@ fn infer_string_type(prop_name: &str) -> Option<String> {
         return Some(get_resource_id_type(singular_name).to_string());
     }
 
-    // AWS Account ID (owner IDs are 12-digit account IDs)
-    if prop_lower.ends_with("ownerid") {
+    // AWS Account ID (owner IDs and account IDs are 12-digit account IDs)
+    if prop_lower.ends_with("ownerid") || prop_lower.ends_with("accountid") {
         return Some("super::aws_account_id()".to_string());
     }
 

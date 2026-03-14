@@ -74,7 +74,7 @@ pub fn ec2_ipam_config() -> AwsccSchemaConfig {
             AttributeSchema::new("operating_regions", AttributeType::List(Box::new(AttributeType::Struct {
                     name: "IpamOperatingRegion".to_string(),
                     fields: vec![
-                    StructField::new("region_name", AttributeType::String).required().with_description("The name of the region.").with_provider_name("RegionName")
+                    StructField::new("region_name", super::awscc_region()).required().with_description("The name of the region.").with_provider_name("RegionName")
                     ],
                 })))
                 .with_description("The regions IPAM is enabled for. Allows pools to be created in these regions, as well as enabling monitoring")

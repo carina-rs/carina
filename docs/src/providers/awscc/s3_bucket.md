@@ -319,7 +319,7 @@ Shorthand formats: `AuthenticatedRead` or `AccessControl.AuthenticatedRead`
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `role` | String | Yes | The Amazon Resource Name (ARN) of the IAMlong (IAM) role that Amazon S3 assumes when replicating obj... |
+| `role` | IamRoleArn | Yes | The Amazon Resource Name (ARN) of the IAMlong (IAM) role that Amazon S3 assumes when replicating obj... |
 | `rules` | [List\<ReplicationRule\>](#replicationrule) | Yes | A container for one or more replication rules. A replication configuration must have at least one ru... |
 
 ### VersioningConfiguration

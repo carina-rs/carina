@@ -19,7 +19,7 @@ pub fn ec2_eip_config() -> AwsccSchemaConfig {
         schema: ResourceSchema::new("awscc.ec2.eip")
         .with_description("Specifies an Elastic IP (EIP) address and can, optionally, associate it with an Amazon EC2 instance.  You can allocate an Elastic IP address from an address pool owned by AWS or from an address pool c...")
         .attribute(
-            AttributeSchema::new("address", AttributeType::String)
+            AttributeSchema::new("address", types::ipv4_address())
                 .create_only()
                 .with_description("")
                 .with_provider_name("Address"),
@@ -72,7 +72,7 @@ pub fn ec2_eip_config() -> AwsccSchemaConfig {
                 .with_provider_name("Tags"),
         )
         .attribute(
-            AttributeSchema::new("transfer_address", AttributeType::String)
+            AttributeSchema::new("transfer_address", types::ipv4_address())
                 .create_only()
                 .with_description("The Elastic IP address you are accepting for transfer. You can only accept one transferred address. For more information on Elastic IP address transfe...")
                 .with_provider_name("TransferAddress"),

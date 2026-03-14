@@ -64,7 +64,7 @@ pub fn ec2_flow_log_config() -> AwsccSchemaConfig {
                 .with_provider_name("Id"),
         )
         .attribute(
-            AttributeSchema::new("log_destination", AttributeType::String)
+            AttributeSchema::new("log_destination", super::arn())
                 .create_only()
                 .with_description("Specifies the destination to which the flow log data is to be published. Flow log data can be published to a CloudWatch Logs log group, an Amazon S3 b...")
                 .with_provider_name("LogDestination"),

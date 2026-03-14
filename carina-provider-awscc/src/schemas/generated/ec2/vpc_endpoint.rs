@@ -141,7 +141,7 @@ pub fn ec2_vpc_endpoint_config() -> AwsccSchemaConfig {
                 .with_provider_name("ServiceNetworkArn"),
         )
         .attribute(
-            AttributeSchema::new("service_region", AttributeType::String)
+            AttributeSchema::new("service_region", super::awscc_region())
                 .create_only()
                 .with_description("Describes a Region.")
                 .with_provider_name("ServiceRegion"),

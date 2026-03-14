@@ -113,7 +113,7 @@ The Amazon Resource Name (ARN) of the service network.
 
 ### `service_region`
 
-- **Type:** String
+- **Type:** Region
 - **Required:** No
 
 Describes a Region.

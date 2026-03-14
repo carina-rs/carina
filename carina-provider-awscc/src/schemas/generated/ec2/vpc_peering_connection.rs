@@ -6,7 +6,7 @@
 
 use super::AwsccSchemaConfig;
 use super::tags_type;
-use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+use carina_core::schema::{AttributeSchema, ResourceSchema};
 
 /// Returns the schema config for ec2_vpc_peering_connection (AWS::EC2::VPCPeeringConnection)
 pub fn ec2_vpc_peering_connection_config() -> AwsccSchemaConfig {
@@ -16,6 +16,12 @@ pub fn ec2_vpc_peering_connection_config() -> AwsccSchemaConfig {
         has_tags: true,
         schema: ResourceSchema::new("awscc.ec2.vpc_peering_connection")
         .with_description("Resource Type definition for AWS::EC2::VPCPeeringConnection")
+        .attribute(
+            AttributeSchema::new("assume_role_region", super::awscc_region())
+                .create_only()
+                .with_description("The Region code to use when calling Security Token Service (STS) to assume the PeerRoleArn, if provided.")
+                .with_provider_name("AssumeRoleRegion"),
+        )
         .attribute(
             AttributeSchema::new("id", super::vpc_peering_connection_id())
                 .with_description("(read-only)")
@@ -28,7 +34,7 @@ pub fn ec2_vpc_peering_connection_config() -> AwsccSchemaConfig {
                 .with_provider_name("PeerOwnerId"),
         )
         .attribute(
-            AttributeSchema::new("peer_region", AttributeType::String)
+            AttributeSchema::new("peer_region", super::awscc_region())
                 .create_only()
                 .with_description("The Region code for the accepter VPC, if the accepter VPC is located in a Region other than the Region in which you make the request.")
                 .with_provider_name("PeerRegion"),

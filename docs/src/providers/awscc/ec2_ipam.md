@@ -98,7 +98,7 @@ Shorthand formats: `free` or `Tier.free`
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `region_name` | String | Yes | The name of the region. |
+| `region_name` | Region | Yes | The name of the region. |
 
 ### IpamOrganizationalUnitExclusion
 
