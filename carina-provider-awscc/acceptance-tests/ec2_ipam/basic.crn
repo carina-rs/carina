@@ -6,7 +6,7 @@ provider awscc {
   region = awscc.Region.ap_northeast_1
 }
 
-awscc.ec2.ipam {
+let ipam = awscc.ec2.ipam {
   tier        = advanced
   description = "Acceptance test IPAM"
 
