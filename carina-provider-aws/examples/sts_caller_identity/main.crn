@@ -1,0 +1,10 @@
+# STS Caller Identity
+#
+# Retrieves the caller identity (data source, read-only).
+# Returns account_id, arn, and user_id of the calling entity.
+
+provider aws {
+  region = aws.Region.ap_northeast_1
+}
+
+let caller = read aws.sts.caller_identity {}

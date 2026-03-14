@@ -1,0 +1,17 @@
+# S3 Bucket
+#
+# Creates an S3 bucket with versioning enabled.
+
+provider aws {
+  region = aws.Region.ap_northeast_1
+}
+
+let bucket = aws.s3.bucket {
+  bucket = "carina-example-s3-bucket"
+
+  versioning_status = aws.s3.bucket.VersioningStatus.Enabled
+
+  tags = {
+    Environment = "example"
+  }
+}
