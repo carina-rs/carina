@@ -20,7 +20,7 @@ awscc.ec2.transit_gateway {
 
 ### `amazon_side_asn`
 
-- **Type:** Int
+- **Type:** Int(1..=4294967294)
 - **Required:** No
 
 ### `association_default_route_table_id`
