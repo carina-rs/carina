@@ -620,25 +620,6 @@ impl CompletionProvider {
                     },
                 ]
             }
-            AttributeType::Enum(variants) => {
-                // Check if this is a region enum (has region-like names but no zone suffix)
-                if variants
-                    .iter()
-                    .any(|v| v.contains("northeast") || v.contains("east_1"))
-                {
-                    return self.region_completions();
-                }
-                // Generic enum completions - wrap in quotes since they're string values
-                variants
-                    .iter()
-                    .map(|v| CompletionItem {
-                        label: format!("\"{}\"", v),
-                        kind: Some(CompletionItemKind::ENUM_MEMBER),
-                        insert_text: Some(format!("\"{}\"", v)),
-                        ..Default::default()
-                    })
-                    .collect()
-            }
             AttributeType::StringEnum {
                 name,
                 values,

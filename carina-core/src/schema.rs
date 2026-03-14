@@ -72,8 +72,6 @@ pub enum AttributeType {
     Float,
     /// Boolean
     Bool,
-    /// Enum (list of allowed values)
-    Enum(Vec<String>),
     /// String enum with optional namespace-aware DSL syntax support
     StringEnum {
         name: String,
@@ -174,18 +172,6 @@ impl AttributeType {
             }),
             (AttributeType::Float, Value::Int(_)) => Ok(()), // integers are valid numbers
             (AttributeType::Bool, Value::Bool(_)) => Ok(()),
-
-            (AttributeType::Enum(variants), Value::String(s)) => {
-                let variant = extract_enum_value(s);
-                if variants.iter().any(|v| v == variant || s == v) {
-                    Ok(())
-                } else {
-                    Err(TypeError::InvalidEnumVariant {
-                        value: s.clone(),
-                        expected: variants.clone(),
-                    })
-                }
-            }
 
             (
                 AttributeType::StringEnum {
@@ -352,7 +338,6 @@ impl AttributeType {
             AttributeType::Int => "Int".to_string(),
             AttributeType::Float => "Float".to_string(),
             AttributeType::Bool => "Bool".to_string(),
-            AttributeType::Enum(variants) => format!("Enum({})", variants.join(" | ")),
             AttributeType::StringEnum { name, .. } => name.clone(),
             AttributeType::Custom { name, .. } => name.clone(),
             AttributeType::List(inner) => format!("List<{}>", inner.type_name()),
@@ -1100,21 +1085,6 @@ mod tests {
         let t = AttributeType::String;
         assert!(t.validate(&Value::String("hello".to_string())).is_ok());
         assert!(t.validate(&Value::Int(42)).is_err());
-    }
-
-    #[test]
-    fn validate_enum_type() {
-        let t = AttributeType::Enum(vec!["a".to_string(), "b".to_string()]);
-        assert!(t.validate(&Value::String("a".to_string())).is_ok());
-        assert!(t.validate(&Value::String("Type.a".to_string())).is_ok());
-        assert!(t.validate(&Value::String("c".to_string())).is_err());
-    }
-
-    #[test]
-    fn validate_enum_type_remains_case_sensitive() {
-        let t = AttributeType::Enum(vec!["Enabled".to_string()]);
-        assert!(t.validate(&Value::String("Enabled".to_string())).is_ok());
-        assert!(t.validate(&Value::String("enabled".to_string())).is_err());
     }
 
     #[test]
