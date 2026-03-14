@@ -144,6 +144,39 @@ pub fn reconcile_prefixed_names(
     }
 }
 
+/// Produce a deterministic string representation of a Value for hashing.
+///
+/// Unlike `format!("{:?}", value)`, this ensures Map entries are sorted by key,
+/// so the output is consistent across runs (HashMap iteration order is random).
+fn deterministic_value_string(value: &Value) -> String {
+    match value {
+        Value::String(s) => format!("String({:?})", s),
+        Value::Int(i) => format!("Int({})", i),
+        Value::Float(f) => format!("Float({})", f),
+        Value::Bool(b) => format!("Bool({})", b),
+        Value::List(items) => {
+            let parts: Vec<String> = items.iter().map(deterministic_value_string).collect();
+            format!("List([{}])", parts.join(", "))
+        }
+        Value::Map(map) => {
+            let mut entries: Vec<(&String, &Value)> = map.iter().collect();
+            entries.sort_by_key(|(k, _)| *k);
+            let parts: Vec<String> = entries
+                .iter()
+                .map(|(k, v)| format!("{:?}: {}", k, deterministic_value_string(v)))
+                .collect();
+            format!("Map({{{}}})", parts.join(", "))
+        }
+        Value::ResourceRef {
+            binding_name,
+            attribute_name,
+        } => format!("ResourceRef({}.{})", binding_name, attribute_name),
+        Value::UnresolvedIdent(name, member) => {
+            format!("UnresolvedIdent({}, {:?})", name, member)
+        }
+    }
+}
+
 /// Maximum Hamming distance (out of 64 bits) for SimHash-based reconciliation.
 /// Two identifiers with distance below this threshold are considered the "same resource"
 /// with modified attributes.
@@ -234,7 +267,7 @@ pub fn compute_anonymous_identifiers(
         if let Some(pc) = providers.iter().find(|p| p.name == *provider_name) {
             for attr_name in &identity_attrs {
                 if let Some(value) = pc.attributes.get(attr_name.as_str()) {
-                    identity_values.insert(attr_name.clone(), format!("{:?}", value));
+                    identity_values.insert(attr_name.clone(), deterministic_value_string(value));
                 }
             }
         }
@@ -245,7 +278,7 @@ pub fn compute_anonymous_identifiers(
         let mut hash_values: BTreeMap<&str, String> = BTreeMap::new();
         for attr_name in &create_only_attrs {
             if let Some(value) = resource.attributes.get(*attr_name) {
-                hash_values.insert(attr_name, format!("{:?}", value));
+                hash_values.insert(attr_name, deterministic_value_string(value));
             }
         }
 
@@ -257,7 +290,7 @@ pub fn compute_anonymous_identifiers(
                 if key.starts_with('_') {
                     continue; // Skip internal attributes like _provider
                 }
-                hash_values.insert(key.as_str(), format!("{:?}", value));
+                hash_values.insert(key.as_str(), deterministic_value_string(value));
             }
         }
 
