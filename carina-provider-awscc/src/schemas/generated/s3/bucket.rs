@@ -24,6 +24,14 @@ const VALID_ACCESS_CONTROL: &[&str] = &[
     "PublicReadWrite",
 ];
 
+const VALID_ACCESS_CONTROL_TRANSLATION_OWNER: &[&str] = &["Destination"];
+
+const VALID_BLOCKED_ENCRYPTION_TYPES_ENCRYPTION_TYPE: &[&str] = &["NONE", "SSE-C"];
+
+const VALID_CORS_RULE_ALLOWED_METHODS: &[&str] = &["GET", "PUT", "HEAD", "POST", "DELETE"];
+
+const VALID_DATA_EXPORT_OUTPUT_SCHEMA_VERSION: &[&str] = &["V_1"];
+
 const VALID_DEFAULT_RETENTION_MODE: &[&str] = &["COMPLIANCE", "GOVERNANCE"];
 
 const VALID_DELETE_MARKER_REPLICATION_STATUS: &[&str] = &["Disabled", "Enabled"];
@@ -33,6 +41,25 @@ const VALID_DESTINATION_FORMAT: &[&str] = &["CSV", "ORC", "Parquet"];
 const VALID_INTELLIGENT_TIERING_CONFIGURATION_STATUS: &[&str] = &["Disabled", "Enabled"];
 
 const VALID_INVENTORY_CONFIGURATION_INCLUDED_OBJECT_VERSIONS: &[&str] = &["All", "Current"];
+
+const VALID_INVENTORY_CONFIGURATION_OPTIONAL_FIELDS: &[&str] = &[
+    "Size",
+    "LastModifiedDate",
+    "StorageClass",
+    "ETag",
+    "IsMultipartUploaded",
+    "ReplicationStatus",
+    "EncryptionStatus",
+    "ObjectLockRetainUntilDate",
+    "ObjectLockMode",
+    "ObjectLockLegalHoldStatus",
+    "IntelligentTieringAccessTier",
+    "BucketKeyStatus",
+    "ChecksumAlgorithm",
+    "ObjectAccessControlList",
+    "ObjectOwner",
+    "LifecycleExpirationDate",
+];
 
 const VALID_INVENTORY_CONFIGURATION_SCHEDULE_FREQUENCY: &[&str] = &["Daily", "Weekly"];
 
@@ -55,6 +82,8 @@ const VALID_NONCURRENT_VERSION_TRANSITION_STORAGE_CLASS: &[&str] = &[
     "ONEZONE_IA",
     "STANDARD_IA",
 ];
+
+const VALID_OBJECT_LOCK_CONFIGURATION_OBJECT_LOCK_ENABLED: &[&str] = &["Enabled"];
 
 const VALID_OWNERSHIP_CONTROLS_RULE_OBJECT_OWNERSHIP: &[&str] = &[
     "ObjectWriter",
@@ -200,7 +229,12 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                     StructField::new("prefix", AttributeType::String).with_description("The prefix to use when exporting data. The prefix is prepended to all results.").with_provider_name("Prefix")
                     ],
                 }).required().with_description("The place to store the data for an analysis.").with_provider_name("Destination"),
-                    StructField::new("output_schema_version", AttributeType::String).required().with_description("The version of the output schema to use when exporting data. Must be ``V_1``.").with_provider_name("OutputSchemaVersion")
+                    StructField::new("output_schema_version", AttributeType::StringEnum {
+                name: "OutputSchemaVersion".to_string(),
+                values: vec!["V_1".to_string()],
+                namespace: Some("awscc.s3.bucket".to_string()),
+                to_dsl: None,
+            }).required().with_description("The version of the output schema to use when exporting data. Must be ``V_1``.").with_provider_name("OutputSchemaVersion")
                     ],
                 }).with_description("Specifies how data related to the storage class analysis for an Amazon S3 bucket should be exported.").with_provider_name("DataExport")
                     ],
@@ -227,7 +261,12 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                     StructField::new("blocked_encryption_types", AttributeType::Struct {
                     name: "BlockedEncryptionTypes".to_string(),
                     fields: vec![
-                    StructField::new("encryption_type", AttributeType::List(Box::new(AttributeType::String))).with_description("The object encryption type that you want to block or unblock for an Amazon S3 general purpose bucket. Currently, this parameter only supports blocking...").with_provider_name("EncryptionType")
+                    StructField::new("encryption_type", AttributeType::List(Box::new(AttributeType::StringEnum {
+                name: "EncryptionType".to_string(),
+                values: vec!["NONE".to_string(), "SSE-C".to_string()],
+                namespace: Some("awscc.s3.bucket".to_string()),
+                to_dsl: Some(|s: &str| s.replace('-', "_")),
+            }))).with_description("The object encryption type that you want to block or unblock for an Amazon S3 general purpose bucket. Currently, this parameter only supports blocking...").with_provider_name("EncryptionType")
                     ],
                 }).with_description("A bucket-level setting for Amazon S3 general purpose buckets used to prevent the upload of new objects encrypted with the specified server-side encryp...").with_provider_name("BlockedEncryptionTypes"),
                     StructField::new("bucket_key_enabled", AttributeType::Bool).with_description("Specifies whether Amazon S3 should use an S3 Bucket Key with server-side encryption using KMS (SSE-KMS) for new objects in the bucket. Existing object...").with_provider_name("BucketKeyEnabled"),
@@ -264,7 +303,12 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                     name: "CorsRule".to_string(),
                     fields: vec![
                     StructField::new("allowed_headers", AttributeType::List(Box::new(AttributeType::String))).with_description("Headers that are specified in the ``Access-Control-Request-Headers`` header. These headers are allowed in a preflight OPTIONS request. In response to ...").with_provider_name("AllowedHeaders"),
-                    StructField::new("allowed_methods", AttributeType::List(Box::new(AttributeType::String))).required().with_description("An HTTP method that you allow the origin to run. *Allowed values*: ``GET`` | ``PUT`` | ``HEAD`` | ``POST`` | ``DELETE``").with_provider_name("AllowedMethods"),
+                    StructField::new("allowed_methods", AttributeType::List(Box::new(AttributeType::StringEnum {
+                name: "AllowedMethods".to_string(),
+                values: vec!["GET".to_string(), "PUT".to_string(), "HEAD".to_string(), "POST".to_string(), "DELETE".to_string()],
+                namespace: Some("awscc.s3.bucket".to_string()),
+                to_dsl: None,
+            }))).required().with_description("An HTTP method that you allow the origin to run. *Allowed values*: ``GET`` | ``PUT`` | ``HEAD`` | ``POST`` | ``DELETE``").with_provider_name("AllowedMethods"),
                     StructField::new("allowed_origins", AttributeType::List(Box::new(AttributeType::String))).required().with_description("One or more origins you want customers to be able to access the bucket from.").with_provider_name("AllowedOrigins"),
                     StructField::new("exposed_headers", AttributeType::List(Box::new(AttributeType::String))).with_description("One or more headers in the response that you want customers to be able to access from their applications (for example, from a JavaScript ``XMLHttpRequ...").with_provider_name("ExposedHeaders"),
                     StructField::new("id", AttributeType::String).with_description("A unique identifier for this rule. The value must be no more than 255 characters.").with_provider_name("Id"),
@@ -349,7 +393,12 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                 namespace: Some("awscc.s3.bucket".to_string()),
                 to_dsl: None,
             }).required().with_description("Object versions to include in the inventory list. If set to ``All``, the list includes all the object versions, which adds the version-related fields ...").with_provider_name("IncludedObjectVersions"),
-                    StructField::new("optional_fields", AttributeType::List(Box::new(AttributeType::String))).with_description("Contains the optional fields that are included in the inventory results.").with_provider_name("OptionalFields"),
+                    StructField::new("optional_fields", AttributeType::List(Box::new(AttributeType::StringEnum {
+                name: "OptionalFields".to_string(),
+                values: vec!["Size".to_string(), "LastModifiedDate".to_string(), "StorageClass".to_string(), "ETag".to_string(), "IsMultipartUploaded".to_string(), "ReplicationStatus".to_string(), "EncryptionStatus".to_string(), "ObjectLockRetainUntilDate".to_string(), "ObjectLockMode".to_string(), "ObjectLockLegalHoldStatus".to_string(), "IntelligentTieringAccessTier".to_string(), "BucketKeyStatus".to_string(), "ChecksumAlgorithm".to_string(), "ObjectAccessControlList".to_string(), "ObjectOwner".to_string(), "LifecycleExpirationDate".to_string()],
+                namespace: Some("awscc.s3.bucket".to_string()),
+                to_dsl: None,
+            }))).with_description("Contains the optional fields that are included in the inventory results.").with_provider_name("OptionalFields"),
                     StructField::new("prefix", AttributeType::String).with_description("Specifies the inventory filter prefix.").with_provider_name("Prefix"),
                     StructField::new("schedule_frequency", AttributeType::StringEnum {
                 name: "ScheduleFrequency".to_string(),
@@ -701,7 +750,12 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
             AttributeSchema::new("object_lock_configuration", AttributeType::Struct {
                     name: "ObjectLockConfiguration".to_string(),
                     fields: vec![
-                    StructField::new("object_lock_enabled", AttributeType::String).with_description("Indicates whether this bucket has an Object Lock configuration enabled. Enable ``ObjectLockEnabled`` when you apply ``ObjectLockConfiguration`` to a b...").with_provider_name("ObjectLockEnabled"),
+                    StructField::new("object_lock_enabled", AttributeType::StringEnum {
+                name: "ObjectLockEnabled".to_string(),
+                values: vec!["Enabled".to_string()],
+                namespace: Some("awscc.s3.bucket".to_string()),
+                to_dsl: None,
+            }).with_description("Indicates whether this bucket has an Object Lock configuration enabled. Enable ``ObjectLockEnabled`` when you apply ``ObjectLockConfiguration`` to a b...").with_provider_name("ObjectLockEnabled"),
                     StructField::new("rule", AttributeType::Struct {
                     name: "ObjectLockRule".to_string(),
                     fields: vec![
@@ -793,7 +847,12 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                     StructField::new("access_control_translation", AttributeType::Struct {
                     name: "AccessControlTranslation".to_string(),
                     fields: vec![
-                    StructField::new("owner", AttributeType::String).required().with_description("Specifies the replica ownership. For default and valid values, see [PUT bucket replication](https://docs.aws.amazon.com/AmazonS3/latest/API/RESTBucket...").with_provider_name("Owner")
+                    StructField::new("owner", AttributeType::StringEnum {
+                name: "Owner".to_string(),
+                values: vec!["Destination".to_string()],
+                namespace: Some("awscc.s3.bucket".to_string()),
+                to_dsl: None,
+            }).required().with_description("Specifies the replica ownership. For default and valid values, see [PUT bucket replication](https://docs.aws.amazon.com/AmazonS3/latest/API/RESTBucket...").with_provider_name("Owner")
                     ],
                 }).with_description("Specify this only in a cross-account scenario (where source and destination bucket owners are not the same), and you want to change replica ownership ...").with_provider_name("AccessControlTranslation"),
                     StructField::new("account", super::aws_account_id()).with_description("Destination bucket owner account ID. In a cross-account scenario, if you direct Amazon S3 to change replica ownership to the AWS-account that owns the...").with_provider_name("Account"),
@@ -996,6 +1055,16 @@ pub fn enum_valid_values() -> (
                 VALID_ACCELERATE_CONFIGURATION_ACCELERATION_STATUS,
             ),
             ("access_control", VALID_ACCESS_CONTROL),
+            ("owner", VALID_ACCESS_CONTROL_TRANSLATION_OWNER),
+            (
+                "encryption_type",
+                VALID_BLOCKED_ENCRYPTION_TYPES_ENCRYPTION_TYPE,
+            ),
+            ("allowed_methods", VALID_CORS_RULE_ALLOWED_METHODS),
+            (
+                "output_schema_version",
+                VALID_DATA_EXPORT_OUTPUT_SCHEMA_VERSION,
+            ),
             ("mode", VALID_DEFAULT_RETENTION_MODE),
             ("status", VALID_DELETE_MARKER_REPLICATION_STATUS),
             ("format", VALID_DESTINATION_FORMAT),
@@ -1003,6 +1072,10 @@ pub fn enum_valid_values() -> (
             (
                 "included_object_versions",
                 VALID_INVENTORY_CONFIGURATION_INCLUDED_OBJECT_VERSIONS,
+            ),
+            (
+                "optional_fields",
+                VALID_INVENTORY_CONFIGURATION_OPTIONAL_FIELDS,
             ),
             (
                 "schedule_frequency",
@@ -1028,6 +1101,10 @@ pub fn enum_valid_values() -> (
             (
                 "storage_class",
                 VALID_NONCURRENT_VERSION_TRANSITION_STORAGE_CLASS,
+            ),
+            (
+                "object_lock_enabled",
+                VALID_OBJECT_LOCK_CONFIGURATION_OBJECT_LOCK_ENABLED,
             ),
             (
                 "object_ownership",
