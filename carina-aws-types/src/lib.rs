@@ -1537,4 +1537,38 @@ mod tests {
     fn iam_role_id_invalid_empty_after_prefix() {
         assert!(validate_iam_role_id("AROA").is_err());
     }
+
+    // Region completion tests
+
+    #[test]
+    fn region_display_names_matches_valid_regions() {
+        let display_regions: Vec<&str> = REGION_DISPLAY_NAMES.iter().map(|(r, _)| *r).collect();
+        assert_eq!(
+            VALID_REGIONS,
+            &display_regions[..],
+            "REGION_DISPLAY_NAMES must match VALID_REGIONS exactly (same entries, same order)"
+        );
+    }
+
+    #[test]
+    fn region_completions_generates_dsl_format() {
+        let completions = region_completions("aws");
+        assert_eq!(completions.len(), VALID_REGIONS.len());
+        // Spot-check a few entries
+        assert_eq!(completions[0].value, "aws.Region.af_south_1");
+        assert_eq!(completions[0].description, "Africa (Cape Town)");
+        let tokyo = completions
+            .iter()
+            .find(|c| c.value.contains("ap_northeast_1"))
+            .unwrap();
+        assert_eq!(tokyo.description, "Asia Pacific (Tokyo)");
+    }
+
+    #[test]
+    fn region_completions_uses_provider_prefix() {
+        let aws = region_completions("aws");
+        let awscc = region_completions("awscc");
+        assert!(aws[0].value.starts_with("aws.Region."));
+        assert!(awscc[0].value.starts_with("awscc.Region."));
+    }
 }
