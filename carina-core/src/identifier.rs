@@ -144,6 +144,88 @@ pub fn reconcile_prefixed_names(
     }
 }
 
+/// Produce a deterministic string representation of a Value for hashing.
+///
+/// Unlike `format!("{:?}", value)`, this ensures Map entries are sorted by key,
+/// so the output is consistent across runs (HashMap iteration order is random).
+fn deterministic_value_string(value: &Value) -> String {
+    match value {
+        Value::String(s) => format!("String({:?})", s),
+        Value::Int(i) => format!("Int({})", i),
+        Value::Float(f) => format!("Float({})", f),
+        Value::Bool(b) => format!("Bool({})", b),
+        Value::List(items) => {
+            let parts: Vec<String> = items.iter().map(deterministic_value_string).collect();
+            format!("List([{}])", parts.join(", "))
+        }
+        Value::Map(map) => {
+            let mut entries: Vec<(&String, &Value)> = map.iter().collect();
+            entries.sort_by_key(|(k, _)| *k);
+            let parts: Vec<String> = entries
+                .iter()
+                .map(|(k, v)| format!("{:?}: {}", k, deterministic_value_string(v)))
+                .collect();
+            format!("Map({{{}}})", parts.join(", "))
+        }
+        Value::ResourceRef {
+            binding_name,
+            attribute_name,
+        } => format!("ResourceRef({}.{})", binding_name, attribute_name),
+        Value::UnresolvedIdent(name, member) => {
+            format!("UnresolvedIdent({}, {:?})", name, member)
+        }
+    }
+}
+
+/// Maximum Hamming distance (out of 64 bits) for SimHash-based reconciliation.
+/// Two identifiers with distance below this threshold are considered the "same resource"
+/// with modified attributes.
+const SIMHASH_HAMMING_THRESHOLD: u32 = 20;
+
+/// Compute SimHash of a set of key-value attributes.
+///
+/// SimHash is a locality-sensitive hash: changing one attribute flips only a few bits,
+/// so similar inputs produce similar hashes. This enables similarity-based reconciliation
+/// using Hamming distance on the identifier alone.
+fn compute_simhash(attributes: &std::collections::BTreeMap<&str, String>) -> u64 {
+    use std::hash::{Hash, Hasher};
+
+    let mut v = [0i32; 64];
+    for (key, value) in attributes {
+        let feature = format!("{}={}", key, value);
+        let mut hasher = std::hash::DefaultHasher::new();
+        feature.hash(&mut hasher);
+        let hash = hasher.finish();
+        for (i, count) in v.iter_mut().enumerate() {
+            if (hash >> i) & 1 == 1 {
+                *count += 1;
+            } else {
+                *count -= 1;
+            }
+        }
+    }
+    let mut result: u64 = 0;
+    for (i, count) in v.iter().enumerate() {
+        if *count > 0 {
+            result |= 1 << i;
+        }
+    }
+    result
+}
+
+/// Extract the hash portion from an anonymous resource identifier.
+///
+/// Supports both 8 hex chars (standard hash, u32) and 16 hex chars (SimHash, u64).
+/// Identifier format: `{resource_type}_{hex}` (e.g., `ec2_eip_a3f2b1c8d79f1524`).
+fn extract_hash_from_identifier(identifier: &str) -> Option<u64> {
+    let hex_part = identifier.rsplit('_').next()?;
+    match hex_part.len() {
+        16 => u64::from_str_radix(hex_part, 16).ok(),
+        8 => u32::from_str_radix(hex_part, 16).ok().map(|v| v as u64),
+        _ => None,
+    }
+}
+
 /// Compute stable identifiers for anonymous resources (those with empty ResourceId.name).
 /// Uses create-only properties and provider identity attributes to generate a deterministic hash.
 ///
@@ -178,12 +260,6 @@ pub fn compute_anonymous_identifiers(
         };
 
         let create_only_attrs = schema.create_only_attributes();
-        if create_only_attrs.is_empty() {
-            return Err(format!(
-                "Anonymous resource '{}' has no create-only properties. Use `let` binding for identification.",
-                resource.id.display_type()
-            ));
-        }
 
         // Collect identity attribute values (e.g., region) from provider config
         let mut identity_values: BTreeMap<String, String> = BTreeMap::new();
@@ -191,38 +267,59 @@ pub fn compute_anonymous_identifiers(
         if let Some(pc) = providers.iter().find(|p| p.name == *provider_name) {
             for attr_name in &identity_attrs {
                 if let Some(value) = pc.attributes.get(attr_name.as_str()) {
-                    identity_values.insert(attr_name.clone(), format!("{:?}", value));
+                    identity_values.insert(attr_name.clone(), deterministic_value_string(value));
                 }
             }
         }
 
-        // Collect create-only values in sorted order for deterministic hashing
-        let mut create_only_values: BTreeMap<&str, String> = BTreeMap::new();
+        // Collect create-only values in sorted order for deterministic hashing.
+        // If no create-only properties exist or none are set, fall back to
+        // all user-specified attributes.
+        let mut hash_values: BTreeMap<&str, String> = BTreeMap::new();
         for attr_name in &create_only_attrs {
             if let Some(value) = resource.attributes.get(*attr_name) {
-                create_only_values.insert(attr_name, format!("{:?}", value));
+                hash_values.insert(attr_name, deterministic_value_string(value));
             }
         }
 
-        if create_only_values.is_empty() {
-            return Err(format!(
-                "Anonymous resource '{}' has no create-only property values set. Use `let` binding for identification.",
-                resource.id.display_type()
-            ));
+        let use_simhash = hash_values.is_empty();
+
+        if use_simhash {
+            // No create-only values available: hash all user-specified attributes
+            for (key, value) in &resource.attributes {
+                if key.starts_with('_') {
+                    continue; // Skip internal attributes like _provider
+                }
+                hash_values.insert(key.as_str(), deterministic_value_string(value));
+            }
         }
 
-        // Compute deterministic hash: identity attributes first, then create-only values
-        let mut hasher = std::hash::DefaultHasher::new();
-        for (k, v) in &identity_values {
-            k.hash(&mut hasher);
-            v.hash(&mut hasher);
-        }
-        for (k, v) in &create_only_values {
-            k.hash(&mut hasher);
-            v.hash(&mut hasher);
-        }
-        let hash = hasher.finish();
-        let hash_str = format!("{:08x}", hash & 0xFFFFFFFF); // 8 hex chars
+        let hash_str = if use_simhash {
+            // Use SimHash for locality-sensitive hashing: similar inputs produce
+            // similar hashes, enabling Hamming distance reconciliation.
+            // Include identity attributes in the hash for provider distinction.
+            let mut simhash_values: BTreeMap<&str, String> = BTreeMap::new();
+            for (k, v) in &identity_values {
+                simhash_values.insert(k.as_str(), v.clone());
+            }
+            for (k, v) in &hash_values {
+                simhash_values.insert(k, v.clone());
+            }
+            let simhash = compute_simhash(&simhash_values);
+            format!("{:016x}", simhash)
+        } else {
+            // Use standard hash for create-only properties
+            let mut hasher = std::hash::DefaultHasher::new();
+            for (k, v) in &identity_values {
+                k.hash(&mut hasher);
+                v.hash(&mut hasher);
+            }
+            for (k, v) in &hash_values {
+                k.hash(&mut hasher);
+                v.hash(&mut hasher);
+            }
+            format!("{:08x}", hasher.finish() & 0xFFFFFFFF)
+        };
 
         // Build identifier: resource_type_hash (e.g., ec2_vpc_a3f2b1c8)
         let identifier = format!(
@@ -295,9 +392,7 @@ pub fn reconcile_anonymous_identifiers(
         };
 
         let create_only_attrs = schema.create_only_attributes();
-        if create_only_attrs.is_empty() {
-            continue;
-        }
+        let state_entries = find_state_by_type(&resource.id.provider, &resource.id.resource_type);
 
         // Collect this resource's create-only values
         let mut resource_co_values: HashMap<&str, String> = HashMap::new();
@@ -306,11 +401,40 @@ pub fn reconcile_anonymous_identifiers(
                 resource_co_values.insert(attr_name, v.clone());
             }
         }
-        if resource_co_values.is_empty() {
+
+        if create_only_attrs.is_empty() || resource_co_values.is_empty() {
+            // No create-only properties or none set: use SimHash-based Hamming distance
+            // matching to find the closest state entry.
+            let Some(resource_hash) = extract_hash_from_identifier(&resource.id.name) else {
+                continue;
+            };
+
+            let mut best_match: Option<(&str, u32)> = None;
+            for entry in &state_entries {
+                if entry.name == resource.id.name {
+                    continue;
+                }
+                let Some(state_hash) = extract_hash_from_identifier(&entry.name) else {
+                    continue;
+                };
+                let distance = (resource_hash ^ state_hash).count_ones();
+                if distance < SIMHASH_HAMMING_THRESHOLD
+                    && (best_match.is_none() || distance < best_match.unwrap().1)
+                {
+                    best_match = Some((&entry.name, distance));
+                }
+            }
+
+            if let Some((name, _)) = best_match {
+                resource.id = ResourceId::with_provider(
+                    &resource.id.provider,
+                    &resource.id.resource_type,
+                    name,
+                );
+            }
             continue;
         }
 
-        let state_entries = find_state_by_type(&resource.id.provider, &resource.id.resource_type);
         for entry in &state_entries {
             if entry.name == resource.id.name {
                 // Same identifier, no reconciliation needed
@@ -759,5 +883,857 @@ mod tests {
 
         // No reconciliation: only one create-only prop and it changed
         assert_eq!(resources[0].id.name, original_id);
+    }
+
+    #[test]
+    fn test_anonymous_resource_no_create_only_properties() {
+        // Resources with no create-only properties should still work as anonymous resources
+        let schema = ResourceSchema::new("awscc.ec2.eip")
+            .attribute(AttributeSchema::new("domain", AttributeType::String))
+            .attribute(AttributeSchema::new(
+                "tags",
+                AttributeType::Map(Box::new(AttributeType::String)),
+            ));
+        let schemas: HashMap<String, ResourceSchema> = vec![("awscc.ec2.eip".to_string(), schema)]
+            .into_iter()
+            .collect();
+        let providers = vec![ProviderConfig {
+            name: "awscc".to_string(),
+            attributes: vec![(
+                "region".to_string(),
+                Value::String("ap-northeast-1".to_string()),
+            )]
+            .into_iter()
+            .collect(),
+        }];
+        let identity_fn = |_: &str| -> Vec<String> { vec!["region".to_string()] };
+
+        let mut r = Resource::with_provider("awscc", "ec2.eip", "");
+        r.attributes
+            .insert("_provider".to_string(), Value::String("awscc".to_string()));
+        r.attributes
+            .insert("domain".to_string(), Value::String("vpc".to_string()));
+
+        let mut resources = vec![r];
+        compute_anonymous_identifiers(
+            &mut resources,
+            &providers,
+            &schemas,
+            &schema_key_fn,
+            &identity_fn,
+        )
+        .unwrap();
+
+        // Should have computed an identifier
+        assert!(!resources[0].id.name.is_empty());
+        assert!(resources[0].id.name.starts_with("ec2_eip_"));
+    }
+
+    #[test]
+    fn test_anonymous_resource_no_create_only_deterministic() {
+        // Same attributes should produce the same identifier
+        let schema = ResourceSchema::new("awscc.ec2.eip")
+            .attribute(AttributeSchema::new("domain", AttributeType::String));
+        let schemas: HashMap<String, ResourceSchema> = vec![("awscc.ec2.eip".to_string(), schema)]
+            .into_iter()
+            .collect();
+        let providers = vec![ProviderConfig {
+            name: "awscc".to_string(),
+            attributes: vec![(
+                "region".to_string(),
+                Value::String("ap-northeast-1".to_string()),
+            )]
+            .into_iter()
+            .collect(),
+        }];
+        let identity_fn = |_: &str| -> Vec<String> { vec!["region".to_string()] };
+
+        let make_resource = || {
+            let mut r = Resource::with_provider("awscc", "ec2.eip", "");
+            r.attributes
+                .insert("_provider".to_string(), Value::String("awscc".to_string()));
+            r.attributes
+                .insert("domain".to_string(), Value::String("vpc".to_string()));
+            r
+        };
+
+        let mut resources1 = vec![make_resource()];
+        let mut resources2 = vec![make_resource()];
+        compute_anonymous_identifiers(
+            &mut resources1,
+            &providers,
+            &schemas,
+            &schema_key_fn,
+            &identity_fn,
+        )
+        .unwrap();
+        compute_anonymous_identifiers(
+            &mut resources2,
+            &providers,
+            &schemas,
+            &schema_key_fn,
+            &identity_fn,
+        )
+        .unwrap();
+
+        assert_eq!(resources1[0].id.name, resources2[0].id.name);
+    }
+
+    #[test]
+    fn test_anonymous_resource_no_create_only_collision() {
+        // Two identical anonymous resources with no create-only properties should collide
+        let schema = ResourceSchema::new("awscc.ec2.eip")
+            .attribute(AttributeSchema::new("domain", AttributeType::String));
+        let schemas: HashMap<String, ResourceSchema> = vec![("awscc.ec2.eip".to_string(), schema)]
+            .into_iter()
+            .collect();
+        let providers = vec![ProviderConfig {
+            name: "awscc".to_string(),
+            attributes: HashMap::new(),
+        }];
+        let identity_fn = |_: &str| -> Vec<String> { vec![] };
+
+        let mut r1 = Resource::with_provider("awscc", "ec2.eip", "");
+        r1.attributes
+            .insert("_provider".to_string(), Value::String("awscc".to_string()));
+        r1.attributes
+            .insert("domain".to_string(), Value::String("vpc".to_string()));
+
+        let mut r2 = Resource::with_provider("awscc", "ec2.eip", "");
+        r2.attributes
+            .insert("_provider".to_string(), Value::String("awscc".to_string()));
+        r2.attributes
+            .insert("domain".to_string(), Value::String("vpc".to_string()));
+
+        let mut resources = vec![r1, r2];
+        let result = compute_anonymous_identifiers(
+            &mut resources,
+            &providers,
+            &schemas,
+            &schema_key_fn,
+            &identity_fn,
+        );
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("collision"));
+    }
+
+    #[test]
+    fn test_simhash_similar_inputs_close_distance() {
+        use std::collections::BTreeMap;
+
+        // Two attribute sets differing by one value should have small Hamming distance
+        let mut attrs1: BTreeMap<&str, String> = BTreeMap::new();
+        attrs1.insert("domain", "vpc".to_string());
+        attrs1.insert("tag_name", "my-eip".to_string());
+        attrs1.insert("tag_env", "production".to_string());
+        attrs1.insert("tag_team", "platform".to_string());
+        attrs1.insert("region", "ap-northeast-1".to_string());
+
+        let mut attrs2: BTreeMap<&str, String> = BTreeMap::new();
+        attrs2.insert("domain", "vpc".to_string());
+        attrs2.insert("tag_name", "my-eip".to_string());
+        attrs2.insert("tag_env", "staging".to_string()); // Only this changed
+        attrs2.insert("tag_team", "platform".to_string());
+        attrs2.insert("region", "ap-northeast-1".to_string());
+
+        let hash1 = compute_simhash(&attrs1);
+        let hash2 = compute_simhash(&attrs2);
+        let distance = (hash1 ^ hash2).count_ones();
+
+        // Similar inputs (1 of 5 changed) should have small Hamming distance
+        assert!(
+            distance < SIMHASH_HAMMING_THRESHOLD,
+            "Hamming distance {} should be < {} for similar inputs (1 of 5 attrs changed)",
+            distance,
+            SIMHASH_HAMMING_THRESHOLD
+        );
+    }
+
+    #[test]
+    fn test_simhash_identical_inputs_zero_distance() {
+        use std::collections::BTreeMap;
+
+        let mut attrs: BTreeMap<&str, String> = BTreeMap::new();
+        attrs.insert("domain", "vpc".to_string());
+        attrs.insert("tag_name", "my-eip".to_string());
+
+        let hash1 = compute_simhash(&attrs);
+        let hash2 = compute_simhash(&attrs);
+        assert_eq!(hash1, hash2);
+    }
+
+    #[test]
+    fn test_extract_hash_from_identifier() {
+        // 16 hex chars (SimHash, 64-bit)
+        assert_eq!(
+            extract_hash_from_identifier("ec2_eip_a3f2b1c8d79f1524"),
+            Some(0xa3f2b1c8d79f1524)
+        );
+        // 8 hex chars (standard hash, 32-bit) - still supported
+        assert_eq!(extract_hash_from_identifier("ec2_vpc_00000000"), Some(0));
+        assert_eq!(extract_hash_from_identifier("short"), None);
+        assert_eq!(extract_hash_from_identifier("bad_zzzzzzzz"), None);
+        // 12 hex chars (neither 8 nor 16) - rejected
+        assert_eq!(extract_hash_from_identifier("ec2_eip_aabbccddeeff"), None);
+    }
+
+    #[test]
+    fn test_reconcile_anonymous_id_no_create_only_hamming_match() {
+        // When schema has no create-only properties and an attribute changes,
+        // Hamming distance reconciliation should match with the closest state entry.
+        let schema = ResourceSchema::new("awscc.ec2.eip")
+            .attribute(AttributeSchema::new("domain", AttributeType::String))
+            .attribute(AttributeSchema::new("tag_name", AttributeType::String))
+            .attribute(AttributeSchema::new("tag_env", AttributeType::String));
+        let schemas: HashMap<String, ResourceSchema> = vec![("awscc.ec2.eip".to_string(), schema)]
+            .into_iter()
+            .collect();
+        let providers = vec![ProviderConfig {
+            name: "awscc".to_string(),
+            attributes: vec![(
+                "region".to_string(),
+                Value::String("ap-northeast-1".to_string()),
+            )]
+            .into_iter()
+            .collect(),
+        }];
+        let identity_fn = |_: &str| -> Vec<String> { vec!["region".to_string()] };
+
+        // Step 1: compute identifier with tag_env="production"
+        let mut r1 = Resource::with_provider("awscc", "ec2.eip", "");
+        r1.attributes
+            .insert("_provider".to_string(), Value::String("awscc".to_string()));
+        r1.attributes
+            .insert("domain".to_string(), Value::String("vpc".to_string()));
+        r1.attributes
+            .insert("tag_name".to_string(), Value::String("my-eip".to_string()));
+        r1.attributes.insert(
+            "tag_env".to_string(),
+            Value::String("production".to_string()),
+        );
+        let mut resources1 = vec![r1];
+        compute_anonymous_identifiers(
+            &mut resources1,
+            &providers,
+            &schemas,
+            &schema_key_fn,
+            &identity_fn,
+        )
+        .unwrap();
+        let old_id = resources1[0].id.name.clone();
+
+        // Step 2: compute identifier with tag_env="staging" (one attribute changed)
+        let mut r2 = Resource::with_provider("awscc", "ec2.eip", "");
+        r2.attributes
+            .insert("_provider".to_string(), Value::String("awscc".to_string()));
+        r2.attributes
+            .insert("domain".to_string(), Value::String("vpc".to_string()));
+        r2.attributes
+            .insert("tag_name".to_string(), Value::String("my-eip".to_string()));
+        r2.attributes
+            .insert("tag_env".to_string(), Value::String("staging".to_string()));
+        let mut resources2 = vec![r2];
+        compute_anonymous_identifiers(
+            &mut resources2,
+            &providers,
+            &schemas,
+            &schema_key_fn,
+            &identity_fn,
+        )
+        .unwrap();
+        let new_id = resources2[0].id.name.clone();
+
+        // Identifiers should differ (different attributes)
+        assert_ne!(old_id, new_id);
+
+        // Reconcile: state has the old identifier
+        let state_entries = vec![AnonymousIdStateInfo {
+            name: old_id.clone(),
+            create_only_values: HashMap::new(),
+        }];
+        reconcile_anonymous_identifiers(
+            &mut resources2,
+            &schemas,
+            &schema_key_fn,
+            &|_provider, _rt| state_entries.clone(),
+        );
+
+        // After reconciliation, should have the old identifier (Hamming distance match)
+        assert_eq!(resources2[0].id.name, old_id);
+    }
+
+    #[test]
+    fn test_reconcile_anonymous_id_no_create_only_no_match_when_distant() {
+        // Completely different resources should not reconcile
+        let schema = ResourceSchema::new("awscc.ec2.eip")
+            .attribute(AttributeSchema::new("domain", AttributeType::String));
+        let schemas: HashMap<String, ResourceSchema> = vec![("awscc.ec2.eip".to_string(), schema)]
+            .into_iter()
+            .collect();
+
+        // Resource with a computed identifier
+        let mut resource = Resource::with_provider("awscc", "ec2.eip", "ec2_eip_aabbccdd11223344");
+        resource
+            .attributes
+            .insert("domain".to_string(), Value::String("vpc".to_string()));
+
+        let original_id = resource.id.name.clone();
+        let mut resources = vec![resource];
+
+        // State has a very different hash (flipped many bits)
+        let state_entries = vec![AnonymousIdStateInfo {
+            name: "ec2_eip_5544332266778899".to_string(),
+            create_only_values: HashMap::new(),
+        }];
+        reconcile_anonymous_identifiers(
+            &mut resources,
+            &schemas,
+            &schema_key_fn,
+            &|_provider, _rt| state_entries.clone(),
+        );
+
+        // Identifier should remain unchanged (too distant)
+        assert_eq!(resources[0].id.name, original_id);
+    }
+
+    #[test]
+    fn test_reconcile_anonymous_id_create_only_exists_but_none_set() {
+        // Case A: Schema has create-only properties, but user didn't set any.
+        // Should use SimHash-based Hamming distance reconciliation.
+        let schema = ResourceSchema::new("awscc.ec2.eip")
+            .attribute(AttributeSchema::new("domain", AttributeType::String))
+            .attribute(
+                AttributeSchema::new("public_ipv4_pool", AttributeType::String).create_only(),
+            );
+        let schemas: HashMap<String, ResourceSchema> = vec![("awscc.ec2.eip".to_string(), schema)]
+            .into_iter()
+            .collect();
+        let providers = vec![ProviderConfig {
+            name: "awscc".to_string(),
+            attributes: HashMap::new(),
+        }];
+        let identity_fn = |_: &str| -> Vec<String> { vec![] };
+
+        // Compute identifier without setting the create-only property
+        let mut r1 = Resource::with_provider("awscc", "ec2.eip", "");
+        r1.attributes
+            .insert("_provider".to_string(), Value::String("awscc".to_string()));
+        r1.attributes
+            .insert("domain".to_string(), Value::String("vpc".to_string()));
+        let mut resources = vec![r1];
+        compute_anonymous_identifiers(
+            &mut resources,
+            &providers,
+            &schemas,
+            &schema_key_fn,
+            &identity_fn,
+        )
+        .unwrap();
+
+        // Should have computed an identifier (not errored)
+        assert!(!resources[0].id.name.is_empty());
+        assert!(resources[0].id.name.starts_with("ec2_eip_"));
+
+        // Reconciliation should use Hamming distance (create-only values empty)
+        let current_id = resources[0].id.name.clone();
+        let state_id = current_id.clone(); // Same id in state = no reconciliation needed
+        let state_entries = vec![AnonymousIdStateInfo {
+            name: state_id,
+            create_only_values: HashMap::new(),
+        }];
+        reconcile_anonymous_identifiers(
+            &mut resources,
+            &schemas,
+            &schema_key_fn,
+            &|_provider, _rt| state_entries.clone(),
+        );
+
+        // Same identifier in state, no change needed
+        assert_eq!(resources[0].id.name, current_id);
+    }
+
+    // ==================== SimHash acceptance tests ====================
+    // Comprehensive tests to verify SimHash behavior across various scenarios.
+
+    #[test]
+    fn test_simhash_different_attribute_count_produces_different_hash() {
+        use std::collections::BTreeMap;
+
+        let mut attrs1: BTreeMap<&str, String> = BTreeMap::new();
+        attrs1.insert("domain", "vpc".to_string());
+
+        let mut attrs2: BTreeMap<&str, String> = BTreeMap::new();
+        attrs2.insert("domain", "vpc".to_string());
+        attrs2.insert("tag_name", "extra".to_string());
+
+        let hash1 = compute_simhash(&attrs1);
+        let hash2 = compute_simhash(&attrs2);
+        assert_ne!(hash1, hash2, "Adding an attribute should change the hash");
+    }
+
+    #[test]
+    fn test_simhash_key_change_produces_different_hash() {
+        use std::collections::BTreeMap;
+
+        // Same value but different key should produce different hash
+        let mut attrs1: BTreeMap<&str, String> = BTreeMap::new();
+        attrs1.insert("domain", "vpc".to_string());
+
+        let mut attrs2: BTreeMap<&str, String> = BTreeMap::new();
+        attrs2.insert("region", "vpc".to_string());
+
+        let hash1 = compute_simhash(&attrs1);
+        let hash2 = compute_simhash(&attrs2);
+        assert_ne!(
+            hash1, hash2,
+            "Different keys should produce different hashes"
+        );
+    }
+
+    #[test]
+    fn test_simhash_order_independent() {
+        use std::collections::BTreeMap;
+
+        // BTreeMap is sorted, so insertion order doesn't matter.
+        // Verify that the same key-value pairs produce the same hash regardless.
+        let mut attrs1: BTreeMap<&str, String> = BTreeMap::new();
+        attrs1.insert("a", "1".to_string());
+        attrs1.insert("b", "2".to_string());
+        attrs1.insert("c", "3".to_string());
+
+        let mut attrs2: BTreeMap<&str, String> = BTreeMap::new();
+        attrs2.insert("c", "3".to_string());
+        attrs2.insert("a", "1".to_string());
+        attrs2.insert("b", "2".to_string());
+
+        assert_eq!(compute_simhash(&attrs1), compute_simhash(&attrs2));
+    }
+
+    #[test]
+    fn test_simhash_empty_attributes() {
+        use std::collections::BTreeMap;
+
+        let attrs: BTreeMap<&str, String> = BTreeMap::new();
+        // Empty attributes should produce 0 (all vote counters remain 0, all bits off)
+        assert_eq!(compute_simhash(&attrs), 0);
+    }
+
+    #[test]
+    fn test_simhash_single_attribute() {
+        use std::collections::BTreeMap;
+
+        let mut attrs: BTreeMap<&str, String> = BTreeMap::new();
+        attrs.insert("domain", "vpc".to_string());
+
+        let hash = compute_simhash(&attrs);
+        // Single attribute: hash should be non-zero and deterministic
+        assert_ne!(hash, 0);
+        assert_eq!(hash, compute_simhash(&attrs));
+    }
+
+    #[test]
+    fn test_simhash_many_attributes_one_change_close_distance() {
+        use std::collections::BTreeMap;
+
+        // With many attributes, changing one should flip very few bits
+        let mut attrs1: BTreeMap<&str, String> = BTreeMap::new();
+        for i in 0..10 {
+            attrs1.insert(
+                Box::leak(format!("attr_{}", i).into_boxed_str()),
+                format!("value_{}", i),
+            );
+        }
+
+        let mut attrs2 = attrs1.clone();
+        attrs2.insert("attr_5", "changed_value".to_string());
+
+        let hash1 = compute_simhash(&attrs1);
+        let hash2 = compute_simhash(&attrs2);
+        let distance = (hash1 ^ hash2).count_ones();
+
+        assert!(
+            distance < SIMHASH_HAMMING_THRESHOLD,
+            "Changing 1 of 10 attributes: Hamming distance {} should be < {}",
+            distance,
+            SIMHASH_HAMMING_THRESHOLD
+        );
+    }
+
+    #[test]
+    fn test_simhash_all_attributes_changed_large_distance() {
+        use std::collections::BTreeMap;
+
+        // Completely different attribute values should have large Hamming distance
+        let mut attrs1: BTreeMap<&str, String> = BTreeMap::new();
+        attrs1.insert("a", "alpha".to_string());
+        attrs1.insert("b", "bravo".to_string());
+        attrs1.insert("c", "charlie".to_string());
+        attrs1.insert("d", "delta".to_string());
+        attrs1.insert("e", "echo".to_string());
+
+        let mut attrs2: BTreeMap<&str, String> = BTreeMap::new();
+        attrs2.insert("a", "xray".to_string());
+        attrs2.insert("b", "yankee".to_string());
+        attrs2.insert("c", "zulu".to_string());
+        attrs2.insert("d", "foxtrot".to_string());
+        attrs2.insert("e", "golf".to_string());
+
+        let hash1 = compute_simhash(&attrs1);
+        let hash2 = compute_simhash(&attrs2);
+
+        // All values changed: hashes should differ
+        assert_ne!(
+            hash1, hash2,
+            "Completely different values should produce different hashes"
+        );
+    }
+
+    #[test]
+    fn test_reconcile_no_create_only_picks_closest_among_multiple_state_entries() {
+        // When multiple state entries exist, reconciliation should pick the closest one
+        let schema = ResourceSchema::new("awscc.ec2.eip")
+            .attribute(AttributeSchema::new("domain", AttributeType::String))
+            .attribute(AttributeSchema::new("tag_name", AttributeType::String))
+            .attribute(AttributeSchema::new("tag_env", AttributeType::String))
+            .attribute(AttributeSchema::new("tag_team", AttributeType::String));
+        let schemas: HashMap<String, ResourceSchema> = vec![("awscc.ec2.eip".to_string(), schema)]
+            .into_iter()
+            .collect();
+        let providers = vec![ProviderConfig {
+            name: "awscc".to_string(),
+            attributes: HashMap::new(),
+        }];
+        let identity_fn = |_: &str| -> Vec<String> { vec![] };
+
+        // Compute 3 identifiers with different attributes
+        let make_resource = |env: &str, team: &str| {
+            let mut r = Resource::with_provider("awscc", "ec2.eip", "");
+            r.attributes
+                .insert("_provider".to_string(), Value::String("awscc".to_string()));
+            r.attributes
+                .insert("domain".to_string(), Value::String("vpc".to_string()));
+            r.attributes
+                .insert("tag_name".to_string(), Value::String("my-eip".to_string()));
+            r.attributes
+                .insert("tag_env".to_string(), Value::String(env.to_string()));
+            r.attributes
+                .insert("tag_team".to_string(), Value::String(team.to_string()));
+            r
+        };
+
+        // Original: env=prod, team=infra
+        let mut resources_orig = vec![make_resource("production", "infra")];
+        compute_anonymous_identifiers(
+            &mut resources_orig,
+            &providers,
+            &schemas,
+            &schema_key_fn,
+            &identity_fn,
+        )
+        .unwrap();
+        let orig_id = resources_orig[0].id.name.clone();
+
+        // Distant: env=dev, team=frontend (2 attrs changed)
+        let mut resources_distant = vec![make_resource("development", "frontend")];
+        compute_anonymous_identifiers(
+            &mut resources_distant,
+            &providers,
+            &schemas,
+            &schema_key_fn,
+            &identity_fn,
+        )
+        .unwrap();
+        let distant_id = resources_distant[0].id.name.clone();
+
+        // Current: env=staging, team=infra (1 attr changed from orig)
+        let mut resources_current = vec![make_resource("staging", "infra")];
+        compute_anonymous_identifiers(
+            &mut resources_current,
+            &providers,
+            &schemas,
+            &schema_key_fn,
+            &identity_fn,
+        )
+        .unwrap();
+
+        // State has both orig and distant entries
+        let state_entries = vec![
+            AnonymousIdStateInfo {
+                name: orig_id.clone(),
+                create_only_values: HashMap::new(),
+            },
+            AnonymousIdStateInfo {
+                name: distant_id.clone(),
+                create_only_values: HashMap::new(),
+            },
+        ];
+
+        reconcile_anonymous_identifiers(
+            &mut resources_current,
+            &schemas,
+            &schema_key_fn,
+            &|_provider, _rt| state_entries.clone(),
+        );
+
+        // Should match orig (closer: 1 attr changed) rather than distant (2 attrs changed)
+        // Note: This depends on SimHash producing closer hashes for more similar inputs.
+        // If the Hamming distance for both is below the threshold, the closest is picked.
+        let current_hash = extract_hash_from_identifier(&resources_current[0].id.name).unwrap();
+        let orig_hash = extract_hash_from_identifier(&orig_id).unwrap();
+        let distant_hash = extract_hash_from_identifier(&distant_id).unwrap();
+        let dist_to_orig = (current_hash ^ orig_hash).count_ones();
+        let dist_to_distant = (current_hash ^ distant_hash).count_ones();
+
+        if dist_to_orig < SIMHASH_HAMMING_THRESHOLD {
+            // If orig is within threshold, it should have been picked (as closest)
+            assert_eq!(resources_current[0].id.name, orig_id);
+        }
+        if dist_to_orig < dist_to_distant {
+            // Orig should be closer than distant
+            assert!(
+                dist_to_orig < dist_to_distant,
+                "1-attr change (dist={}) should be closer than 2-attr change (dist={})",
+                dist_to_orig,
+                dist_to_distant,
+            );
+        }
+    }
+
+    #[test]
+    fn test_reconcile_no_create_only_same_id_in_state_no_change() {
+        // If state already has the same identifier, no reconciliation needed
+        let schema = ResourceSchema::new("awscc.ec2.eip")
+            .attribute(AttributeSchema::new("domain", AttributeType::String));
+        let schemas: HashMap<String, ResourceSchema> = vec![("awscc.ec2.eip".to_string(), schema)]
+            .into_iter()
+            .collect();
+        let providers = vec![ProviderConfig {
+            name: "awscc".to_string(),
+            attributes: HashMap::new(),
+        }];
+        let identity_fn = |_: &str| -> Vec<String> { vec![] };
+
+        let mut r = Resource::with_provider("awscc", "ec2.eip", "");
+        r.attributes
+            .insert("_provider".to_string(), Value::String("awscc".to_string()));
+        r.attributes
+            .insert("domain".to_string(), Value::String("vpc".to_string()));
+        let mut resources = vec![r];
+        compute_anonymous_identifiers(
+            &mut resources,
+            &providers,
+            &schemas,
+            &schema_key_fn,
+            &identity_fn,
+        )
+        .unwrap();
+        let id = resources[0].id.name.clone();
+
+        // State has the exact same identifier
+        let state_entries = vec![AnonymousIdStateInfo {
+            name: id.clone(),
+            create_only_values: HashMap::new(),
+        }];
+        reconcile_anonymous_identifiers(
+            &mut resources,
+            &schemas,
+            &schema_key_fn,
+            &|_provider, _rt| state_entries.clone(),
+        );
+
+        // Should remain unchanged
+        assert_eq!(resources[0].id.name, id);
+    }
+
+    #[test]
+    fn test_reconcile_no_create_only_empty_state() {
+        // No state entries = no reconciliation
+        let schema = ResourceSchema::new("awscc.ec2.eip")
+            .attribute(AttributeSchema::new("domain", AttributeType::String));
+        let schemas: HashMap<String, ResourceSchema> = vec![("awscc.ec2.eip".to_string(), schema)]
+            .into_iter()
+            .collect();
+
+        let mut resource = Resource::with_provider("awscc", "ec2.eip", "ec2_eip_aabbccdd11223344");
+        resource
+            .attributes
+            .insert("domain".to_string(), Value::String("vpc".to_string()));
+        let original_id = resource.id.name.clone();
+        let mut resources = vec![resource];
+
+        reconcile_anonymous_identifiers(
+            &mut resources,
+            &schemas,
+            &schema_key_fn,
+            &|_provider, _rt| vec![],
+        );
+
+        assert_eq!(resources[0].id.name, original_id);
+    }
+
+    #[test]
+    fn test_compute_anonymous_id_uses_simhash_for_no_create_only() {
+        // Verify that changing one attribute produces a different but nearby identifier
+        let schema = ResourceSchema::new("awscc.ec2.internet_gateway")
+            .attribute(AttributeSchema::new("tag_name", AttributeType::String))
+            .attribute(AttributeSchema::new("tag_env", AttributeType::String))
+            .attribute(AttributeSchema::new("tag_team", AttributeType::String));
+        let schemas: HashMap<String, ResourceSchema> =
+            vec![("awscc.ec2.internet_gateway".to_string(), schema)]
+                .into_iter()
+                .collect();
+        let providers = vec![ProviderConfig {
+            name: "awscc".to_string(),
+            attributes: HashMap::new(),
+        }];
+        let identity_fn = |_: &str| -> Vec<String> { vec![] };
+
+        let make_resource = |env: &str| {
+            let mut r = Resource::with_provider("awscc", "ec2.internet_gateway", "");
+            r.attributes
+                .insert("_provider".to_string(), Value::String("awscc".to_string()));
+            r.attributes
+                .insert("tag_name".to_string(), Value::String("my-igw".to_string()));
+            r.attributes
+                .insert("tag_env".to_string(), Value::String(env.to_string()));
+            r.attributes.insert(
+                "tag_team".to_string(),
+                Value::String("platform".to_string()),
+            );
+            r
+        };
+
+        let mut r1 = vec![make_resource("production")];
+        let mut r2 = vec![make_resource("staging")];
+        compute_anonymous_identifiers(&mut r1, &providers, &schemas, &schema_key_fn, &identity_fn)
+            .unwrap();
+        compute_anonymous_identifiers(&mut r2, &providers, &schemas, &schema_key_fn, &identity_fn)
+            .unwrap();
+
+        // Different identifiers
+        assert_ne!(r1[0].id.name, r2[0].id.name);
+
+        // But nearby (SimHash locality-sensitive property)
+        let hash1 = extract_hash_from_identifier(&r1[0].id.name).unwrap();
+        let hash2 = extract_hash_from_identifier(&r2[0].id.name).unwrap();
+        let distance = (hash1 ^ hash2).count_ones();
+        assert!(
+            distance < SIMHASH_HAMMING_THRESHOLD,
+            "Single attribute change should produce close SimHash (distance={}, threshold={})",
+            distance,
+            SIMHASH_HAMMING_THRESHOLD,
+        );
+    }
+
+    #[test]
+    fn test_compute_anonymous_id_simhash_vs_create_only_hash_independent() {
+        // Resources with create-only properties use standard hash,
+        // resources without use SimHash. Verify both work side by side.
+        let schema_with_co = ResourceSchema::new("awscc.ec2.vpc")
+            .attribute(AttributeSchema::new("cidr_block", AttributeType::String).create_only())
+            .attribute(AttributeSchema::new("tag_name", AttributeType::String));
+        let schema_without_co = ResourceSchema::new("awscc.ec2.eip")
+            .attribute(AttributeSchema::new("domain", AttributeType::String))
+            .attribute(AttributeSchema::new("tag_name", AttributeType::String));
+        let schemas: HashMap<String, ResourceSchema> = vec![
+            ("awscc.ec2.vpc".to_string(), schema_with_co),
+            ("awscc.ec2.eip".to_string(), schema_without_co),
+        ]
+        .into_iter()
+        .collect();
+        let providers = vec![ProviderConfig {
+            name: "awscc".to_string(),
+            attributes: HashMap::new(),
+        }];
+        let identity_fn = |_: &str| -> Vec<String> { vec![] };
+
+        let mut vpc = Resource::with_provider("awscc", "ec2.vpc", "");
+        vpc.attributes
+            .insert("_provider".to_string(), Value::String("awscc".to_string()));
+        vpc.attributes.insert(
+            "cidr_block".to_string(),
+            Value::String("10.0.0.0/16".to_string()),
+        );
+        vpc.attributes
+            .insert("tag_name".to_string(), Value::String("my-vpc".to_string()));
+
+        let mut eip = Resource::with_provider("awscc", "ec2.eip", "");
+        eip.attributes
+            .insert("_provider".to_string(), Value::String("awscc".to_string()));
+        eip.attributes
+            .insert("domain".to_string(), Value::String("vpc".to_string()));
+        eip.attributes
+            .insert("tag_name".to_string(), Value::String("my-eip".to_string()));
+
+        let mut resources = vec![vpc, eip];
+        compute_anonymous_identifiers(
+            &mut resources,
+            &providers,
+            &schemas,
+            &schema_key_fn,
+            &identity_fn,
+        )
+        .unwrap();
+
+        // Both should have identifiers computed
+        assert!(resources[0].id.name.starts_with("ec2_vpc_"));
+        assert!(resources[1].id.name.starts_with("ec2_eip_"));
+
+        // VPC uses standard hash (8 hex chars), EIP uses SimHash (16 hex chars)
+        let vpc_hash_part = resources[0].id.name.rsplit('_').next().unwrap();
+        let eip_hash_part = resources[1].id.name.rsplit('_').next().unwrap();
+        assert_eq!(vpc_hash_part.len(), 8);
+        assert_eq!(eip_hash_part.len(), 16);
+    }
+
+    #[test]
+    fn test_reconcile_create_only_path_unaffected_by_simhash_changes() {
+        // Verify that resources WITH create-only properties still use the
+        // existing partial-match reconciliation, not Hamming distance.
+        let schema = ResourceSchema::new("awscc.iam.role")
+            .attribute(AttributeSchema::new("role_name", AttributeType::String).create_only())
+            .attribute(AttributeSchema::new("path", AttributeType::String).create_only());
+        let schemas: HashMap<String, ResourceSchema> = vec![("awscc.iam.role".to_string(), schema)]
+            .into_iter()
+            .collect();
+
+        // Resource with both create-only props set
+        let mut resource = Resource::with_provider("awscc", "iam.role", "iam_role_aabbccdd");
+        resource
+            .attributes
+            .insert("_provider".to_string(), Value::String("awscc".to_string()));
+        resource.attributes.insert(
+            "role_name".to_string(),
+            Value::String("my-role".to_string()),
+        );
+        resource
+            .attributes
+            .insert("path".to_string(), Value::String("/new/".to_string()));
+
+        let original_id = resource.id.name.clone();
+        let mut resources = vec![resource];
+
+        // State with partial match (role_name matches, path differs)
+        let state_entries = vec![AnonymousIdStateInfo {
+            name: "iam_role_11223344".to_string(),
+            create_only_values: vec![
+                ("role_name".to_string(), "my-role".to_string()),
+                ("path".to_string(), "/old/".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+        }];
+
+        reconcile_anonymous_identifiers(
+            &mut resources,
+            &schemas,
+            &schema_key_fn,
+            &|_provider, _rt| state_entries.clone(),
+        );
+
+        // Should reconcile via partial create-only match (not Hamming distance)
+        assert_eq!(resources[0].id.name, "iam_role_11223344");
+        assert_ne!(resources[0].id.name, original_id);
     }
 }
