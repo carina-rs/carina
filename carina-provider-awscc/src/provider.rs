@@ -2135,4 +2135,30 @@ mod tests {
         let result = aws_value_to_dsl("protocol", &json_val, &attr_type, "ec2.sg");
         assert_eq!(result, Some(Value::Int(42)));
     }
+
+    #[test]
+    fn test_aws_value_to_dsl_region_in_struct_uses_underscores() {
+        // Region values inside struct fields should use underscore format (ap_northeast_1),
+        // not hyphen format (ap-northeast-1), to match DSL conventions.
+        // This ensures idempotency for resources like ec2.ipam operating_regions.
+        use crate::schemas::awscc_types::awscc_region;
+
+        let fields = vec![
+            StructField::new("region_name", awscc_region())
+                .required()
+                .with_provider_name("RegionName"),
+        ];
+        let attr_type = AttributeType::List(Box::new(AttributeType::Struct {
+            name: "IpamOperatingRegion".to_string(),
+            fields,
+        }));
+        let json_val = json!([{"RegionName": "ap-northeast-1"}]);
+
+        let result = aws_value_to_dsl("operating_regions", &json_val, &attr_type, "ec2.ipam");
+        let expected = Value::List(vec![Value::Map(HashMap::from([(
+            "region_name".to_string(),
+            Value::String("awscc.Region.ap_northeast_1".to_string()),
+        )]))]);
+        assert_eq!(result, Some(expected));
+    }
 }

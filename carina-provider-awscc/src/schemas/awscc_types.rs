@@ -77,7 +77,7 @@ pub fn awscc_region() -> AttributeType {
             }
         },
         namespace: Some("awscc".to_string()),
-        to_dsl: None,
+        to_dsl: Some(|s: &str| s.replace('-', "_")),
     }
 }
 
