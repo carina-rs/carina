@@ -655,7 +655,14 @@ fn generate_markdown(schema: &CfnSchema, type_name: &str) -> Result<String> {
     if !enums.is_empty() {
         let aliases = known_enum_aliases();
         md.push_str("## Enum Values\n\n");
+        let mut rendered_enums: HashSet<(String, Vec<String>)> = HashSet::new();
         for (prop_name, enum_info) in &enums {
+            // Skip duplicate enum types with identical values
+            // (e.g., Ingress.IpProtocol and Egress.IpProtocol share the same type and values)
+            let key = (enum_info.type_name.clone(), enum_info.values.clone());
+            if !rendered_enums.insert(key) {
+                continue;
+            }
             // For composite keys "DefName.FieldName", use just "FieldName" for display
             let field_name = prop_name
                 .split('.')
@@ -5301,6 +5308,212 @@ mod tests {
             "Struct field with $ref to enum-only definition should display as Enum, got:\n{}",
             md.lines()
                 .filter(|l| l.contains("mode"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+
+    #[test]
+    fn test_shared_enum_type_across_structs_is_deduplicated_in_markdown() {
+        // Two structs (Ingress, Egress) sharing the same enum field (IpProtocol)
+        // should produce only one enum section in markdown
+        let mut ingress_props = BTreeMap::new();
+        ingress_props.insert(
+            "IpProtocol".to_string(),
+            CfnProperty {
+                ref_path: Some("#/definitions/IpProtocol".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let mut egress_props = BTreeMap::new();
+        egress_props.insert(
+            "IpProtocol".to_string(),
+            CfnProperty {
+                ref_path: Some("#/definitions/IpProtocol".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let mut definitions = BTreeMap::new();
+        definitions.insert(
+            "Ingress".to_string(),
+            CfnDefinition {
+                def_type: Some("object".to_string()),
+                properties: Some(ingress_props),
+                required: vec![],
+                enum_values: None,
+                items: None,
+                one_of: vec![],
+            },
+        );
+        definitions.insert(
+            "Egress".to_string(),
+            CfnDefinition {
+                def_type: Some("object".to_string()),
+                properties: Some(egress_props),
+                required: vec![],
+                enum_values: None,
+                items: None,
+                one_of: vec![],
+            },
+        );
+        definitions.insert(
+            "IpProtocol".to_string(),
+            CfnDefinition {
+                def_type: Some("string".to_string()),
+                properties: None,
+                required: vec![],
+                enum_values: Some(vec![
+                    EnumValue::Str("tcp".to_string()),
+                    EnumValue::Str("udp".to_string()),
+                ]),
+                items: None,
+                one_of: vec![],
+            },
+        );
+
+        let mut properties = BTreeMap::new();
+        properties.insert(
+            "SecurityGroupIngress".to_string(),
+            CfnProperty {
+                prop_type: Some(TypeValue::Single("array".to_string())),
+                items: Some(Box::new(CfnProperty {
+                    ref_path: Some("#/definitions/Ingress".to_string()),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            },
+        );
+        properties.insert(
+            "SecurityGroupEgress".to_string(),
+            CfnProperty {
+                prop_type: Some(TypeValue::Single("array".to_string())),
+                items: Some(Box::new(CfnProperty {
+                    ref_path: Some("#/definitions/Egress".to_string()),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            },
+        );
+
+        let schema = CfnSchema {
+            type_name: "AWS::EC2::SecurityGroup".to_string(),
+            description: None,
+            properties,
+            required: vec![],
+            read_only_properties: vec![],
+            create_only_properties: vec![],
+            write_only_properties: vec![],
+            primary_identifier: None,
+            definitions: Some(definitions),
+            tagging: None,
+        };
+
+        let md = generate_markdown(&schema, "AWS::EC2::SecurityGroup").unwrap();
+        let ip_protocol_count = md.matches("### ip_protocol (IpProtocol)").count();
+        assert_eq!(
+            ip_protocol_count,
+            1,
+            "Expected exactly 1 IpProtocol enum section, found {}.\nEnum sections:\n{}",
+            ip_protocol_count,
+            md.lines()
+                .filter(|l| l.contains("IpProtocol"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+
+    #[test]
+    fn test_same_type_name_different_values_not_deduplicated() {
+        // Two structs with a "Status" field but different enum values
+        // should produce two separate enum sections
+        let mut config_a_props = BTreeMap::new();
+        config_a_props.insert(
+            "Status".to_string(),
+            CfnProperty {
+                enum_values: Some(vec![
+                    EnumValue::Str("Disabled".to_string()),
+                    EnumValue::Str("Enabled".to_string()),
+                ]),
+                ..Default::default()
+            },
+        );
+
+        let mut config_b_props = BTreeMap::new();
+        config_b_props.insert(
+            "Status".to_string(),
+            CfnProperty {
+                enum_values: Some(vec![
+                    EnumValue::Str("Enabled".to_string()),
+                    EnumValue::Str("Suspended".to_string()),
+                ]),
+                ..Default::default()
+            },
+        );
+
+        let mut definitions = BTreeMap::new();
+        definitions.insert(
+            "ConfigA".to_string(),
+            CfnDefinition {
+                def_type: Some("object".to_string()),
+                properties: Some(config_a_props),
+                required: vec![],
+                enum_values: None,
+                items: None,
+                one_of: vec![],
+            },
+        );
+        definitions.insert(
+            "ConfigB".to_string(),
+            CfnDefinition {
+                def_type: Some("object".to_string()),
+                properties: Some(config_b_props),
+                required: vec![],
+                enum_values: None,
+                items: None,
+                one_of: vec![],
+            },
+        );
+
+        let mut properties = BTreeMap::new();
+        properties.insert(
+            "ConfigA".to_string(),
+            CfnProperty {
+                ref_path: Some("#/definitions/ConfigA".to_string()),
+                ..Default::default()
+            },
+        );
+        properties.insert(
+            "ConfigB".to_string(),
+            CfnProperty {
+                ref_path: Some("#/definitions/ConfigB".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let schema = CfnSchema {
+            type_name: "AWS::Test::Resource".to_string(),
+            description: None,
+            properties,
+            required: vec![],
+            read_only_properties: vec![],
+            create_only_properties: vec![],
+            write_only_properties: vec![],
+            primary_identifier: None,
+            definitions: Some(definitions),
+            tagging: None,
+        };
+
+        let md = generate_markdown(&schema, "AWS::Test::Resource").unwrap();
+        let status_count = md.matches("### status (Status)").count();
+        assert_eq!(
+            status_count,
+            2,
+            "Expected 2 Status enum sections (different values), found {}.\nEnum Values section:\n{}",
+            status_count,
+            md.lines()
+                .filter(|l| l.contains("Status") || l.contains("status"))
                 .collect::<Vec<_>>()
                 .join("\n")
         );
