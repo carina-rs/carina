@@ -275,9 +275,16 @@ pub fn compute_anonymous_identifiers(
         // Collect create-only values in sorted order for deterministic hashing.
         // If no create-only properties exist or none are set, fall back to
         // all user-specified attributes.
+        //
+        // For prefixed attributes (e.g., bucket_name_prefix -> bucket_name),
+        // hash the prefix value instead of the randomly generated name.
+        // This ensures the anonymous identifier is stable across runs.
         let mut hash_values: BTreeMap<&str, String> = BTreeMap::new();
         for attr_name in &create_only_attrs {
-            if let Some(value) = resource.attributes.get(*attr_name) {
+            if let Some(prefix) = resource.prefixes.get(*attr_name) {
+                // Use the prefix for hashing to produce a stable identifier
+                hash_values.insert(attr_name, format!("Prefix({:?})", prefix));
+            } else if let Some(value) = resource.attributes.get(*attr_name) {
                 hash_values.insert(attr_name, deterministic_value_string(value));
             }
         }
@@ -1735,5 +1742,92 @@ mod tests {
         // Should reconcile via partial create-only match (not Hamming distance)
         assert_eq!(resources[0].id.name, "iam_role_11223344");
         assert_ne!(resources[0].id.name, original_id);
+    }
+
+    #[test]
+    fn test_compute_anonymous_id_stable_with_prefixed_create_only_attribute() {
+        // When a create-only attribute has a prefix (e.g., bucket_name_prefix),
+        // the anonymous identifier should be based on the prefix, not the
+        // randomly generated name. This ensures the hash is stable across runs.
+        let schema = ResourceSchema::new("awscc.s3.bucket")
+            .attribute(AttributeSchema::new("bucket_name", AttributeType::String).create_only());
+        let schemas: HashMap<String, ResourceSchema> =
+            vec![("awscc.s3.bucket".to_string(), schema)]
+                .into_iter()
+                .collect();
+        let providers = vec![ProviderConfig {
+            name: "awscc".to_string(),
+            attributes: HashMap::new(),
+        }];
+        let identity_fn = |_: &str| -> Vec<String> { vec![] };
+
+        // Simulate two runs with different random suffixes but same prefix
+        let make_resource = |generated_name: &str| {
+            let mut r = Resource::with_provider("awscc", "s3.bucket", "");
+            r.attributes
+                .insert("_provider".to_string(), Value::String("awscc".to_string()));
+            r.attributes.insert(
+                "bucket_name".to_string(),
+                Value::String(generated_name.to_string()),
+            );
+            r.prefixes
+                .insert("bucket_name".to_string(), "my-app-".to_string());
+            r
+        };
+
+        let mut r1 = vec![make_resource("my-app-abc12345")];
+        let mut r2 = vec![make_resource("my-app-xyz98765")];
+        compute_anonymous_identifiers(&mut r1, &providers, &schemas, &schema_key_fn, &identity_fn)
+            .unwrap();
+        compute_anonymous_identifiers(&mut r2, &providers, &schemas, &schema_key_fn, &identity_fn)
+            .unwrap();
+
+        // Same prefix should produce the same anonymous identifier
+        assert_eq!(
+            r1[0].id.name, r2[0].id.name,
+            "Prefixed create-only attributes should produce stable identifiers"
+        );
+    }
+
+    #[test]
+    fn test_compute_anonymous_id_different_prefix_produces_different_id() {
+        // Different prefixes should produce different anonymous identifiers
+        let schema = ResourceSchema::new("awscc.s3.bucket")
+            .attribute(AttributeSchema::new("bucket_name", AttributeType::String).create_only());
+        let schemas: HashMap<String, ResourceSchema> =
+            vec![("awscc.s3.bucket".to_string(), schema)]
+                .into_iter()
+                .collect();
+        let providers = vec![ProviderConfig {
+            name: "awscc".to_string(),
+            attributes: HashMap::new(),
+        }];
+        let identity_fn = |_: &str| -> Vec<String> { vec![] };
+
+        let make_resource = |prefix: &str, generated_name: &str| {
+            let mut r = Resource::with_provider("awscc", "s3.bucket", "");
+            r.attributes
+                .insert("_provider".to_string(), Value::String("awscc".to_string()));
+            r.attributes.insert(
+                "bucket_name".to_string(),
+                Value::String(generated_name.to_string()),
+            );
+            r.prefixes
+                .insert("bucket_name".to_string(), prefix.to_string());
+            r
+        };
+
+        let mut r1 = vec![make_resource("app-a-", "app-a-abc12345")];
+        let mut r2 = vec![make_resource("app-b-", "app-b-xyz98765")];
+        compute_anonymous_identifiers(&mut r1, &providers, &schemas, &schema_key_fn, &identity_fn)
+            .unwrap();
+        compute_anonymous_identifiers(&mut r2, &providers, &schemas, &schema_key_fn, &identity_fn)
+            .unwrap();
+
+        // Different prefixes should produce different identifiers
+        assert_ne!(
+            r1[0].id.name, r2[0].id.name,
+            "Different prefixes should produce different identifiers"
+        );
     }
 }
