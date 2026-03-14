@@ -89,41 +89,25 @@ fn aws_value_to_dsl(
         return Some(Value::String(namespaced));
     }
 
-    // For List(Struct{fields}), recurse into struct fields for type-aware conversion
+    // For List types, recurse into each item with the inner type for type-aware conversion
     if let AttributeType::List(inner) = attr_type
-        && let AttributeType::Struct { fields, .. } = inner.as_ref()
         && let Some(arr) = value.as_array()
     {
         let items: Vec<Value> = arr
             .iter()
-            .filter_map(|item| {
-                if let Some(obj) = item.as_object() {
-                    let map: HashMap<String, Value> = fields
-                        .iter()
-                        .filter_map(|field| {
-                            let provider_key =
-                                field.provider_name.as_deref().unwrap_or(&field.name);
-                            let json_val = obj.get(provider_key)?;
-                            let dsl_val = aws_value_to_dsl(
-                                &field.name,
-                                json_val,
-                                &field.field_type,
-                                resource_type,
-                            );
-                            dsl_val.map(|v| (field.name.clone(), v))
-                        })
-                        .collect();
-                    if map.is_empty() {
-                        None
-                    } else {
-                        Some(Value::Map(map))
-                    }
-                } else {
-                    json_to_value(item)
-                }
-            })
+            .filter_map(|item| aws_value_to_dsl(dsl_name, item, inner, resource_type))
             .collect();
         return Some(Value::List(items));
+    }
+
+    // For Union types, try each member type and use the first that produces a type-aware result
+    if let AttributeType::Union(members) = attr_type {
+        for member in members {
+            if let Some(result) = aws_value_to_dsl(dsl_name, value, member, resource_type) {
+                return Some(result);
+            }
+        }
+        return json_to_value(value);
     }
 
     // For bare Struct{fields}, recurse into fields
@@ -226,39 +210,22 @@ fn dsl_value_to_aws(
             _ => value_to_json(value),
         }
     } else if let AttributeType::List(inner) = attr_type
-        && let AttributeType::Struct { fields, .. } = inner.as_ref()
         && let Value::List(items) = value
     {
-        // Recurse into struct fields for type-aware conversion
+        // Recurse into list items with inner type for type-aware conversion
         let arr: Vec<serde_json::Value> = items
             .iter()
-            .filter_map(|item| {
-                if let Value::Map(map) = item {
-                    let obj: serde_json::Map<String, serde_json::Value> = fields
-                        .iter()
-                        .filter_map(|field| {
-                            let dsl_val = map.get(&field.name)?;
-                            let provider_key = field
-                                .provider_name
-                                .as_deref()
-                                .unwrap_or(&field.name)
-                                .to_string();
-                            let json_val = dsl_value_to_aws(
-                                dsl_val,
-                                &field.field_type,
-                                resource_type,
-                                &field.name,
-                            );
-                            json_val.map(|v| (provider_key, v))
-                        })
-                        .collect();
-                    Some(serde_json::Value::Object(obj))
-                } else {
-                    value_to_json(item)
-                }
-            })
+            .filter_map(|item| dsl_value_to_aws(item, inner, resource_type, attr_name))
             .collect();
         Some(serde_json::Value::Array(arr))
+    } else if let AttributeType::Union(members) = attr_type {
+        // Try each member type; use the first that produces a type-aware result
+        for member in members {
+            if let Some(result) = dsl_value_to_aws(value, member, resource_type, attr_name) {
+                return Some(result);
+            }
+        }
+        value_to_json(value)
     } else if let AttributeType::Struct { fields, .. } = attr_type
         && let Value::Map(map) = value
     {
@@ -2054,5 +2021,118 @@ mod tests {
         let value = Value::String("awscc.Region.ap_northeast_1".to_string());
         let result = dsl_value_to_aws(&value, &attr_type, "logs.log_group", "region");
         assert_eq!(result, Some(json!("ap-northeast-1")));
+    }
+
+    #[test]
+    fn test_dsl_value_to_aws_list_string_enum() {
+        // List(StringEnum) items should have enum conversion applied
+        let inner = AttributeType::StringEnum {
+            name: "AllowedMethod".to_string(),
+            values: vec!["GET".to_string(), "PUT".to_string(), "DELETE".to_string()],
+            namespace: Some("awscc.s3.bucket".to_string()),
+            to_dsl: None,
+        };
+        let attr_type = AttributeType::List(Box::new(inner));
+        let value = Value::List(vec![
+            Value::String("awscc.s3.bucket.AllowedMethod.GET".to_string()),
+            Value::String("awscc.s3.bucket.AllowedMethod.PUT".to_string()),
+        ]);
+        let result = dsl_value_to_aws(&value, &attr_type, "s3.bucket", "allowed_methods");
+        assert_eq!(result, Some(json!(["GET", "PUT"])));
+    }
+
+    #[test]
+    fn test_aws_value_to_dsl_list_string_enum() {
+        // List(StringEnum) read-back should namespace each item
+        let inner = AttributeType::StringEnum {
+            name: "AllowedMethod".to_string(),
+            values: vec!["GET".to_string(), "PUT".to_string(), "DELETE".to_string()],
+            namespace: Some("awscc.s3.bucket".to_string()),
+            to_dsl: None,
+        };
+        let attr_type = AttributeType::List(Box::new(inner));
+        let json_val = json!(["GET", "PUT"]);
+        let result = aws_value_to_dsl("allowed_methods", &json_val, &attr_type, "s3.bucket");
+        assert_eq!(
+            result,
+            Some(Value::List(vec![
+                Value::String("awscc.s3.bucket.AllowedMethod.GET".to_string()),
+                Value::String("awscc.s3.bucket.AllowedMethod.PUT".to_string()),
+            ]))
+        );
+    }
+
+    #[test]
+    fn test_dsl_value_to_aws_list_string_enum_roundtrip() {
+        // Verify List(StringEnum) round-trips correctly
+        let inner = AttributeType::StringEnum {
+            name: "AllowedMethod".to_string(),
+            values: vec!["GET".to_string(), "PUT".to_string()],
+            namespace: Some("awscc.s3.bucket".to_string()),
+            to_dsl: None,
+        };
+        let attr_type = AttributeType::List(Box::new(inner));
+
+        let aws_json = json!(["GET", "PUT"]);
+        let dsl = aws_value_to_dsl("allowed_methods", &aws_json, &attr_type, "s3.bucket")
+            .expect("read should succeed");
+        let written = dsl_value_to_aws(&dsl, &attr_type, "s3.bucket", "allowed_methods")
+            .expect("write should succeed");
+        assert_eq!(written, aws_json, "Round-trip should produce original JSON");
+    }
+
+    #[test]
+    fn test_dsl_value_to_aws_union_with_string_enum() {
+        // Union member that is a namespaced StringEnum should be converted.
+        // More specific types (StringEnum) should come before generic ones (String).
+        let attr_type = AttributeType::Union(vec![
+            AttributeType::StringEnum {
+                name: "Protocol".to_string(),
+                values: vec!["tcp".to_string(), "udp".to_string()],
+                namespace: Some("awscc.ec2.sg".to_string()),
+                to_dsl: None,
+            },
+            AttributeType::String,
+        ]);
+        let value = Value::String("awscc.ec2.sg.Protocol.tcp".to_string());
+        let result = dsl_value_to_aws(&value, &attr_type, "ec2.sg", "protocol");
+        assert_eq!(result, Some(json!("tcp")));
+    }
+
+    #[test]
+    fn test_aws_value_to_dsl_union_with_string_enum() {
+        // Union: read-back should try members and pick the namespaced one
+        let attr_type = AttributeType::Union(vec![
+            AttributeType::StringEnum {
+                name: "Protocol".to_string(),
+                values: vec!["tcp".to_string(), "udp".to_string()],
+                namespace: Some("awscc.ec2.sg".to_string()),
+                to_dsl: None,
+            },
+            AttributeType::String,
+        ]);
+        let json_val = json!("tcp");
+        let result = aws_value_to_dsl("protocol", &json_val, &attr_type, "ec2.sg");
+        assert_eq!(
+            result,
+            Some(Value::String("awscc.ec2.sg.Protocol.tcp".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_aws_value_to_dsl_union_fallback() {
+        // Union: when no member produces type-aware result, fall back to generic
+        let attr_type = AttributeType::Union(vec![
+            AttributeType::StringEnum {
+                name: "Protocol".to_string(),
+                values: vec!["tcp".to_string(), "udp".to_string()],
+                namespace: Some("awscc.ec2.sg".to_string()),
+                to_dsl: None,
+            },
+            AttributeType::Int,
+        ]);
+        let json_val = json!(42);
+        let result = aws_value_to_dsl("protocol", &json_val, &attr_type, "ec2.sg");
+        assert_eq!(result, Some(Value::Int(42)));
     }
 }
