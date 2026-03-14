@@ -602,6 +602,19 @@ fn generate_markdown(schema: &CfnSchema, type_name: &str) -> Result<String> {
         collect_struct_defs(prop, prop_name, schema, &mut struct_defs);
     }
 
+    // Scan struct definition fields for enum info (const values, $ref to enum-only definitions)
+    for (def_name, def_info) in &struct_defs {
+        for (field_name, field_prop) in &def_info.properties {
+            let (_, enum_info) = cfn_type_to_carina_type_with_enum(
+                field_prop, field_name, schema, &namespace, &enums,
+            );
+            if let Some(info) = enum_info {
+                let composite_key = format!("{}.{}", def_name, field_name);
+                enums.insert(composite_key, info);
+            }
+        }
+    }
+
     // Title
     md.push_str(&format!("# awscc.{}\n\n", dsl_resource));
     md.push_str(&format!("CloudFormation Type: `{}`\n\n", type_name));
@@ -708,10 +721,19 @@ fn generate_markdown(schema: &CfnSchema, type_name: &str) -> Result<String> {
             for (field_name, field_prop) in &def_info.properties {
                 let snake_name = field_name.to_snake_case();
                 let is_req = required_set.contains(field_name.as_str());
+                let composite_key = format!("{}.{}", def_info.def_name, field_name);
                 let field_type_display: String = if overrides.contains_key(field_name.as_str())
                     || field_prop.enum_values.is_some()
                 {
                     "Enum".to_string()
+                } else if enums.contains_key(&composite_key) {
+                    let enum_info = &enums[&composite_key];
+                    format!(
+                        "[Enum ({})](#{}-{})",
+                        enum_info.type_name,
+                        snake_name,
+                        enum_info.type_name.to_lowercase()
+                    )
                 } else {
                     type_display_string(field_name, field_prop, schema, &enums)
                 };
@@ -5139,6 +5161,137 @@ mod tests {
         assert!(
             generated.contains("AttributeType::List(Box::new(AttributeType::StringEnum"),
             "array with enum items should generate List(StringEnum): {generated}"
+        );
+    }
+
+    #[test]
+    fn test_struct_field_const_value_shows_enum_in_markdown() {
+        let mut def_props = BTreeMap::new();
+        def_props.insert(
+            "ObjectLockEnabled".to_string(),
+            CfnProperty {
+                prop_type: Some(TypeValue::Single("string".to_string())),
+                const_value: Some(serde_json::Value::String("Enabled".to_string())),
+                description: Some("Object lock enabled".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let mut definitions = BTreeMap::new();
+        definitions.insert(
+            "ObjectLockConfiguration".to_string(),
+            CfnDefinition {
+                def_type: Some("object".to_string()),
+                properties: Some(def_props),
+                required: vec![],
+                enum_values: None,
+                items: None,
+                one_of: vec![],
+            },
+        );
+
+        let mut properties = BTreeMap::new();
+        properties.insert(
+            "ObjectLockConfiguration".to_string(),
+            CfnProperty {
+                ref_path: Some("#/definitions/ObjectLockConfiguration".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let schema = CfnSchema {
+            type_name: "AWS::S3::Bucket".to_string(),
+            description: None,
+            properties,
+            required: vec![],
+            read_only_properties: vec![],
+            create_only_properties: vec![],
+            write_only_properties: vec![],
+            primary_identifier: None,
+            definitions: Some(definitions),
+            tagging: None,
+        };
+
+        let md = generate_markdown(&schema, "AWS::S3::Bucket").unwrap();
+        assert!(
+            md.contains("Enum (ObjectLockEnabled)"),
+            "Struct field with const_value should display as Enum in markdown, got:\n{}",
+            md.lines()
+                .filter(|l| l.contains("object_lock_enabled"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+
+    #[test]
+    fn test_struct_field_ref_enum_shows_enum_in_markdown() {
+        // Struct field with $ref to an enum-only definition
+        let mut def_props = BTreeMap::new();
+        def_props.insert(
+            "Mode".to_string(),
+            CfnProperty {
+                ref_path: Some("#/definitions/RetentionMode".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let mut definitions = BTreeMap::new();
+        definitions.insert(
+            "DefaultRetention".to_string(),
+            CfnDefinition {
+                def_type: Some("object".to_string()),
+                properties: Some(def_props),
+                required: vec![],
+                enum_values: None,
+                items: None,
+                one_of: vec![],
+            },
+        );
+        definitions.insert(
+            "RetentionMode".to_string(),
+            CfnDefinition {
+                def_type: Some("string".to_string()),
+                properties: None,
+                required: vec![],
+                enum_values: Some(vec![
+                    EnumValue::Str("COMPLIANCE".to_string()),
+                    EnumValue::Str("GOVERNANCE".to_string()),
+                ]),
+                items: None,
+                one_of: vec![],
+            },
+        );
+
+        let mut properties = BTreeMap::new();
+        properties.insert(
+            "DefaultRetention".to_string(),
+            CfnProperty {
+                ref_path: Some("#/definitions/DefaultRetention".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let schema = CfnSchema {
+            type_name: "AWS::S3::Bucket".to_string(),
+            description: None,
+            properties,
+            required: vec![],
+            read_only_properties: vec![],
+            create_only_properties: vec![],
+            write_only_properties: vec![],
+            primary_identifier: None,
+            definitions: Some(definitions),
+            tagging: None,
+        };
+
+        let md = generate_markdown(&schema, "AWS::S3::Bucket").unwrap();
+        assert!(
+            md.contains("Enum (RetentionMode)"),
+            "Struct field with $ref to enum-only definition should display as Enum, got:\n{}",
+            md.lines()
+                .filter(|l| l.contains("mode"))
+                .collect::<Vec<_>>()
+                .join("\n")
         );
     }
 }

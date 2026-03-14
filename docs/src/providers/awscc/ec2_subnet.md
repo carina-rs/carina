@@ -148,13 +148,34 @@ Any tags assigned to the subnet.
 
 The ID of the VPC the subnet is in. If you update this property, you must also update the ``CidrBlock`` property.
 
+## Enum Values
+
+### internet_gateway_block_mode (InternetGatewayBlockMode)
+
+| Value | DSL Identifier |
+|-------|----------------|
+| `off` | `awscc.ec2.subnet.InternetGatewayBlockMode.off` |
+| `block-bidirectional` | `awscc.ec2.subnet.InternetGatewayBlockMode.block_bidirectional` |
+| `block-ingress` | `awscc.ec2.subnet.InternetGatewayBlockMode.block_ingress` |
+
+Shorthand formats: `off` or `InternetGatewayBlockMode.off`
+
+### hostname_type (HostnameType)
+
+| Value | DSL Identifier |
+|-------|----------------|
+| `ip-name` | `awscc.ec2.subnet.HostnameType.ip_name` |
+| `resource-name` | `awscc.ec2.subnet.HostnameType.resource_name` |
+
+Shorthand formats: `ip_name` or `HostnameType.ip_name`
+
 ## Struct Definitions
 
 ### BlockPublicAccessStates
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `internet_gateway_block_mode` | String | No | The mode of VPC BPA. Options here are off, block-bidirectional, block-ingress  |
+| `internet_gateway_block_mode` | [Enum (InternetGatewayBlockMode)](#internet_gateway_block_mode-internetgatewayblockmode) | No | The mode of VPC BPA. Options here are off, block-bidirectional, block-ingress  |
 
 ### PrivateDnsNameOptionsOnLaunch
 

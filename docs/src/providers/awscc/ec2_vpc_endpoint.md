@@ -148,6 +148,39 @@ The ID of the VPC.
 
 ## Enum Values
 
+### dns_record_ip_type (DnsRecordIpType)
+
+| Value | DSL Identifier |
+|-------|----------------|
+| `ipv4` | `awscc.ec2.vpc_endpoint.DnsRecordIpType.ipv4` |
+| `ipv6` | `awscc.ec2.vpc_endpoint.DnsRecordIpType.ipv6` |
+| `dualstack` | `awscc.ec2.vpc_endpoint.DnsRecordIpType.dualstack` |
+| `service-defined` | `awscc.ec2.vpc_endpoint.DnsRecordIpType.service_defined` |
+| `not-specified` | `awscc.ec2.vpc_endpoint.DnsRecordIpType.not_specified` |
+
+Shorthand formats: `ipv4` or `DnsRecordIpType.ipv4`
+
+### private_dns_only_for_inbound_resolver_endpoint (PrivateDnsOnlyForInboundResolverEndpoint)
+
+| Value | DSL Identifier |
+|-------|----------------|
+| `OnlyInboundResolver` | `awscc.ec2.vpc_endpoint.PrivateDnsOnlyForInboundResolverEndpoint.OnlyInboundResolver` |
+| `AllResolvers` | `awscc.ec2.vpc_endpoint.PrivateDnsOnlyForInboundResolverEndpoint.AllResolvers` |
+| `NotSpecified` | `awscc.ec2.vpc_endpoint.PrivateDnsOnlyForInboundResolverEndpoint.NotSpecified` |
+
+Shorthand formats: `OnlyInboundResolver` or `PrivateDnsOnlyForInboundResolverEndpoint.OnlyInboundResolver`
+
+### private_dns_preference (PrivateDnsPreference)
+
+| Value | DSL Identifier |
+|-------|----------------|
+| `VERIFIED_DOMAINS_ONLY` | `awscc.ec2.vpc_endpoint.PrivateDnsPreference.VERIFIED_DOMAINS_ONLY` |
+| `ALL_DOMAINS` | `awscc.ec2.vpc_endpoint.PrivateDnsPreference.ALL_DOMAINS` |
+| `VERIFIED_DOMAINS_AND_SPECIFIED_DOMAINS` | `awscc.ec2.vpc_endpoint.PrivateDnsPreference.VERIFIED_DOMAINS_AND_SPECIFIED_DOMAINS` |
+| `SPECIFIED_DOMAINS_ONLY` | `awscc.ec2.vpc_endpoint.PrivateDnsPreference.SPECIFIED_DOMAINS_ONLY` |
+
+Shorthand formats: `VERIFIED_DOMAINS_ONLY` or `PrivateDnsPreference.VERIFIED_DOMAINS_ONLY`
+
 ### ip_address_type (IpAddressType)
 
 | Value | DSL Identifier |

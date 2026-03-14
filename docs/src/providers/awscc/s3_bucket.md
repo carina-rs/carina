@@ -180,6 +180,15 @@ Information used to configure the bucket as a static website. For more informati
 
 Shorthand formats: `Enabled` or `AbacStatus.Enabled`
 
+### acceleration_status (AccelerationStatus)
+
+| Value | DSL Identifier |
+|-------|----------------|
+| `Enabled` | `awscc.s3.bucket.AccelerationStatus.Enabled` |
+| `Suspended` | `awscc.s3.bucket.AccelerationStatus.Suspended` |
+
+Shorthand formats: `Enabled` or `AccelerationStatus.Enabled`
+
 ### access_control (AccessControl)
 
 | Value | DSL Identifier |
@@ -194,6 +203,82 @@ Shorthand formats: `Enabled` or `AbacStatus.Enabled`
 | `PublicReadWrite` | `awscc.s3.bucket.AccessControl.PublicReadWrite` |
 
 Shorthand formats: `AuthenticatedRead` or `AccessControl.AuthenticatedRead`
+
+### status (Status)
+
+| Value | DSL Identifier |
+|-------|----------------|
+| `Disabled` | `awscc.s3.bucket.Status.Disabled` |
+| `Enabled` | `awscc.s3.bucket.Status.Enabled` |
+
+Shorthand formats: `Disabled` or `Status.Disabled`
+
+### included_object_versions (IncludedObjectVersions)
+
+| Value | DSL Identifier |
+|-------|----------------|
+| `All` | `awscc.s3.bucket.IncludedObjectVersions.All` |
+| `Current` | `awscc.s3.bucket.IncludedObjectVersions.Current` |
+
+Shorthand formats: `All` or `IncludedObjectVersions.All`
+
+### optional_fields (OptionalFields)
+
+| Value | DSL Identifier |
+|-------|----------------|
+| `Size` | `awscc.s3.bucket.OptionalFields.Size` |
+| `LastModifiedDate` | `awscc.s3.bucket.OptionalFields.LastModifiedDate` |
+| `StorageClass` | `awscc.s3.bucket.OptionalFields.StorageClass` |
+| `ETag` | `awscc.s3.bucket.OptionalFields.ETag` |
+| `IsMultipartUploaded` | `awscc.s3.bucket.OptionalFields.IsMultipartUploaded` |
+| `ReplicationStatus` | `awscc.s3.bucket.OptionalFields.ReplicationStatus` |
+| `EncryptionStatus` | `awscc.s3.bucket.OptionalFields.EncryptionStatus` |
+| `ObjectLockRetainUntilDate` | `awscc.s3.bucket.OptionalFields.ObjectLockRetainUntilDate` |
+| `ObjectLockMode` | `awscc.s3.bucket.OptionalFields.ObjectLockMode` |
+| `ObjectLockLegalHoldStatus` | `awscc.s3.bucket.OptionalFields.ObjectLockLegalHoldStatus` |
+| `IntelligentTieringAccessTier` | `awscc.s3.bucket.OptionalFields.IntelligentTieringAccessTier` |
+| `BucketKeyStatus` | `awscc.s3.bucket.OptionalFields.BucketKeyStatus` |
+| `ChecksumAlgorithm` | `awscc.s3.bucket.OptionalFields.ChecksumAlgorithm` |
+| `ObjectAccessControlList` | `awscc.s3.bucket.OptionalFields.ObjectAccessControlList` |
+| `ObjectOwner` | `awscc.s3.bucket.OptionalFields.ObjectOwner` |
+| `LifecycleExpirationDate` | `awscc.s3.bucket.OptionalFields.LifecycleExpirationDate` |
+
+Shorthand formats: `Size` or `OptionalFields.Size`
+
+### schedule_frequency (ScheduleFrequency)
+
+| Value | DSL Identifier |
+|-------|----------------|
+| `Daily` | `awscc.s3.bucket.ScheduleFrequency.Daily` |
+| `Weekly` | `awscc.s3.bucket.ScheduleFrequency.Weekly` |
+
+Shorthand formats: `Daily` or `ScheduleFrequency.Daily`
+
+### transition_default_minimum_object_size (TransitionDefaultMinimumObjectSize)
+
+| Value | DSL Identifier |
+|-------|----------------|
+| `varies_by_storage_class` | `awscc.s3.bucket.TransitionDefaultMinimumObjectSize.varies_by_storage_class` |
+| `all_storage_classes_128K` | `awscc.s3.bucket.TransitionDefaultMinimumObjectSize.all_storage_classes_128K` |
+
+Shorthand formats: `varies_by_storage_class` or `TransitionDefaultMinimumObjectSize.varies_by_storage_class`
+
+### object_lock_enabled (ObjectLockEnabled)
+
+| Value | DSL Identifier |
+|-------|----------------|
+| `Enabled` | `awscc.s3.bucket.ObjectLockEnabled.Enabled` |
+
+Shorthand formats: `Enabled` or `ObjectLockEnabled.Enabled`
+
+### status (Status)
+
+| Value | DSL Identifier |
+|-------|----------------|
+| `Enabled` | `awscc.s3.bucket.Status.Enabled` |
+| `Suspended` | `awscc.s3.bucket.Status.Suspended` |
+
+Shorthand formats: `Enabled` or `Status.Enabled`
 
 ## Struct Definitions
 
@@ -242,7 +327,7 @@ Shorthand formats: `AuthenticatedRead` or `AccessControl.AuthenticatedRead`
 | `enabled` | Bool | Yes | Specifies whether the inventory is enabled or disabled. If set to ``True``, an inventory list is gen... |
 | `id` | String | Yes | The ID used to identify the inventory configuration. |
 | `included_object_versions` | Enum | Yes | Object versions to include in the inventory list. If set to ``All``, the list includes all the objec... |
-| `optional_fields` | `List<String>` | No | Contains the optional fields that are included in the inventory results. |
+| `optional_fields` | [Enum (OptionalFields)](#optional_fields-optionalfields) | No | Contains the optional fields that are included in the inventory results. |
 | `prefix` | String | No | Specifies the inventory filter prefix. |
 | `schedule_frequency` | Enum | Yes | Specifies the schedule for generating inventory results. |
 
@@ -297,7 +382,7 @@ Shorthand formats: `AuthenticatedRead` or `AccessControl.AuthenticatedRead`
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `object_lock_enabled` | String | No | Indicates whether this bucket has an Object Lock configuration enabled. Enable ``ObjectLockEnabled``... |
+| `object_lock_enabled` | [Enum (ObjectLockEnabled)](#object_lock_enabled-objectlockenabled) | No | Indicates whether this bucket has an Object Lock configuration enabled. Enable ``ObjectLockEnabled``... |
 | `rule` | [Struct(ObjectLockRule)](#objectlockrule) | No | Specifies the Object Lock rule for the specified object. Enable this rule when you apply ``ObjectLoc... |
 
 ### OwnershipControls
