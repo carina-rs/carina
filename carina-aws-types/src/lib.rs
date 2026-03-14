@@ -45,61 +45,8 @@ pub fn canonicalize_enum_value(raw: &str, valid_values: &[&str]) -> String {
 
 // ========== Region constants ==========
 
-/// Valid AWS regions (in AWS format with hyphens)
-pub const VALID_REGIONS: &[&str] = &[
-    // Africa
-    "af-south-1",
-    // Asia Pacific
-    "ap-east-1",
-    "ap-east-2",
-    "ap-northeast-1",
-    "ap-northeast-2",
-    "ap-northeast-3",
-    "ap-south-1",
-    "ap-south-2",
-    "ap-southeast-1",
-    "ap-southeast-2",
-    "ap-southeast-3",
-    "ap-southeast-4",
-    "ap-southeast-5",
-    "ap-southeast-6",
-    "ap-southeast-7",
-    // Canada
-    "ca-central-1",
-    "ca-west-1",
-    // China
-    "cn-north-1",
-    "cn-northwest-1",
-    // Europe
-    "eu-central-1",
-    "eu-central-2",
-    "eu-north-1",
-    "eu-south-1",
-    "eu-south-2",
-    "eu-west-1",
-    "eu-west-2",
-    "eu-west-3",
-    // Israel
-    "il-central-1",
-    // Middle East
-    "me-central-1",
-    "me-south-1",
-    // Mexico
-    "mx-central-1",
-    // South America
-    "sa-east-1",
-    // US
-    "us-east-1",
-    "us-east-2",
-    "us-gov-east-1",
-    "us-gov-west-1",
-    "us-west-1",
-    "us-west-2",
-];
-
-/// Region display names (AWS format with hyphens → human-readable name).
-/// Order matches `VALID_REGIONS`.
-pub const REGION_DISPLAY_NAMES: &[(&str, &str)] = &[
+/// AWS regions with display names. Single source of truth for validation and completions.
+pub const REGIONS: &[(&str, &str)] = &[
     // Africa
     ("af-south-1", "Africa (Cape Town)"),
     // Asia Pacific
@@ -150,12 +97,26 @@ pub const REGION_DISPLAY_NAMES: &[(&str, &str)] = &[
     ("us-west-2", "US West (Oregon)"),
 ];
 
+/// Check if a region code is valid.
+pub fn is_valid_region(region: &str) -> bool {
+    REGIONS.iter().any(|(code, _)| *code == region)
+}
+
+/// Format valid region codes as a comma-separated string for error messages.
+pub fn valid_regions_display() -> String {
+    REGIONS
+        .iter()
+        .map(|(code, _)| *code)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Generate region completion values for a given provider prefix (e.g., "aws" or "awscc").
 ///
 /// Converts AWS region format (`ap-northeast-1`) to DSL format (`ap_northeast_1`)
 /// and prefixes with `{prefix}.Region.`.
 pub fn region_completions(prefix: &str) -> Vec<CompletionValue> {
-    REGION_DISPLAY_NAMES
+    REGIONS
         .iter()
         .map(|(code, name)| {
             let dsl_code = code.replace('-', "_");
@@ -1541,19 +1502,9 @@ mod tests {
     // Region completion tests
 
     #[test]
-    fn region_display_names_matches_valid_regions() {
-        let display_regions: Vec<&str> = REGION_DISPLAY_NAMES.iter().map(|(r, _)| *r).collect();
-        assert_eq!(
-            VALID_REGIONS,
-            &display_regions[..],
-            "REGION_DISPLAY_NAMES must match VALID_REGIONS exactly (same entries, same order)"
-        );
-    }
-
-    #[test]
     fn region_completions_generates_dsl_format() {
         let completions = region_completions("aws");
-        assert_eq!(completions.len(), VALID_REGIONS.len());
+        assert_eq!(completions.len(), REGIONS.len());
         // Spot-check a few entries
         assert_eq!(completions[0].value, "aws.Region.af_south_1");
         assert_eq!(completions[0].description, "Africa (Cape Town)");

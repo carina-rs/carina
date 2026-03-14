@@ -38,13 +38,13 @@ pub fn aws_region() -> AttributeType {
                     .map_err(|reason| format!("Invalid region '{}': {}", s, reason))?;
                 // Normalize the input to AWS format (hyphens)
                 let normalized = extract_enum_value(s).replace('_', "-");
-                if VALID_REGIONS.contains(&normalized.as_str()) {
+                if is_valid_region(&normalized) {
                     Ok(())
                 } else {
                     Err(format!(
                         "Invalid region '{}', expected one of: {} or DSL format like aws.Region.ap_northeast_1",
                         s,
-                        VALID_REGIONS.join(", ")
+                        valid_regions_display()
                     ))
                 }
             } else {
@@ -144,7 +144,7 @@ mod tests {
     #[test]
     fn region_validates_all_valid_regions() {
         let region_type = aws_region();
-        for region in VALID_REGIONS {
+        for (region, _) in REGIONS {
             assert!(
                 region_type
                     .validate(&Value::String(region.to_string()))

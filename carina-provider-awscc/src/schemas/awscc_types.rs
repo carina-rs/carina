@@ -63,13 +63,13 @@ pub fn awscc_region() -> AttributeType {
                 validate_enum_namespace(s, "Region", "awscc")
                     .map_err(|reason| format!("Invalid region '{}': {}", s, reason))?;
                 let normalized = extract_enum_value(s).replace('_', "-");
-                if VALID_REGIONS.contains(&normalized.as_str()) {
+                if is_valid_region(&normalized) {
                     Ok(())
                 } else {
                     Err(format!(
                         "Invalid region '{}', expected one of: {} or DSL format like awscc.Region.ap_northeast_1",
                         s,
-                        VALID_REGIONS.join(", ")
+                        valid_regions_display()
                     ))
                 }
             } else {
