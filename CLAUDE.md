@@ -164,15 +164,17 @@ Directory-based modules (e.g., `modules/web_tier/`) require special handling:
 
 ### Worktree-Based Development
 
-Always create a git worktree before starting a new task. This isolates work from the current branch and avoids conflicts:
+**IMPORTANT: Use `git wt` (NOT `git worktree`).** `git wt` is a separate tool (`/opt/homebrew/bin/git-wt`) with its own syntax. NEVER use `git worktree` commands.
 
 ```bash
-git worktree add ../<worktree-dir> -b <branch-name> main
-```
+# Create worktree for a new task
+git wt <branch-name> main
 
-After the PR is merged, clean up the worktree:
-```bash
-git worktree remove ../<worktree-dir>
+# List worktrees
+git wt
+
+# Delete worktree after PR is merged (from main worktree, not feature worktree)
+git wt -d <branch-name>
 ```
 
 ### Branch Cleanup
