@@ -5,7 +5,7 @@
 //! DO NOT EDIT MANUALLY - regenerate with carina-codegen
 
 use super::AwsccSchemaConfig;
-use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+use carina_core::schema::{AttributeSchema, ResourceSchema};
 
 /// Returns the schema config for ec2_subnet_route_table_association (AWS::EC2::SubnetRouteTableAssociation)
 pub fn ec2_subnet_route_table_association_config() -> AwsccSchemaConfig {
@@ -16,7 +16,7 @@ pub fn ec2_subnet_route_table_association_config() -> AwsccSchemaConfig {
         schema: ResourceSchema::new("awscc.ec2.subnet_route_table_association")
         .with_description("Associates a subnet with a route table. The subnet and route table must be in the same VPC. This association causes traffic originating from the subnet to be routed according to the routes in the rout...")
         .attribute(
-            AttributeSchema::new("id", AttributeType::String)
+            AttributeSchema::new("id", super::subnet_route_table_association_id())
                 .with_description(" (read-only)")
                 .with_provider_name("Id"),
         )

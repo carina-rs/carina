@@ -17,7 +17,7 @@ pub fn ec2_transit_gateway_attachment_config() -> AwsccSchemaConfig {
         schema: ResourceSchema::new("awscc.ec2.transit_gateway_attachment")
         .with_description("Resource Type definition for AWS::EC2::TransitGatewayAttachment")
         .attribute(
-            AttributeSchema::new("id", AttributeType::String)
+            AttributeSchema::new("id", super::transit_gateway_attachment_id())
                 .with_description("(read-only)")
                 .with_provider_name("Id"),
         )

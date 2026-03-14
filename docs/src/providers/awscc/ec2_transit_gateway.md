@@ -135,6 +135,15 @@ Shorthand formats: `enable` or `DnsSupport.enable`
 
 Shorthand formats: `disable` or `EncryptionSupport.disable`
 
+### encryption_support_state (EncryptionSupportState)
+
+| Value | DSL Identifier |
+|-------|----------------|
+| `disable` | `awscc.ec2.transit_gateway.EncryptionSupportState.disable` |
+| `enable` | `awscc.ec2.transit_gateway.EncryptionSupportState.enable` |
+
+Shorthand formats: `disable` or `EncryptionSupportState.disable`
+
 ### multicast_support (MulticastSupport)
 
 | Value | DSL Identifier |
@@ -166,11 +175,11 @@ Shorthand formats: `enable` or `VpnEcmpSupport.enable`
 
 ### `encryption_support_state`
 
-- **Type:** String
+- **Type:** [Enum (EncryptionSupportState)](#encryption_support_state-encryptionsupportstate)
 
 ### `id`
 
-- **Type:** String
+- **Type:** TransitGatewayId
 
 ### `transit_gateway_arn`
 

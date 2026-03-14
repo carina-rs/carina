@@ -40,6 +40,6 @@ The ID of the VPC for which to create the egress-only internet gateway.
 
 ### `id`
 
-- **Type:** String
+- **Type:** EgressOnlyInternetGatewayId
 
 

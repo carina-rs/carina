@@ -71,6 +71,6 @@ The ID of the VPC.
 
 ### `id`
 
-- **Type:** String
+- **Type:** VpcPeeringConnectionId
 
 

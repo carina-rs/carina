@@ -18,6 +18,8 @@ const VALID_DNS_SUPPORT: &[&str] = &["enable", "disable"];
 
 const VALID_ENCRYPTION_SUPPORT: &[&str] = &["disable", "enable"];
 
+const VALID_ENCRYPTION_SUPPORT_STATE: &[&str] = &["disable", "enable"];
+
 const VALID_MULTICAST_SUPPORT: &[&str] = &["enable", "disable"];
 
 const VALID_SECURITY_GROUP_REFERENCING_SUPPORT: &[&str] = &["enable", "disable"];
@@ -109,12 +111,20 @@ pub fn ec2_transit_gateway_config() -> AwsccSchemaConfig {
                 .with_provider_name("EncryptionSupport"),
             )
             .attribute(
-                AttributeSchema::new("encryption_support_state", AttributeType::String)
-                    .with_description("(read-only)")
-                    .with_provider_name("EncryptionSupportState"),
+                AttributeSchema::new(
+                    "encryption_support_state",
+                    AttributeType::StringEnum {
+                        name: "EncryptionSupportState".to_string(),
+                        values: vec!["disable".to_string(), "enable".to_string()],
+                        namespace: Some("awscc.ec2.transit_gateway".to_string()),
+                        to_dsl: None,
+                    },
+                )
+                .with_description("(read-only)")
+                .with_provider_name("EncryptionSupportState"),
             )
             .attribute(
-                AttributeSchema::new("id", AttributeType::String)
+                AttributeSchema::new("id", super::transit_gateway_id())
                     .with_description("(read-only)")
                     .with_provider_name("Id"),
             )
@@ -200,6 +210,7 @@ pub fn enum_valid_values() -> (
             ),
             ("dns_support", VALID_DNS_SUPPORT),
             ("encryption_support", VALID_ENCRYPTION_SUPPORT),
+            ("encryption_support_state", VALID_ENCRYPTION_SUPPORT_STATE),
             ("multicast_support", VALID_MULTICAST_SUPPORT),
             (
                 "security_group_referencing_support",

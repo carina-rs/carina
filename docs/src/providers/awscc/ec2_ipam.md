@@ -122,7 +122,7 @@ Shorthand formats: `free` or `Tier.free`
 
 ### `ipam_id`
 
-- **Type:** String
+- **Type:** IpamId
 
 ### `private_default_scope_id`
 

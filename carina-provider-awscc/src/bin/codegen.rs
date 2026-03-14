@@ -386,6 +386,15 @@ fn override_type_to_display_name(override_type: &str) -> &str {
         "super::prefix_list_id()" => "PrefixListId",
         "super::carrier_gateway_id()" => "CarrierGatewayId",
         "super::local_gateway_id()" => "LocalGatewayId",
+        "super::egress_only_internet_gateway_id()" => "EgressOnlyInternetGatewayId",
+        "super::transit_gateway_id()" => "TransitGatewayId",
+        "super::vpc_peering_connection_id()" => "VpcPeeringConnectionId",
+        "super::vpc_endpoint_id()" => "VpcEndpointId",
+        "super::transit_gateway_attachment_id()" => "TransitGatewayAttachmentId",
+        "super::flow_log_id()" => "FlowLogId",
+        "super::subnet_route_table_association_id()" => "SubnetRouteTableAssociationId",
+        "super::ipam_id()" => "IpamId",
+        "super::iam_role_id()" => "IamRoleId",
         _ => "String",
     }
 }
@@ -1581,6 +1590,7 @@ fn known_enum_overrides() -> &'static HashMap<&'static str, Vec<&'static str>> {
         m.insert("MulticastSupport", vec!["enable", "disable"]);
         m.insert("SecurityGroupReferencingSupport", vec!["enable", "disable"]);
         m.insert("VpnEcmpSupport", vec!["enable", "disable"]);
+        m.insert("EncryptionSupportState", vec!["disable", "enable"]);
         m
     });
     &OVERRIDES
@@ -1630,6 +1640,7 @@ fn known_string_type_overrides() -> &'static HashMap<&'static str, &'static str>
         m.insert("KMSMasterKeyID", "super::kms_key_id()");
         m.insert("ReplicaKmsKeyID", "super::kms_key_id()");
         m.insert("KmsKeyArn", "super::kms_key_arn()");
+        m.insert("IpamId", "super::ipam_id()");
         m
     });
     &OVERRIDES
@@ -1645,8 +1656,37 @@ fn resource_specific_type_overrides() -> &'static HashMap<(&'static str, &'stati
             let mut m = HashMap::new();
             // IAM Role's Arn is always an IAM Role ARN
             m.insert(("AWS::IAM::Role", "Arn"), "super::iam_role_arn()");
+            // IAM Role's RoleId uses AROA prefix pattern
+            m.insert(("AWS::IAM::Role", "RoleId"), "super::iam_role_id()");
             // EC2 Route's GatewayId accepts both igw-* and vgw-*
             m.insert(("AWS::EC2::Route", "GatewayId"), "super::gateway_id()");
+            // Generic "Id" attributes on resources where the specific ID type is known
+            m.insert(
+                ("AWS::EC2::EgressOnlyInternetGateway", "Id"),
+                "super::egress_only_internet_gateway_id()",
+            );
+            m.insert(
+                ("AWS::EC2::TransitGateway", "Id"),
+                "super::transit_gateway_id()",
+            );
+            m.insert(
+                ("AWS::EC2::VPCPeeringConnection", "Id"),
+                "super::vpc_peering_connection_id()",
+            );
+            m.insert(("AWS::EC2::VPCEndpoint", "Id"), "super::vpc_endpoint_id()");
+            m.insert(
+                ("AWS::EC2::SecurityGroup", "Id"),
+                "super::security_group_id()",
+            );
+            m.insert(
+                ("AWS::EC2::TransitGatewayAttachment", "Id"),
+                "super::transit_gateway_attachment_id()",
+            );
+            m.insert(("AWS::EC2::FlowLog", "Id"), "super::flow_log_id()");
+            m.insert(
+                ("AWS::EC2::SubnetRouteTableAssociation", "Id"),
+                "super::subnet_route_table_association_id()",
+            );
             m
         });
     &OVERRIDES

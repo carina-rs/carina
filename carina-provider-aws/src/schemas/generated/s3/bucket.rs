@@ -15,6 +15,8 @@ const VALID_ACL: &[&str] = &[
     "public-read-write",
 ];
 
+const VALID_BUCKET_NAMESPACE: &[&str] = &["account-regional", "global"];
+
 const VALID_OBJECT_OWNERSHIP: &[&str] = &[
     "BucketOwnerEnforced",
     "BucketOwnerPreferred",
@@ -46,6 +48,17 @@ pub fn s3_bucket_config() -> AwsSchemaConfig {
                 .create_only()
                 .with_description("The name of the bucket to create. General purpose buckets - For information about bucket naming restrictions, see Bucket naming rules in the Amazon S3...")
                 .with_provider_name("Bucket"),
+        )
+        .attribute(
+            AttributeSchema::new("bucket_namespace", AttributeType::StringEnum {
+                name: "BucketNamespace".to_string(),
+                values: vec!["account-regional".to_string(), "global".to_string()],
+                namespace: Some("aws.s3.bucket".to_string()),
+                to_dsl: Some(|s: &str| s.replace('-', "_")),
+            })
+                .create_only()
+                .with_description("Specifies the namespace where you want to create your general purpose bucket. When you create a general purpose bucket, you can choose to create a buc...")
+                .with_provider_name("BucketNamespace"),
         )
         .attribute(
             AttributeSchema::new("grant_full_control", AttributeType::String)
@@ -114,6 +127,7 @@ pub fn enum_valid_values() -> (
         "s3.bucket",
         &[
             ("acl", VALID_ACL),
+            ("bucket_namespace", VALID_BUCKET_NAMESPACE),
             ("object_ownership", VALID_OBJECT_OWNERSHIP),
             ("versioning_status", VALID_VERSIONING_STATUS),
         ],

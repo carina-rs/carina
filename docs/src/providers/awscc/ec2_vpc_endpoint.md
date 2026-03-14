@@ -194,7 +194,7 @@ Shorthand formats: `Interface` or `VpcEndpointType.Interface`
 
 ### `id`
 
-- **Type:** String
+- **Type:** VpcEndpointId
 
 ### `network_interface_ids`
 

@@ -103,13 +103,19 @@ pub fn validate_aws_resource_id(id: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Validate a resource ID with a specific prefix (e.g., "vpc", "subnet").
+/// Validate a resource ID with a specific prefix (e.g., "vpc", "subnet", "tgw-attach").
 pub fn validate_prefixed_resource_id(id: &str, expected_prefix: &str) -> Result<(), String> {
     let expected_format = format!("{}-xxxxxxxx", expected_prefix);
-    if !id.starts_with(&format!("{}-", expected_prefix)) {
+    let Some(hex_part) = id.strip_prefix(&format!("{}-", expected_prefix)) else {
         return Err(format!("expected format '{}'", expected_format));
+    };
+    if hex_part.len() < 8 {
+        return Err("ID part must be at least 8 characters after prefix".to_string());
     }
-    validate_aws_resource_id(id)
+    if !hex_part.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err("ID part must contain only hex digits".to_string());
+    }
+    Ok(())
 }
 
 /// AWS resource ID type (e.g., "vpc-1a2b3c4d", "subnet-0123456789abcdef0")
@@ -458,6 +464,133 @@ pub fn network_acl_id() -> AttributeType {
             if let Value::String(s) = value {
                 validate_prefixed_resource_id(s, "acl")
                     .map_err(|reason| format!("Invalid Network ACL ID '{}': {}", s, reason))
+            } else {
+                Err("Expected string".to_string())
+            }
+        },
+        namespace: None,
+        to_dsl: None,
+    }
+}
+
+/// Transit Gateway Attachment ID type (e.g., "tgw-attach-0123456789abcdef0")
+pub fn transit_gateway_attachment_id() -> AttributeType {
+    AttributeType::Custom {
+        name: "TransitGatewayAttachmentId".to_string(),
+        base: Box::new(AttributeType::String),
+        validate: |value| {
+            if let Value::String(s) = value {
+                validate_prefixed_resource_id(s, "tgw-attach").map_err(|reason| {
+                    format!("Invalid Transit Gateway Attachment ID '{}': {}", s, reason)
+                })
+            } else {
+                Err("Expected string".to_string())
+            }
+        },
+        namespace: None,
+        to_dsl: None,
+    }
+}
+
+/// Flow Log ID type (e.g., "fl-0123456789abcdef0")
+pub fn flow_log_id() -> AttributeType {
+    AttributeType::Custom {
+        name: "FlowLogId".to_string(),
+        base: Box::new(AttributeType::String),
+        validate: |value| {
+            if let Value::String(s) = value {
+                validate_prefixed_resource_id(s, "fl")
+                    .map_err(|reason| format!("Invalid Flow Log ID '{}': {}", s, reason))
+            } else {
+                Err("Expected string".to_string())
+            }
+        },
+        namespace: None,
+        to_dsl: None,
+    }
+}
+
+/// IPAM ID type (e.g., "ipam-0123456789abcdef0")
+pub fn ipam_id() -> AttributeType {
+    AttributeType::Custom {
+        name: "IpamId".to_string(),
+        base: Box::new(AttributeType::String),
+        validate: |value| {
+            if let Value::String(s) = value {
+                validate_prefixed_resource_id(s, "ipam")
+                    .map_err(|reason| format!("Invalid IPAM ID '{}': {}", s, reason))
+            } else {
+                Err("Expected string".to_string())
+            }
+        },
+        namespace: None,
+        to_dsl: None,
+    }
+}
+
+/// Subnet Route Table Association ID type (e.g., "rtbassoc-0123456789abcdef0")
+pub fn subnet_route_table_association_id() -> AttributeType {
+    AttributeType::Custom {
+        name: "SubnetRouteTableAssociationId".to_string(),
+        base: Box::new(AttributeType::String),
+        validate: |value| {
+            if let Value::String(s) = value {
+                validate_prefixed_resource_id(s, "rtbassoc").map_err(|reason| {
+                    format!(
+                        "Invalid Subnet Route Table Association ID '{}': {}",
+                        s, reason
+                    )
+                })
+            } else {
+                Err("Expected string".to_string())
+            }
+        },
+        namespace: None,
+        to_dsl: None,
+    }
+}
+
+/// Security Group Rule ID type (e.g., "sgr-0123456789abcdef0")
+pub fn security_group_rule_id() -> AttributeType {
+    AttributeType::Custom {
+        name: "SecurityGroupRuleId".to_string(),
+        base: Box::new(AttributeType::String),
+        validate: |value| {
+            if let Value::String(s) = value {
+                validate_prefixed_resource_id(s, "sgr")
+                    .map_err(|reason| format!("Invalid Security Group Rule ID '{}': {}", s, reason))
+            } else {
+                Err("Expected string".to_string())
+            }
+        },
+        namespace: None,
+        to_dsl: None,
+    }
+}
+
+/// Validate IAM Role ID format: starts with "AROA" followed by alphanumeric characters.
+pub fn validate_iam_role_id(id: &str) -> Result<(), String> {
+    let Some(rest) = id.strip_prefix("AROA") else {
+        return Err("must start with 'AROA'".to_string());
+    };
+    if rest.is_empty() {
+        return Err("must have characters after 'AROA' prefix".to_string());
+    }
+    if !rest.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return Err("characters after prefix must be alphanumeric".to_string());
+    }
+    Ok(())
+}
+
+/// IAM Role ID type (e.g., "AROAEXAMPLEID")
+pub fn iam_role_id() -> AttributeType {
+    AttributeType::Custom {
+        name: "IamRoleId".to_string(),
+        base: Box::new(AttributeType::String),
+        validate: |value| {
+            if let Value::String(s) = value {
+                validate_iam_role_id(s)
+                    .map_err(|reason| format!("Invalid IAM Role ID '{}': {}", s, reason))
             } else {
                 Err("Expected string".to_string())
             }
@@ -1210,5 +1343,68 @@ mod tests {
             .collect(),
         );
         assert!(t.validate(&valid_doc).is_ok());
+    }
+
+    #[test]
+    fn transit_gateway_attachment_id_valid() {
+        assert!(
+            validate_prefixed_resource_id("tgw-attach-0123456789abcdef0", "tgw-attach").is_ok()
+        );
+    }
+
+    #[test]
+    fn transit_gateway_attachment_id_invalid() {
+        assert!(validate_prefixed_resource_id("tgw-0123456789abcdef0", "tgw-attach").is_err());
+    }
+
+    #[test]
+    fn flow_log_id_valid() {
+        assert!(validate_prefixed_resource_id("fl-0123456789abcdef0", "fl").is_ok());
+    }
+
+    #[test]
+    fn flow_log_id_invalid() {
+        assert!(validate_prefixed_resource_id("fl-xyz", "fl").is_err());
+    }
+
+    #[test]
+    fn ipam_id_valid() {
+        assert!(validate_prefixed_resource_id("ipam-0123456789abcdef0", "ipam").is_ok());
+    }
+
+    #[test]
+    fn ipam_id_invalid() {
+        assert!(validate_prefixed_resource_id("ipam-pool-0123456789abcdef0", "ipam").is_err());
+    }
+
+    #[test]
+    fn subnet_route_table_association_id_valid() {
+        assert!(validate_prefixed_resource_id("rtbassoc-0123456789abcdef0", "rtbassoc").is_ok());
+    }
+
+    #[test]
+    fn security_group_rule_id_valid() {
+        assert!(validate_prefixed_resource_id("sgr-0123456789abcdef0", "sgr").is_ok());
+    }
+
+    #[test]
+    fn security_group_rule_id_invalid() {
+        assert!(validate_prefixed_resource_id("sg-0123456789abcdef0", "sgr").is_err());
+    }
+
+    #[test]
+    fn iam_role_id_valid() {
+        assert!(validate_iam_role_id("AROAEXAMPLEID123").is_ok());
+        assert!(validate_iam_role_id("AROA1234567890ABCDEF").is_ok());
+    }
+
+    #[test]
+    fn iam_role_id_invalid_prefix() {
+        assert!(validate_iam_role_id("AIDA1234567890ABCDEF").is_err());
+    }
+
+    #[test]
+    fn iam_role_id_invalid_empty_after_prefix() {
+        assert!(validate_iam_role_id("AROA").is_err());
     }
 }

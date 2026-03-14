@@ -87,6 +87,6 @@ A list of tags that are attached to the role. For more information about tagging
 
 ### `role_id`
 
-- **Type:** String
+- **Type:** IamRoleId
 
 

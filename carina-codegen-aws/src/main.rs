@@ -2346,6 +2346,7 @@ fn type_code_to_display(type_code: &str) -> String {
         s if s.contains("kms_key_id") => "KmsKeyId".to_string(),
         s if s.contains("vpc_id") => "VpcId".to_string(),
         s if s.contains("subnet_id") => "SubnetId".to_string(),
+        s if s.contains("security_group_rule_id") => "SecurityGroupRuleId".to_string(),
         s if s.contains("security_group_id") => "SecurityGroupId".to_string(),
         s if s.contains("ipam_pool_id") => "IpamPoolId".to_string(),
         s if s.contains("instance_id") => "InstanceId".to_string(),
@@ -2410,6 +2411,7 @@ fn known_string_type_overrides() -> &'static HashMap<&'static str, &'static str>
         m.insert("KMSMasterKeyID", "super::kms_key_id()");
         m.insert("ReplicaKmsKeyID", "super::kms_key_id()");
         m.insert("KmsKeyArn", "super::kms_key_arn()");
+        m.insert("SecurityGroupRuleId", "super::security_group_rule_id()");
         m
     });
     &OVERRIDES
