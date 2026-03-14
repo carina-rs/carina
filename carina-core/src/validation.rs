@@ -136,10 +136,9 @@ pub fn validate_resource_ref_types(
 /// Check if an AttributeType is string-compatible (can accept a string value).
 pub fn is_string_compatible_type(attr_type: &AttributeType) -> bool {
     match attr_type {
-        AttributeType::String
-        | AttributeType::Custom { .. }
-        | AttributeType::Enum(_)
-        | AttributeType::StringEnum { .. } => true,
+        AttributeType::String | AttributeType::Custom { .. } | AttributeType::StringEnum { .. } => {
+            true
+        }
         AttributeType::Union(types) => types.iter().all(is_string_compatible_type),
         _ => false,
     }

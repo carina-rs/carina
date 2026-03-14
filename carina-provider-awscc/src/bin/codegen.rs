@@ -4231,11 +4231,6 @@ mod tests {
 
         let generated = generate_schema_code(&schema, "AWS::EC2::TestResource").unwrap();
 
-        // The struct field's enum should be StringEnum, not Enum
-        assert!(
-            !generated.contains("AttributeType::Enum("),
-            "struct field enums must use StringEnum, not Enum: {generated}"
-        );
         assert!(
             generated.contains("AttributeType::StringEnum {"),
             "struct field enums should be emitted as StringEnum: {generated}"
