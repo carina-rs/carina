@@ -856,13 +856,20 @@ fn collect_struct_defs(
         if let Some(props) = &def.properties
             && !props.is_empty()
         {
-            struct_defs
-                .entry(def_name.to_string())
-                .or_insert_with(|| StructDefInfo {
-                    def_name: def_name.to_string(),
-                    properties: props.clone(),
-                    required: def.required.clone(),
-                });
+            if !struct_defs.contains_key(def_name) {
+                struct_defs.insert(
+                    def_name.to_string(),
+                    StructDefInfo {
+                        def_name: def_name.to_string(),
+                        properties: props.clone(),
+                        required: def.required.clone(),
+                    },
+                );
+                // Recursively collect nested struct defs
+                for (field_name, field_prop) in props {
+                    collect_struct_defs(field_prop, field_name, schema, struct_defs);
+                }
+            }
         } else if !def.one_of.is_empty() {
             // Merge oneOf variant properties into a single struct
             let mut merged_props = BTreeMap::new();
@@ -873,18 +880,19 @@ fn collect_struct_defs(
                     }
                 }
             }
-            if !merged_props.is_empty() {
+            if !merged_props.is_empty() && !struct_defs.contains_key(def_name) {
+                struct_defs.insert(
+                    def_name.to_string(),
+                    StructDefInfo {
+                        def_name: def_name.to_string(),
+                        properties: merged_props.clone(),
+                        required: vec![], // oneOf variants are mutually exclusive
+                    },
+                );
                 // Recursively collect struct defs from merged properties
                 for (field_name, field_prop) in &merged_props {
                     collect_struct_defs(field_prop, field_name, schema, struct_defs);
                 }
-                struct_defs
-                    .entry(def_name.to_string())
-                    .or_insert_with(|| StructDefInfo {
-                        def_name: def_name.to_string(),
-                        properties: merged_props,
-                        required: vec![], // oneOf variants are mutually exclusive
-                    });
             }
         }
     }
@@ -896,28 +904,40 @@ fn collect_struct_defs(
         && let Some(def) = resolve_ref(schema, ref_path)
         && let Some(props) = &def.properties
         && !props.is_empty()
+        && !struct_defs.contains_key(def_name)
     {
-        struct_defs
-            .entry(def_name.to_string())
-            .or_insert_with(|| StructDefInfo {
+        struct_defs.insert(
+            def_name.to_string(),
+            StructDefInfo {
                 def_name: def_name.to_string(),
                 properties: props.clone(),
                 required: def.required.clone(),
-            });
+            },
+        );
+        // Recursively collect nested struct defs
+        for (field_name, field_prop) in props {
+            collect_struct_defs(field_prop, field_name, schema, struct_defs);
+        }
     }
     // Handle inline object with properties
     if let Some(type_val) = &prop.prop_type
         && type_val.as_str() == Some("object")
         && let Some(props) = &prop.properties
         && !props.is_empty()
+        && !struct_defs.contains_key(prop_name)
     {
-        struct_defs
-            .entry(prop_name.to_string())
-            .or_insert_with(|| StructDefInfo {
+        struct_defs.insert(
+            prop_name.to_string(),
+            StructDefInfo {
                 def_name: prop_name.to_string(),
                 properties: props.clone(),
                 required: prop.required.clone(),
-            });
+            },
+        );
+        // Recursively collect nested struct defs
+        for (field_name, field_prop) in props {
+            collect_struct_defs(field_prop, field_name, schema, struct_defs);
+        }
     }
 }
 
