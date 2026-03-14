@@ -51,6 +51,7 @@ pub const VALID_REGIONS: &[&str] = &[
     "af-south-1",
     // Asia Pacific
     "ap-east-1",
+    "ap-east-2",
     "ap-northeast-1",
     "ap-northeast-2",
     "ap-northeast-3",
@@ -61,6 +62,7 @@ pub const VALID_REGIONS: &[&str] = &[
     "ap-southeast-3",
     "ap-southeast-4",
     "ap-southeast-5",
+    "ap-southeast-6",
     "ap-southeast-7",
     // Canada
     "ca-central-1",
@@ -1171,6 +1173,7 @@ mod tests {
 
     #[test]
     fn validate_availability_zone_invalid() {
+        assert!(validate_availability_zone("us-east-1").is_err()); // region, not AZ
         assert!(validate_availability_zone("a").is_err()); // too short
         assert!(validate_availability_zone("invalid").is_err()); // no numeric part
         assert!(validate_availability_zone("us-east").is_err()); // no numeric part
