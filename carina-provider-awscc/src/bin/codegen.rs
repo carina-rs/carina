@@ -158,6 +158,9 @@ struct CfnProperty {
     /// Whether additional properties are allowed (for object types)
     #[serde(default)]
     additional_properties: Option<bool>,
+    /// Const value (single fixed value for this property)
+    #[serde(rename = "const")]
+    const_value: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -183,6 +186,9 @@ struct CfnDefinition {
     one_of: Vec<CfnOneOfVariant>,
     /// Array item schema (for array-typed definitions)
     items: Option<Box<CfnProperty>>,
+    /// Enum values (for enum-only definitions)
+    #[serde(rename = "enum")]
+    enum_values: Option<Vec<EnumValue>>,
 }
 
 /// Compute module name from CloudFormation type name
@@ -422,12 +428,30 @@ fn type_display_string(
     enums: &BTreeMap<String, EnumInfo>,
 ) -> String {
     if enums.contains_key(prop_name) {
-        format!(
+        let enum_link = format!(
             "[Enum ({})](#{}-{})",
             enums[prop_name].type_name,
             prop_name.to_snake_case(),
             enums[prop_name].type_name.to_lowercase()
-        )
+        );
+        // Check if property is an array type — if so, wrap as List<Enum>
+        let is_array = prop
+            .prop_type
+            .as_ref()
+            .and_then(|t| t.as_str())
+            .map(|t| t == "array")
+            .unwrap_or(false);
+        let is_ref_array = prop
+            .ref_path
+            .as_ref()
+            .and_then(|ref_path| resolve_ref(schema, ref_path))
+            .map(|def| def.def_type.as_deref() == Some("array"))
+            .unwrap_or(false);
+        if is_array || is_ref_array {
+            format!("List\\<{}\\>", enum_link)
+        } else {
+            enum_link
+        }
     } else if prop_name == "Tags" {
         "Map".to_string()
     } else if let Some(ref_path) = &prop.ref_path {
@@ -513,6 +537,13 @@ fn type_display_string(
                                     .unwrap_or(false)
                             {
                                 format!("[List\\<{}\\>](#{})", def_name, def_name.to_lowercase())
+                            } else if enums.contains_key(prop_name) {
+                                format!(
+                                    "List\\<[Enum ({})](#{}-{})\\>",
+                                    enums[prop_name].type_name,
+                                    prop_name.to_snake_case(),
+                                    enums[prop_name].type_name.to_lowercase()
+                                )
                             } else {
                                 "`List<String>`".to_string()
                             }
@@ -1230,7 +1261,7 @@ pub fn {}() -> AwsccSchemaConfig {{
                 .map(|v| format!("\"{}\".to_string()", v))
                 .collect::<Vec<_>>()
                 .join(", ");
-            format!(
+            let enum_type = format!(
                 r#"AttributeType::StringEnum {{
                 name: "{}".to_string(),
                 values: vec![{}],
@@ -1238,7 +1269,26 @@ pub fn {}() -> AwsccSchemaConfig {{
                 to_dsl: {},
             }}"#,
                 enum_info.type_name, values_str, namespace, to_dsl_code
-            )
+            );
+            // Wrap in List if the property is an array type
+            let is_array = prop
+                .prop_type
+                .as_ref()
+                .and_then(|t| t.as_str())
+                .map(|t| t == "array")
+                .unwrap_or(false);
+            // Also check if the property is a $ref to an array-typed definition
+            let is_ref_array = prop
+                .ref_path
+                .as_ref()
+                .and_then(|ref_path| resolve_ref(schema, ref_path))
+                .map(|def| def.def_type.as_deref() == Some("array"))
+                .unwrap_or(false);
+            if is_array || is_ref_array {
+                format!("AttributeType::List(Box::new({}))", enum_type)
+            } else {
+                enum_type
+            }
         } else {
             let (attr_type, _) =
                 cfn_type_to_carina_type_with_enum(prop, prop_name, schema, &namespace, &enums);
@@ -1588,9 +1638,12 @@ fn generate_struct_type(
             // If enum detected in struct field and it's in the enums map, use shared string enum type.
             // Try composite key "DefName.FieldName" first (for definition-scoped enums),
             // then fall back to plain "FieldName" (for top-level property enums).
+            // Check if the original field type was a List (array)
+            let is_list_field = field_type.contains("AttributeType::List");
             let field_type = if let Some(local_enum_info) = enum_info {
                 let composite_key = format!("{}.{}", def_name, field_name);
-                if let Some(enum_info) = enums.get(&composite_key).or_else(|| enums.get(field_name))
+                let enum_type = if let Some(enum_info) =
+                    enums.get(&composite_key).or_else(|| enums.get(field_name))
                 {
                     let prop_aliases = aliases.get(field_name.as_str());
                     let has_hyphens = enum_info.values.iter().any(|v| v.contains('-'));
@@ -1668,6 +1721,12 @@ fn generate_struct_type(
             }}"#,
                         local_enum_info.type_name, values_str, namespace, to_dsl_code
                     )
+                };
+                // Wrap in List if the original field type was a List
+                if is_list_field {
+                    format!("AttributeType::List(Box::new({}))", enum_type)
+                } else {
+                    enum_type
                 }
             } else {
                 field_type
@@ -2208,6 +2267,20 @@ fn cfn_type_to_carina_type_with_enum(
         return ("tags_type()".to_string(), None);
     }
 
+    // Handle const values - generate single-value enum
+    if let Some(const_val) = &prop.const_value {
+        let value_str = match const_val {
+            serde_json::Value::String(s) => s.clone(),
+            other => other.to_string(),
+        };
+        let type_name = prop_name.to_pascal_case();
+        let enum_info = EnumInfo {
+            type_name,
+            values: vec![value_str],
+        };
+        return ("/* enum */".to_string(), Some(enum_info));
+    }
+
     // Handle $ref
     if let Some(ref_path) = &prop.ref_path {
         if ref_path.contains("/Tag") {
@@ -2250,14 +2323,29 @@ fn cfn_type_to_carina_type_with_enum(
                     );
                 }
             }
+            // Handle enum-only $ref definitions (no properties, just enum values)
+            if let Some(enum_values) = &def.enum_values
+                && !enum_values.is_empty()
+            {
+                let def_name = ref_def_name(ref_path).unwrap_or(prop_name);
+                let type_name = def_name.to_pascal_case();
+                let string_values: Vec<String> =
+                    enum_values.iter().map(|v| v.to_string_value()).collect();
+                let deduped =
+                    deduplicate_enum_values(string_values.clone()).unwrap_or(string_values);
+                let enum_info = EnumInfo {
+                    type_name,
+                    values: deduped,
+                };
+                return ("/* enum */".to_string(), Some(enum_info));
+            }
             // Handle array-typed $ref definitions (e.g., BlockedEncryptionTypeList)
             if def.def_type.as_deref() == Some("array")
                 && let Some(items) = &def.items
             {
                 let (item_type, item_enum) =
                     cfn_type_to_carina_type_with_enum(items, prop_name, schema, namespace, enums);
-                // Don't propagate item_enum — enum handling is for scalar
-                // fields, not list items. The list type wraps the item type.
+                // Propagate item_enum so callers can register the enum type.
                 let effective_item_type = if item_enum.is_some() {
                     "AttributeType::String".to_string()
                 } else {
@@ -2265,7 +2353,7 @@ fn cfn_type_to_carina_type_with_enum(
                 };
                 return (
                     format!("AttributeType::List(Box::new({}))", effective_item_type),
-                    None,
+                    item_enum,
                 );
             }
         }
@@ -2462,8 +2550,9 @@ fn cfn_type_to_carina_type_with_enum(
                 }
                 let (item_type, item_enum) =
                     cfn_type_to_carina_type_with_enum(items, prop_name, schema, namespace, enums);
-                // If array items are enum values, use String as the item type
-                // (enum validation happens at the attribute level, not item level)
+                // If array items have enum values, propagate the enum info so the
+                // caller can register it. The item type uses String as a placeholder;
+                // the actual enum type will be substituted when the enum is registered.
                 let effective_item_type = if item_enum.is_some() {
                     "AttributeType::String".to_string()
                 } else {
@@ -2471,7 +2560,7 @@ fn cfn_type_to_carina_type_with_enum(
                 };
                 (
                     format!("AttributeType::List(Box::new({}))", effective_item_type),
-                    None,
+                    item_enum,
                 )
             } else {
                 (
@@ -2768,6 +2857,7 @@ mod tests {
             minimum: None,
             maximum: None,
             additional_properties: None,
+            const_value: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::SecurityGroupIngress".to_string(),
@@ -2837,6 +2927,7 @@ mod tests {
             minimum: None,
             maximum: None,
             additional_properties: None,
+            const_value: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::SecurityGroupIngress".to_string(),
@@ -2873,6 +2964,7 @@ mod tests {
             minimum: None,
             maximum: None,
             additional_properties: None,
+            const_value: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::SecurityGroupIngress".to_string(),
@@ -2909,6 +3001,7 @@ mod tests {
             minimum: None,
             maximum: None,
             additional_properties: None,
+            const_value: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::NatGateway".to_string(),
@@ -2950,6 +3043,7 @@ mod tests {
             minimum: None,
             maximum: None,
             additional_properties: None,
+            const_value: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::EIP".to_string(),
@@ -2986,6 +3080,7 @@ mod tests {
             minimum: None,
             maximum: None,
             additional_properties: None,
+            const_value: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::NatGateway".to_string(),
@@ -3026,6 +3121,7 @@ mod tests {
             minimum: None,
             maximum: None,
             additional_properties: None,
+            const_value: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::Subnet".to_string(),
@@ -3117,6 +3213,7 @@ mod tests {
             minimum: None,
             maximum: None,
             additional_properties: None,
+            const_value: None,
         };
         assert_eq!(
             list_element_type_display(&prop, "GenericProp", ""),
@@ -3136,6 +3233,7 @@ mod tests {
             minimum: None,
             maximum: None,
             additional_properties: None,
+            const_value: None,
         };
         assert_eq!(
             list_element_type_display(&prop, "GenericProp", ""),
@@ -3155,6 +3253,7 @@ mod tests {
             minimum: None,
             maximum: None,
             additional_properties: None,
+            const_value: None,
         };
         assert_eq!(
             list_element_type_display(&prop, "GenericProp", ""),
@@ -3174,6 +3273,7 @@ mod tests {
             minimum: None,
             maximum: None,
             additional_properties: None,
+            const_value: None,
         };
         assert_eq!(
             list_element_type_display(&prop, "GenericProp", ""),
@@ -3195,6 +3295,7 @@ mod tests {
             minimum: None,
             maximum: None,
             additional_properties: None,
+            const_value: None,
         };
         assert_eq!(
             list_element_type_display(&prop, "SubnetIds", ""),
@@ -3257,6 +3358,7 @@ mod tests {
                 minimum: None,
                 maximum: None,
                 additional_properties: None,
+                const_value: None,
             })),
             ref_path: None,
             insertion_order: None,
@@ -3265,6 +3367,7 @@ mod tests {
             minimum: None,
             maximum: None,
             additional_properties: None,
+            const_value: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::VPC".to_string(),
@@ -3304,6 +3407,7 @@ mod tests {
                 minimum: None,
                 maximum: None,
                 additional_properties: None,
+                const_value: None,
             })),
             ref_path: None,
             insertion_order: None,
@@ -3312,6 +3416,7 @@ mod tests {
             minimum: None,
             maximum: None,
             additional_properties: None,
+            const_value: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::VPC".to_string(),
@@ -3347,6 +3452,7 @@ mod tests {
             minimum: None,
             maximum: None,
             additional_properties: None,
+            const_value: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::VPC".to_string(),
@@ -3393,6 +3499,7 @@ mod tests {
                 minimum: None,
                 maximum: None,
                 additional_properties: None,
+                const_value: None,
             };
             let result = list_element_type_display(&prop, "GenericProp", "");
             assert!(
@@ -3435,6 +3542,7 @@ mod tests {
             minimum: None,
             maximum: None,
             additional_properties: None,
+            const_value: None,
         };
         let result = type_display_string("Prop1", &prop, &schema, &enums);
         assert_ne!(
@@ -3459,6 +3567,7 @@ mod tests {
                 minimum: None,
                 maximum: None,
                 additional_properties: None,
+                const_value: None,
             })),
             ref_path: None,
             insertion_order: None,
@@ -3467,6 +3576,7 @@ mod tests {
             minimum: None,
             maximum: None,
             additional_properties: None,
+            const_value: None,
         };
         let result = type_display_string("Prop2", &prop, &schema, &enums);
         assert_ne!(
@@ -3491,6 +3601,7 @@ mod tests {
                 minimum: None,
                 maximum: None,
                 additional_properties: None,
+                const_value: None,
             })),
             ref_path: None,
             insertion_order: None,
@@ -3499,6 +3610,7 @@ mod tests {
             minimum: None,
             maximum: None,
             additional_properties: None,
+            const_value: None,
         };
         let result = type_display_string("Prop3", &prop, &schema, &enums);
         assert_ne!(
@@ -3523,6 +3635,7 @@ mod tests {
                 minimum: None,
                 maximum: None,
                 additional_properties: None,
+                const_value: None,
             })),
             ref_path: None,
             insertion_order: None,
@@ -3531,6 +3644,7 @@ mod tests {
             minimum: None,
             maximum: None,
             additional_properties: None,
+            const_value: None,
         };
         let result = type_display_string("Prop4", &prop, &schema, &enums);
         assert_ne!(
@@ -3553,6 +3667,7 @@ mod tests {
             minimum: Some(0),
             maximum: Some(32),
             additional_properties: None,
+            const_value: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::VPC".to_string(),
@@ -3604,6 +3719,7 @@ mod tests {
             minimum: None,
             maximum: None,
             additional_properties: None,
+            const_value: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::VPC".to_string(),
@@ -3637,6 +3753,7 @@ mod tests {
             minimum: Some(0),
             maximum: None,
             additional_properties: None,
+            const_value: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::VPC".to_string(),
@@ -3679,6 +3796,7 @@ mod tests {
             minimum: None,
             maximum: Some(100),
             additional_properties: None,
+            const_value: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::VPC".to_string(),
@@ -3727,6 +3845,7 @@ mod tests {
             minimum: None,
             maximum: None,
             additional_properties: None,
+            const_value: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::Logs::LogGroup".to_string(),
@@ -3778,6 +3897,7 @@ mod tests {
             minimum: Some(1),
             maximum: None,
             additional_properties: None,
+            const_value: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::NatGateway".to_string(),
@@ -3814,6 +3934,7 @@ mod tests {
             minimum: None,
             maximum: None,
             additional_properties: None,
+            const_value: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::Logs::LogGroup".to_string(),
@@ -3846,6 +3967,7 @@ mod tests {
             minimum: Some(0),
             maximum: Some(32),
             additional_properties: None,
+            const_value: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::VPC".to_string(),
@@ -3916,6 +4038,7 @@ mod tests {
             minimum: None,
             maximum: None,
             additional_properties: None,
+            const_value: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::VPC".to_string(),
@@ -3954,6 +4077,7 @@ mod tests {
             minimum: None,
             maximum: None,
             additional_properties: None,
+            const_value: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::SecurityGroupIngress".to_string(),
@@ -3991,6 +4115,7 @@ mod tests {
             minimum: None,
             maximum: None,
             additional_properties: None,
+            const_value: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::S3::Bucket".to_string(),
@@ -4041,6 +4166,7 @@ mod tests {
             minimum: Some(0),
             maximum: Some(65535),
             additional_properties: None,
+            const_value: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::SecurityGroupIngress".to_string(),
@@ -4659,6 +4785,7 @@ mod tests {
                 minimum: None,
                 maximum: None,
                 additional_properties: None,
+                const_value: None,
             },
         );
 
@@ -4716,6 +4843,7 @@ mod tests {
                 minimum: None,
                 maximum: None,
                 additional_properties: None,
+                const_value: None,
             },
         );
 
@@ -4728,6 +4856,7 @@ mod tests {
                 required: vec![],
                 one_of: vec![],
                 items: None,
+                enum_values: None,
             },
         );
 
@@ -4746,6 +4875,7 @@ mod tests {
                 minimum: None,
                 maximum: None,
                 additional_properties: None,
+                const_value: None,
             },
         );
 
@@ -4777,6 +4907,238 @@ mod tests {
         assert!(
             generated.contains("s.replace('-', \"_\")"),
             "hyphenated enum values should generate to_dsl: {generated}"
+        );
+    }
+
+    #[test]
+    fn test_const_value_generates_single_value_enum() {
+        let prop = CfnProperty {
+            const_value: Some(serde_json::Value::String("V_1".to_string())),
+            ..Default::default()
+        };
+        let schema = CfnSchema {
+            type_name: "AWS::S3::Bucket".to_string(),
+            description: None,
+            properties: BTreeMap::new(),
+            required: vec![],
+            read_only_properties: vec![],
+            create_only_properties: vec![],
+            write_only_properties: vec![],
+            primary_identifier: None,
+            definitions: None,
+            tagging: None,
+        };
+        let enums = BTreeMap::new();
+        let (_, enum_info) = cfn_type_to_carina_type_with_enum(
+            &prop,
+            "OutputSchemaVersion",
+            &schema,
+            "awscc.s3.bucket",
+            &enums,
+        );
+        assert!(enum_info.is_some(), "const value should produce enum info");
+        let info = enum_info.unwrap();
+        assert_eq!(info.values, vec!["V_1"]);
+        assert_eq!(info.type_name, "OutputSchemaVersion");
+    }
+
+    #[test]
+    fn test_array_items_enum_propagated() {
+        let prop = CfnProperty {
+            prop_type: Some(TypeValue::Single("array".to_string())),
+            items: Some(Box::new(CfnProperty {
+                prop_type: Some(TypeValue::Single("string".to_string())),
+                enum_values: Some(vec![
+                    EnumValue::Str("GET".to_string()),
+                    EnumValue::Str("PUT".to_string()),
+                    EnumValue::Str("HEAD".to_string()),
+                    EnumValue::Str("POST".to_string()),
+                    EnumValue::Str("DELETE".to_string()),
+                ]),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let schema = CfnSchema {
+            type_name: "AWS::S3::Bucket".to_string(),
+            description: None,
+            properties: BTreeMap::new(),
+            required: vec![],
+            read_only_properties: vec![],
+            create_only_properties: vec![],
+            write_only_properties: vec![],
+            primary_identifier: None,
+            definitions: None,
+            tagging: None,
+        };
+        let enums = BTreeMap::new();
+        let (type_str, enum_info) = cfn_type_to_carina_type_with_enum(
+            &prop,
+            "AllowedMethods",
+            &schema,
+            "awscc.s3.bucket",
+            &enums,
+        );
+        assert!(
+            type_str.contains("List"),
+            "array type should produce List: {type_str}"
+        );
+        assert!(
+            enum_info.is_some(),
+            "array item enum should be propagated back"
+        );
+        let info = enum_info.unwrap();
+        assert_eq!(info.values.len(), 5);
+        assert!(info.values.contains(&"GET".to_string()));
+    }
+
+    #[test]
+    fn test_ref_enum_only_definition_resolved() {
+        let mut definitions = BTreeMap::new();
+        definitions.insert(
+            "HttpMethod".to_string(),
+            CfnDefinition {
+                def_type: Some("string".to_string()),
+                properties: None,
+                required: vec![],
+                one_of: vec![],
+                items: None,
+                enum_values: Some(vec![
+                    EnumValue::Str("GET".to_string()),
+                    EnumValue::Str("POST".to_string()),
+                ]),
+            },
+        );
+        let prop = CfnProperty {
+            ref_path: Some("#/definitions/HttpMethod".to_string()),
+            ..Default::default()
+        };
+        let schema = CfnSchema {
+            type_name: "AWS::S3::Bucket".to_string(),
+            description: None,
+            properties: BTreeMap::new(),
+            required: vec![],
+            read_only_properties: vec![],
+            create_only_properties: vec![],
+            write_only_properties: vec![],
+            primary_identifier: None,
+            definitions: Some(definitions),
+            tagging: None,
+        };
+        let enums = BTreeMap::new();
+        let (_, enum_info) = cfn_type_to_carina_type_with_enum(
+            &prop,
+            "HttpMethod",
+            &schema,
+            "awscc.s3.bucket",
+            &enums,
+        );
+        assert!(
+            enum_info.is_some(),
+            "enum-only $ref definition should produce enum info"
+        );
+        let info = enum_info.unwrap();
+        assert_eq!(info.values, vec!["GET", "POST"]);
+        assert_eq!(info.type_name, "HttpMethod");
+    }
+
+    #[test]
+    fn test_ref_array_with_enum_items_definition() {
+        // Test a $ref to an array-typed definition where items have enum values
+        // (e.g., BlockedEncryptionTypeList)
+        let mut definitions = BTreeMap::new();
+        definitions.insert(
+            "BlockedEncryptionTypeList".to_string(),
+            CfnDefinition {
+                def_type: Some("array".to_string()),
+                properties: None,
+                required: vec![],
+                one_of: vec![],
+                items: Some(Box::new(CfnProperty {
+                    prop_type: Some(TypeValue::Single("string".to_string())),
+                    enum_values: Some(vec![
+                        EnumValue::Str("NONE".to_string()),
+                        EnumValue::Str("SSE-C".to_string()),
+                    ]),
+                    ..Default::default()
+                })),
+                enum_values: None,
+            },
+        );
+        let prop = CfnProperty {
+            ref_path: Some("#/definitions/BlockedEncryptionTypeList".to_string()),
+            ..Default::default()
+        };
+        let schema = CfnSchema {
+            type_name: "AWS::S3::Bucket".to_string(),
+            description: None,
+            properties: BTreeMap::new(),
+            required: vec![],
+            read_only_properties: vec![],
+            create_only_properties: vec![],
+            write_only_properties: vec![],
+            primary_identifier: None,
+            definitions: Some(definitions),
+            tagging: None,
+        };
+        let enums = BTreeMap::new();
+        let (type_str, enum_info) = cfn_type_to_carina_type_with_enum(
+            &prop,
+            "BlockedEncryptionTypes",
+            &schema,
+            "awscc.s3.bucket",
+            &enums,
+        );
+        assert!(
+            type_str.contains("List"),
+            "should produce List type: {type_str}"
+        );
+        assert!(
+            enum_info.is_some(),
+            "array item enum should be propagated from $ref definition"
+        );
+        let info = enum_info.unwrap();
+        assert_eq!(info.values.len(), 2);
+        assert!(info.values.contains(&"NONE".to_string()));
+        assert!(info.values.contains(&"SSE-C".to_string()));
+    }
+
+    #[test]
+    fn test_list_enum_generates_list_of_string_enum_in_schema_code() {
+        // Ensure that when an array property has enum items, the generated
+        // schema code wraps the StringEnum in List
+        let mut properties = BTreeMap::new();
+        properties.insert(
+            "AllowedMethods".to_string(),
+            CfnProperty {
+                prop_type: Some(TypeValue::Single("array".to_string())),
+                items: Some(Box::new(CfnProperty {
+                    prop_type: Some(TypeValue::Single("string".to_string())),
+                    enum_values: Some(vec![
+                        EnumValue::Str("GET".to_string()),
+                        EnumValue::Str("PUT".to_string()),
+                    ]),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            },
+        );
+        let schema = CfnSchema {
+            type_name: "AWS::S3::Bucket".to_string(),
+            description: None,
+            properties,
+            required: vec![],
+            read_only_properties: vec![],
+            create_only_properties: vec![],
+            write_only_properties: vec![],
+            primary_identifier: None,
+            definitions: None,
+            tagging: None,
+        };
+        let generated = generate_schema_code(&schema, "AWS::S3::Bucket").unwrap();
+        assert!(
+            generated.contains("AttributeType::List(Box::new(AttributeType::StringEnum"),
+            "array with enum items should generate List(StringEnum): {generated}"
         );
     }
 }
