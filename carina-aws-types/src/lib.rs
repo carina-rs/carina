@@ -5,7 +5,7 @@
 //! schema config structs) remain in their respective crates.
 
 use carina_core::resource::Value;
-use carina_core::schema::{AttributeType, StructField};
+use carina_core::schema::{AttributeType, CompletionValue, StructField};
 
 // ========== Enum helpers ==========
 
@@ -45,57 +45,85 @@ pub fn canonicalize_enum_value(raw: &str, valid_values: &[&str]) -> String {
 
 // ========== Region constants ==========
 
-/// Valid AWS regions (in AWS format with hyphens)
-pub const VALID_REGIONS: &[&str] = &[
+/// AWS regions with display names. Single source of truth for validation and completions.
+pub const REGIONS: &[(&str, &str)] = &[
     // Africa
-    "af-south-1",
+    ("af-south-1", "Africa (Cape Town)"),
     // Asia Pacific
-    "ap-east-1",
-    "ap-east-2",
-    "ap-northeast-1",
-    "ap-northeast-2",
-    "ap-northeast-3",
-    "ap-south-1",
-    "ap-south-2",
-    "ap-southeast-1",
-    "ap-southeast-2",
-    "ap-southeast-3",
-    "ap-southeast-4",
-    "ap-southeast-5",
-    "ap-southeast-6",
-    "ap-southeast-7",
+    ("ap-east-1", "Asia Pacific (Hong Kong)"),
+    ("ap-east-2", "Asia Pacific (Malaysia)"),
+    ("ap-northeast-1", "Asia Pacific (Tokyo)"),
+    ("ap-northeast-2", "Asia Pacific (Seoul)"),
+    ("ap-northeast-3", "Asia Pacific (Osaka)"),
+    ("ap-south-1", "Asia Pacific (Mumbai)"),
+    ("ap-south-2", "Asia Pacific (Hyderabad)"),
+    ("ap-southeast-1", "Asia Pacific (Singapore)"),
+    ("ap-southeast-2", "Asia Pacific (Sydney)"),
+    ("ap-southeast-3", "Asia Pacific (Jakarta)"),
+    ("ap-southeast-4", "Asia Pacific (Melbourne)"),
+    ("ap-southeast-5", "Asia Pacific (Auckland)"),
+    ("ap-southeast-6", "Asia Pacific (Thailand)"),
+    ("ap-southeast-7", "Asia Pacific (Taiwan)"),
     // Canada
-    "ca-central-1",
-    "ca-west-1",
+    ("ca-central-1", "Canada (Central)"),
+    ("ca-west-1", "Canada West (Calgary)"),
     // China
-    "cn-north-1",
-    "cn-northwest-1",
+    ("cn-north-1", "China (Beijing)"),
+    ("cn-northwest-1", "China (Ningxia)"),
     // Europe
-    "eu-central-1",
-    "eu-central-2",
-    "eu-north-1",
-    "eu-south-1",
-    "eu-south-2",
-    "eu-west-1",
-    "eu-west-2",
-    "eu-west-3",
+    ("eu-central-1", "Europe (Frankfurt)"),
+    ("eu-central-2", "Europe (Zurich)"),
+    ("eu-north-1", "Europe (Stockholm)"),
+    ("eu-south-1", "Europe (Milan)"),
+    ("eu-south-2", "Europe (Spain)"),
+    ("eu-west-1", "Europe (Ireland)"),
+    ("eu-west-2", "Europe (London)"),
+    ("eu-west-3", "Europe (Paris)"),
     // Israel
-    "il-central-1",
+    ("il-central-1", "Israel (Tel Aviv)"),
     // Middle East
-    "me-central-1",
-    "me-south-1",
+    ("me-central-1", "Middle East (UAE)"),
+    ("me-south-1", "Middle East (Bahrain)"),
     // Mexico
-    "mx-central-1",
+    ("mx-central-1", "Mexico (Central)"),
     // South America
-    "sa-east-1",
+    ("sa-east-1", "South America (Sao Paulo)"),
     // US
-    "us-east-1",
-    "us-east-2",
-    "us-gov-east-1",
-    "us-gov-west-1",
-    "us-west-1",
-    "us-west-2",
+    ("us-east-1", "US East (N. Virginia)"),
+    ("us-east-2", "US East (Ohio)"),
+    ("us-gov-east-1", "AWS GovCloud (US-East)"),
+    ("us-gov-west-1", "AWS GovCloud (US-West)"),
+    ("us-west-1", "US West (N. California)"),
+    ("us-west-2", "US West (Oregon)"),
 ];
+
+/// Check if a region code is valid.
+pub fn is_valid_region(region: &str) -> bool {
+    REGIONS.iter().any(|(code, _)| *code == region)
+}
+
+/// Format valid region codes as a comma-separated string for error messages.
+pub fn valid_regions_display() -> String {
+    REGIONS
+        .iter()
+        .map(|(code, _)| *code)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Generate region completion values for a given provider prefix (e.g., "aws" or "awscc").
+///
+/// Converts AWS region format (`ap-northeast-1`) to DSL format (`ap_northeast_1`)
+/// and prefixes with `{prefix}.Region.`.
+pub fn region_completions(prefix: &str) -> Vec<CompletionValue> {
+    REGIONS
+        .iter()
+        .map(|(code, name)| {
+            let dsl_code = code.replace('-', "_");
+            CompletionValue::new(format!("{}.Region.{}", prefix, dsl_code), *name)
+        })
+        .collect()
+}
 
 // ========== Tags ==========
 
@@ -1469,5 +1497,29 @@ mod tests {
     #[test]
     fn iam_role_id_invalid_empty_after_prefix() {
         assert!(validate_iam_role_id("AROA").is_err());
+    }
+
+    // Region completion tests
+
+    #[test]
+    fn region_completions_generates_dsl_format() {
+        let completions = region_completions("aws");
+        assert_eq!(completions.len(), REGIONS.len());
+        // Spot-check a few entries
+        assert_eq!(completions[0].value, "aws.Region.af_south_1");
+        assert_eq!(completions[0].description, "Africa (Cape Town)");
+        let tokyo = completions
+            .iter()
+            .find(|c| c.value.contains("ap_northeast_1"))
+            .unwrap();
+        assert_eq!(tokyo.description, "Asia Pacific (Tokyo)");
+    }
+
+    #[test]
+    fn region_completions_uses_provider_prefix() {
+        let aws = region_completions("aws");
+        let awscc = region_completions("awscc");
+        assert!(aws[0].value.starts_with("aws.Region."));
+        assert!(awscc[0].value.starts_with("awscc.Region."));
     }
 }
