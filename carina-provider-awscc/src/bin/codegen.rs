@@ -461,25 +461,43 @@ fn type_display_string(
             }
             Some("boolean") => "Bool".to_string(),
             Some("integer") => {
-                let range = if let (Some(min), Some(max)) = (prop.minimum, prop.maximum) {
-                    Some((min, max))
-                } else {
-                    known_int_range_overrides().get(prop_name).copied()
-                };
+                // Check for integer enum values first
+                if let Some(enum_values) = &prop.enum_values {
+                    let all_ints = enum_values.iter().all(|v| matches!(v, EnumValue::Int(_)));
+                    if all_ints && !enum_values.is_empty() {
+                        let values_str = enum_values
+                            .iter()
+                            .map(|v| v.to_string_value())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        return format!("IntEnum([{}])", values_str);
+                    }
+                }
+                let range: Option<(Option<i64>, Option<i64>)> =
+                    if prop.minimum.is_some() || prop.maximum.is_some() {
+                        Some((prop.minimum, prop.maximum))
+                    } else {
+                        known_int_range_overrides()
+                            .get(prop_name)
+                            .map(|&(min, max)| (Some(min), Some(max)))
+                    };
                 if let Some((min, max)) = range {
-                    format!("Int({}..={})", min, max)
+                    format!("Int({})", range_display_string(min, max))
                 } else {
                     "Int".to_string()
                 }
             }
             Some("number") => {
-                let range = if let (Some(min), Some(max)) = (prop.minimum, prop.maximum) {
-                    Some((min, max))
-                } else {
-                    known_int_range_overrides().get(prop_name).copied()
-                };
+                let range: Option<(Option<i64>, Option<i64>)> =
+                    if prop.minimum.is_some() || prop.maximum.is_some() {
+                        Some((prop.minimum, prop.maximum))
+                    } else {
+                        known_int_range_overrides()
+                            .get(prop_name)
+                            .map(|&(min, max)| (Some(min), Some(max)))
+                    };
                 if let Some((min, max)) = range {
-                    format!("Float({}..={})", min, max)
+                    format!("Float({})", range_display_string(min, max))
                 } else {
                     "Float".to_string()
                 }
@@ -831,8 +849,9 @@ fn generate_schema_code(schema: &CfnSchema, type_name: &str) -> Result<String> {
     let mut needs_tags_type = false;
     let mut needs_struct_field = false;
     let mut enums: BTreeMap<String, EnumInfo> = BTreeMap::new();
-    let mut ranged_ints: BTreeMap<String, (i64, i64)> = BTreeMap::new();
-    let mut ranged_floats: BTreeMap<String, (i64, i64)> = BTreeMap::new();
+    let mut ranged_ints: BTreeMap<String, (Option<i64>, Option<i64>)> = BTreeMap::new();
+    let mut ranged_floats: BTreeMap<String, (Option<i64>, Option<i64>)> = BTreeMap::new();
+    let mut int_enums: BTreeMap<String, Vec<i64>> = BTreeMap::new();
 
     for (prop_name, prop) in &schema.properties {
         let (attr_type, enum_info) =
@@ -852,49 +871,97 @@ fn generate_schema_code(schema: &CfnSchema, type_name: &str) -> Result<String> {
         if let Some(info) = enum_info {
             enums.insert(prop_name.clone(), info);
         }
-        // Collect ranged integer/number properties
+        // Collect ranged integer/number properties (including one-sided ranges)
         match prop.prop_type.as_ref().and_then(|t| t.as_str()) {
             Some("integer") => {
-                if let (Some(min), Some(max)) = (prop.minimum, prop.maximum) {
-                    ranged_ints.insert(prop_name.clone(), (min, max));
+                if prop.minimum.is_some() || prop.maximum.is_some() {
+                    ranged_ints.insert(prop_name.clone(), (prop.minimum, prop.maximum));
                 } else if let Some(&(min, max)) =
                     known_int_range_overrides().get(prop_name.as_str())
                 {
-                    ranged_ints.insert(prop_name.clone(), (min, max));
+                    ranged_ints.insert(prop_name.clone(), (Some(min), Some(max)));
+                }
+                // Collect integer enum values
+                if let Some(enum_values) = &prop.enum_values {
+                    let values: Vec<i64> = enum_values
+                        .iter()
+                        .filter_map(|v| match v {
+                            EnumValue::Int(i) => Some(*i),
+                            _ => None,
+                        })
+                        .collect();
+                    if !values.is_empty()
+                        && enum_values.iter().all(|v| matches!(v, EnumValue::Int(_)))
+                    {
+                        int_enums.insert(prop_name.clone(), values);
+                    }
                 }
             }
             Some("number") => {
-                if let (Some(min), Some(max)) = (prop.minimum, prop.maximum) {
-                    ranged_floats.insert(prop_name.clone(), (min, max));
+                if prop.minimum.is_some() || prop.maximum.is_some() {
+                    ranged_floats.insert(prop_name.clone(), (prop.minimum, prop.maximum));
                 } else if let Some(&(min, max)) =
                     known_int_range_overrides().get(prop_name.as_str())
                 {
-                    ranged_floats.insert(prop_name.clone(), (min, max));
+                    ranged_floats.insert(prop_name.clone(), (Some(min), Some(max)));
                 }
             }
             _ => {}
         }
     }
 
-    // Also scan definitions for struct field integer properties matching overrides
+    // Also scan definitions for struct field integer/number properties
     let int_overrides = known_int_range_overrides();
     if let Some(definitions) = &schema.definitions {
         for def in definitions.values() {
             if let Some(props) = &def.properties {
                 for (field_name, field_prop) in props {
                     let prop_type = field_prop.prop_type.as_ref().and_then(|t| t.as_str());
-                    if matches!(prop_type, Some("integer") | Some("number"))
-                        && field_prop.minimum.is_none()
-                        && field_prop.maximum.is_none()
-                        && int_overrides.contains_key(field_name.as_str())
-                    {
-                        let (min, max) = int_overrides[field_name.as_str()];
-                        if prop_type == Some("number") {
-                            if !ranged_floats.contains_key(field_name) {
-                                ranged_floats.insert(field_name.clone(), (min, max));
+                    if matches!(prop_type, Some("integer") | Some("number")) {
+                        // Collect ranges from definitions (including one-sided ranges)
+                        if field_prop.minimum.is_some() || field_prop.maximum.is_some() {
+                            if prop_type == Some("number") {
+                                if !ranged_floats.contains_key(field_name) {
+                                    ranged_floats.insert(
+                                        field_name.clone(),
+                                        (field_prop.minimum, field_prop.maximum),
+                                    );
+                                }
+                            } else if !ranged_ints.contains_key(field_name) {
+                                ranged_ints.insert(
+                                    field_name.clone(),
+                                    (field_prop.minimum, field_prop.maximum),
+                                );
                             }
-                        } else if !ranged_ints.contains_key(field_name) {
-                            ranged_ints.insert(field_name.clone(), (min, max));
+                        } else if int_overrides.contains_key(field_name.as_str()) {
+                            // Fall back to known overrides
+                            let (min, max) = int_overrides[field_name.as_str()];
+                            if prop_type == Some("number") {
+                                if !ranged_floats.contains_key(field_name) {
+                                    ranged_floats
+                                        .insert(field_name.clone(), (Some(min), Some(max)));
+                                }
+                            } else if !ranged_ints.contains_key(field_name) {
+                                ranged_ints.insert(field_name.clone(), (Some(min), Some(max)));
+                            }
+                        }
+                    }
+                    // Also collect integer enums from definitions
+                    if prop_type == Some("integer")
+                        && let Some(enum_values) = &field_prop.enum_values
+                    {
+                        let values: Vec<i64> = enum_values
+                            .iter()
+                            .filter_map(|v| match v {
+                                EnumValue::Int(i) => Some(*i),
+                                _ => None,
+                            })
+                            .collect();
+                        if !values.is_empty()
+                            && enum_values.iter().all(|v| matches!(v, EnumValue::Int(_)))
+                            && !int_enums.contains_key(field_name)
+                        {
+                            int_enums.insert(field_name.clone(), values);
                         }
                     }
                 }
@@ -933,6 +1000,7 @@ fn generate_schema_code(schema: &CfnSchema, type_name: &str) -> Result<String> {
     let has_enums = !enums.is_empty();
     let has_ranged_ints = !ranged_ints.is_empty();
     let has_ranged_floats = !ranged_floats.is_empty();
+    let has_int_enums = !int_enums.is_empty();
 
     // Enums use AttributeType::Custom with AttributeType::String base
     if has_enums {
@@ -941,6 +1009,11 @@ fn generate_schema_code(schema: &CfnSchema, type_name: &str) -> Result<String> {
 
     // Ranged ints/floats use AttributeType::Custom with AttributeType::Int/Float base
     if has_ranged_ints || has_ranged_floats {
+        needs_attribute_type = true;
+    }
+
+    // Int enums use AttributeType::Custom with AttributeType::Int base
+    if has_int_enums {
         needs_attribute_type = true;
     }
 
@@ -972,7 +1045,7 @@ use super::AwsccSchemaConfig;
         resource, type_name, schema_imports_str
     ));
 
-    if has_ranged_ints || has_ranged_floats {
+    if has_ranged_ints || has_ranged_floats || has_int_enums {
         code.push_str("use carina_core::resource::Value;\n");
     }
     if needs_tags_type {
@@ -1012,11 +1085,12 @@ use super::AwsccSchemaConfig;
     // Generate range validation functions for integer properties
     for (prop_name, (min, max)) in &ranged_ints {
         let fn_name = format!("validate_{}_range", prop_name.to_snake_case());
+        let (condition, range_display) = int_range_condition_and_display(*min, *max);
         code.push_str(&format!(
             r#"fn {}(value: &Value) -> Result<(), String> {{
     if let Value::Int(n) = value {{
-        if *n < {} || *n > {} {{
-            Err(format!("Value {{}} is out of range {}..={}", n))
+        if {} {{
+            Err(format!("Value {{}} is out of range {}", n))
         }} else {{
             Ok(())
         }}
@@ -1026,13 +1100,14 @@ use super::AwsccSchemaConfig;
 }}
 
 "#,
-            fn_name, min, max, min, max
+            fn_name, condition, range_display
         ));
     }
 
     // Generate range validation functions for float (number) properties
     for (prop_name, (min, max)) in &ranged_floats {
         let fn_name = format!("validate_{}_range", prop_name.to_snake_case());
+        let (condition, range_display) = float_range_condition_and_display(*min, *max);
         code.push_str(&format!(
             r#"fn {}(value: &Value) -> Result<(), String> {{
     let n = match value {{
@@ -1040,15 +1115,44 @@ use super::AwsccSchemaConfig;
         Value::Float(f) => *f,
         _ => return Err("Expected number".to_string()),
     }};
-    if n < {}.0 || n > {}.0 {{
-        Err(format!("Value {{}} is out of range {}..={}", n))
+    if {} {{
+        Err(format!("Value {{}} is out of range {}", n))
     }} else {{
         Ok(())
     }}
 }}
 
 "#,
-            fn_name, min, max, min, max
+            fn_name, condition, range_display
+        ));
+    }
+
+    // Generate validation functions for integer enum properties
+    for (prop_name, values) in &int_enums {
+        let fn_name = format!("validate_{}_int_enum", prop_name.to_snake_case());
+        let const_name = format!("VALID_{}_VALUES", prop_name.to_snake_case().to_uppercase());
+        let values_str = values
+            .iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        code.push_str(&format!(
+            r#"const {}: &[i64] = &[{}];
+
+fn {}(value: &Value) -> Result<(), String> {{
+    if let Value::Int(n) = value {{
+        if {}.contains(n) {{
+            Ok(())
+        }} else {{
+            Err(format!("Value {{}} is not a valid value", n))
+        }}
+    }} else {{
+        Err("Expected integer".to_string())
+    }}
+}}
+
+"#,
+            const_name, values_str, fn_name, const_name
         ));
     }
 
@@ -1635,6 +1739,42 @@ fn known_enum_aliases() -> &'static HashMap<&'static str, Vec<(&'static str, &'s
     &ALIASES
 }
 
+/// Generate condition string and display string for integer range validation.
+fn int_range_condition_and_display(min: Option<i64>, max: Option<i64>) -> (String, String) {
+    match (min, max) {
+        (Some(min), Some(max)) => (
+            format!("*n < {} || *n > {}", min, max),
+            format!("{}..={}", min, max),
+        ),
+        (Some(min), None) => (format!("*n < {}", min), format!("{}..", min)),
+        (None, Some(max)) => (format!("*n > {}", max), format!("..={}", max)),
+        (None, None) => unreachable!("at least one bound must be present"),
+    }
+}
+
+/// Generate condition string and display string for float range validation.
+fn float_range_condition_and_display(min: Option<i64>, max: Option<i64>) -> (String, String) {
+    match (min, max) {
+        (Some(min), Some(max)) => (
+            format!("n < {}.0 || n > {}.0", min, max),
+            format!("{}..={}", min, max),
+        ),
+        (Some(min), None) => (format!("n < {}.0", min), format!("{}..", min)),
+        (None, Some(max)) => (format!("n > {}.0", max), format!("..={}", max)),
+        (None, None) => unreachable!("at least one bound must be present"),
+    }
+}
+
+/// Format a range display string for type names.
+fn range_display_string(min: Option<i64>, max: Option<i64>) -> String {
+    match (min, max) {
+        (Some(min), Some(max)) => format!("{}..={}", min, max),
+        (Some(min), None) => format!("{}..", min),
+        (None, Some(max)) => format!("..={}", max),
+        (None, None) => unreachable!("at least one bound must be present"),
+    }
+}
+
 /// Known integer range overrides for properties where CloudFormation schemas
 /// don't include min/max constraints but the ranges are well-known.
 fn known_int_range_overrides() -> &'static HashMap<&'static str, (i64, i64)> {
@@ -2138,14 +2278,35 @@ fn cfn_type_to_carina_type_with_enum(
 
     // Handle explicit enum
     if let Some(enum_values) = &prop.enum_values {
-        // If all enum values are integers, skip enum treatment and use the base type
+        // If all enum values are integers, generate IntEnum Custom type
         let all_ints = enum_values.iter().all(|v| matches!(v, EnumValue::Int(_)));
-        if all_ints {
-            return match prop.prop_type.as_ref().and_then(|t| t.as_str()) {
-                Some("integer") => ("AttributeType::Int".to_string(), None),
-                Some("number") => ("AttributeType::Float".to_string(), None),
-                _ => ("AttributeType::String".to_string(), None),
-            };
+        if all_ints && !enum_values.is_empty() {
+            let values: Vec<i64> = enum_values
+                .iter()
+                .filter_map(|v| match v {
+                    EnumValue::Int(i) => Some(*i),
+                    _ => None,
+                })
+                .collect();
+            let values_str = values
+                .iter()
+                .map(|v| v.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let validate_fn = format!("validate_{}_int_enum", prop_name.to_snake_case());
+            return (
+                format!(
+                    r#"AttributeType::Custom {{
+                name: "IntEnum([{}])".to_string(),
+                base: Box::new(AttributeType::Int),
+                validate: {},
+                namespace: None,
+                to_dsl: None,
+            }}"#,
+                    values_str, validate_fn
+                ),
+                None,
+            );
         }
 
         let type_name = prop_name.to_pascal_case();
@@ -2215,25 +2376,29 @@ fn cfn_type_to_carina_type_with_enum(
         }
         Some("boolean") => ("AttributeType::Bool".to_string(), None),
         Some("integer") => {
-            // Use CF min/max if available, otherwise check known overrides
-            let range = if let (Some(min), Some(max)) = (prop.minimum, prop.maximum) {
-                Some((min, max))
-            } else {
-                known_int_range_overrides().get(prop_name).copied()
-            };
+            // Use CF min/max if available (including one-sided), otherwise check known overrides
+            let range: Option<(Option<i64>, Option<i64>)> =
+                if prop.minimum.is_some() || prop.maximum.is_some() {
+                    Some((prop.minimum, prop.maximum))
+                } else {
+                    known_int_range_overrides()
+                        .get(prop_name)
+                        .map(|&(min, max)| (Some(min), Some(max)))
+                };
             if let Some((min, max)) = range {
                 // Generate a ranged int type with validation
                 let validate_fn = format!("validate_{}_range", prop_name.to_snake_case());
+                let display = range_display_string(min, max);
                 (
                     format!(
                         r#"AttributeType::Custom {{
-                name: "Int({}..={})".to_string(),
+                name: "Int({})".to_string(),
                 base: Box::new(AttributeType::Int),
                 validate: {},
                 namespace: None,
                 to_dsl: None,
             }}"#,
-                        min, max, validate_fn
+                        display, validate_fn
                     ),
                     None,
                 )
@@ -2242,25 +2407,29 @@ fn cfn_type_to_carina_type_with_enum(
             }
         }
         Some("number") => {
-            // Use CF min/max if available, otherwise check known overrides
-            let range = if let (Some(min), Some(max)) = (prop.minimum, prop.maximum) {
-                Some((min, max))
-            } else {
-                known_int_range_overrides().get(prop_name).copied()
-            };
+            // Use CF min/max if available (including one-sided), otherwise check known overrides
+            let range: Option<(Option<i64>, Option<i64>)> =
+                if prop.minimum.is_some() || prop.maximum.is_some() {
+                    Some((prop.minimum, prop.maximum))
+                } else {
+                    known_int_range_overrides()
+                        .get(prop_name)
+                        .map(|&(min, max)| (Some(min), Some(max)))
+                };
             if let Some((min, max)) = range {
                 // Generate a ranged float type with validation
                 let validate_fn = format!("validate_{}_range", prop_name.to_snake_case());
+                let display = range_display_string(min, max);
                 (
                     format!(
                         r#"AttributeType::Custom {{
-                name: "Float({}..={})".to_string(),
+                name: "Float({})".to_string(),
                 base: Box::new(AttributeType::Float),
                 validate: {},
                 namespace: None,
                 to_dsl: None,
             }}"#,
-                        min, max, validate_fn
+                        display, validate_fn
                     ),
                     None,
                 )
@@ -3454,8 +3623,8 @@ mod tests {
     }
 
     #[test]
-    fn test_integer_with_only_minimum_produces_plain_int() {
-        // Only minimum set, no maximum - should remain plain Int
+    fn test_integer_with_only_minimum_produces_custom_type() {
+        // Only minimum set - should produce Custom type with one-sided range
         let prop = CfnProperty {
             prop_type: Some(TypeValue::Single("integer".to_string())),
             description: Some("Some integer value.".to_string()),
@@ -3483,7 +3652,184 @@ mod tests {
         };
         let (type_str, _) =
             cfn_type_to_carina_type_with_enum(&prop, "SomeCount", &schema, "", &BTreeMap::new());
-        assert_eq!(type_str, "AttributeType::Int");
+        assert!(
+            type_str.contains("AttributeType::Custom"),
+            "Integer with only minimum should produce Custom type, got: {}",
+            type_str
+        );
+        assert!(
+            type_str.contains("Int(0..)"),
+            "Custom type name should show one-sided range, got: {}",
+            type_str
+        );
+    }
+
+    #[test]
+    fn test_integer_with_only_maximum_produces_custom_type() {
+        // Only maximum set - should produce Custom type with one-sided range
+        let prop = CfnProperty {
+            prop_type: Some(TypeValue::Single("integer".to_string())),
+            description: Some("Some integer value.".to_string()),
+            enum_values: None,
+            items: None,
+            ref_path: None,
+            insertion_order: None,
+            properties: None,
+            required: vec![],
+            minimum: None,
+            maximum: Some(100),
+            additional_properties: None,
+        };
+        let schema = CfnSchema {
+            type_name: "AWS::EC2::VPC".to_string(),
+            description: None,
+            properties: BTreeMap::new(),
+            required: vec![],
+            read_only_properties: vec![],
+            create_only_properties: vec![],
+            write_only_properties: vec![],
+            primary_identifier: None,
+            definitions: None,
+            tagging: None,
+        };
+        let (type_str, _) =
+            cfn_type_to_carina_type_with_enum(&prop, "SomeCount", &schema, "", &BTreeMap::new());
+        assert!(
+            type_str.contains("AttributeType::Custom"),
+            "Integer with only maximum should produce Custom type, got: {}",
+            type_str
+        );
+        assert!(
+            type_str.contains("Int(..=100)"),
+            "Custom type name should show one-sided range, got: {}",
+            type_str
+        );
+    }
+
+    #[test]
+    fn test_integer_enum_produces_custom_type() {
+        // Integer enum values should produce Custom IntEnum type
+        let prop = CfnProperty {
+            prop_type: Some(TypeValue::Single("integer".to_string())),
+            description: Some("Retention in days.".to_string()),
+            enum_values: Some(vec![
+                EnumValue::Int(1),
+                EnumValue::Int(3),
+                EnumValue::Int(5),
+                EnumValue::Int(7),
+                EnumValue::Int(14),
+            ]),
+            items: None,
+            ref_path: None,
+            insertion_order: None,
+            properties: None,
+            required: vec![],
+            minimum: None,
+            maximum: None,
+            additional_properties: None,
+        };
+        let schema = CfnSchema {
+            type_name: "AWS::Logs::LogGroup".to_string(),
+            description: None,
+            properties: BTreeMap::new(),
+            required: vec![],
+            read_only_properties: vec![],
+            create_only_properties: vec![],
+            write_only_properties: vec![],
+            primary_identifier: None,
+            definitions: None,
+            tagging: None,
+        };
+        let (type_str, _) = cfn_type_to_carina_type_with_enum(
+            &prop,
+            "RetentionInDays",
+            &schema,
+            "",
+            &BTreeMap::new(),
+        );
+        assert!(
+            type_str.contains("AttributeType::Custom"),
+            "Integer enum should produce Custom type, got: {}",
+            type_str
+        );
+        assert!(
+            type_str.contains("IntEnum([1, 3, 5, 7, 14])"),
+            "Custom type name should list enum values, got: {}",
+            type_str
+        );
+        assert!(
+            type_str.contains("validate_retention_in_days_int_enum"),
+            "Should reference int enum validation function, got: {}",
+            type_str
+        );
+    }
+
+    #[test]
+    fn test_type_display_string_one_sided_range() {
+        let prop = CfnProperty {
+            prop_type: Some(TypeValue::Single("integer".to_string())),
+            description: Some("Count.".to_string()),
+            enum_values: None,
+            items: None,
+            ref_path: None,
+            insertion_order: None,
+            properties: None,
+            required: vec![],
+            minimum: Some(1),
+            maximum: None,
+            additional_properties: None,
+        };
+        let schema = CfnSchema {
+            type_name: "AWS::EC2::NatGateway".to_string(),
+            description: None,
+            properties: BTreeMap::new(),
+            required: vec![],
+            read_only_properties: vec![],
+            create_only_properties: vec![],
+            write_only_properties: vec![],
+            primary_identifier: None,
+            definitions: None,
+            tagging: None,
+        };
+        let enums = BTreeMap::new();
+        let result = type_display_string("SecondaryPrivateIpAddressCount", &prop, &schema, &enums);
+        assert_eq!(result, "Int(1..)");
+    }
+
+    #[test]
+    fn test_type_display_string_int_enum() {
+        let prop = CfnProperty {
+            prop_type: Some(TypeValue::Single("integer".to_string())),
+            description: Some("Retention in days.".to_string()),
+            enum_values: Some(vec![
+                EnumValue::Int(1),
+                EnumValue::Int(3),
+                EnumValue::Int(5),
+            ]),
+            items: None,
+            ref_path: None,
+            insertion_order: None,
+            properties: None,
+            required: vec![],
+            minimum: None,
+            maximum: None,
+            additional_properties: None,
+        };
+        let schema = CfnSchema {
+            type_name: "AWS::Logs::LogGroup".to_string(),
+            description: None,
+            properties: BTreeMap::new(),
+            required: vec![],
+            read_only_properties: vec![],
+            create_only_properties: vec![],
+            write_only_properties: vec![],
+            primary_identifier: None,
+            definitions: None,
+            tagging: None,
+        };
+        let enums = BTreeMap::new();
+        let result = type_display_string("RetentionInDays", &prop, &schema, &enums);
+        assert_eq!(result, "IntEnum([1, 3, 5])");
     }
 
     #[test]

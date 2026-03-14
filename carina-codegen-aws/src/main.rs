@@ -68,11 +68,11 @@ struct AttrInfo {
     enum_info: Option<EnumInfo>,
 }
 
-/// Integer range constraint
+/// Integer range constraint (supports one-sided ranges)
 #[derive(Debug, Clone, Copy)]
 struct IntRange {
-    min: i64,
-    max: i64,
+    min: Option<i64>,
+    max: Option<i64>,
 }
 
 /// Convert a DSL resource name to a Rust module name.
@@ -596,11 +596,12 @@ fn generate_resource(res: &ResourceDef, model: &SmithyModel) -> Result<String> {
     // Generate range validation functions
     for (prop_name, range) in &all_ranged_ints {
         let fn_name = format!("validate_{}_range", prop_name.to_snake_case());
+        let (condition, display) = int_range_condition_and_display(range.min, range.max);
         code.push_str(&format!(
             "fn {}(value: &Value) -> Result<(), String> {{\n\
              \x20   if let Value::Int(n) = value {{\n\
-             \x20       if *n < {} || *n > {} {{\n\
-             \x20           Err(format!(\"Value {{}} is out of range {}..={}\", n))\n\
+             \x20       if {} {{\n\
+             \x20           Err(format!(\"Value {{}} is out of range {}\", n))\n\
              \x20       }} else {{\n\
              \x20           Ok(())\n\
              \x20       }}\n\
@@ -608,7 +609,7 @@ fn generate_resource(res: &ResourceDef, model: &SmithyModel) -> Result<String> {
              \x20       Err(\"Expected integer\".to_string())\n\
              \x20   }}\n\
              }}\n\n",
-            fn_name, range.min, range.max, range.min, range.max
+            fn_name, condition, display
         ));
     }
 
@@ -857,16 +858,17 @@ fn resolve_type(
             if let Some(r) = range {
                 all_ranged_ints.entry(field_name.to_string()).or_insert(r);
                 let validate_fn = format!("validate_{}_range", field_name.to_snake_case());
+                let display = range_display_string(r.min, r.max);
                 (
                     format!(
                         "AttributeType::Custom {{\n\
-                         \x20               name: \"Int({}..={})\".to_string(),\n\
+                         \x20               name: \"Int({})\".to_string(),\n\
                          \x20               base: Box::new(AttributeType::Int),\n\
                          \x20               validate: {},\n\
                          \x20               namespace: None,\n\
                          \x20               to_dsl: None,\n\
                          \x20           }}",
-                        r.min, r.max, validate_fn
+                        display, validate_fn
                     ),
                     None,
                 )
@@ -1077,13 +1079,16 @@ fn get_int_range(model: &SmithyModel, target: &str, field_name: &str) -> Option<
                 // Check known overrides for the field name
                 return known_int_range_overrides()
                     .get(field_name)
-                    .map(|&(min, max)| IntRange { min, max });
+                    .map(|&(min, max)| IntRange {
+                        min: Some(min),
+                        max: Some(max),
+                    });
             }
         };
         if let Some(range_val) = traits.get("smithy.api#range") {
             let min = range_val.get("min").and_then(|v| v.as_i64());
             let max = range_val.get("max").and_then(|v| v.as_i64());
-            if let (Some(min), Some(max)) = (min, max) {
+            if min.is_some() || max.is_some() {
                 return Some(IntRange { min, max });
             }
         }
@@ -1092,7 +1097,10 @@ fn get_int_range(model: &SmithyModel, target: &str, field_name: &str) -> Option<
     // Check known overrides
     known_int_range_overrides()
         .get(field_name)
-        .map(|&(min, max)| IntRange { min, max })
+        .map(|&(min, max)| IntRange {
+            min: Some(min),
+            max: Some(max),
+        })
 }
 
 /// Generate per-service mod.rs files that declare resource modules.
@@ -2254,7 +2262,7 @@ fn type_display_string_md<'a>(
         Some(ShapeKind::Integer) | Some(ShapeKind::Long) => {
             let range = get_int_range(model, target, field_name);
             if let Some(r) = range {
-                format!("Int({}..={})", r.min, r.max)
+                format!("Int({})", range_display_string(r.min, r.max))
             } else {
                 "Int".to_string()
             }
@@ -2427,6 +2435,29 @@ fn known_enum_overrides() -> &'static HashMap<&'static str, Vec<&'static str>> {
         m
     });
     &OVERRIDES
+}
+
+/// Generate condition string and display string for integer range validation.
+fn int_range_condition_and_display(min: Option<i64>, max: Option<i64>) -> (String, String) {
+    match (min, max) {
+        (Some(min), Some(max)) => (
+            format!("*n < {} || *n > {}", min, max),
+            format!("{}..={}", min, max),
+        ),
+        (Some(min), None) => (format!("*n < {}", min), format!("{}..", min)),
+        (None, Some(max)) => (format!("*n > {}", max), format!("..={}", max)),
+        (None, None) => unreachable!("at least one bound must be present"),
+    }
+}
+
+/// Format a range display string for type names.
+fn range_display_string(min: Option<i64>, max: Option<i64>) -> String {
+    match (min, max) {
+        (Some(min), Some(max)) => format!("{}..={}", min, max),
+        (Some(min), None) => format!("{}..", min),
+        (None, Some(max)) => format!("..={}", max),
+        (None, None) => unreachable!("at least one bound must be present"),
+    }
 }
 
 fn known_int_range_overrides() -> &'static HashMap<&'static str, (i64, i64)> {

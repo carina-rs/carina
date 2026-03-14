@@ -6,6 +6,7 @@
 
 use super::AwsccSchemaConfig;
 use super::tags_type;
+use carina_core::resource::Value;
 use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
 
 const VALID_ABAC_STATUS: &[&str] = &["Enabled", "Disabled"];
@@ -105,6 +106,30 @@ const VALID_TRANSITION_STORAGE_CLASS: &[&str] = &[
 ];
 
 const VALID_VERSIONING_CONFIGURATION_STATUS: &[&str] = &["Enabled", "Suspended"];
+
+fn validate_days_after_initiation_range(value: &Value) -> Result<(), String> {
+    if let Value::Int(n) = value {
+        if *n < 0 {
+            Err(format!("Value {} is out of range 0..", n))
+        } else {
+            Ok(())
+        }
+    } else {
+        Err("Expected integer".to_string())
+    }
+}
+
+fn validate_max_age_range(value: &Value) -> Result<(), String> {
+    if let Value::Int(n) = value {
+        if *n < 0 {
+            Err(format!("Value {} is out of range 0..", n))
+        } else {
+            Ok(())
+        }
+    } else {
+        Err("Expected integer".to_string())
+    }
+}
 
 /// Returns the schema config for s3_bucket (AWS::S3::Bucket)
 pub fn s3_bucket_config() -> AwsccSchemaConfig {
@@ -243,7 +268,13 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                     StructField::new("allowed_origins", AttributeType::List(Box::new(AttributeType::String))).required().with_description("One or more origins you want customers to be able to access the bucket from.").with_provider_name("AllowedOrigins"),
                     StructField::new("exposed_headers", AttributeType::List(Box::new(AttributeType::String))).with_description("One or more headers in the response that you want customers to be able to access from their applications (for example, from a JavaScript ``XMLHttpRequ...").with_provider_name("ExposedHeaders"),
                     StructField::new("id", AttributeType::String).with_description("A unique identifier for this rule. The value must be no more than 255 characters.").with_provider_name("Id"),
-                    StructField::new("max_age", AttributeType::Int).with_description("The time in seconds that your browser is to cache the preflight response for the specified resource.").with_provider_name("MaxAge")
+                    StructField::new("max_age", AttributeType::Custom {
+                name: "Int(0..)".to_string(),
+                base: Box::new(AttributeType::Int),
+                validate: validate_max_age_range,
+                namespace: None,
+                to_dsl: None,
+            }).with_description("The time in seconds that your browser is to cache the preflight response for the specified resource.").with_provider_name("MaxAge")
                     ],
                 }))).required().with_description("A set of origins and methods (cross-origin access that you want to allow). You can add up to 100 rules to the configuration.").with_provider_name("CorsRules")
                     ],
@@ -342,7 +373,13 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                     StructField::new("abort_incomplete_multipart_upload", AttributeType::Struct {
                     name: "AbortIncompleteMultipartUpload".to_string(),
                     fields: vec![
-                    StructField::new("days_after_initiation", AttributeType::Int).required().with_description("Specifies the number of days after which Amazon S3 stops an incomplete multipart upload.").with_provider_name("DaysAfterInitiation")
+                    StructField::new("days_after_initiation", AttributeType::Custom {
+                name: "Int(0..)".to_string(),
+                base: Box::new(AttributeType::Int),
+                validate: validate_days_after_initiation_range,
+                namespace: None,
+                to_dsl: None,
+            }).required().with_description("Specifies the number of days after which Amazon S3 stops an incomplete multipart upload.").with_provider_name("DaysAfterInitiation")
                     ],
                 }).with_description("Specifies a lifecycle rule that stops incomplete multipart uploads to an Amazon S3 bucket.").with_provider_name("AbortIncompleteMultipartUpload"),
                     StructField::new("expiration_date", AttributeType::String).with_description("Indicates when objects are deleted from Amazon S3 and Amazon S3 Glacier. The date value must be in ISO 8601 format. The time is always midnight UTC. I...").with_provider_name("ExpirationDate"),

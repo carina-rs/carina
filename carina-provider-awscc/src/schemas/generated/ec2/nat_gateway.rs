@@ -6,11 +6,24 @@
 
 use super::AwsccSchemaConfig;
 use super::tags_type;
+use carina_core::resource::Value;
 use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField, types};
 
 const VALID_AVAILABILITY_MODE: &[&str] = &["zonal", "regional"];
 
 const VALID_CONNECTIVITY_TYPE: &[&str] = &["public", "private"];
+
+fn validate_secondary_private_ip_address_count_range(value: &Value) -> Result<(), String> {
+    if let Value::Int(n) = value {
+        if *n < 1 {
+            Err(format!("Value {} is out of range 1..", n))
+        } else {
+            Ok(())
+        }
+    } else {
+        Err("Expected integer".to_string())
+    }
+}
 
 /// Returns the schema config for ec2_nat_gateway (AWS::EC2::NatGateway)
 pub fn ec2_nat_gateway_config() -> AwsccSchemaConfig {
@@ -103,7 +116,13 @@ pub fn ec2_nat_gateway_config() -> AwsccSchemaConfig {
                 .with_provider_name("SecondaryAllocationIds"),
         )
         .attribute(
-            AttributeSchema::new("secondary_private_ip_address_count", AttributeType::Int)
+            AttributeSchema::new("secondary_private_ip_address_count", AttributeType::Custom {
+                name: "Int(1..)".to_string(),
+                base: Box::new(AttributeType::Int),
+                validate: validate_secondary_private_ip_address_count_range,
+                namespace: None,
+                to_dsl: None,
+            })
                 .with_description("[Private NAT gateway only] The number of secondary private IPv4 addresses you want to assign to the NAT gateway. For more information about secondary ...")
                 .with_provider_name("SecondaryPrivateIpAddressCount"),
         )
