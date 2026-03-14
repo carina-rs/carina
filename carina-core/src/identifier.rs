@@ -144,10 +144,10 @@ pub fn reconcile_prefixed_names(
     }
 }
 
-/// Maximum Hamming distance (out of 32 bits) for SimHash-based reconciliation.
+/// Maximum Hamming distance (out of 64 bits) for SimHash-based reconciliation.
 /// Two identifiers with distance below this threshold are considered the "same resource"
 /// with modified attributes.
-const SIMHASH_HAMMING_THRESHOLD: u32 = 10;
+const SIMHASH_HAMMING_THRESHOLD: u32 = 20;
 
 /// Compute SimHash of a set of key-value attributes.
 ///
@@ -180,15 +180,17 @@ fn compute_simhash(attributes: &std::collections::BTreeMap<&str, String>) -> u64
     result
 }
 
-/// Extract the hash portion (last 8 hex chars) from an anonymous resource identifier.
+/// Extract the hash portion from an anonymous resource identifier.
 ///
-/// Identifier format: `{resource_type}_{hex}` (e.g., `ec2_eip_a3f2b1c8`).
-fn extract_hash_from_identifier(identifier: &str) -> Option<u32> {
+/// Supports both 8 hex chars (standard hash, u32) and 16 hex chars (SimHash, u64).
+/// Identifier format: `{resource_type}_{hex}` (e.g., `ec2_eip_a3f2b1c8d79f1524`).
+fn extract_hash_from_identifier(identifier: &str) -> Option<u64> {
     let hex_part = identifier.rsplit('_').next()?;
-    if hex_part.len() != 8 {
-        return None;
+    match hex_part.len() {
+        16 => u64::from_str_radix(hex_part, 16).ok(),
+        8 => u32::from_str_radix(hex_part, 16).ok().map(|v| v as u64),
+        _ => None,
     }
-    u32::from_str_radix(hex_part, 16).ok()
 }
 
 /// Compute stable identifiers for anonymous resources (those with empty ResourceId.name).
@@ -271,7 +273,7 @@ pub fn compute_anonymous_identifiers(
                 simhash_values.insert(k, v.clone());
             }
             let simhash = compute_simhash(&simhash_values);
-            format!("{:08x}", simhash & 0xFFFFFFFF)
+            format!("{:016x}", simhash)
         } else {
             // Use standard hash for create-only properties
             let mut hasher = std::hash::DefaultHasher::new();
@@ -992,20 +994,24 @@ mod tests {
         attrs1.insert("domain", "vpc".to_string());
         attrs1.insert("tag_name", "my-eip".to_string());
         attrs1.insert("tag_env", "production".to_string());
+        attrs1.insert("tag_team", "platform".to_string());
+        attrs1.insert("region", "ap-northeast-1".to_string());
 
         let mut attrs2: BTreeMap<&str, String> = BTreeMap::new();
         attrs2.insert("domain", "vpc".to_string());
         attrs2.insert("tag_name", "my-eip".to_string());
         attrs2.insert("tag_env", "staging".to_string()); // Only this changed
+        attrs2.insert("tag_team", "platform".to_string());
+        attrs2.insert("region", "ap-northeast-1".to_string());
 
-        let hash1 = compute_simhash(&attrs1) as u32;
-        let hash2 = compute_simhash(&attrs2) as u32;
+        let hash1 = compute_simhash(&attrs1);
+        let hash2 = compute_simhash(&attrs2);
         let distance = (hash1 ^ hash2).count_ones();
 
-        // Similar inputs should have small Hamming distance (below threshold)
+        // Similar inputs (1 of 5 changed) should have small Hamming distance
         assert!(
             distance < SIMHASH_HAMMING_THRESHOLD,
-            "Hamming distance {} should be < {} for similar inputs",
+            "Hamming distance {} should be < {} for similar inputs (1 of 5 attrs changed)",
             distance,
             SIMHASH_HAMMING_THRESHOLD
         );
@@ -1026,13 +1032,17 @@ mod tests {
 
     #[test]
     fn test_extract_hash_from_identifier() {
+        // 16 hex chars (SimHash, 64-bit)
         assert_eq!(
-            extract_hash_from_identifier("ec2_eip_a3f2b1c8"),
-            Some(0xa3f2b1c8)
+            extract_hash_from_identifier("ec2_eip_a3f2b1c8d79f1524"),
+            Some(0xa3f2b1c8d79f1524)
         );
+        // 8 hex chars (standard hash, 32-bit) - still supported
         assert_eq!(extract_hash_from_identifier("ec2_vpc_00000000"), Some(0));
         assert_eq!(extract_hash_from_identifier("short"), None);
         assert_eq!(extract_hash_from_identifier("bad_zzzzzzzz"), None);
+        // 12 hex chars (neither 8 nor 16) - rejected
+        assert_eq!(extract_hash_from_identifier("ec2_eip_aabbccddeeff"), None);
     }
 
     #[test]
@@ -1130,7 +1140,7 @@ mod tests {
             .collect();
 
         // Resource with a computed identifier
-        let mut resource = Resource::with_provider("awscc", "ec2.eip", "ec2_eip_aabbccdd");
+        let mut resource = Resource::with_provider("awscc", "ec2.eip", "ec2_eip_aabbccdd11223344");
         resource
             .attributes
             .insert("domain".to_string(), Value::String("vpc".to_string()));
@@ -1140,7 +1150,7 @@ mod tests {
 
         // State has a very different hash (flipped many bits)
         let state_entries = vec![AnonymousIdStateInfo {
-            name: "ec2_eip_55443322".to_string(),
+            name: "ec2_eip_5544332266778899".to_string(),
             create_only_values: HashMap::new(),
         }];
         reconcile_anonymous_identifiers(
@@ -1305,8 +1315,8 @@ mod tests {
         let mut attrs2 = attrs1.clone();
         attrs2.insert("attr_5", "changed_value".to_string());
 
-        let hash1 = compute_simhash(&attrs1) as u32;
-        let hash2 = compute_simhash(&attrs2) as u32;
+        let hash1 = compute_simhash(&attrs1);
+        let hash2 = compute_simhash(&attrs2);
         let distance = (hash1 ^ hash2).count_ones();
 
         assert!(
@@ -1512,7 +1522,7 @@ mod tests {
             .into_iter()
             .collect();
 
-        let mut resource = Resource::with_provider("awscc", "ec2.eip", "ec2_eip_aabbccdd");
+        let mut resource = Resource::with_provider("awscc", "ec2.eip", "ec2_eip_aabbccdd11223344");
         resource
             .attributes
             .insert("domain".to_string(), Value::String("vpc".to_string()));
@@ -1637,11 +1647,11 @@ mod tests {
         assert!(resources[0].id.name.starts_with("ec2_vpc_"));
         assert!(resources[1].id.name.starts_with("ec2_eip_"));
 
-        // Both should have 8 hex char suffixes
+        // VPC uses standard hash (8 hex chars), EIP uses SimHash (16 hex chars)
         let vpc_hash_part = resources[0].id.name.rsplit('_').next().unwrap();
         let eip_hash_part = resources[1].id.name.rsplit('_').next().unwrap();
         assert_eq!(vpc_hash_part.len(), 8);
-        assert_eq!(eip_hash_part.len(), 8);
+        assert_eq!(eip_hash_part.len(), 16);
     }
 
     #[test]
