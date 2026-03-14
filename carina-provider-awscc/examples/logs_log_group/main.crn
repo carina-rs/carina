@@ -1,0 +1,16 @@
+# CloudWatch Logs Log Group Example
+#
+# Creates a log group with a 30-day retention period.
+
+provider awscc {
+  region = awscc.Region.ap_northeast_1
+}
+
+awscc.logs.log_group {
+  log_group_name    = "/example/my-app"
+  retention_in_days = 30
+
+  tags = {
+    Environment = "example"
+  }
+}

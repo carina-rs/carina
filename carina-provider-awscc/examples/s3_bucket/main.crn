@@ -1,0 +1,19 @@
+# S3 Bucket Example
+#
+# Creates an S3 bucket with versioning enabled.
+
+provider awscc {
+  region = awscc.Region.ap_northeast_1
+}
+
+awscc.s3.bucket {
+  bucket_name = "my-example-bucket"
+
+  versioning_configuration = {
+    status = Enabled
+  }
+
+  tags = {
+    Environment = "example"
+  }
+}
