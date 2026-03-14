@@ -1605,6 +1605,33 @@ mod tests {
     }
 
     #[test]
+    fn validate_cidr_accepts_both_ipv4_and_ipv6() {
+        let t = types::cidr();
+
+        // Valid IPv4 CIDRs
+        assert!(
+            t.validate(&Value::String("10.0.0.0/16".to_string()))
+                .is_ok()
+        );
+        assert!(t.validate(&Value::String("0.0.0.0/0".to_string())).is_ok());
+
+        // Valid IPv6 CIDRs
+        assert!(
+            t.validate(&Value::String("2001:db8::/32".to_string()))
+                .is_ok()
+        );
+        assert!(t.validate(&Value::String("::/0".to_string())).is_ok());
+
+        // Invalid
+        assert!(
+            t.validate(&Value::String("not-a-cidr".to_string()))
+                .is_err()
+        );
+        assert!(t.validate(&Value::String("10.0.0.0".to_string())).is_err()); // no prefix
+        assert!(t.validate(&Value::Int(42)).is_err());
+    }
+
+    #[test]
     fn custom_type_accepts_resource_ref() {
         // ResourceRef values resolve to strings at runtime, so Custom types should accept them
         let ipv4 = types::ipv4_cidr();

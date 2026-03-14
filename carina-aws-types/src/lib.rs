@@ -1191,6 +1191,35 @@ mod tests {
         );
     }
 
+    #[test]
+    fn validate_tgw_route_table_id_valid() {
+        let t = tgw_route_table_id();
+        assert!(
+            t.validate(&Value::String("tgw-rtb-12345678".to_string()))
+                .is_ok()
+        );
+        assert!(
+            t.validate(&Value::String("tgw-rtb-0123456789abcdef0".to_string()))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn validate_tgw_route_table_id_invalid() {
+        let t = tgw_route_table_id();
+        // Regular route table ID should fail
+        assert!(
+            t.validate(&Value::String("rtb-12345678".to_string()))
+                .is_err()
+        );
+        // Transit gateway ID should fail
+        assert!(
+            t.validate(&Value::String("tgw-12345678".to_string()))
+                .is_err()
+        );
+        assert!(t.validate(&Value::String("invalid".to_string())).is_err());
+    }
+
     // Availability zone tests
 
     #[test]
