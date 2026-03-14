@@ -766,11 +766,7 @@ fn generate_markdown(schema: &CfnSchema, type_name: &str) -> Result<String> {
                 let snake_name = field_name.to_snake_case();
                 let is_req = required_set.contains(field_name.as_str());
                 let composite_key = format!("{}.{}", def_info.def_name, field_name);
-                let field_type_display: String = if overrides.contains_key(field_name.as_str())
-                    || field_prop.enum_values.is_some()
-                {
-                    "Enum".to_string()
-                } else if enums.contains_key(&composite_key) {
+                let field_type_display: String = if enums.contains_key(&composite_key) {
                     let enum_info = &enums[&composite_key];
                     let enum_link = format!(
                         "[Enum ({})](#{}-{})",
@@ -789,6 +785,8 @@ fn generate_markdown(schema: &CfnSchema, type_name: &str) -> Result<String> {
                     } else {
                         enum_link
                     }
+                } else if overrides.contains_key(field_name.as_str()) {
+                    "Enum".to_string()
                 } else {
                     type_display_string(field_name, field_prop, schema, &enums)
                 };
@@ -5875,6 +5873,79 @@ mod tests {
         assert!(
             !md.contains("### status (Status)"),
             "Should not have ambiguous '### status (Status)' heading"
+        );
+    }
+
+    #[test]
+    fn test_inline_enum_struct_fields_display_as_links_not_plain_enum() {
+        // Struct fields with inline enum_values should display as linked
+        // "[Enum (TypeName)](#...)" in the struct table, not plain "Enum".
+        let mut config_props = BTreeMap::new();
+        config_props.insert(
+            "Status".to_string(),
+            CfnProperty {
+                enum_values: Some(vec![
+                    EnumValue::Str("Enabled".to_string()),
+                    EnumValue::Str("Disabled".to_string()),
+                ]),
+                description: Some("The status field".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let mut definitions = BTreeMap::new();
+        definitions.insert(
+            "MyConfig".to_string(),
+            CfnDefinition {
+                def_type: Some("object".to_string()),
+                properties: Some(config_props),
+                required: vec![],
+                enum_values: None,
+                items: None,
+                one_of: vec![],
+            },
+        );
+
+        let mut properties = BTreeMap::new();
+        properties.insert(
+            "MyConfig".to_string(),
+            CfnProperty {
+                ref_path: Some("#/definitions/MyConfig".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let schema = CfnSchema {
+            type_name: "AWS::Test::Resource".to_string(),
+            description: None,
+            properties,
+            required: vec![],
+            read_only_properties: vec![],
+            create_only_properties: vec![],
+            write_only_properties: vec![],
+            primary_identifier: None,
+            definitions: Some(definitions),
+            tagging: None,
+        };
+
+        let md = generate_markdown(&schema, "AWS::Test::Resource").unwrap();
+
+        // The struct field table should contain a link, not plain "Enum"
+        assert!(
+            md.contains("[Enum (Status)]"),
+            "Expected linked enum type in struct field table, got plain 'Enum'.\nStruct lines:\n{}",
+            md.lines()
+                .filter(|l| l.contains("status") || l.contains("Enum"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        assert!(
+            !md.contains("| Enum |"),
+            "Should not have plain 'Enum' in struct field table.\nStruct lines:\n{}",
+            md.lines()
+                .filter(|l| l.contains("status") || l.contains("Enum"))
+                .collect::<Vec<_>>()
+                .join("\n")
         );
     }
 }

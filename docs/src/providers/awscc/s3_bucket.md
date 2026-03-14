@@ -535,7 +535,7 @@ Shorthand formats: `Enabled` or `VersioningConfigurationStatus.Enabled`
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `acceleration_status` | Enum | Yes | Specifies the transfer acceleration status of the bucket. |
+| `acceleration_status` | [Enum (AccelerationStatus)](#acceleration_status-accelerationstatus) | Yes | Specifies the transfer acceleration status of the bucket. |
 
 ### AccessControlTranslation
 
@@ -593,14 +593,14 @@ Shorthand formats: `Enabled` or `VersioningConfigurationStatus.Enabled`
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `days` | Int | No | The number of days that you want to specify for the default retention period. If Object Lock is turn... |
-| `mode` | Enum | No | The default Object Lock retention mode you want to apply to new objects placed in the specified buck... |
+| `mode` | [Enum (Mode)](#mode-mode) | No | The default Object Lock retention mode you want to apply to new objects placed in the specified buck... |
 | `years` | Int | No | The number of years that you want to specify for the default retention period. If Object Lock is tur... |
 
 ### DeleteMarkerReplication
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `status` | Enum | No | Indicates whether to replicate delete markers. |
+| `status` | [Enum (DeleteMarkerReplicationStatus)](#status-deletemarkerreplicationstatus) | No | Indicates whether to replicate delete markers. |
 
 ### Destination
 
@@ -608,7 +608,7 @@ Shorthand formats: `Enabled` or `VersioningConfigurationStatus.Enabled`
 |-------|------|----------|-------------|
 | `bucket_account_id` | AwsAccountId | No | The account ID that owns the destination S3 bucket. If no account ID is provided, the owner is not v... |
 | `bucket_arn` | Arn | Yes | The Amazon Resource Name (ARN) of the bucket to which data is exported. |
-| `format` | Enum | Yes | Specifies the file format used when exporting data to Amazon S3. *Allowed values*: ``CSV`` | ``ORC``... |
+| `format` | [Enum (Format)](#format-format) | Yes | Specifies the file format used when exporting data to Amazon S3. *Allowed values*: ``CSV`` | ``ORC``... |
 | `prefix` | String | No | The prefix to use when exporting data. The prefix is prepended to all results. |
 
 ### EncryptionConfiguration
@@ -636,7 +636,7 @@ Shorthand formats: `Enabled` or `VersioningConfigurationStatus.Enabled`
 |-------|------|----------|-------------|
 | `id` | String | Yes | The ID used to identify the S3 Intelligent-Tiering configuration. |
 | `prefix` | String | No | An object key name prefix that identifies the subset of objects to which the rule applies. |
-| `status` | Enum | Yes | Specifies the status of the configuration. |
+| `status` | [Enum (IntelligentTieringConfigurationStatus)](#status-intelligenttieringconfigurationstatus) | Yes | Specifies the status of the configuration. |
 | `tag_filters` | `List<Map>` | No | A container for a key-value pair. |
 | `tierings` | [List\<Tiering\>](#tiering) | Yes | Specifies a list of S3 Intelligent-Tiering storage class tiers in the configuration. At least one ti... |
 
@@ -647,16 +647,16 @@ Shorthand formats: `Enabled` or `VersioningConfigurationStatus.Enabled`
 | `destination` | [Struct(Destination)](#destination) | Yes | Contains information about where to publish the inventory results. |
 | `enabled` | Bool | Yes | Specifies whether the inventory is enabled or disabled. If set to ``True``, an inventory list is gen... |
 | `id` | String | Yes | The ID used to identify the inventory configuration. |
-| `included_object_versions` | Enum | Yes | Object versions to include in the inventory list. If set to ``All``, the list includes all the objec... |
+| `included_object_versions` | [Enum (IncludedObjectVersions)](#included_object_versions-includedobjectversions) | Yes | Object versions to include in the inventory list. If set to ``All``, the list includes all the objec... |
 | `optional_fields` | List\<[Enum (OptionalFields)](#optional_fields-optionalfields)\> | No | Contains the optional fields that are included in the inventory results. |
 | `prefix` | String | No | Specifies the inventory filter prefix. |
-| `schedule_frequency` | Enum | Yes | Specifies the schedule for generating inventory results. |
+| `schedule_frequency` | [Enum (ScheduleFrequency)](#schedule_frequency-schedulefrequency) | Yes | Specifies the schedule for generating inventory results. |
 
 ### InventoryTableConfiguration
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `configuration_state` | Enum | Yes | The configuration state of the inventory table, indicating whether the inventory table is enabled or... |
+| `configuration_state` | [Enum (ConfigurationState)](#configuration_state-configurationstate) | Yes | The configuration state of the inventory table, indicating whether the inventory table is enabled or... |
 | `encryption_configuration` | [Struct(MetadataTableEncryptionConfiguration)](#metadatatableencryptionconfiguration) | No | The encryption configuration for the inventory table. |
 | `table_arn` | Arn | No | The Amazon Resource Name (ARN) for the inventory table. |
 | `table_name` | String | No | The name of the inventory table. |
@@ -683,7 +683,7 @@ Shorthand formats: `Enabled` or `VersioningConfigurationStatus.Enabled`
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `rules` | [List\<Rule\>](#rule) | Yes | A lifecycle rule for individual objects in an Amazon S3 bucket. |
-| `transition_default_minimum_object_size` | Enum | No | Indicates which default minimum object size behavior is applied to the lifecycle configuration. This... |
+| `transition_default_minimum_object_size` | [Enum (TransitionDefaultMinimumObjectSize)](#transition_default_minimum_object_size-transitiondefaultminimumobjectsize) | No | Indicates which default minimum object size behavior is applied to the lifecycle configuration. This... |
 
 ### LoggingConfiguration
 
@@ -706,7 +706,7 @@ Shorthand formats: `Enabled` or `VersioningConfigurationStatus.Enabled`
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `table_bucket_arn` | Arn | No | The Amazon Resource Name (ARN) of the table bucket where the metadata configuration is stored. |
-| `table_bucket_type` | Enum | Yes | The type of the table bucket where the metadata configuration is stored. The ``aws`` value indicates... |
+| `table_bucket_type` | [Enum (TableBucketType)](#table_bucket_type-tablebuckettype) | Yes | The type of the table bucket where the metadata configuration is stored. The ``aws`` value indicates... |
 | `table_namespace` | String | No | The namespace in the table bucket where the metadata tables for a metadata configuration are stored. |
 
 ### MetadataTableConfiguration
@@ -720,14 +720,14 @@ Shorthand formats: `Enabled` or `VersioningConfigurationStatus.Enabled`
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `kms_key_arn` | KmsKeyArn | No | If server-side encryption with KMSlong (KMS) keys (SSE-KMS) is specified, you must also specify the ... |
-| `sse_algorithm` | Enum | Yes | The encryption type specified for a metadata table. To specify server-side encryption with KMSlong (... |
+| `sse_algorithm` | [Enum (MetadataTableEncryptionConfigurationSseAlgorithm)](#sse_algorithm-metadatatableencryptionconfigurationssealgorithm) | Yes | The encryption type specified for a metadata table. To specify server-side encryption with KMSlong (... |
 
 ### Metrics
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `event_threshold` | [Struct(ReplicationTimeValue)](#replicationtimevalue) | No | A container specifying the time threshold for emitting the ``s3:Replication:OperationMissedThreshold... |
-| `status` | Enum | Yes | Specifies whether the replication metrics are enabled. |
+| `status` | [Enum (MetricsStatus)](#status-metricsstatus) | Yes | Specifies whether the replication metrics are enabled. |
 
 ### MetricsConfiguration
 
@@ -750,7 +750,7 @@ Shorthand formats: `Enabled` or `VersioningConfigurationStatus.Enabled`
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `newer_noncurrent_versions` | Int | No | Specifies how many noncurrent versions S3 will retain. If there are this many more recent noncurrent... |
-| `storage_class` | Enum | Yes | The class of storage used to store the object. |
+| `storage_class` | [Enum (NoncurrentVersionTransitionStorageClass)](#storage_class-noncurrentversiontransitionstorageclass) | Yes | The class of storage used to store the object. |
 | `transition_in_days` | Int | Yes | Specifies the number of days an object is noncurrent before Amazon S3 can perform the associated act... |
 
 ### NotificationConfiguration
@@ -791,13 +791,13 @@ Shorthand formats: `Enabled` or `VersioningConfigurationStatus.Enabled`
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `object_ownership` | Enum | No | Specifies an object ownership rule. |
+| `object_ownership` | [Enum (ObjectOwnership)](#object_ownership-objectownership) | No | Specifies an object ownership rule. |
 
 ### PartitionedPrefix
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `partition_date_source` | Enum | No | Specifies the partition date source for the partitioned prefix. ``PartitionDateSource`` can be ``Eve... |
+| `partition_date_source` | [Enum (PartitionDateSource)](#partition_date_source-partitiondatesource) | No | Specifies the partition date source for the partitioned prefix. ``PartitionDateSource`` can be ``Eve... |
 
 ### PublicAccessBlockConfiguration
 
@@ -821,14 +821,14 @@ Shorthand formats: `Enabled` or `VersioningConfigurationStatus.Enabled`
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `days` | Int | No | If you enable journal table record expiration, you can set the number of days to retain your journal... |
-| `expiration` | Enum | Yes | Specifies whether journal table record expiration is enabled or disabled. |
+| `expiration` | [Enum (Expiration)](#expiration-expiration) | Yes | Specifies whether journal table record expiration is enabled or disabled. |
 
 ### RedirectAllRequestsTo
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `host_name` | String | Yes | Name of the host where requests are redirected. |
-| `protocol` | Enum | No | Protocol to use when redirecting requests. The default is the protocol that is used in the original ... |
+| `protocol` | [Enum (Protocol)](#protocol-protocol) | No | Protocol to use when redirecting requests. The default is the protocol that is used in the original ... |
 
 ### RedirectRule
 
@@ -836,7 +836,7 @@ Shorthand formats: `Enabled` or `VersioningConfigurationStatus.Enabled`
 |-------|------|----------|-------------|
 | `host_name` | String | No | The host name to use in the redirect request. |
 | `http_redirect_code` | String | No | The HTTP redirect code to use on the response. Not required if one of the siblings is present. |
-| `protocol` | Enum | No | Protocol to use when redirecting requests. The default is the protocol that is used in the original ... |
+| `protocol` | [Enum (Protocol)](#protocol-protocol) | No | Protocol to use when redirecting requests. The default is the protocol that is used in the original ... |
 | `replace_key_prefix_with` | String | No | The object key prefix to use in the redirect request. For example, to redirect requests for all page... |
 | `replace_key_with` | String | No | The specific object key to use in the redirect request. For example, redirect request to ``error.htm... |
 
@@ -844,7 +844,7 @@ Shorthand formats: `Enabled` or `VersioningConfigurationStatus.Enabled`
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `status` | Enum | Yes | Specifies whether Amazon S3 replicates modifications on replicas. *Allowed values*: ``Enabled`` | ``... |
+| `status` | [Enum (ReplicaModificationsStatus)](#status-replicamodificationsstatus) | Yes | Specifies whether Amazon S3 replicates modifications on replicas. *Allowed values*: ``Enabled`` | ``... |
 
 ### ReplicationConfiguration
 
@@ -863,7 +863,7 @@ Shorthand formats: `Enabled` or `VersioningConfigurationStatus.Enabled`
 | `encryption_configuration` | [Struct(EncryptionConfiguration)](#encryptionconfiguration) | No | Specifies encryption-related information. |
 | `metrics` | [Struct(Metrics)](#metrics) | No | A container specifying replication metrics-related settings enabling replication metrics and events. |
 | `replication_time` | [Struct(ReplicationTime)](#replicationtime) | No | A container specifying S3 Replication Time Control (S3 RTC), including whether S3 RTC is enabled and... |
-| `storage_class` | Enum | No | The storage class to use when replicating objects, such as S3 Standard or reduced redundancy. By def... |
+| `storage_class` | [Enum (ReplicationDestinationStorageClass)](#storage_class-replicationdestinationstorageclass) | No | The storage class to use when replicating objects, such as S3 Standard or reduced redundancy. By def... |
 
 ### ReplicationRule
 
@@ -876,7 +876,7 @@ Shorthand formats: `Enabled` or `VersioningConfigurationStatus.Enabled`
 | `prefix` | String | No | An object key name prefix that identifies the object or objects to which the rule applies. The maxim... |
 | `priority` | Int | No | The priority indicates which rule has precedence whenever two or more replication rules conflict. Am... |
 | `source_selection_criteria` | [Struct(SourceSelectionCriteria)](#sourceselectioncriteria) | No | A container that describes additional filters for identifying the source objects that you want to re... |
-| `status` | Enum | Yes | Specifies whether the rule is enabled. |
+| `status` | [Enum (ReplicationRuleStatus)](#status-replicationrulestatus) | Yes | Specifies whether the rule is enabled. |
 
 ### ReplicationRuleAndOperator
 
@@ -897,7 +897,7 @@ Shorthand formats: `Enabled` or `VersioningConfigurationStatus.Enabled`
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `status` | Enum | Yes | Specifies whether the replication time is enabled. |
+| `status` | [Enum (ReplicationTimeStatus)](#status-replicationtimestatus) | Yes | Specifies whether the replication time is enabled. |
 | `time` | [Struct(ReplicationTimeValue)](#replicationtimevalue) | Yes | A container specifying the time by which replication should be complete for all objects and operatio... |
 
 ### ReplicationTimeValue
@@ -936,7 +936,7 @@ Shorthand formats: `Enabled` or `VersioningConfigurationStatus.Enabled`
 | `object_size_greater_than` | String | No | Specifies the minimum object size in bytes for this rule to apply to. Objects must be larger than th... |
 | `object_size_less_than` | String | No | Specifies the maximum object size in bytes for this rule to apply to. Objects must be smaller than t... |
 | `prefix` | String | No | Object key prefix that identifies one or more objects to which this rule applies. Replacement must b... |
-| `status` | Enum | Yes | If ``Enabled``, the rule is currently being applied. If ``Disabled``, the rule is not currently bein... |
+| `status` | [Enum (RuleStatus)](#status-rulestatus) | Yes | If ``Enabled``, the rule is currently being applied. If ``Disabled``, the rule is not currently bein... |
 | `tag_filters` | `List<Map>` | No | Tags to use to identify a subset of objects to which the lifecycle rule applies. |
 | `transition` | [Struct(Transition)](#transition) | No | (Deprecated.) Specifies when an object transitions to a specified storage class. If you specify an e... |
 | `transitions` | [List\<Transition\>](#transition) | No | One or more transition rules that specify when an object transitions to a specified storage class. I... |
@@ -961,7 +961,7 @@ Shorthand formats: `Enabled` or `VersioningConfigurationStatus.Enabled`
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `kms_master_key_id` | KmsKeyId | No | AWS Key Management Service (KMS) customer managed key ID to use for the default encryption. + *Gener... |
-| `sse_algorithm` | Enum | Yes | Server-side encryption algorithm to use for the default encryption. For directory buckets, there are... |
+| `sse_algorithm` | [Enum (ServerSideEncryptionByDefaultSseAlgorithm)](#sse_algorithm-serversideencryptionbydefaultssealgorithm) | Yes | Server-side encryption algorithm to use for the default encryption. For directory buckets, there are... |
 
 ### ServerSideEncryptionRule
 
@@ -982,7 +982,7 @@ Shorthand formats: `Enabled` or `VersioningConfigurationStatus.Enabled`
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `status` | Enum | Yes | Specifies whether Amazon S3 replicates objects created with server-side encryption using an AWS KMS ... |
+| `status` | [Enum (SseKmsEncryptedObjectsStatus)](#status-ssekmsencryptedobjectsstatus) | Yes | Specifies whether Amazon S3 replicates objects created with server-side encryption using an AWS KMS ... |
 
 ### StorageClassAnalysis
 
@@ -1001,7 +1001,7 @@ Shorthand formats: `Enabled` or `VersioningConfigurationStatus.Enabled`
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `access_tier` | Enum | Yes | S3 Intelligent-Tiering access tier. See [Storage class for automatically optimizing frequently and i... |
+| `access_tier` | [Enum (AccessTier)](#access_tier-accesstier) | Yes | S3 Intelligent-Tiering access tier. See [Storage class for automatically optimizing frequently and i... |
 | `days` | Int | Yes | The number of consecutive days of no access after which an object will be eligible to be transitione... |
 
 ### TopicConfiguration
@@ -1016,7 +1016,7 @@ Shorthand formats: `Enabled` or `VersioningConfigurationStatus.Enabled`
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `storage_class` | Enum | Yes | The storage class to which you want the object to transition. |
+| `storage_class` | [Enum (TransitionStorageClass)](#storage_class-transitionstorageclass) | Yes | The storage class to which you want the object to transition. |
 | `transition_date` | String | No | Indicates when objects are transitioned to the specified storage class. The date value must be in IS... |
 | `transition_in_days` | Int | No | Indicates the number of days after creation when objects are transitioned to the specified storage c... |
 
@@ -1024,7 +1024,7 @@ Shorthand formats: `Enabled` or `VersioningConfigurationStatus.Enabled`
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `status` | Enum | Yes | The versioning state of the bucket. |
+| `status` | [Enum (VersioningConfigurationStatus)](#status-versioningconfigurationstatus) | Yes | The versioning state of the bucket. |
 
 ### WebsiteConfiguration
 

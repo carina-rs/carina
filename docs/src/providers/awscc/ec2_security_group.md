@@ -105,7 +105,7 @@ Shorthand formats: `tcp` or `IpProtocol.tcp`
 | `destination_prefix_list_id` | PrefixListId | No |  |
 | `destination_security_group_id` | SecurityGroupId | No |  |
 | `from_port` | Int(-1..=65535) | No |  |
-| `ip_protocol` | Enum | Yes |  |
+| `ip_protocol` | [Enum (IpProtocol)](#ip_protocol-ipprotocol) | Yes |  |
 | `to_port` | Int(-1..=65535) | No |  |
 
 ### Ingress
@@ -116,7 +116,7 @@ Shorthand formats: `tcp` or `IpProtocol.tcp`
 | `cidr_ipv6` | Ipv6Cidr | No |  |
 | `description` | String | No |  |
 | `from_port` | Int(-1..=65535) | No |  |
-| `ip_protocol` | Enum | Yes |  |
+| `ip_protocol` | [Enum (IpProtocol)](#ip_protocol-ipprotocol) | Yes |  |
 | `source_prefix_list_id` | PrefixListId | No |  |
 | `source_security_group_id` | SecurityGroupId | No |  |
 | `source_security_group_name` | String | No |  |

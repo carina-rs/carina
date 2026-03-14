@@ -210,9 +210,9 @@ Shorthand formats: `Interface` or `VpcEndpointType.Interface`
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `dns_record_ip_type` | Enum | No | The DNS records created for the endpoint. |
-| `private_dns_only_for_inbound_resolver_endpoint` | Enum | No | Indicates whether to enable private DNS only for inbound endpoints. This option is available only fo... |
-| `private_dns_preference` | Enum | No | The preference for which private domains have a private hosted zone created for and associated with ... |
+| `dns_record_ip_type` | [Enum (DnsRecordIpType)](#dns_record_ip_type-dnsrecordiptype) | No | The DNS records created for the endpoint. |
+| `private_dns_only_for_inbound_resolver_endpoint` | [Enum (PrivateDnsOnlyForInboundResolverEndpoint)](#private_dns_only_for_inbound_resolver_endpoint-privatednsonlyforinboundresolverendpoint) | No | Indicates whether to enable private DNS only for inbound endpoints. This option is available only fo... |
+| `private_dns_preference` | [Enum (PrivateDnsPreference)](#private_dns_preference-privatednspreference) | No | The preference for which private domains have a private hosted zone created for and associated with ... |
 | `private_dns_specified_domains` | `List<String>` | No | Indicates which of the private domains to create private hosted zones for and associate with the spe... |
 
 ## Attribute Reference
