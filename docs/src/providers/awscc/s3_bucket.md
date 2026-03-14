@@ -271,6 +271,15 @@ Shorthand formats: `varies_by_storage_class` or `TransitionDefaultMinimumObjectS
 
 Shorthand formats: `Enabled` or `ObjectLockEnabled.Enabled`
 
+### status (Status)
+
+| Value | DSL Identifier |
+|-------|----------------|
+| `Enabled` | `awscc.s3.bucket.Status.Enabled` |
+| `Suspended` | `awscc.s3.bucket.Status.Suspended` |
+
+Shorthand formats: `Enabled` or `Status.Enabled`
+
 ## Struct Definitions
 
 ### AccelerateConfiguration
