@@ -1,0 +1,15 @@
+# EC2 EIP - in-place update test (step 1)
+#
+# Tests: create EIP with initial tags
+
+provider awscc {
+  region = awscc.Region.ap_northeast_1
+}
+
+awscc.ec2.eip {
+  domain = "vpc"
+
+  tags = {
+    Environment = "acceptance-test"
+  }
+}

@@ -1,0 +1,20 @@
+# EC2 Route Table - in-place update test (step 2)
+#
+# Tests: update tags (in-place update)
+
+provider awscc {
+  region = awscc.Region.ap_northeast_1
+}
+
+let vpc = awscc.ec2.vpc {
+  cidr_block = "10.103.0.0/16"
+}
+
+awscc.ec2.route_table {
+  vpc_id = vpc.vpc_id
+
+  tags = {
+    Environment = "acceptance-test"
+    UpdatedBy   = "carina"
+  }
+}

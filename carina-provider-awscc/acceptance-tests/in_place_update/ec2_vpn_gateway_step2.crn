@@ -1,0 +1,16 @@
+# EC2 VPN Gateway - in-place update test (step 2)
+#
+# Tests: update tags (in-place update)
+
+provider awscc {
+  region = awscc.Region.ap_northeast_1
+}
+
+awscc.ec2.vpn_gateway {
+  type = "ipsec.1"
+
+  tags = {
+    Environment = "acceptance-test"
+    UpdatedBy   = "carina"
+  }
+}
