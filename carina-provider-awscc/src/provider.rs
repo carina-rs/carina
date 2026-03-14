@@ -857,8 +857,8 @@ impl AwsccProvider {
                 .for_resource(id.clone())
         })?;
 
-        // Only VPC supports in-place updates currently
-        if id.resource_type != "ec2.vpc" {
+        // Reject updates for resource types marked as force_replace in the schema
+        if config.schema.force_replace {
             return Err(ProviderError::new(format!(
                 "Update not supported for {}, delete and recreate",
                 id.resource_type
