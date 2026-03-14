@@ -1487,6 +1487,13 @@ pub fn {}() -> AwsccSchemaConfig {{
         }
     }
 
+    // Resource types where CloudControl API rejects updates despite the schema
+    // having an update handler. These must be replaced instead of updated.
+    const FORCE_REPLACE_TYPES: &[&str] = &["AWS::EC2::InternetGateway", "AWS::EC2::IPAM"];
+    if FORCE_REPLACE_TYPES.contains(&type_name) {
+        code.push_str("        .force_replace()\n");
+    }
+
     // Close the schema (ResourceSchema) and the AwsccSchemaConfig struct
     code.push_str("    }\n}\n");
 

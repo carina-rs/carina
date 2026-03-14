@@ -324,7 +324,12 @@ pub fn create_plan(
                     schemas,
                 );
 
-                if changed_create_only.is_empty() {
+                // Check if the resource type forces replacement (no update support)
+                let schema_force_replace =
+                    find_schema(&resource.id.provider, &resource.id.resource_type, schemas)
+                        .is_some_and(|s| s.force_replace);
+
+                if changed_create_only.is_empty() && !schema_force_replace {
                     plan.add(Effect::Update {
                         id,
                         from,
@@ -859,6 +864,66 @@ mod tests {
         assert!(
             matches!(plan.effects()[0], Effect::Update { .. }),
             "Expected Update, got {:?}",
+            plan.effects()[0]
+        );
+    }
+
+    #[test]
+    fn replace_when_schema_force_replace() {
+        use crate::schema::AttributeType;
+
+        // Resource has changed attributes but NO create-only attributes
+        let resources = vec![
+            Resource::new("ec2.internet_gateway", "my-igw").with_attribute(
+                "tags",
+                Value::Map(
+                    vec![("Name".to_string(), Value::String("new-name".to_string()))]
+                        .into_iter()
+                        .collect(),
+                ),
+            ),
+        ];
+
+        let mut current_states = HashMap::new();
+        let mut attrs = HashMap::new();
+        attrs.insert(
+            "tags".to_string(),
+            Value::Map(
+                vec![("Name".to_string(), Value::String("old-name".to_string()))]
+                    .into_iter()
+                    .collect(),
+            ),
+        );
+        current_states.insert(
+            ResourceId::new("ec2.internet_gateway", "my-igw"),
+            State::existing(ResourceId::new("ec2.internet_gateway", "my-igw"), attrs),
+        );
+
+        // Schema has force_replace=true (no create-only attributes)
+        let mut schemas = HashMap::new();
+        schemas.insert(
+            "ec2.internet_gateway".to_string(),
+            crate::schema::ResourceSchema::new("ec2.internet_gateway")
+                .attribute(crate::schema::AttributeSchema::new(
+                    "tags",
+                    AttributeType::String,
+                ))
+                .force_replace(),
+        );
+
+        let plan = create_plan(
+            &resources,
+            &current_states,
+            &HashMap::new(),
+            &schemas,
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+
+        assert_eq!(plan.effects().len(), 1);
+        assert!(
+            matches!(plan.effects()[0], Effect::Replace { .. }),
+            "Expected Replace for force_replace schema, got {:?}",
             plan.effects()[0]
         );
     }

@@ -26,6 +26,7 @@ pub fn ec2_internet_gateway_config() -> AwsccSchemaConfig {
                 .with_description("Any tags to assign to the internet gateway.")
                 .with_provider_name("Tags"),
         )
+        .force_replace()
     }
 }
 

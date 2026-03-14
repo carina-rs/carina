@@ -116,6 +116,7 @@ pub fn ec2_ipam_config() -> AwsccSchemaConfig {
                 .with_description("The tier of the IPAM.")
                 .with_provider_name("Tier"),
         )
+        .force_replace()
     }
 }
 
