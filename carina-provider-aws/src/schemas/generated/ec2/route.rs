@@ -13,7 +13,6 @@ pub fn ec2_route_config() -> AwsSchemaConfig {
         aws_type_name: "AWS::EC2::Route",
         resource_type_name: "ec2.route",
         has_tags: false,
-        data_source: false,
         schema: ResourceSchema::new("aws.ec2.route")
         .with_description("Describes a route in a route table.")
         .attribute(

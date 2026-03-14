@@ -19,8 +19,6 @@ pub struct AwsSchemaConfig {
     pub resource_type_name: &'static str,
     /// Whether this resource type uses tags
     pub has_tags: bool,
-    /// Whether this is a data source (read-only) resource type
-    pub data_source: bool,
     /// The resource schema with attribute definitions
     pub schema: ResourceSchema,
 }
