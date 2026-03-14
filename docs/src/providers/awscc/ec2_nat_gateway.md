@@ -90,7 +90,7 @@ Secondary EIP allocation IDs. For more information, see [Create a NAT gateway](h
 
 ### `secondary_private_ip_address_count`
 
-- **Type:** Int
+- **Type:** Int(1..)
 - **Required:** No
 
 [Private NAT gateway only] The number of secondary private IPv4 addresses you want to assign to the NAT gateway. For more information about secondary addresses, see [Create a NAT gateway](https://docs.aws.amazon.com/vpc/latest/userguide/vpc-nat-gateway.html#nat-gateway-creating) in the *Amazon Virtual Private Cloud User Guide*. ``SecondaryPrivateIpAddressCount`` and ``SecondaryPrivateIpAddresses`` cannot be set at the same time.

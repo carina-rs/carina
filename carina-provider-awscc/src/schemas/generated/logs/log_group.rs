@@ -6,9 +6,27 @@
 
 use super::AwsccSchemaConfig;
 use super::tags_type;
+use carina_core::resource::Value;
 use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
 const VALID_LOG_GROUP_CLASS: &[&str] = &["STANDARD", "INFREQUENT_ACCESS", "DELIVERY"];
+
+const VALID_RETENTION_IN_DAYS_VALUES: &[i64] = &[
+    1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1096, 1827, 2192, 2557, 2922,
+    3288, 3653,
+];
+
+fn validate_retention_in_days_int_enum(value: &Value) -> Result<(), String> {
+    if let Value::Int(n) = value {
+        if VALID_RETENTION_IN_DAYS_VALUES.contains(n) {
+            Ok(())
+        } else {
+            Err(format!("Value {} is not a valid value", n))
+        }
+    } else {
+        Err("Expected integer".to_string())
+    }
+}
 
 /// Returns the schema config for logs_log_group (AWS::Logs::LogGroup)
 pub fn logs_log_group_config() -> AwsccSchemaConfig {
@@ -65,7 +83,13 @@ pub fn logs_log_group_config() -> AwsccSchemaConfig {
                 .with_provider_name("ResourcePolicyDocument"),
         )
         .attribute(
-            AttributeSchema::new("retention_in_days", AttributeType::Int)
+            AttributeSchema::new("retention_in_days", AttributeType::Custom {
+                name: "IntEnum([1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1096, 1827, 2192, 2557, 2922, 3288, 3653])".to_string(),
+                base: Box::new(AttributeType::Int),
+                validate: validate_retention_in_days_int_enum,
+                namespace: None,
+                to_dsl: None,
+            })
                 .with_description("The number of days to retain the log events in the specified log group. Possible values are: 1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545,...")
                 .with_provider_name("RetentionInDays"),
         )
