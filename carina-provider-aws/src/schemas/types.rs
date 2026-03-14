@@ -59,21 +59,28 @@ pub fn aws_region() -> AttributeType {
 }
 
 /// Availability zone type with validation (e.g., "us-east-1a")
+/// Accepts:
+/// - DSL format: aws.AvailabilityZone.us_east_1a
+/// - AWS string format: "us-east-1a"
+/// - Shorthand: us_east_1a
 pub fn availability_zone() -> AttributeType {
     AttributeType::Custom {
         name: "AvailabilityZone".to_string(),
         base: Box::new(AttributeType::String),
         validate: |value| {
             if let Value::String(s) = value {
-                let normalized = extract_enum_value(s).replace('_', "-");
+                validate_enum_namespace(s, "AvailabilityZone", "aws")
+                    .map_err(|reason| format!("Invalid availability zone '{}': {}", s, reason))?;
+                let extracted = extract_enum_value(s);
+                let normalized = extracted.replace('_', "-");
                 validate_availability_zone(&normalized)
                     .map_err(|reason| format!("Invalid availability zone '{}': {}", s, reason))
             } else {
                 Err("Expected string".to_string())
             }
         },
-        namespace: None,
-        to_dsl: None,
+        namespace: Some("aws".to_string()),
+        to_dsl: Some(|s: &str| s.replace('-', "_")),
     }
 }
 
@@ -151,6 +158,84 @@ mod tests {
                 "Region {} should be valid",
                 region
             );
+        }
+    }
+
+    // Availability zone validation tests
+
+    #[test]
+    fn az_accepts_aws_format() {
+        let az_type = availability_zone();
+        assert!(
+            az_type
+                .validate(&Value::String("us-east-1a".to_string()))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn az_accepts_dsl_format() {
+        let az_type = availability_zone();
+        assert!(
+            az_type
+                .validate(&Value::String(
+                    "aws.AvailabilityZone.us_east_1a".to_string()
+                ))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn az_accepts_shorthand_format() {
+        let az_type = availability_zone();
+        assert!(
+            az_type
+                .validate(&Value::String("us_east_1a".to_string()))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn az_rejects_invalid_az() {
+        let az_type = availability_zone();
+        assert!(
+            az_type
+                .validate(&Value::String("invalid-zone".to_string()))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn az_rejects_wrong_namespace() {
+        let az_type = availability_zone();
+        assert!(
+            az_type
+                .validate(&Value::String(
+                    "gcp.AvailabilityZone.us_east_1a".to_string()
+                ))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn az_has_namespace() {
+        let az_type = availability_zone();
+        if let AttributeType::Custom { namespace, .. } = &az_type {
+            assert_eq!(namespace.as_deref(), Some("aws"));
+        } else {
+            panic!("Expected Custom type");
+        }
+    }
+
+    #[test]
+    fn az_has_to_dsl() {
+        let az_type = availability_zone();
+        if let AttributeType::Custom { to_dsl, .. } = &az_type {
+            assert!(to_dsl.is_some());
+            let convert = to_dsl.unwrap();
+            assert_eq!(convert("us-east-1a"), "us_east_1a");
+        } else {
+            panic!("Expected Custom type");
         }
     }
 
