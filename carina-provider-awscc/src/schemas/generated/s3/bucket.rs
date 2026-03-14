@@ -168,7 +168,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                     StructField::new("destination", AttributeType::Struct {
                     name: "Destination".to_string(),
                     fields: vec![
-                    StructField::new("bucket_account_id", AttributeType::String).with_description("The account ID that owns the destination S3 bucket. If no account ID is provided, the owner is not validated before exporting data. Although this valu...").with_provider_name("BucketAccountId"),
+                    StructField::new("bucket_account_id", super::aws_account_id()).with_description("The account ID that owns the destination S3 bucket. If no account ID is provided, the owner is not validated before exporting data. Although this valu...").with_provider_name("BucketAccountId"),
                     StructField::new("bucket_arn", super::arn()).required().with_description("The Amazon Resource Name (ARN) of the bucket to which data is exported.").with_provider_name("BucketArn"),
                     StructField::new("format", AttributeType::StringEnum {
                 name: "Format".to_string(),
@@ -303,7 +303,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                     StructField::new("destination", AttributeType::Struct {
                     name: "Destination".to_string(),
                     fields: vec![
-                    StructField::new("bucket_account_id", AttributeType::String).with_description("The account ID that owns the destination S3 bucket. If no account ID is provided, the owner is not validated before exporting data. Although this valu...").with_provider_name("BucketAccountId"),
+                    StructField::new("bucket_account_id", super::aws_account_id()).with_description("The account ID that owns the destination S3 bucket. If no account ID is provided, the owner is not validated before exporting data. Although this valu...").with_provider_name("BucketAccountId"),
                     StructField::new("bucket_arn", super::arn()).required().with_description("The Amazon Resource Name (ARN) of the bucket to which data is exported.").with_provider_name("BucketArn"),
                     StructField::new("format", AttributeType::StringEnum {
                 name: "Format".to_string(),
@@ -605,7 +605,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                 }).required().with_description("A container for object key name prefix and suffix filtering rules.").with_provider_name("S3Key")
                     ],
                 }).with_description("The filtering rules that determine which objects invoke the AWS Lambda function. For example, you can create a filter so that only image files with a ...").with_provider_name("Filter"),
-                    StructField::new("function", AttributeType::String).required().with_description("The Amazon Resource Name (ARN) of the LAMlong function that Amazon S3 invokes when the specified event type occurs.").with_provider_name("Function")
+                    StructField::new("function", super::arn()).required().with_description("The Amazon Resource Name (ARN) of the LAMlong function that Amazon S3 invokes when the specified event type occurs.").with_provider_name("Function")
                     ],
                 }))).with_description("Describes the LAMlong functions to invoke and the events for which to invoke them.").with_provider_name("LambdaConfigurations"),
                     StructField::new("queue_configurations", AttributeType::List(Box::new(AttributeType::Struct {
@@ -629,7 +629,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                 }).required().with_description("A container for object key name prefix and suffix filtering rules.").with_provider_name("S3Key")
                     ],
                 }).with_description("The filtering rules that determine which objects trigger notifications. For example, you can create a filter so that Amazon S3 sends notifications onl...").with_provider_name("Filter"),
-                    StructField::new("queue", AttributeType::String).required().with_description("The Amazon Resource Name (ARN) of the Amazon SQS queue to which Amazon S3 publishes a message when it detects events of the specified type. FIFO queue...").with_provider_name("Queue")
+                    StructField::new("queue", super::arn()).required().with_description("The Amazon Resource Name (ARN) of the Amazon SQS queue to which Amazon S3 publishes a message when it detects events of the specified type. FIFO queue...").with_provider_name("Queue")
                     ],
                 }))).with_description("The Amazon Simple Queue Service queues to publish messages to and the events for which to publish messages.").with_provider_name("QueueConfigurations"),
                     StructField::new("topic_configurations", AttributeType::List(Box::new(AttributeType::Struct {
@@ -653,7 +653,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                 }).required().with_description("A container for object key name prefix and suffix filtering rules.").with_provider_name("S3Key")
                     ],
                 }).with_description("The filtering rules that determine for which objects to send notifications. For example, you can create a filter so that Amazon S3 sends notifications...").with_provider_name("Filter"),
-                    StructField::new("topic", AttributeType::String).required().with_description("The Amazon Resource Name (ARN) of the Amazon SNS topic to which Amazon S3 publishes a message when it detects events of the specified type.").with_provider_name("Topic")
+                    StructField::new("topic", super::arn()).required().with_description("The Amazon Resource Name (ARN) of the Amazon SNS topic to which Amazon S3 publishes a message when it detects events of the specified type.").with_provider_name("Topic")
                     ],
                 }))).with_description("The topic to which notifications are sent and the events for which notifications are generated.").with_provider_name("TopicConfigurations")
                     ],
@@ -736,7 +736,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
             AttributeSchema::new("replication_configuration", AttributeType::Struct {
                     name: "ReplicationConfiguration".to_string(),
                     fields: vec![
-                    StructField::new("role", AttributeType::String).required().with_description("The Amazon Resource Name (ARN) of the IAMlong (IAM) role that Amazon S3 assumes when replicating objects. For more information, see [How to Set Up Rep...").with_provider_name("Role"),
+                    StructField::new("role", super::iam_role_arn()).required().with_description("The Amazon Resource Name (ARN) of the IAMlong (IAM) role that Amazon S3 assumes when replicating objects. For more information, see [How to Set Up Rep...").with_provider_name("Role"),
                     StructField::new("rules", AttributeType::List(Box::new(AttributeType::Struct {
                     name: "ReplicationRule".to_string(),
                     fields: vec![
@@ -760,7 +760,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                     StructField::new("owner", AttributeType::String).required().with_description("Specifies the replica ownership. For default and valid values, see [PUT bucket replication](https://docs.aws.amazon.com/AmazonS3/latest/API/RESTBucket...").with_provider_name("Owner")
                     ],
                 }).with_description("Specify this only in a cross-account scenario (where source and destination bucket owners are not the same), and you want to change replica ownership ...").with_provider_name("AccessControlTranslation"),
-                    StructField::new("account", AttributeType::String).with_description("Destination bucket owner account ID. In a cross-account scenario, if you direct Amazon S3 to change replica ownership to the AWS-account that owns the...").with_provider_name("Account"),
+                    StructField::new("account", super::aws_account_id()).with_description("Destination bucket owner account ID. In a cross-account scenario, if you direct Amazon S3 to change replica ownership to the AWS-account that owns the...").with_provider_name("Account"),
                     StructField::new("bucket", AttributeType::String).required().with_description("The Amazon Resource Name (ARN) of the bucket where you want Amazon S3 to store the results.").with_provider_name("Bucket"),
                     StructField::new("encryption_configuration", AttributeType::Struct {
                     name: "EncryptionConfiguration".to_string(),

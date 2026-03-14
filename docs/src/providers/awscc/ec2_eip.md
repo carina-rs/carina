@@ -22,7 +22,7 @@ awscc.ec2.eip {
 
 ### `address`
 
-- **Type:** String
+- **Type:** Ipv4Address
 - **Required:** No
 
 
@@ -71,7 +71,7 @@ Any tags assigned to the Elastic IP address. Updates to the ``Tags`` property ma
 
 ### `transfer_address`
 
-- **Type:** String
+- **Type:** Ipv4Address
 - **Required:** No
 
 The Elastic IP address you are accepting for transfer. You can only accept one transferred address. For more information on Elastic IP address transfers, see [Transfer Elastic IP addresses](https://docs.aws.amazon.com/vpc/latest/userguide/vpc-eips.html#transfer-EIPs-intro) in the *Amazon Virtual Private Cloud User Guide*.

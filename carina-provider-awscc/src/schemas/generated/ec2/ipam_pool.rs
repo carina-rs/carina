@@ -123,7 +123,7 @@ pub fn ec2_ipam_pool_config() -> AwsccSchemaConfig {
                 .with_provider_name("IpamScopeType"),
         )
         .attribute(
-            AttributeSchema::new("locale", AttributeType::String)
+            AttributeSchema::new("locale", super::awscc_region())
                 .create_only()
                 .with_description("The region of this pool. If not set, this will default to \"None\" which will disable non-custom allocations. If the locale has been specified for the...")
                 .with_provider_name("Locale"),
@@ -173,7 +173,7 @@ pub fn ec2_ipam_pool_config() -> AwsccSchemaConfig {
                     fields: vec![
                     StructField::new("resource_id", AttributeType::String).required().with_provider_name("ResourceId"),
                     StructField::new("resource_owner", AttributeType::String).required().with_provider_name("ResourceOwner"),
-                    StructField::new("resource_region", AttributeType::String).required().with_provider_name("ResourceRegion"),
+                    StructField::new("resource_region", super::awscc_region()).required().with_provider_name("ResourceRegion"),
                     StructField::new("resource_type", AttributeType::String).required().with_provider_name("ResourceType")
                     ],
                 })

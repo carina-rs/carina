@@ -351,6 +351,8 @@ fn infer_string_type_display(prop_name: &str, resource_type: &str) -> String {
         }
     } else if prop_lower == "availabilityzone" || prop_lower == "availabilityzones" {
         "AvailabilityZone".to_string()
+    } else if prop_lower.ends_with("region") || prop_lower == "regionname" {
+        "Region".to_string()
     } else if prop_lower.ends_with("arn")
         || prop_lower.ends_with("arns")
         || prop_lower.contains("_arn")
@@ -360,7 +362,7 @@ fn infer_string_type_display(prop_name: &str, resource_type: &str) -> String {
         "IpamPoolId".to_string()
     } else if is_aws_resource_id_property(singular_name) {
         get_resource_id_display_name(singular_name).to_string()
-    } else if prop_lower.ends_with("ownerid") {
+    } else if prop_lower.ends_with("ownerid") || prop_lower.ends_with("accountid") {
         "AwsAccountId".to_string()
     } else {
         "String".to_string()
@@ -395,6 +397,10 @@ fn override_type_to_display_name(override_type: &str) -> &str {
         "super::subnet_route_table_association_id()" => "SubnetRouteTableAssociationId",
         "super::ipam_id()" => "IpamId",
         "super::iam_role_id()" => "IamRoleId",
+        "super::awscc_region()" => "Region",
+        "types::ipv4_address()" => "Ipv4Address",
+        "super::arn()" => "Arn",
+        "super::ipam_pool_id()" => "IpamPoolId",
         _ => "String",
     }
 }
@@ -1641,6 +1647,8 @@ fn known_string_type_overrides() -> &'static HashMap<&'static str, &'static str>
         m.insert("ReplicaKmsKeyID", "super::kms_key_id()");
         m.insert("KmsKeyArn", "super::kms_key_arn()");
         m.insert("IpamId", "super::ipam_id()");
+        m.insert("Locale", "super::awscc_region()");
+        m.insert("BucketAccountId", "super::aws_account_id()");
         m
     });
     &OVERRIDES
@@ -1687,6 +1695,22 @@ fn resource_specific_type_overrides() -> &'static HashMap<(&'static str, &'stati
                 ("AWS::EC2::SubnetRouteTableAssociation", "Id"),
                 "super::subnet_route_table_association_id()",
             );
+            // EIP Address and TransferAddress are IPv4 addresses
+            m.insert(("AWS::EC2::EIP", "Address"), "types::ipv4_address()");
+            m.insert(
+                ("AWS::EC2::EIP", "TransferAddress"),
+                "types::ipv4_address()",
+            );
+            // FlowLog LogDestination is an ARN (S3 bucket, CloudWatch log group, or Firehose)
+            m.insert(("AWS::EC2::FlowLog", "LogDestination"), "super::arn()");
+            // S3 Bucket notification ARNs
+            m.insert(("AWS::S3::Bucket", "Function"), "super::arn()");
+            m.insert(("AWS::S3::Bucket", "Queue"), "super::arn()");
+            m.insert(("AWS::S3::Bucket", "Topic"), "super::arn()");
+            // S3 Bucket replication role is an IAM Role ARN
+            m.insert(("AWS::S3::Bucket", "Role"), "super::iam_role_arn()");
+            // S3 Bucket replication destination account
+            m.insert(("AWS::S3::Bucket", "Account"), "super::aws_account_id()");
             m
         });
     &OVERRIDES
@@ -1752,6 +1776,11 @@ fn infer_string_type(prop_name: &str, resource_type: &str) -> Option<String> {
         return Some("super::availability_zone()".to_string());
     }
 
+    // Region types (e.g., PeerRegion, ServiceRegion, RegionName, ResourceRegion)
+    if prop_lower.ends_with("region") || prop_lower == "regionname" {
+        return Some("super::awscc_region()".to_string());
+    }
+
     // Check ARN pattern
     if prop_lower.ends_with("arn") || prop_lower.ends_with("arns") || prop_lower.contains("_arn") {
         return Some("super::arn()".to_string());
@@ -1767,8 +1796,8 @@ fn infer_string_type(prop_name: &str, resource_type: &str) -> Option<String> {
         return Some(get_resource_id_type(singular_name).to_string());
     }
 
-    // AWS Account ID (owner IDs are 12-digit account IDs)
-    if prop_lower.ends_with("ownerid") {
+    // AWS Account ID (owner IDs and account IDs are 12-digit account IDs)
+    if prop_lower.ends_with("ownerid") || prop_lower.ends_with("accountid") {
         return Some("super::aws_account_id()".to_string());
     }
 
