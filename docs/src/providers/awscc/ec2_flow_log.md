@@ -157,6 +157,6 @@ Shorthand formats: `ACCEPT` or `TrafficType.ACCEPT`
 
 ### `id`
 
-- **Type:** String
+- **Type:** FlowLogId
 
 

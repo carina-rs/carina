@@ -386,6 +386,15 @@ fn override_type_to_display_name(override_type: &str) -> &str {
         "super::prefix_list_id()" => "PrefixListId",
         "super::carrier_gateway_id()" => "CarrierGatewayId",
         "super::local_gateway_id()" => "LocalGatewayId",
+        "super::egress_only_internet_gateway_id()" => "EgressOnlyInternetGatewayId",
+        "super::transit_gateway_id()" => "TransitGatewayId",
+        "super::vpc_peering_connection_id()" => "VpcPeeringConnectionId",
+        "super::vpc_endpoint_id()" => "VpcEndpointId",
+        "super::transit_gateway_attachment_id()" => "TransitGatewayAttachmentId",
+        "super::flow_log_id()" => "FlowLogId",
+        "super::subnet_route_table_association_id()" => "SubnetRouteTableAssociationId",
+        "super::ipam_id()" => "IpamId",
+        "super::iam_role_id()" => "IamRoleId",
         _ => "String",
     }
 }

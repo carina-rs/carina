@@ -179,7 +179,7 @@ Shorthand formats: `enable` or `VpnEcmpSupport.enable`
 
 ### `id`
 
-- **Type:** String
+- **Type:** TransitGatewayId
 
 ### `transit_gateway_arn`
 

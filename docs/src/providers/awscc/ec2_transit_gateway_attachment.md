@@ -48,6 +48,6 @@ The options for the transit gateway vpc attachment.
 
 ### `id`
 
-- **Type:** String
+- **Type:** TransitGatewayAttachmentId
 
 

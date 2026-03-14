@@ -49,6 +49,6 @@ The ID of the subnet.
 
 ### `id`
 
-- **Type:** String
+- **Type:** SubnetRouteTableAssociationId
 
 
