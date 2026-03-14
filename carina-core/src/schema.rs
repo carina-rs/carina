@@ -168,7 +168,10 @@ impl AttributeType {
             // ResourceRef values resolve to strings at runtime, so they're valid for String types
             (AttributeType::String, Value::String(_) | Value::ResourceRef { .. }) => Ok(()),
             (AttributeType::Int, Value::Int(_)) => Ok(()),
-            (AttributeType::Float, Value::Float(_)) => Ok(()),
+            (AttributeType::Float, Value::Float(f)) if f.is_finite() => Ok(()),
+            (AttributeType::Float, Value::Float(f)) => Err(TypeError::ValidationFailed {
+                message: format!("non-finite float value: {f}"),
+            }),
             (AttributeType::Float, Value::Int(_)) => Ok(()), // integers are valid numbers
             (AttributeType::Bool, Value::Bool(_)) => Ok(()),
 
@@ -1187,6 +1190,14 @@ mod tests {
         assert!(t.validate(&Value::Int(42)).is_ok()); // integers are valid numbers
         assert!(t.validate(&Value::String("3.14".to_string())).is_err());
         assert!(t.validate(&Value::Bool(true)).is_err());
+    }
+
+    #[test]
+    fn validate_float_rejects_non_finite() {
+        let t = AttributeType::Float;
+        assert!(t.validate(&Value::Float(f64::NAN)).is_err());
+        assert!(t.validate(&Value::Float(f64::INFINITY)).is_err());
+        assert!(t.validate(&Value::Float(f64::NEG_INFINITY)).is_err());
     }
 
     #[test]

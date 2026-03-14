@@ -896,11 +896,23 @@ fn parse_primary_value(
             Ok(Value::Bool(b))
         }
         Rule::float => {
-            let f: f64 = inner.as_str().parse().unwrap();
+            let f: f64 = inner
+                .as_str()
+                .parse()
+                .map_err(|e| ParseError::InvalidExpression {
+                    line: inner.line_col().0,
+                    message: format!("invalid float literal: {e}"),
+                })?;
             Ok(Value::Float(f))
         }
         Rule::number => {
-            let n: i64 = inner.as_str().parse().unwrap();
+            let n: i64 = inner
+                .as_str()
+                .parse()
+                .map_err(|e| ParseError::InvalidExpression {
+                    line: inner.line_col().0,
+                    message: format!("integer literal out of range: {e}"),
+                })?;
             Ok(Value::Int(n))
         }
         Rule::string => {
@@ -2192,6 +2204,28 @@ mod tests {
             parsed
                 .find_resource_by_attr("ec2.vpc", "bucket", "my-bucket")
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn parse_integer_overflow_returns_error() {
+        // i64::MAX is 9223372036854775807; one more should fail
+        let input = r#"
+provider aws {
+    region = aws.Region.ap_northeast_1
+}
+
+aws.s3.bucket {
+    name = "test"
+    count = 99999999999999999999
+}
+"#;
+        let result = parse(input);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("integer literal out of range"),
+            "expected 'integer literal out of range' error, got: {err}"
         );
     }
 }
