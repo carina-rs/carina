@@ -16,9 +16,9 @@ use serde_json::json;
 use carina_core::schema::{AttributeType, StructField};
 
 use crate::schemas::generated::{
-    AwsccSchemaConfig, canonicalize_enum_value, find_matching_enum_value, get_enum_alias_reverse,
+    AwsccSchemaConfig, canonicalize_enum_value, get_enum_alias_reverse,
 };
-use carina_core::utils::{convert_enum_value, extract_enum_value};
+use carina_core::utils::{convert_enum_value, extract_enum_value_with_values};
 
 /// Get the AwsccSchemaConfig for a resource type
 fn get_schema_config(resource_type: &str) -> Option<AwsccSchemaConfig> {
@@ -182,20 +182,13 @@ fn dsl_value_to_aws(
     if attr_type.namespaced_enum_parts().is_some() {
         match value {
             Value::String(s) => {
-                // First, check if the string is a plain value (not a DSL namespaced
-                // identifier) that directly matches a valid enum value. This handles
-                // cases like "ipsec.1" where the dot is part of the value itself,
-                // not a namespace separator.
+                // Extract the raw enum value from the namespaced identifier, using
+                // known valid values for disambiguation when enum values contain dots
+                // (e.g., "ipsec.1" in "awscc.ec2.vpn_gateway.Type.ipsec.1").
                 let raw = if let Some((_, values, _, _)) = attr_type.string_enum_parts() {
                     let valid: Vec<&str> = values.iter().map(String::as_str).collect();
-                    if let Some(matched) = find_matching_enum_value(s, &valid) {
-                        matched.to_string()
-                    } else {
-                        // Not a direct match — extract the last part of the namespace
-                        // and resolve against valid values.
-                        let raw_extracted = extract_enum_value(s);
-                        canonicalize_enum_value(raw_extracted, &valid)
-                    }
+                    let raw_extracted = extract_enum_value_with_values(s, &valid);
+                    canonicalize_enum_value(raw_extracted, &valid)
                 } else {
                     convert_enum_value(s)
                 };
@@ -2431,10 +2424,60 @@ mod tests {
     }
 
     #[test]
-    fn test_dsl_value_to_aws_string_enum_with_dot_in_value() {
-        // "ipsec.1" is a valid enum value for ec2.vpn_gateway's type attribute.
-        // It contains a dot but is NOT a namespaced identifier — it's a literal string.
-        // extract_enum_value must not strip the "ipsec." prefix.
+    fn test_aws_value_to_dsl_enum_value_with_dot() {
+        // When an enum value itself contains a dot (e.g., "ipsec.1" for VPN Gateway type),
+        // aws_value_to_dsl should produce a valid namespaced identifier.
+        let attr_type = AttributeType::StringEnum {
+            name: "Type".to_string(),
+            values: vec!["ipsec.1".to_string()],
+            namespace: Some("awscc.ec2.vpn_gateway".to_string()),
+            to_dsl: None,
+        };
+        let json_val = json!("ipsec.1");
+
+        let result = aws_value_to_dsl("type", &json_val, &attr_type, "ec2.vpn_gateway");
+        assert_eq!(
+            result,
+            Some(Value::String(
+                "awscc.ec2.vpn_gateway.Type.ipsec.1".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn test_dsl_value_to_aws_enum_value_with_dot() {
+        // When given a namespaced identifier with a dotted enum value,
+        // dsl_value_to_aws should correctly extract the value using known valid values.
+        let attr_type = AttributeType::StringEnum {
+            name: "Type".to_string(),
+            values: vec!["ipsec.1".to_string()],
+            namespace: Some("awscc.ec2.vpn_gateway".to_string()),
+            to_dsl: None,
+        };
+        let value = Value::String("awscc.ec2.vpn_gateway.Type.ipsec.1".to_string());
+
+        let result = dsl_value_to_aws(&value, &attr_type, "ec2.vpn_gateway", "type");
+        assert_eq!(result, Some(json!("ipsec.1")));
+    }
+
+    #[test]
+    fn test_dsl_value_to_aws_enum_plain_dot_value() {
+        // Plain string "ipsec.1" (not namespaced) should also work
+        let attr_type = AttributeType::StringEnum {
+            name: "Type".to_string(),
+            values: vec!["ipsec.1".to_string()],
+            namespace: Some("awscc.ec2.vpn_gateway".to_string()),
+            to_dsl: None,
+        };
+        let value = Value::String("ipsec.1".to_string());
+
+        let result = dsl_value_to_aws(&value, &attr_type, "ec2.vpn_gateway", "type");
+        assert_eq!(result, Some(json!("ipsec.1")));
+    }
+
+    #[test]
+    fn test_enum_round_trip_with_dotted_value() {
+        // Full round-trip: AWS value -> DSL -> back to AWS
         let attr_type = AttributeType::StringEnum {
             name: "Type".to_string(),
             values: vec!["ipsec.1".to_string()],
@@ -2442,8 +2485,19 @@ mod tests {
             to_dsl: None,
         };
 
-        let value = Value::String("ipsec.1".to_string());
-        let result = dsl_value_to_aws(&value, &attr_type, "ec2.vpn_gateway", "type");
-        assert_eq!(result, Some(json!("ipsec.1")));
+        // AWS -> DSL (read path)
+        let aws_val = json!("ipsec.1");
+        let dsl_val = aws_value_to_dsl("type", &aws_val, &attr_type, "ec2.vpn_gateway");
+        assert_eq!(
+            dsl_val,
+            Some(Value::String(
+                "awscc.ec2.vpn_gateway.Type.ipsec.1".to_string()
+            ))
+        );
+
+        // DSL -> AWS (write path)
+        let back_to_aws =
+            dsl_value_to_aws(&dsl_val.unwrap(), &attr_type, "ec2.vpn_gateway", "type");
+        assert_eq!(back_to_aws, Some(json!("ipsec.1")));
     }
 }

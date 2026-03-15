@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::fmt;
 
 use crate::resource::{Resource, Value};
-use crate::utils::{extract_enum_value, validate_enum_namespace};
+use crate::utils::{extract_enum_value_with_values, validate_enum_namespace};
 
 /// Type alias for resource validator functions
 pub type ResourceValidator = fn(&HashMap<String, Value>) -> Result<(), Vec<TypeError>>;
@@ -203,7 +203,8 @@ impl AttributeType {
                     let variant = if direct_match {
                         s.as_str()
                     } else {
-                        extract_enum_value(s)
+                        let valid: Vec<&str> = values.iter().map(String::as_str).collect();
+                        extract_enum_value_with_values(s, &valid)
                     };
                     let matches_canonical =
                         values.iter().any(|v| string_enum_value_matches(variant, v));

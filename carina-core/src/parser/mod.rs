@@ -1360,6 +1360,25 @@ mod tests {
     }
 
     #[test]
+    fn namespaced_id_with_digit_segment() {
+        // Enum values containing dots (e.g., "ipsec.1") should be parsed
+        // as part of a namespaced_id when written as an identifier
+        let input = r#"
+            let gw = awscc.ec2.vpn_gateway {
+                type = awscc.ec2.vpn_gateway.Type.ipsec.1
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+        assert_eq!(
+            result.resources[0].attributes.get("type"),
+            Some(&Value::String(
+                "awscc.ec2.vpn_gateway.Type.ipsec.1".to_string()
+            ))
+        );
+    }
+
+    #[test]
     fn parse_nested_blocks_terraform_style() {
         let input = r#"
             let web_sg = aws.security_group {

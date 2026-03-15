@@ -20,6 +20,71 @@ pub fn extract_enum_value(s: &str) -> &str {
     }
 }
 
+/// Extract the enum value from a namespaced identifier using known valid values
+/// for disambiguation.
+///
+/// When enum values themselves contain dots (e.g., `"ipsec.1"`), the simple
+/// last-dot-segment approach of [`extract_enum_value`] produces wrong results.
+/// This function checks each possible split point against the known valid values
+/// to find the correct enum value.
+///
+/// Falls back to [`extract_enum_value`] if no valid values match.
+///
+/// # Examples
+///
+/// ```
+/// use carina_core::utils::extract_enum_value_with_values;
+///
+/// let values = &["ipsec.1"];
+/// assert_eq!(
+///     extract_enum_value_with_values("awscc.ec2.vpn_gateway.Type.ipsec.1", values),
+///     "ipsec.1"
+/// );
+///
+/// let values = &["default", "dedicated", "host"];
+/// assert_eq!(
+///     extract_enum_value_with_values("awscc.ec2.vpc.InstanceTenancy.default", values),
+///     "default"
+/// );
+/// ```
+pub fn extract_enum_value_with_values<'a>(s: &'a str, valid_values: &[&str]) -> &'a str {
+    if !s.contains('.') {
+        return s;
+    }
+    // First, check if the entire string directly matches a valid value (e.g., "ipsec.1").
+    // This handles cases where the value contains dots but is not a namespaced identifier.
+    if valid_values.iter().any(|v| v.eq_ignore_ascii_case(s)) {
+        return s;
+    }
+    // Try each possible split point after a dot, from earliest to latest.
+    // The value portion is everything after the namespace prefix and type name.
+    // For "awscc.ec2.vpn_gateway.Type.ipsec.1", we try:
+    //   "ec2.vpn_gateway.Type.ipsec.1", "vpn_gateway.Type.ipsec.1", "Type.ipsec.1",
+    //   "ipsec.1", "1"
+    // We want the earliest match against valid_values, but we need at least
+    // a namespace prefix, so we check suffixes that could be the value part.
+    // The value is after the TypeName part. Since TypeName starts with uppercase,
+    // find the TypeName position and take everything after it.
+    let parts: Vec<&str> = s.split('.').collect();
+    // Find the TypeName part (starts with uppercase) to determine where the value begins
+    for (i, part) in parts.iter().enumerate() {
+        if part.chars().next().is_some_and(|c| c.is_uppercase()) && i + 1 < parts.len() {
+            // The value is everything after this TypeName part
+            let value_start = parts[..=i].iter().map(|p| p.len() + 1).sum::<usize>();
+            let candidate = &s[value_start..];
+            // Check if this candidate matches a valid value (case-insensitive)
+            if valid_values
+                .iter()
+                .any(|v| v.eq_ignore_ascii_case(candidate))
+            {
+                return candidate;
+            }
+        }
+    }
+    // Fallback to simple last-segment extraction
+    extract_enum_value(s)
+}
+
 /// Convert DSL enum value to provider SDK format.
 ///
 /// Handles the following patterns:
@@ -78,15 +143,18 @@ pub fn convert_enum_value(value: &str) -> String {
                 return value.to_string();
             }
         }
-        // 5-part: provider.service.resource.TypeName.value
+        // 5+ part: provider.service.resource.TypeName.value (value may contain dots)
         // e.g., "awscc.ec2.vpc.InstanceTenancy.default" -> "default"
-        5 => {
+        // e.g., "awscc.ec2.vpn_gateway.Type.ipsec.1" -> "ipsec.1"
+        n if n >= 5 => {
             let provider = parts[0];
             let type_name = parts[3];
             if provider.chars().all(|c| c.is_lowercase())
                 && type_name.chars().next().is_some_and(|c| c.is_uppercase())
             {
-                parts[4]
+                // Rejoin all parts after TypeName (index 3) to handle values with dots
+                let value_start = parts[..4].iter().map(|p| p.len() + 1).sum::<usize>();
+                return value[value_start..].replace('_', "-");
             } else {
                 return value.to_string();
             }
@@ -143,7 +211,9 @@ pub fn is_dsl_enum_format(s: &str) -> bool {
                 && type_name.chars().next().is_some_and(|c| c.is_uppercase())
         }
         // provider.service.resource.TypeName.value (e.g., awscc.ec2.vpc.InstanceTenancy.default)
-        5 => {
+        // Also handles 6+ parts where the enum value itself contains dots
+        // (e.g., awscc.ec2.vpn_gateway.Type.ipsec.1)
+        n if n >= 5 => {
             let provider = parts[0];
             let service = parts[1];
             let resource = parts[2];
@@ -216,8 +286,10 @@ pub fn validate_enum_namespace(s: &str, type_name: &str, namespace: &str) -> Res
                 ));
             }
         }
-        n if n == expected_full_len => {
-            // Full namespaced form: namespace.TypeName.value
+        // Full namespaced form: namespace.TypeName.value
+        // The value part may itself contain dots (e.g., "ipsec.1"), so accept
+        // any part count >= expected_full_len as long as the namespace and type_name match.
+        n if n >= expected_full_len => {
             for (i, &expected) in ns_parts.iter().enumerate() {
                 if parts[i] != expected {
                     return Err(format!("expected format {}.{}.value", namespace, type_name));
@@ -515,10 +587,77 @@ mod tests {
     }
 
     #[test]
+    fn test_is_dsl_enum_format_6_part_dotted_value() {
+        // 6-part: provider.service.resource.TypeName.value.with.dots
+        assert!(is_dsl_enum_format("awscc.ec2.vpn_gateway.Type.ipsec.1"));
+    }
+
+    #[test]
     fn test_is_dsl_enum_format_non_matching() {
         assert!(!is_dsl_enum_format("my-bucket"));
         assert!(!is_dsl_enum_format("ap-northeast-1"));
         assert!(!is_dsl_enum_format("some.random.string"));
         assert!(!is_dsl_enum_format("a.b.c.d.e.f"));
+    }
+
+    // extract_enum_value_with_values tests
+
+    #[test]
+    fn test_extract_enum_value_with_values_dotted() {
+        let values = &["ipsec.1"];
+        assert_eq!(
+            extract_enum_value_with_values("awscc.ec2.vpn_gateway.Type.ipsec.1", values),
+            "ipsec.1"
+        );
+    }
+
+    #[test]
+    fn test_extract_enum_value_with_values_simple() {
+        let values = &["default", "dedicated", "host"];
+        assert_eq!(
+            extract_enum_value_with_values("awscc.ec2.vpc.InstanceTenancy.default", values),
+            "default"
+        );
+    }
+
+    #[test]
+    fn test_extract_enum_value_with_values_no_dots() {
+        let values = &["Enabled", "Suspended"];
+        assert_eq!(extract_enum_value_with_values("Enabled", values), "Enabled");
+    }
+
+    #[test]
+    fn test_extract_enum_value_with_values_fallback() {
+        // When no valid value matches, falls back to last segment
+        let values = &["foo", "bar"];
+        assert_eq!(
+            extract_enum_value_with_values("awscc.ec2.vpc.InstanceTenancy.default", values),
+            "default"
+        );
+    }
+
+    // validate_enum_namespace with dotted values
+
+    #[test]
+    fn test_validate_namespace_6_part_dotted_value() {
+        // Value contains a dot: "ipsec.1" → 6 parts total
+        assert!(
+            validate_enum_namespace(
+                "awscc.ec2.vpn_gateway.Type.ipsec.1",
+                "Type",
+                "awscc.ec2.vpn_gateway"
+            )
+            .is_ok()
+        );
+    }
+
+    // convert_enum_value with dotted values
+
+    #[test]
+    fn test_convert_enum_value_6_part_dotted_value() {
+        assert_eq!(
+            convert_enum_value("awscc.ec2.vpn_gateway.Type.ipsec.1"),
+            "ipsec.1"
+        );
     }
 }
