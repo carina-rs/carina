@@ -8,6 +8,7 @@ use super::AwsccSchemaConfig;
 use super::tags_type;
 use carina_core::resource::Value;
 use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
+use regex::Regex;
 
 const VALID_ABAC_STATUS: &[&str] = &["Enabled", "Disabled"];
 
@@ -157,6 +158,34 @@ fn validate_max_age_range(value: &Value) -> Result<(), String> {
         }
     } else {
         Err("Expected integer".to_string())
+    }
+}
+
+fn validate_object_size_greater_than_pattern(value: &Value) -> Result<(), String> {
+    if let Value::String(s) = value {
+        static RE: std::sync::LazyLock<Regex> =
+            std::sync::LazyLock::new(|| Regex::new("[0-9]+").expect("invalid pattern regex"));
+        if RE.is_match(s) {
+            Ok(())
+        } else {
+            Err(format!("Value '{}' does not match pattern [0-9]+", s))
+        }
+    } else {
+        Err("Expected string".to_string())
+    }
+}
+
+fn validate_object_size_less_than_pattern(value: &Value) -> Result<(), String> {
+    if let Value::String(s) = value {
+        static RE: std::sync::LazyLock<Regex> =
+            std::sync::LazyLock::new(|| Regex::new("[0-9]+").expect("invalid pattern regex"));
+        if RE.is_match(s) {
+            Ok(())
+        } else {
+            Err(format!("Value '{}' does not match pattern [0-9]+", s))
+        }
+    } else {
+        Err("Expected string".to_string())
     }
 }
 
@@ -469,8 +498,20 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                     StructField::new("transition_in_days", AttributeType::Int).required().with_description("Specifies the number of days an object is noncurrent before Amazon S3 can perform the associated action. For information about the noncurrent days cal...").with_provider_name("TransitionInDays")
                     ],
                 }))).with_description("For buckets with versioning enabled (or suspended), one or more transition rules that specify when non-current objects transition to a specified stora...").with_provider_name("NoncurrentVersionTransitions"),
-                    StructField::new("object_size_greater_than", AttributeType::String).with_description("Specifies the minimum object size in bytes for this rule to apply to. Objects must be larger than this value in bytes. For more information about size...").with_provider_name("ObjectSizeGreaterThan"),
-                    StructField::new("object_size_less_than", AttributeType::String).with_description("Specifies the maximum object size in bytes for this rule to apply to. Objects must be smaller than this value in bytes. For more information about siz...").with_provider_name("ObjectSizeLessThan"),
+                    StructField::new("object_size_greater_than", AttributeType::Custom {
+                name: "String(pattern)".to_string(),
+                base: Box::new(AttributeType::String),
+                validate: validate_object_size_greater_than_pattern,
+                namespace: None,
+                to_dsl: None,
+            }).with_description("Specifies the minimum object size in bytes for this rule to apply to. Objects must be larger than this value in bytes. For more information about size...").with_provider_name("ObjectSizeGreaterThan"),
+                    StructField::new("object_size_less_than", AttributeType::Custom {
+                name: "String(pattern)".to_string(),
+                base: Box::new(AttributeType::String),
+                validate: validate_object_size_less_than_pattern,
+                namespace: None,
+                to_dsl: None,
+            }).with_description("Specifies the maximum object size in bytes for this rule to apply to. Objects must be smaller than this value in bytes. For more information about siz...").with_provider_name("ObjectSizeLessThan"),
                     StructField::new("prefix", AttributeType::String).with_description("Object key prefix that identifies one or more objects to which this rule applies. Replacement must be made for object keys containing special characte...").with_provider_name("Prefix"),
                     StructField::new("status", AttributeType::StringEnum {
                 name: "RuleStatus".to_string(),

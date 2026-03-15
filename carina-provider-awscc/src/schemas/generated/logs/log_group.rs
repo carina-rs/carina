@@ -8,6 +8,7 @@ use super::AwsccSchemaConfig;
 use super::tags_type;
 use carina_core::resource::Value;
 use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+use regex::Regex;
 
 const VALID_LOG_GROUP_CLASS: &[&str] = &["STANDARD", "INFREQUENT_ACCESS", "DELIVERY"];
 
@@ -25,6 +26,24 @@ fn validate_retention_in_days_int_enum(value: &Value) -> Result<(), String> {
         }
     } else {
         Err("Expected integer".to_string())
+    }
+}
+
+fn validate_log_group_name_pattern(value: &Value) -> Result<(), String> {
+    if let Value::String(s) = value {
+        static RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+            Regex::new("^[.\\-_/#A-Za-z0-9]{1,512}\\z").expect("invalid pattern regex")
+        });
+        if RE.is_match(s) {
+            Ok(())
+        } else {
+            Err(format!(
+                "Value '{}' does not match pattern ^[.\\-_/#A-Za-z0-9]{{1,512}}\\z",
+                s
+            ))
+        }
+    } else {
+        Err("Expected string".to_string())
     }
 }
 
@@ -74,7 +93,13 @@ pub fn logs_log_group_config() -> AwsccSchemaConfig {
                 .with_default(Value::String("STANDARD".to_string())),
         )
         .attribute(
-            AttributeSchema::new("log_group_name", AttributeType::String)
+            AttributeSchema::new("log_group_name", AttributeType::Custom {
+                name: "String(pattern)".to_string(),
+                base: Box::new(AttributeType::String),
+                validate: validate_log_group_name_pattern,
+                namespace: None,
+                to_dsl: None,
+            })
                 .create_only()
                 .with_description("The name of the log group. If you don't specify a name, CFNlong generates a unique ID for the log group.")
                 .with_provider_name("LogGroupName"),

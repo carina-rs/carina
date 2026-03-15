@@ -179,6 +179,9 @@ struct CfnProperty {
     /// Default value for this property
     #[serde(rename = "default")]
     default_value: Option<serde_json::Value>,
+    /// Regex pattern constraint (for string types)
+    #[serde(default)]
+    pattern: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -988,6 +991,7 @@ fn generate_schema_code(schema: &CfnSchema, type_name: &str) -> Result<String> {
     let mut ranged_ints: BTreeMap<String, (Option<i64>, Option<i64>)> = BTreeMap::new();
     let mut ranged_floats: BTreeMap<String, (Option<i64>, Option<i64>)> = BTreeMap::new();
     let mut int_enums: BTreeMap<String, Vec<i64>> = BTreeMap::new();
+    let mut patterns: BTreeMap<String, String> = BTreeMap::new();
 
     for (prop_name, prop) in &schema.properties {
         let (attr_type, enum_info) =
@@ -1063,6 +1067,13 @@ fn generate_schema_code(schema: &CfnSchema, type_name: &str) -> Result<String> {
             }
             _ => {}
         }
+        // Collect pattern constraints for string properties
+        if attr_type.contains("validate_")
+            && attr_type.contains("_pattern")
+            && let Some(pattern) = &prop.pattern
+        {
+            patterns.insert(prop_name.clone(), pattern.clone());
+        }
     }
 
     // Also scan definitions for struct field integer/number properties
@@ -1119,6 +1130,21 @@ fn generate_schema_code(schema: &CfnSchema, type_name: &str) -> Result<String> {
                             int_enums.insert(field_name.clone(), values);
                         }
                     }
+                    // Also collect pattern constraints from definitions
+                    if prop_type == Some("string")
+                        && field_prop.pattern.is_some()
+                        && !patterns.contains_key(field_name)
+                    {
+                        // Check if this field would actually use a pattern type
+                        // (skip if it has a known type override)
+                        let (field_type, _) = cfn_type_to_carina_type_with_enum(
+                            field_prop, field_name, schema, &namespace, &enums,
+                        );
+                        if field_type.contains("validate_") && field_type.contains("_pattern") {
+                            patterns
+                                .insert(field_name.clone(), field_prop.pattern.clone().unwrap());
+                        }
+                    }
                 }
             }
         }
@@ -1158,6 +1184,7 @@ fn generate_schema_code(schema: &CfnSchema, type_name: &str) -> Result<String> {
     let has_ranged_ints = !ranged_ints.is_empty();
     let has_ranged_floats = !ranged_floats.is_empty();
     let has_int_enums = !int_enums.is_empty();
+    let has_patterns = !patterns.is_empty();
     let has_defaults = schema.properties.values().any(|p| {
         p.default_value
             .as_ref()
@@ -1176,6 +1203,11 @@ fn generate_schema_code(schema: &CfnSchema, type_name: &str) -> Result<String> {
 
     // Int enums use AttributeType::Custom with AttributeType::Int base
     if has_int_enums {
+        needs_attribute_type = true;
+    }
+
+    // Patterns use AttributeType::Custom with AttributeType::String base
+    if has_patterns {
         needs_attribute_type = true;
     }
 
@@ -1207,8 +1239,11 @@ use super::AwsccSchemaConfig;
         resource, type_name, schema_imports_str
     ));
 
-    if has_ranged_ints || has_ranged_floats || has_int_enums || has_defaults {
+    if has_ranged_ints || has_ranged_floats || has_int_enums || has_defaults || has_patterns {
         code.push_str("use carina_core::resource::Value;\n");
+    }
+    if has_patterns {
+        code.push_str("use regex::Regex;\n");
     }
     if needs_tags_type {
         code.push_str("use super::tags_type;\n");
@@ -1316,6 +1351,41 @@ fn {}(value: &Value) -> Result<(), String> {{
 "#,
             const_name, values_str, fn_name, const_name
         ));
+    }
+
+    // Generate pattern validation functions for string properties
+    for (prop_name, pattern) in &patterns {
+        let fn_name = format!("validate_{}_pattern", prop_name.to_snake_case());
+        // Convert PCRE-specific constructs to Rust regex equivalents
+        let rust_pattern = pattern.replace("\\Z", "\\z");
+        // Escape for Rust string literal (double the backslashes, escape quotes)
+        let escaped_for_rust = rust_pattern.replace('\\', "\\\\").replace('"', "\\\"");
+        // For the error message, also escape { and } for the inner format!() macro
+        let escaped_for_msg = escaped_for_rust.replace('{', "{{").replace('}', "}}");
+        code.push_str("fn ");
+        code.push_str(&fn_name);
+        code.push_str("(value: &Value) -> Result<(), String> {\n");
+        code.push_str("    if let Value::String(s) = value {\n");
+        code.push_str(
+            "        static RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {\n",
+        );
+        code.push_str(&format!(
+            "            Regex::new(\"{}\").expect(\"invalid pattern regex\")\n",
+            escaped_for_rust
+        ));
+        code.push_str("        });\n");
+        code.push_str("        if RE.is_match(s) {\n");
+        code.push_str("            Ok(())\n");
+        code.push_str("        } else {\n");
+        code.push_str(&format!(
+            "            Err(format!(\"Value '{{}}' does not match pattern {}\", s))\n",
+            escaped_for_msg
+        ));
+        code.push_str("        }\n");
+        code.push_str("    } else {\n");
+        code.push_str("        Err(\"Expected string\".to_string())\n");
+        code.push_str("    }\n");
+        code.push_str("}\n\n");
     }
 
     // Generate config function
@@ -2729,6 +2799,24 @@ fn cfn_type_to_carina_type_with_enum(
                 return ("/* enum */".to_string(), Some(enum_info));
             }
 
+            // Check for regex pattern constraint
+            if prop.pattern.is_some() {
+                let validate_fn = format!("validate_{}_pattern", prop_name.to_snake_case());
+                return (
+                    format!(
+                        r#"AttributeType::Custom {{
+                name: "String(pattern)".to_string(),
+                base: Box::new(AttributeType::String),
+                validate: {},
+                namespace: None,
+                to_dsl: None,
+            }}"#,
+                        validate_fn
+                    ),
+                    None,
+                );
+            }
+
             ("AttributeType::String".to_string(), None)
         }
         Some("boolean") => ("AttributeType::Bool".to_string(), None),
@@ -3220,6 +3308,7 @@ mod tests {
             additional_properties: None,
             const_value: None,
             default_value: None,
+            pattern: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::SecurityGroupIngress".to_string(),
@@ -3291,6 +3380,7 @@ mod tests {
             additional_properties: None,
             const_value: None,
             default_value: None,
+            pattern: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::SecurityGroupIngress".to_string(),
@@ -3329,6 +3419,7 @@ mod tests {
             additional_properties: None,
             const_value: None,
             default_value: None,
+            pattern: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::SecurityGroupIngress".to_string(),
@@ -3367,6 +3458,7 @@ mod tests {
             additional_properties: None,
             const_value: None,
             default_value: None,
+            pattern: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::NatGateway".to_string(),
@@ -3410,6 +3502,7 @@ mod tests {
             additional_properties: None,
             const_value: None,
             default_value: None,
+            pattern: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::EIP".to_string(),
@@ -3448,6 +3541,7 @@ mod tests {
             additional_properties: None,
             const_value: None,
             default_value: None,
+            pattern: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::NatGateway".to_string(),
@@ -3490,6 +3584,7 @@ mod tests {
             additional_properties: None,
             const_value: None,
             default_value: None,
+            pattern: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::Subnet".to_string(),
@@ -3583,6 +3678,7 @@ mod tests {
             additional_properties: None,
             const_value: None,
             default_value: None,
+            pattern: None,
         };
         assert_eq!(
             list_element_type_display(&prop, "GenericProp", ""),
@@ -3604,6 +3700,7 @@ mod tests {
             additional_properties: None,
             const_value: None,
             default_value: None,
+            pattern: None,
         };
         assert_eq!(
             list_element_type_display(&prop, "GenericProp", ""),
@@ -3625,6 +3722,7 @@ mod tests {
             additional_properties: None,
             const_value: None,
             default_value: None,
+            pattern: None,
         };
         assert_eq!(
             list_element_type_display(&prop, "GenericProp", ""),
@@ -3646,6 +3744,7 @@ mod tests {
             additional_properties: None,
             const_value: None,
             default_value: None,
+            pattern: None,
         };
         assert_eq!(
             list_element_type_display(&prop, "GenericProp", ""),
@@ -3669,6 +3768,7 @@ mod tests {
             additional_properties: None,
             const_value: None,
             default_value: None,
+            pattern: None,
         };
         assert_eq!(
             list_element_type_display(&prop, "SubnetIds", ""),
@@ -3733,6 +3833,7 @@ mod tests {
                 additional_properties: None,
                 const_value: None,
                 default_value: None,
+                pattern: None,
             })),
             ref_path: None,
             insertion_order: None,
@@ -3743,6 +3844,7 @@ mod tests {
             additional_properties: None,
             const_value: None,
             default_value: None,
+            pattern: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::VPC".to_string(),
@@ -3784,6 +3886,7 @@ mod tests {
                 additional_properties: None,
                 const_value: None,
                 default_value: None,
+                pattern: None,
             })),
             ref_path: None,
             insertion_order: None,
@@ -3794,6 +3897,7 @@ mod tests {
             additional_properties: None,
             const_value: None,
             default_value: None,
+            pattern: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::VPC".to_string(),
@@ -3831,6 +3935,7 @@ mod tests {
             additional_properties: None,
             const_value: None,
             default_value: None,
+            pattern: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::VPC".to_string(),
@@ -3879,6 +3984,7 @@ mod tests {
                 additional_properties: None,
                 const_value: None,
                 default_value: None,
+                pattern: None,
             };
             let result = list_element_type_display(&prop, "GenericProp", "");
             assert!(
@@ -3923,6 +4029,7 @@ mod tests {
             additional_properties: None,
             const_value: None,
             default_value: None,
+            pattern: None,
         };
         let result = type_display_string("Prop1", &prop, &schema, &enums);
         assert_ne!(
@@ -3949,6 +4056,7 @@ mod tests {
                 additional_properties: None,
                 const_value: None,
                 default_value: None,
+                pattern: None,
             })),
             ref_path: None,
             insertion_order: None,
@@ -3959,6 +4067,7 @@ mod tests {
             additional_properties: None,
             const_value: None,
             default_value: None,
+            pattern: None,
         };
         let result = type_display_string("Prop2", &prop, &schema, &enums);
         assert_ne!(
@@ -3985,6 +4094,7 @@ mod tests {
                 additional_properties: None,
                 const_value: None,
                 default_value: None,
+                pattern: None,
             })),
             ref_path: None,
             insertion_order: None,
@@ -3995,6 +4105,7 @@ mod tests {
             additional_properties: None,
             const_value: None,
             default_value: None,
+            pattern: None,
         };
         let result = type_display_string("Prop3", &prop, &schema, &enums);
         assert_ne!(
@@ -4021,6 +4132,7 @@ mod tests {
                 additional_properties: None,
                 const_value: None,
                 default_value: None,
+                pattern: None,
             })),
             ref_path: None,
             insertion_order: None,
@@ -4031,6 +4143,7 @@ mod tests {
             additional_properties: None,
             const_value: None,
             default_value: None,
+            pattern: None,
         };
         let result = type_display_string("Prop4", &prop, &schema, &enums);
         assert_ne!(
@@ -4055,6 +4168,7 @@ mod tests {
             additional_properties: None,
             const_value: None,
             default_value: None,
+            pattern: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::VPC".to_string(),
@@ -4108,6 +4222,7 @@ mod tests {
             additional_properties: None,
             const_value: None,
             default_value: None,
+            pattern: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::VPC".to_string(),
@@ -4143,6 +4258,7 @@ mod tests {
             additional_properties: None,
             const_value: None,
             default_value: None,
+            pattern: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::VPC".to_string(),
@@ -4187,6 +4303,7 @@ mod tests {
             additional_properties: None,
             const_value: None,
             default_value: None,
+            pattern: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::VPC".to_string(),
@@ -4237,6 +4354,7 @@ mod tests {
             additional_properties: None,
             const_value: None,
             default_value: None,
+            pattern: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::Logs::LogGroup".to_string(),
@@ -4290,6 +4408,7 @@ mod tests {
             additional_properties: None,
             const_value: None,
             default_value: None,
+            pattern: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::NatGateway".to_string(),
@@ -4329,6 +4448,7 @@ mod tests {
             additional_properties: None,
             const_value: None,
             default_value: None,
+            pattern: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::SomeService::Resource".to_string(),
@@ -4368,6 +4488,7 @@ mod tests {
             additional_properties: None,
             const_value: None,
             default_value: None,
+            pattern: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::Logs::LogGroup".to_string(),
@@ -4406,6 +4527,7 @@ mod tests {
             additional_properties: None,
             const_value: None,
             default_value: None,
+            pattern: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::VPC".to_string(),
@@ -4478,6 +4600,7 @@ mod tests {
             additional_properties: None,
             const_value: None,
             default_value: None,
+            pattern: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::VPC".to_string(),
@@ -4518,6 +4641,7 @@ mod tests {
             additional_properties: None,
             const_value: None,
             default_value: None,
+            pattern: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::SecurityGroupIngress".to_string(),
@@ -4557,6 +4681,7 @@ mod tests {
             additional_properties: None,
             const_value: None,
             default_value: None,
+            pattern: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::S3::Bucket".to_string(),
@@ -4609,6 +4734,7 @@ mod tests {
             additional_properties: None,
             const_value: None,
             default_value: None,
+            pattern: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::SecurityGroupIngress".to_string(),
@@ -5270,6 +5396,7 @@ mod tests {
                 additional_properties: None,
                 const_value: None,
                 default_value: None,
+                pattern: None,
             },
         );
 
@@ -5329,6 +5456,7 @@ mod tests {
                 additional_properties: None,
                 const_value: None,
                 default_value: None,
+                pattern: None,
             },
         );
 
@@ -5362,6 +5490,7 @@ mod tests {
                 additional_properties: None,
                 const_value: None,
                 default_value: None,
+                pattern: None,
             },
         );
 
@@ -6230,5 +6359,119 @@ mod tests {
         );
         assert_eq!(json_default_to_value_code(&serde_json::Value::Null), None,);
         assert_eq!(json_default_to_value_code(&serde_json::json!([])), None,);
+    }
+
+    #[test]
+    fn test_string_with_pattern_produces_custom_type() {
+        let prop = CfnProperty {
+            prop_type: Some(TypeValue::Single("string".to_string())),
+            description: Some("The name of the log group.".to_string()),
+            pattern: Some(r"^[.\-_/#A-Za-z0-9]{1,512}\Z".to_string()),
+            ..Default::default()
+        };
+        let schema = CfnSchema {
+            type_name: "AWS::Logs::LogGroup".to_string(),
+            description: None,
+            properties: BTreeMap::new(),
+            required: vec![],
+            read_only_properties: vec![],
+            create_only_properties: vec![],
+            write_only_properties: vec![],
+            primary_identifier: None,
+            definitions: None,
+            tagging: None,
+        };
+        let (type_str, _) = cfn_type_to_carina_type_with_enum(
+            &prop,
+            "LogGroupName",
+            &schema,
+            "awscc.logs.log_group",
+            &BTreeMap::new(),
+        );
+        assert!(
+            type_str.contains("AttributeType::Custom"),
+            "String with pattern should produce Custom type, got: {}",
+            type_str
+        );
+        assert!(
+            type_str.contains("validate_log_group_name_pattern"),
+            "Should reference pattern validation function, got: {}",
+            type_str
+        );
+    }
+
+    #[test]
+    fn test_string_with_pattern_but_known_type_skips_pattern() {
+        // KmsKeyId has a pattern but is already recognized as a KMS ARN type
+        let prop = CfnProperty {
+            prop_type: Some(TypeValue::Single("string".to_string())),
+            description: Some("The ARN of the KMS key.".to_string()),
+            pattern: Some(r"^arn:[a-z0-9-]+:kms:[a-z0-9-]+:\d{12}:(key|alias)/.+\Z".to_string()),
+            ..Default::default()
+        };
+        let schema = CfnSchema {
+            type_name: "AWS::Logs::LogGroup".to_string(),
+            description: None,
+            properties: BTreeMap::new(),
+            required: vec![],
+            read_only_properties: vec![],
+            create_only_properties: vec![],
+            write_only_properties: vec![],
+            primary_identifier: None,
+            definitions: None,
+            tagging: None,
+        };
+        let (type_str, _) = cfn_type_to_carina_type_with_enum(
+            &prop,
+            "KmsKeyId",
+            &schema,
+            "awscc.logs.log_group",
+            &BTreeMap::new(),
+        );
+        // KmsKeyId should be resolved to a specific ARN type, not pattern-validated
+        assert!(
+            !type_str.contains("validate_kms_key_id_pattern"),
+            "Known type (KmsKeyId) should not get pattern validation, got: {}",
+            type_str
+        );
+    }
+
+    #[test]
+    fn test_pattern_validation_generated_in_schema_code() {
+        let mut properties = BTreeMap::new();
+        properties.insert(
+            "LogGroupName".to_string(),
+            CfnProperty {
+                prop_type: Some(TypeValue::Single("string".to_string())),
+                description: Some("The name of the log group.".to_string()),
+                pattern: Some(r"^[.\-_/#A-Za-z0-9]{1,512}\Z".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let schema = CfnSchema {
+            type_name: "AWS::Logs::LogGroup".to_string(),
+            description: None,
+            properties,
+            required: vec![],
+            read_only_properties: vec![],
+            create_only_properties: vec![],
+            write_only_properties: vec![],
+            primary_identifier: None,
+            definitions: None,
+            tagging: None,
+        };
+
+        let code = generate_schema_code(&schema, "AWS::Logs::LogGroup").unwrap();
+        assert!(
+            code.contains("fn validate_log_group_name_pattern"),
+            "Generated code should contain pattern validation function:\n{}",
+            code
+        );
+        assert!(
+            code.contains("Regex::new"),
+            "Pattern validation should use Regex:\n{}",
+            code
+        );
     }
 }
