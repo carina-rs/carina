@@ -1,0 +1,11 @@
+# Negative test: invalid enum value for instance_tenancy
+# Expected: validation error for invalid InstanceTenancy variant
+
+provider awscc {
+  region = awscc.Region.ap_northeast_1
+}
+
+awscc.ec2.vpc {
+  cidr_block       = "10.0.0.0/16"
+  instance_tenancy = invalid_value
+}

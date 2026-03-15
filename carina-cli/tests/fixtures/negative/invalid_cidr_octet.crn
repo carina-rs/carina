@@ -1,0 +1,10 @@
+# Negative test: CIDR with octet > 255
+# Expected: validation error for invalid IP address
+
+provider awscc {
+  region = awscc.Region.ap_northeast_1
+}
+
+awscc.ec2.vpc {
+  cidr_block = "10.0.0.256/16"
+}

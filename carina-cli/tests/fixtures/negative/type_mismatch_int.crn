@@ -1,0 +1,11 @@
+# Negative test: string value where int is expected
+# Expected: validation error for ipv4_netmask_length
+
+provider awscc {
+  region = awscc.Region.ap_northeast_1
+}
+
+awscc.ec2.vpc {
+  cidr_block           = "10.0.0.0/16"
+  ipv4_netmask_length  = "sixteen"
+}

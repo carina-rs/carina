@@ -1,0 +1,10 @@
+# Negative test: invalid CIDR format
+# Expected: validation error for cidr_block
+
+provider awscc {
+  region = awscc.Region.ap_northeast_1
+}
+
+awscc.ec2.vpc {
+  cidr_block = "not-a-cidr"
+}
