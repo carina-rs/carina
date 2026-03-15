@@ -2951,10 +2951,6 @@ fn cfn_type_to_carina_type_with_enum(
     }
 }
 
-/// Compute singular block name from a plural snake_case attribute name.
-///
-/// Returns `Some(singular)` if the singular differs from the original,
-/// or `None` if the name is already singular or doesn't match known patterns.
 /// Convert a JSON default value to a Rust `Value::...` expression string.
 /// Returns `None` for unsupported types (arrays, objects, null).
 fn json_default_to_value_code(val: &serde_json::Value) -> Option<String> {
@@ -2986,6 +2982,10 @@ fn json_default_to_markdown(val: &serde_json::Value) -> Option<String> {
     }
 }
 
+/// Compute singular block name from a plural snake_case attribute name.
+///
+/// Returns `Some(singular)` if the singular differs from the original,
+/// or `None` if the name is already singular or doesn't match known patterns.
 fn compute_block_name(name: &str) -> Option<String> {
     let singular = if let Some(stem) = name.strip_suffix("ies") {
         // policies -> policy, entries -> entry
