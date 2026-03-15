@@ -7,7 +7,7 @@ provider awscc {
 }
 
 awscc.ec2.vpn_gateway {
-  type = "ipsec.1"
+  type = awscc.ec2.vpn_gateway.Type.ipsec.1
 
   tags = {
     Environment = "example"
