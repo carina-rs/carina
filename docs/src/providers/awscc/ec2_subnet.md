@@ -45,7 +45,7 @@ The Availability Zone of the subnet. If you update this property, you must also 
 
 ### `availability_zone_id`
 
-- **Type:** String
+- **Type:** AvailabilityZoneId
 - **Required:** No
 
 The AZ ID of the subnet.
