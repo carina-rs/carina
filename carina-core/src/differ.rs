@@ -2703,8 +2703,6 @@ mod tests {
             AttributeSchema::new("port", AttributeType::Float),
         );
 
-        let mut desired_attrs = HashMap::new();
-        desired_attrs.insert("port".to_string(), Value::Int(443));
         let desired =
             Resource::new("test.resource", "test").with_attribute("port", Value::Int(443));
 
