@@ -115,15 +115,16 @@ impl Value {
             }
             Value::Bool(b) => b.hash(hasher),
             Value::List(items) => {
-                // For list hashing, use an order-independent combination (XOR of element hashes)
+                // For list hashing, use an order-independent combination (wrapping sum)
                 // so that lists with same elements in different order hash the same.
-                // This is used inside canonical_hash for nested lists.
+                // Wrapping sum is preferred over XOR because XOR causes all lists
+                // with duplicate elements to collide (e.g., [1,1] XOR = 0, [2,2] XOR = 0).
                 items.len().hash(hasher);
-                let mut xor_hash: u64 = 0;
+                let mut sum_hash: u64 = 0;
                 for item in items {
-                    xor_hash ^= item.canonical_hash();
+                    sum_hash = sum_hash.wrapping_add(item.canonical_hash());
                 }
-                xor_hash.hash(hasher);
+                sum_hash.hash(hasher);
             }
             Value::Map(map) => {
                 map.len().hash(hasher);
