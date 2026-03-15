@@ -733,6 +733,7 @@ pub fn aws_account_id() -> AttributeType {
 // ========== ARN validators ==========
 
 /// Validate basic ARN format (starts with "arn:", has 6+ colon-separated parts).
+/// Enforces that partition and service are non-empty.
 pub fn validate_arn(arn: &str) -> Result<(), String> {
     if !arn.starts_with("arn:") {
         return Err("must start with 'arn:'".to_string());
@@ -742,6 +743,16 @@ pub fn validate_arn(arn: &str) -> Result<(), String> {
         return Err(
             "must have at least 6 colon-separated parts (arn:partition:service:region:account:resource)".to_string()
         );
+    }
+    // Partition must be non-empty (e.g., "aws", "aws-cn", "aws-us-gov")
+    if parts[1].is_empty() {
+        return Err(
+            "partition must not be empty (e.g., 'aws', 'aws-cn', 'aws-us-gov')".to_string(),
+        );
+    }
+    // Service must be non-empty (e.g., "s3", "iam", "ec2")
+    if parts[2].is_empty() {
+        return Err("service must not be empty (e.g., 's3', 'iam', 'ec2')".to_string());
     }
     Ok(())
 }
@@ -999,6 +1010,61 @@ pub fn validate_availability_zone(az: &str) -> Result<(), String> {
     Ok(())
 }
 
+// ========== Availability Zone ID ==========
+
+/// Validate availability zone ID format.
+/// AZ IDs use a compact format like "use1-az1", "usw2-az2", "apne1-az4", "euc1-az1".
+/// Format: region-abbreviation + number + "-az" + digit(s)
+pub fn validate_availability_zone_id(az_id: &str) -> Result<(), String> {
+    // Must contain "-az" separator
+    let Some(az_pos) = az_id.find("-az") else {
+        return Err("must contain '-az' (e.g., 'use1-az1')".to_string());
+    };
+
+    let prefix = &az_id[..az_pos];
+    let suffix = &az_id[az_pos + 3..]; // after "-az"
+
+    // Prefix must be non-empty and contain only lowercase letters and digits,
+    // ending with a digit (the region number)
+    if prefix.is_empty() {
+        return Err("region prefix must not be empty".to_string());
+    }
+    if !prefix
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+    {
+        return Err("region prefix must contain only lowercase letters and digits".to_string());
+    }
+    if !prefix.chars().last().is_some_and(|c| c.is_ascii_digit()) {
+        return Err("region prefix must end with a digit (e.g., 'use1', 'apne1')".to_string());
+    }
+
+    // Suffix (after "-az") must be one or more digits
+    if suffix.is_empty() || !suffix.chars().all(|c| c.is_ascii_digit()) {
+        return Err("AZ number after '-az' must be one or more digits".to_string());
+    }
+
+    Ok(())
+}
+
+/// Availability Zone ID type (e.g., "use1-az1", "usw2-az2", "apne1-az4")
+pub fn availability_zone_id() -> AttributeType {
+    AttributeType::Custom {
+        name: "AvailabilityZoneId".to_string(),
+        base: Box::new(AttributeType::String),
+        validate: |value| {
+            if let Value::String(s) = value {
+                validate_availability_zone_id(s)
+                    .map_err(|reason| format!("Invalid availability zone ID '{}': {}", s, reason))
+            } else {
+                Err("Expected string".to_string())
+            }
+        },
+        namespace: None,
+        to_dsl: None,
+    }
+}
+
 // ========== IAM Policy Document ==========
 
 /// String or list of strings type — for IAM policy fields like action, resource
@@ -1151,6 +1217,19 @@ mod tests {
     }
 
     #[test]
+    fn validate_arn_rejects_empty_partition() {
+        // "arn::::::" has empty partition and service — should be rejected
+        assert!(validate_arn("arn::s3:::my-bucket").is_err());
+        assert!(validate_arn("arn:::::").is_err());
+    }
+
+    #[test]
+    fn validate_arn_rejects_empty_service() {
+        assert!(validate_arn("arn:aws::::").is_err());
+        assert!(validate_arn("arn:aws:::123456789012:resource").is_err());
+    }
+
+    #[test]
     fn validate_arn_type_with_value() {
         let t = arn();
         assert!(
@@ -1296,6 +1375,52 @@ mod tests {
         assert!(validate_availability_zone("a").is_err()); // too short
         assert!(validate_availability_zone("invalid").is_err()); // no numeric part
         assert!(validate_availability_zone("us-east").is_err()); // no numeric part
+    }
+
+    // Availability zone ID tests
+
+    #[test]
+    fn validate_availability_zone_id_valid() {
+        assert!(validate_availability_zone_id("use1-az1").is_ok());
+        assert!(validate_availability_zone_id("use1-az2").is_ok());
+        assert!(validate_availability_zone_id("usw2-az1").is_ok());
+        assert!(validate_availability_zone_id("usw2-az4").is_ok());
+        assert!(validate_availability_zone_id("apne1-az1").is_ok());
+        assert!(validate_availability_zone_id("apne1-az4").is_ok());
+        assert!(validate_availability_zone_id("euc1-az1").is_ok());
+        assert!(validate_availability_zone_id("aps1-az1").is_ok());
+        assert!(validate_availability_zone_id("mes1-az1").is_ok());
+        assert!(validate_availability_zone_id("afs1-az1").is_ok());
+    }
+
+    #[test]
+    fn validate_availability_zone_id_invalid() {
+        assert!(validate_availability_zone_id("us-east-1a").is_err()); // AZ name, not ID
+        assert!(validate_availability_zone_id("use1").is_err()); // missing -az suffix
+        assert!(validate_availability_zone_id("az1").is_err()); // missing region prefix
+        assert!(validate_availability_zone_id("").is_err()); // empty
+        assert!(validate_availability_zone_id("USE1-AZ1").is_err()); // uppercase
+        assert!(validate_availability_zone_id("use-az1").is_err()); // prefix doesn't end with digit
+        assert!(validate_availability_zone_id("use1-az").is_err()); // missing AZ number
+        assert!(validate_availability_zone_id("use1-azX").is_err()); // non-digit after -az
+    }
+
+    #[test]
+    fn validate_availability_zone_id_type_with_value() {
+        let t = availability_zone_id();
+        assert!(t.validate(&Value::String("use1-az1".to_string())).is_ok());
+        assert!(
+            t.validate(&Value::String("us-east-1a".to_string()))
+                .is_err()
+        );
+        assert!(t.validate(&Value::Int(42)).is_err());
+        assert!(
+            t.validate(&Value::ResourceRef {
+                binding_name: "subnet".to_string(),
+                attribute_name: "availability_zone_id".to_string(),
+            })
+            .is_ok()
+        );
     }
 
     // Enum helpers

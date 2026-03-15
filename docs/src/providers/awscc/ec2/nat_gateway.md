@@ -151,7 +151,7 @@ Shorthand formats: `public` or `ConnectivityType.public`
 |-------|------|----------|-------------|
 | `allocation_ids` | `List<AllocationId>` | Yes | The allocation IDs of the Elastic IP addresses (EIPs) to be used for handling outbound NAT traffic i... |
 | `availability_zone` | AvailabilityZone | No | For regional NAT gateways only: The Availability Zone where this specific NAT gateway configuration ... |
-| `availability_zone_id` | String | No | For regional NAT gateways only: The ID of the Availability Zone where this specific NAT gateway conf... |
+| `availability_zone_id` | AvailabilityZoneId | No | For regional NAT gateways only: The ID of the Availability Zone where this specific NAT gateway conf... |
 
 ## Attribute Reference
 

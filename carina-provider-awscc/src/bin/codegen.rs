@@ -377,6 +377,8 @@ fn infer_string_type_display(prop_name: &str, resource_type: &str) -> String {
         }
     } else if prop_lower == "availabilityzone" || prop_lower == "availabilityzones" {
         "AvailabilityZone".to_string()
+    } else if prop_lower == "availabilityzoneid" || prop_lower == "availabilityzoneids" {
+        "AvailabilityZoneId".to_string()
     } else if prop_lower.ends_with("region") || prop_lower == "regionname" {
         "Region".to_string()
     } else if prop_lower.ends_with("arn")
@@ -2260,6 +2262,11 @@ fn infer_string_type(prop_name: &str, resource_type: &str) -> Option<String> {
         return Some("super::availability_zone()".to_string());
     }
 
+    // Availability zone ID (e.g., "use1-az1", "usw2-az2")
+    if prop_lower == "availabilityzoneid" || prop_lower == "availabilityzoneids" {
+        return Some("super::availability_zone_id()".to_string());
+    }
+
     // Region types (e.g., PeerRegion, ServiceRegion, RegionName, ResourceRegion)
     if prop_lower.ends_with("region") || prop_lower == "regionname" {
         return Some("super::awscc_region()".to_string());
@@ -3446,7 +3453,7 @@ mod tests {
         );
         assert_eq!(type_str, "super::availability_zone()");
 
-        // AvailabilityZoneId should stay String
+        // AvailabilityZoneId should use super::availability_zone_id()
         let (type_str, _) = cfn_type_to_carina_type_with_enum(
             &prop,
             "AvailabilityZoneId",
@@ -3454,7 +3461,7 @@ mod tests {
             "",
             &BTreeMap::new(),
         );
-        assert_eq!(type_str, "AttributeType::String");
+        assert_eq!(type_str, "super::availability_zone_id()");
     }
 
     #[test]
@@ -5012,8 +5019,11 @@ mod tests {
             infer_string_type("AvailabilityZone", ""),
             Some("super::availability_zone()".to_string())
         );
-        // AvailabilityZoneId should NOT match (uses AZ ID format like "use1-az1")
-        assert_eq!(infer_string_type("AvailabilityZoneId", ""), None);
+        // AvailabilityZoneId should use availability_zone_id()
+        assert_eq!(
+            infer_string_type("AvailabilityZoneId", ""),
+            Some("super::availability_zone_id()".to_string())
+        );
     }
 
     #[test]
