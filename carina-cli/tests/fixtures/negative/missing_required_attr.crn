@@ -1,0 +1,10 @@
+# Negative test: missing required attribute
+# Expected: validation error for missing group_description on security_group
+
+provider awscc {
+  region = awscc.Region.ap_northeast_1
+}
+
+awscc.ec2.security_group {
+  vpc_id = "vpc-12345678abcdef012"
+}

@@ -75,6 +75,11 @@ fn unknown_resource_type() {
 }
 
 #[test]
+fn missing_required_attribute() {
+    assert_validate_fails("missing_required_attr.crn", "group_description");
+}
+
+#[test]
 fn invalid_region() {
     assert_validate_fails("invalid_region.crn", "region");
 }
