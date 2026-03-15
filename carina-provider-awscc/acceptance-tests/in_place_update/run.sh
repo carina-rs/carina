@@ -5,8 +5,20 @@
 #   aws-vault exec <profile> -- ./run.sh [filter]
 #
 # Tests:
-#   logs_log_group - Change retention_in_days (7 -> 14)
-#   s3_bucket      - Toggle versioning (Enabled -> Disabled)
+#   logs_log_group                     - Change retention_in_days (7 -> 14)
+#   s3_bucket                          - Toggle versioning (Enabled -> Disabled)
+#   ec2_vpc                            - Toggle enable_dns_hostnames (false -> true)
+#   ec2_subnet                         - Toggle map_public_ip_on_launch (false -> true)
+#   iam_role                           - Change max_session_duration (3600 -> 7200)
+#   ec2_transit_gateway                - Change description
+#   ec2_security_group                 - Add ingress rule
+#   ec2_eip                            - Update tags
+#   ec2_route_table                    - Update tags
+#   ec2_flow_log                       - Update tags
+#   ec2_nat_gateway                    - Update tags
+#   ec2_egress_only_internet_gateway   - Update tags
+#   ec2_vpc_endpoint                   - Add policy_document
+#   ec2_vpc_peering_connection         - Update tags
 #
 # Filter (optional): substring to match test names (e.g. "logs_log_group", "s3_bucket")
 
@@ -154,6 +166,78 @@ run_test "s3_bucket" \
     "$SCRIPT_DIR/s3_bucket_step1.crn" \
     "$SCRIPT_DIR/s3_bucket_step2.crn" \
     "Test 2: S3 Bucket (versioning Enabled -> Disabled)"
+
+# Test 3: EC2 VPC - toggle enable_dns_hostnames (false -> true)
+run_test "ec2_vpc" \
+    "$SCRIPT_DIR/ec2_vpc_step1.crn" \
+    "$SCRIPT_DIR/ec2_vpc_step2.crn" \
+    "Test 3: EC2 VPC (enable_dns_hostnames false -> true)"
+
+# Test 4: EC2 Subnet - toggle map_public_ip_on_launch (false -> true)
+run_test "ec2_subnet" \
+    "$SCRIPT_DIR/ec2_subnet_step1.crn" \
+    "$SCRIPT_DIR/ec2_subnet_step2.crn" \
+    "Test 4: EC2 Subnet (map_public_ip_on_launch false -> true)"
+
+# Test 5: IAM Role - change max_session_duration (3600 -> 7200)
+run_test "iam_role" \
+    "$SCRIPT_DIR/iam_role_step1.crn" \
+    "$SCRIPT_DIR/iam_role_step2.crn" \
+    "Test 5: IAM Role (max_session_duration 3600 -> 7200)"
+
+# Test 6: EC2 Transit Gateway - change description
+run_test "ec2_transit_gateway" \
+    "$SCRIPT_DIR/ec2_transit_gateway_step1.crn" \
+    "$SCRIPT_DIR/ec2_transit_gateway_step2.crn" \
+    "Test 6: EC2 Transit Gateway (description update)"
+
+# Test 7: EC2 Security Group - add ingress rule
+run_test "ec2_security_group" \
+    "$SCRIPT_DIR/ec2_security_group_step1.crn" \
+    "$SCRIPT_DIR/ec2_security_group_step2.crn" \
+    "Test 7: EC2 Security Group (add HTTPS ingress rule)"
+
+# Test 8: EC2 EIP - update tags
+run_test "ec2_eip" \
+    "$SCRIPT_DIR/ec2_eip_step1.crn" \
+    "$SCRIPT_DIR/ec2_eip_step2.crn" \
+    "Test 8: EC2 EIP (tags update)"
+
+# Test 9: EC2 Route Table - update tags
+run_test "ec2_route_table" \
+    "$SCRIPT_DIR/ec2_route_table_step1.crn" \
+    "$SCRIPT_DIR/ec2_route_table_step2.crn" \
+    "Test 9: EC2 Route Table (tags update)"
+
+# Test 10: EC2 Flow Log - update tags
+run_test "ec2_flow_log" \
+    "$SCRIPT_DIR/ec2_flow_log_step1.crn" \
+    "$SCRIPT_DIR/ec2_flow_log_step2.crn" \
+    "Test 10: EC2 Flow Log (tags update)"
+
+# Test 11: EC2 NAT Gateway - update tags
+run_test "ec2_nat_gateway" \
+    "$SCRIPT_DIR/ec2_nat_gateway_step1.crn" \
+    "$SCRIPT_DIR/ec2_nat_gateway_step2.crn" \
+    "Test 11: EC2 NAT Gateway (tags update)"
+
+# Test 12: EC2 Egress Only Internet Gateway - update tags
+run_test "ec2_egress_only_internet_gateway" \
+    "$SCRIPT_DIR/ec2_egress_only_internet_gateway_step1.crn" \
+    "$SCRIPT_DIR/ec2_egress_only_internet_gateway_step2.crn" \
+    "Test 12: EC2 Egress Only Internet Gateway (tags update)"
+
+# Test 13: EC2 VPC Endpoint - add policy_document
+run_test "ec2_vpc_endpoint" \
+    "$SCRIPT_DIR/ec2_vpc_endpoint_step1.crn" \
+    "$SCRIPT_DIR/ec2_vpc_endpoint_step2.crn" \
+    "Test 13: EC2 VPC Endpoint (add policy_document)"
+
+# Test 14: EC2 VPC Peering Connection - update tags
+run_test "ec2_vpc_peering_connection" \
+    "$SCRIPT_DIR/ec2_vpc_peering_connection_step1.crn" \
+    "$SCRIPT_DIR/ec2_vpc_peering_connection_step2.crn" \
+    "Test 14: EC2 VPC Peering Connection (tags update)"
 
 echo "════════════════════════════════════════"
 echo "Total: $TOTAL_PASSED passed, $TOTAL_FAILED failed"

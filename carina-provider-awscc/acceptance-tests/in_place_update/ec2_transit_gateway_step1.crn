@@ -1,0 +1,15 @@
+# EC2 Transit Gateway - in-place update test (step 1)
+#
+# Tests: create transit gateway with initial description
+
+provider awscc {
+  region = awscc.Region.ap_northeast_1
+}
+
+awscc.ec2.transit_gateway {
+  description = "carina acceptance test - step 1"
+
+  tags = {
+    Environment = "acceptance-test"
+  }
+}
