@@ -477,9 +477,9 @@ fn parse_pipe_expr_with_resource_or_module(
         parse_primary_with_resource_or_module(primary, ctx, binding_name)?;
 
     // Pipe operator is parsed but not yet implemented — reject with a clear error
-    if inner.next().is_some() {
+    if let Some(func_call) = inner.next() {
         return Err(ParseError::InvalidExpression {
-            line: 0,
+            line: func_call.line_col().0,
             message: "Pipe operator is not yet supported".to_string(),
         });
     }
@@ -780,9 +780,9 @@ fn parse_pipe_expr(
     let value = parse_primary_value(primary, ctx)?;
 
     // Pipe operator is parsed but not yet implemented — reject with a clear error
-    if inner.next().is_some() {
+    if let Some(func_call) = inner.next() {
         return Err(ParseError::InvalidExpression {
-            line: 0,
+            line: func_call.line_col().0,
             message: "Pipe operator is not yet supported".to_string(),
         });
     }
