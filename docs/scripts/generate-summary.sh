@@ -36,10 +36,10 @@ generate_provider_section() {
         return
     fi
 
-    # Check if there are any resource doc files (exclude index.md)
+    # Check if there are any service subdirectories with doc files
     local HAS_FILES=false
-    for f in "$DOCS_DIR"/*.md; do
-        [ "$(basename "$f")" = "index.md" ] && continue
+    for f in "$DOCS_DIR"/*/*.md; do
+        [ -f "$f" ] || continue
         HAS_FILES=true
         break
     done
@@ -51,10 +51,13 @@ generate_provider_section() {
     echo "- [${LABEL}](providers/${PROVIDER}/index.md)" >> "$SUMMARY_FILE"
 
     local PREV_SERVICE=""
-    for DOC_FILE in "$DOCS_DIR"/*.md; do
-        local BASENAME
-        BASENAME=$(basename "$DOC_FILE" .md)
-        [ "$BASENAME" = "index" ] && continue
+    for DOC_FILE in "$DOCS_DIR"/*/*.md; do
+        [ -f "$DOC_FILE" ] || continue
+
+        local SERVICE_DIR
+        SERVICE_DIR=$(basename "$(dirname "$DOC_FILE")")
+        local RESOURCE_NAME
+        RESOURCE_NAME=$(basename "$DOC_FILE" .md)
 
         # Extract service display name from CloudFormation Type line
         # e.g., "CloudFormation Type: `AWS::EC2::VPC`" -> "EC2"
@@ -66,8 +69,8 @@ generate_provider_section() {
         fi
 
         if [ -z "$SERVICE_DISPLAY" ]; then
-            # Fallback: uppercase first segment of filename
-            SERVICE_DISPLAY=$(echo "$BASENAME" | awk -F'_' '{print toupper($1)}')
+            # Fallback: uppercase service directory name
+            SERVICE_DISPLAY=$(echo "$SERVICE_DIR" | tr '[:lower:]' '[:upper:]')
         fi
 
         # Extract DSL name from first heading
@@ -81,7 +84,7 @@ generate_provider_section() {
             PREV_SERVICE="$SERVICE_DISPLAY"
         fi
 
-        echo "    - [${DSL_NAME}](providers/${PROVIDER}/${BASENAME}.md)" >> "$SUMMARY_FILE"
+        echo "    - [${DSL_NAME}](providers/${PROVIDER}/${SERVICE_DIR}/${RESOURCE_NAME}.md)" >> "$SUMMARY_FILE"
     done
 }
 

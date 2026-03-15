@@ -4,6 +4,28 @@ CloudFormation Type: `AWS::EC2::Subnet`
 
 Describes a subnet.
 
+## Example
+
+```crn
+let vpc = aws.ec2.vpc {
+  cidr_block = "10.0.0.0/16"
+
+  tags = {
+    Environment = "example"
+  }
+}
+
+let subnet = aws.ec2.subnet {
+  vpc_id            = vpc.vpc_id
+  cidr_block        = "10.0.1.0/24"
+  availability_zone = aws.AvailabilityZone.ap_northeast_1a
+
+  tags = {
+    Environment = "example"
+  }
+}
+```
+
 ## Argument Reference
 
 ### `assign_ipv6_address_on_creation`

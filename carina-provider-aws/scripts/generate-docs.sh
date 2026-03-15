@@ -29,13 +29,10 @@ cargo run -p carina-codegen-aws --bin smithy-codegen -- \
   --format markdown
 
 # Insert examples into generated docs (after description, before Argument Reference)
-for DOC_FILE in "$DOCS_DIR"/*.md; do
+for DOC_FILE in "$DOCS_DIR"/*/*.md; do
+    SERVICE_DIR=$(basename "$(dirname "$DOC_FILE")")
     RESOURCE_NAME=$(basename "$DOC_FILE" .md)
-    # Skip non-resource files like index.md
-    if [ "$RESOURCE_NAME" = "index" ]; then
-        continue
-    fi
-    EXAMPLE_FILE="$EXAMPLES_DIR/${RESOURCE_NAME}/main.crn"
+    EXAMPLE_FILE="$EXAMPLES_DIR/${SERVICE_DIR}_${RESOURCE_NAME}/main.crn"
     if [ -f "$EXAMPLE_FILE" ]; then
         EXAMPLE_TMPFILE=$(mktemp)
         {
