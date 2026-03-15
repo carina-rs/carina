@@ -17,7 +17,7 @@ use clap::Parser;
 use heck::{ToPascalCase, ToSnakeCase};
 use regex::Regex;
 use serde::Deserialize;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::{self, Read};
 use std::sync::LazyLock;
 
@@ -1071,8 +1071,8 @@ fn generate_schema_code(schema: &CfnSchema, type_name: &str) -> Result<String> {
     let mut ranged_lists: BTreeMap<String, (Option<i64>, Option<i64>)> = BTreeMap::new();
     let mut patterns: BTreeMap<String, String> = BTreeMap::new();
     let mut ranged_strings: BTreeMap<String, (Option<u64>, Option<u64>)> = BTreeMap::new();
-    // Combined pattern + length constraints: pattern -> (min_length, max_length)
-    let mut pattern_with_lengths: BTreeMap<String, (Option<u64>, Option<u64>)> = BTreeMap::new();
+    // Combined pattern + length constraints: (pattern, min_length, max_length) set
+    let mut pattern_with_lengths: BTreeSet<(String, Option<u64>, Option<u64>)> = BTreeSet::new();
     // Patterns that are used standalone (without length constraints)
     let mut patterns_used_standalone: HashSet<String> = HashSet::new();
 
@@ -1192,9 +1192,7 @@ fn generate_schema_code(schema: &CfnSchema, type_name: &str) -> Result<String> {
                 let effective_min = prop.min_length.filter(|&m| m > 0);
                 let has_length = effective_min.is_some() || prop.max_length.is_some();
                 if has_length {
-                    pattern_with_lengths
-                        .entry(pattern.clone())
-                        .or_insert((effective_min, prop.max_length));
+                    pattern_with_lengths.insert((pattern.clone(), effective_min, prop.max_length));
                 } else {
                     patterns_used_standalone.insert(pattern.clone());
                 }
@@ -1284,9 +1282,11 @@ fn generate_schema_code(schema: &CfnSchema, type_name: &str) -> Result<String> {
                             let has_length =
                                 effective_min.is_some() || field_prop.max_length.is_some();
                             if has_length {
-                                pattern_with_lengths
-                                    .entry(pattern.clone())
-                                    .or_insert((effective_min, field_prop.max_length));
+                                pattern_with_lengths.insert((
+                                    pattern.clone(),
+                                    effective_min,
+                                    field_prop.max_length,
+                                ));
                             } else {
                                 patterns_used_standalone.insert(pattern.clone());
                             }
@@ -1309,9 +1309,11 @@ fn generate_schema_code(schema: &CfnSchema, type_name: &str) -> Result<String> {
                             let has_length =
                                 effective_min.is_some() || ref_def.max_length.is_some();
                             if has_length {
-                                pattern_with_lengths
-                                    .entry(pattern.clone())
-                                    .or_insert((effective_min, ref_def.max_length));
+                                pattern_with_lengths.insert((
+                                    pattern.clone(),
+                                    effective_min,
+                                    ref_def.max_length,
+                                ));
                             } else {
                                 patterns_used_standalone.insert(pattern.clone());
                             }
@@ -1568,7 +1570,7 @@ fn {}(value: &Value) -> Result<(), String> {{
                 continue;
             }
             // Skip if this pattern is only used with combined length constraints
-            if pattern_with_lengths.contains_key(pattern)
+            if pattern_with_lengths.iter().any(|(p, _, _)| p == pattern)
                 && !patterns_used_standalone.contains(pattern)
             {
                 generated_patterns.insert(pattern.clone());
@@ -1676,7 +1678,7 @@ fn {}(value: &Value) -> Result<(), String> {{
     // Generate combined pattern + length validation functions (deduplicated)
     {
         let mut generated_combined: HashSet<String> = HashSet::new();
-        for (pattern, (min, max)) in &pattern_with_lengths {
+        for (pattern, min, max) in &pattern_with_lengths {
             let fn_name = pattern_and_length_fn_name(pattern, *min, *max);
             if generated_combined.contains(&fn_name) {
                 continue;
