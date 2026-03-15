@@ -1075,11 +1075,25 @@ fn string_or_list_of_strings() -> AttributeType {
     ])
 }
 
-/// String or map type — for IAM policy principal fields
-fn string_or_map() -> AttributeType {
+/// String or principal struct type — for IAM policy principal fields
+/// Principal can be either a string (e.g., "*") or a struct with known fields
+/// (Service, AWS, Federated) whose values are string or list of strings.
+fn string_or_principal_struct() -> AttributeType {
+    // Struct must come before String because Union tries members in order,
+    // and dsl_value_to_aws's fallthrough to value_to_json would match
+    // Value::Map against String incorrectly.
     AttributeType::Union(vec![
+        AttributeType::Struct {
+            name: "IamPolicyPrincipal".to_string(),
+            fields: vec![
+                StructField::new("service", string_or_list_of_strings())
+                    .with_provider_name("Service"),
+                StructField::new("aws", string_or_list_of_strings()).with_provider_name("AWS"),
+                StructField::new("federated", string_or_list_of_strings())
+                    .with_provider_name("Federated"),
+            ],
+        },
         AttributeType::String,
-        AttributeType::Map(Box::new(string_or_list_of_strings())),
     ])
 }
 
@@ -1145,8 +1159,10 @@ fn iam_policy_statement() -> AttributeType {
                 .with_provider_name("Resource"),
             StructField::new("not_resource", string_or_list_of_strings())
                 .with_provider_name("NotResource"),
-            StructField::new("principal", string_or_map()).with_provider_name("Principal"),
-            StructField::new("not_principal", string_or_map()).with_provider_name("NotPrincipal"),
+            StructField::new("principal", string_or_principal_struct())
+                .with_provider_name("Principal"),
+            StructField::new("not_principal", string_or_principal_struct())
+                .with_provider_name("NotPrincipal"),
             StructField::new(
                 "condition",
                 AttributeType::Map(Box::new(AttributeType::Map(Box::new(
@@ -1161,25 +1177,11 @@ fn iam_policy_statement() -> AttributeType {
 /// IAM Policy Document type
 /// Validates the structure of IAM policy documents (trust policies, inline policies, etc.)
 ///
-/// Uses `Custom` wrapping (not bare `Struct`) because the DSL uses map assignment
-/// syntax (`assume_role_policy_document = { ... }`), which produces `Value::Map`.
-/// Bare `Struct` in `aws_value_to_dsl` wraps results in `Value::List`, causing
-/// a mismatch with the parser output and false updates on every plan.
-/// The `Custom` type falls through to `json_to_value`/`value_to_json` generic paths,
-/// which correctly produce `Value::Map` for both read and write.
+/// Uses `Struct` type so that `dsl_value_to_aws` and `aws_value_to_dsl` properly
+/// convert between snake_case DSL field names and PascalCase IAM field names
+/// (e.g., `version` <-> `Version`, `statement` <-> `Statement`).
 pub fn iam_policy_document() -> AttributeType {
-    AttributeType::Custom {
-        name: "IamPolicyDocument".to_string(),
-        base: Box::new(AttributeType::Map(Box::new(AttributeType::String))),
-        validate: |value| validate_iam_policy_document(value),
-        namespace: None,
-        to_dsl: None,
-    }
-}
-
-/// Validate IAM policy document structure
-pub fn validate_iam_policy_document(value: &Value) -> Result<(), String> {
-    let struct_type = AttributeType::Struct {
+    AttributeType::Struct {
         name: "IamPolicyDocument".to_string(),
         fields: vec![
             StructField::new("version", iam_policy_version()).with_provider_name("Version"),
@@ -1190,8 +1192,14 @@ pub fn validate_iam_policy_document(value: &Value) -> Result<(), String> {
             )
             .with_provider_name("Statement"),
         ],
-    };
-    struct_type.validate(value).map_err(|e| e.to_string())
+    }
+}
+
+/// Validate IAM policy document structure
+pub fn validate_iam_policy_document(value: &Value) -> Result<(), String> {
+    iam_policy_document()
+        .validate(value)
+        .map_err(|e| e.to_string())
 }
 
 #[cfg(test)]

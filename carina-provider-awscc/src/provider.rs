@@ -2249,6 +2249,155 @@ mod tests {
     }
 
     #[test]
+    fn test_dsl_value_to_aws_iam_policy_document_uses_pascal_case() {
+        // IAM policy documents must use PascalCase keys (Version, Statement, Effect, etc.)
+        // when sent to AWS. The DSL uses snake_case (version, statement, effect, etc.).
+        use carina_aws_types::iam_policy_document;
+
+        let attr_type = iam_policy_document();
+        let value = Value::Map(
+            vec![
+                (
+                    "version".to_string(),
+                    Value::String("2012-10-17".to_string()),
+                ),
+                (
+                    "statement".to_string(),
+                    Value::List(vec![Value::Map(
+                        vec![
+                            ("effect".to_string(), Value::String("Allow".to_string())),
+                            (
+                                "action".to_string(),
+                                Value::String("sts:AssumeRole".to_string()),
+                            ),
+                            (
+                                "principal".to_string(),
+                                Value::Map(
+                                    vec![(
+                                        "service".to_string(),
+                                        Value::String("lambda.amazonaws.com".to_string()),
+                                    )]
+                                    .into_iter()
+                                    .collect(),
+                                ),
+                            ),
+                        ]
+                        .into_iter()
+                        .collect(),
+                    )]),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        );
+
+        let result = dsl_value_to_aws(
+            &value,
+            &attr_type,
+            "iam.role",
+            "assume_role_policy_document",
+        );
+        let result = result.expect("Should return Some");
+
+        // Top-level keys must be PascalCase
+        let obj = result.as_object().expect("Expected JSON Object");
+        assert_eq!(obj.get("Version"), Some(&json!("2012-10-17")));
+        assert!(
+            obj.get("version").is_none(),
+            "snake_case 'version' should not exist"
+        );
+
+        // Statement array
+        let statements = obj.get("Statement").expect("Should have Statement");
+        assert!(
+            obj.get("statement").is_none(),
+            "snake_case 'statement' should not exist"
+        );
+        let stmt = statements.as_array().unwrap().first().unwrap();
+        let stmt_obj = stmt.as_object().unwrap();
+
+        // Statement fields must be PascalCase
+        assert_eq!(stmt_obj.get("Effect"), Some(&json!("Allow")));
+        assert!(stmt_obj.get("effect").is_none());
+        assert_eq!(stmt_obj.get("Action"), Some(&json!("sts:AssumeRole")));
+        assert!(stmt_obj.get("action").is_none());
+
+        // Principal nested map must have PascalCase keys
+        let principal = stmt_obj.get("Principal").expect("Should have Principal");
+        assert!(stmt_obj.get("principal").is_none());
+        let principal_obj = principal.as_object().unwrap();
+        assert_eq!(
+            principal_obj.get("Service"),
+            Some(&json!("lambda.amazonaws.com"))
+        );
+        assert!(principal_obj.get("service").is_none());
+    }
+
+    #[test]
+    fn test_aws_value_to_dsl_iam_policy_document_uses_snake_case() {
+        // Reading IAM policy documents from AWS should convert PascalCase to snake_case
+        use carina_aws_types::iam_policy_document;
+
+        let attr_type = iam_policy_document();
+        let aws_json = json!({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Action": "sts:AssumeRole",
+                "Principal": {
+                    "Service": "lambda.amazonaws.com"
+                }
+            }]
+        });
+
+        let result = aws_value_to_dsl(
+            "assume_role_policy_document",
+            &aws_json,
+            &attr_type,
+            "iam.role",
+        );
+        let result = result.expect("Should return Some");
+
+        if let Value::Map(map) = &result {
+            assert_eq!(
+                map.get("version"),
+                Some(&Value::String("2012-10-17".to_string()))
+            );
+            assert!(
+                map.get("Version").is_none(),
+                "PascalCase 'Version' should not exist"
+            );
+
+            if let Some(Value::List(stmts)) = map.get("statement") {
+                if let Some(Value::Map(stmt)) = stmts.first() {
+                    assert_eq!(
+                        stmt.get("effect"),
+                        Some(&Value::String("Allow".to_string()))
+                    );
+                    assert_eq!(
+                        stmt.get("action"),
+                        Some(&Value::String("sts:AssumeRole".to_string()))
+                    );
+                    if let Some(Value::Map(principal)) = stmt.get("principal") {
+                        assert_eq!(
+                            principal.get("service"),
+                            Some(&Value::String("lambda.amazonaws.com".to_string()))
+                        );
+                    } else {
+                        panic!("Expected principal to be a Map");
+                    }
+                } else {
+                    panic!("Expected statement to contain a Map");
+                }
+            } else {
+                panic!("Expected statement to be a List");
+            }
+        } else {
+            panic!("Expected Value::Map, got: {:?}", result);
+        }
+    }
+
+    #[test]
     fn test_aws_value_to_dsl_region_in_struct_uses_underscores() {
         // Region values inside struct fields should use underscore format (ap_northeast_1),
         // not hyphen format (ap-northeast-1), to match DSL conventions.
