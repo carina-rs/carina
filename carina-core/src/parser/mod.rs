@@ -476,9 +476,12 @@ fn parse_pipe_expr_with_resource_or_module(
     let (value, maybe_resource, maybe_module_call) =
         parse_primary_with_resource_or_module(primary, ctx, binding_name)?;
 
-    // Pipe operator handling (for future extension)
-    for _func_call in inner {
-        // TODO: Implement pipe operator
+    // Pipe operator is parsed but not yet implemented — reject with a clear error
+    if inner.next().is_some() {
+        return Err(ParseError::InvalidExpression {
+            line: 0,
+            message: "Pipe operator is not yet supported".to_string(),
+        });
     }
 
     Ok((value, maybe_resource, maybe_module_call))
@@ -776,9 +779,12 @@ fn parse_pipe_expr(
     let primary = inner.next().unwrap();
     let value = parse_primary_value(primary, ctx)?;
 
-    // Pipe operator handling (for future extension)
-    for _func_call in inner {
-        // TODO: Implement pipe operator
+    // Pipe operator is parsed but not yet implemented — reject with a clear error
+    if inner.next().is_some() {
+        return Err(ParseError::InvalidExpression {
+            line: 0,
+            message: "Pipe operator is not yet supported".to_string(),
+        });
     }
 
     Ok(value)
@@ -2245,6 +2251,42 @@ aws.s3.bucket {
         assert!(
             err.contains("integer literal out of range"),
             "expected 'integer literal out of range' error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn pipe_operator_produces_error() {
+        let input = r#"
+            let x = "hello" |> upper()
+        "#;
+        let result = parse(input);
+        assert!(
+            result.is_err(),
+            "pipe operator should produce an error, but parsing succeeded"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("Pipe operator is not yet supported"),
+            "expected 'Pipe operator is not yet supported' error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn pipe_operator_in_attribute_produces_error() {
+        let input = r#"
+            let bucket = aws.s3_bucket {
+                name = "test" |> lower()
+            }
+        "#;
+        let result = parse(input);
+        assert!(
+            result.is_err(),
+            "pipe operator in attribute should produce an error, but parsing succeeded"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("Pipe operator is not yet supported"),
+            "expected 'Pipe operator is not yet supported' error, got: {err}"
         );
     }
 }
