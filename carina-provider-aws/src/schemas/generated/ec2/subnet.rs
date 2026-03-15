@@ -55,7 +55,7 @@ pub fn ec2_subnet_config() -> AwsSchemaConfig {
                 .with_provider_name("AvailabilityZone"),
         )
         .attribute(
-            AttributeSchema::new("availability_zone_id", AttributeType::String)
+            AttributeSchema::new("availability_zone_id", super::availability_zone_id())
                 .create_only()
                 .with_description("The AZ ID or the Local Zone ID of the subnet.")
                 .with_provider_name("AvailabilityZoneId"),

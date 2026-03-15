@@ -2385,6 +2385,7 @@ fn type_code_to_display(type_code: &str) -> String {
         s if s.contains("arn()") => "Arn".to_string(),
         s if s.contains("aws_account_id") => "AwsAccountId".to_string(),
         s if s.contains("aws_resource_id") => "AwsResourceId".to_string(),
+        s if s.contains("availability_zone_id") => "AvailabilityZoneId".to_string(),
         s if s.contains("availability_zone") => "AvailabilityZone".to_string(),
         _ => type_code
             .trim_start_matches("super::")
@@ -2548,6 +2549,11 @@ fn infer_string_type(prop_name: &str) -> Option<String> {
     // Availability zone (but not AvailabilityZoneId which uses AZ ID format like "use1-az1")
     if prop_lower == "availabilityzone" || prop_lower == "availabilityzones" {
         return Some("super::availability_zone()".to_string());
+    }
+
+    // Availability zone ID (e.g., "use1-az1", "usw2-az2")
+    if prop_lower == "availabilityzoneid" || prop_lower == "availabilityzoneids" {
+        return Some("super::availability_zone_id()".to_string());
     }
 
     // Region types (e.g., PeerRegion, ServiceRegion, RegionName, ResourceRegion)

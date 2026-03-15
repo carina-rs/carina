@@ -44,7 +44,7 @@ The Availability Zone or Local Zone for the subnet. Default: Amazon Web Services
 
 ### `availability_zone_id`
 
-- **Type:** String
+- **Type:** AvailabilityZoneId
 - **Required:** No
 
 The AZ ID or the Local Zone ID of the subnet.
