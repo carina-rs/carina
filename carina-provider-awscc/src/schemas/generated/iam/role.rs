@@ -65,7 +65,8 @@ pub fn iam_role_config() -> AwsccSchemaConfig {
             AttributeSchema::new("path", AttributeType::String)
                 .create_only()
                 .with_description("The path to the role. For more information about paths, see [IAM Identifiers](https://docs.aws.amazon.com/IAM/latest/UserGuide/Using_Identifiers.html)...")
-                .with_provider_name("Path"),
+                .with_provider_name("Path")
+                .with_default(Value::String("/".to_string())),
         )
         .attribute(
             AttributeSchema::new("permissions_boundary", super::iam_policy_arn())

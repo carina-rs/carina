@@ -49,7 +49,8 @@ pub fn logs_log_group_config() -> AwsccSchemaConfig {
         .attribute(
             AttributeSchema::new("deletion_protection_enabled", AttributeType::Bool)
                 .with_description("Indicates whether deletion protection is enabled for this log group. When enabled, deletion protection blocks all deletion operations until it is expl...")
-                .with_provider_name("DeletionProtectionEnabled"),
+                .with_provider_name("DeletionProtectionEnabled")
+                .with_default(Value::Bool(false)),
         )
         .attribute(
             AttributeSchema::new("field_index_policies", AttributeType::List(Box::new(AttributeType::Map(Box::new(AttributeType::String)))))
@@ -69,7 +70,8 @@ pub fn logs_log_group_config() -> AwsccSchemaConfig {
                 to_dsl: None,
             })
                 .with_description("Specifies the log group class for this log group. There are two classes: + The ``Standard`` log class supports all CWL features. + The ``Infrequent Ac...")
-                .with_provider_name("LogGroupClass"),
+                .with_provider_name("LogGroupClass")
+                .with_default(Value::String("STANDARD".to_string())),
         )
         .attribute(
             AttributeSchema::new("log_group_name", AttributeType::String)
