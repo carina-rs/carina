@@ -10,7 +10,7 @@ use crate::effect::{CascadingUpdate, Effect, TemporaryName};
 use crate::identifier::generate_random_suffix;
 use crate::plan::Plan;
 use crate::resource::{LifecycleConfig, Resource, ResourceId, State, Value, merge_with_saved};
-use crate::schema::ResourceSchema;
+use crate::schema::{AttributeType, ResourceSchema};
 
 /// Result of a diff operation
 #[derive(Debug, Clone, PartialEq)]
@@ -42,11 +42,14 @@ impl Diff {
 /// into desired before comparison, preventing false diffs when AWS returns extra fields.
 /// If `prev_desired_keys` is provided, attributes that were previously in the user's
 /// desired state but are now absent are detected as removals.
+/// If `schema` is provided, type-aware comparison is used (e.g., Int/Float coercion,
+/// case-insensitive enum matching).
 pub fn diff(
     desired: &Resource,
     current: &State,
     saved: Option<&HashMap<String, Value>>,
     prev_desired_keys: Option<&[String]>,
+    schema: Option<&ResourceSchema>,
 ) -> Diff {
     if !current.exists {
         return Diff::Create(desired.clone());
@@ -57,6 +60,7 @@ pub fn diff(
         &current.attributes,
         saved,
         prev_desired_keys,
+        schema,
     );
 
     if changed.is_empty() {
@@ -121,17 +125,128 @@ fn filter_non_removable_removals(
         .collect()
 }
 
+/// Type-aware semantic comparison of two Values.
+///
+/// When an `AttributeType` is provided, the comparison uses type information
+/// to detect semantically equivalent values that differ textually:
+/// - Int/Float coercion: `Int(1)` equals `Float(1.0)` for numeric types
+/// - List/Map: recurse with inner element type
+/// - Struct: recurse with per-field type information
+///
+/// StringEnum values are NOT matched flexibly here. The `to_dsl` callbacks
+/// in providers normalize enum values before they reach the differ, so
+/// adding leniency here would mask normalization bugs.
+///
+/// Without type information, falls back to `Value::semantically_equal()`.
+fn type_aware_equal(a: &Value, b: &Value, attr_type: Option<&AttributeType>) -> bool {
+    match attr_type {
+        None => a.semantically_equal(b),
+        Some(at) => match (a, b, at) {
+            // Int/Float coercion for numeric types
+            (Value::Int(i), Value::Float(f), AttributeType::Float | AttributeType::Int) => {
+                (*i as f64) == *f && (*i as f64) as i64 == *i
+            }
+            (Value::Float(f), Value::Int(i), AttributeType::Float | AttributeType::Int) => {
+                *f == (*i as f64) && (*i as f64) as i64 == *i
+            }
+
+            // Lists: multiset comparison with inner type awareness
+            (Value::List(la), Value::List(lb), AttributeType::List(inner)) => {
+                type_aware_lists_equal(la, lb, Some(inner))
+            }
+
+            // Maps: recursive comparison with inner value type
+            (Value::Map(ma), Value::Map(mb), AttributeType::Map(inner)) => {
+                type_aware_maps_equal(ma, mb, |_key| Some(inner.as_ref()))
+            }
+
+            // Struct: per-field type-aware comparison
+            (Value::Map(ma), Value::Map(mb), AttributeType::Struct { fields, .. }) => {
+                let field_types: HashMap<&str, &AttributeType> = fields
+                    .iter()
+                    .map(|f| (f.name.as_str(), &f.field_type))
+                    .collect();
+                type_aware_maps_equal(ma, mb, |key| field_types.get(key).copied())
+            }
+
+            // Union: try each member type; if any says equal, they're equal
+            (_, _, AttributeType::Union(types)) => {
+                // Also check Int/Float coercion for unions containing numeric types
+                match (a, b) {
+                    (Value::Int(i), Value::Float(f)) | (Value::Float(f), Value::Int(i))
+                        if types
+                            .iter()
+                            .any(|t| matches!(t, AttributeType::Float | AttributeType::Int)) =>
+                    {
+                        (*i as f64) == *f && (*i as f64) as i64 == *i
+                    }
+                    _ => types.iter().any(|t| type_aware_equal(a, b, Some(t))),
+                }
+            }
+
+            // Custom types with base type: delegate to base
+            (_, _, AttributeType::Custom { base, .. }) => type_aware_equal(a, b, Some(base)),
+
+            // All other cases: fall back to semantic equality
+            _ => a.semantically_equal(b),
+        },
+    }
+}
+
+/// Multiset comparison for lists with type-aware element comparison.
+fn type_aware_lists_equal(a: &[Value], b: &[Value], inner: Option<&AttributeType>) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut matched = vec![false; b.len()];
+    for item_a in a {
+        let mut found = false;
+        for (j, item_b) in b.iter().enumerate() {
+            if !matched[j] && type_aware_equal(item_a, item_b, inner) {
+                matched[j] = true;
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            return false;
+        }
+    }
+    true
+}
+
+/// Map comparison with per-key type lookup.
+fn type_aware_maps_equal<'a, F>(
+    a: &HashMap<String, Value>,
+    b: &HashMap<String, Value>,
+    get_type: F,
+) -> bool
+where
+    F: Fn(&str) -> Option<&'a AttributeType>,
+{
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().all(|(k, va)| {
+        b.get(k)
+            .map(|vb| type_aware_equal(va, vb, get_type(k)))
+            .unwrap_or(false)
+    })
+}
+
 /// Find changed attributes between desired and current state.
 /// If `saved` is provided, each desired value is merged with the saved value
 /// before comparison, filling in unmanaged nested fields.
 /// If `prev_desired_keys` is provided, attributes that were previously in the user's
 /// desired state but are now absent from desired (while still present in current)
 /// are detected as removals.
+/// If `schema` is provided, type-aware comparison is used for each attribute.
 fn find_changed_attributes(
     desired: &HashMap<String, Value>,
     current: &HashMap<String, Value>,
     saved: Option<&HashMap<String, Value>>,
     prev_desired_keys: Option<&[String]>,
+    schema: Option<&ResourceSchema>,
 ) -> Vec<String> {
     let mut changed = Vec::new();
 
@@ -141,17 +256,21 @@ fn find_changed_attributes(
             continue;
         }
 
+        let attr_type = schema
+            .and_then(|s| s.attributes.get(key))
+            .map(|a| &a.attr_type);
+
         let is_equal = match saved.and_then(|s| s.get(key)) {
             Some(saved_value) => {
                 let effective_desired = merge_with_saved(desired_value, saved_value);
                 current
                     .get(key)
-                    .map(|cv| cv.semantically_equal(&effective_desired))
+                    .map(|cv| type_aware_equal(cv, &effective_desired, attr_type))
                     .unwrap_or(false)
             }
             None => current
                 .get(key)
-                .map(|cv| cv.semantically_equal(desired_value))
+                .map(|cv| type_aware_equal(cv, desired_value, attr_type))
                 .unwrap_or(false),
         };
 
@@ -290,7 +409,14 @@ pub fn create_plan(
 
         let saved = saved_attrs.get(&resource.id);
         let prev_keys = prev_desired_keys.get(&resource.id);
-        let d = diff(resource, &current, saved, prev_keys.map(|v| v.as_slice()));
+        let schema = find_schema(&resource.id.provider, &resource.id.resource_type, schemas);
+        let d = diff(
+            resource,
+            &current,
+            saved,
+            prev_keys.map(|v| v.as_slice()),
+            schema,
+        );
 
         match d {
             Diff::Create(r) => plan.add(Effect::Create(r)),
@@ -527,7 +653,7 @@ mod tests {
         let desired = Resource::new("bucket", "test");
         let current = State::not_found(ResourceId::new("bucket", "test"));
 
-        let result = diff(&desired, &current, None, None);
+        let result = diff(&desired, &current, None, None, None);
         assert!(matches!(result, Diff::Create(_)));
     }
 
@@ -543,7 +669,7 @@ mod tests {
         );
         let current = State::existing(ResourceId::new("bucket", "test"), attrs);
 
-        let result = diff(&desired, &current, None, None);
+        let result = diff(&desired, &current, None, None, None);
         assert!(matches!(result, Diff::NoChange(_)));
     }
 
@@ -559,7 +685,7 @@ mod tests {
         );
         let current = State::existing(ResourceId::new("bucket", "test"), attrs);
 
-        let result = diff(&desired, &current, None, None);
+        let result = diff(&desired, &current, None, None, None);
         match result {
             Diff::Update {
                 changed_attributes, ..
@@ -652,7 +778,7 @@ mod tests {
             current_attrs,
         );
 
-        let result = diff(&desired, &current, None, None);
+        let result = diff(&desired, &current, None, None, None);
         match result {
             Diff::Update {
                 changed_attributes, ..
@@ -765,7 +891,7 @@ mod tests {
         );
         let current = State::existing(ResourceId::new("ec2.vpc", "vpc"), attrs);
 
-        let result = diff(&desired, &current, None, None);
+        let result = diff(&desired, &current, None, None, None);
         assert!(
             matches!(result, Diff::NoChange(_)),
             "Expected NoChange when neither side has 'name', got {:?}",
@@ -1062,7 +1188,7 @@ mod tests {
             current_attrs,
         );
 
-        let result = diff(&desired, &current, None, None);
+        let result = diff(&desired, &current, None, None, None);
         assert!(
             matches!(result, Diff::NoChange(_)),
             "Expected NoChange when list-of-maps has same content in different order, got {:?}",
@@ -1176,7 +1302,7 @@ mod tests {
             Value::Map(saved),
         )]);
 
-        let result = diff(&desired, &current, Some(&saved_map), None);
+        let result = diff(&desired, &current, Some(&saved_map), None, None);
         assert!(
             matches!(result, Diff::NoChange(_)),
             "Expected NoChange when saved fills extra struct fields, got {:?}",
@@ -1240,7 +1366,7 @@ mod tests {
             Value::Map(saved),
         )]);
 
-        let result = diff(&desired, &current, Some(&saved_map), None);
+        let result = diff(&desired, &current, Some(&saved_map), None, None);
         assert!(
             matches!(result, Diff::Update { .. }),
             "Expected Update when unmanaged field drifted, got {:?}",
@@ -1306,7 +1432,7 @@ mod tests {
             ])),
         )]);
 
-        let result = diff(&desired, &current, Some(&saved_map), None);
+        let result = diff(&desired, &current, Some(&saved_map), None, None);
         assert!(
             matches!(result, Diff::NoChange(_)),
             "Expected NoChange for bare struct with extra fields from saved, got {:?}",
@@ -1341,7 +1467,7 @@ mod tests {
         // Without saved state, the map comparison uses semantically_equal which
         // checks both key count AND values. Since desired map has 2 keys and current
         // has 3, this will show as Update (which is the existing behavior).
-        let result = diff(&desired, &current, None, None);
+        let result = diff(&desired, &current, None, None, None);
         assert!(
             matches!(result, Diff::Update { .. }),
             "Expected Update without saved state when maps have different sizes, got {:?}",
@@ -2127,7 +2253,7 @@ mod tests {
         // Previous desired state had both "region" and "tags"
         let prev_keys = vec!["region".to_string(), "tags".to_string()];
 
-        let result = diff(&desired, &current, None, Some(&prev_keys));
+        let result = diff(&desired, &current, None, Some(&prev_keys), None);
         match result {
             Diff::Update {
                 changed_attributes, ..
@@ -2162,7 +2288,7 @@ mod tests {
         // User previously only specified "region", not "arn"
         let prev_keys = vec!["region".to_string()];
 
-        let result = diff(&desired, &current, None, Some(&prev_keys));
+        let result = diff(&desired, &current, None, Some(&prev_keys), None);
         match result {
             Diff::Update {
                 changed_attributes, ..
@@ -2200,7 +2326,7 @@ mod tests {
         );
         let current = State::existing(ResourceId::new("s3.bucket", "test"), current_attrs);
 
-        let result = diff(&desired, &current, None, None);
+        let result = diff(&desired, &current, None, None, None);
         assert!(
             matches!(result, Diff::NoChange(_)),
             "Without prev_desired_keys, extra attributes in current should not trigger Update, got {:?}",
@@ -2404,10 +2530,141 @@ mod tests {
 
         let prev_keys = vec!["region".to_string(), "_internal".to_string()];
 
-        let result = diff(&desired, &current, None, Some(&prev_keys));
+        let result = diff(&desired, &current, None, Some(&prev_keys), None);
         assert!(
             matches!(result, Diff::NoChange(_)),
             "Should skip internal attributes starting with '_', got {:?}",
+            result
+        );
+    }
+
+    // --- Type-aware comparison tests ---
+
+    #[test]
+    fn type_aware_int_float_coercion() {
+        assert!(type_aware_equal(
+            &Value::Int(42),
+            &Value::Float(42.0),
+            Some(&AttributeType::Float),
+        ));
+        assert!(type_aware_equal(
+            &Value::Float(42.0),
+            &Value::Int(42),
+            Some(&AttributeType::Float),
+        ));
+        // Non-exact conversion should not be equal
+        assert!(!type_aware_equal(
+            &Value::Int(42),
+            &Value::Float(42.5),
+            Some(&AttributeType::Float),
+        ));
+        // Without type info, Int and Float are not equal
+        assert!(!type_aware_equal(
+            &Value::Int(42),
+            &Value::Float(42.0),
+            None,
+        ));
+    }
+
+    #[test]
+    fn type_aware_int_float_coercion_for_int_type() {
+        // Int type also allows coercion (e.g., provider returns Float for an Int field)
+        assert!(type_aware_equal(
+            &Value::Int(10),
+            &Value::Float(10.0),
+            Some(&AttributeType::Int),
+        ));
+    }
+
+    #[test]
+    fn type_aware_list_with_inner_type() {
+        let list_type = AttributeType::List(Box::new(AttributeType::Float));
+        // List of Int vs Float with coercion
+        assert!(type_aware_equal(
+            &Value::List(vec![Value::Int(1), Value::Int(2)]),
+            &Value::List(vec![Value::Float(2.0), Value::Float(1.0)]),
+            Some(&list_type),
+        ));
+    }
+
+    #[test]
+    fn type_aware_struct_per_field() {
+        use crate::schema::StructField;
+
+        let struct_type = AttributeType::Struct {
+            name: "Config".to_string(),
+            fields: vec![
+                StructField::new("count", AttributeType::Float),
+                StructField::new("name", AttributeType::String),
+            ],
+        };
+        let a = Value::Map(HashMap::from([
+            ("count".to_string(), Value::Int(5)),
+            ("name".to_string(), Value::String("test".to_string())),
+        ]));
+        let b = Value::Map(HashMap::from([
+            ("count".to_string(), Value::Float(5.0)),
+            ("name".to_string(), Value::String("test".to_string())),
+        ]));
+        assert!(type_aware_equal(&a, &b, Some(&struct_type)));
+    }
+
+    #[test]
+    fn type_aware_union_numeric() {
+        let union_type = AttributeType::Union(vec![AttributeType::Int, AttributeType::Float]);
+        assert!(type_aware_equal(
+            &Value::Int(7),
+            &Value::Float(7.0),
+            Some(&union_type),
+        ));
+    }
+
+    #[test]
+    fn type_aware_custom_delegates_to_base() {
+        let custom_type = AttributeType::Custom {
+            name: "Port".to_string(),
+            base: Box::new(AttributeType::Float),
+            validate: |_| Ok(()),
+            namespace: None,
+            to_dsl: None,
+        };
+        assert!(type_aware_equal(
+            &Value::Int(8080),
+            &Value::Float(8080.0),
+            Some(&custom_type),
+        ));
+    }
+
+    #[test]
+    fn type_aware_diff_no_change_with_schema() {
+        use crate::schema::{AttributeSchema, ResourceSchema};
+
+        let mut schema = ResourceSchema::new("test.resource");
+        schema.attributes.insert(
+            "port".to_string(),
+            AttributeSchema::new("port", AttributeType::Float),
+        );
+
+        let desired =
+            Resource::new("test.resource", "test").with_attribute("port", Value::Int(443));
+
+        let mut current_attrs = HashMap::new();
+        current_attrs.insert("port".to_string(), Value::Float(443.0));
+        let current = State::existing(ResourceId::new("test.resource", "test"), current_attrs);
+
+        // Without schema: detects a change (Int != Float)
+        let result = diff(&desired, &current, None, None, None);
+        assert!(
+            matches!(result, Diff::Update { .. }),
+            "Without schema, Int(443) != Float(443.0) should be Update, got {:?}",
+            result
+        );
+
+        // With schema: no change (type-aware coercion)
+        let result = diff(&desired, &current, None, None, Some(&schema));
+        assert!(
+            matches!(result, Diff::NoChange(_)),
+            "With schema, Int(443) and Float(443.0) should be NoChange, got {:?}",
             result
         );
     }
