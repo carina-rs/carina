@@ -130,9 +130,12 @@ fn filter_non_removable_removals(
 /// When an `AttributeType` is provided, the comparison uses type information
 /// to detect semantically equivalent values that differ textually:
 /// - Int/Float coercion: `Int(1)` equals `Float(1.0)` for numeric types
-/// - StringEnum: case-insensitive + hyphen/underscore flexible matching
 /// - List/Map: recurse with inner element type
 /// - Struct: recurse with per-field type information
+///
+/// StringEnum values are NOT matched flexibly here. The `to_dsl` callbacks
+/// in providers normalize enum values before they reach the differ, so
+/// adding leniency here would mask normalization bugs.
 ///
 /// Without type information, falls back to `Value::semantically_equal()`.
 fn type_aware_equal(a: &Value, b: &Value, attr_type: Option<&AttributeType>) -> bool {
@@ -145,24 +148,6 @@ fn type_aware_equal(a: &Value, b: &Value, attr_type: Option<&AttributeType>) -> 
             }
             (Value::Float(f), Value::Int(i), AttributeType::Float | AttributeType::Int) => {
                 *f == (*i as f64) && (*i as f64) as i64 == *i
-            }
-
-            // StringEnum: case-insensitive + hyphen/underscore flexible matching
-            (Value::String(sa), Value::String(sb), AttributeType::StringEnum { to_dsl, .. }) => {
-                if sa == sb {
-                    return true;
-                }
-                // Normalize both values through to_dsl if available, then compare
-                let na = to_dsl.map_or_else(|| sa.clone(), |f| f(sa));
-                let nb = to_dsl.map_or_else(|| sb.clone(), |f| f(sb));
-                if na == nb {
-                    return true;
-                }
-                // Case-insensitive + hyphen/underscore flexible
-                na.eq_ignore_ascii_case(&nb)
-                    || na
-                        .replace('_', "-")
-                        .eq_ignore_ascii_case(&nb.replace('_', "-"))
             }
 
             // Lists: multiset comparison with inner type awareness
@@ -2588,49 +2573,6 @@ mod tests {
             &Value::Int(10),
             &Value::Float(10.0),
             Some(&AttributeType::Int),
-        ));
-    }
-
-    #[test]
-    fn type_aware_string_enum_case_insensitive() {
-        let enum_type = AttributeType::StringEnum {
-            name: "Status".to_string(),
-            values: vec!["Enabled".to_string(), "Disabled".to_string()],
-            namespace: None,
-            to_dsl: None,
-        };
-        // Case-insensitive match
-        assert!(type_aware_equal(
-            &Value::String("Enabled".to_string()),
-            &Value::String("enabled".to_string()),
-            Some(&enum_type),
-        ));
-        assert!(type_aware_equal(
-            &Value::String("ENABLED".to_string()),
-            &Value::String("enabled".to_string()),
-            Some(&enum_type),
-        ));
-        // Different values are not equal
-        assert!(!type_aware_equal(
-            &Value::String("Enabled".to_string()),
-            &Value::String("Disabled".to_string()),
-            Some(&enum_type),
-        ));
-    }
-
-    #[test]
-    fn type_aware_string_enum_hyphen_underscore() {
-        let enum_type = AttributeType::StringEnum {
-            name: "Region".to_string(),
-            values: vec!["ap-northeast-1".to_string()],
-            namespace: None,
-            to_dsl: Some(|s: &str| s.replace('-', "_")),
-        };
-        // Hyphen vs underscore should match via to_dsl normalization
-        assert!(type_aware_equal(
-            &Value::String("ap-northeast-1".to_string()),
-            &Value::String("ap_northeast_1".to_string()),
-            Some(&enum_type),
         ));
     }
 
