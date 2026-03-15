@@ -182,6 +182,12 @@ struct CfnProperty {
     /// Regex pattern constraint (for string types)
     #[serde(default)]
     pattern: Option<String>,
+    /// Minimum number of items (for array types)
+    #[serde(default)]
+    min_items: Option<i64>,
+    /// Maximum number of items (for array types)
+    #[serde(default)]
+    max_items: Option<i64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -570,7 +576,7 @@ fn type_display_string(
                 }
             }
             Some("array") => {
-                if let Some(items) = &prop.items {
+                let base_display = if let Some(items) = &prop.items {
                     if let Some(ref_path) = &items.ref_path {
                         if !ref_path.contains("/Tag") {
                             if let Some(def_name) = ref_def_name(ref_path)
@@ -598,6 +604,13 @@ fn type_display_string(
                     }
                 } else {
                     "`List<String>`".to_string()
+                };
+                // Append item count constraints if present
+                if prop.min_items.is_some() || prop.max_items.is_some() {
+                    let constraint = range_display_string(prop.min_items, prop.max_items);
+                    format!("{} (items: {})", base_display, constraint)
+                } else {
+                    base_display
                 }
             }
             Some("object") => {
@@ -991,6 +1004,7 @@ fn generate_schema_code(schema: &CfnSchema, type_name: &str) -> Result<String> {
     let mut ranged_ints: BTreeMap<String, (Option<i64>, Option<i64>)> = BTreeMap::new();
     let mut ranged_floats: BTreeMap<String, (Option<i64>, Option<i64>)> = BTreeMap::new();
     let mut int_enums: BTreeMap<String, Vec<i64>> = BTreeMap::new();
+    let mut ranged_lists: BTreeMap<String, (Option<i64>, Option<i64>)> = BTreeMap::new();
     let mut patterns: BTreeMap<String, String> = BTreeMap::new();
 
     for (prop_name, prop) in &schema.properties {
@@ -1065,6 +1079,11 @@ fn generate_schema_code(schema: &CfnSchema, type_name: &str) -> Result<String> {
                     ranged_floats.insert(prop_name.clone(), (Some(min), Some(max)));
                 }
             }
+            Some("array") => {
+                if prop.min_items.is_some() || prop.max_items.is_some() {
+                    ranged_lists.insert(prop_name.clone(), (prop.min_items, prop.max_items));
+                }
+            }
             _ => {}
         }
         // Collect pattern constraints for string properties
@@ -1111,6 +1130,16 @@ fn generate_schema_code(schema: &CfnSchema, type_name: &str) -> Result<String> {
                                 ranged_ints.insert(field_name.clone(), (Some(min), Some(max)));
                             }
                         }
+                    }
+                    // Collect array item count constraints from definitions
+                    if prop_type == Some("array")
+                        && (field_prop.min_items.is_some() || field_prop.max_items.is_some())
+                        && !ranged_lists.contains_key(field_name)
+                    {
+                        ranged_lists.insert(
+                            field_name.clone(),
+                            (field_prop.min_items, field_prop.max_items),
+                        );
                     }
                     // Also collect integer enums from definitions
                     if prop_type == Some("integer")
@@ -1184,6 +1213,7 @@ fn generate_schema_code(schema: &CfnSchema, type_name: &str) -> Result<String> {
     let has_ranged_ints = !ranged_ints.is_empty();
     let has_ranged_floats = !ranged_floats.is_empty();
     let has_int_enums = !int_enums.is_empty();
+    let has_ranged_lists = !ranged_lists.is_empty();
     let has_patterns = !patterns.is_empty();
     let has_defaults = schema.properties.values().any(|p| {
         p.default_value
@@ -1196,8 +1226,8 @@ fn generate_schema_code(schema: &CfnSchema, type_name: &str) -> Result<String> {
         needs_attribute_type = true;
     }
 
-    // Ranged ints/floats use AttributeType::Custom with AttributeType::Int/Float base
-    if has_ranged_ints || has_ranged_floats {
+    // Ranged ints/floats/lists use AttributeType::Custom with AttributeType::Int/Float/List base
+    if has_ranged_ints || has_ranged_floats || has_ranged_lists {
         needs_attribute_type = true;
     }
 
@@ -1239,7 +1269,13 @@ use super::AwsccSchemaConfig;
         resource, type_name, schema_imports_str
     ));
 
-    if has_ranged_ints || has_ranged_floats || has_int_enums || has_defaults || has_patterns {
+    if has_ranged_ints
+        || has_ranged_floats
+        || has_int_enums
+        || has_ranged_lists
+        || has_defaults
+        || has_patterns
+    {
         code.push_str("use carina_core::resource::Value;\n");
     }
     if has_patterns {
@@ -1386,6 +1422,29 @@ fn {}(value: &Value) -> Result<(), String> {{
         code.push_str("        Err(\"Expected string\".to_string())\n");
         code.push_str("    }\n");
         code.push_str("}\n\n");
+    }
+
+    // Generate validation functions for array item count constraints
+    for (prop_name, (min, max)) in &ranged_lists {
+        let fn_name = format!("validate_{}_items", prop_name.to_snake_case());
+        let (condition, range_display) = list_items_condition_and_display(*min, *max);
+        code.push_str(&format!(
+            r#"fn {}(value: &Value) -> Result<(), String> {{
+    if let Value::List(items) = value {{
+        let len = items.len();
+        if {} {{
+            Err(format!("List has {{}} items, expected {}", len))
+        }} else {{
+            Ok(())
+        }}
+    }} else {{
+        Err("Expected list".to_string())
+    }}
+}}
+
+"#,
+            fn_name, condition, range_display
+        ));
     }
 
     // Generate config function
@@ -2064,6 +2123,19 @@ fn int_range_condition_and_display(min: Option<i64>, max: Option<i64>) -> (Strin
 }
 
 /// Generate condition string and display string for float range validation.
+/// Generate condition string and display string for list item count validation.
+fn list_items_condition_and_display(min: Option<i64>, max: Option<i64>) -> (String, String) {
+    match (min, max) {
+        (Some(min), Some(max)) => (
+            format!("!({}..={}).contains(&len)", min, max),
+            format!("{}..={}", min, max),
+        ),
+        (Some(min), None) => (format!("len < {}", min), format!("{}..", min)),
+        (None, Some(max)) => (format!("len > {}", max), format!("..={}", max)),
+        (None, None) => unreachable!("at least one bound must be present"),
+    }
+}
+
 fn float_range_condition_and_display(min: Option<i64>, max: Option<i64>) -> (String, String) {
     match (min, max) {
         (Some(min), Some(max)) => (
@@ -2944,7 +3016,7 @@ fn cfn_type_to_carina_type_with_enum(
             }
         }
         Some("array") => {
-            if let Some(items) = &prop.items {
+            let (list_type, item_enum) = if let Some(items) = &prop.items {
                 // Check if items has a $ref to a definition
                 if let Some(ref_path) = &items.ref_path
                     && !ref_path.contains("/Tag")
@@ -2961,30 +3033,52 @@ fn cfn_type_to_carina_type_with_enum(
                         namespace,
                         enums,
                     );
-                    return (
+                    (
                         format!("AttributeType::List(Box::new({}))", struct_type),
                         None,
-                    );
-                }
-                let (item_type, item_enum) =
-                    cfn_type_to_carina_type_with_enum(items, prop_name, schema, namespace, enums);
-                // If array items have enum values, propagate the enum info so the
-                // caller can register it. The item type uses String as a placeholder;
-                // the actual enum type will be substituted when the enum is registered.
-                let effective_item_type = if item_enum.is_some() {
-                    "AttributeType::String".to_string()
+                    )
                 } else {
-                    item_type
-                };
-                (
-                    format!("AttributeType::List(Box::new({}))", effective_item_type),
-                    item_enum,
-                )
+                    let (item_type, item_enum) = cfn_type_to_carina_type_with_enum(
+                        items, prop_name, schema, namespace, enums,
+                    );
+                    // If array items have enum values, propagate the enum info so the
+                    // caller can register it. The item type uses String as a placeholder;
+                    // the actual enum type will be substituted when the enum is registered.
+                    let effective_item_type = if item_enum.is_some() {
+                        "AttributeType::String".to_string()
+                    } else {
+                        item_type
+                    };
+                    (
+                        format!("AttributeType::List(Box::new({}))", effective_item_type),
+                        item_enum,
+                    )
+                }
             } else {
                 (
                     "AttributeType::List(Box::new(AttributeType::String))".to_string(),
                     None,
                 )
+            };
+            // Wrap in Custom type if minItems/maxItems constraints exist
+            if prop.min_items.is_some() || prop.max_items.is_some() {
+                let validate_fn = format!("validate_{}_items", prop_name.to_snake_case());
+                let display = range_display_string(prop.min_items, prop.max_items);
+                (
+                    format!(
+                        r#"AttributeType::Custom {{
+                name: "List({})".to_string(),
+                base: Box::new({}),
+                validate: {},
+                namespace: None,
+                to_dsl: None,
+            }}"#,
+                        display, list_type, validate_fn
+                    ),
+                    item_enum,
+                )
+            } else {
+                (list_type, item_enum)
             }
         }
         Some("object") => {
@@ -3309,6 +3403,8 @@ mod tests {
             const_value: None,
             default_value: None,
             pattern: None,
+            min_items: None,
+            max_items: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::SecurityGroupIngress".to_string(),
@@ -3381,6 +3477,8 @@ mod tests {
             const_value: None,
             default_value: None,
             pattern: None,
+            min_items: None,
+            max_items: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::SecurityGroupIngress".to_string(),
@@ -3420,6 +3518,8 @@ mod tests {
             const_value: None,
             default_value: None,
             pattern: None,
+            min_items: None,
+            max_items: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::SecurityGroupIngress".to_string(),
@@ -3459,6 +3559,8 @@ mod tests {
             const_value: None,
             default_value: None,
             pattern: None,
+            min_items: None,
+            max_items: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::NatGateway".to_string(),
@@ -3503,6 +3605,8 @@ mod tests {
             const_value: None,
             default_value: None,
             pattern: None,
+            min_items: None,
+            max_items: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::EIP".to_string(),
@@ -3542,6 +3646,8 @@ mod tests {
             const_value: None,
             default_value: None,
             pattern: None,
+            min_items: None,
+            max_items: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::NatGateway".to_string(),
@@ -3585,6 +3691,8 @@ mod tests {
             const_value: None,
             default_value: None,
             pattern: None,
+            min_items: None,
+            max_items: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::Subnet".to_string(),
@@ -3679,6 +3787,8 @@ mod tests {
             const_value: None,
             default_value: None,
             pattern: None,
+            min_items: None,
+            max_items: None,
         };
         assert_eq!(
             list_element_type_display(&prop, "GenericProp", ""),
@@ -3701,6 +3811,8 @@ mod tests {
             const_value: None,
             default_value: None,
             pattern: None,
+            min_items: None,
+            max_items: None,
         };
         assert_eq!(
             list_element_type_display(&prop, "GenericProp", ""),
@@ -3723,6 +3835,8 @@ mod tests {
             const_value: None,
             default_value: None,
             pattern: None,
+            min_items: None,
+            max_items: None,
         };
         assert_eq!(
             list_element_type_display(&prop, "GenericProp", ""),
@@ -3745,6 +3859,8 @@ mod tests {
             const_value: None,
             default_value: None,
             pattern: None,
+            min_items: None,
+            max_items: None,
         };
         assert_eq!(
             list_element_type_display(&prop, "GenericProp", ""),
@@ -3769,6 +3885,8 @@ mod tests {
             const_value: None,
             default_value: None,
             pattern: None,
+            min_items: None,
+            max_items: None,
         };
         assert_eq!(
             list_element_type_display(&prop, "SubnetIds", ""),
@@ -3834,6 +3952,8 @@ mod tests {
                 const_value: None,
                 default_value: None,
                 pattern: None,
+                min_items: None,
+                max_items: None,
             })),
             ref_path: None,
             insertion_order: None,
@@ -3845,6 +3965,8 @@ mod tests {
             const_value: None,
             default_value: None,
             pattern: None,
+            min_items: None,
+            max_items: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::VPC".to_string(),
@@ -3887,6 +4009,8 @@ mod tests {
                 const_value: None,
                 default_value: None,
                 pattern: None,
+                min_items: None,
+                max_items: None,
             })),
             ref_path: None,
             insertion_order: None,
@@ -3898,6 +4022,8 @@ mod tests {
             const_value: None,
             default_value: None,
             pattern: None,
+            min_items: None,
+            max_items: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::VPC".to_string(),
@@ -3936,6 +4062,8 @@ mod tests {
             const_value: None,
             default_value: None,
             pattern: None,
+            min_items: None,
+            max_items: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::VPC".to_string(),
@@ -3985,6 +4113,8 @@ mod tests {
                 const_value: None,
                 default_value: None,
                 pattern: None,
+                min_items: None,
+                max_items: None,
             };
             let result = list_element_type_display(&prop, "GenericProp", "");
             assert!(
@@ -4030,6 +4160,8 @@ mod tests {
             const_value: None,
             default_value: None,
             pattern: None,
+            min_items: None,
+            max_items: None,
         };
         let result = type_display_string("Prop1", &prop, &schema, &enums);
         assert_ne!(
@@ -4057,6 +4189,8 @@ mod tests {
                 const_value: None,
                 default_value: None,
                 pattern: None,
+                min_items: None,
+                max_items: None,
             })),
             ref_path: None,
             insertion_order: None,
@@ -4068,6 +4202,8 @@ mod tests {
             const_value: None,
             default_value: None,
             pattern: None,
+            min_items: None,
+            max_items: None,
         };
         let result = type_display_string("Prop2", &prop, &schema, &enums);
         assert_ne!(
@@ -4095,6 +4231,8 @@ mod tests {
                 const_value: None,
                 default_value: None,
                 pattern: None,
+                min_items: None,
+                max_items: None,
             })),
             ref_path: None,
             insertion_order: None,
@@ -4106,6 +4244,8 @@ mod tests {
             const_value: None,
             default_value: None,
             pattern: None,
+            min_items: None,
+            max_items: None,
         };
         let result = type_display_string("Prop3", &prop, &schema, &enums);
         assert_ne!(
@@ -4133,6 +4273,8 @@ mod tests {
                 const_value: None,
                 default_value: None,
                 pattern: None,
+                min_items: None,
+                max_items: None,
             })),
             ref_path: None,
             insertion_order: None,
@@ -4144,6 +4286,8 @@ mod tests {
             const_value: None,
             default_value: None,
             pattern: None,
+            min_items: None,
+            max_items: None,
         };
         let result = type_display_string("Prop4", &prop, &schema, &enums);
         assert_ne!(
@@ -4169,6 +4313,8 @@ mod tests {
             const_value: None,
             default_value: None,
             pattern: None,
+            min_items: None,
+            max_items: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::VPC".to_string(),
@@ -4223,6 +4369,8 @@ mod tests {
             const_value: None,
             default_value: None,
             pattern: None,
+            min_items: None,
+            max_items: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::VPC".to_string(),
@@ -4259,6 +4407,8 @@ mod tests {
             const_value: None,
             default_value: None,
             pattern: None,
+            min_items: None,
+            max_items: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::VPC".to_string(),
@@ -4304,6 +4454,8 @@ mod tests {
             const_value: None,
             default_value: None,
             pattern: None,
+            min_items: None,
+            max_items: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::VPC".to_string(),
@@ -4355,6 +4507,8 @@ mod tests {
             const_value: None,
             default_value: None,
             pattern: None,
+            min_items: None,
+            max_items: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::Logs::LogGroup".to_string(),
@@ -4409,6 +4563,8 @@ mod tests {
             const_value: None,
             default_value: None,
             pattern: None,
+            min_items: None,
+            max_items: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::NatGateway".to_string(),
@@ -4449,6 +4605,8 @@ mod tests {
             const_value: None,
             default_value: None,
             pattern: None,
+            min_items: None,
+            max_items: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::SomeService::Resource".to_string(),
@@ -4489,6 +4647,8 @@ mod tests {
             const_value: None,
             default_value: None,
             pattern: None,
+            min_items: None,
+            max_items: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::Logs::LogGroup".to_string(),
@@ -4528,6 +4688,8 @@ mod tests {
             const_value: None,
             default_value: None,
             pattern: None,
+            min_items: None,
+            max_items: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::VPC".to_string(),
@@ -4601,6 +4763,8 @@ mod tests {
             const_value: None,
             default_value: None,
             pattern: None,
+            min_items: None,
+            max_items: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::VPC".to_string(),
@@ -4642,6 +4806,8 @@ mod tests {
             const_value: None,
             default_value: None,
             pattern: None,
+            min_items: None,
+            max_items: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::SecurityGroupIngress".to_string(),
@@ -4682,6 +4848,8 @@ mod tests {
             const_value: None,
             default_value: None,
             pattern: None,
+            min_items: None,
+            max_items: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::S3::Bucket".to_string(),
@@ -4735,6 +4903,8 @@ mod tests {
             const_value: None,
             default_value: None,
             pattern: None,
+            min_items: None,
+            max_items: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::SecurityGroupIngress".to_string(),
@@ -5397,6 +5567,8 @@ mod tests {
                 const_value: None,
                 default_value: None,
                 pattern: None,
+                min_items: None,
+                max_items: None,
             },
         );
 
@@ -5457,6 +5629,8 @@ mod tests {
                 const_value: None,
                 default_value: None,
                 pattern: None,
+                min_items: None,
+                max_items: None,
             },
         );
 
@@ -5491,6 +5665,8 @@ mod tests {
                 const_value: None,
                 default_value: None,
                 pattern: None,
+                min_items: None,
+                max_items: None,
             },
         );
 
@@ -6472,6 +6648,206 @@ mod tests {
             code.contains("Regex::new"),
             "Pattern validation should use Regex:\n{}",
             code
+        );
+    }
+
+    #[test]
+    fn test_array_with_min_max_items_generates_custom_list_type() {
+        // Array with minItems/maxItems should generate a Custom type wrapping List
+        let prop = CfnProperty {
+            prop_type: Some(TypeValue::Single("array".to_string())),
+            items: Some(Box::new(CfnProperty {
+                prop_type: Some(TypeValue::Single("string".to_string())),
+                ..Default::default()
+            })),
+            min_items: Some(1),
+            max_items: Some(10),
+            ..Default::default()
+        };
+        let schema = CfnSchema {
+            type_name: "AWS::EC2::VPCEndpoint".to_string(),
+            description: None,
+            properties: BTreeMap::new(),
+            required: vec![],
+            read_only_properties: vec![],
+            create_only_properties: vec![],
+            write_only_properties: vec![],
+            primary_identifier: None,
+            definitions: None,
+            tagging: None,
+        };
+        let enums = BTreeMap::new();
+        let (type_str, _) = cfn_type_to_carina_type_with_enum(
+            &prop,
+            "PrivateDnsSpecifiedDomains",
+            &schema,
+            "awscc.ec2.vpc_endpoint",
+            &enums,
+        );
+        assert!(
+            type_str.contains("Custom"),
+            "array with minItems/maxItems should produce Custom type: {type_str}"
+        );
+        assert!(
+            type_str.contains("List"),
+            "Custom type should wrap a List: {type_str}"
+        );
+        assert!(
+            type_str.contains("validate_private_dns_specified_domains_items"),
+            "should reference items validation function: {type_str}"
+        );
+    }
+
+    #[test]
+    fn test_array_with_only_min_items_generates_custom_list_type() {
+        let prop = CfnProperty {
+            prop_type: Some(TypeValue::Single("array".to_string())),
+            items: Some(Box::new(CfnProperty {
+                prop_type: Some(TypeValue::Single("string".to_string())),
+                ..Default::default()
+            })),
+            min_items: Some(1),
+            max_items: None,
+            ..Default::default()
+        };
+        let schema = CfnSchema {
+            type_name: "AWS::EC2::VPCEndpoint".to_string(),
+            description: None,
+            properties: BTreeMap::new(),
+            required: vec![],
+            read_only_properties: vec![],
+            create_only_properties: vec![],
+            write_only_properties: vec![],
+            primary_identifier: None,
+            definitions: None,
+            tagging: None,
+        };
+        let enums = BTreeMap::new();
+        let (type_str, _) = cfn_type_to_carina_type_with_enum(
+            &prop,
+            "SomeArray",
+            &schema,
+            "awscc.ec2.vpc_endpoint",
+            &enums,
+        );
+        assert!(
+            type_str.contains("Custom"),
+            "array with only minItems should produce Custom type: {type_str}"
+        );
+        assert!(
+            type_str.contains("1.."),
+            "should show min bound in type name: {type_str}"
+        );
+    }
+
+    #[test]
+    fn test_array_without_min_max_items_produces_plain_list() {
+        let prop = CfnProperty {
+            prop_type: Some(TypeValue::Single("array".to_string())),
+            items: Some(Box::new(CfnProperty {
+                prop_type: Some(TypeValue::Single("string".to_string())),
+                ..Default::default()
+            })),
+            min_items: None,
+            max_items: None,
+            ..Default::default()
+        };
+        let schema = CfnSchema {
+            type_name: "AWS::EC2::VPCEndpoint".to_string(),
+            description: None,
+            properties: BTreeMap::new(),
+            required: vec![],
+            read_only_properties: vec![],
+            create_only_properties: vec![],
+            write_only_properties: vec![],
+            primary_identifier: None,
+            definitions: None,
+            tagging: None,
+        };
+        let enums = BTreeMap::new();
+        let (type_str, _) = cfn_type_to_carina_type_with_enum(
+            &prop,
+            "SomeArray",
+            &schema,
+            "awscc.ec2.vpc_endpoint",
+            &enums,
+        );
+        assert!(
+            !type_str.contains("Custom"),
+            "array without minItems/maxItems should not produce Custom type: {type_str}"
+        );
+        assert!(
+            type_str.contains("List"),
+            "should produce plain List type: {type_str}"
+        );
+    }
+
+    #[test]
+    fn test_generate_schema_code_emits_list_items_validation() {
+        // Test that generate_schema_code emits validation functions for array properties
+        // with minItems/maxItems constraints (via struct field in a definition)
+        let mut dns_props = BTreeMap::new();
+        dns_props.insert(
+            "PrivateDnsSpecifiedDomains".to_string(),
+            CfnProperty {
+                prop_type: Some(TypeValue::Single("array".to_string())),
+                items: Some(Box::new(CfnProperty {
+                    prop_type: Some(TypeValue::Single("string".to_string())),
+                    ..Default::default()
+                })),
+                min_items: Some(1),
+                max_items: Some(10),
+                ..Default::default()
+            },
+        );
+
+        let mut definitions = BTreeMap::new();
+        definitions.insert(
+            "DnsOptionsSpecification".to_string(),
+            CfnDefinition {
+                def_type: Some("object".to_string()),
+                properties: Some(dns_props),
+                required: vec![],
+                one_of: vec![],
+                items: None,
+                enum_values: None,
+            },
+        );
+
+        let mut properties = BTreeMap::new();
+        properties.insert(
+            "DnsOptions".to_string(),
+            CfnProperty {
+                ref_path: Some("#/definitions/DnsOptionsSpecification".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let schema = CfnSchema {
+            type_name: "AWS::EC2::VPCEndpoint".to_string(),
+            description: Some("Test".to_string()),
+            properties,
+            required: vec![],
+            read_only_properties: vec![],
+            create_only_properties: vec![],
+            write_only_properties: vec![],
+            primary_identifier: None,
+            definitions: Some(definitions),
+            tagging: None,
+        };
+
+        let generated = generate_schema_code(&schema, "AWS::EC2::VPCEndpoint").unwrap();
+        assert!(
+            generated.contains("validate_private_dns_specified_domains_items"),
+            "should generate items validation function: {generated}"
+        );
+        assert!(
+            generated.contains("Value::List(items)"),
+            "validation function should check Value::List: {generated}"
+        );
+        assert!(
+            generated.contains("1..=10"),
+            "should show range 1..=10 in validation: {generated}"
         );
     }
 }
