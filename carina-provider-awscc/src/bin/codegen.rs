@@ -8377,6 +8377,44 @@ mod tests {
     }
 
     #[test]
+    fn test_disambiguate_prefixes_colliding_struct_field_enums() {
+        // When multiple struct field enums share the same type_name but have different
+        // values, they should be disambiguated by prefixing the parent struct name.
+        // This ensures that e.g. VersioningConfiguration.Status (Enabled/Suspended) and
+        // IntelligentTieringConfiguration.Status (Enabled/Disabled) get distinct type names.
+        // See: https://github.com/carina-rs/carina/issues/640
+        let mut enums = BTreeMap::new();
+
+        enums.insert(
+            "VersioningConfiguration.Status".to_string(),
+            EnumInfo {
+                type_name: "Status".to_string(),
+                values: vec!["Enabled".to_string(), "Suspended".to_string()],
+            },
+        );
+        enums.insert(
+            "IntelligentTieringConfiguration.Status".to_string(),
+            EnumInfo {
+                type_name: "Status".to_string(),
+                values: vec!["Disabled".to_string(), "Enabled".to_string()],
+            },
+        );
+
+        disambiguate_enum_type_names(&mut enums);
+
+        let versioning = enums.get("VersioningConfiguration.Status").unwrap();
+        assert_eq!(
+            versioning.type_name, "VersioningConfigurationStatus",
+            "Colliding struct field enum should be prefixed with parent struct name"
+        );
+        let tiering = enums.get("IntelligentTieringConfiguration.Status").unwrap();
+        assert_eq!(
+            tiering.type_name, "IntelligentTieringConfigurationStatus",
+            "Colliding struct field enum should be prefixed with parent struct name"
+        );
+    }
+
+    #[test]
     fn test_format_field_parsed_from_schema() {
         // Verify that the format field is correctly parsed from JSON
         let json = r#"{
