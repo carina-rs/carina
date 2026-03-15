@@ -222,6 +222,9 @@ struct CfnDefinition {
     /// Enum values (for enum-only definitions)
     #[serde(rename = "enum")]
     enum_values: Option<Vec<EnumValue>>,
+    /// Regex pattern constraint (for string-typed definitions)
+    #[serde(default)]
+    pattern: Option<String>,
 }
 
 /// Compute module name from CloudFormation type name
@@ -1128,11 +1131,17 @@ fn generate_schema_code(schema: &CfnSchema, type_name: &str) -> Result<String> {
             _ => {}
         }
         // Collect pattern constraints for string properties
-        if attr_type.contains("validate_")
-            && attr_type.contains("_pattern")
-            && let Some(pattern) = &prop.pattern
-        {
-            patterns.insert(prop_name.clone(), pattern.clone());
+        if attr_type.contains("validate_") && attr_type.contains("_pattern") {
+            // Pattern can come from the property directly or from a $ref definition
+            let pattern = prop.pattern.clone().or_else(|| {
+                prop.ref_path
+                    .as_ref()
+                    .and_then(|ref_path| resolve_ref(schema, ref_path))
+                    .and_then(|def| def.pattern.clone())
+            });
+            if let Some(pattern) = pattern {
+                patterns.insert(prop_name.clone(), pattern);
+            }
         }
     }
 
@@ -1213,6 +1222,20 @@ fn generate_schema_code(schema: &CfnSchema, type_name: &str) -> Result<String> {
                         if field_type.contains("validate_") && field_type.contains("_pattern") {
                             patterns
                                 .insert(field_name.clone(), field_prop.pattern.clone().unwrap());
+                        }
+                    }
+                    // Collect pattern constraints from $ref to string definitions with patterns
+                    if let Some(ref_path) = &field_prop.ref_path
+                        && let Some(ref_def) = resolve_ref(schema, ref_path)
+                        && ref_def.def_type.as_deref() == Some("string")
+                        && let Some(pattern) = &ref_def.pattern
+                        && !patterns.contains_key(field_name)
+                    {
+                        let (field_type, _) = cfn_type_to_carina_type_with_enum(
+                            field_prop, field_name, schema, &namespace, &enums,
+                        );
+                        if field_type.contains("validate_") && field_type.contains("_pattern") {
+                            patterns.insert(field_name.clone(), pattern.clone());
                         }
                     }
                 }
@@ -2904,6 +2927,26 @@ fn cfn_type_to_carina_type_with_enum(
                     format!("AttributeType::List(Box::new({}))", effective_item_type),
                     item_enum,
                 );
+            }
+            // Handle string-typed $ref definitions with pattern constraints
+            if def.def_type.as_deref() == Some("string") && def.pattern.is_some() {
+                // Check if name-based heuristics would override the type
+                if infer_string_type(prop_name, &schema.type_name).is_none() {
+                    let validate_fn = format!("validate_{}_pattern", prop_name.to_snake_case());
+                    return (
+                        format!(
+                            r#"AttributeType::Custom {{
+                name: "String(pattern)".to_string(),
+                base: Box::new(AttributeType::String),
+                validate: {},
+                namespace: None,
+                to_dsl: None,
+            }}"#,
+                            validate_fn
+                        ),
+                        None,
+                    );
+                }
             }
         }
         // Apply name-based heuristics for unresolvable $ref
@@ -5868,6 +5911,7 @@ mod tests {
                 properties: Some(def_props),
                 required: vec![],
                 one_of: vec![],
+                pattern: None,
                 items: None,
                 enum_values: None,
             },
@@ -6021,6 +6065,7 @@ mod tests {
                 properties: None,
                 required: vec![],
                 one_of: vec![],
+                pattern: None,
                 items: None,
                 enum_values: Some(vec![
                     EnumValue::Str("GET".to_string()),
@@ -6073,6 +6118,7 @@ mod tests {
                 properties: None,
                 required: vec![],
                 one_of: vec![],
+                pattern: None,
                 items: Some(Box::new(CfnProperty {
                     prop_type: Some(TypeValue::Single("string".to_string())),
                     enum_values: Some(vec![
@@ -6184,6 +6230,7 @@ mod tests {
                 enum_values: None,
                 items: None,
                 one_of: vec![],
+                pattern: None,
             },
         );
 
@@ -6242,6 +6289,7 @@ mod tests {
                 enum_values: None,
                 items: None,
                 one_of: vec![],
+                pattern: None,
             },
         );
         definitions.insert(
@@ -6256,6 +6304,7 @@ mod tests {
                 ]),
                 items: None,
                 one_of: vec![],
+                pattern: None,
             },
         );
 
@@ -6324,6 +6373,7 @@ mod tests {
                 enum_values: None,
                 items: None,
                 one_of: vec![],
+                pattern: None,
             },
         );
         definitions.insert(
@@ -6335,6 +6385,7 @@ mod tests {
                 enum_values: None,
                 items: None,
                 one_of: vec![],
+                pattern: None,
             },
         );
         definitions.insert(
@@ -6349,6 +6400,7 @@ mod tests {
                 ]),
                 items: None,
                 one_of: vec![],
+                pattern: None,
             },
         );
 
@@ -6441,6 +6493,7 @@ mod tests {
                 enum_values: None,
                 items: None,
                 one_of: vec![],
+                pattern: None,
             },
         );
         definitions.insert(
@@ -6452,6 +6505,7 @@ mod tests {
                 enum_values: None,
                 items: None,
                 one_of: vec![],
+                pattern: None,
             },
         );
 
@@ -6548,6 +6602,7 @@ mod tests {
                 enum_values: None,
                 items: None,
                 one_of: vec![],
+                pattern: None,
             },
         );
 
@@ -7037,6 +7092,7 @@ mod tests {
                 properties: Some(dns_props),
                 required: vec![],
                 one_of: vec![],
+                pattern: None,
                 items: None,
                 enum_values: None,
             },
@@ -7200,6 +7256,194 @@ mod tests {
         assert!(
             generated.contains("..=256"),
             "Should display open-ended range for max-only: {generated}"
+        );
+    }
+
+    #[test]
+    fn test_ref_to_definition_with_pattern_produces_custom_type() {
+        // When a property uses $ref to a definition that is a simple string with a pattern,
+        // the pattern should be propagated to the referencing property.
+        let prop = CfnProperty {
+            ref_path: Some("#/definitions/iso8601UTC".to_string()),
+            description: Some("Indicates when objects are deleted.".to_string()),
+            ..Default::default()
+        };
+
+        let mut definitions = BTreeMap::new();
+        definitions.insert(
+            "iso8601UTC".to_string(),
+            CfnDefinition {
+                def_type: Some("string".to_string()),
+                pattern: Some(
+                    r"^(\d{4})-(0[0-9]|1[0-2])-([0-2]\d|3[01])T([01]\d|2[0-4]):([0-5]\d):([0-6]\d)((\.\d{3})?)Z$".to_string(),
+                ),
+                ..Default::default()
+            },
+        );
+
+        let schema = CfnSchema {
+            type_name: "AWS::S3::Bucket".to_string(),
+            description: None,
+            properties: BTreeMap::new(),
+            required: vec![],
+            read_only_properties: vec![],
+            create_only_properties: vec![],
+            write_only_properties: vec![],
+            primary_identifier: None,
+            definitions: Some(definitions),
+            tagging: None,
+        };
+
+        let (type_str, _) = cfn_type_to_carina_type_with_enum(
+            &prop,
+            "ExpirationDate",
+            &schema,
+            "awscc.s3.bucket",
+            &BTreeMap::new(),
+        );
+        assert!(
+            type_str.contains("AttributeType::Custom"),
+            "Ref to string definition with pattern should produce Custom type, got: {}",
+            type_str
+        );
+        assert!(
+            type_str.contains("validate_expiration_date_pattern"),
+            "Should reference pattern validation function, got: {}",
+            type_str
+        );
+    }
+
+    #[test]
+    fn test_ref_pattern_collected_in_generate_schema_code() {
+        // When a struct field uses $ref to a definition with a pattern,
+        // the pattern validation function should be generated in the schema code.
+        let mut rule_props = BTreeMap::new();
+        rule_props.insert(
+            "ExpirationDate".to_string(),
+            CfnProperty {
+                ref_path: Some("#/definitions/iso8601UTC".to_string()),
+                description: Some("Indicates when objects are deleted.".to_string()),
+                ..Default::default()
+            },
+        );
+        rule_props.insert(
+            "Status".to_string(),
+            CfnProperty {
+                prop_type: Some(TypeValue::Single("string".to_string())),
+                enum_values: Some(vec![
+                    EnumValue::Str("Enabled".to_string()),
+                    EnumValue::Str("Disabled".to_string()),
+                ]),
+                ..Default::default()
+            },
+        );
+
+        let mut definitions = BTreeMap::new();
+        definitions.insert(
+            "iso8601UTC".to_string(),
+            CfnDefinition {
+                def_type: Some("string".to_string()),
+                pattern: Some(
+                    r"^(\d{4})-(0[0-9]|1[0-2])-([0-2]\d|3[01])T([01]\d|2[0-4]):([0-5]\d):([0-6]\d)((\.\d{3})?)Z$".to_string(),
+                ),
+                ..Default::default()
+            },
+        );
+        definitions.insert(
+            "Rule".to_string(),
+            CfnDefinition {
+                def_type: Some("object".to_string()),
+                properties: Some(rule_props),
+                required: vec!["Status".to_string()],
+                ..Default::default()
+            },
+        );
+
+        let mut properties = BTreeMap::new();
+        properties.insert(
+            "LifecycleConfiguration".to_string(),
+            CfnProperty {
+                prop_type: Some(TypeValue::Single("object".to_string())),
+                properties: Some({
+                    let mut lc_props = BTreeMap::new();
+                    lc_props.insert(
+                        "Rules".to_string(),
+                        CfnProperty {
+                            prop_type: Some(TypeValue::Single("array".to_string())),
+                            items: Some(Box::new(CfnProperty {
+                                ref_path: Some("#/definitions/Rule".to_string()),
+                                ..Default::default()
+                            })),
+                            ..Default::default()
+                        },
+                    );
+                    lc_props
+                }),
+                ..Default::default()
+            },
+        );
+
+        let schema = CfnSchema {
+            type_name: "AWS::S3::Bucket".to_string(),
+            description: None,
+            properties,
+            required: vec![],
+            read_only_properties: vec![],
+            create_only_properties: vec![],
+            write_only_properties: vec![],
+            primary_identifier: None,
+            definitions: Some(definitions),
+            tagging: None,
+        };
+
+        let generated = generate_schema_code(&schema, "AWS::S3::Bucket").unwrap();
+        assert!(
+            generated.contains("validate_expiration_date_pattern"),
+            "Should generate pattern validation function for $ref definition pattern: {generated}"
+        );
+    }
+
+    #[test]
+    fn test_top_level_ref_pattern_collected_in_generate_schema_code() {
+        // When a top-level property uses $ref to a definition with a pattern,
+        // the pattern validation function should be generated.
+        let mut definitions = BTreeMap::new();
+        definitions.insert(
+            "iso8601UTC".to_string(),
+            CfnDefinition {
+                def_type: Some("string".to_string()),
+                pattern: Some(r"^(\d{4})-(0[0-9]|1[0-2])$".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let mut properties = BTreeMap::new();
+        properties.insert(
+            "CreatedDate".to_string(),
+            CfnProperty {
+                ref_path: Some("#/definitions/iso8601UTC".to_string()),
+                description: Some("When the resource was created.".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let schema = CfnSchema {
+            type_name: "AWS::Test::Resource".to_string(),
+            description: None,
+            properties,
+            required: vec![],
+            read_only_properties: vec![],
+            create_only_properties: vec![],
+            write_only_properties: vec![],
+            primary_identifier: None,
+            definitions: Some(definitions),
+            tagging: None,
+        };
+
+        let generated = generate_schema_code(&schema, "AWS::Test::Resource").unwrap();
+        assert!(
+            generated.contains("validate_created_date_pattern"),
+            "Should generate pattern validation function for top-level $ref pattern: {generated}"
         );
     }
 }
