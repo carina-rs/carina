@@ -17,12 +17,6 @@ pub fn ec2_vpc_peering_connection_config() -> AwsccSchemaConfig {
         schema: ResourceSchema::new("awscc.ec2.vpc_peering_connection")
         .with_description("Resource Type definition for AWS::EC2::VPCPeeringConnection")
         .attribute(
-            AttributeSchema::new("assume_role_region", super::awscc_region())
-                .create_only()
-                .with_description("The Region code to use when calling Security Token Service (STS) to assume the PeerRoleArn, if provided.")
-                .with_provider_name("AssumeRoleRegion"),
-        )
-        .attribute(
             AttributeSchema::new("id", super::vpc_peering_connection_id())
                 .with_description("(read-only)")
                 .with_provider_name("Id"),

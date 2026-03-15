@@ -176,6 +176,9 @@ struct CfnProperty {
     /// Const value (single fixed value for this property)
     #[serde(rename = "const")]
     const_value: Option<serde_json::Value>,
+    /// Default value for this property
+    #[serde(rename = "default")]
+    default_value: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -682,6 +685,11 @@ fn generate_markdown(schema: &CfnSchema, type_name: &str) -> Result<String> {
         } else {
             md.push_str("- **Required:** No\n");
         }
+        if let Some(default_val) = &prop.default_value
+            && let Some(display) = json_default_to_markdown(default_val)
+        {
+            md.push_str(&format!("- **Default:** `{}`\n", display));
+        }
         md.push('\n');
 
         if let Some(d) = &prop.description {
@@ -1150,6 +1158,11 @@ fn generate_schema_code(schema: &CfnSchema, type_name: &str) -> Result<String> {
     let has_ranged_ints = !ranged_ints.is_empty();
     let has_ranged_floats = !ranged_floats.is_empty();
     let has_int_enums = !int_enums.is_empty();
+    let has_defaults = schema.properties.values().any(|p| {
+        p.default_value
+            .as_ref()
+            .is_some_and(|v| json_default_to_value_code(v).is_some())
+    });
 
     // Enums use AttributeType::Custom with AttributeType::String base
     if has_enums {
@@ -1194,7 +1207,7 @@ use super::AwsccSchemaConfig;
         resource, type_name, schema_imports_str
     ));
 
-    if has_ranged_ints || has_ranged_floats || has_int_enums {
+    if has_ranged_ints || has_ranged_floats || has_int_enums || has_defaults {
         code.push_str("use carina_core::resource::Value;\n");
     }
     if needs_tags_type {
@@ -1447,6 +1460,16 @@ pub fn {}() -> AwsccSchemaConfig {{
             "\n                .with_provider_name(\"{}\")",
             prop_name
         ));
+
+        // Add default value if defined in CloudFormation schema
+        if let Some(default_val) = &prop.default_value
+            && let Some(default_code) = json_default_to_value_code(default_val)
+        {
+            attr_code.push_str(&format!(
+                "\n                .with_default({})",
+                default_code
+            ));
+        }
 
         // Add block_name for List(Struct) attributes with a natural singular form
         if attr_type.starts_with("AttributeType::List(Box::new(AttributeType::Struct")
@@ -2932,6 +2955,37 @@ fn cfn_type_to_carina_type_with_enum(
 ///
 /// Returns `Some(singular)` if the singular differs from the original,
 /// or `None` if the name is already singular or doesn't match known patterns.
+/// Convert a JSON default value to a Rust `Value::...` expression string.
+/// Returns `None` for unsupported types (arrays, objects, null).
+fn json_default_to_value_code(val: &serde_json::Value) -> Option<String> {
+    match val {
+        serde_json::Value::String(s) => {
+            let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
+            Some(format!("Value::String(\"{}\".to_string())", escaped))
+        }
+        serde_json::Value::Bool(b) => Some(format!("Value::Bool({})", b)),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                Some(format!("Value::Int({})", i))
+            } else {
+                n.as_f64().map(|f| format!("Value::Float({:.1})", f))
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Convert a JSON default value to a display string for markdown documentation.
+/// Returns `None` for unsupported types (arrays, objects, null).
+fn json_default_to_markdown(val: &serde_json::Value) -> Option<String> {
+    match val {
+        serde_json::Value::String(s) => Some(format!("\"{}\"", s)),
+        serde_json::Value::Bool(b) => Some(format!("{}", b)),
+        serde_json::Value::Number(n) => Some(format!("{}", n)),
+        _ => None,
+    }
+}
+
 fn compute_block_name(name: &str) -> Option<String> {
     let singular = if let Some(stem) = name.strip_suffix("ies") {
         // policies -> policy, entries -> entry
@@ -3165,6 +3219,7 @@ mod tests {
             maximum: None,
             additional_properties: None,
             const_value: None,
+            default_value: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::SecurityGroupIngress".to_string(),
@@ -3235,6 +3290,7 @@ mod tests {
             maximum: None,
             additional_properties: None,
             const_value: None,
+            default_value: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::SecurityGroupIngress".to_string(),
@@ -3272,6 +3328,7 @@ mod tests {
             maximum: None,
             additional_properties: None,
             const_value: None,
+            default_value: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::SecurityGroupIngress".to_string(),
@@ -3309,6 +3366,7 @@ mod tests {
             maximum: None,
             additional_properties: None,
             const_value: None,
+            default_value: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::NatGateway".to_string(),
@@ -3351,6 +3409,7 @@ mod tests {
             maximum: None,
             additional_properties: None,
             const_value: None,
+            default_value: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::EIP".to_string(),
@@ -3388,6 +3447,7 @@ mod tests {
             maximum: None,
             additional_properties: None,
             const_value: None,
+            default_value: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::NatGateway".to_string(),
@@ -3429,6 +3489,7 @@ mod tests {
             maximum: None,
             additional_properties: None,
             const_value: None,
+            default_value: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::Subnet".to_string(),
@@ -3521,6 +3582,7 @@ mod tests {
             maximum: None,
             additional_properties: None,
             const_value: None,
+            default_value: None,
         };
         assert_eq!(
             list_element_type_display(&prop, "GenericProp", ""),
@@ -3541,6 +3603,7 @@ mod tests {
             maximum: None,
             additional_properties: None,
             const_value: None,
+            default_value: None,
         };
         assert_eq!(
             list_element_type_display(&prop, "GenericProp", ""),
@@ -3561,6 +3624,7 @@ mod tests {
             maximum: None,
             additional_properties: None,
             const_value: None,
+            default_value: None,
         };
         assert_eq!(
             list_element_type_display(&prop, "GenericProp", ""),
@@ -3581,6 +3645,7 @@ mod tests {
             maximum: None,
             additional_properties: None,
             const_value: None,
+            default_value: None,
         };
         assert_eq!(
             list_element_type_display(&prop, "GenericProp", ""),
@@ -3603,6 +3668,7 @@ mod tests {
             maximum: None,
             additional_properties: None,
             const_value: None,
+            default_value: None,
         };
         assert_eq!(
             list_element_type_display(&prop, "SubnetIds", ""),
@@ -3666,6 +3732,7 @@ mod tests {
                 maximum: None,
                 additional_properties: None,
                 const_value: None,
+                default_value: None,
             })),
             ref_path: None,
             insertion_order: None,
@@ -3675,6 +3742,7 @@ mod tests {
             maximum: None,
             additional_properties: None,
             const_value: None,
+            default_value: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::VPC".to_string(),
@@ -3715,6 +3783,7 @@ mod tests {
                 maximum: None,
                 additional_properties: None,
                 const_value: None,
+                default_value: None,
             })),
             ref_path: None,
             insertion_order: None,
@@ -3724,6 +3793,7 @@ mod tests {
             maximum: None,
             additional_properties: None,
             const_value: None,
+            default_value: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::VPC".to_string(),
@@ -3760,6 +3830,7 @@ mod tests {
             maximum: None,
             additional_properties: None,
             const_value: None,
+            default_value: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::VPC".to_string(),
@@ -3807,6 +3878,7 @@ mod tests {
                 maximum: None,
                 additional_properties: None,
                 const_value: None,
+                default_value: None,
             };
             let result = list_element_type_display(&prop, "GenericProp", "");
             assert!(
@@ -3850,6 +3922,7 @@ mod tests {
             maximum: None,
             additional_properties: None,
             const_value: None,
+            default_value: None,
         };
         let result = type_display_string("Prop1", &prop, &schema, &enums);
         assert_ne!(
@@ -3875,6 +3948,7 @@ mod tests {
                 maximum: None,
                 additional_properties: None,
                 const_value: None,
+                default_value: None,
             })),
             ref_path: None,
             insertion_order: None,
@@ -3884,6 +3958,7 @@ mod tests {
             maximum: None,
             additional_properties: None,
             const_value: None,
+            default_value: None,
         };
         let result = type_display_string("Prop2", &prop, &schema, &enums);
         assert_ne!(
@@ -3909,6 +3984,7 @@ mod tests {
                 maximum: None,
                 additional_properties: None,
                 const_value: None,
+                default_value: None,
             })),
             ref_path: None,
             insertion_order: None,
@@ -3918,6 +3994,7 @@ mod tests {
             maximum: None,
             additional_properties: None,
             const_value: None,
+            default_value: None,
         };
         let result = type_display_string("Prop3", &prop, &schema, &enums);
         assert_ne!(
@@ -3943,6 +4020,7 @@ mod tests {
                 maximum: None,
                 additional_properties: None,
                 const_value: None,
+                default_value: None,
             })),
             ref_path: None,
             insertion_order: None,
@@ -3952,6 +4030,7 @@ mod tests {
             maximum: None,
             additional_properties: None,
             const_value: None,
+            default_value: None,
         };
         let result = type_display_string("Prop4", &prop, &schema, &enums);
         assert_ne!(
@@ -3975,6 +4054,7 @@ mod tests {
             maximum: Some(32),
             additional_properties: None,
             const_value: None,
+            default_value: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::VPC".to_string(),
@@ -4027,6 +4107,7 @@ mod tests {
             maximum: None,
             additional_properties: None,
             const_value: None,
+            default_value: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::VPC".to_string(),
@@ -4061,6 +4142,7 @@ mod tests {
             maximum: None,
             additional_properties: None,
             const_value: None,
+            default_value: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::VPC".to_string(),
@@ -4104,6 +4186,7 @@ mod tests {
             maximum: Some(100),
             additional_properties: None,
             const_value: None,
+            default_value: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::VPC".to_string(),
@@ -4153,6 +4236,7 @@ mod tests {
             maximum: None,
             additional_properties: None,
             const_value: None,
+            default_value: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::Logs::LogGroup".to_string(),
@@ -4205,6 +4289,7 @@ mod tests {
             maximum: None,
             additional_properties: None,
             const_value: None,
+            default_value: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::NatGateway".to_string(),
@@ -4243,6 +4328,7 @@ mod tests {
             maximum: None,
             additional_properties: None,
             const_value: None,
+            default_value: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::SomeService::Resource".to_string(),
@@ -4281,6 +4367,7 @@ mod tests {
             maximum: None,
             additional_properties: None,
             const_value: None,
+            default_value: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::Logs::LogGroup".to_string(),
@@ -4318,6 +4405,7 @@ mod tests {
             maximum: Some(32),
             additional_properties: None,
             const_value: None,
+            default_value: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::VPC".to_string(),
@@ -4389,6 +4477,7 @@ mod tests {
             maximum: None,
             additional_properties: None,
             const_value: None,
+            default_value: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::VPC".to_string(),
@@ -4428,6 +4517,7 @@ mod tests {
             maximum: None,
             additional_properties: None,
             const_value: None,
+            default_value: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::SecurityGroupIngress".to_string(),
@@ -4466,6 +4556,7 @@ mod tests {
             maximum: None,
             additional_properties: None,
             const_value: None,
+            default_value: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::S3::Bucket".to_string(),
@@ -4517,6 +4608,7 @@ mod tests {
             maximum: Some(65535),
             additional_properties: None,
             const_value: None,
+            default_value: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::SecurityGroupIngress".to_string(),
@@ -5177,6 +5269,7 @@ mod tests {
                 maximum: None,
                 additional_properties: None,
                 const_value: None,
+                default_value: None,
             },
         );
 
@@ -5235,6 +5328,7 @@ mod tests {
                 maximum: None,
                 additional_properties: None,
                 const_value: None,
+                default_value: None,
             },
         );
 
@@ -5267,6 +5361,7 @@ mod tests {
                 maximum: None,
                 additional_properties: None,
                 const_value: None,
+                default_value: None,
             },
         );
 
@@ -5964,5 +6059,176 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join("\n")
         );
+    }
+
+    #[test]
+    fn test_generate_schema_code_emits_default_string_value() {
+        let mut properties = BTreeMap::new();
+        properties.insert(
+            "Path".to_string(),
+            CfnProperty {
+                prop_type: Some(TypeValue::Single("string".to_string())),
+                description: Some("The path to the role.".to_string()),
+                default_value: Some(serde_json::Value::String("/".to_string())),
+                ..Default::default()
+            },
+        );
+
+        let schema = CfnSchema {
+            type_name: "AWS::IAM::Role".to_string(),
+            description: None,
+            properties,
+            required: vec![],
+            read_only_properties: vec![],
+            create_only_properties: vec![],
+            write_only_properties: vec![],
+            primary_identifier: None,
+            definitions: None,
+            tagging: None,
+        };
+
+        let generated = generate_schema_code(&schema, "AWS::IAM::Role").unwrap();
+
+        assert!(
+            generated.contains(r#".with_default(Value::String("/".to_string()))"#),
+            "Should emit .with_default() for string default value: {generated}"
+        );
+        assert!(
+            generated.contains("use carina_core::resource::Value;"),
+            "Should import Value when defaults are present: {generated}"
+        );
+    }
+
+    #[test]
+    fn test_generate_schema_code_emits_default_bool_value() {
+        let mut properties = BTreeMap::new();
+        properties.insert(
+            "DeletionProtectionEnabled".to_string(),
+            CfnProperty {
+                prop_type: Some(TypeValue::Single("boolean".to_string())),
+                description: Some("Whether deletion protection is enabled.".to_string()),
+                default_value: Some(serde_json::Value::Bool(false)),
+                ..Default::default()
+            },
+        );
+
+        let schema = CfnSchema {
+            type_name: "AWS::Logs::LogGroup".to_string(),
+            description: None,
+            properties,
+            required: vec![],
+            read_only_properties: vec![],
+            create_only_properties: vec![],
+            write_only_properties: vec![],
+            primary_identifier: None,
+            definitions: None,
+            tagging: None,
+        };
+
+        let generated = generate_schema_code(&schema, "AWS::Logs::LogGroup").unwrap();
+
+        assert!(
+            generated.contains(".with_default(Value::Bool(false))"),
+            "Should emit .with_default() for boolean default value: {generated}"
+        );
+    }
+
+    #[test]
+    fn test_generate_schema_code_emits_default_int_value() {
+        let mut properties = BTreeMap::new();
+        properties.insert(
+            "MaxRetries".to_string(),
+            CfnProperty {
+                prop_type: Some(TypeValue::Single("integer".to_string())),
+                description: Some("Maximum retry count.".to_string()),
+                default_value: Some(serde_json::json!(3)),
+                ..Default::default()
+            },
+        );
+
+        let schema = CfnSchema {
+            type_name: "AWS::Test::Resource".to_string(),
+            description: None,
+            properties,
+            required: vec![],
+            read_only_properties: vec![],
+            create_only_properties: vec![],
+            write_only_properties: vec![],
+            primary_identifier: None,
+            definitions: None,
+            tagging: None,
+        };
+
+        let generated = generate_schema_code(&schema, "AWS::Test::Resource").unwrap();
+
+        assert!(
+            generated.contains(".with_default(Value::Int(3))"),
+            "Should emit .with_default() for integer default value: {generated}"
+        );
+    }
+
+    #[test]
+    fn test_generate_markdown_shows_default_values() {
+        let mut properties = BTreeMap::new();
+        properties.insert(
+            "Path".to_string(),
+            CfnProperty {
+                prop_type: Some(TypeValue::Single("string".to_string())),
+                description: Some("The path.".to_string()),
+                default_value: Some(serde_json::Value::String("/".to_string())),
+                ..Default::default()
+            },
+        );
+        properties.insert(
+            "Enabled".to_string(),
+            CfnProperty {
+                prop_type: Some(TypeValue::Single("boolean".to_string())),
+                description: Some("Whether enabled.".to_string()),
+                default_value: Some(serde_json::Value::Bool(true)),
+                ..Default::default()
+            },
+        );
+
+        let schema = CfnSchema {
+            type_name: "AWS::Test::Resource".to_string(),
+            description: None,
+            properties,
+            required: vec![],
+            read_only_properties: vec![],
+            create_only_properties: vec![],
+            write_only_properties: vec![],
+            primary_identifier: None,
+            definitions: None,
+            tagging: None,
+        };
+
+        let md = generate_markdown(&schema, "AWS::Test::Resource").unwrap();
+
+        assert!(
+            md.contains("**Default:** `\"/\"`"),
+            "Should show string default in markdown: {md}"
+        );
+        assert!(
+            md.contains("**Default:** `true`"),
+            "Should show boolean default in markdown: {md}"
+        );
+    }
+
+    #[test]
+    fn test_json_default_to_value_code() {
+        assert_eq!(
+            json_default_to_value_code(&serde_json::Value::String("hello".to_string())),
+            Some("Value::String(\"hello\".to_string())".to_string())
+        );
+        assert_eq!(
+            json_default_to_value_code(&serde_json::Value::Bool(true)),
+            Some("Value::Bool(true)".to_string())
+        );
+        assert_eq!(
+            json_default_to_value_code(&serde_json::json!(42)),
+            Some("Value::Int(42)".to_string())
+        );
+        assert_eq!(json_default_to_value_code(&serde_json::Value::Null), None,);
+        assert_eq!(json_default_to_value_code(&serde_json::json!([])), None,);
     }
 }
