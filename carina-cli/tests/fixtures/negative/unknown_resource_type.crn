@@ -1,0 +1,10 @@
+# Negative test: unknown resource type
+# Expected: validation error for unknown resource type
+
+provider awscc {
+  region = awscc.Region.ap_northeast_1
+}
+
+awscc.ec2.nonexistent_resource {
+  name = "test"
+}
