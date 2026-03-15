@@ -189,6 +189,45 @@ fn validate_object_size_less_than_pattern(value: &Value) -> Result<(), String> {
     }
 }
 
+fn validate_id_length(value: &Value) -> Result<(), String> {
+    if let Value::String(s) = value {
+        let len = s.len();
+        if len > 255 {
+            Err(format!("String length {} is out of range ..=255", len))
+        } else {
+            Ok(())
+        }
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_name_length(value: &Value) -> Result<(), String> {
+    if let Value::String(s) = value {
+        let len = s.len();
+        if len > 1024 {
+            Err(format!("String length {} is out of range ..=1024", len))
+        } else {
+            Ok(())
+        }
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_prefix_length(value: &Value) -> Result<(), String> {
+    if let Value::String(s) = value {
+        let len = s.len();
+        if len > 1024 {
+            Err(format!("String length {} is out of range ..=1024", len))
+        } else {
+            Ok(())
+        }
+    } else {
+        Ok(())
+    }
+}
+
 /// Returns the schema config for s3_bucket (AWS::S3::Bucket)
 pub fn s3_bucket_config() -> AwsccSchemaConfig {
     AwsccSchemaConfig {
@@ -340,7 +379,13 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
             }))).required().with_description("An HTTP method that you allow the origin to run. *Allowed values*: ``GET`` | ``PUT`` | ``HEAD`` | ``POST`` | ``DELETE``").with_provider_name("AllowedMethods"),
                     StructField::new("allowed_origins", AttributeType::List(Box::new(AttributeType::String))).required().with_description("One or more origins you want customers to be able to access the bucket from.").with_provider_name("AllowedOrigins"),
                     StructField::new("exposed_headers", AttributeType::List(Box::new(AttributeType::String))).with_description("One or more headers in the response that you want customers to be able to access from their applications (for example, from a JavaScript ``XMLHttpRequ...").with_provider_name("ExposedHeaders"),
-                    StructField::new("id", AttributeType::String).with_description("A unique identifier for this rule. The value must be no more than 255 characters.").with_provider_name("Id"),
+                    StructField::new("id", AttributeType::Custom {
+                name: "String(len: ..=255)".to_string(),
+                base: Box::new(AttributeType::String),
+                validate: validate_id_length,
+                namespace: None,
+                to_dsl: None,
+            }).with_description("A unique identifier for this rule. The value must be no more than 255 characters.").with_provider_name("Id"),
                     StructField::new("max_age", AttributeType::Custom {
                 name: "Int(0..)".to_string(),
                 base: Box::new(AttributeType::Int),
@@ -463,7 +508,13 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                     StructField::new("expiration_date", AttributeType::String).with_description("Indicates when objects are deleted from Amazon S3 and Amazon S3 Glacier. The date value must be in ISO 8601 format. The time is always midnight UTC. I...").with_provider_name("ExpirationDate"),
                     StructField::new("expiration_in_days", AttributeType::Int).with_description("Indicates the number of days after creation when objects are deleted from Amazon S3 and Amazon S3 Glacier. If you specify an expiration and transition...").with_provider_name("ExpirationInDays"),
                     StructField::new("expired_object_delete_marker", AttributeType::Bool).with_description("Indicates whether Amazon S3 will remove a delete marker without any noncurrent versions. If set to true, the delete marker will be removed if there ar...").with_provider_name("ExpiredObjectDeleteMarker"),
-                    StructField::new("id", AttributeType::String).with_description("Unique identifier for the rule. The value can't be longer than 255 characters.").with_provider_name("Id"),
+                    StructField::new("id", AttributeType::Custom {
+                name: "String(len: ..=255)".to_string(),
+                base: Box::new(AttributeType::String),
+                validate: validate_id_length,
+                namespace: None,
+                to_dsl: None,
+            }).with_description("Unique identifier for the rule. The value can't be longer than 255 characters.").with_provider_name("Id"),
                     StructField::new("noncurrent_version_expiration", AttributeType::Struct {
                     name: "NoncurrentVersionExpiration".to_string(),
                     fields: vec![
@@ -723,7 +774,13 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                     StructField::new("rules", AttributeType::List(Box::new(AttributeType::Struct {
                     name: "FilterRule".to_string(),
                     fields: vec![
-                    StructField::new("name", AttributeType::String).required().with_description("The object key name prefix or suffix identifying one or more objects to which the filtering rule applies. The maximum length is 1,024 characters. Over...").with_provider_name("Name"),
+                    StructField::new("name", AttributeType::Custom {
+                name: "String(len: ..=1024)".to_string(),
+                base: Box::new(AttributeType::String),
+                validate: validate_name_length,
+                namespace: None,
+                to_dsl: None,
+            }).required().with_description("The object key name prefix or suffix identifying one or more objects to which the filtering rule applies. The maximum length is 1,024 characters. Over...").with_provider_name("Name"),
                     StructField::new("value", AttributeType::String).required().with_description("The value that the filter searches for in object key names.").with_provider_name("Value")
                     ],
                 }))).required().with_description("A list of containers for the key-value pair that defines the criteria for the filter rule.").with_provider_name("Rules")
@@ -747,7 +804,13 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                     StructField::new("rules", AttributeType::List(Box::new(AttributeType::Struct {
                     name: "FilterRule".to_string(),
                     fields: vec![
-                    StructField::new("name", AttributeType::String).required().with_description("The object key name prefix or suffix identifying one or more objects to which the filtering rule applies. The maximum length is 1,024 characters. Over...").with_provider_name("Name"),
+                    StructField::new("name", AttributeType::Custom {
+                name: "String(len: ..=1024)".to_string(),
+                base: Box::new(AttributeType::String),
+                validate: validate_name_length,
+                namespace: None,
+                to_dsl: None,
+            }).required().with_description("The object key name prefix or suffix identifying one or more objects to which the filtering rule applies. The maximum length is 1,024 characters. Over...").with_provider_name("Name"),
                     StructField::new("value", AttributeType::String).required().with_description("The value that the filter searches for in object key names.").with_provider_name("Value")
                     ],
                 }))).required().with_description("A list of containers for the key-value pair that defines the criteria for the filter rule.").with_provider_name("Rules")
@@ -771,7 +834,13 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                     StructField::new("rules", AttributeType::List(Box::new(AttributeType::Struct {
                     name: "FilterRule".to_string(),
                     fields: vec![
-                    StructField::new("name", AttributeType::String).required().with_description("The object key name prefix or suffix identifying one or more objects to which the filtering rule applies. The maximum length is 1,024 characters. Over...").with_provider_name("Name"),
+                    StructField::new("name", AttributeType::Custom {
+                name: "String(len: ..=1024)".to_string(),
+                base: Box::new(AttributeType::String),
+                validate: validate_name_length,
+                namespace: None,
+                to_dsl: None,
+            }).required().with_description("The object key name prefix or suffix identifying one or more objects to which the filtering rule applies. The maximum length is 1,024 characters. Over...").with_provider_name("Name"),
                     StructField::new("value", AttributeType::String).required().with_description("The value that the filter searches for in object key names.").with_provider_name("Value")
                     ],
                 }))).required().with_description("A list of containers for the key-value pair that defines the criteria for the filter rule.").with_provider_name("Rules")
@@ -960,8 +1029,20 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                     StructField::new("tag_filter", tags_type()).with_description("A container for specifying a tag key and value. The rule applies only to objects that have the tag in their tag set.").with_provider_name("TagFilter")
                     ],
                 }).with_description("A filter that identifies the subset of objects to which the replication rule applies. A ``Filter`` must specify exactly one ``Prefix``, ``TagFilter``,...").with_provider_name("Filter"),
-                    StructField::new("id", AttributeType::String).with_description("A unique identifier for the rule. The maximum value is 255 characters. If you don't specify a value, AWS CloudFormation generates a random ID. When us...").with_provider_name("Id"),
-                    StructField::new("prefix", AttributeType::String).with_description("An object key name prefix that identifies the object or objects to which the rule applies. The maximum prefix length is 1,024 characters. To include a...").with_provider_name("Prefix"),
+                    StructField::new("id", AttributeType::Custom {
+                name: "String(len: ..=255)".to_string(),
+                base: Box::new(AttributeType::String),
+                validate: validate_id_length,
+                namespace: None,
+                to_dsl: None,
+            }).with_description("A unique identifier for the rule. The maximum value is 255 characters. If you don't specify a value, AWS CloudFormation generates a random ID. When us...").with_provider_name("Id"),
+                    StructField::new("prefix", AttributeType::Custom {
+                name: "String(len: ..=1024)".to_string(),
+                base: Box::new(AttributeType::String),
+                validate: validate_prefix_length,
+                namespace: None,
+                to_dsl: None,
+            }).with_description("An object key name prefix that identifies the object or objects to which the rule applies. The maximum prefix length is 1,024 characters. To include a...").with_provider_name("Prefix"),
                     StructField::new("priority", AttributeType::Int).with_description("The priority indicates which rule has precedence whenever two or more replication rules conflict. Amazon S3 will attempt to replicate objects accordin...").with_provider_name("Priority"),
                     StructField::new("source_selection_criteria", AttributeType::Struct {
                     name: "SourceSelectionCriteria".to_string(),

@@ -594,7 +594,7 @@ Shorthand formats: `Enabled` or `VersioningConfigurationStatus.Enabled`
 | `allowed_methods` | List\<[Enum (AllowedMethods)](#allowed_methods-allowedmethods)\> | Yes | An HTTP method that you allow the origin to run. *Allowed values*: ``GET`` | ``PUT`` | ``HEAD`` | ``... |
 | `allowed_origins` | `List<String>` | Yes | One or more origins you want customers to be able to access the bucket from. |
 | `exposed_headers` | `List<String>` | No | One or more headers in the response that you want customers to be able to access from their applicat... |
-| `id` | String | No | A unique identifier for this rule. The value must be no more than 255 characters. |
+| `id` | String(len: ..=255) | No | A unique identifier for this rule. The value must be no more than 255 characters. |
 | `max_age` | Int(0..) | No | The time in seconds that your browser is to cache the preflight response for the specified resource. |
 
 ### DataExport
@@ -643,7 +643,7 @@ Shorthand formats: `Enabled` or `VersioningConfigurationStatus.Enabled`
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `name` | String | Yes | The object key name prefix or suffix identifying one or more objects to which the filtering rule app... |
+| `name` | String(len: ..=1024) | Yes | The object key name prefix or suffix identifying one or more objects to which the filtering rule app... |
 | `value` | String | Yes | The value that the filter searches for in object key names. |
 
 ### IntelligentTieringConfiguration
@@ -888,8 +888,8 @@ Shorthand formats: `Enabled` or `VersioningConfigurationStatus.Enabled`
 | `delete_marker_replication` | [Struct(DeleteMarkerReplication)](#deletemarkerreplication) | No | Specifies whether Amazon S3 replicates delete markers. If you specify a ``Filter`` in your replicati... |
 | `destination` | [Struct(ReplicationDestination)](#replicationdestination) | Yes | A container for information about the replication destination and its configurations including enabl... |
 | `filter` | [Struct(ReplicationRuleFilter)](#replicationrulefilter) | No | A filter that identifies the subset of objects to which the replication rule applies. A ``Filter`` m... |
-| `id` | String | No | A unique identifier for the rule. The maximum value is 255 characters. If you don't specify a value,... |
-| `prefix` | String | No | An object key name prefix that identifies the object or objects to which the rule applies. The maxim... |
+| `id` | String(len: ..=255) | No | A unique identifier for the rule. The maximum value is 255 characters. If you don't specify a value,... |
+| `prefix` | String(len: ..=1024) | No | An object key name prefix that identifies the object or objects to which the rule applies. The maxim... |
 | `priority` | Int | No | The priority indicates which rule has precedence whenever two or more replication rules conflict. Am... |
 | `source_selection_criteria` | [Struct(SourceSelectionCriteria)](#sourceselectioncriteria) | No | A container that describes additional filters for identifying the source objects that you want to re... |
 | `status` | [Enum (ReplicationRuleStatus)](#status-replicationrulestatus) | Yes | Specifies whether the rule is enabled. |
@@ -944,13 +944,13 @@ Shorthand formats: `Enabled` or `VersioningConfigurationStatus.Enabled`
 | `expiration_date` | String | No | Indicates when objects are deleted from Amazon S3 and Amazon S3 Glacier. The date value must be in I... |
 | `expiration_in_days` | Int | No | Indicates the number of days after creation when objects are deleted from Amazon S3 and Amazon S3 Gl... |
 | `expired_object_delete_marker` | Bool | No | Indicates whether Amazon S3 will remove a delete marker without any noncurrent versions. If set to t... |
-| `id` | String | No | Unique identifier for the rule. The value can't be longer than 255 characters. |
+| `id` | String(len: ..=255) | No | Unique identifier for the rule. The value can't be longer than 255 characters. |
 | `noncurrent_version_expiration` | [Struct(NoncurrentVersionExpiration)](#noncurrentversionexpiration) | No | Specifies when noncurrent object versions expire. Upon expiration, S3 permanently deletes the noncur... |
 | `noncurrent_version_expiration_in_days` | Int | No | (Deprecated.) For buckets with versioning enabled (or suspended), specifies the time, in days, betwe... |
 | `noncurrent_version_transition` | [Struct(NoncurrentVersionTransition)](#noncurrentversiontransition) | No | (Deprecated.) For buckets with versioning enabled (or suspended), specifies when non-current objects... |
 | `noncurrent_version_transitions` | [List\<NoncurrentVersionTransition\>](#noncurrentversiontransition) | No | For buckets with versioning enabled (or suspended), one or more transition rules that specify when n... |
-| `object_size_greater_than` | String | No | Specifies the minimum object size in bytes for this rule to apply to. Objects must be larger than th... |
-| `object_size_less_than` | String | No | Specifies the maximum object size in bytes for this rule to apply to. Objects must be smaller than t... |
+| `object_size_greater_than` | String(len: ..=20) | No | Specifies the minimum object size in bytes for this rule to apply to. Objects must be larger than th... |
+| `object_size_less_than` | String(len: ..=20) | No | Specifies the maximum object size in bytes for this rule to apply to. Objects must be smaller than t... |
 | `prefix` | String | No | Object key prefix that identifies one or more objects to which this rule applies. Replacement must b... |
 | `status` | [Enum (RuleStatus)](#status-rulestatus) | Yes | If ``Enabled``, the rule is currently being applied. If ``Disabled``, the rule is not currently bein... |
 | `tag_filters` | `List<Map>` | No | Tags to use to identify a subset of objects to which the lifecycle rule applies. |

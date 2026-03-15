@@ -6,11 +6,38 @@
 
 use super::AwsccSchemaConfig;
 use super::tags_type;
+use carina_core::resource::Value;
 use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
 
 const VALID_METERED_ACCOUNT: &[&str] = &["ipam-owner", "resource-owner"];
 
 const VALID_TIER: &[&str] = &["free", "advanced"];
+
+fn validate_organizations_entity_path_length(value: &Value) -> Result<(), String> {
+    if let Value::String(s) = value {
+        let len = s.len();
+        if len < 1 {
+            Err(format!("String length {} is out of range 1..", len))
+        } else {
+            Ok(())
+        }
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_public_default_scope_id_length(value: &Value) -> Result<(), String> {
+    if let Value::String(s) = value {
+        let len = s.len();
+        if len > 255 {
+            Err(format!("String length {} is out of range ..=255", len))
+        } else {
+            Ok(())
+        }
+    } else {
+        Ok(())
+    }
+}
 
 /// Returns the schema config for ec2_ipam (AWS::EC2::IPAM)
 pub fn ec2_ipam_config() -> AwsccSchemaConfig {
@@ -39,7 +66,13 @@ pub fn ec2_ipam_config() -> AwsccSchemaConfig {
             AttributeSchema::new("default_resource_discovery_organizational_unit_exclusions", AttributeType::List(Box::new(AttributeType::Struct {
                     name: "IpamOrganizationalUnitExclusion".to_string(),
                     fields: vec![
-                    StructField::new("organizations_entity_path", AttributeType::String).required().with_description("An AWS Organizations entity path. Build the path for the OU(s) using AWS Organizations IDs separated by a '/'. Include all child OUs by ending the pat...").with_provider_name("OrganizationsEntityPath")
+                    StructField::new("organizations_entity_path", AttributeType::Custom {
+                name: "String(len: 1..)".to_string(),
+                base: Box::new(AttributeType::String),
+                validate: validate_organizations_entity_path_length,
+                namespace: None,
+                to_dsl: None,
+            }).required().with_description("An AWS Organizations entity path. Build the path for the OU(s) using AWS Organizations IDs separated by a '/'. Include all child OUs by ending the pat...").with_provider_name("OrganizationsEntityPath")
                     ],
                 })))
                 .with_description("A set of organizational unit (OU) exclusions for the default resource discovery, created with this IPAM.")
@@ -87,7 +120,13 @@ pub fn ec2_ipam_config() -> AwsccSchemaConfig {
                 .with_provider_name("PrivateDefaultScopeId"),
         )
         .attribute(
-            AttributeSchema::new("public_default_scope_id", AttributeType::String)
+            AttributeSchema::new("public_default_scope_id", AttributeType::Custom {
+                name: "String(len: ..=255)".to_string(),
+                base: Box::new(AttributeType::String),
+                validate: validate_public_default_scope_id_length,
+                namespace: None,
+                to_dsl: None,
+            })
                 .with_description("The Id of the default scope for publicly routable IP space, created with this IPAM. (read-only)")
                 .with_provider_name("PublicDefaultScopeId"),
         )

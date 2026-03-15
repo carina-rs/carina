@@ -188,6 +188,12 @@ struct CfnProperty {
     /// Maximum number of items (for array types)
     #[serde(default)]
     max_items: Option<i64>,
+    /// Minimum length constraint (for string types)
+    #[serde(default, rename = "minLength")]
+    min_length: Option<u64>,
+    /// Maximum length constraint (for string types)
+    #[serde(default, rename = "maxLength")]
+    max_length: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -509,7 +515,18 @@ fn type_display_string(
                 if prop_name.ends_with("PolicyDocument") {
                     "IamPolicyDocument".to_string()
                 } else {
-                    infer_string_type_display(prop_name, &schema.type_name)
+                    let base = infer_string_type_display(prop_name, &schema.type_name);
+                    // Append length constraint if present and type is plain String
+                    let effective_min = prop.min_length.filter(|&m| m > 0);
+                    if base == "String"
+                        && (effective_min.is_some() || prop.max_length.is_some())
+                        && prop.enum_values.is_none()
+                    {
+                        let range = string_length_display(effective_min, prop.max_length);
+                        format!("String(len: {})", range)
+                    } else {
+                        base
+                    }
                 }
             }
             Some("boolean") => "Bool".to_string(),
@@ -1006,6 +1023,7 @@ fn generate_schema_code(schema: &CfnSchema, type_name: &str) -> Result<String> {
     let mut int_enums: BTreeMap<String, Vec<i64>> = BTreeMap::new();
     let mut ranged_lists: BTreeMap<String, (Option<i64>, Option<i64>)> = BTreeMap::new();
     let mut patterns: BTreeMap<String, String> = BTreeMap::new();
+    let mut ranged_strings: BTreeMap<String, (Option<u64>, Option<u64>)> = BTreeMap::new();
 
     for (prop_name, prop) in &schema.properties {
         let (attr_type, enum_info) =
@@ -1082,6 +1100,29 @@ fn generate_schema_code(schema: &CfnSchema, type_name: &str) -> Result<String> {
             Some("array") => {
                 if prop.min_items.is_some() || prop.max_items.is_some() {
                     ranged_lists.insert(prop_name.clone(), (prop.min_items, prop.max_items));
+                }
+            }
+            Some("string") => {
+                // Collect string length constraints (only for plain strings without
+                // enum values or type overrides that would take precedence)
+                // Treat minLength=0 as no constraint since usize is always >= 0
+                let effective_min = prop.min_length.filter(|&m| m > 0);
+                if effective_min.is_some() || prop.max_length.is_some() {
+                    let has_desc_enum = prop
+                        .description
+                        .as_ref()
+                        .and_then(|d| extract_enum_from_description(d))
+                        .is_some();
+                    if prop.enum_values.is_none()
+                        && !enums.contains_key(prop_name)
+                        && !has_desc_enum
+                        && infer_string_type(prop_name, &schema.type_name).is_none()
+                        && !prop_name.ends_with("PolicyDocument")
+                        && prop_name != "Tags"
+                        && prop.pattern.is_none()
+                    {
+                        ranged_strings.insert(prop_name.clone(), (effective_min, prop.max_length));
+                    }
                 }
             }
             _ => {}
@@ -1179,6 +1220,28 @@ fn generate_schema_code(schema: &CfnSchema, type_name: &str) -> Result<String> {
         }
     }
 
+    // Also scan definitions for struct field string length constraints
+    // (including array items with string length constraints)
+    // Skip Tag definitions since Tags are handled specially by tags_type()
+    if let Some(definitions) = &schema.definitions {
+        for (def_name, def) in definitions {
+            if def_name.contains("Tag") {
+                continue;
+            }
+            if let Some(props) = &def.properties {
+                for (field_name, field_prop) in props {
+                    collect_string_length_constraints(field_name, field_prop, &mut ranged_strings);
+                }
+            }
+        }
+    }
+    // Also scan top-level array items for string length constraints
+    for (prop_name, prop) in &schema.properties {
+        if let Some(items) = &prop.items {
+            collect_string_length_constraints(prop_name, items, &mut ranged_strings);
+        }
+    }
+
     // Also scan definitions for struct field enum properties
     // Use composite key "DefName.FieldName" to avoid conflicts when different
     // definitions have fields with the same name but different enum values
@@ -1215,6 +1278,7 @@ fn generate_schema_code(schema: &CfnSchema, type_name: &str) -> Result<String> {
     let has_int_enums = !int_enums.is_empty();
     let has_ranged_lists = !ranged_lists.is_empty();
     let has_patterns = !patterns.is_empty();
+    let has_ranged_strings = !ranged_strings.is_empty();
     let has_defaults = schema.properties.values().any(|p| {
         p.default_value
             .as_ref()
@@ -1226,8 +1290,8 @@ fn generate_schema_code(schema: &CfnSchema, type_name: &str) -> Result<String> {
         needs_attribute_type = true;
     }
 
-    // Ranged ints/floats/lists use AttributeType::Custom with AttributeType::Int/Float/List base
-    if has_ranged_ints || has_ranged_floats || has_ranged_lists {
+    // Ranged ints/floats/lists/strings use AttributeType::Custom with AttributeType::Int/Float/List/String base
+    if has_ranged_ints || has_ranged_floats || has_ranged_lists || has_ranged_strings {
         needs_attribute_type = true;
     }
 
@@ -1273,6 +1337,7 @@ use super::AwsccSchemaConfig;
         || has_ranged_floats
         || has_int_enums
         || has_ranged_lists
+        || has_ranged_strings
         || has_defaults
         || has_patterns
     {
@@ -1439,6 +1504,29 @@ fn {}(value: &Value) -> Result<(), String> {{
         }}
     }} else {{
         Err("Expected list".to_string())
+    }}
+}}
+
+"#,
+            fn_name, condition, range_display
+        ));
+    }
+
+    // Generate length validation functions for string properties
+    for (prop_name, (min, max)) in &ranged_strings {
+        let fn_name = format!("validate_{}_length", prop_name.to_snake_case());
+        let (condition, range_display) = string_length_condition_and_display(*min, *max);
+        code.push_str(&format!(
+            r#"fn {}(value: &Value) -> Result<(), String> {{
+    if let Value::String(s) = value {{
+        let len = s.len();
+        if {} {{
+            Err(format!("String length {{}} is out of range {}", len))
+        }} else {{
+            Ok(())
+        }}
+    }} else {{
+        Ok(())
     }}
 }}
 
@@ -2158,6 +2246,56 @@ fn range_display_string(min: Option<i64>, max: Option<i64>) -> String {
     }
 }
 
+/// Recursively collect string length constraints from a property and its array items.
+/// Treats minLength=0 as no constraint since usize is always >= 0.
+fn collect_string_length_constraints(
+    prop_name: &str,
+    prop: &CfnProperty,
+    ranged_strings: &mut BTreeMap<String, (Option<u64>, Option<u64>)>,
+) {
+    let prop_type = prop.prop_type.as_ref().and_then(|t| t.as_str());
+    let effective_min = prop.min_length.filter(|&m| m > 0);
+    if prop_type == Some("string")
+        && (effective_min.is_some() || prop.max_length.is_some())
+        && prop.enum_values.is_none()
+        && prop.pattern.is_none()
+        && !ranged_strings.contains_key(prop_name)
+    {
+        ranged_strings.insert(prop_name.to_string(), (effective_min, prop.max_length));
+    }
+    // Recurse into array items
+    if prop_type == Some("array")
+        && let Some(items) = &prop.items
+    {
+        collect_string_length_constraints(prop_name, items, ranged_strings);
+    }
+}
+
+/// Format a range display string for string length type names.
+fn string_length_display(min: Option<u64>, max: Option<u64>) -> String {
+    match (min, max) {
+        (Some(min), Some(max)) => format!("{}..={}", min, max),
+        (Some(min), None) => format!("{}..", min),
+        (None, Some(max)) => format!("..={}", max),
+        (None, None) => unreachable!("at least one bound must be present"),
+    }
+}
+
+/// Generate condition string and display string for string length validation.
+/// Treats min=0 as no minimum since `usize` is always >= 0.
+fn string_length_condition_and_display(min: Option<u64>, max: Option<u64>) -> (String, String) {
+    let effective_min = min.filter(|&m| m > 0);
+    match (effective_min, max) {
+        (Some(min), Some(max)) => (
+            format!("!({}..={}).contains(&len)", min, max),
+            format!("{}..={}", min, max),
+        ),
+        (Some(min), None) => (format!("len < {}", min), format!("{}..", min)),
+        (None, Some(max)) => (format!("len > {}", max), format!("..={}", max)),
+        (None, None) => unreachable!("at least one bound must be present"),
+    }
+}
+
 /// Known integer range overrides for properties where CloudFormation schemas
 /// don't include min/max constraints but the ranges are well-known.
 fn known_int_range_overrides() -> &'static HashMap<&'static str, (i64, i64)> {
@@ -2845,19 +2983,6 @@ fn cfn_type_to_carina_type_with_enum(
                 return ("super::iam_policy_document()".to_string(), None);
             }
 
-            let prop_lower = prop_name.to_lowercase();
-
-            // Other IDs not matched by infer_string_type() are plain strings
-            // (e.g., AvailabilityZoneId which uses AZ ID format like "use1-az1")
-            if prop_lower.ends_with("id") {
-                return ("AttributeType::String".to_string(), None);
-            }
-
-            // Other zone/region fields are strings
-            if prop_lower.contains("zone") || prop_lower.contains("region") {
-                return ("AttributeType::String".to_string(), None);
-            }
-
             // Try to extract enum values from description
             if let Some(desc) = &prop.description
                 && let Some(enum_values) = extract_enum_from_description(desc)
@@ -2884,6 +3009,27 @@ fn cfn_type_to_carina_type_with_enum(
                 to_dsl: None,
             }}"#,
                         validate_fn
+                    ),
+                    None,
+                );
+            }
+
+            // Check for string length constraints (minLength/maxLength)
+            // Treat minLength=0 as no constraint since usize is always >= 0
+            let effective_min = prop.min_length.filter(|&m| m > 0);
+            if effective_min.is_some() || prop.max_length.is_some() {
+                let validate_fn = format!("validate_{}_length", prop_name.to_snake_case());
+                let display = string_length_display(effective_min, prop.max_length);
+                return (
+                    format!(
+                        r#"AttributeType::Custom {{
+                name: "String(len: {})".to_string(),
+                base: Box::new(AttributeType::String),
+                validate: {},
+                namespace: None,
+                to_dsl: None,
+            }}"#,
+                        display, validate_fn
                     ),
                     None,
                 );
@@ -3405,6 +3551,8 @@ mod tests {
             pattern: None,
             min_items: None,
             max_items: None,
+            min_length: None,
+            max_length: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::SecurityGroupIngress".to_string(),
@@ -3479,6 +3627,8 @@ mod tests {
             pattern: None,
             min_items: None,
             max_items: None,
+            min_length: None,
+            max_length: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::SecurityGroupIngress".to_string(),
@@ -3520,6 +3670,8 @@ mod tests {
             pattern: None,
             min_items: None,
             max_items: None,
+            min_length: None,
+            max_length: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::SecurityGroupIngress".to_string(),
@@ -3561,6 +3713,8 @@ mod tests {
             pattern: None,
             min_items: None,
             max_items: None,
+            min_length: None,
+            max_length: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::NatGateway".to_string(),
@@ -3607,6 +3761,8 @@ mod tests {
             pattern: None,
             min_items: None,
             max_items: None,
+            min_length: None,
+            max_length: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::EIP".to_string(),
@@ -3648,6 +3804,8 @@ mod tests {
             pattern: None,
             min_items: None,
             max_items: None,
+            min_length: None,
+            max_length: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::NatGateway".to_string(),
@@ -3693,6 +3851,8 @@ mod tests {
             pattern: None,
             min_items: None,
             max_items: None,
+            min_length: None,
+            max_length: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::Subnet".to_string(),
@@ -3789,6 +3949,8 @@ mod tests {
             pattern: None,
             min_items: None,
             max_items: None,
+            min_length: None,
+            max_length: None,
         };
         assert_eq!(
             list_element_type_display(&prop, "GenericProp", ""),
@@ -3813,6 +3975,8 @@ mod tests {
             pattern: None,
             min_items: None,
             max_items: None,
+            min_length: None,
+            max_length: None,
         };
         assert_eq!(
             list_element_type_display(&prop, "GenericProp", ""),
@@ -3837,6 +4001,8 @@ mod tests {
             pattern: None,
             min_items: None,
             max_items: None,
+            min_length: None,
+            max_length: None,
         };
         assert_eq!(
             list_element_type_display(&prop, "GenericProp", ""),
@@ -3861,6 +4027,8 @@ mod tests {
             pattern: None,
             min_items: None,
             max_items: None,
+            min_length: None,
+            max_length: None,
         };
         assert_eq!(
             list_element_type_display(&prop, "GenericProp", ""),
@@ -3887,6 +4055,8 @@ mod tests {
             pattern: None,
             min_items: None,
             max_items: None,
+            min_length: None,
+            max_length: None,
         };
         assert_eq!(
             list_element_type_display(&prop, "SubnetIds", ""),
@@ -3954,6 +4124,8 @@ mod tests {
                 pattern: None,
                 min_items: None,
                 max_items: None,
+                min_length: None,
+                max_length: None,
             })),
             ref_path: None,
             insertion_order: None,
@@ -3967,6 +4139,8 @@ mod tests {
             pattern: None,
             min_items: None,
             max_items: None,
+            min_length: None,
+            max_length: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::VPC".to_string(),
@@ -4011,6 +4185,8 @@ mod tests {
                 pattern: None,
                 min_items: None,
                 max_items: None,
+                min_length: None,
+                max_length: None,
             })),
             ref_path: None,
             insertion_order: None,
@@ -4024,6 +4200,8 @@ mod tests {
             pattern: None,
             min_items: None,
             max_items: None,
+            min_length: None,
+            max_length: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::VPC".to_string(),
@@ -4064,6 +4242,8 @@ mod tests {
             pattern: None,
             min_items: None,
             max_items: None,
+            min_length: None,
+            max_length: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::VPC".to_string(),
@@ -4115,6 +4295,8 @@ mod tests {
                 pattern: None,
                 min_items: None,
                 max_items: None,
+                min_length: None,
+                max_length: None,
             };
             let result = list_element_type_display(&prop, "GenericProp", "");
             assert!(
@@ -4162,6 +4344,8 @@ mod tests {
             pattern: None,
             min_items: None,
             max_items: None,
+            min_length: None,
+            max_length: None,
         };
         let result = type_display_string("Prop1", &prop, &schema, &enums);
         assert_ne!(
@@ -4191,6 +4375,8 @@ mod tests {
                 pattern: None,
                 min_items: None,
                 max_items: None,
+                min_length: None,
+                max_length: None,
             })),
             ref_path: None,
             insertion_order: None,
@@ -4204,6 +4390,8 @@ mod tests {
             pattern: None,
             min_items: None,
             max_items: None,
+            min_length: None,
+            max_length: None,
         };
         let result = type_display_string("Prop2", &prop, &schema, &enums);
         assert_ne!(
@@ -4233,6 +4421,8 @@ mod tests {
                 pattern: None,
                 min_items: None,
                 max_items: None,
+                min_length: None,
+                max_length: None,
             })),
             ref_path: None,
             insertion_order: None,
@@ -4246,6 +4436,8 @@ mod tests {
             pattern: None,
             min_items: None,
             max_items: None,
+            min_length: None,
+            max_length: None,
         };
         let result = type_display_string("Prop3", &prop, &schema, &enums);
         assert_ne!(
@@ -4275,6 +4467,8 @@ mod tests {
                 pattern: None,
                 min_items: None,
                 max_items: None,
+                min_length: None,
+                max_length: None,
             })),
             ref_path: None,
             insertion_order: None,
@@ -4288,6 +4482,8 @@ mod tests {
             pattern: None,
             min_items: None,
             max_items: None,
+            min_length: None,
+            max_length: None,
         };
         let result = type_display_string("Prop4", &prop, &schema, &enums);
         assert_ne!(
@@ -4315,6 +4511,8 @@ mod tests {
             pattern: None,
             min_items: None,
             max_items: None,
+            min_length: None,
+            max_length: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::VPC".to_string(),
@@ -4371,6 +4569,8 @@ mod tests {
             pattern: None,
             min_items: None,
             max_items: None,
+            min_length: None,
+            max_length: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::VPC".to_string(),
@@ -4409,6 +4609,8 @@ mod tests {
             pattern: None,
             min_items: None,
             max_items: None,
+            min_length: None,
+            max_length: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::VPC".to_string(),
@@ -4456,6 +4658,8 @@ mod tests {
             pattern: None,
             min_items: None,
             max_items: None,
+            min_length: None,
+            max_length: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::VPC".to_string(),
@@ -4509,6 +4713,8 @@ mod tests {
             pattern: None,
             min_items: None,
             max_items: None,
+            min_length: None,
+            max_length: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::Logs::LogGroup".to_string(),
@@ -4565,6 +4771,8 @@ mod tests {
             pattern: None,
             min_items: None,
             max_items: None,
+            min_length: None,
+            max_length: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::NatGateway".to_string(),
@@ -4607,6 +4815,8 @@ mod tests {
             pattern: None,
             min_items: None,
             max_items: None,
+            min_length: None,
+            max_length: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::SomeService::Resource".to_string(),
@@ -4649,6 +4859,8 @@ mod tests {
             pattern: None,
             min_items: None,
             max_items: None,
+            min_length: None,
+            max_length: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::Logs::LogGroup".to_string(),
@@ -4690,6 +4902,8 @@ mod tests {
             pattern: None,
             min_items: None,
             max_items: None,
+            min_length: None,
+            max_length: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::VPC".to_string(),
@@ -4765,6 +4979,8 @@ mod tests {
             pattern: None,
             min_items: None,
             max_items: None,
+            min_length: None,
+            max_length: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::VPC".to_string(),
@@ -4808,6 +5024,8 @@ mod tests {
             pattern: None,
             min_items: None,
             max_items: None,
+            min_length: None,
+            max_length: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::SecurityGroupIngress".to_string(),
@@ -4850,6 +5068,8 @@ mod tests {
             pattern: None,
             min_items: None,
             max_items: None,
+            min_length: None,
+            max_length: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::S3::Bucket".to_string(),
@@ -4905,6 +5125,8 @@ mod tests {
             pattern: None,
             min_items: None,
             max_items: None,
+            min_length: None,
+            max_length: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::SecurityGroupIngress".to_string(),
@@ -5569,6 +5791,8 @@ mod tests {
                 pattern: None,
                 min_items: None,
                 max_items: None,
+                min_length: None,
+                max_length: None,
             },
         );
 
@@ -5631,6 +5855,8 @@ mod tests {
                 pattern: None,
                 min_items: None,
                 max_items: None,
+                min_length: None,
+                max_length: None,
             },
         );
 
@@ -5667,6 +5893,8 @@ mod tests {
                 pattern: None,
                 min_items: None,
                 max_items: None,
+                min_length: None,
+                max_length: None,
             },
         );
 
@@ -6848,6 +7076,130 @@ mod tests {
         assert!(
             generated.contains("1..=10"),
             "should show range 1..=10 in validation: {generated}"
+        );
+    }
+
+    #[test]
+    fn test_generate_schema_code_string_min_max_length() {
+        let mut properties = BTreeMap::new();
+        properties.insert(
+            "LogGroupName".to_string(),
+            CfnProperty {
+                prop_type: Some(TypeValue::Single("string".to_string())),
+                description: Some("The name of the log group.".to_string()),
+                min_length: Some(1),
+                max_length: Some(512),
+                ..Default::default()
+            },
+        );
+
+        let schema = CfnSchema {
+            type_name: "AWS::Logs::LogGroup".to_string(),
+            description: None,
+            properties,
+            required: vec![],
+            read_only_properties: vec![],
+            create_only_properties: vec![],
+            write_only_properties: vec![],
+            primary_identifier: None,
+            definitions: None,
+            tagging: None,
+        };
+
+        let generated = generate_schema_code(&schema, "AWS::Logs::LogGroup").unwrap();
+
+        // Should generate a length validation function
+        assert!(
+            generated.contains("validate_log_group_name_length"),
+            "Should generate length validation function: {generated}"
+        );
+
+        // Should use AttributeType::Custom wrapping String
+        assert!(
+            generated.contains("base: Box::new(AttributeType::String)"),
+            "Should wrap String in Custom type with length constraint: {generated}"
+        );
+
+        // Should display length range
+        assert!(
+            generated.contains("1..=512"),
+            "Should display length range: {generated}"
+        );
+    }
+
+    #[test]
+    fn test_generate_schema_code_string_min_length_only() {
+        let mut properties = BTreeMap::new();
+        properties.insert(
+            "ResourceName".to_string(),
+            CfnProperty {
+                prop_type: Some(TypeValue::Single("string".to_string())),
+                description: Some("Name of the resource.".to_string()),
+                min_length: Some(1),
+                ..Default::default()
+            },
+        );
+
+        let schema = CfnSchema {
+            type_name: "AWS::Test::Resource".to_string(),
+            description: None,
+            properties,
+            required: vec![],
+            read_only_properties: vec![],
+            create_only_properties: vec![],
+            write_only_properties: vec![],
+            primary_identifier: None,
+            definitions: None,
+            tagging: None,
+        };
+
+        let generated = generate_schema_code(&schema, "AWS::Test::Resource").unwrap();
+
+        assert!(
+            generated.contains("validate_resource_name_length"),
+            "Should generate length validation function for min-only: {generated}"
+        );
+        assert!(
+            generated.contains("1.."),
+            "Should display open-ended range for min-only: {generated}"
+        );
+    }
+
+    #[test]
+    fn test_generate_schema_code_string_max_length_only() {
+        let mut properties = BTreeMap::new();
+        properties.insert(
+            "Description".to_string(),
+            CfnProperty {
+                prop_type: Some(TypeValue::Single("string".to_string())),
+                description: Some("A description.".to_string()),
+                max_length: Some(256),
+                ..Default::default()
+            },
+        );
+
+        let schema = CfnSchema {
+            type_name: "AWS::Test::Resource".to_string(),
+            description: None,
+            properties,
+            required: vec![],
+            read_only_properties: vec![],
+            create_only_properties: vec![],
+            write_only_properties: vec![],
+            primary_identifier: None,
+            definitions: None,
+            tagging: None,
+        };
+
+        let generated = generate_schema_code(&schema, "AWS::Test::Resource").unwrap();
+
+        assert!(
+            generated.contains("validate_description_length"),
+            "Should generate length validation function for max-only: {generated}"
+        );
+        assert!(
+            generated.contains("..=256"),
+            "Should display open-ended range for max-only: {generated}"
         );
     }
 }
