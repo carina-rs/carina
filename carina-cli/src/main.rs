@@ -3975,4 +3975,353 @@ mod tests {
             "Data sources should not appear in destroy plan"
         );
     }
+
+    /// Simulate the full plan-verify cycle for an anonymous S3 bucket with prefix.
+    ///
+    /// This test reproduces the bug from issue #535 where after a successful apply,
+    /// running plan again shows the resource as needing to be created because the
+    /// anonymous resource identifier changes between runs.
+    #[test]
+    fn test_plan_verify_idempotency_anonymous_resource_with_prefix() {
+        // --- First run (apply) ---
+        // 1. Parse: anonymous resource with bucket_name_prefix
+        let mut resource_run1 = Resource::with_provider("awscc", "s3.bucket", "");
+        resource_run1
+            .attributes
+            .insert("_provider".to_string(), Value::String("awscc".to_string()));
+        resource_run1.attributes.insert(
+            "bucket_name_prefix".to_string(),
+            Value::String("my-app-".to_string()),
+        );
+
+        let providers = vec![make_awscc_provider("awscc.Region.ap_northeast_1")];
+
+        // 2. resolve_names (resolve_attr_prefixes)
+        let mut resources_run1 = vec![resource_run1];
+        resolve_names(&mut resources_run1).unwrap();
+
+        // Verify prefix was resolved
+        assert!(
+            resources_run1[0].prefixes.contains_key("bucket_name"),
+            "bucket_name should be in prefixes"
+        );
+        let run1_bucket_name = match resources_run1[0].attributes.get("bucket_name") {
+            Some(Value::String(s)) => s.clone(),
+            _ => panic!("bucket_name should be a string"),
+        };
+        assert!(
+            run1_bucket_name.starts_with("my-app-"),
+            "bucket_name should start with prefix"
+        );
+
+        // 3. compute_anonymous_identifiers
+        compute_anonymous_identifiers(&mut resources_run1, &providers).unwrap();
+        let run1_name = resources_run1[0].id.name.clone();
+        assert!(
+            !run1_name.is_empty(),
+            "Anonymous identifier should be assigned"
+        );
+
+        // 4. Simulate state after apply
+        let applied_state = State::existing(
+            resources_run1[0].id.clone(),
+            vec![(
+                "bucket_name".to_string(),
+                Value::String(run1_bucket_name.clone()),
+            )]
+            .into_iter()
+            .collect(),
+        )
+        .with_identifier("my-app-abcd1234");
+
+        let resource_state =
+            ResourceState::from_provider_state(&resources_run1[0], &applied_state, None);
+
+        let mut state_file = StateFile::new();
+        state_file.upsert_resource(resource_state);
+
+        // --- Second run (plan-verify) ---
+        // 1. Parse again: same anonymous resource with bucket_name_prefix
+        let mut resource_run2 = Resource::with_provider("awscc", "s3.bucket", "");
+        resource_run2
+            .attributes
+            .insert("_provider".to_string(), Value::String("awscc".to_string()));
+        resource_run2.attributes.insert(
+            "bucket_name_prefix".to_string(),
+            Value::String("my-app-".to_string()),
+        );
+
+        // 2. resolve_names (resolve_attr_prefixes) - generates NEW random suffix
+        let mut resources_run2 = vec![resource_run2];
+        resolve_names(&mut resources_run2).unwrap();
+
+        // The random suffix is different on each run (highly probable with 8 hex chars)
+
+        // 3. compute_anonymous_identifiers - should produce SAME identifier
+        compute_anonymous_identifiers(&mut resources_run2, &providers).unwrap();
+        let run2_name = resources_run2[0].id.name.clone();
+
+        assert_eq!(
+            run1_name, run2_name,
+            "Anonymous identifier should be stable across runs (prefix-based hash)"
+        );
+
+        // 4. reconcile_prefixed_names - should restore original bucket_name from state
+        reconcile_prefixed_names(&mut resources_run2, &Some(state_file.clone()));
+
+        let reconciled_bucket_name = match resources_run2[0].attributes.get("bucket_name") {
+            Some(Value::String(s)) => s.clone(),
+            _ => panic!("bucket_name should be a string after reconciliation"),
+        };
+        assert_eq!(
+            reconciled_bucket_name, run1_bucket_name,
+            "Prefix reconciliation should restore original bucket_name from state"
+        );
+
+        // 5. get_identifier_for_resource - should find the resource in state
+        let identifier = state_file.get_identifier_for_resource(&resources_run2[0]);
+        assert_eq!(
+            identifier,
+            Some("my-app-abcd1234".to_string()),
+            "Should find identifier in state for plan-verify (issue #535)"
+        );
+    }
+
+    /// Simulate plan-verify for an anonymous IAM role with role_name_prefix and path.
+    /// This matches the exact failure case from issue #535.
+    #[test]
+    fn test_plan_verify_idempotency_iam_role_with_prefix_and_path() {
+        let providers = vec![make_awscc_provider("awscc.Region.ap_northeast_1")];
+
+        // --- First run ---
+        let mut resource_run1 = Resource::with_provider("awscc", "iam.role", "");
+        resource_run1
+            .attributes
+            .insert("_provider".to_string(), Value::String("awscc".to_string()));
+        resource_run1.attributes.insert(
+            "role_name_prefix".to_string(),
+            Value::String("carina-acc-test-".to_string()),
+        );
+        resource_run1.attributes.insert(
+            "path".to_string(),
+            Value::String("/carina/acceptance-test/".to_string()),
+        );
+        resource_run1.attributes.insert(
+            "assume_role_policy_document".to_string(),
+            Value::Map(
+                vec![(
+                    "version".to_string(),
+                    Value::String("2012-10-17".to_string()),
+                )]
+                .into_iter()
+                .collect(),
+            ),
+        );
+
+        let mut resources_run1 = vec![resource_run1];
+        resolve_names(&mut resources_run1).unwrap();
+        compute_anonymous_identifiers(&mut resources_run1, &providers).unwrap();
+        let run1_name = resources_run1[0].id.name.clone();
+
+        // Simulate state after apply
+        let run1_role_name = match resources_run1[0].attributes.get("role_name") {
+            Some(Value::String(s)) => s.clone(),
+            _ => panic!("role_name should be set after prefix resolution"),
+        };
+        let applied_state = State::existing(
+            resources_run1[0].id.clone(),
+            vec![
+                (
+                    "role_name".to_string(),
+                    Value::String(run1_role_name.clone()),
+                ),
+                (
+                    "path".to_string(),
+                    Value::String("/carina/acceptance-test/".to_string()),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        )
+        .with_identifier(run1_role_name.as_str());
+
+        let resource_state =
+            ResourceState::from_provider_state(&resources_run1[0], &applied_state, None);
+        let mut state_file = StateFile::new();
+        state_file.upsert_resource(resource_state);
+
+        // --- Second run ---
+        let mut resource_run2 = Resource::with_provider("awscc", "iam.role", "");
+        resource_run2
+            .attributes
+            .insert("_provider".to_string(), Value::String("awscc".to_string()));
+        resource_run2.attributes.insert(
+            "role_name_prefix".to_string(),
+            Value::String("carina-acc-test-".to_string()),
+        );
+        resource_run2.attributes.insert(
+            "path".to_string(),
+            Value::String("/carina/acceptance-test/".to_string()),
+        );
+        resource_run2.attributes.insert(
+            "assume_role_policy_document".to_string(),
+            Value::Map(
+                vec![(
+                    "version".to_string(),
+                    Value::String("2012-10-17".to_string()),
+                )]
+                .into_iter()
+                .collect(),
+            ),
+        );
+
+        let mut resources_run2 = vec![resource_run2];
+        resolve_names(&mut resources_run2).unwrap();
+        compute_anonymous_identifiers(&mut resources_run2, &providers).unwrap();
+        let run2_name = resources_run2[0].id.name.clone();
+
+        assert_eq!(
+            run1_name, run2_name,
+            "IAM role anonymous identifier should be stable across runs"
+        );
+
+        reconcile_prefixed_names(&mut resources_run2, &Some(state_file.clone()));
+
+        let identifier = state_file.get_identifier_for_resource(&resources_run2[0]);
+        assert!(
+            identifier.is_some(),
+            "Should find IAM role identifier in state for plan-verify (issue #535)"
+        );
+    }
+
+    /// Simulate plan-verify for an anonymous flow_log with ResourceRef create-only attributes.
+    /// ec2_flow_log/s3 test uses ResourceRef values (vpc.vpc_id, bucket.arn) in create-only
+    /// attributes, which must produce the same hash across runs.
+    #[test]
+    fn test_plan_verify_idempotency_anonymous_flow_log_with_resource_refs() {
+        let providers = vec![make_awscc_provider("awscc.Region.ap_northeast_1")];
+
+        // --- First run ---
+        let mut resource_run1 = Resource::with_provider("awscc", "ec2.flow_log", "");
+        resource_run1
+            .attributes
+            .insert("_provider".to_string(), Value::String("awscc".to_string()));
+        resource_run1.attributes.insert(
+            "resource_id".to_string(),
+            Value::ResourceRef {
+                binding_name: "vpc".to_string(),
+                attribute_name: "vpc_id".to_string(),
+            },
+        );
+        resource_run1.attributes.insert(
+            "resource_type".to_string(),
+            Value::UnresolvedIdent("VPC".to_string(), None),
+        );
+        resource_run1.attributes.insert(
+            "traffic_type".to_string(),
+            Value::UnresolvedIdent("ALL".to_string(), None),
+        );
+        resource_run1.attributes.insert(
+            "log_destination_type".to_string(),
+            Value::UnresolvedIdent("s3".to_string(), None),
+        );
+        resource_run1.attributes.insert(
+            "log_destination".to_string(),
+            Value::ResourceRef {
+                binding_name: "bucket".to_string(),
+                attribute_name: "arn".to_string(),
+            },
+        );
+        resource_run1.attributes.insert(
+            "destination_options".to_string(),
+            Value::Map(
+                vec![
+                    (
+                        "file_format".to_string(),
+                        Value::String("plain-text".to_string()),
+                    ),
+                    ("hive_compatible_partitions".to_string(), Value::Bool(false)),
+                    ("per_hour_partition".to_string(), Value::Bool(false)),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+        );
+
+        let mut resources_run1 = vec![resource_run1];
+        compute_anonymous_identifiers(&mut resources_run1, &providers).unwrap();
+        let run1_name = resources_run1[0].id.name.clone();
+
+        // Simulate state after apply
+        let applied_state = State::existing(resources_run1[0].id.clone(), HashMap::new())
+            .with_identifier("fl-12345678");
+
+        let resource_state =
+            ResourceState::from_provider_state(&resources_run1[0], &applied_state, None);
+        let mut state_file = StateFile::new();
+        state_file.upsert_resource(resource_state);
+
+        // --- Second run ---
+        let mut resource_run2 = Resource::with_provider("awscc", "ec2.flow_log", "");
+        resource_run2
+            .attributes
+            .insert("_provider".to_string(), Value::String("awscc".to_string()));
+        resource_run2.attributes.insert(
+            "resource_id".to_string(),
+            Value::ResourceRef {
+                binding_name: "vpc".to_string(),
+                attribute_name: "vpc_id".to_string(),
+            },
+        );
+        resource_run2.attributes.insert(
+            "resource_type".to_string(),
+            Value::UnresolvedIdent("VPC".to_string(), None),
+        );
+        resource_run2.attributes.insert(
+            "traffic_type".to_string(),
+            Value::UnresolvedIdent("ALL".to_string(), None),
+        );
+        resource_run2.attributes.insert(
+            "log_destination_type".to_string(),
+            Value::UnresolvedIdent("s3".to_string(), None),
+        );
+        resource_run2.attributes.insert(
+            "log_destination".to_string(),
+            Value::ResourceRef {
+                binding_name: "bucket".to_string(),
+                attribute_name: "arn".to_string(),
+            },
+        );
+        resource_run2.attributes.insert(
+            "destination_options".to_string(),
+            Value::Map(
+                vec![
+                    (
+                        "file_format".to_string(),
+                        Value::String("plain-text".to_string()),
+                    ),
+                    ("hive_compatible_partitions".to_string(), Value::Bool(false)),
+                    ("per_hour_partition".to_string(), Value::Bool(false)),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+        );
+
+        let mut resources_run2 = vec![resource_run2];
+        compute_anonymous_identifiers(&mut resources_run2, &providers).unwrap();
+        let run2_name = resources_run2[0].id.name.clone();
+
+        assert_eq!(
+            run1_name, run2_name,
+            "Flow log anonymous identifier should be stable across runs"
+        );
+
+        let identifier = state_file.get_identifier_for_resource(&resources_run2[0]);
+        assert_eq!(
+            identifier,
+            Some("fl-12345678".to_string()),
+            "Should find flow_log identifier in state for plan-verify (issue #535)"
+        );
+    }
 }
