@@ -187,7 +187,12 @@ impl AttributeType {
                     return Ok(());
                 }
                 if let Value::String(s) = &resolved_value {
-                    if let Some(ns) = namespace.as_deref() {
+                    // Check if the raw string directly matches a valid enum value
+                    // before namespace validation. This handles values containing
+                    // dots (e.g., "ipsec.1") that would be misinterpreted as
+                    // namespace separators.
+                    let direct_match = values.iter().any(|v| string_enum_value_matches(s, v));
+                    if !direct_match && let Some(ns) = namespace.as_deref() {
                         validate_enum_namespace(s, name, ns).map_err(|message| {
                             TypeError::ValidationFailed {
                                 message: format!("Invalid {} '{}': {}", name, s, message),
@@ -195,7 +200,11 @@ impl AttributeType {
                         })?;
                     }
 
-                    let variant = extract_enum_value(s);
+                    let variant = if direct_match {
+                        s.as_str()
+                    } else {
+                        extract_enum_value(s)
+                    };
                     let matches_canonical =
                         values.iter().any(|v| string_enum_value_matches(variant, v));
                     let matches_alias = to_dsl.is_some_and(|f| {
@@ -1166,6 +1175,22 @@ mod tests {
         assert!(t.validate(&Value::String("tcp".to_string())).is_ok());
         // Invalid values should still be rejected
         assert!(t.validate(&Value::String("invalid".to_string())).is_err());
+    }
+
+    #[test]
+    fn validate_string_enum_accepts_values_with_dots() {
+        // Values like "ipsec.1" contain dots that should not be treated as
+        // namespace separators (issue #611)
+        let t = AttributeType::StringEnum {
+            name: "Type".to_string(),
+            values: vec!["ipsec.1".to_string()],
+            namespace: Some("awscc.ec2.vpn_gateway".to_string()),
+            to_dsl: None,
+        };
+        // Quoted string with dot should match directly
+        assert!(t.validate(&Value::String("ipsec.1".to_string())).is_ok());
+        // Invalid value should still be rejected
+        assert!(t.validate(&Value::String("ipsec.2".to_string())).is_err());
     }
 
     #[test]
