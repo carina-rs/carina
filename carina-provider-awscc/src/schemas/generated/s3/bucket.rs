@@ -161,6 +161,24 @@ fn validate_max_age_range(value: &Value) -> Result<(), String> {
     }
 }
 
+fn validate_expiration_date_pattern(value: &Value) -> Result<(), String> {
+    if let Value::String(s) = value {
+        static RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+            Regex::new("^(\\d{4})-(0[0-9]|1[0-2])-([0-2]\\d|3[01])T([01]\\d|2[0-4]):([0-5]\\d):([0-6]\\d)((\\.\\d{3})?)Z$").expect("invalid pattern regex")
+        });
+        if RE.is_match(s) {
+            Ok(())
+        } else {
+            Err(format!(
+                "Value '{}' does not match pattern ^(\\d{{4}})-(0[0-9]|1[0-2])-([0-2]\\d|3[01])T([01]\\d|2[0-4]):([0-5]\\d):([0-6]\\d)((\\.\\d{{3}})?)Z$",
+                s
+            ))
+        }
+    } else {
+        Err("Expected string".to_string())
+    }
+}
+
 fn validate_object_size_greater_than_pattern(value: &Value) -> Result<(), String> {
     if let Value::String(s) = value {
         static RE: std::sync::LazyLock<Regex> =
@@ -183,6 +201,24 @@ fn validate_object_size_less_than_pattern(value: &Value) -> Result<(), String> {
             Ok(())
         } else {
             Err(format!("Value '{}' does not match pattern [0-9]+", s))
+        }
+    } else {
+        Err("Expected string".to_string())
+    }
+}
+
+fn validate_transition_date_pattern(value: &Value) -> Result<(), String> {
+    if let Value::String(s) = value {
+        static RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+            Regex::new("^(\\d{4})-(0[0-9]|1[0-2])-([0-2]\\d|3[01])T([01]\\d|2[0-4]):([0-5]\\d):([0-6]\\d)((\\.\\d{3})?)Z$").expect("invalid pattern regex")
+        });
+        if RE.is_match(s) {
+            Ok(())
+        } else {
+            Err(format!(
+                "Value '{}' does not match pattern ^(\\d{{4}})-(0[0-9]|1[0-2])-([0-2]\\d|3[01])T([01]\\d|2[0-4]):([0-5]\\d):([0-6]\\d)((\\.\\d{{3}})?)Z$",
+                s
+            ))
         }
     } else {
         Err("Expected string".to_string())
@@ -505,7 +541,13 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
             }).required().with_description("Specifies the number of days after which Amazon S3 stops an incomplete multipart upload.").with_provider_name("DaysAfterInitiation")
                     ],
                 }).with_description("Specifies a lifecycle rule that stops incomplete multipart uploads to an Amazon S3 bucket.").with_provider_name("AbortIncompleteMultipartUpload"),
-                    StructField::new("expiration_date", AttributeType::String).with_description("Indicates when objects are deleted from Amazon S3 and Amazon S3 Glacier. The date value must be in ISO 8601 format. The time is always midnight UTC. I...").with_provider_name("ExpirationDate"),
+                    StructField::new("expiration_date", AttributeType::Custom {
+                name: "String(pattern)".to_string(),
+                base: Box::new(AttributeType::String),
+                validate: validate_expiration_date_pattern,
+                namespace: None,
+                to_dsl: None,
+            }).with_description("Indicates when objects are deleted from Amazon S3 and Amazon S3 Glacier. The date value must be in ISO 8601 format. The time is always midnight UTC. I...").with_provider_name("ExpirationDate"),
                     StructField::new("expiration_in_days", AttributeType::Int).with_description("Indicates the number of days after creation when objects are deleted from Amazon S3 and Amazon S3 Glacier. If you specify an expiration and transition...").with_provider_name("ExpirationInDays"),
                     StructField::new("expired_object_delete_marker", AttributeType::Bool).with_description("Indicates whether Amazon S3 will remove a delete marker without any noncurrent versions. If set to true, the delete marker will be removed if there ar...").with_provider_name("ExpiredObjectDeleteMarker"),
                     StructField::new("id", AttributeType::Custom {
@@ -580,7 +622,13 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                 namespace: Some("awscc.s3.bucket".to_string()),
                 to_dsl: None,
             }).required().with_description("The storage class to which you want the object to transition.").with_provider_name("StorageClass"),
-                    StructField::new("transition_date", AttributeType::String).with_description("Indicates when objects are transitioned to the specified storage class. The date value must be in ISO 8601 format. The time is always midnight UTC.").with_provider_name("TransitionDate"),
+                    StructField::new("transition_date", AttributeType::Custom {
+                name: "String(pattern)".to_string(),
+                base: Box::new(AttributeType::String),
+                validate: validate_transition_date_pattern,
+                namespace: None,
+                to_dsl: None,
+            }).with_description("Indicates when objects are transitioned to the specified storage class. The date value must be in ISO 8601 format. The time is always midnight UTC.").with_provider_name("TransitionDate"),
                     StructField::new("transition_in_days", AttributeType::Int).with_description("Indicates the number of days after creation when objects are transitioned to the specified storage class. If the specified storage class is ``INTELLIG...").with_provider_name("TransitionInDays")
                     ],
                 }).with_description("(Deprecated.) Specifies when an object transitions to a specified storage class. If you specify an expiration and transition time, you must use the sa...").with_provider_name("Transition"),
@@ -593,7 +641,13 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                 namespace: Some("awscc.s3.bucket".to_string()),
                 to_dsl: None,
             }).required().with_description("The storage class to which you want the object to transition.").with_provider_name("StorageClass"),
-                    StructField::new("transition_date", AttributeType::String).with_description("Indicates when objects are transitioned to the specified storage class. The date value must be in ISO 8601 format. The time is always midnight UTC.").with_provider_name("TransitionDate"),
+                    StructField::new("transition_date", AttributeType::Custom {
+                name: "String(pattern)".to_string(),
+                base: Box::new(AttributeType::String),
+                validate: validate_transition_date_pattern,
+                namespace: None,
+                to_dsl: None,
+            }).with_description("Indicates when objects are transitioned to the specified storage class. The date value must be in ISO 8601 format. The time is always midnight UTC.").with_provider_name("TransitionDate"),
                     StructField::new("transition_in_days", AttributeType::Int).with_description("Indicates the number of days after creation when objects are transitioned to the specified storage class. If the specified storage class is ``INTELLIG...").with_provider_name("TransitionInDays")
                     ],
                 }))).with_description("One or more transition rules that specify when an object transitions to a specified storage class. If you specify an expiration and transition time, y...").with_provider_name("Transitions")
