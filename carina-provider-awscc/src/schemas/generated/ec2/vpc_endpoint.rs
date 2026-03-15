@@ -6,6 +6,7 @@
 
 use super::AwsccSchemaConfig;
 use super::tags_type;
+use carina_core::resource::Value;
 use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
 
 const VALID_DNS_OPTIONS_SPECIFICATION_DNS_RECORD_IP_TYPE: &[&str] = &[
@@ -35,6 +36,19 @@ const VALID_VPC_ENDPOINT_TYPE: &[&str] = &[
     "ServiceNetwork",
     "Resource",
 ];
+
+fn validate_private_dns_specified_domains_items(value: &Value) -> Result<(), String> {
+    if let Value::List(items) = value {
+        let len = items.len();
+        if !(1..=10).contains(&len) {
+            Err(format!("List has {} items, expected 1..=10", len))
+        } else {
+            Ok(())
+        }
+    } else {
+        Err("Expected list".to_string())
+    }
+}
 
 /// Returns the schema config for ec2_vpc_endpoint (AWS::EC2::VPCEndpoint)
 pub fn ec2_vpc_endpoint_config() -> AwsccSchemaConfig {
@@ -76,7 +90,13 @@ pub fn ec2_vpc_endpoint_config() -> AwsccSchemaConfig {
                 namespace: Some("awscc.ec2.vpc_endpoint".to_string()),
                 to_dsl: None,
             }).with_description("The preference for which private domains have a private hosted zone created for and associated with the specified VPC. Only supported when private DNS...").with_provider_name("PrivateDnsPreference"),
-                    StructField::new("private_dns_specified_domains", AttributeType::List(Box::new(AttributeType::String))).with_description("Indicates which of the private domains to create private hosted zones for and associate with the specified VPC. Only supported when private DNS is ena...").with_provider_name("PrivateDnsSpecifiedDomains")
+                    StructField::new("private_dns_specified_domains", AttributeType::Custom {
+                name: "List(1..=10)".to_string(),
+                base: Box::new(AttributeType::List(Box::new(AttributeType::String))),
+                validate: validate_private_dns_specified_domains_items,
+                namespace: None,
+                to_dsl: None,
+            }).with_description("Indicates which of the private domains to create private hosted zones for and associate with the specified VPC. Only supported when private DNS is ena...").with_provider_name("PrivateDnsSpecifiedDomains")
                     ],
                 })
                 .with_description("Describes the DNS options for an endpoint.")
