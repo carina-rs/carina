@@ -2,15 +2,19 @@
 # Run acceptance tests for AWSCC provider
 #
 # Usage (from project root):
-#   ./carina-provider-awscc/acceptance-tests/run-tests.sh [command] [filter...]
+#   ./carina-provider-awscc/acceptance-tests/run-tests.sh [options] [command] [filter...]
+#
+# Options:
+#   --accounts START-END  Use only accounts in range (e.g., 0-3, 4-6, 7-9)
+#                         Enables concurrent runs with non-overlapping account pools
 #
 # Commands:
 #   validate   - Validate .crn files (default, no AWS credentials needed)
 #   plan       - Run plan on .crn files (single account, needs aws-vault)
 #   apply      - Apply .crn files (single account, needs aws-vault)
 #   destroy    - Destroy resources created by .crn files (single account)
-#   full       - Run apply+plan-verify+destroy per test, 10 accounts in parallel
-#   cleanup    - Run destroy across all 10 accounts in parallel (recover from stuck state)
+#   full       - Run apply+plan-verify+destroy per test, accounts in parallel
+#   cleanup    - Run destroy across accounts in parallel (recover from stuck state)
 #
 # For validate, no AWS credentials are needed.
 # For plan/apply/destroy, wrap with: aws-vault exec <profile> -- ./run-tests.sh ...
@@ -27,6 +31,8 @@
 #   ./run-tests.sh full                              # apply+plan-verify+destroy, 10 parallel accounts
 #   ./run-tests.sh full ec2_vpc                      # apply+plan-verify+destroy VPC tests only
 #   ./run-tests.sh full ec2_ipam ec2_vpc/with_ipam   # multiple filters in single invocation
+#   ./run-tests.sh full --accounts 0-3 iam_role      # use only accounts 000-003
+#   ./run-tests.sh full --accounts 4-6 ec2_vpc       # concurrent run with accounts 004-006
 #   ./run-tests.sh cleanup                           # destroy all matching tests across 10 accounts
 #   ./run-tests.sh cleanup ec2_vpc                   # destroy VPC tests only across 10 accounts
 
@@ -35,53 +41,51 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
+# ── Parse options ─────────────────────────────────────────────────────
+ACCOUNT_START=""
+ACCOUNT_END=""
+
+# Parse --accounts before command
+ARGS=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --accounts)
+            if [ -z "$2" ]; then
+                echo "ERROR: --accounts requires a range argument (e.g., 0-3)"
+                exit 1
+            fi
+            RANGE="$2"
+            ACCOUNT_START="${RANGE%-*}"
+            ACCOUNT_END="${RANGE#*-}"
+            if ! echo "$ACCOUNT_START" | grep -q '^[0-9]\{1,\}$' || ! echo "$ACCOUNT_END" | grep -q '^[0-9]\{1,\}$'; then
+                echo "ERROR: --accounts range must be START-END (e.g., 0-3)"
+                exit 1
+            fi
+            if [ "$ACCOUNT_START" -gt "$ACCOUNT_END" ]; then
+                echo "ERROR: --accounts START must be <= END (got $ACCOUNT_START-$ACCOUNT_END)"
+                exit 1
+            fi
+            if [ "$ACCOUNT_START" -gt 9 ] || [ "$ACCOUNT_END" -gt 9 ]; then
+                echo "ERROR: --accounts range must be within 0-9"
+                exit 1
+            fi
+            shift 2
+            ;;
+        *)
+            ARGS+=("$1")
+            shift
+            ;;
+    esac
+done
+
+set -- "${ARGS[@]}"
+
 COMMAND="${1:-validate}"
 shift || true
 FILTERS=("$@")
 
-# ── File-based lock to prevent concurrent executions ──────────────────
-# Uses mkdir (atomic on POSIX) + PID file for stale lock detection.
-# Applies to all commands except 'validate' which doesn't use AWS.
-LOCK_DIR="/tmp/carina-acceptance-tests.lock"
-
-acquire_lock() {
-    if mkdir "$LOCK_DIR" 2>/dev/null; then
-        echo $$ > "$LOCK_DIR/pid"
-        return 0
-    fi
-
-    # Lock exists - check if the holding process is still alive
-    if [ -f "$LOCK_DIR/pid" ]; then
-        OLD_PID=$(cat "$LOCK_DIR/pid" 2>/dev/null || echo "")
-        if [ -n "$OLD_PID" ] && kill -0 "$OLD_PID" 2>/dev/null; then
-            echo "ERROR: Another run-tests.sh instance is already running (PID $OLD_PID, lock: $LOCK_DIR)"
-            return 1
-        fi
-    fi
-
-    # Stale lock (process no longer running) - reclaim it
-    echo "Removing stale lock (previous process no longer running)"
-    rm -rf "$LOCK_DIR"
-    mkdir "$LOCK_DIR" 2>/dev/null || {
-        echo "ERROR: Failed to acquire lock (race condition). Retry."
-        return 1
-    }
-    echo $$ > "$LOCK_DIR/pid"
-    return 0
-}
-
-release_lock() {
-    rm -rf "$LOCK_DIR"
-}
-
-if [ "$COMMAND" != "validate" ]; then
-    if ! acquire_lock; then
-        exit 1
-    fi
-    trap release_lock EXIT
-fi
-
-ACCOUNTS=(
+# ── Build account list ────────────────────────────────────────────────
+ALL_ACCOUNTS=(
     carina-test-000
     carina-test-001
     carina-test-002
@@ -93,7 +97,84 @@ ACCOUNTS=(
     carina-test-008
     carina-test-009
 )
+
+if [ -n "$ACCOUNT_START" ]; then
+    ACCOUNTS=()
+    ACCOUNT_INDICES=()
+    for i in $(seq "$ACCOUNT_START" "$ACCOUNT_END"); do
+        ACCOUNTS+=("${ALL_ACCOUNTS[$i]}")
+        ACCOUNT_INDICES+=("$i")
+    done
+else
+    ACCOUNTS=("${ALL_ACCOUNTS[@]}")
+    ACCOUNT_INDICES=()
+    for i in $(seq 0 9); do
+        ACCOUNT_INDICES+=("$i")
+    done
+fi
 NUM_ACCOUNTS=${#ACCOUNTS[@]}
+
+# ── Per-account lock files ────────────────────────────────────────────
+# Each account gets its own lock to allow concurrent runs with
+# non-overlapping account pools.
+LOCK_BASE="/tmp/carina-acceptance-tests"
+LOCKED_ACCOUNTS=()
+
+acquire_account_lock() {
+    local account_index="$1"
+    local lock_dir="${LOCK_BASE}-${account_index}.lock"
+
+    if mkdir "$lock_dir" 2>/dev/null; then
+        echo $$ > "$lock_dir/pid"
+        LOCKED_ACCOUNTS+=("$account_index")
+        return 0
+    fi
+
+    # Lock exists - check if the holding process is still alive
+    if [ -f "$lock_dir/pid" ]; then
+        OLD_PID=$(cat "$lock_dir/pid" 2>/dev/null || echo "")
+        if [ -n "$OLD_PID" ] && kill -0 "$OLD_PID" 2>/dev/null; then
+            echo "ERROR: Account ${account_index} is already locked by another run-tests.sh instance (PID $OLD_PID)"
+            return 1
+        fi
+    fi
+
+    # Stale lock - reclaim
+    echo "Removing stale lock for account ${account_index} (previous process no longer running)"
+    rm -rf "$lock_dir"
+    mkdir "$lock_dir" 2>/dev/null || {
+        echo "ERROR: Failed to acquire lock for account ${account_index} (race condition). Retry."
+        return 1
+    }
+    echo $$ > "$lock_dir/pid"
+    LOCKED_ACCOUNTS+=("$account_index")
+    return 0
+}
+
+release_account_locks() {
+    for account_index in "${LOCKED_ACCOUNTS[@]}"; do
+        rm -rf "${LOCK_BASE}-${account_index}.lock"
+    done
+    LOCKED_ACCOUNTS=()
+}
+
+acquire_all_account_locks() {
+    for account_index in "${ACCOUNT_INDICES[@]}"; do
+        if ! acquire_account_lock "$account_index"; then
+            # Release any locks we already acquired
+            release_account_locks
+            return 1
+        fi
+    done
+    return 0
+}
+
+if [ "$COMMAND" != "validate" ]; then
+    if ! acquire_all_account_locks; then
+        exit 1
+    fi
+    trap release_account_locks EXIT
+fi
 
 # Validate command
 case "$COMMAND" in
@@ -101,7 +182,7 @@ case "$COMMAND" in
         ;;
     *)
         echo "ERROR: Unknown command '$COMMAND'"
-        echo "Usage: $0 [validate|plan|apply|destroy|full|cleanup] [filter...]"
+        echo "Usage: $0 [--accounts START-END] [validate|plan|apply|destroy|full|cleanup] [filter...]"
         exit 1
         ;;
 esac
@@ -155,16 +236,16 @@ if [ ${#TESTS[@]} -eq 0 ]; then
     exit 0
 fi
 
-# ── cleanup: destroy across all 10 accounts in parallel ───────────────
+# ── cleanup: destroy across accounts in parallel ─────────────────────
 if [ "$COMMAND" = "cleanup" ]; then
     TOTAL=${#TESTS[@]}
     echo "Running cleanup (destroy) on $TOTAL test(s) across $NUM_ACCOUNTS accounts"
     echo ""
 
     WORK_DIR=$(mktemp -d)
-    trap "rm -rf $WORK_DIR; release_lock" EXIT
+    trap "rm -rf $WORK_DIR; release_account_locks" EXIT
 
-    # Pre-authenticate all accounts
+    # Pre-authenticate accounts
     echo "Pre-authenticating AWS accounts..."
     for SLOT in $(seq 0 $((NUM_ACCOUNTS - 1))); do
         ACCOUNT="${ACCOUNTS[$SLOT]}"
@@ -246,10 +327,13 @@ if [ "$COMMAND" = "cleanup" ]; then
     exit $OVERALL_EXIT
 fi
 
-# ── full: 10-account parallel execution ──────────────────────────────
+# ── full: parallel execution across selected accounts ─────────────────
 if [ "$COMMAND" = "full" ]; then
     TOTAL=${#TESTS[@]}
     echo "Running full cycle (apply -> plan-verify -> destroy) on $TOTAL test(s) across $NUM_ACCOUNTS accounts"
+    if [ -n "$ACCOUNT_START" ]; then
+        echo "  Using accounts: ${ACCOUNTS[*]}"
+    fi
     echo ""
 
     WORK_DIR=$(mktemp -d)
@@ -268,15 +352,15 @@ if [ "$COMMAND" = "full" ]; then
         done
         echo "All workers finished."
         rm -rf "$WORK_DIR"
-        release_lock
+        release_account_locks
         exit 1
     }
     trap cleanup_main INT TERM
 
-    # Clean up temp dir and release lock on normal exit
-    trap "rm -rf $WORK_DIR; release_lock" EXIT
+    # Clean up temp dir and release locks on normal exit
+    trap "rm -rf $WORK_DIR; release_account_locks" EXIT
 
-    # Pre-authenticate all accounts sequentially to avoid opening
+    # Pre-authenticate accounts sequentially to avoid opening
     # multiple SSO browser tabs simultaneously
     echo "Pre-authenticating AWS accounts..."
     for SLOT in $(seq 0 $((NUM_ACCOUNTS - 1))); do
