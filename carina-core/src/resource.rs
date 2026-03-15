@@ -1,6 +1,7 @@
 //! Resource - Representing resources and their state
 
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 
 use serde::{Deserialize, Serialize};
 
@@ -93,6 +94,60 @@ impl Value {
             _ => self == other,
         }
     }
+
+    /// Produce a deterministic hash for use in hash-based multiset comparison.
+    /// For Maps, keys are sorted to ensure deterministic output.
+    fn canonical_hash(&self) -> u64 {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.hash_into(&mut hasher);
+        hasher.finish()
+    }
+
+    /// Feed a deterministic representation of this Value into a Hasher.
+    fn hash_into(&self, hasher: &mut impl Hasher) {
+        std::mem::discriminant(self).hash(hasher);
+        match self {
+            Value::String(s) => s.hash(hasher),
+            Value::Int(i) => i.hash(hasher),
+            Value::Float(f) => {
+                // Use bits for deterministic hashing (NaN == NaN for our purposes)
+                f.to_bits().hash(hasher);
+            }
+            Value::Bool(b) => b.hash(hasher),
+            Value::List(items) => {
+                // For list hashing, use an order-independent combination (XOR of element hashes)
+                // so that lists with same elements in different order hash the same.
+                // This is used inside canonical_hash for nested lists.
+                items.len().hash(hasher);
+                let mut xor_hash: u64 = 0;
+                for item in items {
+                    xor_hash ^= item.canonical_hash();
+                }
+                xor_hash.hash(hasher);
+            }
+            Value::Map(map) => {
+                map.len().hash(hasher);
+                // Sort keys for deterministic hashing
+                let mut keys: Vec<&String> = map.keys().collect();
+                keys.sort();
+                for key in keys {
+                    key.hash(hasher);
+                    map[key].hash_into(hasher);
+                }
+            }
+            Value::ResourceRef {
+                binding_name,
+                attribute_name,
+            } => {
+                binding_name.hash(hasher);
+                attribute_name.hash(hasher);
+            }
+            Value::UnresolvedIdent(name, member) => {
+                name.hash(hasher);
+                member.hash(hasher);
+            }
+        }
+    }
 }
 
 /// Compare two maps using semantic equality for their values.
@@ -105,13 +160,28 @@ fn maps_semantically_equal(a: &HashMap<String, Value>, b: &HashMap<String, Value
         .all(|(k, v)| b.get(k).map(|bv| v.semantically_equal(bv)).unwrap_or(false))
 }
 
+/// Threshold below which we use the simple O(n^2) algorithm.
+/// For small lists, the overhead of hashing is not worth it.
+const HASH_THRESHOLD: usize = 20;
+
 /// Multiset (bag) comparison for two lists of Values.
 /// Returns true if both lists contain the same elements with the same multiplicities,
-/// regardless of order. Uses O(n²) matching to handle non-hashable Values.
+/// regardless of order.
+///
+/// For small lists (< 20 elements), uses O(n^2) matching.
+/// For large lists, uses hash-based bucketing to achieve O(n) average case.
 fn lists_equal(a: &[Value], b: &[Value]) -> bool {
     if a.len() != b.len() {
         return false;
     }
+    if a.len() < HASH_THRESHOLD {
+        return lists_equal_quadratic(a, b);
+    }
+    lists_equal_hashed(a, b)
+}
+
+/// O(n^2) multiset comparison for small lists.
+fn lists_equal_quadratic(a: &[Value], b: &[Value]) -> bool {
     let mut matched = vec![false; b.len()];
     for item_a in a {
         let mut found = false;
@@ -120,6 +190,36 @@ fn lists_equal(a: &[Value], b: &[Value]) -> bool {
                 matched[j] = true;
                 found = true;
                 break;
+            }
+        }
+        if !found {
+            return false;
+        }
+    }
+    true
+}
+
+/// Hash-based multiset comparison for large lists.
+/// Groups elements by hash, then does quadratic matching only within same-hash buckets.
+/// Average case O(n), worst case O(n^2) on hash collisions.
+fn lists_equal_hashed(a: &[Value], b: &[Value]) -> bool {
+    // Build hash buckets for b
+    let mut b_buckets: HashMap<u64, Vec<usize>> = HashMap::new();
+    for (j, item) in b.iter().enumerate() {
+        b_buckets.entry(item.canonical_hash()).or_default().push(j);
+    }
+
+    let mut matched = vec![false; b.len()];
+    for item_a in a {
+        let hash = item_a.canonical_hash();
+        let mut found = false;
+        if let Some(bucket) = b_buckets.get(&hash) {
+            for &j in bucket {
+                if !matched[j] && item_a.semantically_equal(&b[j]) {
+                    matched[j] = true;
+                    found = true;
+                    break;
+                }
             }
         }
         if !found {
@@ -156,16 +256,25 @@ pub fn merge_with_saved(desired: &Value, saved: &Value) -> Value {
 }
 
 /// Merge two lists by pairing elements via similarity score, then merging each pair.
+///
+/// For large lists, uses hash-based bucketing to narrow candidate matches.
+/// For small lists, uses the simple O(n^2) scan.
 fn merge_lists(desired: &[Value], saved: &[Value]) -> Vec<Value> {
     if desired.is_empty() {
         return desired.to_vec();
     }
+    if saved.len() < HASH_THRESHOLD {
+        return merge_lists_quadratic(desired, saved);
+    }
+    merge_lists_hashed(desired, saved)
+}
 
+/// O(n^2) merge for small lists.
+fn merge_lists_quadratic(desired: &[Value], saved: &[Value]) -> Vec<Value> {
     let mut used = vec![false; saved.len()];
     let mut result = Vec::with_capacity(desired.len());
 
     for d in desired {
-        // Find the best matching saved element
         let mut best_idx = None;
         let mut best_score = 0;
 
@@ -177,6 +286,71 @@ fn merge_lists(desired: &[Value], saved: &[Value]) -> Vec<Value> {
             if score > best_score {
                 best_score = score;
                 best_idx = Some(j);
+            }
+        }
+
+        if let Some(idx) = best_idx {
+            used[idx] = true;
+            result.push(merge_with_saved(d, &saved[idx]));
+        } else {
+            result.push(d.clone());
+        }
+    }
+
+    result
+}
+
+/// Hash-based merge for large lists.
+/// For Map values, tries exact hash match first, then falls back to scanning
+/// same-discriminant elements for best similarity. For non-Map values, uses
+/// hash bucketing for O(1) lookup.
+fn merge_lists_hashed(desired: &[Value], saved: &[Value]) -> Vec<Value> {
+    // Build hash buckets for saved elements
+    let mut saved_buckets: HashMap<u64, Vec<usize>> = HashMap::new();
+    for (j, item) in saved.iter().enumerate() {
+        saved_buckets
+            .entry(item.canonical_hash())
+            .or_default()
+            .push(j);
+    }
+
+    let mut used = vec![false; saved.len()];
+    let mut result = Vec::with_capacity(desired.len());
+
+    for d in desired {
+        let hash = d.canonical_hash();
+        let mut best_idx = None;
+        let mut best_score = 0;
+
+        // First, check exact hash matches (most common case for identical elements)
+        if let Some(bucket) = saved_buckets.get(&hash) {
+            for &j in bucket {
+                if used[j] {
+                    continue;
+                }
+                let score = similarity_score(d, &saved[j]);
+                if score > best_score {
+                    best_score = score;
+                    best_idx = Some(j);
+                }
+            }
+        }
+
+        // For Maps, also check other saved Maps for partial matches
+        // (a Map may have extra fields from saved state, giving a different hash)
+        if matches!(d, Value::Map(_)) {
+            for (j, s) in saved.iter().enumerate() {
+                if used[j] || matches!(best_idx, Some(bi) if bi == j) {
+                    continue;
+                }
+                if !matches!(s, Value::Map(_)) {
+                    continue;
+                }
+                let score = similarity_score(d, s);
+                if score > best_score {
+                    best_score = score;
+                    best_idx = Some(j);
+                }
             }
         }
 
@@ -611,5 +785,135 @@ mod tests {
         let saved = Value::Int(99);
         let merged = merge_with_saved(&desired, &saved);
         assert_eq!(merged, Value::Int(42));
+    }
+
+    #[test]
+    fn lists_equal_large_list_correctness() {
+        // Verify correctness with a list larger than HASH_THRESHOLD
+        let n = 200;
+        let a: Vec<Value> = (0..n).map(Value::Int).collect();
+        let b: Vec<Value> = (0..n).rev().map(Value::Int).collect();
+        assert!(lists_equal(&a, &b));
+
+        // Different content
+        let mut c: Vec<Value> = (0..n).map(Value::Int).collect();
+        c[n as usize - 1] = Value::Int(n); // change last element
+        assert!(!lists_equal(&a, &c));
+    }
+
+    #[test]
+    fn lists_equal_large_list_with_duplicates() {
+        let n = 100;
+        let a: Vec<Value> = (0..n)
+            .flat_map(|i| vec![Value::Int(i), Value::Int(i)])
+            .collect();
+        let b: Vec<Value> = (0..n)
+            .rev()
+            .flat_map(|i| vec![Value::Int(i), Value::Int(i)])
+            .collect();
+        assert!(lists_equal(&a, &b));
+
+        // Different multiplicities
+        let mut c = a.clone();
+        c[0] = Value::Int(999);
+        assert!(!lists_equal(&a, &c));
+    }
+
+    #[test]
+    fn lists_equal_large_list_of_maps() {
+        // Simulates security group rules (100+ maps)
+        let n = 150;
+        let make_rule = |i: i64| {
+            Value::Map(HashMap::from([
+                ("port".to_string(), Value::Int(i)),
+                ("protocol".to_string(), Value::String("tcp".to_string())),
+                (
+                    "cidr".to_string(),
+                    Value::String(format!("10.0.{}.0/24", i)),
+                ),
+            ]))
+        };
+
+        let a: Vec<Value> = (0..n).map(make_rule).collect();
+        let b: Vec<Value> = (0..n).rev().map(make_rule).collect();
+        assert!(lists_equal(&a, &b));
+    }
+
+    #[test]
+    fn lists_equal_performance_large_list() {
+        // Benchmark: 1000-element list comparison should complete quickly
+        // With O(n^2), 1000 elements = 1M comparisons; with hashing, ~1000.
+        let n = 1000;
+        let a: Vec<Value> = (0..n).map(Value::Int).collect();
+        let b: Vec<Value> = (0..n).rev().map(Value::Int).collect();
+
+        let start = std::time::Instant::now();
+        for _ in 0..100 {
+            assert!(lists_equal(&a, &b));
+        }
+        let elapsed = start.elapsed();
+        // Should complete well under 1 second for 100 iterations
+        assert!(
+            elapsed.as_secs() < 5,
+            "lists_equal with 1000 elements took {:?} for 100 iterations, expected < 5s",
+            elapsed
+        );
+    }
+
+    #[test]
+    fn merge_lists_large_list_correctness() {
+        // Verify merge_lists works correctly with large lists
+        let n = 50;
+        let desired: Vec<Value> = (0..n)
+            .map(|i| Value::Map(HashMap::from([("port".to_string(), Value::Int(i))])))
+            .collect();
+        let saved: Vec<Value> = (0..n)
+            .rev()
+            .map(|i| {
+                Value::Map(HashMap::from([
+                    ("port".to_string(), Value::Int(i)),
+                    ("protocol".to_string(), Value::String("tcp".to_string())),
+                ]))
+            })
+            .collect();
+
+        let merged = merge_lists(&desired, &saved);
+        assert_eq!(merged.len(), n as usize);
+
+        // Each merged element should have both port and protocol
+        for item in &merged {
+            if let Value::Map(map) = item {
+                assert!(map.contains_key("port"), "Missing port in merged item");
+                assert!(
+                    map.contains_key("protocol"),
+                    "Missing protocol in merged item"
+                );
+            } else {
+                panic!("Expected Map, got {:?}", item);
+            }
+        }
+    }
+
+    #[test]
+    fn canonical_hash_consistency() {
+        // Same value should produce same hash
+        let v1 = Value::Int(42);
+        let v2 = Value::Int(42);
+        assert_eq!(v1.canonical_hash(), v2.canonical_hash());
+
+        // Different values should (usually) produce different hashes
+        let v3 = Value::Int(43);
+        assert_ne!(v1.canonical_hash(), v3.canonical_hash());
+
+        // Maps with same content should hash the same regardless of insertion order
+        let m1 = Value::Map(HashMap::from([
+            ("a".to_string(), Value::Int(1)),
+            ("b".to_string(), Value::Int(2)),
+        ]));
+        let m2 = Value::Map(HashMap::from([
+            ("b".to_string(), Value::Int(2)),
+            ("a".to_string(), Value::Int(1)),
+        ]));
+        assert_eq!(m1.canonical_hash(), m2.canonical_hash());
     }
 }
