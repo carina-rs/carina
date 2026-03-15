@@ -1131,11 +1131,17 @@ fn generate_schema_code(schema: &CfnSchema, type_name: &str) -> Result<String> {
             _ => {}
         }
         // Collect pattern constraints for string properties
-        if attr_type.contains("validate_")
-            && attr_type.contains("_pattern")
-            && let Some(pattern) = &prop.pattern
-        {
-            patterns.insert(prop_name.clone(), pattern.clone());
+        if attr_type.contains("validate_") && attr_type.contains("_pattern") {
+            // Pattern can come from the property directly or from a $ref definition
+            let pattern = prop.pattern.clone().or_else(|| {
+                prop.ref_path
+                    .as_ref()
+                    .and_then(|ref_path| resolve_ref(schema, ref_path))
+                    .and_then(|def| def.pattern.clone())
+            });
+            if let Some(pattern) = pattern {
+                patterns.insert(prop_name.clone(), pattern);
+            }
         }
     }
 
@@ -7394,6 +7400,50 @@ mod tests {
         assert!(
             generated.contains("validate_expiration_date_pattern"),
             "Should generate pattern validation function for $ref definition pattern: {generated}"
+        );
+    }
+
+    #[test]
+    fn test_top_level_ref_pattern_collected_in_generate_schema_code() {
+        // When a top-level property uses $ref to a definition with a pattern,
+        // the pattern validation function should be generated.
+        let mut definitions = BTreeMap::new();
+        definitions.insert(
+            "iso8601UTC".to_string(),
+            CfnDefinition {
+                def_type: Some("string".to_string()),
+                pattern: Some(r"^(\d{4})-(0[0-9]|1[0-2])$".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let mut properties = BTreeMap::new();
+        properties.insert(
+            "CreatedDate".to_string(),
+            CfnProperty {
+                ref_path: Some("#/definitions/iso8601UTC".to_string()),
+                description: Some("When the resource was created.".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let schema = CfnSchema {
+            type_name: "AWS::Test::Resource".to_string(),
+            description: None,
+            properties,
+            required: vec![],
+            read_only_properties: vec![],
+            create_only_properties: vec![],
+            write_only_properties: vec![],
+            primary_identifier: None,
+            definitions: Some(definitions),
+            tagging: None,
+        };
+
+        let generated = generate_schema_code(&schema, "AWS::Test::Resource").unwrap();
+        assert!(
+            generated.contains("validate_created_date_pattern"),
+            "Should generate pattern validation function for top-level $ref pattern: {generated}"
         );
     }
 }
