@@ -476,6 +476,16 @@ impl DiagnosticEngine {
                                         .err()
                                         .map(|e| e.to_string())
                                 }
+                                // Validate Union static values (non-ResourceRef)
+                                (carina_core::schema::AttributeType::Union(_), value)
+                                    if !matches!(value, Value::ResourceRef { .. }) =>
+                                {
+                                    attr_schema
+                                        .attr_type
+                                        .validate(value)
+                                        .err()
+                                        .map(|e| e.to_string())
+                                }
                                 _ => None,
                             };
 
@@ -2294,6 +2304,158 @@ awscc.ec2.ipam {
         assert!(
             mixed_error.is_some(),
             "Should error on mixed block_name and canonical name. Got: {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    /// Build a DiagnosticEngine with custom schemas (no real providers needed)
+    fn custom_engine(
+        schemas: HashMap<String, carina_core::schema::ResourceSchema>,
+    ) -> DiagnosticEngine {
+        let provider_names: Vec<String> = schemas
+            .keys()
+            .filter_map(|k| k.split('.').next())
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .map(|s| s.to_string())
+            .collect();
+        DiagnosticEngine::new(Arc::new(schemas), provider_names, Arc::new(vec![]))
+    }
+
+    #[test]
+    fn union_static_value_validated() {
+        use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
+        let schema = ResourceSchema::new("test.resource")
+            .attribute(AttributeSchema::new("name", AttributeType::String).required())
+            .attribute(AttributeSchema::new(
+                "mode",
+                AttributeType::Union(vec![
+                    AttributeType::StringEnum {
+                        name: "Mode".to_string(),
+                        values: vec!["active".to_string(), "passive".to_string()],
+                        namespace: None,
+                        to_dsl: None,
+                    },
+                    AttributeType::Int,
+                ]),
+            ));
+
+        let mut schemas = HashMap::new();
+        schemas.insert("test.test.resource".to_string(), schema);
+
+        let engine = custom_engine(schemas);
+        let doc = create_document(
+            r#"provider test {
+    region = "ap-northeast-1"
+}
+
+test.test.resource {
+    name = "my-resource"
+    mode = "invalid_mode"
+}"#,
+        );
+
+        let diagnostics = engine.analyze(&doc, None);
+
+        let type_error = diagnostics
+            .iter()
+            .find(|d| d.message.contains("Type mismatch"));
+        assert!(
+            type_error.is_some(),
+            "Should warn about invalid Union value. Got diagnostics: {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn union_valid_static_value_no_warning() {
+        use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
+        let schema = ResourceSchema::new("test.resource")
+            .attribute(AttributeSchema::new("name", AttributeType::String).required())
+            .attribute(AttributeSchema::new(
+                "mode",
+                AttributeType::Union(vec![
+                    AttributeType::StringEnum {
+                        name: "Mode".to_string(),
+                        values: vec!["active".to_string(), "passive".to_string()],
+                        namespace: None,
+                        to_dsl: None,
+                    },
+                    AttributeType::Int,
+                ]),
+            ));
+
+        let mut schemas = HashMap::new();
+        schemas.insert("test.test.resource".to_string(), schema);
+
+        let engine = custom_engine(schemas);
+        let doc = create_document(
+            r#"provider test {
+    region = "ap-northeast-1"
+}
+
+test.test.resource {
+    name = "my-resource"
+    mode = "active"
+}"#,
+        );
+
+        let diagnostics = engine.analyze(&doc, None);
+
+        let type_error = diagnostics
+            .iter()
+            .find(|d| d.message.contains("Type mismatch"));
+        assert!(
+            type_error.is_none(),
+            "Should NOT warn about valid Union value. Got diagnostics: {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn union_valid_int_value_no_warning() {
+        use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
+        let schema = ResourceSchema::new("test.resource")
+            .attribute(AttributeSchema::new("name", AttributeType::String).required())
+            .attribute(AttributeSchema::new(
+                "mode",
+                AttributeType::Union(vec![
+                    AttributeType::StringEnum {
+                        name: "Mode".to_string(),
+                        values: vec!["active".to_string(), "passive".to_string()],
+                        namespace: None,
+                        to_dsl: None,
+                    },
+                    AttributeType::Int,
+                ]),
+            ));
+
+        let mut schemas = HashMap::new();
+        schemas.insert("test.test.resource".to_string(), schema);
+
+        let engine = custom_engine(schemas);
+        let doc = create_document(
+            r#"provider test {
+    region = "ap-northeast-1"
+}
+
+test.test.resource {
+    name = "my-resource"
+    mode = 42
+}"#,
+        );
+
+        let diagnostics = engine.analyze(&doc, None);
+
+        let type_error = diagnostics
+            .iter()
+            .find(|d| d.message.contains("Type mismatch"));
+        assert!(
+            type_error.is_none(),
+            "Should NOT warn when Int value matches Union member. Got diagnostics: {:?}",
             diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
     }
