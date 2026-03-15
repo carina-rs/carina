@@ -304,27 +304,29 @@ if [ "$COMMAND" = "full" ]; then
 
         ACCOUNT="${ACCOUNTS[$SLOT]}"
         LOG_FILE="$WORK_DIR/slot_${SLOT}.log"
-        STATE_DIR="$WORK_DIR/state_${SLOT}"
-        mkdir -p "$STATE_DIR"
+        SLOT_DIR="$WORK_DIR/state_${SLOT}"
+        mkdir -p "$SLOT_DIR"
 
         (
             set +e
             PASSED=0
             FAILED=0
             CURRENT_TEST_FILE=""
+            CURRENT_STATE_DIR=""
             INTERRUPTED=0
 
             # Worker trap: attempt destroy for the current test on interruption
             worker_cleanup() {
                 INTERRUPTED=1
-                if [ -n "$CURRENT_TEST_FILE" ]; then
+                if [ -n "$CURRENT_TEST_FILE" ] && [ -n "$CURRENT_STATE_DIR" ]; then
                     REL_PATH="${CURRENT_TEST_FILE#$SCRIPT_DIR/}"
                     echo "INTERRUPTED - destroying resources for $REL_PATH"
-                    cd "$STATE_DIR" && aws-vault exec "$ACCOUNT" -- "$CARINA_BIN" destroy --auto-approve "$CURRENT_TEST_FILE" 2>&1 || true
+                    cd "$CURRENT_STATE_DIR" && aws-vault exec "$ACCOUNT" -- "$CARINA_BIN" destroy --auto-approve "$CURRENT_TEST_FILE" 2>&1 || true
                 fi
             }
             trap worker_cleanup INT TERM
 
+            TEST_INDEX=0
             while IFS= read -r TEST_FILE; do
                 if [ $INTERRUPTED -eq 1 ]; then
                     break
@@ -333,9 +335,15 @@ if [ "$COMMAND" = "full" ]; then
                 REL_PATH="${TEST_FILE#$SCRIPT_DIR/}"
                 CURRENT_TEST_FILE="$TEST_FILE"
 
-                # Apply (run from STATE_DIR so each account has its own state file)
+                # Use a separate state directory per test to prevent
+                # state file cross-contamination between tests (issue #537)
+                CURRENT_STATE_DIR="$SLOT_DIR/test_${TEST_INDEX}"
+                mkdir -p "$CURRENT_STATE_DIR"
+                TEST_INDEX=$((TEST_INDEX + 1))
+
+                # Apply (run from state dir so each test has its own state file)
                 echo "RUNNING apply $REL_PATH"
-                APPLY_OUTPUT=$(cd "$STATE_DIR" && aws-vault exec "$ACCOUNT" -- "$CARINA_BIN" apply --auto-approve "$TEST_FILE" 2>&1)
+                APPLY_OUTPUT=$(cd "$CURRENT_STATE_DIR" && aws-vault exec "$ACCOUNT" -- "$CARINA_BIN" apply --auto-approve "$TEST_FILE" 2>&1)
                 APPLY_RC=$?
                 if [ $INTERRUPTED -eq 1 ]; then
                     break
@@ -345,14 +353,15 @@ if [ "$COMMAND" = "full" ]; then
                     echo "  ERROR: $APPLY_OUTPUT"
                     FAILED=$((FAILED + 1))
                     # Try to destroy whatever was partially created
-                    cd "$STATE_DIR" && aws-vault exec "$ACCOUNT" -- "$CARINA_BIN" destroy --auto-approve "$TEST_FILE" 2>&1 || true
+                    cd "$CURRENT_STATE_DIR" && aws-vault exec "$ACCOUNT" -- "$CARINA_BIN" destroy --auto-approve "$TEST_FILE" 2>&1 || true
                     CURRENT_TEST_FILE=""
+                    CURRENT_STATE_DIR=""
                     continue
                 fi
 
                 # Post-apply plan verification (idempotency check)
                 echo "RUNNING plan-verify $REL_PATH"
-                PLAN_OUTPUT=$(cd "$STATE_DIR" && aws-vault exec "$ACCOUNT" -- "$CARINA_BIN" plan --detailed-exitcode "$TEST_FILE" 2>&1)
+                PLAN_OUTPUT=$(cd "$CURRENT_STATE_DIR" && aws-vault exec "$ACCOUNT" -- "$CARINA_BIN" plan --detailed-exitcode "$TEST_FILE" 2>&1)
                 PLAN_RC=$?
                 if [ $INTERRUPTED -eq 1 ]; then
                     break
@@ -363,33 +372,37 @@ if [ "$COMMAND" = "full" ]; then
                     echo "  $PLAN_OUTPUT"
                     FAILED=$((FAILED + 1))
                     # Still destroy to clean up
-                    cd "$STATE_DIR" && aws-vault exec "$ACCOUNT" -- "$CARINA_BIN" destroy --auto-approve "$TEST_FILE" 2>&1 || true
+                    cd "$CURRENT_STATE_DIR" && aws-vault exec "$ACCOUNT" -- "$CARINA_BIN" destroy --auto-approve "$TEST_FILE" 2>&1 || true
                     CURRENT_TEST_FILE=""
+                    CURRENT_STATE_DIR=""
                     continue
                 elif [ $PLAN_RC -ne 0 ]; then
                     echo "FAIL (plan-verify) $REL_PATH"
                     echo "  ERROR: $PLAN_OUTPUT"
                     FAILED=$((FAILED + 1))
-                    cd "$STATE_DIR" && aws-vault exec "$ACCOUNT" -- "$CARINA_BIN" destroy --auto-approve "$TEST_FILE" 2>&1 || true
+                    cd "$CURRENT_STATE_DIR" && aws-vault exec "$ACCOUNT" -- "$CARINA_BIN" destroy --auto-approve "$TEST_FILE" 2>&1 || true
                     CURRENT_TEST_FILE=""
+                    CURRENT_STATE_DIR=""
                     continue
                 fi
 
                 # Destroy
                 echo "RUNNING destroy $REL_PATH"
-                DESTROY_OUTPUT=$(cd "$STATE_DIR" && aws-vault exec "$ACCOUNT" -- "$CARINA_BIN" destroy --auto-approve "$TEST_FILE" 2>&1)
+                DESTROY_OUTPUT=$(cd "$CURRENT_STATE_DIR" && aws-vault exec "$ACCOUNT" -- "$CARINA_BIN" destroy --auto-approve "$TEST_FILE" 2>&1)
                 DESTROY_RC=$?
                 if [ $DESTROY_RC -ne 0 ] || echo "$DESTROY_OUTPUT" | grep -q "failed"; then
                     echo "FAIL (destroy) $REL_PATH"
                     echo "  ERROR: $DESTROY_OUTPUT"
                     FAILED=$((FAILED + 1))
                     CURRENT_TEST_FILE=""
+                    CURRENT_STATE_DIR=""
                     continue
                 fi
 
                 echo "OK   $REL_PATH"
                 PASSED=$((PASSED + 1))
                 CURRENT_TEST_FILE=""
+                CURRENT_STATE_DIR=""
             done < "$LIST_FILE"
 
             echo "---"
