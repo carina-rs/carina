@@ -646,7 +646,34 @@ impl CompletionProvider {
             }
             // List(non-Struct): delegate to inner type completions
             AttributeType::List(inner) => self.completions_for_type(inner),
-            AttributeType::Union(_) | AttributeType::String | AttributeType::Custom { .. } => {
+            // Map: delegate to inner value type completions
+            AttributeType::Map(inner) => self.completions_for_type(inner),
+            // Union: collect completions from all member types
+            AttributeType::Union(members) => {
+                let mut completions = Vec::new();
+                let mut seen_labels = std::collections::HashSet::new();
+                for member in members {
+                    for item in self.completions_for_type(member) {
+                        if seen_labels.insert(item.label.clone()) {
+                            completions.push(item);
+                        }
+                    }
+                }
+                // Always include env() for Union types
+                let env_label = "env".to_string();
+                if seen_labels.insert(env_label.clone()) {
+                    completions.push(CompletionItem {
+                        label: env_label,
+                        kind: Some(CompletionItemKind::FUNCTION),
+                        insert_text: Some("env(\"${1:VAR_NAME}\")".to_string()),
+                        insert_text_format: Some(InsertTextFormat::SNIPPET),
+                        detail: Some("Read environment variable".to_string()),
+                        ..Default::default()
+                    });
+                }
+                completions
+            }
+            AttributeType::String | AttributeType::Custom { .. } => {
                 vec![CompletionItem {
                     label: "env".to_string(),
                     kind: Some(CompletionItemKind::FUNCTION),
@@ -1911,6 +1938,93 @@ simple {
         assert!(
             item.detail.as_ref().unwrap().contains("operating_regions"),
             "Detail should reference canonical name"
+        );
+    }
+
+    #[test]
+    fn union_completions_include_member_types() {
+        use carina_core::schema::AttributeType;
+
+        let provider = test_provider();
+        let completions = provider.completions_for_type(&AttributeType::Union(vec![
+            AttributeType::StringEnum {
+                name: "Mode".to_string(),
+                values: vec!["active".to_string(), "passive".to_string()],
+                namespace: None,
+                to_dsl: None,
+            },
+            AttributeType::Bool,
+        ]));
+
+        let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+
+        // Should have StringEnum completions
+        assert!(
+            labels.contains(&"\"active\""),
+            "Should offer 'active' from StringEnum member. Got: {:?}",
+            labels
+        );
+        assert!(
+            labels.contains(&"\"passive\""),
+            "Should offer 'passive' from StringEnum member. Got: {:?}",
+            labels
+        );
+        // Should have Bool completions
+        assert!(
+            labels.contains(&"true"),
+            "Should offer 'true' from Bool member. Got: {:?}",
+            labels
+        );
+        assert!(
+            labels.contains(&"false"),
+            "Should offer 'false' from Bool member. Got: {:?}",
+            labels
+        );
+        // Should also include env()
+        assert!(
+            labels.contains(&"env"),
+            "Should offer 'env' for Union. Got: {:?}",
+            labels
+        );
+    }
+
+    #[test]
+    fn union_completions_dedup_labels() {
+        use carina_core::schema::AttributeType;
+
+        let provider = test_provider();
+        let completions = provider.completions_for_type(&AttributeType::Union(vec![
+            AttributeType::Bool,
+            AttributeType::Bool,
+        ]));
+
+        let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+        let true_count = labels.iter().filter(|&&l| l == "true").count();
+        assert_eq!(
+            true_count, 1,
+            "Should deduplicate 'true' in Union completions. Got: {:?}",
+            labels
+        );
+    }
+
+    #[test]
+    fn map_completions_delegate_to_inner_type() {
+        use carina_core::schema::AttributeType;
+
+        let provider = test_provider();
+        let completions =
+            provider.completions_for_type(&AttributeType::Map(Box::new(AttributeType::Bool)));
+
+        let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+        assert!(
+            labels.contains(&"true"),
+            "Map(Bool) should offer 'true'. Got: {:?}",
+            labels
+        );
+        assert!(
+            labels.contains(&"false"),
+            "Map(Bool) should offer 'false'. Got: {:?}",
+            labels
         );
     }
 }
