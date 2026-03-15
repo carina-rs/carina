@@ -2,6 +2,20 @@
 
 CloudFormation Type: `AWS::S3::Bucket`
 
+## Example
+
+```crn
+let bucket = aws.s3.bucket {
+  bucket = "carina-example-s3-bucket"
+
+  versioning_status = aws.s3.bucket.VersioningStatus.Enabled
+
+  tags = {
+    Environment = "example"
+  }
+}
+```
+
 ## Argument Reference
 
 ### `acl`

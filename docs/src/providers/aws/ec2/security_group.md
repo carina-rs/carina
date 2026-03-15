@@ -4,6 +4,28 @@ CloudFormation Type: `AWS::EC2::SecurityGroup`
 
 Describes a security group.
 
+## Example
+
+```crn
+let vpc = aws.ec2.vpc {
+  cidr_block = "10.0.0.0/16"
+
+  tags = {
+    Environment = "example"
+  }
+}
+
+let sg = aws.ec2.security_group {
+  group_name  = "carina-example-sg"
+  description = "Example security group"
+  vpc_id      = vpc.vpc_id
+
+  tags = {
+    Environment = "example"
+  }
+}
+```
+
 ## Argument Reference
 
 ### `description`

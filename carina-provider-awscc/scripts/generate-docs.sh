@@ -77,8 +77,12 @@ if [ ! -f "$CODEGEN_BIN" ]; then
 fi
 
 for TYPE_NAME in "${RESOURCE_TYPES[@]}"; do
+    DSL_RESOURCE=$("$CODEGEN_BIN" --type-name "$TYPE_NAME" --print-dsl-resource-name)
+    SERVICE="${DSL_RESOURCE%%.*}"
+    RESOURCE="${DSL_RESOURCE#*.}"
     FULL_RESOURCE=$("$CODEGEN_BIN" --type-name "$TYPE_NAME" --print-full-resource-name)
-    OUTPUT_FILE="$DOCS_DIR/${FULL_RESOURCE}.md"
+    mkdir -p "$DOCS_DIR/$SERVICE"
+    OUTPUT_FILE="$DOCS_DIR/${SERVICE}/${RESOURCE}.md"
 
     echo "Generating $TYPE_NAME -> $OUTPUT_FILE"
 

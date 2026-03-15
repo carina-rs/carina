@@ -181,9 +181,10 @@ fn main() -> Result<()> {
                 let model = models.get(res.service_namespace).unwrap();
                 let md = generate_markdown_resource(res, model)?;
 
-                let output_path = args
-                    .output_dir
-                    .join(format!("{}.md", module_name(res.name)));
+                let (service, resource) = split_service_resource(res.name);
+                let service_dir = args.output_dir.join(service);
+                std::fs::create_dir_all(&service_dir)?;
+                let output_path = service_dir.join(format!("{}.md", resource));
                 std::fs::write(&output_path, &md)
                     .with_context(|| format!("Failed to write {}", output_path.display()))?;
                 eprintln!("Generated: {}", output_path.display());
