@@ -1941,43 +1941,11 @@ simple {
         );
     }
 
-    /// Build a CompletionProvider with custom schemas
-    fn custom_provider(
-        schemas: std::collections::HashMap<String, carina_core::schema::ResourceSchema>,
-    ) -> CompletionProvider {
-        let provider_names: Vec<String> = schemas
-            .keys()
-            .filter_map(|k| k.split('.').next())
-            .collect::<std::collections::HashSet<_>>()
-            .into_iter()
-            .map(|s| s.to_string())
-            .collect();
-        CompletionProvider::new(Arc::new(schemas), provider_names, vec![])
-    }
-
     #[test]
     fn union_completions_include_member_types() {
-        use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+        use carina_core::schema::AttributeType;
 
-        let schema = ResourceSchema::new("test.resource")
-            .attribute(AttributeSchema::new("name", AttributeType::String).required())
-            .attribute(AttributeSchema::new(
-                "mode",
-                AttributeType::Union(vec![
-                    AttributeType::StringEnum {
-                        name: "Mode".to_string(),
-                        values: vec!["active".to_string(), "passive".to_string()],
-                        namespace: None,
-                        to_dsl: None,
-                    },
-                    AttributeType::Bool,
-                ]),
-            ));
-
-        let mut schemas = std::collections::HashMap::new();
-        schemas.insert("test.test.resource".to_string(), schema);
-
-        let provider = custom_provider(schemas);
+        let provider = test_provider();
         let completions = provider.completions_for_type(&AttributeType::Union(vec![
             AttributeType::StringEnum {
                 name: "Mode".to_string(),
