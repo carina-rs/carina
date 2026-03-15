@@ -11,7 +11,6 @@ use aws_sdk_cloudcontrol::Client as CloudControlClient;
 use aws_sdk_cloudcontrol::types::OperationStatus;
 use carina_core::provider::{ProviderError, ProviderResult};
 use carina_core::resource::{LifecycleConfig, Resource, ResourceId, State, Value};
-use heck::{ToPascalCase, ToSnakeCase};
 use serde_json::json;
 
 use carina_core::schema::{AttributeType, StructField};
@@ -129,6 +128,19 @@ fn aws_value_to_dsl(
         }
     }
 
+    // For Map types, preserve keys as-is (user-defined) and recurse into values
+    if let AttributeType::Map(inner) = attr_type
+        && let Some(obj) = value.as_object()
+    {
+        let map: HashMap<String, Value> = obj
+            .iter()
+            .filter_map(|(k, v)| {
+                aws_value_to_dsl(dsl_name, v, inner, resource_type).map(|val| (k.clone(), val))
+            })
+            .collect();
+        return Some(Value::Map(map));
+    }
+
     json_to_value(value)
 }
 
@@ -151,7 +163,7 @@ fn json_to_value(value: &serde_json::Value) -> Option<Value> {
         serde_json::Value::Object(obj) => {
             let map: HashMap<String, Value> = obj
                 .iter()
-                .filter_map(|(k, v)| json_to_value(v).map(|val| (k.to_snake_case(), val)))
+                .filter_map(|(k, v)| json_to_value(v).map(|val| (k.clone(), val)))
                 .collect();
             Some(Value::Map(map))
         }
@@ -266,6 +278,17 @@ fn dsl_value_to_aws(
             })
             .collect();
         Some(serde_json::Value::Object(obj))
+    } else if let AttributeType::Map(inner) = attr_type
+        && let Value::Map(map) = value
+    {
+        // Map type: preserve keys as-is (user-defined), recurse into values with inner type
+        let obj: serde_json::Map<String, serde_json::Value> = map
+            .iter()
+            .filter_map(|(k, v)| {
+                dsl_value_to_aws(v, inner, resource_type, attr_name).map(|val| (k.clone(), val))
+            })
+            .collect();
+        Some(serde_json::Value::Object(obj))
     } else {
         value_to_json(value)
     }
@@ -285,7 +308,7 @@ fn value_to_json(value: &Value) -> Option<serde_json::Value> {
         Value::Map(map) => {
             let obj: serde_json::Map<String, serde_json::Value> = map
                 .iter()
-                .filter_map(|(k, v)| value_to_json(v).map(|val| (k.to_pascal_case(), val)))
+                .filter_map(|(k, v)| value_to_json(v).map(|val| (k.clone(), val)))
                 .collect();
             Some(serde_json::Value::Object(obj))
         }
@@ -2097,6 +2120,95 @@ mod tests {
         let value = Value::String("awscc.ec2.sg.Protocol.tcp".to_string());
         let result = dsl_value_to_aws(&value, &attr_type, "ec2.sg", "protocol");
         assert_eq!(result, Some(json!("tcp")));
+    }
+
+    #[test]
+    fn test_dsl_value_to_aws_map_preserves_user_keys() {
+        // Map(String) should preserve user-defined keys as-is, not PascalCase them
+        let attr_type = AttributeType::Map(Box::new(AttributeType::String));
+
+        let mut map = HashMap::new();
+        map.insert(
+            "my_custom_key".to_string(),
+            Value::String("value1".to_string()),
+        );
+        map.insert(
+            "another-key".to_string(),
+            Value::String("value2".to_string()),
+        );
+        let dsl_value = Value::Map(map);
+
+        let result = dsl_value_to_aws(&dsl_value, &attr_type, "s3.bucket", "tags");
+        let result = result.expect("Should return Some");
+
+        if let serde_json::Value::Object(obj) = &result {
+            // Keys must be preserved exactly as written, not PascalCased
+            assert_eq!(obj.get("my_custom_key"), Some(&json!("value1")));
+            assert_eq!(obj.get("another-key"), Some(&json!("value2")));
+            // Verify PascalCased versions do NOT exist
+            assert!(obj.get("MyCustomKey").is_none());
+            assert!(obj.get("AnotherKey").is_none());
+        } else {
+            panic!("Expected JSON Object, got: {:?}", result);
+        }
+    }
+
+    #[test]
+    fn test_dsl_value_to_aws_map_recurses_into_values() {
+        // Map with enum values should recurse for type-aware conversion
+        let inner_type = AttributeType::StringEnum {
+            name: "Status".to_string(),
+            values: vec!["Active".to_string(), "Inactive".to_string()],
+            namespace: Some("awscc.test.resource".to_string()),
+            to_dsl: None,
+        };
+        let attr_type = AttributeType::Map(Box::new(inner_type));
+
+        let mut map = HashMap::new();
+        map.insert(
+            "item_one".to_string(),
+            Value::String("awscc.test.resource.Status.Active".to_string()),
+        );
+        let dsl_value = Value::Map(map);
+
+        let result = dsl_value_to_aws(&dsl_value, &attr_type, "test.resource", "status_map");
+        let result = result.expect("Should return Some");
+
+        if let serde_json::Value::Object(obj) = &result {
+            // Key preserved, value converted from namespaced enum to raw value
+            assert_eq!(obj.get("item_one"), Some(&json!("Active")));
+        } else {
+            panic!("Expected JSON Object, got: {:?}", result);
+        }
+    }
+
+    #[test]
+    fn test_aws_value_to_dsl_map_preserves_user_keys() {
+        // Map(String) read path should preserve keys as-is, not snake_case them
+        let attr_type = AttributeType::Map(Box::new(AttributeType::String));
+
+        let aws_json = json!({
+            "MyCustomKey": "value1",
+            "another-key": "value2"
+        });
+
+        let result = aws_value_to_dsl("tags", &aws_json, &attr_type, "s3.bucket");
+        let result = result.expect("Should return Some");
+
+        if let Value::Map(map) = &result {
+            assert_eq!(
+                map.get("MyCustomKey"),
+                Some(&Value::String("value1".to_string()))
+            );
+            assert_eq!(
+                map.get("another-key"),
+                Some(&Value::String("value2".to_string()))
+            );
+            // Verify snake_cased versions do NOT exist
+            assert!(map.get("my_custom_key").is_none());
+        } else {
+            panic!("Expected Value::Map, got: {:?}", result);
+        }
     }
 
     #[test]
