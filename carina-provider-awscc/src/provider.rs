@@ -11,7 +11,7 @@ use aws_sdk_cloudcontrol::Client as CloudControlClient;
 use aws_sdk_cloudcontrol::types::OperationStatus;
 use carina_core::provider::{ProviderError, ProviderResult};
 use carina_core::resource::{LifecycleConfig, Resource, ResourceId, State, Value};
-use heck::{ToPascalCase, ToSnakeCase};
+use heck::ToSnakeCase;
 use serde_json::json;
 
 use carina_core::schema::{AttributeType, StructField};
@@ -266,6 +266,17 @@ fn dsl_value_to_aws(
             })
             .collect();
         Some(serde_json::Value::Object(obj))
+    } else if let AttributeType::Map(inner) = attr_type
+        && let Value::Map(map) = value
+    {
+        // Map type: preserve keys as-is (user-defined), recurse into values with inner type
+        let obj: serde_json::Map<String, serde_json::Value> = map
+            .iter()
+            .filter_map(|(k, v)| {
+                dsl_value_to_aws(v, inner, resource_type, attr_name).map(|val| (k.clone(), val))
+            })
+            .collect();
+        Some(serde_json::Value::Object(obj))
     } else {
         value_to_json(value)
     }
@@ -285,7 +296,7 @@ fn value_to_json(value: &Value) -> Option<serde_json::Value> {
         Value::Map(map) => {
             let obj: serde_json::Map<String, serde_json::Value> = map
                 .iter()
-                .filter_map(|(k, v)| value_to_json(v).map(|val| (k.to_pascal_case(), val)))
+                .filter_map(|(k, v)| value_to_json(v).map(|val| (k.clone(), val)))
                 .collect();
             Some(serde_json::Value::Object(obj))
         }
@@ -2097,6 +2108,66 @@ mod tests {
         let value = Value::String("awscc.ec2.sg.Protocol.tcp".to_string());
         let result = dsl_value_to_aws(&value, &attr_type, "ec2.sg", "protocol");
         assert_eq!(result, Some(json!("tcp")));
+    }
+
+    #[test]
+    fn test_dsl_value_to_aws_map_preserves_user_keys() {
+        // Map(String) should preserve user-defined keys as-is, not PascalCase them
+        let attr_type = AttributeType::Map(Box::new(AttributeType::String));
+
+        let mut map = HashMap::new();
+        map.insert(
+            "my_custom_key".to_string(),
+            Value::String("value1".to_string()),
+        );
+        map.insert(
+            "another-key".to_string(),
+            Value::String("value2".to_string()),
+        );
+        let dsl_value = Value::Map(map);
+
+        let result = dsl_value_to_aws(&dsl_value, &attr_type, "s3.bucket", "tags");
+        let result = result.expect("Should return Some");
+
+        if let serde_json::Value::Object(obj) = &result {
+            // Keys must be preserved exactly as written, not PascalCased
+            assert_eq!(obj.get("my_custom_key"), Some(&json!("value1")));
+            assert_eq!(obj.get("another-key"), Some(&json!("value2")));
+            // Verify PascalCased versions do NOT exist
+            assert!(obj.get("MyCustomKey").is_none());
+            assert!(obj.get("AnotherKey").is_none());
+        } else {
+            panic!("Expected JSON Object, got: {:?}", result);
+        }
+    }
+
+    #[test]
+    fn test_dsl_value_to_aws_map_recurses_into_values() {
+        // Map with enum values should recurse for type-aware conversion
+        let inner_type = AttributeType::StringEnum {
+            name: "Status".to_string(),
+            values: vec!["Active".to_string(), "Inactive".to_string()],
+            namespace: Some("awscc.test.resource".to_string()),
+            to_dsl: None,
+        };
+        let attr_type = AttributeType::Map(Box::new(inner_type));
+
+        let mut map = HashMap::new();
+        map.insert(
+            "item_one".to_string(),
+            Value::String("awscc.test.resource.Status.Active".to_string()),
+        );
+        let dsl_value = Value::Map(map);
+
+        let result = dsl_value_to_aws(&dsl_value, &attr_type, "test.resource", "status_map");
+        let result = result.expect("Should return Some");
+
+        if let serde_json::Value::Object(obj) = &result {
+            // Key preserved, value converted from namespaced enum to raw value
+            assert_eq!(obj.get("item_one"), Some(&json!("Active")));
+        } else {
+            panic!("Expected JSON Object, got: {:?}", result);
+        }
     }
 
     #[test]
