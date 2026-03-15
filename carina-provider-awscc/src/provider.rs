@@ -11,7 +11,6 @@ use aws_sdk_cloudcontrol::Client as CloudControlClient;
 use aws_sdk_cloudcontrol::types::OperationStatus;
 use carina_core::provider::{ProviderError, ProviderResult};
 use carina_core::resource::{LifecycleConfig, Resource, ResourceId, State, Value};
-use heck::ToSnakeCase;
 use serde_json::json;
 
 use carina_core::schema::{AttributeType, StructField};
@@ -129,6 +128,19 @@ fn aws_value_to_dsl(
         }
     }
 
+    // For Map types, preserve keys as-is (user-defined) and recurse into values
+    if let AttributeType::Map(inner) = attr_type
+        && let Some(obj) = value.as_object()
+    {
+        let map: HashMap<String, Value> = obj
+            .iter()
+            .filter_map(|(k, v)| {
+                aws_value_to_dsl(dsl_name, v, inner, resource_type).map(|val| (k.clone(), val))
+            })
+            .collect();
+        return Some(Value::Map(map));
+    }
+
     json_to_value(value)
 }
 
@@ -151,7 +163,7 @@ fn json_to_value(value: &serde_json::Value) -> Option<Value> {
         serde_json::Value::Object(obj) => {
             let map: HashMap<String, Value> = obj
                 .iter()
-                .filter_map(|(k, v)| json_to_value(v).map(|val| (k.to_snake_case(), val)))
+                .filter_map(|(k, v)| json_to_value(v).map(|val| (k.clone(), val)))
                 .collect();
             Some(Value::Map(map))
         }
@@ -2167,6 +2179,35 @@ mod tests {
             assert_eq!(obj.get("item_one"), Some(&json!("Active")));
         } else {
             panic!("Expected JSON Object, got: {:?}", result);
+        }
+    }
+
+    #[test]
+    fn test_aws_value_to_dsl_map_preserves_user_keys() {
+        // Map(String) read path should preserve keys as-is, not snake_case them
+        let attr_type = AttributeType::Map(Box::new(AttributeType::String));
+
+        let aws_json = json!({
+            "MyCustomKey": "value1",
+            "another-key": "value2"
+        });
+
+        let result = aws_value_to_dsl("tags", &aws_json, &attr_type, "s3.bucket");
+        let result = result.expect("Should return Some");
+
+        if let Value::Map(map) = &result {
+            assert_eq!(
+                map.get("MyCustomKey"),
+                Some(&Value::String("value1".to_string()))
+            );
+            assert_eq!(
+                map.get("another-key"),
+                Some(&Value::String("value2".to_string()))
+            );
+            // Verify snake_cased versions do NOT exist
+            assert!(map.get("my_custom_key").is_none());
+        } else {
+            panic!("Expected Value::Map, got: {:?}", result);
         }
     }
 
