@@ -131,11 +131,10 @@ fn filter_non_removable_removals(
 /// to detect semantically equivalent values that differ textually:
 /// - Int/Float coercion: `Int(1)` equals `Float(1.0)` for numeric types
 /// - List/Map: recurse with inner element type
-/// - Struct: recurse with per-field type information
-///
-/// StringEnum values are NOT matched flexibly here. The `to_dsl` callbacks
-/// in providers normalize enum values before they reach the differ, so
-/// adding leniency here would mask normalization bugs.
+/// - Struct: recurse with per-field type information, tolerating extra fields
+///   with default values (e.g., `false` for Bool)
+/// - StringEnum: extract enum values from namespaced identifiers and compare
+///   case-insensitively (e.g., `awscc.s3.bucket.Type.AES256` equals `"AES256"`)
 ///
 /// Without type information, falls back to `Value::semantically_equal()`.
 fn type_aware_equal(a: &Value, b: &Value, attr_type: Option<&AttributeType>) -> bool {
@@ -160,13 +159,9 @@ fn type_aware_equal(a: &Value, b: &Value, attr_type: Option<&AttributeType>) -> 
                 type_aware_maps_equal(ma, mb, |_key| Some(inner.as_ref()))
             }
 
-            // Struct: per-field type-aware comparison
+            // Struct: per-field type-aware comparison with default-value tolerance
             (Value::Map(ma), Value::Map(mb), AttributeType::Struct { fields, .. }) => {
-                let field_types: HashMap<&str, &AttributeType> = fields
-                    .iter()
-                    .map(|f| (f.name.as_str(), &f.field_type))
-                    .collect();
-                type_aware_maps_equal(ma, mb, |key| field_types.get(key).copied())
+                type_aware_struct_equal(ma, mb, fields)
             }
 
             // Union: try each member type; if any says equal, they're equal
@@ -182,6 +177,16 @@ fn type_aware_equal(a: &Value, b: &Value, attr_type: Option<&AttributeType>) -> 
                     }
                     _ => types.iter().any(|t| type_aware_equal(a, b, Some(t))),
                 }
+            }
+
+            // StringEnum: extract enum values from namespaced identifiers and compare
+            (Value::String(sa), Value::String(sb), AttributeType::StringEnum { values, .. })
+                if sa != sb =>
+            {
+                let valid_values: Vec<&str> = values.iter().map(String::as_str).collect();
+                let va = crate::utils::extract_enum_value_with_values(sa, &valid_values);
+                let vb = crate::utils::extract_enum_value_with_values(sb, &valid_values);
+                va.eq_ignore_ascii_case(vb)
             }
 
             // Custom types with base type: delegate to base
@@ -232,6 +237,78 @@ where
             .map(|vb| type_aware_equal(va, vb, get_type(k)))
             .unwrap_or(false)
     })
+}
+
+/// Struct comparison that tolerates extra fields with default values.
+///
+/// When comparing structs, one map may have extra keys that the other doesn't.
+/// If the extra key's value is the "zero/default" for its type (e.g., `false`
+/// for Bool, `0` for Int), the extra field is ignored. This prevents false diffs
+/// when AWS returns default values for fields the user didn't specify.
+fn type_aware_struct_equal(
+    a: &HashMap<String, Value>,
+    b: &HashMap<String, Value>,
+    fields: &[crate::schema::StructField],
+) -> bool {
+    let field_types: HashMap<&str, &AttributeType> = fields
+        .iter()
+        .map(|f| (f.name.as_str(), &f.field_type))
+        .collect();
+
+    // Check all keys present in both maps are equal
+    for (k, va) in a {
+        match b.get(k) {
+            Some(vb) => {
+                if !type_aware_equal(va, vb, field_types.get(k.as_str()).copied()) {
+                    return false;
+                }
+            }
+            None => {
+                // Key only in `a` — must be a type default to be tolerated
+                let ft = field_types.get(k.as_str()).copied();
+                if !is_type_default(va, ft) {
+                    return false;
+                }
+            }
+        }
+    }
+
+    // Check keys only in `b`
+    for (k, vb) in b {
+        if a.contains_key(k) {
+            continue; // Already checked above
+        }
+        let ft = field_types.get(k.as_str()).copied();
+        if !is_type_default(vb, ft) {
+            return false;
+        }
+    }
+
+    true
+}
+
+/// Check if a value is the "zero/default" for its type.
+///
+/// - Bool: `false`
+/// - Int: `0`
+/// - Float: `0.0`
+/// - String: `""`
+/// - List: empty list
+/// - Map: empty map
+fn is_type_default(value: &Value, attr_type: Option<&AttributeType>) -> bool {
+    match (value, attr_type) {
+        (Value::Bool(false), Some(AttributeType::Bool) | None) => true,
+        (Value::Int(0), Some(AttributeType::Int)) => true,
+        (Value::Float(f), Some(AttributeType::Float)) if *f == 0.0 => true,
+        (Value::String(s), Some(AttributeType::String)) if s.is_empty() => true,
+        (Value::List(l), Some(AttributeType::List(_))) if l.is_empty() => true,
+        (Value::Map(m), Some(AttributeType::Map(_) | AttributeType::Struct { .. }))
+            if m.is_empty() =>
+        {
+            true
+        }
+        _ => false,
+    }
 }
 
 /// Find changed attributes between desired and current state.
@@ -2666,6 +2743,126 @@ mod tests {
             matches!(result, Diff::NoChange(_)),
             "With schema, Int(443) and Float(443.0) should be NoChange, got {:?}",
             result
+        );
+    }
+
+    #[test]
+    fn type_aware_struct_ignores_default_bool_false() {
+        use crate::schema::StructField;
+
+        // Struct with an optional bool field (bucket_key_enabled)
+        let struct_type = AttributeType::Struct {
+            name: "ServerSideEncryptionRule".to_string(),
+            fields: vec![
+                StructField::new("bucket_key_enabled", AttributeType::Bool),
+                StructField::new("sse_algorithm", AttributeType::String),
+            ],
+        };
+
+        // Desired: only sse_algorithm specified (no bucket_key_enabled)
+        let desired = Value::Map(HashMap::from([(
+            "sse_algorithm".to_string(),
+            Value::String("AES256".to_string()),
+        )]));
+
+        // Current (from AWS): includes bucket_key_enabled: false as default
+        let current = Value::Map(HashMap::from([
+            ("bucket_key_enabled".to_string(), Value::Bool(false)),
+            (
+                "sse_algorithm".to_string(),
+                Value::String("AES256".to_string()),
+            ),
+        ]));
+
+        assert!(
+            type_aware_equal(&desired, &current, Some(&struct_type)),
+            "Struct with extra default Bool(false) should be considered equal"
+        );
+    }
+
+    #[test]
+    fn type_aware_struct_does_not_ignore_non_default_bool() {
+        use crate::schema::StructField;
+
+        let struct_type = AttributeType::Struct {
+            name: "ServerSideEncryptionRule".to_string(),
+            fields: vec![
+                StructField::new("bucket_key_enabled", AttributeType::Bool),
+                StructField::new("sse_algorithm", AttributeType::String),
+            ],
+        };
+
+        // Desired: only sse_algorithm
+        let desired = Value::Map(HashMap::from([(
+            "sse_algorithm".to_string(),
+            Value::String("AES256".to_string()),
+        )]));
+
+        // Current: bucket_key_enabled is true (non-default) — should NOT be equal
+        let current = Value::Map(HashMap::from([
+            ("bucket_key_enabled".to_string(), Value::Bool(true)),
+            (
+                "sse_algorithm".to_string(),
+                Value::String("AES256".to_string()),
+            ),
+        ]));
+
+        assert!(
+            !type_aware_equal(&desired, &current, Some(&struct_type)),
+            "Struct with non-default Bool(true) should NOT be considered equal"
+        );
+    }
+
+    #[test]
+    fn type_aware_string_enum_namespaced_vs_raw() {
+        // StringEnum with namespace
+        let enum_type = AttributeType::StringEnum {
+            name: "ServerSideEncryptionByDefaultSseAlgorithm".to_string(),
+            values: vec![
+                "aws:kms".to_string(),
+                "AES256".to_string(),
+                "aws:kms:dsse".to_string(),
+            ],
+            namespace: Some("awscc.s3.bucket".to_string()),
+            to_dsl: None,
+        };
+
+        // Namespaced form vs raw string
+        assert!(
+            type_aware_equal(
+                &Value::String(
+                    "awscc.s3.bucket.ServerSideEncryptionByDefaultSseAlgorithm.AES256".to_string()
+                ),
+                &Value::String("AES256".to_string()),
+                Some(&enum_type),
+            ),
+            "Namespaced enum and raw value should be considered equal"
+        );
+
+        // Both in namespaced form
+        assert!(
+            type_aware_equal(
+                &Value::String(
+                    "awscc.s3.bucket.ServerSideEncryptionByDefaultSseAlgorithm.AES256".to_string()
+                ),
+                &Value::String(
+                    "awscc.s3.bucket.ServerSideEncryptionByDefaultSseAlgorithm.AES256".to_string()
+                ),
+                Some(&enum_type),
+            ),
+            "Both namespaced should be equal"
+        );
+
+        // Different values should not match
+        assert!(
+            !type_aware_equal(
+                &Value::String(
+                    "awscc.s3.bucket.ServerSideEncryptionByDefaultSseAlgorithm.AES256".to_string()
+                ),
+                &Value::String("aws:kms".to_string()),
+                Some(&enum_type),
+            ),
+            "Different enum values should not be equal"
         );
     }
 }
