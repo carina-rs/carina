@@ -104,7 +104,7 @@ Shorthand formats: `free` or `Tier.free`
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `organizations_entity_path` | String | Yes | An AWS Organizations entity path. Build the path for the OU(s) using AWS Organizations IDs separated... |
+| `organizations_entity_path` | String(len: 1..) | Yes | An AWS Organizations entity path. Build the path for the OU(s) using AWS Organizations IDs separated... |
 
 ## Attribute Reference
 
@@ -130,7 +130,7 @@ Shorthand formats: `free` or `Tier.free`
 
 ### `public_default_scope_id`
 
-- **Type:** String
+- **Type:** String(len: ..=255)
 
 ### `resource_discovery_association_count`
 

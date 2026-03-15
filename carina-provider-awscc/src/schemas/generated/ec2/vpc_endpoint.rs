@@ -50,6 +50,19 @@ fn validate_private_dns_specified_domains_items(value: &Value) -> Result<(), Str
     }
 }
 
+fn validate_private_dns_specified_domains_length(value: &Value) -> Result<(), String> {
+    if let Value::String(s) = value {
+        let len = s.len();
+        if !(1..=255).contains(&len) {
+            Err(format!("String length {} is out of range 1..=255", len))
+        } else {
+            Ok(())
+        }
+    } else {
+        Ok(())
+    }
+}
+
 /// Returns the schema config for ec2_vpc_endpoint (AWS::EC2::VPCEndpoint)
 pub fn ec2_vpc_endpoint_config() -> AwsccSchemaConfig {
     AwsccSchemaConfig {
@@ -92,7 +105,13 @@ pub fn ec2_vpc_endpoint_config() -> AwsccSchemaConfig {
             }).with_description("The preference for which private domains have a private hosted zone created for and associated with the specified VPC. Only supported when private DNS...").with_provider_name("PrivateDnsPreference"),
                     StructField::new("private_dns_specified_domains", AttributeType::Custom {
                 name: "List(1..=10)".to_string(),
-                base: Box::new(AttributeType::List(Box::new(AttributeType::String))),
+                base: Box::new(AttributeType::List(Box::new(AttributeType::Custom {
+                name: "String(len: 1..=255)".to_string(),
+                base: Box::new(AttributeType::String),
+                validate: validate_private_dns_specified_domains_length,
+                namespace: None,
+                to_dsl: None,
+            }))),
                 validate: validate_private_dns_specified_domains_items,
                 namespace: None,
                 to_dsl: None,
