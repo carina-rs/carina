@@ -194,6 +194,9 @@ struct CfnProperty {
     /// Maximum length constraint (for string types)
     #[serde(default, rename = "maxLength")]
     max_length: Option<u64>,
+    /// Format constraint (e.g., "int64", "uri", "double")
+    #[serde(default)]
+    format: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -519,10 +522,22 @@ fn type_display_string(
                     "IamPolicyDocument".to_string()
                 } else {
                     let base = infer_string_type_display(prop_name, &schema.type_name);
+                    if base != "String" {
+                        return base;
+                    }
+                    // Check for numeric string pattern
+                    if let Some(ref pattern) = prop.pattern
+                        && is_numeric_string_pattern(pattern)
+                    {
+                        return "NumericString".to_string();
+                    }
+                    // Check for string format constraint
+                    if let Some(ref fmt) = prop.format {
+                        return format!("String({})", fmt);
+                    }
                     // Append length constraint if present and type is plain String
                     let effective_min = prop.min_length.filter(|&m| m > 0);
-                    if base == "String"
-                        && (effective_min.is_some() || prop.max_length.is_some())
+                    if (effective_min.is_some() || prop.max_length.is_some())
                         && prop.enum_values.is_none()
                     {
                         let range = string_length_display(effective_min, prop.max_length);
@@ -569,7 +584,14 @@ fn type_display_string(
                             .map(|&(min, max)| (Some(min), Some(max)))
                     };
                 if let Some((min, max)) = range {
-                    format!("Int({})", range_display_string(min, max))
+                    let range_str = range_display_string(min, max);
+                    if let Some(ref fmt) = prop.format {
+                        format!("Int({}, {})", range_str, fmt)
+                    } else {
+                        format!("Int({})", range_str)
+                    }
+                } else if let Some(ref fmt) = prop.format {
+                    format!("Int({})", fmt)
                 } else {
                     "Int".to_string()
                 }
@@ -590,7 +612,14 @@ fn type_display_string(
                             .map(|&(min, max)| (Some(min), Some(max)))
                     };
                 if let Some((min, max)) = range {
-                    format!("Float({})", range_display_string(min, max))
+                    let range_str = range_display_string(min, max);
+                    if let Some(ref fmt) = prop.format {
+                        format!("Float({}, {})", range_str, fmt)
+                    } else {
+                        format!("Float({})", range_str)
+                    }
+                } else if let Some(ref fmt) = prop.format {
+                    format!("Float({})", fmt)
                 } else {
                     "Float".to_string()
                 }
@@ -2295,6 +2324,15 @@ fn range_display_string(min: Option<i64>, max: Option<i64>) -> String {
     }
 }
 
+/// Check if a regex pattern represents a numeric string (digits only).
+/// Matches patterns like "[0-9]+", "^[0-9]+$", "^\d+$", etc.
+fn is_numeric_string_pattern(pattern: &str) -> bool {
+    matches!(
+        pattern,
+        "[0-9]+" | "^[0-9]+$" | "\\d+" | "^\\d+$" | "[0-9]*" | "^[0-9]*$"
+    )
+}
+
 /// Recursively collect string length constraints from a property and its array items.
 /// Treats minLength=0 as no constraint since usize is always >= 0.
 fn collect_string_length_constraints(
@@ -3100,6 +3138,26 @@ fn cfn_type_to_carina_type_with_enum(
                 return ("/* enum */".to_string(), Some(enum_info));
             }
 
+            // Check for numeric string pattern (e.g., "[0-9]+")
+            if let Some(ref pattern) = prop.pattern
+                && is_numeric_string_pattern(pattern)
+            {
+                let validate_fn = pattern_fn_name(pattern);
+                return (
+                    format!(
+                        r#"AttributeType::Custom {{
+                name: "NumericString".to_string(),
+                base: Box::new(AttributeType::String),
+                validate: {},
+                namespace: None,
+                to_dsl: None,
+            }}"#,
+                        validate_fn
+                    ),
+                    None,
+                );
+            }
+
             // Check for regex pattern constraint
             if let Some(pattern) = &prop.pattern {
                 let validate_fn = pattern_fn_name(pattern);
@@ -3113,6 +3171,23 @@ fn cfn_type_to_carina_type_with_enum(
                 to_dsl: None,
             }}"#,
                         validate_fn
+                    ),
+                    None,
+                );
+            }
+
+            // Check for string format constraint (e.g., "uri", "date-time")
+            if let Some(ref fmt) = prop.format {
+                return (
+                    format!(
+                        r#"AttributeType::Custom {{
+                name: "String({})".to_string(),
+                base: Box::new(AttributeType::String),
+                validate: |_| Ok(()),
+                namespace: None,
+                to_dsl: None,
+            }}"#,
+                        fmt
                     ),
                     None,
                 );
@@ -3196,7 +3271,12 @@ fn cfn_type_to_carina_type_with_enum(
             if let Some((min, max)) = range {
                 // Generate a ranged int type with validation
                 let validate_fn = format!("validate_{}_range", prop_name.to_snake_case());
-                let display = range_display_string(min, max);
+                let range_str = range_display_string(min, max);
+                let display = if let Some(ref fmt) = prop.format {
+                    format!("{}, {}", range_str, fmt)
+                } else {
+                    range_str
+                };
                 (
                     format!(
                         r#"AttributeType::Custom {{
@@ -3207,6 +3287,21 @@ fn cfn_type_to_carina_type_with_enum(
                 to_dsl: None,
             }}"#,
                         display, validate_fn
+                    ),
+                    None,
+                )
+            } else if let Some(ref fmt) = prop.format {
+                // Format-only integer (e.g., int64) - informational, no range validation
+                (
+                    format!(
+                        r#"AttributeType::Custom {{
+                name: "Int({})".to_string(),
+                base: Box::new(AttributeType::Int),
+                validate: |_| Ok(()),
+                namespace: None,
+                to_dsl: None,
+            }}"#,
+                        fmt
                     ),
                     None,
                 )
@@ -3247,7 +3342,12 @@ fn cfn_type_to_carina_type_with_enum(
             if let Some((min, max)) = range {
                 // Generate a ranged float type with validation
                 let validate_fn = format!("validate_{}_range", prop_name.to_snake_case());
-                let display = range_display_string(min, max);
+                let range_str = range_display_string(min, max);
+                let display = if let Some(ref fmt) = prop.format {
+                    format!("{}, {}", range_str, fmt)
+                } else {
+                    range_str
+                };
                 (
                     format!(
                         r#"AttributeType::Custom {{
@@ -3258,6 +3358,21 @@ fn cfn_type_to_carina_type_with_enum(
                 to_dsl: None,
             }}"#,
                         display, validate_fn
+                    ),
+                    None,
+                )
+            } else if let Some(ref fmt) = prop.format {
+                // Format-only float (e.g., double) - informational, no range validation
+                (
+                    format!(
+                        r#"AttributeType::Custom {{
+                name: "Float({})".to_string(),
+                base: Box::new(AttributeType::Float),
+                validate: |_| Ok(()),
+                namespace: None,
+                to_dsl: None,
+            }}"#,
+                        fmt
                     ),
                     None,
                 )
@@ -3657,6 +3772,7 @@ mod tests {
             max_items: None,
             min_length: None,
             max_length: None,
+            format: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::SecurityGroupIngress".to_string(),
@@ -3733,6 +3849,7 @@ mod tests {
             max_items: None,
             min_length: None,
             max_length: None,
+            format: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::SecurityGroupIngress".to_string(),
@@ -3776,6 +3893,7 @@ mod tests {
             max_items: None,
             min_length: None,
             max_length: None,
+            format: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::SecurityGroupIngress".to_string(),
@@ -3819,6 +3937,7 @@ mod tests {
             max_items: None,
             min_length: None,
             max_length: None,
+            format: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::NatGateway".to_string(),
@@ -3867,6 +3986,7 @@ mod tests {
             max_items: None,
             min_length: None,
             max_length: None,
+            format: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::EIP".to_string(),
@@ -3910,6 +4030,7 @@ mod tests {
             max_items: None,
             min_length: None,
             max_length: None,
+            format: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::NatGateway".to_string(),
@@ -3957,6 +4078,7 @@ mod tests {
             max_items: None,
             min_length: None,
             max_length: None,
+            format: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::Subnet".to_string(),
@@ -4055,6 +4177,7 @@ mod tests {
             max_items: None,
             min_length: None,
             max_length: None,
+            format: None,
         };
         assert_eq!(
             list_element_type_display(&prop, "GenericProp", ""),
@@ -4081,6 +4204,7 @@ mod tests {
             max_items: None,
             min_length: None,
             max_length: None,
+            format: None,
         };
         assert_eq!(
             list_element_type_display(&prop, "GenericProp", ""),
@@ -4107,6 +4231,7 @@ mod tests {
             max_items: None,
             min_length: None,
             max_length: None,
+            format: None,
         };
         assert_eq!(
             list_element_type_display(&prop, "GenericProp", ""),
@@ -4133,6 +4258,7 @@ mod tests {
             max_items: None,
             min_length: None,
             max_length: None,
+            format: None,
         };
         assert_eq!(
             list_element_type_display(&prop, "GenericProp", ""),
@@ -4161,6 +4287,7 @@ mod tests {
             max_items: None,
             min_length: None,
             max_length: None,
+            format: None,
         };
         assert_eq!(
             list_element_type_display(&prop, "SubnetIds", ""),
@@ -4230,6 +4357,7 @@ mod tests {
                 max_items: None,
                 min_length: None,
                 max_length: None,
+                format: None,
             })),
             ref_path: None,
             insertion_order: None,
@@ -4245,6 +4373,7 @@ mod tests {
             max_items: None,
             min_length: None,
             max_length: None,
+            format: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::VPC".to_string(),
@@ -4291,6 +4420,7 @@ mod tests {
                 max_items: None,
                 min_length: None,
                 max_length: None,
+                format: None,
             })),
             ref_path: None,
             insertion_order: None,
@@ -4306,6 +4436,7 @@ mod tests {
             max_items: None,
             min_length: None,
             max_length: None,
+            format: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::VPC".to_string(),
@@ -4348,6 +4479,7 @@ mod tests {
             max_items: None,
             min_length: None,
             max_length: None,
+            format: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::VPC".to_string(),
@@ -4401,6 +4533,7 @@ mod tests {
                 max_items: None,
                 min_length: None,
                 max_length: None,
+                format: None,
             };
             let result = list_element_type_display(&prop, "GenericProp", "");
             assert!(
@@ -4450,6 +4583,7 @@ mod tests {
             max_items: None,
             min_length: None,
             max_length: None,
+            format: None,
         };
         let result = type_display_string("Prop1", &prop, &schema, &enums);
         assert_ne!(
@@ -4481,6 +4615,7 @@ mod tests {
                 max_items: None,
                 min_length: None,
                 max_length: None,
+                format: None,
             })),
             ref_path: None,
             insertion_order: None,
@@ -4496,6 +4631,7 @@ mod tests {
             max_items: None,
             min_length: None,
             max_length: None,
+            format: None,
         };
         let result = type_display_string("Prop2", &prop, &schema, &enums);
         assert_ne!(
@@ -4527,6 +4663,7 @@ mod tests {
                 max_items: None,
                 min_length: None,
                 max_length: None,
+                format: None,
             })),
             ref_path: None,
             insertion_order: None,
@@ -4542,6 +4679,7 @@ mod tests {
             max_items: None,
             min_length: None,
             max_length: None,
+            format: None,
         };
         let result = type_display_string("Prop3", &prop, &schema, &enums);
         assert_ne!(
@@ -4573,6 +4711,7 @@ mod tests {
                 max_items: None,
                 min_length: None,
                 max_length: None,
+                format: None,
             })),
             ref_path: None,
             insertion_order: None,
@@ -4588,6 +4727,7 @@ mod tests {
             max_items: None,
             min_length: None,
             max_length: None,
+            format: None,
         };
         let result = type_display_string("Prop4", &prop, &schema, &enums);
         assert_ne!(
@@ -4617,6 +4757,7 @@ mod tests {
             max_items: None,
             min_length: None,
             max_length: None,
+            format: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::VPC".to_string(),
@@ -4675,6 +4816,7 @@ mod tests {
             max_items: None,
             min_length: None,
             max_length: None,
+            format: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::VPC".to_string(),
@@ -4715,6 +4857,7 @@ mod tests {
             max_items: None,
             min_length: None,
             max_length: None,
+            format: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::VPC".to_string(),
@@ -4764,6 +4907,7 @@ mod tests {
             max_items: None,
             min_length: None,
             max_length: None,
+            format: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::VPC".to_string(),
@@ -4819,6 +4963,7 @@ mod tests {
             max_items: None,
             min_length: None,
             max_length: None,
+            format: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::Logs::LogGroup".to_string(),
@@ -4877,6 +5022,7 @@ mod tests {
             max_items: None,
             min_length: None,
             max_length: None,
+            format: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::NatGateway".to_string(),
@@ -4921,6 +5067,7 @@ mod tests {
             max_items: None,
             min_length: None,
             max_length: None,
+            format: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::SomeService::Resource".to_string(),
@@ -4965,6 +5112,7 @@ mod tests {
             max_items: None,
             min_length: None,
             max_length: None,
+            format: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::Logs::LogGroup".to_string(),
@@ -5008,6 +5156,7 @@ mod tests {
             max_items: None,
             min_length: None,
             max_length: None,
+            format: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::VPC".to_string(),
@@ -5085,6 +5234,7 @@ mod tests {
             max_items: None,
             min_length: None,
             max_length: None,
+            format: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::VPC".to_string(),
@@ -5130,6 +5280,7 @@ mod tests {
             max_items: None,
             min_length: None,
             max_length: None,
+            format: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::SecurityGroupIngress".to_string(),
@@ -5174,6 +5325,7 @@ mod tests {
             max_items: None,
             min_length: None,
             max_length: None,
+            format: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::S3::Bucket".to_string(),
@@ -5231,6 +5383,7 @@ mod tests {
             max_items: None,
             min_length: None,
             max_length: None,
+            format: None,
         };
         let schema = CfnSchema {
             type_name: "AWS::EC2::SecurityGroupIngress".to_string(),
@@ -5897,6 +6050,7 @@ mod tests {
                 max_items: None,
                 min_length: None,
                 max_length: None,
+                format: None,
             },
         );
 
@@ -5961,6 +6115,7 @@ mod tests {
                 max_items: None,
                 min_length: None,
                 max_length: None,
+                format: None,
             },
         );
 
@@ -6000,6 +6155,7 @@ mod tests {
                 max_items: None,
                 min_length: None,
                 max_length: None,
+                format: None,
             },
         );
 
@@ -7710,5 +7866,261 @@ mod tests {
             fn_count, 1,
             "Should generate exactly one shared items validation function, got {fn_count}: {generated}"
         );
+    }
+
+    #[test]
+    fn test_integer_format_int64_generates_int_with_format() {
+        // "type": "integer", "format": "int64" should include int64 in type name
+        let prop = CfnProperty {
+            prop_type: Some(TypeValue::Single("integer".to_string())),
+            description: Some("A 64-bit integer value".to_string()),
+            format: Some("int64".to_string()),
+            ..CfnProperty::default()
+        };
+        let schema = CfnSchema {
+            type_name: "AWS::Test::Resource".to_string(),
+            description: None,
+            properties: BTreeMap::new(),
+            required: vec![],
+            read_only_properties: vec![],
+            create_only_properties: vec![],
+            write_only_properties: vec![],
+            primary_identifier: None,
+            definitions: None,
+            tagging: None,
+        };
+        let (type_str, _) =
+            cfn_type_to_carina_type_with_enum(&prop, "SomeValue", &schema, "", &BTreeMap::new());
+        assert!(
+            type_str.contains("int64"),
+            "int64 format should appear in type: {type_str}"
+        );
+    }
+
+    #[test]
+    fn test_integer_format_int64_display() {
+        // Markdown display for int64 should show Int(int64)
+        let prop = CfnProperty {
+            prop_type: Some(TypeValue::Single("integer".to_string())),
+            description: Some("A 64-bit integer value".to_string()),
+            format: Some("int64".to_string()),
+            ..CfnProperty::default()
+        };
+        let schema = CfnSchema {
+            type_name: "AWS::Test::Resource".to_string(),
+            description: None,
+            properties: BTreeMap::new(),
+            required: vec![],
+            read_only_properties: vec![],
+            create_only_properties: vec![],
+            write_only_properties: vec![],
+            primary_identifier: None,
+            definitions: None,
+            tagging: None,
+        };
+        let display = type_display_string("SomeValue", &prop, &schema, &BTreeMap::new());
+        assert!(
+            display.contains("int64"),
+            "int64 format should appear in display: {display}"
+        );
+    }
+
+    #[test]
+    fn test_string_format_uri_type() {
+        // "type": "string", "format": "uri" should produce String(uri) type
+        let prop = CfnProperty {
+            prop_type: Some(TypeValue::Single("string".to_string())),
+            description: Some("A URL".to_string()),
+            format: Some("uri".to_string()),
+            ..CfnProperty::default()
+        };
+        let schema = CfnSchema {
+            type_name: "AWS::Test::Resource".to_string(),
+            description: None,
+            properties: BTreeMap::new(),
+            required: vec![],
+            read_only_properties: vec![],
+            create_only_properties: vec![],
+            write_only_properties: vec![],
+            primary_identifier: None,
+            definitions: None,
+            tagging: None,
+        };
+        let (type_str, _) =
+            cfn_type_to_carina_type_with_enum(&prop, "Url", &schema, "", &BTreeMap::new());
+        assert!(
+            type_str.contains("uri"),
+            "uri format should appear in type: {type_str}"
+        );
+    }
+
+    #[test]
+    fn test_string_format_uri_display() {
+        // "type": "string", "format": "uri" should show String(uri) in display
+        let prop = CfnProperty {
+            prop_type: Some(TypeValue::Single("string".to_string())),
+            description: Some("A URL".to_string()),
+            format: Some("uri".to_string()),
+            ..CfnProperty::default()
+        };
+        let schema = CfnSchema {
+            type_name: "AWS::Test::Resource".to_string(),
+            description: None,
+            properties: BTreeMap::new(),
+            required: vec![],
+            read_only_properties: vec![],
+            create_only_properties: vec![],
+            write_only_properties: vec![],
+            primary_identifier: None,
+            definitions: None,
+            tagging: None,
+        };
+        let display = type_display_string("Url", &prop, &schema, &BTreeMap::new());
+        assert!(
+            display.contains("uri"),
+            "uri format should appear in display: {display}"
+        );
+    }
+
+    #[test]
+    fn test_numeric_string_pattern_generates_numeric_string_type() {
+        // "type": "string", "pattern": "[0-9]+" should be treated as numeric string
+        let prop = CfnProperty {
+            prop_type: Some(TypeValue::Single("string".to_string())),
+            description: Some("Object size in bytes".to_string()),
+            pattern: Some("[0-9]+".to_string()),
+            max_length: Some(20),
+            ..CfnProperty::default()
+        };
+        let schema = CfnSchema {
+            type_name: "AWS::S3::Bucket".to_string(),
+            description: None,
+            properties: BTreeMap::new(),
+            required: vec![],
+            read_only_properties: vec![],
+            create_only_properties: vec![],
+            write_only_properties: vec![],
+            primary_identifier: None,
+            definitions: None,
+            tagging: None,
+        };
+        let (type_str, _) = cfn_type_to_carina_type_with_enum(
+            &prop,
+            "ObjectSizeGreaterThan",
+            &schema,
+            "",
+            &BTreeMap::new(),
+        );
+        assert!(
+            type_str.contains("NumericString"),
+            "Numeric string pattern should produce NumericString type: {type_str}"
+        );
+    }
+
+    #[test]
+    fn test_numeric_string_pattern_display() {
+        // Markdown display for numeric string pattern
+        let prop = CfnProperty {
+            prop_type: Some(TypeValue::Single("string".to_string())),
+            description: Some("Object size in bytes".to_string()),
+            pattern: Some("[0-9]+".to_string()),
+            max_length: Some(20),
+            ..CfnProperty::default()
+        };
+        let schema = CfnSchema {
+            type_name: "AWS::S3::Bucket".to_string(),
+            description: None,
+            properties: BTreeMap::new(),
+            required: vec![],
+            read_only_properties: vec![],
+            create_only_properties: vec![],
+            write_only_properties: vec![],
+            primary_identifier: None,
+            definitions: None,
+            tagging: None,
+        };
+        let display =
+            type_display_string("ObjectSizeGreaterThan", &prop, &schema, &BTreeMap::new());
+        assert!(
+            display.contains("NumericString"),
+            "Numeric string should show NumericString in display: {display}"
+        );
+    }
+
+    #[test]
+    fn test_number_format_double_display() {
+        // "type": "number", "format": "double" should show Float(double) in display
+        let prop = CfnProperty {
+            prop_type: Some(TypeValue::Single("number".to_string())),
+            description: Some("A floating point value".to_string()),
+            format: Some("double".to_string()),
+            ..CfnProperty::default()
+        };
+        let schema = CfnSchema {
+            type_name: "AWS::Test::Resource".to_string(),
+            description: None,
+            properties: BTreeMap::new(),
+            required: vec![],
+            read_only_properties: vec![],
+            create_only_properties: vec![],
+            write_only_properties: vec![],
+            primary_identifier: None,
+            definitions: None,
+            tagging: None,
+        };
+        let display = type_display_string("Value", &prop, &schema, &BTreeMap::new());
+        assert!(
+            display.contains("double"),
+            "double format should appear in display: {display}"
+        );
+    }
+
+    #[test]
+    fn test_integer_format_int64_with_range_combines() {
+        // "type": "integer", "format": "int64", "minimum": 0, "maximum": 100
+        // should show both the format and range
+        let prop = CfnProperty {
+            prop_type: Some(TypeValue::Single("integer".to_string())),
+            description: Some("A bounded int64 value".to_string()),
+            format: Some("int64".to_string()),
+            minimum: Some(0),
+            maximum: Some(100),
+            ..CfnProperty::default()
+        };
+        let schema = CfnSchema {
+            type_name: "AWS::Test::Resource".to_string(),
+            description: None,
+            properties: BTreeMap::new(),
+            required: vec![],
+            read_only_properties: vec![],
+            create_only_properties: vec![],
+            write_only_properties: vec![],
+            primary_identifier: None,
+            definitions: None,
+            tagging: None,
+        };
+        let (type_str, _) =
+            cfn_type_to_carina_type_with_enum(&prop, "BoundedValue", &schema, "", &BTreeMap::new());
+        // Should have range validation (0..=100) and int64 format info
+        assert!(
+            type_str.contains("0..=100"),
+            "Should have range constraint: {type_str}"
+        );
+        assert!(
+            type_str.contains("int64"),
+            "Should have int64 format info: {type_str}"
+        );
+    }
+
+    #[test]
+    fn test_format_field_parsed_from_schema() {
+        // Verify that the format field is correctly parsed from JSON
+        let json = r#"{
+            "type": "integer",
+            "format": "int64",
+            "description": "Test"
+        }"#;
+        let prop: CfnProperty = serde_json::from_str(json).unwrap();
+        assert_eq!(prop.format, Some("int64".to_string()));
     }
 }

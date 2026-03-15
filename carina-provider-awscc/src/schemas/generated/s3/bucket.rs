@@ -547,14 +547,14 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                     ],
                 }))).with_description("For buckets with versioning enabled (or suspended), one or more transition rules that specify when non-current objects transition to a specified stora...").with_provider_name("NoncurrentVersionTransitions"),
                     StructField::new("object_size_greater_than", AttributeType::Custom {
-                name: "String(pattern)".to_string(),
+                name: "NumericString".to_string(),
                 base: Box::new(AttributeType::String),
                 validate: validate_string_pattern_3ee03875337c12ab,
                 namespace: None,
                 to_dsl: None,
             }).with_description("Specifies the minimum object size in bytes for this rule to apply to. Objects must be larger than this value in bytes. For more information about size...").with_provider_name("ObjectSizeGreaterThan"),
                     StructField::new("object_size_less_than", AttributeType::Custom {
-                name: "String(pattern)".to_string(),
+                name: "NumericString".to_string(),
                 base: Box::new(AttributeType::String),
                 validate: validate_string_pattern_3ee03875337c12ab,
                 namespace: None,
@@ -1164,7 +1164,13 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                 .with_provider_name("WebsiteConfiguration"),
         )
         .attribute(
-            AttributeSchema::new("website_url", AttributeType::String)
+            AttributeSchema::new("website_url", AttributeType::Custom {
+                name: "String(uri)".to_string(),
+                base: Box::new(AttributeType::String),
+                validate: |_| Ok(()),
+                namespace: None,
+                to_dsl: None,
+            })
                 .with_description(" (read-only)")
                 .with_provider_name("WebsiteURL"),
         )
