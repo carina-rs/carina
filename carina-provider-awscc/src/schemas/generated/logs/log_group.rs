@@ -29,19 +29,22 @@ fn validate_retention_in_days_int_enum(value: &Value) -> Result<(), String> {
     }
 }
 
-fn validate_string_pattern_b6dfbc56753dfe38(value: &Value) -> Result<(), String> {
+fn validate_string_pattern_b6dfbc56753dfe38_len_1_512(value: &Value) -> Result<(), String> {
     if let Value::String(s) = value {
         static RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
             Regex::new("^[.\\-_/#A-Za-z0-9]{1,512}\\z").expect("invalid pattern regex")
         });
-        if RE.is_match(s) {
-            Ok(())
-        } else {
-            Err(format!(
+        if !RE.is_match(s) {
+            return Err(format!(
                 "Value '{}' does not match pattern ^[.\\-_/#A-Za-z0-9]{{1,512}}\\z",
                 s
-            ))
+            ));
         }
+        let len = s.len();
+        if !(1..=512).contains(&len) {
+            return Err(format!("String length {} is out of range 1..=512", len));
+        }
+        Ok(())
     } else {
         Err("Expected string".to_string())
     }
@@ -94,9 +97,9 @@ pub fn logs_log_group_config() -> AwsccSchemaConfig {
         )
         .attribute(
             AttributeSchema::new("log_group_name", AttributeType::Custom {
-                name: "String(pattern)".to_string(),
+                name: "String(pattern, len: 1..=512)".to_string(),
                 base: Box::new(AttributeType::String),
-                validate: validate_string_pattern_b6dfbc56753dfe38,
+                validate: validate_string_pattern_b6dfbc56753dfe38_len_1_512,
                 namespace: None,
                 to_dsl: None,
             })

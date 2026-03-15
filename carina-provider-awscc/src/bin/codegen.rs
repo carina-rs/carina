@@ -228,6 +228,12 @@ struct CfnDefinition {
     /// Regex pattern constraint (for string-typed definitions)
     #[serde(default)]
     pattern: Option<String>,
+    /// Minimum string length constraint (for string-typed definitions)
+    #[serde(default, rename = "minLength")]
+    min_length: Option<u64>,
+    /// Maximum string length constraint (for string-typed definitions)
+    #[serde(default, rename = "maxLength")]
+    max_length: Option<u64>,
 }
 
 /// Compute module name from CloudFormation type name
@@ -525,21 +531,30 @@ fn type_display_string(
                     if base != "String" {
                         return base;
                     }
+                    let effective_min = prop.min_length.filter(|&m| m > 0);
+                    let has_length = effective_min.is_some() || prop.max_length.is_some();
                     // Check for numeric string pattern
                     if let Some(ref pattern) = prop.pattern
                         && is_numeric_string_pattern(pattern)
                     {
-                        return "NumericString".to_string();
+                        return if has_length {
+                            let range = string_length_display(effective_min, prop.max_length);
+                            format!("NumericString(len: {})", range)
+                        } else {
+                            "NumericString".to_string()
+                        };
+                    }
+                    // Check for pattern + length combination
+                    if prop.pattern.is_some() && has_length {
+                        let range = string_length_display(effective_min, prop.max_length);
+                        return format!("String(pattern, len: {})", range);
                     }
                     // Check for string format constraint
                     if let Some(ref fmt) = prop.format {
                         return format!("String({})", fmt);
                     }
                     // Append length constraint if present and type is plain String
-                    let effective_min = prop.min_length.filter(|&m| m > 0);
-                    if (effective_min.is_some() || prop.max_length.is_some())
-                        && prop.enum_values.is_none()
-                    {
+                    if has_length && prop.enum_values.is_none() {
                         let range = string_length_display(effective_min, prop.max_length);
                         format!("String(len: {})", range)
                     } else {
@@ -1056,6 +1071,10 @@ fn generate_schema_code(schema: &CfnSchema, type_name: &str) -> Result<String> {
     let mut ranged_lists: BTreeMap<String, (Option<i64>, Option<i64>)> = BTreeMap::new();
     let mut patterns: BTreeMap<String, String> = BTreeMap::new();
     let mut ranged_strings: BTreeMap<String, (Option<u64>, Option<u64>)> = BTreeMap::new();
+    // Combined pattern + length constraints: pattern -> (min_length, max_length)
+    let mut pattern_with_lengths: BTreeMap<String, (Option<u64>, Option<u64>)> = BTreeMap::new();
+    // Patterns that are used standalone (without length constraints)
+    let mut patterns_used_standalone: HashSet<String> = HashSet::new();
 
     for (prop_name, prop) in &schema.properties {
         let (attr_type, enum_info) =
@@ -1169,6 +1188,16 @@ fn generate_schema_code(schema: &CfnSchema, type_name: &str) -> Result<String> {
                     .and_then(|def| def.pattern.clone())
             });
             if let Some(pattern) = pattern {
+                // Check if this pattern also has length constraints
+                let effective_min = prop.min_length.filter(|&m| m > 0);
+                let has_length = effective_min.is_some() || prop.max_length.is_some();
+                if has_length {
+                    pattern_with_lengths
+                        .entry(pattern.clone())
+                        .or_insert((effective_min, prop.max_length));
+                } else {
+                    patterns_used_standalone.insert(pattern.clone());
+                }
                 patterns.insert(prop_name.clone(), pattern);
             }
         }
@@ -1249,8 +1278,19 @@ fn generate_schema_code(schema: &CfnSchema, type_name: &str) -> Result<String> {
                             field_prop, field_name, schema, &namespace, &enums,
                         );
                         if field_type.contains("validate_") && field_type.contains("_pattern") {
-                            patterns
-                                .insert(field_name.clone(), field_prop.pattern.clone().unwrap());
+                            let pattern = field_prop.pattern.clone().unwrap();
+                            // Check if this pattern also has length constraints
+                            let effective_min = field_prop.min_length.filter(|&m| m > 0);
+                            let has_length =
+                                effective_min.is_some() || field_prop.max_length.is_some();
+                            if has_length {
+                                pattern_with_lengths
+                                    .entry(pattern.clone())
+                                    .or_insert((effective_min, field_prop.max_length));
+                            } else {
+                                patterns_used_standalone.insert(pattern.clone());
+                            }
+                            patterns.insert(field_name.clone(), pattern);
                         }
                     }
                     // Collect pattern constraints from $ref to string definitions with patterns
@@ -1264,6 +1304,17 @@ fn generate_schema_code(schema: &CfnSchema, type_name: &str) -> Result<String> {
                             field_prop, field_name, schema, &namespace, &enums,
                         );
                         if field_type.contains("validate_") && field_type.contains("_pattern") {
+                            // Check length constraints from the $ref definition
+                            let effective_min = ref_def.min_length.filter(|&m| m > 0);
+                            let has_length =
+                                effective_min.is_some() || ref_def.max_length.is_some();
+                            if has_length {
+                                pattern_with_lengths
+                                    .entry(pattern.clone())
+                                    .or_insert((effective_min, ref_def.max_length));
+                            } else {
+                                patterns_used_standalone.insert(pattern.clone());
+                            }
                             patterns.insert(field_name.clone(), pattern.clone());
                         }
                     }
@@ -1508,10 +1559,19 @@ fn {}(value: &Value) -> Result<(), String> {{
 
     // Generate pattern validation functions for string properties (deduplicated)
     // Multiple properties with the same pattern share one validation function.
+    // Skip patterns that are only used with combined length constraints
+    // (those get combined validation functions generated separately).
     {
         let mut generated_patterns: HashSet<String> = HashSet::new();
         for pattern in patterns.values() {
             if generated_patterns.contains(pattern) {
+                continue;
+            }
+            // Skip if this pattern is only used with combined length constraints
+            if pattern_with_lengths.contains_key(pattern)
+                && !patterns_used_standalone.contains(pattern)
+            {
+                generated_patterns.insert(pattern.clone());
                 continue;
             }
             generated_patterns.insert(pattern.clone());
@@ -1609,6 +1669,43 @@ fn {}(value: &Value) -> Result<(), String> {{
 
 "#,
                 fn_name, condition, range_display
+            ));
+        }
+    }
+
+    // Generate combined pattern + length validation functions (deduplicated)
+    {
+        let mut generated_combined: HashSet<String> = HashSet::new();
+        for (pattern, (min, max)) in &pattern_with_lengths {
+            let fn_name = pattern_and_length_fn_name(pattern, *min, *max);
+            if generated_combined.contains(&fn_name) {
+                continue;
+            }
+            generated_combined.insert(fn_name.clone());
+            let rust_pattern = pattern.replace("\\Z", "\\z");
+            let escaped_for_rust = rust_pattern.replace('\\', "\\\\").replace('"', "\\\"");
+            let escaped_for_msg = escaped_for_rust.replace('{', "{{").replace('}', "}}");
+            let (len_condition, range_display) = string_length_condition_and_display(*min, *max);
+            code.push_str(&format!(
+                r#"fn {fn_name}(value: &Value) -> Result<(), String> {{
+    if let Value::String(s) = value {{
+        static RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {{
+            Regex::new("{escaped_for_rust}").expect("invalid pattern regex")
+        }});
+        if !RE.is_match(s) {{
+            return Err(format!("Value '{{}}' does not match pattern {escaped_for_msg}", s));
+        }}
+        let len = s.len();
+        if {len_condition} {{
+            return Err(format!("String length {{}} is out of range {range_display}", len));
+        }}
+        Ok(())
+    }} else {{
+        Err("Expected string".to_string())
+    }}
+}}
+
+"#
             ));
         }
     }
@@ -2401,6 +2498,31 @@ fn pattern_fn_name(pattern: &str) -> String {
     format!("validate_string_pattern_{:016x}", hash)
 }
 
+/// Generate a constraint-based function name for combined pattern + length validation.
+/// Uses a hash of the pattern combined with length bounds.
+fn pattern_and_length_fn_name(pattern: &str, min: Option<u64>, max: Option<u64>) -> String {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    pattern.hash(&mut hasher);
+    let hash = hasher.finish();
+    let effective_min = min.filter(|&m| m > 0);
+    match (effective_min, max) {
+        (Some(min_val), Some(max_val)) => {
+            format!(
+                "validate_string_pattern_{:016x}_len_{min_val}_{max_val}",
+                hash
+            )
+        }
+        (Some(min_val), None) => {
+            format!("validate_string_pattern_{:016x}_len_min_{min_val}", hash)
+        }
+        (None, Some(max_val)) => {
+            format!("validate_string_pattern_{:016x}_len_max_{max_val}", hash)
+        }
+        (None, None) => pattern_fn_name(pattern),
+    }
+}
+
 /// Generate condition string and display string for string length validation.
 /// Treats min=0 as no minimum since `usize` is always >= 0.
 fn string_length_condition_and_display(min: Option<u64>, max: Option<u64>) -> (String, String) {
@@ -3031,17 +3153,29 @@ fn cfn_type_to_carina_type_with_enum(
             {
                 // Check if name-based heuristics would override the type
                 if infer_string_type(prop_name, &schema.type_name).is_none() {
-                    let validate_fn = pattern_fn_name(pattern);
+                    let effective_min = def.min_length.filter(|&m| m > 0);
+                    let has_length = effective_min.is_some() || def.max_length.is_some();
+                    let validate_fn = if has_length {
+                        pattern_and_length_fn_name(pattern, effective_min, def.max_length)
+                    } else {
+                        pattern_fn_name(pattern)
+                    };
+                    let name = if has_length {
+                        let range = string_length_display(effective_min, def.max_length);
+                        format!("String(pattern, len: {})", range)
+                    } else {
+                        "String(pattern)".to_string()
+                    };
                     return (
                         format!(
                             r#"AttributeType::Custom {{
-                name: "String(pattern)".to_string(),
+                name: "{}".to_string(),
                 base: Box::new(AttributeType::String),
                 validate: {},
                 namespace: None,
                 to_dsl: None,
             }}"#,
-                            validate_fn
+                            name, validate_fn
                         ),
                         None,
                     );
@@ -3138,21 +3272,35 @@ fn cfn_type_to_carina_type_with_enum(
                 return ("/* enum */".to_string(), Some(enum_info));
             }
 
+            // Check for string length constraints
+            let effective_min = prop.min_length.filter(|&m| m > 0);
+            let has_length = effective_min.is_some() || prop.max_length.is_some();
+
             // Check for numeric string pattern (e.g., "[0-9]+")
             if let Some(ref pattern) = prop.pattern
                 && is_numeric_string_pattern(pattern)
             {
-                let validate_fn = pattern_fn_name(pattern);
+                let validate_fn = if has_length {
+                    pattern_and_length_fn_name(pattern, effective_min, prop.max_length)
+                } else {
+                    pattern_fn_name(pattern)
+                };
+                let name = if has_length {
+                    let range = string_length_display(effective_min, prop.max_length);
+                    format!("NumericString(len: {})", range)
+                } else {
+                    "NumericString".to_string()
+                };
                 return (
                     format!(
                         r#"AttributeType::Custom {{
-                name: "NumericString".to_string(),
+                name: "{}".to_string(),
                 base: Box::new(AttributeType::String),
                 validate: {},
                 namespace: None,
                 to_dsl: None,
             }}"#,
-                        validate_fn
+                        name, validate_fn
                     ),
                     None,
                 );
@@ -3160,17 +3308,27 @@ fn cfn_type_to_carina_type_with_enum(
 
             // Check for regex pattern constraint
             if let Some(pattern) = &prop.pattern {
-                let validate_fn = pattern_fn_name(pattern);
+                let validate_fn = if has_length {
+                    pattern_and_length_fn_name(pattern, effective_min, prop.max_length)
+                } else {
+                    pattern_fn_name(pattern)
+                };
+                let name = if has_length {
+                    let range = string_length_display(effective_min, prop.max_length);
+                    format!("String(pattern, len: {})", range)
+                } else {
+                    "String(pattern)".to_string()
+                };
                 return (
                     format!(
                         r#"AttributeType::Custom {{
-                name: "String(pattern)".to_string(),
+                name: "{}".to_string(),
                 base: Box::new(AttributeType::String),
                 validate: {},
                 namespace: None,
                 to_dsl: None,
             }}"#,
-                        validate_fn
+                        name, validate_fn
                     ),
                     None,
                 );
@@ -3194,9 +3352,7 @@ fn cfn_type_to_carina_type_with_enum(
             }
 
             // Check for string length constraints (minLength/maxLength)
-            // Treat minLength=0 as no constraint since usize is always >= 0
-            let effective_min = prop.min_length.filter(|&m| m > 0);
-            if effective_min.is_some() || prop.max_length.is_some() {
+            if has_length {
                 let validate_fn = string_length_fn_name(effective_min, prop.max_length);
                 let display = string_length_display(effective_min, prop.max_length);
                 return (
@@ -6130,6 +6286,8 @@ mod tests {
                 pattern: None,
                 items: None,
                 enum_values: None,
+                min_length: None,
+                max_length: None,
             },
         );
 
@@ -6288,6 +6446,8 @@ mod tests {
                     EnumValue::Str("GET".to_string()),
                     EnumValue::Str("POST".to_string()),
                 ]),
+                min_length: None,
+                max_length: None,
             },
         );
         let prop = CfnProperty {
@@ -6345,6 +6505,8 @@ mod tests {
                     ..Default::default()
                 })),
                 enum_values: None,
+                min_length: None,
+                max_length: None,
             },
         );
         let prop = CfnProperty {
@@ -6448,6 +6610,8 @@ mod tests {
                 items: None,
                 one_of: vec![],
                 pattern: None,
+                min_length: None,
+                max_length: None,
             },
         );
 
@@ -6507,6 +6671,8 @@ mod tests {
                 items: None,
                 one_of: vec![],
                 pattern: None,
+                min_length: None,
+                max_length: None,
             },
         );
         definitions.insert(
@@ -6522,6 +6688,8 @@ mod tests {
                 items: None,
                 one_of: vec![],
                 pattern: None,
+                min_length: None,
+                max_length: None,
             },
         );
 
@@ -6591,6 +6759,8 @@ mod tests {
                 items: None,
                 one_of: vec![],
                 pattern: None,
+                min_length: None,
+                max_length: None,
             },
         );
         definitions.insert(
@@ -6603,6 +6773,8 @@ mod tests {
                 items: None,
                 one_of: vec![],
                 pattern: None,
+                min_length: None,
+                max_length: None,
             },
         );
         definitions.insert(
@@ -6618,6 +6790,8 @@ mod tests {
                 items: None,
                 one_of: vec![],
                 pattern: None,
+                min_length: None,
+                max_length: None,
             },
         );
 
@@ -6711,6 +6885,8 @@ mod tests {
                 items: None,
                 one_of: vec![],
                 pattern: None,
+                min_length: None,
+                max_length: None,
             },
         );
         definitions.insert(
@@ -6723,6 +6899,8 @@ mod tests {
                 items: None,
                 one_of: vec![],
                 pattern: None,
+                min_length: None,
+                max_length: None,
             },
         );
 
@@ -6820,6 +6998,8 @@ mod tests {
                 items: None,
                 one_of: vec![],
                 pattern: None,
+                min_length: None,
+                max_length: None,
             },
         );
 
@@ -7312,6 +7492,8 @@ mod tests {
                 pattern: None,
                 items: None,
                 enum_values: None,
+                min_length: None,
+                max_length: None,
             },
         );
 
@@ -7823,6 +8005,8 @@ mod tests {
                 items: None,
                 enum_values: None,
                 pattern: None,
+                min_length: None,
+                max_length: None,
             },
         );
 
@@ -8109,6 +8293,84 @@ mod tests {
         assert!(
             type_str.contains("int64"),
             "Should have int64 format info: {type_str}"
+        );
+    }
+
+    #[test]
+    fn test_numeric_string_pattern_with_max_length_combines_constraints() {
+        // "type": "string", "pattern": "[0-9]+", "maxLength": 20
+        // should produce a validate function that checks BOTH pattern and length
+        let prop = CfnProperty {
+            prop_type: Some(TypeValue::Single("string".to_string())),
+            description: Some("Object size in bytes".to_string()),
+            pattern: Some("[0-9]+".to_string()),
+            max_length: Some(20),
+            ..CfnProperty::default()
+        };
+        let schema = CfnSchema {
+            type_name: "AWS::S3::Bucket".to_string(),
+            description: None,
+            properties: BTreeMap::new(),
+            required: vec![],
+            read_only_properties: vec![],
+            create_only_properties: vec![],
+            write_only_properties: vec![],
+            primary_identifier: None,
+            definitions: None,
+            tagging: None,
+        };
+        let (type_str, _) = cfn_type_to_carina_type_with_enum(
+            &prop,
+            "ObjectSizeGreaterThan",
+            &schema,
+            "",
+            &BTreeMap::new(),
+        );
+        // Should mention both constraints
+        assert!(
+            type_str.contains("NumericString"),
+            "Should have NumericString type: {type_str}"
+        );
+        assert!(
+            type_str.contains("20"),
+            "Should have max length constraint 20: {type_str}"
+        );
+    }
+
+    #[test]
+    fn test_string_pattern_with_length_constraints_combines() {
+        // "type": "string", "pattern": "^[a-z]+$", "minLength": 1, "maxLength": 64
+        // should produce a validate function that checks BOTH pattern and length
+        let prop = CfnProperty {
+            prop_type: Some(TypeValue::Single("string".to_string())),
+            description: Some("A constrained string".to_string()),
+            pattern: Some("^[a-z]+$".to_string()),
+            min_length: Some(1),
+            max_length: Some(64),
+            ..CfnProperty::default()
+        };
+        let schema = CfnSchema {
+            type_name: "AWS::Test::Resource".to_string(),
+            description: None,
+            properties: BTreeMap::new(),
+            required: vec![],
+            read_only_properties: vec![],
+            create_only_properties: vec![],
+            write_only_properties: vec![],
+            primary_identifier: None,
+            definitions: None,
+            tagging: None,
+        };
+        let (type_str, _) =
+            cfn_type_to_carina_type_with_enum(&prop, "SomeName", &schema, "", &BTreeMap::new());
+        // Should mention both constraints
+        assert!(
+            type_str.contains("pattern"),
+            "Should have pattern constraint: {type_str}"
+        );
+        assert!(
+            type_str.contains("len:"),
+            "Should have length constraint: {type_str}"
         );
     }
 

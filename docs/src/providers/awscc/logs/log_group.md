@@ -62,7 +62,7 @@ Specifies the log group class for this log group. There are two classes: + The `
 
 ### `log_group_name`
 
-- **Type:** String(len: 1..=512)
+- **Type:** String(pattern, len: 1..=512)
 - **Required:** No
 
 The name of the log group. If you don't specify a name, CFNlong generates a unique ID for the log group.

@@ -949,8 +949,8 @@ Shorthand formats: `Enabled` or `VersioningConfigurationStatus.Enabled`
 | `noncurrent_version_expiration_in_days` | Int | No | (Deprecated.) For buckets with versioning enabled (or suspended), specifies the time, in days, betwe... |
 | `noncurrent_version_transition` | [Struct(NoncurrentVersionTransition)](#noncurrentversiontransition) | No | (Deprecated.) For buckets with versioning enabled (or suspended), specifies when non-current objects... |
 | `noncurrent_version_transitions` | [List\<NoncurrentVersionTransition\>](#noncurrentversiontransition) | No | For buckets with versioning enabled (or suspended), one or more transition rules that specify when n... |
-| `object_size_greater_than` | NumericString | No | Specifies the minimum object size in bytes for this rule to apply to. Objects must be larger than th... |
-| `object_size_less_than` | NumericString | No | Specifies the maximum object size in bytes for this rule to apply to. Objects must be smaller than t... |
+| `object_size_greater_than` | NumericString(len: ..=20) | No | Specifies the minimum object size in bytes for this rule to apply to. Objects must be larger than th... |
+| `object_size_less_than` | NumericString(len: ..=20) | No | Specifies the maximum object size in bytes for this rule to apply to. Objects must be smaller than t... |
 | `prefix` | String | No | Object key prefix that identifies one or more objects to which this rule applies. Replacement must b... |
 | `status` | [Enum (RuleStatus)](#status-rulestatus) | Yes | If ``Enabled``, the rule is currently being applied. If ``Disabled``, the rule is not currently bein... |
 | `tag_filters` | `List<Map>` | No | Tags to use to identify a subset of objects to which the lifecycle rule applies. |

@@ -179,20 +179,6 @@ fn validate_string_pattern_cc806c69dc4cdaf7(value: &Value) -> Result<(), String>
     }
 }
 
-fn validate_string_pattern_3ee03875337c12ab(value: &Value) -> Result<(), String> {
-    if let Value::String(s) = value {
-        static RE: std::sync::LazyLock<Regex> =
-            std::sync::LazyLock::new(|| Regex::new("[0-9]+").expect("invalid pattern regex"));
-        if RE.is_match(s) {
-            Ok(())
-        } else {
-            Err(format!("Value '{}' does not match pattern [0-9]+", s))
-        }
-    } else {
-        Err("Expected string".to_string())
-    }
-}
-
 fn validate_string_length_max_255(value: &Value) -> Result<(), String> {
     if let Value::String(s) = value {
         let len = s.len();
@@ -216,6 +202,23 @@ fn validate_string_length_max_1024(value: &Value) -> Result<(), String> {
         }
     } else {
         Ok(())
+    }
+}
+
+fn validate_string_pattern_3ee03875337c12ab_len_max_20(value: &Value) -> Result<(), String> {
+    if let Value::String(s) = value {
+        static RE: std::sync::LazyLock<Regex> =
+            std::sync::LazyLock::new(|| Regex::new("[0-9]+").expect("invalid pattern regex"));
+        if !RE.is_match(s) {
+            return Err(format!("Value '{}' does not match pattern [0-9]+", s));
+        }
+        let len = s.len();
+        if len > 20 {
+            return Err(format!("String length {} is out of range ..=20", len));
+        }
+        Ok(())
+    } else {
+        Err("Expected string".to_string())
     }
 }
 
@@ -547,16 +550,16 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                     ],
                 }))).with_description("For buckets with versioning enabled (or suspended), one or more transition rules that specify when non-current objects transition to a specified stora...").with_provider_name("NoncurrentVersionTransitions"),
                     StructField::new("object_size_greater_than", AttributeType::Custom {
-                name: "NumericString".to_string(),
+                name: "NumericString(len: ..=20)".to_string(),
                 base: Box::new(AttributeType::String),
-                validate: validate_string_pattern_3ee03875337c12ab,
+                validate: validate_string_pattern_3ee03875337c12ab_len_max_20,
                 namespace: None,
                 to_dsl: None,
             }).with_description("Specifies the minimum object size in bytes for this rule to apply to. Objects must be larger than this value in bytes. For more information about size...").with_provider_name("ObjectSizeGreaterThan"),
                     StructField::new("object_size_less_than", AttributeType::Custom {
-                name: "NumericString".to_string(),
+                name: "NumericString(len: ..=20)".to_string(),
                 base: Box::new(AttributeType::String),
-                validate: validate_string_pattern_3ee03875337c12ab,
+                validate: validate_string_pattern_3ee03875337c12ab_len_max_20,
                 namespace: None,
                 to_dsl: None,
             }).with_description("Specifies the maximum object size in bytes for this rule to apply to. Objects must be smaller than this value in bytes. For more information about siz...").with_provider_name("ObjectSizeLessThan"),
