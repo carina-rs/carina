@@ -1477,47 +1477,63 @@ fn {}(value: &Value) -> Result<(), String> {{
         ));
     }
 
-    // Generate pattern validation functions for string properties
-    for (prop_name, pattern) in &patterns {
-        let fn_name = format!("validate_{}_pattern", prop_name.to_snake_case());
-        // Convert PCRE-specific constructs to Rust regex equivalents
-        let rust_pattern = pattern.replace("\\Z", "\\z");
-        // Escape for Rust string literal (double the backslashes, escape quotes)
-        let escaped_for_rust = rust_pattern.replace('\\', "\\\\").replace('"', "\\\"");
-        // For the error message, also escape { and } for the inner format!() macro
-        let escaped_for_msg = escaped_for_rust.replace('{', "{{").replace('}', "}}");
-        code.push_str("fn ");
-        code.push_str(&fn_name);
-        code.push_str("(value: &Value) -> Result<(), String> {\n");
-        code.push_str("    if let Value::String(s) = value {\n");
-        code.push_str(
-            "        static RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {\n",
-        );
-        code.push_str(&format!(
-            "            Regex::new(\"{}\").expect(\"invalid pattern regex\")\n",
-            escaped_for_rust
-        ));
-        code.push_str("        });\n");
-        code.push_str("        if RE.is_match(s) {\n");
-        code.push_str("            Ok(())\n");
-        code.push_str("        } else {\n");
-        code.push_str(&format!(
-            "            Err(format!(\"Value '{{}}' does not match pattern {}\", s))\n",
-            escaped_for_msg
-        ));
-        code.push_str("        }\n");
-        code.push_str("    } else {\n");
-        code.push_str("        Err(\"Expected string\".to_string())\n");
-        code.push_str("    }\n");
-        code.push_str("}\n\n");
+    // Generate pattern validation functions for string properties (deduplicated)
+    // Multiple properties with the same pattern share one validation function.
+    {
+        let mut generated_patterns: HashSet<String> = HashSet::new();
+        for pattern in patterns.values() {
+            if generated_patterns.contains(pattern) {
+                continue;
+            }
+            generated_patterns.insert(pattern.clone());
+            let fn_name = pattern_fn_name(pattern);
+            // Convert PCRE-specific constructs to Rust regex equivalents
+            let rust_pattern = pattern.replace("\\Z", "\\z");
+            // Escape for Rust string literal (double the backslashes, escape quotes)
+            let escaped_for_rust = rust_pattern.replace('\\', "\\\\").replace('"', "\\\"");
+            // For the error message, also escape { and } for the inner format!() macro
+            let escaped_for_msg = escaped_for_rust.replace('{', "{{").replace('}', "}}");
+            code.push_str("fn ");
+            code.push_str(&fn_name);
+            code.push_str("(value: &Value) -> Result<(), String> {\n");
+            code.push_str("    if let Value::String(s) = value {\n");
+            code.push_str(
+                "        static RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {\n",
+            );
+            code.push_str(&format!(
+                "            Regex::new(\"{}\").expect(\"invalid pattern regex\")\n",
+                escaped_for_rust
+            ));
+            code.push_str("        });\n");
+            code.push_str("        if RE.is_match(s) {\n");
+            code.push_str("            Ok(())\n");
+            code.push_str("        } else {\n");
+            code.push_str(&format!(
+                "            Err(format!(\"Value '{{}}' does not match pattern {}\", s))\n",
+                escaped_for_msg
+            ));
+            code.push_str("        }\n");
+            code.push_str("    } else {\n");
+            code.push_str("        Err(\"Expected string\".to_string())\n");
+            code.push_str("    }\n");
+            code.push_str("}\n\n");
+        }
     }
 
-    // Generate validation functions for array item count constraints
-    for (prop_name, (min, max)) in &ranged_lists {
-        let fn_name = format!("validate_{}_items", prop_name.to_snake_case());
-        let (condition, range_display) = list_items_condition_and_display(*min, *max);
-        code.push_str(&format!(
-            r#"fn {}(value: &Value) -> Result<(), String> {{
+    // Generate validation functions for array item count constraints (deduplicated)
+    // Multiple properties with the same min/max items share one validation function.
+    {
+        let mut generated_items: HashSet<(Option<i64>, Option<i64>)> = HashSet::new();
+        for (min, max) in ranged_lists.values() {
+            let key = (*min, *max);
+            if generated_items.contains(&key) {
+                continue;
+            }
+            generated_items.insert(key);
+            let fn_name = list_items_fn_name(*min, *max);
+            let (condition, range_display) = list_items_condition_and_display(*min, *max);
+            code.push_str(&format!(
+                r#"fn {}(value: &Value) -> Result<(), String> {{
     if let Value::List(items) = value {{
         let len = items.len();
         if {} {{
@@ -1531,16 +1547,25 @@ fn {}(value: &Value) -> Result<(), String> {{
 }}
 
 "#,
-            fn_name, condition, range_display
-        ));
+                fn_name, condition, range_display
+            ));
+        }
     }
 
-    // Generate length validation functions for string properties
-    for (prop_name, (min, max)) in &ranged_strings {
-        let fn_name = format!("validate_{}_length", prop_name.to_snake_case());
-        let (condition, range_display) = string_length_condition_and_display(*min, *max);
-        code.push_str(&format!(
-            r#"fn {}(value: &Value) -> Result<(), String> {{
+    // Generate length validation functions for string properties (deduplicated)
+    // Multiple properties with the same min/max length share one validation function.
+    {
+        let mut generated_lengths: HashSet<(Option<u64>, Option<u64>)> = HashSet::new();
+        for (min, max) in ranged_strings.values() {
+            let key = (*min, *max);
+            if generated_lengths.contains(&key) {
+                continue;
+            }
+            generated_lengths.insert(key);
+            let fn_name = string_length_fn_name(*min, *max);
+            let (condition, range_display) = string_length_condition_and_display(*min, *max);
+            code.push_str(&format!(
+                r#"fn {}(value: &Value) -> Result<(), String> {{
     if let Value::String(s) = value {{
         let len = s.len();
         if {} {{
@@ -1554,8 +1579,9 @@ fn {}(value: &Value) -> Result<(), String> {{
 }}
 
 "#,
-            fn_name, condition, range_display
-        ));
+                fn_name, condition, range_display
+            ));
+        }
     }
 
     // Generate config function
@@ -2304,6 +2330,39 @@ fn string_length_display(min: Option<u64>, max: Option<u64>) -> String {
     }
 }
 
+/// Generate a constraint-based function name for string length validation.
+/// E.g., `validate_string_length_max_1024` or `validate_string_length_1_512`.
+fn string_length_fn_name(min: Option<u64>, max: Option<u64>) -> String {
+    let effective_min = min.filter(|&m| m > 0);
+    match (effective_min, max) {
+        (Some(min), Some(max)) => format!("validate_string_length_{min}_{max}"),
+        (Some(min), None) => format!("validate_string_length_min_{min}"),
+        (None, Some(max)) => format!("validate_string_length_max_{max}"),
+        (None, None) => unreachable!("at least one bound must be present"),
+    }
+}
+
+/// Generate a constraint-based function name for list items validation.
+/// E.g., `validate_list_items_1_100` or `validate_list_items_max_10`.
+fn list_items_fn_name(min: Option<i64>, max: Option<i64>) -> String {
+    match (min, max) {
+        (Some(min), Some(max)) => format!("validate_list_items_{min}_{max}"),
+        (Some(min), None) => format!("validate_list_items_min_{min}"),
+        (None, Some(max)) => format!("validate_list_items_max_{max}"),
+        (None, None) => unreachable!("at least one bound must be present"),
+    }
+}
+
+/// Generate a constraint-based function name for pattern validation.
+/// Uses a hash of the pattern to create a unique but deterministic name.
+fn pattern_fn_name(pattern: &str) -> String {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    pattern.hash(&mut hasher);
+    let hash = hasher.finish();
+    format!("validate_string_pattern_{:016x}", hash)
+}
+
 /// Generate condition string and display string for string length validation.
 /// Treats min=0 as no minimum since `usize` is always >= 0.
 fn string_length_condition_and_display(min: Option<u64>, max: Option<u64>) -> (String, String) {
@@ -2929,10 +2988,12 @@ fn cfn_type_to_carina_type_with_enum(
                 );
             }
             // Handle string-typed $ref definitions with pattern constraints
-            if def.def_type.as_deref() == Some("string") && def.pattern.is_some() {
+            if def.def_type.as_deref() == Some("string")
+                && let Some(pattern) = &def.pattern
+            {
                 // Check if name-based heuristics would override the type
                 if infer_string_type(prop_name, &schema.type_name).is_none() {
-                    let validate_fn = format!("validate_{}_pattern", prop_name.to_snake_case());
+                    let validate_fn = pattern_fn_name(pattern);
                     return (
                         format!(
                             r#"AttributeType::Custom {{
@@ -3040,8 +3101,8 @@ fn cfn_type_to_carina_type_with_enum(
             }
 
             // Check for regex pattern constraint
-            if prop.pattern.is_some() {
-                let validate_fn = format!("validate_{}_pattern", prop_name.to_snake_case());
+            if let Some(pattern) = &prop.pattern {
+                let validate_fn = pattern_fn_name(pattern);
                 return (
                     format!(
                         r#"AttributeType::Custom {{
@@ -3061,7 +3122,7 @@ fn cfn_type_to_carina_type_with_enum(
             // Treat minLength=0 as no constraint since usize is always >= 0
             let effective_min = prop.min_length.filter(|&m| m > 0);
             if effective_min.is_some() || prop.max_length.is_some() {
-                let validate_fn = format!("validate_{}_length", prop_name.to_snake_case());
+                let validate_fn = string_length_fn_name(effective_min, prop.max_length);
                 let display = string_length_display(effective_min, prop.max_length);
                 return (
                     format!(
@@ -3251,7 +3312,7 @@ fn cfn_type_to_carina_type_with_enum(
             };
             // Wrap in Custom type if minItems/maxItems constraints exist
             if prop.min_items.is_some() || prop.max_items.is_some() {
-                let validate_fn = format!("validate_{}_items", prop_name.to_snake_case());
+                let validate_fn = list_items_fn_name(prop.min_items, prop.max_items);
                 let display = range_display_string(prop.min_items, prop.max_items);
                 (
                     format!(
@@ -6853,7 +6914,7 @@ mod tests {
             type_str
         );
         assert!(
-            type_str.contains("validate_log_group_name_pattern"),
+            type_str.contains("validate_string_pattern_"),
             "Should reference pattern validation function, got: {}",
             type_str
         );
@@ -6889,7 +6950,7 @@ mod tests {
         );
         // KmsKeyId should be resolved to a specific ARN type, not pattern-validated
         assert!(
-            !type_str.contains("validate_kms_key_id_pattern"),
+            !type_str.contains("validate_string_pattern_"),
             "Known type (KmsKeyId) should not get pattern validation, got: {}",
             type_str
         );
@@ -6923,7 +6984,7 @@ mod tests {
 
         let code = generate_schema_code(&schema, "AWS::Logs::LogGroup").unwrap();
         assert!(
-            code.contains("fn validate_log_group_name_pattern"),
+            code.contains("fn validate_string_pattern_"),
             "Generated code should contain pattern validation function:\n{}",
             code
         );
@@ -6976,7 +7037,7 @@ mod tests {
             "Custom type should wrap a List: {type_str}"
         );
         assert!(
-            type_str.contains("validate_private_dns_specified_domains_items"),
+            type_str.contains("validate_list_items_1_10"),
             "should reference items validation function: {type_str}"
         );
     }
@@ -7122,7 +7183,7 @@ mod tests {
 
         let generated = generate_schema_code(&schema, "AWS::EC2::VPCEndpoint").unwrap();
         assert!(
-            generated.contains("validate_private_dns_specified_domains_items"),
+            generated.contains("validate_list_items_1_10"),
             "should generate items validation function: {generated}"
         );
         assert!(
@@ -7166,7 +7227,7 @@ mod tests {
 
         // Should generate a length validation function
         assert!(
-            generated.contains("validate_log_group_name_length"),
+            generated.contains("validate_string_length_1_512"),
             "Should generate length validation function: {generated}"
         );
 
@@ -7212,7 +7273,7 @@ mod tests {
         let generated = generate_schema_code(&schema, "AWS::Test::Resource").unwrap();
 
         assert!(
-            generated.contains("validate_resource_name_length"),
+            generated.contains("validate_string_length_min_1"),
             "Should generate length validation function for min-only: {generated}"
         );
         assert!(
@@ -7250,7 +7311,7 @@ mod tests {
         let generated = generate_schema_code(&schema, "AWS::Test::Resource").unwrap();
 
         assert!(
-            generated.contains("validate_description_length"),
+            generated.contains("validate_string_length_max_256"),
             "Should generate length validation function for max-only: {generated}"
         );
         assert!(
@@ -7307,8 +7368,8 @@ mod tests {
             type_str
         );
         assert!(
-            type_str.contains("validate_expiration_date_pattern"),
-            "Should reference pattern validation function, got: {}",
+            type_str.contains("validate_string_pattern_"),
+            "Should reference hash-based pattern validation function, got: {}",
             type_str
         );
     }
@@ -7398,8 +7459,8 @@ mod tests {
 
         let generated = generate_schema_code(&schema, "AWS::S3::Bucket").unwrap();
         assert!(
-            generated.contains("validate_expiration_date_pattern"),
-            "Should generate pattern validation function for $ref definition pattern: {generated}"
+            generated.contains("fn validate_string_pattern_"),
+            "Should generate hash-based pattern validation function for $ref definition pattern: {generated}"
         );
     }
 
@@ -7442,8 +7503,212 @@ mod tests {
 
         let generated = generate_schema_code(&schema, "AWS::Test::Resource").unwrap();
         assert!(
-            generated.contains("validate_created_date_pattern"),
-            "Should generate pattern validation function for top-level $ref pattern: {generated}"
+            generated.contains("fn validate_string_pattern_"),
+            "Should generate hash-based pattern validation function for top-level $ref pattern: {generated}"
+        );
+    }
+
+    #[test]
+    fn test_dedup_string_length_validation_functions() {
+        // Two properties with identical maxLength constraints should share one validation function
+        let mut properties = BTreeMap::new();
+        properties.insert(
+            "Name".to_string(),
+            CfnProperty {
+                prop_type: Some(TypeValue::Single("string".to_string())),
+                description: Some("Name field".to_string()),
+                max_length: Some(1024),
+                ..Default::default()
+            },
+        );
+        properties.insert(
+            "Prefix".to_string(),
+            CfnProperty {
+                prop_type: Some(TypeValue::Single("string".to_string())),
+                description: Some("Prefix field".to_string()),
+                max_length: Some(1024),
+                ..Default::default()
+            },
+        );
+
+        let schema = CfnSchema {
+            type_name: "AWS::Test::Resource".to_string(),
+            description: None,
+            properties,
+            required: vec![],
+            read_only_properties: vec![],
+            create_only_properties: vec![],
+            write_only_properties: vec![],
+            primary_identifier: None,
+            definitions: None,
+            tagging: None,
+        };
+
+        let generated = generate_schema_code(&schema, "AWS::Test::Resource").unwrap();
+
+        // Should NOT have per-property validation functions
+        assert!(
+            !generated.contains("fn validate_name_length"),
+            "Should not generate per-property length function: {generated}"
+        );
+        assert!(
+            !generated.contains("fn validate_prefix_length"),
+            "Should not generate per-property length function: {generated}"
+        );
+
+        // Should have a single shared validation function named by constraints
+        let fn_count = generated.matches("fn validate_string_length_").count();
+        assert_eq!(
+            fn_count, 1,
+            "Should generate exactly one shared length validation function, got {fn_count}: {generated}"
+        );
+
+        // Both properties should reference the same validation function
+        let ref_count = generated.matches("validate_string_length_max_1024").count();
+        assert!(
+            ref_count >= 3,
+            "Both properties should reference the shared function (1 def + 2 refs), got {ref_count}: {generated}"
+        );
+    }
+
+    #[test]
+    fn test_dedup_pattern_validation_functions() {
+        // Two properties with identical pattern constraints should share one validation function
+        let mut properties = BTreeMap::new();
+        properties.insert(
+            "ObjectSizeGreaterThan".to_string(),
+            CfnProperty {
+                prop_type: Some(TypeValue::Single("string".to_string())),
+                pattern: Some("[0-9]+".to_string()),
+                ..Default::default()
+            },
+        );
+        properties.insert(
+            "ObjectSizeLessThan".to_string(),
+            CfnProperty {
+                prop_type: Some(TypeValue::Single("string".to_string())),
+                pattern: Some("[0-9]+".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let schema = CfnSchema {
+            type_name: "AWS::Test::Resource".to_string(),
+            description: None,
+            properties,
+            required: vec![],
+            read_only_properties: vec![],
+            create_only_properties: vec![],
+            write_only_properties: vec![],
+            primary_identifier: None,
+            definitions: None,
+            tagging: None,
+        };
+
+        let generated = generate_schema_code(&schema, "AWS::Test::Resource").unwrap();
+
+        // Should NOT have per-property pattern validation functions
+        assert!(
+            !generated.contains("fn validate_object_size_greater_than_pattern"),
+            "Should not generate per-property pattern function: {generated}"
+        );
+        assert!(
+            !generated.contains("fn validate_object_size_less_than_pattern"),
+            "Should not generate per-property pattern function: {generated}"
+        );
+
+        // Should have exactly one shared pattern validation function
+        let fn_count = generated.matches("fn validate_string_pattern_").count();
+        assert_eq!(
+            fn_count, 1,
+            "Should generate exactly one shared pattern validation function, got {fn_count}: {generated}"
+        );
+    }
+
+    #[test]
+    fn test_dedup_list_items_validation_functions() {
+        // Two array properties with identical minItems/maxItems should share one validation function
+        let mut def_props = BTreeMap::new();
+        def_props.insert(
+            "AllowedOrigins".to_string(),
+            CfnProperty {
+                prop_type: Some(TypeValue::Single("array".to_string())),
+                items: Some(Box::new(CfnProperty {
+                    prop_type: Some(TypeValue::Single("string".to_string())),
+                    ..Default::default()
+                })),
+                min_items: Some(1),
+                max_items: Some(100),
+                ..Default::default()
+            },
+        );
+        def_props.insert(
+            "AllowedHeaders".to_string(),
+            CfnProperty {
+                prop_type: Some(TypeValue::Single("array".to_string())),
+                items: Some(Box::new(CfnProperty {
+                    prop_type: Some(TypeValue::Single("string".to_string())),
+                    ..Default::default()
+                })),
+                min_items: Some(1),
+                max_items: Some(100),
+                ..Default::default()
+            },
+        );
+
+        let mut definitions = BTreeMap::new();
+        definitions.insert(
+            "CorsRule".to_string(),
+            CfnDefinition {
+                def_type: Some("object".to_string()),
+                properties: Some(def_props),
+                required: vec![],
+                one_of: vec![],
+                items: None,
+                enum_values: None,
+                pattern: None,
+            },
+        );
+
+        let mut properties = BTreeMap::new();
+        properties.insert(
+            "CorsRules".to_string(),
+            CfnProperty {
+                ref_path: Some("#/definitions/CorsRule".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let schema = CfnSchema {
+            type_name: "AWS::Test::Resource".to_string(),
+            description: None,
+            properties,
+            required: vec![],
+            read_only_properties: vec![],
+            create_only_properties: vec![],
+            write_only_properties: vec![],
+            primary_identifier: None,
+            definitions: Some(definitions),
+            tagging: None,
+        };
+
+        let generated = generate_schema_code(&schema, "AWS::Test::Resource").unwrap();
+
+        // Should NOT have per-property items validation functions
+        assert!(
+            !generated.contains("fn validate_allowed_origins_items"),
+            "Should not generate per-property items function: {generated}"
+        );
+        assert!(
+            !generated.contains("fn validate_allowed_headers_items"),
+            "Should not generate per-property items function: {generated}"
+        );
+
+        // Should have exactly one shared items validation function
+        let fn_count = generated.matches("fn validate_list_items_").count();
+        assert_eq!(
+            fn_count, 1,
+            "Should generate exactly one shared items validation function, got {fn_count}: {generated}"
         );
     }
 }

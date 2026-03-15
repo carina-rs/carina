@@ -13,7 +13,7 @@ const VALID_METERED_ACCOUNT: &[&str] = &["ipam-owner", "resource-owner"];
 
 const VALID_TIER: &[&str] = &["free", "advanced"];
 
-fn validate_organizations_entity_path_length(value: &Value) -> Result<(), String> {
+fn validate_string_length_min_1(value: &Value) -> Result<(), String> {
     if let Value::String(s) = value {
         let len = s.len();
         if len < 1 {
@@ -26,7 +26,7 @@ fn validate_organizations_entity_path_length(value: &Value) -> Result<(), String
     }
 }
 
-fn validate_public_default_scope_id_length(value: &Value) -> Result<(), String> {
+fn validate_string_length_max_255(value: &Value) -> Result<(), String> {
     if let Value::String(s) = value {
         let len = s.len();
         if len > 255 {
@@ -69,7 +69,7 @@ pub fn ec2_ipam_config() -> AwsccSchemaConfig {
                     StructField::new("organizations_entity_path", AttributeType::Custom {
                 name: "String(len: 1..)".to_string(),
                 base: Box::new(AttributeType::String),
-                validate: validate_organizations_entity_path_length,
+                validate: validate_string_length_min_1,
                 namespace: None,
                 to_dsl: None,
             }).required().with_description("An AWS Organizations entity path. Build the path for the OU(s) using AWS Organizations IDs separated by a '/'. Include all child OUs by ending the pat...").with_provider_name("OrganizationsEntityPath")
@@ -123,7 +123,7 @@ pub fn ec2_ipam_config() -> AwsccSchemaConfig {
             AttributeSchema::new("public_default_scope_id", AttributeType::Custom {
                 name: "String(len: ..=255)".to_string(),
                 base: Box::new(AttributeType::String),
-                validate: validate_public_default_scope_id_length,
+                validate: validate_string_length_max_255,
                 namespace: None,
                 to_dsl: None,
             })

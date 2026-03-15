@@ -161,7 +161,7 @@ fn validate_max_age_range(value: &Value) -> Result<(), String> {
     }
 }
 
-fn validate_expiration_date_pattern(value: &Value) -> Result<(), String> {
+fn validate_string_pattern_cc806c69dc4cdaf7(value: &Value) -> Result<(), String> {
     if let Value::String(s) = value {
         static RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
             Regex::new("^(\\d{4})-(0[0-9]|1[0-2])-([0-2]\\d|3[01])T([01]\\d|2[0-4]):([0-5]\\d):([0-6]\\d)((\\.\\d{3})?)Z$").expect("invalid pattern regex")
@@ -179,7 +179,7 @@ fn validate_expiration_date_pattern(value: &Value) -> Result<(), String> {
     }
 }
 
-fn validate_object_size_greater_than_pattern(value: &Value) -> Result<(), String> {
+fn validate_string_pattern_3ee03875337c12ab(value: &Value) -> Result<(), String> {
     if let Value::String(s) = value {
         static RE: std::sync::LazyLock<Regex> =
             std::sync::LazyLock::new(|| Regex::new("[0-9]+").expect("invalid pattern regex"));
@@ -193,39 +193,7 @@ fn validate_object_size_greater_than_pattern(value: &Value) -> Result<(), String
     }
 }
 
-fn validate_object_size_less_than_pattern(value: &Value) -> Result<(), String> {
-    if let Value::String(s) = value {
-        static RE: std::sync::LazyLock<Regex> =
-            std::sync::LazyLock::new(|| Regex::new("[0-9]+").expect("invalid pattern regex"));
-        if RE.is_match(s) {
-            Ok(())
-        } else {
-            Err(format!("Value '{}' does not match pattern [0-9]+", s))
-        }
-    } else {
-        Err("Expected string".to_string())
-    }
-}
-
-fn validate_transition_date_pattern(value: &Value) -> Result<(), String> {
-    if let Value::String(s) = value {
-        static RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
-            Regex::new("^(\\d{4})-(0[0-9]|1[0-2])-([0-2]\\d|3[01])T([01]\\d|2[0-4]):([0-5]\\d):([0-6]\\d)((\\.\\d{3})?)Z$").expect("invalid pattern regex")
-        });
-        if RE.is_match(s) {
-            Ok(())
-        } else {
-            Err(format!(
-                "Value '{}' does not match pattern ^(\\d{{4}})-(0[0-9]|1[0-2])-([0-2]\\d|3[01])T([01]\\d|2[0-4]):([0-5]\\d):([0-6]\\d)((\\.\\d{{3}})?)Z$",
-                s
-            ))
-        }
-    } else {
-        Err("Expected string".to_string())
-    }
-}
-
-fn validate_id_length(value: &Value) -> Result<(), String> {
+fn validate_string_length_max_255(value: &Value) -> Result<(), String> {
     if let Value::String(s) = value {
         let len = s.len();
         if len > 255 {
@@ -238,20 +206,7 @@ fn validate_id_length(value: &Value) -> Result<(), String> {
     }
 }
 
-fn validate_name_length(value: &Value) -> Result<(), String> {
-    if let Value::String(s) = value {
-        let len = s.len();
-        if len > 1024 {
-            Err(format!("String length {} is out of range ..=1024", len))
-        } else {
-            Ok(())
-        }
-    } else {
-        Ok(())
-    }
-}
-
-fn validate_prefix_length(value: &Value) -> Result<(), String> {
+fn validate_string_length_max_1024(value: &Value) -> Result<(), String> {
     if let Value::String(s) = value {
         let len = s.len();
         if len > 1024 {
@@ -418,7 +373,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                     StructField::new("id", AttributeType::Custom {
                 name: "String(len: ..=255)".to_string(),
                 base: Box::new(AttributeType::String),
-                validate: validate_id_length,
+                validate: validate_string_length_max_255,
                 namespace: None,
                 to_dsl: None,
             }).with_description("A unique identifier for this rule. The value must be no more than 255 characters.").with_provider_name("Id"),
@@ -544,7 +499,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                     StructField::new("expiration_date", AttributeType::Custom {
                 name: "String(pattern)".to_string(),
                 base: Box::new(AttributeType::String),
-                validate: validate_expiration_date_pattern,
+                validate: validate_string_pattern_cc806c69dc4cdaf7,
                 namespace: None,
                 to_dsl: None,
             }).with_description("Indicates when objects are deleted from Amazon S3 and Amazon S3 Glacier. The date value must be in ISO 8601 format. The time is always midnight UTC. I...").with_provider_name("ExpirationDate"),
@@ -553,7 +508,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                     StructField::new("id", AttributeType::Custom {
                 name: "String(len: ..=255)".to_string(),
                 base: Box::new(AttributeType::String),
-                validate: validate_id_length,
+                validate: validate_string_length_max_255,
                 namespace: None,
                 to_dsl: None,
             }).with_description("Unique identifier for the rule. The value can't be longer than 255 characters.").with_provider_name("Id"),
@@ -594,14 +549,14 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                     StructField::new("object_size_greater_than", AttributeType::Custom {
                 name: "String(pattern)".to_string(),
                 base: Box::new(AttributeType::String),
-                validate: validate_object_size_greater_than_pattern,
+                validate: validate_string_pattern_3ee03875337c12ab,
                 namespace: None,
                 to_dsl: None,
             }).with_description("Specifies the minimum object size in bytes for this rule to apply to. Objects must be larger than this value in bytes. For more information about size...").with_provider_name("ObjectSizeGreaterThan"),
                     StructField::new("object_size_less_than", AttributeType::Custom {
                 name: "String(pattern)".to_string(),
                 base: Box::new(AttributeType::String),
-                validate: validate_object_size_less_than_pattern,
+                validate: validate_string_pattern_3ee03875337c12ab,
                 namespace: None,
                 to_dsl: None,
             }).with_description("Specifies the maximum object size in bytes for this rule to apply to. Objects must be smaller than this value in bytes. For more information about siz...").with_provider_name("ObjectSizeLessThan"),
@@ -625,7 +580,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                     StructField::new("transition_date", AttributeType::Custom {
                 name: "String(pattern)".to_string(),
                 base: Box::new(AttributeType::String),
-                validate: validate_transition_date_pattern,
+                validate: validate_string_pattern_cc806c69dc4cdaf7,
                 namespace: None,
                 to_dsl: None,
             }).with_description("Indicates when objects are transitioned to the specified storage class. The date value must be in ISO 8601 format. The time is always midnight UTC.").with_provider_name("TransitionDate"),
@@ -644,7 +599,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                     StructField::new("transition_date", AttributeType::Custom {
                 name: "String(pattern)".to_string(),
                 base: Box::new(AttributeType::String),
-                validate: validate_transition_date_pattern,
+                validate: validate_string_pattern_cc806c69dc4cdaf7,
                 namespace: None,
                 to_dsl: None,
             }).with_description("Indicates when objects are transitioned to the specified storage class. The date value must be in ISO 8601 format. The time is always midnight UTC.").with_provider_name("TransitionDate"),
@@ -831,7 +786,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                     StructField::new("name", AttributeType::Custom {
                 name: "String(len: ..=1024)".to_string(),
                 base: Box::new(AttributeType::String),
-                validate: validate_name_length,
+                validate: validate_string_length_max_1024,
                 namespace: None,
                 to_dsl: None,
             }).required().with_description("The object key name prefix or suffix identifying one or more objects to which the filtering rule applies. The maximum length is 1,024 characters. Over...").with_provider_name("Name"),
@@ -861,7 +816,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                     StructField::new("name", AttributeType::Custom {
                 name: "String(len: ..=1024)".to_string(),
                 base: Box::new(AttributeType::String),
-                validate: validate_name_length,
+                validate: validate_string_length_max_1024,
                 namespace: None,
                 to_dsl: None,
             }).required().with_description("The object key name prefix or suffix identifying one or more objects to which the filtering rule applies. The maximum length is 1,024 characters. Over...").with_provider_name("Name"),
@@ -891,7 +846,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                     StructField::new("name", AttributeType::Custom {
                 name: "String(len: ..=1024)".to_string(),
                 base: Box::new(AttributeType::String),
-                validate: validate_name_length,
+                validate: validate_string_length_max_1024,
                 namespace: None,
                 to_dsl: None,
             }).required().with_description("The object key name prefix or suffix identifying one or more objects to which the filtering rule applies. The maximum length is 1,024 characters. Over...").with_provider_name("Name"),
@@ -1086,14 +1041,14 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                     StructField::new("id", AttributeType::Custom {
                 name: "String(len: ..=255)".to_string(),
                 base: Box::new(AttributeType::String),
-                validate: validate_id_length,
+                validate: validate_string_length_max_255,
                 namespace: None,
                 to_dsl: None,
             }).with_description("A unique identifier for the rule. The maximum value is 255 characters. If you don't specify a value, AWS CloudFormation generates a random ID. When us...").with_provider_name("Id"),
                     StructField::new("prefix", AttributeType::Custom {
                 name: "String(len: ..=1024)".to_string(),
                 base: Box::new(AttributeType::String),
-                validate: validate_prefix_length,
+                validate: validate_string_length_max_1024,
                 namespace: None,
                 to_dsl: None,
             }).with_description("An object key name prefix that identifies the object or objects to which the rule applies. The maximum prefix length is 1,024 characters. To include a...").with_provider_name("Prefix"),

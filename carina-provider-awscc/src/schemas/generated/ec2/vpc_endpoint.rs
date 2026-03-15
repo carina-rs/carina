@@ -37,7 +37,7 @@ const VALID_VPC_ENDPOINT_TYPE: &[&str] = &[
     "Resource",
 ];
 
-fn validate_private_dns_specified_domains_items(value: &Value) -> Result<(), String> {
+fn validate_list_items_1_10(value: &Value) -> Result<(), String> {
     if let Value::List(items) = value {
         let len = items.len();
         if !(1..=10).contains(&len) {
@@ -50,7 +50,7 @@ fn validate_private_dns_specified_domains_items(value: &Value) -> Result<(), Str
     }
 }
 
-fn validate_private_dns_specified_domains_length(value: &Value) -> Result<(), String> {
+fn validate_string_length_1_255(value: &Value) -> Result<(), String> {
     if let Value::String(s) = value {
         let len = s.len();
         if !(1..=255).contains(&len) {
@@ -108,11 +108,11 @@ pub fn ec2_vpc_endpoint_config() -> AwsccSchemaConfig {
                 base: Box::new(AttributeType::List(Box::new(AttributeType::Custom {
                 name: "String(len: 1..=255)".to_string(),
                 base: Box::new(AttributeType::String),
-                validate: validate_private_dns_specified_domains_length,
+                validate: validate_string_length_1_255,
                 namespace: None,
                 to_dsl: None,
             }))),
-                validate: validate_private_dns_specified_domains_items,
+                validate: validate_list_items_1_10,
                 namespace: None,
                 to_dsl: None,
             }).with_description("Indicates which of the private domains to create private hosted zones for and associate with the specified VPC. Only supported when private DNS is ena...").with_provider_name("PrivateDnsSpecifiedDomains")
