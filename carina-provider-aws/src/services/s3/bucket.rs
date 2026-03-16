@@ -47,26 +47,27 @@ impl AwsProvider {
                 // Handle bucket not found
                 use aws_sdk_s3::error::SdkError;
 
-                let is_not_found = match &err {
+                let error_kind = match &err {
                     SdkError::ServiceError(service_err) => {
-                        // NotFound error or 301/403/404 status codes
-                        // 403 is returned when bucket doesn't exist or is owned by another account
                         let status = service_err.raw().status().as_u16();
-                        service_err.err().is_not_found()
-                            || status == 301
-                            || status == 403
-                            || status == 404
+                        classify_head_bucket_status(status, service_err.err().is_not_found())
                     }
-                    _ => false,
+                    _ => HeadBucketErrorKind::Other,
                 };
 
-                if is_not_found {
-                    Ok(State::not_found(id.clone()))
-                } else {
-                    Err(
-                        ProviderError::new(format!("Failed to read bucket: {:?}", err))
-                            .for_resource(id.clone()),
-                    )
+                match error_kind {
+                    HeadBucketErrorKind::NotFound => Ok(State::not_found(id.clone())),
+                    HeadBucketErrorKind::AccessDenied => Err(ProviderError::new(format!(
+                        "Access denied for bucket '{}'. This may indicate insufficient IAM \
+                         permissions or the bucket is owned by a different AWS account.",
+                        name
+                    ))
+                    .for_resource(id.clone())),
+                    HeadBucketErrorKind::Other => Err(ProviderError::new(format!(
+                        "Failed to read bucket: {:?}",
+                        err
+                    ))
+                    .for_resource(id.clone())),
                 }
             }
         }
@@ -557,6 +558,30 @@ impl AwsProvider {
     }
 }
 
+/// Result of classifying an S3 HeadBucket error.
+#[derive(Debug, PartialEq)]
+enum HeadBucketErrorKind {
+    /// Bucket does not exist (301 redirect to wrong region, or 404 not found).
+    NotFound,
+    /// Access denied (403) - could be permissions issue or bucket owned by another account.
+    AccessDenied,
+    /// Other error that should be propagated.
+    Other,
+}
+
+/// Classify an HTTP status code from a HeadBucket error.
+///
+/// This is extracted as a pure function to enable unit testing.
+fn classify_head_bucket_status(status: u16, is_not_found_error: bool) -> HeadBucketErrorKind {
+    if is_not_found_error || status == 301 || status == 404 {
+        HeadBucketErrorKind::NotFound
+    } else if status == 403 {
+        HeadBucketErrorKind::AccessDenied
+    } else {
+        HeadBucketErrorKind::Other
+    }
+}
+
 /// Check if an S3 SDK error is a "not configured" error that should be silently ignored.
 fn is_s3_not_configured_error<E: aws_sdk_s3::error::ProvideErrorMetadata>(
     err: &aws_sdk_s3::error::SdkError<E>,
@@ -676,5 +701,47 @@ mod tests {
         let custom = vec!["id=\"abc123\"".to_string()];
         let result = infer_canned_acl(&custom, &[], &[], &[], &[]);
         assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_classify_head_bucket_status_403_is_access_denied() {
+        // 403 should be classified as AccessDenied, not NotFound
+        assert_eq!(
+            classify_head_bucket_status(403, false),
+            HeadBucketErrorKind::AccessDenied
+        );
+    }
+
+    #[test]
+    fn test_classify_head_bucket_status_404_is_not_found() {
+        assert_eq!(
+            classify_head_bucket_status(404, false),
+            HeadBucketErrorKind::NotFound
+        );
+    }
+
+    #[test]
+    fn test_classify_head_bucket_status_301_is_not_found() {
+        assert_eq!(
+            classify_head_bucket_status(301, false),
+            HeadBucketErrorKind::NotFound
+        );
+    }
+
+    #[test]
+    fn test_classify_head_bucket_status_sdk_not_found_error() {
+        // When the SDK itself reports is_not_found, it should be NotFound
+        assert_eq!(
+            classify_head_bucket_status(400, true),
+            HeadBucketErrorKind::NotFound
+        );
+    }
+
+    #[test]
+    fn test_classify_head_bucket_status_other() {
+        assert_eq!(
+            classify_head_bucket_status(500, false),
+            HeadBucketErrorKind::Other
+        );
     }
 }
