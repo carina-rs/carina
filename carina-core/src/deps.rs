@@ -339,34 +339,20 @@ mod tests {
         let result = sort_resources_by_dependencies(&[a]);
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(
-            err.contains("Circular dependency detected"),
-            "Expected circular dependency error, got: {}",
-            err
-        );
-        assert!(err.contains("a"), "Error should mention 'a': {}", err);
+        assert_eq!(err, "Circular dependency detected: a -> a");
     }
 
     #[test]
     fn test_sort_resources_transitive_circular_dependency() {
-        // A -> B -> C -> A
+        // A depends on C, B depends on A, C depends on B
+        // Traversal: a -> c -> b -> a (cycle)
         let a = make_resource("a", &["c"]);
         let b = make_resource("b", &["a"]);
         let c = make_resource("c", &["b"]);
         let result = sort_resources_by_dependencies(&[a, b, c]);
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(
-            err.contains("Circular dependency detected"),
-            "Expected circular dependency error, got: {}",
-            err
-        );
-        // The cycle path should show the chain
-        assert!(
-            err.contains(" -> "),
-            "Error should show cycle path: {}",
-            err
-        );
+        assert_eq!(err, "Circular dependency detected: a -> c -> b -> a");
     }
 
     #[test]
