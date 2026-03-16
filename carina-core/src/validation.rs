@@ -570,12 +570,9 @@ let route = awscc.ec2.route {
         );
 
         let result = validate_resource_ref_types(&[subnet], &schemas, &test_schema_key_fn);
-        assert!(result.is_err(), "Expected error for unknown binding 'vpc'");
-        let err = result.unwrap_err();
-        assert!(
-            err.contains("vpc"),
-            "Error should mention the unknown binding 'vpc': {}",
-            err
+        assert_eq!(
+            result.unwrap_err(),
+            "awscc.ec2.subnet.web-subnet: unknown binding 'vpc' in reference vpc.vpc_id"
         );
     }
 
@@ -606,15 +603,9 @@ let route = awscc.ec2.route {
         );
 
         let result = validate_resource_ref_types(&[vpc, subnet], &schemas, &test_schema_key_fn);
-        assert!(
-            result.is_err(),
-            "Expected error for unknown attribute 'nonexistent_attr'"
-        );
-        let err = result.unwrap_err();
-        assert!(
-            err.contains("nonexistent_attr"),
-            "Error should mention the unknown attribute: {}",
-            err
+        assert_eq!(
+            result.unwrap_err(),
+            "awscc.ec2.subnet.web-subnet: unknown attribute 'nonexistent_attr' on 'vpc' in reference vpc.nonexistent_attr"
         );
     }
 }
