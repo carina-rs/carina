@@ -1,0 +1,31 @@
+# S3 Bucket - logging_configuration test
+#
+# Tests: logging_configuration with destination_bucket_name and log_file_prefix,
+#        resource reference between two S3 buckets (let binding),
+#        plan-verify confirms logging settings are reconciled,
+#        destroy cleans up both buckets.
+
+provider awscc {
+  region = awscc.Region.ap_northeast_1
+}
+
+let log_bucket = awscc.s3.bucket {
+  bucket_name_prefix = "carina-acc-test-log-"
+
+  lifecycle {
+    force_delete = true
+  }
+}
+
+awscc.s3.bucket {
+  bucket_name_prefix = "carina-acc-test-src-"
+
+  logging_configuration = {
+    destination_bucket_name = log_bucket.bucket_name
+    log_file_prefix        = "access-logs/"
+  }
+
+  lifecycle {
+    force_delete = true
+  }
+}
