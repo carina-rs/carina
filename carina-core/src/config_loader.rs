@@ -172,3 +172,409 @@ pub fn find_crn_files_in_dir(dir: &PathBuf) -> Result<Vec<PathBuf>, String> {
     }
     Ok(files)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    /// Helper to create a temporary directory for tests
+    fn create_temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("carina_config_loader_test_{}", name));
+        // Clean up if it exists from a previous run
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Helper to clean up a temporary directory
+    fn cleanup(dir: &Path) {
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // ========== find_crn_files_in_dir tests ==========
+
+    #[test]
+    fn find_crn_files_in_dir_empty_directory() {
+        let dir = create_temp_dir("in_dir_empty");
+        let result = find_crn_files_in_dir(&dir).unwrap();
+        assert!(result.is_empty());
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn find_crn_files_in_dir_with_crn_files() {
+        let dir = create_temp_dir("in_dir_with_crn");
+        fs::write(dir.join("a.crn"), "").unwrap();
+        fs::write(dir.join("b.crn"), "").unwrap();
+
+        let mut result = find_crn_files_in_dir(&dir).unwrap();
+        result.sort();
+        assert_eq!(result.len(), 2);
+        assert!(result[0].ends_with("a.crn"));
+        assert!(result[1].ends_with("b.crn"));
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn find_crn_files_in_dir_ignores_non_crn_files() {
+        let dir = create_temp_dir("in_dir_non_crn");
+        fs::write(dir.join("a.crn"), "").unwrap();
+        fs::write(dir.join("b.txt"), "").unwrap();
+        fs::write(dir.join("c.rs"), "").unwrap();
+
+        let result = find_crn_files_in_dir(&dir).unwrap();
+        assert_eq!(result.len(), 1);
+        assert!(result[0].ends_with("a.crn"));
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn find_crn_files_in_dir_does_not_recurse() {
+        let dir = create_temp_dir("in_dir_no_recurse");
+        fs::write(dir.join("top.crn"), "").unwrap();
+        let sub = dir.join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(sub.join("nested.crn"), "").unwrap();
+
+        let result = find_crn_files_in_dir(&dir).unwrap();
+        assert_eq!(result.len(), 1);
+        assert!(result[0].ends_with("top.crn"));
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn find_crn_files_in_dir_nonexistent_directory() {
+        let dir = PathBuf::from("/tmp/carina_config_loader_test_nonexistent_dir_xyz");
+        let result = find_crn_files_in_dir(&dir);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Failed to read directory"));
+    }
+
+    // ========== find_crn_files_recursive tests ==========
+
+    #[test]
+    fn find_crn_files_recursive_empty_directory() {
+        let dir = create_temp_dir("recursive_empty");
+        let result = find_crn_files_recursive(&dir).unwrap();
+        assert!(result.is_empty());
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn find_crn_files_recursive_finds_nested_files() {
+        let dir = create_temp_dir("recursive_nested");
+        fs::write(dir.join("top.crn"), "").unwrap();
+        let sub = dir.join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(sub.join("nested.crn"), "").unwrap();
+        let deep = sub.join("deep");
+        fs::create_dir_all(&deep).unwrap();
+        fs::write(deep.join("deep.crn"), "").unwrap();
+
+        let mut result = find_crn_files_recursive(&dir).unwrap();
+        result.sort();
+        assert_eq!(result.len(), 3);
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn find_crn_files_recursive_skips_hidden_directories() {
+        let dir = create_temp_dir("recursive_hidden");
+        fs::write(dir.join("visible.crn"), "").unwrap();
+        let hidden = dir.join(".hidden");
+        fs::create_dir_all(&hidden).unwrap();
+        fs::write(hidden.join("secret.crn"), "").unwrap();
+
+        let result = find_crn_files_recursive(&dir).unwrap();
+        assert_eq!(result.len(), 1);
+        assert!(result[0].ends_with("visible.crn"));
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn find_crn_files_recursive_skips_target_directory() {
+        let dir = create_temp_dir("recursive_target");
+        fs::write(dir.join("main.crn"), "").unwrap();
+        let target = dir.join("target");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("build.crn"), "").unwrap();
+
+        let result = find_crn_files_recursive(&dir).unwrap();
+        assert_eq!(result.len(), 1);
+        assert!(result[0].ends_with("main.crn"));
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn find_crn_files_recursive_skips_node_modules() {
+        let dir = create_temp_dir("recursive_node_modules");
+        fs::write(dir.join("app.crn"), "").unwrap();
+        let nm = dir.join("node_modules");
+        fs::create_dir_all(&nm).unwrap();
+        fs::write(nm.join("dep.crn"), "").unwrap();
+
+        let result = find_crn_files_recursive(&dir).unwrap();
+        assert_eq!(result.len(), 1);
+        assert!(result[0].ends_with("app.crn"));
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn find_crn_files_recursive_ignores_non_crn_files() {
+        let dir = create_temp_dir("recursive_non_crn");
+        fs::write(dir.join("a.crn"), "").unwrap();
+        fs::write(dir.join("b.txt"), "").unwrap();
+        fs::write(dir.join("c.json"), "").unwrap();
+
+        let result = find_crn_files_recursive(&dir).unwrap();
+        assert_eq!(result.len(), 1);
+        assert!(result[0].ends_with("a.crn"));
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn find_crn_files_recursive_nonexistent_directory() {
+        let dir = PathBuf::from("/tmp/carina_config_loader_test_recursive_nonexistent_xyz");
+        let result = find_crn_files_recursive(&dir);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Failed to read directory"));
+    }
+
+    // ========== get_base_dir tests ==========
+
+    #[test]
+    fn get_base_dir_for_file() {
+        let dir = create_temp_dir("base_dir_file");
+        let file = dir.join("test.crn");
+        fs::write(&file, "").unwrap();
+
+        let base = get_base_dir(&file);
+        assert_eq!(base, dir.as_path());
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn get_base_dir_for_directory() {
+        let dir = create_temp_dir("base_dir_directory");
+
+        let base = get_base_dir(&dir);
+        assert_eq!(base, dir.as_path());
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn get_base_dir_for_nonexistent_path() {
+        // Non-existent path is neither file nor dir, so returns the path itself
+        let path = Path::new("/tmp/carina_nonexistent_path_xyz");
+        let base = get_base_dir(path);
+        assert_eq!(base, path);
+    }
+
+    // ========== load_configuration tests ==========
+
+    #[test]
+    fn load_configuration_single_file() {
+        let dir = create_temp_dir("load_single_file");
+        let file = dir.join("test.crn");
+        fs::write(
+            &file,
+            r#"provider aws {
+    region = aws.Region.ap_northeast_1
+}
+"#,
+        )
+        .unwrap();
+
+        let config = load_configuration(&file).unwrap();
+        assert_eq!(config.parsed.providers.len(), 1);
+        assert!(config.backend_file.is_none());
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn load_configuration_single_file_with_backend() {
+        let dir = create_temp_dir("load_single_backend");
+        let file = dir.join("test.crn");
+        fs::write(
+            &file,
+            r#"backend s3 {
+    bucket = "my-bucket"
+    key    = "state.json"
+    region = "ap-northeast-1"
+}
+"#,
+        )
+        .unwrap();
+
+        let config = load_configuration(&file).unwrap();
+        assert!(config.parsed.backend.is_some());
+        assert_eq!(config.backend_file.unwrap(), file);
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn load_configuration_nonexistent_path() {
+        let path = PathBuf::from("/tmp/carina_config_loader_test_nonexistent_file_xyz");
+        let result = load_configuration(&path);
+        match result {
+            Err(e) => assert!(e.contains("Path not found"), "unexpected error: {}", e),
+            Ok(_) => panic!("expected error for nonexistent path"),
+        }
+    }
+
+    #[test]
+    fn load_configuration_empty_directory() {
+        let dir = create_temp_dir("load_empty_dir");
+        let result = load_configuration(&dir);
+        match result {
+            Err(e) => assert!(e.contains("No .crn files found"), "unexpected error: {}", e),
+            Ok(_) => panic!("expected error for empty directory"),
+        }
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn load_configuration_directory_with_single_file() {
+        let dir = create_temp_dir("load_dir_single");
+        fs::write(
+            dir.join("main.crn"),
+            r#"provider aws {
+    region = aws.Region.ap_northeast_1
+}
+"#,
+        )
+        .unwrap();
+
+        let config = load_configuration(&dir).unwrap();
+        assert_eq!(config.parsed.providers.len(), 1);
+        assert!(config.backend_file.is_none());
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn load_configuration_directory_merges_multiple_files() {
+        let dir = create_temp_dir("load_dir_merge");
+        fs::write(
+            dir.join("provider.crn"),
+            r#"provider aws {
+    region = aws.Region.ap_northeast_1
+}
+"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.join("backend.crn"),
+            r#"backend s3 {
+    bucket = "my-bucket"
+    key    = "state.json"
+    region = "ap-northeast-1"
+}
+"#,
+        )
+        .unwrap();
+
+        let config = load_configuration(&dir).unwrap();
+        assert_eq!(config.parsed.providers.len(), 1);
+        assert!(config.parsed.backend.is_some());
+        assert!(config.backend_file.is_some());
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn load_configuration_directory_ignores_non_crn_files() {
+        let dir = create_temp_dir("load_dir_ignore_non_crn");
+        fs::write(
+            dir.join("main.crn"),
+            r#"provider aws {
+    region = aws.Region.ap_northeast_1
+}
+"#,
+        )
+        .unwrap();
+        fs::write(dir.join("notes.txt"), "not a crn file").unwrap();
+
+        let config = load_configuration(&dir).unwrap();
+        assert_eq!(config.parsed.providers.len(), 1);
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn load_configuration_directory_with_parse_error() {
+        let dir = create_temp_dir("load_dir_parse_error");
+        fs::write(dir.join("bad.crn"), "this is not valid crn syntax {{{").unwrap();
+
+        let result = load_configuration(&dir);
+        assert!(result.is_err());
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn load_configuration_single_file_with_parse_error() {
+        let dir = create_temp_dir("load_file_parse_error");
+        let file = dir.join("bad.crn");
+        fs::write(&file, "this is not valid crn syntax {{{").unwrap();
+
+        let result = load_configuration(&file);
+        match result {
+            Err(e) => assert!(e.contains("Parse error"), "unexpected error: {}", e),
+            Ok(_) => panic!("expected parse error"),
+        }
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn load_configuration_preserves_unresolved_parsed() {
+        let dir = create_temp_dir("load_unresolved");
+        let file = dir.join("test.crn");
+        fs::write(
+            &file,
+            r#"provider aws {
+    region = aws.Region.ap_northeast_1
+}
+"#,
+        )
+        .unwrap();
+
+        let config = load_configuration(&file).unwrap();
+        // unresolved_parsed should also have the provider
+        assert_eq!(config.unresolved_parsed.providers.len(), 1);
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn load_configuration_directory_multiple_backends_error() {
+        let dir = create_temp_dir("load_dir_multi_backend");
+        fs::write(
+            dir.join("a.crn"),
+            r#"backend s3 {
+    bucket = "bucket-a"
+    key    = "state-a.json"
+    region = "ap-northeast-1"
+}
+"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.join("b.crn"),
+            r#"backend s3 {
+    bucket = "bucket-b"
+    key    = "state-b.json"
+    region = "ap-northeast-1"
+}
+"#,
+        )
+        .unwrap();
+
+        let result = load_configuration(&dir);
+        match result {
+            Err(e) => assert!(
+                e.contains("multiple backend blocks defined"),
+                "unexpected error: {}",
+                e
+            ),
+            Ok(_) => panic!("expected error for multiple backends"),
+        }
+        cleanup(&dir);
+    }
+}
