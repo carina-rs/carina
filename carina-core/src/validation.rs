@@ -96,14 +96,22 @@ pub fn validate_resource_ref_types(
 
             // Look up the referenced binding's schema to get the type of the referenced attribute
             let Some(ref_resource) = binding_map.get(ref_binding.as_str()) else {
-                continue; // Unknown binding, skip
+                all_errors.push(format!(
+                    "{}: unknown binding '{}' in reference {}.{}",
+                    resource.id, ref_binding, ref_binding, ref_attr,
+                ));
+                continue;
             };
             let ref_schema_key_str = schema_key_fn(ref_resource);
             let Some(ref_schema) = schemas.get(&ref_schema_key_str) else {
                 continue;
             };
             let Some(ref_attr_schema) = ref_schema.attributes.get(ref_attr.as_str()) else {
-                continue; // Unknown attribute on referenced resource, skip
+                all_errors.push(format!(
+                    "{}: unknown attribute '{}' on '{}' in reference {}.{}",
+                    resource.id, ref_attr, ref_binding, ref_binding, ref_attr,
+                ));
+                continue;
             };
             let ref_type_name = ref_attr_schema.attr_type.type_name();
 
@@ -507,5 +515,97 @@ let route = awscc.ec2.route {
             "igw_attachment should not be unused"
         );
         assert_eq!(unused, vec!["route"]);
+    }
+
+    /// Helper to create a simple ResourceSchema with given attributes.
+    fn make_schema(resource_type: &str, attrs: Vec<(&str, AttributeType)>) -> ResourceSchema {
+        let mut attributes = HashMap::new();
+        for (name, attr_type) in attrs {
+            attributes.insert(
+                name.to_string(),
+                crate::schema::AttributeSchema {
+                    name: name.to_string(),
+                    attr_type,
+                    required: false,
+                    default: None,
+                    description: None,
+                    completions: None,
+                    provider_name: None,
+                    create_only: false,
+                    removable: None,
+                    block_name: None,
+                },
+            );
+        }
+        ResourceSchema {
+            resource_type: resource_type.to_string(),
+            attributes,
+            description: None,
+            validator: None,
+            data_source: false,
+            name_attribute: None,
+            force_replace: false,
+        }
+    }
+
+    fn test_schema_key_fn(r: &Resource) -> String {
+        r.id.resource_type.clone()
+    }
+
+    #[test]
+    fn unknown_binding_reference_reports_error() {
+        let mut schemas = HashMap::new();
+        schemas.insert(
+            "ec2.subnet".to_string(),
+            make_schema("ec2.subnet", vec![("vpc_id", AttributeType::String)]),
+        );
+
+        // Subnet references "vpc" binding which doesn't exist
+        let subnet = Resource::with_provider("awscc", "ec2.subnet", "web-subnet").with_attribute(
+            "vpc_id",
+            Value::ResourceRef {
+                binding_name: "vpc".to_string(),
+                attribute_name: "vpc_id".to_string(),
+            },
+        );
+
+        let result = validate_resource_ref_types(&[subnet], &schemas, &test_schema_key_fn);
+        assert_eq!(
+            result.unwrap_err(),
+            "awscc.ec2.subnet.web-subnet: unknown binding 'vpc' in reference vpc.vpc_id"
+        );
+    }
+
+    #[test]
+    fn unknown_attribute_reference_reports_error() {
+        let mut schemas = HashMap::new();
+        schemas.insert(
+            "ec2.vpc".to_string(),
+            make_schema("ec2.vpc", vec![("cidr_block", AttributeType::String)]),
+        );
+        schemas.insert(
+            "ec2.subnet".to_string(),
+            make_schema("ec2.subnet", vec![("vpc_id", AttributeType::String)]),
+        );
+
+        // VPC resource with binding
+        let vpc = Resource::with_provider("awscc", "ec2.vpc", "main-vpc")
+            .with_attribute("_binding", Value::String("vpc".to_string()))
+            .with_attribute("cidr_block", Value::String("10.0.0.0/16".to_string()));
+
+        // Subnet references vpc.nonexistent_attr which doesn't exist on the VPC schema
+        let subnet = Resource::with_provider("awscc", "ec2.subnet", "web-subnet").with_attribute(
+            "vpc_id",
+            Value::ResourceRef {
+                binding_name: "vpc".to_string(),
+                attribute_name: "nonexistent_attr".to_string(),
+            },
+        );
+
+        let result = validate_resource_ref_types(&[vpc, subnet], &schemas, &test_schema_key_fn);
+        assert_eq!(
+            result.unwrap_err(),
+            "awscc.ec2.subnet.web-subnet: unknown attribute 'nonexistent_attr' on 'vpc' in reference vpc.nonexistent_attr"
+        );
     }
 }
