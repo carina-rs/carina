@@ -467,3 +467,114 @@ mode = 42
         diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
     );
 }
+
+#[test]
+fn output_block_undefined_binding_reference() {
+    let engine = test_engine();
+    let doc = create_document(
+        r#"provider awscc {
+region = awscc.Region.ap_northeast_1
+}
+
+output {
+    sg_id: string = nonexistent.id
+}"#,
+    );
+
+    let diagnostics = engine.analyze(&doc, None);
+
+    let undefined_diag = diagnostics
+        .iter()
+        .find(|d| d.message.contains("Undefined") && d.message.contains("nonexistent"));
+    assert!(
+        undefined_diag.is_some(),
+        "Should warn about undefined binding in output block. Got diagnostics: {:?}",
+        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn output_block_valid_binding_reference() {
+    let engine = test_engine();
+    let doc = create_document(
+        r#"provider awscc {
+region = awscc.Region.ap_northeast_1
+}
+
+let sg = awscc.ec2.security_group {
+group_description = "Test security group"
+}
+
+output {
+    sg_id: string = sg.group_id
+}"#,
+    );
+
+    let diagnostics = engine.analyze(&doc, None);
+
+    let undefined_diag = diagnostics
+        .iter()
+        .find(|d| d.message.contains("Undefined") && d.message.contains("sg"));
+    assert!(
+        undefined_diag.is_none(),
+        "Should NOT warn about defined binding in output block. Got diagnostics: {:?}",
+        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn output_block_type_mismatch_bool_to_string() {
+    let engine = test_engine();
+    let doc = create_document(
+        r#"provider awscc {
+region = awscc.Region.ap_northeast_1
+}
+
+output {
+    flag: string = true
+}"#,
+    );
+
+    let diagnostics = engine.analyze(&doc, None);
+
+    let type_diag = diagnostics
+        .iter()
+        .find(|d| d.message.contains("Type mismatch") && d.message.contains("string"));
+    assert!(
+        type_diag.is_some(),
+        "Should warn about type mismatch in output block (bool assigned to string). Got diagnostics: {:?}",
+        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn output_block_valid_types_no_warning() {
+    let engine = test_engine();
+    let doc = create_document(
+        r#"provider awscc {
+region = awscc.Region.ap_northeast_1
+}
+
+let sg = awscc.ec2.security_group {
+group_description = "Test security group"
+}
+
+output {
+    sg_id: string = sg.group_id
+    name: string = "hello"
+    enabled: bool = true
+    count: int = 42
+}"#,
+    );
+
+    let diagnostics = engine.analyze(&doc, None);
+
+    let type_diag = diagnostics
+        .iter()
+        .find(|d| d.message.contains("Type mismatch") && d.message.contains("output"));
+    assert!(
+        type_diag.is_none(),
+        "Should NOT warn about valid types in output block. Got diagnostics: {:?}",
+        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}

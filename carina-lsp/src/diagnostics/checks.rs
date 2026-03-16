@@ -380,6 +380,205 @@ impl DiagnosticEngine {
         bindings
     }
 
+    /// Check output blocks for type mismatches and undefined binding references.
+    pub(super) fn check_output_blocks(
+        &self,
+        doc: &Document,
+        parsed: &ParsedFile,
+    ) -> Vec<Diagnostic> {
+        let mut diagnostics = Vec::new();
+
+        // Collect defined binding names from parsed resources
+        let mut defined_bindings: HashSet<String> = HashSet::new();
+        for resource in &parsed.resources {
+            if let Some(Value::String(binding_name)) = resource.attributes.get("_binding") {
+                defined_bindings.insert(binding_name.clone());
+            }
+        }
+
+        for output in &parsed.outputs {
+            if let Some(value) = &output.value {
+                // Check for undefined binding references
+                if let Value::ResourceRef { binding_name, .. } = value
+                    && !defined_bindings.contains(binding_name.as_str())
+                    && let Some((line, col)) = self.find_output_value_position(doc, &output.name)
+                {
+                    diagnostics.push(Diagnostic {
+                        range: Range {
+                            start: Position {
+                                line,
+                                character: col,
+                            },
+                            end: Position {
+                                line,
+                                character: col + binding_name.len() as u32,
+                            },
+                        },
+                        severity: Some(DiagnosticSeverity::ERROR),
+                        source: Some("carina".to_string()),
+                        message: format!(
+                            "Undefined resource '{}' in output '{}'. Define it with 'let {} = ...'",
+                            binding_name, output.name, binding_name
+                        ),
+                        ..Default::default()
+                    });
+                }
+
+                // Type validation
+                if let Some(type_error) =
+                    self.validate_output_type(&output.type_expr, value, &output.name)
+                    && let Some((line, col)) = self.find_output_param_position(doc, &output.name)
+                {
+                    diagnostics.push(Diagnostic {
+                        range: Range {
+                            start: Position {
+                                line,
+                                character: col,
+                            },
+                            end: Position {
+                                line,
+                                character: col + output.name.len() as u32,
+                            },
+                        },
+                        severity: Some(DiagnosticSeverity::WARNING),
+                        source: Some("carina".to_string()),
+                        message: type_error,
+                        ..Default::default()
+                    });
+                }
+            }
+        }
+
+        diagnostics
+    }
+
+    /// Validate an output value against its declared type.
+    fn validate_output_type(
+        &self,
+        type_expr: &TypeExpr,
+        value: &Value,
+        output_name: &str,
+    ) -> Option<String> {
+        match (type_expr, value) {
+            // ResourceRef is always allowed (type is resolved at runtime)
+            (_, Value::ResourceRef { .. }) => None,
+            // String type checks
+            (TypeExpr::String, Value::Bool(b)) => Some(format!(
+                "Type mismatch in output '{}': expected string, got bool ({})",
+                output_name, b
+            )),
+            (TypeExpr::String, Value::Int(n)) => Some(format!(
+                "Type mismatch in output '{}': expected string, got int ({})",
+                output_name, n
+            )),
+            (TypeExpr::String, Value::Float(f)) => Some(format!(
+                "Type mismatch in output '{}': expected string, got float ({})",
+                output_name, f
+            )),
+            // Bool type checks
+            (TypeExpr::Bool, Value::String(s)) => Some(format!(
+                "Type mismatch in output '{}': expected bool, got string \"{}\". Use true or false.",
+                output_name, s
+            )),
+            (TypeExpr::Bool, Value::Int(n)) => Some(format!(
+                "Type mismatch in output '{}': expected bool, got int ({})",
+                output_name, n
+            )),
+            // Int type checks
+            (TypeExpr::Int, Value::String(s)) => Some(format!(
+                "Type mismatch in output '{}': expected int, got string \"{}\"",
+                output_name, s
+            )),
+            (TypeExpr::Int, Value::Bool(b)) => Some(format!(
+                "Type mismatch in output '{}': expected int, got bool ({})",
+                output_name, b
+            )),
+            // Float type checks
+            (TypeExpr::Float, Value::String(s)) => Some(format!(
+                "Type mismatch in output '{}': expected float, got string \"{}\"",
+                output_name, s
+            )),
+            (TypeExpr::Float, Value::Bool(b)) => Some(format!(
+                "Type mismatch in output '{}': expected float, got bool ({})",
+                output_name, b
+            )),
+            _ => None,
+        }
+    }
+
+    /// Find the position of an output parameter name in the document.
+    fn find_output_param_position(&self, doc: &Document, param_name: &str) -> Option<(u32, u32)> {
+        let text = doc.text();
+        let mut in_output_block = false;
+
+        for (line_idx, line) in text.lines().enumerate() {
+            let trimmed = line.trim();
+
+            if trimmed.starts_with("output ") && trimmed.contains('{') || trimmed == "output {" {
+                in_output_block = true;
+                continue;
+            }
+
+            if in_output_block {
+                if trimmed == "}" {
+                    in_output_block = false;
+                    continue;
+                }
+
+                // Look for "param_name:" pattern
+                if trimmed.starts_with(param_name)
+                    && trimmed[param_name.len()..]
+                        .chars()
+                        .next()
+                        .is_some_and(|c| c == ':')
+                {
+                    let leading_ws = line.len() - trimmed.len();
+                    return Some((line_idx as u32, leading_ws as u32));
+                }
+            }
+        }
+        None
+    }
+
+    /// Find the position of the value expression in an output parameter line.
+    fn find_output_value_position(&self, doc: &Document, param_name: &str) -> Option<(u32, u32)> {
+        let text = doc.text();
+        let mut in_output_block = false;
+
+        for (line_idx, line) in text.lines().enumerate() {
+            let trimmed = line.trim();
+
+            if trimmed.starts_with("output ") && trimmed.contains('{') || trimmed == "output {" {
+                in_output_block = true;
+                continue;
+            }
+
+            if in_output_block {
+                if trimmed == "}" {
+                    in_output_block = false;
+                    continue;
+                }
+
+                // Look for "param_name: type = value" pattern
+                if trimmed.starts_with(param_name)
+                    && trimmed[param_name.len()..]
+                        .chars()
+                        .next()
+                        .is_some_and(|c| c == ':')
+                {
+                    // Find the "=" and return position after it
+                    if let Some(eq_pos) = line.find('=') {
+                        let after_eq = &line[eq_pos + 1..];
+                        let trimmed_after = after_eq.trim_start();
+                        let value_col = eq_pos + 1 + (after_eq.len() - trimmed_after.len());
+                        return Some((line_idx as u32, value_col as u32));
+                    }
+                }
+            }
+        }
+        None
+    }
+
     /// Check for undefined resource references in attribute values
     pub(super) fn check_undefined_references(
         &self,
