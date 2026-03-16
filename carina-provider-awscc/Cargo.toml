@@ -27,6 +27,7 @@ heck = "0.5"
 regex = "1.0"
 anyhow = "1.0"
 clap = { version = "4.0", features = ["derive"] }
+log = "0.4"
 
 [dev-dependencies]
 http = "1"

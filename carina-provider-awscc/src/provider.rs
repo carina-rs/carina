@@ -491,8 +491,8 @@ impl AwsccProvider {
                             if Self::is_retryable_status_message(&e.message)
                                 && attempt < CREATE_RETRY_MAX_ATTEMPTS =>
                         {
-                            eprintln!(
-                                "  Retryable error creating {} (attempt {}/{}): {}. Retrying in {}s...",
+                            log::warn!(
+                                "Retryable error creating {} (attempt {}/{}): {}. Retrying in {}s...",
                                 type_name,
                                 attempt + 1,
                                 CREATE_RETRY_MAX_ATTEMPTS,
@@ -508,8 +508,8 @@ impl AwsccProvider {
                 }
                 Err(e) => {
                     if Self::is_retryable_sdk_error(&e) && attempt < CREATE_RETRY_MAX_ATTEMPTS {
-                        eprintln!(
-                            "  Retryable error creating {} (attempt {}/{}): {:?}. Retrying in {}s...",
+                        log::warn!(
+                            "Retryable error creating {} (attempt {}/{}): {:?}. Retrying in {}s...",
                             type_name,
                             attempt + 1,
                             CREATE_RETRY_MAX_ATTEMPTS,
@@ -602,8 +602,8 @@ impl AwsccProvider {
                                 if Self::is_retryable_status_message(&e.message)
                                     && attempt < DELETE_RETRY_MAX_ATTEMPTS =>
                             {
-                                eprintln!(
-                                    "  Retryable error deleting {} (attempt {}/{}): {}. Retrying in {}s...",
+                                log::warn!(
+                                    "Retryable error deleting {} (attempt {}/{}): {}. Retrying in {}s...",
                                     type_name,
                                     attempt + 1,
                                     DELETE_RETRY_MAX_ATTEMPTS,
@@ -621,8 +621,8 @@ impl AwsccProvider {
                 }
                 Err(e) => {
                     if Self::is_retryable_sdk_error(&e) && attempt < DELETE_RETRY_MAX_ATTEMPTS {
-                        eprintln!(
-                            "  Retryable error deleting {} (attempt {}/{}): {:?}. Retrying in {}s...",
+                        log::warn!(
+                            "Retryable error deleting {} (attempt {}/{}): {:?}. Retrying in {}s...",
                             type_name,
                             attempt + 1,
                             DELETE_RETRY_MAX_ATTEMPTS,
@@ -2758,5 +2758,28 @@ mod tests {
         let back_to_aws =
             dsl_value_to_aws(&dsl_val.unwrap(), &attr_type, "ec2.vpn_gateway", "type");
         assert_eq!(back_to_aws, Some(json!("ipsec.1")));
+    }
+
+    // =========================================================================
+    // Retry logging tests (verify log framework is used instead of eprintln!)
+    // =========================================================================
+
+    #[test]
+    fn test_retry_logging_uses_log_framework() {
+        // Verify that retry messages go through the log framework.
+        // The source code should use log::warn! instead of eprintln!.
+        // Count lines that START with eprintln (after trimming), which are actual macro calls,
+        // excluding this test code itself.
+        let source = include_str!("provider.rs");
+        let actual_eprintln_calls = source
+            .lines()
+            .filter(|line| line.trim().starts_with("eprintln!"))
+            .count();
+        assert_eq!(
+            actual_eprintln_calls, 0,
+            "Found {} eprintln! macro calls in provider.rs; \
+             all should be replaced with log::warn!",
+            actual_eprintln_calls
+        );
     }
 }
