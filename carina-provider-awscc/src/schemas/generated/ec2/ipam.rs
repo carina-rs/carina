@@ -15,7 +15,7 @@ const VALID_TIER: &[&str] = &["free", "advanced"];
 
 fn validate_string_length_min_1(value: &Value) -> Result<(), String> {
     if let Value::String(s) = value {
-        let len = s.len();
+        let len = s.chars().count();
         if len < 1 {
             Err(format!("String length {} is out of range 1..", len))
         } else {
@@ -28,7 +28,7 @@ fn validate_string_length_min_1(value: &Value) -> Result<(), String> {
 
 fn validate_string_length_max_255(value: &Value) -> Result<(), String> {
     if let Value::String(s) = value {
-        let len = s.len();
+        let len = s.chars().count();
         if len > 255 {
             Err(format!("String length {} is out of range ..=255", len))
         } else {

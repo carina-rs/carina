@@ -40,7 +40,7 @@ fn validate_string_pattern_b6dfbc56753dfe38_len_1_512(value: &Value) -> Result<(
                 s
             ));
         }
-        let len = s.len();
+        let len = s.chars().count();
         if !(1..=512).contains(&len) {
             return Err(format!("String length {} is out of range 1..=512", len));
         }

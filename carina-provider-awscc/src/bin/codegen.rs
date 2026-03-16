@@ -1658,7 +1658,7 @@ fn {}(value: &Value) -> Result<(), String> {{
             code.push_str(&format!(
                 r#"fn {}(value: &Value) -> Result<(), String> {{
     if let Value::String(s) = value {{
-        let len = s.len();
+        let len = s.chars().count();
         if {} {{
             Err(format!("String length {{}} is out of range {}", len))
         }} else {{
@@ -1697,7 +1697,7 @@ fn {}(value: &Value) -> Result<(), String> {{
         if !RE.is_match(s) {{
             return Err(format!("Value '{{}}' does not match pattern {escaped_for_msg}", s));
         }}
-        let len = s.len();
+        let len = s.chars().count();
         if {len_condition} {{
             return Err(format!("String length {{}} is out of range {range_display}", len));
         }}
@@ -7908,6 +7908,48 @@ mod tests {
         assert!(
             ref_count >= 3,
             "Both properties should reference the shared function (1 def + 2 refs), got {ref_count}: {generated}"
+        );
+    }
+
+    #[test]
+    fn test_string_length_validation_uses_char_count() {
+        // String length validation should use s.chars().count() (character count)
+        // instead of s.len() (byte count) to correctly handle multi-byte characters.
+        // e.g., "テスト" is 3 characters but 9 bytes in UTF-8.
+        let mut properties = BTreeMap::new();
+        properties.insert(
+            "DisplayName".to_string(),
+            CfnProperty {
+                prop_type: Some(TypeValue::Single("string".to_string())),
+                description: Some("Display name.".to_string()),
+                max_length: Some(10),
+                ..Default::default()
+            },
+        );
+
+        let schema = CfnSchema {
+            type_name: "AWS::Test::Resource".to_string(),
+            description: None,
+            properties,
+            required: vec![],
+            read_only_properties: vec![],
+            create_only_properties: vec![],
+            write_only_properties: vec![],
+            primary_identifier: None,
+            definitions: None,
+            tagging: None,
+        };
+
+        let generated = generate_schema_code(&schema, "AWS::Test::Resource").unwrap();
+
+        // Should use chars().count() for character-based length, not byte-based len()
+        assert!(
+            generated.contains("s.chars().count()"),
+            "String length validation should use s.chars().count() instead of s.len(): {generated}"
+        );
+        assert!(
+            !generated.contains("let len = s.len()"),
+            "String length validation should NOT use s.len() for string properties: {generated}"
         );
     }
 
