@@ -1528,6 +1528,107 @@ async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
     .await
 }
 
+/// Detect infrastructure drift by comparing planned states against actual infrastructure.
+///
+/// Returns `Ok(None)` if no drift is detected, or `Ok(Some(messages))` with drift details.
+/// Returns `Err` if a resource is missing from planned_states or if a provider read fails.
+async fn detect_drift(
+    sorted_resources: &[Resource],
+    planned_states: &HashMap<ResourceId, State>,
+    provider: &dyn Provider,
+) -> Result<Option<Vec<String>>, String> {
+    let mut drift_detected = false;
+    let mut drift_messages: Vec<String> = Vec::new();
+
+    for resource in sorted_resources {
+        let planned_state = planned_states.get(&resource.id);
+        let identifier = planned_state.and_then(|s| s.identifier.as_deref());
+
+        let actual_state = provider
+            .read(&resource.id, identifier)
+            .await
+            .map_err(|e| format!("Failed to read current state of {}: {}", resource.id, e))?;
+
+        if let Some(planned) = planned_state {
+            if planned.exists != actual_state.exists {
+                drift_detected = true;
+                if planned.exists {
+                    drift_messages.push(format!(
+                        "  {} {}: resource existed at plan time but no longer exists",
+                        "~".yellow(),
+                        resource.id
+                    ));
+                } else {
+                    drift_messages.push(format!(
+                        "  {} {}: resource did not exist at plan time but now exists",
+                        "~".yellow(),
+                        resource.id
+                    ));
+                }
+            } else if planned.exists && actual_state.exists {
+                // Compare attributes for existing resources
+                let mut attr_diffs: Vec<String> = Vec::new();
+                for (key, planned_val) in &planned.attributes {
+                    if key.starts_with('_') {
+                        continue;
+                    }
+                    match actual_state.attributes.get(key) {
+                        Some(actual_val) if actual_val != planned_val => {
+                            attr_diffs.push(format!(
+                                "      {}: {} → {}",
+                                key,
+                                format_value(planned_val),
+                                format_value(actual_val)
+                            ));
+                        }
+                        None => {
+                            attr_diffs.push(format!(
+                                "      {}: {} → (removed)",
+                                key,
+                                format_value(planned_val)
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
+                for (key, actual_val) in &actual_state.attributes {
+                    if key.starts_with('_') {
+                        continue;
+                    }
+                    if !planned.attributes.contains_key(key) {
+                        attr_diffs.push(format!(
+                            "      {}: (none) → {}",
+                            key,
+                            format_value(actual_val)
+                        ));
+                    }
+                }
+                if !attr_diffs.is_empty() {
+                    drift_detected = true;
+                    drift_messages.push(format!(
+                        "  {} {}: attributes have changed since plan was created:",
+                        "~".yellow(),
+                        resource.id
+                    ));
+                    drift_messages.extend(attr_diffs);
+                }
+            }
+        } else {
+            return Err(format!(
+                "Resource {} is present in plan but missing from planned states. \
+                 The plan file may be corrupted. Please re-run 'carina plan'.",
+                resource.id
+            ));
+        }
+    }
+
+    if drift_detected {
+        Ok(Some(drift_messages))
+    } else {
+        Ok(None)
+    }
+}
+
 async fn run_apply_from_plan(plan_path: &PathBuf, auto_approve: bool) -> Result<(), String> {
     // Read and deserialize the plan file
     let content =
@@ -1645,86 +1746,9 @@ async fn run_apply_from_plan(plan_path: &PathBuf, auto_approve: bool) -> Result<
 
     // Drift detection: re-read actual infrastructure state and compare against planned states
     println!("{}", "Checking for infrastructure drift...".cyan());
-    let mut drift_detected = false;
-    let mut drift_messages: Vec<String> = Vec::new();
+    let drift_result = detect_drift(sorted_resources, &planned_states, provider.as_ref()).await?;
 
-    for resource in sorted_resources {
-        let planned_state = planned_states.get(&resource.id);
-        let identifier = planned_state.and_then(|s| s.identifier.as_deref());
-
-        let actual_state = provider
-            .read(&resource.id, identifier)
-            .await
-            .map_err(|e| format!("Failed to read current state of {}: {}", resource.id, e))?;
-
-        if let Some(planned) = planned_state {
-            if planned.exists != actual_state.exists {
-                drift_detected = true;
-                if planned.exists {
-                    drift_messages.push(format!(
-                        "  {} {}: resource existed at plan time but no longer exists",
-                        "~".yellow(),
-                        resource.id
-                    ));
-                } else {
-                    drift_messages.push(format!(
-                        "  {} {}: resource did not exist at plan time but now exists",
-                        "~".yellow(),
-                        resource.id
-                    ));
-                }
-            } else if planned.exists && actual_state.exists {
-                // Compare attributes for existing resources
-                let mut attr_diffs: Vec<String> = Vec::new();
-                for (key, planned_val) in &planned.attributes {
-                    if key.starts_with('_') {
-                        continue;
-                    }
-                    match actual_state.attributes.get(key) {
-                        Some(actual_val) if actual_val != planned_val => {
-                            attr_diffs.push(format!(
-                                "      {}: {} → {}",
-                                key,
-                                format_value(planned_val),
-                                format_value(actual_val)
-                            ));
-                        }
-                        None => {
-                            attr_diffs.push(format!(
-                                "      {}: {} → (removed)",
-                                key,
-                                format_value(planned_val)
-                            ));
-                        }
-                        _ => {}
-                    }
-                }
-                for (key, actual_val) in &actual_state.attributes {
-                    if key.starts_with('_') {
-                        continue;
-                    }
-                    if !planned.attributes.contains_key(key) {
-                        attr_diffs.push(format!(
-                            "      {}: (none) → {}",
-                            key,
-                            format_value(actual_val)
-                        ));
-                    }
-                }
-                if !attr_diffs.is_empty() {
-                    drift_detected = true;
-                    drift_messages.push(format!(
-                        "  {} {}: attributes have changed since plan was created:",
-                        "~".yellow(),
-                        resource.id
-                    ));
-                    drift_messages.extend(attr_diffs);
-                }
-            }
-        }
-    }
-
-    if drift_detected {
+    if let Some(drift_messages) = drift_result {
         println!();
         println!("{}", "Error: Infrastructure drift detected!".red().bold());
         println!(
@@ -3992,5 +4016,85 @@ mod tests {
             Some("fl-12345678".to_string()),
             "Should find flow_log identifier in state for plan-verify (issue #535)"
         );
+    }
+
+    #[tokio::test]
+    async fn detect_drift_errors_when_resource_missing_from_planned_states() {
+        let resource = Resource::with_provider("aws", "s3.bucket", "my-bucket");
+        let id = resource.id.clone();
+
+        // Provider returns a non-existing state (identifier is None since no planned state)
+        let provider = TestProvider::with_read_state(&id, "", State::not_found(id.clone()));
+
+        // planned_states is empty - resource is missing
+        let planned_states: HashMap<ResourceId, State> = HashMap::new();
+
+        let result = detect_drift(&[resource], &planned_states, &provider).await;
+
+        assert!(
+            result.is_err(),
+            "Should return error when resource is missing from planned states"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("missing from planned states"),
+            "Error message should mention missing planned states, got: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn detect_drift_returns_none_when_no_drift() {
+        let resource = Resource::with_provider("aws", "s3.bucket", "my-bucket");
+        let id = resource.id.clone();
+        let identifier = "my-bucket";
+
+        let state = State::existing(
+            id.clone(),
+            HashMap::from([("name".to_string(), Value::String("my-bucket".to_string()))]),
+        )
+        .with_identifier(identifier);
+
+        let provider = TestProvider::with_read_state(&id, identifier, state.clone());
+        let planned_states = HashMap::from([(id.clone(), state)]);
+
+        let result = detect_drift(&[resource], &planned_states, &provider).await;
+
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none(), "Should detect no drift");
+    }
+
+    #[tokio::test]
+    async fn detect_drift_returns_messages_when_drift_detected() {
+        let resource = Resource::with_provider("aws", "s3.bucket", "my-bucket");
+        let id = resource.id.clone();
+        let identifier = "my-bucket";
+
+        let planned = State::existing(
+            id.clone(),
+            HashMap::from([("name".to_string(), Value::String("my-bucket".to_string()))]),
+        )
+        .with_identifier(identifier);
+
+        // Actual state has different attribute value
+        let actual = State::existing(
+            id.clone(),
+            HashMap::from([(
+                "name".to_string(),
+                Value::String("changed-bucket".to_string()),
+            )]),
+        )
+        .with_identifier(identifier);
+
+        let provider = TestProvider::with_read_state(&id, identifier, actual);
+        let planned_states = HashMap::from([(id.clone(), planned)]);
+
+        let result = detect_drift(&[resource], &planned_states, &provider).await;
+
+        assert!(result.is_ok());
+        let messages = result.unwrap();
+        assert!(messages.is_some(), "Should detect drift");
+        let msgs = messages.unwrap();
+        assert!(!msgs.is_empty(), "Should have drift messages");
     }
 }
