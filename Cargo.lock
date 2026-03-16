@@ -688,6 +688,8 @@ dependencies = [
  "clap",
  "clap_complete",
  "colored",
+ "env_logger",
+ "log",
  "serde",
  "serde_json",
  "similar",
