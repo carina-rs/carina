@@ -96,7 +96,17 @@ fn aws_value_to_dsl(
     {
         let items: Vec<Value> = arr
             .iter()
-            .filter_map(|item| aws_value_to_dsl(dsl_name, item, inner, resource_type))
+            .enumerate()
+            .filter_map(|(i, item)| {
+                let result = aws_value_to_dsl(dsl_name, item, inner, resource_type);
+                if result.is_none() {
+                    log::warn!(
+                        "aws_value_to_dsl: dropping unconvertible array item at index {} for attribute '{}' in resource '{}': {:?}",
+                        i, dsl_name, resource_type, item
+                    );
+                }
+                result
+            })
             .collect();
         return Some(Value::List(items));
     }
@@ -137,7 +147,14 @@ fn aws_value_to_dsl(
         let map: HashMap<String, Value> = obj
             .iter()
             .filter_map(|(k, v)| {
-                aws_value_to_dsl(dsl_name, v, inner, resource_type).map(|val| (k.clone(), val))
+                let result = aws_value_to_dsl(dsl_name, v, inner, resource_type);
+                if result.is_none() {
+                    log::warn!(
+                        "aws_value_to_dsl: dropping unconvertible map entry '{}' for attribute '{}' in resource '{}': {:?}",
+                        k, dsl_name, resource_type, v
+                    );
+                }
+                result.map(|val| (k.clone(), val))
             })
             .collect();
         return Some(Value::Map(map));
@@ -159,13 +176,37 @@ fn json_to_value(value: &serde_json::Value) -> Option<Value> {
             }
         }
         serde_json::Value::Array(arr) => {
-            let items: Vec<Value> = arr.iter().filter_map(json_to_value).collect();
+            let items: Vec<Value> = arr
+                .iter()
+                .enumerate()
+                .filter_map(|(i, item)| {
+                    let result = json_to_value(item);
+                    if result.is_none() {
+                        log::warn!(
+                            "json_to_value: dropping unconvertible array item at index {}: {:?}",
+                            i,
+                            item
+                        );
+                    }
+                    result
+                })
+                .collect();
             Some(Value::List(items))
         }
         serde_json::Value::Object(obj) => {
             let map: HashMap<String, Value> = obj
                 .iter()
-                .filter_map(|(k, v)| json_to_value(v).map(|val| (k.clone(), val)))
+                .filter_map(|(k, v)| {
+                    let result = json_to_value(v);
+                    if result.is_none() {
+                        log::warn!(
+                            "json_to_value: dropping unconvertible map entry '{}': {:?}",
+                            k,
+                            v
+                        );
+                    }
+                    result.map(|val| (k.clone(), val))
+                })
                 .collect();
             Some(Value::Map(map))
         }
@@ -229,7 +270,17 @@ fn dsl_value_to_aws(
         // Recurse into list items with inner type for type-aware conversion
         let arr: Vec<serde_json::Value> = items
             .iter()
-            .filter_map(|item| dsl_value_to_aws(item, inner, resource_type, attr_name))
+            .enumerate()
+            .filter_map(|(i, item)| {
+                let result = dsl_value_to_aws(item, inner, resource_type, attr_name);
+                if result.is_none() {
+                    log::warn!(
+                        "dsl_value_to_aws: dropping unconvertible list item at index {} for attribute '{}' in resource '{}': {:?}",
+                        i, attr_name, resource_type, item
+                    );
+                }
+                result
+            })
             .collect();
         Some(serde_json::Value::Array(arr))
     } else if let AttributeType::Union(members) = attr_type {
@@ -287,7 +338,14 @@ fn dsl_value_to_aws(
         let obj: serde_json::Map<String, serde_json::Value> = map
             .iter()
             .filter_map(|(k, v)| {
-                dsl_value_to_aws(v, inner, resource_type, attr_name).map(|val| (k.clone(), val))
+                let result = dsl_value_to_aws(v, inner, resource_type, attr_name);
+                if result.is_none() {
+                    log::warn!(
+                        "dsl_value_to_aws: dropping unconvertible map entry '{}' for attribute '{}' in resource '{}': {:?}",
+                        k, attr_name, resource_type, v
+                    );
+                }
+                result.map(|val| (k.clone(), val))
             })
             .collect();
         Some(serde_json::Value::Object(obj))
@@ -305,13 +363,37 @@ fn value_to_json(value: &Value) -> Option<serde_json::Value> {
         Value::Float(f) if f.is_finite() => Some(json!(f)),
         Value::Float(_) => None,
         Value::List(items) => {
-            let arr: Vec<serde_json::Value> = items.iter().filter_map(value_to_json).collect();
+            let arr: Vec<serde_json::Value> = items
+                .iter()
+                .enumerate()
+                .filter_map(|(i, item)| {
+                    let result = value_to_json(item);
+                    if result.is_none() {
+                        log::warn!(
+                            "value_to_json: dropping unconvertible list item at index {}: {:?}",
+                            i,
+                            item
+                        );
+                    }
+                    result
+                })
+                .collect();
             Some(serde_json::Value::Array(arr))
         }
         Value::Map(map) => {
             let obj: serde_json::Map<String, serde_json::Value> = map
                 .iter()
-                .filter_map(|(k, v)| value_to_json(v).map(|val| (k.clone(), val)))
+                .filter_map(|(k, v)| {
+                    let result = value_to_json(v);
+                    if result.is_none() {
+                        log::warn!(
+                            "value_to_json: dropping unconvertible map entry '{}': {:?}",
+                            k,
+                            v
+                        );
+                    }
+                    result.map(|val| (k.clone(), val))
+                })
                 .collect();
             Some(serde_json::Value::Object(obj))
         }
@@ -2914,6 +2996,82 @@ mod tests {
         let result = value_to_json(&value);
         assert!(result.is_some());
         assert_eq!(result.unwrap(), serde_json::json!(1.5));
+    }
+
+    // =========================================================================
+    // Silent array/map drop warning tests
+    // =========================================================================
+
+    #[test]
+    fn test_json_to_value_array_with_null_logs_warning() {
+        // json_to_value should warn when array items are dropped (e.g., null values)
+        // Verify the source code contains log::warn! in json_to_value's Array branch
+        let source = include_str!("provider.rs");
+
+        // Find the json_to_value function and check it warns on dropped array items
+        let in_json_to_value = source
+            .split("fn json_to_value")
+            .nth(1)
+            .expect("json_to_value function not found");
+        let fn_body = &in_json_to_value[..in_json_to_value
+            .find("\nfn ")
+            .unwrap_or(in_json_to_value.len())];
+
+        assert!(
+            fn_body.contains("log::warn!"),
+            "json_to_value should log a warning when array items or map entries are dropped"
+        );
+    }
+
+    #[test]
+    fn test_aws_value_to_dsl_list_logs_warning_on_dropped_items() {
+        // aws_value_to_dsl should warn when List items are dropped
+        let source = include_str!("provider.rs");
+
+        let in_fn = source
+            .split("fn aws_value_to_dsl")
+            .nth(1)
+            .expect("aws_value_to_dsl function not found");
+        let fn_body = &in_fn[..in_fn.find("\nfn ").unwrap_or(in_fn.len())];
+
+        assert!(
+            fn_body.contains("log::warn!"),
+            "aws_value_to_dsl should log a warning when list items or map entries are dropped"
+        );
+    }
+
+    #[test]
+    fn test_dsl_value_to_aws_list_logs_warning_on_dropped_items() {
+        // dsl_value_to_aws should warn when List items are dropped
+        let source = include_str!("provider.rs");
+
+        let in_fn = source
+            .split("fn dsl_value_to_aws")
+            .nth(1)
+            .expect("dsl_value_to_aws function not found");
+        let fn_body = &in_fn[..in_fn.find("\nfn ").unwrap_or(in_fn.len())];
+
+        assert!(
+            fn_body.contains("log::warn!"),
+            "dsl_value_to_aws should log a warning when list items or map entries are dropped"
+        );
+    }
+
+    #[test]
+    fn test_value_to_json_list_logs_warning_on_dropped_items() {
+        // value_to_json should warn when List items are dropped
+        let source = include_str!("provider.rs");
+
+        let in_fn = source
+            .split("fn value_to_json")
+            .nth(1)
+            .expect("value_to_json function not found");
+        let fn_body = &in_fn[..in_fn.find("\nfn ").unwrap_or(in_fn.len())];
+
+        assert!(
+            fn_body.contains("log::warn!"),
+            "value_to_json should log a warning when list items or map entries are dropped"
+        );
     }
 
     // =========================================================================
