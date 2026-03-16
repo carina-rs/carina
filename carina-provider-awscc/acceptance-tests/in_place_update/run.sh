@@ -12,6 +12,8 @@
 #   iam_role                           - Change max_session_duration (3600 -> 7200)
 #   ec2_transit_gateway                - Change description
 #   ec2_security_group                 - Add ingress rule
+#   ec2_security_group_ingress         - Change description
+#   ec2_security_group_egress          - Change description
 #   ec2_eip                            - Update tags
 #   ec2_route_table                    - Update tags
 #   ec2_flow_log                       - Update tags
@@ -19,7 +21,7 @@
 #   ec2_egress_only_internet_gateway   - Update tags
 #   ec2_vpc_endpoint                   - Add policy_document
 #   ec2_vpc_peering_connection         - Update tags
-#   ec2_transit_gateway_attachment      - Update tags
+#   ec2_transit_gateway_attachment     - Update tags
 #   ec2_route                          - Change route target (IGW -> NAT GW)
 #
 # Filter (optional): substring to match test names (e.g. "logs_log_group", "s3_bucket")
@@ -199,59 +201,71 @@ run_test "ec2_security_group" \
     "$SCRIPT_DIR/ec2_security_group_step2.crn" \
     "Test 7: EC2 Security Group (add HTTPS ingress rule)"
 
-# Test 8: EC2 EIP - update tags
+# Test 8: EC2 Security Group Ingress - change description
+run_test "ec2_security_group_ingress" \
+    "$SCRIPT_DIR/ec2_security_group_ingress_step1.crn" \
+    "$SCRIPT_DIR/ec2_security_group_ingress_step2.crn" \
+    "Test 8: EC2 Security Group Ingress (description update)"
+
+# Test 9: EC2 Security Group Egress - change description
+run_test "ec2_security_group_egress" \
+    "$SCRIPT_DIR/ec2_security_group_egress_step1.crn" \
+    "$SCRIPT_DIR/ec2_security_group_egress_step2.crn" \
+    "Test 9: EC2 Security Group Egress (description update)"
+
+# Test 10: EC2 EIP - update tags
 run_test "ec2_eip" \
     "$SCRIPT_DIR/ec2_eip_step1.crn" \
     "$SCRIPT_DIR/ec2_eip_step2.crn" \
-    "Test 8: EC2 EIP (tags update)"
+    "Test 10: EC2 EIP (tags update)"
 
-# Test 9: EC2 Route Table - update tags
+# Test 11: EC2 Route Table - update tags
 run_test "ec2_route_table" \
     "$SCRIPT_DIR/ec2_route_table_step1.crn" \
     "$SCRIPT_DIR/ec2_route_table_step2.crn" \
-    "Test 9: EC2 Route Table (tags update)"
+    "Test 11: EC2 Route Table (tags update)"
 
-# Test 10: EC2 Flow Log - update tags
+# Test 12: EC2 Flow Log - update tags
 run_test "ec2_flow_log" \
     "$SCRIPT_DIR/ec2_flow_log_step1.crn" \
     "$SCRIPT_DIR/ec2_flow_log_step2.crn" \
-    "Test 10: EC2 Flow Log (tags update)"
+    "Test 12: EC2 Flow Log (tags update)"
 
-# Test 11: EC2 NAT Gateway - update tags
+# Test 13: EC2 NAT Gateway - update tags
 run_test "ec2_nat_gateway" \
     "$SCRIPT_DIR/ec2_nat_gateway_step1.crn" \
     "$SCRIPT_DIR/ec2_nat_gateway_step2.crn" \
-    "Test 11: EC2 NAT Gateway (tags update)"
+    "Test 13: EC2 NAT Gateway (tags update)"
 
-# Test 12: EC2 Egress Only Internet Gateway - update tags
+# Test 14: EC2 Egress Only Internet Gateway - update tags
 run_test "ec2_egress_only_internet_gateway" \
     "$SCRIPT_DIR/ec2_egress_only_internet_gateway_step1.crn" \
     "$SCRIPT_DIR/ec2_egress_only_internet_gateway_step2.crn" \
-    "Test 12: EC2 Egress Only Internet Gateway (tags update)"
+    "Test 14: EC2 Egress Only Internet Gateway (tags update)"
 
-# Test 13: EC2 VPC Endpoint - add policy_document
+# Test 15: EC2 VPC Endpoint - add policy_document
 run_test "ec2_vpc_endpoint" \
     "$SCRIPT_DIR/ec2_vpc_endpoint_step1.crn" \
     "$SCRIPT_DIR/ec2_vpc_endpoint_step2.crn" \
-    "Test 13: EC2 VPC Endpoint (add policy_document)"
+    "Test 15: EC2 VPC Endpoint (add policy_document)"
 
-# Test 14: EC2 VPC Peering Connection - update tags
+# Test 16: EC2 VPC Peering Connection - update tags
 run_test "ec2_vpc_peering_connection" \
     "$SCRIPT_DIR/ec2_vpc_peering_connection_step1.crn" \
     "$SCRIPT_DIR/ec2_vpc_peering_connection_step2.crn" \
-    "Test 14: EC2 VPC Peering Connection (tags update)"
+    "Test 16: EC2 VPC Peering Connection (tags update)"
 
-# Test 15: EC2 Transit Gateway Attachment - update tags
+# Test 17: EC2 Transit Gateway Attachment - update tags
 run_test "ec2_transit_gateway_attachment" \
     "$SCRIPT_DIR/ec2_transit_gateway_attachment_step1.crn" \
     "$SCRIPT_DIR/ec2_transit_gateway_attachment_step2.crn" \
-    "Test 15: EC2 Transit Gateway Attachment (tags update)"
+    "Test 17: EC2 Transit Gateway Attachment (tags update)"
 
-# Test 16: EC2 Route - change route target (IGW -> NAT GW)
+# Test 18: EC2 Route - change route target (IGW -> NAT GW)
 run_test "ec2_route" \
     "$SCRIPT_DIR/ec2_route_step1.crn" \
     "$SCRIPT_DIR/ec2_route_step2.crn" \
-    "Test 16: EC2 Route (target IGW -> NAT GW)"
+    "Test 18: EC2 Route (target IGW -> NAT GW)"
 
 echo "════════════════════════════════════════"
 echo "Total: $TOTAL_PASSED passed, $TOTAL_FAILED failed"
