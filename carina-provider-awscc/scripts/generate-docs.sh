@@ -15,6 +15,17 @@
 
 set -e
 
+# Temp file variables (initialized for trap safety)
+EXAMPLE_TMPFILE=""
+MERGED_TMPFILE=""
+
+# Cleanup temp files on exit (normal or error)
+cleanup() {
+    [ -n "$EXAMPLE_TMPFILE" ] && rm -f "$EXAMPLE_TMPFILE"
+    [ -n "$MERGED_TMPFILE" ] && rm -f "$MERGED_TMPFILE"
+}
+trap cleanup EXIT
+
 # Parse flags
 REFRESH_CACHE=false
 for arg in "$@"; do
