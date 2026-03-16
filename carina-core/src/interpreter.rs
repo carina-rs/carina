@@ -629,6 +629,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn replace_create_before_destroy_missing_identifier_returns_error() {
+        use crate::resource::Value;
+        use std::collections::HashMap;
+
+        let interpreter = Interpreter::new(TestProvider);
+        let mut plan = Plan::new();
+        plan.add(Effect::Replace {
+            id: ResourceId::new("test", "example"),
+            from: Box::new(State::existing(
+                ResourceId::new("test", "example"),
+                HashMap::from([("key".to_string(), Value::String("old".to_string()))]),
+            )),
+            // No identifier set on `from`
+            to: Resource::new("test", "example")
+                .with_attribute("key", Value::String("new".to_string())),
+            lifecycle: LifecycleConfig {
+                force_delete: false,
+                create_before_destroy: true,
+            },
+            changed_create_only: vec!["key".to_string()],
+            cascading_updates: vec![],
+            temporary_name: None,
+        });
+
+        let result = interpreter.apply(&plan).await;
+        assert_eq!(result.failure_count, 1);
+        let err = result.outcomes[0].as_ref().unwrap_err();
+        assert!(
+            err.message.contains("identifier"),
+            "expected error about missing identifier, got: {}",
+            err.message
+        );
+    }
+
+    #[tokio::test]
     async fn replace_create_before_destroy_with_temporary_name_no_rename() {
         use crate::effect::TemporaryName;
         use crate::resource::Value;
