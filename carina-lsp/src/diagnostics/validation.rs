@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet};
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
 
 use crate::document::Document;
+use crate::position;
 use carina_core::resource::Value;
 use carina_core::schema::ResourceSchema;
 
@@ -135,8 +136,7 @@ impl DiagnosticEngine {
             if trimmed.starts_with(block_name) && !trimmed.contains('=') {
                 let after = trimmed[block_name.len()..].trim();
                 if after.starts_with('{') {
-                    let leading_ws = line.len() - trimmed.len();
-                    positions.push((line_idx as u32, leading_ws as u32));
+                    positions.push((line_idx as u32, position::leading_whitespace_chars(line)));
                 }
             }
         }
@@ -168,8 +168,7 @@ impl DiagnosticEngine {
             if let Some(rest) = after_trimmed.strip_prefix('=') {
                 let rest_trimmed = rest.trim_start();
                 if rest_trimmed.starts_with('[') {
-                    let leading_ws = line.len() - trimmed.len();
-                    return Some((line_idx as u32, leading_ws as u32));
+                    return Some((line_idx as u32, position::leading_whitespace_chars(line)));
                 }
             }
         }
@@ -271,8 +270,8 @@ impl DiagnosticEngine {
                     && let Some(after) = trimmed.strip_prefix(field_name)
                     && (after.starts_with(' ') || after.starts_with('=') || after.starts_with('{'))
                 {
-                    let leading_ws = line.len() - trimmed.len();
-                    found_in_current_block = Some((line_idx as u32, leading_ws as u32));
+                    found_in_current_block =
+                        Some((line_idx as u32, position::leading_whitespace_chars(line)));
                 }
 
                 for ch in trimmed.chars() {

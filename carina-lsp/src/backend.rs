@@ -14,6 +14,20 @@ use crate::document::Document;
 use crate::hover::HoverProvider;
 use crate::semantic_tokens::{self, SemanticTokensProvider};
 
+/// Calculate the end position (line, character) of a text document.
+/// Returns (last_line, last_character) using character counts (not byte lengths).
+pub fn document_end_position(text: &str) -> (u32, u32) {
+    let line_count = text.chars().filter(|&c| c == '\n').count();
+    let last_line = line_count as u32;
+    let last_char = text
+        .lines()
+        .last()
+        .map(|l| l.chars().count() as u32)
+        .unwrap_or(0);
+    let last_char = if text.ends_with('\n') { 0 } else { last_char };
+    (last_line, last_char)
+}
+
 pub struct Backend {
     client: Client,
     documents: DashMap<Url, Document>,
@@ -199,12 +213,7 @@ impl LanguageServer for Backend {
                     }
 
                     // Calculate the range covering the entire document
-                    // Note: lines() doesn't include trailing empty lines, so we count newlines manually
-                    let line_count = text.chars().filter(|&c| c == '\n').count();
-                    let last_line = line_count as u32;
-                    let last_char = text.lines().last().map(|l| l.len() as u32).unwrap_or(0);
-                    // If text ends with newline, last line is empty
-                    let last_char = if text.ends_with('\n') { 0 } else { last_char };
+                    let (last_line, last_char) = document_end_position(&text);
 
                     let edit = TextEdit {
                         range: Range {
@@ -229,5 +238,60 @@ impl LanguageServer for Backend {
             }
         }
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_document_end_position_ascii() {
+        let text = "line1\nline2\nline3";
+        let (line, char) = document_end_position(text);
+        assert_eq!(line, 2);
+        assert_eq!(char, 5); // "line3" is 5 chars
+    }
+
+    #[test]
+    fn test_document_end_position_trailing_newline() {
+        let text = "line1\nline2\n";
+        let (line, char) = document_end_position(text);
+        assert_eq!(line, 2);
+        assert_eq!(char, 0); // ends with newline, last line is empty
+    }
+
+    #[test]
+    fn test_document_end_position_non_ascii_last_line() {
+        // Last line contains Japanese characters (3 bytes each in UTF-8)
+        // "あいう" = 3 chars but 9 bytes
+        let text = "line1\nあいう";
+        let (line, char) = document_end_position(text);
+        assert_eq!(line, 1);
+        assert_eq!(
+            char, 3,
+            "Should count characters (3), not bytes (9) for non-ASCII last line"
+        );
+    }
+
+    #[test]
+    fn test_document_end_position_empty() {
+        let text = "";
+        let (line, char) = document_end_position(text);
+        assert_eq!(line, 0);
+        assert_eq!(char, 0);
+    }
+
+    #[test]
+    fn test_document_end_position_mixed_content() {
+        // "// コメント" on last line: 2 + 1 + 5 = 8 chars, but 2 + 1 + 15 = 18 bytes
+        let text = "aws.s3.bucket {\n    name = \"テスト\"\n// コメント";
+        let (line, char) = document_end_position(text);
+        assert_eq!(line, 2);
+        assert_eq!(
+            char,
+            "// コメント".chars().count() as u32,
+            "Should use character count for mixed ASCII/non-ASCII"
+        );
     }
 }

@@ -3,6 +3,7 @@ pub mod completion;
 pub mod diagnostics;
 pub mod document;
 pub mod hover;
+pub mod position;
 pub mod semantic_tokens;
 
 pub use backend::Backend;

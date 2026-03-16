@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet};
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
 
 use crate::document::Document;
+use crate::position;
 use carina_core::parser::{InputParameter, ParsedFile, TypeExpr};
 use carina_core::resource::Value;
 use carina_core::schema::validate_ipv4_cidr;
@@ -65,8 +66,7 @@ impl DiagnosticEngine {
 
             if in_provider {
                 if trimmed.starts_with("region") {
-                    let leading_ws = line.len() - trimmed.len();
-                    return Some((line_idx as u32, leading_ws as u32));
+                    return Some((line_idx as u32, position::leading_whitespace_chars(line)));
                 }
 
                 if trimmed == "}" {
@@ -252,8 +252,11 @@ impl DiagnosticEngine {
         let pattern = format!("{} {{", module_name);
 
         for (line_idx, line) in text.lines().enumerate() {
-            if let Some(col) = line.find(&pattern) {
-                return Some((line_idx as u32, col as u32));
+            if let Some(byte_pos) = line.find(&pattern) {
+                return Some((
+                    line_idx as u32,
+                    position::byte_offset_to_char_offset(line, byte_pos),
+                ));
             }
         }
         None
@@ -283,8 +286,7 @@ impl DiagnosticEngine {
                         .next()
                         .is_some_and(|c| c == ' ' || c == '=')
                 {
-                    let leading_ws = line.len() - trimmed.len();
-                    return Some((line_idx as u32, leading_ws as u32));
+                    return Some((line_idx as u32, position::leading_whitespace_chars(line)));
                 }
 
                 if trimmed == "}" {
@@ -532,8 +534,7 @@ impl DiagnosticEngine {
                         .next()
                         .is_some_and(|c| c == ':')
                 {
-                    let leading_ws = line.len() - trimmed.len();
-                    return Some((line_idx as u32, leading_ws as u32));
+                    return Some((line_idx as u32, position::leading_whitespace_chars(line)));
                 }
             }
         }
@@ -567,11 +568,15 @@ impl DiagnosticEngine {
                         .is_some_and(|c| c == ':')
                 {
                     // Find the "=" and return position after it
-                    if let Some(eq_pos) = line.find('=') {
-                        let after_eq = &line[eq_pos + 1..];
+                    if let Some(eq_byte_pos) = line.find('=') {
+                        let after_eq = &line[eq_byte_pos + 1..];
                         let trimmed_after = after_eq.trim_start();
-                        let value_col = eq_pos + 1 + (after_eq.len() - trimmed_after.len());
-                        return Some((line_idx as u32, value_col as u32));
+                        // Whitespace after '=' is ASCII, so byte diff == char count
+                        let ws_after_eq = after_eq.len() - trimmed_after.len();
+                        let value_col = position::byte_offset_to_char_offset(line, eq_byte_pos)
+                            + 1
+                            + ws_after_eq as u32;
+                        return Some((line_idx as u32, value_col));
                     }
                 }
             }
@@ -589,10 +594,11 @@ impl DiagnosticEngine {
 
         for (line_idx, line) in text.lines().enumerate() {
             // Look for patterns like "binding_name.id" or "binding_name.name" after "="
-            if let Some(eq_pos) = line.find('=') {
-                let after_eq = &line[eq_pos + 1..];
+            if let Some(eq_byte_pos) = line.find('=') {
+                let after_eq = &line[eq_byte_pos + 1..];
                 let after_eq_trimmed = after_eq.trim_start();
-                let whitespace_len = after_eq.len() - after_eq_trimmed.len();
+                // Whitespace after '=' is ASCII spaces, so byte diff == char count
+                let whitespace_chars = after_eq.len() - after_eq_trimmed.len();
 
                 // Skip if it's a string literal
                 if after_eq_trimmed.starts_with('"') {
@@ -627,7 +633,9 @@ impl DiagnosticEngine {
                     {
                         // Check if the binding is defined
                         if !defined_bindings.contains(identifier) {
-                            let col = (eq_pos + 1 + whitespace_len) as u32;
+                            let col = position::byte_offset_to_char_offset(line, eq_byte_pos)
+                                + 1
+                                + whitespace_chars as u32;
                             diagnostics.push(Diagnostic {
                                 range: Range {
                                     start: Position {
