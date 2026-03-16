@@ -32,6 +32,8 @@ pub struct StructField {
     pub description: Option<String>,
     /// Provider-side property name (e.g., "IpProtocol")
     pub provider_name: Option<String>,
+    /// Alternative block name for repeated block syntax (e.g., "transition" for "transitions")
+    pub block_name: Option<String>,
 }
 
 impl StructField {
@@ -42,6 +44,7 @@ impl StructField {
             required: false,
             description: None,
             provider_name: None,
+            block_name: None,
         }
     }
 
@@ -57,6 +60,11 @@ impl StructField {
 
     pub fn with_provider_name(mut self, name: impl Into<String>) -> Self {
         self.provider_name = Some(name.into());
+        self
+    }
+
+    pub fn with_block_name(mut self, name: impl Into<String>) -> Self {
+        self.block_name = Some(name.into());
         self
     }
 }
@@ -739,11 +747,76 @@ impl ResourceSchema {
     }
 }
 
+/// Resolve block name aliases in a map using struct field definitions.
+///
+/// For each key in `map` that matches a `block_name` on a struct field,
+/// renames it to the canonical field name. Also recurses into nested
+/// struct values to resolve block names at all nesting levels.
+fn resolve_block_names_in_map(
+    map: &mut HashMap<String, Value>,
+    fields: &[StructField],
+    resource_id: &str,
+    errors: &mut Vec<String>,
+) {
+    // Build block_name -> canonical field name mapping
+    let bn_map: HashMap<String, String> = fields
+        .iter()
+        .filter_map(|f| f.block_name.as_ref().map(|bn| (bn.clone(), f.name.clone())))
+        .collect();
+
+    // Rename block name keys to canonical names
+    let renames: Vec<(String, String)> = map
+        .keys()
+        .filter_map(|key| bn_map.get(key).map(|canon| (key.clone(), canon.clone())))
+        .collect();
+
+    for (block_key, canon_key) in renames {
+        if map.contains_key(&canon_key) {
+            errors.push(format!(
+                "{}: cannot use both '{}' and '{}' (they refer to the same attribute)",
+                resource_id, block_key, canon_key
+            ));
+            continue;
+        }
+        let value = map.remove(&block_key).unwrap();
+        map.insert(canon_key, value);
+    }
+
+    // Recurse into nested struct values
+    for field in fields {
+        let value = match map.get_mut(&field.name) {
+            Some(v) => v,
+            None => continue,
+        };
+        match &field.field_type {
+            AttributeType::Struct { fields: inner, .. } => {
+                if let Value::Map(inner_map) = value {
+                    resolve_block_names_in_map(inner_map, inner, resource_id, errors);
+                }
+            }
+            AttributeType::List(inner) => {
+                if let AttributeType::Struct { fields: inner, .. } = inner.as_ref()
+                    && let Value::List(items) = value
+                {
+                    for item in items.iter_mut() {
+                        if let Value::Map(item_map) = item {
+                            resolve_block_names_in_map(item_map, inner, resource_id, errors);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Resolve block name aliases in resources.
 ///
 /// For each resource attribute key that matches a `block_name` in the schema,
 /// renames it to the canonical attribute name. Errors if both the block_name
 /// (singular) and the canonical attribute name (plural) are present.
+///
+/// Also recursively resolves block names in nested struct values.
 ///
 /// The `schema_key_fn` closure computes the schema lookup key for a resource.
 pub fn resolve_block_names(
@@ -761,9 +834,6 @@ pub fn resolve_block_names(
         };
 
         let bn_map = schema.block_name_map();
-        if bn_map.is_empty() {
-            continue;
-        }
 
         // Collect keys to rename: (block_name_key, canonical_attr_name)
         let renames: Vec<(String, String)> = resource
@@ -783,6 +853,43 @@ pub fn resolve_block_names(
 
             let value = resource.attributes.remove(&block_key).unwrap();
             resource.attributes.insert(canon_key, value);
+        }
+
+        // Recurse into nested struct values to resolve block names at all levels
+        for (attr_name, attr_schema) in &schema.attributes {
+            let value = match resource.attributes.get_mut(attr_name) {
+                Some(v) => v,
+                None => continue,
+            };
+            match &attr_schema.attr_type {
+                AttributeType::Struct { fields, .. } => {
+                    if let Value::Map(inner_map) = value {
+                        resolve_block_names_in_map(
+                            inner_map,
+                            fields,
+                            &resource.id.to_string(),
+                            &mut all_errors,
+                        );
+                    }
+                }
+                AttributeType::List(inner) => {
+                    if let AttributeType::Struct { fields, .. } = inner.as_ref()
+                        && let Value::List(items) = value
+                    {
+                        for item in items.iter_mut() {
+                            if let Value::Map(item_map) = item {
+                                resolve_block_names_in_map(
+                                    item_map,
+                                    fields,
+                                    &resource.id.to_string(),
+                                    &mut all_errors,
+                                );
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
         }
     }
 
@@ -2140,5 +2247,82 @@ mod tests {
 
         // Key should remain unchanged
         assert!(resources[0].attributes.contains_key("operating_region"));
+    }
+
+    #[test]
+    fn struct_field_with_block_name() {
+        let field = StructField::new(
+            "transitions",
+            AttributeType::List(Box::new(AttributeType::Struct {
+                name: "Transition".to_string(),
+                fields: vec![],
+            })),
+        )
+        .with_block_name("transition");
+        assert_eq!(field.block_name.as_deref(), Some("transition"));
+    }
+
+    #[test]
+    fn resolve_block_names_nested_struct() {
+        // Simulate: lifecycle_configuration = { transition { ... } }
+        // where "transition" is the block name for "transitions" field
+        let mut inner_map = HashMap::new();
+        inner_map.insert(
+            "transition".to_string(),
+            Value::List(vec![Value::Map({
+                let mut m = HashMap::new();
+                m.insert(
+                    "storage_class".to_string(),
+                    Value::String("GLACIER".to_string()),
+                );
+                m
+            })]),
+        );
+
+        let mut resources = vec![{
+            let mut r = Resource::new("s3.bucket", "my-bucket");
+            r.attributes
+                .insert("lifecycle_configuration".to_string(), Value::Map(inner_map));
+            r.attributes
+                .insert("_provider".to_string(), Value::String("awscc".to_string()));
+            r
+        }];
+
+        let mut schemas = HashMap::new();
+        schemas.insert(
+            "s3.bucket".to_string(),
+            ResourceSchema::new("s3.bucket").attribute(AttributeSchema::new(
+                "lifecycle_configuration",
+                AttributeType::Struct {
+                    name: "LifecycleConfiguration".to_string(),
+                    fields: vec![
+                        StructField::new(
+                            "transitions",
+                            AttributeType::List(Box::new(AttributeType::Struct {
+                                name: "Transition".to_string(),
+                                fields: vec![],
+                            })),
+                        )
+                        .with_block_name("transition"),
+                    ],
+                },
+            )),
+        );
+
+        resolve_block_names(&mut resources, &schemas, |r| r.id.resource_type.clone()).unwrap();
+
+        // The nested "transition" key should be renamed to "transitions"
+        let lifecycle = match resources[0].attributes.get("lifecycle_configuration") {
+            Some(Value::Map(m)) => m,
+            _ => panic!("expected Map"),
+        };
+        assert!(
+            lifecycle.contains_key("transitions"),
+            "expected 'transitions' key after resolve"
+        );
+        assert!(
+            !lifecycle.contains_key("transition"),
+            "expected 'transition' key to be removed"
+        );
     }
 }

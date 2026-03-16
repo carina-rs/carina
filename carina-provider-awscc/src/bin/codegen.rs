@@ -2205,6 +2205,9 @@ fn generate_struct_type(
     let required_set: HashSet<&str> = required.iter().map(|s| s.as_str()).collect();
     let aliases = known_enum_aliases();
 
+    // Collect all field names (snake_case) to check block name conflicts
+    let all_field_names: HashSet<String> = properties.keys().map(|k| k.to_snake_case()).collect();
+
     let fields: Vec<String> = properties
         .iter()
         .map(|(field_name, field_prop)| {
@@ -2323,6 +2326,15 @@ fn generate_struct_type(
                 field_code.push_str(&format!(".with_description(\"{}\")", truncated));
             }
             field_code.push_str(&format!(".with_provider_name(\"{}\")", field_name));
+
+            // Add block_name for List(Struct) fields with a natural singular form
+            if field_type.starts_with("AttributeType::List(Box::new(AttributeType::Struct")
+                && let Some(singular) = compute_block_name(&snake_name)
+                && !all_field_names.contains(&singular)
+            {
+                field_code.push_str(&format!(".with_block_name(\"{}\")", singular));
+            }
+
             field_code
         })
         .collect();
