@@ -19,6 +19,7 @@
 #   ec2_egress_only_internet_gateway   - Update tags
 #   ec2_vpc_endpoint                   - Add policy_document
 #   ec2_vpc_peering_connection         - Update tags
+#   ec2_route                          - Change route target (IGW -> NAT GW)
 #
 # Filter (optional): substring to match test names (e.g. "logs_log_group", "s3_bucket")
 
@@ -238,6 +239,12 @@ run_test "ec2_vpc_peering_connection" \
     "$SCRIPT_DIR/ec2_vpc_peering_connection_step1.crn" \
     "$SCRIPT_DIR/ec2_vpc_peering_connection_step2.crn" \
     "Test 14: EC2 VPC Peering Connection (tags update)"
+
+# Test 15: EC2 Route - change route target (IGW -> NAT GW)
+run_test "ec2_route" \
+    "$SCRIPT_DIR/ec2_route_step1.crn" \
+    "$SCRIPT_DIR/ec2_route_step2.crn" \
+    "Test 15: EC2 Route (target IGW -> NAT GW)"
 
 echo "════════════════════════════════════════"
 echo "Total: $TOTAL_PASSED passed, $TOTAL_FAILED failed"
