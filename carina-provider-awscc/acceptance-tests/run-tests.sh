@@ -36,7 +36,7 @@
 #   ./run-tests.sh cleanup                           # destroy all matching tests across 10 accounts
 #   ./run-tests.sh cleanup ec2_vpc                   # destroy VPC tests only across 10 accounts
 
-set -e
+set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
@@ -50,7 +50,7 @@ ARGS=()
 while [ $# -gt 0 ]; do
     case "$1" in
         --accounts)
-            if [ -z "$2" ]; then
+            if [ -z "${2:-}" ]; then
                 echo "ERROR: --accounts requires a range argument (e.g., 0-3)"
                 exit 1
             fi
@@ -78,7 +78,7 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-set -- "${ARGS[@]}"
+set -- ${ARGS[@]+"${ARGS[@]}"}
 
 COMMAND="${1:-validate}"
 shift || true
@@ -152,7 +152,7 @@ acquire_account_lock() {
 }
 
 release_account_locks() {
-    for account_index in "${LOCKED_ACCOUNTS[@]}"; do
+    for account_index in ${LOCKED_ACCOUNTS[@]+"${LOCKED_ACCOUNTS[@]}"}; do
         rm -rf "${LOCK_BASE}-${account_index}.lock"
     done
     LOCKED_ACCOUNTS=()
@@ -304,7 +304,7 @@ if [ "$COMMAND" = "cleanup" ]; then
 
     # Wait for all workers
     OVERALL_EXIT=0
-    for PID in "${PIDS[@]}"; do
+    for PID in ${PIDS[@]+"${PIDS[@]}"}; do
         wait "$PID" || OVERALL_EXIT=1
     done
 
@@ -343,11 +343,11 @@ if [ "$COMMAND" = "full" ]; then
     cleanup_main() {
         echo ""
         echo "Interrupted! Signaling workers to clean up..."
-        for PID in "${PIDS[@]}"; do
+        for PID in ${PIDS[@]+"${PIDS[@]}"}; do
             kill -TERM "$PID" 2>/dev/null || true
         done
         echo "Waiting for workers to finish cleanup..."
-        for PID in "${PIDS[@]}"; do
+        for PID in ${PIDS[@]+"${PIDS[@]}"}; do
             wait "$PID" 2>/dev/null || true
         done
         echo "All workers finished."
