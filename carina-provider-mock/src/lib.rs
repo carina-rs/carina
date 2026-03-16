@@ -69,7 +69,7 @@ impl Provider for MockProvider {
             if let Some(attrs) = states.get(&key) {
                 let attributes: HashMap<String, Value> = attrs
                     .iter()
-                    .map(|(k, v)| (k.clone(), json_to_dsl_value(v)))
+                    .filter_map(|(k, v)| json_to_dsl_value(v).map(|val| (k.clone(), val)))
                     .collect();
                 Ok(State::existing(id, attributes).with_identifier("mock-id"))
             } else {

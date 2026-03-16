@@ -45,29 +45,33 @@ pub fn value_to_json(value: &Value) -> Result<serde_json::Value, String> {
     }
 }
 
-/// Convert `serde_json::Value` to DSL `Value`
-pub fn json_to_dsl_value(json: &serde_json::Value) -> Value {
+/// Convert `serde_json::Value` to DSL `Value`.
+///
+/// Returns `None` for JSON null, since null represents a missing/unset value
+/// rather than a meaningful attribute value. Callers should filter out `None`
+/// entries when building attribute maps.
+pub fn json_to_dsl_value(json: &serde_json::Value) -> Option<Value> {
     match json {
-        serde_json::Value::String(s) => Value::String(s.clone()),
+        serde_json::Value::String(s) => Some(Value::String(s.clone())),
         serde_json::Value::Number(n) => {
             if let Some(i) = n.as_i64() {
-                Value::Int(i)
+                Some(Value::Int(i))
             } else {
-                Value::Float(n.as_f64().unwrap_or(0.0))
+                Some(Value::Float(n.as_f64().unwrap_or(0.0)))
             }
         }
-        serde_json::Value::Bool(b) => Value::Bool(*b),
-        serde_json::Value::Array(items) => {
-            Value::List(items.iter().map(json_to_dsl_value).collect())
-        }
+        serde_json::Value::Bool(b) => Some(Value::Bool(*b)),
+        serde_json::Value::Array(items) => Some(Value::List(
+            items.iter().filter_map(json_to_dsl_value).collect(),
+        )),
         serde_json::Value::Object(map) => {
             let m: HashMap<_, _> = map
                 .iter()
-                .map(|(k, v)| (k.clone(), json_to_dsl_value(v)))
+                .filter_map(|(k, v)| json_to_dsl_value(v).map(|val| (k.clone(), val)))
                 .collect();
-            Value::Map(m)
+            Some(Value::Map(m))
         }
-        serde_json::Value::Null => Value::String("null".to_string()),
+        serde_json::Value::Null => None,
     }
 }
 
@@ -244,25 +248,28 @@ mod tests {
     #[test]
     fn test_json_to_dsl_value_string() {
         let j = serde_json::json!("hello");
-        assert_eq!(json_to_dsl_value(&j), Value::String("hello".to_string()));
+        assert_eq!(
+            json_to_dsl_value(&j),
+            Some(Value::String("hello".to_string()))
+        );
     }
 
     #[test]
     fn test_json_to_dsl_value_int() {
         let j = serde_json::json!(42);
-        assert_eq!(json_to_dsl_value(&j), Value::Int(42));
+        assert_eq!(json_to_dsl_value(&j), Some(Value::Int(42)));
     }
 
     #[test]
     fn test_json_to_dsl_value_float() {
         let j = serde_json::json!(1.5);
-        assert_eq!(json_to_dsl_value(&j), Value::Float(1.5));
+        assert_eq!(json_to_dsl_value(&j), Some(Value::Float(1.5)));
     }
 
     #[test]
     fn test_json_to_dsl_value_bool() {
         let j = serde_json::json!(true);
-        assert_eq!(json_to_dsl_value(&j), Value::Bool(true));
+        assert_eq!(json_to_dsl_value(&j), Some(Value::Bool(true)));
     }
 
     #[test]
@@ -270,14 +277,37 @@ mod tests {
         let j = serde_json::json!([1, 2]);
         assert_eq!(
             json_to_dsl_value(&j),
-            Value::List(vec![Value::Int(1), Value::Int(2)])
+            Some(Value::List(vec![Value::Int(1), Value::Int(2)]))
         );
     }
 
     #[test]
     fn test_json_to_dsl_value_null() {
         let j = serde_json::Value::Null;
-        assert_eq!(json_to_dsl_value(&j), Value::String("null".to_string()));
+        assert_eq!(json_to_dsl_value(&j), None);
+    }
+
+    #[test]
+    fn test_json_to_dsl_value_null_in_array() {
+        let j = serde_json::json!([1, null, 2]);
+        assert_eq!(
+            json_to_dsl_value(&j),
+            Some(Value::List(vec![Value::Int(1), Value::Int(2)]))
+        );
+    }
+
+    #[test]
+    fn test_json_to_dsl_value_null_in_object() {
+        let j = serde_json::json!({"a": 1, "b": null, "c": "hello"});
+        let result = json_to_dsl_value(&j).unwrap();
+        if let Value::Map(map) = result {
+            assert_eq!(map.len(), 2);
+            assert_eq!(map.get("a"), Some(&Value::Int(1)));
+            assert_eq!(map.get("b"), None);
+            assert_eq!(map.get("c"), Some(&Value::String("hello".to_string())));
+        } else {
+            panic!("Expected Map");
+        }
     }
 
     #[test]
@@ -288,7 +318,7 @@ mod tests {
             Value::Bool(false),
         ]);
         let json = value_to_json(&original).unwrap();
-        let back = json_to_dsl_value(&json);
+        let back = json_to_dsl_value(&json).unwrap();
         assert_eq!(back, original);
     }
 
