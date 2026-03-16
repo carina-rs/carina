@@ -449,8 +449,7 @@ impl AwsccProvider {
                 }
             }
             Err(e) => {
-                let err_str = format!("{:?}", e);
-                if err_str.contains("ResourceNotFound") || err_str.contains("NotFound") {
+                if Self::is_not_found_error(&e) {
                     Ok(None)
                 } else {
                     Err(ProviderError::new(format!(
@@ -664,6 +663,34 @@ impl AwsccProvider {
             return 360; // 30 minutes (360 * 5s)
         }
         120 // Default: 10 minutes (120 * 5s)
+    }
+
+    /// Returns true if the SDK error represents a "not found" condition.
+    ///
+    /// Uses structured error metadata (`ProvideErrorMetadata::code()`) instead of
+    /// fragile string matching against Debug-formatted output.
+    ///
+    /// Not-found error codes:
+    /// - `ResourceNotFoundException`: The resource does not exist
+    /// - `HandlerNotFoundException`: The resource handler was not found
+    fn is_not_found_error<E, R>(error: &SdkError<E, R>) -> bool
+    where
+        E: ProvideErrorMetadata,
+    {
+        const NOT_FOUND_ERROR_CODES: &[&str] =
+            &["ResourceNotFoundException", "HandlerNotFoundException"];
+
+        match error {
+            SdkError::ServiceError(service_error) => {
+                let err = service_error.err();
+                if let Some(code) = err.code() {
+                    NOT_FOUND_ERROR_CODES.contains(&code)
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        }
     }
 
     /// Returns true if an AWS SDK error represents a retryable condition.
@@ -1579,6 +1606,68 @@ mod tests {
         );
         let sdk_err = SdkError::service_error(err, http::Response::new(""));
         assert!(!AwsccProvider::is_retryable_sdk_error(&sdk_err));
+    }
+
+    // =========================================================================
+    // is_not_found_error tests (for structured "not found" error detection)
+    // =========================================================================
+
+    #[test]
+    fn test_is_not_found_error_resource_not_found() {
+        use aws_sdk_cloudcontrol::operation::get_resource::GetResourceError;
+        use aws_sdk_cloudcontrol::types::error::ResourceNotFoundException;
+        use aws_smithy_runtime_api::client::result::SdkError;
+
+        let err = GetResourceError::ResourceNotFoundException(
+            ResourceNotFoundException::builder()
+                .message("Resource not found")
+                .meta(error_meta("ResourceNotFoundException"))
+                .build(),
+        );
+        let sdk_err = SdkError::service_error(err, http::Response::new(""));
+        assert!(AwsccProvider::is_not_found_error(&sdk_err));
+    }
+
+    #[test]
+    fn test_is_not_found_error_handler_not_found_code() {
+        use aws_sdk_cloudcontrol::operation::get_resource::GetResourceError;
+        use aws_smithy_runtime_api::client::result::SdkError;
+
+        // HandlerNotFoundException is not a typed variant, but may appear as an error code
+        let err = GetResourceError::generic(
+            aws_smithy_types::error::ErrorMetadata::builder()
+                .code("HandlerNotFoundException")
+                .message("Handler not found")
+                .build(),
+        );
+        let sdk_err = SdkError::service_error(err, http::Response::new(""));
+        assert!(AwsccProvider::is_not_found_error(&sdk_err));
+    }
+
+    #[test]
+    fn test_is_not_found_error_throttling_is_not_found() {
+        use aws_sdk_cloudcontrol::operation::get_resource::GetResourceError;
+        use aws_sdk_cloudcontrol::types::error::ThrottlingException;
+        use aws_smithy_runtime_api::client::result::SdkError;
+
+        let err = GetResourceError::ThrottlingException(
+            ThrottlingException::builder()
+                .message("Rate exceeded")
+                .meta(error_meta("ThrottlingException"))
+                .build(),
+        );
+        let sdk_err = SdkError::service_error(err, http::Response::new(""));
+        assert!(!AwsccProvider::is_not_found_error(&sdk_err));
+    }
+
+    #[test]
+    fn test_is_not_found_error_timeout_is_not_found() {
+        use aws_sdk_cloudcontrol::operation::get_resource::GetResourceError;
+        use aws_smithy_runtime_api::client::result::SdkError;
+
+        let sdk_err: SdkError<GetResourceError, http::Response<&str>> =
+            SdkError::timeout_error("connection timed out");
+        assert!(!AwsccProvider::is_not_found_error(&sdk_err));
     }
 
     #[test]
