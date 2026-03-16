@@ -570,6 +570,468 @@ fn apply_name_overrides(resources: &mut [Resource], state_file: &Option<StateFil
     }
 }
 
+/// Result of executing a plan's effects.
+struct ApplyResult {
+    success_count: usize,
+    failure_count: usize,
+    skip_count: usize,
+    applied_states: HashMap<ResourceId, State>,
+    successfully_deleted: HashSet<ResourceId>,
+    permanent_name_overrides: HashMap<ResourceId, HashMap<String, String>>,
+    failed_refreshes: HashSet<ResourceId>,
+}
+
+/// Execute all effects in a plan, resolving references dynamically.
+///
+/// This is the shared apply execution logic used by both `run_apply()` and
+/// `run_apply_from_plan()`.
+async fn execute_effects(
+    plan: &Plan,
+    provider: &dyn Provider,
+    binding_map: &mut HashMap<String, HashMap<String, Value>>,
+    current_states: &mut HashMap<ResourceId, State>,
+) -> ApplyResult {
+    let mut success_count = 0;
+    let mut failure_count = 0;
+    let mut skip_count = 0;
+    let mut applied_states: HashMap<ResourceId, State> = HashMap::new();
+    let mut failed_bindings: HashSet<String> = HashSet::new();
+    let mut successfully_deleted: HashSet<ResourceId> = HashSet::new();
+    let mut permanent_name_overrides: HashMap<ResourceId, HashMap<String, String>> = HashMap::new();
+    let mut pending_refreshes: HashMap<ResourceId, String> = HashMap::new();
+
+    for effect in plan.effects() {
+        // Check if any dependency has failed - skip this effect if so
+        if let Some(failed_dep) = find_failed_dependency(effect, &failed_bindings) {
+            println!(
+                "  {} {} - dependency '{}' failed",
+                "⊘".yellow(),
+                format_effect(effect),
+                failed_dep
+            );
+            skip_count += 1;
+            // Propagate failure to this binding so transitive dependents are also skipped
+            if let Some(binding) = effect.binding_name() {
+                failed_bindings.insert(binding);
+            }
+            continue;
+        }
+
+        match effect {
+            Effect::Create(resource) => {
+                // Re-resolve references with current binding_map
+                let mut resolved_resource = resource.clone();
+                for (key, value) in &resource.attributes {
+                    resolved_resource
+                        .attributes
+                        .insert(key.clone(), resolve_ref_value(value, binding_map));
+                }
+
+                match provider.create(&resolved_resource).await {
+                    Ok(state) => {
+                        println!("  {} {}", "✓".green(), format_effect(effect));
+                        success_count += 1;
+
+                        // Track the applied state
+                        applied_states.insert(resource.id.clone(), state.clone());
+
+                        // Update binding_map with the newly created resource's state (including id)
+                        if let Some(Value::String(binding_name)) =
+                            resource.attributes.get("_binding")
+                        {
+                            let mut attrs = resolved_resource.attributes.clone();
+                            for (k, v) in &state.attributes {
+                                attrs.insert(k.clone(), v.clone());
+                            }
+                            binding_map.insert(binding_name.clone(), attrs);
+                        }
+                    }
+                    Err(e) => {
+                        println!("  {} {} - {}", "✗".red(), format_effect(effect), e);
+                        failure_count += 1;
+                        if let Some(binding) = effect.binding_name() {
+                            failed_bindings.insert(binding);
+                        }
+                    }
+                }
+            }
+            Effect::Update { id, from, to, .. } => {
+                // Re-resolve references
+                let mut resolved_to = to.clone();
+                for (key, value) in &to.attributes {
+                    resolved_to
+                        .attributes
+                        .insert(key.clone(), resolve_ref_value(value, binding_map));
+                }
+
+                // Get identifier from current state
+                let identifier = from.identifier.as_deref().unwrap_or("");
+                match provider.update(id, identifier, from, &resolved_to).await {
+                    Ok(state) => {
+                        println!("  {} {}", "✓".green(), format_effect(effect));
+                        success_count += 1;
+
+                        // Track the applied state
+                        applied_states.insert(id.clone(), state.clone());
+
+                        // Update binding_map
+                        if let Some(Value::String(binding_name)) = to.attributes.get("_binding") {
+                            let mut attrs = resolved_to.attributes.clone();
+                            for (k, v) in &state.attributes {
+                                attrs.insert(k.clone(), v.clone());
+                            }
+                            binding_map.insert(binding_name.clone(), attrs);
+                        }
+                    }
+                    Err(e) => {
+                        println!("  {} {} - {}", "✗".red(), format_effect(effect), e);
+                        failure_count += 1;
+                        queue_state_refresh(&mut pending_refreshes, id, Some(identifier));
+                        if let Some(binding) = effect.binding_name() {
+                            failed_bindings.insert(binding);
+                        }
+                    }
+                }
+            }
+            Effect::Replace {
+                id,
+                from,
+                to,
+                lifecycle,
+                cascading_updates,
+                temporary_name,
+                ..
+            } => {
+                if lifecycle.create_before_destroy {
+                    // Create the new resource first
+                    let mut resolved_resource = to.clone();
+                    for (key, value) in &to.attributes {
+                        resolved_resource
+                            .attributes
+                            .insert(key.clone(), resolve_ref_value(value, binding_map));
+                    }
+
+                    match provider.create(&resolved_resource).await {
+                        Ok(state) => {
+                            // Update binding_map with the new resource's state before cascading
+                            if let Some(Value::String(binding_name)) = to.attributes.get("_binding")
+                            {
+                                let mut attrs = resolved_resource.attributes.clone();
+                                for (k, v) in &state.attributes {
+                                    attrs.insert(k.clone(), v.clone());
+                                }
+                                binding_map.insert(binding_name.clone(), attrs);
+                            }
+
+                            // Execute cascading updates for dependent resources
+                            let mut cascade_failed = false;
+                            for cascade in cascading_updates {
+                                let mut resolved_to = cascade.to.clone();
+                                for (key, value) in &cascade.to.attributes {
+                                    resolved_to
+                                        .attributes
+                                        .insert(key.clone(), resolve_ref_value(value, binding_map));
+                                }
+                                let cascade_identifier =
+                                    cascade.from.identifier.as_deref().unwrap_or("");
+                                match provider
+                                    .update(
+                                        &cascade.id,
+                                        cascade_identifier,
+                                        &cascade.from,
+                                        &resolved_to,
+                                    )
+                                    .await
+                                {
+                                    Ok(cascade_state) => {
+                                        println!(
+                                            "  {} Update {} (cascade)",
+                                            "✓".green(),
+                                            cascade.id
+                                        );
+                                        applied_states
+                                            .insert(cascade.id.clone(), cascade_state.clone());
+                                        if let Some(Value::String(binding_name)) =
+                                            cascade.to.attributes.get("_binding")
+                                        {
+                                            let mut attrs = resolved_to.attributes.clone();
+                                            for (k, v) in &cascade_state.attributes {
+                                                attrs.insert(k.clone(), v.clone());
+                                            }
+                                            binding_map.insert(binding_name.clone(), attrs);
+                                        }
+                                    }
+                                    Err(e) => {
+                                        println!(
+                                            "  {} Update {} (cascade) - {}",
+                                            "✗".red(),
+                                            cascade.id,
+                                            e
+                                        );
+                                        queue_state_refresh(
+                                            &mut pending_refreshes,
+                                            &cascade.id,
+                                            Some(cascade_identifier),
+                                        );
+                                        cascade_failed = true;
+                                        failure_count += 1;
+                                        break;
+                                    }
+                                }
+                            }
+
+                            if cascade_failed {
+                                queue_state_refresh(
+                                    &mut pending_refreshes,
+                                    &to.id,
+                                    state.identifier.as_deref(),
+                                );
+                                // Don't delete old resource if cascade failed
+                                if let Some(binding) = effect.binding_name() {
+                                    failed_bindings.insert(binding);
+                                }
+                            } else {
+                                // Then delete the old resource
+                                let identifier = from.identifier.as_deref().unwrap_or("");
+                                match provider.delete(id, identifier, lifecycle).await {
+                                    Ok(()) => {
+                                        // If a temporary name was used and the name is updatable,
+                                        // rename the resource back to the desired name
+                                        let final_state = if let Some(temp) = temporary_name
+                                            && temp.can_rename
+                                        {
+                                            let new_identifier =
+                                                state.identifier.as_deref().unwrap_or("");
+                                            let mut rename_to = to.clone();
+                                            rename_to.attributes.insert(
+                                                temp.attribute.clone(),
+                                                Value::String(temp.original_value.clone()),
+                                            );
+                                            match provider
+                                                .update(id, new_identifier, &state, &rename_to)
+                                                .await
+                                            {
+                                                Ok(renamed_state) => {
+                                                    println!(
+                                                        "  {} Rename {} \"{}\" → \"{}\"",
+                                                        "✓".green(),
+                                                        id,
+                                                        temp.temporary_value,
+                                                        temp.original_value
+                                                    );
+                                                    renamed_state
+                                                }
+                                                Err(e) => {
+                                                    println!(
+                                                        "  {} Rename {} - {}",
+                                                        "✗".red(),
+                                                        id,
+                                                        e
+                                                    );
+                                                    // Use the state with temp name
+                                                    state.clone()
+                                                }
+                                            }
+                                        } else {
+                                            // Track permanent name override for can_rename=false
+                                            if let Some(temp) = temporary_name
+                                                && !temp.can_rename
+                                            {
+                                                let mut overrides = HashMap::new();
+                                                overrides.insert(
+                                                    temp.attribute.clone(),
+                                                    temp.temporary_value.clone(),
+                                                );
+                                                permanent_name_overrides
+                                                    .insert(to.id.clone(), overrides);
+                                            }
+                                            state.clone()
+                                        };
+
+                                        println!("  {} {}", "✓".green(), format_effect(effect));
+                                        success_count += 1;
+
+                                        applied_states.insert(to.id.clone(), final_state);
+                                    }
+                                    Err(e) => {
+                                        println!(
+                                            "  {} {} - {}",
+                                            "✗".red(),
+                                            format_effect(effect),
+                                            e
+                                        );
+                                        failure_count += 1;
+                                        queue_state_refresh(
+                                            &mut pending_refreshes,
+                                            &to.id,
+                                            state.identifier.as_deref(),
+                                        );
+                                        if let Some(binding) = effect.binding_name() {
+                                            failed_bindings.insert(binding);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            println!("  {} {} - {}", "✗".red(), format_effect(effect), e);
+                            failure_count += 1;
+                            if let Some(binding) = effect.binding_name() {
+                                failed_bindings.insert(binding);
+                            }
+                        }
+                    }
+                } else {
+                    // Delete the existing resource first
+                    let identifier = from.identifier.as_deref().unwrap_or("");
+                    match provider.delete(id, identifier, lifecycle).await {
+                        Ok(()) => {
+                            // Re-resolve references with current binding_map
+                            let mut resolved_resource = to.clone();
+                            for (key, value) in &to.attributes {
+                                resolved_resource
+                                    .attributes
+                                    .insert(key.clone(), resolve_ref_value(value, binding_map));
+                            }
+
+                            // Create the new resource
+                            match provider.create(&resolved_resource).await {
+                                Ok(state) => {
+                                    println!("  {} {}", "✓".green(), format_effect(effect));
+                                    success_count += 1;
+
+                                    applied_states.insert(to.id.clone(), state.clone());
+
+                                    if let Some(Value::String(binding_name)) =
+                                        to.attributes.get("_binding")
+                                    {
+                                        let mut attrs = resolved_resource.attributes.clone();
+                                        for (k, v) in &state.attributes {
+                                            attrs.insert(k.clone(), v.clone());
+                                        }
+                                        binding_map.insert(binding_name.clone(), attrs);
+                                    }
+                                }
+                                Err(e) => {
+                                    println!("  {} {} - {}", "✗".red(), format_effect(effect), e);
+                                    failure_count += 1;
+                                    queue_state_refresh(
+                                        &mut pending_refreshes,
+                                        &to.id,
+                                        Some(identifier),
+                                    );
+                                    if let Some(binding) = effect.binding_name() {
+                                        failed_bindings.insert(binding);
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            println!("  {} {} - {}", "✗".red(), format_effect(effect), e);
+                            failure_count += 1;
+                            queue_state_refresh(&mut pending_refreshes, id, Some(identifier));
+                            if let Some(binding) = effect.binding_name() {
+                                failed_bindings.insert(binding);
+                            }
+                        }
+                    }
+                }
+            }
+            Effect::Delete {
+                id,
+                identifier,
+                lifecycle,
+            } => match provider.delete(id, identifier, lifecycle).await {
+                Ok(()) => {
+                    println!("  {} {}", "✓".green(), format_effect(effect));
+                    success_count += 1;
+                    successfully_deleted.insert(id.clone());
+                }
+                Err(e) => {
+                    println!("  {} {} - {}", "✗".red(), format_effect(effect), e);
+                    failure_count += 1;
+                    queue_state_refresh(&mut pending_refreshes, id, Some(identifier));
+                }
+            },
+            Effect::Read { .. } => {}
+        }
+    }
+
+    let failed_refreshes =
+        refresh_pending_states(provider, current_states, &pending_refreshes).await;
+
+    ApplyResult {
+        success_count,
+        failure_count,
+        skip_count,
+        applied_states,
+        successfully_deleted,
+        permanent_name_overrides,
+        failed_refreshes,
+    }
+}
+
+/// Save state after apply, release lock, and print summary.
+async fn finalize_apply(
+    result: &ApplyResult,
+    state_file: Option<StateFile>,
+    sorted_resources: &[Resource],
+    current_states: &HashMap<ResourceId, State>,
+    plan: &Plan,
+    backend: &dyn StateBackend,
+    lock: &LockInfo,
+) -> Result<(), String> {
+    // Save state
+    println!();
+    println!("{}", "Saving state...".cyan());
+
+    let mut state = build_state_after_apply(ApplyStateSave {
+        state_file,
+        sorted_resources,
+        current_states,
+        applied_states: &result.applied_states,
+        permanent_name_overrides: &result.permanent_name_overrides,
+        plan,
+        successfully_deleted: &result.successfully_deleted,
+        failed_refreshes: &result.failed_refreshes,
+    });
+
+    // Increment serial and save
+    state.increment_serial();
+    backend
+        .write_state(&state)
+        .await
+        .map_err(|e| format!("Failed to write state: {}", e))?;
+    println!("  {} State saved (serial: {})", "✓".green(), state.serial);
+
+    // Release lock
+    backend
+        .release_lock(lock)
+        .await
+        .map_err(|e| format!("Failed to release lock: {}", e))?;
+    println!("  {} Lock released", "✓".green());
+
+    println!();
+    if result.failure_count == 0 && result.skip_count == 0 {
+        println!(
+            "{}",
+            format!("Apply complete! {} changes applied.", result.success_count)
+                .green()
+                .bold()
+        );
+        Ok(())
+    } else {
+        let mut parts = vec![format!("{} succeeded", result.success_count)];
+        if result.failure_count > 0 {
+            parts.push(format!("{} failed", result.failure_count));
+        }
+        if result.skip_count > 0 {
+            parts.push(format!("{} skipped", result.skip_count));
+        }
+        Err(format!("Apply failed. {}.", parts.join(", ")))
+    }
+}
+
 fn queue_state_refresh(
     pending_refreshes: &mut HashMap<ResourceId, String>,
     id: &ResourceId,
@@ -581,7 +1043,7 @@ fn queue_state_refresh(
 }
 
 async fn refresh_pending_states(
-    provider: &impl Provider,
+    provider: &dyn Provider,
     current_states: &mut HashMap<ResourceId, State>,
     pending_refreshes: &HashMap<ResourceId, String>,
 ) -> HashSet<ResourceId> {
@@ -1042,428 +1504,26 @@ async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
     println!("{}", "Applying changes...".cyan().bold());
     println!();
 
-    let mut success_count = 0;
-    let mut failure_count = 0;
-    let mut skip_count = 0;
-    let mut applied_states: HashMap<ResourceId, State> = HashMap::new();
-    let mut failed_bindings: HashSet<String> = HashSet::new();
-    let mut successfully_deleted: HashSet<ResourceId> = HashSet::new();
-    let mut permanent_name_overrides: HashMap<ResourceId, HashMap<String, String>> = HashMap::new();
-    let mut pending_refreshes: HashMap<ResourceId, String> = HashMap::new();
+    let result = execute_effects(
+        &plan,
+        provider.as_ref(),
+        &mut binding_map,
+        &mut current_states,
+    )
+    .await;
 
-    // Apply each effect in order, resolving references dynamically
-    for effect in plan.effects() {
-        // Check if any dependency has failed - skip this effect if so
-        if let Some(failed_dep) = find_failed_dependency(effect, &failed_bindings) {
-            println!(
-                "  {} {} - dependency '{}' failed",
-                "⊘".yellow(),
-                format_effect(effect),
-                failed_dep
-            );
-            skip_count += 1;
-            // Propagate failure to this binding so transitive dependents are also skipped
-            if let Some(binding) = effect.binding_name() {
-                failed_bindings.insert(binding);
-            }
-            continue;
-        }
-
-        match effect {
-            Effect::Create(resource) => {
-                // Re-resolve references with current binding_map
-                let mut resolved_resource = resource.clone();
-                for (key, value) in &resource.attributes {
-                    resolved_resource
-                        .attributes
-                        .insert(key.clone(), resolve_ref_value(value, &binding_map));
-                }
-
-                match provider.create(&resolved_resource).await {
-                    Ok(state) => {
-                        println!("  {} {}", "✓".green(), format_effect(effect));
-                        success_count += 1;
-
-                        // Track the applied state
-                        applied_states.insert(resource.id.clone(), state.clone());
-
-                        // Update binding_map with the newly created resource's state (including id)
-                        if let Some(Value::String(binding_name)) =
-                            resource.attributes.get("_binding")
-                        {
-                            let mut attrs = resolved_resource.attributes.clone();
-                            for (k, v) in &state.attributes {
-                                attrs.insert(k.clone(), v.clone());
-                            }
-                            binding_map.insert(binding_name.clone(), attrs);
-                        }
-                    }
-                    Err(e) => {
-                        println!("  {} {} - {}", "✗".red(), format_effect(effect), e);
-                        failure_count += 1;
-                        if let Some(binding) = effect.binding_name() {
-                            failed_bindings.insert(binding);
-                        }
-                    }
-                }
-            }
-            Effect::Update { id, from, to, .. } => {
-                // Re-resolve references
-                let mut resolved_to = to.clone();
-                for (key, value) in &to.attributes {
-                    resolved_to
-                        .attributes
-                        .insert(key.clone(), resolve_ref_value(value, &binding_map));
-                }
-
-                // Get identifier from current state
-                let identifier = from.identifier.as_deref().unwrap_or("");
-                match provider.update(id, identifier, from, &resolved_to).await {
-                    Ok(state) => {
-                        println!("  {} {}", "✓".green(), format_effect(effect));
-                        success_count += 1;
-
-                        // Track the applied state
-                        applied_states.insert(id.clone(), state.clone());
-
-                        // Update binding_map
-                        if let Some(Value::String(binding_name)) = to.attributes.get("_binding") {
-                            let mut attrs = resolved_to.attributes.clone();
-                            for (k, v) in &state.attributes {
-                                attrs.insert(k.clone(), v.clone());
-                            }
-                            binding_map.insert(binding_name.clone(), attrs);
-                        }
-                    }
-                    Err(e) => {
-                        println!("  {} {} - {}", "✗".red(), format_effect(effect), e);
-                        failure_count += 1;
-                        queue_state_refresh(&mut pending_refreshes, id, Some(identifier));
-                        if let Some(binding) = effect.binding_name() {
-                            failed_bindings.insert(binding);
-                        }
-                    }
-                }
-            }
-            Effect::Replace {
-                id,
-                from,
-                to,
-                lifecycle,
-                cascading_updates,
-                temporary_name,
-                ..
-            } => {
-                if lifecycle.create_before_destroy {
-                    // Create the new resource first
-                    let mut resolved_resource = to.clone();
-                    for (key, value) in &to.attributes {
-                        resolved_resource
-                            .attributes
-                            .insert(key.clone(), resolve_ref_value(value, &binding_map));
-                    }
-
-                    match provider.create(&resolved_resource).await {
-                        Ok(state) => {
-                            // Update binding_map with the new resource's state before cascading
-                            if let Some(Value::String(binding_name)) = to.attributes.get("_binding")
-                            {
-                                let mut attrs = resolved_resource.attributes.clone();
-                                for (k, v) in &state.attributes {
-                                    attrs.insert(k.clone(), v.clone());
-                                }
-                                binding_map.insert(binding_name.clone(), attrs);
-                            }
-
-                            // Execute cascading updates for dependent resources
-                            let mut cascade_failed = false;
-                            for cascade in cascading_updates {
-                                let mut resolved_to = cascade.to.clone();
-                                for (key, value) in &cascade.to.attributes {
-                                    resolved_to.attributes.insert(
-                                        key.clone(),
-                                        resolve_ref_value(value, &binding_map),
-                                    );
-                                }
-                                let cascade_identifier =
-                                    cascade.from.identifier.as_deref().unwrap_or("");
-                                match provider
-                                    .update(
-                                        &cascade.id,
-                                        cascade_identifier,
-                                        &cascade.from,
-                                        &resolved_to,
-                                    )
-                                    .await
-                                {
-                                    Ok(cascade_state) => {
-                                        println!(
-                                            "  {} Update {} (cascade)",
-                                            "✓".green(),
-                                            cascade.id
-                                        );
-                                        applied_states
-                                            .insert(cascade.id.clone(), cascade_state.clone());
-                                        if let Some(Value::String(binding_name)) =
-                                            cascade.to.attributes.get("_binding")
-                                        {
-                                            let mut attrs = resolved_to.attributes.clone();
-                                            for (k, v) in &cascade_state.attributes {
-                                                attrs.insert(k.clone(), v.clone());
-                                            }
-                                            binding_map.insert(binding_name.clone(), attrs);
-                                        }
-                                    }
-                                    Err(e) => {
-                                        println!(
-                                            "  {} Update {} (cascade) - {}",
-                                            "✗".red(),
-                                            cascade.id,
-                                            e
-                                        );
-                                        queue_state_refresh(
-                                            &mut pending_refreshes,
-                                            &cascade.id,
-                                            Some(cascade_identifier),
-                                        );
-                                        cascade_failed = true;
-                                        failure_count += 1;
-                                        break;
-                                    }
-                                }
-                            }
-
-                            if cascade_failed {
-                                queue_state_refresh(
-                                    &mut pending_refreshes,
-                                    &to.id,
-                                    state.identifier.as_deref(),
-                                );
-                                // Don't delete old resource if cascade failed
-                                if let Some(binding) = effect.binding_name() {
-                                    failed_bindings.insert(binding);
-                                }
-                            } else {
-                                // Then delete the old resource
-                                let identifier = from.identifier.as_deref().unwrap_or("");
-                                match provider.delete(id, identifier, lifecycle).await {
-                                    Ok(()) => {
-                                        // If a temporary name was used and the name is updatable,
-                                        // rename the resource back to the desired name
-                                        let final_state = if let Some(temp) = temporary_name
-                                            && temp.can_rename
-                                        {
-                                            let new_identifier =
-                                                state.identifier.as_deref().unwrap_or("");
-                                            let mut rename_to = to.clone();
-                                            rename_to.attributes.insert(
-                                                temp.attribute.clone(),
-                                                Value::String(temp.original_value.clone()),
-                                            );
-                                            match provider
-                                                .update(id, new_identifier, &state, &rename_to)
-                                                .await
-                                            {
-                                                Ok(renamed_state) => {
-                                                    println!(
-                                                        "  {} Rename {} \"{}\" → \"{}\"",
-                                                        "✓".green(),
-                                                        id,
-                                                        temp.temporary_value,
-                                                        temp.original_value
-                                                    );
-                                                    renamed_state
-                                                }
-                                                Err(e) => {
-                                                    println!(
-                                                        "  {} Rename {} - {}",
-                                                        "✗".red(),
-                                                        id,
-                                                        e
-                                                    );
-                                                    // Use the state with temp name
-                                                    state.clone()
-                                                }
-                                            }
-                                        } else {
-                                            // Track permanent name override for can_rename=false
-                                            if let Some(temp) = temporary_name
-                                                && !temp.can_rename
-                                            {
-                                                let mut overrides = HashMap::new();
-                                                overrides.insert(
-                                                    temp.attribute.clone(),
-                                                    temp.temporary_value.clone(),
-                                                );
-                                                permanent_name_overrides
-                                                    .insert(to.id.clone(), overrides);
-                                            }
-                                            state.clone()
-                                        };
-
-                                        println!("  {} {}", "✓".green(), format_effect(effect));
-                                        success_count += 1;
-
-                                        applied_states.insert(to.id.clone(), final_state);
-                                    }
-                                    Err(e) => {
-                                        println!(
-                                            "  {} {} - {}",
-                                            "✗".red(),
-                                            format_effect(effect),
-                                            e
-                                        );
-                                        failure_count += 1;
-                                        queue_state_refresh(
-                                            &mut pending_refreshes,
-                                            &to.id,
-                                            state.identifier.as_deref(),
-                                        );
-                                        if let Some(binding) = effect.binding_name() {
-                                            failed_bindings.insert(binding);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            println!("  {} {} - {}", "✗".red(), format_effect(effect), e);
-                            failure_count += 1;
-                            if let Some(binding) = effect.binding_name() {
-                                failed_bindings.insert(binding);
-                            }
-                        }
-                    }
-                } else {
-                    // Delete the existing resource first
-                    let identifier = from.identifier.as_deref().unwrap_or("");
-                    match provider.delete(id, identifier, lifecycle).await {
-                        Ok(()) => {
-                            // Re-resolve references with current binding_map
-                            let mut resolved_resource = to.clone();
-                            for (key, value) in &to.attributes {
-                                resolved_resource
-                                    .attributes
-                                    .insert(key.clone(), resolve_ref_value(value, &binding_map));
-                            }
-
-                            // Create the new resource
-                            match provider.create(&resolved_resource).await {
-                                Ok(state) => {
-                                    println!("  {} {}", "✓".green(), format_effect(effect));
-                                    success_count += 1;
-
-                                    applied_states.insert(to.id.clone(), state.clone());
-
-                                    if let Some(Value::String(binding_name)) =
-                                        to.attributes.get("_binding")
-                                    {
-                                        let mut attrs = resolved_resource.attributes.clone();
-                                        for (k, v) in &state.attributes {
-                                            attrs.insert(k.clone(), v.clone());
-                                        }
-                                        binding_map.insert(binding_name.clone(), attrs);
-                                    }
-                                }
-                                Err(e) => {
-                                    println!("  {} {} - {}", "✗".red(), format_effect(effect), e);
-                                    failure_count += 1;
-                                    queue_state_refresh(
-                                        &mut pending_refreshes,
-                                        &to.id,
-                                        Some(identifier),
-                                    );
-                                    if let Some(binding) = effect.binding_name() {
-                                        failed_bindings.insert(binding);
-                                    }
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            println!("  {} {} - {}", "✗".red(), format_effect(effect), e);
-                            failure_count += 1;
-                            queue_state_refresh(&mut pending_refreshes, id, Some(identifier));
-                            if let Some(binding) = effect.binding_name() {
-                                failed_bindings.insert(binding);
-                            }
-                        }
-                    }
-                }
-            }
-            Effect::Delete {
-                id,
-                identifier,
-                lifecycle,
-            } => match provider.delete(id, identifier, lifecycle).await {
-                Ok(()) => {
-                    println!("  {} {}", "✓".green(), format_effect(effect));
-                    success_count += 1;
-                    successfully_deleted.insert(id.clone());
-                }
-                Err(e) => {
-                    println!("  {} {} - {}", "✗".red(), format_effect(effect), e);
-                    failure_count += 1;
-                    queue_state_refresh(&mut pending_refreshes, id, Some(identifier));
-                }
-            },
-            Effect::Read { .. } => {}
-        }
-    }
-
-    let failed_refreshes =
-        refresh_pending_states(&provider, &mut current_states, &pending_refreshes).await;
-
-    // Save state
-    println!();
-    println!("{}", "Saving state...".cyan());
-
-    let mut state = build_state_after_apply(ApplyStateSave {
+    // lock is Option<LockInfo> in run_apply; unwrap since we always acquire it
+    let lock_info = lock.as_ref().expect("lock should have been acquired");
+    finalize_apply(
+        &result,
         state_file,
-        sorted_resources: &sorted_resources,
-        current_states: &current_states,
-        applied_states: &applied_states,
-        permanent_name_overrides: &permanent_name_overrides,
-        plan: &plan,
-        successfully_deleted: &successfully_deleted,
-        failed_refreshes: &failed_refreshes,
-    });
-
-    // Increment serial and save
-    state.increment_serial();
-    backend
-        .write_state(&state)
-        .await
-        .map_err(|e| format!("Failed to write state: {}", e))?;
-    println!("  {} State saved (serial: {})", "✓".green(), state.serial);
-
-    // Release lock
-    if let Some(ref lock_info) = lock {
-        backend
-            .release_lock(lock_info)
-            .await
-            .map_err(|e| format!("Failed to release lock: {}", e))?;
-        println!("  {} Lock released", "✓".green());
-    }
-
-    println!();
-    if failure_count == 0 && skip_count == 0 {
-        println!(
-            "{}",
-            format!("Apply complete! {} changes applied.", success_count)
-                .green()
-                .bold()
-        );
-        Ok(())
-    } else {
-        let mut parts = vec![format!("{} succeeded", success_count)];
-        if failure_count > 0 {
-            parts.push(format!("{} failed", failure_count));
-        }
-        if skip_count > 0 {
-            parts.push(format!("{} skipped", skip_count));
-        }
-        Err(format!("Apply failed. {}.", parts.join(", ")))
-    }
+        &sorted_resources,
+        &current_states,
+        &plan,
+        backend.as_ref(),
+        lock_info,
+    )
+    .await
 }
 
 async fn run_apply_from_plan(plan_path: &PathBuf, auto_approve: bool) -> Result<(), String> {
@@ -1753,411 +1813,24 @@ async fn run_apply_from_plan(plan_path: &PathBuf, auto_approve: bool) -> Result<
     println!("{}", "Applying changes...".cyan().bold());
     println!();
 
-    let mut success_count = 0;
-    let mut failure_count = 0;
-    let mut skip_count = 0;
-    let mut applied_states: HashMap<ResourceId, State> = HashMap::new();
-    let mut failed_bindings: HashSet<String> = HashSet::new();
-    let mut successfully_deleted: HashSet<ResourceId> = HashSet::new();
-    let mut permanent_name_overrides: HashMap<ResourceId, HashMap<String, String>> = HashMap::new();
-    let mut pending_refreshes: HashMap<ResourceId, String> = HashMap::new();
+    let result = execute_effects(
+        plan,
+        provider.as_ref(),
+        &mut binding_map,
+        &mut current_states,
+    )
+    .await;
 
-    // Apply each effect in order, resolving references dynamically
-    for effect in plan.effects() {
-        // Check if any dependency has failed - skip this effect if so
-        if let Some(failed_dep) = find_failed_dependency(effect, &failed_bindings) {
-            println!(
-                "  {} {} - dependency '{}' failed",
-                "⊘".yellow(),
-                format_effect(effect),
-                failed_dep
-            );
-            skip_count += 1;
-            // Propagate failure to this binding so transitive dependents are also skipped
-            if let Some(binding) = effect.binding_name() {
-                failed_bindings.insert(binding);
-            }
-            continue;
-        }
-
-        match effect {
-            Effect::Create(resource) => {
-                let mut resolved_resource = resource.clone();
-                for (key, value) in &resource.attributes {
-                    resolved_resource
-                        .attributes
-                        .insert(key.clone(), resolve_ref_value(value, &binding_map));
-                }
-
-                match provider.create(&resolved_resource).await {
-                    Ok(state) => {
-                        println!("  {} {}", "✓".green(), format_effect(effect));
-                        success_count += 1;
-                        applied_states.insert(resource.id.clone(), state.clone());
-
-                        if let Some(Value::String(binding_name)) =
-                            resource.attributes.get("_binding")
-                        {
-                            let mut attrs = resolved_resource.attributes.clone();
-                            for (k, v) in &state.attributes {
-                                attrs.insert(k.clone(), v.clone());
-                            }
-                            binding_map.insert(binding_name.clone(), attrs);
-                        }
-                    }
-                    Err(e) => {
-                        println!("  {} {} - {}", "✗".red(), format_effect(effect), e);
-                        failure_count += 1;
-                        if let Some(binding) = effect.binding_name() {
-                            failed_bindings.insert(binding);
-                        }
-                    }
-                }
-            }
-            Effect::Update { id, from, to, .. } => {
-                let mut resolved_to = to.clone();
-                for (key, value) in &to.attributes {
-                    resolved_to
-                        .attributes
-                        .insert(key.clone(), resolve_ref_value(value, &binding_map));
-                }
-
-                let identifier = from.identifier.as_deref().unwrap_or("");
-                match provider.update(id, identifier, from, &resolved_to).await {
-                    Ok(state) => {
-                        println!("  {} {}", "✓".green(), format_effect(effect));
-                        success_count += 1;
-                        applied_states.insert(id.clone(), state.clone());
-
-                        if let Some(Value::String(binding_name)) = to.attributes.get("_binding") {
-                            let mut attrs = resolved_to.attributes.clone();
-                            for (k, v) in &state.attributes {
-                                attrs.insert(k.clone(), v.clone());
-                            }
-                            binding_map.insert(binding_name.clone(), attrs);
-                        }
-                    }
-                    Err(e) => {
-                        println!("  {} {} - {}", "✗".red(), format_effect(effect), e);
-                        failure_count += 1;
-                        queue_state_refresh(&mut pending_refreshes, id, Some(identifier));
-                        if let Some(binding) = effect.binding_name() {
-                            failed_bindings.insert(binding);
-                        }
-                    }
-                }
-            }
-            Effect::Replace {
-                id,
-                from,
-                to,
-                lifecycle,
-                cascading_updates,
-                temporary_name,
-                ..
-            } => {
-                if lifecycle.create_before_destroy {
-                    // Create the new resource first
-                    let mut resolved_resource = to.clone();
-                    for (key, value) in &to.attributes {
-                        resolved_resource
-                            .attributes
-                            .insert(key.clone(), resolve_ref_value(value, &binding_map));
-                    }
-
-                    match provider.create(&resolved_resource).await {
-                        Ok(state) => {
-                            // Update binding_map with the new resource's state before cascading
-                            if let Some(Value::String(binding_name)) = to.attributes.get("_binding")
-                            {
-                                let mut attrs = resolved_resource.attributes.clone();
-                                for (k, v) in &state.attributes {
-                                    attrs.insert(k.clone(), v.clone());
-                                }
-                                binding_map.insert(binding_name.clone(), attrs);
-                            }
-
-                            // Execute cascading updates for dependent resources
-                            let mut cascade_failed = false;
-                            for cascade in cascading_updates {
-                                let mut resolved_to = cascade.to.clone();
-                                for (key, value) in &cascade.to.attributes {
-                                    resolved_to.attributes.insert(
-                                        key.clone(),
-                                        resolve_ref_value(value, &binding_map),
-                                    );
-                                }
-                                let cascade_identifier =
-                                    cascade.from.identifier.as_deref().unwrap_or("");
-                                match provider
-                                    .update(
-                                        &cascade.id,
-                                        cascade_identifier,
-                                        &cascade.from,
-                                        &resolved_to,
-                                    )
-                                    .await
-                                {
-                                    Ok(cascade_state) => {
-                                        println!(
-                                            "  {} Update {} (cascade)",
-                                            "✓".green(),
-                                            cascade.id
-                                        );
-                                        applied_states
-                                            .insert(cascade.id.clone(), cascade_state.clone());
-                                        if let Some(Value::String(binding_name)) =
-                                            cascade.to.attributes.get("_binding")
-                                        {
-                                            let mut attrs = resolved_to.attributes.clone();
-                                            for (k, v) in &cascade_state.attributes {
-                                                attrs.insert(k.clone(), v.clone());
-                                            }
-                                            binding_map.insert(binding_name.clone(), attrs);
-                                        }
-                                    }
-                                    Err(e) => {
-                                        println!(
-                                            "  {} Update {} (cascade) - {}",
-                                            "✗".red(),
-                                            cascade.id,
-                                            e
-                                        );
-                                        queue_state_refresh(
-                                            &mut pending_refreshes,
-                                            &cascade.id,
-                                            Some(cascade_identifier),
-                                        );
-                                        cascade_failed = true;
-                                        failure_count += 1;
-                                        break;
-                                    }
-                                }
-                            }
-
-                            if cascade_failed {
-                                queue_state_refresh(
-                                    &mut pending_refreshes,
-                                    &to.id,
-                                    state.identifier.as_deref(),
-                                );
-                                if let Some(binding) = effect.binding_name() {
-                                    failed_bindings.insert(binding);
-                                }
-                            } else {
-                                // Then delete the old resource
-                                let identifier = from.identifier.as_deref().unwrap_or("");
-                                match provider.delete(id, identifier, lifecycle).await {
-                                    Ok(()) => {
-                                        // If a temporary name was used and the name is updatable,
-                                        // rename the resource back to the desired name
-                                        let final_state = if let Some(temp) = temporary_name
-                                            && temp.can_rename
-                                        {
-                                            let new_identifier =
-                                                state.identifier.as_deref().unwrap_or("");
-                                            let mut rename_to = to.clone();
-                                            rename_to.attributes.insert(
-                                                temp.attribute.clone(),
-                                                Value::String(temp.original_value.clone()),
-                                            );
-                                            match provider
-                                                .update(id, new_identifier, &state, &rename_to)
-                                                .await
-                                            {
-                                                Ok(renamed_state) => {
-                                                    println!(
-                                                        "  {} Rename {} \"{}\" → \"{}\"",
-                                                        "✓".green(),
-                                                        id,
-                                                        temp.temporary_value,
-                                                        temp.original_value
-                                                    );
-                                                    renamed_state
-                                                }
-                                                Err(e) => {
-                                                    println!(
-                                                        "  {} Rename {} - {}",
-                                                        "✗".red(),
-                                                        id,
-                                                        e
-                                                    );
-                                                    // Use the state with temp name
-                                                    state.clone()
-                                                }
-                                            }
-                                        } else {
-                                            // Track permanent name override for can_rename=false
-                                            if let Some(temp) = temporary_name
-                                                && !temp.can_rename
-                                            {
-                                                let mut overrides = HashMap::new();
-                                                overrides.insert(
-                                                    temp.attribute.clone(),
-                                                    temp.temporary_value.clone(),
-                                                );
-                                                permanent_name_overrides
-                                                    .insert(to.id.clone(), overrides);
-                                            }
-                                            state.clone()
-                                        };
-
-                                        println!("  {} {}", "✓".green(), format_effect(effect));
-                                        success_count += 1;
-                                        applied_states.insert(to.id.clone(), final_state);
-                                    }
-                                    Err(e) => {
-                                        println!(
-                                            "  {} {} - {}",
-                                            "✗".red(),
-                                            format_effect(effect),
-                                            e
-                                        );
-                                        failure_count += 1;
-                                        queue_state_refresh(
-                                            &mut pending_refreshes,
-                                            &to.id,
-                                            state.identifier.as_deref(),
-                                        );
-                                        if let Some(binding) = effect.binding_name() {
-                                            failed_bindings.insert(binding);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            println!("  {} {} - {}", "✗".red(), format_effect(effect), e);
-                            failure_count += 1;
-                            if let Some(binding) = effect.binding_name() {
-                                failed_bindings.insert(binding);
-                            }
-                        }
-                    }
-                } else {
-                    let identifier = from.identifier.as_deref().unwrap_or("");
-                    match provider.delete(id, identifier, lifecycle).await {
-                        Ok(()) => {
-                            let mut resolved_resource = to.clone();
-                            for (key, value) in &to.attributes {
-                                resolved_resource
-                                    .attributes
-                                    .insert(key.clone(), resolve_ref_value(value, &binding_map));
-                            }
-
-                            match provider.create(&resolved_resource).await {
-                                Ok(state) => {
-                                    println!("  {} {}", "✓".green(), format_effect(effect));
-                                    success_count += 1;
-                                    applied_states.insert(to.id.clone(), state.clone());
-
-                                    if let Some(Value::String(binding_name)) =
-                                        to.attributes.get("_binding")
-                                    {
-                                        let mut attrs = resolved_resource.attributes.clone();
-                                        for (k, v) in &state.attributes {
-                                            attrs.insert(k.clone(), v.clone());
-                                        }
-                                        binding_map.insert(binding_name.clone(), attrs);
-                                    }
-                                }
-                                Err(e) => {
-                                    println!("  {} {} - {}", "✗".red(), format_effect(effect), e);
-                                    failure_count += 1;
-                                    queue_state_refresh(
-                                        &mut pending_refreshes,
-                                        &to.id,
-                                        Some(identifier),
-                                    );
-                                    if let Some(binding) = effect.binding_name() {
-                                        failed_bindings.insert(binding);
-                                    }
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            println!("  {} {} - {}", "✗".red(), format_effect(effect), e);
-                            failure_count += 1;
-                            queue_state_refresh(&mut pending_refreshes, id, Some(identifier));
-                            if let Some(binding) = effect.binding_name() {
-                                failed_bindings.insert(binding);
-                            }
-                        }
-                    }
-                }
-            }
-            Effect::Delete {
-                id,
-                identifier,
-                lifecycle,
-            } => match provider.delete(id, identifier, lifecycle).await {
-                Ok(()) => {
-                    println!("  {} {}", "✓".green(), format_effect(effect));
-                    success_count += 1;
-                    successfully_deleted.insert(id.clone());
-                }
-                Err(e) => {
-                    println!("  {} {} - {}", "✗".red(), format_effect(effect), e);
-                    failure_count += 1;
-                    queue_state_refresh(&mut pending_refreshes, id, Some(identifier));
-                }
-            },
-            Effect::Read { .. } => {}
-        }
-    }
-
-    let failed_refreshes =
-        refresh_pending_states(&provider, &mut current_states, &pending_refreshes).await;
-
-    // Save state
-    println!();
-    println!("{}", "Saving state...".cyan());
-
-    let mut state = build_state_after_apply(ApplyStateSave {
+    finalize_apply(
+        &result,
         state_file,
         sorted_resources,
-        current_states: &current_states,
-        applied_states: &applied_states,
-        permanent_name_overrides: &permanent_name_overrides,
+        &current_states,
         plan,
-        successfully_deleted: &successfully_deleted,
-        failed_refreshes: &failed_refreshes,
-    });
-
-    // Increment serial and save
-    state.increment_serial();
-    backend
-        .write_state(&state)
-        .await
-        .map_err(|e| format!("Failed to write state: {}", e))?;
-    println!("  {} State saved (serial: {})", "✓".green(), state.serial);
-
-    // Release lock
-    backend
-        .release_lock(&lock)
-        .await
-        .map_err(|e| format!("Failed to release lock: {}", e))?;
-    println!("  {} Lock released", "✓".green());
-
-    println!();
-    if failure_count == 0 && skip_count == 0 {
-        println!(
-            "{}",
-            format!("Apply complete! {} changes applied.", success_count)
-                .green()
-                .bold()
-        );
-        Ok(())
-    } else {
-        let mut parts = vec![format!("{} succeeded", success_count)];
-        if failure_count > 0 {
-            parts.push(format!("{} failed", failure_count));
-        }
-        if skip_count > 0 {
-            parts.push(format!("{} skipped", skip_count));
-        }
-        Err(format!("Apply failed. {}.", parts.join(", ")))
-    }
+        backend.as_ref(),
+        &lock,
+    )
+    .await
 }
 
 /// Create a provider from a saved ProviderConfig
