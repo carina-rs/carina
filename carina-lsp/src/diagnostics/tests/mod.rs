@@ -63,6 +63,42 @@ pub(super) fn test_engine_with_nested_structs() -> DiagnosticEngine {
     )
 }
 
+pub(super) fn test_engine_with_block_name_nested() -> DiagnosticEngine {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
+
+    let transition_struct = AttributeType::Struct {
+        name: "Transition".to_string(),
+        fields: vec![
+            StructField::new("days", AttributeType::Int),
+            StructField::new("storage_class", AttributeType::String),
+        ],
+    };
+
+    let config_struct = AttributeType::Struct {
+        name: "Config".to_string(),
+        fields: vec![
+            StructField::new(
+                "transitions",
+                AttributeType::List(Box::new(transition_struct)),
+            )
+            .with_block_name("transition"),
+            StructField::new("enabled", AttributeType::Bool),
+        ],
+    };
+
+    let schema = ResourceSchema::new("test.block.resource")
+        .attribute(AttributeSchema::new("config", config_struct));
+
+    let mut schemas = HashMap::new();
+    schemas.insert("test.block.resource".to_string(), schema);
+
+    DiagnosticEngine::new(
+        Arc::new(schemas),
+        vec!["test".to_string()],
+        Arc::new(vec![]),
+    )
+}
+
 pub(super) fn custom_engine(
     schemas: HashMap<String, carina_core::schema::ResourceSchema>,
 ) -> DiagnosticEngine {

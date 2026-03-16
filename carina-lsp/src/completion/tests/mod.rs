@@ -24,6 +24,38 @@ pub(super) fn test_provider() -> CompletionProvider {
     CompletionProvider::new(schemas, provider_names, region_completions)
 }
 
+pub(super) fn test_provider_with_block_name_nested() -> CompletionProvider {
+    // Nested struct where a StructField has block_name set.
+    // Schema: config -> transitions (List<Struct>, block_name="transition") -> each has "days" + "storage_class"
+    let transition_struct = AttributeType::Struct {
+        name: "Transition".to_string(),
+        fields: vec![
+            StructField::new("days", AttributeType::Int),
+            StructField::new("storage_class", AttributeType::String),
+        ],
+    };
+
+    let config_struct = AttributeType::Struct {
+        name: "Config".to_string(),
+        fields: vec![
+            StructField::new(
+                "transitions",
+                AttributeType::List(Box::new(transition_struct)),
+            )
+            .with_block_name("transition"),
+            StructField::new("enabled", AttributeType::Bool),
+        ],
+    };
+
+    let schema = ResourceSchema::new("test.block.resource")
+        .attribute(AttributeSchema::new("config", config_struct));
+
+    let mut schemas = HashMap::new();
+    schemas.insert("test.block.resource".to_string(), schema);
+
+    CompletionProvider::new(Arc::new(schemas), vec!["test".to_string()], vec![])
+}
+
 pub(super) fn test_provider_with_nested_structs() -> CompletionProvider {
     let inner_struct = AttributeType::Struct {
         name: "InnerStruct".to_string(),

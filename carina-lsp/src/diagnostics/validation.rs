@@ -37,6 +37,11 @@ impl DiagnosticEngine {
         };
 
         let field_names: HashSet<&str> = fields.iter().map(|f| f.name.as_str()).collect();
+        // Also include block_names as valid field names
+        let block_name_to_canonical: HashMap<&str, &str> = fields
+            .iter()
+            .filter_map(|f| f.block_name.as_deref().map(|bn| (bn, f.name.as_str())))
+            .collect();
         let field_map: HashMap<&str, &carina_core::schema::StructField> =
             fields.iter().map(|f| (f.name.as_str(), f)).collect();
 
@@ -45,8 +50,14 @@ impl DiagnosticEngine {
                 let all_positions = self.find_all_nested_field_positions(doc, attr_name, key);
                 if let Some(Some((line, col))) = all_positions.get(map_index) {
                     let (line, col) = (*line, *col);
+                    // Resolve block_name to canonical name
+                    let canonical_key = block_name_to_canonical
+                        .get(key.as_str())
+                        .copied()
+                        .unwrap_or(key.as_str());
+
                     // Check for unknown fields
-                    if !field_names.contains(key.as_str()) {
+                    if !field_names.contains(canonical_key) {
                         diagnostics.push(Diagnostic {
                             range: Range {
                                 start: Position {
@@ -67,7 +78,7 @@ impl DiagnosticEngine {
                     }
 
                     // Type validation for known fields
-                    if let Some(field) = field_map.get(key.as_str()) {
+                    if let Some(field) = field_map.get(canonical_key) {
                         // Skip validation for ResourceRef values (resolved at runtime)
                         let type_error = if matches!(val, Value::ResourceRef { .. }) {
                             None

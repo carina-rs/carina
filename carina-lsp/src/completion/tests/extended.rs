@@ -286,3 +286,27 @@ fn map_completions_delegate_to_inner_type() {
         labels
     );
 }
+
+#[test]
+fn nested_struct_completions_via_block_name_in_path() {
+    // When a user writes `config { transition { ... } }` where "transition" is
+    // the block_name for field "transitions", the path resolution at depth > 1
+    // should find the struct fields via StructField.block_name.
+    let provider = test_provider_with_block_name_nested();
+    // Path: config -> transition (block_name for "transitions")
+    let completions = provider.struct_field_completions(
+        "test.block.resource",
+        &["config".to_string(), "transition".to_string()],
+    );
+    let field_names: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+    assert!(
+        field_names.contains(&"days"),
+        "Should resolve struct fields when nested path uses block_name 'transition'. Got: {:?}",
+        field_names
+    );
+    assert!(
+        field_names.contains(&"storage_class"),
+        "Should resolve struct fields when nested path uses block_name 'transition'. Got: {:?}",
+        field_names
+    );
+}
