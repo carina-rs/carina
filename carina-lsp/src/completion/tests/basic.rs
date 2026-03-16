@@ -525,3 +525,81 @@ fn context_detection_uses_last_ref_on_line() {
         context
     );
 }
+
+#[test]
+fn ref_completion_uses_text_edit_to_replace_from_ref_open_paren() {
+    let provider = test_provider();
+    // User has typed "ref(aws." and wants completion for a resource type
+    let doc = create_document("ref(aws.");
+    let position = Position {
+        line: 0,
+        character: 8, // cursor after "ref(aws."
+    };
+
+    let completions = provider.complete(&doc, position, None);
+
+    // Find any ref type completion (e.g., aws.s3.bucket)
+    let s3_completion = completions
+        .iter()
+        .find(|c| c.label == "aws.s3.bucket")
+        .expect("Should have aws.s3.bucket ref completion");
+
+    // Must use text_edit (not insert_text) to avoid duplication with dotted identifiers
+    assert!(
+        s3_completion.text_edit.is_some(),
+        "ref() completion should use text_edit to handle dotted identifiers correctly"
+    );
+
+    // The text_edit range should start right after "ref(" (column 4) and end at cursor (column 8)
+    if let Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(edit)) = &s3_completion.text_edit {
+        assert_eq!(
+            edit.range.start.character, 4,
+            "Should replace from right after 'ref('"
+        );
+        assert_eq!(
+            edit.range.end.character, 8,
+            "Should replace up to cursor position"
+        );
+        assert_eq!(
+            edit.new_text, "aws.s3.bucket)",
+            "Insert text should include closing paren"
+        );
+    } else {
+        panic!("Expected CompletionTextEdit::Edit");
+    }
+}
+
+#[test]
+fn ref_completion_with_empty_parens() {
+    let provider = test_provider();
+    // User has typed "ref(" with nothing after
+    let doc = create_document("ref(");
+    let position = Position {
+        line: 0,
+        character: 4, // cursor right after "ref("
+    };
+
+    let completions = provider.complete(&doc, position, None);
+
+    let s3_completion = completions
+        .iter()
+        .find(|c| c.label == "aws.s3.bucket")
+        .expect("Should have aws.s3.bucket ref completion");
+
+    if let Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(edit)) = &s3_completion.text_edit {
+        assert_eq!(
+            edit.range.start.character, 4,
+            "Should replace from right after 'ref('"
+        );
+        assert_eq!(
+            edit.range.end.character, 4,
+            "Should replace up to cursor position"
+        );
+        assert_eq!(
+            edit.new_text, "aws.s3.bucket)",
+            "Insert text should include closing paren"
+        );
+    } else {
+        panic!("Expected CompletionTextEdit::Edit");
+    }
+}

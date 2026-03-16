@@ -72,7 +72,7 @@ impl CompletionProvider {
                 field_name,
             } => self.value_completions_for_struct_field(&resource_type, &attr_path, &field_name),
             CompletionContext::AfterProviderRegion => self.region_completions(),
-            CompletionContext::AfterRefType => self.ref_type_completions(),
+            CompletionContext::AfterRefType => self.ref_type_completions(position, &text),
             CompletionContext::AfterInputDot => self.input_parameter_completions(&text),
             CompletionContext::None => vec![],
         }

@@ -1,6 +1,8 @@
 //! Attribute, value, and type-specific completions.
 
-use tower_lsp::lsp_types::{Command, CompletionItem, CompletionItemKind, InsertTextFormat};
+use tower_lsp::lsp_types::{
+    Command, CompletionItem, CompletionItemKind, InsertTextFormat, Position, Range, TextEdit,
+};
 
 use carina_core::schema::AttributeType;
 
@@ -339,7 +341,38 @@ impl CompletionProvider {
         }]
     }
 
-    pub(super) fn ref_type_completions(&self) -> Vec<CompletionItem> {
+    pub(super) fn ref_type_completions(
+        &self,
+        position: Position,
+        text: &str,
+    ) -> Vec<CompletionItem> {
+        // Calculate the replacement range: from right after "ref(" to the cursor position.
+        // This ensures dotted identifiers like "aws.ec2.vpc" are replaced correctly
+        // without duplication from LSP word-boundary-based insertion.
+        let lines: Vec<&str> = text.lines().collect();
+        let line_idx = position.line as usize;
+        let col = position.character as usize;
+
+        let ref_content_start = if line_idx < lines.len() {
+            let prefix: String = lines[line_idx].chars().take(col).collect();
+            // Find the last unclosed "ref(" and position right after the "("
+            if let Some(ref_pos) = prefix.rfind("ref(") {
+                (ref_pos + 4) as u32
+            } else {
+                position.character
+            }
+        } else {
+            position.character
+        };
+
+        let replacement_range = Range {
+            start: Position {
+                line: position.line,
+                character: ref_content_start,
+            },
+            end: position,
+        };
+
         self.schemas
             .keys()
             .map(|resource_type| {
@@ -353,7 +386,10 @@ impl CompletionProvider {
                     label: resource_type.clone(),
                     kind: Some(CompletionItemKind::TYPE_PARAMETER),
                     detail: Some(format!("{} reference", description)),
-                    insert_text: Some(format!("{})", resource_type)),
+                    text_edit: Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(TextEdit {
+                        range: replacement_range,
+                        new_text: format!("{})", resource_type),
+                    })),
                     ..Default::default()
                 }
             })
