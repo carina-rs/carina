@@ -1,0 +1,406 @@
+//! Plan generation from diffs and cascading update logic.
+
+use std::collections::{HashMap, HashSet};
+
+use crate::deps::get_resource_dependencies;
+use crate::effect::{CascadingUpdate, Effect, TemporaryName};
+use crate::identifier::generate_random_suffix;
+use crate::plan::Plan;
+use crate::resource::{LifecycleConfig, Resource, ResourceId, State, Value};
+use crate::schema::ResourceSchema;
+
+use super::{Diff, diff};
+
+/// Check which changed attributes are create-only according to the schema
+fn find_changed_create_only(
+    provider: &str,
+    resource_type: &str,
+    changed_attributes: &[String],
+    schemas: &HashMap<String, ResourceSchema>,
+) -> Vec<String> {
+    let Some(schema) = find_schema(provider, resource_type, schemas) else {
+        return Vec::new();
+    };
+
+    let create_only_attrs = schema.create_only_attributes();
+    changed_attributes
+        .iter()
+        .filter(|attr| create_only_attrs.contains(&attr.as_str()))
+        .cloned()
+        .collect()
+}
+
+/// Filter out non-removable attribute removals from the changed list.
+/// A "removal" is an attribute that appears in `changed_attributes` but not in `to`.
+/// Only attributes marked as `removable` in the schema should be kept as removals.
+/// Non-removal changes (attribute present in `to`) are always kept.
+fn filter_non_removable_removals(
+    provider: &str,
+    resource_type: &str,
+    to: &Resource,
+    changed_attributes: Vec<String>,
+    schemas: &HashMap<String, ResourceSchema>,
+) -> Vec<String> {
+    let Some(schema) = find_schema(provider, resource_type, schemas) else {
+        // No schema available — keep all changes (conservative)
+        return changed_attributes;
+    };
+
+    let removable_attrs = schema.removable_attributes();
+
+    changed_attributes
+        .into_iter()
+        .filter(|attr| {
+            // Keep if the attribute is still in desired (it's a change, not a removal)
+            if to.attributes.contains_key(attr) {
+                return true;
+            }
+            // It's a removal — only keep if the attribute is removable
+            removable_attrs.contains(&attr.as_str())
+        })
+        .collect()
+}
+
+/// Look up the schema for a resource, trying both direct and provider-prefixed keys.
+fn find_schema<'a>(
+    provider: &str,
+    resource_type: &str,
+    schemas: &'a HashMap<String, ResourceSchema>,
+) -> Option<&'a ResourceSchema> {
+    schemas.get(resource_type).or_else(|| {
+        if !provider.is_empty() {
+            schemas.get(&format!("{}.{}", provider, resource_type))
+        } else {
+            None
+        }
+    })
+}
+
+/// Generate a temporary name for create-before-destroy replacement.
+///
+/// When a resource has a `name_attribute` with a unique constraint and uses
+/// `create_before_destroy`, we need a temporary name for the new resource to
+/// avoid conflicts with the old resource that still exists.
+///
+/// Returns `None` if no temporary name is needed (no name_attribute,
+/// the resource already uses name_prefix for that attribute, or
+/// the name_attribute value changed between `from` and `to`).
+fn generate_temporary_name(
+    resource: &Resource,
+    from: &State,
+    schema: &ResourceSchema,
+) -> Option<TemporaryName> {
+    let name_attr = schema.name_attribute.as_ref()?;
+
+    // Skip if the resource uses name_prefix for this attribute
+    if resource.prefixes.contains_key(name_attr) {
+        return None;
+    }
+
+    // Get the current value of the name attribute
+    let original_value = match resource.attributes.get(name_attr) {
+        Some(Value::String(s)) => s.clone(),
+        _ => return None,
+    };
+
+    // Skip if the name_attribute value changed (new name is already different from old)
+    if let Some(Value::String(from_name)) = from.attributes.get(name_attr)
+        && *from_name != original_value
+    {
+        return None;
+    }
+
+    // Check if the name attribute is create-only (cannot be renamed after creation)
+    let can_rename = schema
+        .attributes
+        .get(name_attr)
+        .map(|attr| !attr.create_only)
+        .unwrap_or(false);
+
+    let temporary_value = format!("{}-{}", original_value, generate_random_suffix());
+
+    Some(TemporaryName {
+        attribute: name_attr.clone(),
+        original_value,
+        temporary_value,
+        can_rename,
+    })
+}
+
+/// Compute Diff for multiple resources and generate a Plan
+///
+/// The `lifecycles` map provides lifecycle configuration for orphaned resources
+/// (resources in state but not in desired). For desired resources, the lifecycle
+/// is read directly from the Resource struct.
+///
+/// The `saved_attrs` map provides the last-known attribute values from the state file.
+/// This is used to merge unmanaged nested fields into desired values before comparison,
+/// preventing false diffs when AWS returns extra fields not specified in the .crn file.
+///
+/// The `prev_desired_keys` map provides the attribute keys that the user explicitly
+/// specified in their .crn file during the last apply. This is used to detect
+/// attribute removal: if a key was previously in the user's desired state but is
+/// now absent, it means the user intentionally removed it.
+pub fn create_plan(
+    desired: &[Resource],
+    current_states: &HashMap<ResourceId, State>,
+    lifecycles: &HashMap<ResourceId, LifecycleConfig>,
+    schemas: &HashMap<String, ResourceSchema>,
+    saved_attrs: &HashMap<ResourceId, HashMap<String, Value>>,
+    prev_desired_keys: &HashMap<ResourceId, Vec<String>>,
+) -> Plan {
+    let mut plan = Plan::new();
+
+    let desired_ids: std::collections::HashSet<&ResourceId> =
+        desired.iter().map(|r| &r.id).collect();
+
+    for resource in desired {
+        // Data sources (read-only resources) only generate Read effects
+        if resource.read_only {
+            plan.add(Effect::Read {
+                resource: resource.clone(),
+            });
+            continue;
+        }
+
+        let current = current_states
+            .get(&resource.id)
+            .cloned()
+            .unwrap_or_else(|| State::not_found(resource.id.clone()));
+
+        let saved = saved_attrs.get(&resource.id);
+        let prev_keys = prev_desired_keys.get(&resource.id);
+        let schema = find_schema(&resource.id.provider, &resource.id.resource_type, schemas);
+        let d = diff(
+            resource,
+            &current,
+            saved,
+            prev_keys.map(|v| v.as_slice()),
+            schema,
+        );
+
+        match d {
+            Diff::Create(r) => plan.add(Effect::Create(r)),
+            Diff::Update {
+                id,
+                from,
+                to,
+                changed_attributes,
+            } => {
+                // Filter out non-removable attribute removals.
+                // A "removal" is an attribute in changed_attributes that is not in `to`.
+                // Only attributes marked as `removable` in the schema should trigger removal.
+                let changed_attributes = filter_non_removable_removals(
+                    &resource.id.provider,
+                    &resource.id.resource_type,
+                    &to,
+                    changed_attributes,
+                    schemas,
+                );
+
+                if changed_attributes.is_empty() {
+                    // All changes were spurious non-removable removals
+                    continue;
+                }
+
+                // Check if any changed attributes are create-only
+                let changed_create_only = find_changed_create_only(
+                    &resource.id.provider,
+                    &resource.id.resource_type,
+                    &changed_attributes,
+                    schemas,
+                );
+
+                // Check if the resource type forces replacement (no update support)
+                let schema_force_replace =
+                    find_schema(&resource.id.provider, &resource.id.resource_type, schemas)
+                        .is_some_and(|s| s.force_replace);
+
+                if changed_create_only.is_empty() && !schema_force_replace {
+                    plan.add(Effect::Update {
+                        id,
+                        from,
+                        to,
+                        changed_attributes,
+                    });
+                } else {
+                    let lifecycle = resource.lifecycle.clone();
+                    let temporary_name = if lifecycle.create_before_destroy {
+                        find_schema(&resource.id.provider, &resource.id.resource_type, schemas)
+                            .and_then(|schema| generate_temporary_name(&to, &from, schema))
+                    } else {
+                        None
+                    };
+
+                    // If a temporary name is generated, modify the `to` resource
+                    let to = if let Some(ref temp) = temporary_name {
+                        let mut modified = to;
+                        modified.attributes.insert(
+                            temp.attribute.clone(),
+                            Value::String(temp.temporary_value.clone()),
+                        );
+                        modified
+                    } else {
+                        to
+                    };
+
+                    plan.add(Effect::Replace {
+                        id,
+                        from,
+                        to,
+                        lifecycle,
+                        changed_create_only,
+                        cascading_updates: vec![],
+                        temporary_name,
+                    });
+                }
+            }
+            Diff::NoChange(_) => {}
+            Diff::Delete(id) => {
+                let identifier = current_states
+                    .get(&id)
+                    .and_then(|s| s.identifier.clone())
+                    .unwrap_or_default();
+                let lifecycle = resource.lifecycle.clone();
+                plan.add(Effect::Delete {
+                    id,
+                    identifier,
+                    lifecycle,
+                });
+            }
+        }
+    }
+
+    // Detect orphaned resources: exist in current_states but not in desired
+    for (id, state) in current_states {
+        if state.exists && !desired_ids.contains(id) {
+            let identifier = state.identifier.clone().unwrap_or_default();
+            let lifecycle = lifecycles.get(id).cloned().unwrap_or_default();
+            plan.add(Effect::Delete {
+                id: id.clone(),
+                identifier,
+                lifecycle,
+            });
+        }
+    }
+
+    plan
+}
+
+/// Populate cascading updates for Replace effects with create_before_destroy.
+///
+/// When a resource is replaced with create_before_destroy, dependent resources
+/// that reference the replaced resource's computed attributes must be updated
+/// between the create (new) and delete (old) steps. This function:
+///
+/// 1. Finds all Replace effects with create_before_destroy = true
+/// 2. Identifies dependent resources that reference the replaced resource's binding
+/// 3. Adds CascadingUpdate entries to the Replace effect with the unresolved
+///    resource (containing ResourceRef values) so apply can re-resolve using the
+///    new resource's state
+///
+/// `unresolved_resources` should be the resources BEFORE ref resolution (still containing
+/// ResourceRef values). `current_states` provides the `from` state for each dependent.
+pub fn cascade_dependent_updates(
+    plan: &mut Plan,
+    unresolved_resources: &[Resource],
+    current_states: &HashMap<ResourceId, State>,
+) {
+    // Build binding/key -> unresolved resource mapping.
+    // Uses the same key logic as the dependent lookup below so anonymous resources
+    // (without _binding) are also found.
+    let mut binding_to_unresolved: HashMap<String, &Resource> = HashMap::new();
+    for resource in unresolved_resources {
+        let key = resource
+            .attributes
+            .get("_binding")
+            .and_then(|v| match v {
+                Value::String(s) => Some(s.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| format!("{}:{}", resource.id.resource_type, resource.id.name));
+        binding_to_unresolved.insert(key, resource);
+    }
+
+    // Build reverse dependency map: replaced_binding -> [dependent_bindings]
+    let mut dependents_of_replaced: HashMap<String, Vec<String>> = HashMap::new();
+
+    // Collect binding names of resources being replaced with create_before_destroy
+    let replaced_bindings: HashSet<String> = plan
+        .effects()
+        .iter()
+        .filter_map(|e| {
+            if let Effect::Replace { lifecycle, .. } = e
+                && lifecycle.create_before_destroy
+            {
+                return e.binding_name();
+            }
+            None
+        })
+        .collect();
+
+    if replaced_bindings.is_empty() {
+        return;
+    }
+
+    // Collect resource IDs that already have effects in the plan
+    let planned_ids: HashSet<&ResourceId> =
+        plan.effects().iter().map(|e| e.resource_id()).collect();
+
+    // For each unresolved resource, check if it depends on a replaced binding
+    for resource in unresolved_resources {
+        // Skip resources that already have effects in the plan
+        if planned_ids.contains(&resource.id) {
+            continue;
+        }
+
+        let deps = get_resource_dependencies(resource);
+        for dep in &deps {
+            if replaced_bindings.contains(dep) {
+                let binding = resource
+                    .attributes
+                    .get("_binding")
+                    .and_then(|v| match v {
+                        Value::String(s) => Some(s.clone()),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| {
+                        format!("{}:{}", resource.id.resource_type, resource.id.name)
+                    });
+                dependents_of_replaced
+                    .entry(dep.clone())
+                    .or_default()
+                    .push(binding);
+            }
+        }
+    }
+
+    // Build cascading updates for each Replace effect
+    // We need to collect updates first, then mutate the plan
+    let mut updates_by_replaced_binding: HashMap<String, Vec<CascadingUpdate>> = HashMap::new();
+
+    for (replaced_binding, dependent_bindings) in &dependents_of_replaced {
+        for dep_binding in dependent_bindings {
+            if let Some(unresolved) = binding_to_unresolved.get(dep_binding) {
+                let from = current_states
+                    .get(&unresolved.id)
+                    .cloned()
+                    .unwrap_or_else(|| State::not_found(unresolved.id.clone()));
+
+                if from.exists {
+                    updates_by_replaced_binding
+                        .entry(replaced_binding.clone())
+                        .or_default()
+                        .push(CascadingUpdate {
+                            id: unresolved.id.clone(),
+                            from: Box::new(from),
+                            to: (*unresolved).clone(),
+                        });
+                }
+            }
+        }
+    }
+
+    // Apply cascading updates to the plan's Replace effects
+    plan.set_cascading_updates(&replaced_bindings, &updates_by_replaced_binding);
+}
