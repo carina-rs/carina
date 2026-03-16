@@ -1425,7 +1425,7 @@ fn build_update_patches(
     let mut patch_ops = Vec::new();
     let resource_type = &to.id.resource_type;
 
-    // Build replace operations for attributes present in `to`
+    // Build replace operations for attributes that changed between `from` and `to`
     for (dsl_name, attr_schema) in &config.schema.attributes {
         // Skip tags - handled separately below
         if dsl_name == "tags" {
@@ -1436,6 +1436,12 @@ fn build_update_patches(
             && let Some(aws_value) =
                 dsl_value_to_aws(value, &attr_schema.attr_type, resource_type, dsl_name)
         {
+            // Skip if the value is unchanged from the current state
+            if let Some(from_value) = from.attributes.get(dsl_name)
+                && from_value == value
+            {
+                continue;
+            }
             patch_ops.push(json!({
                 "op": "replace",
                 "path": format!("/{}", aws_name),
@@ -1470,14 +1476,18 @@ fn build_update_patches(
     // Handle tags
     if config.has_tags {
         if let Some(Value::Map(user_tags)) = to.attributes.get("tags") {
-            let mut tags = Vec::new();
-            for (key, value) in user_tags {
-                if let Value::String(v) = value {
-                    tags.push(json!({"Key": key, "Value": v}));
+            // Skip if tags are unchanged from the current state
+            let tags_unchanged = matches!(from.attributes.get("tags"), Some(Value::Map(from_tags)) if from_tags == user_tags);
+            if !tags_unchanged {
+                let mut tags = Vec::new();
+                for (key, value) in user_tags {
+                    if let Value::String(v) = value {
+                        tags.push(json!({"Key": key, "Value": v}));
+                    }
                 }
-            }
-            if !tags.is_empty() {
-                patch_ops.push(json!({"op": "replace", "path": "/Tags", "value": tags}));
+                if !tags.is_empty() {
+                    patch_ops.push(json!({"op": "replace", "path": "/Tags", "value": tags}));
+                }
             }
         } else if from.attributes.contains_key("tags") {
             // Tags existed in from but removed in to: generate remove operation
@@ -3369,6 +3379,119 @@ mod tests {
         assert!(
             !has_remove,
             "Should not have remove operations when attribute is present in both from and to, got: {:?}",
+            patches
+        );
+    }
+
+    #[test]
+    fn test_build_update_patches_skip_unchanged_attributes() {
+        let config = get_vpc_config();
+        let id = ResourceId::with_provider("awscc", "ec2.vpc", "test");
+
+        // from and to have identical values for cidr_block, different for instance_tenancy
+        let mut from_attrs = HashMap::new();
+        from_attrs.insert(
+            "cidr_block".to_string(),
+            Value::String("10.0.0.0/16".to_string()),
+        );
+        from_attrs.insert(
+            "instance_tenancy".to_string(),
+            Value::String("awscc.ec2.vpc.InstanceTenancy.default".to_string()),
+        );
+        let from = State::existing(id.clone(), from_attrs);
+
+        let mut to = Resource::new("ec2.vpc", "test");
+        to.attributes.insert(
+            "cidr_block".to_string(),
+            Value::String("10.0.0.0/16".to_string()),
+        );
+        to.attributes.insert(
+            "instance_tenancy".to_string(),
+            Value::String("awscc.ec2.vpc.InstanceTenancy.dedicated".to_string()),
+        );
+
+        let patches = build_update_patches(&config, &from, &to);
+
+        // cidr_block is unchanged, so no patch should be generated for it
+        let has_cidr_replace = patches.iter().any(|p| {
+            p.get("op").and_then(|v| v.as_str()) == Some("replace")
+                && p.get("path").and_then(|v| v.as_str()) == Some("/CidrBlock")
+        });
+        assert!(
+            !has_cidr_replace,
+            "Should not generate replace patch for unchanged attribute /CidrBlock, got: {:?}",
+            patches
+        );
+
+        // instance_tenancy changed, so a replace patch should be generated
+        let has_tenancy_replace = patches.iter().any(|p| {
+            p.get("op").and_then(|v| v.as_str()) == Some("replace")
+                && p.get("path").and_then(|v| v.as_str()) == Some("/InstanceTenancy")
+        });
+        assert!(
+            has_tenancy_replace,
+            "Should generate replace patch for changed attribute /InstanceTenancy, got: {:?}",
+            patches
+        );
+    }
+
+    #[test]
+    fn test_build_update_patches_no_patches_when_identical() {
+        let config = get_vpc_config();
+        let id = ResourceId::with_provider("awscc", "ec2.vpc", "test");
+
+        // from and to are completely identical
+        let mut from_attrs = HashMap::new();
+        from_attrs.insert(
+            "cidr_block".to_string(),
+            Value::String("10.0.0.0/16".to_string()),
+        );
+        let from = State::existing(id.clone(), from_attrs);
+
+        let mut to = Resource::new("ec2.vpc", "test");
+        to.attributes.insert(
+            "cidr_block".to_string(),
+            Value::String("10.0.0.0/16".to_string()),
+        );
+
+        let patches = build_update_patches(&config, &from, &to);
+
+        assert!(
+            patches.is_empty(),
+            "Should generate no patches when from and to are identical, got: {:?}",
+            patches
+        );
+    }
+
+    #[test]
+    fn test_build_update_patches_skip_unchanged_tags() {
+        let config = get_vpc_config();
+        let id = ResourceId::with_provider("awscc", "ec2.vpc", "test");
+
+        // from and to have identical tags
+        let mut from_attrs = HashMap::new();
+        from_attrs.insert(
+            "cidr_block".to_string(),
+            Value::String("10.0.0.0/16".to_string()),
+        );
+        let mut tags = HashMap::new();
+        tags.insert("Name".to_string(), Value::String("my-vpc".to_string()));
+        from_attrs.insert("tags".to_string(), Value::Map(tags.clone()));
+        let from = State::existing(id.clone(), from_attrs);
+
+        let mut to = Resource::new("ec2.vpc", "test");
+        to.attributes.insert(
+            "cidr_block".to_string(),
+            Value::String("10.0.0.0/16".to_string()),
+        );
+        to.attributes.insert("tags".to_string(), Value::Map(tags));
+
+        let patches = build_update_patches(&config, &from, &to);
+
+        // No patches should be generated since everything is identical
+        assert!(
+            patches.is_empty(),
+            "Should generate no patches when tags are unchanged, got: {:?}",
             patches
         );
     }
