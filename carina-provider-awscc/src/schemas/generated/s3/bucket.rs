@@ -181,7 +181,7 @@ fn validate_string_pattern_cc806c69dc4cdaf7(value: &Value) -> Result<(), String>
 
 fn validate_string_length_max_255(value: &Value) -> Result<(), String> {
     if let Value::String(s) = value {
-        let len = s.len();
+        let len = s.chars().count();
         if len > 255 {
             Err(format!("String length {} is out of range ..=255", len))
         } else {
@@ -194,7 +194,7 @@ fn validate_string_length_max_255(value: &Value) -> Result<(), String> {
 
 fn validate_string_length_max_1024(value: &Value) -> Result<(), String> {
     if let Value::String(s) = value {
-        let len = s.len();
+        let len = s.chars().count();
         if len > 1024 {
             Err(format!("String length {} is out of range ..=1024", len))
         } else {
@@ -212,7 +212,7 @@ fn validate_string_pattern_3ee03875337c12ab_len_max_20(value: &Value) -> Result<
         if !RE.is_match(s) {
             return Err(format!("Value '{}' does not match pattern [0-9]+", s));
         }
-        let len = s.len();
+        let len = s.chars().count();
         if len > 20 {
             return Err(format!("String length {} is out of range ..=20", len));
         }
