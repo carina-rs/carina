@@ -302,7 +302,8 @@ fn value_to_json(value: &Value) -> Option<serde_json::Value> {
         Value::String(s) => Some(json!(s)),
         Value::Bool(b) => Some(json!(b)),
         Value::Int(i) => Some(json!(i)),
-        Value::Float(f) => Some(json!(f)),
+        Value::Float(f) if f.is_finite() => Some(json!(f)),
+        Value::Float(_) => None,
         Value::List(items) => {
             let arr: Vec<serde_json::Value> = items.iter().filter_map(value_to_json).collect();
             Some(serde_json::Value::Array(arr))
@@ -2787,5 +2788,35 @@ mod tests {
              all should be replaced with log::warn!",
             actual_eprintln_calls
         );
+    }
+
+    // =========================================================================
+    // value_to_json tests
+    // =========================================================================
+
+    #[test]
+    fn test_value_to_json_nan_returns_none() {
+        let value = Value::Float(f64::NAN);
+        assert_eq!(value_to_json(&value), None);
+    }
+
+    #[test]
+    fn test_value_to_json_infinity_returns_none() {
+        let value = Value::Float(f64::INFINITY);
+        assert_eq!(value_to_json(&value), None);
+    }
+
+    #[test]
+    fn test_value_to_json_neg_infinity_returns_none() {
+        let value = Value::Float(f64::NEG_INFINITY);
+        assert_eq!(value_to_json(&value), None);
+    }
+
+    #[test]
+    fn test_value_to_json_finite_float() {
+        let value = Value::Float(1.5);
+        let result = value_to_json(&value);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap(), serde_json::json!(1.5));
     }
 }
