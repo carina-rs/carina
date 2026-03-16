@@ -1645,7 +1645,7 @@ mod tests {
     }
 
     #[test]
-    fn test_is_not_found_error_throttling_is_not_found() {
+    fn test_is_not_found_error_false_for_throttling() {
         use aws_sdk_cloudcontrol::operation::get_resource::GetResourceError;
         use aws_sdk_cloudcontrol::types::error::ThrottlingException;
         use aws_smithy_runtime_api::client::result::SdkError;
@@ -1661,7 +1661,7 @@ mod tests {
     }
 
     #[test]
-    fn test_is_not_found_error_timeout_is_not_found() {
+    fn test_is_not_found_error_false_for_timeout() {
         use aws_sdk_cloudcontrol::operation::get_resource::GetResourceError;
         use aws_smithy_runtime_api::client::result::SdkError;
 
