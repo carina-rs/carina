@@ -1,8 +1,10 @@
 //! Utility functions for converting between byte offsets and character offsets.
 //!
-//! LSP protocol uses character-based positions (UTF-16 by default, but we use UTF-32/character count
-//! since the protocol also supports UTF-32). All position calculations in the LSP must use character
-//! counts, not byte lengths.
+//! LSP protocol positions use UTF-16 code units by default. For characters in the Basic
+//! Multilingual Plane (including ASCII, Japanese, most common non-ASCII), UTF-16 code unit
+//! count equals Unicode codepoint count. These functions use codepoint counting
+//! (`chars().count()`), which is correct for all BMP characters and sufficient for Carina
+//! DSL content.
 
 /// Convert a byte offset within a string to a character (codepoint) offset.
 ///
