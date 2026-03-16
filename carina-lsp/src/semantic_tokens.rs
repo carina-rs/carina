@@ -92,10 +92,13 @@ impl SemanticTokensProvider {
             tokens.push((indent, 8, 0)); // KEYWORD: provider
             if let Some(name_start) = line.find("provider ") {
                 let after_provider = &line[name_start + 9..];
-                if let Some(name_end) = after_provider.find([' ', '{']) {
-                    let name = &after_provider[..name_end];
+                let leading_spaces = after_provider.len() - after_provider.trim_start().len();
+                let after_provider_trimmed = after_provider.trim_start();
+                if let Some(name_end) = after_provider_trimmed.find([' ', '{']) {
+                    let name = &after_provider_trimmed[..name_end];
                     if !name.is_empty() {
-                        tokens.push(((name_start + 9) as u32, name.len() as u32, 1)); // TYPE
+                        let name_pos = name_start + 9 + leading_spaces;
+                        tokens.push((name_pos as u32, name.len() as u32, 1)); // TYPE
                     }
                 }
             }
@@ -103,10 +106,13 @@ impl SemanticTokensProvider {
             tokens.push((indent, 7, 0)); // KEYWORD: backend
             if let Some(name_start) = line.find("backend ") {
                 let after_backend = &line[name_start + 8..];
-                if let Some(name_end) = after_backend.find([' ', '{']) {
-                    let name = &after_backend[..name_end];
+                let leading_spaces = after_backend.len() - after_backend.trim_start().len();
+                let after_backend_trimmed = after_backend.trim_start();
+                if let Some(name_end) = after_backend_trimmed.find([' ', '{']) {
+                    let name = &after_backend_trimmed[..name_end];
                     if !name.is_empty() {
-                        tokens.push(((name_start + 8) as u32, name.len() as u32, 1)); // TYPE
+                        let name_pos = name_start + 8 + leading_spaces;
+                        tokens.push((name_pos as u32, name.len() as u32, 1)); // TYPE
                     }
                 }
             }
@@ -730,6 +736,64 @@ mod tests {
             type_count_with >= 1,
             "Should highlight with registration too"
         );
+    }
+
+    #[test]
+    fn test_provider_name_with_extra_whitespace() {
+        let provider = SemanticTokensProvider::new(&[]);
+        // Double space after "provider" - the name should still be highlighted
+        let tokens = provider.tokenize_line("provider  aws {", 0);
+
+        // Should have TYPE token for "aws"
+        let type_token = tokens.iter().find(|(_, _, typ)| *typ == 1);
+        assert!(
+            type_token.is_some(),
+            "Should highlight provider name 'aws' even with extra whitespace. Got: {:?}",
+            tokens
+        );
+        let (start, len, _) = type_token.unwrap();
+        assert_eq!(*len, 3, "Provider name 'aws' should have length 3");
+        assert_eq!(
+            *start, 10,
+            "Provider name 'aws' should start at column 10 (after 'provider  ')"
+        );
+    }
+
+    #[test]
+    fn test_backend_name_with_extra_whitespace() {
+        let provider = SemanticTokensProvider::new(&[]);
+        // Double space after "backend" - the name should still be highlighted
+        let tokens = provider.tokenize_line("backend  s3 {", 0);
+
+        // Should have TYPE token for "s3"
+        let type_token = tokens.iter().find(|(_, _, typ)| *typ == 1);
+        assert!(
+            type_token.is_some(),
+            "Should highlight backend name 's3' even with extra whitespace. Got: {:?}",
+            tokens
+        );
+        let (start, len, _) = type_token.unwrap();
+        assert_eq!(*len, 2, "Backend name 's3' should have length 2");
+        assert_eq!(
+            *start, 9,
+            "Backend name 's3' should start at column 9 (after 'backend  ')"
+        );
+    }
+
+    #[test]
+    fn test_provider_name_with_many_extra_spaces() {
+        let provider = SemanticTokensProvider::new(&[]);
+        let tokens = provider.tokenize_line("provider    awscc {", 0);
+
+        let type_token = tokens.iter().find(|(_, _, typ)| *typ == 1);
+        assert!(
+            type_token.is_some(),
+            "Should highlight provider name 'awscc' with many extra spaces. Got: {:?}",
+            tokens
+        );
+        let (start, len, _) = type_token.unwrap();
+        assert_eq!(*len, 5, "Provider name 'awscc' should have length 5");
+        assert_eq!(*start, 12, "Provider name should start at column 12");
     }
 
     #[test]
