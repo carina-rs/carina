@@ -275,7 +275,7 @@ impl SemanticTokensProvider {
 
         // Sort by position and deduplicate
         tokens.sort_by_key(|(start, _, _)| *start);
-        tokens.dedup_by(|a, b| a.0 == b.0);
+        tokens.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1 && a.2 == b.2);
 
         tokens
     }
@@ -736,6 +736,63 @@ mod tests {
             type_count_with >= 1,
             "Should highlight with registration too"
         );
+    }
+
+    #[test]
+    fn test_dedup_only_removes_exact_duplicates() {
+        // Regression test for issue #725: dedup_by should compare all three fields
+        // (start, length, type), not just start position.
+        use carina_core::schema::CompletionValue;
+
+        // Register a region pattern that overlaps with find_resource_types:
+        // "custom.Region.my_region_1" is a 3-part dotted pattern, so find_resource_types
+        // will match it as TYPE, and the region pattern will also match it as TYPE.
+        // These are exact duplicates (same start, length, type) and should be deduped to one.
+        let regions = vec![CompletionValue::new(
+            "custom.Region.my_region_1",
+            "My Region",
+        )];
+        let provider = SemanticTokensProvider::new(&regions);
+        let tokens = provider.tokenize_line("    region = custom.Region.my_region_1", 0);
+
+        // Exact duplicates should be removed
+        let type_tokens: Vec<_> = tokens.iter().filter(|(_, _, typ)| *typ == 1).collect();
+        assert_eq!(
+            type_tokens.len(),
+            1,
+            "Exact duplicate TYPE tokens should be deduped to one. Got: {:?}",
+            tokens
+        );
+    }
+
+    #[test]
+    fn test_dedup_preserves_different_tokens_at_same_position() {
+        // Regression test for issue #725: the dedup logic in tokenize_line should only
+        // remove exact duplicates (same start, length, and type), not drop tokens that
+        // merely share the same start position.
+        //
+        // This test verifies the dedup contract directly, as the current tokenization
+        // rules don't naturally produce different tokens at the same position. However,
+        // adding new token patterns in the future could create such overlaps, and the
+        // dedup must handle them correctly.
+        let mut tokens: Vec<(u32, u32, u32)> = vec![
+            (0, 13, 1), // TYPE token: e.g., aws.s3.bucket
+            (0, 3, 0),  // KEYWORD token at same position but different length/type
+            (5, 4, 3),  // PROPERTY token
+            (5, 4, 3),  // Exact duplicate of above - should be removed
+            (10, 2, 6), // OPERATOR token
+        ];
+        tokens.sort_by_key(|(start, _, _)| *start);
+        tokens.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1 && a.2 == b.2);
+        assert_eq!(
+            tokens.len(),
+            4,
+            "Should keep both tokens at position 0 (different type/length), dedup exact duplicate at position 5, and keep position 10. Got: {:?}",
+            tokens
+        );
+        // Verify the tokens at position 0 are both present
+        let at_0: Vec<_> = tokens.iter().filter(|(s, _, _)| *s == 0).collect();
+        assert_eq!(at_0.len(), 2, "Both tokens at position 0 should survive");
     }
 
     #[test]
