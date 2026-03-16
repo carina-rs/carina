@@ -114,10 +114,13 @@ impl SemanticTokensProvider {
             tokens.push((indent, 3, 0)); // KEYWORD: let
             if let Some(let_start) = line.find("let ") {
                 let after_let = &line[let_start + 4..];
-                if let Some(name_end) = after_let.find([' ', '=']) {
-                    let name = &after_let[..name_end].trim();
+                let leading_spaces = after_let.len() - after_let.trim_start().len();
+                let after_let_trimmed = after_let.trim_start();
+                if let Some(name_end) = after_let_trimmed.find([' ', '=']) {
+                    let name = &after_let_trimmed[..name_end];
                     if !name.is_empty() {
-                        tokens.push(((let_start + 4) as u32, name.len() as u32, 2)); // VARIABLE
+                        let name_start = let_start + 4 + leading_spaces;
+                        tokens.push((name_start as u32, name.len() as u32, 2)); // VARIABLE
                     }
                 }
                 // Check for "read" keyword after "let name = read ..."
@@ -727,5 +730,43 @@ mod tests {
             type_count_with >= 1,
             "Should highlight with registration too"
         );
+    }
+
+    #[test]
+    fn test_let_binding_with_extra_whitespace() {
+        let provider = SemanticTokensProvider::new(&[]);
+        // Double space after "let" - the variable name should still be highlighted
+        let tokens = provider.tokenize_line("let  x = aws.s3.bucket {", 0);
+
+        // Should have VARIABLE token for "x"
+        let var_token = tokens.iter().find(|(_, _, typ)| *typ == 2);
+        assert!(
+            var_token.is_some(),
+            "Should highlight variable 'x' even with extra whitespace after 'let'. Got: {:?}",
+            tokens
+        );
+        let (start, len, _) = var_token.unwrap();
+        assert_eq!(*len, 1, "Variable 'x' should have length 1");
+        assert_eq!(
+            *start, 5,
+            "Variable 'x' should start at column 5 (after 'let  ')"
+        );
+    }
+
+    #[test]
+    fn test_let_binding_with_multiple_extra_spaces() {
+        let provider = SemanticTokensProvider::new(&[]);
+        // Multiple spaces after "let"
+        let tokens = provider.tokenize_line("let    bucket = aws.s3.bucket {", 0);
+
+        let var_token = tokens.iter().find(|(_, _, typ)| *typ == 2);
+        assert!(
+            var_token.is_some(),
+            "Should highlight variable 'bucket' with multiple spaces after 'let'. Got: {:?}",
+            tokens
+        );
+        let (start, len, _) = var_token.unwrap();
+        assert_eq!(*len, 6, "Variable 'bucket' should have length 6");
+        assert_eq!(*start, 7, "Variable 'bucket' should start at column 7");
     }
 }
