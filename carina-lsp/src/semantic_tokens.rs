@@ -137,6 +137,28 @@ impl SemanticTokensProvider {
                     tokens.push((read_start as u32, 4, 0)); // KEYWORD: read
                 }
             }
+        } else if trimmed.starts_with("import ") {
+            tokens.push((indent, 6, 0)); // KEYWORD: import
+            // Find "as" keyword and module alias name
+            if let Some(import_start) = line.find("import ") {
+                let after_import = &line[import_start + 7..];
+                if let Some(as_pos) = after_import.find(" as ") {
+                    let as_start = import_start + 7 + as_pos + 1; // position of "as"
+                    tokens.push((as_start as u32, 2, 0)); // KEYWORD: as
+                    let alias_start = as_start + 3; // position after "as "
+                    let rest = &line[alias_start..];
+                    let alias = rest
+                        .find(|c: char| !c.is_alphanumeric() && c != '_')
+                        .map_or(rest, |end| &rest[..end]);
+                    if !alias.is_empty() {
+                        tokens.push((alias_start as u32, alias.len() as u32, 2)); // VARIABLE
+                    }
+                }
+            }
+        } else if trimmed.starts_with("output ") || trimmed == "output{" {
+            tokens.push((indent, 6, 0)); // KEYWORD: output
+        } else if trimmed.starts_with("input ") || trimmed == "input{" {
+            tokens.push((indent, 5, 0)); // KEYWORD: input
         }
 
         // Nested block names: "identifier {" without "=" (e.g., "security_group_ingress {")
@@ -144,6 +166,11 @@ impl SemanticTokensProvider {
         if !trimmed.starts_with("provider ")
             && !trimmed.starts_with("backend ")
             && !trimmed.starts_with("let ")
+            && !trimmed.starts_with("import ")
+            && !trimmed.starts_with("output ")
+            && !trimmed.starts_with("output{")
+            && !trimmed.starts_with("input ")
+            && !trimmed.starts_with("input{")
             && !trimmed.contains('=')
             && !trimmed.contains('.')
             && trimmed.ends_with('{')
@@ -602,6 +629,82 @@ mod tests {
         );
         let (start, _, _) = prop_token.unwrap();
         assert_eq!(*start, 4, "Property should start at char position 4");
+    }
+
+    #[test]
+    fn test_import_keyword_highlighted() {
+        let provider = SemanticTokensProvider::new(&[]);
+        let tokens = provider.tokenize_line("import \"./modules/web.crn\" as web", 0);
+        let keyword_token = tokens
+            .iter()
+            .find(|(start, _, typ)| *start == 0 && *typ == 0);
+        assert!(
+            keyword_token.is_some(),
+            "Should highlight 'import' as KEYWORD. Got: {:?}",
+            tokens
+        );
+        let (_, len, _) = keyword_token.unwrap();
+        assert_eq!(*len, 6, "import keyword length should be 6");
+    }
+
+    #[test]
+    fn test_output_keyword_highlighted() {
+        let provider = SemanticTokensProvider::new(&[]);
+        let tokens = provider.tokenize_line("output {", 0);
+        let keyword_token = tokens
+            .iter()
+            .find(|(start, _, typ)| *start == 0 && *typ == 0);
+        assert!(
+            keyword_token.is_some(),
+            "Should highlight 'output' as KEYWORD. Got: {:?}",
+            tokens
+        );
+        let (_, len, _) = keyword_token.unwrap();
+        assert_eq!(*len, 6, "output keyword length should be 6");
+    }
+
+    #[test]
+    fn test_input_keyword_highlighted() {
+        let provider = SemanticTokensProvider::new(&[]);
+        let tokens = provider.tokenize_line("input {", 0);
+        let keyword_token = tokens
+            .iter()
+            .find(|(start, _, typ)| *start == 0 && *typ == 0);
+        assert!(
+            keyword_token.is_some(),
+            "Should highlight 'input' as KEYWORD. Got: {:?}",
+            tokens
+        );
+        let (_, len, _) = keyword_token.unwrap();
+        assert_eq!(*len, 5, "input keyword length should be 5");
+    }
+
+    #[test]
+    fn test_import_as_keyword_highlighted() {
+        let provider = SemanticTokensProvider::new(&[]);
+        let tokens = provider.tokenize_line("import \"./modules/web.crn\" as web", 0);
+        // "as" should also be highlighted as KEYWORD
+        let as_token = tokens
+            .iter()
+            .find(|(start, len, typ)| *typ == 0 && *len == 2 && *start > 0);
+        assert!(
+            as_token.is_some(),
+            "Should highlight 'as' as KEYWORD in import statement. Got: {:?}",
+            tokens
+        );
+    }
+
+    #[test]
+    fn test_import_module_name_highlighted_as_variable() {
+        let provider = SemanticTokensProvider::new(&[]);
+        let tokens = provider.tokenize_line("import \"./modules/web.crn\" as web", 0);
+        // "web" should be highlighted as VARIABLE
+        let var_token = tokens.iter().find(|(_, _, typ)| *typ == 2);
+        assert!(
+            var_token.is_some(),
+            "Should highlight module alias as VARIABLE in import statement. Got: {:?}",
+            tokens
+        );
     }
 
     #[test]
