@@ -7,35 +7,40 @@ use crate::utils::is_dsl_enum_format;
 
 /// Convert `Value` to `serde_json::Value`.
 ///
-/// # Panics
-///
-/// Panics if `value` contains a non-finite float because JSON cannot represent
-/// `NaN` or infinity.
-pub fn value_to_json(value: &Value) -> serde_json::Value {
+/// Returns an error if `value` contains a non-finite float (NaN or infinity)
+/// because JSON cannot represent these values.
+pub fn value_to_json(value: &Value) -> Result<serde_json::Value, String> {
     match value {
-        Value::String(s) => serde_json::Value::String(s.clone()),
-        Value::Int(n) => serde_json::Value::Number((*n).into()),
-        Value::Float(f) => serde_json::Value::Number(
-            serde_json::Number::from_f64(*f)
-                .unwrap_or_else(|| panic!("cannot convert non-finite float {f} to JSON")),
-        ),
-        Value::Bool(b) => serde_json::Value::Bool(*b),
-        Value::List(items) => serde_json::Value::Array(items.iter().map(value_to_json).collect()),
+        Value::String(s) => Ok(serde_json::Value::String(s.clone())),
+        Value::Int(n) => Ok(serde_json::Value::Number((*n).into())),
+        Value::Float(f) => {
+            let num = serde_json::Number::from_f64(*f)
+                .ok_or_else(|| format!("cannot convert non-finite float {f} to JSON"))?;
+            Ok(serde_json::Value::Number(num))
+        }
+        Value::Bool(b) => Ok(serde_json::Value::Bool(*b)),
+        Value::List(items) => {
+            let arr: Result<Vec<_>, _> = items.iter().map(value_to_json).collect();
+            Ok(serde_json::Value::Array(arr?))
+        }
         Value::Map(map) => {
-            let obj: serde_json::Map<_, _> = map
+            let obj: Result<serde_json::Map<_, _>, _> = map
                 .iter()
-                .map(|(k, v)| (k.clone(), value_to_json(v)))
+                .map(|(k, v)| value_to_json(v).map(|jv| (k.clone(), jv)))
                 .collect();
-            serde_json::Value::Object(obj)
+            Ok(serde_json::Value::Object(obj?))
         }
         Value::ResourceRef {
             binding_name,
             attribute_name,
             ..
-        } => serde_json::Value::String(format!("${{{}.{}}}", binding_name, attribute_name)),
+        } => Ok(serde_json::Value::String(format!(
+            "${{{}.{}}}",
+            binding_name, attribute_name
+        ))),
         Value::UnresolvedIdent(name, member) => match member {
-            Some(m) => serde_json::Value::String(format!("{}.{}", name, m)),
-            None => serde_json::Value::String(name.clone()),
+            Some(m) => Ok(serde_json::Value::String(format!("{}.{}", name, m))),
+            None => Ok(serde_json::Value::String(name.clone())),
         },
     }
 }
@@ -147,45 +152,55 @@ mod tests {
     #[test]
     fn test_value_to_json_string() {
         let v = Value::String("hello".to_string());
-        assert_eq!(value_to_json(&v), serde_json::json!("hello"));
+        assert_eq!(value_to_json(&v).unwrap(), serde_json::json!("hello"));
     }
 
     #[test]
     fn test_value_to_json_int() {
         let v = Value::Int(42);
-        assert_eq!(value_to_json(&v), serde_json::json!(42));
+        assert_eq!(value_to_json(&v).unwrap(), serde_json::json!(42));
     }
 
     #[test]
     fn test_value_to_json_float() {
         let v = Value::Float(1.5);
-        assert_eq!(value_to_json(&v), serde_json::json!(1.5));
+        assert_eq!(value_to_json(&v).unwrap(), serde_json::json!(1.5));
     }
 
     #[test]
-    #[should_panic(expected = "cannot convert non-finite float NaN to JSON")]
-    fn test_value_to_json_nan_panics() {
+    fn test_value_to_json_nan_returns_error() {
         let v = Value::Float(f64::NAN);
-        let _ = value_to_json(&v);
+        let result = value_to_json(&v);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("NaN"));
     }
 
     #[test]
-    #[should_panic(expected = "cannot convert non-finite float inf to JSON")]
-    fn test_value_to_json_infinity_panics() {
+    fn test_value_to_json_infinity_returns_error() {
         let v = Value::Float(f64::INFINITY);
-        let _ = value_to_json(&v);
+        let result = value_to_json(&v);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("inf"));
+    }
+
+    #[test]
+    fn test_value_to_json_neg_infinity_returns_error() {
+        let v = Value::Float(f64::NEG_INFINITY);
+        let result = value_to_json(&v);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("-inf"));
     }
 
     #[test]
     fn test_value_to_json_bool() {
         let v = Value::Bool(true);
-        assert_eq!(value_to_json(&v), serde_json::json!(true));
+        assert_eq!(value_to_json(&v).unwrap(), serde_json::json!(true));
     }
 
     #[test]
     fn test_value_to_json_list() {
         let v = Value::List(vec![Value::Int(1), Value::Int(2)]);
-        assert_eq!(value_to_json(&v), serde_json::json!([1, 2]));
+        assert_eq!(value_to_json(&v).unwrap(), serde_json::json!([1, 2]));
     }
 
     #[test]
@@ -193,7 +208,10 @@ mod tests {
         let mut map = HashMap::new();
         map.insert("key".to_string(), Value::String("val".to_string()));
         let v = Value::Map(map);
-        assert_eq!(value_to_json(&v), serde_json::json!({"key": "val"}));
+        assert_eq!(
+            value_to_json(&v).unwrap(),
+            serde_json::json!({"key": "val"})
+        );
     }
 
     #[test]
@@ -202,7 +220,7 @@ mod tests {
             binding_name: "vpc".to_string(),
             attribute_name: "id".to_string(),
         };
-        assert_eq!(value_to_json(&v), serde_json::json!("${vpc.id}"));
+        assert_eq!(value_to_json(&v).unwrap(), serde_json::json!("${vpc.id}"));
     }
 
     #[test]
@@ -251,7 +269,7 @@ mod tests {
             Value::Int(42),
             Value::Bool(false),
         ]);
-        let json = value_to_json(&original);
+        let json = value_to_json(&original).unwrap();
         let back = json_to_dsl_value(&json);
         assert_eq!(back, original);
     }
