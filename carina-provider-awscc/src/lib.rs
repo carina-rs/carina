@@ -113,13 +113,14 @@ impl Provider for AwsccProvider {
         &self,
         id: &ResourceId,
         identifier: &str,
-        _from: &State,
+        from: &State,
         to: &Resource,
     ) -> BoxFuture<'_, ProviderResult<State>> {
         let id = id.clone();
         let identifier = identifier.to_string();
+        let from = from.clone();
         let to = to.clone();
-        Box::pin(async move { self.update_resource(id, &identifier, to).await })
+        Box::pin(async move { self.update_resource(id, &identifier, &from, to).await })
     }
 
     fn delete(
