@@ -388,7 +388,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                 to_dsl: None,
             }).with_description("The time in seconds that your browser is to cache the preflight response for the specified resource.").with_provider_name("MaxAge")
                     ],
-                }))).required().with_description("A set of origins and methods (cross-origin access that you want to allow). You can add up to 100 rules to the configuration.").with_provider_name("CorsRules")
+                }))).required().with_description("A set of origins and methods (cross-origin access that you want to allow). You can add up to 100 rules to the configuration.").with_provider_name("CorsRules").with_block_name("cors_rule")
                     ],
                 })
                 .with_description("Describes the cross-origin access configuration for objects in an Amazon S3 bucket. For more information, see [Enabling Cross-Origin Resource Sharing]...")
@@ -428,7 +428,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
             }).required().with_description("S3 Intelligent-Tiering access tier. See [Storage class for automatically optimizing frequently and infrequently accessed objects](https://docs.aws.ama...").with_provider_name("AccessTier"),
                     StructField::new("days", AttributeType::Int).required().with_description("The number of consecutive days of no access after which an object will be eligible to be transitioned to the corresponding tier. The minimum number of...").with_provider_name("Days")
                     ],
-                }))).required().with_description("Specifies a list of S3 Intelligent-Tiering storage class tiers in the configuration. At least one tier must be defined in the list. At most, you can s...").with_provider_name("Tierings")
+                }))).required().with_description("Specifies a list of S3 Intelligent-Tiering storage class tiers in the configuration. At least one tier must be defined in the list. At most, you can s...").with_provider_name("Tierings").with_block_name("tiering")
                     ],
                 })))
                 .with_description("Defines how Amazon S3 handles Intelligent-Tiering storage.")
@@ -610,7 +610,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                     ],
                 }))).with_description("One or more transition rules that specify when an object transitions to a specified storage class. If you specify an expiration and transition time, y...").with_provider_name("Transitions")
                     ],
-                }))).required().with_description("A lifecycle rule for individual objects in an Amazon S3 bucket.").with_provider_name("Rules"),
+                }))).required().with_description("A lifecycle rule for individual objects in an Amazon S3 bucket.").with_provider_name("Rules").with_block_name("rule"),
                     StructField::new("transition_default_minimum_object_size", AttributeType::StringEnum {
                 name: "TransitionDefaultMinimumObjectSize".to_string(),
                 values: vec!["varies_by_storage_class".to_string(), "all_storage_classes_128K".to_string()],
@@ -795,14 +795,14 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
             }).required().with_description("The object key name prefix or suffix identifying one or more objects to which the filtering rule applies. The maximum length is 1,024 characters. Over...").with_provider_name("Name"),
                     StructField::new("value", AttributeType::String).required().with_description("The value that the filter searches for in object key names.").with_provider_name("Value")
                     ],
-                }))).required().with_description("A list of containers for the key-value pair that defines the criteria for the filter rule.").with_provider_name("Rules")
+                }))).required().with_description("A list of containers for the key-value pair that defines the criteria for the filter rule.").with_provider_name("Rules").with_block_name("rule")
                     ],
                 }).required().with_description("A container for object key name prefix and suffix filtering rules.").with_provider_name("S3Key")
                     ],
                 }).with_description("The filtering rules that determine which objects invoke the AWS Lambda function. For example, you can create a filter so that only image files with a ...").with_provider_name("Filter"),
                     StructField::new("function", super::arn()).required().with_description("The Amazon Resource Name (ARN) of the LAMlong function that Amazon S3 invokes when the specified event type occurs.").with_provider_name("Function")
                     ],
-                }))).with_description("Describes the LAMlong functions to invoke and the events for which to invoke them.").with_provider_name("LambdaConfigurations"),
+                }))).with_description("Describes the LAMlong functions to invoke and the events for which to invoke them.").with_provider_name("LambdaConfigurations").with_block_name("lambda_configuration"),
                     StructField::new("queue_configurations", AttributeType::List(Box::new(AttributeType::Struct {
                     name: "QueueConfiguration".to_string(),
                     fields: vec![
@@ -825,14 +825,14 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
             }).required().with_description("The object key name prefix or suffix identifying one or more objects to which the filtering rule applies. The maximum length is 1,024 characters. Over...").with_provider_name("Name"),
                     StructField::new("value", AttributeType::String).required().with_description("The value that the filter searches for in object key names.").with_provider_name("Value")
                     ],
-                }))).required().with_description("A list of containers for the key-value pair that defines the criteria for the filter rule.").with_provider_name("Rules")
+                }))).required().with_description("A list of containers for the key-value pair that defines the criteria for the filter rule.").with_provider_name("Rules").with_block_name("rule")
                     ],
                 }).required().with_description("A container for object key name prefix and suffix filtering rules.").with_provider_name("S3Key")
                     ],
                 }).with_description("The filtering rules that determine which objects trigger notifications. For example, you can create a filter so that Amazon S3 sends notifications onl...").with_provider_name("Filter"),
                     StructField::new("queue", super::arn()).required().with_description("The Amazon Resource Name (ARN) of the Amazon SQS queue to which Amazon S3 publishes a message when it detects events of the specified type. FIFO queue...").with_provider_name("Queue")
                     ],
-                }))).with_description("The Amazon Simple Queue Service queues to publish messages to and the events for which to publish messages.").with_provider_name("QueueConfigurations"),
+                }))).with_description("The Amazon Simple Queue Service queues to publish messages to and the events for which to publish messages.").with_provider_name("QueueConfigurations").with_block_name("queue_configuration"),
                     StructField::new("topic_configurations", AttributeType::List(Box::new(AttributeType::Struct {
                     name: "TopicConfiguration".to_string(),
                     fields: vec![
@@ -855,14 +855,14 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
             }).required().with_description("The object key name prefix or suffix identifying one or more objects to which the filtering rule applies. The maximum length is 1,024 characters. Over...").with_provider_name("Name"),
                     StructField::new("value", AttributeType::String).required().with_description("The value that the filter searches for in object key names.").with_provider_name("Value")
                     ],
-                }))).required().with_description("A list of containers for the key-value pair that defines the criteria for the filter rule.").with_provider_name("Rules")
+                }))).required().with_description("A list of containers for the key-value pair that defines the criteria for the filter rule.").with_provider_name("Rules").with_block_name("rule")
                     ],
                 }).required().with_description("A container for object key name prefix and suffix filtering rules.").with_provider_name("S3Key")
                     ],
                 }).with_description("The filtering rules that determine for which objects to send notifications. For example, you can create a filter so that Amazon S3 sends notifications...").with_provider_name("Filter"),
                     StructField::new("topic", super::arn()).required().with_description("The Amazon Resource Name (ARN) of the Amazon SNS topic to which Amazon S3 publishes a message when it detects events of the specified type.").with_provider_name("Topic")
                     ],
-                }))).with_description("The topic to which notifications are sent and the events for which notifications are generated.").with_provider_name("TopicConfigurations")
+                }))).with_description("The topic to which notifications are sent and the events for which notifications are generated.").with_provider_name("TopicConfigurations").with_block_name("topic_configuration")
                     ],
                 })
                 .with_description("Configuration that defines how Amazon S3 handles bucket notifications.")
@@ -920,7 +920,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                 to_dsl: None,
             }).with_description("Specifies an object ownership rule.").with_provider_name("ObjectOwnership")
                     ],
-                }))).required().with_description("Specifies the container element for Object Ownership rules.").with_provider_name("Rules")
+                }))).required().with_description("Specifies the container element for Object Ownership rules.").with_provider_name("Rules").with_block_name("rule")
                     ],
                 })
                 .with_description("Configuration that defines how Amazon S3 handles Object Ownership rules.")
@@ -1090,7 +1090,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                 to_dsl: None,
             }).required().with_description("Specifies whether the rule is enabled.").with_provider_name("Status")
                     ],
-                }))).required().with_description("A container for one or more replication rules. A replication configuration must have at least one rule and can contain a maximum of 1,000 rules.").with_provider_name("Rules")
+                }))).required().with_description("A container for one or more replication rules. A replication configuration must have at least one rule and can contain a maximum of 1,000 rules.").with_provider_name("Rules").with_block_name("rule")
                     ],
                 })
                 .with_description("Configuration for replicating objects in an S3 bucket. To enable replication, you must also enable versioning by using the ``VersioningConfiguration``...")
@@ -1160,7 +1160,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                     ],
                 }).with_description("A container for describing a condition that must be met for the specified redirect to apply. For example, 1. If request is for pages in the ``/docs`` ...").with_provider_name("RoutingRuleCondition")
                     ],
-                }))).with_description("Rules that define when a redirect is applied and the redirect behavior.").with_provider_name("RoutingRules")
+                }))).with_description("Rules that define when a redirect is applied and the redirect behavior.").with_provider_name("RoutingRules").with_block_name("routing_rule")
                     ],
                 })
                 .with_description("Information used to configure the bucket as a static website. For more information, see [Hosting Websites on Amazon S3](https://docs.aws.amazon.com/Am...")
