@@ -247,3 +247,116 @@ fn type_aware_string_enum_namespaced_vs_raw() {
         "Different enum values should not be equal"
     );
 }
+
+#[test]
+fn type_aware_struct_ignores_default_string_enum_empty() {
+    use crate::schema::StructField;
+
+    let struct_type = AttributeType::Struct {
+        name: "Config".to_string(),
+        fields: vec![
+            StructField::new("name", AttributeType::String),
+            StructField::new(
+                "status",
+                AttributeType::StringEnum {
+                    name: "Status".to_string(),
+                    values: vec!["Active".to_string(), "Inactive".to_string()],
+                    namespace: None,
+                    to_dsl: None,
+                },
+            ),
+        ],
+    };
+
+    // Desired: only name specified
+    let desired = Value::Map(HashMap::from([(
+        "name".to_string(),
+        Value::String("test".to_string()),
+    )]));
+
+    // Current: includes status: "" as default
+    let current = Value::Map(HashMap::from([
+        ("name".to_string(), Value::String("test".to_string())),
+        ("status".to_string(), Value::String(String::new())),
+    ]));
+
+    assert!(
+        type_aware_equal(&desired, &current, Some(&struct_type)),
+        "Struct with extra default StringEnum empty string should be considered equal"
+    );
+}
+
+#[test]
+fn type_aware_struct_ignores_default_custom_type() {
+    use crate::schema::StructField;
+
+    let struct_type = AttributeType::Struct {
+        name: "Config".to_string(),
+        fields: vec![
+            StructField::new("name", AttributeType::String),
+            StructField::new(
+                "port",
+                AttributeType::Custom {
+                    name: "Port".to_string(),
+                    base: Box::new(AttributeType::Int),
+                    validate: |_| Ok(()),
+                    namespace: None,
+                    to_dsl: None,
+                },
+            ),
+        ],
+    };
+
+    // Desired: only name specified
+    let desired = Value::Map(HashMap::from([(
+        "name".to_string(),
+        Value::String("test".to_string()),
+    )]));
+
+    // Current: includes port: 0 as default
+    let current = Value::Map(HashMap::from([
+        ("name".to_string(), Value::String("test".to_string())),
+        ("port".to_string(), Value::Int(0)),
+    ]));
+
+    assert!(
+        type_aware_equal(&desired, &current, Some(&struct_type)),
+        "Struct with extra default Custom(Int) zero should be considered equal"
+    );
+}
+
+#[test]
+fn type_aware_struct_ignores_default_nested_struct_empty() {
+    use crate::schema::StructField;
+
+    let struct_type = AttributeType::Struct {
+        name: "Outer".to_string(),
+        fields: vec![
+            StructField::new("name", AttributeType::String),
+            StructField::new(
+                "inner",
+                AttributeType::Struct {
+                    name: "Inner".to_string(),
+                    fields: vec![StructField::new("value", AttributeType::String)],
+                },
+            ),
+        ],
+    };
+
+    // Desired: only name specified
+    let desired = Value::Map(HashMap::from([(
+        "name".to_string(),
+        Value::String("test".to_string()),
+    )]));
+
+    // Current: includes inner: {} as default
+    let current = Value::Map(HashMap::from([
+        ("name".to_string(), Value::String("test".to_string())),
+        ("inner".to_string(), Value::Map(HashMap::new())),
+    ]));
+
+    assert!(
+        type_aware_equal(&desired, &current, Some(&struct_type)),
+        "Struct with extra default nested Struct empty map should be considered equal"
+    );
+}

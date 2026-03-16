@@ -181,12 +181,15 @@ fn is_type_default(value: &Value, attr_type: Option<&AttributeType>) -> bool {
         (Value::Int(0), Some(AttributeType::Int)) => true,
         (Value::Float(f), Some(AttributeType::Float)) if *f == 0.0 => true,
         (Value::String(s), Some(AttributeType::String)) if s.is_empty() => true,
+        (Value::String(s), Some(AttributeType::StringEnum { .. })) if s.is_empty() => true,
         (Value::List(l), Some(AttributeType::List(_))) if l.is_empty() => true,
         (Value::Map(m), Some(AttributeType::Map(_) | AttributeType::Struct { .. }))
             if m.is_empty() =>
         {
             true
         }
+        // Custom types: delegate to the base type
+        (_, Some(AttributeType::Custom { base, .. })) => is_type_default(value, Some(base)),
         _ => false,
     }
 }
