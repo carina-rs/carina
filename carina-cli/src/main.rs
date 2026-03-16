@@ -2598,7 +2598,7 @@ async fn run_state_refresh(path: &PathBuf) -> Result<(), String> {
             let old_attrs: HashMap<String, Value> = existing_rs
                 .attributes
                 .iter()
-                .map(|(k, v)| (k.clone(), json_to_dsl_value(v)))
+                .filter_map(|(k, v)| json_to_dsl_value(v).map(|val| (k.clone(), val)))
                 .collect();
 
             if !fresh_state.exists {

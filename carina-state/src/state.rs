@@ -116,7 +116,7 @@ impl StateFile {
             let attrs: HashMap<String, Value> = rs
                 .attributes
                 .iter()
-                .map(|(k, v)| (k.clone(), json_to_dsl_value(v)))
+                .filter_map(|(k, v)| json_to_dsl_value(v).map(|val| (k.clone(), val)))
                 .collect();
             result.insert(id, attrs);
         }
