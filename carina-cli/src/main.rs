@@ -3290,14 +3290,14 @@ mod tests {
             .insert("_provider".to_string(), Value::String("awscc".to_string()));
         resource.attributes.insert(
             "operating_region".to_string(),
-            Value::Map(
+            Value::List(vec![Value::Map(
                 vec![(
                     "region_name".to_string(),
                     Value::String("us-east-1".to_string()),
                 )]
                 .into_iter()
                 .collect(),
-            ),
+            )]),
         );
 
         let mut resources = vec![resource];

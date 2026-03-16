@@ -548,7 +548,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
             }).required().with_description("The class of storage used to store the object.").with_provider_name("StorageClass"),
                     StructField::new("transition_in_days", AttributeType::Int).required().with_description("Specifies the number of days an object is noncurrent before Amazon S3 can perform the associated action. For information about the noncurrent days cal...").with_provider_name("TransitionInDays")
                     ],
-                }))).with_description("For buckets with versioning enabled (or suspended), one or more transition rules that specify when non-current objects transition to a specified stora...").with_provider_name("NoncurrentVersionTransitions"),
+                }))).with_description("For buckets with versioning enabled (or suspended), one or more transition rules that specify when non-current objects transition to a specified stora...").with_provider_name("NoncurrentVersionTransitions").with_block_name("noncurrent_version_transition"),
                     StructField::new("object_size_greater_than", AttributeType::Custom {
                 name: "NumericString(len: ..=20)".to_string(),
                 base: Box::new(AttributeType::String),
@@ -608,7 +608,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
             }).with_description("Indicates when objects are transitioned to the specified storage class. The date value must be in ISO 8601 format. The time is always midnight UTC.").with_provider_name("TransitionDate"),
                     StructField::new("transition_in_days", AttributeType::Int).with_description("Indicates the number of days after creation when objects are transitioned to the specified storage class. If the specified storage class is ``INTELLIG...").with_provider_name("TransitionInDays")
                     ],
-                }))).with_description("One or more transition rules that specify when an object transitions to a specified storage class. If you specify an expiration and transition time, y...").with_provider_name("Transitions")
+                }))).with_description("One or more transition rules that specify when an object transitions to a specified storage class. If you specify an expiration and transition time, y...").with_provider_name("Transitions").with_block_name("transition")
                     ],
                 }))).required().with_description("A lifecycle rule for individual objects in an Amazon S3 bucket.").with_provider_name("Rules").with_block_name("rule"),
                     StructField::new("transition_default_minimum_object_size", AttributeType::StringEnum {

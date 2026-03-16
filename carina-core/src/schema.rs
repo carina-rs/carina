@@ -764,10 +764,21 @@ fn resolve_block_names_in_map(
         .filter_map(|f| f.block_name.as_ref().map(|bn| (bn.clone(), f.name.clone())))
         .collect();
 
-    // Rename block name keys to canonical names
+    // Rename block name keys to canonical names, but only when the value
+    // is a List (from block syntax). Non-list values (e.g., Value::Map from
+    // attribute assignment) target the actual field with that name.
     let renames: Vec<(String, String)> = map
         .keys()
-        .filter_map(|key| bn_map.get(key).map(|canon| (key.clone(), canon.clone())))
+        .filter_map(|key| {
+            bn_map.get(key).and_then(|canon| {
+                // Only rename if the value is a List (block-originated)
+                if matches!(map.get(key), Some(Value::List(_))) {
+                    Some((key.clone(), canon.clone()))
+                } else {
+                    None
+                }
+            })
+        })
         .collect();
 
     for (block_key, canon_key) in renames {
@@ -836,10 +847,20 @@ pub fn resolve_block_names(
         let bn_map = schema.block_name_map();
 
         // Collect keys to rename: (block_name_key, canonical_attr_name)
+        // Only rename when the value is a List (from block syntax). Non-list values
+        // (e.g., Value::Map from attribute assignment) target the actual field with that name.
         let renames: Vec<(String, String)> = resource
             .attributes
             .keys()
-            .filter_map(|key| bn_map.get(key).map(|canon| (key.clone(), canon.clone())))
+            .filter_map(|key| {
+                bn_map.get(key).and_then(|canon| {
+                    if matches!(resource.attributes.get(key), Some(Value::List(_))) {
+                        Some((key.clone(), canon.clone()))
+                    } else {
+                        None
+                    }
+                })
+            })
             .collect();
 
         for (block_key, canon_key) in renames {
@@ -2153,9 +2174,17 @@ mod tests {
     fn resolve_block_names_renames_key() {
         let mut resources = vec![{
             let mut r = Resource::new("ec2.ipam", "my-ipam");
+            // Block syntax produces Value::List
             r.attributes.insert(
                 "operating_region".to_string(),
-                Value::String("us-east-1".to_string()),
+                Value::List(vec![Value::Map({
+                    let mut m = HashMap::new();
+                    m.insert(
+                        "region_name".to_string(),
+                        Value::String("us-east-1".to_string()),
+                    );
+                    m
+                })]),
             );
             r.attributes
                 .insert("_provider".to_string(), Value::String("awscc".to_string()));
@@ -2202,13 +2231,29 @@ mod tests {
     fn resolve_block_names_errors_on_mixed_syntax() {
         let mut resources = vec![{
             let mut r = Resource::new("ec2.ipam", "my-ipam");
+            // Block syntax produces Value::List
             r.attributes.insert(
                 "operating_region".to_string(),
-                Value::String("us-east-1".to_string()),
+                Value::List(vec![Value::Map({
+                    let mut m = HashMap::new();
+                    m.insert(
+                        "region_name".to_string(),
+                        Value::String("us-east-1".to_string()),
+                    );
+                    m
+                })]),
             );
+            // User also explicitly set the canonical name
             r.attributes.insert(
                 "operating_regions".to_string(),
-                Value::String("us-west-2".to_string()),
+                Value::List(vec![Value::Map({
+                    let mut m = HashMap::new();
+                    m.insert(
+                        "region_name".to_string(),
+                        Value::String("us-west-2".to_string()),
+                    );
+                    m
+                })]),
             );
             r
         }];
@@ -2323,6 +2368,153 @@ mod tests {
         assert!(
             !lifecycle.contains_key("transition"),
             "expected 'transition' key to be removed"
+        );
+    }
+
+    #[test]
+    fn resolve_block_names_singular_field_not_renamed_when_assigned() {
+        // When a struct has both `transition` (Struct) and `transitions` (List(Struct))
+        // with block_name("transition") on the List field, an attribute assignment
+        // `transition = { ... }` (Value::Map) should NOT be renamed to `transitions`.
+        // Only block syntax `transition { ... }` (Value::List) should be renamed.
+        let mut inner_map = HashMap::new();
+        // This is an attribute assignment: transition = { storage_class = "GLACIER" }
+        // Parser produces Value::Map for attribute assignments
+        inner_map.insert(
+            "transition".to_string(),
+            Value::Map({
+                let mut m = HashMap::new();
+                m.insert(
+                    "storage_class".to_string(),
+                    Value::String("GLACIER".to_string()),
+                );
+                m
+            }),
+        );
+
+        let mut resources = vec![{
+            let mut r = Resource::new("s3.bucket", "my-bucket");
+            r.attributes
+                .insert("lifecycle_configuration".to_string(), Value::Map(inner_map));
+            r.attributes
+                .insert("_provider".to_string(), Value::String("awscc".to_string()));
+            r
+        }];
+
+        let mut schemas = HashMap::new();
+        schemas.insert(
+            "s3.bucket".to_string(),
+            ResourceSchema::new("s3.bucket").attribute(AttributeSchema::new(
+                "lifecycle_configuration",
+                AttributeType::Struct {
+                    name: "LifecycleConfiguration".to_string(),
+                    fields: vec![
+                        StructField::new(
+                            "transition",
+                            AttributeType::Struct {
+                                name: "Transition".to_string(),
+                                fields: vec![],
+                            },
+                        ),
+                        StructField::new(
+                            "transitions",
+                            AttributeType::List(Box::new(AttributeType::Struct {
+                                name: "Transition".to_string(),
+                                fields: vec![],
+                            })),
+                        )
+                        .with_block_name("transition"),
+                    ],
+                },
+            )),
+        );
+
+        resolve_block_names(&mut resources, &schemas, |r| r.id.resource_type.clone()).unwrap();
+
+        let lifecycle = match resources[0].attributes.get("lifecycle_configuration") {
+            Some(Value::Map(m)) => m,
+            _ => panic!("expected Map"),
+        };
+        // The Value::Map should remain as "transition" (not renamed)
+        assert!(
+            lifecycle.contains_key("transition"),
+            "expected 'transition' key to remain (attribute assignment)"
+        );
+        assert!(
+            !lifecycle.contains_key("transitions"),
+            "expected 'transitions' key NOT to be created from attribute assignment"
+        );
+    }
+
+    #[test]
+    fn resolve_block_names_block_syntax_renamed_when_singular_field_exists() {
+        // Block syntax `transition { ... }` should still be renamed to `transitions`
+        // even when a singular `transition` field exists in the schema.
+        let mut inner_map = HashMap::new();
+        // Block syntax produces Value::List
+        inner_map.insert(
+            "transition".to_string(),
+            Value::List(vec![Value::Map({
+                let mut m = HashMap::new();
+                m.insert(
+                    "storage_class".to_string(),
+                    Value::String("GLACIER".to_string()),
+                );
+                m
+            })]),
+        );
+
+        let mut resources = vec![{
+            let mut r = Resource::new("s3.bucket", "my-bucket");
+            r.attributes
+                .insert("lifecycle_configuration".to_string(), Value::Map(inner_map));
+            r.attributes
+                .insert("_provider".to_string(), Value::String("awscc".to_string()));
+            r
+        }];
+
+        let mut schemas = HashMap::new();
+        schemas.insert(
+            "s3.bucket".to_string(),
+            ResourceSchema::new("s3.bucket").attribute(AttributeSchema::new(
+                "lifecycle_configuration",
+                AttributeType::Struct {
+                    name: "LifecycleConfiguration".to_string(),
+                    fields: vec![
+                        StructField::new(
+                            "transition",
+                            AttributeType::Struct {
+                                name: "Transition".to_string(),
+                                fields: vec![],
+                            },
+                        ),
+                        StructField::new(
+                            "transitions",
+                            AttributeType::List(Box::new(AttributeType::Struct {
+                                name: "Transition".to_string(),
+                                fields: vec![],
+                            })),
+                        )
+                        .with_block_name("transition"),
+                    ],
+                },
+            )),
+        );
+
+        resolve_block_names(&mut resources, &schemas, |r| r.id.resource_type.clone()).unwrap();
+
+        let lifecycle = match resources[0].attributes.get("lifecycle_configuration") {
+            Some(Value::Map(m)) => m,
+            _ => panic!("expected Map"),
+        };
+        // Block syntax (Value::List) should be renamed to "transitions"
+        assert!(
+            lifecycle.contains_key("transitions"),
+            "expected 'transitions' key after resolve (block syntax)"
+        );
+        assert!(
+            !lifecycle.contains_key("transition"),
+            "expected 'transition' key to be removed (block syntax renamed)"
         );
     }
 }
