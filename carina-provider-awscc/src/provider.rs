@@ -1477,7 +1477,7 @@ fn build_update_patches(
     if config.has_tags {
         if let Some(Value::Map(user_tags)) = to.attributes.get("tags") {
             // Skip if tags are unchanged from the current state
-            let tags_unchanged = matches!(from.attributes.get("tags"), Some(from_tags) if from_tags == &Value::Map(user_tags.clone()));
+            let tags_unchanged = matches!(from.attributes.get("tags"), Some(Value::Map(from_tags)) if from_tags == user_tags);
             if !tags_unchanged {
                 let mut tags = Vec::new();
                 for (key, value) in user_tags {
