@@ -175,18 +175,7 @@ impl HoverProvider {
     }
 
     fn keyword_hover(&self, word: &str) -> Option<Hover> {
-        let content = match word {
-            "provider" => {
-                "## provider\n\nDefines a provider block with configuration.\n\n```carina\nprovider aws {\n    region = aws.Region.ap_northeast_1\n}\n```"
-            }
-            "let" => {
-                "## let\n\nDefines a named resource or variable binding.\n\n```carina\nlet my_bucket = aws.s3.bucket {\n    name = \"my-bucket\"\n    region = aws.Region.ap_northeast_1\n}\n```"
-            }
-            "env" => {
-                "## env()\n\nReads a value from an environment variable.\n\n```carina\nname = env(\"BUCKET_NAME\")\n```"
-            }
-            _ => return None,
-        };
+        let content = Self::keyword_description(word)?;
 
         Some(Hover {
             contents: HoverContents::Markup(MarkupContent {
@@ -195,6 +184,36 @@ impl HoverProvider {
             }),
             range: None,
         })
+    }
+
+    fn keyword_description(word: &str) -> Option<&'static str> {
+        match word {
+            "provider" => Some(
+                "## provider\n\nDefines a provider block with configuration.\n\n```carina\nprovider aws {\n    region = aws.Region.ap_northeast_1\n}\n```",
+            ),
+            "let" => Some(
+                "## let\n\nDefines a named resource or variable binding.\n\n```carina\nlet my_bucket = aws.s3.bucket {\n    name = \"my-bucket\"\n    region = aws.Region.ap_northeast_1\n}\n```",
+            ),
+            "env" => Some(
+                "## env()\n\nReads a value from an environment variable.\n\n```carina\nname = env(\"BUCKET_NAME\")\n```",
+            ),
+            "output" => Some(
+                "## output\n\nDefines module output values that can be referenced by the caller.\n\n```carina\noutput {\n    bucket_name: String = my_bucket.name\n}\n```",
+            ),
+            "input" => Some(
+                "## input\n\nDefines module input parameters that must be provided by the caller.\n\n```carina\ninput {\n    env: String\n    region: String\n}\n```",
+            ),
+            "import" => Some(
+                "## import\n\nImports a module from a file or directory.\n\n```carina\nimport \"./modules/network/main.crn\" as network\n```",
+            ),
+            "backend" => Some(
+                "## backend\n\nConfigures the state backend for storing resource state.\n\n```carina\nbackend s3 {\n    bucket = \"my-carina-state\"\n    key    = \"prod/carina.crnstate\"\n    region = aws.Region.ap_northeast_1\n}\n```",
+            ),
+            "read" => Some(
+                "## read\n\nReads an existing resource as a data source without managing it.\n\n```carina\nlet my_vpc = read aws.ec2.vpc {\n    name = \"existing-vpc\"\n}\n```",
+            ),
+            _ => None,
+        }
     }
 
     fn region_hover(&self, word: &str) -> Option<Hover> {
@@ -241,5 +260,71 @@ impl HoverProvider {
         }
 
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_keyword_hover_provider() {
+        assert!(HoverProvider::keyword_description("provider").is_some());
+        let desc = HoverProvider::keyword_description("provider").unwrap();
+        assert!(desc.contains("provider"));
+    }
+
+    #[test]
+    fn test_keyword_hover_let() {
+        assert!(HoverProvider::keyword_description("let").is_some());
+        let desc = HoverProvider::keyword_description("let").unwrap();
+        assert!(desc.contains("named resource"));
+    }
+
+    #[test]
+    fn test_keyword_hover_env() {
+        assert!(HoverProvider::keyword_description("env").is_some());
+        let desc = HoverProvider::keyword_description("env").unwrap();
+        assert!(desc.contains("environment variable"));
+    }
+
+    #[test]
+    fn test_keyword_hover_output() {
+        assert!(HoverProvider::keyword_description("output").is_some());
+        let desc = HoverProvider::keyword_description("output").unwrap();
+        assert!(desc.contains("output"));
+    }
+
+    #[test]
+    fn test_keyword_hover_input() {
+        assert!(HoverProvider::keyword_description("input").is_some());
+        let desc = HoverProvider::keyword_description("input").unwrap();
+        assert!(desc.contains("input"));
+    }
+
+    #[test]
+    fn test_keyword_hover_import() {
+        assert!(HoverProvider::keyword_description("import").is_some());
+        let desc = HoverProvider::keyword_description("import").unwrap();
+        assert!(desc.contains("import"));
+    }
+
+    #[test]
+    fn test_keyword_hover_backend() {
+        assert!(HoverProvider::keyword_description("backend").is_some());
+        let desc = HoverProvider::keyword_description("backend").unwrap();
+        assert!(desc.contains("backend"));
+    }
+
+    #[test]
+    fn test_keyword_hover_read() {
+        assert!(HoverProvider::keyword_description("read").is_some());
+        let desc = HoverProvider::keyword_description("read").unwrap();
+        assert!(desc.contains("data source"));
+    }
+
+    #[test]
+    fn test_keyword_hover_unknown_returns_none() {
+        assert!(HoverProvider::keyword_description("foobar").is_none());
     }
 }
