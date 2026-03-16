@@ -146,7 +146,10 @@ impl SemanticTokensProvider {
                     let as_start = import_start + 7 + as_pos + 1; // position of "as"
                     tokens.push((as_start as u32, 2, 0)); // KEYWORD: as
                     let alias_start = as_start + 3; // position after "as "
-                    let alias = line[alias_start..].trim();
+                    let rest = &line[alias_start..];
+                    let alias = rest
+                        .find(|c: char| !c.is_alphanumeric() && c != '_')
+                        .map_or(rest, |end| &rest[..end]);
                     if !alias.is_empty() {
                         tokens.push((alias_start as u32, alias.len() as u32, 2)); // VARIABLE
                     }
