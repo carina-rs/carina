@@ -580,6 +580,28 @@ output {
 }
 
 #[test]
+fn find_let_binding_position_with_multibyte_leading_whitespace() {
+    // Regression test for issue #724: find_let_binding_position uses byte offset
+    // as character column. When multi-byte whitespace (e.g., full-width space U+3000)
+    // appears before "let", the byte offset differs from the character offset.
+    let engine = test_engine();
+
+    // U+3000 (ideographic space) is 3 bytes in UTF-8 but 1 character.
+    // Rust's str::trim() strips it as Unicode whitespace.
+    // Line: "\u{3000}let my_var = awscc.ec2.vpc { }"
+    // "let " starts at byte 3, but character offset 1.
+    // name_col should be char 1 + 4 = 5 (correct)
+    // Bug produces byte 3 + 4 = 7 (wrong)
+    let text = "\u{3000}let my_var = awscc.ec2.vpc { }";
+    let result = engine.find_let_binding_position(text, "my_var");
+    assert_eq!(
+        result,
+        Some((0, 5)),
+        "Column should be character offset (5), not byte offset (7)"
+    );
+}
+
+#[test]
 fn output_block_detection_with_brace_on_same_line() {
     // Regression test: ensure output block detection works correctly
     // after removing the redundant `|| trimmed == "output {"` condition.

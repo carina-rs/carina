@@ -352,9 +352,10 @@ impl DiagnosticEngine {
                 let name = rest[..eq_pos].trim();
                 if name == binding_name {
                     // Find the column of the binding name in the original line
-                    let let_pos = line.find("let ").unwrap();
-                    let name_col = let_pos + 4; // "let " is 4 chars
-                    return Some((line_idx as u32, name_col as u32));
+                    let let_byte_pos = line.find("let ").unwrap();
+                    let let_char_pos = position::byte_offset_to_char_offset(line, let_byte_pos);
+                    let name_col = let_char_pos + 4; // "let " is 4 chars
+                    return Some((line_idx as u32, name_col));
                 }
             }
         }
