@@ -66,11 +66,24 @@ impl SemanticTokensProvider {
         tokens
     }
 
+    /// Convert a byte offset in a string to a character offset
+    fn byte_to_char_offset(s: &str, byte_offset: usize) -> u32 {
+        s[..byte_offset].chars().count() as u32
+    }
+
+    /// Get the character length (not byte length) of a string
+    fn char_len(s: &str) -> u32 {
+        s.chars().count() as u32
+    }
+
     /// Tokenize a single line, returning (start_col, length, token_type_index)
+    /// All positions and lengths are in characters (not bytes) for LSP compatibility.
     fn tokenize_line(&self, line: &str, _line_idx: u32) -> Vec<(u32, u32, u32)> {
         let mut tokens = Vec::new();
         let trimmed = line.trim_start();
-        let indent = (line.len() - trimmed.len()) as u32;
+        let indent_bytes = line.len() - trimmed.len();
+        // Indent is always ASCII spaces/tabs, so byte count == char count
+        let indent = indent_bytes as u32;
 
         // Skip empty lines
         if trimmed.is_empty() {
@@ -79,14 +92,15 @@ impl SemanticTokensProvider {
 
         // Comment
         if trimmed.starts_with("//") {
-            tokens.push((indent, line.len() as u32 - indent, 8)); // COMMENT
+            tokens.push((indent, Self::char_len(line) - indent, 8)); // COMMENT
             return tokens;
         }
 
         // Keywords at start of line
+        // Note: keywords like "provider", "backend", "let" and their arguments
+        // are ASCII-only, so byte positions == char positions in this section.
         if trimmed.starts_with("provider ") {
             tokens.push((indent, 8, 0)); // KEYWORD: provider
-            // Provider name after "provider "
             if let Some(name_start) = line.find("provider ") {
                 let after_provider = &line[name_start + 9..];
                 if let Some(name_end) = after_provider.find([' ', '{']) {
@@ -98,7 +112,6 @@ impl SemanticTokensProvider {
             }
         } else if trimmed.starts_with("backend ") {
             tokens.push((indent, 7, 0)); // KEYWORD: backend
-            // Backend type after "backend "
             if let Some(name_start) = line.find("backend ") {
                 let after_backend = &line[name_start + 8..];
                 if let Some(name_end) = after_backend.find([' ', '{']) {
@@ -110,7 +123,6 @@ impl SemanticTokensProvider {
             }
         } else if trimmed.starts_with("let ") {
             tokens.push((indent, 3, 0)); // KEYWORD: let
-            // Variable name after "let "
             if let Some(let_start) = line.find("let ") {
                 let after_let = &line[let_start + 4..];
                 if let Some(name_end) = after_let.find([' ', '=']) {
@@ -151,59 +163,81 @@ impl SemanticTokensProvider {
         }
 
         // env() function
-        if let Some(start) = line.find("env(") {
-            tokens.push((start as u32, 3, 7)); // FUNCTION: env
+        if let Some(byte_pos) = line.find("env(") {
+            tokens.push((Self::byte_to_char_offset(line, byte_pos), 3, 7)); // FUNCTION: env
         }
 
         // Property names (before =)
-        if let Some(eq_pos) = line.find('=') {
-            let before_eq = &line[..eq_pos];
+        if let Some(eq_byte_pos) = line.find('=') {
+            let before_eq = &line[..eq_byte_pos];
             let prop_name = before_eq.trim();
             if !prop_name.is_empty()
                 && !prop_name.starts_with("provider")
                 && !prop_name.starts_with("let")
                 && !prop_name.contains('.')
-                && let Some(prop_start) = line.find(prop_name)
+                && let Some(prop_byte_start) = line.find(prop_name)
             {
-                tokens.push((prop_start as u32, prop_name.len() as u32, 3)); // PROPERTY
+                tokens.push((
+                    Self::byte_to_char_offset(line, prop_byte_start),
+                    Self::char_len(prop_name),
+                    3,
+                )); // PROPERTY
             }
             // Operator =
-            tokens.push((eq_pos as u32, 1, 6)); // OPERATOR
+            tokens.push((Self::byte_to_char_offset(line, eq_byte_pos), 1, 6)); // OPERATOR
         }
 
         // String literals
         let mut in_string = false;
-        let mut string_start = 0;
-        for (i, c) in line.char_indices() {
+        let mut string_start_char = 0u32;
+        for (char_idx, (_byte_idx, c)) in line.char_indices().enumerate() {
+            let char_idx = char_idx as u32;
             if c == '"' {
                 if in_string {
-                    tokens.push((string_start as u32, (i - string_start + 1) as u32, 4)); // STRING
+                    tokens.push((string_start_char, char_idx - string_start_char + 1, 4));
+                    // STRING
                     in_string = false;
                 } else {
-                    string_start = i;
+                    string_start_char = char_idx;
                     in_string = true;
                 }
             }
         }
 
-        // Number literals
-        for (i, c) in line.char_indices() {
+        // Number literals - use byte-level operations for adjacent char checks
+        for (byte_idx, c) in line.char_indices() {
             if c.is_ascii_digit() {
-                // Check if it's a standalone number (not part of identifier)
-                let prev_char = if i > 0 { line.chars().nth(i - 1) } else { None };
-                let next_char = line.chars().nth(i + 1);
+                // Check adjacent bytes - digits and their neighbors are ASCII,
+                // so byte-level access is safe for boundary checks
+                let prev_byte = if byte_idx > 0 {
+                    Some(line.as_bytes()[byte_idx - 1])
+                } else {
+                    None
+                };
+                let next_byte_pos = byte_idx + 1; // ASCII digit is 1 byte
+                let next_byte = if next_byte_pos < line.len() {
+                    Some(line.as_bytes()[next_byte_pos])
+                } else {
+                    None
+                };
 
-                if prev_char.is_none_or(|c| !c.is_alphanumeric() && c != '_')
-                    && next_char.is_none_or(|c| !c.is_alphanumeric() && c != '_')
-                {
+                let prev_is_word =
+                    prev_byte.is_some_and(|b| b.is_ascii_alphanumeric() || b == b'_');
+                let next_is_word =
+                    next_byte.is_some_and(|b| b.is_ascii_alphanumeric() || b == b'_');
+
+                let char_pos = Self::byte_to_char_offset(line, byte_idx);
+
+                if !prev_is_word && !next_is_word {
                     // Single digit number
-                    tokens.push((i as u32, 1, 5)); // NUMBER
-                } else if prev_char.is_none_or(|c| !c.is_alphanumeric() && c != '_') {
-                    // Multi-digit number - find the end
-                    let num_end = line[i..]
+                    tokens.push((char_pos, 1, 5)); // NUMBER
+                } else if !prev_is_word {
+                    // Multi-digit number - find the end (bytes are fine since digits are ASCII)
+                    let num_end = line[byte_idx..]
                         .find(|c: char| !c.is_ascii_digit())
-                        .map_or(line.len() - i, |pos| pos);
-                    tokens.push((i as u32, num_end as u32, 5)); // NUMBER
+                        .map_or(line.len() - byte_idx, |pos| pos);
+                    // num_end is in bytes, but since all digits are ASCII, byte count == char count
+                    tokens.push((char_pos, num_end as u32, 5)); // NUMBER
                 }
             }
         }
@@ -297,23 +331,32 @@ impl SemanticTokensProvider {
     ) {
         let mut search_start = 0;
         while let Some(pos) = line[search_start..].find(pattern) {
-            let absolute_pos = search_start + pos;
-            // Check word boundaries - allow dots within identifiers
-            let before_char = if absolute_pos > 0 {
-                line.chars().nth(absolute_pos - 1)
+            let absolute_byte_pos = search_start + pos;
+            // Check word boundaries using byte-level access.
+            // Patterns and boundary characters are ASCII, so byte access is safe.
+            let before_byte = if absolute_byte_pos > 0 {
+                Some(line.as_bytes()[absolute_byte_pos - 1])
             } else {
                 None
             };
-            let after_char = line.chars().nth(absolute_pos + pattern.len());
+            let after_byte_pos = absolute_byte_pos + pattern.len();
+            let after_byte = if after_byte_pos < line.len() {
+                Some(line.as_bytes()[after_byte_pos])
+            } else {
+                None
+            };
 
             let before_ok =
-                before_char.is_none_or(|c| !c.is_alphanumeric() && c != '_' && c != '.');
-            let after_ok = after_char.is_none_or(|c| !c.is_alphanumeric() && c != '_' && c != '.');
+                before_byte.is_none_or(|b| !b.is_ascii_alphanumeric() && b != b'_' && b != b'.');
+            let after_ok =
+                after_byte.is_none_or(|b| !b.is_ascii_alphanumeric() && b != b'_' && b != b'.');
 
             if before_ok && after_ok {
-                tokens.push((absolute_pos as u32, pattern.len() as u32, token_type));
+                let char_pos = Self::byte_to_char_offset(line, absolute_byte_pos);
+                // Pattern is ASCII, so byte length == char length
+                tokens.push((char_pos, pattern.len() as u32, token_type));
             }
-            search_start = absolute_pos + pattern.len();
+            search_start = absolute_byte_pos + pattern.len();
         }
     }
 }
@@ -463,6 +506,102 @@ mod tests {
             "Should highlight awscc.Region.ap_northeast_1 as TYPE. Got: {:?}",
             tokens
         );
+    }
+
+    #[test]
+    fn test_non_ascii_comment_no_panic() {
+        let provider = SemanticTokensProvider::new(&[]);
+        // Japanese comment should not panic and should be highlighted as COMMENT
+        let tokens = provider.tokenize_line("// これはコメントです", 0);
+        let comment_token = tokens.iter().find(|(_, _, typ)| *typ == 8);
+        assert!(
+            comment_token.is_some(),
+            "Should highlight Japanese comment as COMMENT. Got: {:?}",
+            tokens
+        );
+        // Position should be 0, length should be char count (not byte count)
+        let (start, len, _) = comment_token.unwrap();
+        assert_eq!(*start, 0);
+        assert_eq!(
+            *len,
+            "// これはコメントです".chars().count() as u32,
+            "Comment length should be in characters, not bytes"
+        );
+    }
+
+    #[test]
+    fn test_non_ascii_string_literal_no_panic() {
+        let provider = SemanticTokensProvider::new(&[]);
+        // String with multi-byte characters
+        let tokens = provider.tokenize_line("    name = \"日本語の名前\"", 0);
+        // Should not panic and should find the string literal
+        let string_token = tokens.iter().find(|(_, _, typ)| *typ == 4);
+        assert!(
+            string_token.is_some(),
+            "Should highlight Japanese string as STRING. Got: {:?}",
+            tokens
+        );
+    }
+
+    #[test]
+    fn test_non_ascii_number_after_multibyte() {
+        let provider = SemanticTokensProvider::new(&[]);
+        // Number literal appearing after multi-byte characters
+        // "// コメント 3" - the number 3 appears after multi-byte chars
+        let tokens = provider.tokenize_line("    count = 3 // 日本語", 0);
+        // Should not panic
+        let number_token = tokens.iter().find(|(_, _, typ)| *typ == 5);
+        assert!(
+            number_token.is_some(),
+            "Should find number token. Got: {:?}",
+            tokens
+        );
+    }
+
+    #[test]
+    fn test_find_and_add_pattern_with_non_ascii() {
+        let provider = SemanticTokensProvider::new(&[]);
+        // Pattern search after multi-byte characters
+        let mut tokens = Vec::new();
+        provider.find_and_add_pattern("    value = true // 日本語", "true", 0, &mut tokens);
+        assert!(
+            !tokens.is_empty(),
+            "Should find 'true' pattern. Got: {:?}",
+            tokens
+        );
+        // Position should be in characters, not bytes
+        let (pos, _, _) = tokens[0];
+        assert_eq!(
+            pos,
+            "    value = ".chars().count() as u32,
+            "Position should be in characters"
+        );
+    }
+
+    #[test]
+    fn test_non_ascii_full_tokenize() {
+        let provider = SemanticTokensProvider::new(&[]);
+        // Full file with mixed ASCII and non-ASCII
+        let content = "// 日本語コメント\naws.s3.bucket {\n    name = \"テスト\"\n}";
+        // Should not panic
+        let tokens = provider.tokenize(content);
+        assert!(!tokens.is_empty(), "Should produce tokens");
+    }
+
+    #[test]
+    fn test_indent_with_non_ascii() {
+        let provider = SemanticTokensProvider::new(&[]);
+        // Indented line with non-ASCII content
+        let tokens = provider.tokenize_line("    name = \"あいう\"", 0);
+        // indent should be 4 (characters), not affected by multi-byte
+        let prop_token = tokens.iter().find(|(_, _, typ)| *typ == 3);
+        assert!(
+            prop_token.is_some(),
+            "Should find property token. Got: {:?}",
+            tokens
+        );
+        let (start, _, _) = prop_token.unwrap();
+        assert_eq!(*start, 4, "Property should start at char position 4");
     }
 
     #[test]
