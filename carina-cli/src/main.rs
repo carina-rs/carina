@@ -910,7 +910,7 @@ async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
     apply_name_overrides(&mut parsed.resources, &state_file);
 
     // Sort resources by dependencies
-    let sorted_resources = sort_resources_by_dependencies(&parsed.resources);
+    let sorted_resources = sort_resources_by_dependencies(&parsed.resources)?;
 
     // Select appropriate Provider based on configuration
     let provider: Box<dyn Provider> = get_provider(&parsed).await;
@@ -2228,7 +2228,7 @@ async fn run_destroy(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
     apply_name_overrides(&mut parsed.resources, &state_file);
 
     // Sort resources by dependencies (for creation order)
-    let sorted_resources = sort_resources_by_dependencies(&parsed.resources);
+    let sorted_resources = sort_resources_by_dependencies(&parsed.resources)?;
 
     // Reverse the order for destruction (dependents first, then dependencies)
     let destroy_order: Vec<Resource> = sorted_resources.into_iter().rev().collect();
@@ -2850,7 +2850,7 @@ async fn run_state_refresh(path: &PathBuf) -> Result<(), String> {
     reconcile_anonymous_identifiers(&mut parsed.resources, &state_file);
     apply_name_overrides(&mut parsed.resources, &state_file);
 
-    let sorted_resources = sort_resources_by_dependencies(&parsed.resources);
+    let sorted_resources = sort_resources_by_dependencies(&parsed.resources)?;
 
     // Select provider
     let provider: Box<dyn Provider> = get_provider(&parsed).await;

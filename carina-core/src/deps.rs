@@ -34,8 +34,11 @@ fn collect_dependencies(value: &Value, deps: &mut HashSet<String>) {
     }
 }
 
-/// Sort resources topologically based on dependencies
-pub fn sort_resources_by_dependencies(resources: &[Resource]) -> Vec<Resource> {
+/// Sort resources topologically based on dependencies.
+///
+/// Returns an error if a circular dependency is detected, with a message
+/// showing the cycle path (e.g., "Circular dependency detected: a -> b -> c -> a").
+pub fn sort_resources_by_dependencies(resources: &[Resource]) -> Result<Vec<Resource>, String> {
     // Build binding name to resource mapping
     let mut binding_to_resource: HashMap<String, &Resource> = HashMap::new();
     for resource in resources {
@@ -47,15 +50,15 @@ pub fn sort_resources_by_dependencies(resources: &[Resource]) -> Vec<Resource> {
     // Build dependency graph
     let mut sorted = Vec::new();
     let mut visited: HashSet<String> = HashSet::new();
-    let mut visiting: HashSet<String> = HashSet::new();
+    let mut visiting: Vec<String> = Vec::new();
 
     fn visit<'a>(
         resource: &'a Resource,
         binding_to_resource: &HashMap<String, &'a Resource>,
         visited: &mut HashSet<String>,
-        visiting: &mut HashSet<String>,
+        visiting: &mut Vec<String>,
         sorted: &mut Vec<Resource>,
-    ) {
+    ) -> Result<(), String> {
         let binding_name = resource
             .attributes
             .get("_binding")
@@ -66,26 +69,34 @@ pub fn sort_resources_by_dependencies(resources: &[Resource]) -> Vec<Resource> {
             .unwrap_or_else(|| format!("{}:{}", resource.id.resource_type, resource.id.name));
 
         if visited.contains(&binding_name) {
-            return;
+            return Ok(());
         }
-        if visiting.contains(&binding_name) {
-            // Circular dependency - just continue
-            return;
+        if let Some(pos) = visiting.iter().position(|n| n == &binding_name) {
+            let cycle: Vec<&str> = visiting[pos..]
+                .iter()
+                .map(|s| s.as_str())
+                .chain(std::iter::once(binding_name.as_str()))
+                .collect();
+            return Err(format!(
+                "Circular dependency detected: {}",
+                cycle.join(" -> ")
+            ));
         }
 
-        visiting.insert(binding_name.clone());
+        visiting.push(binding_name.clone());
 
         // Visit dependencies first
         let deps = get_resource_dependencies(resource);
-        for dep in deps {
-            if let Some(dep_resource) = binding_to_resource.get(&dep) {
-                visit(dep_resource, binding_to_resource, visited, visiting, sorted);
+        for dep in &deps {
+            if let Some(dep_resource) = binding_to_resource.get(dep) {
+                visit(dep_resource, binding_to_resource, visited, visiting, sorted)?;
             }
         }
 
-        visiting.remove(&binding_name);
+        visiting.pop();
         visited.insert(binding_name);
         sorted.push(resource.clone());
+        Ok(())
     }
 
     for resource in resources {
@@ -95,10 +106,10 @@ pub fn sort_resources_by_dependencies(resources: &[Resource]) -> Vec<Resource> {
             &mut visited,
             &mut visiting,
             &mut sorted,
-        );
+        )?;
     }
 
-    sorted
+    Ok(sorted)
 }
 
 /// Build a reverse dependency map: for each binding, which bindings depend on it.
@@ -203,7 +214,7 @@ mod tests {
         let b = make_resource("b", &["a"]);
 
         // Even if b comes first in the input, a should come first in the output
-        let sorted = sort_resources_by_dependencies(&[b, a]);
+        let sorted = sort_resources_by_dependencies(&[b, a]).unwrap();
         let binding_order: Vec<_> = sorted
             .iter()
             .filter_map(|r| match r.attributes.get("_binding") {
@@ -319,6 +330,43 @@ mod tests {
 
         let result = find_failed_dependent("b", &dependents_map, &failed_bindings);
         assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_sort_resources_direct_circular_dependency() {
+        // A depends on itself
+        let a = make_resource("a", &["a"]);
+        let result = sort_resources_by_dependencies(&[a]);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("Circular dependency detected"),
+            "Expected circular dependency error, got: {}",
+            err
+        );
+        assert!(err.contains("a"), "Error should mention 'a': {}", err);
+    }
+
+    #[test]
+    fn test_sort_resources_transitive_circular_dependency() {
+        // A -> B -> C -> A
+        let a = make_resource("a", &["c"]);
+        let b = make_resource("b", &["a"]);
+        let c = make_resource("c", &["b"]);
+        let result = sort_resources_by_dependencies(&[a, b, c]);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("Circular dependency detected"),
+            "Expected circular dependency error, got: {}",
+            err
+        );
+        // The cycle path should show the chain
+        assert!(
+            err.contains(" -> "),
+            "Error should show cycle path: {}",
+            err
+        );
     }
 
     #[test]

@@ -229,7 +229,7 @@ pub async fn create_plan_from_parsed(
     parsed: &ParsedFile,
     state_file: &Option<StateFile>,
 ) -> Result<PlanContext, String> {
-    let sorted_resources = sort_resources_by_dependencies(&parsed.resources);
+    let sorted_resources = sort_resources_by_dependencies(&parsed.resources)?;
 
     // Select appropriate Provider based on configuration
     let provider: Box<dyn Provider> = get_provider(parsed).await;
