@@ -165,16 +165,21 @@ impl<P: Provider> Interpreter<P> {
                     let state = if let Some(temp) = temporary_name
                         && temp.can_rename
                     {
-                        let new_identifier = Self::require_identifier(&state, "rename")?;
-                        let mut rename_to = to.clone();
-                        rename_to.attributes.insert(
-                            temp.attribute.clone(),
-                            crate::resource::Value::String(temp.original_value.clone()),
-                        );
-                        self.provider
-                            .update(id, &new_identifier, &state, &rename_to)
-                            .await
-                            .unwrap_or(state)
+                        // Rename is non-fatal: if identifier is missing or update fails,
+                        // fall back to keeping the temporary name.
+                        if let Ok(new_identifier) = Self::require_identifier(&state, "rename") {
+                            let mut rename_to = to.clone();
+                            rename_to.attributes.insert(
+                                temp.attribute.clone(),
+                                crate::resource::Value::String(temp.original_value.clone()),
+                            );
+                            self.provider
+                                .update(id, &new_identifier, &state, &rename_to)
+                                .await
+                                .unwrap_or(state)
+                        } else {
+                            state
+                        }
                     } else {
                         state
                     };
