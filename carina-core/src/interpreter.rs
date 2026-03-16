@@ -97,6 +97,21 @@ impl<P: Provider> Interpreter<P> {
         }
     }
 
+    /// Extract identifier from state, returning an error if missing.
+    fn require_identifier(state: &State, operation: &str) -> ProviderResult<String> {
+        state
+            .identifier
+            .clone()
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| {
+                ProviderError::new(format!(
+                    "missing resource identifier for {} operation",
+                    operation
+                ))
+                .for_resource(state.id.clone())
+            })
+    }
+
     /// Execute a single Effect
     async fn execute_effect(&self, effect: &Effect) -> ProviderResult<EffectOutcome> {
         if self.config.dry_run {
@@ -116,9 +131,8 @@ impl<P: Provider> Interpreter<P> {
                 Ok(EffectOutcome::Created { state })
             }
             Effect::Update { id, from, to, .. } => {
-                // Use identifier from current state if available
-                let identifier = from.identifier.as_deref().unwrap_or("");
-                let state = self.provider.update(id, identifier, from, to).await?;
+                let identifier = Self::require_identifier(from, "update")?;
+                let state = self.provider.update(id, &identifier, from, to).await?;
                 Ok(EffectOutcome::Updated { state })
             }
             Effect::Replace {
@@ -135,14 +149,15 @@ impl<P: Provider> Interpreter<P> {
                     let state = self.provider.create(to).await?;
                     // Execute cascading updates for dependent resources
                     for cascade in cascading_updates {
-                        let cascade_identifier = cascade.from.identifier.as_deref().unwrap_or("");
+                        let cascade_identifier =
+                            Self::require_identifier(&cascade.from, "cascading update")?;
                         self.provider
-                            .update(&cascade.id, cascade_identifier, &cascade.from, &cascade.to)
+                            .update(&cascade.id, &cascade_identifier, &cascade.from, &cascade.to)
                             .await?;
                     }
                     // Then delete the old resource
-                    let identifier = from.identifier.as_deref().unwrap_or("");
-                    self.provider.delete(id, identifier, lifecycle).await?;
+                    let identifier = Self::require_identifier(from, "delete (replace)")?;
+                    self.provider.delete(id, &identifier, lifecycle).await?;
                     // If a temporary name was used and the name is updatable,
                     // rename the new resource back to the desired name.
                     // Rename failure is non-fatal: the old resource is already deleted,
@@ -150,14 +165,14 @@ impl<P: Provider> Interpreter<P> {
                     let state = if let Some(temp) = temporary_name
                         && temp.can_rename
                     {
-                        let new_identifier = state.identifier.as_deref().unwrap_or("");
+                        let new_identifier = Self::require_identifier(&state, "rename")?;
                         let mut rename_to = to.clone();
                         rename_to.attributes.insert(
                             temp.attribute.clone(),
                             crate::resource::Value::String(temp.original_value.clone()),
                         );
                         self.provider
-                            .update(id, new_identifier, &state, &rename_to)
+                            .update(id, &new_identifier, &state, &rename_to)
                             .await
                             .unwrap_or(state)
                     } else {
@@ -166,8 +181,8 @@ impl<P: Provider> Interpreter<P> {
                     Ok(EffectOutcome::Replaced { state })
                 } else {
                     // Delete the existing resource first
-                    let identifier = from.identifier.as_deref().unwrap_or("");
-                    self.provider.delete(id, identifier, lifecycle).await?;
+                    let identifier = Self::require_identifier(from, "delete (replace)")?;
+                    self.provider.delete(id, &identifier, lifecycle).await?;
                     // Then create the new resource
                     let state = self.provider.create(to).await?;
                     Ok(EffectOutcome::Replaced { state })
@@ -545,6 +560,67 @@ mod tests {
         // Verify order: create (with temp name) → delete (old) → update (rename back)
         let ops = ops.lock().unwrap();
         assert_eq!(*ops, vec!["create", "delete", "update"]);
+    }
+
+    #[tokio::test]
+    async fn update_missing_identifier_returns_error() {
+        use crate::resource::Value;
+        use std::collections::HashMap;
+
+        let interpreter = Interpreter::new(TestProvider);
+        let mut plan = Plan::new();
+        plan.add(Effect::Update {
+            id: ResourceId::new("test", "example"),
+            from: Box::new(State::existing(
+                ResourceId::new("test", "example"),
+                HashMap::from([("key".to_string(), Value::String("old".to_string()))]),
+            )),
+            // No identifier set on `from`
+            to: Resource::new("test", "example")
+                .with_attribute("key", Value::String("new".to_string())),
+            changed_attributes: vec!["key".to_string()],
+        });
+
+        let result = interpreter.apply(&plan).await;
+        assert_eq!(result.failure_count, 1);
+        let err = result.outcomes[0].as_ref().unwrap_err();
+        assert!(
+            err.message.contains("identifier"),
+            "expected error about missing identifier, got: {}",
+            err.message
+        );
+    }
+
+    #[tokio::test]
+    async fn replace_missing_identifier_returns_error() {
+        use crate::resource::Value;
+        use std::collections::HashMap;
+
+        let interpreter = Interpreter::new(TestProvider);
+        let mut plan = Plan::new();
+        plan.add(Effect::Replace {
+            id: ResourceId::new("test", "example"),
+            from: Box::new(State::existing(
+                ResourceId::new("test", "example"),
+                HashMap::from([("key".to_string(), Value::String("old".to_string()))]),
+            )),
+            // No identifier set on `from`
+            to: Resource::new("test", "example")
+                .with_attribute("key", Value::String("new".to_string())),
+            lifecycle: LifecycleConfig::default(),
+            changed_create_only: vec!["key".to_string()],
+            cascading_updates: vec![],
+            temporary_name: None,
+        });
+
+        let result = interpreter.apply(&plan).await;
+        assert_eq!(result.failure_count, 1);
+        let err = result.outcomes[0].as_ref().unwrap_err();
+        assert!(
+            err.message.contains("identifier"),
+            "expected error about missing identifier, got: {}",
+            err.message
+        );
     }
 
     #[tokio::test]
