@@ -3075,6 +3075,75 @@ mod tests {
     }
 
     // =========================================================================
+    // Behavioral tests for array/map value conversion with unconvertible items
+    // =========================================================================
+
+    #[test]
+    fn test_json_to_value_array_with_null_drops_null_items() {
+        // JSON null cannot be represented as a DSL Value, so it is dropped.
+        // This test documents the behavior and ensures warnings are logged.
+        let json = serde_json::json!(["a", null, "b"]);
+        let result = json_to_value(&json);
+        let expected = Value::List(vec![
+            Value::String("a".to_string()),
+            Value::String("b".to_string()),
+        ]);
+        assert_eq!(result, Some(expected));
+    }
+
+    #[test]
+    fn test_json_to_value_map_with_null_value_drops_entry() {
+        let json = serde_json::json!({"key1": "val1", "key2": null});
+        let result = json_to_value(&json);
+        match result {
+            Some(Value::Map(map)) => {
+                assert_eq!(map.len(), 1);
+                assert_eq!(map.get("key1"), Some(&Value::String("val1".to_string())));
+                assert!(!map.contains_key("key2"));
+            }
+            other => panic!("Expected Some(Value::Map), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_aws_value_to_dsl_list_with_null_drops_null_items() {
+        let json = serde_json::json!(["a", null, "b"]);
+        let attr_type = AttributeType::List(Box::new(AttributeType::String));
+        let result = aws_value_to_dsl("test_attr", &json, &attr_type, "test.resource");
+        let expected = Value::List(vec![
+            Value::String("a".to_string()),
+            Value::String("b".to_string()),
+        ]);
+        assert_eq!(result, Some(expected));
+    }
+
+    #[test]
+    fn test_value_to_json_list_with_nan_drops_nan_items() {
+        // NaN floats cannot be represented in JSON, so they are dropped.
+        let value = Value::List(vec![
+            Value::Float(1.0),
+            Value::Float(f64::NAN),
+            Value::Float(2.0),
+        ]);
+        let result = value_to_json(&value);
+        let expected = serde_json::json!([1.0, 2.0]);
+        assert_eq!(result, Some(expected));
+    }
+
+    #[test]
+    fn test_dsl_value_to_aws_list_with_nan_drops_nan_items() {
+        let value = Value::List(vec![
+            Value::Float(1.0),
+            Value::Float(f64::NAN),
+            Value::Float(2.0),
+        ]);
+        let attr_type = AttributeType::List(Box::new(AttributeType::Float));
+        let result = dsl_value_to_aws(&value, &attr_type, "test.resource", "test_attr");
+        let expected = serde_json::json!([1.0, 2.0]);
+        assert_eq!(result, Some(expected));
+    }
+
+    // =========================================================================
     // parse_resource_properties tests
     // =========================================================================
 
