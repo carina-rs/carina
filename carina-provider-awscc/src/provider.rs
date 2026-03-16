@@ -367,7 +367,9 @@ impl AwsccProvider {
                     if let Some(vid) = version.version_id() {
                         id = id.version_id(vid);
                     }
-                    objects_to_delete.push(id.build().unwrap());
+                    objects_to_delete.push(id.build().map_err(|e| {
+                        ProviderError::new(format!("Failed to build ObjectIdentifier: {:?}", e))
+                    })?);
                 }
             }
 
@@ -378,7 +380,9 @@ impl AwsccProvider {
                     if let Some(vid) = marker.version_id() {
                         id = id.version_id(vid);
                     }
-                    objects_to_delete.push(id.build().unwrap());
+                    objects_to_delete.push(id.build().map_err(|e| {
+                        ProviderError::new(format!("Failed to build ObjectIdentifier: {:?}", e))
+                    })?);
                 }
             }
 
@@ -388,7 +392,9 @@ impl AwsccProvider {
                     .set_objects(Some(objects_to_delete))
                     .quiet(true)
                     .build()
-                    .unwrap();
+                    .map_err(|e| {
+                        ProviderError::new(format!("Failed to build Delete request: {:?}", e))
+                    })?;
 
                 s3.delete_objects()
                     .bucket(bucket_name)
