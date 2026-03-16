@@ -514,7 +514,7 @@ impl DiagnosticEngine {
         for (line_idx, line) in text.lines().enumerate() {
             let trimmed = line.trim();
 
-            if trimmed.starts_with("output ") && trimmed.contains('{') || trimmed == "output {" {
+            if trimmed.starts_with("output ") && trimmed.contains('{') {
                 in_output_block = true;
                 continue;
             }
@@ -548,7 +548,7 @@ impl DiagnosticEngine {
         for (line_idx, line) in text.lines().enumerate() {
             let trimmed = line.trim();
 
-            if trimmed.starts_with("output ") && trimmed.contains('{') || trimmed == "output {" {
+            if trimmed.starts_with("output ") && trimmed.contains('{') {
                 in_output_block = true;
                 continue;
             }

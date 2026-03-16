@@ -578,3 +578,32 @@ output {
         diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
     );
 }
+
+#[test]
+fn output_block_detection_with_brace_on_same_line() {
+    // Regression test: ensure output block detection works correctly
+    // after removing the redundant `|| trimmed == "output {"` condition.
+    // The simplified condition `starts_with("output ") && contains('{')` must
+    // still detect `output {` (the only valid output block syntax).
+    let engine = test_engine();
+    let doc = create_document(
+        r#"provider awscc {
+region = awscc.Region.ap_northeast_1
+}
+
+output {
+    flag: string = true
+}"#,
+    );
+
+    let diagnostics = engine.analyze(&doc, None);
+
+    let type_diag = diagnostics
+        .iter()
+        .find(|d| d.message.contains("Type mismatch") && d.message.contains("string"));
+    assert!(
+        type_diag.is_some(),
+        "Output block detection should work with simplified condition. Got diagnostics: {:?}",
+        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}
