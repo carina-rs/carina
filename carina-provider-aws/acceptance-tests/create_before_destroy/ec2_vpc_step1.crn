@@ -1,0 +1,19 @@
+# EC2 VPC - create_before_destroy test (step 1: initial)
+#
+# VPC has no name_attribute, so create_before_destroy replacement should
+# proceed without temporary name generation.
+
+provider aws {
+  region = aws.Region.ap_northeast_1
+}
+
+aws.ec2.vpc {
+  cidr_block           = "10.200.0.0/16"
+  enable_dns_support   = true
+  enable_dns_hostnames = true
+
+  tags = {
+    Name        = "carina-acc-test-cbd-vpc"
+    Environment = "acceptance-test"
+  }
+}

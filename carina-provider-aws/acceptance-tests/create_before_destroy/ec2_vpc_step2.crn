@@ -1,0 +1,23 @@
+# EC2 VPC - create_before_destroy test (step 2: replace)
+#
+# Changes cidr_block (create-only) with create_before_destroy lifecycle.
+# VPC has no name_attribute, so no temporary name is generated.
+
+provider aws {
+  region = aws.Region.ap_northeast_1
+}
+
+aws.ec2.vpc {
+  cidr_block           = "10.201.0.0/16"
+  enable_dns_support   = true
+  enable_dns_hostnames = true
+
+  lifecycle {
+    create_before_destroy = true
+  }
+
+  tags = {
+    Name        = "carina-acc-test-cbd-vpc"
+    Environment = "acceptance-test"
+  }
+}

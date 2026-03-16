@@ -1,0 +1,26 @@
+# EC2 Subnet - in-place update test (step 1)
+#
+# Tests: create subnet with map_public_ip_on_launch = false
+
+provider aws {
+  region = aws.Region.ap_northeast_1
+}
+
+let vpc = aws.ec2.vpc {
+  cidr_block = "10.101.0.0/16"
+
+  tags = {
+    Environment = "acceptance-test"
+  }
+}
+
+aws.ec2.subnet {
+  vpc_id                  = vpc.vpc_id
+  cidr_block              = "10.101.1.0/24"
+  availability_zone       = aws.AvailabilityZone.ap_northeast_1a
+  map_public_ip_on_launch = false
+
+  tags = {
+    Environment = "acceptance-test"
+  }
+}
