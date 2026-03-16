@@ -580,6 +580,34 @@ output {
 }
 
 #[test]
+fn nested_block_name_not_flagged_as_unknown() {
+    // When a nested struct field uses block_name (e.g., "transition" for "transitions"),
+    // validate_struct_value should not flag it as an unknown field.
+    let engine = test_engine_with_block_name_nested();
+    let doc = create_document(
+        r#"let r = test.block.resource {
+config = {
+    transition {
+        days = 30
+        storage_class = "GLACIER"
+    }
+}
+}"#,
+    );
+
+    let diagnostics = engine.analyze(&doc, None);
+
+    let unknown = diagnostics
+        .iter()
+        .find(|d| d.message.contains("Unknown field 'transition'"));
+    assert!(
+        unknown.is_none(),
+        "block_name 'transition' should not be flagged as unknown in nested struct. Got: {:?}",
+        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn find_let_binding_position_with_multibyte_leading_whitespace() {
     // Regression test for issue #724: find_let_binding_position uses byte offset
     // as character column. When multi-byte whitespace (e.g., full-width space U+3000)

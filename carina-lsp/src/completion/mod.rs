@@ -303,7 +303,9 @@ impl CompletionProvider {
 
         // Walk down the remaining path
         for name in &attr_path[1..] {
-            let field = fields.iter().find(|f| f.name == *name)?;
+            let field = fields
+                .iter()
+                .find(|f| f.name == *name || f.block_name.as_deref() == Some(name))?;
             fields = self.extract_struct_fields(&field.field_type)?;
         }
 
