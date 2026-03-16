@@ -1407,6 +1407,16 @@ fn parse_error_to_diagnostic(error: &ParseError) -> Diagnostic {
             message: format!("Module not found: {}", name),
             ..Default::default()
         },
+        ParseError::InternalError { expected, context } => Diagnostic {
+            range: Range::default(),
+            severity: Some(DiagnosticSeverity::ERROR),
+            source: Some("carina".to_string()),
+            message: format!(
+                "Internal parser error: expected {} in {}",
+                expected, context
+            ),
+            ..Default::default()
+        },
     }
 }
 
