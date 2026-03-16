@@ -36,6 +36,9 @@ pub enum ParseError {
 
     #[error("Module not found: {0}")]
     ModuleNotFound(String),
+
+    #[error("Internal parser error: expected {expected} in {context}")]
+    InternalError { expected: String, context: String },
 }
 
 /// Resource type path for typed references (e.g., aws.vpc, aws.security_group)
@@ -226,6 +229,32 @@ impl ParseContext {
     }
 }
 
+/// Helper to get the next element from a pest iterator, returning a ParseError on failure
+fn next_pair<'a>(
+    iter: &mut pest::iterators::Pairs<'a, Rule>,
+    expected: &str,
+    context: &str,
+) -> Result<pest::iterators::Pair<'a, Rule>, ParseError> {
+    iter.next().ok_or_else(|| ParseError::InternalError {
+        expected: expected.to_string(),
+        context: context.to_string(),
+    })
+}
+
+/// Helper to get the first inner pair from a pest pair
+fn first_inner<'a>(
+    pair: pest::iterators::Pair<'a, Rule>,
+    expected: &str,
+    context: &str,
+) -> Result<pest::iterators::Pair<'a, Rule>, ParseError> {
+    pair.into_inner()
+        .next()
+        .ok_or_else(|| ParseError::InternalError {
+            expected: expected.to_string(),
+            context: context.to_string(),
+        })
+}
+
 /// Parse a .crn file
 pub fn parse(input: &str) -> Result<ParsedFile, ParseError> {
     let pairs = CarinaParser::parse(Rule::file, input)?;
@@ -320,8 +349,14 @@ fn parse_input_block(pair: pest::iterators::Pair<Rule>) -> Result<Vec<InputParam
     for param in pair.into_inner() {
         if param.as_rule() == Rule::input_param {
             let mut param_inner = param.into_inner();
-            let name = param_inner.next().unwrap().as_str().to_string();
-            let type_expr = parse_type_expr(param_inner.next().unwrap())?;
+            let name = next_pair(&mut param_inner, "parameter name", "input block")?
+                .as_str()
+                .to_string();
+            let type_expr = parse_type_expr(next_pair(
+                &mut param_inner,
+                "type expression",
+                "input parameter",
+            )?)?;
             let default = if let Some(expr) = param_inner.next() {
                 Some(parse_expression(expr, &ctx)?)
             } else {
@@ -348,8 +383,14 @@ fn parse_output_block(
     for param in pair.into_inner() {
         if param.as_rule() == Rule::output_param {
             let mut param_inner = param.into_inner();
-            let name = param_inner.next().unwrap().as_str().to_string();
-            let type_expr = parse_type_expr(param_inner.next().unwrap())?;
+            let name = next_pair(&mut param_inner, "parameter name", "output block")?
+                .as_str()
+                .to_string();
+            let type_expr = parse_type_expr(next_pair(
+                &mut param_inner,
+                "type expression",
+                "output parameter",
+            )?)?;
             let value = if let Some(expr) = param_inner.next() {
                 Some(parse_expression(expr, ctx)?)
             } else {
@@ -368,7 +409,7 @@ fn parse_output_block(
 
 /// Parse type expression
 fn parse_type_expr(pair: pest::iterators::Pair<Rule>) -> Result<TypeExpr, ParseError> {
-    let inner = pair.into_inner().next().unwrap();
+    let inner = first_inner(pair, "type", "type expression")?;
     match inner.as_rule() {
         Rule::type_simple => match inner.as_str() {
             "string" => Ok(TypeExpr::String),
@@ -385,7 +426,11 @@ fn parse_type_expr(pair: pest::iterators::Pair<Rule>) -> Result<TypeExpr, ParseE
 
             // Get the inner type expression
             let mut generic_inner = inner.into_inner();
-            let inner_type = parse_type_expr(generic_inner.next().unwrap())?;
+            let inner_type = parse_type_expr(next_pair(
+                &mut generic_inner,
+                "inner type",
+                "generic type expression",
+            )?)?;
 
             if is_list {
                 Ok(TypeExpr::List(Box::new(inner_type)))
@@ -396,7 +441,7 @@ fn parse_type_expr(pair: pest::iterators::Pair<Rule>) -> Result<TypeExpr, ParseE
         Rule::type_ref => {
             // Parse ref(resource_type_path)
             let mut ref_inner = inner.into_inner();
-            let path_str = ref_inner.next().unwrap().as_str();
+            let path_str = next_pair(&mut ref_inner, "resource type path", "type ref")?.as_str();
             let path = ResourceTypePath::parse(path_str).ok_or_else(|| {
                 ParseError::InvalidResourceType(format!("Invalid resource type path: {}", path_str))
             })?;
@@ -409,8 +454,10 @@ fn parse_type_expr(pair: pest::iterators::Pair<Rule>) -> Result<TypeExpr, ParseE
 /// Parse import statement
 fn parse_import_stmt(pair: pest::iterators::Pair<Rule>) -> Result<ImportStatement, ParseError> {
     let mut inner = pair.into_inner();
-    let path = parse_string(inner.next().unwrap());
-    let alias = inner.next().unwrap().as_str().to_string();
+    let path = parse_string(next_pair(&mut inner, "import path", "import statement")?);
+    let alias = next_pair(&mut inner, "alias", "import statement")?
+        .as_str()
+        .to_string();
 
     Ok(ImportStatement { path, alias })
 }
@@ -421,14 +468,21 @@ fn parse_module_call(
     ctx: &ParseContext,
 ) -> Result<ModuleCall, ParseError> {
     let mut inner = pair.into_inner();
-    let module_name = inner.next().unwrap().as_str().to_string();
+    let module_name = next_pair(&mut inner, "module name", "module call")?
+        .as_str()
+        .to_string();
 
     let mut arguments = HashMap::new();
     for arg in inner {
         if arg.as_rule() == Rule::module_call_arg {
             let mut arg_inner = arg.into_inner();
-            let key = arg_inner.next().unwrap().as_str().to_string();
-            let value = parse_expression(arg_inner.next().unwrap(), ctx)?;
+            let key = next_pair(&mut arg_inner, "argument name", "module call argument")?
+                .as_str()
+                .to_string();
+            let value = parse_expression(
+                next_pair(&mut arg_inner, "argument value", "module call argument")?,
+                ctx,
+            )?;
             arguments.insert(key, value);
         }
     }
@@ -446,8 +500,10 @@ fn parse_let_binding_extended(
     ctx: &ParseContext,
 ) -> Result<(String, Value, Option<Resource>, Option<ModuleCall>), ParseError> {
     let mut inner = pair.into_inner();
-    let name = inner.next().unwrap().as_str().to_string();
-    let expr_pair = inner.next().unwrap();
+    let name = next_pair(&mut inner, "binding name", "let binding")?
+        .as_str()
+        .to_string();
+    let expr_pair = next_pair(&mut inner, "expression", "let binding")?;
 
     // Check if it's a module call or resource expression
     let (value, maybe_resource, maybe_module_call) =
@@ -462,7 +518,7 @@ fn parse_expression_with_resource_or_module(
     ctx: &ParseContext,
     binding_name: &str,
 ) -> Result<(Value, Option<Resource>, Option<ModuleCall>), ParseError> {
-    let inner = pair.into_inner().next().unwrap();
+    let inner = first_inner(pair, "expression", "expression with resource or module")?;
     parse_pipe_expr_with_resource_or_module(inner, ctx, binding_name)
 }
 
@@ -472,7 +528,7 @@ fn parse_pipe_expr_with_resource_or_module(
     binding_name: &str,
 ) -> Result<(Value, Option<Resource>, Option<ModuleCall>), ParseError> {
     let mut inner = pair.into_inner();
-    let primary = inner.next().unwrap();
+    let primary = next_pair(&mut inner, "primary expression", "pipe expression")?;
     let (value, maybe_resource, maybe_module_call) =
         parse_primary_with_resource_or_module(primary, ctx, binding_name)?;
 
@@ -492,7 +548,7 @@ fn parse_primary_with_resource_or_module(
     ctx: &ParseContext,
     binding_name: &str,
 ) -> Result<(Value, Option<Resource>, Option<ModuleCall>), ParseError> {
-    let inner = pair.into_inner().next().unwrap();
+    let inner = first_inner(pair, "value", "primary expression")?;
 
     match inner.as_rule() {
         Rule::read_resource_expr => {
@@ -519,14 +575,21 @@ fn parse_provider_block(
     ctx: &ParseContext,
 ) -> Result<ProviderConfig, ParseError> {
     let mut inner = pair.into_inner();
-    let name = inner.next().unwrap().as_str().to_string();
+    let name = next_pair(&mut inner, "provider name", "provider block")?
+        .as_str()
+        .to_string();
 
     let mut attributes = HashMap::new();
     for attr_pair in inner {
         if attr_pair.as_rule() == Rule::attribute {
             let mut attr_inner = attr_pair.into_inner();
-            let key = attr_inner.next().unwrap().as_str().to_string();
-            let value = parse_expression(attr_inner.next().unwrap(), ctx)?;
+            let key = next_pair(&mut attr_inner, "attribute name", "provider block")?
+                .as_str()
+                .to_string();
+            let value = parse_expression(
+                next_pair(&mut attr_inner, "attribute value", "provider block")?,
+                ctx,
+            )?;
             attributes.insert(key, value);
         }
     }
@@ -539,14 +602,21 @@ fn parse_backend_block(
     ctx: &ParseContext,
 ) -> Result<BackendConfig, ParseError> {
     let mut inner = pair.into_inner();
-    let backend_type = inner.next().unwrap().as_str().to_string();
+    let backend_type = next_pair(&mut inner, "backend type", "backend block")?
+        .as_str()
+        .to_string();
 
     let mut attributes = HashMap::new();
     for attr_pair in inner {
         if attr_pair.as_rule() == Rule::attribute {
             let mut attr_inner = attr_pair.into_inner();
-            let key = attr_inner.next().unwrap().as_str().to_string();
-            let value = parse_expression(attr_inner.next().unwrap(), ctx)?;
+            let key = next_pair(&mut attr_inner, "attribute name", "backend block")?
+                .as_str()
+                .to_string();
+            let value = parse_expression(
+                next_pair(&mut attr_inner, "attribute value", "backend block")?,
+                ctx,
+            )?;
             attributes.insert(key, value);
         }
     }
@@ -563,7 +633,9 @@ fn parse_anonymous_resource(
 ) -> Result<Resource, ParseError> {
     let mut inner = pair.into_inner();
 
-    let namespaced_type = inner.next().unwrap().as_str().to_string();
+    let namespaced_type = next_pair(&mut inner, "resource type", "anonymous resource")?
+        .as_str()
+        .to_string();
 
     // Extract resource type from namespace (aws.s3_bucket -> s3_bucket)
     let parts: Vec<&str> = namespaced_type.split('.').collect();
@@ -609,17 +681,24 @@ fn parse_block_contents(
     for content_pair in pairs {
         match content_pair.as_rule() {
             Rule::block_content => {
-                let inner = content_pair.into_inner().next().unwrap();
+                let inner = first_inner(content_pair, "block content item", "block content")?;
                 match inner.as_rule() {
                     Rule::attribute => {
                         let mut attr_inner = inner.into_inner();
-                        let key = attr_inner.next().unwrap().as_str().to_string();
-                        let value = parse_expression(attr_inner.next().unwrap(), ctx)?;
+                        let key = next_pair(&mut attr_inner, "attribute name", "block content")?
+                            .as_str()
+                            .to_string();
+                        let value = parse_expression(
+                            next_pair(&mut attr_inner, "attribute value", "block content")?,
+                            ctx,
+                        )?;
                         attributes.insert(key, value);
                     }
                     Rule::nested_block => {
                         let mut block_inner = inner.into_inner();
-                        let block_name = block_inner.next().unwrap().as_str().to_string();
+                        let block_name = next_pair(&mut block_inner, "block name", "nested block")?
+                            .as_str()
+                            .to_string();
 
                         // Recursively parse nested block contents (supports arbitrary depth)
                         let block_attrs = parse_block_contents(block_inner, ctx)?;
@@ -635,8 +714,13 @@ fn parse_block_contents(
             }
             Rule::attribute => {
                 let mut attr_inner = content_pair.into_inner();
-                let key = attr_inner.next().unwrap().as_str().to_string();
-                let value = parse_expression(attr_inner.next().unwrap(), ctx)?;
+                let key = next_pair(&mut attr_inner, "attribute name", "block content")?
+                    .as_str()
+                    .to_string();
+                let value = parse_expression(
+                    next_pair(&mut attr_inner, "attribute value", "block content")?,
+                    ctx,
+                )?;
                 attributes.insert(key, value);
             }
             _ => {}
@@ -677,7 +761,9 @@ fn parse_resource_expr(
 ) -> Result<Resource, ParseError> {
     let mut inner = pair.into_inner();
 
-    let namespaced_type = inner.next().unwrap().as_str().to_string();
+    let namespaced_type = next_pair(&mut inner, "resource type", "resource expression")?
+        .as_str()
+        .to_string();
 
     // Extract resource type from namespace (aws.s3_bucket -> s3_bucket)
     let parts: Vec<&str> = namespaced_type.split('.').collect();
@@ -723,7 +809,9 @@ fn parse_read_resource_expr(
 ) -> Result<Resource, ParseError> {
     let mut inner = pair.into_inner();
 
-    let namespaced_type = inner.next().unwrap().as_str().to_string();
+    let namespaced_type = next_pair(&mut inner, "resource type", "read resource expression")?
+        .as_str()
+        .to_string();
 
     // Extract resource type from namespace (aws.s3_bucket -> s3_bucket)
     let parts: Vec<&str> = namespaced_type.split('.').collect();
@@ -767,7 +855,7 @@ fn parse_expression(
     pair: pest::iterators::Pair<Rule>,
     ctx: &ParseContext,
 ) -> Result<Value, ParseError> {
-    let inner = pair.into_inner().next().unwrap();
+    let inner = first_inner(pair, "expression body", "expression")?;
     parse_pipe_expr(inner, ctx)
 }
 
@@ -776,7 +864,7 @@ fn parse_pipe_expr(
     ctx: &ParseContext,
 ) -> Result<Value, ParseError> {
     let mut inner = pair.into_inner();
-    let primary = inner.next().unwrap();
+    let primary = next_pair(&mut inner, "primary expression", "pipe expression")?;
     let value = parse_primary_value(primary, ctx)?;
 
     // Pipe operator is parsed but not yet implemented — reject with a clear error
@@ -796,7 +884,7 @@ fn parse_primary_value(
 ) -> Result<Value, ParseError> {
     // For primary, get inner content; otherwise process directly
     let inner = if pair.as_rule() == Rule::primary {
-        pair.into_inner().next().unwrap()
+        first_inner(pair, "value", "primary expression")?
     } else {
         pair
     };
@@ -804,7 +892,7 @@ fn parse_primary_value(
     match inner.as_rule() {
         Rule::env_var => {
             let mut env_inner = inner.into_inner();
-            let var_name = parse_string(env_inner.next().unwrap());
+            let var_name = parse_string(next_pair(&mut env_inner, "variable name", "env() call")?);
             match env::var(&var_name) {
                 Ok(val) => Ok(Value::String(val)),
                 Err(_) => Err(ParseError::EnvVarNotSet(var_name)),
@@ -831,13 +919,21 @@ fn parse_primary_value(
                 match entry.as_rule() {
                     Rule::map_entry => {
                         let mut entry_inner = entry.into_inner();
-                        let key = entry_inner.next().unwrap().as_str().to_string();
-                        let value = parse_expression(entry_inner.next().unwrap(), ctx)?;
+                        let key = next_pair(&mut entry_inner, "map key", "map entry")?
+                            .as_str()
+                            .to_string();
+                        let value = parse_expression(
+                            next_pair(&mut entry_inner, "map value", "map entry")?,
+                            ctx,
+                        )?;
                         map.insert(key, value);
                     }
                     Rule::nested_block => {
                         let mut block_inner = entry.into_inner();
-                        let block_name = block_inner.next().unwrap().as_str().to_string();
+                        let block_name =
+                            next_pair(&mut block_inner, "block name", "nested block in map")?
+                                .as_str()
+                                .to_string();
                         let block_attrs = parse_block_contents(block_inner, ctx)?;
                         nested_blocks
                             .entry(block_name)
@@ -928,7 +1024,7 @@ fn parse_primary_value(
         Rule::variable_ref => {
             // variable_ref can be "identifier" or "identifier.identifier" (member access)
             let mut parts = inner.into_inner();
-            let first_ident = parts.next().unwrap().as_str();
+            let first_ident = next_pair(&mut parts, "identifier", "variable reference")?.as_str();
 
             if let Some(second_part) = parts.next() {
                 // Member access: resource.attribute or input.param
@@ -2287,6 +2383,20 @@ aws.s3.bucket {
         assert!(
             err.contains("Pipe operator is not yet supported"),
             "expected 'Pipe operator is not yet supported' error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_error_has_internal_error_variant() {
+        // Verify the InternalError variant exists and formats correctly
+        let err = ParseError::InternalError {
+            expected: "identifier".to_string(),
+            context: "provider block".to_string(),
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("expected identifier in provider block"),
+            "InternalError should format with expected and context, got: {msg}"
         );
     }
 }
