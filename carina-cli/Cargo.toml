@@ -17,9 +17,9 @@ carina-state = { path = "../carina-state" }
 chrono = "0.4"
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 colored = "3"
+env_logger = "0.11"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-env_logger = "0.11"
 similar = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
