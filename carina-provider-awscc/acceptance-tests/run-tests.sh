@@ -7,6 +7,8 @@
 # Options:
 #   --accounts START-END  Use only accounts in range (e.g., 0-3, 4-6, 7-9)
 #                         Enables concurrent runs with non-overlapping account pools
+#   --include-slow        Include tests marked as slow (skipped by default)
+#                         Tests are marked slow by placing a .slow file next to the .crn file
 #
 # Commands:
 #   validate   - Validate .crn files (default, no AWS credentials needed)
@@ -33,6 +35,8 @@
 #   ./run-tests.sh full ec2_ipam ec2_vpc/with_ipam   # multiple filters in single invocation
 #   ./run-tests.sh full --accounts 0-3 iam_role      # use only accounts 000-003
 #   ./run-tests.sh full --accounts 4-6 ec2_vpc       # concurrent run with accounts 004-006
+#   ./run-tests.sh full --include-slow               # include slow tests in the run
+#   ./run-tests.sh full ec2_subnet/with_ipam          # slow tests run when explicitly filtered
 #   ./run-tests.sh cleanup                           # destroy all matching tests across 10 accounts
 #   ./run-tests.sh cleanup ec2_vpc                   # destroy VPC tests only across 10 accounts
 
@@ -44,8 +48,9 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 # ── Parse options ─────────────────────────────────────────────────────
 ACCOUNT_START=""
 ACCOUNT_END=""
+INCLUDE_SLOW=0
 
-# Parse --accounts before command
+# Parse options before command
 ARGS=()
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -70,6 +75,10 @@ while [ $# -gt 0 ]; do
                 exit 1
             fi
             shift 2
+            ;;
+        --include-slow)
+            INCLUDE_SLOW=1
+            shift
             ;;
         *)
             ARGS+=("$1")
@@ -213,7 +222,15 @@ matches_any_filter() {
     return 1
 }
 
+# is_slow_test: returns 0 if the test has a .slow marker file
+is_slow_test() {
+    local crn_file="$1"
+    local slow_file="${crn_file%.crn}.slow"
+    [ -f "$slow_file" ]
+}
+
 TESTS=()
+SKIPPED_SLOW=()
 while IFS= read -r -d '' file; do
     REL_PATH="${file#$SCRIPT_DIR/}"
     if ! matches_any_filter "$REL_PATH"; then
@@ -224,8 +241,21 @@ while IFS= read -r -d '' file; do
     if [ -f "$DIR_OF_FILE/run.sh" ]; then
         continue
     fi
+    # Skip slow tests unless --include-slow is set or a filter is provided
+    if is_slow_test "$file" && [ $INCLUDE_SLOW -eq 0 ] && [ ${#FILTERS[@]} -eq 0 ]; then
+        SKIPPED_SLOW+=("$REL_PATH")
+        continue
+    fi
     TESTS+=("$file")
 done < <(find "$SCRIPT_DIR" -name "*.crn" -print0 | sort -z)
+
+if [ ${#SKIPPED_SLOW[@]} -gt 0 ]; then
+    echo "Skipping ${#SKIPPED_SLOW[@]} slow test(s) (use --include-slow to include):"
+    for SLOW_TEST in "${SKIPPED_SLOW[@]}"; do
+        echo "  $SLOW_TEST"
+    done
+    echo ""
+fi
 
 if [ ${#TESTS[@]} -eq 0 ]; then
     if [ ${#FILTERS[@]} -gt 0 ]; then
