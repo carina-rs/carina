@@ -192,6 +192,24 @@ mod tests {
     }
 
     #[test]
+    fn test_value_to_json_nan_in_list_returns_error() {
+        let v = Value::List(vec![Value::Int(1), Value::Float(f64::NAN)]);
+        let result = value_to_json(&v);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("NaN"));
+    }
+
+    #[test]
+    fn test_value_to_json_nan_in_map_returns_error() {
+        let mut map = HashMap::new();
+        map.insert("key".to_string(), Value::Float(f64::INFINITY));
+        let v = Value::Map(map);
+        let result = value_to_json(&v);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("inf"));
+    }
+
+    #[test]
     fn test_value_to_json_bool() {
         let v = Value::Bool(true);
         assert_eq!(value_to_json(&v).unwrap(), serde_json::json!(true));
