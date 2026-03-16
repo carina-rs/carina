@@ -987,4 +987,848 @@ mod tests {
             ))
         );
     }
+
+    // --- convert_protocol_value tests ---
+
+    #[test]
+    fn test_convert_protocol_value_tcp() {
+        assert_eq!(convert_protocol_value("tcp"), "tcp");
+    }
+
+    #[test]
+    fn test_convert_protocol_value_udp() {
+        assert_eq!(convert_protocol_value("udp"), "udp");
+    }
+
+    #[test]
+    fn test_convert_protocol_value_all_keyword() {
+        assert_eq!(convert_protocol_value("all"), "-1");
+    }
+
+    #[test]
+    fn test_convert_protocol_value_minus_one() {
+        assert_eq!(convert_protocol_value("-1"), "-1");
+    }
+
+    #[test]
+    fn test_convert_protocol_value_dsl_format_tcp() {
+        assert_eq!(convert_protocol_value("aws.Protocol.tcp"), "tcp");
+    }
+
+    #[test]
+    fn test_convert_protocol_value_dsl_format_all() {
+        assert_eq!(convert_protocol_value("aws.Protocol.all"), "-1");
+    }
+
+    #[test]
+    fn test_convert_protocol_value_short_dsl_format() {
+        assert_eq!(convert_protocol_value("Protocol.tcp"), "tcp");
+    }
+
+    // --- ec2_tags_to_value tests ---
+
+    #[test]
+    fn test_ec2_tags_to_value_empty() {
+        let tags: Vec<aws_sdk_ec2::types::Tag> = vec![];
+        assert_eq!(AwsProvider::ec2_tags_to_value(&tags), None);
+    }
+
+    #[test]
+    fn test_ec2_tags_to_value_single_tag() {
+        let tags = vec![
+            aws_sdk_ec2::types::Tag::builder()
+                .key("Name")
+                .value("my-resource")
+                .build(),
+        ];
+        let result = AwsProvider::ec2_tags_to_value(&tags);
+        assert!(result.is_some());
+        if let Some(Value::Map(map)) = result {
+            assert_eq!(
+                map.get("Name"),
+                Some(&Value::String("my-resource".to_string()))
+            );
+        } else {
+            panic!("Expected Value::Map");
+        }
+    }
+
+    #[test]
+    fn test_ec2_tags_to_value_multiple_tags() {
+        let tags = vec![
+            aws_sdk_ec2::types::Tag::builder()
+                .key("Name")
+                .value("test")
+                .build(),
+            aws_sdk_ec2::types::Tag::builder()
+                .key("Environment")
+                .value("production")
+                .build(),
+        ];
+        let result = AwsProvider::ec2_tags_to_value(&tags);
+        if let Some(Value::Map(map)) = result {
+            assert_eq!(map.len(), 2);
+            assert_eq!(map.get("Name"), Some(&Value::String("test".to_string())));
+            assert_eq!(
+                map.get("Environment"),
+                Some(&Value::String("production".to_string()))
+            );
+        } else {
+            panic!("Expected Value::Map with 2 entries");
+        }
+    }
+
+    #[test]
+    fn test_ec2_tags_to_value_missing_key_or_value() {
+        // Tag with no key set
+        let tags = vec![aws_sdk_ec2::types::Tag::builder().build()];
+        assert_eq!(AwsProvider::ec2_tags_to_value(&tags), None);
+    }
+
+    // --- value_to_ec2_tags tests ---
+
+    #[test]
+    fn test_value_to_ec2_tags_from_map() {
+        let value = Value::Map(HashMap::from([
+            ("Name".to_string(), Value::String("test".to_string())),
+            ("Env".to_string(), Value::String("prod".to_string())),
+        ]));
+        let tags = AwsProvider::value_to_ec2_tags(&value);
+        assert_eq!(tags.len(), 2);
+        // Check both tags exist (order not guaranteed from HashMap)
+        let tag_map: HashMap<String, String> = tags
+            .iter()
+            .map(|t| {
+                (
+                    t.key().unwrap_or("").to_string(),
+                    t.value().unwrap_or("").to_string(),
+                )
+            })
+            .collect();
+        assert_eq!(tag_map.get("Name"), Some(&"test".to_string()));
+        assert_eq!(tag_map.get("Env"), Some(&"prod".to_string()));
+    }
+
+    #[test]
+    fn test_value_to_ec2_tags_non_map_value() {
+        let value = Value::String("not a map".to_string());
+        let tags = AwsProvider::value_to_ec2_tags(&value);
+        assert!(tags.is_empty());
+    }
+
+    #[test]
+    fn test_value_to_ec2_tags_non_string_values_skipped() {
+        let value = Value::Map(HashMap::from([
+            ("Name".to_string(), Value::String("test".to_string())),
+            ("Count".to_string(), Value::Int(42)),
+        ]));
+        let tags = AwsProvider::value_to_ec2_tags(&value);
+        assert_eq!(tags.len(), 1);
+        assert_eq!(tags[0].key(), Some("Name"));
+        assert_eq!(tags[0].value(), Some("test"));
+    }
+
+    #[test]
+    fn test_value_to_ec2_tags_empty_map() {
+        let value = Value::Map(HashMap::new());
+        let tags = AwsProvider::value_to_ec2_tags(&value);
+        assert!(tags.is_empty());
+    }
+
+    // --- extract_ec2_vpc_attributes tests ---
+
+    #[test]
+    fn test_extract_ec2_vpc_attributes() {
+        let vpc = aws_sdk_ec2::types::Vpc::builder()
+            .vpc_id("vpc-12345678")
+            .cidr_block("10.0.0.0/16")
+            .instance_tenancy(aws_sdk_ec2::types::Tenancy::Default)
+            .build();
+        let mut attributes = HashMap::new();
+        let identifier = AwsProvider::extract_ec2_vpc_attributes(&vpc, &mut attributes);
+        assert_eq!(identifier, Some("vpc-12345678".to_string()));
+        assert_eq!(
+            attributes.get("vpc_id"),
+            Some(&Value::String("vpc-12345678".to_string()))
+        );
+        assert_eq!(
+            attributes.get("cidr_block"),
+            Some(&Value::String("10.0.0.0/16".to_string()))
+        );
+        assert_eq!(
+            attributes.get("instance_tenancy"),
+            Some(&Value::String("default".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_extract_ec2_vpc_attributes_minimal() {
+        let vpc = aws_sdk_ec2::types::Vpc::builder().build();
+        let mut attributes = HashMap::new();
+        let identifier = AwsProvider::extract_ec2_vpc_attributes(&vpc, &mut attributes);
+        assert_eq!(identifier, None);
+        assert!(attributes.is_empty());
+    }
+
+    // --- extract_ec2_subnet_attributes tests ---
+
+    #[test]
+    fn test_extract_ec2_subnet_attributes() {
+        let subnet = aws_sdk_ec2::types::Subnet::builder()
+            .subnet_id("subnet-12345678")
+            .vpc_id("vpc-12345678")
+            .cidr_block("10.0.1.0/24")
+            .availability_zone("ap-northeast-1a")
+            .map_public_ip_on_launch(false)
+            .build();
+        let mut attributes = HashMap::new();
+        let identifier = AwsProvider::extract_ec2_subnet_attributes(&subnet, &mut attributes);
+        assert_eq!(identifier, Some("subnet-12345678".to_string()));
+        assert_eq!(
+            attributes.get("subnet_id"),
+            Some(&Value::String("subnet-12345678".to_string()))
+        );
+        assert_eq!(
+            attributes.get("vpc_id"),
+            Some(&Value::String("vpc-12345678".to_string()))
+        );
+        assert_eq!(
+            attributes.get("cidr_block"),
+            Some(&Value::String("10.0.1.0/24".to_string()))
+        );
+        assert_eq!(
+            attributes.get("availability_zone"),
+            Some(&Value::String("ap-northeast-1a".to_string()))
+        );
+        assert_eq!(
+            attributes.get("map_public_ip_on_launch"),
+            Some(&Value::Bool(false))
+        );
+    }
+
+    #[test]
+    fn test_extract_ec2_subnet_attributes_minimal() {
+        let subnet = aws_sdk_ec2::types::Subnet::builder().build();
+        let mut attributes = HashMap::new();
+        let identifier = AwsProvider::extract_ec2_subnet_attributes(&subnet, &mut attributes);
+        assert_eq!(identifier, None);
+    }
+
+    // --- extract_ec2_internet_gateway_attributes tests ---
+
+    #[test]
+    fn test_extract_ec2_internet_gateway_attributes() {
+        let igw = aws_sdk_ec2::types::InternetGateway::builder()
+            .internet_gateway_id("igw-12345678")
+            .build();
+        let mut attributes = HashMap::new();
+        let identifier =
+            AwsProvider::extract_ec2_internet_gateway_attributes(&igw, &mut attributes);
+        assert_eq!(identifier, Some("igw-12345678".to_string()));
+        assert_eq!(
+            attributes.get("internet_gateway_id"),
+            Some(&Value::String("igw-12345678".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_extract_ec2_internet_gateway_attributes_minimal() {
+        let igw = aws_sdk_ec2::types::InternetGateway::builder().build();
+        let mut attributes = HashMap::new();
+        let identifier =
+            AwsProvider::extract_ec2_internet_gateway_attributes(&igw, &mut attributes);
+        assert_eq!(identifier, None);
+        assert!(attributes.is_empty());
+    }
+
+    // --- extract_ec2_route_table_attributes tests ---
+
+    #[test]
+    fn test_extract_ec2_route_table_attributes() {
+        let rt = aws_sdk_ec2::types::RouteTable::builder()
+            .route_table_id("rtb-12345678")
+            .vpc_id("vpc-12345678")
+            .build();
+        let mut attributes = HashMap::new();
+        let identifier = AwsProvider::extract_ec2_route_table_attributes(&rt, &mut attributes);
+        assert_eq!(identifier, Some("rtb-12345678".to_string()));
+        assert_eq!(
+            attributes.get("route_table_id"),
+            Some(&Value::String("rtb-12345678".to_string()))
+        );
+        assert_eq!(
+            attributes.get("vpc_id"),
+            Some(&Value::String("vpc-12345678".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_extract_ec2_route_table_attributes_minimal() {
+        let rt = aws_sdk_ec2::types::RouteTable::builder().build();
+        let mut attributes = HashMap::new();
+        let identifier = AwsProvider::extract_ec2_route_table_attributes(&rt, &mut attributes);
+        assert_eq!(identifier, None);
+    }
+
+    // --- extract_ec2_route_attributes tests ---
+
+    #[test]
+    fn test_extract_ec2_route_attributes() {
+        let route = aws_sdk_ec2::types::Route::builder()
+            .destination_cidr_block("0.0.0.0/0")
+            .gateway_id("igw-12345678")
+            .build();
+        let mut attributes = HashMap::new();
+        let identifier = AwsProvider::extract_ec2_route_attributes(&route, &mut attributes);
+        // Route extraction returns None (no single identifier)
+        assert_eq!(identifier, None);
+        assert_eq!(
+            attributes.get("destination_cidr_block"),
+            Some(&Value::String("0.0.0.0/0".to_string()))
+        );
+        assert_eq!(
+            attributes.get("gateway_id"),
+            Some(&Value::String("igw-12345678".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_extract_ec2_route_attributes_with_nat_gateway() {
+        let route = aws_sdk_ec2::types::Route::builder()
+            .destination_cidr_block("10.0.0.0/8")
+            .nat_gateway_id("nat-12345678")
+            .build();
+        let mut attributes = HashMap::new();
+        AwsProvider::extract_ec2_route_attributes(&route, &mut attributes);
+        assert_eq!(
+            attributes.get("destination_cidr_block"),
+            Some(&Value::String("10.0.0.0/8".to_string()))
+        );
+        assert_eq!(
+            attributes.get("nat_gateway_id"),
+            Some(&Value::String("nat-12345678".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_extract_ec2_route_attributes_with_transit_gateway() {
+        let route = aws_sdk_ec2::types::Route::builder()
+            .destination_cidr_block("172.16.0.0/12")
+            .transit_gateway_id("tgw-12345678")
+            .build();
+        let mut attributes = HashMap::new();
+        AwsProvider::extract_ec2_route_attributes(&route, &mut attributes);
+        assert_eq!(
+            attributes.get("transit_gateway_id"),
+            Some(&Value::String("tgw-12345678".to_string()))
+        );
+    }
+
+    // --- extract_ec2_security_group_attributes tests ---
+
+    #[test]
+    fn test_extract_ec2_security_group_attributes() {
+        let sg = aws_sdk_ec2::types::SecurityGroup::builder()
+            .group_id("sg-12345678")
+            .group_name("test-sg")
+            .description("Test security group")
+            .vpc_id("vpc-12345678")
+            .build();
+        let mut attributes = HashMap::new();
+        let identifier = AwsProvider::extract_ec2_security_group_attributes(&sg, &mut attributes);
+        assert_eq!(identifier, Some("sg-12345678".to_string()));
+        assert_eq!(
+            attributes.get("group_id"),
+            Some(&Value::String("sg-12345678".to_string()))
+        );
+        assert_eq!(
+            attributes.get("group_name"),
+            Some(&Value::String("test-sg".to_string()))
+        );
+        assert_eq!(
+            attributes.get("description"),
+            Some(&Value::String("Test security group".to_string()))
+        );
+        assert_eq!(
+            attributes.get("vpc_id"),
+            Some(&Value::String("vpc-12345678".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_extract_ec2_security_group_attributes_minimal() {
+        let sg = aws_sdk_ec2::types::SecurityGroup::builder().build();
+        let mut attributes = HashMap::new();
+        let identifier = AwsProvider::extract_ec2_security_group_attributes(&sg, &mut attributes);
+        assert_eq!(identifier, None);
+    }
+
+    // --- extract_ec2_security_group_ingress_attributes tests ---
+
+    #[test]
+    fn test_extract_ec2_security_group_ingress_attributes() {
+        let rule = aws_sdk_ec2::types::SecurityGroupRule::builder()
+            .security_group_rule_id("sgr-12345678")
+            .group_id("sg-12345678")
+            .ip_protocol("tcp")
+            .from_port(443)
+            .to_port(443)
+            .description("HTTPS")
+            .build();
+        let mut attributes = HashMap::new();
+        let identifier =
+            AwsProvider::extract_ec2_security_group_ingress_attributes(&rule, &mut attributes);
+        assert_eq!(identifier, Some("sgr-12345678".to_string()));
+        assert_eq!(
+            attributes.get("security_group_rule_id"),
+            Some(&Value::String("sgr-12345678".to_string()))
+        );
+        assert_eq!(
+            attributes.get("group_id"),
+            Some(&Value::String("sg-12345678".to_string()))
+        );
+        assert_eq!(
+            attributes.get("ip_protocol"),
+            Some(&Value::String("tcp".to_string()))
+        );
+        assert_eq!(attributes.get("from_port"), Some(&Value::Int(443)));
+        assert_eq!(attributes.get("to_port"), Some(&Value::Int(443)));
+        assert_eq!(
+            attributes.get("description"),
+            Some(&Value::String("HTTPS".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_extract_ec2_security_group_ingress_attributes_with_prefix_list() {
+        let rule = aws_sdk_ec2::types::SecurityGroupRule::builder()
+            .security_group_rule_id("sgr-99999999")
+            .group_id("sg-12345678")
+            .ip_protocol("tcp")
+            .from_port(80)
+            .to_port(80)
+            .prefix_list_id("pl-12345678")
+            .build();
+        let mut attributes = HashMap::new();
+        AwsProvider::extract_ec2_security_group_ingress_attributes(&rule, &mut attributes);
+        assert_eq!(
+            attributes.get("source_prefix_list_id"),
+            Some(&Value::String("pl-12345678".to_string()))
+        );
+    }
+
+    // --- extract_ec2_security_group_egress_attributes tests ---
+
+    #[test]
+    fn test_extract_ec2_security_group_egress_attributes() {
+        let rule = aws_sdk_ec2::types::SecurityGroupRule::builder()
+            .security_group_rule_id("sgr-87654321")
+            .group_id("sg-12345678")
+            .ip_protocol("-1")
+            .from_port(0)
+            .to_port(0)
+            .build();
+        let mut attributes = HashMap::new();
+        let identifier =
+            AwsProvider::extract_ec2_security_group_egress_attributes(&rule, &mut attributes);
+        assert_eq!(identifier, Some("sgr-87654321".to_string()));
+        assert_eq!(
+            attributes.get("group_id"),
+            Some(&Value::String("sg-12345678".to_string()))
+        );
+        assert_eq!(
+            attributes.get("ip_protocol"),
+            Some(&Value::String("-1".to_string()))
+        );
+        assert_eq!(attributes.get("from_port"), Some(&Value::Int(0)));
+        assert_eq!(attributes.get("to_port"), Some(&Value::Int(0)));
+    }
+
+    #[test]
+    fn test_extract_ec2_security_group_egress_attributes_with_prefix_list() {
+        let rule = aws_sdk_ec2::types::SecurityGroupRule::builder()
+            .security_group_rule_id("sgr-11111111")
+            .group_id("sg-12345678")
+            .ip_protocol("tcp")
+            .from_port(443)
+            .to_port(443)
+            .prefix_list_id("pl-87654321")
+            .build();
+        let mut attributes = HashMap::new();
+        AwsProvider::extract_ec2_security_group_egress_attributes(&rule, &mut attributes);
+        assert_eq!(
+            attributes.get("destination_prefix_list_id"),
+            Some(&Value::String("pl-87654321".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_extract_ec2_security_group_egress_attributes_with_ipv6() {
+        let rule = aws_sdk_ec2::types::SecurityGroupRule::builder()
+            .security_group_rule_id("sgr-22222222")
+            .group_id("sg-12345678")
+            .ip_protocol("-1")
+            .from_port(0)
+            .to_port(0)
+            .cidr_ipv6("::/0")
+            .build();
+        let mut attributes = HashMap::new();
+        AwsProvider::extract_ec2_security_group_egress_attributes(&rule, &mut attributes);
+        assert_eq!(
+            attributes.get("cidr_ipv6"),
+            Some(&Value::String("::/0".to_string()))
+        );
+    }
+
+    // --- resolve_enum_identifiers for EC2 types ---
+
+    #[test]
+    fn test_resolve_enum_identifiers_ec2_vpc_instance_tenancy() {
+        let mut resource = Resource::new("ec2.vpc", "test-vpc");
+        resource
+            .attributes
+            .insert("_provider".to_string(), Value::String("aws".to_string()));
+        resource.attributes.insert(
+            "instance_tenancy".to_string(),
+            Value::UnresolvedIdent("InstanceTenancy".to_string(), Some("dedicated".to_string())),
+        );
+        let mut resources = vec![resource];
+        resolve_enum_identifiers_impl(&mut resources);
+        assert_eq!(
+            resources[0].attributes.get("instance_tenancy"),
+            Some(&Value::String(
+                "aws.ec2.vpc.InstanceTenancy.dedicated".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn test_resolve_enum_identifiers_ec2_security_group_ingress_protocol() {
+        let mut resource = Resource::new("ec2.security_group_ingress", "test-rule");
+        resource
+            .attributes
+            .insert("_provider".to_string(), Value::String("aws".to_string()));
+        resource.attributes.insert(
+            "ip_protocol".to_string(),
+            Value::UnresolvedIdent("IpProtocol".to_string(), Some("tcp".to_string())),
+        );
+        let mut resources = vec![resource];
+        resolve_enum_identifiers_impl(&mut resources);
+        assert_eq!(
+            resources[0].attributes.get("ip_protocol"),
+            Some(&Value::String(
+                "aws.ec2.security_group_ingress.IpProtocol.tcp".to_string()
+            ))
+        );
+    }
+
+    // --- normalize_state_enums for EC2 types ---
+
+    #[test]
+    fn test_normalize_state_enums_ec2_vpc_tenancy() {
+        let mut attributes = HashMap::from([(
+            "instance_tenancy".to_string(),
+            Value::String("default".to_string()),
+        )]);
+        normalize_state_enums("ec2.vpc", &mut attributes);
+        assert_eq!(
+            attributes.get("instance_tenancy"),
+            Some(&Value::String(
+                "aws.ec2.vpc.InstanceTenancy.default".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn test_normalize_state_enums_ec2_security_group_egress() {
+        let mut attributes =
+            HashMap::from([("ip_protocol".to_string(), Value::String("-1".to_string()))]);
+        normalize_state_enums("ec2.security_group_egress", &mut attributes);
+        assert_eq!(
+            attributes.get("ip_protocol"),
+            Some(&Value::String(
+                "aws.ec2.security_group_egress.IpProtocol.all".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn test_normalize_state_enums_ec2_security_group_egress_tcp() {
+        let mut attributes =
+            HashMap::from([("ip_protocol".to_string(), Value::String("tcp".to_string()))]);
+        normalize_state_enums("ec2.security_group_egress", &mut attributes);
+        assert_eq!(
+            attributes.get("ip_protocol"),
+            Some(&Value::String(
+                "aws.ec2.security_group_egress.IpProtocol.tcp".to_string()
+            ))
+        );
+    }
+
+    // --- Route composite identifier parsing tests ---
+
+    #[test]
+    fn test_route_identifier_parsing() {
+        let identifier = "rtb-12345678|0.0.0.0/0";
+        let (route_table_id, destination) = identifier.split_once('|').unwrap();
+        assert_eq!(route_table_id, "rtb-12345678");
+        assert_eq!(destination, "0.0.0.0/0");
+    }
+
+    #[test]
+    fn test_route_identifier_parsing_no_separator() {
+        let identifier = "rtb-12345678";
+        assert_eq!(identifier.split_once('|'), None);
+    }
+
+    #[test]
+    fn test_route_identifier_parsing_ipv6_destination() {
+        let identifier = "rtb-12345678|::/0";
+        let (route_table_id, destination) = identifier.split_once('|').unwrap();
+        assert_eq!(route_table_id, "rtb-12345678");
+        assert_eq!(destination, "::/0");
+    }
+
+    // --- EC2 route table route extraction from describe response ---
+
+    #[test]
+    fn test_route_table_routes_extraction() {
+        // Simulates the route extraction logic in read_ec2_route_table
+        let route1 = aws_sdk_ec2::types::Route::builder()
+            .destination_cidr_block("10.0.0.0/16")
+            .gateway_id("local")
+            .build();
+        let route2 = aws_sdk_ec2::types::Route::builder()
+            .destination_cidr_block("0.0.0.0/0")
+            .gateway_id("igw-12345678")
+            .build();
+
+        let rt = aws_sdk_ec2::types::RouteTable::builder()
+            .route_table_id("rtb-12345678")
+            .vpc_id("vpc-12345678")
+            .routes(route1)
+            .routes(route2)
+            .build();
+
+        // Replicate route extraction logic from read_ec2_route_table
+        let mut routes_list = Vec::new();
+        for route in rt.routes() {
+            let mut route_map = HashMap::new();
+            if let Some(dest) = route.destination_cidr_block() {
+                route_map.insert("destination".to_string(), Value::String(dest.to_string()));
+            }
+            if let Some(gw) = route.gateway_id() {
+                route_map.insert("gateway_id".to_string(), Value::String(gw.to_string()));
+            }
+            if !route_map.is_empty() {
+                routes_list.push(Value::Map(route_map));
+            }
+        }
+
+        assert_eq!(routes_list.len(), 2);
+        if let Value::Map(ref map) = routes_list[0] {
+            assert_eq!(
+                map.get("destination"),
+                Some(&Value::String("10.0.0.0/16".to_string()))
+            );
+            assert_eq!(
+                map.get("gateway_id"),
+                Some(&Value::String("local".to_string()))
+            );
+        }
+        if let Value::Map(ref map) = routes_list[1] {
+            assert_eq!(
+                map.get("destination"),
+                Some(&Value::String("0.0.0.0/0".to_string()))
+            );
+            assert_eq!(
+                map.get("gateway_id"),
+                Some(&Value::String("igw-12345678".to_string()))
+            );
+        }
+    }
+
+    #[test]
+    fn test_route_table_routes_extraction_empty() {
+        let rt = aws_sdk_ec2::types::RouteTable::builder()
+            .route_table_id("rtb-12345678")
+            .build();
+        assert!(rt.routes().is_empty());
+    }
+
+    // --- Internet Gateway attachment extraction ---
+
+    #[test]
+    fn test_internet_gateway_attachment_extraction() {
+        // Simulates the vpc_id extraction from IGW attachments
+        let attachment = aws_sdk_ec2::types::InternetGatewayAttachment::builder()
+            .vpc_id("vpc-12345678")
+            .state(aws_sdk_ec2::types::AttachmentStatus::from("available"))
+            .build();
+        let igw = aws_sdk_ec2::types::InternetGateway::builder()
+            .internet_gateway_id("igw-12345678")
+            .attachments(attachment)
+            .build();
+
+        // Replicate logic from read_ec2_internet_gateway
+        let mut attributes = HashMap::new();
+        if let Some(att) = igw.attachments().first()
+            && let Some(vpc_id) = att.vpc_id()
+        {
+            attributes.insert("vpc_id".to_string(), Value::String(vpc_id.to_string()));
+        }
+
+        assert_eq!(
+            attributes.get("vpc_id"),
+            Some(&Value::String("vpc-12345678".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_internet_gateway_no_attachment() {
+        let igw = aws_sdk_ec2::types::InternetGateway::builder()
+            .internet_gateway_id("igw-12345678")
+            .build();
+
+        let mut attributes = HashMap::new();
+        if let Some(att) = igw.attachments().first()
+            && let Some(vpc_id) = att.vpc_id()
+        {
+            attributes.insert("vpc_id".to_string(), Value::String(vpc_id.to_string()));
+        }
+
+        assert!(!attributes.contains_key("vpc_id"));
+    }
+
+    // --- Subnet availability zone DSL format conversion ---
+
+    #[test]
+    fn test_subnet_availability_zone_dsl_format() {
+        // Simulates the AZ conversion in read_ec2_subnet
+        let az = "ap-northeast-1a";
+        let az_dsl = format!("aws.AvailabilityZone.{}", az.replace('-', "_"));
+        assert_eq!(az_dsl, "aws.AvailabilityZone.ap_northeast_1a");
+    }
+
+    #[test]
+    fn test_subnet_availability_zone_dsl_format_us_east() {
+        let az = "us-east-1b";
+        let az_dsl = format!("aws.AvailabilityZone.{}", az.replace('-', "_"));
+        assert_eq!(az_dsl, "aws.AvailabilityZone.us_east_1b");
+    }
+
+    // --- Security group rule referenced group extraction ---
+
+    #[test]
+    fn test_security_group_rule_referenced_group() {
+        let ref_group = aws_sdk_ec2::types::ReferencedSecurityGroup::builder()
+            .group_id("sg-ref-12345678")
+            .build();
+        let rule = aws_sdk_ec2::types::SecurityGroupRule::builder()
+            .security_group_rule_id("sgr-12345678")
+            .group_id("sg-12345678")
+            .ip_protocol("tcp")
+            .from_port(443)
+            .to_port(443)
+            .referenced_group_info(ref_group)
+            .build();
+
+        // Replicate logic from read_ec2_security_group_rule for ingress
+        let mut attributes = HashMap::new();
+        if let Some(ref_g) = rule.referenced_group_info()
+            && let Some(group_id) = ref_g.group_id()
+        {
+            attributes.insert(
+                "source_security_group_id".to_string(),
+                Value::String(group_id.to_string()),
+            );
+        }
+
+        assert_eq!(
+            attributes.get("source_security_group_id"),
+            Some(&Value::String("sg-ref-12345678".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_security_group_rule_cidr_ipv4() {
+        let rule = aws_sdk_ec2::types::SecurityGroupRule::builder()
+            .security_group_rule_id("sgr-12345678")
+            .group_id("sg-12345678")
+            .ip_protocol("tcp")
+            .from_port(80)
+            .to_port(80)
+            .cidr_ipv4("10.0.0.0/8")
+            .build();
+
+        // Replicate logic from read_ec2_security_group_rule
+        let mut attributes = HashMap::new();
+        if let Some(cidr_ip) = rule.cidr_ipv4() {
+            attributes.insert("cidr_ip".to_string(), Value::String(cidr_ip.to_string()));
+        }
+
+        assert_eq!(
+            attributes.get("cidr_ip"),
+            Some(&Value::String("10.0.0.0/8".to_string()))
+        );
+    }
+
+    // --- Security group rule is_egress filtering ---
+
+    #[test]
+    fn test_security_group_rule_is_egress_filtering() {
+        let ingress_rule = aws_sdk_ec2::types::SecurityGroupRule::builder()
+            .security_group_rule_id("sgr-ingress")
+            .is_egress(false)
+            .build();
+        let egress_rule = aws_sdk_ec2::types::SecurityGroupRule::builder()
+            .security_group_rule_id("sgr-egress")
+            .is_egress(true)
+            .build();
+
+        let rules = [ingress_rule, egress_rule];
+
+        // Filter for ingress (is_ingress=true means is_egress should be false)
+        let ingress_filtered: Vec<_> = rules
+            .iter()
+            .filter(|rule| rule.is_egress() == Some(false))
+            .collect();
+        assert_eq!(ingress_filtered.len(), 1);
+        assert_eq!(
+            ingress_filtered[0].security_group_rule_id(),
+            Some("sgr-ingress")
+        );
+
+        // Filter for egress (is_ingress=false means is_egress should be true)
+        let egress_filtered: Vec<_> = rules
+            .iter()
+            .filter(|rule| rule.is_egress() == Some(true))
+            .collect();
+        assert_eq!(egress_filtered.len(), 1);
+        assert_eq!(
+            egress_filtered[0].security_group_rule_id(),
+            Some("sgr-egress")
+        );
+    }
+
+    // --- Security group rule comma-separated identifiers ---
+
+    #[test]
+    fn test_security_group_rule_comma_separated_ids() {
+        // Tests the comma-separated rule ID pattern used in multi-rule support
+        let identifier = "sgr-111,sgr-222,sgr-333";
+        let rule_ids: Vec<&str> = identifier.split(',').collect();
+        assert_eq!(rule_ids.len(), 3);
+        assert_eq!(rule_ids[0], "sgr-111");
+        assert_eq!(rule_ids[1], "sgr-222");
+        assert_eq!(rule_ids[2], "sgr-333");
+    }
+
+    #[test]
+    fn test_security_group_rule_single_id() {
+        let identifier = "sgr-111";
+        let rule_ids: Vec<&str> = identifier.split(',').collect();
+        assert_eq!(rule_ids.len(), 1);
+        assert_eq!(rule_ids[0], "sgr-111");
+    }
 }
