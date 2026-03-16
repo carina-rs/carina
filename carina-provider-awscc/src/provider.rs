@@ -9,6 +9,8 @@ use std::time::Duration;
 use aws_config::Region;
 use aws_sdk_cloudcontrol::Client as CloudControlClient;
 use aws_sdk_cloudcontrol::types::OperationStatus;
+use aws_smithy_runtime_api::client::result::SdkError;
+use aws_smithy_types::error::metadata::ProvideErrorMetadata;
 use carina_core::provider::{ProviderError, ProviderResult};
 use carina_core::resource::{LifecycleConfig, Resource, ResourceId, State, Value};
 use serde_json::json;
@@ -486,7 +488,7 @@ impl AwsccProvider {
                     match self.wait_for_operation(request_token).await {
                         Ok(identifier) => return Ok(identifier),
                         Err(e)
-                            if Self::is_retryable_error(&e.message)
+                            if Self::is_retryable_status_message(&e.message)
                                 && attempt < CREATE_RETRY_MAX_ATTEMPTS =>
                         {
                             eprintln!(
@@ -505,14 +507,13 @@ impl AwsccProvider {
                     }
                 }
                 Err(e) => {
-                    let err_str = format!("{:?}", e);
-                    if Self::is_retryable_error(&err_str) && attempt < CREATE_RETRY_MAX_ATTEMPTS {
+                    if Self::is_retryable_sdk_error(&e) && attempt < CREATE_RETRY_MAX_ATTEMPTS {
                         eprintln!(
-                            "  Retryable error creating {} (attempt {}/{}): {}. Retrying in {}s...",
+                            "  Retryable error creating {} (attempt {}/{}): {:?}. Retrying in {}s...",
                             type_name,
                             attempt + 1,
                             CREATE_RETRY_MAX_ATTEMPTS,
-                            err_str,
+                            e,
                             delay_secs,
                         );
                         tokio::time::sleep(Duration::from_secs(delay_secs)).await;
@@ -598,7 +599,7 @@ impl AwsccProvider {
                         {
                             Ok(_) => return Ok(()),
                             Err(e)
-                                if Self::is_retryable_error(&e.message)
+                                if Self::is_retryable_status_message(&e.message)
                                     && attempt < DELETE_RETRY_MAX_ATTEMPTS =>
                             {
                                 eprintln!(
@@ -619,14 +620,13 @@ impl AwsccProvider {
                     return Ok(());
                 }
                 Err(e) => {
-                    let err_str = format!("{:?}", e);
-                    if Self::is_retryable_error(&err_str) && attempt < DELETE_RETRY_MAX_ATTEMPTS {
+                    if Self::is_retryable_sdk_error(&e) && attempt < DELETE_RETRY_MAX_ATTEMPTS {
                         eprintln!(
-                            "  Retryable error deleting {} (attempt {}/{}): {}. Retrying in {}s...",
+                            "  Retryable error deleting {} (attempt {}/{}): {:?}. Retrying in {}s...",
                             type_name,
                             attempt + 1,
                             DELETE_RETRY_MAX_ATTEMPTS,
-                            err_str,
+                            e,
                             delay_secs,
                         );
                         tokio::time::sleep(Duration::from_secs(delay_secs)).await;
@@ -659,12 +659,70 @@ impl AwsccProvider {
         120 // Default: 10 minutes (120 * 5s)
     }
 
-    /// Returns true if the error message indicates a retryable condition.
+    /// Returns true if an AWS SDK error represents a retryable condition.
     ///
-    /// Some operations fail transiently, e.g., IPAM Pool CIDR propagation
-    /// delays cause "missing a source resource" errors for subnet creation.
-    fn is_retryable_error(error_message: &str) -> bool {
-        let retryable_patterns = [
+    /// Uses structured error types from the AWS SDK rather than string matching.
+    /// This detects retryable conditions based on the error variant or error code,
+    /// which are part of the AWS API contract and more stable than error messages.
+    ///
+    /// Retryable error types:
+    /// - `ThrottlingException`: Request rate exceeded (covers "Throttling", "Rate exceeded")
+    /// - `ServiceInternalErrorException`: AWS internal server error
+    /// - `HandlerFailureException`: Resource handler failed (may be transient)
+    /// - `HandlerInternalFailureException`: Internal handler error
+    /// - `NetworkFailureException`: Network connectivity issues
+    /// - `ConcurrentOperationException`: Another operation is in progress
+    /// - `NotStabilizedException`: Resource not yet stabilized
+    /// - `SdkError::TimeoutError`: Connection timeout
+    /// - `SdkError::DispatchFailure`: HTTP dispatch failure
+    fn is_retryable_sdk_error<E, R>(error: &SdkError<E, R>) -> bool
+    where
+        E: ProvideErrorMetadata,
+    {
+        /// Error codes from the CloudControl API that indicate retryable conditions.
+        const RETRYABLE_ERROR_CODES: &[&str] = &[
+            "ThrottlingException",
+            "ServiceInternalErrorException",
+            "HandlerFailureException",
+            "HandlerInternalFailureException",
+            "NetworkFailureException",
+            "ConcurrentOperationException",
+            "NotStabilizedException",
+        ];
+
+        match error {
+            SdkError::TimeoutError(_) | SdkError::DispatchFailure(_) => true,
+            SdkError::ServiceError(service_error) => {
+                let err = service_error.err();
+                if let Some(code) = err.code() {
+                    RETRYABLE_ERROR_CODES.contains(&code)
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        }
+    }
+
+    /// Returns true if a CloudControl operation status message indicates a retryable condition.
+    ///
+    /// When a CloudControl operation (create/delete) succeeds at the API level but the
+    /// async operation fails, the error details come as a plain-text status message from
+    /// `progress_event.status_message()`. These messages don't have structured error codes,
+    /// so string pattern matching is the only option.
+    ///
+    /// **Fragility note**: These patterns depend on AWS error message wording. If AWS
+    /// changes the message format, retries may silently stop working. The patterns below
+    /// are based on observed CloudControl API behavior as of 2025:
+    ///
+    /// - `"missing a source resource"`: IPAM Pool CIDR propagation delay causes subnet
+    ///   creation to fail transiently while the pool is still provisioning.
+    /// - `"Throttling"` / `"Rate exceeded"` / `"RequestLimitExceeded"`: Downstream service
+    ///   throttling reported through CloudControl operation status.
+    /// - `"ServiceUnavailable"` / `"InternalError"`: Transient downstream service errors
+    ///   reported through CloudControl operation status.
+    fn is_retryable_status_message(status_message: &str) -> bool {
+        const RETRYABLE_STATUS_PATTERNS: &[&str] = &[
             "missing a source resource",
             "Throttling",
             "Rate exceeded",
@@ -672,9 +730,9 @@ impl AwsccProvider {
             "ServiceUnavailable",
             "InternalError",
         ];
-        retryable_patterns
+        RETRYABLE_STATUS_PATTERNS
             .iter()
-            .any(|pattern| error_message.contains(pattern))
+            .any(|pattern| status_message.contains(pattern))
     }
 
     /// Wait for a Cloud Control operation to complete
@@ -1267,52 +1325,253 @@ pub fn restore_unreturned_attrs_impl(
 mod tests {
     use super::*;
 
+    // =========================================================================
+    // is_retryable_status_message tests (for CloudControl operation status strings)
+    // =========================================================================
+
     #[test]
-    fn test_is_retryable_error_ipam_source_resource() {
-        assert!(AwsccProvider::is_retryable_error(
+    fn test_is_retryable_status_message_ipam_source_resource() {
+        assert!(AwsccProvider::is_retryable_status_message(
             "Operation failed: IpamPool 'ipam-pool-xxx' is missing a source resource"
         ));
     }
 
     #[test]
-    fn test_is_retryable_error_throttling() {
-        assert!(AwsccProvider::is_retryable_error(
+    fn test_is_retryable_status_message_throttling() {
+        assert!(AwsccProvider::is_retryable_status_message(
             "Throttling: Rate exceeded"
         ));
     }
 
     #[test]
-    fn test_is_retryable_error_request_limit() {
-        assert!(AwsccProvider::is_retryable_error(
+    fn test_is_retryable_status_message_request_limit() {
+        assert!(AwsccProvider::is_retryable_status_message(
             "RequestLimitExceeded: too many requests"
         ));
     }
 
     #[test]
-    fn test_is_retryable_error_service_unavailable() {
-        assert!(AwsccProvider::is_retryable_error(
+    fn test_is_retryable_status_message_service_unavailable() {
+        assert!(AwsccProvider::is_retryable_status_message(
             "ServiceUnavailable: try again later"
         ));
     }
 
     #[test]
-    fn test_is_retryable_error_internal_error() {
-        assert!(AwsccProvider::is_retryable_error(
+    fn test_is_retryable_status_message_internal_error() {
+        assert!(AwsccProvider::is_retryable_status_message(
             "InternalError: something went wrong"
         ));
     }
 
     #[test]
-    fn test_is_not_retryable_error() {
-        assert!(!AwsccProvider::is_retryable_error(
+    fn test_is_not_retryable_status_message() {
+        assert!(!AwsccProvider::is_retryable_status_message(
             "InvalidParameterValue: invalid CIDR"
         ));
-        assert!(!AwsccProvider::is_retryable_error(
+        assert!(!AwsccProvider::is_retryable_status_message(
             "ResourceNotFoundException: not found"
         ));
-        assert!(!AwsccProvider::is_retryable_error(
+        assert!(!AwsccProvider::is_retryable_status_message(
             "AccessDeniedException: not authorized"
         ));
+    }
+
+    // =========================================================================
+    // is_retryable_sdk_error tests (for structured AWS SDK error types)
+    // =========================================================================
+
+    /// Helper to build an ErrorMetadata with a given error code.
+    fn error_meta(code: &str) -> aws_smithy_types::error::ErrorMetadata {
+        aws_smithy_types::error::ErrorMetadata::builder()
+            .code(code)
+            .build()
+    }
+
+    #[test]
+    fn test_is_retryable_sdk_error_throttling() {
+        use aws_sdk_cloudcontrol::operation::create_resource::CreateResourceError;
+        use aws_sdk_cloudcontrol::types::error::ThrottlingException;
+        use aws_smithy_runtime_api::client::result::SdkError;
+
+        let err = CreateResourceError::ThrottlingException(
+            ThrottlingException::builder()
+                .message("Rate exceeded")
+                .meta(error_meta("ThrottlingException"))
+                .build(),
+        );
+        let sdk_err = SdkError::service_error(err, http::Response::new(""));
+        assert!(AwsccProvider::is_retryable_sdk_error(&sdk_err));
+    }
+
+    #[test]
+    fn test_is_retryable_sdk_error_service_internal() {
+        use aws_sdk_cloudcontrol::operation::create_resource::CreateResourceError;
+        use aws_sdk_cloudcontrol::types::error::ServiceInternalErrorException;
+        use aws_smithy_runtime_api::client::result::SdkError;
+
+        let err = CreateResourceError::ServiceInternalErrorException(
+            ServiceInternalErrorException::builder()
+                .message("Internal error")
+                .meta(error_meta("ServiceInternalErrorException"))
+                .build(),
+        );
+        let sdk_err = SdkError::service_error(err, http::Response::new(""));
+        assert!(AwsccProvider::is_retryable_sdk_error(&sdk_err));
+    }
+
+    #[test]
+    fn test_is_retryable_sdk_error_handler_failure() {
+        use aws_sdk_cloudcontrol::operation::create_resource::CreateResourceError;
+        use aws_sdk_cloudcontrol::types::error::HandlerFailureException;
+        use aws_smithy_runtime_api::client::result::SdkError;
+
+        let err = CreateResourceError::HandlerFailureException(
+            HandlerFailureException::builder()
+                .message("Handler failed")
+                .meta(error_meta("HandlerFailureException"))
+                .build(),
+        );
+        let sdk_err = SdkError::service_error(err, http::Response::new(""));
+        assert!(AwsccProvider::is_retryable_sdk_error(&sdk_err));
+    }
+
+    #[test]
+    fn test_is_retryable_sdk_error_handler_internal_failure() {
+        use aws_sdk_cloudcontrol::operation::create_resource::CreateResourceError;
+        use aws_sdk_cloudcontrol::types::error::HandlerInternalFailureException;
+        use aws_smithy_runtime_api::client::result::SdkError;
+
+        let err = CreateResourceError::HandlerInternalFailureException(
+            HandlerInternalFailureException::builder()
+                .message("Internal failure")
+                .meta(error_meta("HandlerInternalFailureException"))
+                .build(),
+        );
+        let sdk_err = SdkError::service_error(err, http::Response::new(""));
+        assert!(AwsccProvider::is_retryable_sdk_error(&sdk_err));
+    }
+
+    #[test]
+    fn test_is_retryable_sdk_error_network_failure() {
+        use aws_sdk_cloudcontrol::operation::create_resource::CreateResourceError;
+        use aws_sdk_cloudcontrol::types::error::NetworkFailureException;
+        use aws_smithy_runtime_api::client::result::SdkError;
+
+        let err = CreateResourceError::NetworkFailureException(
+            NetworkFailureException::builder()
+                .message("Network error")
+                .meta(error_meta("NetworkFailureException"))
+                .build(),
+        );
+        let sdk_err = SdkError::service_error(err, http::Response::new(""));
+        assert!(AwsccProvider::is_retryable_sdk_error(&sdk_err));
+    }
+
+    #[test]
+    fn test_is_retryable_sdk_error_concurrent_operation() {
+        use aws_sdk_cloudcontrol::operation::create_resource::CreateResourceError;
+        use aws_sdk_cloudcontrol::types::error::ConcurrentOperationException;
+        use aws_smithy_runtime_api::client::result::SdkError;
+
+        let err = CreateResourceError::ConcurrentOperationException(
+            ConcurrentOperationException::builder()
+                .message("Concurrent operation")
+                .meta(error_meta("ConcurrentOperationException"))
+                .build(),
+        );
+        let sdk_err = SdkError::service_error(err, http::Response::new(""));
+        assert!(AwsccProvider::is_retryable_sdk_error(&sdk_err));
+    }
+
+    #[test]
+    fn test_is_retryable_sdk_error_not_stabilized() {
+        use aws_sdk_cloudcontrol::operation::create_resource::CreateResourceError;
+        use aws_sdk_cloudcontrol::types::error::NotStabilizedException;
+        use aws_smithy_runtime_api::client::result::SdkError;
+
+        let err = CreateResourceError::NotStabilizedException(
+            NotStabilizedException::builder()
+                .message("Not stabilized")
+                .meta(error_meta("NotStabilizedException"))
+                .build(),
+        );
+        let sdk_err = SdkError::service_error(err, http::Response::new(""));
+        assert!(AwsccProvider::is_retryable_sdk_error(&sdk_err));
+    }
+
+    #[test]
+    fn test_is_not_retryable_sdk_error_invalid_request() {
+        use aws_sdk_cloudcontrol::operation::create_resource::CreateResourceError;
+        use aws_sdk_cloudcontrol::types::error::InvalidRequestException;
+        use aws_smithy_runtime_api::client::result::SdkError;
+
+        let err = CreateResourceError::InvalidRequestException(
+            InvalidRequestException::builder()
+                .message("Invalid request")
+                .meta(error_meta("InvalidRequestException"))
+                .build(),
+        );
+        let sdk_err = SdkError::service_error(err, http::Response::new(""));
+        assert!(!AwsccProvider::is_retryable_sdk_error(&sdk_err));
+    }
+
+    #[test]
+    fn test_is_not_retryable_sdk_error_already_exists() {
+        use aws_sdk_cloudcontrol::operation::create_resource::CreateResourceError;
+        use aws_sdk_cloudcontrol::types::error::AlreadyExistsException;
+        use aws_smithy_runtime_api::client::result::SdkError;
+
+        let err = CreateResourceError::AlreadyExistsException(
+            AlreadyExistsException::builder()
+                .message("Already exists")
+                .meta(error_meta("AlreadyExistsException"))
+                .build(),
+        );
+        let sdk_err = SdkError::service_error(err, http::Response::new(""));
+        assert!(!AwsccProvider::is_retryable_sdk_error(&sdk_err));
+    }
+
+    #[test]
+    fn test_is_retryable_sdk_error_timeout() {
+        use aws_sdk_cloudcontrol::operation::create_resource::CreateResourceError;
+        use aws_smithy_runtime_api::client::result::SdkError;
+
+        let sdk_err: SdkError<CreateResourceError, http::Response<&str>> =
+            SdkError::timeout_error("connection timed out");
+        assert!(AwsccProvider::is_retryable_sdk_error(&sdk_err));
+    }
+
+    #[test]
+    fn test_is_retryable_sdk_error_delete_throttling() {
+        use aws_sdk_cloudcontrol::operation::delete_resource::DeleteResourceError;
+        use aws_sdk_cloudcontrol::types::error::ThrottlingException;
+        use aws_smithy_runtime_api::client::result::SdkError;
+
+        let err = DeleteResourceError::ThrottlingException(
+            ThrottlingException::builder()
+                .message("Rate exceeded")
+                .meta(error_meta("ThrottlingException"))
+                .build(),
+        );
+        let sdk_err = SdkError::service_error(err, http::Response::new(""));
+        assert!(AwsccProvider::is_retryable_sdk_error(&sdk_err));
+    }
+
+    #[test]
+    fn test_is_not_retryable_sdk_error_delete_type_not_found() {
+        use aws_sdk_cloudcontrol::operation::delete_resource::DeleteResourceError;
+        use aws_sdk_cloudcontrol::types::error::TypeNotFoundException;
+        use aws_smithy_runtime_api::client::result::SdkError;
+
+        let err = DeleteResourceError::TypeNotFoundException(
+            TypeNotFoundException::builder()
+                .message("Type not found")
+                .meta(error_meta("TypeNotFoundException"))
+                .build(),
+        );
+        let sdk_err = SdkError::service_error(err, http::Response::new(""));
+        assert!(!AwsccProvider::is_retryable_sdk_error(&sdk_err));
     }
 
     #[test]
