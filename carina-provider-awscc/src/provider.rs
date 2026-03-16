@@ -441,8 +441,7 @@ impl AwsccProvider {
                 if let Some(desc) = response.resource_description()
                     && let Some(props_str) = desc.properties()
                 {
-                    let props: serde_json::Value =
-                        serde_json::from_str(props_str).unwrap_or_default();
+                    let props = parse_resource_properties(props_str)?;
                     Ok(Some(props))
                 } else {
                     Ok(None)
@@ -1326,6 +1325,14 @@ pub fn restore_unreturned_attrs_impl(
             }
         }
     }
+}
+
+/// Parse a JSON string from CloudControl API response into a `serde_json::Value`.
+///
+/// Returns an error instead of silently returning an empty object when the JSON is malformed.
+fn parse_resource_properties(props_str: &str) -> ProviderResult<serde_json::Value> {
+    serde_json::from_str(props_str)
+        .map_err(|e| ProviderError::new(format!("Failed to parse resource properties: {}", e)))
 }
 
 #[cfg(test)]
@@ -2818,5 +2825,38 @@ mod tests {
         let result = value_to_json(&value);
         assert!(result.is_some());
         assert_eq!(result.unwrap(), serde_json::json!(1.5));
+    }
+
+    // =========================================================================
+    // parse_resource_properties tests
+    // =========================================================================
+
+    #[test]
+    fn test_parse_resource_properties_valid_json() {
+        let json_str = r#"{"VpcId": "vpc-123", "CidrBlock": "10.0.0.0/16"}"#;
+        let result = parse_resource_properties(json_str);
+        assert!(result.is_ok());
+        let value = result.unwrap();
+        assert_eq!(value["VpcId"], "vpc-123");
+        assert_eq!(value["CidrBlock"], "10.0.0.0/16");
+    }
+
+    #[test]
+    fn test_parse_resource_properties_malformed_json_returns_error() {
+        let malformed = r#"{"VpcId": "vpc-123", invalid"#;
+        let result = parse_resource_properties(malformed);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.message.contains("Failed to parse resource properties"),
+            "Expected error message about parsing, got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn test_parse_resource_properties_empty_string_returns_error() {
+        let result = parse_resource_properties("");
+        assert!(result.is_err());
     }
 }
