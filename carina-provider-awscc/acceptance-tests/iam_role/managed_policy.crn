@@ -1,0 +1,29 @@
+# IAM Role - managed policy ARNs test
+#
+# Tests: role_name_prefix, assume_role_policy_document, managed_policy_arns
+
+provider awscc {
+  region = awscc.Region.ap_northeast_1
+}
+
+awscc.iam.role {
+  role_name_prefix = "carina-acc-test-"
+
+  assume_role_policy_document = {
+    version = "2012-10-17"
+    statement {
+      effect    = "Allow"
+      principal = { service = "lambda.amazonaws.com" }
+      action    = "sts:AssumeRole"
+    }
+  }
+
+  managed_policy_arns = [
+    "arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess"
+  ]
+
+  tags = {
+    Environment = "acceptance-test"
+    ManagedBy   = "carina"
+  }
+}
