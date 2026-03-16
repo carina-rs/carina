@@ -23,9 +23,7 @@ use carina_core::effect::Effect;
 use carina_core::formatter::{self, FormatConfig};
 use carina_core::lint::{find_list_literal_attrs, list_struct_attr_names};
 use carina_core::module_resolver;
-#[cfg(test)]
-use carina_core::parser::ParsedFile;
-use carina_core::parser::{BackendConfig, ProviderConfig};
+use carina_core::parser::{BackendConfig, ParsedFile, ProviderConfig};
 use carina_core::plan::Plan;
 use carina_core::provider::{self as provider_mod, Provider};
 use carina_core::resolver::{resolve_ref_value, resolve_refs_with_state};
@@ -300,28 +298,57 @@ fn run_module_info(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Run the common validation and module resolution pipeline.
+///
+/// Steps:
+/// 1. Validate provider region
+/// 2. Validate module call arguments (before expansion)
+/// 3. Resolve module imports and expand module calls
+/// 4. Resolve names (let bindings -> resource names)
+/// 5. Validate resources (schema checks) — skipped when `skip_resource_validation` is true
+/// 6. Validate resource ref types — skipped when `skip_resource_validation` is true
+/// 7. Compute anonymous identifiers
+///
+/// `skip_resource_validation` is used by destroy and state refresh, which only need
+/// name resolution and identifier computation without full schema validation.
+fn validate_and_resolve(
+    parsed: &mut ParsedFile,
+    base_dir: &Path,
+    skip_resource_validation: bool,
+) -> Result<(), String> {
+    // Validate provider region
+    validate_provider_region(parsed)?;
+
+    // Validate module call arguments before expansion
+    validate_module_calls(parsed, base_dir)?;
+
+    // Resolve module imports and expand module calls
+    module_resolver::resolve_modules(parsed, base_dir)
+        .map_err(|e| format!("Module resolution error: {}", e))?;
+
+    // Resolve names (let bindings -> resource names)
+    resolve_names(&mut parsed.resources)?;
+
+    if !skip_resource_validation {
+        validate_resources(&parsed.resources)?;
+        validate_resource_ref_types(&parsed.resources)?;
+    }
+
+    // Compute anonymous identifiers
+    compute_anonymous_identifiers(&mut parsed.resources, &parsed.providers)?;
+
+    Ok(())
+}
+
 fn run_validate(path: &PathBuf) -> Result<(), String> {
     let loaded = load_configuration(path)?;
     let mut parsed = loaded.parsed;
 
     let base_dir = get_base_dir(path);
 
-    // Validate provider region
-    validate_provider_region(&parsed)?;
-
-    // Validate module call arguments before expansion
-    validate_module_calls(&parsed, base_dir)?;
-
-    // Resolve module imports and expand module calls
-    module_resolver::resolve_modules(&mut parsed, base_dir)
-        .map_err(|e| format!("Module resolution error: {}", e))?;
-
     println!("{}", "Validating...".cyan());
 
-    resolve_names(&mut parsed.resources)?;
-    validate_resources(&parsed.resources)?;
-    validate_resource_ref_types(&parsed.resources)?;
-    compute_anonymous_identifiers(&mut parsed.resources, &parsed.providers)?;
+    validate_and_resolve(&mut parsed, base_dir, false)?;
 
     // Check for unused let bindings (warnings, not errors)
     // Use unresolved_parsed because resolve_resource_refs resolves intermediate
@@ -360,18 +387,8 @@ fn run_validate(path: &PathBuf) -> Result<(), String> {
 async fn run_plan(path: &PathBuf, out: Option<&PathBuf>) -> Result<bool, String> {
     let mut parsed = load_configuration(path)?.parsed;
 
-    // Resolve module imports and expand module calls
     let base_dir = get_base_dir(path);
-    module_resolver::resolve_modules(&mut parsed, base_dir)
-        .map_err(|e| format!("Module resolution error: {}", e))?;
-
-    // Validate provider region
-    validate_provider_region(&parsed)?;
-
-    resolve_names(&mut parsed.resources)?;
-    validate_resources(&parsed.resources)?;
-    validate_resource_ref_types(&parsed.resources)?;
-    compute_anonymous_identifiers(&mut parsed.resources, &parsed.providers)?;
+    validate_and_resolve(&mut parsed, base_dir, false)?;
 
     // Check for backend configuration and load state
     // Use local backend by default if no backend is configured
@@ -657,18 +674,8 @@ async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
     let mut parsed = loaded.parsed;
     let backend_file = loaded.backend_file;
 
-    // Resolve module imports and expand module calls
     let base_dir = get_base_dir(path);
-    module_resolver::resolve_modules(&mut parsed, base_dir)
-        .map_err(|e| format!("Module resolution error: {}", e))?;
-
-    // Validate provider region
-    validate_provider_region(&parsed)?;
-
-    resolve_names(&mut parsed.resources)?;
-    validate_resources(&parsed.resources)?;
-    validate_resource_ref_types(&parsed.resources)?;
-    compute_anonymous_identifiers(&mut parsed.resources, &parsed.providers)?;
+    validate_and_resolve(&mut parsed, base_dir, false)?;
 
     // Check for backend configuration - use local backend by default
     let backend_config = parsed.backend.as_ref();
@@ -2157,16 +2164,8 @@ async fn run_apply_from_plan(plan_path: &PathBuf, auto_approve: bool) -> Result<
 async fn run_destroy(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
     let mut parsed = load_configuration(path)?.parsed;
 
-    // Resolve module imports and expand module calls
     let base_dir = get_base_dir(path);
-    module_resolver::resolve_modules(&mut parsed, base_dir)
-        .map_err(|e| format!("Module resolution error: {}", e))?;
-
-    // Validate provider region
-    validate_provider_region(&parsed)?;
-
-    resolve_names(&mut parsed.resources)?;
-    compute_anonymous_identifiers(&mut parsed.resources, &parsed.providers)?;
+    validate_and_resolve(&mut parsed, base_dir, true)?;
 
     if parsed.resources.is_empty() {
         println!("{}", "No resources defined in configuration.".yellow());
@@ -2786,16 +2785,8 @@ async fn run_state_refresh(path: &PathBuf) -> Result<(), String> {
     let loaded = load_configuration(path)?;
     let mut parsed = loaded.parsed;
 
-    // Resolve module imports and expand module calls
     let base_dir = get_base_dir(path);
-    module_resolver::resolve_modules(&mut parsed, base_dir)
-        .map_err(|e| format!("Module resolution error: {}", e))?;
-
-    // Validate provider region
-    validate_provider_region(&parsed)?;
-
-    resolve_names(&mut parsed.resources)?;
-    compute_anonymous_identifiers(&mut parsed.resources, &parsed.providers)?;
+    validate_and_resolve(&mut parsed, base_dir, true)?;
 
     // Create backend
     let backend_config = parsed.backend.as_ref();
