@@ -51,8 +51,10 @@ pub fn print_plan(plan: &Plan) {
 
     for (idx, deps) in &effect_deps {
         for dep in deps {
-            if let Some(&dep_idx) = binding_to_effect.get(dep) {
-                dependents.get_mut(&dep_idx).unwrap().push(*idx);
+            if let Some(&dep_idx) = binding_to_effect.get(dep)
+                && let Some(deps) = dependents.get_mut(&dep_idx)
+            {
+                deps.push(*idx);
             }
         }
     }
@@ -670,4 +672,59 @@ pub fn format_list_diff(old_value: Option<&Value>, new_value: &Value, attr_prefi
     }
 
     lines.join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use carina_core::effect::Effect;
+    use carina_core::plan::Plan;
+    use carina_core::resource::{Resource, Value};
+
+    fn make_resource(resource_type: &str, name: &str, binding: &str, deps: &[&str]) -> Resource {
+        let mut r = Resource::new(resource_type, name);
+        r.attributes
+            .insert("_binding".to_string(), Value::String(binding.to_string()));
+        for dep in deps {
+            r.attributes.insert(
+                format!("ref_{}", dep),
+                Value::ResourceRef {
+                    binding_name: dep.to_string(),
+                    attribute_name: "id".to_string(),
+                },
+            );
+        }
+        r
+    }
+
+    /// Test that print_plan does not panic when a resource has a dependency
+    /// on a binding that is not present in the plan (external dependency).
+    /// This exercises the dependency graph construction code path where
+    /// `.unwrap()` could theoretically panic if `dep_idx` were invalid.
+    #[test]
+    fn test_print_plan_with_external_dependency_does_not_panic() {
+        // Resource "b" depends on "a", but "a" is NOT in the plan.
+        // This simulates an external/unresolved dependency.
+        let b = make_resource("test.resource", "b", "b", &["a"]);
+        let mut plan = Plan::new();
+        plan.add(Effect::Create(b));
+
+        // Should not panic
+        print_plan(&plan);
+    }
+
+    /// Test that print_plan handles the dependency graph correctly when
+    /// dependents map is accessed with valid indices.
+    #[test]
+    fn test_print_plan_with_internal_dependency_does_not_panic() {
+        let a = make_resource("test.resource", "a", "a", &[]);
+        let b = make_resource("test.resource", "b", "b", &["a"]);
+        let mut plan = Plan::new();
+        plan.add(Effect::Create(a));
+        plan.add(Effect::Create(b));
+
+        // Should not panic
+        print_plan(&plan);
+    }
 }
