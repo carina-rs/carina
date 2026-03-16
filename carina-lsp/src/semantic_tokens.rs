@@ -1,3 +1,4 @@
+use crate::position;
 use tower_lsp::lsp_types::{SemanticToken, SemanticTokenType, SemanticTokensLegend};
 
 /// Token types supported by this language server
@@ -66,24 +67,12 @@ impl SemanticTokensProvider {
         tokens
     }
 
-    /// Convert a byte offset in a string to a character offset
-    fn byte_to_char_offset(s: &str, byte_offset: usize) -> u32 {
-        s[..byte_offset].chars().count() as u32
-    }
-
-    /// Get the character length (not byte length) of a string
-    fn char_len(s: &str) -> u32 {
-        s.chars().count() as u32
-    }
-
     /// Tokenize a single line, returning (start_col, length, token_type_index)
     /// All positions and lengths are in characters (not bytes) for LSP compatibility.
     fn tokenize_line(&self, line: &str, _line_idx: u32) -> Vec<(u32, u32, u32)> {
         let mut tokens = Vec::new();
         let trimmed = line.trim_start();
-        let indent_bytes = line.len() - trimmed.len();
-        // Indent is always ASCII spaces/tabs, so byte count == char count
-        let indent = indent_bytes as u32;
+        let indent = position::leading_whitespace_chars(line);
 
         // Skip empty lines
         if trimmed.is_empty() {
@@ -92,7 +81,7 @@ impl SemanticTokensProvider {
 
         // Comment
         if trimmed.starts_with("//") {
-            tokens.push((indent, Self::char_len(line) - indent, 8)); // COMMENT
+            tokens.push((indent, position::char_len(line) - indent, 8)); // COMMENT
             return tokens;
         }
 
@@ -191,7 +180,7 @@ impl SemanticTokensProvider {
 
         // env() function
         if let Some(byte_pos) = line.find("env(") {
-            tokens.push((Self::byte_to_char_offset(line, byte_pos), 3, 7)); // FUNCTION: env
+            tokens.push((position::byte_offset_to_char_offset(line, byte_pos), 3, 7)); // FUNCTION: env
         }
 
         // Property names (before =)
@@ -205,13 +194,17 @@ impl SemanticTokensProvider {
                 && let Some(prop_byte_start) = line.find(prop_name)
             {
                 tokens.push((
-                    Self::byte_to_char_offset(line, prop_byte_start),
-                    Self::char_len(prop_name),
+                    position::byte_offset_to_char_offset(line, prop_byte_start),
+                    position::char_len(prop_name),
                     3,
                 )); // PROPERTY
             }
             // Operator =
-            tokens.push((Self::byte_to_char_offset(line, eq_byte_pos), 1, 6)); // OPERATOR
+            tokens.push((
+                position::byte_offset_to_char_offset(line, eq_byte_pos),
+                1,
+                6,
+            )); // OPERATOR
         }
 
         // String literals
@@ -231,39 +224,37 @@ impl SemanticTokensProvider {
             }
         }
 
-        // Number literals - use byte-level operations for adjacent char checks
-        for (byte_idx, c) in line.char_indices() {
+        // Number literals - use character-level operations for correct UTF-8 handling
+        let chars: Vec<char> = line.chars().collect();
+        for (char_idx, &c) in chars.iter().enumerate() {
             if c.is_ascii_digit() {
-                // Check adjacent bytes - digits and their neighbors are ASCII,
-                // so byte-level access is safe for boundary checks
-                let prev_byte = if byte_idx > 0 {
-                    Some(line.as_bytes()[byte_idx - 1])
+                let prev_char = if char_idx > 0 {
+                    Some(chars[char_idx - 1])
                 } else {
                     None
                 };
-                let next_byte_pos = byte_idx + 1; // ASCII digit is 1 byte
-                let next_byte = if next_byte_pos < line.len() {
-                    Some(line.as_bytes()[next_byte_pos])
+                let next_char = if char_idx + 1 < chars.len() {
+                    Some(chars[char_idx + 1])
                 } else {
                     None
                 };
 
                 let prev_is_word =
-                    prev_byte.is_some_and(|b| b.is_ascii_alphanumeric() || b == b'_');
+                    prev_char.is_some_and(|ch| ch.is_ascii_alphanumeric() || ch == '_');
                 let next_is_word =
-                    next_byte.is_some_and(|b| b.is_ascii_alphanumeric() || b == b'_');
+                    next_char.is_some_and(|ch| ch.is_ascii_alphanumeric() || ch == '_');
 
-                let char_pos = Self::byte_to_char_offset(line, byte_idx);
+                let char_pos = char_idx as u32;
 
                 if !prev_is_word && !next_is_word {
                     // Single digit number
                     tokens.push((char_pos, 1, 5)); // NUMBER
                 } else if !prev_is_word {
-                    // Multi-digit number - find the end (bytes are fine since digits are ASCII)
-                    let num_end = line[byte_idx..]
-                        .find(|c: char| !c.is_ascii_digit())
-                        .map_or(line.len() - byte_idx, |pos| pos);
-                    // num_end is in bytes, but since all digits are ASCII, byte count == char count
+                    // Multi-digit number - find the end
+                    let num_end = chars[char_idx..]
+                        .iter()
+                        .position(|ch| !ch.is_ascii_digit())
+                        .unwrap_or(chars.len() - char_idx);
                     tokens.push((char_pos, num_end as u32, 5)); // NUMBER
                 }
             }
@@ -379,7 +370,7 @@ impl SemanticTokensProvider {
                 after_byte.is_none_or(|b| !b.is_ascii_alphanumeric() && b != b'_' && b != b'.');
 
             if before_ok && after_ok {
-                let char_pos = Self::byte_to_char_offset(line, absolute_byte_pos);
+                let char_pos = position::byte_offset_to_char_offset(line, absolute_byte_pos);
                 // Pattern is ASCII, so byte length == char length
                 tokens.push((char_pos, pattern.len() as u32, token_type));
             }

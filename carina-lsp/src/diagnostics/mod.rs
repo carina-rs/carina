@@ -11,6 +11,7 @@ use std::sync::Arc;
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
 
 use crate::document::Document;
+use crate::position;
 use carina_core::parser::ParseError;
 use carina_core::provider::ProviderFactory;
 use carina_core::resource::Value;
@@ -605,8 +606,11 @@ impl DiagnosticEngine {
         for (line_idx, line) in text.lines().enumerate() {
             for provider_name in &self.provider_names {
                 let pattern = format!("{}.{}", provider_name, resource_type);
-                if let Some(col) = line.find(pattern.as_str()) {
-                    return Some((line_idx as u32, col as u32));
+                if let Some(byte_pos) = line.find(pattern.as_str()) {
+                    return Some((
+                        line_idx as u32,
+                        position::byte_offset_to_char_offset(line, byte_pos),
+                    ));
                 }
             }
         }
@@ -627,8 +631,7 @@ impl DiagnosticEngine {
                 continue;
             }
             // Calculate column position (account for leading whitespace)
-            let leading_ws = line.len() - trimmed.len();
-            return Some((line_idx as u32, leading_ws as u32));
+            return Some((line_idx as u32, position::leading_whitespace_chars(line)));
         }
         None
     }
