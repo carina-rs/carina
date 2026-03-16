@@ -215,6 +215,8 @@ struct CurrentStateEntry {
 
 #[tokio::main]
 async fn main() {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
+
     let cli = Cli::parse();
 
     // Handle Plan separately since it returns Result<bool, String>
