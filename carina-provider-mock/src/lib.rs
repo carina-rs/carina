@@ -87,8 +87,9 @@ impl Provider for MockProvider {
             let attrs: HashMap<String, serde_json::Value> = resource
                 .attributes
                 .iter()
-                .map(|(k, v)| (k.clone(), value_to_json(v)))
-                .collect();
+                .map(|(k, v)| value_to_json(v).map(|jv| (k.clone(), jv)))
+                .collect::<Result<_, _>>()
+                .map_err(|e| ProviderError::new(format!("Failed to convert value: {}", e)))?;
 
             states.insert(key, attrs);
             self.save_states(&states)
@@ -117,8 +118,9 @@ impl Provider for MockProvider {
             let attrs: HashMap<String, serde_json::Value> = to
                 .attributes
                 .iter()
-                .map(|(k, v)| (k.clone(), value_to_json(v)))
-                .collect();
+                .map(|(k, v)| value_to_json(v).map(|jv| (k.clone(), jv)))
+                .collect::<Result<_, _>>()
+                .map_err(|e| ProviderError::new(format!("Failed to convert value: {}", e)))?;
 
             states.insert(key, attrs);
             self.save_states(&states)

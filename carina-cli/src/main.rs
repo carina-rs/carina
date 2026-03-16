@@ -994,7 +994,7 @@ async fn finalize_apply(
         plan,
         successfully_deleted: &result.successfully_deleted,
         failed_refreshes: &result.failed_refreshes,
-    });
+    })?;
 
     // Increment serial and save
     state.increment_serial();
@@ -1085,7 +1085,7 @@ struct ApplyStateSave<'a> {
     failed_refreshes: &'a HashSet<ResourceId>,
 }
 
-fn build_state_after_apply(save: ApplyStateSave<'_>) -> StateFile {
+fn build_state_after_apply(save: ApplyStateSave<'_>) -> Result<StateFile, String> {
     let ApplyStateSave {
         state_file,
         sorted_resources,
@@ -1102,7 +1102,7 @@ fn build_state_after_apply(save: ApplyStateSave<'_>) -> StateFile {
         let existing = state.find_resource(&resource.id.resource_type, &resource.id.name);
         if let Some(applied_state) = applied_states.get(&resource.id) {
             let mut resource_state =
-                ResourceState::from_provider_state(resource, applied_state, existing);
+                ResourceState::from_provider_state(resource, applied_state, existing)?;
             if let Some(overrides) = permanent_name_overrides.get(&resource.id) {
                 resource_state.name_overrides = overrides.clone();
             }
@@ -1112,7 +1112,7 @@ fn build_state_after_apply(save: ApplyStateSave<'_>) -> StateFile {
         } else if let Some(current_state) = current_states.get(&resource.id) {
             if current_state.exists {
                 let resource_state =
-                    ResourceState::from_provider_state(resource, current_state, existing);
+                    ResourceState::from_provider_state(resource, current_state, existing)?;
                 state.upsert_resource(resource_state);
             } else {
                 state.remove_resource(&resource.id.resource_type, &resource.id.name);
@@ -1128,7 +1128,7 @@ fn build_state_after_apply(save: ApplyStateSave<'_>) -> StateFile {
         }
     }
 
-    state
+    Ok(state)
 }
 
 async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
@@ -2649,7 +2649,7 @@ async fn run_state_refresh(path: &PathBuf) -> Result<(), String> {
         if fresh_state.exists {
             let existing_rs = state.find_resource(&resource.id.resource_type, &resource.id.name);
             let resource_state =
-                ResourceState::from_provider_state(resource, fresh_state, existing_rs);
+                ResourceState::from_provider_state(resource, fresh_state, existing_rs)?;
             state.upsert_resource(resource_state);
         } else {
             state.remove_resource(&resource.id.resource_type, &resource.id.name);
@@ -2988,7 +2988,8 @@ mod tests {
             plan: &Plan::new(),
             successfully_deleted: &HashSet::new(),
             failed_refreshes: &failed_refreshes,
-        });
+        })
+        .unwrap();
 
         let saved_resource = saved.find_resource("s3.bucket", "bucket").unwrap();
         assert_eq!(
@@ -3034,7 +3035,8 @@ mod tests {
             plan: &Plan::new(),
             successfully_deleted: &HashSet::new(),
             failed_refreshes: &failed_refreshes,
-        });
+        })
+        .unwrap();
 
         assert!(saved.find_resource("s3.bucket", "bucket").is_none());
     }
@@ -3079,7 +3081,8 @@ mod tests {
             plan: &Plan::new(),
             successfully_deleted: &HashSet::new(),
             failed_refreshes: &failed_refreshes,
-        });
+        })
+        .unwrap();
 
         let saved_resource = saved.find_resource("s3.bucket", "bucket").unwrap();
         assert_eq!(
@@ -3699,7 +3702,7 @@ mod tests {
         .with_identifier("my-app-abcd1234");
 
         let resource_state =
-            ResourceState::from_provider_state(&resources_run1[0], &applied_state, None);
+            ResourceState::from_provider_state(&resources_run1[0], &applied_state, None).unwrap();
 
         let mut state_file = StateFile::new();
         state_file.upsert_resource(resource_state);
@@ -3810,7 +3813,7 @@ mod tests {
         .with_identifier(run1_role_name.as_str());
 
         let resource_state =
-            ResourceState::from_provider_state(&resources_run1[0], &applied_state, None);
+            ResourceState::from_provider_state(&resources_run1[0], &applied_state, None).unwrap();
         let mut state_file = StateFile::new();
         state_file.upsert_resource(resource_state);
 
@@ -3921,7 +3924,7 @@ mod tests {
             .with_identifier("fl-12345678");
 
         let resource_state =
-            ResourceState::from_provider_state(&resources_run1[0], &applied_state, None);
+            ResourceState::from_provider_state(&resources_run1[0], &applied_state, None).unwrap();
         let mut state_file = StateFile::new();
         state_file.upsert_resource(resource_state);
 

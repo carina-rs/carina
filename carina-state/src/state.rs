@@ -245,11 +245,14 @@ impl ResourceState {
     /// Build a ResourceState from a Resource and its provider-returned State.
     ///
     /// If `existing` is provided, the `protected` flag is preserved from it.
+    ///
+    /// Returns an error if any attribute value cannot be converted to JSON
+    /// (e.g., non-finite float values).
     pub fn from_provider_state(
         resource: &Resource,
         state: &State,
         existing: Option<&ResourceState>,
-    ) -> Self {
+    ) -> Result<Self, String> {
         let mut rs = Self::new(
             &resource.id.resource_type,
             &resource.id.name,
@@ -257,7 +260,7 @@ impl ResourceState {
         );
         rs.identifier = state.identifier.clone();
         for (k, v) in &state.attributes {
-            rs.attributes.insert(k.clone(), value_to_json(v));
+            rs.attributes.insert(k.clone(), value_to_json(v)?);
         }
         if let Some(existing) = existing {
             rs.protected = existing.protected;
@@ -273,7 +276,7 @@ impl ResourceState {
             .cloned()
             .collect();
         rs.desired_keys.sort();
-        rs
+        Ok(rs)
     }
 }
 
@@ -478,7 +481,8 @@ mod tests {
 
         let existing = ResourceState::new("s3.bucket", "my-bucket", "awscc").with_protected(true);
 
-        let rs = ResourceState::from_provider_state(&resource, &provider_state, Some(&existing));
+        let rs = ResourceState::from_provider_state(&resource, &provider_state, Some(&existing))
+            .unwrap();
 
         assert_eq!(rs.identifier, Some("my-bucket-abcd1234".to_string()));
         assert_eq!(
@@ -504,7 +508,7 @@ mod tests {
             exists: true,
         };
 
-        let rs = ResourceState::from_provider_state(&resource, &provider_state, None);
+        let rs = ResourceState::from_provider_state(&resource, &provider_state, None).unwrap();
         assert!(!rs.protected);
         assert_eq!(rs.identifier, Some("test-id".to_string()));
     }
