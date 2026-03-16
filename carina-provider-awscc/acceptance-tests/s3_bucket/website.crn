@@ -1,0 +1,22 @@
+# S3 Bucket - website_configuration test
+#
+# Tests: website_configuration with index_document and error_document,
+#        plan-verify confirms website hosting state is reconciled,
+#        destroy cleans up the bucket.
+
+provider awscc {
+  region = awscc.Region.ap_northeast_1
+}
+
+awscc.s3.bucket {
+  bucket_name_prefix = "carina-acc-test-"
+
+  website_configuration = {
+    index_document = "index.html"
+    error_document = "error.html"
+  }
+
+  lifecycle {
+    force_delete = true
+  }
+}
