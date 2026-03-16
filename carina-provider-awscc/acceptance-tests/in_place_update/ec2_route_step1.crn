@@ -1,7 +1,6 @@
-# EC2 Route in-place update test - Step 1
+# EC2 Route - in-place update test (step 1)
 #
-# Route 10.1.0.0/16 via Internet Gateway
-# Step 2 changes to NAT Gateway
+# Tests: create route 10.1.0.0/16 via Internet Gateway
 
 provider awscc {
   region = awscc.Region.ap_northeast_1

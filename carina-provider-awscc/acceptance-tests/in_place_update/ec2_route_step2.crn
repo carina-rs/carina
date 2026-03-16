@@ -1,6 +1,6 @@
-# EC2 Route in-place update test - Step 2
+# EC2 Route - in-place update test (step 2)
 #
-# Route 10.1.0.0/16 via NAT Gateway (changed from IGW in step 1)
+# Tests: change route target from IGW to NAT Gateway (in-place update)
 
 provider awscc {
   region = awscc.Region.ap_northeast_1
