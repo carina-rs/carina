@@ -172,9 +172,10 @@ fn type_aware_struct_equal(
 /// - Bool: `false`
 /// - Int: `0`
 /// - Float: `0.0`
-/// - String: `""`
+/// - String / StringEnum: `""`
 /// - List: empty list
-/// - Map: empty map
+/// - Map / Struct: empty map
+/// - Custom: delegates to the base type
 fn is_type_default(value: &Value, attr_type: Option<&AttributeType>) -> bool {
     match (value, attr_type) {
         (Value::Bool(false), Some(AttributeType::Bool) | None) => true,
