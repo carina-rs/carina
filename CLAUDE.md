@@ -87,17 +87,19 @@ The DSL uses `aws.Region.ap_northeast_1` format, but AWS SDK uses `ap-northeast-
 
 When modifying the DSL or resource schemas, also update the LSP:
 
-- **Completion** (`carina-lsp/src/completion.rs`):
-  - `top_level_completions()`: Add keywords (e.g., `backend`, `provider`, `let`)
-  - `attribute_completions_for_type()`: Add attribute completions for resource types
-  - `value_completions_for_attr()`: Add value completions for specific attributes
+- **Completion** (`carina-lsp/src/completion/`):
+  - `top_level_completions()` in `top_level.rs`: Add keywords (e.g., `backend`, `provider`, `let`)
+  - `attribute_completions_for_type()` in `values.rs`: Add attribute completions for resource types
+  - `value_completions_for_attr()` in `values.rs`: Add value completions for specific attributes
 
 - **Semantic Tokens** (`carina-lsp/src/semantic_tokens.rs`):
   - `tokenize_line()`: Add keyword highlighting for new DSL constructs
   - Keywords like `provider`, `backend`, `let` are highlighted at line start
 
-- **Diagnostics** (`carina-lsp/src/diagnostics.rs`):
-  - Add type validation for new types
+- **Diagnostics** (`carina-lsp/src/diagnostics/`):
+  - `mod.rs`: Core diagnostic logic and type validation
+  - `validation.rs`: Struct and nested field validation
+  - `checks.rs`: Module loading and additional checks
   - Parser errors are automatically detected via `carina-core::parser`
 
 **Testing**: When bugs are found or issues are pointed out, write test code to capture the fix. This ensures regressions are caught and documents expected behavior.
@@ -110,7 +112,7 @@ AWS-specific type definitions (e.g., region validation, versioning status) belon
 
 Resource types in DSL use dot notation (`s3.bucket`, `ec2.vpc`). When mapping between DSL resource types and schema lookups:
 - DSL: `aws.s3.bucket` → Schema key: `s3.bucket`
-- Ensure `extract_resource_type()` in completion.rs and `valid_resource_types` in diagnostics.rs use consistent dot notation
+- Ensure `extract_resource_type()` in `completion/mod.rs` and resource type validation in `diagnostics/mod.rs` use consistent dot notation
 
 ### Validation Formats
 
@@ -136,7 +138,7 @@ Enum values use namespaced identifiers like `aws.s3.VersioningStatus.Enabled` or
 
 3. **Plan display should not quote namespaced identifiers** - They are identifiers, not strings
 
-4. **LSP diagnostics must validate Custom types** - When adding `AttributeType::Custom` with a validate function, ensure `carina-lsp/src/diagnostics.rs` calls the validate function for editor warnings
+4. **LSP diagnostics must validate Custom types** - When adding `AttributeType::Custom` with a validate function, ensure `carina-lsp/src/diagnostics/mod.rs` calls the validate function for editor warnings
 
 5. **Always test with actual values** - Don't assume pattern matching works; write a quick test to verify
 
@@ -151,14 +153,14 @@ Enum values use namespaced identifiers like `aws.s3.VersioningStatus.Enabled` or
 - Codegen resolves CloudFormation `$ref` and inline object definitions into Struct types
 
 **LSP integration:**
-- When adding Struct validation, update `carina-lsp/src/diagnostics.rs` to validate nested fields
+- When adding Struct validation, update `carina-lsp/src/diagnostics/validation.rs` to validate nested fields
 - Completion should work recursively for struct fields
 
 ### Module Loading
 
 Directory-based modules (e.g., `modules/web_tier/`) require special handling:
 - CLI: `load_module()` checks `is_dir()` and reads `main.crn` from directory
-- LSP: `load_directory_module()` in diagnostics.rs handles directory modules for proper validation
+- LSP: Module loading in `diagnostics/checks.rs` handles directory modules for proper validation
 
 ## Git Workflow
 
