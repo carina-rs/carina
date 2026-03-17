@@ -158,17 +158,3 @@ impl Provider for AwsccProvider {
         Box::pin(async move { self.delete_resource(&id, &identifier, &lifecycle).await })
     }
 }
-
-impl ProviderSchemaExt for AwsccProvider {
-    fn normalize_desired(&self, resources: &mut [Resource]) {
-        crate::provider::resolve_enum_identifiers_impl(resources);
-    }
-
-    fn hydrate_read_state(
-        &self,
-        current_states: &mut HashMap<ResourceId, State>,
-        saved_attrs: &SavedAttrs,
-    ) {
-        crate::provider::restore_unreturned_attrs_impl(current_states, saved_attrs);
-    }
-}

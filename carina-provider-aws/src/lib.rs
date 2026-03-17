@@ -699,12 +699,6 @@ impl Provider for AwsProvider {
     }
 }
 
-impl ProviderSchemaExt for AwsProvider {
-    fn normalize_desired(&self, resources: &mut [Resource]) {
-        resolve_enum_identifiers_impl(resources);
-    }
-}
-
 /// Resolve enum identifiers in resources to their fully-qualified DSL format.
 ///
 /// For example, resolves bare `Enabled` or `VersioningStatus.Enabled` into
