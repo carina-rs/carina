@@ -1,0 +1,17 @@
+# EC2 VPC - in-place update test (step 1)
+#
+# Tests: create VPC with enable_dns_hostnames = false
+
+provider aws {
+  region = aws.Region.ap_northeast_1
+}
+
+aws.ec2.vpc {
+  cidr_block           = "10.100.0.0/16"
+  enable_dns_support   = true
+  enable_dns_hostnames = false
+
+  tags = {
+    Environment = "acceptance-test"
+  }
+}

@@ -1,0 +1,17 @@
+# S3 Bucket - versioning_status test
+#
+# Tests: versioning_status with Enabled
+
+provider aws {
+  region = aws.Region.ap_northeast_1
+}
+
+let bucket = aws.s3.bucket {
+  bucket = "carina-acc-test-aws-s3-versioning"
+
+  versioning_status = aws.s3.bucket.VersioningStatus.Enabled
+
+  tags = {
+    Environment = "acceptance-test"
+  }
+}

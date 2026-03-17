@@ -1,0 +1,17 @@
+# S3 Bucket - in-place update test (step 1)
+#
+# Tests: create bucket with versioning Enabled
+
+provider aws {
+  region = aws.Region.ap_northeast_1
+}
+
+aws.s3.bucket {
+  bucket = "carina-acc-test-aws-s3-update"
+
+  versioning_status = aws.s3.bucket.VersioningStatus.Enabled
+
+  tags = {
+    Environment = "acceptance-test"
+  }
+}
