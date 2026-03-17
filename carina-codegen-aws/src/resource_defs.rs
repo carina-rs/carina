@@ -115,7 +115,6 @@ pub fn ec2_resources() -> Vec<ResourceDef> {
         ResourceDef {
             name: "ec2.vpc",
             service_namespace: "com.amazonaws.ec2",
-
             simple_delete: true,
             noop_update: false,
             create_op: "CreateVpc",
@@ -152,7 +151,6 @@ pub fn ec2_resources() -> Vec<ResourceDef> {
         ResourceDef {
             name: "ec2.subnet",
             service_namespace: "com.amazonaws.ec2",
-
             simple_delete: true,
             noop_update: true,
             create_op: "CreateSubnet",
