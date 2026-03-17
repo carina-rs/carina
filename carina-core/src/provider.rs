@@ -316,15 +316,13 @@ pub fn schema_key_for_resource(
     factories: &[Box<dyn ProviderFactory>],
     resource: &Resource,
 ) -> String {
-    match resource.attributes.get("_provider") {
-        Some(Value::String(provider)) => {
-            if let Some(factory) = find_factory(factories, provider) {
-                factory.format_schema_key(&resource.id.resource_type)
-            } else {
-                resource.id.resource_type.clone()
-            }
-        }
-        _ => resource.id.resource_type.clone(),
+    if resource.id.provider.is_empty() {
+        return resource.id.resource_type.clone();
+    }
+    if let Some(factory) = find_factory(factories, &resource.id.provider) {
+        factory.format_schema_key(&resource.id.resource_type)
+    } else {
+        resource.id.resource_type.clone()
     }
 }
 
@@ -549,5 +547,49 @@ mod tests {
                 .message
                 .contains("Unknown provider: nonexistent")
         );
+    }
+
+    // Mock ProviderFactory for testing schema_key_for_resource
+    struct MockProviderFactory;
+
+    impl ProviderFactory for MockProviderFactory {
+        fn name(&self) -> &str {
+            "mock"
+        }
+
+        fn display_name(&self) -> &str {
+            "Mock provider"
+        }
+
+        fn validate_config(&self, _attributes: &HashMap<String, Value>) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn extract_region(&self, _attributes: &HashMap<String, Value>) -> String {
+            "us-east-1".to_string()
+        }
+
+        fn create_provider(
+            &self,
+            _attributes: &HashMap<String, Value>,
+        ) -> BoxFuture<'_, Box<dyn Provider>> {
+            Box::pin(async { Box::new(MockProvider) as Box<dyn Provider> })
+        }
+
+        fn schemas(&self) -> Vec<crate::schema::ResourceSchema> {
+            vec![]
+        }
+    }
+
+    #[test]
+    fn schema_key_for_resource_uses_id_provider_not_attribute() {
+        let factories: Vec<Box<dyn ProviderFactory>> = vec![Box::new(MockProviderFactory)];
+
+        // Resource with id.provider set but NO _provider attribute
+        let resource = Resource::with_provider("mock", "s3.bucket", "my-bucket");
+        assert!(!resource.attributes.contains_key("_provider"));
+
+        let key = schema_key_for_resource(&factories, &resource);
+        assert_eq!(key, "mock.s3.bucket");
     }
 }

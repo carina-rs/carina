@@ -692,11 +692,7 @@ fn resolve_enum_identifiers_impl(resources: &mut [Resource]) {
 
     for resource in resources.iter_mut() {
         // Only handle aws resources
-        let is_aws = matches!(
-            resource.attributes.get("_provider"),
-            Some(Value::String(p)) if p == "aws"
-        );
-        if !is_aws {
+        if resource.id.provider != "aws" {
             continue;
         }
 
@@ -801,10 +797,7 @@ mod tests {
 
     #[test]
     fn test_resolve_enum_identifiers_namespaced_value() {
-        let mut resource = Resource::new("s3.bucket", "test-bucket");
-        resource
-            .attributes
-            .insert("_provider".to_string(), Value::String("aws".to_string()));
+        let mut resource = Resource::with_provider("aws", "s3.bucket", "test-bucket");
         resource.attributes.insert(
             "versioning_status".to_string(),
             Value::String("aws.s3.bucket.VersioningStatus.Enabled".to_string()),
@@ -821,10 +814,7 @@ mod tests {
 
     #[test]
     fn test_resolve_enum_identifiers_bare_ident() {
-        let mut resource = Resource::new("s3.bucket", "test-bucket");
-        resource
-            .attributes
-            .insert("_provider".to_string(), Value::String("aws".to_string()));
+        let mut resource = Resource::with_provider("aws", "s3.bucket", "test-bucket");
         resource.attributes.insert(
             "versioning_status".to_string(),
             Value::UnresolvedIdent("Enabled".to_string(), None),
@@ -841,10 +831,7 @@ mod tests {
 
     #[test]
     fn test_resolve_enum_identifiers_typename_value() {
-        let mut resource = Resource::new("s3.bucket", "test-bucket");
-        resource
-            .attributes
-            .insert("_provider".to_string(), Value::String("aws".to_string()));
+        let mut resource = Resource::with_provider("aws", "s3.bucket", "test-bucket");
         resource.attributes.insert(
             "object_ownership".to_string(),
             Value::UnresolvedIdent(
@@ -864,10 +851,7 @@ mod tests {
 
     #[test]
     fn test_resolve_enum_identifiers_plain_string() {
-        let mut resource = Resource::new("s3.bucket", "test-bucket");
-        resource
-            .attributes
-            .insert("_provider".to_string(), Value::String("aws".to_string()));
+        let mut resource = Resource::with_provider("aws", "s3.bucket", "test-bucket");
         resource.attributes.insert(
             "versioning_status".to_string(),
             Value::String("Enabled".to_string()),
@@ -884,10 +868,7 @@ mod tests {
 
     #[test]
     fn test_resolve_enum_identifiers_skips_non_aws() {
-        let mut resource = Resource::new("s3.bucket", "test");
-        resource
-            .attributes
-            .insert("_provider".to_string(), Value::String("awscc".to_string()));
+        let mut resource = Resource::with_provider("awscc", "s3.bucket", "test");
         resource.attributes.insert(
             "versioning_status".to_string(),
             Value::String("Enabled".to_string()),
@@ -904,10 +885,8 @@ mod tests {
     #[test]
     fn test_resolve_enum_identifiers_with_to_dsl() {
         // ip_protocol has to_dsl that maps "-1" → "all"
-        let mut resource = Resource::new("ec2.security_group_ingress", "test-rule");
-        resource
-            .attributes
-            .insert("_provider".to_string(), Value::String("aws".to_string()));
+        let mut resource =
+            Resource::with_provider("aws", "ec2.security_group_ingress", "test-rule");
         resource
             .attributes
             .insert("ip_protocol".to_string(), Value::String("-1".to_string()));
@@ -1480,10 +1459,7 @@ mod tests {
 
     #[test]
     fn test_resolve_enum_identifiers_ec2_vpc_instance_tenancy() {
-        let mut resource = Resource::new("ec2.vpc", "test-vpc");
-        resource
-            .attributes
-            .insert("_provider".to_string(), Value::String("aws".to_string()));
+        let mut resource = Resource::with_provider("aws", "ec2.vpc", "test-vpc");
         resource.attributes.insert(
             "instance_tenancy".to_string(),
             Value::UnresolvedIdent("InstanceTenancy".to_string(), Some("dedicated".to_string())),
@@ -1500,10 +1476,8 @@ mod tests {
 
     #[test]
     fn test_resolve_enum_identifiers_ec2_security_group_ingress_protocol() {
-        let mut resource = Resource::new("ec2.security_group_ingress", "test-rule");
-        resource
-            .attributes
-            .insert("_provider".to_string(), Value::String("aws".to_string()));
+        let mut resource =
+            Resource::with_provider("aws", "ec2.security_group_ingress", "test-rule");
         resource.attributes.insert(
             "ip_protocol".to_string(),
             Value::UnresolvedIdent("IpProtocol".to_string(), Some("tcp".to_string())),

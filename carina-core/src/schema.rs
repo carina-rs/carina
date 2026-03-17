@@ -2186,8 +2186,6 @@ mod tests {
                     m
                 })]),
             );
-            r.attributes
-                .insert("_provider".to_string(), Value::String("awscc".to_string()));
             r
         }];
 
@@ -2328,8 +2326,6 @@ mod tests {
             let mut r = Resource::new("s3.bucket", "my-bucket");
             r.attributes
                 .insert("lifecycle_configuration".to_string(), Value::Map(inner_map));
-            r.attributes
-                .insert("_provider".to_string(), Value::String("awscc".to_string()));
             r
         }];
 
@@ -2396,8 +2392,6 @@ mod tests {
             let mut r = Resource::new("s3.bucket", "my-bucket");
             r.attributes
                 .insert("lifecycle_configuration".to_string(), Value::Map(inner_map));
-            r.attributes
-                .insert("_provider".to_string(), Value::String("awscc".to_string()));
             r
         }];
 
@@ -2468,8 +2462,6 @@ mod tests {
             let mut r = Resource::new("s3.bucket", "my-bucket");
             r.attributes
                 .insert("lifecycle_configuration".to_string(), Value::Map(inner_map));
-            r.attributes
-                .insert("_provider".to_string(), Value::String("awscc".to_string()));
             r
         }];
 

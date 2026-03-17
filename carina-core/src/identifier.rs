@@ -249,10 +249,11 @@ pub fn compute_anonymous_identifiers(
             continue;
         }
 
-        // Look up schema for this resource's provider (skip if no _provider set)
-        let Some(Value::String(provider_name)) = resource.attributes.get("_provider") else {
+        // Look up schema for this resource's provider (skip if no provider set)
+        if resource.id.provider.is_empty() {
             continue;
-        };
+        }
+        let provider_name = &resource.id.provider;
         let schema_key = schema_key_fn(resource);
 
         let Some(schema) = schemas.get(&schema_key) else {
@@ -295,7 +296,7 @@ pub fn compute_anonymous_identifiers(
             // No create-only values available: hash all user-specified attributes
             for (key, value) in &resource.attributes {
                 if key.starts_with('_') {
-                    continue; // Skip internal attributes like _provider
+                    continue; // Skip internal attributes like _type, _binding
                 }
                 hash_values.insert(key.as_str(), deterministic_value_string(value));
             }
@@ -488,9 +489,10 @@ mod tests {
     }
 
     fn schema_key_fn(resource: &Resource) -> String {
-        match resource.attributes.get("_provider") {
-            Some(Value::String(provider)) => format!("{}.{}", provider, resource.id.resource_type),
-            _ => resource.id.resource_type.clone(),
+        if resource.id.provider.is_empty() {
+            resource.id.resource_type.clone()
+        } else {
+            format!("{}.{}", resource.id.provider, resource.id.resource_type)
         }
     }
 
@@ -504,9 +506,6 @@ mod tests {
     #[test]
     fn test_resolve_attr_prefixes_extracts_prefix_and_generates_name() {
         let mut resource = Resource::with_provider("awscc", "s3.bucket", "test-bucket");
-        resource
-            .attributes
-            .insert("_provider".to_string(), Value::String("awscc".to_string()));
         resource.attributes.insert(
             "bucket_name_prefix".to_string(),
             Value::String("my-app-".to_string()),
@@ -538,9 +537,6 @@ mod tests {
     #[test]
     fn test_resolve_attr_prefixes_leaves_non_matching_prefix_alone() {
         let mut resource = Resource::with_provider("awscc", "s3.bucket", "test-bucket");
-        resource
-            .attributes
-            .insert("_provider".to_string(), Value::String("awscc".to_string()));
         resource.attributes.insert(
             "nonexistent_attr_prefix".to_string(),
             Value::String("some-value".to_string()),
@@ -563,9 +559,6 @@ mod tests {
     #[test]
     fn test_resolve_attr_prefixes_errors_when_both_prefix_and_attr_specified() {
         let mut resource = Resource::with_provider("awscc", "s3.bucket", "test-bucket");
-        resource
-            .attributes
-            .insert("_provider".to_string(), Value::String("awscc".to_string()));
         resource.attributes.insert(
             "bucket_name_prefix".to_string(),
             Value::String("my-app-".to_string()),
@@ -586,9 +579,6 @@ mod tests {
     #[test]
     fn test_resolve_attr_prefixes_errors_on_empty_prefix() {
         let mut resource = Resource::with_provider("awscc", "s3.bucket", "test-bucket");
-        resource
-            .attributes
-            .insert("_provider".to_string(), Value::String("awscc".to_string()));
         resource.attributes.insert(
             "bucket_name_prefix".to_string(),
             Value::String("".to_string()),
@@ -704,8 +694,6 @@ mod tests {
 
         // Step 1: compute identifier with path="/"
         let mut r1 = Resource::with_provider("awscc", "iam.role", "");
-        r1.attributes
-            .insert("_provider".to_string(), Value::String("awscc".to_string()));
         r1.attributes.insert(
             "role_name".to_string(),
             Value::String("my-role".to_string()),
@@ -725,8 +713,6 @@ mod tests {
 
         // Step 2: compute identifier with path="/carina/" (changed create-only)
         let mut r2 = Resource::with_provider("awscc", "iam.role", "");
-        r2.attributes
-            .insert("_provider".to_string(), Value::String("awscc".to_string()));
         r2.attributes.insert(
             "role_name".to_string(),
             Value::String("my-role".to_string()),
@@ -917,8 +903,6 @@ mod tests {
 
         let mut r = Resource::with_provider("awscc", "ec2.eip", "");
         r.attributes
-            .insert("_provider".to_string(), Value::String("awscc".to_string()));
-        r.attributes
             .insert("domain".to_string(), Value::String("vpc".to_string()));
 
         let mut resources = vec![r];
@@ -957,8 +941,6 @@ mod tests {
 
         let make_resource = || {
             let mut r = Resource::with_provider("awscc", "ec2.eip", "");
-            r.attributes
-                .insert("_provider".to_string(), Value::String("awscc".to_string()));
             r.attributes
                 .insert("domain".to_string(), Value::String("vpc".to_string()));
             r
@@ -1002,13 +984,9 @@ mod tests {
 
         let mut r1 = Resource::with_provider("awscc", "ec2.eip", "");
         r1.attributes
-            .insert("_provider".to_string(), Value::String("awscc".to_string()));
-        r1.attributes
             .insert("domain".to_string(), Value::String("vpc".to_string()));
 
         let mut r2 = Resource::with_provider("awscc", "ec2.eip", "");
-        r2.attributes
-            .insert("_provider".to_string(), Value::String("awscc".to_string()));
         r2.attributes
             .insert("domain".to_string(), Value::String("vpc".to_string()));
 
@@ -1110,8 +1088,6 @@ mod tests {
         // Step 1: compute identifier with tag_env="production"
         let mut r1 = Resource::with_provider("awscc", "ec2.eip", "");
         r1.attributes
-            .insert("_provider".to_string(), Value::String("awscc".to_string()));
-        r1.attributes
             .insert("domain".to_string(), Value::String("vpc".to_string()));
         r1.attributes
             .insert("tag_name".to_string(), Value::String("my-eip".to_string()));
@@ -1132,8 +1108,6 @@ mod tests {
 
         // Step 2: compute identifier with tag_env="staging" (one attribute changed)
         let mut r2 = Resource::with_provider("awscc", "ec2.eip", "");
-        r2.attributes
-            .insert("_provider".to_string(), Value::String("awscc".to_string()));
         r2.attributes
             .insert("domain".to_string(), Value::String("vpc".to_string()));
         r2.attributes
@@ -1224,8 +1198,6 @@ mod tests {
 
         // Compute identifier without setting the create-only property
         let mut r1 = Resource::with_provider("awscc", "ec2.eip", "");
-        r1.attributes
-            .insert("_provider".to_string(), Value::String("awscc".to_string()));
         r1.attributes
             .insert("domain".to_string(), Value::String("vpc".to_string()));
         let mut resources = vec![r1];
@@ -1417,8 +1389,6 @@ mod tests {
         let make_resource = |env: &str, team: &str| {
             let mut r = Resource::with_provider("awscc", "ec2.eip", "");
             r.attributes
-                .insert("_provider".to_string(), Value::String("awscc".to_string()));
-            r.attributes
                 .insert("domain".to_string(), Value::String("vpc".to_string()));
             r.attributes
                 .insert("tag_name".to_string(), Value::String("my-eip".to_string()));
@@ -1523,8 +1493,6 @@ mod tests {
 
         let mut r = Resource::with_provider("awscc", "ec2.eip", "");
         r.attributes
-            .insert("_provider".to_string(), Value::String("awscc".to_string()));
-        r.attributes
             .insert("domain".to_string(), Value::String("vpc".to_string()));
         let mut resources = vec![r];
         compute_anonymous_identifiers(
@@ -1599,8 +1567,6 @@ mod tests {
         let make_resource = |env: &str| {
             let mut r = Resource::with_provider("awscc", "ec2.internet_gateway", "");
             r.attributes
-                .insert("_provider".to_string(), Value::String("awscc".to_string()));
-            r.attributes
                 .insert("tag_name".to_string(), Value::String("my-igw".to_string()));
             r.attributes
                 .insert("tag_env".to_string(), Value::String(env.to_string()));
@@ -1656,8 +1622,6 @@ mod tests {
         let identity_fn = |_: &str| -> Vec<String> { vec![] };
 
         let mut vpc = Resource::with_provider("awscc", "ec2.vpc", "");
-        vpc.attributes
-            .insert("_provider".to_string(), Value::String("awscc".to_string()));
         vpc.attributes.insert(
             "cidr_block".to_string(),
             Value::String("10.0.0.0/16".to_string()),
@@ -1666,8 +1630,6 @@ mod tests {
             .insert("tag_name".to_string(), Value::String("my-vpc".to_string()));
 
         let mut eip = Resource::with_provider("awscc", "ec2.eip", "");
-        eip.attributes
-            .insert("_provider".to_string(), Value::String("awscc".to_string()));
         eip.attributes
             .insert("domain".to_string(), Value::String("vpc".to_string()));
         eip.attributes
@@ -1707,9 +1669,6 @@ mod tests {
 
         // Resource with both create-only props set
         let mut resource = Resource::with_provider("awscc", "iam.role", "iam_role_aabbccdd");
-        resource
-            .attributes
-            .insert("_provider".to_string(), Value::String("awscc".to_string()));
         resource.attributes.insert(
             "role_name".to_string(),
             Value::String("my-role".to_string()),
@@ -1764,8 +1723,6 @@ mod tests {
         // Simulate two runs with different random suffixes but same prefix
         let make_resource = |generated_name: &str| {
             let mut r = Resource::with_provider("awscc", "s3.bucket", "");
-            r.attributes
-                .insert("_provider".to_string(), Value::String("awscc".to_string()));
             r.attributes.insert(
                 "bucket_name".to_string(),
                 Value::String(generated_name.to_string()),
@@ -1806,8 +1763,6 @@ mod tests {
 
         let make_resource = |prefix: &str, generated_name: &str| {
             let mut r = Resource::with_provider("awscc", "s3.bucket", "");
-            r.attributes
-                .insert("_provider".to_string(), Value::String("awscc".to_string()));
             r.attributes.insert(
                 "bucket_name".to_string(),
                 Value::String(generated_name.to_string()),
