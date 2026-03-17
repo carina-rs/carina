@@ -270,6 +270,33 @@ impl AwsProvider {
         if let Some(v) = obj.outpost_arn() {
             attributes.insert("outpost_arn".to_string(), Value::String(v.to_string()));
         }
+        if let Some(dns_opts) = obj.private_dns_name_options_on_launch() {
+            let mut fields = HashMap::new();
+            if let Some(ht) = dns_opts.hostname_type() {
+                fields.insert(
+                    "hostname_type".to_string(),
+                    Value::String(ht.as_str().to_string()),
+                );
+            }
+            if let Some(v) = dns_opts.enable_resource_name_dns_a_record() {
+                fields.insert(
+                    "enable_resource_name_dns_a_record".to_string(),
+                    Value::Bool(v),
+                );
+            }
+            if let Some(v) = dns_opts.enable_resource_name_dns_aaaa_record() {
+                fields.insert(
+                    "enable_resource_name_dns_aaaa_record".to_string(),
+                    Value::Bool(v),
+                );
+            }
+            if !fields.is_empty() {
+                attributes.insert(
+                    "private_dns_name_options_on_launch".to_string(),
+                    Value::Map(fields),
+                );
+            }
+        }
         if let Some(v) = obj.subnet_id() {
             attributes.insert("subnet_id".to_string(), Value::String(v.to_string()));
         }
