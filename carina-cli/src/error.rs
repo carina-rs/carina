@@ -85,6 +85,20 @@ mod tests {
     }
 
     #[test]
+    fn from_string() {
+        let app_err: AppError = "some error".to_string().into();
+        assert!(matches!(app_err, AppError::Config(_)));
+        assert_eq!(app_err.to_string(), "some error");
+    }
+
+    #[test]
+    fn from_str() {
+        let app_err: AppError = "some error".into();
+        assert!(matches!(app_err, AppError::Config(_)));
+        assert_eq!(app_err.to_string(), "some error");
+    }
+
+    #[test]
     fn implements_std_error() {
         let app_err = AppError::Validation("test".to_string());
         let _: &dyn std::error::Error = &app_err;
