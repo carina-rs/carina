@@ -768,4 +768,43 @@ mod tests {
             120
         );
     }
+
+    // =========================================================================
+    // format_sdk_error tests
+    // =========================================================================
+
+    #[test]
+    fn test_format_sdk_error_service_error() {
+        use aws_sdk_cloudcontrol::operation::update_resource::UpdateResourceError;
+        use aws_sdk_cloudcontrol::types::error::GeneralServiceException;
+        use aws_smithy_runtime_api::client::result::SdkError;
+
+        let meta = aws_smithy_types::error::ErrorMetadata::builder()
+            .code("GeneralServiceException")
+            .message("Handler returned status FAILED")
+            .build();
+        let err = UpdateResourceError::GeneralServiceException(
+            GeneralServiceException::builder()
+                .message("Handler returned status FAILED")
+                .meta(meta)
+                .build(),
+        );
+        let sdk_err = SdkError::service_error(err, http::Response::new(""));
+        let formatted = AwsccProvider::format_sdk_error(&sdk_err);
+        assert_eq!(
+            formatted,
+            "GeneralServiceException: Handler returned status FAILED"
+        );
+    }
+
+    #[test]
+    fn test_format_sdk_error_timeout() {
+        use aws_sdk_cloudcontrol::operation::update_resource::UpdateResourceError;
+        use aws_smithy_runtime_api::client::result::SdkError;
+
+        let sdk_err: SdkError<UpdateResourceError, http::Response<&str>> =
+            SdkError::timeout_error("connection timed out");
+        let formatted = AwsccProvider::format_sdk_error(&sdk_err);
+        assert_eq!(formatted, "request has timed out");
+    }
 }
