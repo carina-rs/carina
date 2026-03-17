@@ -21,7 +21,7 @@ pub(crate) fn parse_resource_properties(props_str: &str) -> ProviderResult<serde
 /// Build JSON Patch operations for updating a resource.
 ///
 /// Compares `from` (current state) and `to` (desired state) to generate:
-/// - `"replace"` operations for attributes present in `to`
+/// - `"add"` operations for attributes present in `to`
 /// - `"remove"` operations for attributes present in `from` but absent in `to`
 ///   (only for non-required, non-create-only attributes with a provider_name)
 pub(crate) fn build_update_patches(
@@ -32,7 +32,7 @@ pub(crate) fn build_update_patches(
     let mut patch_ops = Vec::new();
     let resource_type = &to.id.resource_type;
 
-    // Build replace operations for attributes that changed between `from` and `to`
+    // Build add operations for attributes that changed between `from` and `to`
     for (dsl_name, attr_schema) in &config.schema.attributes {
         // Skip tags - handled separately below
         if dsl_name == "tags" {
