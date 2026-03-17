@@ -652,9 +652,7 @@ fn parse_anonymous_resource(
     // identifier computed from create-only properties after parsing.
     let resource_name = String::new();
 
-    // Add provider information to attributes
     let mut attributes = attributes;
-    attributes.insert("_provider".to_string(), Value::String(provider.to_string()));
     attributes.insert("_type".to_string(), Value::String(namespaced_type.clone()));
 
     // Extract lifecycle block from attributes (it's a meta-argument, not a real attribute)
@@ -783,8 +781,6 @@ fn parse_resource_expr(
     // Extract lifecycle block from attributes (it's a meta-argument, not a real attribute)
     let lifecycle = extract_lifecycle_config(&mut attributes);
 
-    // Add provider information to attributes
-    attributes.insert("_provider".to_string(), Value::String(provider.to_string()));
     attributes.insert("_type".to_string(), Value::String(namespaced_type.clone()));
     // Save binding name (for reference)
     attributes.insert(
@@ -831,8 +827,6 @@ fn parse_read_resource_expr(
     // Extract lifecycle block from attributes (it's a meta-argument, not a real attribute)
     let lifecycle = extract_lifecycle_config(&mut attributes);
 
-    // Add provider information to attributes
-    attributes.insert("_provider".to_string(), Value::String(provider.to_string()));
     attributes.insert("_type".to_string(), Value::String(namespaced_type.clone()));
     // Save binding name (for reference)
     attributes.insert(
@@ -1305,10 +1299,9 @@ mod tests {
         let result = parse(input).unwrap();
         assert_eq!(result.resources.len(), 1);
         assert_eq!(result.resources[0].id.resource_type, "storage.bucket");
-        assert_eq!(
-            result.resources[0].attributes.get("_provider"),
-            Some(&Value::String("gcp".to_string()))
-        );
+        assert_eq!(result.resources[0].id.provider, "gcp");
+        // _provider attribute should NOT be set (provider identity is in ResourceId)
+        assert!(!result.resources[0].attributes.contains_key("_provider"));
     }
 
     #[test]

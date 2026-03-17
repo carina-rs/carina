@@ -3190,9 +3190,6 @@ mod tests {
     #[test]
     fn test_resolve_attr_prefixes_extracts_prefix_and_generates_name() {
         let mut resource = Resource::with_provider("awscc", "s3.bucket", "test-bucket");
-        resource
-            .attributes
-            .insert("_provider".to_string(), Value::String("awscc".to_string()));
         resource.attributes.insert(
             "bucket_name_prefix".to_string(),
             Value::String("my-app-".to_string()),
@@ -3223,9 +3220,6 @@ mod tests {
     fn test_resolve_attr_prefixes_leaves_non_matching_prefix_alone() {
         // If base attr doesn't exist in schema, leave _prefix as-is
         let mut resource = Resource::with_provider("awscc", "s3.bucket", "test-bucket");
-        resource
-            .attributes
-            .insert("_provider".to_string(), Value::String("awscc".to_string()));
         resource.attributes.insert(
             "nonexistent_attr_prefix".to_string(),
             Value::String("some-value".to_string()),
@@ -3246,9 +3240,6 @@ mod tests {
     #[test]
     fn test_resolve_attr_prefixes_errors_when_both_prefix_and_attr_specified() {
         let mut resource = Resource::with_provider("awscc", "s3.bucket", "test-bucket");
-        resource
-            .attributes
-            .insert("_provider".to_string(), Value::String("awscc".to_string()));
         resource.attributes.insert(
             "bucket_name_prefix".to_string(),
             Value::String("my-app-".to_string()),
@@ -3267,9 +3258,6 @@ mod tests {
     #[test]
     fn test_resolve_attr_prefixes_errors_on_empty_prefix() {
         let mut resource = Resource::with_provider("awscc", "s3.bucket", "test-bucket");
-        resource
-            .attributes
-            .insert("_provider".to_string(), Value::String("awscc".to_string()));
         resource.attributes.insert(
             "bucket_name_prefix".to_string(),
             Value::String("".to_string()),
@@ -3285,9 +3273,6 @@ mod tests {
     fn test_resolve_names_handles_block_name_before_prefix() {
         // resolve_names should first resolve block names, then resolve attr prefixes
         let mut resource = Resource::with_provider("awscc", "ec2.ipam", "test-ipam");
-        resource
-            .attributes
-            .insert("_provider".to_string(), Value::String("awscc".to_string()));
         resource.attributes.insert(
             "operating_region".to_string(),
             Value::List(vec![Value::Map(
@@ -3432,16 +3417,12 @@ mod tests {
     fn test_anonymous_id_different_regions_produce_different_identifiers() {
         // Two anonymous ec2_vpc resources with same cidr_block but different provider regions
         let mut r1 = Resource::with_provider("awscc", "ec2.vpc", "");
-        r1.attributes
-            .insert("_provider".to_string(), Value::String("awscc".to_string()));
         r1.attributes.insert(
             "cidr_block".to_string(),
             Value::String("10.0.0.0/16".to_string()),
         );
 
         let mut r2 = Resource::with_provider("awscc", "ec2.vpc", "");
-        r2.attributes
-            .insert("_provider".to_string(), Value::String("awscc".to_string()));
         r2.attributes.insert(
             "cidr_block".to_string(),
             Value::String("10.0.0.0/16".to_string()),
@@ -3469,16 +3450,12 @@ mod tests {
     fn test_anonymous_id_same_region_same_create_only_collides() {
         // Two anonymous ec2_vpc resources with same cidr_block and same provider region → collision
         let mut r1 = Resource::with_provider("awscc", "ec2.vpc", "");
-        r1.attributes
-            .insert("_provider".to_string(), Value::String("awscc".to_string()));
         r1.attributes.insert(
             "cidr_block".to_string(),
             Value::String("10.0.0.0/16".to_string()),
         );
 
         let mut r2 = Resource::with_provider("awscc", "ec2.vpc", "");
-        r2.attributes
-            .insert("_provider".to_string(), Value::String("awscc".to_string()));
         r2.attributes.insert(
             "cidr_block".to_string(),
             Value::String("10.0.0.0/16".to_string()),
@@ -3495,16 +3472,12 @@ mod tests {
     fn test_anonymous_id_different_create_only_same_region_no_collision() {
         // Two anonymous ec2_vpc resources with different cidr_block in same provider region → no collision
         let mut r1 = Resource::with_provider("awscc", "ec2.vpc", "");
-        r1.attributes
-            .insert("_provider".to_string(), Value::String("awscc".to_string()));
         r1.attributes.insert(
             "cidr_block".to_string(),
             Value::String("10.0.0.0/16".to_string()),
         );
 
         let mut r2 = Resource::with_provider("awscc", "ec2.vpc", "");
-        r2.attributes
-            .insert("_provider".to_string(), Value::String("awscc".to_string()));
         r2.attributes.insert(
             "cidr_block".to_string(),
             Value::String("10.1.0.0/16".to_string()),
@@ -3523,8 +3496,6 @@ mod tests {
     fn test_anonymous_id_named_resources_are_skipped() {
         // Named resources should not be processed by compute_anonymous_identifiers
         let mut r1 = Resource::with_provider("awscc", "ec2.vpc", "my_vpc");
-        r1.attributes
-            .insert("_provider".to_string(), Value::String("awscc".to_string()));
         r1.attributes.insert(
             "cidr_block".to_string(),
             Value::String("10.0.0.0/16".to_string()),
@@ -3578,8 +3549,7 @@ mod tests {
 
     #[test]
     fn validate_data_source_without_read_keyword_errors() {
-        let resource = Resource::with_provider("aws", "sts.caller_identity", "identity")
-            .with_attribute("_provider", Value::String("aws".to_string()));
+        let resource = Resource::with_provider("aws", "sts.caller_identity", "identity");
         // read_only defaults to false, simulating missing `read` keyword
         let result = validate_resources(&[resource]);
         assert!(result.is_err());
@@ -3598,9 +3568,8 @@ mod tests {
 
     #[test]
     fn validate_data_source_with_read_keyword_passes() {
-        let resource = Resource::with_provider("aws", "sts.caller_identity", "identity")
-            .with_attribute("_provider", Value::String("aws".to_string()))
-            .with_read_only(true);
+        let resource =
+            Resource::with_provider("aws", "sts.caller_identity", "identity").with_read_only(true);
         let result = validate_resources(&[resource]);
         assert!(
             result.is_ok(),
@@ -3612,7 +3581,6 @@ mod tests {
     #[test]
     fn validate_regular_resource_without_read_keyword_passes() {
         let resource = Resource::with_provider("aws", "s3.bucket", "my-bucket")
-            .with_attribute("_provider", Value::String("aws".to_string()))
             .with_attribute("bucket", Value::String("my-bucket".to_string()))
             .with_attribute("region", Value::String("ap-northeast-1".to_string()));
         let result = validate_resources(&[resource]);
@@ -3679,9 +3647,6 @@ mod tests {
         // --- First run (apply) ---
         // 1. Parse: anonymous resource with bucket_name_prefix
         let mut resource_run1 = Resource::with_provider("awscc", "s3.bucket", "");
-        resource_run1
-            .attributes
-            .insert("_provider".to_string(), Value::String("awscc".to_string()));
         resource_run1.attributes.insert(
             "bucket_name_prefix".to_string(),
             Value::String("my-app-".to_string()),
@@ -3736,9 +3701,6 @@ mod tests {
         // --- Second run (plan-verify) ---
         // 1. Parse again: same anonymous resource with bucket_name_prefix
         let mut resource_run2 = Resource::with_provider("awscc", "s3.bucket", "");
-        resource_run2
-            .attributes
-            .insert("_provider".to_string(), Value::String("awscc".to_string()));
         resource_run2.attributes.insert(
             "bucket_name_prefix".to_string(),
             Value::String("my-app-".to_string()),
@@ -3788,9 +3750,6 @@ mod tests {
 
         // --- First run ---
         let mut resource_run1 = Resource::with_provider("awscc", "iam.role", "");
-        resource_run1
-            .attributes
-            .insert("_provider".to_string(), Value::String("awscc".to_string()));
         resource_run1.attributes.insert(
             "role_name_prefix".to_string(),
             Value::String("carina-acc-test-".to_string()),
@@ -3845,9 +3804,6 @@ mod tests {
 
         // --- Second run ---
         let mut resource_run2 = Resource::with_provider("awscc", "iam.role", "");
-        resource_run2
-            .attributes
-            .insert("_provider".to_string(), Value::String("awscc".to_string()));
         resource_run2.attributes.insert(
             "role_name_prefix".to_string(),
             Value::String("carina-acc-test-".to_string()),
@@ -3896,9 +3852,6 @@ mod tests {
 
         // --- First run ---
         let mut resource_run1 = Resource::with_provider("awscc", "ec2.flow_log", "");
-        resource_run1
-            .attributes
-            .insert("_provider".to_string(), Value::String("awscc".to_string()));
         resource_run1.attributes.insert(
             "resource_id".to_string(),
             Value::ResourceRef {
@@ -3956,9 +3909,6 @@ mod tests {
 
         // --- Second run ---
         let mut resource_run2 = Resource::with_provider("awscc", "ec2.flow_log", "");
-        resource_run2
-            .attributes
-            .insert("_provider".to_string(), Value::String("awscc".to_string()));
         resource_run2.attributes.insert(
             "resource_id".to_string(),
             Value::ResourceRef {

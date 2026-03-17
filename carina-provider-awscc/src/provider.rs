@@ -1236,11 +1236,7 @@ pub fn resolve_enum_identifiers_impl(resources: &mut [Resource]) {
 
     for resource in resources.iter_mut() {
         // Only handle awscc resources
-        let is_awscc = matches!(
-            resource.attributes.get("_provider"),
-            Some(Value::String(p)) if p == "awscc"
-        );
-        if !is_awscc {
+        if resource.id.provider != "awscc" {
             continue;
         }
 
@@ -1837,10 +1833,7 @@ mod tests {
 
     #[test]
     fn test_resolve_enum_identifiers_bare_ident() {
-        let mut resource = Resource::new("ec2.vpc", "test");
-        resource
-            .attributes
-            .insert("_provider".to_string(), Value::String("awscc".to_string()));
+        let mut resource = Resource::with_provider("awscc", "ec2.vpc", "test");
         resource.attributes.insert(
             "instance_tenancy".to_string(),
             Value::UnresolvedIdent("dedicated".to_string(), None),
@@ -1861,10 +1854,7 @@ mod tests {
 
     #[test]
     fn test_resolve_enum_identifiers_typename_value() {
-        let mut resource = Resource::new("ec2.vpc", "test");
-        resource
-            .attributes
-            .insert("_provider".to_string(), Value::String("awscc".to_string()));
+        let mut resource = Resource::with_provider("awscc", "ec2.vpc", "test");
         resource.attributes.insert(
             "instance_tenancy".to_string(),
             Value::UnresolvedIdent("InstanceTenancy".to_string(), Some("dedicated".to_string())),
@@ -1884,10 +1874,7 @@ mod tests {
 
     #[test]
     fn test_resolve_enum_identifiers_skips_non_awscc() {
-        let mut resource = Resource::new("s3.bucket", "test");
-        resource
-            .attributes
-            .insert("_provider".to_string(), Value::String("aws".to_string()));
+        let mut resource = Resource::with_provider("aws", "s3.bucket", "test");
         resource.attributes.insert(
             "instance_tenancy".to_string(),
             Value::UnresolvedIdent("dedicated".to_string(), None),
@@ -1905,10 +1892,7 @@ mod tests {
     #[test]
     fn test_resolve_enum_identifiers_hyphen_to_underscore() {
         // Test that flow log's log_destination_type with hyphens gets converted to underscores
-        let mut resource = Resource::new("ec2.flow_log", "test");
-        resource
-            .attributes
-            .insert("_provider".to_string(), Value::String("awscc".to_string()));
+        let mut resource = Resource::with_provider("awscc", "ec2.flow_log", "test");
         resource.attributes.insert(
             "log_destination_type".to_string(),
             Value::UnresolvedIdent("cloud_watch_logs".to_string(), None),
@@ -1931,10 +1915,7 @@ mod tests {
     #[test]
     fn test_resolve_enum_identifiers_hyphen_string_to_underscore() {
         // Test that a plain string with hyphens is converted to underscores via to_dsl
-        let mut resource = Resource::new("ec2.flow_log", "test");
-        resource
-            .attributes
-            .insert("_provider".to_string(), Value::String("awscc".to_string()));
+        let mut resource = Resource::with_provider("awscc", "ec2.flow_log", "test");
         resource.attributes.insert(
             "log_destination_type".to_string(),
             Value::String("cloud-watch-logs".to_string()),
@@ -2069,10 +2050,7 @@ mod tests {
     #[test]
     fn test_resolve_enum_identifiers_ip_protocol_all_alias() {
         // Test that bare "all" identifier resolves to namespaced form for IpProtocol
-        let mut resource = Resource::new("ec2.security_group_egress", "test");
-        resource
-            .attributes
-            .insert("_provider".to_string(), Value::String("awscc".to_string()));
+        let mut resource = Resource::with_provider("awscc", "ec2.security_group_egress", "test");
         resource.attributes.insert(
             "ip_protocol".to_string(),
             Value::UnresolvedIdent("all".to_string(), None),
@@ -2095,10 +2073,7 @@ mod tests {
     #[test]
     fn test_resolve_enum_identifiers_ip_protocol_tcp() {
         // Test that bare "tcp" identifier resolves correctly
-        let mut resource = Resource::new("ec2.security_group_egress", "test");
-        resource
-            .attributes
-            .insert("_provider".to_string(), Value::String("awscc".to_string()));
+        let mut resource = Resource::with_provider("awscc", "ec2.security_group_egress", "test");
         resource.attributes.insert(
             "ip_protocol".to_string(),
             Value::UnresolvedIdent("tcp".to_string(), None),
@@ -2379,10 +2354,7 @@ mod tests {
         let attr_schema = config.schema.attributes.get("vpc_endpoint_type").unwrap();
 
         // 1. DSL side: resolve_enum_identifiers_impl converts bare `Gateway` ident
-        let mut resource = Resource::new("ec2.vpc_endpoint", "test");
-        resource
-            .attributes
-            .insert("_provider".to_string(), Value::String("awscc".to_string()));
+        let mut resource = Resource::with_provider("awscc", "ec2.vpc_endpoint", "test");
         resource
             .attributes
             .insert("vpc_id".to_string(), Value::String("vpc-123".to_string()));
@@ -2446,10 +2418,7 @@ mod tests {
     fn test_resolve_enum_identifiers_impl_struct_field() {
         // Test that resolve_enum_identifiers_impl handles struct field enums
         // in ec2_security_group
-        let mut resource = Resource::new("ec2.security_group", "test-sg");
-        resource
-            .attributes
-            .insert("_provider".to_string(), Value::String("awscc".to_string()));
+        let mut resource = Resource::with_provider("awscc", "ec2.security_group", "test-sg");
         resource.attributes.insert(
             "group_description".to_string(),
             Value::String("test".to_string()),
