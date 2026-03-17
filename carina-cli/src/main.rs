@@ -236,6 +236,12 @@ async fn main() {
             }
             Err(e) => {
                 eprintln!("{} {}", "Error:".red().bold(), e);
+                if let AppError::Backend(BackendError::Locked { ref lock_id, .. }) = e {
+                    eprintln!(
+                        "If you believe this is stale, run: carina force-unlock {}",
+                        lock_id
+                    );
+                }
                 std::process::exit(1);
             }
         }
@@ -271,6 +277,12 @@ async fn main() {
 
     if let Err(e) = result {
         eprintln!("{} {}", "Error:".red().bold(), e);
+        if let AppError::Backend(BackendError::Locked { ref lock_id, .. }) = e {
+            eprintln!(
+                "If you believe this is stale, run: carina force-unlock {}",
+                lock_id
+            );
+        }
         std::process::exit(1);
     }
 }
