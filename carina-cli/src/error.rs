@@ -15,11 +15,11 @@ pub enum AppError {
     Provider(#[from] ProviderError),
 
     /// Validation errors (schema mismatch, invalid config, etc.)
-    #[error("validation: {0}")]
+    #[error("{0}")]
     Validation(String),
 
     /// Configuration errors (missing attributes, invalid paths, etc.)
-    #[error("configuration: {0}")]
+    #[error("{0}")]
     Config(String),
 }
 
@@ -61,13 +61,13 @@ mod tests {
     #[test]
     fn validation_error() {
         let app_err = AppError::Validation("invalid region".to_string());
-        assert_eq!(app_err.to_string(), "validation: invalid region");
+        assert_eq!(app_err.to_string(), "invalid region");
     }
 
     #[test]
     fn config_error() {
         let app_err = AppError::Config("missing path".to_string());
-        assert_eq!(app_err.to_string(), "configuration: missing path");
+        assert_eq!(app_err.to_string(), "missing path");
     }
 
     #[test]
