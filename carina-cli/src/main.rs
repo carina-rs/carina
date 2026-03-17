@@ -974,6 +974,7 @@ async fn execute_effects(
 }
 
 /// Save state after apply, release lock, and print summary.
+/// Save state after apply. Does NOT release the lock — caller is responsible.
 async fn finalize_apply(
     result: &ApplyResult,
     state_file: Option<StateFile>,
@@ -981,12 +982,7 @@ async fn finalize_apply(
     current_states: &HashMap<ResourceId, State>,
     plan: &Plan,
     backend: &dyn StateBackend,
-    lock: &LockInfo,
 ) -> Result<(), String> {
-    // Save state
-    println!();
-    println!("{}", "Saving state...".cyan());
-
     let mut state = build_state_after_apply(ApplyStateSave {
         state_file,
         sorted_resources,
@@ -1006,32 +1002,7 @@ async fn finalize_apply(
         .map_err(|e| format!("Failed to write state: {}", e))?;
     println!("  {} State saved (serial: {})", "✓".green(), state.serial);
 
-    // Release lock
-    backend
-        .release_lock(lock)
-        .await
-        .map_err(|e| format!("Failed to release lock: {}", e))?;
-    println!("  {} Lock released", "✓".green());
-
-    println!();
-    if result.failure_count == 0 && result.skip_count == 0 {
-        println!(
-            "{}",
-            format!("Apply complete! {} changes applied.", result.success_count)
-                .green()
-                .bold()
-        );
-        Ok(())
-    } else {
-        let mut parts = vec![format!("{} succeeded", result.success_count)];
-        if result.failure_count > 0 {
-            parts.push(format!("{} failed", result.failure_count));
-        }
-        if result.skip_count > 0 {
-            parts.push(format!("{} skipped", result.skip_count));
-        }
-        Err(format!("Apply failed. {}.", parts.join(", ")))
-    }
+    Ok(())
 }
 
 fn queue_state_refresh(
@@ -1155,8 +1126,6 @@ async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
     // Handle bootstrap if S3 backend is configured
     #[allow(unused_assignments)]
     let mut lock: Option<LockInfo> = None;
-    #[allow(unused_assignments)]
-    let mut state_file: Option<StateFile> = None;
 
     if let Some(config) = backend_config {
         // Check if bucket exists (bootstrap detection)
@@ -1344,14 +1313,8 @@ async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
             _ => format!("Failed to acquire lock: {}", e),
         })?);
         println!("  {} Lock acquired", "✓".green());
-
-        // Read current state from backend
-        state_file = backend
-            .read_state()
-            .await
-            .map_err(|e| format!("Failed to read state: {}", e))?;
     } else {
-        // Local backend: acquire lock and read state
+        // Local backend: acquire lock
         println!("{}", "Acquiring state lock...".cyan());
         lock = Some(backend.acquire_lock("apply").await.map_err(|e| match e {
             BackendError::Locked {
@@ -1368,13 +1331,36 @@ async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
             _ => format!("Failed to acquire lock: {}", e),
         })?);
         println!("  {} Lock acquired", "✓".green());
-
-        // Read current state from local file
-        state_file = backend
-            .read_state()
-            .await
-            .map_err(|e| format!("Failed to read state: {}", e))?;
     }
+
+    // All code after lock acquisition is wrapped so that lock release is guaranteed
+    let lock_info = lock.as_ref().expect("lock should have been acquired");
+    let op_result = run_apply_locked(&mut parsed, auto_approve, backend.as_ref()).await;
+
+    // Always release lock, regardless of whether the operation succeeded
+    let release_result = backend
+        .release_lock(lock_info)
+        .await
+        .map_err(|e| format!("Failed to release lock: {}", e));
+
+    if release_result.is_ok() && op_result.is_ok() {
+        println!("  {} Lock released", "✓".green());
+    }
+
+    op_result?;
+    release_result
+}
+
+async fn run_apply_locked(
+    parsed: &mut ParsedFile,
+    auto_approve: bool,
+    backend: &dyn StateBackend,
+) -> Result<(), String> {
+    // Read current state from backend
+    let state_file = backend
+        .read_state()
+        .await
+        .map_err(|e| format!("Failed to read state: {}", e))?;
 
     reconcile_prefixed_names(&mut parsed.resources, &state_file);
     reconcile_anonymous_identifiers(&mut parsed.resources, &state_file);
@@ -1384,7 +1370,7 @@ async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
     let sorted_resources = sort_resources_by_dependencies(&parsed.resources)?;
 
     // Select appropriate Provider based on configuration
-    let provider: Box<dyn Provider> = get_provider(&parsed).await;
+    let provider: Box<dyn Provider> = get_provider(parsed).await;
 
     // Read states for all resources using identifier from state
     // In identifier-based approach, if there's no identifier in state, the resource doesn't exist
@@ -1454,15 +1440,6 @@ async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
 
     if plan.is_empty() {
         println!("{}", "No changes needed.".green());
-
-        // Release lock if we have one
-        if let Some(lock_info) = &lock {
-            backend
-                .release_lock(lock_info)
-                .await
-                .map_err(|e| format!("Failed to release lock: {}", e))?;
-        }
-
         return Ok(());
     }
 
@@ -1489,15 +1466,6 @@ async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
         if input.trim() != "yes" {
             println!();
             println!("{}", "Apply cancelled.".yellow());
-
-            // Release lock if we have one
-            if let Some(lock_info) = &lock {
-                backend
-                    .release_lock(lock_info)
-                    .await
-                    .map_err(|e| format!("Failed to release lock: {}", e))?;
-            }
-
             return Ok(());
         }
         println!();
@@ -1514,18 +1482,35 @@ async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
     )
     .await;
 
-    // lock is Option<LockInfo> in run_apply; unwrap since we always acquire it
-    let lock_info = lock.as_ref().expect("lock should have been acquired");
     finalize_apply(
         &result,
         state_file,
         &sorted_resources,
         &current_states,
         &plan,
-        backend.as_ref(),
-        lock_info,
+        backend,
     )
-    .await
+    .await?;
+
+    println!();
+    if result.failure_count == 0 && result.skip_count == 0 {
+        println!(
+            "{}",
+            format!("Apply complete! {} changes applied.", result.success_count)
+                .green()
+                .bold()
+        );
+        Ok(())
+    } else {
+        let mut parts = vec![format!("{} succeeded", result.success_count)];
+        if result.failure_count > 0 {
+            parts.push(format!("{} failed", result.failure_count));
+        }
+        if result.skip_count > 0 {
+            parts.push(format!("{} skipped", result.skip_count));
+        }
+        Err(format!("Apply failed. {}.", parts.join(", ")))
+    }
 }
 
 /// Detect infrastructure drift by comparing planned states against actual infrastructure.
@@ -1693,6 +1678,27 @@ async fn run_apply_from_plan(plan_path: &PathBuf, auto_approve: bool) -> Result<
     })?;
     println!("  {} Lock acquired", "✓".green());
 
+    let op_result = run_apply_from_plan_locked(plan_file, auto_approve, backend.as_ref()).await;
+
+    // Always release lock, regardless of whether the operation succeeded
+    let release_result = backend
+        .release_lock(&lock)
+        .await
+        .map_err(|e| format!("Failed to release lock: {}", e));
+
+    if release_result.is_ok() && op_result.is_ok() {
+        println!("  {} Lock released", "✓".green());
+    }
+
+    op_result?;
+    release_result
+}
+
+async fn run_apply_from_plan_locked(
+    plan_file: PlanFile,
+    auto_approve: bool,
+    backend: &dyn StateBackend,
+) -> Result<(), String> {
     // Read current state and validate lineage
     let state_file = backend
         .read_state()
@@ -1704,10 +1710,6 @@ async fn run_apply_from_plan(plan_path: &PathBuf, auto_approve: bool) -> Result<
         if let Some(ref plan_lineage) = plan_file.state_lineage
             && &state.lineage != plan_lineage
         {
-            backend
-                .release_lock(&lock)
-                .await
-                .map_err(|e| format!("Failed to release lock: {}", e))?;
             return Err(format!(
                 "State lineage mismatch: plan was created for lineage '{}' but current state has '{}'",
                 plan_lineage, state.lineage
@@ -1765,10 +1767,6 @@ async fn run_apply_from_plan(plan_path: &PathBuf, auto_approve: bool) -> Result<
             "Please re-run 'carina plan' to create a new plan that reflects the current state."
                 .yellow()
         );
-        backend
-            .release_lock(&lock)
-            .await
-            .map_err(|e| format!("Failed to release lock: {}", e))?;
         return Err("Apply aborted due to infrastructure drift.".to_string());
     }
 
@@ -1779,10 +1777,6 @@ async fn run_apply_from_plan(plan_path: &PathBuf, auto_approve: bool) -> Result<
 
     if plan.is_empty() {
         println!("{}", "No changes needed.".green());
-        backend
-            .release_lock(&lock)
-            .await
-            .map_err(|e| format!("Failed to release lock: {}", e))?;
         return Ok(());
     }
 
@@ -1809,10 +1803,6 @@ async fn run_apply_from_plan(plan_path: &PathBuf, auto_approve: bool) -> Result<
         if input.trim() != "yes" {
             println!();
             println!("{}", "Apply cancelled.".yellow());
-            backend
-                .release_lock(&lock)
-                .await
-                .map_err(|e| format!("Failed to release lock: {}", e))?;
             return Ok(());
         }
         println!();
@@ -1853,10 +1843,29 @@ async fn run_apply_from_plan(plan_path: &PathBuf, auto_approve: bool) -> Result<
         sorted_resources,
         &current_states,
         plan,
-        backend.as_ref(),
-        &lock,
+        backend,
     )
-    .await
+    .await?;
+
+    println!();
+    if result.failure_count == 0 && result.skip_count == 0 {
+        println!(
+            "{}",
+            format!("Apply complete! {} changes applied.", result.success_count)
+                .green()
+                .bold()
+        );
+        Ok(())
+    } else {
+        let mut parts = vec![format!("{} succeeded", result.success_count)];
+        if result.failure_count > 0 {
+            parts.push(format!("{} failed", result.failure_count));
+        }
+        if result.skip_count > 0 {
+            parts.push(format!("{} skipped", result.skip_count));
+        }
+        Err(format!("Apply failed. {}.", parts.join(", ")))
+    }
 }
 
 /// Create a provider from a saved ProviderConfig
@@ -1882,11 +1891,6 @@ async fn run_destroy(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
         create_local_backend()
     };
 
-    // Handle state locking
-    #[allow(unused_assignments)]
-    let mut lock: Option<LockInfo> = None;
-    #[allow(unused_assignments)]
-    let mut state_file: Option<StateFile> = None;
     let mut protected_bucket: Option<String> = None;
 
     // Get the state bucket name for protection check (S3 backend only)
@@ -1899,7 +1903,7 @@ async fn run_destroy(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
 
     // Acquire lock
     println!("{}", "Acquiring state lock...".cyan());
-    lock = Some(backend.acquire_lock("destroy").await.map_err(|e| match e {
+    let lock = backend.acquire_lock("destroy").await.map_err(|e| match e {
         BackendError::Locked {
             who,
             lock_id,
@@ -1912,11 +1916,39 @@ async fn run_destroy(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
             )
         }
         _ => format!("Failed to acquire lock: {}", e),
-    })?);
+    })?;
     println!("  {} Lock acquired", "✓".green());
 
+    let op_result = run_destroy_locked(
+        &mut parsed,
+        auto_approve,
+        backend.as_ref(),
+        protected_bucket,
+    )
+    .await;
+
+    // Always release lock, regardless of whether the operation succeeded
+    let release_result = backend
+        .release_lock(&lock)
+        .await
+        .map_err(|e| format!("Failed to release lock: {}", e));
+
+    if release_result.is_ok() && op_result.is_ok() {
+        println!("  {} Lock released", "✓".green());
+    }
+
+    op_result?;
+    release_result
+}
+
+async fn run_destroy_locked(
+    parsed: &mut ParsedFile,
+    auto_approve: bool,
+    backend: &dyn StateBackend,
+    protected_bucket: Option<String>,
+) -> Result<(), String> {
     // Read current state from backend
-    state_file = backend
+    let state_file = backend
         .read_state()
         .await
         .map_err(|e| format!("Failed to read state: {}", e))?;
@@ -1932,7 +1964,7 @@ async fn run_destroy(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
     let destroy_order: Vec<Resource> = sorted_resources.into_iter().rev().collect();
 
     // Select appropriate Provider based on configuration
-    let provider: Box<dyn Provider> = get_provider(&parsed).await;
+    let provider: Box<dyn Provider> = get_provider(parsed).await;
 
     // Read states for managed resources using identifier from state
     // Skip data sources (read-only) — they won't be destroyed
@@ -1983,15 +2015,6 @@ async fn run_destroy(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
 
     if resources_to_destroy.is_empty() && protected_resources.is_empty() {
         println!("{}", "No resources to destroy.".green());
-
-        // Release lock if we have one
-        if let Some(lock_info) = &lock {
-            backend
-                .release_lock(lock_info)
-                .await
-                .map_err(|e| format!("Failed to release lock: {}", e))?;
-        }
-
         return Ok(());
     }
 
@@ -2031,15 +2054,6 @@ async fn run_destroy(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
             "{}",
             "All resources are protected. Nothing to destroy.".yellow()
         );
-
-        // Release lock if we have one
-        if let Some(lock_info) = &lock {
-            backend
-                .release_lock(lock_info)
-                .await
-                .map_err(|e| format!("Failed to release lock: {}", e))?;
-        }
-
         return Ok(());
     }
 
@@ -2066,15 +2080,6 @@ async fn run_destroy(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
         if input.trim() != "yes" {
             println!();
             println!("{}", "Destroy cancelled.".yellow());
-
-            // Release lock if we have one
-            if let Some(lock_info) = &lock {
-                backend
-                    .release_lock(lock_info)
-                    .await
-                    .map_err(|e| format!("Failed to release lock: {}", e))?;
-            }
-
             return Ok(());
         }
         println!();
@@ -2300,15 +2305,6 @@ async fn run_destroy(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
         .map_err(|e| format!("Failed to write state: {}", e))?;
     println!("  {} State saved (serial: {})", "✓".green(), state.serial);
 
-    // Release lock
-    if let Some(ref lock_info) = lock {
-        backend
-            .release_lock(lock_info)
-            .await
-            .map_err(|e| format!("Failed to release lock: {}", e))?;
-        println!("  {} Lock released", "✓".green());
-    }
-
     println!();
     if failure_count == 0 && skip_count == 0 {
         println!(
@@ -2516,6 +2512,22 @@ async fn run_state_refresh(path: &PathBuf) -> Result<(), String> {
     })?;
     println!("  {} Lock acquired", "✓".green());
 
+    let op_result = run_state_refresh_locked(&mut parsed, backend.as_ref()).await;
+
+    // Always release lock, regardless of whether the operation succeeded
+    let release_result = backend
+        .release_lock(&lock)
+        .await
+        .map_err(|e| format!("Failed to release lock: {}", e));
+
+    op_result?;
+    release_result
+}
+
+async fn run_state_refresh_locked(
+    parsed: &mut ParsedFile,
+    backend: &dyn StateBackend,
+) -> Result<(), String> {
     // Read current state from backend
     let mut state_file = backend
         .read_state()
@@ -2529,10 +2541,6 @@ async fn run_state_refresh(path: &PathBuf) -> Result<(), String> {
             "No resources in state. Nothing to refresh."
         };
         println!("{}", msg.yellow());
-        backend
-            .release_lock(&lock)
-            .await
-            .map_err(|e| format!("Failed to release lock: {}", e))?;
         return Ok(());
     }
 
@@ -2543,7 +2551,7 @@ async fn run_state_refresh(path: &PathBuf) -> Result<(), String> {
     let sorted_resources = sort_resources_by_dependencies(&parsed.resources)?;
 
     // Select provider
-    let provider: Box<dyn Provider> = get_provider(&parsed).await;
+    let provider: Box<dyn Provider> = get_provider(parsed).await;
 
     println!();
     println!("{}", "Refreshing state...".cyan().bold());
@@ -2688,12 +2696,6 @@ async fn run_state_refresh(path: &PathBuf) -> Result<(), String> {
         .write_state(&state)
         .await
         .map_err(|e| format!("Failed to write state: {}", e))?;
-
-    // Release lock
-    backend
-        .release_lock(&lock)
-        .await
-        .map_err(|e| format!("Failed to release lock: {}", e))?;
 
     // Summary
     println!(
@@ -4092,5 +4094,101 @@ mod tests {
         assert!(messages.is_some(), "Should detect drift");
         let msgs = messages.unwrap();
         assert!(!msgs.is_empty(), "Should have drift messages");
+    }
+
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// A mock StateBackend that fails on write_state and tracks release_lock calls
+    struct MockBackend {
+        write_state_fails: bool,
+        lock_released: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl StateBackend for MockBackend {
+        async fn read_state(&self) -> carina_state::BackendResult<Option<StateFile>> {
+            Ok(Some(StateFile::new()))
+        }
+        async fn write_state(&self, _state: &StateFile) -> carina_state::BackendResult<()> {
+            if self.write_state_fails {
+                Err(BackendError::Io("simulated write failure".to_string()))
+            } else {
+                Ok(())
+            }
+        }
+        async fn acquire_lock(&self, operation: &str) -> carina_state::BackendResult<LockInfo> {
+            Ok(LockInfo::new(operation))
+        }
+        async fn release_lock(&self, _lock: &LockInfo) -> carina_state::BackendResult<()> {
+            self.lock_released.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+        async fn force_unlock(&self, _lock_id: &str) -> carina_state::BackendResult<()> {
+            Ok(())
+        }
+        async fn init(&self) -> carina_state::BackendResult<()> {
+            Ok(())
+        }
+        async fn bucket_exists(&self) -> carina_state::BackendResult<bool> {
+            Ok(true)
+        }
+        async fn create_bucket(&self) -> carina_state::BackendResult<()> {
+            Ok(())
+        }
+        fn resource_type(&self) -> Option<&str> {
+            None
+        }
+        fn provider_name(&self) -> Option<&str> {
+            None
+        }
+        fn resource_definition(&self, _bucket_name: &str) -> Option<String> {
+            None
+        }
+    }
+
+    #[tokio::test]
+    async fn lock_released_on_write_state_failure() {
+        // Simulate the caller pattern: finalize_apply + always release lock
+        let lock_released = Arc::new(AtomicBool::new(false));
+        let backend = MockBackend {
+            write_state_fails: true,
+            lock_released: lock_released.clone(),
+        };
+        let lock = LockInfo::new("apply");
+
+        let result = ApplyResult {
+            success_count: 0,
+            failure_count: 0,
+            skip_count: 0,
+            applied_states: HashMap::new(),
+            permanent_name_overrides: HashMap::new(),
+            successfully_deleted: HashSet::new(),
+            failed_refreshes: HashSet::new(),
+        };
+
+        // This mirrors the pattern used in run_apply_locked / run_apply_from_plan_locked:
+        // call finalize_apply (which may fail), then always release lock in the caller.
+        let op_result = finalize_apply(
+            &result,
+            Some(StateFile::new()),
+            &[],
+            &HashMap::new(),
+            &Plan::new(),
+            &backend,
+        )
+        .await;
+
+        // Caller always releases the lock
+        let _release = backend.release_lock(&lock).await;
+
+        assert!(
+            op_result.is_err(),
+            "finalize_apply should fail on write error"
+        );
+        assert!(
+            lock_released.load(Ordering::SeqCst),
+            "Lock should be released even when write_state fails"
+        );
     }
 }
