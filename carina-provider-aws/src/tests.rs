@@ -106,7 +106,7 @@ fn test_extract_ec2_subnet_attributes_with_private_dns_name_options() {
     let identifier = AwsProvider::extract_ec2_subnet_attributes(&subnet, &mut attributes);
     assert_eq!(identifier, Some("subnet-12345678".to_string()));
 
-    // Verify the struct is extracted as a Value::Struct
+    // Verify the struct is extracted as a Value::Map
     let dns_value = attributes
         .get("private_dns_name_options_on_launch")
         .expect("private_dns_name_options_on_launch should be present");

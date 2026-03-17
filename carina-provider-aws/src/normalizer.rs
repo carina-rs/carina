@@ -97,14 +97,35 @@ pub(crate) fn normalize_state_enums(resource_type: &str, attributes: &mut HashMa
 
     let mut resolved = HashMap::new();
     for (key, value) in attributes.iter() {
-        if let Some(attr_schema) = config.schema.attributes.get(key.as_str())
-            && let Some((type_name, ns, to_dsl)) = attr_schema.attr_type.namespaced_enum_parts()
-            && let Value::String(s) = value
-            && !s.contains('.')
-        {
-            let dsl_val = to_dsl.map_or_else(|| s.clone(), |f| f(s));
-            let namespaced = format!("{}.{}.{}", ns, type_name, dsl_val);
-            resolved.insert(key.clone(), Value::String(namespaced));
+        if let Some(attr_schema) = config.schema.attributes.get(key.as_str()) {
+            if let Some((type_name, ns, to_dsl)) = attr_schema.attr_type.namespaced_enum_parts()
+                && let Value::String(s) = value
+                && !s.contains('.')
+            {
+                let dsl_val = to_dsl.map_or_else(|| s.clone(), |f| f(s));
+                let namespaced = format!("{}.{}.{}", ns, type_name, dsl_val);
+                resolved.insert(key.clone(), Value::String(namespaced));
+            }
+            // Normalize enum fields within struct (Map) values
+            if let carina_core::schema::AttributeType::Struct { fields, .. } =
+                &attr_schema.attr_type
+                && let Value::Map(map_fields) = value
+            {
+                let mut normalized_map = map_fields.clone();
+                for field in fields {
+                    if let Some((type_name, ns, to_dsl)) = field.field_type.namespaced_enum_parts()
+                        && let Some(Value::String(s)) = map_fields.get(&field.name)
+                        && !s.contains('.')
+                    {
+                        let dsl_val = to_dsl.map_or_else(|| s.clone(), |f| f(s));
+                        let namespaced = format!("{}.{}.{}", ns, type_name, dsl_val);
+                        normalized_map.insert(field.name.clone(), Value::String(namespaced));
+                    }
+                }
+                if normalized_map != *map_fields {
+                    resolved.insert(key.clone(), Value::Map(normalized_map));
+                }
+            }
         }
     }
 
@@ -346,6 +367,39 @@ mod tests {
                 "aws.ec2.security_group_egress.IpProtocol.all".to_string()
             ))
         );
+    }
+
+    #[test]
+    fn test_normalize_state_enums_struct_field_enum() {
+        let mut inner = HashMap::new();
+        inner.insert(
+            "hostname_type".to_string(),
+            Value::String("ip-name".to_string()),
+        );
+        inner.insert(
+            "enable_resource_name_dns_a_record".to_string(),
+            Value::Bool(true),
+        );
+        let mut attributes = HashMap::from([(
+            "private_dns_name_options_on_launch".to_string(),
+            Value::Map(inner),
+        )]);
+        normalize_state_enums("ec2.subnet", &mut attributes);
+        if let Some(Value::Map(fields)) = attributes.get("private_dns_name_options_on_launch") {
+            assert_eq!(
+                fields.get("hostname_type"),
+                Some(&Value::String(
+                    "aws.ec2.subnet.HostnameType.ip_name".to_string()
+                ))
+            );
+            // Non-enum fields should not be modified
+            assert_eq!(
+                fields.get("enable_resource_name_dns_a_record"),
+                Some(&Value::Bool(true))
+            );
+        } else {
+            panic!("Expected Value::Map for private_dns_name_options_on_launch");
+        }
     }
 
     #[test]
