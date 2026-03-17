@@ -402,6 +402,14 @@ pub fn reconcile_anonymous_identifiers(
         let create_only_attrs = schema.create_only_attributes();
         let state_entries = find_state_by_type(&resource.id.provider, &resource.id.resource_type);
 
+        // If the resource's name already exists in state, no reconciliation is needed.
+        // This prevents named resources (let-bound) from being incorrectly swapped
+        // when they share some create-only attributes with other resources of the
+        // same type (e.g., two security_group_ingress rules on the same SG).
+        if state_entries.iter().any(|e| e.name == resource.id.name) {
+            continue;
+        }
+
         // Collect this resource's create-only values
         let mut resource_co_values: HashMap<&str, String> = HashMap::new();
         for attr_name in &create_only_attrs {
@@ -1783,6 +1791,96 @@ mod tests {
         assert_ne!(
             r1[0].id.name, r2[0].id.name,
             "Different prefixes should produce different identifiers"
+        );
+    }
+
+    #[test]
+    fn test_reconcile_does_not_swap_named_resources_with_overlapping_create_only() {
+        // Regression test for #788: two security_group_ingress rules on the same SG
+        // should not be swapped by reconciliation when they share some create-only
+        // attributes (cidr_ip, ip_protocol) but differ on others (description, from_port).
+        //
+        // Both resources are named (let-bound) and already match state entries by name.
+        // Reconciliation should leave them unchanged.
+        let schema = ResourceSchema::new("aws.ec2.security_group_ingress")
+            .attribute(AttributeSchema::new("cidr_ip", AttributeType::String).create_only())
+            .attribute(AttributeSchema::new("ip_protocol", AttributeType::String).create_only())
+            .attribute(AttributeSchema::new("description", AttributeType::String).create_only());
+        let schemas: HashMap<String, ResourceSchema> =
+            vec![("aws.ec2.security_group_ingress".to_string(), schema)]
+                .into_iter()
+                .collect();
+
+        // Two named ingress resources with overlapping create-only attributes
+        let mut ingress_http =
+            Resource::with_provider("aws", "ec2.security_group_ingress", "ingress_http");
+        ingress_http.attributes.insert(
+            "cidr_ip".to_string(),
+            Value::String("0.0.0.0/0".to_string()),
+        );
+        ingress_http
+            .attributes
+            .insert("ip_protocol".to_string(), Value::String("tcp".to_string()));
+        ingress_http.attributes.insert(
+            "description".to_string(),
+            Value::String("Allow HTTP".to_string()),
+        );
+
+        let mut ingress_https =
+            Resource::with_provider("aws", "ec2.security_group_ingress", "ingress_https");
+        ingress_https.attributes.insert(
+            "cidr_ip".to_string(),
+            Value::String("0.0.0.0/0".to_string()),
+        );
+        ingress_https
+            .attributes
+            .insert("ip_protocol".to_string(), Value::String("tcp".to_string()));
+        ingress_https.attributes.insert(
+            "description".to_string(),
+            Value::String("Allow HTTPS".to_string()),
+        );
+
+        let mut resources = vec![ingress_http, ingress_https];
+
+        // State has both resources with matching names
+        let state_entries = vec![
+            AnonymousIdStateInfo {
+                name: "ingress_http".to_string(),
+                create_only_values: vec![
+                    ("cidr_ip".to_string(), "0.0.0.0/0".to_string()),
+                    ("ip_protocol".to_string(), "tcp".to_string()),
+                    ("description".to_string(), "Allow HTTP".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+            },
+            AnonymousIdStateInfo {
+                name: "ingress_https".to_string(),
+                create_only_values: vec![
+                    ("cidr_ip".to_string(), "0.0.0.0/0".to_string()),
+                    ("ip_protocol".to_string(), "tcp".to_string()),
+                    ("description".to_string(), "Allow HTTPS".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+            },
+        ];
+
+        reconcile_anonymous_identifiers(
+            &mut resources,
+            &schemas,
+            &schema_key_fn,
+            &|_provider, _rt| state_entries.clone(),
+        );
+
+        // Names must remain unchanged - no swapping
+        assert_eq!(
+            resources[0].id.name, "ingress_http",
+            "ingress_http should not be renamed to ingress_https"
+        );
+        assert_eq!(
+            resources[1].id.name, "ingress_https",
+            "ingress_https should not be renamed to ingress_http"
         );
     }
 }
