@@ -110,20 +110,9 @@ impl AwsProvider {
         self.apply_ec2_tags(&resource.id, subnet_id, &resource.attributes, None)
             .await?;
 
-        // Apply map_public_ip_on_launch if specified
-        if let Some(Value::Bool(enabled)) = resource.attributes.get("map_public_ip_on_launch") {
-            self.ec2_client
-                .modify_subnet_attribute()
-                .subnet_id(subnet_id)
-                .map_public_ip_on_launch(AttributeBooleanValue::builder().value(*enabled).build())
-                .send()
-                .await
-                .map_err(|e| {
-                    ProviderError::new("Failed to set map_public_ip_on_launch")
-                        .with_cause(e)
-                        .for_resource(resource.id.clone())
-                })?;
-        }
+        // Apply subnet attributes that require ModifySubnetAttribute
+        self.modify_subnet_attributes(&resource.id, subnet_id, &resource.attributes)
+            .await?;
 
         // Read back using subnet ID (reliable identifier)
         self.read_ec2_subnet(&resource.id, Some(subnet_id)).await
@@ -137,59 +126,69 @@ impl AwsProvider {
         from: &State,
         to: Resource,
     ) -> ProviderResult<State> {
-        let subnet_id = identifier.to_string();
+        // Apply subnet attributes that require ModifySubnetAttribute
+        self.modify_subnet_attributes(&id, identifier, &to.attributes)
+            .await?;
 
-        // Update map_public_ip_on_launch
-        if let Some(Value::Bool(enabled)) = to.attributes.get("map_public_ip_on_launch") {
+        // Update tags
+        self.apply_ec2_tags(&id, identifier, &to.attributes, Some(&from.attributes))
+            .await?;
+
+        self.read_ec2_subnet(&id, Some(identifier)).await
+    }
+
+    /// Apply boolean subnet attributes via ModifySubnetAttribute API.
+    /// Used by both create (post-creation) and update paths.
+    async fn modify_subnet_attributes(
+        &self,
+        id: &ResourceId,
+        subnet_id: &str,
+        attributes: &HashMap<String, Value>,
+    ) -> ProviderResult<()> {
+        if let Some(Value::Bool(enabled)) = attributes.get("map_public_ip_on_launch") {
             self.ec2_client
                 .modify_subnet_attribute()
-                .subnet_id(&subnet_id)
+                .subnet_id(subnet_id)
                 .map_public_ip_on_launch(AttributeBooleanValue::builder().value(*enabled).build())
                 .send()
                 .await
                 .map_err(|e| {
-                    ProviderError::new("Failed to update map_public_ip_on_launch")
+                    ProviderError::new("Failed to set map_public_ip_on_launch")
                         .with_cause(e)
                         .for_resource(id.clone())
                 })?;
         }
 
-        // Update assign_ipv6_address_on_creation
-        if let Some(Value::Bool(enabled)) = to.attributes.get("assign_ipv6_address_on_creation") {
+        if let Some(Value::Bool(enabled)) = attributes.get("assign_ipv6_address_on_creation") {
             self.ec2_client
                 .modify_subnet_attribute()
-                .subnet_id(&subnet_id)
+                .subnet_id(subnet_id)
                 .assign_ipv6_address_on_creation(
                     AttributeBooleanValue::builder().value(*enabled).build(),
                 )
                 .send()
                 .await
                 .map_err(|e| {
-                    ProviderError::new("Failed to update assign_ipv6_address_on_creation")
+                    ProviderError::new("Failed to set assign_ipv6_address_on_creation")
                         .with_cause(e)
                         .for_resource(id.clone())
                 })?;
         }
 
-        // Update enable_dns64
-        if let Some(Value::Bool(enabled)) = to.attributes.get("enable_dns64") {
+        if let Some(Value::Bool(enabled)) = attributes.get("enable_dns64") {
             self.ec2_client
                 .modify_subnet_attribute()
-                .subnet_id(&subnet_id)
+                .subnet_id(subnet_id)
                 .enable_dns64(AttributeBooleanValue::builder().value(*enabled).build())
                 .send()
                 .await
                 .map_err(|e| {
-                    ProviderError::new("Failed to update enable_dns64")
+                    ProviderError::new("Failed to set enable_dns64")
                         .with_cause(e)
                         .for_resource(id.clone())
                 })?;
         }
 
-        // Update tags
-        self.apply_ec2_tags(&id, &subnet_id, &to.attributes, Some(&from.attributes))
-            .await?;
-
-        self.read_ec2_subnet(&id, Some(identifier)).await
+        Ok(())
     }
 }
