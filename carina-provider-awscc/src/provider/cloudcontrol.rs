@@ -151,7 +151,10 @@ impl AwsccProvider {
             .patch_document(patch_document)
             .send()
             .await
-            .map_err(|e| ProviderError::new("Failed to update resource").with_cause(e))?;
+            .map_err(|e| {
+                let detail = Self::format_sdk_error(&e);
+                ProviderError::new(format!("Failed to update resource: {}", detail))
+            })?;
 
         if let Some(request_token) = result.progress_event().and_then(|p| p.request_token()) {
             self.wait_for_operation(request_token).await?;
@@ -249,6 +252,26 @@ impl AwsccProvider {
             return 360; // 30 minutes (360 * 5s)
         }
         120 // Default: 10 minutes (120 * 5s)
+    }
+
+    /// Formats an SDK error into a human-readable message.
+    ///
+    /// The `SdkError::Display` implementation only outputs generic labels like "service error"
+    /// without including the actual error code or message. This method extracts the structured
+    /// error metadata (code and message) from service errors to provide actionable error messages.
+    pub(crate) fn format_sdk_error<E, R>(error: &SdkError<E, R>) -> String
+    where
+        E: ProvideErrorMetadata + std::fmt::Display,
+    {
+        match error {
+            SdkError::ServiceError(service_error) => {
+                let err = service_error.err();
+                let code = err.code().unwrap_or("Unknown");
+                let message = err.message().unwrap_or("no details");
+                format!("{}: {}", code, message)
+            }
+            other => format!("{}", other),
+        }
     }
 
     /// Returns true if the SDK error represents a "not found" condition.

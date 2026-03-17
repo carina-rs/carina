@@ -50,7 +50,7 @@ pub(crate) fn build_update_patches(
                 continue;
             }
             patch_ops.push(json!({
-                "op": "replace",
+                "op": "add",
                 "path": format!("/{}", aws_name),
                 "value": aws_value
             }));
@@ -93,7 +93,7 @@ pub(crate) fn build_update_patches(
                     }
                 }
                 if !tags.is_empty() {
-                    patch_ops.push(json!({"op": "replace", "path": "/Tags", "value": tags}));
+                    patch_ops.push(json!({"op": "add", "path": "/Tags", "value": tags}));
                 }
             }
         } else if from.attributes.contains_key("tags") {
@@ -246,7 +246,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_update_patches_replace_only_when_both_present() {
+    fn test_build_update_patches_no_remove_when_both_present() {
         let config = get_vpc_config();
         let id = ResourceId::with_provider("awscc", "ec2.vpc", "test");
 
@@ -312,22 +312,22 @@ mod tests {
         let patches = build_update_patches(&config, &from, &to);
 
         let has_cidr_replace = patches.iter().any(|p| {
-            p.get("op").and_then(|v| v.as_str()) == Some("replace")
+            p.get("op").and_then(|v| v.as_str()) == Some("add")
                 && p.get("path").and_then(|v| v.as_str()) == Some("/CidrBlock")
         });
         assert!(
             !has_cidr_replace,
-            "Should not generate replace patch for unchanged attribute /CidrBlock, got: {:?}",
+            "Should not generate add patch for unchanged attribute /CidrBlock, got: {:?}",
             patches
         );
 
         let has_tenancy_replace = patches.iter().any(|p| {
-            p.get("op").and_then(|v| v.as_str()) == Some("replace")
+            p.get("op").and_then(|v| v.as_str()) == Some("add")
                 && p.get("path").and_then(|v| v.as_str()) == Some("/InstanceTenancy")
         });
         assert!(
             has_tenancy_replace,
-            "Should generate replace patch for changed attribute /InstanceTenancy, got: {:?}",
+            "Should generate add patch for changed attribute /InstanceTenancy, got: {:?}",
             patches
         );
     }
@@ -388,6 +388,96 @@ mod tests {
             "Should generate no patches when tags are unchanged, got: {:?}",
             patches
         );
+    }
+
+    #[test]
+    fn test_build_update_patches_uses_add_op_not_replace() {
+        // CloudControl API JSON Patch: "add" works whether the property exists or not,
+        // while "replace" fails if the property doesn't exist in the model.
+        // Using "add" is more robust and matches the AWS AWSCC Terraform provider behavior.
+        let config = get_vpc_config();
+        let id = ResourceId::with_provider("awscc", "ec2.vpc", "test");
+
+        let mut from_attrs = HashMap::new();
+        from_attrs.insert(
+            "cidr_block".to_string(),
+            Value::String("10.0.0.0/16".to_string()),
+        );
+        from_attrs.insert(
+            "instance_tenancy".to_string(),
+            Value::String("awscc.ec2.vpc.InstanceTenancy.default".to_string()),
+        );
+        let from = State::existing(id.clone(), from_attrs);
+
+        let mut to = Resource::new("ec2.vpc", "test");
+        to.attributes.insert(
+            "cidr_block".to_string(),
+            Value::String("10.0.0.0/16".to_string()),
+        );
+        to.attributes.insert(
+            "instance_tenancy".to_string(),
+            Value::String("awscc.ec2.vpc.InstanceTenancy.dedicated".to_string()),
+        );
+
+        let patches = build_update_patches(&config, &from, &to);
+
+        // All value-setting operations should use "add", not "replace"
+        for patch in &patches {
+            let op = patch.get("op").and_then(|v| v.as_str()).unwrap_or("");
+            if op != "remove" {
+                assert_eq!(
+                    op, "add",
+                    "Expected 'add' op for value-setting patch, got '{}': {:?}",
+                    op, patch
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_build_update_patches_log_group_retention_uses_add() {
+        // Regression test for issue #791: logs_log_group in-place update fails
+        // because "replace" op fails when the property path doesn't exist in
+        // the CloudControl model.
+        let config =
+            get_schema_config("logs.log_group").expect("logs.log_group schema should exist");
+        let id = ResourceId::with_provider("awscc", "logs.log_group", "test");
+
+        let mut from_attrs = HashMap::new();
+        from_attrs.insert("retention_in_days".to_string(), Value::Int(7));
+        from_attrs.insert(
+            "log_group_name".to_string(),
+            Value::String("/carina/test-group".to_string()),
+        );
+        let from = State::existing(id.clone(), from_attrs);
+
+        let mut to = Resource::new("logs.log_group", "test");
+        to.attributes
+            .insert("retention_in_days".to_string(), Value::Int(14));
+        to.attributes.insert(
+            "log_group_name".to_string(),
+            Value::String("/carina/test-group".to_string()),
+        );
+
+        let patches = build_update_patches(&config, &from, &to);
+
+        assert_eq!(
+            patches.len(),
+            1,
+            "Should have exactly one patch: {:?}",
+            patches
+        );
+        let patch = &patches[0];
+        assert_eq!(
+            patch.get("op").and_then(|v| v.as_str()),
+            Some("add"),
+            "Should use 'add' op for RetentionInDays update"
+        );
+        assert_eq!(
+            patch.get("path").and_then(|v| v.as_str()),
+            Some("/RetentionInDays"),
+        );
+        assert_eq!(patch.get("value"), Some(&serde_json::json!(14)),);
     }
 
     #[test]
