@@ -679,6 +679,7 @@ dependencies = [
 name = "carina-cli"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "carina-core",
  "carina-provider-aws",
  "carina-provider-awscc",
