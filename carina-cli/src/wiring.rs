@@ -198,9 +198,10 @@ pub async fn get_provider(parsed: &ParsedFile) -> ProviderRouter {
     }
 
     if router.is_empty() {
-        // Use mock provider for other cases
+        // Use mock provider for other cases.
+        // Register with empty key to match resources without a provider prefix.
         println!("{}", "Using mock provider".cyan());
-        router.add_provider("mock".to_string(), Box::new(MockProvider::new()));
+        router.add_provider(String::new(), Box::new(MockProvider::new()));
     }
 
     router
@@ -227,7 +228,7 @@ pub async fn create_providers_from_configs(configs: &[ProviderConfig]) -> Provid
 
     if router.is_empty() {
         println!("{}", "Using mock provider".cyan());
-        router.add_provider("mock".to_string(), Box::new(MockProvider::new()));
+        router.add_provider(String::new(), Box::new(MockProvider::new()));
     }
 
     router
