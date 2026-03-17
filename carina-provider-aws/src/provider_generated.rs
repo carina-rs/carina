@@ -109,19 +109,6 @@ impl AwsProvider {
         Ok(())
     }
 
-    /// Update ec2.subnet: apply tag changes and read back (generated)
-    pub(crate) async fn update_ec2_subnet(
-        &self,
-        id: ResourceId,
-        identifier: &str,
-        from: &State,
-        to: Resource,
-    ) -> ProviderResult<State> {
-        self.apply_ec2_tags(&id, identifier, &to.attributes, Some(&from.attributes))
-            .await?;
-        self.read_ec2_subnet(&id, Some(identifier)).await
-    }
-
     /// Update ec2.internet_gateway: apply tag changes and read back (generated)
     pub(crate) async fn update_ec2_internet_gateway(
         &self,

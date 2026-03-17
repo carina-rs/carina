@@ -460,6 +460,26 @@ fn test_internet_gateway_no_attachment() {
     assert!(!attributes.contains_key("vpc_id"));
 }
 
+// --- extract_ec2_subnet_attributes with map_public_ip_on_launch true ---
+
+#[test]
+fn test_extract_ec2_subnet_attributes_map_public_ip_true() {
+    let subnet = aws_sdk_ec2::types::Subnet::builder()
+        .subnet_id("subnet-12345678")
+        .vpc_id("vpc-12345678")
+        .cidr_block("10.0.1.0/24")
+        .availability_zone("ap-northeast-1a")
+        .map_public_ip_on_launch(true)
+        .build();
+    let mut attributes = HashMap::new();
+    let identifier = AwsProvider::extract_ec2_subnet_attributes(&subnet, &mut attributes);
+    assert_eq!(identifier, Some("subnet-12345678".to_string()));
+    assert_eq!(
+        attributes.get("map_public_ip_on_launch"),
+        Some(&Value::Bool(true))
+    );
+}
+
 // --- Subnet availability zone DSL format conversion ---
 
 #[test]

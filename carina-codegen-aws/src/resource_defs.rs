@@ -152,7 +152,7 @@ pub fn ec2_resources() -> Vec<ResourceDef> {
             name: "ec2.subnet",
             service_namespace: "com.amazonaws.ec2",
             simple_delete: true,
-            noop_update: true,
+            noop_update: false,
             create_op: "CreateSubnet",
             read_structure: Some("Subnet"),
             read_ops: vec![],

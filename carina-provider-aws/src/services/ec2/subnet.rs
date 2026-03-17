@@ -5,6 +5,7 @@ use carina_core::resource::{Resource, ResourceId, State, Value};
 use carina_core::utils::convert_enum_value;
 
 use crate::AwsProvider;
+use aws_sdk_ec2::types::AttributeBooleanValue;
 
 impl AwsProvider {
     /// Read an EC2 Subnet
@@ -109,7 +110,86 @@ impl AwsProvider {
         self.apply_ec2_tags(&resource.id, subnet_id, &resource.attributes, None)
             .await?;
 
+        // Apply map_public_ip_on_launch if specified
+        if let Some(Value::Bool(enabled)) = resource.attributes.get("map_public_ip_on_launch") {
+            self.ec2_client
+                .modify_subnet_attribute()
+                .subnet_id(subnet_id)
+                .map_public_ip_on_launch(AttributeBooleanValue::builder().value(*enabled).build())
+                .send()
+                .await
+                .map_err(|e| {
+                    ProviderError::new("Failed to set map_public_ip_on_launch")
+                        .with_cause(e)
+                        .for_resource(resource.id.clone())
+                })?;
+        }
+
         // Read back using subnet ID (reliable identifier)
         self.read_ec2_subnet(&resource.id, Some(subnet_id)).await
+    }
+
+    /// Update an EC2 Subnet
+    pub(crate) async fn update_ec2_subnet(
+        &self,
+        id: ResourceId,
+        identifier: &str,
+        from: &State,
+        to: Resource,
+    ) -> ProviderResult<State> {
+        let subnet_id = identifier.to_string();
+
+        // Update map_public_ip_on_launch
+        if let Some(Value::Bool(enabled)) = to.attributes.get("map_public_ip_on_launch") {
+            self.ec2_client
+                .modify_subnet_attribute()
+                .subnet_id(&subnet_id)
+                .map_public_ip_on_launch(AttributeBooleanValue::builder().value(*enabled).build())
+                .send()
+                .await
+                .map_err(|e| {
+                    ProviderError::new("Failed to update map_public_ip_on_launch")
+                        .with_cause(e)
+                        .for_resource(id.clone())
+                })?;
+        }
+
+        // Update assign_ipv6_address_on_creation
+        if let Some(Value::Bool(enabled)) = to.attributes.get("assign_ipv6_address_on_creation") {
+            self.ec2_client
+                .modify_subnet_attribute()
+                .subnet_id(&subnet_id)
+                .assign_ipv6_address_on_creation(
+                    AttributeBooleanValue::builder().value(*enabled).build(),
+                )
+                .send()
+                .await
+                .map_err(|e| {
+                    ProviderError::new("Failed to update assign_ipv6_address_on_creation")
+                        .with_cause(e)
+                        .for_resource(id.clone())
+                })?;
+        }
+
+        // Update enable_dns64
+        if let Some(Value::Bool(enabled)) = to.attributes.get("enable_dns64") {
+            self.ec2_client
+                .modify_subnet_attribute()
+                .subnet_id(&subnet_id)
+                .enable_dns64(AttributeBooleanValue::builder().value(*enabled).build())
+                .send()
+                .await
+                .map_err(|e| {
+                    ProviderError::new("Failed to update enable_dns64")
+                        .with_cause(e)
+                        .for_resource(id.clone())
+                })?;
+        }
+
+        // Update tags
+        self.apply_ec2_tags(&id, &subnet_id, &to.attributes, Some(&from.attributes))
+            .await?;
+
+        self.read_ec2_subnet(&id, Some(identifier)).await
     }
 }
