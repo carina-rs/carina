@@ -19,6 +19,8 @@ use carina_provider_awscc::AwsccProviderFactory;
 use carina_provider_mock::MockProvider;
 use carina_state::StateFile;
 
+use crate::error::AppError;
+
 /// Result of creating a plan, with context needed for saving
 pub struct PlanContext {
     pub plan: Plan,
@@ -34,38 +36,42 @@ pub fn get_schemas() -> HashMap<String, ResourceSchema> {
     provider_mod::collect_schemas(&provider_factories())
 }
 
-pub fn validate_resources(resources: &[Resource]) -> Result<(), String> {
+pub fn validate_resources(resources: &[Resource]) -> Result<(), AppError> {
     let factories = provider_factories();
     let schemas = get_schemas();
     validation::validate_resources(resources, &schemas, &|r| {
         provider_mod::schema_key_for_resource(&factories, r)
     })
+    .map_err(AppError::Validation)
 }
 
-pub fn validate_resource_ref_types(resources: &[Resource]) -> Result<(), String> {
+pub fn validate_resource_ref_types(resources: &[Resource]) -> Result<(), AppError> {
     let factories = provider_factories();
     let schemas = get_schemas();
     validation::validate_resource_ref_types(resources, &schemas, &|r| {
         provider_mod::schema_key_for_resource(&factories, r)
     })
+    .map_err(AppError::Validation)
 }
 
 /// Resolve block name aliases and attribute prefixes in one step.
-pub fn resolve_names(resources: &mut [Resource]) -> Result<(), String> {
+pub fn resolve_names(resources: &mut [Resource]) -> Result<(), AppError> {
     let factories = provider_factories();
     let schemas = get_schemas();
     resolve_block_names(resources, &schemas, |r| {
         provider_mod::schema_key_for_resource(&factories, r)
-    })?;
+    })
+    .map_err(AppError::Validation)?;
     resolve_attr_prefixes(resources)
 }
 
-pub fn resolve_attr_prefixes(resources: &mut [Resource]) -> Result<(), String> {
+pub fn resolve_attr_prefixes(resources: &mut [Resource]) -> Result<(), AppError> {
     let factories = provider_factories();
     let schemas = get_schemas();
     identifier::resolve_attr_prefixes(resources, &schemas, &|r| {
         provider_mod::schema_key_for_resource(&factories, r)
     })
+    .map_err(AppError::Validation)
 }
 
 pub fn reconcile_prefixed_names(resources: &mut [Resource], state_file: &Option<StateFile>) {
@@ -133,7 +139,7 @@ pub fn reconcile_anonymous_identifiers(resources: &mut [Resource], state_file: &
 pub fn compute_anonymous_identifiers(
     resources: &mut [Resource],
     providers: &[ProviderConfig],
-) -> Result<(), String> {
+) -> Result<(), AppError> {
     let factories = provider_factories();
     let schemas = get_schemas();
     identifier::compute_anonymous_identifiers(
@@ -152,18 +158,19 @@ pub fn compute_anonymous_identifiers(
                 .unwrap_or_default()
         },
     )
+    .map_err(AppError::Validation)
 }
 
 pub fn check_unused_bindings(parsed: &ParsedFile) -> Vec<String> {
     validation::check_unused_bindings(parsed)
 }
 
-pub fn validate_provider_region(parsed: &ParsedFile) -> Result<(), String> {
+pub fn validate_provider_region(parsed: &ParsedFile) -> Result<(), AppError> {
     let factories = provider_factories();
-    validation::validate_provider_config(parsed, &factories)
+    validation::validate_provider_config(parsed, &factories).map_err(AppError::Validation)
 }
 
-pub fn validate_module_calls(parsed: &ParsedFile, base_dir: &Path) -> Result<(), String> {
+pub fn validate_module_calls(parsed: &ParsedFile, base_dir: &Path) -> Result<(), AppError> {
     // Build a map of imported modules: alias -> inputs
     let mut imported_modules = HashMap::new();
     for import in &parsed.imports {
@@ -174,6 +181,7 @@ pub fn validate_module_calls(parsed: &ParsedFile, base_dir: &Path) -> Result<(),
     }
 
     validation::validate_module_calls(&parsed.module_calls, &imported_modules)
+        .map_err(AppError::Validation)
 }
 
 pub async fn get_provider(parsed: &ParsedFile) -> Box<dyn Provider> {
@@ -228,8 +236,9 @@ pub async fn create_providers_from_configs(configs: &[ProviderConfig]) -> Box<dy
 pub async fn create_plan_from_parsed(
     parsed: &ParsedFile,
     state_file: &Option<StateFile>,
-) -> Result<PlanContext, String> {
-    let sorted_resources = sort_resources_by_dependencies(&parsed.resources)?;
+) -> Result<PlanContext, AppError> {
+    let sorted_resources =
+        sort_resources_by_dependencies(&parsed.resources).map_err(AppError::Validation)?;
 
     // Select appropriate Provider based on configuration
     let provider: Box<dyn Provider> = get_provider(parsed).await;
@@ -241,10 +250,7 @@ pub async fn create_plan_from_parsed(
         let identifier = state_file
             .as_ref()
             .and_then(|sf| sf.get_identifier_for_resource(resource));
-        let state = provider
-            .read(&resource.id, identifier.as_deref())
-            .await
-            .map_err(|e| format!("Failed to read state: {}", e))?;
+        let state = provider.read(&resource.id, identifier.as_deref()).await?;
         current_states.insert(resource.id.clone(), state);
     }
 
