@@ -1,6 +1,4 @@
-//! Resource type definitions for AWS Cloud Control API
-//!
-//! Resource types are automatically derived from generated schema configs.
+//! Schema configuration tests for AWS Cloud Control API resources.
 
 #[cfg(test)]
 mod tests {

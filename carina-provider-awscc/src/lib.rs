@@ -4,7 +4,7 @@
 //!
 //! ## Module Structure
 //!
-//! - `resources` - Resource type definitions and configurations
+//! - `resources` - Schema configuration tests
 //! - `provider` - AwsccProvider implementation
 //! - `schemas` - Auto-generated resource schemas
 
