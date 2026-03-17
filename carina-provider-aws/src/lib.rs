@@ -12,9 +12,7 @@ use aws_config::Region;
 use aws_sdk_ec2::Client as Ec2Client;
 use aws_sdk_s3::Client as S3Client;
 use aws_sdk_sts::Client as StsClient;
-use carina_core::provider::{
-    BoxFuture, Provider, ProviderError, ProviderFactory, ProviderResult, ResourceType,
-};
+use carina_core::provider::{BoxFuture, Provider, ProviderError, ProviderFactory, ProviderResult};
 use carina_core::resource::{LifecycleConfig, Resource, ResourceId, State, Value};
 use carina_core::utils::convert_enum_value;
 
@@ -520,10 +518,6 @@ impl Provider for AwsProvider {
         "aws"
     }
 
-    fn resource_types(&self) -> Vec<Box<dyn ResourceType>> {
-        provider_generated::resource_types()
-    }
-
     fn read(
         &self,
         id: &ResourceId,
@@ -796,12 +790,6 @@ fn convert_protocol_value(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_s3_bucket_type_name() {
-        let bucket_type = provider_generated::S3BucketType;
-        assert_eq!(bucket_type.name(), "s3.bucket");
-    }
 
     #[test]
     fn test_resolve_enum_identifiers_namespaced_value() {

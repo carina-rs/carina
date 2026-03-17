@@ -2895,7 +2895,7 @@ fn run_lint(path: &PathBuf) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use carina_core::provider::{BoxFuture, ProviderError, ProviderResult, ResourceType};
+    use carina_core::provider::{BoxFuture, ProviderError, ProviderResult};
     use serde_json::json;
 
     struct TestProvider {
@@ -2925,10 +2925,6 @@ mod tests {
     impl Provider for TestProvider {
         fn name(&self) -> &'static str {
             "test"
-        }
-
-        fn resource_types(&self) -> Vec<Box<dyn ResourceType>> {
-            vec![]
         }
 
         fn read(

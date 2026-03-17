@@ -32,9 +32,6 @@ pub struct ResourceDef {
     pub name: &'static str,
     /// Smithy service namespace (e.g., "com.amazonaws.ec2")
     pub service_namespace: &'static str,
-    /// Rust struct name prefix for ResourceType (e.g., "S3Bucket", "Vpc")
-    /// The generated struct will be `{type_struct_name}Type`.
-    pub type_struct_name: &'static str,
     /// Whether delete is a single API call (delete_op + identifier).
     /// true: VPC, Subnet, Route Table, Security Group, S3 Bucket
     /// false: IGW (detach+delete), Route (no-op), SG rules (multi-rule revoke)
@@ -118,7 +115,6 @@ pub fn ec2_resources() -> Vec<ResourceDef> {
         ResourceDef {
             name: "ec2.vpc",
             service_namespace: "com.amazonaws.ec2",
-            type_struct_name: "Vpc",
             simple_delete: true,
             noop_update: false,
             create_op: "CreateVpc",
@@ -155,7 +151,6 @@ pub fn ec2_resources() -> Vec<ResourceDef> {
         ResourceDef {
             name: "ec2.subnet",
             service_namespace: "com.amazonaws.ec2",
-            type_struct_name: "Subnet",
             simple_delete: true,
             noop_update: true,
             create_op: "CreateSubnet",
@@ -188,7 +183,6 @@ pub fn ec2_resources() -> Vec<ResourceDef> {
         ResourceDef {
             name: "ec2.internet_gateway",
             service_namespace: "com.amazonaws.ec2",
-            type_struct_name: "InternetGateway",
             simple_delete: false,
             noop_update: true,
             create_op: "CreateInternetGateway",
@@ -212,7 +206,6 @@ pub fn ec2_resources() -> Vec<ResourceDef> {
         ResourceDef {
             name: "ec2.route_table",
             service_namespace: "com.amazonaws.ec2",
-            type_struct_name: "RouteTable",
             simple_delete: true,
             noop_update: true,
             create_op: "CreateRouteTable",
@@ -236,7 +229,6 @@ pub fn ec2_resources() -> Vec<ResourceDef> {
         ResourceDef {
             name: "ec2.route",
             service_namespace: "com.amazonaws.ec2",
-            type_struct_name: "Route",
             simple_delete: false,
             noop_update: false,
             create_op: "CreateRoute",
@@ -275,7 +267,6 @@ pub fn ec2_resources() -> Vec<ResourceDef> {
         ResourceDef {
             name: "ec2.security_group",
             service_namespace: "com.amazonaws.ec2",
-            type_struct_name: "SecurityGroup",
             simple_delete: true,
             noop_update: true,
             create_op: "CreateSecurityGroup",
@@ -299,7 +290,6 @@ pub fn ec2_resources() -> Vec<ResourceDef> {
         ResourceDef {
             name: "ec2.security_group_ingress",
             service_namespace: "com.amazonaws.ec2",
-            type_struct_name: "SecurityGroupIngressRule",
             simple_delete: false,
             noop_update: false,
             create_op: "AuthorizeSecurityGroupIngress",
@@ -352,7 +342,6 @@ pub fn ec2_resources() -> Vec<ResourceDef> {
         ResourceDef {
             name: "ec2.security_group_egress",
             service_namespace: "com.amazonaws.ec2",
-            type_struct_name: "SecurityGroupEgressRule",
             simple_delete: false,
             noop_update: false,
             create_op: "AuthorizeSecurityGroupEgress",
@@ -411,7 +400,6 @@ pub fn sts_resources() -> Vec<ResourceDef> {
         ResourceDef {
             name: "sts.caller_identity",
             service_namespace: "com.amazonaws.sts",
-            type_struct_name: "StsCallerIdentity",
             simple_delete: false,
             noop_update: false,
             create_op: "",
@@ -449,7 +437,6 @@ pub fn s3_resources() -> Vec<ResourceDef> {
         ResourceDef {
             name: "s3.bucket",
             service_namespace: "com.amazonaws.s3",
-            type_struct_name: "S3Bucket",
             simple_delete: true,
             noop_update: false,
             create_op: "CreateBucket",

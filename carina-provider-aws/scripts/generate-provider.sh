@@ -4,8 +4,8 @@
 # Usage (from project root):
 #   ./carina-provider-aws/scripts/generate-provider.sh
 #
-# This script generates ResourceType structs, simple delete methods,
-# and no-op update methods from ResourceDef metadata.
+# This script generates simple delete methods and no-op update methods
+# from ResourceDef metadata.
 
 set -euo pipefail
 
