@@ -1,0 +1,206 @@
+use std::fs;
+use std::path::PathBuf;
+
+use colored::Colorize;
+use serde::{Deserialize, Serialize};
+
+use carina_core::config_loader::{get_base_dir, load_configuration};
+use carina_core::parser::{BackendConfig, ProviderConfig};
+use carina_core::plan::Plan;
+use carina_core::resource::{Resource, ResourceId, State, Value};
+use carina_state::{
+    BackendConfig as StateBackendConfig, StateBackend, StateFile, create_backend,
+    create_local_backend,
+};
+
+use super::validate_and_resolve;
+use crate::commands::apply::apply_name_overrides;
+use crate::display::print_plan;
+use crate::error::AppError;
+use crate::wiring::{
+    create_plan_from_parsed, reconcile_anonymous_identifiers, reconcile_prefixed_names,
+};
+
+/// Saved plan file for `plan --out` / `apply plan.json`
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PlanFile {
+    /// Plan file format version
+    pub version: u32,
+    /// Carina version that created this plan
+    pub carina_version: String,
+    /// ISO 8601 timestamp
+    pub timestamp: String,
+    /// Original .crn path (informational)
+    pub source_path: String,
+    /// State lineage for drift detection
+    pub state_lineage: Option<String>,
+    /// State serial for drift detection
+    pub state_serial: Option<u64>,
+    /// Provider configurations
+    pub provider_configs: Vec<ProviderConfig>,
+    /// Backend configuration
+    pub backend_config: Option<BackendConfig>,
+    /// The plan (effects)
+    pub plan: Plan,
+    /// Resources sorted by dependencies (for post-apply state saving)
+    pub sorted_resources: Vec<Resource>,
+    /// Current states (for binding_map + state saving)
+    pub current_states: Vec<CurrentStateEntry>,
+}
+
+/// Entry for serializing current resource states
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CurrentStateEntry {
+    pub id: ResourceId,
+    pub state: State,
+}
+
+pub async fn run_plan(path: &PathBuf, out: Option<&PathBuf>) -> Result<bool, AppError> {
+    let mut parsed = load_configuration(path)?.parsed;
+
+    let base_dir = get_base_dir(path);
+    validate_and_resolve(&mut parsed, base_dir, false)?;
+
+    // Check for backend configuration and load state
+    // Use local backend by default if no backend is configured
+    let mut will_create_state_bucket = false;
+    let mut state_bucket_name = String::new();
+    let mut state_file: Option<StateFile> = None;
+
+    let plan_backend: Box<dyn StateBackend> = if let Some(config) = parsed.backend.as_ref() {
+        let state_config = StateBackendConfig::from(config);
+        let backend = create_backend(&state_config)
+            .await
+            .map_err(AppError::Backend)?;
+
+        let bucket_exists = backend.bucket_exists().await.map_err(AppError::Backend)?;
+
+        if bucket_exists {
+            // Try to load state from backend
+            state_file = backend.read_state().await.map_err(AppError::Backend)?;
+        } else {
+            // Check if there's a matching s3_bucket resource defined
+            let bucket_name = config
+                .attributes
+                .get("bucket")
+                .and_then(|v| match v {
+                    Value::String(s) => Some(s.clone()),
+                    _ => None,
+                })
+                .ok_or("Backend bucket name not specified")?;
+
+            let backend_resource_type = backend
+                .resource_type()
+                .ok_or("Backend does not specify a resource type")?;
+            let has_bucket_resource = parsed.resources.iter().any(|r| {
+                r.id.resource_type == backend_resource_type
+                    && r.attributes
+                        .get("bucket")
+                        .is_some_and(|v| matches!(v, Value::String(s) if s == &bucket_name))
+            });
+
+            if !has_bucket_resource {
+                let auto_create = config
+                    .attributes
+                    .get("auto_create")
+                    .and_then(|v| match v {
+                        Value::Bool(b) => Some(*b),
+                        _ => None,
+                    })
+                    .unwrap_or(true);
+
+                if auto_create {
+                    will_create_state_bucket = true;
+                    state_bucket_name = bucket_name;
+                } else {
+                    return Err(AppError::Config(format!(
+                        "Backend bucket '{}' not found and auto_create is disabled",
+                        bucket_name
+                    )));
+                }
+            }
+        }
+        backend
+    } else {
+        // Use local backend by default
+        let backend = create_local_backend();
+        state_file = backend.read_state().await.map_err(AppError::Backend)?;
+        backend
+    };
+
+    // Show bootstrap plan if needed
+    if will_create_state_bucket {
+        let backend_provider = plan_backend
+            .provider_name()
+            .ok_or("Backend does not specify a provider name")?;
+        let backend_resource_type = plan_backend
+            .resource_type()
+            .ok_or("Backend does not specify a resource type")?;
+        println!("{}", "Bootstrap Plan:".cyan().bold());
+        println!(
+            "  {} {} (state bucket with versioning enabled)",
+            "+".green(),
+            format!(
+                "{}.{}.{}",
+                backend_provider, backend_resource_type, state_bucket_name
+            )
+            .green()
+        );
+        println!(
+            "  {} Resource definition will be added to .crn file",
+            "→".cyan()
+        );
+        println!();
+    }
+
+    reconcile_prefixed_names(&mut parsed.resources, &state_file);
+    reconcile_anonymous_identifiers(&mut parsed.resources, &state_file);
+    apply_name_overrides(&mut parsed.resources, &state_file);
+
+    let ctx = create_plan_from_parsed(&parsed, &state_file).await?;
+    let has_changes = ctx.plan.mutation_count() > 0;
+    print_plan(&ctx.plan);
+
+    // Save plan to file if --out was specified
+    if let Some(out_path) = out {
+        let plan_file = PlanFile {
+            version: 1,
+            carina_version: env!("CARGO_PKG_VERSION").to_string(),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            source_path: path.display().to_string(),
+            state_lineage: state_file.as_ref().map(|s| s.lineage.clone()),
+            state_serial: state_file.as_ref().map(|s| s.serial),
+            provider_configs: parsed.providers.clone(),
+            backend_config: parsed.backend.clone(),
+            plan: ctx.plan,
+            sorted_resources: ctx.sorted_resources,
+            current_states: ctx
+                .current_states
+                .into_iter()
+                .map(|(id, state)| CurrentStateEntry { id, state })
+                .collect(),
+        };
+
+        let json = serde_json::to_string_pretty(&plan_file)
+            .map_err(|e| format!("Failed to serialize plan: {}", e))?;
+        fs::write(out_path, json).map_err(|e| format!("Failed to write plan file: {}", e))?;
+
+        println!();
+        println!(
+            "{}",
+            format!("Plan saved to {}", out_path.display())
+                .green()
+                .bold()
+        );
+        println!(
+            "{}",
+            format!(
+                "To apply this plan, run: carina apply {}",
+                out_path.display()
+            )
+            .cyan()
+        );
+    }
+
+    Ok(has_changes)
+}
