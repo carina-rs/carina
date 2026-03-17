@@ -204,20 +204,17 @@ impl Provider for ProviderRouter {
         id: &ResourceId,
         identifier: Option<&str>,
     ) -> BoxFuture<'_, ProviderResult<State>> {
-        let id = id.clone();
-        let identifier = identifier.map(|s| s.to_string());
-        Box::pin(async move {
-            let provider = self.get_provider_or_error(&id.provider)?;
-            provider.read(&id, identifier.as_deref()).await
-        })
+        match self.get_provider_or_error(&id.provider) {
+            Ok(provider) => provider.read(id, identifier),
+            Err(e) => Box::pin(async move { Err(e) }),
+        }
     }
 
     fn create(&self, resource: &Resource) -> BoxFuture<'_, ProviderResult<State>> {
-        let resource = resource.clone();
-        Box::pin(async move {
-            let provider = self.get_provider_or_error(&resource.id.provider)?;
-            provider.create(&resource).await
-        })
+        match self.get_provider_or_error(&resource.id.provider) {
+            Ok(provider) => provider.create(resource),
+            Err(e) => Box::pin(async move { Err(e) }),
+        }
     }
 
     fn update(
@@ -227,14 +224,10 @@ impl Provider for ProviderRouter {
         from: &State,
         to: &Resource,
     ) -> BoxFuture<'_, ProviderResult<State>> {
-        let id = id.clone();
-        let identifier = identifier.to_string();
-        let from = from.clone();
-        let to = to.clone();
-        Box::pin(async move {
-            let provider = self.get_provider_or_error(&id.provider)?;
-            provider.update(&id, &identifier, &from, &to).await
-        })
+        match self.get_provider_or_error(&id.provider) {
+            Ok(provider) => provider.update(id, identifier, from, to),
+            Err(e) => Box::pin(async move { Err(e) }),
+        }
     }
 
     fn delete(
@@ -243,13 +236,10 @@ impl Provider for ProviderRouter {
         identifier: &str,
         lifecycle: &LifecycleConfig,
     ) -> BoxFuture<'_, ProviderResult<()>> {
-        let id = id.clone();
-        let identifier = identifier.to_string();
-        let lifecycle = lifecycle.clone();
-        Box::pin(async move {
-            let provider = self.get_provider_or_error(&id.provider)?;
-            provider.delete(&id, &identifier, &lifecycle).await
-        })
+        match self.get_provider_or_error(&id.provider) {
+            Ok(provider) => provider.delete(id, identifier, lifecycle),
+            Err(e) => Box::pin(async move { Err(e) }),
+        }
     }
 
     fn resolve_enum_identifiers(&self, resources: &mut [Resource]) {
@@ -505,6 +495,29 @@ mod tests {
         let state = router.create(&resource).await.unwrap();
         assert!(state.exists);
         assert_eq!(state.identifier, Some("mock-id-123".to_string()));
+    }
+
+    #[tokio::test]
+    async fn provider_router_dispatches_update_by_provider_name() {
+        let mut router = ProviderRouter::new();
+        router.add_provider("mock".to_string(), Box::new(MockProvider));
+
+        let id = ResourceId::with_provider("mock", "test", "example");
+        let from = State::existing(id.clone(), HashMap::new());
+        let to = Resource::with_provider("mock", "test", "example");
+        let state = router.update(&id, "mock-id-123", &from, &to).await.unwrap();
+        assert!(state.exists);
+    }
+
+    #[tokio::test]
+    async fn provider_router_dispatches_delete_by_provider_name() {
+        let mut router = ProviderRouter::new();
+        router.add_provider("mock".to_string(), Box::new(MockProvider));
+
+        let id = ResourceId::with_provider("mock", "test", "example");
+        let lifecycle = LifecycleConfig::default();
+        let result = router.delete(&id, "mock-id-123", &lifecycle).await;
+        assert!(result.is_ok());
     }
 
     #[tokio::test]
