@@ -1,4 +1,5 @@
 mod display;
+mod error;
 mod wiring;
 
 use std::collections::HashMap;
@@ -36,6 +37,7 @@ use carina_state::{
 use std::collections::HashSet;
 
 use display::{format_effect, print_plan};
+use error::AppError;
 #[cfg(test)]
 use wiring::resolve_attr_prefixes;
 use wiring::{
@@ -273,13 +275,32 @@ async fn main() {
     }
 }
 
-fn run_module_command(command: ModuleCommands) -> Result<(), String> {
+/// Convert a lock acquisition error into an `AppError`.
+///
+/// For `Locked` errors, includes a hint about `force-unlock`.
+/// All other backend errors are passed through as `AppError::Backend`.
+fn map_lock_error(e: BackendError) -> AppError {
+    match e {
+        BackendError::Locked {
+            who,
+            lock_id,
+            operation,
+        } => AppError::Config(format!(
+            "State is locked by {} (lock ID: {}, operation: {})\n\
+             If you believe this is stale, run: carina force-unlock {}",
+            who, lock_id, operation, lock_id
+        )),
+        other => AppError::Backend(other),
+    }
+}
+
+fn run_module_command(command: ModuleCommands) -> Result<(), AppError> {
     match command {
         ModuleCommands::Info { file } => run_module_info(&file),
     }
 }
 
-fn run_module_info(path: &Path) -> Result<(), String> {
+fn run_module_info(path: &Path) -> Result<(), AppError> {
     let parsed = if path.is_dir() {
         // Read all .crn files in the directory and merge them
         module_resolver::load_module_from_directory(path)?
@@ -317,7 +338,7 @@ fn validate_and_resolve(
     parsed: &mut ParsedFile,
     base_dir: &Path,
     skip_resource_validation: bool,
-) -> Result<(), String> {
+) -> Result<(), AppError> {
     // Validate provider region
     validate_provider_region(parsed)?;
 
@@ -342,7 +363,7 @@ fn validate_and_resolve(
     Ok(())
 }
 
-fn run_validate(path: &PathBuf) -> Result<(), String> {
+fn run_validate(path: &PathBuf) -> Result<(), AppError> {
     let loaded = load_configuration(path)?;
     let mut parsed = loaded.parsed;
 
@@ -386,7 +407,7 @@ fn run_validate(path: &PathBuf) -> Result<(), String> {
     Ok(())
 }
 
-async fn run_plan(path: &PathBuf, out: Option<&PathBuf>) -> Result<bool, String> {
+async fn run_plan(path: &PathBuf, out: Option<&PathBuf>) -> Result<bool, AppError> {
     let mut parsed = load_configuration(path)?.parsed;
 
     let base_dir = get_base_dir(path);
@@ -402,19 +423,13 @@ async fn run_plan(path: &PathBuf, out: Option<&PathBuf>) -> Result<bool, String>
         let state_config = StateBackendConfig::from(config);
         let backend = create_backend(&state_config)
             .await
-            .map_err(|e| format!("Failed to create backend: {}", e))?;
+            .map_err(AppError::Backend)?;
 
-        let bucket_exists = backend
-            .bucket_exists()
-            .await
-            .map_err(|e| format!("Failed to check bucket: {}", e))?;
+        let bucket_exists = backend.bucket_exists().await.map_err(AppError::Backend)?;
 
         if bucket_exists {
             // Try to load state from backend
-            state_file = backend
-                .read_state()
-                .await
-                .map_err(|e| format!("Failed to read state: {}", e))?;
+            state_file = backend.read_state().await.map_err(AppError::Backend)?;
         } else {
             // Check if there's a matching s3_bucket resource defined
             let bucket_name = config
@@ -450,10 +465,10 @@ async fn run_plan(path: &PathBuf, out: Option<&PathBuf>) -> Result<bool, String>
                     will_create_state_bucket = true;
                     state_bucket_name = bucket_name;
                 } else {
-                    return Err(format!(
+                    return Err(AppError::Config(format!(
                         "Backend bucket '{}' not found and auto_create is disabled",
                         bucket_name
-                    ));
+                    )));
                 }
             }
         }
@@ -461,10 +476,7 @@ async fn run_plan(path: &PathBuf, out: Option<&PathBuf>) -> Result<bool, String>
     } else {
         // Use local backend by default
         let backend = create_local_backend();
-        state_file = backend
-            .read_state()
-            .await
-            .map_err(|e| format!("Failed to read state: {}", e))?;
+        state_file = backend.read_state().await.map_err(AppError::Backend)?;
         backend
     };
 
@@ -981,7 +993,7 @@ async fn finalize_apply(
     current_states: &HashMap<ResourceId, State>,
     plan: &Plan,
     backend: &dyn StateBackend,
-) -> Result<(), String> {
+) -> Result<(), AppError> {
     println!();
     println!("{}", "Saving state...".cyan());
 
@@ -1001,7 +1013,7 @@ async fn finalize_apply(
     backend
         .write_state(&state)
         .await
-        .map_err(|e| format!("Failed to write state: {}", e))?;
+        .map_err(AppError::Backend)?;
     println!("  {} State saved (serial: {})", "✓".green(), state.serial);
 
     Ok(())
@@ -1060,7 +1072,7 @@ struct ApplyStateSave<'a> {
     failed_refreshes: &'a HashSet<ResourceId>,
 }
 
-fn build_state_after_apply(save: ApplyStateSave<'_>) -> Result<StateFile, String> {
+fn build_state_after_apply(save: ApplyStateSave<'_>) -> Result<StateFile, AppError> {
     let ApplyStateSave {
         state_file,
         sorted_resources,
@@ -1106,7 +1118,7 @@ fn build_state_after_apply(save: ApplyStateSave<'_>) -> Result<StateFile, String
     Ok(state)
 }
 
-async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
+async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), AppError> {
     let loaded = load_configuration(path)?;
     let mut parsed = loaded.parsed;
     let backend_file = loaded.backend_file;
@@ -1120,7 +1132,7 @@ async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
         let state_config = StateBackendConfig::from(config);
         create_backend(&state_config)
             .await
-            .map_err(|e| format!("Failed to create backend: {}", e))?
+            .map_err(AppError::Backend)?
     } else {
         create_local_backend()
     };
@@ -1131,10 +1143,7 @@ async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
 
     if let Some(config) = backend_config {
         // Check if bucket exists (bootstrap detection)
-        let bucket_exists = backend
-            .bucket_exists()
-            .await
-            .map_err(|e| format!("Failed to check bucket: {}", e))?;
+        let bucket_exists = backend.bucket_exists().await.map_err(AppError::Backend)?;
 
         if !bucket_exists {
             println!(
@@ -1189,7 +1198,10 @@ async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
                         println!("  {} Created state bucket: {}", "✓".green(), bucket_name);
                     }
                     Err(e) => {
-                        return Err(format!("Failed to create state bucket: {}", e));
+                        return Err(AppError::Config(format!(
+                            "Failed to create state bucket: {}",
+                            e
+                        )));
                     }
                 }
             } else {
@@ -1205,10 +1217,7 @@ async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
 
                 if auto_create {
                     println!("Auto-creating state bucket: {}", bucket_name.cyan());
-                    backend
-                        .create_bucket()
-                        .await
-                        .map_err(|e| format!("Failed to create bucket: {}", e))?;
+                    backend.create_bucket().await.map_err(AppError::Backend)?;
                     println!("  {} Created state bucket", "✓".green());
 
                     let backend_provider_name = backend
@@ -1262,7 +1271,7 @@ async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
                     backend
                         .write_state(&initial_state)
                         .await
-                        .map_err(|e| format!("Failed to write initial state: {}", e))?;
+                        .map_err(AppError::Backend)?;
                     println!(
                         "  {} Registered state bucket as protected resource",
                         "✓".green()
@@ -1273,14 +1282,14 @@ async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
                     if let Err(e) =
                         module_resolver::resolve_modules(&mut parsed, get_base_dir(path))
                     {
-                        return Err(format!("Module resolution error: {}", e));
+                        return Err(AppError::Config(format!("Module resolution error: {}", e)));
                     }
                     resolve_names(&mut parsed.resources)?;
                 } else {
-                    return Err(format!(
+                    return Err(AppError::Config(format!(
                         "Backend bucket '{}' not found and auto_create is disabled",
                         bucket_name
-                    ));
+                    )));
                 }
             }
 
@@ -1288,50 +1297,31 @@ async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
             if backend
                 .read_state()
                 .await
-                .map_err(|e| format!("Failed to read state: {}", e))?
+                .map_err(AppError::Backend)?
                 .is_none()
             {
-                backend
-                    .init()
-                    .await
-                    .map_err(|e| format!("Failed to initialize state: {}", e))?;
+                backend.init().await.map_err(AppError::Backend)?;
             }
         }
 
         // Acquire lock
         println!("{}", "Acquiring state lock...".cyan());
-        lock = Some(backend.acquire_lock("apply").await.map_err(|e| match e {
-            BackendError::Locked {
-                who,
-                lock_id,
-                operation,
-            } => {
-                format!(
-                    "State is locked by {} (lock ID: {}, operation: {})\n\
-                            If you believe this is stale, run: carina force-unlock {}",
-                    who, lock_id, operation, lock_id
-                )
-            }
-            _ => format!("Failed to acquire lock: {}", e),
-        })?);
+        lock = Some(
+            backend
+                .acquire_lock("apply")
+                .await
+                .map_err(map_lock_error)?,
+        );
         println!("  {} Lock acquired", "✓".green());
     } else {
         // Local backend: acquire lock
         println!("{}", "Acquiring state lock...".cyan());
-        lock = Some(backend.acquire_lock("apply").await.map_err(|e| match e {
-            BackendError::Locked {
-                who,
-                lock_id,
-                operation,
-            } => {
-                format!(
-                    "State is locked by {} (lock ID: {}, operation: {})\n\
-                            If you believe this is stale, run: carina force-unlock {}",
-                    who, lock_id, operation, lock_id
-                )
-            }
-            _ => format!("Failed to acquire lock: {}", e),
-        })?);
+        lock = Some(
+            backend
+                .acquire_lock("apply")
+                .await
+                .map_err(map_lock_error)?,
+        );
         println!("  {} Lock acquired", "✓".green());
     }
 
@@ -1343,7 +1333,7 @@ async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
     let release_result = backend
         .release_lock(lock_info)
         .await
-        .map_err(|e| format!("Failed to release lock: {}", e));
+        .map_err(AppError::Backend);
 
     if release_result.is_ok() && op_result.is_ok() {
         println!("  {} Lock released", "✓".green());
@@ -1357,12 +1347,9 @@ async fn run_apply_locked(
     parsed: &mut ParsedFile,
     auto_approve: bool,
     backend: &dyn StateBackend,
-) -> Result<(), String> {
+) -> Result<(), AppError> {
     // Read current state from backend
-    let state_file = backend
-        .read_state()
-        .await
-        .map_err(|e| format!("Failed to read state: {}", e))?;
+    let state_file = backend.read_state().await.map_err(AppError::Backend)?;
 
     reconcile_prefixed_names(&mut parsed.resources, &state_file);
     reconcile_anonymous_identifiers(&mut parsed.resources, &state_file);
@@ -1384,7 +1371,7 @@ async fn run_apply_locked(
         let state = provider
             .read(&resource.id, identifier.as_deref())
             .await
-            .map_err(|e| format!("Failed to read state: {}", e))?;
+            .map_err(AppError::Provider)?;
         current_states.insert(resource.id.clone(), state);
     }
 
@@ -1511,7 +1498,10 @@ async fn run_apply_locked(
         if result.skip_count > 0 {
             parts.push(format!("{} skipped", result.skip_count));
         }
-        Err(format!("Apply failed. {}.", parts.join(", ")))
+        Err(AppError::Config(format!(
+            "Apply failed. {}.",
+            parts.join(", ")
+        )))
     }
 }
 
@@ -1523,7 +1513,7 @@ async fn detect_drift(
     sorted_resources: &[Resource],
     planned_states: &HashMap<ResourceId, State>,
     provider: &dyn Provider,
-) -> Result<Option<Vec<String>>, String> {
+) -> Result<Option<Vec<String>>, AppError> {
     let mut drift_detected = false;
     let mut drift_messages: Vec<String> = Vec::new();
 
@@ -1534,7 +1524,7 @@ async fn detect_drift(
         let actual_state = provider
             .read(&resource.id, identifier)
             .await
-            .map_err(|e| format!("Failed to read current state of {}: {}", resource.id, e))?;
+            .map_err(AppError::Provider)?;
 
         if let Some(planned) = planned_state {
             if planned.exists != actual_state.exists {
@@ -1601,11 +1591,11 @@ async fn detect_drift(
                 }
             }
         } else {
-            return Err(format!(
+            return Err(AppError::Config(format!(
                 "Resource {} is present in plan but missing from planned states. \
                  The plan file may be corrupted. Please re-run 'carina plan'.",
                 resource.id
-            ));
+            )));
         }
     }
 
@@ -1616,7 +1606,7 @@ async fn detect_drift(
     }
 }
 
-async fn run_apply_from_plan(plan_path: &PathBuf, auto_approve: bool) -> Result<(), String> {
+async fn run_apply_from_plan(plan_path: &PathBuf, auto_approve: bool) -> Result<(), AppError> {
     // Read and deserialize the plan file
     let content =
         fs::read_to_string(plan_path).map_err(|e| format!("Failed to read plan file: {}", e))?;
@@ -1625,10 +1615,10 @@ async fn run_apply_from_plan(plan_path: &PathBuf, auto_approve: bool) -> Result<
 
     // Validate version compatibility
     if plan_file.version != 1 {
-        return Err(format!(
+        return Err(AppError::Config(format!(
             "Unsupported plan file version: {} (expected 1)",
             plan_file.version
-        ));
+        )));
     }
 
     let current_version = env!("CARGO_PKG_VERSION");
@@ -1657,36 +1647,23 @@ async fn run_apply_from_plan(plan_path: &PathBuf, auto_approve: bool) -> Result<
         let state_config = StateBackendConfig::from(config);
         create_backend(&state_config)
             .await
-            .map_err(|e| format!("Failed to create backend: {}", e))?
+            .map_err(AppError::Backend)?
     } else {
         create_local_backend()
     };
 
     // Acquire lock
     println!("{}", "Acquiring state lock...".cyan());
-    let lock = backend.acquire_lock("apply").await.map_err(|e| match e {
-        BackendError::Locked {
-            who,
-            lock_id,
-            operation,
-        } => {
-            format!(
-                "State is locked by {} (lock ID: {}, operation: {})\n\
-                        If you believe this is stale, run: carina force-unlock {}",
-                who, lock_id, operation, lock_id
-            )
-        }
-        _ => format!("Failed to acquire lock: {}", e),
-    })?;
+    let lock = backend
+        .acquire_lock("apply")
+        .await
+        .map_err(map_lock_error)?;
     println!("  {} Lock acquired", "✓".green());
 
     let op_result = run_apply_from_plan_locked(plan_file, auto_approve, backend.as_ref()).await;
 
     // Always release lock, regardless of whether the operation succeeded
-    let release_result = backend
-        .release_lock(&lock)
-        .await
-        .map_err(|e| format!("Failed to release lock: {}", e));
+    let release_result = backend.release_lock(&lock).await.map_err(AppError::Backend);
 
     if release_result.is_ok() && op_result.is_ok() {
         println!("  {} Lock released", "✓".green());
@@ -1700,22 +1677,19 @@ async fn run_apply_from_plan_locked(
     plan_file: PlanFile,
     auto_approve: bool,
     backend: &dyn StateBackend,
-) -> Result<(), String> {
+) -> Result<(), AppError> {
     // Read current state and validate lineage
-    let state_file = backend
-        .read_state()
-        .await
-        .map_err(|e| format!("Failed to read state: {}", e))?;
+    let state_file = backend.read_state().await.map_err(AppError::Backend)?;
 
     if let Some(ref state) = state_file {
         // Validate state lineage
         if let Some(ref plan_lineage) = plan_file.state_lineage
             && &state.lineage != plan_lineage
         {
-            return Err(format!(
+            return Err(AppError::Config(format!(
                 "State lineage mismatch: plan was created for lineage '{}' but current state has '{}'",
                 plan_lineage, state.lineage
-            ));
+            )));
         }
 
         // Warn on serial mismatch (state may have drifted)
@@ -1769,7 +1743,9 @@ async fn run_apply_from_plan_locked(
             "Please re-run 'carina plan' to create a new plan that reflects the current state."
                 .yellow()
         );
-        return Err("Apply aborted due to infrastructure drift.".to_string());
+        return Err(AppError::Config(
+            "Apply aborted due to infrastructure drift.".to_string(),
+        ));
     }
 
     println!("  {} No drift detected.", "✓".green());
@@ -1866,12 +1842,15 @@ async fn run_apply_from_plan_locked(
         if result.skip_count > 0 {
             parts.push(format!("{} skipped", result.skip_count));
         }
-        Err(format!("Apply failed. {}.", parts.join(", ")))
+        Err(AppError::Config(format!(
+            "Apply failed. {}.",
+            parts.join(", ")
+        )))
     }
 }
 
 /// Create a provider from a saved ProviderConfig
-async fn run_destroy(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
+async fn run_destroy(path: &PathBuf, auto_approve: bool) -> Result<(), AppError> {
     let mut parsed = load_configuration(path)?.parsed;
 
     let base_dir = get_base_dir(path);
@@ -1888,7 +1867,7 @@ async fn run_destroy(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
         let state_config = StateBackendConfig::from(config);
         create_backend(&state_config)
             .await
-            .map_err(|e| format!("Failed to create backend: {}", e))?
+            .map_err(AppError::Backend)?
     } else {
         create_local_backend()
     };
@@ -1905,20 +1884,10 @@ async fn run_destroy(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
 
     // Acquire lock
     println!("{}", "Acquiring state lock...".cyan());
-    let lock = backend.acquire_lock("destroy").await.map_err(|e| match e {
-        BackendError::Locked {
-            who,
-            lock_id,
-            operation,
-        } => {
-            format!(
-                "State is locked by {} (lock ID: {}, operation: {})\n\
-                        If you believe this is stale, run: carina force-unlock {}",
-                who, lock_id, operation, lock_id
-            )
-        }
-        _ => format!("Failed to acquire lock: {}", e),
-    })?;
+    let lock = backend
+        .acquire_lock("destroy")
+        .await
+        .map_err(map_lock_error)?;
     println!("  {} Lock acquired", "✓".green());
 
     let op_result = run_destroy_locked(
@@ -1930,10 +1899,7 @@ async fn run_destroy(path: &PathBuf, auto_approve: bool) -> Result<(), String> {
     .await;
 
     // Always release lock, regardless of whether the operation succeeded
-    let release_result = backend
-        .release_lock(&lock)
-        .await
-        .map_err(|e| format!("Failed to release lock: {}", e));
+    let release_result = backend.release_lock(&lock).await.map_err(AppError::Backend);
 
     if release_result.is_ok() && op_result.is_ok() {
         println!("  {} Lock released", "✓".green());
@@ -1948,12 +1914,9 @@ async fn run_destroy_locked(
     auto_approve: bool,
     backend: &dyn StateBackend,
     protected_bucket: Option<String>,
-) -> Result<(), String> {
+) -> Result<(), AppError> {
     // Read current state from backend
-    let state_file = backend
-        .read_state()
-        .await
-        .map_err(|e| format!("Failed to read state: {}", e))?;
+    let state_file = backend.read_state().await.map_err(AppError::Backend)?;
 
     reconcile_prefixed_names(&mut parsed.resources, &state_file);
     reconcile_anonymous_identifiers(&mut parsed.resources, &state_file);
@@ -1981,7 +1944,7 @@ async fn run_destroy_locked(
         let state = provider
             .read(&resource.id, identifier.as_deref())
             .await
-            .map_err(|e| format!("Failed to read state: {}", e))?;
+            .map_err(AppError::Provider)?;
         current_states.insert(resource.id.clone(), state);
     }
 
@@ -2304,7 +2267,7 @@ async fn run_destroy_locked(
     backend
         .write_state(&state)
         .await
-        .map_err(|e| format!("Failed to write state: {}", e))?;
+        .map_err(AppError::Backend)?;
     println!("  {} State saved (serial: {})", "✓".green(), state.serial);
 
     println!();
@@ -2317,10 +2280,10 @@ async fn run_destroy_locked(
         );
         Ok(())
     } else {
-        Err(format!(
+        Err(AppError::Config(format!(
             "Destroy failed. {} succeeded, {} failed, {} skipped.",
             success_count, failure_count, skip_count
-        ))
+        )))
     }
 }
 
@@ -2329,7 +2292,7 @@ async fn run_destroy_locked(
 // =============================================================================
 
 /// Run force-unlock command
-async fn run_force_unlock(lock_id: &str, path: &PathBuf) -> Result<(), String> {
+async fn run_force_unlock(lock_id: &str, path: &PathBuf) -> Result<(), AppError> {
     let parsed = load_configuration(path)?.parsed;
 
     let backend_config = parsed
@@ -2340,7 +2303,7 @@ async fn run_force_unlock(lock_id: &str, path: &PathBuf) -> Result<(), String> {
     let state_config = StateBackendConfig::from(backend_config);
     let backend = create_backend(&state_config)
         .await
-        .map_err(|e| format!("Failed to create backend: {}", e))?;
+        .map_err(AppError::Backend)?;
 
     println!("{}", "Force unlocking state...".yellow().bold());
     println!("Lock ID: {}", lock_id);
@@ -2350,17 +2313,20 @@ async fn run_force_unlock(lock_id: &str, path: &PathBuf) -> Result<(), String> {
             println!("{}", "State has been successfully unlocked.".green().bold());
             Ok(())
         }
-        Err(BackendError::LockNotFound(_)) => Err(format!("Lock with ID '{}' not found.", lock_id)),
-        Err(BackendError::LockMismatch { expected, actual }) => Err(format!(
+        Err(BackendError::LockNotFound(_)) => Err(AppError::Config(format!(
+            "Lock with ID '{}' not found.",
+            lock_id
+        ))),
+        Err(BackendError::LockMismatch { expected, actual }) => Err(AppError::Config(format!(
             "Lock ID mismatch. Expected '{}', found '{}'.",
             expected, actual
-        )),
-        Err(e) => Err(format!("Failed to force unlock: {}", e)),
+        ))),
+        Err(e) => Err(AppError::Backend(e)),
     }
 }
 
 /// Run state subcommands
-async fn run_state_command(command: StateCommands) -> Result<(), String> {
+async fn run_state_command(command: StateCommands) -> Result<(), AppError> {
     match command {
         StateCommands::BucketDelete {
             bucket_name,
@@ -2376,7 +2342,7 @@ async fn run_state_bucket_delete(
     bucket_name: &str,
     force: bool,
     path: &PathBuf,
-) -> Result<(), String> {
+) -> Result<(), AppError> {
     let parsed = load_configuration(path)?.parsed;
 
     let backend_config = parsed
@@ -2395,10 +2361,10 @@ async fn run_state_bucket_delete(
         .ok_or("Backend configuration missing 'bucket' attribute")?;
 
     if config_bucket != bucket_name {
-        return Err(format!(
+        return Err(AppError::Config(format!(
             "Bucket name '{}' does not match backend configuration bucket '{}'.",
             bucket_name, config_bucket
-        ));
+        )));
     }
 
     println!(
@@ -2431,7 +2397,7 @@ async fn run_state_bucket_delete(
     let state_config = StateBackendConfig::from(backend_config);
     let backend = create_backend(&state_config)
         .await
-        .map_err(|e| format!("Failed to create backend: {}", e))?;
+        .map_err(AppError::Backend)?;
 
     // Get provider metadata from backend
     let backend_provider_name = backend
@@ -2473,12 +2439,12 @@ async fn run_state_bucket_delete(
             );
             Ok(())
         }
-        Err(e) => Err(format!("Failed to delete bucket: {}", e)),
+        Err(e) => Err(AppError::Provider(e)),
     }
 }
 
 /// Run state refresh command
-async fn run_state_refresh(path: &PathBuf) -> Result<(), String> {
+async fn run_state_refresh(path: &PathBuf) -> Result<(), AppError> {
     let loaded = load_configuration(path)?;
     let mut parsed = loaded.parsed;
 
@@ -2491,36 +2457,23 @@ async fn run_state_refresh(path: &PathBuf) -> Result<(), String> {
         let state_config = StateBackendConfig::from(config);
         create_backend(&state_config)
             .await
-            .map_err(|e| format!("Failed to create backend: {}", e))?
+            .map_err(AppError::Backend)?
     } else {
         create_local_backend()
     };
 
     // Acquire lock
     println!("{}", "Acquiring state lock...".cyan());
-    let lock = backend.acquire_lock("refresh").await.map_err(|e| match e {
-        BackendError::Locked {
-            who,
-            lock_id,
-            operation,
-        } => {
-            format!(
-                "State is locked by {} (lock ID: {}, operation: {})\n\
-                 If you believe this is stale, run: carina force-unlock {}",
-                who, lock_id, operation, lock_id
-            )
-        }
-        _ => format!("Failed to acquire lock: {}", e),
-    })?;
+    let lock = backend
+        .acquire_lock("refresh")
+        .await
+        .map_err(map_lock_error)?;
     println!("  {} Lock acquired", "✓".green());
 
     let op_result = run_state_refresh_locked(&mut parsed, backend.as_ref()).await;
 
     // Always release lock, regardless of whether the operation succeeded
-    let release_result = backend
-        .release_lock(&lock)
-        .await
-        .map_err(|e| format!("Failed to release lock: {}", e));
+    let release_result = backend.release_lock(&lock).await.map_err(AppError::Backend);
 
     op_result?;
     release_result
@@ -2529,12 +2482,9 @@ async fn run_state_refresh(path: &PathBuf) -> Result<(), String> {
 async fn run_state_refresh_locked(
     parsed: &mut ParsedFile,
     backend: &dyn StateBackend,
-) -> Result<(), String> {
+) -> Result<(), AppError> {
     // Read current state from backend
-    let mut state_file = backend
-        .read_state()
-        .await
-        .map_err(|e| format!("Failed to read state: {}", e))?;
+    let mut state_file = backend.read_state().await.map_err(AppError::Backend)?;
 
     if state_file.as_ref().is_none_or(|s| s.resources.is_empty()) {
         let msg = if state_file.is_none() {
@@ -2573,7 +2523,7 @@ async fn run_state_refresh_locked(
         let fresh_state = provider
             .read(&resource.id, identifier.as_deref())
             .await
-            .map_err(|e| format!("Failed to read state for {}: {}", resource.id, e))?;
+            .map_err(AppError::Provider)?;
         current_states.insert(resource.id.clone(), fresh_state);
     }
 
@@ -2697,7 +2647,7 @@ async fn run_state_refresh_locked(
     backend
         .write_state(&state)
         .await
-        .map_err(|e| format!("Failed to write state: {}", e))?;
+        .map_err(AppError::Backend)?;
 
     // Summary
     println!(
@@ -2713,7 +2663,7 @@ async fn run_state_refresh_locked(
 }
 
 // Format command implementation
-fn run_fmt(path: &PathBuf, check: bool, show_diff: bool, recursive: bool) -> Result<(), String> {
+fn run_fmt(path: &PathBuf, check: bool, show_diff: bool, recursive: bool) -> Result<(), AppError> {
     let config = FormatConfig::default();
 
     let files = if path.is_file() {
@@ -2773,13 +2723,17 @@ fn run_fmt(path: &PathBuf, check: bool, show_diff: bool, recursive: bool) -> Res
             for (file, err) in &errors {
                 eprintln!("{} {}: {}", "Error:".red(), file.display(), err);
             }
-            Err("Some files are not properly formatted".to_string())
+            Err(AppError::Validation(
+                "Some files are not properly formatted".to_string(),
+            ))
         }
     } else if !errors.is_empty() {
         for (file, err) in &errors {
             eprintln!("{} {}: {}", "Error:".red(), file.display(), err);
         }
-        Err("Some files had formatting errors".to_string())
+        Err(AppError::Validation(
+            "Some files had formatting errors".to_string(),
+        ))
     } else {
         let count = needs_formatting.len();
         if count > 0 {
@@ -2812,7 +2766,7 @@ struct LintWarning {
     message: String,
 }
 
-fn run_lint(path: &PathBuf) -> Result<(), String> {
+fn run_lint(path: &PathBuf) -> Result<(), AppError> {
     let mut parsed = load_configuration(path)?.parsed;
 
     let base_dir = get_base_dir(path);
@@ -2839,7 +2793,10 @@ fn run_lint(path: &PathBuf) -> Result<(), String> {
         }
         texts
     } else {
-        return Err(format!("Path not found: {}", path.display()));
+        return Err(AppError::Config(format!(
+            "Path not found: {}",
+            path.display()
+        )));
     };
 
     // Collect all List<Struct> attribute names from schemas of parsed resources
@@ -2892,7 +2849,10 @@ fn run_lint(path: &PathBuf) -> Result<(), String> {
                 w.message
             );
         }
-        Err(format!("Found {} lint warning(s).", warnings.len()))
+        Err(AppError::Validation(format!(
+            "Found {} lint warning(s).",
+            warnings.len()
+        )))
     }
 }
 
@@ -3252,7 +3212,12 @@ mod tests {
         let mut resources = vec![resource];
         let result = resolve_attr_prefixes(&mut resources);
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("cannot specify both"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("cannot specify both")
+        );
     }
 
     #[test]
@@ -3266,7 +3231,7 @@ mod tests {
         let mut resources = vec![resource];
         let result = resolve_attr_prefixes(&mut resources);
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("cannot be empty"));
+        assert!(result.unwrap_err().to_string().contains("cannot be empty"));
     }
 
     #[test]
@@ -3465,7 +3430,7 @@ mod tests {
         let mut resources = vec![r1, r2];
         let result = compute_anonymous_identifiers(&mut resources, &providers);
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("collision"));
+        assert!(result.unwrap_err().to_string().contains("collision"));
     }
 
     #[test]
@@ -3553,7 +3518,7 @@ mod tests {
         // read_only defaults to false, simulating missing `read` keyword
         let result = validate_resources(&[resource]);
         assert!(result.is_err());
-        let err = result.unwrap_err();
+        let err = result.unwrap_err().to_string();
         assert!(
             err.contains("data source"),
             "Error should mention 'data source': {}",
@@ -3985,7 +3950,7 @@ mod tests {
             result.is_err(),
             "Should return error when resource is missing from planned states"
         );
-        let err = result.unwrap_err();
+        let err = result.unwrap_err().to_string();
         assert!(
             err.contains("missing from planned states"),
             "Error message should mention missing planned states, got: {}",
