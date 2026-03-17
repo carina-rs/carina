@@ -5,7 +5,7 @@
 
 use crate::effect::Effect;
 use crate::plan::Plan;
-use crate::provider::{Provider, ProviderError, ProviderResult};
+use crate::provider::{ProviderError, ProviderResult, ProviderRuntime};
 use crate::resource::State;
 
 /// Result of executing each Effect
@@ -49,12 +49,12 @@ pub struct InterpreterConfig {
 }
 
 /// Interpreter that executes Effects using a Provider
-pub struct Interpreter<P: Provider> {
+pub struct Interpreter<P: ProviderRuntime> {
     provider: P,
     config: InterpreterConfig,
 }
 
-impl<P: Provider> Interpreter<P> {
+impl<P: ProviderRuntime> Interpreter<P> {
     pub fn new(provider: P) -> Self {
         Self {
             provider,
@@ -205,7 +205,7 @@ mod tests {
 
     struct TestProvider;
 
-    impl Provider for TestProvider {
+    impl ProviderRuntime for TestProvider {
         fn name(&self) -> &'static str {
             "test"
         }
@@ -326,7 +326,7 @@ mod tests {
         ops: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     }
 
-    impl Provider for OrderTrackingProvider {
+    impl ProviderRuntime for OrderTrackingProvider {
         fn name(&self) -> &'static str {
             "order_tracking"
         }
@@ -652,7 +652,7 @@ mod tests {
         ops: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     }
 
-    impl Provider for RenameFailProvider {
+    impl ProviderRuntime for RenameFailProvider {
         fn name(&self) -> &'static str {
             "rename_fail"
         }

@@ -12,7 +12,10 @@ use aws_config::Region;
 use aws_sdk_ec2::Client as Ec2Client;
 use aws_sdk_s3::Client as S3Client;
 use aws_sdk_sts::Client as StsClient;
-use carina_core::provider::{BoxFuture, Provider, ProviderError, ProviderFactory, ProviderResult};
+use carina_core::provider::{
+    BoxFuture, Provider, ProviderError, ProviderFactory, ProviderResult, ProviderRuntime,
+    ProviderSchemaExt,
+};
 use carina_core::resource::{LifecycleConfig, Resource, ResourceId, State, Value};
 use carina_core::utils::convert_enum_value;
 
@@ -521,7 +524,7 @@ impl AwsProvider {
     }
 }
 
-impl Provider for AwsProvider {
+impl ProviderRuntime for AwsProvider {
     fn name(&self) -> &'static str {
         "aws"
     }
@@ -645,10 +648,6 @@ impl Provider for AwsProvider {
         })
     }
 
-    fn resolve_enum_identifiers(&self, resources: &mut [Resource]) {
-        resolve_enum_identifiers_impl(resources);
-    }
-
     fn delete(
         &self,
         id: &ResourceId,
@@ -680,6 +679,12 @@ impl Provider for AwsProvider {
                 .for_resource(id.clone())),
             }
         })
+    }
+}
+
+impl ProviderSchemaExt for AwsProvider {
+    fn normalize_desired(&self, resources: &mut [Resource]) {
+        resolve_enum_identifiers_impl(resources);
     }
 }
 

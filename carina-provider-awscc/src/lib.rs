@@ -17,7 +17,9 @@ pub use provider::AwsccProvider;
 
 use std::collections::HashMap;
 
-use carina_core::provider::{BoxFuture, Provider, ProviderFactory, ProviderResult};
+use carina_core::provider::{
+    BoxFuture, Provider, ProviderFactory, ProviderResult, ProviderRuntime, ProviderSchemaExt,
+};
 use carina_core::resource::{LifecycleConfig, Resource, ResourceId, State, Value};
 
 /// Factory for creating and configuring the AWSCC Provider
@@ -80,7 +82,7 @@ impl ProviderFactory for AwsccProviderFactory {
 // Provider Trait Implementation
 // =============================================================================
 
-impl Provider for AwsccProvider {
+impl ProviderRuntime for AwsccProvider {
     fn name(&self) -> &'static str {
         "awscc"
     }
@@ -128,12 +130,14 @@ impl Provider for AwsccProvider {
         let lifecycle = lifecycle.clone();
         Box::pin(async move { self.delete_resource(&id, &identifier, &lifecycle).await })
     }
+}
 
-    fn resolve_enum_identifiers(&self, resources: &mut [Resource]) {
+impl ProviderSchemaExt for AwsccProvider {
+    fn normalize_desired(&self, resources: &mut [Resource]) {
         crate::provider::resolve_enum_identifiers_impl(resources);
     }
 
-    fn restore_unreturned_attrs(
+    fn hydrate_read_state(
         &self,
         current_states: &mut HashMap<ResourceId, State>,
         saved_attrs: &HashMap<ResourceId, HashMap<String, Value>>,

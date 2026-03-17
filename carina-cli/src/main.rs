@@ -25,7 +25,7 @@ use carina_core::lint::{find_list_literal_attrs, list_struct_attr_names};
 use carina_core::module_resolver;
 use carina_core::parser::{BackendConfig, ParsedFile, ProviderConfig};
 use carina_core::plan::Plan;
-use carina_core::provider::{self as provider_mod, Provider};
+use carina_core::provider::{self as provider_mod, Provider, ProviderSchemaExt};
 use carina_core::resolver::{resolve_ref_value, resolve_refs_with_state};
 use carina_core::resource::{LifecycleConfig, Resource, ResourceId, State, Value};
 use carina_core::value::{format_value, json_to_dsl_value};
@@ -1393,7 +1393,7 @@ async fn run_apply_locked(
         .as_ref()
         .map(|sf| sf.build_saved_attrs())
         .unwrap_or_default();
-    provider.restore_unreturned_attrs(&mut current_states, &saved_attrs);
+    provider.hydrate_read_state(&mut current_states, &saved_attrs);
 
     // Build initial binding map for reference resolution
     let mut binding_map: HashMap<String, HashMap<String, Value>> = HashMap::new();
@@ -1417,7 +1417,7 @@ async fn run_apply_locked(
     // Resolve references and enum identifiers, then create initial plan for display
     let mut resources_for_plan = sorted_resources.clone();
     resolve_refs_with_state(&mut resources_for_plan, &current_states);
-    provider.resolve_enum_identifiers(&mut resources_for_plan);
+    provider.normalize_desired(&mut resources_for_plan);
     let lifecycles = state_file
         .as_ref()
         .map(|sf| sf.build_lifecycles())
@@ -2582,7 +2582,7 @@ async fn run_state_refresh_locked(
         .as_ref()
         .map(|sf| sf.build_saved_attrs())
         .unwrap_or_default();
-    provider.restore_unreturned_attrs(&mut current_states, &saved_attrs);
+    provider.hydrate_read_state(&mut current_states, &saved_attrs);
 
     let mut state = state_file.take().unwrap();
 
@@ -2899,7 +2899,9 @@ fn run_lint(path: &PathBuf) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use carina_core::provider::{BoxFuture, ProviderError, ProviderResult};
+    use carina_core::provider::{
+        BoxFuture, ProviderError, ProviderResult, ProviderRuntime, ProviderSchemaExt,
+    };
     use serde_json::json;
 
     struct TestProvider {
@@ -2926,7 +2928,7 @@ mod tests {
         }
     }
 
-    impl Provider for TestProvider {
+    impl ProviderRuntime for TestProvider {
         fn name(&self) -> &'static str {
             "test"
         }
@@ -2968,6 +2970,8 @@ mod tests {
             Box::pin(async { Err(ProviderError::new("unexpected delete")) })
         }
     }
+
+    impl ProviderSchemaExt for TestProvider {}
 
     #[tokio::test]
     async fn refresh_pending_states_updates_saved_state_from_provider_read() {

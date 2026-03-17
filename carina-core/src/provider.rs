@@ -71,11 +71,11 @@ pub type ProviderResult<T> = Result<T, ProviderError>;
 /// Return type for async operations
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
-/// Main Provider trait
+/// Runtime CRUD operations for a provider.
 ///
-/// Each infrastructure provider (AWS, GCP, etc.) implements this trait.
-/// All operations are async and involve side effects.
-pub trait Provider: Send + Sync {
+/// Each infrastructure provider (AWS, GCP, etc.) implements this trait
+/// to define how resources are read, created, updated, and deleted.
+pub trait ProviderRuntime: Send + Sync {
     /// Name of this Provider (e.g., "aws")
     fn name(&self) -> &'static str;
 
@@ -114,27 +114,42 @@ pub trait Provider: Send + Sync {
         identifier: &str,
         lifecycle: &LifecycleConfig,
     ) -> BoxFuture<'_, ProviderResult<()>>;
+}
 
-    /// Resolve enum identifiers in resources to their fully-qualified DSL format.
+/// Plan-time schema extensions for a provider.
+///
+/// Handles normalization of desired state and hydration of read state.
+/// These operations are synchronous and run before/after CRUD operations.
+pub trait ProviderSchemaExt: Send + Sync {
+    /// Normalize desired resources before diffing.
     ///
-    /// For example, resolves bare `advanced` or `Tier.advanced` into
-    /// `awscc.ec2_ipam.Tier.advanced` based on schema definitions.
+    /// For example, resolves bare enum identifiers like `advanced` or `Tier.advanced`
+    /// into fully-qualified DSL format like `awscc.ec2_ipam.Tier.advanced`.
     /// Default implementation is a no-op for providers without enum types.
-    fn resolve_enum_identifiers(&self, _resources: &mut [Resource]) {}
+    fn normalize_desired(&self, _resources: &mut [Resource]) {}
 
-    /// Restore unreturned attributes from saved state into current read states.
+    /// Hydrate read state with saved attributes that the API did not return.
     ///
     /// Some APIs (e.g., CloudControl) don't return certain properties in read responses
     /// (create-only properties, or normal properties like `description` on some resources).
     /// This method carries them forward from previously saved attribute values.
     /// Default implementation is a no-op.
-    fn restore_unreturned_attrs(
+    fn hydrate_read_state(
         &self,
         _current_states: &mut HashMap<ResourceId, State>,
         _saved_attrs: &HashMap<ResourceId, HashMap<String, Value>>,
     ) {
     }
 }
+
+/// Main Provider trait combining runtime operations and schema extensions.
+///
+/// This is a supertrait of `ProviderRuntime` and `ProviderSchemaExt`.
+/// Providers that implement both traits automatically implement `Provider`.
+pub trait Provider: ProviderRuntime + ProviderSchemaExt {}
+
+/// Blanket implementation: any type implementing both sub-traits is a Provider.
+impl<T: ProviderRuntime + ProviderSchemaExt> Provider for T {}
 
 /// A provider that routes operations to the correct sub-provider
 /// based on the resource's provider name (`ResourceId.provider`).
@@ -171,7 +186,7 @@ impl ProviderRouter {
     }
 }
 
-impl Provider for ProviderRouter {
+impl ProviderRuntime for ProviderRouter {
     fn name(&self) -> &'static str {
         "router"
     }
@@ -218,20 +233,22 @@ impl Provider for ProviderRouter {
             Err(e) => Box::pin(async move { Err(e) }),
         }
     }
+}
 
-    fn resolve_enum_identifiers(&self, resources: &mut [Resource]) {
+impl ProviderSchemaExt for ProviderRouter {
+    fn normalize_desired(&self, resources: &mut [Resource]) {
         for provider in self.providers.values() {
-            provider.resolve_enum_identifiers(resources);
+            provider.normalize_desired(resources);
         }
     }
 
-    fn restore_unreturned_attrs(
+    fn hydrate_read_state(
         &self,
         current_states: &mut HashMap<ResourceId, State>,
         saved_attrs: &HashMap<ResourceId, HashMap<String, Value>>,
     ) {
         for provider in self.providers.values() {
-            provider.restore_unreturned_attrs(current_states, saved_attrs);
+            provider.hydrate_read_state(current_states, saved_attrs);
         }
     }
 }
@@ -326,9 +343,9 @@ pub fn schema_key_for_resource(
     }
 }
 
-/// Provider implementation for Box<dyn Provider>
+/// ProviderRuntime implementation for Box<dyn Provider>
 /// This enables dynamic dispatch for Providers
-impl Provider for Box<dyn Provider> {
+impl ProviderRuntime for Box<dyn Provider> {
     fn name(&self) -> &'static str {
         (**self).name()
     }
@@ -363,17 +380,19 @@ impl Provider for Box<dyn Provider> {
     ) -> BoxFuture<'_, ProviderResult<()>> {
         (**self).delete(id, identifier, lifecycle)
     }
+}
 
-    fn resolve_enum_identifiers(&self, resources: &mut [Resource]) {
-        (**self).resolve_enum_identifiers(resources)
+impl ProviderSchemaExt for Box<dyn Provider> {
+    fn normalize_desired(&self, resources: &mut [Resource]) {
+        (**self).normalize_desired(resources)
     }
 
-    fn restore_unreturned_attrs(
+    fn hydrate_read_state(
         &self,
         current_states: &mut HashMap<ResourceId, State>,
         saved_attrs: &HashMap<ResourceId, HashMap<String, Value>>,
     ) {
-        (**self).restore_unreturned_attrs(current_states, saved_attrs)
+        (**self).hydrate_read_state(current_states, saved_attrs)
     }
 }
 
@@ -384,7 +403,7 @@ mod tests {
     // Mock Provider for testing
     struct MockProvider;
 
-    impl Provider for MockProvider {
+    impl ProviderRuntime for MockProvider {
         fn name(&self) -> &'static str {
             "mock"
         }
@@ -425,6 +444,8 @@ mod tests {
             Box::pin(async { Ok(()) })
         }
     }
+
+    impl ProviderSchemaExt for MockProvider {}
 
     #[tokio::test]
     async fn mock_provider_read_returns_not_found() {
@@ -579,6 +600,116 @@ mod tests {
         fn schemas(&self) -> Vec<crate::schema::ResourceSchema> {
             vec![]
         }
+    }
+
+    // --- Tests for ProviderRuntime + ProviderSchemaExt trait split ---
+
+    struct SplitMockProvider;
+
+    impl ProviderRuntime for SplitMockProvider {
+        fn name(&self) -> &'static str {
+            "split_mock"
+        }
+
+        fn read(
+            &self,
+            id: &ResourceId,
+            _identifier: Option<&str>,
+        ) -> BoxFuture<'_, ProviderResult<State>> {
+            let id = id.clone();
+            Box::pin(async move { Ok(State::not_found(id)) })
+        }
+
+        fn create(&self, resource: &Resource) -> BoxFuture<'_, ProviderResult<State>> {
+            let id = resource.id.clone();
+            let attrs = resource.attributes.clone();
+            Box::pin(async move { Ok(State::existing(id, attrs).with_identifier("split-id")) })
+        }
+
+        fn update(
+            &self,
+            id: &ResourceId,
+            _identifier: &str,
+            _from: &State,
+            to: &Resource,
+        ) -> BoxFuture<'_, ProviderResult<State>> {
+            let id = id.clone();
+            let attrs = to.attributes.clone();
+            Box::pin(async move { Ok(State::existing(id, attrs)) })
+        }
+
+        fn delete(
+            &self,
+            _id: &ResourceId,
+            _identifier: &str,
+            _lifecycle: &LifecycleConfig,
+        ) -> BoxFuture<'_, ProviderResult<()>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    impl ProviderSchemaExt for SplitMockProvider {
+        fn normalize_desired(&self, resources: &mut [Resource]) {
+            // Mock: uppercase all string attribute values
+            for r in resources.iter_mut() {
+                if r.id.provider != "split_mock" {
+                    continue;
+                }
+                for val in r.attributes.values_mut() {
+                    if let Value::String(s) = val {
+                        *s = s.to_uppercase();
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn split_traits_can_be_implemented_separately() {
+        let provider = SplitMockProvider;
+        // ProviderRuntime methods work
+        let id = ResourceId::new("test", "example");
+        let state = provider.read(&id, None).await.unwrap();
+        assert!(!state.exists);
+
+        let resource = Resource::new("test", "example");
+        let state = provider.create(&resource).await.unwrap();
+        assert!(state.exists);
+        assert_eq!(state.identifier, Some("split-id".to_string()));
+    }
+
+    #[test]
+    fn split_traits_normalize_desired_works() {
+        let provider = SplitMockProvider;
+        let mut resources = vec![
+            Resource::with_provider("split_mock", "test", "example")
+                .with_attribute("key", Value::String("hello".to_string())),
+        ];
+        provider.normalize_desired(&mut resources);
+        assert_eq!(
+            resources[0].attributes.get("key"),
+            Some(&Value::String("HELLO".to_string()))
+        );
+    }
+
+    #[test]
+    fn split_traits_hydrate_read_state_default_is_noop() {
+        let provider = SplitMockProvider;
+        let id = ResourceId::new("test", "example");
+        let mut states = HashMap::new();
+        states.insert(id.clone(), State::existing(id.clone(), HashMap::new()));
+        let saved = HashMap::new();
+        // Default implementation should not panic
+        provider.hydrate_read_state(&mut states, &saved);
+    }
+
+    #[test]
+    fn provider_supertrait_requires_both() {
+        // SplitMockProvider implements both ProviderRuntime and ProviderSchemaExt,
+        // so it should satisfy the Provider supertrait bound.
+        fn assert_provider<T: Provider>(_p: &T) {}
+        let provider = SplitMockProvider;
+        assert_provider(&provider);
     }
 
     #[test]

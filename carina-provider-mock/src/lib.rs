@@ -2,7 +2,9 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 
-use carina_core::provider::{BoxFuture, Provider, ProviderError, ProviderResult};
+use carina_core::provider::{
+    BoxFuture, ProviderError, ProviderResult, ProviderRuntime, ProviderSchemaExt,
+};
 use carina_core::resource::{LifecycleConfig, Resource, ResourceId, State, Value};
 use carina_core::value::{json_to_dsl_value, value_to_json};
 
@@ -47,7 +49,7 @@ impl Default for MockProvider {
     }
 }
 
-impl Provider for MockProvider {
+impl ProviderRuntime for MockProvider {
     fn name(&self) -> &'static str {
         "mock"
     }
@@ -145,3 +147,5 @@ impl Provider for MockProvider {
         })
     }
 }
+
+impl ProviderSchemaExt for MockProvider {}
