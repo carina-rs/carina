@@ -25,7 +25,7 @@ use carina_core::lint::{find_list_literal_attrs, list_struct_attr_names};
 use carina_core::module_resolver;
 use carina_core::parser::{BackendConfig, ParsedFile, ProviderConfig};
 use carina_core::plan::Plan;
-use carina_core::provider::{self as provider_mod, Provider};
+use carina_core::provider::{self as provider_mod, Provider, ProviderNormalizer};
 use carina_core::resolver::{resolve_ref_value, resolve_refs_with_state};
 use carina_core::resource::{LifecycleConfig, Resource, ResourceId, State, Value};
 use carina_core::value::{format_value, json_to_dsl_value};
@@ -1372,7 +1372,7 @@ async fn run_apply_locked(
     let sorted_resources = sort_resources_by_dependencies(&parsed.resources)?;
 
     // Select appropriate Provider based on configuration
-    let provider: Box<dyn Provider> = get_provider(parsed).await;
+    let provider = get_provider(parsed).await;
 
     // Read states for all resources using identifier from state
     // In identifier-based approach, if there's no identifier in state, the resource doesn't exist
@@ -1393,7 +1393,7 @@ async fn run_apply_locked(
         .as_ref()
         .map(|sf| sf.build_saved_attrs())
         .unwrap_or_default();
-    provider.restore_unreturned_attrs(&mut current_states, &saved_attrs);
+    provider.hydrate_read_state(&mut current_states, &saved_attrs);
 
     // Build initial binding map for reference resolution
     let mut binding_map: HashMap<String, HashMap<String, Value>> = HashMap::new();
@@ -1417,7 +1417,7 @@ async fn run_apply_locked(
     // Resolve references and enum identifiers, then create initial plan for display
     let mut resources_for_plan = sorted_resources.clone();
     resolve_refs_with_state(&mut resources_for_plan, &current_states);
-    provider.resolve_enum_identifiers(&mut resources_for_plan);
+    provider.normalize_desired(&mut resources_for_plan);
     let lifecycles = state_file
         .as_ref()
         .map(|sf| sf.build_lifecycles())
@@ -1476,13 +1476,7 @@ async fn run_apply_locked(
     println!("{}", "Applying changes...".cyan().bold());
     println!();
 
-    let result = execute_effects(
-        &plan,
-        provider.as_ref(),
-        &mut binding_map,
-        &mut current_states,
-    )
-    .await;
+    let result = execute_effects(&plan, &provider, &mut binding_map, &mut current_states).await;
 
     finalize_apply(
         &result,
@@ -1745,12 +1739,11 @@ async fn run_apply_from_plan_locked(
         .collect();
 
     // Create provider early for drift detection
-    let provider: Box<dyn Provider> =
-        create_providers_from_configs(&plan_file.provider_configs).await;
+    let provider = create_providers_from_configs(&plan_file.provider_configs).await;
 
     // Drift detection: re-read actual infrastructure state and compare against planned states
     println!("{}", "Checking for infrastructure drift...".cyan());
-    let drift_result = detect_drift(sorted_resources, &planned_states, provider.as_ref()).await?;
+    let drift_result = detect_drift(sorted_resources, &planned_states, &provider).await?;
 
     if let Some(drift_messages) = drift_result {
         println!();
@@ -1831,13 +1824,7 @@ async fn run_apply_from_plan_locked(
     println!("{}", "Applying changes...".cyan().bold());
     println!();
 
-    let result = execute_effects(
-        plan,
-        provider.as_ref(),
-        &mut binding_map,
-        &mut current_states,
-    )
-    .await;
+    let result = execute_effects(plan, &provider, &mut binding_map, &mut current_states).await;
 
     finalize_apply(
         &result,
@@ -1966,7 +1953,7 @@ async fn run_destroy_locked(
     let destroy_order: Vec<Resource> = sorted_resources.into_iter().rev().collect();
 
     // Select appropriate Provider based on configuration
-    let provider: Box<dyn Provider> = get_provider(parsed).await;
+    let provider = get_provider(parsed).await;
 
     // Read states for managed resources using identifier from state
     // Skip data sources (read-only) — they won't be destroyed
@@ -2553,7 +2540,7 @@ async fn run_state_refresh_locked(
     let sorted_resources = sort_resources_by_dependencies(&parsed.resources)?;
 
     // Select provider
-    let provider: Box<dyn Provider> = get_provider(parsed).await;
+    let provider = get_provider(parsed).await;
 
     println!();
     println!("{}", "Refreshing state...".cyan().bold());
@@ -2582,7 +2569,7 @@ async fn run_state_refresh_locked(
         .as_ref()
         .map(|sf| sf.build_saved_attrs())
         .unwrap_or_default();
-    provider.restore_unreturned_attrs(&mut current_states, &saved_attrs);
+    provider.hydrate_read_state(&mut current_states, &saved_attrs);
 
     let mut state = state_file.take().unwrap();
 

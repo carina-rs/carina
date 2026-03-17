@@ -71,10 +71,16 @@ pub type ProviderResult<T> = Result<T, ProviderError>;
 /// Return type for async operations
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
-/// Main Provider trait
+/// Saved attribute values keyed by resource ID.
 ///
-/// Each infrastructure provider (AWS, GCP, etc.) implements this trait.
-/// All operations are async and involve side effects.
+/// Used by `ProviderNormalizer::hydrate_read_state` to carry forward
+/// attributes that APIs don't return in read responses.
+pub type SavedAttrs = HashMap<ResourceId, HashMap<String, Value>>;
+
+/// Runtime CRUD operations for a provider.
+///
+/// Each infrastructure provider (AWS, GCP, etc.) implements this trait
+/// to perform actual API calls against its infrastructure.
 pub trait Provider: Send + Sync {
     /// Name of this Provider (e.g., "aws")
     fn name(&self) -> &'static str;
@@ -114,24 +120,34 @@ pub trait Provider: Send + Sync {
         identifier: &str,
         lifecycle: &LifecycleConfig,
     ) -> BoxFuture<'_, ProviderResult<()>>;
+}
 
-    /// Resolve enum identifiers in resources to their fully-qualified DSL format.
+/// Plan-time normalizer for a provider.
+///
+/// Normalizes desired state and read state so that diffs produce correct
+/// plans. Uses provider-specific schema knowledge. Separated from `Provider`
+/// because these operations are synchronous, plan-time concerns rather
+/// than runtime CRUD.
+pub trait ProviderNormalizer: Send + Sync {
+    /// Normalize desired resource state before diffing.
     ///
-    /// For example, resolves bare `advanced` or `Tier.advanced` into
+    /// For example, resolves bare enum identifiers like `advanced` or
+    /// `Tier.advanced` into fully-qualified DSL format like
     /// `awscc.ec2_ipam.Tier.advanced` based on schema definitions.
     /// Default implementation is a no-op for providers without enum types.
-    fn resolve_enum_identifiers(&self, _resources: &mut [Resource]) {}
+    fn normalize_desired(&self, _resources: &mut [Resource]) {}
 
-    /// Restore unreturned attributes from saved state into current read states.
+    /// Hydrate read state with saved attributes that APIs don't return.
     ///
-    /// Some APIs (e.g., CloudControl) don't return certain properties in read responses
-    /// (create-only properties, or normal properties like `description` on some resources).
-    /// This method carries them forward from previously saved attribute values.
+    /// Some APIs (e.g., CloudControl) don't return certain properties in read
+    /// responses (create-only properties, or normal properties like `description`
+    /// on some resources). This method carries them forward from previously
+    /// saved attribute values.
     /// Default implementation is a no-op.
-    fn restore_unreturned_attrs(
+    fn hydrate_read_state(
         &self,
         _current_states: &mut HashMap<ResourceId, State>,
-        _saved_attrs: &HashMap<ResourceId, HashMap<String, Value>>,
+        _saved_attrs: &SavedAttrs,
     ) {
     }
 }
@@ -140,6 +156,7 @@ pub trait Provider: Send + Sync {
 /// based on the resource's provider name (`ResourceId.provider`).
 pub struct ProviderRouter {
     providers: HashMap<String, Box<dyn Provider>>,
+    normalizers: Vec<Box<dyn ProviderNormalizer>>,
 }
 
 impl Default for ProviderRouter {
@@ -152,11 +169,16 @@ impl ProviderRouter {
     pub fn new() -> Self {
         Self {
             providers: HashMap::new(),
+            normalizers: Vec::new(),
         }
     }
 
     pub fn add_provider(&mut self, name: String, provider: Box<dyn Provider>) {
         self.providers.insert(name, provider);
+    }
+
+    pub fn add_normalizer(&mut self, ext: Box<dyn ProviderNormalizer>) {
+        self.normalizers.push(ext);
     }
 
     pub fn is_empty(&self) -> bool {
@@ -218,20 +240,22 @@ impl Provider for ProviderRouter {
             Err(e) => Box::pin(async move { Err(e) }),
         }
     }
+}
 
-    fn resolve_enum_identifiers(&self, resources: &mut [Resource]) {
-        for provider in self.providers.values() {
-            provider.resolve_enum_identifiers(resources);
+impl ProviderNormalizer for ProviderRouter {
+    fn normalize_desired(&self, resources: &mut [Resource]) {
+        for ext in &self.normalizers {
+            ext.normalize_desired(resources);
         }
     }
 
-    fn restore_unreturned_attrs(
+    fn hydrate_read_state(
         &self,
         current_states: &mut HashMap<ResourceId, State>,
-        saved_attrs: &HashMap<ResourceId, HashMap<String, Value>>,
+        saved_attrs: &SavedAttrs,
     ) {
-        for provider in self.providers.values() {
-            provider.restore_unreturned_attrs(current_states, saved_attrs);
+        for ext in &self.normalizers {
+            ext.hydrate_read_state(current_states, saved_attrs);
         }
     }
 }
@@ -261,6 +285,18 @@ pub trait ProviderFactory: Send + Sync {
         &self,
         attributes: &HashMap<String, Value>,
     ) -> BoxFuture<'_, Box<dyn Provider>>;
+
+    /// Create a schema extension instance from configuration attributes.
+    ///
+    /// Returns `None` if this provider has no schema extensions (the default).
+    /// Providers that need plan-time normalization or state hydration should
+    /// override this method.
+    fn create_normalizer(
+        &self,
+        _attributes: &HashMap<String, Value>,
+    ) -> BoxFuture<'_, Option<Box<dyn ProviderNormalizer>>> {
+        Box::pin(async { None })
+    }
 
     /// Get all resource schemas for this provider.
     fn schemas(&self) -> Vec<crate::schema::ResourceSchema>;
@@ -362,18 +398,6 @@ impl Provider for Box<dyn Provider> {
         lifecycle: &LifecycleConfig,
     ) -> BoxFuture<'_, ProviderResult<()>> {
         (**self).delete(id, identifier, lifecycle)
-    }
-
-    fn resolve_enum_identifiers(&self, resources: &mut [Resource]) {
-        (**self).resolve_enum_identifiers(resources)
-    }
-
-    fn restore_unreturned_attrs(
-        &self,
-        current_states: &mut HashMap<ResourceId, State>,
-        saved_attrs: &HashMap<ResourceId, HashMap<String, Value>>,
-    ) {
-        (**self).restore_unreturned_attrs(current_states, saved_attrs)
     }
 }
 
@@ -579,6 +603,147 @@ mod tests {
         fn schemas(&self) -> Vec<crate::schema::ResourceSchema> {
             vec![]
         }
+    }
+
+    #[test]
+    fn provider_normalizer_separate_from_runtime() {
+        // Verify that ProviderNormalizer can be implemented independently from Provider.
+        // A provider implementing both traits should have its schema extension
+        // methods callable without going through the Provider trait.
+        struct SchemaOnlyProvider;
+
+        impl ProviderNormalizer for SchemaOnlyProvider {
+            fn normalize_desired(&self, resources: &mut [Resource]) {
+                // Prefix all string attribute values with "normalized:"
+                for resource in resources.iter_mut() {
+                    for value in resource.attributes.values_mut() {
+                        if let Value::String(s) = value {
+                            *s = format!("normalized:{}", s);
+                        }
+                    }
+                }
+            }
+
+            fn hydrate_read_state(
+                &self,
+                states: &mut HashMap<ResourceId, State>,
+                saved: &SavedAttrs,
+            ) {
+                for (id, saved_attrs) in saved {
+                    if let Some(state) = states.get_mut(id) {
+                        for (key, value) in saved_attrs {
+                            state
+                                .attributes
+                                .entry(key.clone())
+                                .or_insert_with(|| value.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        // Test normalize_desired
+        let ext = SchemaOnlyProvider;
+        let mut resources = vec![
+            Resource::new("test", "example")
+                .with_attribute("key", Value::String("value".to_string())),
+        ];
+        ext.normalize_desired(&mut resources);
+        assert_eq!(
+            resources[0].attributes.get("key"),
+            Some(&Value::String("normalized:value".to_string()))
+        );
+
+        // Test hydrate_read_state
+        let id = ResourceId::new("test", "example");
+        let mut states = HashMap::new();
+        states.insert(id.clone(), State::existing(id.clone(), HashMap::new()));
+        let mut saved: SavedAttrs = HashMap::new();
+        saved.insert(
+            id.clone(),
+            HashMap::from([("restored".to_string(), Value::String("data".to_string()))]),
+        );
+        ext.hydrate_read_state(&mut states, &saved);
+        assert_eq!(
+            states.get(&id).unwrap().attributes.get("restored"),
+            Some(&Value::String("data".to_string()))
+        );
+    }
+
+    #[test]
+    fn provider_router_delegates_normalizer() {
+        // Test that ProviderRouter delegates ProviderNormalizer methods to sub-providers
+        struct NormalizingProvider;
+
+        impl Provider for NormalizingProvider {
+            fn name(&self) -> &'static str {
+                "normalizing"
+            }
+
+            fn read(
+                &self,
+                id: &ResourceId,
+                _identifier: Option<&str>,
+            ) -> BoxFuture<'_, ProviderResult<State>> {
+                let id = id.clone();
+                Box::pin(async move { Ok(State::not_found(id)) })
+            }
+
+            fn create(&self, resource: &Resource) -> BoxFuture<'_, ProviderResult<State>> {
+                let id = resource.id.clone();
+                Box::pin(async move { Ok(State::not_found(id)) })
+            }
+
+            fn update(
+                &self,
+                id: &ResourceId,
+                _identifier: &str,
+                _from: &State,
+                _to: &Resource,
+            ) -> BoxFuture<'_, ProviderResult<State>> {
+                let id = id.clone();
+                Box::pin(async move { Ok(State::not_found(id)) })
+            }
+
+            fn delete(
+                &self,
+                _id: &ResourceId,
+                _identifier: &str,
+                _lifecycle: &LifecycleConfig,
+            ) -> BoxFuture<'_, ProviderResult<()>> {
+                Box::pin(async { Ok(()) })
+            }
+        }
+
+        // Separate schema ext struct for the router
+        struct TestNormalizer;
+        impl ProviderNormalizer for TestNormalizer {
+            fn normalize_desired(&self, resources: &mut [Resource]) {
+                for resource in resources.iter_mut() {
+                    if resource.id.provider == "normalizing" {
+                        for value in resource.attributes.values_mut() {
+                            if let Value::String(s) = value {
+                                *s = format!("norm:{}", s);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut router = ProviderRouter::new();
+        router.add_provider("normalizing".to_string(), Box::new(NormalizingProvider));
+        router.add_normalizer(Box::new(TestNormalizer));
+
+        let mut resources = vec![
+            Resource::with_provider("normalizing", "test", "example")
+                .with_attribute("key", Value::String("val".to_string())),
+        ];
+        router.normalize_desired(&mut resources);
+        assert_eq!(
+            resources[0].attributes.get("key"),
+            Some(&Value::String("norm:val".to_string()))
+        );
     }
 
     #[test]

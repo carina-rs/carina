@@ -17,8 +17,30 @@ pub use provider::AwsccProvider;
 
 use std::collections::HashMap;
 
-use carina_core::provider::{BoxFuture, Provider, ProviderFactory, ProviderResult};
+use carina_core::provider::{
+    BoxFuture, Provider, ProviderFactory, ProviderNormalizer, ProviderResult, SavedAttrs,
+};
 use carina_core::resource::{LifecycleConfig, Resource, ResourceId, State, Value};
+
+/// Schema extension for the AWSCC provider.
+///
+/// Handles plan-time normalization of enum identifiers and hydration of
+/// unreturned attributes from saved state.
+pub struct AwsccNormalizer;
+
+impl ProviderNormalizer for AwsccNormalizer {
+    fn normalize_desired(&self, resources: &mut [Resource]) {
+        crate::provider::resolve_enum_identifiers_impl(resources);
+    }
+
+    fn hydrate_read_state(
+        &self,
+        current_states: &mut HashMap<ResourceId, State>,
+        saved_attrs: &SavedAttrs,
+    ) {
+        crate::provider::restore_unreturned_attrs_impl(current_states, saved_attrs);
+    }
+}
 
 /// Factory for creating and configuring the AWSCC Provider
 pub struct AwsccProviderFactory;
@@ -61,6 +83,13 @@ impl ProviderFactory for AwsccProviderFactory {
     ) -> BoxFuture<'_, Box<dyn Provider>> {
         let region = self.extract_region(attributes);
         Box::pin(async move { Box::new(AwsccProvider::new(&region).await) as Box<dyn Provider> })
+    }
+
+    fn create_normalizer(
+        &self,
+        _attributes: &HashMap<String, Value>,
+    ) -> BoxFuture<'_, Option<Box<dyn ProviderNormalizer>>> {
+        Box::pin(async { Some(Box::new(AwsccNormalizer) as Box<dyn ProviderNormalizer>) })
     }
 
     fn schemas(&self) -> Vec<carina_core::schema::ResourceSchema> {
@@ -127,17 +156,5 @@ impl Provider for AwsccProvider {
         let identifier = identifier.to_string();
         let lifecycle = lifecycle.clone();
         Box::pin(async move { self.delete_resource(&id, &identifier, &lifecycle).await })
-    }
-
-    fn resolve_enum_identifiers(&self, resources: &mut [Resource]) {
-        crate::provider::resolve_enum_identifiers_impl(resources);
-    }
-
-    fn restore_unreturned_attrs(
-        &self,
-        current_states: &mut HashMap<ResourceId, State>,
-        saved_attrs: &HashMap<ResourceId, HashMap<String, Value>>,
-    ) {
-        crate::provider::restore_unreturned_attrs_impl(current_states, saved_attrs);
     }
 }

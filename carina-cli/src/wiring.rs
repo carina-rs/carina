@@ -9,7 +9,9 @@ use carina_core::identifier::{self, AnonymousIdStateInfo, PrefixStateInfo};
 use carina_core::module_resolver;
 use carina_core::parser::{ParsedFile, ProviderConfig};
 use carina_core::plan::Plan;
-use carina_core::provider::{self as provider_mod, Provider, ProviderFactory, ProviderRouter};
+use carina_core::provider::{
+    self as provider_mod, Provider, ProviderFactory, ProviderNormalizer, ProviderRouter,
+};
 use carina_core::resolver::resolve_refs_with_state;
 use carina_core::resource::{Resource, ResourceId, State};
 use carina_core::schema::{ResourceSchema, resolve_block_names};
@@ -176,7 +178,7 @@ pub fn validate_module_calls(parsed: &ParsedFile, base_dir: &Path) -> Result<(),
     validation::validate_module_calls(&parsed.module_calls, &imported_modules)
 }
 
-pub async fn get_provider(parsed: &ParsedFile) -> Box<dyn Provider> {
+pub async fn get_provider(parsed: &ParsedFile) -> ProviderRouter {
     let factories = provider_factories();
     let mut router = ProviderRouter::new();
 
@@ -189,19 +191,23 @@ pub async fn get_provider(parsed: &ParsedFile) -> Box<dyn Provider> {
             );
             let provider = factory.create_provider(&provider_config.attributes).await;
             router.add_provider(provider_config.name.clone(), provider);
+            if let Some(ext) = factory.create_normalizer(&provider_config.attributes).await {
+                router.add_normalizer(ext);
+            }
         }
     }
 
     if router.is_empty() {
-        // Use mock provider for other cases
+        // Use mock provider for other cases.
+        // Register with empty key to match resources without a provider prefix.
         println!("{}", "Using mock provider".cyan());
-        Box::new(MockProvider::new())
-    } else {
-        Box::new(router)
+        router.add_provider(String::new(), Box::new(MockProvider::new()));
     }
+
+    router
 }
 
-pub async fn create_providers_from_configs(configs: &[ProviderConfig]) -> Box<dyn Provider> {
+pub async fn create_providers_from_configs(configs: &[ProviderConfig]) -> ProviderRouter {
     let factories = provider_factories();
     let mut router = ProviderRouter::new();
 
@@ -214,15 +220,18 @@ pub async fn create_providers_from_configs(configs: &[ProviderConfig]) -> Box<dy
             );
             let provider = factory.create_provider(&config.attributes).await;
             router.add_provider(config.name.clone(), provider);
+            if let Some(ext) = factory.create_normalizer(&config.attributes).await {
+                router.add_normalizer(ext);
+            }
         }
     }
 
     if router.is_empty() {
         println!("{}", "Using mock provider".cyan());
-        Box::new(MockProvider::new())
-    } else {
-        Box::new(router)
+        router.add_provider(String::new(), Box::new(MockProvider::new()));
     }
+
+    router
 }
 
 pub async fn create_plan_from_parsed(
@@ -232,7 +241,7 @@ pub async fn create_plan_from_parsed(
     let sorted_resources = sort_resources_by_dependencies(&parsed.resources)?;
 
     // Select appropriate Provider based on configuration
-    let provider: Box<dyn Provider> = get_provider(parsed).await;
+    let provider = get_provider(parsed).await;
 
     // Read states for all resources using identifier from state
     // In identifier-based approach, if there's no identifier in state, the resource doesn't exist
@@ -253,12 +262,12 @@ pub async fn create_plan_from_parsed(
         .as_ref()
         .map(|sf| sf.build_saved_attrs())
         .unwrap_or_default();
-    provider.restore_unreturned_attrs(&mut current_states, &saved_attrs);
+    provider.hydrate_read_state(&mut current_states, &saved_attrs);
 
     // Resolve ResourceRef values and enum identifiers using AWS state
     let mut resources = sorted_resources.clone();
     resolve_refs_with_state(&mut resources, &current_states);
-    provider.resolve_enum_identifiers(&mut resources);
+    provider.normalize_desired(&mut resources);
 
     // Build lifecycles map from state file for orphaned resource deletion
     let lifecycles = state_file
