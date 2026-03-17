@@ -24,6 +24,25 @@ fi
 TOTAL_PASSED=0
 TOTAL_FAILED=0
 
+# Track active work dir for signal cleanup
+ACTIVE_WORK_DIR=""
+ACTIVE_STEP1=""
+ACTIVE_STEP2=""
+
+signal_cleanup() {
+    if [ -n "$ACTIVE_WORK_DIR" ] && [ -d "$ACTIVE_WORK_DIR" ]; then
+        echo ""
+        echo "Interrupted. Cleaning up resources..."
+        cd "$ACTIVE_WORK_DIR" && "$CARINA_BIN" destroy --auto-approve "$ACTIVE_STEP2" 2>&1 || true
+        cd "$ACTIVE_WORK_DIR" && "$CARINA_BIN" destroy --auto-approve "$ACTIVE_STEP1" 2>&1 || true
+        rm -rf "$ACTIVE_WORK_DIR"
+        ACTIVE_WORK_DIR=""
+    fi
+    exit 1
+}
+
+trap signal_cleanup INT TERM
+
 run_step() {
     local work_dir="$1"
     local description="$2"
@@ -101,12 +120,19 @@ run_test() {
     local work_dir
     work_dir=$(mktemp -d)
 
+    # Register for signal cleanup
+    ACTIVE_WORK_DIR="$work_dir"
+    ACTIVE_STEP1="$step1"
+    ACTIVE_STEP2="$step2"
+
     echo "$desc"
     echo ""
 
     # Step 1: Apply initial config
     if ! run_step "$work_dir" "step1: apply initial" "apply" "$step1" "--auto-approve"; then
+        cleanup "$work_dir" "$step2" "$step1"
         rm -rf "$work_dir"
+        ACTIVE_WORK_DIR=""
         return 1
     fi
 
@@ -114,6 +140,7 @@ run_test() {
     if ! run_plan_verify "$work_dir" "step1: plan-verify initial" "$step1"; then
         cleanup "$work_dir" "$step2" "$step1"
         rm -rf "$work_dir"
+        ACTIVE_WORK_DIR=""
         return 1
     fi
 
@@ -121,6 +148,7 @@ run_test() {
     if ! run_step "$work_dir" "step2: apply replace (create_before_destroy)" "apply" "$step2" "--auto-approve"; then
         cleanup "$work_dir" "$step2" "$step1"
         rm -rf "$work_dir"
+        ACTIVE_WORK_DIR=""
         return 1
     fi
 
@@ -128,13 +156,20 @@ run_test() {
     if ! run_plan_verify "$work_dir" "step3: plan-verify after replace" "$step2"; then
         cleanup "$work_dir" "$step2" "$step1"
         rm -rf "$work_dir"
+        ACTIVE_WORK_DIR=""
         return 1
     fi
 
     # Step 4: Destroy
-    run_step "$work_dir" "step4: destroy" "destroy" "$step2" "--auto-approve"
+    if ! run_step "$work_dir" "step4: destroy" "destroy" "$step2" "--auto-approve"; then
+        cleanup "$work_dir" "$step2" "$step1"
+        rm -rf "$work_dir"
+        ACTIVE_WORK_DIR=""
+        return 1
+    fi
 
     rm -rf "$work_dir"
+    ACTIVE_WORK_DIR=""
     echo ""
 }
 
