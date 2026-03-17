@@ -174,7 +174,8 @@ impl AwsProvider {
             .send()
             .await
             .map_err(|e| {
-                ProviderError::new(format!("Failed to delete vpc: {:?}", e))
+                ProviderError::new("Failed to delete vpc")
+                    .with_cause(e)
                     .for_resource(id.clone())
             })?;
         Ok(())
@@ -192,7 +193,8 @@ impl AwsProvider {
             .send()
             .await
             .map_err(|e| {
-                ProviderError::new(format!("Failed to delete subnet: {:?}", e))
+                ProviderError::new("Failed to delete subnet")
+                    .with_cause(e)
                     .for_resource(id.clone())
             })?;
         Ok(())
@@ -210,7 +212,8 @@ impl AwsProvider {
             .send()
             .await
             .map_err(|e| {
-                ProviderError::new(format!("Failed to delete route table: {:?}", e))
+                ProviderError::new("Failed to delete route table")
+                    .with_cause(e)
                     .for_resource(id.clone())
             })?;
         Ok(())
@@ -228,7 +231,8 @@ impl AwsProvider {
             .send()
             .await
             .map_err(|e| {
-                ProviderError::new(format!("Failed to delete security group: {:?}", e))
+                ProviderError::new("Failed to delete security group")
+                    .with_cause(e)
                     .for_resource(id.clone())
             })?;
         Ok(())
@@ -246,7 +250,8 @@ impl AwsProvider {
             .send()
             .await
             .map_err(|e| {
-                ProviderError::new(format!("Failed to delete bucket: {:?}", e))
+                ProviderError::new("Failed to delete bucket")
+                    .with_cause(e)
                     .for_resource(id.clone())
             })?;
         Ok(())
@@ -318,11 +323,9 @@ impl AwsProvider {
             .send()
             .await
             .map_err(|e| {
-                ProviderError::new(format!(
-                    "Failed to read s3.bucket GetBucketVersioning: {}",
-                    e
-                ))
-                .for_resource(id.clone())
+                ProviderError::new("Failed to read s3.bucket GetBucketVersioning")
+                    .with_cause(e)
+                    .for_resource(id.clone())
             })?;
         let value = output
             .status()
@@ -356,7 +359,8 @@ impl AwsProvider {
                 .send()
                 .await
                 .map_err(|e| {
-                    ProviderError::new(format!("Failed to put bucket versioning: {}", e))
+                    ProviderError::new("Failed to put bucket versioning")
+                        .with_cause(e)
                         .for_resource(id.clone())
                 })?;
         }

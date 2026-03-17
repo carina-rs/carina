@@ -63,11 +63,9 @@ impl AwsProvider {
                         name
                     ))
                     .for_resource(id.clone())),
-                    HeadBucketErrorKind::Other => Err(ProviderError::new(format!(
-                        "Failed to read bucket: {:?}",
-                        err
-                    ))
-                    .for_resource(id.clone())),
+                    HeadBucketErrorKind::Other => Err(ProviderError::new("Failed to read bucket")
+                        .with_cause(err)
+                        .for_resource(id.clone())),
                 }
             }
         }
@@ -141,7 +139,8 @@ impl AwsProvider {
         }
 
         req.send().await.map_err(|e| {
-            ProviderError::new(format!("Failed to create bucket: {:?}", e))
+            ProviderError::new("Failed to create bucket")
+                .with_cause(e)
                 .for_resource(resource.id.clone())
         })?;
 
@@ -187,7 +186,8 @@ impl AwsProvider {
                 .send()
                 .await
                 .map_err(|e| {
-                    ProviderError::new(format!("Failed to delete bucket tags: {:?}", e))
+                    ProviderError::new("Failed to delete bucket tags")
+                        .with_cause(e)
                         .for_resource(id.clone())
                 })?;
         } else {
@@ -222,11 +222,11 @@ impl AwsProvider {
             }
             Err(err) => {
                 if !is_s3_not_configured_error(&err, "OwnershipControlsNotFoundError") {
-                    return Err(ProviderError::new(format!(
-                        "Failed to read bucket ownership controls: {}",
-                        err
-                    ))
-                    .for_resource(id.clone()));
+                    return Err(
+                        ProviderError::new("Failed to read bucket ownership controls")
+                            .with_cause(err)
+                            .for_resource(id.clone()),
+                    );
                 }
             }
         }
@@ -247,14 +247,16 @@ impl AwsProvider {
                 .object_ownership(ObjectOwnership::from(normalized))
                 .build()
                 .map_err(|e| {
-                    ProviderError::new(format!("Failed to build ownership controls rule: {}", e))
+                    ProviderError::new("Failed to build ownership controls rule")
+                        .with_cause(e)
                         .for_resource(id.clone())
                 })?;
             let controls = OwnershipControls::builder()
                 .rules(rule)
                 .build()
                 .map_err(|e| {
-                    ProviderError::new(format!("Failed to build ownership controls: {}", e))
+                    ProviderError::new("Failed to build ownership controls")
+                        .with_cause(e)
                         .for_resource(id.clone())
                 })?;
             self.s3_client
@@ -264,7 +266,8 @@ impl AwsProvider {
                 .send()
                 .await
                 .map_err(|e| {
-                    ProviderError::new(format!("Failed to put bucket ownership controls: {}", e))
+                    ProviderError::new("Failed to put bucket ownership controls")
+                        .with_cause(e)
                         .for_resource(id.clone())
                 })?;
         }
@@ -302,11 +305,11 @@ impl AwsProvider {
                         Value::Bool(false),
                     );
                 } else {
-                    return Err(ProviderError::new(format!(
-                        "Failed to read object lock configuration: {}",
-                        err
-                    ))
-                    .for_resource(id.clone()));
+                    return Err(
+                        ProviderError::new("Failed to read object lock configuration")
+                            .with_cause(err)
+                            .for_resource(id.clone()),
+                    );
                 }
             }
         }
@@ -327,7 +330,8 @@ impl AwsProvider {
             .send()
             .await
             .map_err(|e| {
-                ProviderError::new(format!("Failed to read bucket ACL: {}", e))
+                ProviderError::new("Failed to read bucket ACL")
+                    .with_cause(e)
                     .for_resource(id.clone())
             })?;
 
@@ -469,7 +473,9 @@ impl AwsProvider {
         }
 
         req.send().await.map_err(|e| {
-            ProviderError::new(format!("Failed to put bucket ACL: {}", e)).for_resource(id.clone())
+            ProviderError::new("Failed to put bucket ACL")
+                .with_cause(e)
+                .for_resource(id.clone())
         })?;
 
         Ok(())
@@ -503,11 +509,9 @@ impl AwsProvider {
             }
             Err(err) => {
                 if !is_s3_not_configured_error(&err, "NoSuchTagSet") {
-                    return Err(ProviderError::new(format!(
-                        "Failed to read bucket tagging: {}",
-                        err
-                    ))
-                    .for_resource(id.clone()));
+                    return Err(ProviderError::new("Failed to read bucket tagging")
+                        .with_cause(err)
+                        .for_resource(id.clone()));
                 }
             }
         }
@@ -538,7 +542,8 @@ impl AwsProvider {
                 .set_tag_set(Some(tags))
                 .build()
                 .map_err(|e| {
-                    ProviderError::new(format!("Failed to build tagging: {:?}", e))
+                    ProviderError::new("Failed to build tagging")
+                        .with_cause(e)
                         .for_resource(id.clone())
                 })?;
 
@@ -549,7 +554,8 @@ impl AwsProvider {
                 .send()
                 .await
                 .map_err(|e| {
-                    ProviderError::new(format!("Failed to put bucket tags: {:?}", e))
+                    ProviderError::new("Failed to put bucket tags")
+                        .with_cause(e)
                         .for_resource(id.clone())
                 })?;
         }

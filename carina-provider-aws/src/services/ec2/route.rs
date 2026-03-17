@@ -29,7 +29,8 @@ impl AwsProvider {
             .send()
             .await
             .map_err(|e| {
-                ProviderError::new(format!("Failed to describe route table: {:?}", e))
+                ProviderError::new("Failed to describe route table")
+                    .with_cause(e)
                     .for_resource(id.clone())
             })?;
 
@@ -93,7 +94,8 @@ impl AwsProvider {
         }
 
         req.send().await.map_err(|e| {
-            ProviderError::new(format!("Failed to create route: {:?}", e))
+            ProviderError::new("Failed to create route")
+                .with_cause(e)
                 .for_resource(resource.id.clone())
         })?;
 
@@ -143,7 +145,9 @@ impl AwsProvider {
         }
 
         req.send().await.map_err(|e| {
-            ProviderError::new(format!("Failed to update route: {:?}", e)).for_resource(id.clone())
+            ProviderError::new("Failed to update route")
+                .with_cause(e)
+                .for_resource(id.clone())
         })?;
 
         // Route identifier is route_table_id|destination_cidr_block
@@ -172,7 +176,9 @@ impl AwsProvider {
             .send()
             .await
             .map_err(|e| {
-                ProviderError::new(format!("Failed to delete route: {:?}", e)).for_resource(id)
+                ProviderError::new("Failed to delete route")
+                    .with_cause(e)
+                    .for_resource(id)
             })?;
 
         Ok(())

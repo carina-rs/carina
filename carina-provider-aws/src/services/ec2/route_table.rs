@@ -30,7 +30,8 @@ impl AwsProvider {
             .send()
             .await
             .map_err(|e| {
-                ProviderError::new(format!("Failed to describe route tables: {:?}", e))
+                ProviderError::new("Failed to describe route tables")
+                    .with_cause(e)
                     .for_resource(id.clone())
             })?;
 
@@ -93,7 +94,8 @@ impl AwsProvider {
             .send()
             .await
             .map_err(|e| {
-                ProviderError::new(format!("Failed to create route table: {:?}", e))
+                ProviderError::new("Failed to create route table")
+                    .with_cause(e)
                     .for_resource(resource.id.clone())
             })?;
 
@@ -137,7 +139,8 @@ impl AwsProvider {
                             .send()
                             .await
                             .map_err(|e| {
-                                ProviderError::new(format!("Failed to create route: {:?}", e))
+                                ProviderError::new("Failed to create route")
+                                    .with_cause(e)
                                     .for_resource(resource.id.clone())
                             })?;
                     }

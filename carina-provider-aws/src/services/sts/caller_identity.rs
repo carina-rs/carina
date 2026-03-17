@@ -17,7 +17,8 @@ impl AwsProvider {
             .send()
             .await
             .map_err(|e| {
-                ProviderError::new(format!("Failed to get STS caller identity: {:?}", e))
+                ProviderError::new("Failed to get STS caller identity")
+                    .with_cause(e)
                     .for_resource(id.clone())
             })?;
 

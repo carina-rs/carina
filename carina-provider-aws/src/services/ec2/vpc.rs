@@ -28,7 +28,8 @@ impl AwsProvider {
             .send()
             .await
             .map_err(|e| {
-                ProviderError::new(format!("Failed to describe VPCs: {:?}", e))
+                ProviderError::new("Failed to describe VPCs")
+                    .with_cause(e)
                     .for_resource(id.clone())
             })?;
 
@@ -115,7 +116,8 @@ impl AwsProvider {
         }
 
         let result = create_vpc_builder.send().await.map_err(|e| {
-            ProviderError::new(format!("Failed to create VPC: {:?}", e))
+            ProviderError::new("Failed to create VPC")
+                .with_cause(e)
                 .for_resource(resource.id.clone())
         })?;
 
@@ -140,7 +142,8 @@ impl AwsProvider {
                 .send()
                 .await
                 .map_err(|e| {
-                    ProviderError::new(format!("Failed to set DNS support: {:?}", e))
+                    ProviderError::new("Failed to set DNS support")
+                        .with_cause(e)
                         .for_resource(resource.id.clone())
                 })?;
         }
@@ -158,7 +161,8 @@ impl AwsProvider {
                 .send()
                 .await
                 .map_err(|e| {
-                    ProviderError::new(format!("Failed to set DNS hostnames: {:?}", e))
+                    ProviderError::new("Failed to set DNS hostnames")
+                        .with_cause(e)
                         .for_resource(resource.id.clone())
                 })?;
         }
@@ -191,7 +195,8 @@ impl AwsProvider {
                 .send()
                 .await
                 .map_err(|e| {
-                    ProviderError::new(format!("Failed to update DNS support: {:?}", e))
+                    ProviderError::new("Failed to update DNS support")
+                        .with_cause(e)
                         .for_resource(id.clone())
                 })?;
         }
@@ -209,7 +214,8 @@ impl AwsProvider {
                 .send()
                 .await
                 .map_err(|e| {
-                    ProviderError::new(format!("Failed to update DNS hostnames: {:?}", e))
+                    ProviderError::new("Failed to update DNS hostnames")
+                        .with_cause(e)
                         .for_resource(id.clone())
                 })?;
         }

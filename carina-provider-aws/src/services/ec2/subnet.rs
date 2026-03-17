@@ -31,7 +31,8 @@ impl AwsProvider {
             .send()
             .await
             .map_err(|e| {
-                ProviderError::new(format!("Failed to describe subnets: {:?}", e))
+                ProviderError::new("Failed to describe subnets")
+                    .with_cause(e)
                     .for_resource(id.clone())
             })?;
 
@@ -94,7 +95,8 @@ impl AwsProvider {
         }
 
         let result = req.send().await.map_err(|e| {
-            ProviderError::new(format!("Failed to create subnet: {:?}", e))
+            ProviderError::new("Failed to create subnet")
+                .with_cause(e)
                 .for_resource(resource.id.clone())
         })?;
 
