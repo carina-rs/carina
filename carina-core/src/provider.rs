@@ -21,10 +21,14 @@ pub struct ProviderError {
 impl std::fmt::Display for ProviderError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if let Some(ref id) = self.resource_id {
-            write!(f, "[{}.{}] {}", id.resource_type, id.name, self.message)
+            write!(f, "[{}.{}] {}", id.resource_type, id.name, self.message)?;
         } else {
-            write!(f, "{}", self.message)
+            write!(f, "{}", self.message)?;
         }
+        if let Some(ref cause) = self.cause {
+            write!(f, ": {}", cause)?;
+        }
+        Ok(())
     }
 }
 
@@ -460,6 +464,54 @@ mod tests {
         let state = router.create(&resource).await.unwrap();
         assert!(state.exists);
         assert_eq!(state.identifier, Some("mock-id-123".to_string()));
+    }
+
+    #[test]
+    fn provider_error_source_returns_cause() {
+        use std::error::Error;
+        let cause = std::io::Error::other("connection refused");
+        let err = ProviderError::new("Failed to create resource").with_cause(cause);
+        let source = err.source().expect("source should be Some");
+        assert_eq!(source.to_string(), "connection refused");
+    }
+
+    #[test]
+    fn provider_error_display_includes_cause() {
+        let cause = std::io::Error::other("connection refused");
+        let err = ProviderError::new("Failed to create resource").with_cause(cause);
+        let display = format!("{}", err);
+        assert!(
+            display.contains("connection refused"),
+            "Display should include cause message, got: {}",
+            display
+        );
+    }
+
+    #[test]
+    fn provider_error_display_without_cause() {
+        let err = ProviderError::new("simple error");
+        let display = format!("{}", err);
+        assert_eq!(display, "simple error");
+    }
+
+    #[test]
+    fn provider_error_display_with_resource_id_and_cause() {
+        let cause = std::io::Error::other("timeout");
+        let id = ResourceId::new("s3.bucket", "my-bucket");
+        let err = ProviderError::new("Failed to read")
+            .with_cause(cause)
+            .for_resource(id);
+        let display = format!("{}", err);
+        assert!(
+            display.contains("timeout"),
+            "Display should include cause message, got: {}",
+            display
+        );
+        assert!(
+            display.contains("s3.bucket"),
+            "Display should include resource type, got: {}",
+            display
+        );
     }
 
     #[tokio::test]

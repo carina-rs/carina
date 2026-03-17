@@ -437,9 +437,10 @@ impl AwsccProvider {
                 req = req.version_id_marker(vim);
             }
 
-            let response = req.send().await.map_err(|e| {
-                ProviderError::new(format!("Failed to list object versions: {:?}", e))
-            })?;
+            let response = req
+                .send()
+                .await
+                .map_err(|e| ProviderError::new("Failed to list object versions").with_cause(e))?;
 
             let mut objects_to_delete = Vec::new();
 
@@ -451,7 +452,7 @@ impl AwsccProvider {
                         id = id.version_id(vid);
                     }
                     objects_to_delete.push(id.build().map_err(|e| {
-                        ProviderError::new(format!("Failed to build ObjectIdentifier: {:?}", e))
+                        ProviderError::new("Failed to build ObjectIdentifier").with_cause(e)
                     })?);
                 }
             }
@@ -464,7 +465,7 @@ impl AwsccProvider {
                         id = id.version_id(vid);
                     }
                     objects_to_delete.push(id.build().map_err(|e| {
-                        ProviderError::new(format!("Failed to build ObjectIdentifier: {:?}", e))
+                        ProviderError::new("Failed to build ObjectIdentifier").with_cause(e)
                     })?);
                 }
             }
@@ -476,7 +477,7 @@ impl AwsccProvider {
                     .quiet(true)
                     .build()
                     .map_err(|e| {
-                        ProviderError::new(format!("Failed to build Delete request: {:?}", e))
+                        ProviderError::new("Failed to build Delete request").with_cause(e)
                     })?;
 
                 s3.delete_objects()
@@ -484,9 +485,7 @@ impl AwsccProvider {
                     .delete(delete)
                     .send()
                     .await
-                    .map_err(|e| {
-                        ProviderError::new(format!("Failed to delete objects: {:?}", e))
-                    })?;
+                    .map_err(|e| ProviderError::new("Failed to delete objects").with_cause(e))?;
             }
 
             if response.is_truncated() == Some(true) {
@@ -533,10 +532,7 @@ impl AwsccProvider {
                 if Self::is_not_found_error(&e) {
                     Ok(None)
                 } else {
-                    Err(ProviderError::new(format!(
-                        "Failed to get resource: {:?}",
-                        e
-                    )))
+                    Err(ProviderError::new("Failed to get resource").with_cause(e))
                 }
             }
         }
@@ -607,10 +603,7 @@ impl AwsccProvider {
                         delay_secs = (delay_secs * 2).min(CREATE_RETRY_MAX_DELAY_SECS);
                         continue;
                     }
-                    return Err(ProviderError::new(format!(
-                        "Failed to create resource: {:?}",
-                        e
-                    )));
+                    return Err(ProviderError::new("Failed to create resource").with_cause(e));
                 }
             }
         }
@@ -633,7 +626,7 @@ impl AwsccProvider {
         }
 
         let patch_document = serde_json::to_string(&patch_ops)
-            .map_err(|e| ProviderError::new(format!("Failed to build patch: {}", e)))?;
+            .map_err(|e| ProviderError::new("Failed to build patch").with_cause(e))?;
 
         let result = self
             .cloudcontrol_client
@@ -643,7 +636,7 @@ impl AwsccProvider {
             .patch_document(patch_document)
             .send()
             .await
-            .map_err(|e| ProviderError::new(format!("Failed to update resource: {:?}", e)))?;
+            .map_err(|e| ProviderError::new("Failed to update resource").with_cause(e))?;
 
         if let Some(request_token) = result.progress_event().and_then(|p| p.request_token()) {
             self.wait_for_operation(request_token).await?;
@@ -720,10 +713,7 @@ impl AwsccProvider {
                         delay_secs = (delay_secs * 2).min(DELETE_RETRY_MAX_DELAY_SECS);
                         continue;
                     }
-                    return Err(ProviderError::new(format!(
-                        "Failed to delete resource: {:?}",
-                        e
-                    )));
+                    return Err(ProviderError::new("Failed to delete resource").with_cause(e));
                 }
             }
         }
@@ -871,9 +861,7 @@ impl AwsccProvider {
                 .request_token(request_token)
                 .send()
                 .await
-                .map_err(|e| {
-                    ProviderError::new(format!("Failed to get operation status: {:?}", e))
-                })?;
+                .map_err(|e| ProviderError::new("Failed to get operation status").with_cause(e))?;
 
             if let Some(progress) = status.progress_event() {
                 match progress.operation_status() {
@@ -1105,7 +1093,8 @@ impl AwsccProvider {
         // Handle force_delete for S3 buckets: empty the bucket before deletion
         if lifecycle.force_delete && id.resource_type == "s3.bucket" {
             self.empty_s3_bucket(identifier).await.map_err(|e| {
-                ProviderError::new(format!("Failed to empty S3 bucket before deletion: {}", e))
+                ProviderError::new("Failed to empty S3 bucket before deletion")
+                    .with_cause(e)
                     .for_resource(id.clone())
             })?;
         }
@@ -1190,10 +1179,10 @@ impl AwsccProvider {
                 self.cc_update_resource(config.aws_type_name, identifier, patch_ops)
                     .await
                     .map_err(|e| {
-                        ProviderError::new(format!(
-                            "Failed to detach Internet Gateway from VPC before deletion: {}",
-                            e
-                        ))
+                        ProviderError::new(
+                            "Failed to detach Internet Gateway from VPC before deletion",
+                        )
+                        .with_cause(e)
                         .for_resource(id.clone())
                     })?;
             }
@@ -1408,7 +1397,7 @@ pub fn restore_unreturned_attrs_impl(
 /// Returns an error instead of silently returning an empty object when the JSON is malformed.
 fn parse_resource_properties(props_str: &str) -> ProviderResult<serde_json::Value> {
     serde_json::from_str(props_str)
-        .map_err(|e| ProviderError::new(format!("Failed to parse resource properties: {}", e)))
+        .map_err(|e| ProviderError::new("Failed to parse resource properties").with_cause(e))
 }
 
 /// Build JSON Patch operations for updating a resource.

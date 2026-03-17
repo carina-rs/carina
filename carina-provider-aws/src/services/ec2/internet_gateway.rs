@@ -30,7 +30,8 @@ impl AwsProvider {
             .send()
             .await
             .map_err(|e| {
-                ProviderError::new(format!("Failed to describe internet gateways: {:?}", e))
+                ProviderError::new("Failed to describe internet gateways")
+                    .with_cause(e)
                     .for_resource(id.clone())
             })?;
 
@@ -76,7 +77,8 @@ impl AwsProvider {
             .send()
             .await
             .map_err(|e| {
-                ProviderError::new(format!("Failed to create internet gateway: {:?}", e))
+                ProviderError::new("Failed to create internet gateway")
+                    .with_cause(e)
                     .for_resource(resource.id.clone())
             })?;
 
@@ -101,7 +103,8 @@ impl AwsProvider {
                 .send()
                 .await
                 .map_err(|e| {
-                    ProviderError::new(format!("Failed to attach internet gateway: {:?}", e))
+                    ProviderError::new("Failed to attach internet gateway")
+                        .with_cause(e)
                         .for_resource(resource.id.clone())
                 })?;
         }
@@ -125,7 +128,8 @@ impl AwsProvider {
             .send()
             .await
             .map_err(|e| {
-                ProviderError::new(format!("Failed to describe internet gateway: {:?}", e))
+                ProviderError::new("Failed to describe internet gateway")
+                    .with_cause(e)
                     .for_resource(id.clone())
             })?;
 
@@ -141,7 +145,8 @@ impl AwsProvider {
                     .send()
                     .await
                     .map_err(|e| {
-                        ProviderError::new(format!("Failed to detach internet gateway: {:?}", e))
+                        ProviderError::new("Failed to detach internet gateway")
+                            .with_cause(e)
                             .for_resource(id.clone())
                     })?;
             }
@@ -154,7 +159,8 @@ impl AwsProvider {
             .send()
             .await
             .map_err(|e| {
-                ProviderError::new(format!("Failed to delete internet gateway: {:?}", e))
+                ProviderError::new("Failed to delete internet gateway")
+                    .with_cause(e)
                     .for_resource(id.clone())
             })?;
 

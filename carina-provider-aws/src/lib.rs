@@ -168,7 +168,8 @@ impl AwsProvider {
                     req = req.tags(aws_sdk_ec2::types::Tag::builder().key(key.as_str()).build());
                 }
                 req.send().await.map_err(|e| {
-                    ProviderError::new(format!("Failed to delete tags: {:?}", e))
+                    ProviderError::new("Failed to delete tags")
+                        .with_cause(e)
                         .for_resource(resource_id.clone())
                 })?;
             }
@@ -183,7 +184,8 @@ impl AwsProvider {
                     req = req.tags(tag);
                 }
                 req.send().await.map_err(|e| {
-                    ProviderError::new(format!("Failed to tag resource: {:?}", e))
+                    ProviderError::new("Failed to tag resource")
+                        .with_cause(e)
                         .for_resource(resource_id.clone())
                 })?;
             }
@@ -210,7 +212,8 @@ impl AwsProvider {
             req = req.security_group_rule_ids(*rule_id);
         }
         let result = req.send().await.map_err(|e| {
-            ProviderError::new(format!("Failed to describe security group rules: {:?}", e))
+            ProviderError::new("Failed to describe security group rules")
+                .with_cause(e)
                 .for_resource(id.clone())
         })?;
         let rules: Vec<_> = result
@@ -394,7 +397,8 @@ impl AwsProvider {
                 .send()
                 .await
                 .map_err(|e| {
-                    ProviderError::new(format!("Failed to create ingress rule: {:?}", e))
+                    ProviderError::new("Failed to create ingress rule")
+                        .with_cause(e)
                         .for_resource(resource.id.clone())
                 })?;
 
@@ -412,7 +416,8 @@ impl AwsProvider {
                 .send()
                 .await
                 .map_err(|e| {
-                    ProviderError::new(format!("Failed to create egress rule: {:?}", e))
+                    ProviderError::new("Failed to create egress rule")
+                        .with_cause(e)
                         .for_resource(resource.id.clone())
                 })?;
 
@@ -467,7 +472,8 @@ impl AwsProvider {
             req = req.security_group_rule_ids(*rule_id);
         }
         let result = req.send().await.map_err(|e| {
-            ProviderError::new(format!("Failed to describe security group rules: {:?}", e))
+            ProviderError::new("Failed to describe security group rules")
+                .with_cause(e)
                 .for_resource(id.clone())
         })?;
 
@@ -492,7 +498,8 @@ impl AwsProvider {
                 request = request.security_group_rule_ids(*rule_id);
             }
             request.send().await.map_err(|e| {
-                ProviderError::new(format!("Failed to delete ingress rules: {:?}", e))
+                ProviderError::new("Failed to delete ingress rules")
+                    .with_cause(e)
                     .for_resource(id.clone())
             })?;
         } else {
@@ -504,7 +511,8 @@ impl AwsProvider {
                 request = request.security_group_rule_ids(*rule_id);
             }
             request.send().await.map_err(|e| {
-                ProviderError::new(format!("Failed to delete egress rules: {:?}", e))
+                ProviderError::new("Failed to delete egress rules")
+                    .with_cause(e)
                     .for_resource(id.clone())
             })?;
         }

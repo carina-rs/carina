@@ -30,7 +30,8 @@ impl AwsProvider {
             .send()
             .await
             .map_err(|e| {
-                ProviderError::new(format!("Failed to describe security groups: {:?}", e))
+                ProviderError::new("Failed to describe security groups")
+                    .with_cause(e)
                     .for_resource(id.clone())
             })?;
 
@@ -91,7 +92,8 @@ impl AwsProvider {
             .send()
             .await
             .map_err(|e| {
-                ProviderError::new(format!("Failed to create security group: {:?}", e))
+                ProviderError::new("Failed to create security group")
+                    .with_cause(e)
                     .for_resource(resource.id.clone())
             })?;
 
