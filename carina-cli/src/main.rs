@@ -973,7 +973,6 @@ async fn execute_effects(
     }
 }
 
-/// Save state after apply, release lock, and print summary.
 /// Save state after apply. Does NOT release the lock — caller is responsible.
 async fn finalize_apply(
     result: &ApplyResult,
@@ -983,6 +982,9 @@ async fn finalize_apply(
     plan: &Plan,
     backend: &dyn StateBackend,
 ) -> Result<(), String> {
+    println!();
+    println!("{}", "Saving state...".cyan());
+
     let mut state = build_state_after_apply(ApplyStateSave {
         state_file,
         sorted_resources,
