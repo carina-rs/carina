@@ -1272,44 +1272,11 @@ fn generate_provider_code(
          //! DO NOT EDIT MANUALLY - regenerate with:\n\
          //!   ./carina-provider-aws/scripts/generate-provider.sh\n\n\
          use std::collections::HashMap;\n\n\
-         use carina_core::provider::{ProviderError, ProviderResult, ResourceSchema, ResourceType};\n\
+         use carina_core::provider::{ProviderError, ProviderResult};\n\
          use carina_core::resource::{Resource, ResourceId, State, Value};\n\
          use carina_core::utils::extract_enum_value;\n\n\
          use crate::AwsProvider;\n\n",
     );
-
-    // Generate ResourceType structs + impls
-    code.push_str("// ===== ResourceType Implementations =====\n\n");
-    for res in all_resources {
-        let struct_name = format!("{}Type", res.type_struct_name);
-        code.push_str(&format!(
-            "/// {} resource type\n\
-             pub struct {};\n\n\
-             impl ResourceType for {} {{\n\
-             \x20   fn name(&self) -> &'static str {{\n\
-             \x20       \"{}\"\n\
-             \x20   }}\n\n\
-             \x20   fn schema(&self) -> ResourceSchema {{\n\
-             \x20       ResourceSchema::default()\n\
-             \x20   }}\n\
-             }}\n\n",
-            res.name, struct_name, struct_name, res.name,
-        ));
-    }
-
-    // Generate resource_types() function
-    code.push_str(
-        "/// Returns all resource types for the AWS provider.\n\
-         pub fn resource_types() -> Vec<Box<dyn ResourceType>> {\n\
-         \x20   vec![\n",
-    );
-    for res in all_resources {
-        code.push_str(&format!(
-            "\x20       Box::new({}Type),\n",
-            res.type_struct_name
-        ));
-    }
-    code.push_str("\x20   ]\n}\n\n");
 
     // Generate methods on AwsProvider
     code.push_str("// ===== Generated Methods on AwsProvider =====\n\n");

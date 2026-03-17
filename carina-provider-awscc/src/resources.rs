@@ -2,38 +2,6 @@
 //!
 //! Resource types are automatically derived from generated schema configs.
 
-use carina_core::provider::{ResourceSchema, ResourceType};
-
-use crate::schemas::generated::configs;
-
-/// A resource type backed by an AwsccSchemaConfig
-struct AwsccResourceType {
-    name: &'static str,
-}
-
-impl ResourceType for AwsccResourceType {
-    fn name(&self) -> &'static str {
-        self.name
-    }
-
-    fn schema(&self) -> ResourceSchema {
-        ResourceSchema::default()
-    }
-}
-
-/// Returns all resource types supported by this provider.
-/// Automatically derived from generated schema configs.
-pub fn resource_types() -> Vec<Box<dyn ResourceType>> {
-    configs()
-        .into_iter()
-        .map(|c| {
-            Box::new(AwsccResourceType {
-                name: c.resource_type_name,
-            }) as Box<dyn ResourceType>
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use crate::schemas::generated::{AwsccSchemaConfig, configs};

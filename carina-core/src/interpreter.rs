@@ -218,10 +218,6 @@ mod tests {
             "test"
         }
 
-        fn resource_types(&self) -> Vec<Box<dyn crate::provider::ResourceType>> {
-            vec![]
-        }
-
         fn read(
             &self,
             id: &ResourceId,
@@ -341,10 +337,6 @@ mod tests {
     impl Provider for OrderTrackingProvider {
         fn name(&self) -> &'static str {
             "order_tracking"
-        }
-
-        fn resource_types(&self) -> Vec<Box<dyn crate::provider::ResourceType>> {
-            vec![]
         }
 
         fn read(

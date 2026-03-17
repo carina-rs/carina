@@ -20,8 +20,6 @@ use std::collections::HashMap;
 use carina_core::provider::{BoxFuture, Provider, ProviderFactory, ProviderResult};
 use carina_core::resource::{LifecycleConfig, Resource, ResourceId, State, Value};
 
-use resources::resource_types;
-
 /// Factory for creating and configuring the AWSCC Provider
 pub struct AwsccProviderFactory;
 
@@ -85,10 +83,6 @@ impl ProviderFactory for AwsccProviderFactory {
 impl Provider for AwsccProvider {
     fn name(&self) -> &'static str {
         "awscc"
-    }
-
-    fn resource_types(&self) -> Vec<Box<dyn carina_core::provider::ResourceType>> {
-        resource_types()
     }
 
     fn read(

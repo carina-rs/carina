@@ -67,23 +67,6 @@ pub type ProviderResult<T> = Result<T, ProviderError>;
 /// Return type for async operations
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
-/// Definition of resource types that a Provider can handle
-pub trait ResourceType: Send + Sync {
-    /// Resource type name (e.g., "s3_bucket")
-    fn name(&self) -> &'static str;
-
-    /// Attribute schema for this resource type (for future type validation)
-    fn schema(&self) -> ResourceSchema {
-        ResourceSchema::default()
-    }
-}
-
-/// Resource attribute schema (for type validation, to be extended)
-#[derive(Debug, Default)]
-pub struct ResourceSchema {
-    // Attribute type definitions to be added later
-}
-
 /// Main Provider trait
 ///
 /// Each infrastructure provider (AWS, GCP, etc.) implements this trait.
@@ -91,9 +74,6 @@ pub struct ResourceSchema {
 pub trait Provider: Send + Sync {
     /// Name of this Provider (e.g., "aws")
     fn name(&self) -> &'static str;
-
-    /// List of resource types this Provider can handle
-    fn resource_types(&self) -> Vec<Box<dyn ResourceType>>;
 
     /// Get the current state of a resource
     ///
@@ -190,13 +170,6 @@ impl ProviderRouter {
 impl Provider for ProviderRouter {
     fn name(&self) -> &'static str {
         "router"
-    }
-
-    fn resource_types(&self) -> Vec<Box<dyn ResourceType>> {
-        self.providers
-            .values()
-            .flat_map(|p| p.resource_types())
-            .collect()
     }
 
     fn read(
@@ -368,10 +341,6 @@ impl Provider for Box<dyn Provider> {
         (**self).name()
     }
 
-    fn resource_types(&self) -> Vec<Box<dyn ResourceType>> {
-        (**self).resource_types()
-    }
-
     fn read(
         &self,
         id: &ResourceId,
@@ -426,10 +395,6 @@ mod tests {
     impl Provider for MockProvider {
         fn name(&self) -> &'static str {
             "mock"
-        }
-
-        fn resource_types(&self) -> Vec<Box<dyn ResourceType>> {
-            vec![]
         }
 
         fn read(
