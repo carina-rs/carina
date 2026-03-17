@@ -118,7 +118,11 @@ impl AwsccProvider {
                         delay_secs = (delay_secs * 2).min(CREATE_RETRY_MAX_DELAY_SECS);
                         continue;
                     }
-                    return Err(ProviderError::new("Failed to create resource").with_cause(e));
+                    let detail = Self::format_sdk_error(&e);
+                    return Err(ProviderError::new(format!(
+                        "Failed to create resource: {}",
+                        detail
+                    )));
                 }
             }
         }
@@ -231,7 +235,11 @@ impl AwsccProvider {
                         delay_secs = (delay_secs * 2).min(DELETE_RETRY_MAX_DELAY_SECS);
                         continue;
                     }
-                    return Err(ProviderError::new("Failed to delete resource").with_cause(e));
+                    let detail = Self::format_sdk_error(&e);
+                    return Err(ProviderError::new(format!(
+                        "Failed to delete resource: {}",
+                        detail
+                    )));
                 }
             }
         }
@@ -772,6 +780,54 @@ mod tests {
     // =========================================================================
     // format_sdk_error tests
     // =========================================================================
+
+    #[test]
+    fn test_format_sdk_error_create_resource_error() {
+        use aws_sdk_cloudcontrol::operation::create_resource::CreateResourceError;
+        use aws_sdk_cloudcontrol::types::error::GeneralServiceException;
+        use aws_smithy_runtime_api::client::result::SdkError;
+
+        let meta = aws_smithy_types::error::ErrorMetadata::builder()
+            .code("GeneralServiceException")
+            .message("Handler returned status FAILED")
+            .build();
+        let err = CreateResourceError::GeneralServiceException(
+            GeneralServiceException::builder()
+                .message("Handler returned status FAILED")
+                .meta(meta)
+                .build(),
+        );
+        let sdk_err = SdkError::service_error(err, http::Response::new(""));
+        let formatted = AwsccProvider::format_sdk_error(&sdk_err);
+        assert_eq!(
+            formatted,
+            "GeneralServiceException: Handler returned status FAILED"
+        );
+    }
+
+    #[test]
+    fn test_format_sdk_error_delete_resource_error() {
+        use aws_sdk_cloudcontrol::operation::delete_resource::DeleteResourceError;
+        use aws_sdk_cloudcontrol::types::error::GeneralServiceException;
+        use aws_smithy_runtime_api::client::result::SdkError;
+
+        let meta = aws_smithy_types::error::ErrorMetadata::builder()
+            .code("GeneralServiceException")
+            .message("Handler returned status FAILED")
+            .build();
+        let err = DeleteResourceError::GeneralServiceException(
+            GeneralServiceException::builder()
+                .message("Handler returned status FAILED")
+                .meta(meta)
+                .build(),
+        );
+        let sdk_err = SdkError::service_error(err, http::Response::new(""));
+        let formatted = AwsccProvider::format_sdk_error(&sdk_err);
+        assert_eq!(
+            formatted,
+            "GeneralServiceException: Handler returned status FAILED"
+        );
+    }
 
     #[test]
     fn test_format_sdk_error_service_error() {
