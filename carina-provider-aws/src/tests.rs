@@ -85,6 +85,53 @@ fn test_extract_ec2_subnet_attributes_minimal() {
     assert_eq!(identifier, None);
 }
 
+#[test]
+fn test_extract_ec2_subnet_attributes_with_private_dns_name_options() {
+    use aws_sdk_ec2::types::{HostnameType, PrivateDnsNameOptionsOnLaunch};
+
+    let dns_options = PrivateDnsNameOptionsOnLaunch::builder()
+        .hostname_type(HostnameType::IpName)
+        .enable_resource_name_dns_a_record(true)
+        .enable_resource_name_dns_aaaa_record(false)
+        .build();
+
+    let subnet = aws_sdk_ec2::types::Subnet::builder()
+        .subnet_id("subnet-12345678")
+        .vpc_id("vpc-12345678")
+        .cidr_block("10.0.1.0/24")
+        .private_dns_name_options_on_launch(dns_options)
+        .build();
+
+    let mut attributes = HashMap::new();
+    let identifier = AwsProvider::extract_ec2_subnet_attributes(&subnet, &mut attributes);
+    assert_eq!(identifier, Some("subnet-12345678".to_string()));
+
+    // Verify the struct is extracted as a Value::Struct
+    let dns_value = attributes
+        .get("private_dns_name_options_on_launch")
+        .expect("private_dns_name_options_on_launch should be present");
+
+    if let Value::Map(fields) = dns_value {
+        assert_eq!(
+            fields.get("hostname_type"),
+            Some(&Value::String("ip-name".to_string()))
+        );
+        assert_eq!(
+            fields.get("enable_resource_name_dns_a_record"),
+            Some(&Value::Bool(true))
+        );
+        assert_eq!(
+            fields.get("enable_resource_name_dns_aaaa_record"),
+            Some(&Value::Bool(false))
+        );
+    } else {
+        panic!(
+            "Expected Value::Map for private_dns_name_options_on_launch, got {:?}",
+            dns_value
+        );
+    }
+}
+
 // --- extract_ec2_internet_gateway_attributes tests ---
 
 #[test]
