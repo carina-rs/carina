@@ -160,26 +160,18 @@ impl<P: Provider> Interpreter<P> {
                     self.provider.delete(id, &identifier, lifecycle).await?;
                     // If a temporary name was used and the name is updatable,
                     // rename the new resource back to the desired name.
-                    // Rename failure is non-fatal: the old resource is already deleted,
-                    // so the replace succeeded — just with the temporary name.
                     let state = if let Some(temp) = temporary_name
                         && temp.can_rename
                     {
-                        // Rename is non-fatal: if identifier is missing or update fails,
-                        // fall back to keeping the temporary name.
-                        if let Ok(new_identifier) = Self::require_identifier(&state, "rename") {
-                            let mut rename_to = to.clone();
-                            rename_to.attributes.insert(
-                                temp.attribute.clone(),
-                                crate::resource::Value::String(temp.original_value.clone()),
-                            );
-                            self.provider
-                                .update(id, &new_identifier, &state, &rename_to)
-                                .await
-                                .unwrap_or(state)
-                        } else {
-                            state
-                        }
+                        let new_identifier = Self::require_identifier(&state, "rename")?;
+                        let mut rename_to = to.clone();
+                        rename_to.attributes.insert(
+                            temp.attribute.clone(),
+                            crate::resource::Value::String(temp.original_value.clone()),
+                        );
+                        self.provider
+                            .update(id, &new_identifier, &state, &rename_to)
+                            .await?
                     } else {
                         state
                     };
@@ -653,6 +645,116 @@ mod tests {
             "expected error about missing identifier, got: {}",
             err.message
         );
+    }
+
+    /// Provider that fails on the rename (update) step after delete in create-before-destroy
+    struct RenameFailProvider {
+        ops: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl Provider for RenameFailProvider {
+        fn name(&self) -> &'static str {
+            "rename_fail"
+        }
+
+        fn read(
+            &self,
+            id: &ResourceId,
+            _identifier: Option<&str>,
+        ) -> BoxFuture<'_, ProviderResult<State>> {
+            let id = id.clone();
+            Box::pin(async move { Ok(State::not_found(id)) })
+        }
+
+        fn create(&self, resource: &Resource) -> BoxFuture<'_, ProviderResult<State>> {
+            self.ops.lock().unwrap().push("create".to_string());
+            let state = State::existing(resource.id.clone(), resource.attributes.clone())
+                .with_identifier("new-id");
+            Box::pin(async move { Ok(state) })
+        }
+
+        fn update(
+            &self,
+            _id: &ResourceId,
+            _identifier: &str,
+            _from: &State,
+            _to: &Resource,
+        ) -> BoxFuture<'_, ProviderResult<State>> {
+            self.ops.lock().unwrap().push("update".to_string());
+            Box::pin(async move { Err(ProviderError::new("rename failed: service unavailable")) })
+        }
+
+        fn delete(
+            &self,
+            _id: &ResourceId,
+            _identifier: &str,
+            _lifecycle: &LifecycleConfig,
+        ) -> BoxFuture<'_, ProviderResult<()>> {
+            self.ops.lock().unwrap().push("delete".to_string());
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    #[tokio::test]
+    async fn replace_create_before_destroy_rename_failure_returns_error() {
+        use crate::effect::TemporaryName;
+        use crate::resource::Value;
+        use std::collections::HashMap;
+
+        let ops = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = RenameFailProvider { ops: ops.clone() };
+        let interpreter = Interpreter::new(provider);
+
+        let mut plan = Plan::new();
+        plan.add(Effect::Replace {
+            id: ResourceId::new("s3.bucket", "my-bucket"),
+            from: Box::new(
+                State::existing(
+                    ResourceId::new("s3.bucket", "my-bucket"),
+                    HashMap::from([
+                        (
+                            "bucket_name".to_string(),
+                            Value::String("my-bucket".to_string()),
+                        ),
+                        ("object_lock_enabled".to_string(), Value::Bool(false)),
+                    ]),
+                )
+                .with_identifier("my-bucket"),
+            ),
+            to: Resource::new("s3.bucket", "my-bucket")
+                .with_attribute(
+                    "bucket_name",
+                    Value::String("my-bucket-abc12345".to_string()),
+                )
+                .with_attribute("object_lock_enabled", Value::Bool(true)),
+            lifecycle: LifecycleConfig {
+                force_delete: false,
+                create_before_destroy: true,
+            },
+            changed_create_only: vec!["object_lock_enabled".to_string()],
+            cascading_updates: vec![],
+            temporary_name: Some(TemporaryName {
+                attribute: "bucket_name".to_string(),
+                original_value: "my-bucket".to_string(),
+                temporary_value: "my-bucket-abc12345".to_string(),
+                can_rename: true,
+            }),
+        });
+
+        let result = interpreter.apply(&plan).await;
+
+        // Rename failure should be reported as an error
+        assert_eq!(result.failure_count, 1);
+        let err = result.outcomes[0].as_ref().unwrap_err();
+        assert!(
+            err.message.contains("rename failed"),
+            "expected rename failure error, got: {}",
+            err.message
+        );
+
+        // Operations should still have been: create, delete, update (rename attempt)
+        let ops = ops.lock().unwrap();
+        assert_eq!(*ops, vec!["create", "delete", "update"]);
     }
 
     #[tokio::test]
