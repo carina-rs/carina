@@ -18,7 +18,7 @@ pub use provider::AwsccProvider;
 use std::collections::HashMap;
 
 use carina_core::provider::{
-    BoxFuture, Provider, ProviderFactory, ProviderResult, ProviderSchemaExt, SavedAttrs,
+    BoxFuture, Provider, ProviderFactory, ProviderNormalizer, ProviderResult, SavedAttrs,
 };
 use carina_core::resource::{LifecycleConfig, Resource, ResourceId, State, Value};
 
@@ -26,9 +26,9 @@ use carina_core::resource::{LifecycleConfig, Resource, ResourceId, State, Value}
 ///
 /// Handles plan-time normalization of enum identifiers and hydration of
 /// unreturned attributes from saved state.
-pub struct AwsccSchemaExt;
+pub struct AwsccNormalizer;
 
-impl ProviderSchemaExt for AwsccSchemaExt {
+impl ProviderNormalizer for AwsccNormalizer {
     fn normalize_desired(&self, resources: &mut [Resource]) {
         crate::provider::resolve_enum_identifiers_impl(resources);
     }
@@ -85,11 +85,11 @@ impl ProviderFactory for AwsccProviderFactory {
         Box::pin(async move { Box::new(AwsccProvider::new(&region).await) as Box<dyn Provider> })
     }
 
-    fn create_schema_ext(
+    fn create_normalizer(
         &self,
         _attributes: &HashMap<String, Value>,
-    ) -> BoxFuture<'_, Option<Box<dyn ProviderSchemaExt>>> {
-        Box::pin(async { Some(Box::new(AwsccSchemaExt) as Box<dyn ProviderSchemaExt>) })
+    ) -> BoxFuture<'_, Option<Box<dyn ProviderNormalizer>>> {
+        Box::pin(async { Some(Box::new(AwsccNormalizer) as Box<dyn ProviderNormalizer>) })
     }
 
     fn schemas(&self) -> Vec<carina_core::schema::ResourceSchema> {

@@ -13,7 +13,7 @@ use aws_sdk_ec2::Client as Ec2Client;
 use aws_sdk_s3::Client as S3Client;
 use aws_sdk_sts::Client as StsClient;
 use carina_core::provider::{
-    BoxFuture, Provider, ProviderError, ProviderFactory, ProviderResult, ProviderSchemaExt,
+    BoxFuture, Provider, ProviderError, ProviderFactory, ProviderNormalizer, ProviderResult,
 };
 use carina_core::resource::{LifecycleConfig, Resource, ResourceId, State, Value};
 use carina_core::utils::convert_enum_value;
@@ -58,11 +58,11 @@ impl ProviderFactory for AwsProviderFactory {
         Box::pin(async move { Box::new(AwsProvider::new(&region).await) as Box<dyn Provider> })
     }
 
-    fn create_schema_ext(
+    fn create_normalizer(
         &self,
         _attributes: &HashMap<String, Value>,
-    ) -> BoxFuture<'_, Option<Box<dyn ProviderSchemaExt>>> {
-        Box::pin(async { Some(Box::new(AwsSchemaExt) as Box<dyn ProviderSchemaExt>) })
+    ) -> BoxFuture<'_, Option<Box<dyn ProviderNormalizer>>> {
+        Box::pin(async { Some(Box::new(AwsNormalizer) as Box<dyn ProviderNormalizer>) })
     }
 
     fn schemas(&self) -> Vec<carina_core::schema::ResourceSchema> {
@@ -81,9 +81,9 @@ impl ProviderFactory for AwsProviderFactory {
 /// Schema extension for the AWS provider.
 ///
 /// Handles plan-time normalization of enum identifiers.
-pub struct AwsSchemaExt;
+pub struct AwsNormalizer;
 
-impl ProviderSchemaExt for AwsSchemaExt {
+impl ProviderNormalizer for AwsNormalizer {
     fn normalize_desired(&self, resources: &mut [Resource]) {
         resolve_enum_identifiers_impl(resources);
     }

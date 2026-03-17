@@ -25,7 +25,7 @@ use carina_core::lint::{find_list_literal_attrs, list_struct_attr_names};
 use carina_core::module_resolver;
 use carina_core::parser::{BackendConfig, ParsedFile, ProviderConfig};
 use carina_core::plan::Plan;
-use carina_core::provider::{self as provider_mod, Provider, ProviderSchemaExt};
+use carina_core::provider::{self as provider_mod, Provider, ProviderNormalizer};
 use carina_core::resolver::{resolve_ref_value, resolve_refs_with_state};
 use carina_core::resource::{LifecycleConfig, Resource, ResourceId, State, Value};
 use carina_core::value::{format_value, json_to_dsl_value};

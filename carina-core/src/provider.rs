@@ -73,7 +73,7 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// Saved attribute values keyed by resource ID.
 ///
-/// Used by `ProviderSchemaExt::hydrate_read_state` to carry forward
+/// Used by `ProviderNormalizer::hydrate_read_state` to carry forward
 /// attributes that APIs don't return in read responses.
 pub type SavedAttrs = HashMap<ResourceId, HashMap<String, Value>>;
 
@@ -122,13 +122,13 @@ pub trait Provider: Send + Sync {
     ) -> BoxFuture<'_, ProviderResult<()>>;
 }
 
-/// Plan-time schema extensions for a provider.
+/// Plan-time normalizer for a provider.
 ///
-/// Handles normalization of desired state and hydration of read state
-/// based on provider-specific schema knowledge. Separated from `Provider`
+/// Normalizes desired state and read state so that diffs produce correct
+/// plans. Uses provider-specific schema knowledge. Separated from `Provider`
 /// because these operations are synchronous, plan-time concerns rather
 /// than runtime CRUD.
-pub trait ProviderSchemaExt: Send + Sync {
+pub trait ProviderNormalizer: Send + Sync {
     /// Normalize desired resource state before diffing.
     ///
     /// For example, resolves bare enum identifiers like `advanced` or
@@ -156,7 +156,7 @@ pub trait ProviderSchemaExt: Send + Sync {
 /// based on the resource's provider name (`ResourceId.provider`).
 pub struct ProviderRouter {
     providers: HashMap<String, Box<dyn Provider>>,
-    schema_exts: Vec<Box<dyn ProviderSchemaExt>>,
+    normalizers: Vec<Box<dyn ProviderNormalizer>>,
 }
 
 impl Default for ProviderRouter {
@@ -169,7 +169,7 @@ impl ProviderRouter {
     pub fn new() -> Self {
         Self {
             providers: HashMap::new(),
-            schema_exts: Vec::new(),
+            normalizers: Vec::new(),
         }
     }
 
@@ -177,8 +177,8 @@ impl ProviderRouter {
         self.providers.insert(name, provider);
     }
 
-    pub fn add_schema_ext(&mut self, ext: Box<dyn ProviderSchemaExt>) {
-        self.schema_exts.push(ext);
+    pub fn add_normalizer(&mut self, ext: Box<dyn ProviderNormalizer>) {
+        self.normalizers.push(ext);
     }
 
     pub fn is_empty(&self) -> bool {
@@ -242,9 +242,9 @@ impl Provider for ProviderRouter {
     }
 }
 
-impl ProviderSchemaExt for ProviderRouter {
+impl ProviderNormalizer for ProviderRouter {
     fn normalize_desired(&self, resources: &mut [Resource]) {
-        for ext in &self.schema_exts {
+        for ext in &self.normalizers {
             ext.normalize_desired(resources);
         }
     }
@@ -254,7 +254,7 @@ impl ProviderSchemaExt for ProviderRouter {
         current_states: &mut HashMap<ResourceId, State>,
         saved_attrs: &SavedAttrs,
     ) {
-        for ext in &self.schema_exts {
+        for ext in &self.normalizers {
             ext.hydrate_read_state(current_states, saved_attrs);
         }
     }
@@ -291,10 +291,10 @@ pub trait ProviderFactory: Send + Sync {
     /// Returns `None` if this provider has no schema extensions (the default).
     /// Providers that need plan-time normalization or state hydration should
     /// override this method.
-    fn create_schema_ext(
+    fn create_normalizer(
         &self,
         _attributes: &HashMap<String, Value>,
-    ) -> BoxFuture<'_, Option<Box<dyn ProviderSchemaExt>>> {
+    ) -> BoxFuture<'_, Option<Box<dyn ProviderNormalizer>>> {
         Box::pin(async { None })
     }
 
@@ -606,13 +606,13 @@ mod tests {
     }
 
     #[test]
-    fn provider_schema_ext_separate_from_runtime() {
-        // Verify that ProviderSchemaExt can be implemented independently from Provider.
+    fn provider_normalizer_separate_from_runtime() {
+        // Verify that ProviderNormalizer can be implemented independently from Provider.
         // A provider implementing both traits should have its schema extension
         // methods callable without going through the Provider trait.
         struct SchemaOnlyProvider;
 
-        impl ProviderSchemaExt for SchemaOnlyProvider {
+        impl ProviderNormalizer for SchemaOnlyProvider {
             fn normalize_desired(&self, resources: &mut [Resource]) {
                 // Prefix all string attribute values with "normalized:"
                 for resource in resources.iter_mut() {
@@ -671,8 +671,8 @@ mod tests {
     }
 
     #[test]
-    fn provider_router_delegates_schema_ext() {
-        // Test that ProviderRouter delegates ProviderSchemaExt methods to sub-providers
+    fn provider_router_delegates_normalizer() {
+        // Test that ProviderRouter delegates ProviderNormalizer methods to sub-providers
         struct NormalizingProvider;
 
         impl Provider for NormalizingProvider {
@@ -716,8 +716,8 @@ mod tests {
         }
 
         // Separate schema ext struct for the router
-        struct NormalizingExt;
-        impl ProviderSchemaExt for NormalizingExt {
+        struct TestNormalizer;
+        impl ProviderNormalizer for TestNormalizer {
             fn normalize_desired(&self, resources: &mut [Resource]) {
                 for resource in resources.iter_mut() {
                     if resource.id.provider == "normalizing" {
@@ -733,7 +733,7 @@ mod tests {
 
         let mut router = ProviderRouter::new();
         router.add_provider("normalizing".to_string(), Box::new(NormalizingProvider));
-        router.add_schema_ext(Box::new(NormalizingExt));
+        router.add_normalizer(Box::new(TestNormalizer));
 
         let mut resources = vec![
             Resource::with_provider("normalizing", "test", "example")

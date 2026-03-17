@@ -10,7 +10,7 @@ use carina_core::module_resolver;
 use carina_core::parser::{ParsedFile, ProviderConfig};
 use carina_core::plan::Plan;
 use carina_core::provider::{
-    self as provider_mod, Provider, ProviderFactory, ProviderRouter, ProviderSchemaExt,
+    self as provider_mod, Provider, ProviderFactory, ProviderNormalizer, ProviderRouter,
 };
 use carina_core::resolver::resolve_refs_with_state;
 use carina_core::resource::{Resource, ResourceId, State};
@@ -191,8 +191,8 @@ pub async fn get_provider(parsed: &ParsedFile) -> ProviderRouter {
             );
             let provider = factory.create_provider(&provider_config.attributes).await;
             router.add_provider(provider_config.name.clone(), provider);
-            if let Some(ext) = factory.create_schema_ext(&provider_config.attributes).await {
-                router.add_schema_ext(ext);
+            if let Some(ext) = factory.create_normalizer(&provider_config.attributes).await {
+                router.add_normalizer(ext);
             }
         }
     }
@@ -220,8 +220,8 @@ pub async fn create_providers_from_configs(configs: &[ProviderConfig]) -> Provid
             );
             let provider = factory.create_provider(&config.attributes).await;
             router.add_provider(config.name.clone(), provider);
-            if let Some(ext) = factory.create_schema_ext(&config.attributes).await {
-                router.add_schema_ext(ext);
+            if let Some(ext) = factory.create_normalizer(&config.attributes).await {
+                router.add_normalizer(ext);
             }
         }
     }
