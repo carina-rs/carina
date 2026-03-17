@@ -151,7 +151,10 @@ impl AwsccProvider {
             .patch_document(patch_document)
             .send()
             .await
-            .map_err(|e| ProviderError::new("Failed to update resource").with_cause(e))?;
+            .map_err(|e| {
+                let detail = Self::format_sdk_error(&e);
+                ProviderError::new(format!("Failed to update resource: {}", detail))
+            })?;
 
         if let Some(request_token) = result.progress_event().and_then(|p| p.request_token()) {
             self.wait_for_operation(request_token).await?;
@@ -249,6 +252,26 @@ impl AwsccProvider {
             return 360; // 30 minutes (360 * 5s)
         }
         120 // Default: 10 minutes (120 * 5s)
+    }
+
+    /// Formats an SDK error into a human-readable message.
+    ///
+    /// The `SdkError::Display` implementation only outputs generic labels like "service error"
+    /// without including the actual error code or message. This method extracts the structured
+    /// error metadata (code and message) from service errors to provide actionable error messages.
+    pub(crate) fn format_sdk_error<E, R>(error: &SdkError<E, R>) -> String
+    where
+        E: ProvideErrorMetadata + std::fmt::Display,
+    {
+        match error {
+            SdkError::ServiceError(service_error) => {
+                let err = service_error.err();
+                let code = err.code().unwrap_or("Unknown");
+                let message = err.message().unwrap_or("no details");
+                format!("{}: {}", code, message)
+            }
+            other => format!("{}", other),
+        }
     }
 
     /// Returns true if the SDK error represents a "not found" condition.
@@ -744,5 +767,44 @@ mod tests {
             AwsccProvider::max_polling_attempts("AWS::EC2::IPAMPool", "create"),
             120
         );
+    }
+
+    // =========================================================================
+    // format_sdk_error tests
+    // =========================================================================
+
+    #[test]
+    fn test_format_sdk_error_service_error() {
+        use aws_sdk_cloudcontrol::operation::update_resource::UpdateResourceError;
+        use aws_sdk_cloudcontrol::types::error::GeneralServiceException;
+        use aws_smithy_runtime_api::client::result::SdkError;
+
+        let meta = aws_smithy_types::error::ErrorMetadata::builder()
+            .code("GeneralServiceException")
+            .message("Handler returned status FAILED")
+            .build();
+        let err = UpdateResourceError::GeneralServiceException(
+            GeneralServiceException::builder()
+                .message("Handler returned status FAILED")
+                .meta(meta)
+                .build(),
+        );
+        let sdk_err = SdkError::service_error(err, http::Response::new(""));
+        let formatted = AwsccProvider::format_sdk_error(&sdk_err);
+        assert_eq!(
+            formatted,
+            "GeneralServiceException: Handler returned status FAILED"
+        );
+    }
+
+    #[test]
+    fn test_format_sdk_error_timeout() {
+        use aws_sdk_cloudcontrol::operation::update_resource::UpdateResourceError;
+        use aws_smithy_runtime_api::client::result::SdkError;
+
+        let sdk_err: SdkError<UpdateResourceError, http::Response<&str>> =
+            SdkError::timeout_error("connection timed out");
+        let formatted = AwsccProvider::format_sdk_error(&sdk_err);
+        assert_eq!(formatted, "request has timed out");
     }
 }
