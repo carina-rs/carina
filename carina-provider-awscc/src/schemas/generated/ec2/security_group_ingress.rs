@@ -85,6 +85,7 @@ pub fn ec2_security_group_ingress_config() -> AwsccSchemaConfig {
         )
         .attribute(
             AttributeSchema::new("id", AttributeType::String)
+                .read_only()
                 .with_description("The Security Group Rule Id (read-only)")
                 .with_provider_name("Id"),
         )

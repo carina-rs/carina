@@ -92,6 +92,7 @@ pub fn ec2_security_group_egress_config() -> AwsccSchemaConfig {
         )
         .attribute(
             AttributeSchema::new("id", AttributeType::String)
+                .read_only()
                 .with_description(" (read-only)")
                 .with_provider_name("Id"),
         )

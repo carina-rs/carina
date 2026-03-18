@@ -73,11 +73,13 @@ pub fn ec2_vpc_endpoint_config() -> AwsccSchemaConfig {
         .with_description("Specifies a VPC endpoint. A VPC endpoint provides a private connection between your VPC and an endpoint service. You can use an endpoint service provided by AWS, an MKT Partner, or another AWS account...")
         .attribute(
             AttributeSchema::new("creation_timestamp", AttributeType::String)
+                .read_only()
                 .with_description(" (read-only)")
                 .with_provider_name("CreationTimestamp"),
         )
         .attribute(
             AttributeSchema::new("dns_entries", AttributeType::List(Box::new(AttributeType::String)))
+                .read_only()
                 .with_description(" (read-only)")
                 .with_provider_name("DnsEntries"),
         )
@@ -123,6 +125,7 @@ pub fn ec2_vpc_endpoint_config() -> AwsccSchemaConfig {
         )
         .attribute(
             AttributeSchema::new("id", super::vpc_endpoint_id())
+                .read_only()
                 .with_description(" (read-only)")
                 .with_provider_name("Id"),
         )
@@ -138,6 +141,7 @@ pub fn ec2_vpc_endpoint_config() -> AwsccSchemaConfig {
         )
         .attribute(
             AttributeSchema::new("network_interface_ids", AttributeType::List(Box::new(super::network_interface_id())))
+                .read_only()
                 .with_description(" (read-only)")
                 .with_provider_name("NetworkInterfaceIds"),
         )

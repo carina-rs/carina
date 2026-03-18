@@ -39,16 +39,19 @@ pub fn ec2_vpc_config() -> AwsccSchemaConfig {
         )
         .attribute(
             AttributeSchema::new("cidr_block_associations", AttributeType::List(Box::new(super::vpc_cidr_block_association_id())))
+                .read_only()
                 .with_description(" (read-only)")
                 .with_provider_name("CidrBlockAssociations"),
         )
         .attribute(
             AttributeSchema::new("default_network_acl", super::network_acl_id())
+                .read_only()
                 .with_description(" (read-only)")
                 .with_provider_name("DefaultNetworkAcl"),
         )
         .attribute(
             AttributeSchema::new("default_security_group", super::security_group_id())
+                .read_only()
                 .with_description(" (read-only)")
                 .with_provider_name("DefaultSecurityGroup"),
         )
@@ -92,6 +95,7 @@ pub fn ec2_vpc_config() -> AwsccSchemaConfig {
         )
         .attribute(
             AttributeSchema::new("ipv6_cidr_blocks", AttributeType::List(Box::new(types::ipv6_cidr())))
+                .read_only()
                 .with_description(" (read-only)")
                 .with_provider_name("Ipv6CidrBlocks"),
         )
@@ -102,6 +106,7 @@ pub fn ec2_vpc_config() -> AwsccSchemaConfig {
         )
         .attribute(
             AttributeSchema::new("vpc_id", super::vpc_id())
+                .read_only()
                 .with_description(" (read-only)")
                 .with_provider_name("VpcId"),
         )

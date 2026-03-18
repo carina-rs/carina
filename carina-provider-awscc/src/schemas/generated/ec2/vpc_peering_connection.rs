@@ -24,6 +24,7 @@ pub fn ec2_vpc_peering_connection_config() -> AwsccSchemaConfig {
         )
         .attribute(
             AttributeSchema::new("id", super::vpc_peering_connection_id())
+                .read_only()
                 .with_description("(read-only)")
                 .with_provider_name("Id"),
         )

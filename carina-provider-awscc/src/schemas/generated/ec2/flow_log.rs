@@ -75,6 +75,7 @@ pub fn ec2_flow_log_config() -> AwsccSchemaConfig {
         )
         .attribute(
             AttributeSchema::new("id", super::flow_log_id())
+                .read_only()
                 .with_description("The Flow Log ID (read-only)")
                 .with_provider_name("Id"),
         )

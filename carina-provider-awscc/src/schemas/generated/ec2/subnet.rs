@@ -70,6 +70,7 @@ pub fn ec2_subnet_config() -> AwsccSchemaConfig {
             }).with_description("The mode of VPC BPA. Options here are off, block-bidirectional, block-ingress ").with_provider_name("InternetGatewayBlockMode")
                     ],
                 })
+                .read_only()
                 .with_description(" (read-only)")
                 .with_provider_name("BlockPublicAccessStates"),
         )
@@ -114,6 +115,7 @@ pub fn ec2_subnet_config() -> AwsccSchemaConfig {
         )
         .attribute(
             AttributeSchema::new("ipv6_cidr_blocks", AttributeType::List(Box::new(types::ipv6_cidr())))
+                .read_only()
                 .with_description(" (read-only)")
                 .with_provider_name("Ipv6CidrBlocks"),
         )
@@ -148,6 +150,7 @@ pub fn ec2_subnet_config() -> AwsccSchemaConfig {
         )
         .attribute(
             AttributeSchema::new("network_acl_association_id", AttributeType::String)
+                .read_only()
                 .with_description(" (read-only)")
                 .with_provider_name("NetworkAclAssociationId"),
         )
@@ -176,6 +179,7 @@ pub fn ec2_subnet_config() -> AwsccSchemaConfig {
         )
         .attribute(
             AttributeSchema::new("subnet_id", super::subnet_id())
+                .read_only()
                 .with_description(" (read-only)")
                 .with_provider_name("SubnetId"),
         )

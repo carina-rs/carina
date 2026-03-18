@@ -532,6 +532,7 @@ let route = awscc.ec2.route {
                     completions: None,
                     provider_name: None,
                     create_only: false,
+                    read_only: false,
                     removable: None,
                     block_name: None,
                 },

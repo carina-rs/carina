@@ -17,6 +17,7 @@ pub fn ec2_subnet_route_table_association_config() -> AwsccSchemaConfig {
         .with_description("Associates a subnet with a route table. The subnet and route table must be in the same VPC. This association causes traffic originating from the subnet to be routed according to the routes in the rout...")
         .attribute(
             AttributeSchema::new("id", super::subnet_route_table_association_id())
+                .read_only()
                 .with_description(" (read-only)")
                 .with_provider_name("Id"),
         )

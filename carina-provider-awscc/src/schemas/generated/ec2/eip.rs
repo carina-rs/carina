@@ -26,6 +26,7 @@ pub fn ec2_eip_config() -> AwsccSchemaConfig {
         )
         .attribute(
             AttributeSchema::new("allocation_id", super::allocation_id())
+                .read_only()
                 .with_description(" (read-only)")
                 .with_provider_name("AllocationId"),
         )
@@ -58,6 +59,7 @@ pub fn ec2_eip_config() -> AwsccSchemaConfig {
         )
         .attribute(
             AttributeSchema::new("public_ip", types::ipv4_address())
+                .read_only()
                 .with_description(" (read-only)")
                 .with_provider_name("PublicIp"),
         )

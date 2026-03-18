@@ -1826,6 +1826,10 @@ pub fn {}() -> AwsccSchemaConfig {{
             attr_code.push_str("\n                .create_only()");
         }
 
+        if is_read_only {
+            attr_code.push_str("\n                .read_only()");
+        }
+
         if let Some(desc) = &prop.description {
             let escaped = collapse_whitespace(&desc.replace('"', "\\\"").replace('\n', " "));
             let truncated = if escaped.len() > 150 {
