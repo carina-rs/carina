@@ -134,13 +134,14 @@ impl Provider for AwsProvider {
         &self,
         id: &ResourceId,
         identifier: &str,
-        _lifecycle: &LifecycleConfig,
+        lifecycle: &LifecycleConfig,
     ) -> BoxFuture<'_, ProviderResult<()>> {
         let id = id.clone();
         let identifier = identifier.to_string();
+        let lifecycle = lifecycle.clone();
         Box::pin(async move {
             match id.resource_type.as_str() {
-                "s3.bucket" => self.delete_s3_bucket(id, &identifier).await,
+                "s3.bucket" => self.delete_s3_bucket(id, &identifier, &lifecycle).await,
                 "ec2.vpc" => self.delete_ec2_vpc(id, &identifier).await,
                 "ec2.subnet" => self.delete_ec2_subnet(id, &identifier).await,
                 "ec2.internet_gateway" => self.delete_ec2_internet_gateway(id, &identifier).await,
