@@ -24,6 +24,7 @@
 #   ec2_transit_gateway_attachment     - Update tags
 #   ec2_route                          - Change route target (IGW -> NAT GW)
 #   ec2_ipam_pool                      - Change description
+#   ec2_vpc_endpoint_interface         - Change private_dns_enabled (false -> true)
 #
 # Filter (optional): substring to match test names (e.g. "logs_log_group", "s3_bucket")
 
@@ -314,6 +315,12 @@ run_test "ec2_ipam_pool" \
     "$SCRIPT_DIR/ec2_ipam_pool_step1.crn" \
     "$SCRIPT_DIR/ec2_ipam_pool_step2.crn" \
     "Test 19: EC2 IPAM Pool (description update)"
+
+# Test 20: EC2 VPC Endpoint (Interface) - change private_dns_enabled (false -> true)
+run_test "ec2_vpc_endpoint_interface" \
+    "$SCRIPT_DIR/ec2_vpc_endpoint_interface_step1.crn" \
+    "$SCRIPT_DIR/ec2_vpc_endpoint_interface_step2.crn" \
+    "Test 20: EC2 VPC Endpoint Interface (private_dns_enabled false -> true)"
 
 echo "════════════════════════════════════════"
 echo "Total: $TOTAL_PASSED passed, $TOTAL_FAILED failed"
