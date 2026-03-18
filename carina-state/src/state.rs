@@ -53,11 +53,16 @@ impl StateFile {
         self.carina_version = env!("CARGO_PKG_VERSION").to_string();
     }
 
-    /// Find a resource by type and name
-    pub fn find_resource(&self, resource_type: &str, name: &str) -> Option<&ResourceState> {
+    /// Find a resource by provider, type, and name
+    pub fn find_resource(
+        &self,
+        provider: &str,
+        resource_type: &str,
+        name: &str,
+    ) -> Option<&ResourceState> {
         self.resources
             .iter()
-            .find(|r| r.resource_type == resource_type && r.name == name)
+            .find(|r| r.provider == provider && r.resource_type == resource_type && r.name == name)
     }
 
     /// Find all resources matching a provider and resource type
@@ -68,20 +73,23 @@ impl StateFile {
             .collect()
     }
 
-    /// Find a resource mutably by type and name
+    /// Find a resource mutably by provider, type, and name
     pub fn find_resource_mut(
         &mut self,
+        provider: &str,
         resource_type: &str,
         name: &str,
     ) -> Option<&mut ResourceState> {
         self.resources
             .iter_mut()
-            .find(|r| r.resource_type == resource_type && r.name == name)
+            .find(|r| r.provider == provider && r.resource_type == resource_type && r.name == name)
     }
 
     /// Add or update a resource in the state
     pub fn upsert_resource(&mut self, resource: ResourceState) {
-        if let Some(existing) = self.find_resource_mut(&resource.resource_type, &resource.name) {
+        if let Some(existing) =
+            self.find_resource_mut(&resource.provider, &resource.resource_type, &resource.name)
+        {
             *existing = resource;
         } else {
             self.resources.push(resource);
@@ -90,9 +98,11 @@ impl StateFile {
 
     /// Get the identifier for a resource from state.
     pub fn get_identifier_for_resource(&self, resource: &Resource) -> Option<String> {
-        if let Some(resource_state) =
-            self.find_resource(&resource.id.resource_type, &resource.id.name)
-        {
+        if let Some(resource_state) = self.find_resource(
+            &resource.id.provider,
+            &resource.id.resource_type,
+            &resource.id.name,
+        ) {
             return resource_state.identifier.clone();
         }
         None
@@ -149,12 +159,15 @@ impl StateFile {
     }
 
     /// Remove a resource from the state
-    pub fn remove_resource(&mut self, resource_type: &str, name: &str) -> Option<ResourceState> {
-        if let Some(pos) = self
-            .resources
-            .iter()
-            .position(|r| r.resource_type == resource_type && r.name == name)
-        {
+    pub fn remove_resource(
+        &mut self,
+        provider: &str,
+        resource_type: &str,
+        name: &str,
+    ) -> Option<ResourceState> {
+        if let Some(pos) = self.resources.iter().position(|r| {
+            r.provider == provider && r.resource_type == resource_type && r.name == name
+        }) {
             Some(self.resources.remove(pos))
         } else {
             None
@@ -333,12 +346,12 @@ mod tests {
         state.upsert_resource(resource);
         assert_eq!(state.resources.len(), 1);
 
-        let removed = state.remove_resource("s3.bucket", "my-bucket");
+        let removed = state.remove_resource("aws", "s3.bucket", "my-bucket");
         assert!(removed.is_some());
         assert_eq!(state.resources.len(), 0);
 
         // Removing non-existent resource returns None
-        let removed = state.remove_resource("s3.bucket", "other-bucket");
+        let removed = state.remove_resource("aws", "s3.bucket", "other-bucket");
         assert!(removed.is_none());
     }
 
@@ -511,5 +524,122 @@ mod tests {
         let rs = ResourceState::from_provider_state(&resource, &provider_state, None).unwrap();
         assert!(!rs.protected);
         assert_eq!(rs.identifier, Some("test-id".to_string()));
+    }
+
+    #[test]
+    fn test_multi_provider_resources_do_not_collide() {
+        use carina_core::resource::Resource;
+
+        let mut state = StateFile::new();
+
+        // Store two resources with the same resource_type and name but different providers
+        let aws_resource =
+            ResourceState::new("s3.bucket", "main", "aws").with_identifier("aws-bucket-id");
+        let awscc_resource =
+            ResourceState::new("s3.bucket", "main", "awscc").with_identifier("awscc-bucket-id");
+
+        state.upsert_resource(aws_resource);
+        state.upsert_resource(awscc_resource);
+
+        // Both should be stored independently
+        assert_eq!(state.resources.len(), 2);
+
+        // find_resource should return the correct one for each provider
+        let found_aws = state.find_resource("aws", "s3.bucket", "main").unwrap();
+        assert_eq!(found_aws.identifier, Some("aws-bucket-id".to_string()));
+
+        let found_awscc = state.find_resource("awscc", "s3.bucket", "main").unwrap();
+        assert_eq!(found_awscc.identifier, Some("awscc-bucket-id".to_string()));
+
+        // get_identifier_for_resource should return provider-scoped identifiers
+        let aws_res = Resource::with_provider("aws", "s3.bucket", "main");
+        assert_eq!(
+            state.get_identifier_for_resource(&aws_res),
+            Some("aws-bucket-id".to_string())
+        );
+
+        let awscc_res = Resource::with_provider("awscc", "s3.bucket", "main");
+        assert_eq!(
+            state.get_identifier_for_resource(&awscc_res),
+            Some("awscc-bucket-id".to_string())
+        );
+
+        // Upsert should only update the matching provider's entry
+        let updated_aws =
+            ResourceState::new("s3.bucket", "main", "aws").with_identifier("aws-bucket-id-v2");
+        state.upsert_resource(updated_aws);
+        assert_eq!(state.resources.len(), 2);
+        assert_eq!(
+            state
+                .find_resource("aws", "s3.bucket", "main")
+                .unwrap()
+                .identifier,
+            Some("aws-bucket-id-v2".to_string())
+        );
+        assert_eq!(
+            state
+                .find_resource("awscc", "s3.bucket", "main")
+                .unwrap()
+                .identifier,
+            Some("awscc-bucket-id".to_string())
+        );
+
+        // remove_resource should only remove the matching provider's entry
+        let removed = state.remove_resource("aws", "s3.bucket", "main");
+        assert!(removed.is_some());
+        assert_eq!(removed.unwrap().provider, "aws");
+        assert_eq!(state.resources.len(), 1);
+
+        // The awscc entry should still exist
+        assert!(state.find_resource("awscc", "s3.bucket", "main").is_some());
+        assert!(state.find_resource("aws", "s3.bucket", "main").is_none());
+    }
+
+    #[test]
+    fn test_build_lifecycles_provider_scoped() {
+        use carina_core::resource::ResourceId;
+
+        let mut state = StateFile::new();
+        let mut aws_rs = ResourceState::new("s3.bucket", "main", "aws");
+        aws_rs.lifecycle.force_delete = true;
+        let mut awscc_rs = ResourceState::new("s3.bucket", "main", "awscc");
+        awscc_rs.lifecycle.force_delete = false;
+
+        state.upsert_resource(aws_rs);
+        state.upsert_resource(awscc_rs);
+
+        let lifecycles = state.build_lifecycles();
+        let aws_id = ResourceId::with_provider("aws", "s3.bucket", "main");
+        let awscc_id = ResourceId::with_provider("awscc", "s3.bucket", "main");
+
+        assert!(lifecycles.get(&aws_id).unwrap().force_delete);
+        assert!(!lifecycles.get(&awscc_id).unwrap().force_delete);
+    }
+
+    #[test]
+    fn test_build_saved_attrs_provider_scoped() {
+        use carina_core::resource::{ResourceId, Value};
+
+        let mut state = StateFile::new();
+        let aws_rs = ResourceState::new("s3.bucket", "main", "aws")
+            .with_attribute("region".to_string(), serde_json::json!("us-east-1"));
+        let awscc_rs = ResourceState::new("s3.bucket", "main", "awscc")
+            .with_attribute("region".to_string(), serde_json::json!("ap-northeast-1"));
+
+        state.upsert_resource(aws_rs);
+        state.upsert_resource(awscc_rs);
+
+        let saved = state.build_saved_attrs();
+        let aws_id = ResourceId::with_provider("aws", "s3.bucket", "main");
+        let awscc_id = ResourceId::with_provider("awscc", "s3.bucket", "main");
+
+        assert_eq!(
+            saved.get(&aws_id).unwrap().get("region"),
+            Some(&Value::String("us-east-1".to_string()))
+        );
+        assert_eq!(
+            saved.get(&awscc_id).unwrap().get("region"),
+            Some(&Value::String("ap-northeast-1".to_string()))
+        );
     }
 }

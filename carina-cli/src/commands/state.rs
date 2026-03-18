@@ -319,7 +319,11 @@ async fn run_state_refresh_locked(
         };
 
         // Compare old state attributes with new
-        let existing = state.find_resource(&resource.id.resource_type, &resource.id.name);
+        let existing = state.find_resource(
+            &resource.id.provider,
+            &resource.id.resource_type,
+            &resource.id.name,
+        );
 
         let mut has_changes = false;
         let mut changes: Vec<String> = Vec::new();
@@ -404,12 +408,20 @@ async fn run_state_refresh_locked(
 
         // Update state with refreshed data
         if fresh_state.exists {
-            let existing_rs = state.find_resource(&resource.id.resource_type, &resource.id.name);
+            let existing_rs = state.find_resource(
+                &resource.id.provider,
+                &resource.id.resource_type,
+                &resource.id.name,
+            );
             let resource_state =
                 ResourceState::from_provider_state(resource, fresh_state, existing_rs)?;
             state.upsert_resource(resource_state);
         } else {
-            state.remove_resource(&resource.id.resource_type, &resource.id.name);
+            state.remove_resource(
+                &resource.id.provider,
+                &resource.id.resource_type,
+                &resource.id.name,
+            );
         }
     }
 

@@ -113,7 +113,7 @@ pub struct PrefixStateInfo {
 /// If the prefix has changed or there's no state match, keeps the new generated name.
 pub fn reconcile_prefixed_names(
     resources: &mut [Resource],
-    find_state: &dyn Fn(&str, &str) -> Option<PrefixStateInfo>,
+    find_state: &dyn Fn(&str, &str, &str) -> Option<PrefixStateInfo>,
 ) {
     for resource in resources.iter_mut() {
         if resource.prefixes.is_empty() {
@@ -121,7 +121,11 @@ pub fn reconcile_prefixed_names(
         }
 
         // Find matching resource in state
-        let state_info = find_state(&resource.id.resource_type, &resource.id.name);
+        let state_info = find_state(
+            &resource.id.provider,
+            &resource.id.resource_type,
+            &resource.id.name,
+        );
         let state_info = match state_info {
             Some(si) => si,
             None => continue,
@@ -612,7 +616,7 @@ mod tests {
         );
 
         let mut resources = vec![resource];
-        reconcile_prefixed_names(&mut resources, &|_resource_type, _name| {
+        reconcile_prefixed_names(&mut resources, &|_provider, _resource_type, _name| {
             Some(PrefixStateInfo {
                 prefixes: vec![("bucket_name".to_string(), "my-app-".to_string())]
                     .into_iter()
@@ -642,7 +646,7 @@ mod tests {
         );
 
         let mut resources = vec![resource];
-        reconcile_prefixed_names(&mut resources, &|_resource_type, _name| {
+        reconcile_prefixed_names(&mut resources, &|_provider, _resource_type, _name| {
             Some(PrefixStateInfo {
                 prefixes: vec![("bucket_name".to_string(), "old-prefix-".to_string())]
                     .into_iter()
@@ -675,7 +679,7 @@ mod tests {
         );
 
         let mut resources = vec![resource];
-        reconcile_prefixed_names(&mut resources, &|_resource_type, _name| None);
+        reconcile_prefixed_names(&mut resources, &|_provider, _resource_type, _name| None);
 
         // No state, so keep the generated name
         assert_eq!(

@@ -426,7 +426,7 @@ async fn run_destroy_locked(
 
     // Remove destroyed resources from state
     for id in &destroyed_ids {
-        state.remove_resource(&id.resource_type, &id.name);
+        state.remove_resource(&id.provider, &id.resource_type, &id.name);
     }
 
     // Increment serial and save
