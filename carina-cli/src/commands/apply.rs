@@ -950,6 +950,16 @@ async fn run_apply_locked(
         current_states.insert(resource.id.clone(), state);
     }
 
+    // Seed current_states with orphaned resources from state file (#844).
+    // These are resources tracked in state but removed from the .crn config.
+    if let Some(sf) = state_file.as_ref() {
+        let desired_ids: HashSet<ResourceId> =
+            sorted_resources.iter().map(|r| r.id.clone()).collect();
+        for (id, state) in sf.build_orphan_states(&desired_ids) {
+            current_states.entry(id).or_insert(state);
+        }
+    }
+
     // Restore unreturned attributes from state file (CloudControl doesn't always return them)
     let saved_attrs = state_file
         .as_ref()
