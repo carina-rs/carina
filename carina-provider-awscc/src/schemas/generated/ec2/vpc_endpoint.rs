@@ -120,6 +120,7 @@ pub fn ec2_vpc_endpoint_config() -> AwsccSchemaConfig {
             }).with_description("Indicates which of the private domains to create private hosted zones for and associate with the specified VPC. Only supported when private DNS is ena...").with_provider_name("PrivateDnsSpecifiedDomains")
                     ],
                 })
+                .create_only()
                 .with_description("Describes the DNS options for an endpoint.")
                 .with_provider_name("DnsOptions"),
         )

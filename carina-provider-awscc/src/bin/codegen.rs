@@ -1745,7 +1745,10 @@ pub fn {}() -> AwsccSchemaConfig {{
         let attr_name = prop_name.to_snake_case();
         let is_required = required.contains(prop_name) && !read_only.contains(prop_name);
         let is_read_only = read_only.contains(prop_name);
-        let is_create_only = create_only.contains(prop_name);
+        let is_create_only = create_only.contains(prop_name)
+            || create_only
+                .iter()
+                .any(|p| p.starts_with(&format!("{}/", prop_name)));
 
         let attr_type = if let Some(enum_info) = enums.get(prop_name) {
             // Use shared schema enum type for constrained strings.
