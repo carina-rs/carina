@@ -82,8 +82,8 @@ pub fn reconcile_prefixed_names(resources: &mut [Resource], state_file: &Option<
         None => return,
     };
 
-    identifier::reconcile_prefixed_names(resources, &|resource_type, name| {
-        let sr = state_file.find_resource(resource_type, name)?;
+    identifier::reconcile_prefixed_names(resources, &|provider, resource_type, name| {
+        let sr = state_file.find_resource(provider, resource_type, name)?;
         Some(PrefixStateInfo {
             prefixes: sr.prefixes.clone(),
             attribute_values: sr

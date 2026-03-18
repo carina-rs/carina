@@ -560,7 +560,11 @@ pub fn build_state_after_apply(save: ApplyStateSave<'_>) -> Result<StateFile, Ap
     let mut state = state_file.unwrap_or_default();
 
     for resource in sorted_resources {
-        let existing = state.find_resource(&resource.id.resource_type, &resource.id.name);
+        let existing = state.find_resource(
+            &resource.id.provider,
+            &resource.id.resource_type,
+            &resource.id.name,
+        );
         if let Some(applied_state) = applied_states.get(&resource.id) {
             let mut resource_state =
                 ResourceState::from_provider_state(resource, applied_state, existing)?;
@@ -576,7 +580,11 @@ pub fn build_state_after_apply(save: ApplyStateSave<'_>) -> Result<StateFile, Ap
                     ResourceState::from_provider_state(resource, current_state, existing)?;
                 state.upsert_resource(resource_state);
             } else {
-                state.remove_resource(&resource.id.resource_type, &resource.id.name);
+                state.remove_resource(
+                    &resource.id.provider,
+                    &resource.id.resource_type,
+                    &resource.id.name,
+                );
             }
         }
     }
@@ -585,7 +593,7 @@ pub fn build_state_after_apply(save: ApplyStateSave<'_>) -> Result<StateFile, Ap
         if let Effect::Delete { id, .. } = effect
             && successfully_deleted.contains(id)
         {
-            state.remove_resource(&id.resource_type, &id.name);
+            state.remove_resource(&id.provider, &id.resource_type, &id.name);
         }
     }
 

@@ -134,7 +134,7 @@ async fn refresh_pending_states_updates_saved_state_from_provider_read() {
     })
     .unwrap();
 
-    let saved_resource = saved.find_resource("s3.bucket", "bucket").unwrap();
+    let saved_resource = saved.find_resource("aws", "s3.bucket", "bucket").unwrap();
     assert_eq!(
         saved_resource.attributes.get("status"),
         Some(&json!("after"))
@@ -181,7 +181,7 @@ async fn refresh_pending_states_removes_not_found_resource_from_saved_state() {
     })
     .unwrap();
 
-    assert!(saved.find_resource("s3.bucket", "bucket").is_none());
+    assert!(saved.find_resource("aws", "s3.bucket", "bucket").is_none());
 }
 
 #[tokio::test]
@@ -227,7 +227,7 @@ async fn refresh_pending_states_does_not_overwrite_with_stale_snapshot_when_refr
     })
     .unwrap();
 
-    let saved_resource = saved.find_resource("s3.bucket", "bucket").unwrap();
+    let saved_resource = saved.find_resource("aws", "s3.bucket", "bucket").unwrap();
     assert_eq!(
         saved_resource.attributes.get("status"),
         Some(&json!("saved"))
