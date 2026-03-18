@@ -1,0 +1,19 @@
+# EC2 VPC - Tag deletion test (Step 1: Initial with two tags)
+#
+# Creates a VPC with two tags. Step 2 removes one tag to test
+# that CloudControl "remove" patch is used for the removed key.
+
+provider awscc {
+  region = awscc.Region.ap_northeast_1
+}
+
+let vpc = awscc.ec2.vpc {
+  cidr_block           = "10.100.0.0/16"
+  enable_dns_support   = true
+  enable_dns_hostnames = true
+
+  tags = {
+    Environment = "acceptance-test"
+    ToBeRemoved = "this-tag-will-be-deleted"
+  }
+}
