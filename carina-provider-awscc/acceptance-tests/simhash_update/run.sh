@@ -104,20 +104,35 @@ run_plan_verify() {
 }
 
 # Cleanup helper: try to destroy with both step configs, then retry
+# Returns 0 if at least one destroy succeeded, 1 if ALL failed
 cleanup() {
     local work_dir="$1"
     local step2="$2"
     local step1="$3"
+    local any_success=false
 
     # Disable set -e to ensure all destroy attempts run
     set +e
     echo "  Cleanup: destroying resources..."
-    cd "$work_dir" && "$CARINA_BIN" destroy --auto-approve "$step2" 2>&1
-    cd "$work_dir" && "$CARINA_BIN" destroy --auto-approve "$step1" 2>&1
+    if cd "$work_dir" && "$CARINA_BIN" destroy --auto-approve "$step2" 2>&1; then
+        any_success=true
+    fi
+    if cd "$work_dir" && "$CARINA_BIN" destroy --auto-approve "$step1" 2>&1; then
+        any_success=true
+    fi
     # Retry: resources may have dependencies that prevent deletion on first pass
-    cd "$work_dir" && "$CARINA_BIN" destroy --auto-approve "$step2" 2>&1
-    cd "$work_dir" && "$CARINA_BIN" destroy --auto-approve "$step1" 2>&1
+    if cd "$work_dir" && "$CARINA_BIN" destroy --auto-approve "$step2" 2>&1; then
+        any_success=true
+    fi
+    if cd "$work_dir" && "$CARINA_BIN" destroy --auto-approve "$step1" 2>&1; then
+        any_success=true
+    fi
     set -e
+
+    if [ "$any_success" = false ]; then
+        return 1
+    fi
+    return 0
 }
 
 # Run a single multi-step test
@@ -177,11 +192,41 @@ run_test() {
     fi
 
     # Step 4: Destroy (use cleanup to try both configs and retry)
-    cleanup "$work_dir" "$step2" "$step1"
+    if ! cleanup "$work_dir" "$step2" "$step1"; then
+        echo "  WARNING: All destroy attempts failed. Preserving work dir for debugging:"
+        echo "    $work_dir"
+        TOTAL_FAILED=$((TOTAL_FAILED + 1))
+        ACTIVE_WORK_DIR=""
+        echo ""
+        return 1
+    fi
 
     rm -rf "$work_dir"
     ACTIVE_WORK_DIR=""
     echo ""
+}
+
+# Single-step cleanup helper: try to destroy with one config, then retry
+# Returns 0 if at least one destroy succeeded, 1 if ALL failed
+cleanup_single() {
+    local work_dir="$1"
+    local crn_file="$2"
+    local any_success=false
+
+    set +e
+    echo "  Cleanup: destroying resources..."
+    if cd "$work_dir" && "$CARINA_BIN" destroy --auto-approve "$crn_file" 2>&1; then
+        any_success=true
+    fi
+    if cd "$work_dir" && "$CARINA_BIN" destroy --auto-approve "$crn_file" 2>&1; then
+        any_success=true
+    fi
+    set -e
+
+    if [ "$any_success" = false ]; then
+        return 1
+    fi
+    return 0
 }
 
 # Run a single-step test (apply + plan-verify + destroy, no update)
@@ -209,11 +254,7 @@ run_test_single() {
 
     # Step 1: Apply
     if ! run_step "$work_dir" "step1: apply" "apply" "$crn_file" "--auto-approve"; then
-        set +e
-        echo "  Cleanup: destroying resources..."
-        cd "$work_dir" && "$CARINA_BIN" destroy --auto-approve "$crn_file" 2>&1
-        cd "$work_dir" && "$CARINA_BIN" destroy --auto-approve "$crn_file" 2>&1
-        set -e
+        cleanup_single "$work_dir" "$crn_file"
         rm -rf "$work_dir"
         ACTIVE_WORK_DIR=""
         return 1
@@ -221,22 +262,21 @@ run_test_single() {
 
     # Step 2: Plan-verify (idempotency check)
     if ! run_plan_verify "$work_dir" "step2: plan-verify" "$crn_file"; then
-        set +e
-        echo "  Cleanup: destroying resources..."
-        cd "$work_dir" && "$CARINA_BIN" destroy --auto-approve "$crn_file" 2>&1
-        cd "$work_dir" && "$CARINA_BIN" destroy --auto-approve "$crn_file" 2>&1
-        set -e
+        cleanup_single "$work_dir" "$crn_file"
         rm -rf "$work_dir"
         ACTIVE_WORK_DIR=""
         return 1
     fi
 
-    # Step 3: Destroy (retry to handle transient failures)
-    set +e
-    echo "  Cleanup: destroying resources..."
-    cd "$work_dir" && "$CARINA_BIN" destroy --auto-approve "$crn_file" 2>&1
-    cd "$work_dir" && "$CARINA_BIN" destroy --auto-approve "$crn_file" 2>&1
-    set -e
+    # Step 3: Destroy
+    if ! cleanup_single "$work_dir" "$crn_file"; then
+        echo "  WARNING: All destroy attempts failed. Preserving work dir for debugging:"
+        echo "    $work_dir"
+        TOTAL_FAILED=$((TOTAL_FAILED + 1))
+        ACTIVE_WORK_DIR=""
+        echo ""
+        return 1
+    fi
 
     rm -rf "$work_dir"
     ACTIVE_WORK_DIR=""
