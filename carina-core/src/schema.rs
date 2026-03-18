@@ -588,11 +588,12 @@ impl AttributeSchema {
     }
 
     /// Whether this attribute can be removed from infrastructure.
-    /// Auto-detected: optional (not required) and mutable (not create-only) attributes
-    /// are removable by default. Can be overridden with `.removable()` or `.non_removable()`.
+    /// Auto-detected: optional (not required), mutable (not create-only), and writable
+    /// (not read-only) attributes are removable by default. Can be overridden with
+    /// `.removable()` or `.non_removable()`.
     pub fn is_removable(&self) -> bool {
         self.removable
-            .unwrap_or(!self.required && !self.create_only)
+            .unwrap_or(!self.required && !self.create_only && !self.read_only)
     }
 
     pub fn with_default(mut self, value: Value) -> Self {
