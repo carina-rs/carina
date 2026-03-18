@@ -1293,6 +1293,16 @@ impl StateBackend for MockBackend {
         self.lock_released.store(true, Ordering::SeqCst);
         Ok(())
     }
+    async fn renew_lock(&self, lock: &LockInfo) -> carina_state::BackendResult<LockInfo> {
+        Ok(lock.renewed())
+    }
+    async fn write_state_locked(
+        &self,
+        state: &carina_state::StateFile,
+        _lock: &LockInfo,
+    ) -> carina_state::BackendResult<()> {
+        self.write_state(state).await
+    }
     async fn force_unlock(&self, _lock_id: &str) -> carina_state::BackendResult<()> {
         Ok(())
     }
