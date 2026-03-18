@@ -2,7 +2,8 @@
 //!
 //! AWS Provider implementation
 
-mod ec2_helpers;
+mod ec2_security_group_rules;
+mod ec2_tags;
 mod factory;
 mod normalizer;
 mod provider;
