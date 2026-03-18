@@ -1,0 +1,21 @@
+# S3 Bucket - Tag deletion test (Step 2: Remove one tag)
+#
+# Same bucket as step 1, but with the "ToBeRemoved" tag deleted.
+# After apply, the tag should be removed via CloudControl "remove"
+# patch and plan should show no changes (idempotent).
+
+provider awscc {
+  region = awscc.Region.ap_northeast_1
+}
+
+let bucket = awscc.s3.bucket {
+  bucket_name_prefix = "carina-acc-test-tag-del-"
+
+  tags = {
+    Environment = "acceptance-test"
+  }
+
+  lifecycle {
+    force_delete = true
+  }
+}

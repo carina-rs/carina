@@ -1,0 +1,15 @@
+# EC2 VPC - Tag deletion test (Step 3: Remove entire tags block)
+#
+# Same VPC as step 1, but with the tags block completely removed.
+# Tests that the differ detects attribute removal when a key exists
+# in current state but is absent from desired state.
+
+provider awscc {
+  region = awscc.Region.ap_northeast_1
+}
+
+let vpc = awscc.ec2.vpc {
+  cidr_block           = "10.100.0.0/16"
+  enable_dns_support   = true
+  enable_dns_hostnames = true
+}

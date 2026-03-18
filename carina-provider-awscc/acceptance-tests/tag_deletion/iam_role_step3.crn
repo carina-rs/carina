@@ -1,0 +1,22 @@
+# IAM Role - Tag deletion test (Step 3: Remove entire tags block)
+#
+# Same role as step 1, but with the tags block completely removed.
+# Tests that the differ detects attribute removal when a key exists
+# in current state but is absent from desired state.
+
+provider awscc {
+  region = awscc.Region.ap_northeast_1
+}
+
+let role = awscc.iam.role {
+  role_name_prefix = "carina-acc-test-tag-del-"
+
+  assume_role_policy_document = {
+    version = "2012-10-17"
+    statement {
+      effect    = "Allow"
+      principal = { service = "lambda.amazonaws.com" }
+      action    = "sts:AssumeRole"
+    }
+  }
+}
