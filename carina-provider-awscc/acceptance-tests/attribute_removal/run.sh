@@ -6,6 +6,7 @@
 #
 # Tests:
 #   ec2_vpc_endpoint - Remove policy_document from VPC endpoint
+#   logs_log_group   - Remove retention_in_days from log group
 #
 # Filter (optional): substring to match test names (e.g. "ec2_vpc_endpoint")
 
@@ -188,6 +189,12 @@ run_test "ec2_vpc_endpoint" \
     "$SCRIPT_DIR/ec2_vpc_endpoint_step1.crn" \
     "$SCRIPT_DIR/ec2_vpc_endpoint_step2.crn" \
     "Test 1: EC2 VPC Endpoint (remove policy_document)"
+
+# Test 2: Logs Log Group - remove retention_in_days via CloudControl "remove" patch
+run_test "logs_log_group" \
+    "$SCRIPT_DIR/logs_log_group_step1.crn" \
+    "$SCRIPT_DIR/logs_log_group_step2.crn" \
+    "Test 2: Logs Log Group (remove retention_in_days)"
 
 echo "════════════════════════════════════════"
 echo "Total: $TOTAL_PASSED passed, $TOTAL_FAILED failed"
