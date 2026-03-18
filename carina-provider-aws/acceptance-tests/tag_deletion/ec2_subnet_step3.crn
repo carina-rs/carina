@@ -1,0 +1,24 @@
+# EC2 Subnet - Tag deletion test (Step 3: Remove entire tags block)
+#
+# Same VPC and subnet as step 1, but with the tags block completely
+# removed from the subnet. Tests that the differ detects attribute
+# removal when a key exists in current state but is absent from desired
+# state (issue #447).
+
+provider aws {
+  region = aws.Region.ap_northeast_1
+}
+
+let vpc = aws.ec2.vpc {
+  cidr_block = "10.105.0.0/16"
+
+  tags = {
+    Environment = "acceptance-test"
+  }
+}
+
+aws.ec2.subnet {
+  vpc_id            = vpc.vpc_id
+  cidr_block        = "10.105.1.0/24"
+  availability_zone = aws.AvailabilityZone.ap_northeast_1a
+}

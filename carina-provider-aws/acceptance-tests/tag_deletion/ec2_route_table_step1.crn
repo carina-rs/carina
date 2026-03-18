@@ -1,0 +1,25 @@
+# EC2 Route Table - Tag deletion test (Step 1: Initial with two tags)
+#
+# Creates a VPC and route table with two tags. Step 2 removes one tag
+# to test that delete_tags is called for the removed key.
+
+provider aws {
+  region = aws.Region.ap_northeast_1
+}
+
+let vpc = aws.ec2.vpc {
+  cidr_block = "10.104.0.0/16"
+
+  tags = {
+    Environment = "acceptance-test"
+  }
+}
+
+aws.ec2.route_table {
+  vpc_id = vpc.vpc_id
+
+  tags = {
+    Environment = "acceptance-test"
+    ToBeRemoved = "this-tag-will-be-deleted"
+  }
+}
