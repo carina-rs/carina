@@ -227,7 +227,8 @@ fn test_extract_ec2_route_attributes_with_nat_gateway() {
 }
 
 #[test]
-fn test_extract_ec2_route_attributes_with_transit_gateway() {
+fn test_extract_ec2_route_attributes_ignores_unsupported() {
+    // transit_gateway_id is not in the schema, so it should not be extracted
     let route = aws_sdk_ec2::types::Route::builder()
         .destination_cidr_block("172.16.0.0/12")
         .transit_gateway_id("tgw-12345678")
@@ -235,9 +236,10 @@ fn test_extract_ec2_route_attributes_with_transit_gateway() {
     let mut attributes = HashMap::new();
     AwsProvider::extract_ec2_route_attributes(&route, &mut attributes);
     assert_eq!(
-        attributes.get("transit_gateway_id"),
-        Some(&Value::String("tgw-12345678".to_string()))
+        attributes.get("destination_cidr_block"),
+        Some(&Value::String("172.16.0.0/12".to_string()))
     );
+    assert_eq!(attributes.get("transit_gateway_id"), None);
 }
 
 // --- extract_ec2_security_group_attributes tests ---
