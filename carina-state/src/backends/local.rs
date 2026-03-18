@@ -243,8 +243,31 @@ impl StateBackend for LocalBackend {
             BackendError::Serialization(format!("Failed to serialize state: {}", e))
         })?;
 
-        std::fs::write(&self.state_path, content)
-            .map_err(|e| BackendError::Io(format!("Failed to write state file: {}", e)))?;
+        // Write to a temp file in the same directory, then rename atomically
+        let tmp_path = self.state_path.with_extension("json.tmp");
+
+        let mut file = std::fs::File::create(&tmp_path)
+            .map_err(|e| BackendError::Io(format!("Failed to create temp state file: {}", e)))?;
+
+        file.write_all(content.as_bytes()).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp_path);
+            BackendError::Io(format!("Failed to write temp state file: {}", e))
+        })?;
+
+        file.sync_all().map_err(|e| {
+            let _ = std::fs::remove_file(&tmp_path);
+            BackendError::Io(format!("Failed to sync temp state file: {}", e))
+        })?;
+
+        std::fs::rename(&tmp_path, &self.state_path)
+            .map_err(|e| BackendError::Io(format!("Failed to rename temp state file: {}", e)))?;
+
+        // Fsync the parent directory to ensure the rename is durable
+        if let Some(parent) = self.state_path.parent()
+            && let Ok(dir) = std::fs::File::open(parent)
+        {
+            let _ = dir.sync_all();
+        }
 
         Ok(())
     }
@@ -598,6 +621,52 @@ mod tests {
 
         let backend = LocalBackend::from_config(&config).unwrap();
         assert_eq!(backend.state_path(), &PathBuf::from("custom.state.json"));
+    }
+
+    #[tokio::test]
+    async fn test_write_state_is_atomic() {
+        let dir = tempdir().unwrap();
+        let state_path = dir.path().join("test.state.json");
+        let backend = LocalBackend::with_path(state_path.clone());
+
+        // Write state
+        let mut state_file = StateFile::new();
+        state_file.increment_serial();
+        backend.write_state(&state_file).await.unwrap();
+
+        // Verify the state file contains valid JSON (not partial/corrupt)
+        let content = std::fs::read_to_string(&state_path).unwrap();
+        let parsed: StateFile = serde_json::from_str(&content).unwrap();
+        assert_eq!(parsed.serial, 1);
+
+        // Verify no temp file is left behind
+        let tmp_path = state_path.with_extension("json.tmp");
+        assert!(!tmp_path.exists(), "temp file should be cleaned up");
+    }
+
+    #[tokio::test]
+    async fn test_write_state_overwrites_existing_atomically() {
+        let dir = tempdir().unwrap();
+        let state_path = dir.path().join("test.state.json");
+        let backend = LocalBackend::with_path(state_path.clone());
+
+        // Write initial state
+        let mut state_file = StateFile::new();
+        state_file.increment_serial();
+        backend.write_state(&state_file).await.unwrap();
+
+        // Overwrite with new state
+        state_file.increment_serial();
+        backend.write_state(&state_file).await.unwrap();
+
+        // Verify the file contains the updated state (not corrupted)
+        let content = std::fs::read_to_string(&state_path).unwrap();
+        let parsed: StateFile = serde_json::from_str(&content).unwrap();
+        assert_eq!(parsed.serial, 2);
+
+        // Verify no temp file is left behind
+        let tmp_path = state_path.with_extension("json.tmp");
+        assert!(!tmp_path.exists(), "temp file should be cleaned up");
     }
 
     #[test]
