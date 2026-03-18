@@ -582,9 +582,17 @@ fi
 echo "Running '$COMMAND' on ${#TESTS[@]} test file(s):"
 echo ""
 
+# Use per-test isolated state directories for commands that touch state
+# (plan/apply/destroy) to prevent cross-contamination between tests (issue #839)
+if [ "$COMMAND" != "validate" ]; then
+    WORK_DIR=$(mktemp -d)
+    trap "rm -rf $WORK_DIR; release_account_locks" EXIT
+fi
+
 PASSED=0
 FAILED=0
 ERRORS=()
+TEST_INDEX=0
 
 for TEST_FILE in "${TESTS[@]}"; do
     REL_PATH="${TEST_FILE#$SCRIPT_DIR/}"
@@ -594,11 +602,22 @@ for TEST_FILE in "${TESTS[@]}"; do
     if [ "$COMMAND" = "apply" ] || [ "$COMMAND" = "destroy" ]; then
         AUTO_APPROVE="--auto-approve"
     fi
-    if OUTPUT=$("$CARINA_BIN" "$COMMAND" $AUTO_APPROVE "$TEST_FILE" 2>&1); then
+
+    # Run from an isolated state directory for stateful commands
+    RUN_PREFIX=""
+    if [ "$COMMAND" != "validate" ]; then
+        STATE_DIR="$WORK_DIR/test_${TEST_INDEX}"
+        mkdir -p "$STATE_DIR"
+        RUN_PREFIX="cd $STATE_DIR &&"
+        TEST_INDEX=$((TEST_INDEX + 1))
+    fi
+
+    if OUTPUT=$(eval "$RUN_PREFIX \"$CARINA_BIN\" \"$COMMAND\" $AUTO_APPROVE \"$TEST_FILE\"" 2>&1); then
         if [ "$COMMAND" = "apply" ]; then
             # Post-apply plan verification (idempotency check)
-            PLAN_OUTPUT=$("$CARINA_BIN" plan --detailed-exitcode "$TEST_FILE" 2>&1)
-            PLAN_RC=$?
+            # Use || to capture non-zero exit codes without triggering set -e
+            PLAN_RC=0
+            PLAN_OUTPUT=$(eval "$RUN_PREFIX \"$CARINA_BIN\" plan --detailed-exitcode \"$TEST_FILE\"" 2>&1) || PLAN_RC=$?
             if [ $PLAN_RC -eq 2 ]; then
                 echo "FAIL (plan-verify)"
                 ERRORS+=("$REL_PATH: Post-apply plan detected changes (not idempotent): $PLAN_OUTPUT")
