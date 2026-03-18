@@ -108,20 +108,35 @@ run_plan_verify() {
 }
 
 # Cleanup helper: try to destroy with both step configs, then retry
+# Returns 0 if at least one destroy succeeded, 1 if ALL failed
 cleanup() {
     local work_dir="$1"
     local step2="$2"
     local step1="$3"
+    local any_success=false
 
     # Disable set -e to ensure all destroy attempts run
     set +e
     echo "  Cleanup: destroying resources..."
-    cd "$work_dir" && "$CARINA_BIN" destroy --auto-approve "$step2" 2>&1
-    cd "$work_dir" && "$CARINA_BIN" destroy --auto-approve "$step1" 2>&1
+    if cd "$work_dir" && "$CARINA_BIN" destroy --auto-approve "$step2" 2>&1; then
+        any_success=true
+    fi
+    if cd "$work_dir" && "$CARINA_BIN" destroy --auto-approve "$step1" 2>&1; then
+        any_success=true
+    fi
     # Retry: resources may have dependencies that prevent deletion on first pass
-    cd "$work_dir" && "$CARINA_BIN" destroy --auto-approve "$step2" 2>&1
-    cd "$work_dir" && "$CARINA_BIN" destroy --auto-approve "$step1" 2>&1
+    if cd "$work_dir" && "$CARINA_BIN" destroy --auto-approve "$step2" 2>&1; then
+        any_success=true
+    fi
+    if cd "$work_dir" && "$CARINA_BIN" destroy --auto-approve "$step1" 2>&1; then
+        any_success=true
+    fi
     set -e
+
+    if [ "$any_success" = false ]; then
+        return 1
+    fi
+    return 0
 }
 
 # Run a single multi-step tag deletion test
@@ -181,7 +196,14 @@ run_test() {
     fi
 
     # Step 4: Destroy (use cleanup to try both configs and retry)
-    cleanup "$work_dir" "$step2" "$step1"
+    if ! cleanup "$work_dir" "$step2" "$step1"; then
+        echo "  WARNING: All destroy attempts failed. Preserving work dir for debugging:"
+        echo "    $work_dir"
+        TOTAL_FAILED=$((TOTAL_FAILED + 1))
+        ACTIVE_WORK_DIR=""
+        echo ""
+        return 1
+    fi
 
     rm -rf "$work_dir"
     ACTIVE_WORK_DIR=""
