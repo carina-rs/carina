@@ -437,7 +437,7 @@ pub fn s3_resources() -> Vec<ResourceDef> {
         ResourceDef {
             name: "s3.bucket",
             service_namespace: "com.amazonaws.s3",
-            simple_delete: true,
+            simple_delete: false, // manually implemented to support lifecycle.force_delete
             noop_update: false,
             create_op: "CreateBucket",
             read_structure: None,

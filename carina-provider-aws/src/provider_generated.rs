@@ -90,24 +90,8 @@ impl AwsProvider {
         Ok(())
     }
 
-    /// Delete s3.bucket (generated)
-    pub(crate) async fn delete_s3_bucket(
-        &self,
-        id: ResourceId,
-        identifier: &str,
-    ) -> ProviderResult<()> {
-        self.s3_client
-            .delete_bucket()
-            .bucket(identifier)
-            .send()
-            .await
-            .map_err(|e| {
-                ProviderError::new("Failed to delete bucket")
-                    .with_cause(e)
-                    .for_resource(id.clone())
-            })?;
-        Ok(())
-    }
+    // Note: delete_s3_bucket is manually implemented in services/s3/bucket.rs
+    // to support lifecycle.force_delete (emptying bucket before deletion).
 
     /// Update ec2.internet_gateway: apply tag changes and read back (generated)
     pub(crate) async fn update_ec2_internet_gateway(

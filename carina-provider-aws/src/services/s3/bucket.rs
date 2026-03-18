@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use carina_core::provider::{ProviderError, ProviderResult};
-use carina_core::resource::{Resource, ResourceId, State, Value};
+use carina_core::resource::{LifecycleConfig, Resource, ResourceId, State, Value};
 use carina_core::utils::{convert_enum_value, extract_enum_value};
 
 use crate::AwsProvider;
@@ -196,6 +196,123 @@ impl AwsProvider {
         }
 
         self.read_s3_bucket(&id, Some(&bucket_name)).await
+    }
+
+    /// Delete an S3 bucket, honoring lifecycle.force_delete
+    pub(crate) async fn delete_s3_bucket(
+        &self,
+        id: ResourceId,
+        identifier: &str,
+        lifecycle: &LifecycleConfig,
+    ) -> ProviderResult<()> {
+        // If force_delete is enabled, empty the bucket before deletion
+        if lifecycle.force_delete {
+            self.empty_s3_bucket(&id, identifier).await?;
+        }
+
+        self.s3_client
+            .delete_bucket()
+            .bucket(identifier)
+            .send()
+            .await
+            .map_err(|e| {
+                ProviderError::new("Failed to delete bucket")
+                    .with_cause(e)
+                    .for_resource(id.clone())
+            })?;
+        Ok(())
+    }
+
+    /// Empty an S3 bucket by deleting all objects and versions
+    async fn empty_s3_bucket(&self, id: &ResourceId, bucket_name: &str) -> ProviderResult<()> {
+        let mut key_marker: Option<String> = None;
+        let mut version_id_marker: Option<String> = None;
+
+        loop {
+            let mut req = self
+                .s3_client
+                .list_object_versions()
+                .bucket(bucket_name)
+                .max_keys(1000);
+            if let Some(ref km) = key_marker {
+                req = req.key_marker(km);
+            }
+            if let Some(ref vim) = version_id_marker {
+                req = req.version_id_marker(vim);
+            }
+
+            let response = req.send().await.map_err(|e| {
+                ProviderError::new("Failed to list object versions")
+                    .with_cause(e)
+                    .for_resource(id.clone())
+            })?;
+
+            let mut objects_to_delete = Vec::new();
+
+            // Collect versions
+            for version in response.versions() {
+                if let Some(key) = version.key() {
+                    let mut oid = aws_sdk_s3::types::ObjectIdentifier::builder().key(key);
+                    if let Some(vid) = version.version_id() {
+                        oid = oid.version_id(vid);
+                    }
+                    objects_to_delete.push(oid.build().map_err(|e| {
+                        ProviderError::new("Failed to build ObjectIdentifier")
+                            .with_cause(e)
+                            .for_resource(id.clone())
+                    })?);
+                }
+            }
+
+            // Collect delete markers
+            for marker in response.delete_markers() {
+                if let Some(key) = marker.key() {
+                    let mut oid = aws_sdk_s3::types::ObjectIdentifier::builder().key(key);
+                    if let Some(vid) = marker.version_id() {
+                        oid = oid.version_id(vid);
+                    }
+                    objects_to_delete.push(oid.build().map_err(|e| {
+                        ProviderError::new("Failed to build ObjectIdentifier")
+                            .with_cause(e)
+                            .for_resource(id.clone())
+                    })?);
+                }
+            }
+
+            // Batch delete (max 1000 per request)
+            if !objects_to_delete.is_empty() {
+                let delete = aws_sdk_s3::types::Delete::builder()
+                    .set_objects(Some(objects_to_delete))
+                    .quiet(true)
+                    .build()
+                    .map_err(|e| {
+                        ProviderError::new("Failed to build Delete request")
+                            .with_cause(e)
+                            .for_resource(id.clone())
+                    })?;
+
+                self.s3_client
+                    .delete_objects()
+                    .bucket(bucket_name)
+                    .delete(delete)
+                    .send()
+                    .await
+                    .map_err(|e| {
+                        ProviderError::new("Failed to delete objects")
+                            .with_cause(e)
+                            .for_resource(id.clone())
+                    })?;
+            }
+
+            if response.is_truncated() == Some(true) {
+                key_marker = response.next_key_marker().map(|s| s.to_string());
+                version_id_marker = response.next_version_id_marker().map(|s| s.to_string());
+            } else {
+                break;
+            }
+        }
+
+        Ok(())
     }
 
     /// Read S3 bucket ownership controls
