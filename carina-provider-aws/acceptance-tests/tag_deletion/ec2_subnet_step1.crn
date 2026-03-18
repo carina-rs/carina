@@ -1,0 +1,27 @@
+# EC2 Subnet - Tag deletion test (Step 1: Initial with two tags)
+#
+# Creates a VPC and subnet with two tags. Step 2 removes one tag
+# to test that delete_tags is called for the removed key.
+
+provider aws {
+  region = aws.Region.ap_northeast_1
+}
+
+let vpc = aws.ec2.vpc {
+  cidr_block = "10.105.0.0/16"
+
+  tags = {
+    Environment = "acceptance-test"
+  }
+}
+
+aws.ec2.subnet {
+  vpc_id            = vpc.vpc_id
+  cidr_block        = "10.105.1.0/24"
+  availability_zone = aws.AvailabilityZone.ap_northeast_1a
+
+  tags = {
+    Environment = "acceptance-test"
+    ToBeRemoved = "this-tag-will-be-deleted"
+  }
+}

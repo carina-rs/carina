@@ -1,0 +1,27 @@
+# EC2 Subnet - Tag deletion test (Step 2: Remove one tag)
+#
+# Same VPC and subnet as step 1, but with the "ToBeRemoved" tag
+# deleted. After apply, the tag should be removed from AWS and plan
+# should show no changes (idempotent).
+
+provider aws {
+  region = aws.Region.ap_northeast_1
+}
+
+let vpc = aws.ec2.vpc {
+  cidr_block = "10.105.0.0/16"
+
+  tags = {
+    Environment = "acceptance-test"
+  }
+}
+
+aws.ec2.subnet {
+  vpc_id            = vpc.vpc_id
+  cidr_block        = "10.105.1.0/24"
+  availability_zone = aws.AvailabilityZone.ap_northeast_1a
+
+  tags = {
+    Environment = "acceptance-test"
+  }
+}
