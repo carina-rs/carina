@@ -189,33 +189,59 @@ impl AwsProvider {
                 })?;
         }
 
+        // The ModifySubnetAttribute API only allows modifying one attribute at a time.
+        // Each private_dns_name_options_on_launch field must be a separate API call.
         if let Some(Value::Map(fields)) = attributes.get("private_dns_name_options_on_launch") {
-            let mut req = self
-                .ec2_client
-                .modify_subnet_attribute()
-                .subnet_id(subnet_id);
-
             if let Some(Value::String(ht)) = fields.get("hostname_type") {
                 let hostname_val = convert_enum_value(ht);
-                req = req
-                    .private_dns_hostname_type_on_launch(HostnameType::from(hostname_val.as_str()));
+                self.ec2_client
+                    .modify_subnet_attribute()
+                    .subnet_id(subnet_id)
+                    .private_dns_hostname_type_on_launch(HostnameType::from(hostname_val.as_str()))
+                    .send()
+                    .await
+                    .map_err(|e| {
+                        ProviderError::new(
+                            "Failed to set private_dns_name_options_on_launch.hostname_type",
+                        )
+                        .with_cause(e)
+                        .for_resource(id.clone())
+                    })?;
             }
             if let Some(Value::Bool(v)) = fields.get("enable_resource_name_dns_a_record") {
-                req = req.enable_resource_name_dns_a_record_on_launch(
-                    AttributeBooleanValue::builder().value(*v).build(),
-                );
+                self.ec2_client
+                    .modify_subnet_attribute()
+                    .subnet_id(subnet_id)
+                    .enable_resource_name_dns_a_record_on_launch(
+                        AttributeBooleanValue::builder().value(*v).build(),
+                    )
+                    .send()
+                    .await
+                    .map_err(|e| {
+                        ProviderError::new(
+                            "Failed to set private_dns_name_options_on_launch.enable_resource_name_dns_a_record",
+                        )
+                        .with_cause(e)
+                        .for_resource(id.clone())
+                    })?;
             }
             if let Some(Value::Bool(v)) = fields.get("enable_resource_name_dns_aaaa_record") {
-                req = req.enable_resource_name_dns_aaaa_record_on_launch(
-                    AttributeBooleanValue::builder().value(*v).build(),
-                );
+                self.ec2_client
+                    .modify_subnet_attribute()
+                    .subnet_id(subnet_id)
+                    .enable_resource_name_dns_aaaa_record_on_launch(
+                        AttributeBooleanValue::builder().value(*v).build(),
+                    )
+                    .send()
+                    .await
+                    .map_err(|e| {
+                        ProviderError::new(
+                            "Failed to set private_dns_name_options_on_launch.enable_resource_name_dns_aaaa_record",
+                        )
+                        .with_cause(e)
+                        .for_resource(id.clone())
+                    })?;
             }
-
-            req.send().await.map_err(|e| {
-                ProviderError::new("Failed to set private_dns_name_options_on_launch")
-                    .with_cause(e)
-                    .for_resource(id.clone())
-            })?;
         }
 
         Ok(())
