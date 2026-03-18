@@ -1,0 +1,26 @@
+# EC2 VPC Endpoint (Interface) - in-place update test (step 1)
+#
+# Tests: create interface endpoint with private_dns_enabled=false
+
+provider awscc {
+  region = awscc.Region.ap_northeast_1
+}
+
+let vpc = awscc.ec2.vpc {
+  cidr_block           = "10.108.0.0/16"
+  enable_dns_support   = true
+  enable_dns_hostnames = true
+}
+
+let sg = awscc.ec2.security_group {
+  vpc_id            = vpc.vpc_id
+  group_description = "SG for interface endpoint test"
+}
+
+awscc.ec2.vpc_endpoint {
+  vpc_id              = vpc.vpc_id
+  service_name        = "com.amazonaws.ap-northeast-1.sts"
+  vpc_endpoint_type   = Interface
+  security_group_ids  = [sg.group_id]
+  private_dns_enabled = false
+}
