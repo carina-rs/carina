@@ -201,6 +201,18 @@ impl ModuleResolver {
             input_values.insert(input.name.clone(), value);
         }
 
+        // Collect intra-module binding names so we can rewrite ResourceRefs
+        let intra_module_bindings: HashSet<String> = module
+            .resources
+            .iter()
+            .filter_map(|r| {
+                r.attributes.get("_binding").and_then(|v| match v {
+                    Value::String(s) => Some(s.clone()),
+                    _ => None,
+                })
+            })
+            .collect();
+
         // Expand resources with substituted values
         let mut expanded_resources = Vec::new();
         for resource in &module.resources {
@@ -214,6 +226,14 @@ impl ModuleResolver {
                 new_name.clone(),
             );
 
+            // Rewrite _binding with instance prefix
+            if let Some(Value::String(binding)) = new_resource.attributes.get("_binding") {
+                let prefixed = format!("{}_{}", instance_prefix, binding);
+                new_resource
+                    .attributes
+                    .insert("_binding".to_string(), Value::String(prefixed));
+            }
+
             // Add module source info
             new_resource.attributes.insert(
                 "_module".to_string(),
@@ -224,10 +244,16 @@ impl ModuleResolver {
                 Value::String(instance_prefix.to_string()),
             );
 
-            // Substitute input references
+            // Rewrite intra-module ResourceRefs BEFORE substituting inputs.
+            // This ensures that caller-provided ResourceRef values (which may
+            // coincidentally share a binding name with a module-internal binding)
+            // are not incorrectly prefixed.
             let mut substituted_attrs = HashMap::new();
             for (key, value) in &new_resource.attributes {
-                substituted_attrs.insert(key.clone(), substitute_inputs(value, &input_values));
+                let rewritten =
+                    rewrite_intra_module_refs(value, instance_prefix, &intra_module_bindings);
+                let substituted = substitute_inputs(&rewritten, &input_values);
+                substituted_attrs.insert(key.clone(), substituted);
             }
             new_resource.attributes = substituted_attrs;
 
@@ -255,6 +281,43 @@ fn substitute_inputs(value: &Value, inputs: &HashMap<String, Value>) -> Value {
         Value::Map(map) => Value::Map(
             map.iter()
                 .map(|(k, v)| (k.clone(), substitute_inputs(v, inputs)))
+                .collect(),
+        ),
+        _ => value.clone(),
+    }
+}
+
+/// Rewrite intra-module ResourceRef binding names with instance prefix.
+///
+/// When a ResourceRef's binding_name matches one of the module's own bindings,
+/// prefix it so that each module instance has isolated references.
+fn rewrite_intra_module_refs(
+    value: &Value,
+    instance_prefix: &str,
+    intra_module_bindings: &HashSet<String>,
+) -> Value {
+    match value {
+        Value::ResourceRef {
+            binding_name,
+            attribute_name,
+        } if intra_module_bindings.contains(binding_name) => Value::ResourceRef {
+            binding_name: format!("{}_{}", instance_prefix, binding_name),
+            attribute_name: attribute_name.clone(),
+        },
+        Value::List(items) => Value::List(
+            items
+                .iter()
+                .map(|v| rewrite_intra_module_refs(v, instance_prefix, intra_module_bindings))
+                .collect(),
+        ),
+        Value::Map(map) => Value::Map(
+            map.iter()
+                .map(|(k, v)| {
+                    (
+                        k.clone(),
+                        rewrite_intra_module_refs(v, instance_prefix, intra_module_bindings),
+                    )
+                })
                 .collect(),
         ),
         _ => value.clone(),
@@ -546,6 +609,137 @@ mod tests {
             sg.attributes.get("_module"),
             Some(&Value::String("test_module".to_string()))
         );
+    }
+
+    /// Module with two resources where one references the other via _binding / ResourceRef.
+    fn create_module_with_intra_refs() -> ParsedFile {
+        ParsedFile {
+            providers: vec![],
+            resources: vec![
+                Resource {
+                    id: ResourceId::new("ec2.vpc", "main_vpc"),
+                    attributes: {
+                        let mut attrs = HashMap::new();
+                        attrs.insert("_binding".to_string(), Value::String("vpc".to_string()));
+                        attrs.insert(
+                            "cidr_block".to_string(),
+                            Value::ResourceRef {
+                                binding_name: "input".to_string(),
+                                attribute_name: "cidr".to_string(),
+                            },
+                        );
+                        attrs
+                    },
+                    read_only: false,
+                    lifecycle: LifecycleConfig::default(),
+                    prefixes: HashMap::new(),
+                },
+                Resource {
+                    id: ResourceId::new("ec2.subnet", "sub"),
+                    attributes: {
+                        let mut attrs = HashMap::new();
+                        attrs.insert("_binding".to_string(), Value::String("subnet".to_string()));
+                        attrs.insert(
+                            "vpc_id".to_string(),
+                            Value::ResourceRef {
+                                binding_name: "vpc".to_string(),
+                                attribute_name: "id".to_string(),
+                            },
+                        );
+                        attrs
+                    },
+                    read_only: false,
+                    lifecycle: LifecycleConfig::default(),
+                    prefixes: HashMap::new(),
+                },
+            ],
+            variables: HashMap::new(),
+            imports: vec![],
+            module_calls: vec![],
+            inputs: vec![InputParameter {
+                name: "cidr".to_string(),
+                type_expr: TypeExpr::String,
+                default: None,
+            }],
+            outputs: vec![],
+            backend: None,
+        }
+    }
+
+    #[test]
+    fn test_multiple_module_instances_no_collision() {
+        let resolver = {
+            let mut r = ModuleResolver::new(".");
+            r.imported_modules
+                .insert("net".to_string(), create_module_with_intra_refs());
+            r
+        };
+
+        let call_a = ModuleCall {
+            module_name: "net".to_string(),
+            binding_name: Some("prod".to_string()),
+            arguments: {
+                let mut args = HashMap::new();
+                args.insert("cidr".to_string(), Value::String("10.0.0.0/16".to_string()));
+                args
+            },
+        };
+        let call_b = ModuleCall {
+            module_name: "net".to_string(),
+            binding_name: Some("staging".to_string()),
+            arguments: {
+                let mut args = HashMap::new();
+                args.insert("cidr".to_string(), Value::String("10.1.0.0/16".to_string()));
+                args
+            },
+        };
+
+        let expanded_a = resolver.expand_module_call(&call_a, "prod").unwrap();
+        let expanded_b = resolver.expand_module_call(&call_b, "staging").unwrap();
+
+        // _binding must be prefixed so they don't collide
+        assert_eq!(
+            expanded_a[0].attributes.get("_binding"),
+            Some(&Value::String("prod_vpc".to_string())),
+            "Instance A vpc _binding should be prefixed"
+        );
+        assert_eq!(
+            expanded_a[1].attributes.get("_binding"),
+            Some(&Value::String("prod_subnet".to_string())),
+            "Instance A subnet _binding should be prefixed"
+        );
+        assert_eq!(
+            expanded_b[0].attributes.get("_binding"),
+            Some(&Value::String("staging_vpc".to_string())),
+            "Instance B vpc _binding should be prefixed"
+        );
+        assert_eq!(
+            expanded_b[1].attributes.get("_binding"),
+            Some(&Value::String("staging_subnet".to_string())),
+            "Instance B subnet _binding should be prefixed"
+        );
+
+        // Intra-module ResourceRef must point to the prefixed binding
+        assert_eq!(
+            expanded_a[1].attributes.get("vpc_id"),
+            Some(&Value::ResourceRef {
+                binding_name: "prod_vpc".to_string(),
+                attribute_name: "id".to_string(),
+            }),
+            "Instance A subnet should reference prod_vpc, not bare vpc"
+        );
+        assert_eq!(
+            expanded_b[1].attributes.get("vpc_id"),
+            Some(&Value::ResourceRef {
+                binding_name: "staging_vpc".to_string(),
+                attribute_name: "id".to_string(),
+            }),
+            "Instance B subnet should reference staging_vpc, not bare vpc"
+        );
+
+        // Resource names should also be distinct
+        assert_eq!(expanded_a[0].id.name, "prod_main_vpc");
+        assert_eq!(expanded_b[0].id.name, "staging_main_vpc");
     }
 
     #[test]
