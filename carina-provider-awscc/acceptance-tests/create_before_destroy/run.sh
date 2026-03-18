@@ -5,10 +5,11 @@
 #   aws-vault exec <profile> -- ./run.sh [filter]
 #
 # Tests:
-#   iam_role - Replacement with temporary name (name_attribute + other create-only)
-#   ec2_vpc  - Replacement without temporary name (no name_attribute)
+#   iam_role                      - Replacement with temporary name (name_attribute + other create-only)
+#   ec2_vpc                       - Replacement without temporary name (no name_attribute)
+#   ec2_transit_gateway_attachment - Replacement with dependent resource rewiring (subnet_ids change)
 #
-# Filter (optional): substring to match test names (e.g. "iam_role", "ec2_vpc")
+# Filter (optional): substring to match test names (e.g. "iam_role", "ec2_vpc", "ec2_transit")
 
 set -e
 
@@ -197,6 +198,13 @@ run_test "ec2_vpc" \
     "$SCRIPT_DIR/ec2_vpc_step1.crn" \
     "$SCRIPT_DIR/ec2_vpc_step2.crn" \
     "Test 2: EC2 VPC (no name_attribute, no temporary name)"
+
+# Test 3: EC2 Transit Gateway Attachment - replacement with dependent resource rewiring
+# subnet_ids is create-only; changing it forces replacement while VPC/TGW refs must be rewired
+run_test "ec2_transit_gateway_attachment" \
+    "$SCRIPT_DIR/ec2_transit_gateway_attachment_step1.crn" \
+    "$SCRIPT_DIR/ec2_transit_gateway_attachment_step2.crn" \
+    "Test 3: EC2 Transit Gateway Attachment (dependent resource rewiring)"
 
 echo "════════════════════════════════════════"
 echo "Total: $TOTAL_PASSED passed, $TOTAL_FAILED failed"
