@@ -70,6 +70,58 @@ run_step() {
     fi
 }
 
+# Extract all resource identifiers from carina.state.json as a sorted newline-separated string.
+# Args: work_dir
+# Outputs: sorted identifiers (one per line), or empty if none found
+get_identifiers() {
+    local work_dir="$1"
+    jq -r '.resources[].identifier // empty' "$work_dir/carina.state.json" 2>/dev/null | sort || true
+}
+
+# Assert that two identifier sets match the expected relationship
+# Args: description ids_after_step1 ids_after_step2 expected("equal"|"different")
+assert_identifiers() {
+    local description="$1"
+    local ids1="$2"
+    local ids2="$3"
+    local expected="$4"
+
+    printf "  %-55s " "$description"
+
+    if [ -z "$ids1" ] || [ -z "$ids2" ]; then
+        echo "FAIL"
+        echo "  ERROR: Could not extract identifiers (step1='$ids1', step2='$ids2')"
+        TOTAL_FAILED=$((TOTAL_FAILED + 1))
+        return 1
+    fi
+
+    if [ "$expected" = "equal" ]; then
+        if [ "$ids1" = "$ids2" ]; then
+            echo "OK"
+            TOTAL_PASSED=$((TOTAL_PASSED + 1))
+            return 0
+        else
+            echo "FAIL"
+            echo "  ERROR: Identifiers changed (expected same):"
+            echo "    before: $ids1"
+            echo "    after:  $ids2"
+            TOTAL_FAILED=$((TOTAL_FAILED + 1))
+            return 1
+        fi
+    else
+        if [ "$ids1" != "$ids2" ]; then
+            echo "OK"
+            TOTAL_PASSED=$((TOTAL_PASSED + 1))
+            return 0
+        else
+            echo "FAIL"
+            echo "  ERROR: Identifiers unchanged (expected different): $ids1"
+            TOTAL_FAILED=$((TOTAL_FAILED + 1))
+            return 1
+        fi
+    fi
+}
+
 run_plan_verify() {
     local work_dir="$1"
     local description="$2"
@@ -172,8 +224,24 @@ run_test() {
         return 1
     fi
 
+    # Capture identifiers after step 1
+    local ids_after_step1
+    ids_after_step1=$(get_identifiers "$work_dir")
+
     # Step 2: Apply modified config (triggers create_before_destroy replacement)
     if ! run_step "$work_dir" "step2: apply replace (create_before_destroy)" "apply" "$step2" "--auto-approve"; then
+        cleanup "$work_dir" "$step2" "$step1"
+        rm -rf "$work_dir"
+        ACTIVE_WORK_DIR=""
+        return 1
+    fi
+
+    # Capture identifiers after step 2
+    local ids_after_step2
+    ids_after_step2=$(get_identifiers "$work_dir")
+
+    # Assert identifiers changed (create_before_destroy should replace at least one resource)
+    if ! assert_identifiers "assert: identifiers changed after replace" "$ids_after_step1" "$ids_after_step2" "different"; then
         cleanup "$work_dir" "$step2" "$step1"
         rm -rf "$work_dir"
         ACTIVE_WORK_DIR=""
