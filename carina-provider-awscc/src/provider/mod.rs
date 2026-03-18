@@ -9,12 +9,18 @@
 //! - `conversion` - Value conversion between DSL and AWS JSON formats
 //! - `normalizer` - Plan-time enum resolution and state hydration
 //! - `operations` - High-level resource operations (read, create, update, delete)
+//! - `s3` - S3-specific operations (empty bucket for force_delete)
+//! - `special_cases` - Resource-type-specific attribute handling
+//! - `tags` - Tag conversion between DSL and CloudFormation formats
 //! - `update` - Update patch building and resource property parsing
 
 mod cloudcontrol;
 pub(crate) mod conversion;
 mod normalizer;
 mod operations;
+mod s3;
+mod special_cases;
+mod tags;
 pub(crate) mod update;
 
 use aws_config::Region;
