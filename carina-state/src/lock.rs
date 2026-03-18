@@ -3,8 +3,12 @@
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 
-/// Default lock timeout in seconds (15 minutes)
-pub const DEFAULT_LOCK_TIMEOUT_SECS: i64 = 900;
+/// Default lock timeout in seconds (60 minutes)
+///
+/// Long-running operations such as `destroy` can legitimately wait 30+ minutes
+/// for timed-out CloudControl deletes, so the TTL must be generous enough to
+/// cover those cases without expiring mid-operation.
+pub const DEFAULT_LOCK_TIMEOUT_SECS: i64 = 3600;
 
 /// Information about a state lock
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -59,6 +63,21 @@ impl LockInfo {
     pub fn time_remaining(&self) -> Duration {
         self.expires - Utc::now()
     }
+
+    /// Create a renewed copy of this lock with a fresh expiration timestamp.
+    ///
+    /// The lock ID, operation, and owner remain the same; only the `created`
+    /// and `expires` fields are refreshed.
+    pub fn renewed(&self) -> Self {
+        let now = Utc::now();
+        Self {
+            id: self.id.clone(),
+            operation: self.operation.clone(),
+            who: self.who.clone(),
+            created: now,
+            expires: now + Duration::seconds(DEFAULT_LOCK_TIMEOUT_SECS),
+        }
+    }
 }
 
 /// Get the lock owner string (username@hostname)
@@ -107,6 +126,24 @@ mod tests {
     fn test_lock_owner_format() {
         let who = get_lock_owner();
         assert!(who.contains('@'));
+    }
+
+    #[test]
+    fn test_lock_info_renewed() {
+        let lock = LockInfo::with_timeout("apply", 10);
+        let renewed = lock.renewed();
+
+        // Same identity
+        assert_eq!(renewed.id, lock.id);
+        assert_eq!(renewed.operation, lock.operation);
+        assert_eq!(renewed.who, lock.who);
+
+        // Fresh expiration (should be close to DEFAULT_LOCK_TIMEOUT_SECS)
+        let remaining = renewed.time_remaining();
+        assert!(
+            remaining.num_seconds() > DEFAULT_LOCK_TIMEOUT_SECS - 5,
+            "renewed lock should have a fresh TTL"
+        );
     }
 
     #[test]

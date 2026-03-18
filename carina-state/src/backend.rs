@@ -25,6 +25,10 @@ pub enum BackendError {
     #[error("Lock ID mismatch: expected {expected}, got {actual}")]
     LockMismatch { expected: String, actual: String },
 
+    /// The caller's lock is no longer held (expired or stolen)
+    #[error("Lock no longer held: {0}")]
+    LockNotHeld(String),
+
     /// The backend type is not supported
     #[error("Unsupported backend type: {0}")]
     UnsupportedBackend(String),
@@ -112,6 +116,19 @@ pub trait StateBackend: Send + Sync {
     ///
     /// This should verify that the lock being released matches the provided lock info
     async fn release_lock(&self, lock: &LockInfo) -> BackendResult<()>;
+
+    /// Renew a lock by refreshing its expiration timestamp.
+    ///
+    /// Returns an updated `LockInfo` with a fresh TTL.  The caller must verify
+    /// that the on-disk lock still belongs to it; if the lock was stolen the
+    /// method returns `LockNotHeld`.
+    async fn renew_lock(&self, lock: &LockInfo) -> BackendResult<LockInfo>;
+
+    /// Write state after verifying the caller still holds the lock.
+    ///
+    /// This prevents silent state corruption when a lock has expired and been
+    /// acquired by another process.
+    async fn write_state_locked(&self, state: &StateFile, lock: &LockInfo) -> BackendResult<()>;
 
     /// Force release a lock by its ID
     ///

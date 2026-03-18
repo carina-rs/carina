@@ -267,6 +267,50 @@ impl StateBackend for S3Backend {
         }
     }
 
+    async fn renew_lock(&self, lock: &LockInfo) -> BackendResult<LockInfo> {
+        // Read the current lock and its ETag
+        let Some((existing_lock, etag)) = self.read_lock_with_etag().await? else {
+            return Err(BackendError::LockNotHeld(
+                "lock file no longer exists".to_string(),
+            ));
+        };
+
+        if existing_lock.id != lock.id {
+            return Err(BackendError::LockNotHeld(format!(
+                "lock {} was replaced by {}",
+                lock.id, existing_lock.id
+            )));
+        }
+
+        // Write a renewed lock, conditioned on the current ETag
+        let renewed = lock.renewed();
+        if !self.replace_lock_if_match(&renewed, &etag).await? {
+            return Err(BackendError::LockNotHeld(
+                "lock was modified concurrently during renewal".to_string(),
+            ));
+        }
+
+        Ok(renewed)
+    }
+
+    async fn write_state_locked(&self, state: &StateFile, lock: &LockInfo) -> BackendResult<()> {
+        // Verify the lock is still held by us before writing state
+        let Some(existing_lock) = self.read_lock().await? else {
+            return Err(BackendError::LockNotHeld(
+                "lock file no longer exists".to_string(),
+            ));
+        };
+
+        if existing_lock.id != lock.id {
+            return Err(BackendError::LockNotHeld(format!(
+                "lock {} was replaced by {}",
+                lock.id, existing_lock.id
+            )));
+        }
+
+        self.write_state(state).await
+    }
+
     async fn release_lock(&self, lock: &LockInfo) -> BackendResult<()> {
         // Verify the lock exists and matches
         if let Some(existing_lock) = self.read_lock().await? {

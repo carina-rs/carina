@@ -373,6 +373,74 @@ impl StateBackend for LocalBackend {
         }
     }
 
+    async fn renew_lock(&self, lock: &LockInfo) -> BackendResult<LockInfo> {
+        // Read the current lock file and verify it still belongs to us
+        let content = std::fs::read_to_string(&self.lock_path)
+            .map_err(|e| BackendError::Io(format!("Failed to read lock file: {}", e)))?;
+
+        let existing_lock: LockInfo = serde_json::from_str(&content)
+            .map_err(|e| BackendError::InvalidState(format!("Failed to parse lock file: {}", e)))?;
+
+        if existing_lock.id != lock.id {
+            return Err(BackendError::LockNotHeld(format!(
+                "lock {} was replaced by {}",
+                lock.id, existing_lock.id
+            )));
+        }
+
+        // Write a renewed lock atomically (write to temp, then rename)
+        let renewed = lock.renewed();
+        let new_content = serde_json::to_string_pretty(&renewed)
+            .map_err(|e| BackendError::Serialization(format!("Failed to serialize lock: {}", e)))?;
+
+        let tmp_path = self.lock_path.with_extension("lock.renew.tmp");
+        let mut file = std::fs::File::create(&tmp_path)
+            .map_err(|e| BackendError::Io(format!("Failed to create temp lock file: {}", e)))?;
+        file.write_all(new_content.as_bytes()).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp_path);
+            BackendError::Io(format!("Failed to write temp lock file: {}", e))
+        })?;
+        file.sync_all().map_err(|e| {
+            let _ = std::fs::remove_file(&tmp_path);
+            BackendError::Io(format!("Failed to sync temp lock file: {}", e))
+        })?;
+
+        std::fs::rename(&tmp_path, &self.lock_path)
+            .map_err(|e| BackendError::Io(format!("Failed to rename temp lock file: {}", e)))?;
+
+        Ok(renewed)
+    }
+
+    async fn write_state_locked(&self, state: &StateFile, lock: &LockInfo) -> BackendResult<()> {
+        // Verify the lock is still held by us before writing state
+        let content = match std::fs::read_to_string(&self.lock_path) {
+            Ok(c) => c,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Err(BackendError::LockNotHeld(
+                    "lock file no longer exists".to_string(),
+                ));
+            }
+            Err(err) => {
+                return Err(BackendError::Io(format!(
+                    "Failed to read lock file: {}",
+                    err
+                )));
+            }
+        };
+
+        let existing_lock: LockInfo = serde_json::from_str(&content)
+            .map_err(|e| BackendError::InvalidState(format!("Failed to parse lock file: {}", e)))?;
+
+        if existing_lock.id != lock.id {
+            return Err(BackendError::LockNotHeld(format!(
+                "lock {} was replaced by {}",
+                lock.id, existing_lock.id
+            )));
+        }
+
+        self.write_state(state).await
+    }
+
     async fn release_lock(&self, lock: &LockInfo) -> BackendResult<()> {
         if !self.lock_path.exists() {
             return Err(BackendError::LockNotFound(lock.id.clone()));
@@ -667,6 +735,96 @@ mod tests {
         // Verify no temp file is left behind
         let tmp_path = state_path.with_extension("json.tmp");
         assert!(!tmp_path.exists(), "temp file should be cleaned up");
+    }
+
+    #[tokio::test]
+    async fn test_renew_lock_refreshes_expiration() {
+        let dir = tempdir().unwrap();
+        let state_path = dir.path().join("test.state.json");
+        let backend = LocalBackend::with_path(state_path);
+
+        let lock = backend.acquire_lock("apply").await.unwrap();
+        let renewed = backend.renew_lock(&lock).await.unwrap();
+
+        assert_eq!(renewed.id, lock.id);
+        assert_eq!(renewed.operation, lock.operation);
+        assert!(renewed.expires > lock.created);
+        assert!(!renewed.is_expired());
+
+        backend.release_lock(&renewed).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_renew_lock_fails_when_lock_stolen() {
+        let dir = tempdir().unwrap();
+        let state_path = dir.path().join("test.state.json");
+        let backend = LocalBackend::with_path(state_path.clone());
+
+        let lock = backend.acquire_lock("apply").await.unwrap();
+
+        // Simulate another process stealing the lock by overwriting the lock file
+        let thief_lock = LockInfo::new("destroy");
+        let thief_content = serde_json::to_string_pretty(&thief_lock).unwrap();
+        std::fs::write(state_path.with_extension("lock"), thief_content).unwrap();
+
+        let result = backend.renew_lock(&lock).await;
+        assert!(matches!(result, Err(BackendError::LockNotHeld(_))));
+    }
+
+    #[tokio::test]
+    async fn test_write_state_locked_succeeds_when_lock_held() {
+        let dir = tempdir().unwrap();
+        let state_path = dir.path().join("test.state.json");
+        let backend = LocalBackend::with_path(state_path.clone());
+
+        let lock = backend.acquire_lock("apply").await.unwrap();
+
+        let mut state_file = StateFile::new();
+        state_file.increment_serial();
+        backend
+            .write_state_locked(&state_file, &lock)
+            .await
+            .unwrap();
+
+        let read_state = backend.read_state().await.unwrap().unwrap();
+        assert_eq!(read_state.serial, 1);
+
+        backend.release_lock(&lock).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_write_state_locked_fails_when_lock_stolen() {
+        let dir = tempdir().unwrap();
+        let state_path = dir.path().join("test.state.json");
+        let backend = LocalBackend::with_path(state_path.clone());
+
+        let lock = backend.acquire_lock("apply").await.unwrap();
+
+        // Simulate another process stealing the lock
+        let thief_lock = LockInfo::new("destroy");
+        let thief_content = serde_json::to_string_pretty(&thief_lock).unwrap();
+        std::fs::write(state_path.with_extension("lock"), thief_content).unwrap();
+
+        let mut state_file = StateFile::new();
+        state_file.increment_serial();
+        let result = backend.write_state_locked(&state_file, &lock).await;
+        assert!(matches!(result, Err(BackendError::LockNotHeld(_))));
+    }
+
+    #[tokio::test]
+    async fn test_write_state_locked_fails_when_lock_file_deleted() {
+        let dir = tempdir().unwrap();
+        let state_path = dir.path().join("test.state.json");
+        let backend = LocalBackend::with_path(state_path.clone());
+
+        let lock = backend.acquire_lock("apply").await.unwrap();
+
+        // Remove the lock file to simulate expiration + deletion
+        std::fs::remove_file(state_path.with_extension("lock")).unwrap();
+
+        let state_file = StateFile::new();
+        let result = backend.write_state_locked(&state_file, &lock).await;
+        assert!(matches!(result, Err(BackendError::LockNotHeld(_))));
     }
 
     #[test]
