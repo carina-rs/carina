@@ -9,6 +9,7 @@
 #   ec2_route_table    - Update tags
 #   ec2_security_group - Update tags
 #   ec2_subnet         - Toggle map_public_ip_on_launch (false -> true)
+#   ec2_route          - Change route target (IGW -> NAT Gateway)
 #   s3_bucket          - Toggle versioning (Enabled -> Suspended)
 #
 # Filter (optional): substring to match test names (e.g. "ec2_vpc", "s3_bucket")
@@ -211,11 +212,17 @@ run_test "ec2_subnet" \
     "$SCRIPT_DIR/ec2_subnet_step2.crn" \
     "Test 4: EC2 Subnet (map_public_ip_on_launch false -> true)"
 
-# Test 5: S3 Bucket - toggle versioning (Enabled -> Suspended)
+# Test 5: EC2 Route - change route target (IGW -> NAT Gateway)
+run_test "ec2_route" \
+    "$SCRIPT_DIR/ec2_route_step1.crn" \
+    "$SCRIPT_DIR/ec2_route_step2.crn" \
+    "Test 5: EC2 Route (gateway_id -> nat_gateway_id)"
+
+# Test 6: S3 Bucket - toggle versioning (Enabled -> Suspended)
 run_test "s3_bucket" \
     "$SCRIPT_DIR/s3_bucket_step1.crn" \
     "$SCRIPT_DIR/s3_bucket_step2.crn" \
-    "Test 5: S3 Bucket (versioning Enabled -> Suspended)"
+    "Test 6: S3 Bucket (versioning Enabled -> Suspended)"
 
 echo "════════════════════════════════════════"
 echo "Total: $TOTAL_PASSED passed, $TOTAL_FAILED failed"
