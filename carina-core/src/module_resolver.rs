@@ -244,16 +244,16 @@ impl ModuleResolver {
                 Value::String(instance_prefix.to_string()),
             );
 
-            // Substitute input references and rewrite intra-module ResourceRefs
+            // Rewrite intra-module ResourceRefs BEFORE substituting inputs.
+            // This ensures that caller-provided ResourceRef values (which may
+            // coincidentally share a binding name with a module-internal binding)
+            // are not incorrectly prefixed.
             let mut substituted_attrs = HashMap::new();
             for (key, value) in &new_resource.attributes {
-                let substituted = substitute_inputs(value, &input_values);
-                let rewritten = rewrite_intra_module_refs(
-                    &substituted,
-                    instance_prefix,
-                    &intra_module_bindings,
-                );
-                substituted_attrs.insert(key.clone(), rewritten);
+                let rewritten =
+                    rewrite_intra_module_refs(value, instance_prefix, &intra_module_bindings);
+                let substituted = substitute_inputs(&rewritten, &input_values);
+                substituted_attrs.insert(key.clone(), substituted);
             }
             new_resource.attributes = substituted_attrs;
 
