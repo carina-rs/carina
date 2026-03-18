@@ -49,10 +49,13 @@ ACTIVE_STEP2=""
 
 signal_cleanup() {
     if [ -n "$ACTIVE_WORK_DIR" ] && [ -d "$ACTIVE_WORK_DIR" ]; then
+        set +e
         echo ""
         echo "Interrupted. Cleaning up resources..."
-        cd "$ACTIVE_WORK_DIR" && "$CARINA_BIN" destroy --auto-approve "$ACTIVE_STEP2" 2>&1 || true
-        cd "$ACTIVE_WORK_DIR" && "$CARINA_BIN" destroy --auto-approve "$ACTIVE_STEP1" 2>&1 || true
+        cd "$ACTIVE_WORK_DIR" && "$CARINA_BIN" destroy --auto-approve "$ACTIVE_STEP2" 2>&1
+        cd "$ACTIVE_WORK_DIR" && "$CARINA_BIN" destroy --auto-approve "$ACTIVE_STEP1" 2>&1
+        cd "$ACTIVE_WORK_DIR" && "$CARINA_BIN" destroy --auto-approve "$ACTIVE_STEP2" 2>&1
+        cd "$ACTIVE_WORK_DIR" && "$CARINA_BIN" destroy --auto-approve "$ACTIVE_STEP1" 2>&1
         rm -rf "$ACTIVE_WORK_DIR"
         ACTIVE_WORK_DIR=""
     fi
@@ -113,13 +116,21 @@ run_plan_verify() {
     return 0
 }
 
-# Cleanup helper: try to destroy with both step configs
+# Cleanup helper: try to destroy with both step configs, then retry
 cleanup() {
     local work_dir="$1"
     local step2="$2"
     local step1="$3"
-    cd "$work_dir" && "$CARINA_BIN" destroy --auto-approve "$step2" 2>&1 || true
-    cd "$work_dir" && "$CARINA_BIN" destroy --auto-approve "$step1" 2>&1 || true
+
+    # Disable set -e to ensure all destroy attempts run
+    set +e
+    echo "  Cleanup: destroying resources..."
+    cd "$work_dir" && "$CARINA_BIN" destroy --auto-approve "$step2" 2>&1
+    cd "$work_dir" && "$CARINA_BIN" destroy --auto-approve "$step1" 2>&1
+    # Retry: resources may have dependencies that prevent deletion on first pass
+    cd "$work_dir" && "$CARINA_BIN" destroy --auto-approve "$step2" 2>&1
+    cd "$work_dir" && "$CARINA_BIN" destroy --auto-approve "$step1" 2>&1
+    set -e
 }
 
 # Run a single multi-step test
@@ -178,13 +189,8 @@ run_test() {
         return 1
     fi
 
-    # Step 4: Destroy
-    if ! run_step "$work_dir" "step4: destroy" "destroy" "$step2" "--auto-approve"; then
-        cleanup "$work_dir" "$step2" "$step1"
-        rm -rf "$work_dir"
-        ACTIVE_WORK_DIR=""
-        return 1
-    fi
+    # Step 4: Destroy (use cleanup to try both configs and retry)
+    cleanup "$work_dir" "$step2" "$step1"
 
     rm -rf "$work_dir"
     ACTIVE_WORK_DIR=""
