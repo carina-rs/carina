@@ -6,6 +6,345 @@ use carina_core::resource::Value;
 
 use crate::AwsProvider;
 
+// --- ec2.route unsupported attribute validation tests ---
+
+mod ec2_route_validation {
+    use std::collections::HashMap;
+
+    use carina_core::resource::{ResourceId, Value};
+
+    use crate::services::ec2::route::validate_ec2_route_attributes;
+
+    fn make_resource_id() -> ResourceId {
+        ResourceId::new("ec2.route", "test-route")
+    }
+
+    #[test]
+    fn test_supported_gateway_id_route() {
+        let mut attrs = HashMap::new();
+        attrs.insert(
+            "route_table_id".to_string(),
+            Value::String("rtb-123".to_string()),
+        );
+        attrs.insert(
+            "destination_cidr_block".to_string(),
+            Value::String("0.0.0.0/0".to_string()),
+        );
+        attrs.insert(
+            "gateway_id".to_string(),
+            Value::String("igw-123".to_string()),
+        );
+        let id = make_resource_id();
+        assert!(validate_ec2_route_attributes(&attrs, &id).is_ok());
+    }
+
+    #[test]
+    fn test_supported_nat_gateway_id_route() {
+        let mut attrs = HashMap::new();
+        attrs.insert(
+            "route_table_id".to_string(),
+            Value::String("rtb-123".to_string()),
+        );
+        attrs.insert(
+            "destination_cidr_block".to_string(),
+            Value::String("0.0.0.0/0".to_string()),
+        );
+        attrs.insert(
+            "nat_gateway_id".to_string(),
+            Value::String("nat-123".to_string()),
+        );
+        let id = make_resource_id();
+        assert!(validate_ec2_route_attributes(&attrs, &id).is_ok());
+    }
+
+    #[test]
+    fn test_unsupported_destination_ipv6() {
+        let mut attrs = HashMap::new();
+        attrs.insert(
+            "route_table_id".to_string(),
+            Value::String("rtb-123".to_string()),
+        );
+        attrs.insert(
+            "destination_ipv6_cidr_block".to_string(),
+            Value::String("::/0".to_string()),
+        );
+        attrs.insert(
+            "gateway_id".to_string(),
+            Value::String("igw-123".to_string()),
+        );
+        let id = make_resource_id();
+        let err = validate_ec2_route_attributes(&attrs, &id).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("destination_ipv6_cidr_block"), "got: {msg}");
+        assert!(msg.contains("awscc.ec2.route"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_unsupported_destination_prefix_list() {
+        let mut attrs = HashMap::new();
+        attrs.insert(
+            "route_table_id".to_string(),
+            Value::String("rtb-123".to_string()),
+        );
+        attrs.insert(
+            "destination_prefix_list_id".to_string(),
+            Value::String("pl-123".to_string()),
+        );
+        attrs.insert(
+            "gateway_id".to_string(),
+            Value::String("igw-123".to_string()),
+        );
+        let id = make_resource_id();
+        let err = validate_ec2_route_attributes(&attrs, &id).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("destination_prefix_list_id"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_unsupported_target_transit_gateway() {
+        let mut attrs = HashMap::new();
+        attrs.insert(
+            "route_table_id".to_string(),
+            Value::String("rtb-123".to_string()),
+        );
+        attrs.insert(
+            "destination_cidr_block".to_string(),
+            Value::String("10.0.0.0/8".to_string()),
+        );
+        attrs.insert(
+            "transit_gateway_id".to_string(),
+            Value::String("tgw-123".to_string()),
+        );
+        let id = make_resource_id();
+        let err = validate_ec2_route_attributes(&attrs, &id).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("transit_gateway_id"), "got: {msg}");
+        assert!(msg.contains("awscc.ec2.route"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_unsupported_target_vpc_peering() {
+        let mut attrs = HashMap::new();
+        attrs.insert(
+            "route_table_id".to_string(),
+            Value::String("rtb-123".to_string()),
+        );
+        attrs.insert(
+            "destination_cidr_block".to_string(),
+            Value::String("10.0.0.0/8".to_string()),
+        );
+        attrs.insert(
+            "vpc_peering_connection_id".to_string(),
+            Value::String("pcx-123".to_string()),
+        );
+        let id = make_resource_id();
+        let err = validate_ec2_route_attributes(&attrs, &id).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("vpc_peering_connection_id"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_unsupported_target_vpc_endpoint() {
+        let mut attrs = HashMap::new();
+        attrs.insert(
+            "route_table_id".to_string(),
+            Value::String("rtb-123".to_string()),
+        );
+        attrs.insert(
+            "destination_cidr_block".to_string(),
+            Value::String("10.0.0.0/8".to_string()),
+        );
+        attrs.insert(
+            "vpc_endpoint_id".to_string(),
+            Value::String("vpce-123".to_string()),
+        );
+        let id = make_resource_id();
+        let err = validate_ec2_route_attributes(&attrs, &id).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("vpc_endpoint_id"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_unsupported_target_network_interface() {
+        let mut attrs = HashMap::new();
+        attrs.insert(
+            "route_table_id".to_string(),
+            Value::String("rtb-123".to_string()),
+        );
+        attrs.insert(
+            "destination_cidr_block".to_string(),
+            Value::String("10.0.0.0/8".to_string()),
+        );
+        attrs.insert(
+            "network_interface_id".to_string(),
+            Value::String("eni-123".to_string()),
+        );
+        let id = make_resource_id();
+        let err = validate_ec2_route_attributes(&attrs, &id).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("network_interface_id"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_unsupported_target_egress_only_igw() {
+        let mut attrs = HashMap::new();
+        attrs.insert(
+            "route_table_id".to_string(),
+            Value::String("rtb-123".to_string()),
+        );
+        attrs.insert(
+            "destination_cidr_block".to_string(),
+            Value::String("10.0.0.0/8".to_string()),
+        );
+        attrs.insert(
+            "egress_only_internet_gateway_id".to_string(),
+            Value::String("eigw-123".to_string()),
+        );
+        let id = make_resource_id();
+        let err = validate_ec2_route_attributes(&attrs, &id).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("egress_only_internet_gateway_id"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_unsupported_target_carrier_gateway() {
+        let mut attrs = HashMap::new();
+        attrs.insert(
+            "route_table_id".to_string(),
+            Value::String("rtb-123".to_string()),
+        );
+        attrs.insert(
+            "destination_cidr_block".to_string(),
+            Value::String("10.0.0.0/8".to_string()),
+        );
+        attrs.insert(
+            "carrier_gateway_id".to_string(),
+            Value::String("cagw-123".to_string()),
+        );
+        let id = make_resource_id();
+        let err = validate_ec2_route_attributes(&attrs, &id).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("carrier_gateway_id"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_unsupported_target_local_gateway() {
+        let mut attrs = HashMap::new();
+        attrs.insert(
+            "route_table_id".to_string(),
+            Value::String("rtb-123".to_string()),
+        );
+        attrs.insert(
+            "destination_cidr_block".to_string(),
+            Value::String("10.0.0.0/8".to_string()),
+        );
+        attrs.insert(
+            "local_gateway_id".to_string(),
+            Value::String("lgw-123".to_string()),
+        );
+        let id = make_resource_id();
+        let err = validate_ec2_route_attributes(&attrs, &id).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("local_gateway_id"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_unsupported_target_core_network_arn() {
+        let mut attrs = HashMap::new();
+        attrs.insert(
+            "route_table_id".to_string(),
+            Value::String("rtb-123".to_string()),
+        );
+        attrs.insert(
+            "destination_cidr_block".to_string(),
+            Value::String("10.0.0.0/8".to_string()),
+        );
+        attrs.insert(
+            "core_network_arn".to_string(),
+            Value::String("arn:aws:networkmanager::123456789012:core-network/cn-123".to_string()),
+        );
+        let id = make_resource_id();
+        let err = validate_ec2_route_attributes(&attrs, &id).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("core_network_arn"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_unsupported_target_instance_id() {
+        let mut attrs = HashMap::new();
+        attrs.insert(
+            "route_table_id".to_string(),
+            Value::String("rtb-123".to_string()),
+        );
+        attrs.insert(
+            "destination_cidr_block".to_string(),
+            Value::String("10.0.0.0/8".to_string()),
+        );
+        attrs.insert(
+            "instance_id".to_string(),
+            Value::String("i-123".to_string()),
+        );
+        let id = make_resource_id();
+        let err = validate_ec2_route_attributes(&attrs, &id).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("instance_id"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_multiple_unsupported_targets() {
+        let mut attrs = HashMap::new();
+        attrs.insert(
+            "route_table_id".to_string(),
+            Value::String("rtb-123".to_string()),
+        );
+        attrs.insert(
+            "destination_cidr_block".to_string(),
+            Value::String("10.0.0.0/8".to_string()),
+        );
+        attrs.insert(
+            "transit_gateway_id".to_string(),
+            Value::String("tgw-123".to_string()),
+        );
+        attrs.insert(
+            "vpc_peering_connection_id".to_string(),
+            Value::String("pcx-123".to_string()),
+        );
+        let id = make_resource_id();
+        let err = validate_ec2_route_attributes(&attrs, &id).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("transit_gateway_id"), "got: {msg}");
+        assert!(msg.contains("vpc_peering_connection_id"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_unsupported_destination_checked_before_target() {
+        // When both unsupported destination and target are present,
+        // the destination error should be returned first
+        let mut attrs = HashMap::new();
+        attrs.insert(
+            "route_table_id".to_string(),
+            Value::String("rtb-123".to_string()),
+        );
+        attrs.insert(
+            "destination_ipv6_cidr_block".to_string(),
+            Value::String("::/0".to_string()),
+        );
+        attrs.insert(
+            "transit_gateway_id".to_string(),
+            Value::String("tgw-123".to_string()),
+        );
+        let id = make_resource_id();
+        let err = validate_ec2_route_attributes(&attrs, &id).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("destination_ipv6_cidr_block"), "got: {msg}");
+        // Should not contain target error since destination check fails first
+        assert!(!msg.contains("transit_gateway_id"), "got: {msg}");
+    }
+}
+
 // --- extract_ec2_vpc_attributes tests ---
 
 #[test]

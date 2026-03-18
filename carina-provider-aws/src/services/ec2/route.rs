@@ -5,6 +5,66 @@ use carina_core::resource::{Resource, ResourceId, State, Value};
 
 use crate::AwsProvider;
 
+/// Unsupported destination attribute names for ec2.route.
+/// The aws provider only supports destination_cidr_block (IPv4 CIDR).
+const UNSUPPORTED_DESTINATIONS: &[&str] =
+    &["destination_ipv6_cidr_block", "destination_prefix_list_id"];
+
+/// Unsupported target attribute names for ec2.route.
+/// The aws provider only supports gateway_id and nat_gateway_id.
+const UNSUPPORTED_TARGETS: &[&str] = &[
+    "carrier_gateway_id",
+    "core_network_arn",
+    "egress_only_internet_gateway_id",
+    "instance_id",
+    "local_gateway_id",
+    "network_interface_id",
+    "transit_gateway_id",
+    "vpc_endpoint_id",
+    "vpc_peering_connection_id",
+];
+
+/// Validate that a route resource only uses supported destination and target types.
+/// Returns an error if any unsupported attributes are set.
+pub(crate) fn validate_ec2_route_attributes(
+    attributes: &HashMap<String, Value>,
+    resource_id: &ResourceId,
+) -> ProviderResult<()> {
+    let unsupported_dest: Vec<&str> = UNSUPPORTED_DESTINATIONS
+        .iter()
+        .filter(|attr| attributes.contains_key(**attr))
+        .copied()
+        .collect();
+
+    if !unsupported_dest.is_empty() {
+        return Err(ProviderError::new(format!(
+            "aws.ec2.route does not support destination type: {}. \
+             Only destination_cidr_block (IPv4 CIDR) is supported. \
+             Use awscc.ec2.route for other destination types.",
+            unsupported_dest.join(", ")
+        ))
+        .for_resource(resource_id.clone()));
+    }
+
+    let unsupported_tgt: Vec<&str> = UNSUPPORTED_TARGETS
+        .iter()
+        .filter(|attr| attributes.contains_key(**attr))
+        .copied()
+        .collect();
+
+    if !unsupported_tgt.is_empty() {
+        return Err(ProviderError::new(format!(
+            "aws.ec2.route does not support target type: {}. \
+             Only gateway_id and nat_gateway_id are supported. \
+             Use awscc.ec2.route for other target types.",
+            unsupported_tgt.join(", ")
+        ))
+        .for_resource(resource_id.clone()));
+    }
+
+    Ok(())
+}
+
 impl AwsProvider {
     /// Read an EC2 Route (routes are identified by route_table_id + destination)
     pub(crate) async fn read_ec2_route(
@@ -61,6 +121,8 @@ impl AwsProvider {
 
     /// Create an EC2 Route
     pub(crate) async fn create_ec2_route(&self, resource: Resource) -> ProviderResult<State> {
+        validate_ec2_route_attributes(&resource.attributes, &resource.id)?;
+
         let route_table_id = match resource.attributes.get("route_table_id") {
             Some(Value::String(s)) => s.clone(),
             _ => {
@@ -111,6 +173,8 @@ impl AwsProvider {
         _identifier: &str,
         to: Resource,
     ) -> ProviderResult<State> {
+        validate_ec2_route_attributes(&to.attributes, &id)?;
+
         let route_table_id = match to.attributes.get("route_table_id") {
             Some(Value::String(s)) => s.clone(),
             _ => {
