@@ -1,0 +1,61 @@
+# EC2 Transit Gateway Attachment - create_before_destroy with dependent rewiring (Step 1: Initial)
+#
+# Creates a VPC, two subnets in different AZs, a transit gateway, and an
+# attachment using subnet_a. Step 2 switches to subnet_b, forcing replacement
+# of the attachment (subnet_ids is create-only) and testing that the dependent
+# resource reference is rewired during create_before_destroy.
+
+provider awscc {
+  region = awscc.Region.ap_northeast_1
+}
+
+let vpc = awscc.ec2.vpc {
+  cidr_block = "10.210.0.0/16"
+
+  tags = {
+    Name        = "carina-acc-test-cbd-tgw-attach"
+    Environment = "acceptance-test"
+  }
+}
+
+let subnet_a = awscc.ec2.subnet {
+  vpc_id            = vpc.vpc_id
+  cidr_block        = "10.210.1.0/24"
+  availability_zone = "ap-northeast-1a"
+
+  tags = {
+    Name        = "carina-acc-test-cbd-tgw-attach-a"
+    Environment = "acceptance-test"
+  }
+}
+
+let subnet_b = awscc.ec2.subnet {
+  vpc_id            = vpc.vpc_id
+  cidr_block        = "10.210.2.0/24"
+  availability_zone = "ap-northeast-1c"
+
+  tags = {
+    Name        = "carina-acc-test-cbd-tgw-attach-b"
+    Environment = "acceptance-test"
+  }
+}
+
+let tgw = awscc.ec2.transit_gateway {
+  description = "carina-acc-test-cbd-tgw-attach"
+
+  tags = {
+    Name        = "carina-acc-test-cbd-tgw-attach"
+    Environment = "acceptance-test"
+  }
+}
+
+awscc.ec2.transit_gateway_attachment {
+  subnet_ids         = [subnet_a.subnet_id]
+  transit_gateway_id = tgw.id
+  vpc_id             = vpc.vpc_id
+
+  tags = {
+    Name        = "carina-acc-test-cbd-tgw-attach"
+    Environment = "acceptance-test"
+  }
+}
