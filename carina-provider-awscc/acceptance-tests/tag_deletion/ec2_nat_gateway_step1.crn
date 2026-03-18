@@ -1,0 +1,44 @@
+# EC2 NAT Gateway - Tag deletion test (Step 1: Initial with two tags)
+#
+# Creates a NAT Gateway with two tags, along with all required parent
+# resources (VPC, internet gateway, subnet, EIP). Step 2 removes one
+# tag to test that CloudControl "remove" patch is used for the removed key.
+
+provider awscc {
+  region = awscc.Region.ap_northeast_1
+}
+
+let vpc = awscc.ec2.vpc {
+  cidr_block           = "10.112.0.0/16"
+  enable_dns_support   = true
+  enable_dns_hostnames = true
+}
+
+let igw = awscc.ec2.internet_gateway {
+}
+
+awscc.ec2.vpc_gateway_attachment {
+  vpc_id              = vpc.vpc_id
+  internet_gateway_id = igw.internet_gateway_id
+}
+
+let public_subnet = awscc.ec2.subnet {
+  vpc_id                  = vpc.vpc_id
+  cidr_block              = "10.112.1.0/24"
+  availability_zone       = "ap-northeast-1a"
+  map_public_ip_on_launch = true
+}
+
+let eip = awscc.ec2.eip {
+  domain = "vpc"
+}
+
+awscc.ec2.nat_gateway {
+  allocation_id = eip.allocation_id
+  subnet_id     = public_subnet.subnet_id
+
+  tags = {
+    Environment = "acceptance-test"
+    ToBeRemoved = "this-tag-will-be-deleted"
+  }
+}
