@@ -394,6 +394,13 @@ pub fn reconcile_anonymous_identifiers(
             continue;
         }
 
+        // Skip let-bound (named) resources entirely. Reconciliation is only
+        // meaningful for anonymous hash-derived identifiers. Named resources
+        // should never be rebound to a different state entry.
+        if resource.attributes.contains_key("_binding") {
+            continue;
+        }
+
         let schema_key = schema_key_fn(resource);
         let Some(schema) = schemas.get(&schema_key) else {
             continue;
@@ -403,9 +410,6 @@ pub fn reconcile_anonymous_identifiers(
         let state_entries = find_state_by_type(&resource.id.provider, &resource.id.resource_type);
 
         // If the resource's name already exists in state, no reconciliation is needed.
-        // This prevents named resources (let-bound) from being incorrectly swapped
-        // when they share some create-only attributes with other resources of the
-        // same type (e.g., two security_group_ingress rules on the same SG).
         if state_entries.iter().any(|e| e.name == resource.id.name) {
             continue;
         }
@@ -451,6 +455,10 @@ pub fn reconcile_anonymous_identifiers(
             continue;
         }
 
+        // Collect all partial matches (at least one create-only property matches
+        // and at least one differs). If there are multiple partial matches, skip
+        // reconciliation to avoid rebinding to the wrong state entry.
+        let mut partial_matches: Vec<&str> = Vec::new();
         for entry in &state_entries {
             if entry.name == resource.id.name {
                 // Same identifier, no reconciliation needed
@@ -470,16 +478,20 @@ pub fn reconcile_anonymous_identifiers(
                 }
             }
 
-            // Reconcile if at least one create-only property matches and
-            // at least one differs (partial match = same resource with changes)
+            // Partial match = same resource with changes to some create-only properties
             if matched > 0 && mismatched > 0 {
-                resource.id = ResourceId::with_provider(
-                    &resource.id.provider,
-                    &resource.id.resource_type,
-                    &entry.name,
-                );
-                break;
+                partial_matches.push(&entry.name);
             }
+        }
+
+        // Only reconcile if there is exactly one partial match (unique best match).
+        // Multiple partial matches are ambiguous - skip to avoid rebinding wrong.
+        if partial_matches.len() == 1 {
+            resource.id = ResourceId::with_provider(
+                &resource.id.provider,
+                &resource.id.resource_type,
+                partial_matches[0],
+            );
         }
     }
 }
@@ -1791,6 +1803,141 @@ mod tests {
         assert_ne!(
             r1[0].id.name, r2[0].id.name,
             "Different prefixes should produce different identifiers"
+        );
+    }
+
+    #[test]
+    fn test_reconcile_skips_let_bound_resources() {
+        // Let-bound (named) resources should never be reconciled, even if their
+        // name doesn't exist in state. The _binding attribute marks them as named.
+        let schema = ResourceSchema::new("aws.ec2.security_group_ingress")
+            .attribute(AttributeSchema::new("cidr_ip", AttributeType::String).create_only())
+            .attribute(AttributeSchema::new("ip_protocol", AttributeType::String).create_only())
+            .attribute(AttributeSchema::new("description", AttributeType::String).create_only());
+        let schemas: HashMap<String, ResourceSchema> =
+            vec![("aws.ec2.security_group_ingress".to_string(), schema)]
+                .into_iter()
+                .collect();
+
+        // A let-bound resource whose name does NOT exist in state
+        let mut ingress_new =
+            Resource::with_provider("aws", "ec2.security_group_ingress", "ingress_new");
+        ingress_new.attributes.insert(
+            "_binding".to_string(),
+            Value::String("ingress_new".to_string()),
+        );
+        ingress_new.attributes.insert(
+            "cidr_ip".to_string(),
+            Value::String("0.0.0.0/0".to_string()),
+        );
+        ingress_new
+            .attributes
+            .insert("ip_protocol".to_string(), Value::String("tcp".to_string()));
+        ingress_new.attributes.insert(
+            "description".to_string(),
+            Value::String("Allow HTTPS".to_string()),
+        );
+
+        let mut resources = vec![ingress_new];
+
+        // State has an unrelated entry that partially matches (same cidr_ip + ip_protocol,
+        // different description). Without the fix, the named resource would be rebound.
+        let state_entries = vec![AnonymousIdStateInfo {
+            name: "ec2_security_group_ingress_aabb1122".to_string(),
+            create_only_values: vec![
+                ("cidr_ip".to_string(), "0.0.0.0/0".to_string()),
+                ("ip_protocol".to_string(), "tcp".to_string()),
+                ("description".to_string(), "Allow HTTP".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+        }];
+
+        reconcile_anonymous_identifiers(
+            &mut resources,
+            &schemas,
+            &schema_key_fn,
+            &|_provider, _rt| state_entries.clone(),
+        );
+
+        // Named resource must keep its original name
+        assert_eq!(
+            resources[0].id.name, "ingress_new",
+            "let-bound resource should not be reconciled"
+        );
+    }
+
+    #[test]
+    fn test_reconcile_skips_when_multiple_partial_matches() {
+        // When multiple state entries partially match an anonymous resource,
+        // reconciliation should skip rather than picking the first match.
+        // This prevents a new SG rule from hijacking an unrelated state entry.
+        let schema = ResourceSchema::new("aws.ec2.security_group_ingress")
+            .attribute(AttributeSchema::new("cidr_ip", AttributeType::String).create_only())
+            .attribute(AttributeSchema::new("ip_protocol", AttributeType::String).create_only())
+            .attribute(AttributeSchema::new("description", AttributeType::String).create_only());
+        let schemas: HashMap<String, ResourceSchema> =
+            vec![("aws.ec2.security_group_ingress".to_string(), schema)]
+                .into_iter()
+                .collect();
+
+        // Anonymous resource with a new hash-derived identifier
+        let mut new_rule = Resource::with_provider(
+            "aws",
+            "ec2.security_group_ingress",
+            "ec2_security_group_ingress_deadbeef",
+        );
+        new_rule.attributes.insert(
+            "cidr_ip".to_string(),
+            Value::String("0.0.0.0/0".to_string()),
+        );
+        new_rule
+            .attributes
+            .insert("ip_protocol".to_string(), Value::String("tcp".to_string()));
+        new_rule.attributes.insert(
+            "description".to_string(),
+            Value::String("Allow gRPC".to_string()),
+        );
+
+        let original_id = new_rule.id.name.clone();
+        let mut resources = vec![new_rule];
+
+        // State has TWO entries that partially match (same cidr_ip + ip_protocol,
+        // different description). Both are valid partial matches.
+        let state_entries = vec![
+            AnonymousIdStateInfo {
+                name: "ec2_security_group_ingress_aabb1122".to_string(),
+                create_only_values: vec![
+                    ("cidr_ip".to_string(), "0.0.0.0/0".to_string()),
+                    ("ip_protocol".to_string(), "tcp".to_string()),
+                    ("description".to_string(), "Allow HTTP".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+            },
+            AnonymousIdStateInfo {
+                name: "ec2_security_group_ingress_ccdd3344".to_string(),
+                create_only_values: vec![
+                    ("cidr_ip".to_string(), "0.0.0.0/0".to_string()),
+                    ("ip_protocol".to_string(), "tcp".to_string()),
+                    ("description".to_string(), "Allow HTTPS".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+            },
+        ];
+
+        reconcile_anonymous_identifiers(
+            &mut resources,
+            &schemas,
+            &schema_key_fn,
+            &|_provider, _rt| state_entries.clone(),
+        );
+
+        // With multiple partial matches, reconciliation should be skipped
+        assert_eq!(
+            resources[0].id.name, original_id,
+            "ambiguous partial matches should not reconcile"
         );
     }
 
