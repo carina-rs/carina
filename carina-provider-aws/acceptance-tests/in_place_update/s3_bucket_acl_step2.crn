@@ -1,0 +1,17 @@
+# S3 Bucket ACL - in-place update test (step 2)
+#
+# Tests: remove ACL, switch to ObjectOwnership BucketOwnerEnforced (in-place update)
+
+provider aws {
+  region = aws.Region.ap_northeast_1
+}
+
+aws.s3.bucket {
+  bucket = "carina-acc-test-aws-s3-acl-update"
+
+  object_ownership = aws.s3.bucket.ObjectOwnership.BucketOwnerEnforced
+
+  tags = {
+    Environment = "acceptance-test"
+  }
+}
