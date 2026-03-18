@@ -42,6 +42,10 @@ pub(crate) fn build_update_patches(
         if attr_schema.read_only {
             continue;
         }
+        // Skip create-only attributes - they cannot be modified after creation
+        if attr_schema.create_only {
+            continue;
+        }
         if let Some(aws_name) = &attr_schema.provider_name
             && let Some(value) = to.attributes.get(dsl_name.as_str())
             && let Some(aws_value) =
@@ -539,6 +543,70 @@ mod tests {
         assert!(
             has_retention_patch,
             "Should include RetentionInDays in update patches, got: {:?}",
+            patches
+        );
+    }
+
+    #[test]
+    fn test_build_update_patches_excludes_create_only_properties() {
+        // Regression test for issue #809: update patch includes create-only property DnsOptions
+        // When DnsOptions has nested create-only sub-properties (PrivateDnsPreference,
+        // PrivateDnsSpecifiedDomains), the whole DnsOptions should be excluded from patches.
+        let config =
+            get_schema_config("ec2.vpc_endpoint").expect("ec2.vpc_endpoint schema should exist");
+        let id = ResourceId::with_provider("awscc", "ec2.vpc_endpoint", "test");
+
+        let mut from_attrs = HashMap::new();
+        from_attrs.insert("vpc_id".to_string(), Value::String("vpc-123".to_string()));
+        from_attrs.insert(
+            "service_name".to_string(),
+            Value::String("com.amazonaws.ap-northeast-1.s3".to_string()),
+        );
+        from_attrs.insert(
+            "policy_document".to_string(),
+            Value::String("{\"Version\":\"2012-10-17\"}".to_string()),
+        );
+        // DnsOptions is returned by CloudControl API but has create-only sub-properties
+        let mut dns_options = HashMap::new();
+        dns_options.insert(
+            "dns_record_ip_type".to_string(),
+            Value::String("awscc.ec2.vpc_endpoint.DnsRecordIpType.ipv4".to_string()),
+        );
+        from_attrs.insert("dns_options".to_string(), Value::Map(dns_options));
+        let from = State::existing(id.clone(), from_attrs);
+
+        // User only specifies policy_document change, no dns_options
+        let mut to = Resource::new("ec2.vpc_endpoint", "test");
+        to.attributes
+            .insert("vpc_id".to_string(), Value::String("vpc-123".to_string()));
+        to.attributes.insert(
+            "service_name".to_string(),
+            Value::String("com.amazonaws.ap-northeast-1.s3".to_string()),
+        );
+        to.attributes.insert(
+            "policy_document".to_string(),
+            Value::String("{\"Version\":\"2012-10-17\",\"Statement\":[]}".to_string()),
+        );
+
+        let patches = build_update_patches(&config, &from, &to);
+
+        // Should not include DnsOptions in patches (it has create-only sub-properties)
+        let has_dns_options_patch = patches
+            .iter()
+            .any(|p| p.get("path").and_then(|v| v.as_str()) == Some("/DnsOptions"));
+        assert!(
+            !has_dns_options_patch,
+            "Should not include create-only property DnsOptions in update patches, got: {:?}",
+            patches
+        );
+
+        // Should still have the policy_document patch
+        let has_policy_patch = patches
+            .iter()
+            .any(|p| p.get("path").and_then(|v| v.as_str()) == Some("/PolicyDocument"));
+        assert!(
+            has_policy_patch,
+            "Should include PolicyDocument in update patches, got: {:?}",
             patches
         );
     }
