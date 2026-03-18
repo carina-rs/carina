@@ -323,68 +323,17 @@ impl AwsProvider {
         obj: &aws_sdk_ec2::types::Route,
         attributes: &mut HashMap<String, Value>,
     ) -> Option<String> {
-        if let Some(v) = obj.carrier_gateway_id() {
-            attributes.insert(
-                "carrier_gateway_id".to_string(),
-                Value::String(v.to_string()),
-            );
-        }
-        if let Some(v) = obj.core_network_arn() {
-            attributes.insert("core_network_arn".to_string(), Value::String(v.to_string()));
-        }
         if let Some(v) = obj.destination_cidr_block() {
             attributes.insert(
                 "destination_cidr_block".to_string(),
                 Value::String(v.to_string()),
             );
         }
-        if let Some(v) = obj.destination_ipv6_cidr_block() {
-            attributes.insert(
-                "destination_ipv6_cidr_block".to_string(),
-                Value::String(v.to_string()),
-            );
-        }
-        if let Some(v) = obj.destination_prefix_list_id() {
-            attributes.insert(
-                "destination_prefix_list_id".to_string(),
-                Value::String(v.to_string()),
-            );
-        }
-        if let Some(v) = obj.egress_only_internet_gateway_id() {
-            attributes.insert(
-                "egress_only_internet_gateway_id".to_string(),
-                Value::String(v.to_string()),
-            );
-        }
         if let Some(v) = obj.gateway_id() {
             attributes.insert("gateway_id".to_string(), Value::String(v.to_string()));
         }
-        if let Some(v) = obj.instance_id() {
-            attributes.insert("instance_id".to_string(), Value::String(v.to_string()));
-        }
-        if let Some(v) = obj.local_gateway_id() {
-            attributes.insert("local_gateway_id".to_string(), Value::String(v.to_string()));
-        }
         if let Some(v) = obj.nat_gateway_id() {
             attributes.insert("nat_gateway_id".to_string(), Value::String(v.to_string()));
-        }
-        if let Some(v) = obj.network_interface_id() {
-            attributes.insert(
-                "network_interface_id".to_string(),
-                Value::String(v.to_string()),
-            );
-        }
-        if let Some(v) = obj.transit_gateway_id() {
-            attributes.insert(
-                "transit_gateway_id".to_string(),
-                Value::String(v.to_string()),
-            );
-        }
-        if let Some(v) = obj.vpc_peering_connection_id() {
-            attributes.insert(
-                "vpc_peering_connection_id".to_string(),
-                Value::String(v.to_string()),
-            );
         }
         None
     }
