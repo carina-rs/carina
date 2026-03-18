@@ -38,6 +38,10 @@ pub(crate) fn build_update_patches(
         if dsl_name == "tags" {
             continue;
         }
+        // Skip read-only attributes - they are set by the provider and cannot be updated
+        if attr_schema.read_only {
+            continue;
+        }
         if let Some(aws_name) = &attr_schema.provider_name
             && let Some(value) = to.attributes.get(dsl_name.as_str())
             && let Some(aws_value) =
@@ -60,6 +64,10 @@ pub(crate) fn build_update_patches(
     // Build remove operations for attributes present in `from` but absent in `to`
     for (dsl_name, attr_schema) in &config.schema.attributes {
         if dsl_name == "tags" {
+            continue;
+        }
+        // Skip read-only attributes - they are set by the provider and cannot be updated
+        if attr_schema.read_only {
             continue;
         }
         // Only generate remove for attributes that:
@@ -478,6 +486,61 @@ mod tests {
             Some("/RetentionInDays"),
         );
         assert_eq!(patch.get("value"), Some(&serde_json::json!(14)),);
+    }
+
+    #[test]
+    fn test_build_update_patches_excludes_read_only_properties() {
+        // Regression test for issue #806: update patch includes readOnly property Arn
+        // CloudFormation rejects patches that include read-only properties like Arn.
+        let config =
+            get_schema_config("logs.log_group").expect("logs.log_group schema should exist");
+        let id = ResourceId::with_provider("awscc", "logs.log_group", "test");
+
+        let mut from_attrs = HashMap::new();
+        from_attrs.insert("retention_in_days".to_string(), Value::Int(7));
+        from_attrs.insert(
+            "log_group_name".to_string(),
+            Value::String("/carina/test-group".to_string()),
+        );
+        // Arn is a read-only property returned by the API in current state
+        from_attrs.insert(
+            "arn".to_string(),
+            Value::String(
+                "arn:aws:logs:ap-northeast-1:123456789012:log-group:/carina/test-group:*"
+                    .to_string(),
+            ),
+        );
+        let from = State::existing(id.clone(), from_attrs);
+
+        let mut to = Resource::new("logs.log_group", "test");
+        to.attributes
+            .insert("retention_in_days".to_string(), Value::Int(14));
+        to.attributes.insert(
+            "log_group_name".to_string(),
+            Value::String("/carina/test-group".to_string()),
+        );
+
+        let patches = build_update_patches(&config, &from, &to);
+
+        // Should only have the retention_in_days patch, not Arn
+        let has_arn_patch = patches
+            .iter()
+            .any(|p| p.get("path").and_then(|v| v.as_str()) == Some("/Arn"));
+        assert!(
+            !has_arn_patch,
+            "Should not include read-only property Arn in update patches, got: {:?}",
+            patches
+        );
+
+        // Should still have the retention_in_days patch
+        let has_retention_patch = patches
+            .iter()
+            .any(|p| p.get("path").and_then(|v| v.as_str()) == Some("/RetentionInDays"));
+        assert!(
+            has_retention_patch,
+            "Should include RetentionInDays in update patches, got: {:?}",
+            patches
+        );
     }
 
     #[test]

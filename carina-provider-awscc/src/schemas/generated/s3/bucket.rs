@@ -310,6 +310,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
         )
         .attribute(
             AttributeSchema::new("arn", super::arn())
+                .read_only()
                 .with_description(" (read-only)")
                 .with_provider_name("Arn"),
         )
@@ -396,11 +397,13 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
         )
         .attribute(
             AttributeSchema::new("domain_name", AttributeType::String)
+                .read_only()
                 .with_description(" (read-only)")
                 .with_provider_name("DomainName"),
         )
         .attribute(
             AttributeSchema::new("dual_stack_domain_name", AttributeType::String)
+                .read_only()
                 .with_description(" (read-only)")
                 .with_provider_name("DualStackDomainName"),
         )
@@ -941,6 +944,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
         )
         .attribute(
             AttributeSchema::new("regional_domain_name", AttributeType::String)
+                .read_only()
                 .with_description(" (read-only)")
                 .with_provider_name("RegionalDomainName"),
         )
@@ -1174,6 +1178,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                 namespace: None,
                 to_dsl: None,
             })
+                .read_only()
                 .with_description(" (read-only)")
                 .with_provider_name("WebsiteURL"),
         )

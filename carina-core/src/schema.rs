@@ -534,6 +534,8 @@ pub struct AttributeSchema {
     pub provider_name: Option<String>,
     /// Whether this attribute is create-only (immutable after creation)
     pub create_only: bool,
+    /// Whether this attribute is read-only (set by the provider, cannot be updated)
+    pub read_only: bool,
     /// Override for removability detection.
     /// `None` = auto-detect: removable if `!required && !create_only`.
     /// `Some(false)` = explicitly non-removable (e.g., region inherited from provider).
@@ -554,6 +556,7 @@ impl AttributeSchema {
             completions: None,
             provider_name: None,
             create_only: false,
+            read_only: false,
             removable: None,
             block_name: None,
         }
@@ -566,6 +569,11 @@ impl AttributeSchema {
 
     pub fn create_only(mut self) -> Self {
         self.create_only = true;
+        self
+    }
+
+    pub fn read_only(mut self) -> Self {
+        self.read_only = true;
         self
     }
 

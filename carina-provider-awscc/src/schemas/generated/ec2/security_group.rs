@@ -54,6 +54,7 @@ pub fn ec2_security_group_config() -> AwsccSchemaConfig {
         )
         .attribute(
             AttributeSchema::new("group_id", super::security_group_id())
+                .read_only()
                 .with_description("The group ID of the specified security group. (read-only)")
                 .with_provider_name("GroupId"),
         )
@@ -65,6 +66,7 @@ pub fn ec2_security_group_config() -> AwsccSchemaConfig {
         )
         .attribute(
             AttributeSchema::new("id", super::security_group_id())
+                .read_only()
                 .with_description("The group name or group ID depending on whether the SG is created in default or specific VPC (read-only)")
                 .with_provider_name("Id"),
         )

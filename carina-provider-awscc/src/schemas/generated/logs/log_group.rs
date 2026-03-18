@@ -60,6 +60,7 @@ pub fn logs_log_group_config() -> AwsccSchemaConfig {
         .with_description("The ``AWS::Logs::LogGroup`` resource specifies a log group. A log group defines common properties for log streams, such as their retention and access control rules. Each log stream must belong to one ...")
         .attribute(
             AttributeSchema::new("arn", super::arn())
+                .read_only()
                 .with_description(" (read-only)")
                 .with_provider_name("Arn"),
         )

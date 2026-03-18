@@ -49,16 +49,19 @@ pub fn ec2_ipam_config() -> AwsccSchemaConfig {
         .with_description("Resource Schema of AWS::EC2::IPAM Type")
         .attribute(
             AttributeSchema::new("arn", super::arn())
+                .read_only()
                 .with_description("The Amazon Resource Name (ARN) of the IPAM. (read-only)")
                 .with_provider_name("Arn"),
         )
         .attribute(
             AttributeSchema::new("default_resource_discovery_association_id", AttributeType::String)
+                .read_only()
                 .with_description("The Id of the default association to the default resource discovery, created with this IPAM. (read-only)")
                 .with_provider_name("DefaultResourceDiscoveryAssociationId"),
         )
         .attribute(
             AttributeSchema::new("default_resource_discovery_id", AttributeType::String)
+                .read_only()
                 .with_description("The Id of the default resource discovery, created with this IPAM. (read-only)")
                 .with_provider_name("DefaultResourceDiscoveryId"),
         )
@@ -90,6 +93,7 @@ pub fn ec2_ipam_config() -> AwsccSchemaConfig {
         )
         .attribute(
             AttributeSchema::new("ipam_id", super::ipam_id())
+                .read_only()
                 .with_description("Id of the IPAM. (read-only)")
                 .with_provider_name("IpamId"),
         )
@@ -116,6 +120,7 @@ pub fn ec2_ipam_config() -> AwsccSchemaConfig {
         )
         .attribute(
             AttributeSchema::new("private_default_scope_id", AttributeType::String)
+                .read_only()
                 .with_description("The Id of the default scope for publicly routable IP space, created with this IPAM. (read-only)")
                 .with_provider_name("PrivateDefaultScopeId"),
         )
@@ -127,16 +132,19 @@ pub fn ec2_ipam_config() -> AwsccSchemaConfig {
                 namespace: None,
                 to_dsl: None,
             })
+                .read_only()
                 .with_description("The Id of the default scope for publicly routable IP space, created with this IPAM. (read-only)")
                 .with_provider_name("PublicDefaultScopeId"),
         )
         .attribute(
             AttributeSchema::new("resource_discovery_association_count", AttributeType::Int)
+                .read_only()
                 .with_description("The count of resource discoveries associated with this IPAM. (read-only)")
                 .with_provider_name("ResourceDiscoveryAssociationCount"),
         )
         .attribute(
             AttributeSchema::new("scope_count", AttributeType::Int)
+                .read_only()
                 .with_description("The number of scopes that currently exist in this IPAM. (read-only)")
                 .with_provider_name("ScopeCount"),
         )

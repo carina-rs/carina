@@ -67,6 +67,7 @@ pub fn ec2_ipam_pool_config() -> AwsccSchemaConfig {
         )
         .attribute(
             AttributeSchema::new("arn", super::arn())
+                .read_only()
                 .with_description("The Amazon Resource Name (ARN) of the IPAM Pool. (read-only)")
                 .with_provider_name("Arn"),
         )
@@ -92,16 +93,19 @@ pub fn ec2_ipam_pool_config() -> AwsccSchemaConfig {
         )
         .attribute(
             AttributeSchema::new("ipam_arn", super::arn())
+                .read_only()
                 .with_description("The Amazon Resource Name (ARN) of the IPAM this pool is a part of. (read-only)")
                 .with_provider_name("IpamArn"),
         )
         .attribute(
             AttributeSchema::new("ipam_pool_id", super::ipam_pool_id())
+                .read_only()
                 .with_description("Id of the IPAM Pool. (read-only)")
                 .with_provider_name("IpamPoolId"),
         )
         .attribute(
             AttributeSchema::new("ipam_scope_arn", super::arn())
+                .read_only()
                 .with_description("The Amazon Resource Name (ARN) of the scope this pool is a part of. (read-only)")
                 .with_provider_name("IpamScopeArn"),
         )
@@ -119,6 +123,7 @@ pub fn ec2_ipam_pool_config() -> AwsccSchemaConfig {
                 namespace: Some("awscc.ec2.ipam_pool".to_string()),
                 to_dsl: None,
             })
+                .read_only()
                 .with_description("Determines whether this scope contains publicly routable space or space for a private network (read-only)")
                 .with_provider_name("IpamScopeType"),
         )
@@ -130,6 +135,7 @@ pub fn ec2_ipam_pool_config() -> AwsccSchemaConfig {
         )
         .attribute(
             AttributeSchema::new("pool_depth", AttributeType::Int)
+                .read_only()
                 .with_description("The depth of this pool in the source pool hierarchy. (read-only)")
                 .with_provider_name("PoolDepth"),
         )
@@ -187,11 +193,13 @@ pub fn ec2_ipam_pool_config() -> AwsccSchemaConfig {
                 namespace: Some("awscc.ec2.ipam_pool".to_string()),
                 to_dsl: Some(|s: &str| s.replace('-', "_")),
             })
+                .read_only()
                 .with_description("The state of this pool. This can be one of the following values: \"create-in-progress\", \"create-complete\", \"modify-in-progress\", \"modify-complet... (read-only)")
                 .with_provider_name("State"),
         )
         .attribute(
             AttributeSchema::new("state_message", AttributeType::String)
+                .read_only()
                 .with_description("An explanation of how the pool arrived at it current state. (read-only)")
                 .with_provider_name("StateMessage"),
         )

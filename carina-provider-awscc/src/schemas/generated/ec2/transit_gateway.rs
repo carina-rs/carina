@@ -142,11 +142,13 @@ pub fn ec2_transit_gateway_config() -> AwsccSchemaConfig {
                         to_dsl: None,
                     },
                 )
+                .read_only()
                 .with_description("(read-only)")
                 .with_provider_name("EncryptionSupportState"),
             )
             .attribute(
                 AttributeSchema::new("id", super::transit_gateway_id())
+                    .read_only()
                     .with_description("(read-only)")
                     .with_provider_name("Id"),
             )
@@ -185,6 +187,7 @@ pub fn ec2_transit_gateway_config() -> AwsccSchemaConfig {
             .attribute(AttributeSchema::new("tags", tags_type()).with_provider_name("Tags"))
             .attribute(
                 AttributeSchema::new("transit_gateway_arn", super::arn())
+                    .read_only()
                     .with_description("(read-only)")
                     .with_provider_name("TransitGatewayArn"),
             )

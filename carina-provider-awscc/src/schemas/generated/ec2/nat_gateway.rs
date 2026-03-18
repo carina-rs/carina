@@ -41,11 +41,13 @@ pub fn ec2_nat_gateway_config() -> AwsccSchemaConfig {
         )
         .attribute(
             AttributeSchema::new("auto_provision_zones", AttributeType::String)
+                .read_only()
                 .with_description(" (read-only)")
                 .with_provider_name("AutoProvisionZones"),
         )
         .attribute(
             AttributeSchema::new("auto_scaling_ips", AttributeType::String)
+                .read_only()
                 .with_description(" (read-only)")
                 .with_provider_name("AutoScalingIps"),
         )
@@ -86,6 +88,7 @@ pub fn ec2_nat_gateway_config() -> AwsccSchemaConfig {
         )
         .attribute(
             AttributeSchema::new("eni_id", super::network_interface_id())
+                .read_only()
                 .with_description(" (read-only)")
                 .with_provider_name("EniId"),
         )
@@ -96,6 +99,7 @@ pub fn ec2_nat_gateway_config() -> AwsccSchemaConfig {
         )
         .attribute(
             AttributeSchema::new("nat_gateway_id", super::nat_gateway_id())
+                .read_only()
                 .with_description(" (read-only)")
                 .with_provider_name("NatGatewayId"),
         )
@@ -107,6 +111,7 @@ pub fn ec2_nat_gateway_config() -> AwsccSchemaConfig {
         )
         .attribute(
             AttributeSchema::new("route_table_id", super::route_table_id())
+                .read_only()
                 .with_description(" (read-only)")
                 .with_provider_name("RouteTableId"),
         )

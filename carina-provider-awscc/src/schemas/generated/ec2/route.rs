@@ -22,6 +22,7 @@ pub fn ec2_route_config() -> AwsccSchemaConfig {
         )
         .attribute(
             AttributeSchema::new("cidr_block", types::ipv4_cidr())
+                .read_only()
                 .with_description(" (read-only)")
                 .with_provider_name("CidrBlock"),
         )

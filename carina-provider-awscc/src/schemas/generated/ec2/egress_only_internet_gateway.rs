@@ -18,6 +18,7 @@ pub fn ec2_egress_only_internet_gateway_config() -> AwsccSchemaConfig {
             .with_description("Resource Type definition for AWS::EC2::EgressOnlyInternetGateway")
             .attribute(
                 AttributeSchema::new("id", super::egress_only_internet_gateway_id())
+                    .read_only()
                     .with_description(
                         "Service Generated ID of the EgressOnlyInternetGateway (read-only)",
                     )
