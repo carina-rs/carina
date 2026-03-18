@@ -289,48 +289,45 @@ async fn run_destroy_locked(
                     dep_id
                 );
 
-                let mut completed = false;
-                for _ in 0..180 {
-                    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-                    match provider.read(&dep_id, Some(&dep_identifier)).await {
-                        Ok(state) if !state.exists => {
-                            println!(
-                                "  {} Delete {} (completed after extended wait)",
-                                "✓".green(),
-                                dep_id
-                            );
-                            destroyed_ids.push(dep_id.clone());
-                            success_count += 1;
-                            completed = true;
-                            break;
-                        }
-                        Ok(_) => {
-                            // Still exists, keep waiting
-                        }
-                        Err(_) => {
-                            // Read error -- resource may be gone, treat as completed
-                            println!(
-                                "  {} Delete {} (completed after extended wait)",
-                                "✓".green(),
-                                dep_id
-                            );
-                            destroyed_ids.push(dep_id.clone());
-                            success_count += 1;
-                            completed = true;
-                            break;
-                        }
+                match wait_for_deletion(
+                    &provider,
+                    &dep_id,
+                    &dep_identifier,
+                    180,
+                    std::time::Duration::from_secs(10),
+                )
+                .await
+                {
+                    WaitResult::Deleted => {
+                        println!(
+                            "  {} Delete {} (completed after extended wait)",
+                            "✓".green(),
+                            dep_id
+                        );
+                        destroyed_ids.push(dep_id.clone());
+                        success_count += 1;
                     }
-                }
-
-                if !completed {
-                    println!(
-                        "  {} {} - still exists after extended wait",
-                        "✗".red(),
-                        dep_id
-                    );
-                    failed_bindings.insert(dep_binding.clone());
-                    failure_count += 1;
-                    wait_failed = true;
+                    WaitResult::ReadError(msg) => {
+                        println!(
+                            "  {} {} - read error during wait: {}",
+                            "✗".red(),
+                            dep_id,
+                            msg
+                        );
+                        failed_bindings.insert(dep_binding.clone());
+                        failure_count += 1;
+                        wait_failed = true;
+                    }
+                    WaitResult::TimedOut => {
+                        println!(
+                            "  {} {} - still exists after extended wait",
+                            "✗".red(),
+                            dep_id
+                        );
+                        failed_bindings.insert(dep_binding.clone());
+                        failure_count += 1;
+                        wait_failed = true;
+                    }
                 }
             }
         }
@@ -380,44 +377,43 @@ async fn run_destroy_locked(
             dep_id
         );
 
-        let mut completed = false;
-        for _ in 0..180 {
-            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-            match provider.read(dep_id, Some(dep_identifier)).await {
-                Ok(state) if !state.exists => {
-                    println!(
-                        "  {} Delete {} (completed after extended wait)",
-                        "✓".green(),
-                        dep_id
-                    );
-                    destroyed_ids.push(dep_id.clone());
-                    success_count += 1;
-                    completed = true;
-                    break;
-                }
-                Ok(_) => {}
-                Err(_) => {
-                    println!(
-                        "  {} Delete {} (completed after extended wait)",
-                        "✓".green(),
-                        dep_id
-                    );
-                    destroyed_ids.push(dep_id.clone());
-                    success_count += 1;
-                    completed = true;
-                    break;
-                }
+        match wait_for_deletion(
+            &provider,
+            dep_id,
+            dep_identifier,
+            180,
+            std::time::Duration::from_secs(10),
+        )
+        .await
+        {
+            WaitResult::Deleted => {
+                println!(
+                    "  {} Delete {} (completed after extended wait)",
+                    "✓".green(),
+                    dep_id
+                );
+                destroyed_ids.push(dep_id.clone());
+                success_count += 1;
             }
-        }
-
-        if !completed {
-            println!(
-                "  {} {} - still exists after extended wait",
-                "✗".red(),
-                dep_id
-            );
-            failed_bindings.insert(dep_binding.clone());
-            failure_count += 1;
+            WaitResult::ReadError(msg) => {
+                println!(
+                    "  {} {} - read error during wait: {}",
+                    "✗".red(),
+                    dep_id,
+                    msg
+                );
+                failed_bindings.insert(dep_binding.clone());
+                failure_count += 1;
+            }
+            WaitResult::TimedOut => {
+                println!(
+                    "  {} {} - still exists after extended wait",
+                    "✗".red(),
+                    dep_id
+                );
+                failed_bindings.insert(dep_binding.clone());
+                failure_count += 1;
+            }
         }
     }
 
@@ -455,5 +451,220 @@ async fn run_destroy_locked(
             "Destroy failed. {} succeeded, {} failed, {} skipped.",
             success_count, failure_count, skip_count
         )))
+    }
+}
+
+/// Result of waiting for a resource deletion to complete.
+#[derive(Debug, PartialEq)]
+enum WaitResult {
+    /// Resource confirmed deleted (`state.exists == false`).
+    Deleted,
+    /// A `provider.read()` call returned an error.
+    ReadError(String),
+    /// The resource still existed after all retry attempts.
+    TimedOut,
+}
+
+/// Poll `provider.read()` in a loop until the resource disappears or an error /
+/// timeout occurs.
+///
+/// * `max_attempts` – how many times to poll (each preceded by `poll_interval`).
+/// * `poll_interval` – sleep duration between polls.
+async fn wait_for_deletion(
+    provider: &dyn Provider,
+    id: &ResourceId,
+    identifier: &str,
+    max_attempts: usize,
+    poll_interval: std::time::Duration,
+) -> WaitResult {
+    for _ in 0..max_attempts {
+        tokio::time::sleep(poll_interval).await;
+        match provider.read(id, Some(identifier)).await {
+            Ok(state) if !state.exists => return WaitResult::Deleted,
+            Ok(_) => {
+                // Still exists, keep waiting
+            }
+            Err(e) => return WaitResult::ReadError(e.to_string()),
+        }
+    }
+    WaitResult::TimedOut
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use carina_core::provider::{BoxFuture, ProviderError, ProviderResult};
+    use carina_core::resource::LifecycleConfig;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A mock provider whose `read()` returns a sequence of results.
+    struct SequenceProvider {
+        /// Each call to `read()` pops the next result from this list.
+        /// When exhausted, returns `State::not_found`.
+        call_count: AtomicUsize,
+        responses: Vec<ProviderResult<State>>,
+    }
+
+    impl SequenceProvider {
+        fn new(responses: Vec<ProviderResult<State>>) -> Self {
+            Self {
+                call_count: AtomicUsize::new(0),
+                responses,
+            }
+        }
+    }
+
+    impl Provider for SequenceProvider {
+        fn name(&self) -> &'static str {
+            "sequence-mock"
+        }
+
+        fn read(
+            &self,
+            id: &ResourceId,
+            _identifier: Option<&str>,
+        ) -> BoxFuture<'_, ProviderResult<State>> {
+            let idx = self.call_count.fetch_add(1, Ordering::SeqCst);
+            let id = id.clone();
+            Box::pin(async move {
+                if idx < self.responses.len() {
+                    // Recreate the result since ProviderResult is not Clone
+                    match &self.responses[idx] {
+                        Ok(state) => Ok(state.clone()),
+                        Err(e) => Err(ProviderError::new(e.message.clone())),
+                    }
+                } else {
+                    Ok(State::not_found(id))
+                }
+            })
+        }
+
+        fn create(&self, _resource: &Resource) -> BoxFuture<'_, ProviderResult<State>> {
+            Box::pin(async { unreachable!() })
+        }
+
+        fn update(
+            &self,
+            _id: &ResourceId,
+            _identifier: &str,
+            _from: &State,
+            _to: &Resource,
+        ) -> BoxFuture<'_, ProviderResult<State>> {
+            Box::pin(async { unreachable!() })
+        }
+
+        fn delete(
+            &self,
+            _id: &ResourceId,
+            _identifier: &str,
+            _lifecycle: &LifecycleConfig,
+        ) -> BoxFuture<'_, ProviderResult<()>> {
+            Box::pin(async { unreachable!() })
+        }
+    }
+
+    #[tokio::test]
+    async fn wait_for_deletion_succeeds_when_resource_disappears() {
+        let id = ResourceId::new("s3.bucket", "test");
+        let provider = SequenceProvider::new(vec![Ok(State::not_found(id.clone()))]);
+
+        let result = wait_for_deletion(
+            &provider,
+            &id,
+            "some-identifier",
+            3,
+            std::time::Duration::from_millis(1),
+        )
+        .await;
+
+        assert_eq!(result, WaitResult::Deleted);
+    }
+
+    #[tokio::test]
+    async fn wait_for_deletion_returns_read_error_on_provider_error() {
+        let id = ResourceId::new("s3.bucket", "test");
+        let provider = SequenceProvider::new(vec![Err(ProviderError::new("auth expired"))]);
+
+        let result = wait_for_deletion(
+            &provider,
+            &id,
+            "some-identifier",
+            3,
+            std::time::Duration::from_millis(1),
+        )
+        .await;
+
+        match result {
+            WaitResult::ReadError(msg) => assert!(
+                msg.contains("auth expired"),
+                "Expected error message to contain 'auth expired', got: {}",
+                msg
+            ),
+            other => panic!("Expected ReadError, got: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn wait_for_deletion_does_not_treat_read_error_as_success() {
+        // This is the core regression test for issue #843.
+        // Previously, Err(_) from provider.read() was treated as successful
+        // deletion, causing live infrastructure to be orphaned while the user
+        // was told it was destroyed.
+        let id = ResourceId::new("s3.bucket", "test");
+        let provider = SequenceProvider::new(vec![Err(ProviderError::new("network timeout"))]);
+
+        let result = wait_for_deletion(
+            &provider,
+            &id,
+            "some-identifier",
+            3,
+            std::time::Duration::from_millis(1),
+        )
+        .await;
+
+        // Must NOT be Deleted -- that was the old (buggy) behavior
+        assert_ne!(result, WaitResult::Deleted);
+    }
+
+    #[tokio::test]
+    async fn wait_for_deletion_times_out_when_resource_keeps_existing() {
+        let id = ResourceId::new("s3.bucket", "test");
+        let existing_state = State::existing(id.clone(), HashMap::new());
+        let provider = SequenceProvider::new(vec![
+            Ok(existing_state.clone()),
+            Ok(existing_state.clone()),
+            Ok(existing_state),
+        ]);
+
+        let result = wait_for_deletion(
+            &provider,
+            &id,
+            "some-identifier",
+            3,
+            std::time::Duration::from_millis(1),
+        )
+        .await;
+
+        assert_eq!(result, WaitResult::TimedOut);
+    }
+
+    #[tokio::test]
+    async fn wait_for_deletion_succeeds_after_transient_exists() {
+        // Resource exists on first poll, then disappears on second.
+        let id = ResourceId::new("s3.bucket", "test");
+        let existing_state = State::existing(id.clone(), HashMap::new());
+        let provider =
+            SequenceProvider::new(vec![Ok(existing_state), Ok(State::not_found(id.clone()))]);
+
+        let result = wait_for_deletion(
+            &provider,
+            &id,
+            "some-identifier",
+            3,
+            std::time::Duration::from_millis(1),
+        )
+        .await;
+
+        assert_eq!(result, WaitResult::Deleted);
     }
 }
