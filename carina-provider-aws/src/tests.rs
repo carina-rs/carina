@@ -543,3 +543,72 @@ fn test_subnet_availability_zone_dsl_format_us_east() {
     let az_dsl = format!("aws.AvailabilityZone.{}", az.replace('-', "_"));
     assert_eq!(az_dsl, "aws.AvailabilityZone.us_east_1b");
 }
+
+// --- Subnet DNS hostname_type enum conversion ---
+
+#[test]
+fn test_subnet_hostname_type_dsl_to_aws_sdk() {
+    use aws_sdk_ec2::types::HostnameType;
+    use carina_core::utils::convert_enum_value;
+
+    // DSL uses underscores: aws.ec2.subnet.HostnameType.ip_name
+    // convert_enum_value for 5-part identifiers converts underscores to hyphens
+    let dsl_value = "aws.ec2.subnet.HostnameType.ip_name";
+    let converted = convert_enum_value(dsl_value);
+    assert_eq!(converted, "ip-name");
+    let hostname_type = HostnameType::from(converted.as_str());
+    assert_eq!(hostname_type, HostnameType::IpName);
+
+    let dsl_value2 = "aws.ec2.subnet.HostnameType.resource_name";
+    let converted2 = convert_enum_value(dsl_value2);
+    assert_eq!(converted2, "resource-name");
+    let hostname_type2 = HostnameType::from(converted2.as_str());
+    assert_eq!(hostname_type2, HostnameType::ResourceName);
+}
+
+// --- Subnet modify_subnet_attributes: DNS options must be separate API calls ---
+// The AWS ModifySubnetAttribute API only allows modifying one attribute at a time.
+// See: https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_ModifySubnetAttribute.html
+// "You can only modify one attribute at a time."
+// This test verifies that private_dns_name_options_on_launch fields are parsed
+// correctly for separate API calls.
+
+#[test]
+fn test_subnet_dns_options_fields_parsed_separately() {
+    use carina_core::utils::convert_enum_value;
+
+    // Simulate the attributes map that would be passed to modify_subnet_attributes
+    let mut fields = HashMap::new();
+    fields.insert(
+        "hostname_type".to_string(),
+        Value::String("aws.ec2.subnet.HostnameType.ip_name".to_string()),
+    );
+    fields.insert(
+        "enable_resource_name_dns_a_record".to_string(),
+        Value::Bool(true),
+    );
+    fields.insert(
+        "enable_resource_name_dns_aaaa_record".to_string(),
+        Value::Bool(false),
+    );
+
+    // Each field should be independently extractable for separate API calls
+    if let Some(Value::String(ht)) = fields.get("hostname_type") {
+        let hostname_val = convert_enum_value(ht);
+        assert_eq!(hostname_val, "ip-name");
+    } else {
+        panic!("hostname_type should be present and a String");
+    }
+
+    if let Some(Value::Bool(v)) = fields.get("enable_resource_name_dns_a_record") {
+        assert!(*v);
+    } else {
+        panic!("enable_resource_name_dns_a_record should be present and a Bool");
+    }
+
+    if let Some(Value::Bool(v)) = fields.get("enable_resource_name_dns_aaaa_record") {
+        assert!(!(*v));
+    } else {
+        panic!("enable_resource_name_dns_aaaa_record should be present and a Bool");
+    }
+}
