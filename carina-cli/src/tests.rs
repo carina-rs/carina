@@ -1170,6 +1170,104 @@ async fn detect_drift_returns_messages_when_drift_detected() {
     assert!(!msgs.is_empty(), "Should have drift messages");
 }
 
+/// Test that resources tracked in the state file but removed from the .crn config
+/// produce a Delete effect in the plan.  This is the regression test for issue #844.
+#[test]
+fn orphaned_state_resource_produces_delete_effect() {
+    use carina_core::differ::create_plan;
+    use std::collections::HashSet;
+
+    // State file has two resources: "keep-bucket" and "removed-bucket"
+    let mut state_file = StateFile::new();
+    state_file.upsert_resource(
+        ResourceState::new("s3.bucket", "keep-bucket", "aws")
+            .with_identifier("keep-bucket")
+            .with_attribute("bucket", json!("keep-bucket")),
+    );
+    state_file.upsert_resource(
+        ResourceState::new("s3.bucket", "removed-bucket", "aws")
+            .with_identifier("removed-bucket")
+            .with_attribute("bucket", json!("removed-bucket")),
+    );
+
+    // Config only has "keep-bucket" -- "removed-bucket" was deleted from .crn
+    let desired = vec![
+        Resource::with_provider("aws", "s3.bucket", "keep-bucket")
+            .with_attribute("bucket", Value::String("keep-bucket".to_string())),
+    ];
+
+    let desired_ids: HashSet<ResourceId> = desired.iter().map(|r| r.id.clone()).collect();
+
+    // Build current_states from desired resources (simulates the provider read loop)
+    let mut current_states: HashMap<ResourceId, State> = HashMap::new();
+    for resource in &desired {
+        current_states.insert(
+            resource.id.clone(),
+            State::existing(
+                resource.id.clone(),
+                HashMap::from([(
+                    "bucket".to_string(),
+                    Value::String("keep-bucket".to_string()),
+                )]),
+            )
+            .with_identifier("keep-bucket"),
+        );
+    }
+
+    // Seed orphaned state entries -- this is the fix for #844
+    let orphan_states = state_file.build_orphan_states(&desired_ids);
+    for (id, state) in orphan_states {
+        current_states.entry(id).or_insert(state);
+    }
+
+    let lifecycles = state_file.build_lifecycles();
+    let saved_attrs = state_file.build_saved_attrs();
+    let prev_desired_keys = state_file.build_desired_keys();
+
+    let plan = create_plan(
+        &desired,
+        &current_states,
+        &lifecycles,
+        &HashMap::new(),
+        &saved_attrs,
+        &prev_desired_keys,
+    );
+
+    // The plan should contain a Delete effect for "removed-bucket"
+    let delete_effects: Vec<_> = plan
+        .effects()
+        .iter()
+        .filter(|e| matches!(e, Effect::Delete { .. }))
+        .collect();
+
+    assert_eq!(
+        delete_effects.len(),
+        1,
+        "Should have exactly one Delete effect for the orphaned resource, got: {:?}",
+        plan.effects()
+    );
+
+    match &delete_effects[0] {
+        Effect::Delete { id, identifier, .. } => {
+            assert_eq!(id.name, "removed-bucket");
+            assert_eq!(identifier, "removed-bucket");
+        }
+        _ => unreachable!(),
+    }
+
+    // The plan should NOT have any effects for "keep-bucket" (it's unchanged)
+    let non_delete_effects: Vec<_> = plan
+        .effects()
+        .iter()
+        .filter(|e| !matches!(e, Effect::Delete { .. }))
+        .collect();
+    assert!(
+        non_delete_effects.is_empty(),
+        "Should have no non-Delete effects for unchanged resource, got: {:?}",
+        non_delete_effects
+    );
+}
+
 /// A mock StateBackend that fails on write_state and tracks release_lock calls
 struct MockBackend {
     write_state_fails: bool,

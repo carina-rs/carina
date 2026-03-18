@@ -135,6 +135,38 @@ impl StateFile {
         result
     }
 
+    /// Build state entries for resources tracked in the state file but absent from the
+    /// desired resource set.  These "orphan" entries are injected into `current_states`
+    /// so that `create_plan()` can detect them and emit Delete effects.
+    pub fn build_orphan_states(
+        &self,
+        desired_ids: &std::collections::HashSet<ResourceId>,
+    ) -> HashMap<ResourceId, State> {
+        let mut result = HashMap::new();
+        for rs in &self.resources {
+            let id = ResourceId::with_provider(&rs.provider, &rs.resource_type, &rs.name);
+            if desired_ids.contains(&id) {
+                continue;
+            }
+            // Only include resources that actually have an identifier (i.e. exist in infra)
+            if let Some(ref identifier) = rs.identifier {
+                let attrs: HashMap<String, Value> = rs
+                    .attributes
+                    .iter()
+                    .filter_map(|(k, v)| json_to_dsl_value(v).map(|val| (k.clone(), val)))
+                    .collect();
+                let state = State {
+                    id: id.clone(),
+                    identifier: Some(identifier.clone()),
+                    attributes: attrs,
+                    exists: true,
+                };
+                result.insert(id, state);
+            }
+        }
+        result
+    }
+
     /// Build a map of ResourceId -> name overrides from this state file.
     /// Name overrides come from create_before_destroy with non-renameable attributes.
     pub fn build_name_overrides(&self) -> HashMap<ResourceId, HashMap<String, String>> {
