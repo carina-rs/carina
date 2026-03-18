@@ -8,9 +8,11 @@
 #   ec2_vpc              - Remove a tag from VPC
 #   s3_bucket            - Remove a tag from S3 bucket
 #   iam_role             - Remove a tag from IAM role
+#   ec2_nat_gateway      - Remove a tag from NAT Gateway
 #   ec2_vpc_all_tags     - Remove entire tags block from VPC
 #   s3_bucket_all_tags   - Remove entire tags block from S3 bucket
 #   iam_role_all_tags    - Remove entire tags block from IAM role
+#   ec2_nat_gateway_all_tags - Remove entire tags block from NAT Gateway
 #
 # Filter (optional): substring to match test names (e.g. "ec2_vpc", "s3_bucket")
 
@@ -206,23 +208,35 @@ run_test "iam_role" \
     "$SCRIPT_DIR/iam_role_step2.crn" \
     "Test 3: IAM Role (remove one tag key)"
 
-# Test 4: EC2 VPC - entire tags block removal
+# Test 4: EC2 NAT Gateway - tag removal via CloudControl "remove" patch
+run_test "ec2_nat_gateway" \
+    "$SCRIPT_DIR/ec2_nat_gateway_step1.crn" \
+    "$SCRIPT_DIR/ec2_nat_gateway_step2.crn" \
+    "Test 4: EC2 NAT Gateway (remove one tag key)"
+
+# Test 5: EC2 VPC - entire tags block removal
 run_test "ec2_vpc_all_tags" \
     "$SCRIPT_DIR/ec2_vpc_step1.crn" \
     "$SCRIPT_DIR/ec2_vpc_step3.crn" \
-    "Test 4: EC2 VPC (remove entire tags block)"
+    "Test 5: EC2 VPC (remove entire tags block)"
 
-# Test 5: S3 Bucket - entire tags block removal
+# Test 6: S3 Bucket - entire tags block removal
 run_test "s3_bucket_all_tags" \
     "$SCRIPT_DIR/s3_bucket_step1.crn" \
     "$SCRIPT_DIR/s3_bucket_step3.crn" \
-    "Test 5: S3 Bucket (remove entire tags block)"
+    "Test 6: S3 Bucket (remove entire tags block)"
 
-# Test 6: IAM Role - entire tags block removal
+# Test 7: IAM Role - entire tags block removal
 run_test "iam_role_all_tags" \
     "$SCRIPT_DIR/iam_role_step1.crn" \
     "$SCRIPT_DIR/iam_role_step3.crn" \
-    "Test 6: IAM Role (remove entire tags block)"
+    "Test 7: IAM Role (remove entire tags block)"
+
+# Test 8: EC2 NAT Gateway - entire tags block removal
+run_test "ec2_nat_gateway_all_tags" \
+    "$SCRIPT_DIR/ec2_nat_gateway_step1.crn" \
+    "$SCRIPT_DIR/ec2_nat_gateway_step3.crn" \
+    "Test 8: EC2 NAT Gateway (remove entire tags block)"
 
 echo "════════════════════════════════════════"
 echo "Total: $TOTAL_PASSED passed, $TOTAL_FAILED failed"
