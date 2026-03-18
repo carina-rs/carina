@@ -11,6 +11,7 @@
 #   ec2_subnet         - Toggle map_public_ip_on_launch (false -> true)
 #   ec2_route          - Change route target (IGW -> NAT Gateway)
 #   s3_bucket          - Toggle versioning (Enabled -> Suspended)
+#   s3_bucket_acl      - ACL/object_ownership transition
 #
 # Filter (optional): substring to match test names (e.g. "ec2_vpc", "s3_bucket")
 
@@ -223,6 +224,12 @@ run_test "s3_bucket" \
     "$SCRIPT_DIR/s3_bucket_step1.crn" \
     "$SCRIPT_DIR/s3_bucket_step2.crn" \
     "Test 6: S3 Bucket (versioning Enabled -> Suspended)"
+
+# Test 7: S3 Bucket ACL - ACL/object_ownership transition
+run_test "s3_bucket_acl" \
+    "$SCRIPT_DIR/s3_bucket_acl_step1.crn" \
+    "$SCRIPT_DIR/s3_bucket_acl_step2.crn" \
+    "Test 7: S3 Bucket ACL (ACL private + BucketOwnerPreferred -> BucketOwnerEnforced)"
 
 echo "════════════════════════════════════════"
 echo "Total: $TOTAL_PASSED passed, $TOTAL_FAILED failed"
