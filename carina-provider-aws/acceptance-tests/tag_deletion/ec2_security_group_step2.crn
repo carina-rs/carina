@@ -1,0 +1,27 @@
+# EC2 Security Group - Tag deletion test (Step 2: Remove one tag)
+#
+# Same VPC and security group as step 1, but with the "ToBeRemoved" tag
+# deleted. After apply, the tag should be removed from AWS and plan
+# should show no changes (idempotent).
+
+provider aws {
+  region = aws.Region.ap_northeast_1
+}
+
+let vpc = aws.ec2.vpc {
+  cidr_block = "10.106.0.0/16"
+
+  tags = {
+    Environment = "acceptance-test"
+  }
+}
+
+aws.ec2.security_group {
+  group_name  = "carina-tag-deletion-test"
+  description = "Carina acceptance test for tag deletion"
+  vpc_id      = vpc.vpc_id
+
+  tags = {
+    Environment = "acceptance-test"
+  }
+}

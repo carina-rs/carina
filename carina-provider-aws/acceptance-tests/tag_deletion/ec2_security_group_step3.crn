@@ -1,0 +1,24 @@
+# EC2 Security Group - Tag deletion test (Step 3: Remove entire tags block)
+#
+# Same VPC and security group as step 1, but with the tags block completely
+# removed from the security group. Tests that the differ detects attribute
+# removal when a key exists in current state but is absent from desired
+# state (issue #447).
+
+provider aws {
+  region = aws.Region.ap_northeast_1
+}
+
+let vpc = aws.ec2.vpc {
+  cidr_block = "10.106.0.0/16"
+
+  tags = {
+    Environment = "acceptance-test"
+  }
+}
+
+aws.ec2.security_group {
+  group_name  = "carina-tag-deletion-test"
+  description = "Carina acceptance test for tag deletion"
+  vpc_id      = vpc.vpc_id
+}
