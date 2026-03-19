@@ -76,6 +76,7 @@ pub async fn execute_effects(
     provider: &dyn Provider,
     binding_map: &mut HashMap<String, HashMap<String, Value>>,
     current_states: &mut HashMap<ResourceId, State>,
+    unresolved_resources: &HashMap<ResourceId, Resource>,
 ) -> ApplyResult {
     let mut success_count = 0;
     let mut failure_count = 0;
@@ -144,9 +145,14 @@ pub async fn execute_effects(
                 }
             }
             Effect::Update { id, from, to, .. } => {
-                // Re-resolve references
+                // Re-resolve references from unresolved resource if available.
+                // The `to` in the effect may contain stale pre-resolved values when
+                // a dependency was replaced via create_before_destroy. Using the
+                // unresolved resource's attributes (which still contain ResourceRef
+                // values) ensures we resolve against the updated binding_map.
+                let resolve_source = unresolved_resources.get(id).unwrap_or(to);
                 let mut resolved_to = to.clone();
-                for (key, value) in &to.attributes {
+                for (key, value) in &resolve_source.attributes {
                     resolved_to
                         .attributes
                         .insert(key.clone(), resolve_ref_value(value, binding_map));
@@ -1056,7 +1062,20 @@ async fn run_apply_locked(
     println!("{}", "Applying changes...".cyan().bold());
     println!();
 
-    let result = execute_effects(&plan, &provider, &mut binding_map, &mut current_states).await;
+    // Build unresolved resource map for re-resolution at apply time
+    let unresolved_resources: HashMap<ResourceId, Resource> = sorted_resources
+        .iter()
+        .map(|r| (r.id.clone(), r.clone()))
+        .collect();
+
+    let result = execute_effects(
+        &plan,
+        &provider,
+        &mut binding_map,
+        &mut current_states,
+        &unresolved_resources,
+    )
+    .await;
 
     finalize_apply(
         &result,
@@ -1292,7 +1311,20 @@ async fn run_apply_from_plan_locked(
     println!("{}", "Applying changes...".cyan().bold());
     println!();
 
-    let result = execute_effects(plan, &provider, &mut binding_map, &mut current_states).await;
+    // Build unresolved resource map for re-resolution at apply time
+    let unresolved_resources: HashMap<ResourceId, Resource> = sorted_resources
+        .iter()
+        .map(|r| (r.id.clone(), r.clone()))
+        .collect();
+
+    let result = execute_effects(
+        plan,
+        &provider,
+        &mut binding_map,
+        &mut current_states,
+        &unresolved_resources,
+    )
+    .await;
 
     finalize_apply(
         &result,
