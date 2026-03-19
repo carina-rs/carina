@@ -291,6 +291,7 @@ pub async fn execute_effects(
                                     Ok(()) => {
                                         // If a temporary name was used and the name is updatable,
                                         // rename the resource back to the desired name
+                                        let mut rename_failed = false;
                                         let final_state = if let Some(temp) = temporary_name
                                             && temp.can_rename
                                         {
@@ -322,6 +323,7 @@ pub async fn execute_effects(
                                                         id,
                                                         e
                                                     );
+                                                    rename_failed = true;
                                                     // Use the state with temp name
                                                     state.clone()
                                                 }
@@ -342,10 +344,23 @@ pub async fn execute_effects(
                                             state.clone()
                                         };
 
-                                        println!("  {} {}", "✓".green(), format_effect(effect));
-                                        success_count += 1;
-
+                                        // Save state regardless (resource exists, possibly with temp name)
                                         applied_states.insert(to.id.clone(), final_state);
+
+                                        if rename_failed {
+                                            println!(
+                                                "  {} {} (rename failed)",
+                                                "✗".red(),
+                                                format_effect(effect)
+                                            );
+                                            failure_count += 1;
+                                            if let Some(binding) = effect.binding_name() {
+                                                failed_bindings.insert(binding);
+                                            }
+                                        } else {
+                                            println!("  {} {}", "✓".green(), format_effect(effect));
+                                            success_count += 1;
+                                        }
                                     }
                                     Err(e) => {
                                         println!(
