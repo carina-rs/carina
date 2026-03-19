@@ -1357,7 +1357,7 @@ async fn lock_released_on_write_state_failure() {
         &HashMap::new(),
         &Plan::new(),
         &backend,
-        &lock,
+        Some(&lock),
     )
     .await;
 
@@ -1487,7 +1487,7 @@ async fn finalize_apply_uses_write_state_locked() {
         &HashMap::new(),
         &Plan::new(),
         &backend,
-        &lock,
+        Some(&lock),
     )
     .await;
 
@@ -1934,7 +1934,7 @@ async fn state_refresh_removes_orphaned_resource_deleted_externally() {
 
     // MockProvider returns not_found for both resources (simulates external deletion)
     let lock = LockInfo::new("state-refresh");
-    let result = run_state_refresh_locked(&mut parsed, &backend, &lock).await;
+    let result = run_state_refresh_locked(&mut parsed, &backend, Some(&lock)).await;
     assert!(result.is_ok(), "refresh should succeed: {:?}", result);
 
     // Verify the written state
@@ -1949,6 +1949,73 @@ async fn state_refresh_removes_orphaned_resource_deleted_externally() {
             .find_resource("", "s3.bucket", "orphan-bucket")
             .is_none(),
         "Orphaned resource should be removed from state after refresh (issue #879)"
+    );
+}
+
+/// Test that save_state_unlocked uses write_state (not write_state_locked) and
+/// does NOT call renew_lock.
+#[tokio::test]
+async fn save_state_unlocked_uses_write_state_without_lock() {
+    use crate::commands::apply::save_state_unlocked;
+
+    let backend = LockTrackingBackend::new();
+    let mut state = StateFile::new();
+
+    let result = save_state_unlocked(&backend, &mut state).await;
+    assert!(result.is_ok(), "save_state_unlocked should succeed");
+
+    assert!(
+        backend.write_state_called.load(Ordering::SeqCst),
+        "save_state_unlocked must call write_state"
+    );
+    assert!(
+        !backend.renew_lock_called.load(Ordering::SeqCst),
+        "save_state_unlocked must NOT call renew_lock"
+    );
+    assert!(
+        !backend.write_state_locked_called.load(Ordering::SeqCst),
+        "save_state_unlocked must NOT call write_state_locked"
+    );
+}
+
+/// Test that finalize_apply with lock=None uses write_state (unlocked path).
+#[tokio::test]
+async fn finalize_apply_without_lock_uses_write_state() {
+    let backend = LockTrackingBackend::new();
+
+    let result = ApplyResult {
+        success_count: 0,
+        failure_count: 0,
+        skip_count: 0,
+        applied_states: HashMap::new(),
+        permanent_name_overrides: HashMap::new(),
+        successfully_deleted: HashSet::new(),
+        failed_refreshes: HashSet::new(),
+    };
+
+    let op_result = finalize_apply(
+        &result,
+        Some(StateFile::new()),
+        &[],
+        &HashMap::new(),
+        &Plan::new(),
+        &backend,
+        None, // No lock
+    )
+    .await;
+
+    assert!(op_result.is_ok(), "finalize_apply should succeed");
+    assert!(
+        backend.write_state_called.load(Ordering::SeqCst),
+        "finalize_apply without lock must use write_state"
+    );
+    assert!(
+        !backend.write_state_locked_called.load(Ordering::SeqCst),
+        "finalize_apply without lock must NOT use write_state_locked"
+    );
+    assert!(
+        !backend.renew_lock_called.load(Ordering::SeqCst),
+        "finalize_apply without lock must NOT call renew_lock"
     );
 }
 

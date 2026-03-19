@@ -60,6 +60,10 @@ pub enum StateCommands {
         /// Path to .crn file or directory
         #[arg(default_value = ".")]
         path: PathBuf,
+
+        /// Enable/disable state locking (default: true)
+        #[arg(long, default_value = "true", action = clap::ArgAction::Set)]
+        lock: bool,
     },
 }
 
@@ -71,7 +75,7 @@ pub async fn run_state_command(command: StateCommands) -> Result<(), AppError> {
             force,
             path,
         } => run_state_bucket_delete(&bucket_name, force, &path).await,
-        StateCommands::Refresh { path } => run_state_refresh(&path).await,
+        StateCommands::Refresh { path, lock } => run_state_refresh(&path, lock).await,
     }
 }
 
@@ -216,7 +220,7 @@ async fn run_state_bucket_delete(
 }
 
 /// Run state refresh command
-pub async fn run_state_refresh(path: &PathBuf) -> Result<(), AppError> {
+pub async fn run_state_refresh(path: &PathBuf, lock: bool) -> Result<(), AppError> {
     let loaded = load_configuration(path)?;
     let mut parsed = loaded.parsed;
 
@@ -234,27 +238,43 @@ pub async fn run_state_refresh(path: &PathBuf) -> Result<(), AppError> {
         create_local_backend()
     };
 
-    // Acquire lock
-    println!("{}", "Acquiring state lock...".cyan());
-    let lock = backend
-        .acquire_lock("refresh")
-        .await
-        .map_err(map_lock_error)?;
-    println!("  {} Lock acquired", "✓".green());
+    // Acquire lock (unless --lock=false)
+    let lock_info: Option<LockInfo> = if lock {
+        println!("{}", "Acquiring state lock...".cyan());
+        let li = backend
+            .acquire_lock("refresh")
+            .await
+            .map_err(map_lock_error)?;
+        println!("  {} Lock acquired", "✓".green());
+        Some(li)
+    } else {
+        println!(
+            "{}",
+            "Warning: State locking is disabled. This is unsafe if others might run commands against the same state."
+                .yellow()
+                .bold()
+        );
+        None
+    };
 
-    let op_result = run_state_refresh_locked(&mut parsed, backend.as_ref(), &lock).await;
+    let op_result =
+        run_state_refresh_locked(&mut parsed, backend.as_ref(), lock_info.as_ref()).await;
 
-    // Always release lock, regardless of whether the operation succeeded
-    let release_result = backend.release_lock(&lock).await.map_err(AppError::Backend);
+    // Always release lock if it was acquired
+    if let Some(ref li) = lock_info {
+        let release_result = backend.release_lock(li).await.map_err(AppError::Backend);
 
-    op_result?;
-    release_result
+        op_result?;
+        release_result
+    } else {
+        op_result
+    }
 }
 
 pub(crate) async fn run_state_refresh_locked(
     parsed: &mut carina_core::parser::ParsedFile,
     backend: &dyn StateBackend,
-    lock: &LockInfo,
+    lock: Option<&LockInfo>,
 ) -> Result<(), AppError> {
     let ctx = WiringContext::new();
 
@@ -572,8 +592,12 @@ pub(crate) async fn run_state_refresh_locked(
         }
     }
 
-    // Renew lock and save with lock validation
-    crate::commands::apply::save_state_locked(backend, lock, &mut state).await?;
+    // Save state (with or without lock validation)
+    if let Some(lock) = lock {
+        crate::commands::apply::save_state_locked(backend, lock, &mut state).await?;
+    } else {
+        crate::commands::apply::save_state_unlocked(backend, &mut state).await?;
+    }
 
     // Summary
     println!(

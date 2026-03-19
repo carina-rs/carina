@@ -25,7 +25,7 @@ use crate::wiring::{
     reconcile_prefixed_names,
 };
 
-pub async fn run_destroy(path: &PathBuf, auto_approve: bool) -> Result<(), AppError> {
+pub async fn run_destroy(path: &PathBuf, auto_approve: bool, lock: bool) -> Result<(), AppError> {
     let mut parsed = load_configuration(path)?.parsed;
 
     let base_dir = get_base_dir(path);
@@ -57,32 +57,47 @@ pub async fn run_destroy(path: &PathBuf, auto_approve: bool) -> Result<(), AppEr
         });
     }
 
-    // Acquire lock
-    println!("{}", "Acquiring state lock...".cyan());
-    let lock = backend
-        .acquire_lock("destroy")
-        .await
-        .map_err(map_lock_error)?;
-    println!("  {} Lock acquired", "✓".green());
+    // Acquire lock (unless --lock=false)
+    let lock_info: Option<LockInfo> = if lock {
+        println!("{}", "Acquiring state lock...".cyan());
+        let li = backend
+            .acquire_lock("destroy")
+            .await
+            .map_err(map_lock_error)?;
+        println!("  {} Lock acquired", "✓".green());
+        Some(li)
+    } else {
+        println!(
+            "{}",
+            "Warning: State locking is disabled. This is unsafe if others might run commands against the same state."
+                .yellow()
+                .bold()
+        );
+        None
+    };
 
     let op_result = run_destroy_locked(
         &mut parsed,
         auto_approve,
         backend.as_ref(),
         protected_bucket,
-        &lock,
+        lock_info.as_ref(),
     )
     .await;
 
-    // Always release lock, regardless of whether the operation succeeded
-    let release_result = backend.release_lock(&lock).await.map_err(AppError::Backend);
+    // Always release lock if it was acquired
+    if let Some(ref li) = lock_info {
+        let release_result = backend.release_lock(li).await.map_err(AppError::Backend);
 
-    if release_result.is_ok() && op_result.is_ok() {
-        println!("  {} Lock released", "✓".green());
+        if release_result.is_ok() && op_result.is_ok() {
+            println!("  {} Lock released", "✓".green());
+        }
+
+        op_result?;
+        release_result
+    } else {
+        op_result
     }
-
-    op_result?;
-    release_result
 }
 
 async fn run_destroy_locked(
@@ -90,7 +105,7 @@ async fn run_destroy_locked(
     auto_approve: bool,
     backend: &dyn StateBackend,
     protected_bucket: Option<String>,
-    lock: &LockInfo,
+    lock: Option<&LockInfo>,
 ) -> Result<(), AppError> {
     let ctx = WiringContext::new();
 
@@ -439,8 +454,12 @@ async fn run_destroy_locked(
         state.remove_resource(&id.provider, &id.resource_type, &id.name);
     }
 
-    // Renew lock and save with lock validation
-    crate::commands::apply::save_state_locked(backend, lock, &mut state).await?;
+    // Save state (with or without lock validation)
+    if let Some(lock) = lock {
+        crate::commands::apply::save_state_locked(backend, lock, &mut state).await?;
+    } else {
+        crate::commands::apply::save_state_unlocked(backend, &mut state).await?;
+    }
     println!("  {} State saved (serial: {})", "✓".green(), state.serial);
 
     println!();
