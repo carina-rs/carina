@@ -17,7 +17,8 @@ use super::validate_and_resolve;
 use crate::commands::apply::apply_name_overrides;
 use crate::error::AppError;
 use crate::wiring::{
-    get_provider, provider_factories, reconcile_anonymous_identifiers, reconcile_prefixed_names,
+    WiringContext, get_provider_with_ctx, reconcile_anonymous_identifiers_with_ctx,
+    reconcile_prefixed_names,
 };
 
 /// Convert a lock acquisition error into an `AppError`.
@@ -177,8 +178,8 @@ async fn run_state_bucket_delete(
     let backend_resource_type = backend
         .resource_type()
         .ok_or("Backend does not specify a resource type")?;
-    let factories = provider_factories();
-    let factory = provider_mod::find_factory(&factories, backend_provider_name)
+    let ctx = WiringContext::new();
+    let factory = provider_mod::find_factory(ctx.factories(), backend_provider_name)
         .ok_or_else(|| format!("No provider factory found for '{}'", backend_provider_name))?;
 
     // Create provider to delete the bucket
@@ -255,6 +256,8 @@ pub(crate) async fn run_state_refresh_locked(
     backend: &dyn StateBackend,
     lock: &LockInfo,
 ) -> Result<(), AppError> {
+    let ctx = WiringContext::new();
+
     // Read current state from backend
     let mut state_file = backend.read_state().await.map_err(AppError::Backend)?;
 
@@ -269,13 +272,15 @@ pub(crate) async fn run_state_refresh_locked(
     }
 
     reconcile_prefixed_names(&mut parsed.resources, &state_file);
-    reconcile_anonymous_identifiers(&mut parsed.resources, &state_file);
+    if let Some(sf) = state_file.as_ref() {
+        reconcile_anonymous_identifiers_with_ctx(&ctx, &mut parsed.resources, sf);
+    }
     apply_name_overrides(&mut parsed.resources, &state_file);
 
     let sorted_resources = sort_resources_by_dependencies(&parsed.resources)?;
 
     // Select provider
-    let provider = get_provider(parsed).await;
+    let provider = get_provider_with_ctx(&ctx, parsed).await;
 
     println!();
     println!("{}", "Refreshing state...".cyan().bold());

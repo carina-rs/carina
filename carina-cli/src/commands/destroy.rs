@@ -20,7 +20,10 @@ use crate::commands::apply::apply_name_overrides;
 use crate::commands::state::map_lock_error;
 use crate::display::format_effect;
 use crate::error::AppError;
-use crate::wiring::{get_provider, reconcile_anonymous_identifiers, reconcile_prefixed_names};
+use crate::wiring::{
+    WiringContext, get_provider_with_ctx, reconcile_anonymous_identifiers_with_ctx,
+    reconcile_prefixed_names,
+};
 
 pub async fn run_destroy(path: &PathBuf, auto_approve: bool) -> Result<(), AppError> {
     let mut parsed = load_configuration(path)?.parsed;
@@ -89,11 +92,15 @@ async fn run_destroy_locked(
     protected_bucket: Option<String>,
     lock: &LockInfo,
 ) -> Result<(), AppError> {
+    let ctx = WiringContext::new();
+
     // Read current state from backend
     let state_file = backend.read_state().await.map_err(AppError::Backend)?;
 
     reconcile_prefixed_names(&mut parsed.resources, &state_file);
-    reconcile_anonymous_identifiers(&mut parsed.resources, &state_file);
+    if let Some(sf) = state_file.as_ref() {
+        reconcile_anonymous_identifiers_with_ctx(&ctx, &mut parsed.resources, sf);
+    }
     apply_name_overrides(&mut parsed.resources, &state_file);
 
     // Sort resources by dependencies (for creation order)
@@ -103,7 +110,7 @@ async fn run_destroy_locked(
     let destroy_order: Vec<Resource> = sorted_resources.into_iter().rev().collect();
 
     // Select appropriate Provider based on configuration
-    let provider = get_provider(parsed).await;
+    let provider = get_provider_with_ctx(&ctx, parsed).await;
 
     // Read states for managed resources using identifier from state
     // Skip data sources (read-only) -- they won't be destroyed

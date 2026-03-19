@@ -14,8 +14,9 @@ use carina_core::parser::ParsedFile;
 
 use crate::error::AppError;
 use crate::wiring::{
-    compute_anonymous_identifiers, resolve_names, validate_module_calls, validate_provider_region,
-    validate_resource_ref_types, validate_resources,
+    WiringContext, compute_anonymous_identifiers_with_ctx, resolve_names_with_ctx,
+    validate_module_calls, validate_provider_region_with_ctx, validate_resource_ref_types_with_ctx,
+    validate_resources_with_ctx,
 };
 
 /// Run the common validation and module resolution pipeline.
@@ -36,8 +37,10 @@ pub fn validate_and_resolve(
     base_dir: &Path,
     skip_resource_validation: bool,
 ) -> Result<(), AppError> {
+    let ctx = WiringContext::new();
+
     // Validate provider region
-    validate_provider_region(parsed)?;
+    validate_provider_region_with_ctx(&ctx, parsed)?;
 
     // Validate module call arguments before expansion
     validate_module_calls(parsed, base_dir)?;
@@ -47,15 +50,15 @@ pub fn validate_and_resolve(
         .map_err(|e| format!("Module resolution error: {}", e))?;
 
     // Resolve names (let bindings -> resource names)
-    resolve_names(&mut parsed.resources)?;
+    resolve_names_with_ctx(&ctx, &mut parsed.resources)?;
 
     if !skip_resource_validation {
-        validate_resources(&parsed.resources)?;
-        validate_resource_ref_types(&parsed.resources)?;
+        validate_resources_with_ctx(&ctx, &parsed.resources)?;
+        validate_resource_ref_types_with_ctx(&ctx, &parsed.resources)?;
     }
 
     // Compute anonymous identifiers
-    compute_anonymous_identifiers(&mut parsed.resources, &parsed.providers)?;
+    compute_anonymous_identifiers_with_ctx(&ctx, &mut parsed.resources, &parsed.providers)?;
 
     Ok(())
 }

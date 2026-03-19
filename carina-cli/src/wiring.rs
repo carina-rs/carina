@@ -30,48 +30,71 @@ pub struct PlanContext {
     pub current_states: HashMap<ResourceId, State>,
 }
 
-pub fn provider_factories() -> Vec<Box<dyn ProviderFactory>> {
-    vec![Box::new(AwsProviderFactory), Box::new(AwsccProviderFactory)]
+/// Cached provider factories and schemas, constructed once per CLI invocation.
+///
+/// Instead of calling `provider_factories()` and `get_schemas()` at each call
+/// site (which rebuilds the full schema set every time), create a single
+/// `WiringContext` and pass it through the command execution path.
+pub struct WiringContext {
+    factories: Vec<Box<dyn ProviderFactory>>,
+    schemas: HashMap<String, ResourceSchema>,
 }
 
-pub fn get_schemas() -> HashMap<String, ResourceSchema> {
-    provider_mod::collect_schemas(&provider_factories())
+impl WiringContext {
+    pub fn new() -> Self {
+        let factories: Vec<Box<dyn ProviderFactory>> =
+            vec![Box::new(AwsProviderFactory), Box::new(AwsccProviderFactory)];
+        let schemas = provider_mod::collect_schemas(&factories);
+        Self { factories, schemas }
+    }
+
+    pub fn factories(&self) -> &[Box<dyn ProviderFactory>] {
+        &self.factories
+    }
+
+    pub fn schemas(&self) -> &HashMap<String, ResourceSchema> {
+        &self.schemas
+    }
 }
 
-pub fn validate_resources(resources: &[Resource]) -> Result<(), AppError> {
-    let factories = provider_factories();
-    let schemas = get_schemas();
-    validation::validate_resources(resources, &schemas, &|r| {
-        provider_mod::schema_key_for_resource(&factories, r)
+pub fn validate_resources_with_ctx(
+    ctx: &WiringContext,
+    resources: &[Resource],
+) -> Result<(), AppError> {
+    validation::validate_resources(resources, ctx.schemas(), &|r| {
+        provider_mod::schema_key_for_resource(ctx.factories(), r)
     })
     .map_err(AppError::Validation)
 }
 
-pub fn validate_resource_ref_types(resources: &[Resource]) -> Result<(), AppError> {
-    let factories = provider_factories();
-    let schemas = get_schemas();
-    validation::validate_resource_ref_types(resources, &schemas, &|r| {
-        provider_mod::schema_key_for_resource(&factories, r)
+pub fn validate_resource_ref_types_with_ctx(
+    ctx: &WiringContext,
+    resources: &[Resource],
+) -> Result<(), AppError> {
+    validation::validate_resource_ref_types(resources, ctx.schemas(), &|r| {
+        provider_mod::schema_key_for_resource(ctx.factories(), r)
     })
     .map_err(AppError::Validation)
 }
 
 /// Resolve block name aliases and attribute prefixes in one step.
-pub fn resolve_names(resources: &mut [Resource]) -> Result<(), AppError> {
-    let factories = provider_factories();
-    let schemas = get_schemas();
-    resolve_block_names(resources, &schemas, |r| {
-        provider_mod::schema_key_for_resource(&factories, r)
+pub fn resolve_names_with_ctx(
+    ctx: &WiringContext,
+    resources: &mut [Resource],
+) -> Result<(), AppError> {
+    resolve_block_names(resources, ctx.schemas(), |r| {
+        provider_mod::schema_key_for_resource(ctx.factories(), r)
     })
     .map_err(AppError::Validation)?;
-    resolve_attr_prefixes(resources)
+    resolve_attr_prefixes_with_ctx(ctx, resources)
 }
 
-pub fn resolve_attr_prefixes(resources: &mut [Resource]) -> Result<(), AppError> {
-    let factories = provider_factories();
-    let schemas = get_schemas();
-    identifier::resolve_attr_prefixes(resources, &schemas, &|r| {
-        provider_mod::schema_key_for_resource(&factories, r)
+pub fn resolve_attr_prefixes_with_ctx(
+    ctx: &WiringContext,
+    resources: &mut [Resource],
+) -> Result<(), AppError> {
+    identifier::resolve_attr_prefixes(resources, ctx.schemas(), &|r| {
+        provider_mod::schema_key_for_resource(ctx.factories(), r)
     })
     .map_err(AppError::Validation)
 }
@@ -95,22 +118,19 @@ pub fn reconcile_prefixed_names(resources: &mut [Resource], state_file: &Option<
     });
 }
 
-pub fn reconcile_anonymous_identifiers(resources: &mut [Resource], state_file: &Option<StateFile>) {
-    let state_file = match state_file {
-        Some(sf) => sf,
-        None => return,
-    };
-
-    let factories = provider_factories();
-    let schemas = get_schemas();
+pub fn reconcile_anonymous_identifiers_with_ctx(
+    ctx: &WiringContext,
+    resources: &mut [Resource],
+    state_file: &StateFile,
+) {
     identifier::reconcile_anonymous_identifiers(
         resources,
-        &schemas,
-        &|r| provider_mod::schema_key_for_resource(&factories, r),
+        ctx.schemas(),
+        &|r| provider_mod::schema_key_for_resource(ctx.factories(), r),
         &|provider, resource_type| {
-            // Look up schema to get create-only attribute names
             let schema_key = format!("{}.{}", provider, resource_type);
-            let create_only_attrs = schemas
+            let create_only_attrs = ctx
+                .schemas()
                 .get(&schema_key)
                 .map(|s| s.create_only_attributes())
                 .unwrap_or_default();
@@ -138,19 +158,18 @@ pub fn reconcile_anonymous_identifiers(resources: &mut [Resource], state_file: &
     );
 }
 
-pub fn compute_anonymous_identifiers(
+pub fn compute_anonymous_identifiers_with_ctx(
+    ctx: &WiringContext,
     resources: &mut [Resource],
     providers: &[ProviderConfig],
 ) -> Result<(), AppError> {
-    let factories = provider_factories();
-    let schemas = get_schemas();
     identifier::compute_anonymous_identifiers(
         resources,
         providers,
-        &schemas,
-        &|r| provider_mod::schema_key_for_resource(&factories, r),
+        ctx.schemas(),
+        &|r| provider_mod::schema_key_for_resource(ctx.factories(), r),
         &|name| {
-            provider_mod::find_factory(&factories, name)
+            provider_mod::find_factory(ctx.factories(), name)
                 .map(|f| {
                     f.identity_attributes()
                         .into_iter()
@@ -167,13 +186,14 @@ pub fn check_unused_bindings(parsed: &ParsedFile) -> Vec<String> {
     validation::check_unused_bindings(parsed)
 }
 
-pub fn validate_provider_region(parsed: &ParsedFile) -> Result<(), AppError> {
-    let factories = provider_factories();
-    validation::validate_provider_config(parsed, &factories).map_err(AppError::Validation)
+pub fn validate_provider_region_with_ctx(
+    ctx: &WiringContext,
+    parsed: &ParsedFile,
+) -> Result<(), AppError> {
+    validation::validate_provider_config(parsed, ctx.factories()).map_err(AppError::Validation)
 }
 
 pub fn validate_module_calls(parsed: &ParsedFile, base_dir: &Path) -> Result<(), AppError> {
-    // Build a map of imported modules: alias -> inputs
     let mut imported_modules = HashMap::new();
     for import in &parsed.imports {
         let module_path = base_dir.join(&import.path);
@@ -186,12 +206,11 @@ pub fn validate_module_calls(parsed: &ParsedFile, base_dir: &Path) -> Result<(),
         .map_err(AppError::Validation)
 }
 
-pub async fn get_provider(parsed: &ParsedFile) -> ProviderRouter {
-    let factories = provider_factories();
+pub async fn get_provider_with_ctx(ctx: &WiringContext, parsed: &ParsedFile) -> ProviderRouter {
     let mut router = ProviderRouter::new();
 
     for provider_config in &parsed.providers {
-        if let Some(factory) = provider_mod::find_factory(&factories, &provider_config.name) {
+        if let Some(factory) = provider_mod::find_factory(ctx.factories(), &provider_config.name) {
             let region = factory.extract_region(&provider_config.attributes);
             println!(
                 "{}",
@@ -216,11 +235,11 @@ pub async fn get_provider(parsed: &ParsedFile) -> ProviderRouter {
 }
 
 pub async fn create_providers_from_configs(configs: &[ProviderConfig]) -> ProviderRouter {
-    let factories = provider_factories();
+    let ctx = WiringContext::new();
     let mut router = ProviderRouter::new();
 
     for config in configs {
-        if let Some(factory) = provider_mod::find_factory(&factories, &config.name) {
+        if let Some(factory) = provider_mod::find_factory(ctx.factories(), &config.name) {
             let region = factory.extract_region(&config.attributes);
             println!(
                 "{}",
@@ -246,11 +265,12 @@ pub async fn create_plan_from_parsed(
     parsed: &ParsedFile,
     state_file: &Option<StateFile>,
 ) -> Result<PlanContext, AppError> {
+    let ctx = WiringContext::new();
     let sorted_resources =
         sort_resources_by_dependencies(&parsed.resources).map_err(AppError::Validation)?;
 
     // Select appropriate Provider based on configuration
-    let provider = get_provider(parsed).await;
+    let provider = get_provider_with_ctx(&ctx, parsed).await;
 
     // Read states for all resources using identifier from state
     // In identifier-based approach, if there's no identifier in state, the resource doesn't exist
@@ -294,7 +314,6 @@ pub async fn create_plan_from_parsed(
         .map(|sf| sf.build_lifecycles())
         .unwrap_or_default();
 
-    let schemas = get_schemas();
     let prev_desired_keys = state_file
         .as_ref()
         .map(|sf| sf.build_desired_keys())
@@ -303,7 +322,7 @@ pub async fn create_plan_from_parsed(
         &resources,
         &current_states,
         &lifecycles,
-        &schemas,
+        ctx.schemas(),
         &saved_attrs,
         &prev_desired_keys,
     );
@@ -318,4 +337,33 @@ pub async fn create_plan_from_parsed(
         sorted_resources,
         current_states,
     })
+}
+
+/// Convenience wrappers for tests. Each creates a fresh `WiringContext` internally,
+/// which is acceptable in test code where the overhead is negligible.
+#[cfg(test)]
+pub fn validate_resources(resources: &[Resource]) -> Result<(), AppError> {
+    let ctx = WiringContext::new();
+    validate_resources_with_ctx(&ctx, resources)
+}
+
+#[cfg(test)]
+pub fn resolve_names(resources: &mut [Resource]) -> Result<(), AppError> {
+    let ctx = WiringContext::new();
+    resolve_names_with_ctx(&ctx, resources)
+}
+
+#[cfg(test)]
+pub fn resolve_attr_prefixes(resources: &mut [Resource]) -> Result<(), AppError> {
+    let ctx = WiringContext::new();
+    resolve_attr_prefixes_with_ctx(&ctx, resources)
+}
+
+#[cfg(test)]
+pub fn compute_anonymous_identifiers(
+    resources: &mut [Resource],
+    providers: &[ProviderConfig],
+) -> Result<(), AppError> {
+    let ctx = WiringContext::new();
+    compute_anonymous_identifiers_with_ctx(&ctx, resources, providers)
 }

@@ -18,7 +18,8 @@ use crate::commands::apply::apply_name_overrides;
 use crate::display::print_plan;
 use crate::error::AppError;
 use crate::wiring::{
-    create_plan_from_parsed, reconcile_anonymous_identifiers, reconcile_prefixed_names,
+    WiringContext, create_plan_from_parsed, reconcile_anonymous_identifiers_with_ctx,
+    reconcile_prefixed_names,
 };
 
 /// Saved plan file for `plan --out` / `apply plan.json`
@@ -153,8 +154,11 @@ pub async fn run_plan(path: &PathBuf, out: Option<&PathBuf>) -> Result<bool, App
         println!();
     }
 
+    let wiring = WiringContext::new();
     reconcile_prefixed_names(&mut parsed.resources, &state_file);
-    reconcile_anonymous_identifiers(&mut parsed.resources, &state_file);
+    if let Some(sf) = state_file.as_ref() {
+        reconcile_anonymous_identifiers_with_ctx(&wiring, &mut parsed.resources, sf);
+    }
     apply_name_overrides(&mut parsed.resources, &state_file);
 
     let ctx = create_plan_from_parsed(&parsed, &state_file).await?;
