@@ -78,6 +78,10 @@ get_identifiers() {
 
 # Assert that two identifier sets match the expected relationship
 # Args: description ids_after_step1 ids_after_step2 expected("equal"|"different")
+#
+# For "different" mode, uses set-based comparison (comm -3) to check if at least
+# one identifier differs between the two sets. This handles the case where most
+# resources keep the same identifiers but only the replaced resource changes.
 assert_identifiers() {
     local description="$1"
     local ids1="$2"
@@ -107,13 +111,17 @@ assert_identifiers() {
             return 1
         fi
     else
-        if [ "$ids1" != "$ids2" ]; then
+        # Use comm -3 to find lines unique to either set (symmetric difference).
+        # If there are any unique lines, at least one identifier changed.
+        local diff_lines
+        diff_lines=$(comm -3 <(echo "$ids1") <(echo "$ids2"))
+        if [ -n "$diff_lines" ]; then
             echo "OK"
             TOTAL_PASSED=$((TOTAL_PASSED + 1))
             return 0
         else
             echo "FAIL"
-            echo "  ERROR: Identifiers unchanged (expected different): $ids1"
+            echo "  ERROR: Identifiers unchanged (expected at least one to differ): $ids1"
             TOTAL_FAILED=$((TOTAL_FAILED + 1))
             return 1
         fi

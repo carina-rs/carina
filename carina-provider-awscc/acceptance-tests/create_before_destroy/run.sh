@@ -7,7 +7,7 @@
 # Tests:
 #   iam_role                      - Replacement with temporary name (name_attribute + other create-only)
 #   ec2_vpc                       - Replacement without temporary name (no name_attribute)
-#   ec2_transit_gateway_attachment - Replacement with dependent resource rewiring (subnet_ids change)
+#   ec2_transit_gateway_attachment - Replacement via transit_gateway_id change (create-only property)
 #
 # Filter (optional): substring to match test names (e.g. "iam_role", "ec2_vpc", "ec2_transit")
 
@@ -80,6 +80,10 @@ get_identifiers() {
 
 # Assert that two identifier sets match the expected relationship
 # Args: description ids_after_step1 ids_after_step2 expected("equal"|"different")
+#
+# For "different" mode, uses set-based comparison (comm -3) to check if at least
+# one identifier differs between the two sets. This handles the case where most
+# resources keep the same identifiers but only the replaced resource changes.
 assert_identifiers() {
     local description="$1"
     local ids1="$2"
@@ -109,13 +113,17 @@ assert_identifiers() {
             return 1
         fi
     else
-        if [ "$ids1" != "$ids2" ]; then
+        # Use comm -3 to find lines unique to either set (symmetric difference).
+        # If there are any unique lines, at least one identifier changed.
+        local diff_lines
+        diff_lines=$(comm -3 <(echo "$ids1") <(echo "$ids2"))
+        if [ -n "$diff_lines" ]; then
             echo "OK"
             TOTAL_PASSED=$((TOTAL_PASSED + 1))
             return 0
         else
             echo "FAIL"
-            echo "  ERROR: Identifiers unchanged (expected different): $ids1"
+            echo "  ERROR: Identifiers unchanged (expected at least one to differ): $ids1"
             TOTAL_FAILED=$((TOTAL_FAILED + 1))
             return 1
         fi
@@ -289,12 +297,12 @@ run_test "ec2_vpc" \
     "$SCRIPT_DIR/ec2_vpc_step2.crn" \
     "Test 2: EC2 VPC (no name_attribute, no temporary name)"
 
-# Test 3: EC2 Transit Gateway Attachment - replacement with dependent resource rewiring
-# subnet_ids is create-only; changing it forces replacement while VPC/TGW refs must be rewired
+# Test 3: EC2 Transit Gateway Attachment - replacement via transit_gateway_id change
+# transit_gateway_id is create-only; changing it forces replacement
 run_test "ec2_transit_gateway_attachment" \
     "$SCRIPT_DIR/ec2_transit_gateway_attachment_step1.crn" \
     "$SCRIPT_DIR/ec2_transit_gateway_attachment_step2.crn" \
-    "Test 3: EC2 Transit Gateway Attachment (dependent resource rewiring)"
+    "Test 3: EC2 Transit Gateway Attachment (transit_gateway_id change)"
 
 echo "════════════════════════════════════════"
 echo "Total: $TOTAL_PASSED passed, $TOTAL_FAILED failed"
