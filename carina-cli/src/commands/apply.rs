@@ -945,7 +945,8 @@ pub async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), AppErro
 
     // All code after lock acquisition is wrapped so that lock release is guaranteed
     let lock_info = lock.as_ref().expect("lock should have been acquired");
-    let op_result = run_apply_locked(&ctx, &mut parsed, auto_approve, backend.as_ref(), lock_info).await;
+    let op_result =
+        run_apply_locked(&ctx, &mut parsed, auto_approve, backend.as_ref(), lock_info).await;
 
     // Always release lock, regardless of whether the operation succeeded
     let release_result = backend
