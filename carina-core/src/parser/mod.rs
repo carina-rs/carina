@@ -274,10 +274,8 @@ pub fn parse_lenient(input: &str) -> Result<ParsedFile, ParseError> {
     parse_with_context(input, ctx)
 }
 
-fn parse_with_context(input: &str, ctx: ParseContext) -> Result<ParsedFile, ParseError> {
+fn parse_with_context(input: &str, mut ctx: ParseContext) -> Result<ParsedFile, ParseError> {
     let pairs = CarinaParser::parse(Rule::file, input)?;
-
-    let mut ctx = ctx;
     let mut providers = Vec::new();
     let mut resources = Vec::new();
     let mut imports = Vec::new();
