@@ -259,12 +259,12 @@ fn list_item_type_validation() {
     // Use a test engine with a List(StringEnum) schema to test list item validation
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
-    let list_enum = AttributeType::List(Box::new(AttributeType::StringEnum {
+    let list_enum = AttributeType::list(AttributeType::StringEnum {
         name: "Protocol".to_string(),
         values: vec!["tcp".to_string(), "udp".to_string()],
         namespace: None,
         to_dsl: None,
-    }));
+    });
 
     let schema = ResourceSchema::new("test.list.resource")
         .attribute(AttributeSchema::new("protocols", list_enum));

@@ -194,7 +194,7 @@ pub fn ec2_transit_gateway_config() -> AwsccSchemaConfig {
             .attribute(
                 AttributeSchema::new(
                     "transit_gateway_cidr_blocks",
-                    AttributeType::List(Box::new(types::cidr())),
+                    AttributeType::list(types::cidr()),
                 )
                 .with_provider_name("TransitGatewayCidrBlocks"),
             )

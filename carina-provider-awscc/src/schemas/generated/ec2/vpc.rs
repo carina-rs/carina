@@ -38,7 +38,7 @@ pub fn ec2_vpc_config() -> AwsccSchemaConfig {
                 .with_provider_name("CidrBlock"),
         )
         .attribute(
-            AttributeSchema::new("cidr_block_associations", AttributeType::List(Box::new(super::vpc_cidr_block_association_id())))
+            AttributeSchema::new("cidr_block_associations", AttributeType::unordered_list(super::vpc_cidr_block_association_id()))
                 .read_only()
                 .with_description(" (read-only)")
                 .with_provider_name("CidrBlockAssociations"),
@@ -94,7 +94,7 @@ pub fn ec2_vpc_config() -> AwsccSchemaConfig {
                 .with_provider_name("Ipv4NetmaskLength"),
         )
         .attribute(
-            AttributeSchema::new("ipv6_cidr_blocks", AttributeType::List(Box::new(types::ipv6_cidr())))
+            AttributeSchema::new("ipv6_cidr_blocks", AttributeType::unordered_list(types::ipv6_cidr()))
                 .read_only()
                 .with_description(" (read-only)")
                 .with_provider_name("Ipv6CidrBlocks"),

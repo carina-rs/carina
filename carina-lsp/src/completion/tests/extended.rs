@@ -146,12 +146,12 @@ outer {
 fn list_string_enum_completions() {
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
 
-    let list_enum = AttributeType::List(Box::new(AttributeType::StringEnum {
+    let list_enum = AttributeType::list(AttributeType::StringEnum {
         name: "Protocol".to_string(),
         values: vec!["tcp".to_string(), "udp".to_string(), "icmp".to_string()],
         namespace: None,
         to_dsl: None,
-    }));
+    });
 
     let schema = ResourceSchema::new("test.list.resource")
         .attribute(AttributeSchema::new("protocols", list_enum));
@@ -162,12 +162,12 @@ fn list_string_enum_completions() {
     let provider = CompletionProvider::new(Arc::new(schemas), vec!["test".to_string()], vec![]);
 
     let completions =
-        provider.completions_for_type(&AttributeType::List(Box::new(AttributeType::StringEnum {
+        provider.completions_for_type(&AttributeType::list(AttributeType::StringEnum {
             name: "Protocol".to_string(),
             values: vec!["tcp".to_string(), "udp".to_string(), "icmp".to_string()],
             namespace: None,
             to_dsl: None,
-        })));
+        }));
 
     let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
     assert!(

@@ -76,7 +76,7 @@ pub fn logs_log_group_config() -> AwsccSchemaConfig {
                 .with_default(Value::Bool(false)),
         )
         .attribute(
-            AttributeSchema::new("field_index_policies", AttributeType::List(Box::new(AttributeType::Map(Box::new(AttributeType::String)))))
+            AttributeSchema::new("field_index_policies", AttributeType::unordered_list(AttributeType::Map(Box::new(AttributeType::String))))
                 .with_description("Creates or updates a *field index policy* for the specified log group. Only log groups in the Standard log class support field index policies. For mor...")
                 .with_provider_name("FieldIndexPolicies"),
         )

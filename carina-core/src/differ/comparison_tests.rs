@@ -38,8 +38,8 @@ fn type_aware_int_float_coercion_for_int_type() {
 
 #[test]
 fn type_aware_list_with_inner_type() {
-    let list_type = AttributeType::List(Box::new(AttributeType::Float));
-    // List of Int vs Float with coercion
+    let list_type = AttributeType::unordered_list(AttributeType::Float);
+    // List of Int vs Float with coercion (unordered, so reordering is fine)
     assert!(type_aware_equal(
         &Value::List(vec![Value::Int(1), Value::Int(2)]),
         &Value::List(vec![Value::Float(2.0), Value::Float(1.0)]),
@@ -358,5 +358,62 @@ fn type_aware_struct_ignores_default_nested_struct_empty() {
     assert!(
         type_aware_equal(&desired, &current, Some(&struct_type)),
         "Struct with extra default nested Struct empty map should be considered equal"
+    );
+}
+
+#[test]
+fn type_aware_ordered_list_detects_reorder() {
+    // An ordered list (insertionOrder=true) should detect reordering as a change
+    let ordered_list_type = AttributeType::List {
+        inner: Box::new(AttributeType::String),
+        ordered: true,
+    };
+
+    // Same elements, different order
+    let a = Value::List(vec![
+        Value::String("a".to_string()),
+        Value::String("b".to_string()),
+    ]);
+    let b = Value::List(vec![
+        Value::String("b".to_string()),
+        Value::String("a".to_string()),
+    ]);
+
+    assert!(
+        !type_aware_equal(&a, &b, Some(&ordered_list_type)),
+        "Ordered list should detect reorder as NOT equal"
+    );
+
+    // Same elements, same order should still be equal
+    let c = Value::List(vec![
+        Value::String("a".to_string()),
+        Value::String("b".to_string()),
+    ]);
+    assert!(
+        type_aware_equal(&a, &c, Some(&ordered_list_type)),
+        "Ordered list with same order should be equal"
+    );
+}
+
+#[test]
+fn type_aware_unordered_list_ignores_reorder() {
+    // An unordered list (insertionOrder=false) should treat reordering as no change
+    let unordered_list_type = AttributeType::List {
+        inner: Box::new(AttributeType::String),
+        ordered: false,
+    };
+
+    let a = Value::List(vec![
+        Value::String("a".to_string()),
+        Value::String("b".to_string()),
+    ]);
+    let b = Value::List(vec![
+        Value::String("b".to_string()),
+        Value::String("a".to_string()),
+    ]);
+
+    assert!(
+        type_aware_equal(&a, &b, Some(&unordered_list_type)),
+        "Unordered list should treat reorder as equal"
     );
 }

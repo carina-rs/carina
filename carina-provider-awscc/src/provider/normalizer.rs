@@ -66,7 +66,7 @@ pub fn resolve_enum_identifiers_impl(resources: &mut [Resource]) {
             // Handle struct fields containing schema-level string enums.
             if let Some(attr_schema) = config.schema.attributes.get(key.as_str()) {
                 let struct_fields = match &attr_schema.attr_type {
-                    AttributeType::List(inner) => {
+                    AttributeType::List { inner, .. } => {
                         if let AttributeType::Struct { fields, .. } = inner.as_ref() {
                             Some(fields)
                         } else {

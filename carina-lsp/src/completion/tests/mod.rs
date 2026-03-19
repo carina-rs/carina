@@ -38,11 +38,8 @@ pub(super) fn test_provider_with_block_name_nested() -> CompletionProvider {
     let config_struct = AttributeType::Struct {
         name: "Config".to_string(),
         fields: vec![
-            StructField::new(
-                "transitions",
-                AttributeType::List(Box::new(transition_struct)),
-            )
-            .with_block_name("transition"),
+            StructField::new("transitions", AttributeType::list(transition_struct))
+                .with_block_name("transition"),
             StructField::new("enabled", AttributeType::Bool),
         ],
     };

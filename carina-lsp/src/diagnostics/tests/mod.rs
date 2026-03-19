@@ -34,21 +34,21 @@ pub(super) fn test_engine_reversed() -> DiagnosticEngine {
 pub(super) fn test_engine_with_nested_structs() -> DiagnosticEngine {
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
 
-    let inner_struct = AttributeType::List(Box::new(AttributeType::Struct {
+    let inner_struct = AttributeType::list(AttributeType::Struct {
         name: "InnerStruct".to_string(),
         fields: vec![
             StructField::new("leaf_field", AttributeType::String),
             StructField::new("leaf_int", AttributeType::Int),
         ],
-    }));
+    });
 
-    let outer_struct = AttributeType::List(Box::new(AttributeType::Struct {
+    let outer_struct = AttributeType::list(AttributeType::Struct {
         name: "OuterStruct".to_string(),
         fields: vec![
             StructField::new("inner", inner_struct),
             StructField::new("outer_field", AttributeType::String),
         ],
-    }));
+    });
 
     let schema = ResourceSchema::new("test.nested.resource")
         .attribute(AttributeSchema::new("outer", outer_struct));
@@ -77,11 +77,8 @@ pub(super) fn test_engine_with_block_name_nested() -> DiagnosticEngine {
     let config_struct = AttributeType::Struct {
         name: "Config".to_string(),
         fields: vec![
-            StructField::new(
-                "transitions",
-                AttributeType::List(Box::new(transition_struct)),
-            )
-            .with_block_name("transition"),
+            StructField::new("transitions", AttributeType::list(transition_struct))
+                .with_block_name("transition"),
             StructField::new("enabled", AttributeType::Bool),
         ],
     };

@@ -1071,7 +1071,7 @@ pub fn availability_zone_id() -> AttributeType {
 fn string_or_list_of_strings() -> AttributeType {
     AttributeType::Union(vec![
         AttributeType::String,
-        AttributeType::List(Box::new(AttributeType::String)),
+        AttributeType::list(AttributeType::String),
     ])
 }
 
@@ -1186,11 +1186,8 @@ pub fn iam_policy_document() -> AttributeType {
         fields: vec![
             StructField::new("version", iam_policy_version()).with_provider_name("Version"),
             StructField::new("id", AttributeType::String).with_provider_name("Id"),
-            StructField::new(
-                "statement",
-                AttributeType::List(Box::new(iam_policy_statement())),
-            )
-            .with_provider_name("Statement"),
+            StructField::new("statement", AttributeType::list(iam_policy_statement()))
+                .with_provider_name("Statement"),
         ],
     }
 }

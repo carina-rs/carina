@@ -71,7 +71,7 @@ pub fn ec2_security_group_config() -> AwsccSchemaConfig {
                 .with_provider_name("Id"),
         )
         .attribute(
-            AttributeSchema::new("security_group_egress", AttributeType::List(Box::new(AttributeType::Struct {
+            AttributeSchema::new("security_group_egress", AttributeType::unordered_list(AttributeType::Struct {
                     name: "Egress".to_string(),
                     fields: vec![
                     StructField::new("cidr_ip", types::ipv4_cidr()).with_provider_name("CidrIp"),
@@ -100,12 +100,12 @@ pub fn ec2_security_group_config() -> AwsccSchemaConfig {
                 to_dsl: None,
             }).with_provider_name("ToPort")
                     ],
-                })))
+                }))
                 .with_description("[VPC only] The outbound rules associated with the security group. There is a short interruption during which you cannot connect to the security group.")
                 .with_provider_name("SecurityGroupEgress"),
         )
         .attribute(
-            AttributeSchema::new("security_group_ingress", AttributeType::List(Box::new(AttributeType::Struct {
+            AttributeSchema::new("security_group_ingress", AttributeType::unordered_list(AttributeType::Struct {
                     name: "Ingress".to_string(),
                     fields: vec![
                     StructField::new("cidr_ip", types::ipv4_cidr()).with_provider_name("CidrIp"),
@@ -136,7 +136,7 @@ pub fn ec2_security_group_config() -> AwsccSchemaConfig {
                 to_dsl: None,
             }).with_provider_name("ToPort")
                     ],
-                })))
+                }))
                 .with_description("The inbound rules associated with the security group. There is a short interruption during which you cannot connect to the security group.")
                 .with_provider_name("SecurityGroupIngress"),
         )

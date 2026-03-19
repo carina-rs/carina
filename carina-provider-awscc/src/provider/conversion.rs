@@ -43,7 +43,7 @@ pub(crate) fn aws_value_to_dsl(
     }
 
     // For List types, recurse into each item with the inner type for type-aware conversion
-    if let AttributeType::List(inner) = attr_type
+    if let AttributeType::List { inner, .. } = attr_type
         && let Some(arr) = value.as_array()
     {
         let items: Vec<Value> = arr
@@ -216,7 +216,7 @@ pub(crate) fn dsl_value_to_aws(
             }
             _ => value_to_json(value),
         }
-    } else if let AttributeType::List(inner) = attr_type
+    } else if let AttributeType::List { inner, .. } = attr_type
         && let Value::List(items) = value
     {
         // Recurse into list items with inner type for type-aware conversion
@@ -591,7 +591,7 @@ mod tests {
             namespace: Some("awscc.s3.bucket".to_string()),
             to_dsl: None,
         };
-        let attr_type = AttributeType::List(Box::new(inner));
+        let attr_type = AttributeType::list(inner);
         let value = Value::List(vec![
             Value::String("awscc.s3.bucket.AllowedMethod.GET".to_string()),
             Value::String("awscc.s3.bucket.AllowedMethod.PUT".to_string()),
@@ -608,7 +608,7 @@ mod tests {
             namespace: Some("awscc.s3.bucket".to_string()),
             to_dsl: None,
         };
-        let attr_type = AttributeType::List(Box::new(inner));
+        let attr_type = AttributeType::list(inner);
         let json_val = json!(["GET", "PUT"]);
         let result = aws_value_to_dsl("allowed_methods", &json_val, &attr_type, "s3.bucket");
         assert_eq!(
@@ -628,7 +628,7 @@ mod tests {
             namespace: Some("awscc.s3.bucket".to_string()),
             to_dsl: None,
         };
-        let attr_type = AttributeType::List(Box::new(inner));
+        let attr_type = AttributeType::list(inner);
 
         let aws_json = json!(["GET", "PUT"]);
         let dsl = aws_value_to_dsl("allowed_methods", &aws_json, &attr_type, "s3.bucket")
@@ -922,10 +922,10 @@ mod tests {
                 .required()
                 .with_provider_name("RegionName"),
         ];
-        let attr_type = AttributeType::List(Box::new(AttributeType::Struct {
+        let attr_type = AttributeType::list(AttributeType::Struct {
             name: "IpamOperatingRegion".to_string(),
             fields,
-        }));
+        });
         let json_val = json!([{"RegionName": "ap-northeast-1"}]);
 
         let result = aws_value_to_dsl("operating_regions", &json_val, &attr_type, "ec2.ipam");
@@ -1060,7 +1060,7 @@ mod tests {
     #[test]
     fn test_aws_value_to_dsl_list_with_null_drops_null_items() {
         let json = serde_json::json!(["a", null, "b"]);
-        let attr_type = AttributeType::List(Box::new(AttributeType::String));
+        let attr_type = AttributeType::list(AttributeType::String);
         let result = aws_value_to_dsl("test_attr", &json, &attr_type, "test.resource");
         let expected = Value::List(vec![
             Value::String("a".to_string()),
@@ -1088,7 +1088,7 @@ mod tests {
             Value::Float(f64::NAN),
             Value::Float(2.0),
         ]);
-        let attr_type = AttributeType::List(Box::new(AttributeType::Float));
+        let attr_type = AttributeType::list(AttributeType::Float);
         let result = dsl_value_to_aws(&value, &attr_type, "test.resource", "test_attr");
         let expected = serde_json::json!([1.0, 2.0]);
         assert_eq!(result, Some(expected));
