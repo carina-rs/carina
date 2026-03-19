@@ -1,10 +1,9 @@
-# EC2 Transit Gateway Attachment - create_before_destroy with dependent rewiring (Step 2: Replace)
+# EC2 Transit Gateway Attachment - create_before_destroy with transit_gateway_id change (Step 2: Replace)
 #
-# Switches the attachment from subnet_a to subnet_b. Since subnet_ids is a
+# Switches the attachment from tgw_a to tgw_b. Since transit_gateway_id is a
 # create-only property, this forces replacement of the attachment. The
-# create_before_destroy lifecycle means the new attachment must be created
-# (referencing the same VPC and transit gateway) before the old one is deleted,
-# testing that dependent resource references are correctly rewired.
+# create_before_destroy lifecycle means the new attachment (to tgw_b) must be
+# created before the old one (to tgw_a) is deleted.
 
 provider awscc {
   region = awscc.Region.ap_northeast_1
@@ -19,30 +18,10 @@ let vpc = awscc.ec2.vpc {
   }
 }
 
-let subnet_a = awscc.ec2.subnet {
+let subnet = awscc.ec2.subnet {
   vpc_id            = vpc.vpc_id
   cidr_block        = "10.210.1.0/24"
   availability_zone = "ap-northeast-1a"
-
-  tags = {
-    Name        = "carina-acc-test-cbd-tgw-attach-a"
-    Environment = "acceptance-test"
-  }
-}
-
-let subnet_b = awscc.ec2.subnet {
-  vpc_id            = vpc.vpc_id
-  cidr_block        = "10.210.2.0/24"
-  availability_zone = "ap-northeast-1c"
-
-  tags = {
-    Name        = "carina-acc-test-cbd-tgw-attach-b"
-    Environment = "acceptance-test"
-  }
-}
-
-let tgw = awscc.ec2.transit_gateway {
-  description = "carina-acc-test-cbd-tgw-attach"
 
   tags = {
     Name        = "carina-acc-test-cbd-tgw-attach"
@@ -50,9 +29,27 @@ let tgw = awscc.ec2.transit_gateway {
   }
 }
 
+let tgw_a = awscc.ec2.transit_gateway {
+  description = "carina-acc-test-cbd-tgw-attach-a"
+
+  tags = {
+    Name        = "carina-acc-test-cbd-tgw-attach-a"
+    Environment = "acceptance-test"
+  }
+}
+
+let tgw_b = awscc.ec2.transit_gateway {
+  description = "carina-acc-test-cbd-tgw-attach-b"
+
+  tags = {
+    Name        = "carina-acc-test-cbd-tgw-attach-b"
+    Environment = "acceptance-test"
+  }
+}
+
 awscc.ec2.transit_gateway_attachment {
-  subnet_ids         = [subnet_b.subnet_id]
-  transit_gateway_id = tgw.id
+  subnet_ids         = [subnet.subnet_id]
+  transit_gateway_id = tgw_b.id
   vpc_id             = vpc.vpc_id
 
   lifecycle {
