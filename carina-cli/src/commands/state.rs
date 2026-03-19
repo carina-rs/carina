@@ -353,6 +353,7 @@ pub(crate) async fn run_state_refresh_locked(
             &resource.id,
             fresh_state,
             &mut state,
+            Some(resource),
             "",
             &mut updated_count,
             &mut unchanged_count,
@@ -369,6 +370,7 @@ pub(crate) async fn run_state_refresh_locked(
             orphan_id,
             fresh_state,
             &mut state,
+            None,
             " (orphan)",
             &mut updated_count,
             &mut unchanged_count,
@@ -394,11 +396,16 @@ pub(crate) async fn run_state_refresh_locked(
 /// Compare old state with fresh provider state for a single resource,
 /// display any changes, and update the state file accordingly.
 ///
+/// When `resource` is `Some`, lifecycle config, prefixes, and desired keys
+/// are preserved from it. When `None` (orphan resources), a minimal
+/// `Resource` is constructed from the id.
+///
 /// `label_suffix` is appended to the resource header (e.g., `" (orphan)"`).
 fn diff_display_update_resource(
     id: &ResourceId,
     fresh_state: &State,
     state: &mut carina_state::StateFile,
+    resource: Option<&Resource>,
     label_suffix: &str,
     updated_count: &mut u32,
     unchanged_count: &mut u32,
@@ -488,10 +495,16 @@ fn diff_display_update_resource(
 
     // Update state with refreshed data
     if fresh_state.exists {
-        let resource = Resource::with_provider(&id.provider, &id.resource_type, &id.name);
+        let owned_resource;
+        let res = match resource {
+            Some(r) => r,
+            None => {
+                owned_resource = Resource::with_provider(&id.provider, &id.resource_type, &id.name);
+                &owned_resource
+            }
+        };
         let existing_rs = state.find_resource(&id.provider, &id.resource_type, &id.name);
-        let resource_state =
-            ResourceState::from_provider_state(&resource, fresh_state, existing_rs)?;
+        let resource_state = ResourceState::from_provider_state(res, fresh_state, existing_rs)?;
         state.upsert_resource(resource_state);
     } else {
         state.remove_resource(&id.provider, &id.resource_type, &id.name);
