@@ -349,112 +349,14 @@ pub(crate) async fn run_state_refresh_locked(
             Some(s) => s,
             None => continue, // Not in state, skip
         };
-
-        // Compare old state attributes with new
-        let existing = state.find_resource(
-            &resource.id.provider,
-            &resource.id.resource_type,
-            &resource.id.name,
-        );
-
-        let mut has_changes = false;
-        let mut changes: Vec<String> = Vec::new();
-
-        if let Some(existing_rs) = existing {
-            // Build old attributes as DSL values for comparison
-            let old_attrs: HashMap<String, Value> = existing_rs
-                .attributes
-                .iter()
-                .filter_map(|(k, v)| json_to_dsl_value(v).map(|val| (k.clone(), val)))
-                .collect();
-
-            if !fresh_state.exists {
-                // Resource was deleted externally
-                has_changes = true;
-                changes.push(format!("    {} resource no longer exists", "-".red()));
-            } else {
-                // Check for modified and removed attributes
-                let mut all_keys: HashSet<&String> = old_attrs.keys().collect();
-                all_keys.extend(fresh_state.attributes.keys());
-
-                let mut sorted_keys: Vec<&&String> = all_keys.iter().collect();
-                sorted_keys.sort();
-
-                for key in sorted_keys {
-                    let old_val = old_attrs.get(*key);
-                    let new_val = fresh_state.attributes.get(*key);
-
-                    match (old_val, new_val) {
-                        (Some(old), Some(new)) if old != new => {
-                            has_changes = true;
-                            changes.push(format!(
-                                "    {} {}: {} {} {}",
-                                "~".yellow(),
-                                key,
-                                format_value(old).red(),
-                                "→".dimmed(),
-                                format_value(new).green(),
-                            ));
-                        }
-                        (Some(old), None) => {
-                            has_changes = true;
-                            changes.push(format!(
-                                "    {} {}: {}",
-                                "-".red(),
-                                key,
-                                format_value(old).red(),
-                            ));
-                        }
-                        (None, Some(new)) => {
-                            has_changes = true;
-                            changes.push(format!(
-                                "    {} {}: {}",
-                                "+".green(),
-                                key,
-                                format_value(new).green(),
-                            ));
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        } else {
-            // Resource in config but not in state -- shouldn't happen during refresh
-            continue;
-        }
-
-        if has_changes {
-            updated_count += 1;
-            println!(
-                "  {} \"{}\":",
-                resource.id.display_type().cyan(),
-                resource.id.name
-            );
-            for change in &changes {
-                println!("{}", change);
-            }
-            println!();
-        } else {
-            unchanged_count += 1;
-        }
-
-        // Update state with refreshed data
-        if fresh_state.exists {
-            let existing_rs = state.find_resource(
-                &resource.id.provider,
-                &resource.id.resource_type,
-                &resource.id.name,
-            );
-            let resource_state =
-                ResourceState::from_provider_state(resource, fresh_state, existing_rs)?;
-            state.upsert_resource(resource_state);
-        } else {
-            state.remove_resource(
-                &resource.id.provider,
-                &resource.id.resource_type,
-                &resource.id.name,
-            );
-        }
+        diff_display_update_resource(
+            &resource.id,
+            fresh_state,
+            &mut state,
+            "",
+            &mut updated_count,
+            &mut unchanged_count,
+        )?;
     }
 
     // Process orphaned resources (in state but removed from config)
@@ -463,113 +365,14 @@ pub(crate) async fn run_state_refresh_locked(
             Some(s) => s,
             None => continue,
         };
-
-        let existing = state.find_resource(
-            &orphan_id.provider,
-            &orphan_id.resource_type,
-            &orphan_id.name,
-        );
-
-        let mut has_changes = false;
-        let mut changes: Vec<String> = Vec::new();
-
-        if let Some(existing_rs) = existing {
-            let old_attrs: HashMap<String, Value> = existing_rs
-                .attributes
-                .iter()
-                .filter_map(|(k, v)| json_to_dsl_value(v).map(|val| (k.clone(), val)))
-                .collect();
-
-            if !fresh_state.exists {
-                has_changes = true;
-                changes.push(format!("    {} resource no longer exists", "-".red()));
-            } else {
-                let mut all_keys: HashSet<&String> = old_attrs.keys().collect();
-                all_keys.extend(fresh_state.attributes.keys());
-
-                let mut sorted_keys: Vec<&&String> = all_keys.iter().collect();
-                sorted_keys.sort();
-
-                for key in sorted_keys {
-                    let old_val = old_attrs.get(*key);
-                    let new_val = fresh_state.attributes.get(*key);
-
-                    match (old_val, new_val) {
-                        (Some(old), Some(new)) if old != new => {
-                            has_changes = true;
-                            changes.push(format!(
-                                "    {} {}: {} {} {}",
-                                "~".yellow(),
-                                key,
-                                format_value(old).red(),
-                                "→".dimmed(),
-                                format_value(new).green(),
-                            ));
-                        }
-                        (Some(old), None) => {
-                            has_changes = true;
-                            changes.push(format!(
-                                "    {} {}: {}",
-                                "-".red(),
-                                key,
-                                format_value(old).red(),
-                            ));
-                        }
-                        (None, Some(new)) => {
-                            has_changes = true;
-                            changes.push(format!(
-                                "    {} {}: {}",
-                                "+".green(),
-                                key,
-                                format_value(new).green(),
-                            ));
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        } else {
-            continue;
-        }
-
-        if has_changes {
-            updated_count += 1;
-            println!(
-                "  {} \"{}\" (orphan):",
-                orphan_id.display_type().cyan(),
-                orphan_id.name
-            );
-            for change in &changes {
-                println!("{}", change);
-            }
-            println!();
-        } else {
-            unchanged_count += 1;
-        }
-
-        // Update state with refreshed data
-        if fresh_state.exists {
-            // Construct a minimal Resource from the orphan's state data for from_provider_state
-            let orphan_resource = Resource::with_provider(
-                &orphan_id.provider,
-                &orphan_id.resource_type,
-                &orphan_id.name,
-            );
-            let existing_rs = state.find_resource(
-                &orphan_id.provider,
-                &orphan_id.resource_type,
-                &orphan_id.name,
-            );
-            let resource_state =
-                ResourceState::from_provider_state(&orphan_resource, fresh_state, existing_rs)?;
-            state.upsert_resource(resource_state);
-        } else {
-            state.remove_resource(
-                &orphan_id.provider,
-                &orphan_id.resource_type,
-                &orphan_id.name,
-            );
-        }
+        diff_display_update_resource(
+            orphan_id,
+            fresh_state,
+            &mut state,
+            " (orphan)",
+            &mut updated_count,
+            &mut unchanged_count,
+        )?;
     }
 
     // Renew lock and save with lock validation
@@ -584,6 +387,115 @@ pub(crate) async fn run_state_refresh_locked(
         if unchanged_count == 1 { "" } else { "s" },
     );
     println!("  {} State saved (serial: {})", "✓".green(), state.serial);
+
+    Ok(())
+}
+
+/// Compare old state with fresh provider state for a single resource,
+/// display any changes, and update the state file accordingly.
+///
+/// `label_suffix` is appended to the resource header (e.g., `" (orphan)"`).
+fn diff_display_update_resource(
+    id: &ResourceId,
+    fresh_state: &State,
+    state: &mut carina_state::StateFile,
+    label_suffix: &str,
+    updated_count: &mut u32,
+    unchanged_count: &mut u32,
+) -> Result<(), AppError> {
+    let existing = state.find_resource(&id.provider, &id.resource_type, &id.name);
+    let existing_rs = match existing {
+        Some(rs) => rs,
+        None => return Ok(()),
+    };
+
+    // Build old attributes as DSL values for comparison
+    let old_attrs: HashMap<String, Value> = existing_rs
+        .attributes
+        .iter()
+        .filter_map(|(k, v)| json_to_dsl_value(v).map(|val| (k.clone(), val)))
+        .collect();
+
+    let mut has_changes = false;
+    let mut changes: Vec<String> = Vec::new();
+
+    if !fresh_state.exists {
+        // Resource was deleted externally
+        has_changes = true;
+        changes.push(format!("    {} resource no longer exists", "-".red()));
+    } else {
+        // Check for modified, added, and removed attributes
+        let mut all_keys: HashSet<&String> = old_attrs.keys().collect();
+        all_keys.extend(fresh_state.attributes.keys());
+
+        let mut sorted_keys: Vec<&&String> = all_keys.iter().collect();
+        sorted_keys.sort();
+
+        for key in sorted_keys {
+            let old_val = old_attrs.get(*key);
+            let new_val = fresh_state.attributes.get(*key);
+
+            match (old_val, new_val) {
+                (Some(old), Some(new)) if old != new => {
+                    has_changes = true;
+                    changes.push(format!(
+                        "    {} {}: {} {} {}",
+                        "~".yellow(),
+                        key,
+                        format_value(old).red(),
+                        "\u{2192}".dimmed(),
+                        format_value(new).green(),
+                    ));
+                }
+                (Some(old), None) => {
+                    has_changes = true;
+                    changes.push(format!(
+                        "    {} {}: {}",
+                        "-".red(),
+                        key,
+                        format_value(old).red(),
+                    ));
+                }
+                (None, Some(new)) => {
+                    has_changes = true;
+                    changes.push(format!(
+                        "    {} {}: {}",
+                        "+".green(),
+                        key,
+                        format_value(new).green(),
+                    ));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    if has_changes {
+        *updated_count += 1;
+        println!(
+            "  {} \"{}\"{}:",
+            id.display_type().cyan(),
+            id.name,
+            label_suffix,
+        );
+        for change in &changes {
+            println!("{}", change);
+        }
+        println!();
+    } else {
+        *unchanged_count += 1;
+    }
+
+    // Update state with refreshed data
+    if fresh_state.exists {
+        let resource = Resource::with_provider(&id.provider, &id.resource_type, &id.name);
+        let existing_rs = state.find_resource(&id.provider, &id.resource_type, &id.name);
+        let resource_state =
+            ResourceState::from_provider_state(&resource, fresh_state, existing_rs)?;
+        state.upsert_resource(resource_state);
+    } else {
+        state.remove_resource(&id.provider, &id.resource_type, &id.name);
+    }
 
     Ok(())
 }
