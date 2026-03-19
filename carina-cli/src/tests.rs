@@ -1440,6 +1440,119 @@ impl Provider for RecordingProvider {
     }
 }
 
+/// Mock provider where create and delete succeed but update (rename) fails.
+struct RenameFailProvider;
+
+impl Provider for RenameFailProvider {
+    fn name(&self) -> &'static str {
+        "test"
+    }
+
+    fn read(
+        &self,
+        id: &ResourceId,
+        _identifier: Option<&str>,
+    ) -> BoxFuture<'_, ProviderResult<State>> {
+        let id = id.clone();
+        Box::pin(async move { Ok(State::not_found(id)) })
+    }
+
+    fn create(&self, resource: &Resource) -> BoxFuture<'_, ProviderResult<State>> {
+        let state = State::existing(resource.id.clone(), resource.attributes.clone())
+            .with_identifier("temp-name-abc");
+        Box::pin(async move { Ok(state) })
+    }
+
+    fn update(
+        &self,
+        _id: &ResourceId,
+        _identifier: &str,
+        _from: &State,
+        _to: &Resource,
+    ) -> BoxFuture<'_, ProviderResult<State>> {
+        Box::pin(async { Err(ProviderError::new("rename failed: API error")) })
+    }
+
+    fn delete(
+        &self,
+        _id: &ResourceId,
+        _identifier: &str,
+        _lifecycle: &LifecycleConfig,
+    ) -> BoxFuture<'_, ProviderResult<()>> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+/// Regression test for #878: when a create_before_destroy rename fails,
+/// the effect should be counted as a failure, not a success.
+#[tokio::test]
+async fn rename_failure_in_create_before_destroy_counts_as_failure() {
+    use carina_core::effect::TemporaryName;
+
+    let id = ResourceId::with_provider("awscc", "s3.bucket", "my-bucket");
+
+    let old_state = State::existing(
+        id.clone(),
+        HashMap::from([(
+            "bucket_name".to_string(),
+            Value::String("my-bucket".to_string()),
+        )]),
+    )
+    .with_identifier("my-bucket");
+
+    let new_resource = Resource::with_provider("awscc", "s3.bucket", "my-bucket")
+        .with_attribute("bucket_name", Value::String("my-bucket-tmp123".to_string()));
+
+    let mut plan = Plan::new();
+    plan.add(Effect::Replace {
+        id: id.clone(),
+        from: Box::new(old_state.clone()),
+        to: new_resource.clone(),
+        lifecycle: LifecycleConfig {
+            force_delete: false,
+            create_before_destroy: true,
+        },
+        changed_create_only: vec!["bucket_name".to_string()],
+        cascading_updates: vec![],
+        temporary_name: Some(TemporaryName {
+            attribute: "bucket_name".to_string(),
+            original_value: "my-bucket".to_string(),
+            temporary_value: "my-bucket-tmp123".to_string(),
+            can_rename: true,
+        }),
+    });
+
+    let provider = RenameFailProvider;
+    let mut binding_map = HashMap::new();
+    let mut current_states = HashMap::from([(id.clone(), old_state)]);
+    let unresolved_resources = HashMap::from([(id.clone(), new_resource)]);
+
+    let result = execute_effects(
+        &plan,
+        &provider,
+        &mut binding_map,
+        &mut current_states,
+        &unresolved_resources,
+    )
+    .await;
+
+    // The rename failed, so the effect should be counted as a failure
+    assert_eq!(
+        result.failure_count, 1,
+        "Rename failure should increment failure_count"
+    );
+    assert_eq!(
+        result.success_count, 0,
+        "Rename failure should not increment success_count"
+    );
+
+    // The state should still be saved (resource exists with temp name)
+    assert!(
+        result.applied_states.contains_key(&id),
+        "State should still be saved even on rename failure"
+    );
+}
+
 /// Regression test for #865: when a resource is replaced via create_before_destroy
 /// and a dependent resource has its own Update effect, the dependent's `to` state
 /// should reference the new (post-replacement) resource ID, not the old one.
