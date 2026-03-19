@@ -327,16 +327,6 @@ pub fn compute_anonymous_identifiers(
 
         let use_simhash = hash_values.is_empty();
 
-        if use_simhash {
-            // No create-only values available: hash all user-specified attributes
-            for (key, value) in &resource.attributes {
-                if key.starts_with('_') {
-                    continue; // Skip internal attributes like _type, _binding
-                }
-                hash_values.insert(key.as_str(), deterministic_value_string(value));
-            }
-        }
-
         let hash_str = if use_simhash {
             // Use SimHash for locality-sensitive hashing: similar inputs produce
             // similar hashes, enabling Hamming distance reconciliation.
