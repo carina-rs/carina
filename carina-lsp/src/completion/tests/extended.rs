@@ -282,6 +282,48 @@ fn map_completions_delegate_to_inner_type() {
 }
 
 #[test]
+fn attribute_completions_return_empty_when_resource_type_unknown() {
+    // When the resource type is not found in schemas (e.g., resource type detection failed),
+    // attribute_completions_for_type should return an empty list instead of
+    // falling back to all attributes from all schemas.
+    let provider = test_provider();
+    let completions = provider.attribute_completions_for_type("nonexistent.resource.type");
+    assert!(
+        completions.is_empty(),
+        "Should return no completions for unknown resource type, but got {} completions: {:?}",
+        completions.len(),
+        completions.iter().map(|c| &c.label).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn no_completions_for_unknown_resource_type_in_block() {
+    // End-to-end test: when inside a resource block whose type can't be detected,
+    // the completion should return empty rather than all attributes from all schemas.
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
+    // Create a provider with two schemas
+    let schema_a = ResourceSchema::new("test.a.resource")
+        .attribute(AttributeSchema::new("attr_a", AttributeType::String));
+    let schema_b = ResourceSchema::new("test.b.resource")
+        .attribute(AttributeSchema::new("attr_b", AttributeType::String));
+
+    let mut schemas = HashMap::new();
+    schemas.insert("test.a.resource".to_string(), schema_a);
+    schemas.insert("test.b.resource".to_string(), schema_b);
+
+    let provider = CompletionProvider::new(Arc::new(schemas), vec!["test".to_string()], vec![]);
+
+    // Simulate being inside a block where resource type detection yields empty string
+    let completions = provider.attribute_completions_for_type("");
+    assert!(
+        completions.is_empty(),
+        "Should return no completions when resource type is empty string, but got {} completions",
+        completions.len()
+    );
+}
+
+#[test]
 fn nested_struct_completions_via_block_name_in_path() {
     // When a user writes `config { transition { ... } }` where "transition" is
     // the block_name for field "transitions", the path resolution at depth > 1
