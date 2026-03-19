@@ -10,8 +10,7 @@ pub const TOKEN_TYPES: &[SemanticTokenType] = &[
     SemanticTokenType::STRING,   // 4: string literals
     SemanticTokenType::NUMBER,   // 5: number literals
     SemanticTokenType::OPERATOR, // 6: =
-    SemanticTokenType::FUNCTION, // 7: env()
-    SemanticTokenType::COMMENT,  // 8: comments
+    SemanticTokenType::COMMENT,  // 7: comments
 ];
 
 /// Create the semantic tokens legend for capability registration
@@ -81,7 +80,7 @@ impl SemanticTokensProvider {
 
         // Comment
         if trimmed.starts_with("//") {
-            tokens.push((indent, position::char_len(line) - indent, 8)); // COMMENT
+            tokens.push((indent, position::char_len(line) - indent, 7)); // COMMENT
             return tokens;
         }
 
@@ -185,11 +184,6 @@ impl SemanticTokensProvider {
         // Region patterns from registered providers (e.g., aws.Region.us_east_1)
         for region in &self.region_patterns {
             self.find_and_add_pattern(line, region, 1, &mut tokens);
-        }
-
-        // env() function
-        if let Some(byte_pos) = line.find("env(") {
-            tokens.push((position::byte_offset_to_char_offset(line, byte_pos), 3, 7)); // FUNCTION: env
         }
 
         // Property names (before =)
@@ -540,7 +534,7 @@ mod tests {
         let provider = SemanticTokensProvider::new(&[]);
         // Japanese comment should not panic and should be highlighted as COMMENT
         let tokens = provider.tokenize_line("// これはコメントです", 0);
-        let comment_token = tokens.iter().find(|(_, _, typ)| *typ == 8);
+        let comment_token = tokens.iter().find(|(_, _, typ)| *typ == 7);
         assert!(
             comment_token.is_some(),
             "Should highlight Japanese comment as COMMENT. Got: {:?}",

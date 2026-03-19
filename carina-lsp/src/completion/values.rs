@@ -215,29 +215,7 @@ impl CompletionProvider {
                         }
                     }
                 }
-                // Always include env() for Union types
-                let env_label = "env".to_string();
-                if seen_labels.insert(env_label.clone()) {
-                    completions.push(CompletionItem {
-                        label: env_label,
-                        kind: Some(CompletionItemKind::FUNCTION),
-                        insert_text: Some("env(\"${1:VAR_NAME}\")".to_string()),
-                        insert_text_format: Some(InsertTextFormat::SNIPPET),
-                        detail: Some("Read environment variable".to_string()),
-                        ..Default::default()
-                    });
-                }
                 completions
-            }
-            AttributeType::String | AttributeType::Custom { .. } => {
-                vec![CompletionItem {
-                    label: "env".to_string(),
-                    kind: Some(CompletionItemKind::FUNCTION),
-                    insert_text: Some("env(\"${1:VAR_NAME}\")".to_string()),
-                    insert_text_format: Some(InsertTextFormat::SNIPPET),
-                    detail: Some("Read environment variable".to_string()),
-                    ..Default::default()
-                }]
             }
             _ => self.generic_value_completions(),
         }
@@ -255,14 +233,6 @@ impl CompletionProvider {
                 label: "false".to_string(),
                 kind: Some(CompletionItemKind::VALUE),
                 detail: Some("Boolean false".to_string()),
-                ..Default::default()
-            },
-            CompletionItem {
-                label: "env".to_string(),
-                kind: Some(CompletionItemKind::FUNCTION),
-                insert_text: Some("env(\"${1:VAR_NAME}\")".to_string()),
-                insert_text_format: Some(InsertTextFormat::SNIPPET),
-                detail: Some("Read environment variable".to_string()),
                 ..Default::default()
             },
         ];

@@ -194,9 +194,6 @@ impl HoverProvider {
             "let" => Some(
                 "## let\n\nDefines a named resource or variable binding.\n\n```carina\nlet my_bucket = aws.s3.bucket {\n    name = \"my-bucket\"\n    region = aws.Region.ap_northeast_1\n}\n```",
             ),
-            "env" => Some(
-                "## env()\n\nReads a value from an environment variable.\n\n```carina\nname = env(\"BUCKET_NAME\")\n```",
-            ),
             "output" => Some(
                 "## output\n\nDefines module output values that can be referenced by the caller.\n\n```carina\noutput {\n    bucket_name: String = my_bucket.name\n}\n```",
             ),
@@ -279,13 +276,6 @@ mod tests {
         assert!(HoverProvider::keyword_description("let").is_some());
         let desc = HoverProvider::keyword_description("let").unwrap();
         assert!(desc.contains("named resource"));
-    }
-
-    #[test]
-    fn test_keyword_hover_env() {
-        assert!(HoverProvider::keyword_description("env").is_some());
-        let desc = HoverProvider::keyword_description("env").unwrap();
-        assert!(desc.contains("environment variable"));
     }
 
     #[test]
