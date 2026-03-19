@@ -481,6 +481,9 @@ pub async fn execute_effects(
 }
 
 /// Save state after apply. Does NOT release the lock -- caller is responsible.
+///
+/// When `lock` is `None` (i.e. `--lock=false`), state is written without lock
+/// validation via `save_state_unlocked`.
 pub async fn finalize_apply(
     result: &ApplyResult,
     state_file: Option<StateFile>,
@@ -488,7 +491,7 @@ pub async fn finalize_apply(
     current_states: &HashMap<ResourceId, State>,
     plan: &Plan,
     backend: &dyn StateBackend,
-    lock: &LockInfo,
+    lock: Option<&LockInfo>,
 ) -> Result<(), AppError> {
     println!();
     println!("{}", "Saving state...".cyan());
@@ -504,7 +507,11 @@ pub async fn finalize_apply(
         failed_refreshes: &result.failed_refreshes,
     })?;
 
-    save_state_locked(backend, lock, &mut state).await?;
+    if let Some(lock) = lock {
+        save_state_locked(backend, lock, &mut state).await?;
+    } else {
+        save_state_unlocked(backend, &mut state).await?;
+    }
     println!("  {} State saved (serial: {})", "✓".green(), state.serial);
 
     Ok(())
@@ -526,6 +533,18 @@ pub async fn save_state_locked(
         .write_state_locked(state, &renewed)
         .await
         .map_err(AppError::Backend)
+}
+
+/// Write state without lock validation.
+///
+/// Used when `--lock=false` is specified. Increments the serial number and
+/// writes using `write_state` (no lock check).
+pub async fn save_state_unlocked(
+    backend: &dyn StateBackend,
+    state: &mut StateFile,
+) -> Result<(), AppError> {
+    state.increment_serial();
+    backend.write_state(state).await.map_err(AppError::Backend)
 }
 
 pub fn queue_state_refresh(
@@ -736,7 +755,7 @@ pub async fn detect_drift(
     }
 }
 
-pub async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), AppError> {
+pub async fn run_apply(path: &PathBuf, auto_approve: bool, lock: bool) -> Result<(), AppError> {
     let ctx = WiringContext::new();
     let loaded = load_configuration(path)?;
     let mut parsed = loaded.parsed;
@@ -758,7 +777,7 @@ pub async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), AppErro
 
     // Handle bootstrap if S3 backend is configured
     #[allow(unused_assignments)]
-    let mut lock: Option<LockInfo> = None;
+    let mut lock_info: Option<LockInfo> = None;
 
     if let Some(config) = backend_config {
         // Check if bucket exists (bootstrap detection)
@@ -921,10 +940,12 @@ pub async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), AppErro
                 backend.init().await.map_err(AppError::Backend)?;
             }
         }
+    }
 
-        // Acquire lock
+    // Acquire lock (unless --lock=false)
+    if lock {
         println!("{}", "Acquiring state lock...".cyan());
-        lock = Some(
+        lock_info = Some(
             backend
                 .acquire_lock("apply")
                 .await
@@ -932,34 +953,37 @@ pub async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), AppErro
         );
         println!("  {} Lock acquired", "✓".green());
     } else {
-        // Local backend: acquire lock
-        println!("{}", "Acquiring state lock...".cyan());
-        lock = Some(
-            backend
-                .acquire_lock("apply")
-                .await
-                .map_err(map_lock_error)?,
+        println!(
+            "{}",
+            "Warning: State locking is disabled. This is unsafe if others might run commands against the same state."
+                .yellow()
+                .bold()
         );
-        println!("  {} Lock acquired", "✓".green());
     }
 
     // All code after lock acquisition is wrapped so that lock release is guaranteed
-    let lock_info = lock.as_ref().expect("lock should have been acquired");
-    let op_result =
-        run_apply_locked(&ctx, &mut parsed, auto_approve, backend.as_ref(), lock_info).await;
+    let op_result = run_apply_locked(
+        &ctx,
+        &mut parsed,
+        auto_approve,
+        backend.as_ref(),
+        lock_info.as_ref(),
+    )
+    .await;
 
-    // Always release lock, regardless of whether the operation succeeded
-    let release_result = backend
-        .release_lock(lock_info)
-        .await
-        .map_err(AppError::Backend);
+    // Always release lock if it was acquired
+    if let Some(ref li) = lock_info {
+        let release_result = backend.release_lock(li).await.map_err(AppError::Backend);
 
-    if release_result.is_ok() && op_result.is_ok() {
-        println!("  {} Lock released", "✓".green());
+        if release_result.is_ok() && op_result.is_ok() {
+            println!("  {} Lock released", "✓".green());
+        }
+
+        op_result?;
+        release_result
+    } else {
+        op_result
     }
-
-    op_result?;
-    release_result
 }
 
 async fn run_apply_locked(
@@ -967,7 +991,7 @@ async fn run_apply_locked(
     parsed: &mut carina_core::parser::ParsedFile,
     auto_approve: bool,
     backend: &dyn StateBackend,
-    lock: &LockInfo,
+    lock: Option<&LockInfo>,
 ) -> Result<(), AppError> {
     // Read current state from backend
     let state_file = backend.read_state().await.map_err(AppError::Backend)?;
@@ -1146,7 +1170,11 @@ async fn run_apply_locked(
     }
 }
 
-pub async fn run_apply_from_plan(plan_path: &PathBuf, auto_approve: bool) -> Result<(), AppError> {
+pub async fn run_apply_from_plan(
+    plan_path: &PathBuf,
+    auto_approve: bool,
+    lock: bool,
+) -> Result<(), AppError> {
     // Read and deserialize the plan file
     let content =
         fs::read_to_string(plan_path).map_err(|e| format!("Failed to read plan file: {}", e))?;
@@ -1192,33 +1220,53 @@ pub async fn run_apply_from_plan(plan_path: &PathBuf, auto_approve: bool) -> Res
         create_local_backend()
     };
 
-    // Acquire lock
-    println!("{}", "Acquiring state lock...".cyan());
-    let lock = backend
-        .acquire_lock("apply")
-        .await
-        .map_err(map_lock_error)?;
-    println!("  {} Lock acquired", "✓".green());
+    // Acquire lock (unless --lock=false)
+    let lock_info: Option<LockInfo> = if lock {
+        println!("{}", "Acquiring state lock...".cyan());
+        let li = backend
+            .acquire_lock("apply")
+            .await
+            .map_err(map_lock_error)?;
+        println!("  {} Lock acquired", "✓".green());
+        Some(li)
+    } else {
+        println!(
+            "{}",
+            "Warning: State locking is disabled. This is unsafe if others might run commands against the same state."
+                .yellow()
+                .bold()
+        );
+        None
+    };
 
-    let op_result =
-        run_apply_from_plan_locked(plan_file, auto_approve, backend.as_ref(), &lock).await;
+    let op_result = run_apply_from_plan_locked(
+        plan_file,
+        auto_approve,
+        backend.as_ref(),
+        lock_info.as_ref(),
+    )
+    .await;
 
-    // Always release lock, regardless of whether the operation succeeded
-    let release_result = backend.release_lock(&lock).await.map_err(AppError::Backend);
+    // Always release lock if it was acquired
+    if let Some(ref li) = lock_info {
+        let release_result = backend.release_lock(li).await.map_err(AppError::Backend);
 
-    if release_result.is_ok() && op_result.is_ok() {
-        println!("  {} Lock released", "✓".green());
+        if release_result.is_ok() && op_result.is_ok() {
+            println!("  {} Lock released", "✓".green());
+        }
+
+        op_result?;
+        release_result
+    } else {
+        op_result
     }
-
-    op_result?;
-    release_result
 }
 
 async fn run_apply_from_plan_locked(
     plan_file: PlanFile,
     auto_approve: bool,
     backend: &dyn StateBackend,
-    lock: &LockInfo,
+    lock: Option<&LockInfo>,
 ) -> Result<(), AppError> {
     // Read current state and validate lineage
     let state_file = backend.read_state().await.map_err(AppError::Backend)?;

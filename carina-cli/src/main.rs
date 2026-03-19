@@ -57,6 +57,10 @@ enum Commands {
         /// Skip confirmation prompt (auto-approve)
         #[arg(long)]
         auto_approve: bool,
+
+        /// Enable/disable state locking (default: true)
+        #[arg(long, default_value = "true", action = clap::ArgAction::Set)]
+        lock: bool,
     },
     /// Destroy all resources defined in the configuration file
     Destroy {
@@ -67,6 +71,10 @@ enum Commands {
         /// Skip confirmation prompt (auto-approve)
         #[arg(long)]
         auto_approve: bool,
+
+        /// Enable/disable state locking (default: true)
+        #[arg(long, default_value = "true", action = clap::ArgAction::Set)]
+        lock: bool,
     },
     /// Format .crn files
     Fmt {
@@ -149,14 +157,22 @@ async fn main() {
     let result = match cli.command {
         Commands::Validate { path } => run_validate(&path),
         Commands::Plan { .. } => unreachable!(),
-        Commands::Apply { path, auto_approve } => {
+        Commands::Apply {
+            path,
+            auto_approve,
+            lock,
+        } => {
             if path.extension().is_some_and(|ext| ext == "json") {
-                run_apply_from_plan(&path, auto_approve).await
+                run_apply_from_plan(&path, auto_approve, lock).await
             } else {
-                run_apply(&path, auto_approve).await
+                run_apply(&path, auto_approve, lock).await
             }
         }
-        Commands::Destroy { path, auto_approve } => run_destroy(&path, auto_approve).await,
+        Commands::Destroy {
+            path,
+            auto_approve,
+            lock,
+        } => run_destroy(&path, auto_approve, lock).await,
         Commands::Fmt {
             path,
             check,
