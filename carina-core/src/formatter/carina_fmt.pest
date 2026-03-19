@@ -104,8 +104,7 @@ function_call = {
 
 // Primary value
 primary = {
-    env_var
-  | resource_expr
+    resource_expr
   | list
   | map
   | namespaced_id
@@ -131,9 +130,6 @@ map_content = _{ trivia | map_entry }
 
 // Map entry: key = value (with optional trailing comma)
 map_entry = { identifier ~ trivia* ~ equals ~ trivia* ~ expression ~ trivia* ~ comma? }
-
-// Environment variable: env("VAR_NAME")
-env_var = { kw_env ~ open_paren ~ trivia* ~ string ~ trivia* ~ close_paren }
 
 // Resource expression: aws.s3_bucket { ... }
 resource_expr = {
@@ -172,7 +168,6 @@ kw_backend = { "backend" }
 kw_import = { "import" }
 kw_as = { "as" }
 kw_let = { "let" }
-kw_env = { "env" }
 kw_input = { "input" }
 kw_output = { "output" }
 kw_ref = { "ref" }

@@ -71,7 +71,6 @@ pub enum NodeKind {
     Expression,
     PipeExpr,
     FunctionCall,
-    EnvVar,
     VariableRef,
     NamespacedId,
     Identifier,

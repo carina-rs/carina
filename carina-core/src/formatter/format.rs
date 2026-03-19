@@ -111,7 +111,6 @@ impl Formatter {
             NodeKind::OutputParam => self.format_output_param(node, 0),
             NodeKind::PipeExpr => self.format_pipe_expr(node),
             NodeKind::FunctionCall => self.format_function_call(node),
-            NodeKind::EnvVar => self.format_env_var(node),
             NodeKind::VariableRef => self.format_variable_ref(node),
             NodeKind::List => self.format_list(node),
             NodeKind::Map => self.format_map(node),
@@ -753,19 +752,6 @@ impl Formatter {
                 CstChild::Trivia(_) => {}
             }
         }
-    }
-
-    fn format_env_var(&mut self, node: &CstNode) {
-        self.write("env(");
-        for child in &node.children {
-            if let CstChild::Token(token) = child
-                && token.text.starts_with('"')
-            {
-                self.write(&token.text);
-                break;
-            }
-        }
-        self.write(")");
     }
 
     fn format_variable_ref(&mut self, node: &CstNode) {

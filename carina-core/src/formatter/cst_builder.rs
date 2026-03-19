@@ -108,7 +108,6 @@ impl<'a> CstBuilder<'a> {
                 let inner = pair.into_inner().next()?;
                 self.build_child(inner)
             }
-            Rule::env_var => Some(CstChild::Node(self.build_node(NodeKind::EnvVar, pair))),
             Rule::list => Some(CstChild::Node(self.build_node(NodeKind::List, pair))),
             Rule::map => Some(CstChild::Node(self.build_node(NodeKind::Map, pair))),
             Rule::map_content => None, // Silent rule
@@ -146,7 +145,6 @@ impl<'a> CstBuilder<'a> {
             Rule::kw_backend => Some(CstChild::Token(Token::new("backend".to_string(), span))),
             Rule::kw_provider => Some(CstChild::Token(Token::new("provider".to_string(), span))),
             Rule::kw_let => Some(CstChild::Token(Token::new("let".to_string(), span))),
-            Rule::kw_env => Some(CstChild::Token(Token::new("env".to_string(), span))),
             Rule::kw_input => Some(CstChild::Token(Token::new("input".to_string(), span))),
             Rule::kw_output => Some(CstChild::Token(Token::new("output".to_string(), span))),
             Rule::kw_ref => Some(CstChild::Token(Token::new("ref".to_string(), span))),
