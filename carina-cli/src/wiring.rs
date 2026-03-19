@@ -224,6 +224,8 @@ pub async fn get_provider_with_ctx(ctx: &WiringContext, parsed: &ParsedFile) -> 
     }
 
     if router.is_empty() {
+        // Use mock provider for other cases.
+        // Register with empty key to match resources without a provider prefix.
         println!("{}", "Using mock provider".cyan());
         router.add_provider(String::new(), Box::new(MockProvider::new()));
     }
@@ -266,8 +268,11 @@ pub async fn create_plan_from_parsed(
     let sorted_resources =
         sort_resources_by_dependencies(&parsed.resources).map_err(AppError::Validation)?;
 
+    // Select appropriate Provider based on configuration
     let provider = get_provider_with_ctx(&ctx, parsed).await;
 
+    // Read states for all resources using identifier from state
+    // In identifier-based approach, if there's no identifier in state, the resource doesn't exist
     let mut current_states: HashMap<ResourceId, State> = HashMap::new();
     for resource in &sorted_resources {
         let identifier = state_file
@@ -280,6 +285,8 @@ pub async fn create_plan_from_parsed(
         current_states.insert(resource.id.clone(), state);
     }
 
+    // Seed current_states with orphaned resources from state file (#844).
+    // These are resources tracked in state but removed from the .crn config.
     if let Some(sf) = state_file.as_ref() {
         let desired_ids: HashSet<ResourceId> =
             sorted_resources.iter().map(|r| r.id.clone()).collect();
@@ -288,16 +295,19 @@ pub async fn create_plan_from_parsed(
         }
     }
 
+    // Restore unreturned attributes from state file (CloudControl doesn't always return them)
     let saved_attrs = state_file
         .as_ref()
         .map(|sf| sf.build_saved_attrs())
         .unwrap_or_default();
     provider.hydrate_read_state(&mut current_states, &saved_attrs);
 
+    // Resolve ResourceRef values and enum identifiers using AWS state
     let mut resources = sorted_resources.clone();
     resolve_refs_with_state(&mut resources, &current_states);
     provider.normalize_desired(&mut resources);
 
+    // Build lifecycles map from state file for orphaned resource deletion
     let lifecycles = state_file
         .as_ref()
         .map(|sf| sf.build_lifecycles())
@@ -316,6 +326,9 @@ pub async fn create_plan_from_parsed(
         &prev_desired_keys,
     );
 
+    // Populate cascading updates for Replace effects with create_before_destroy.
+    // Uses unresolved resources (sorted_resources) so dependent Update effects
+    // retain ResourceRef values for re-resolution at apply time.
     cascade_dependent_updates(&mut plan, &sorted_resources, &current_states);
 
     Ok(PlanContext {
