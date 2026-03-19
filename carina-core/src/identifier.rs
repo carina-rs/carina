@@ -186,12 +186,43 @@ fn deterministic_value_string(value: &Value) -> String {
 /// with modified attributes.
 const SIMHASH_HAMMING_THRESHOLD: u32 = 20;
 
+/// Flatten a Value into individual SimHash features.
+///
+/// Map values are expanded so each entry becomes a separate feature (e.g., `tags.Environment`),
+/// allowing SimHash to produce close hashes when only one map entry changes.
+/// Non-map values use `deterministic_value_string` as the feature value.
+fn flatten_value_for_simhash(
+    prefix: &str,
+    value: &Value,
+    out: &mut std::collections::BTreeMap<String, String>,
+) {
+    match value {
+        Value::Map(map) => {
+            for (k, v) in map {
+                let key = format!("{}.{}", prefix, k);
+                flatten_value_for_simhash(&key, v, out);
+            }
+        }
+        Value::List(items) => {
+            for (i, item) in items.iter().enumerate() {
+                let key = format!("{}[{}]", prefix, i);
+                flatten_value_for_simhash(&key, item, out);
+            }
+        }
+        _ => {
+            out.insert(prefix.to_string(), deterministic_value_string(value));
+        }
+    }
+}
+
 /// Compute SimHash of a set of key-value attributes.
 ///
 /// SimHash is a locality-sensitive hash: changing one attribute flips only a few bits,
 /// so similar inputs produce similar hashes. This enables similarity-based reconciliation
 /// using Hamming distance on the identifier alone.
-fn compute_simhash(attributes: &std::collections::BTreeMap<&str, String>) -> u64 {
+fn compute_simhash<K: std::fmt::Display>(
+    attributes: &std::collections::BTreeMap<K, String>,
+) -> u64 {
     use std::hash::{Hash, Hasher};
 
     let mut v = [0i32; 64];
@@ -296,26 +327,23 @@ pub fn compute_anonymous_identifiers(
 
         let use_simhash = hash_values.is_empty();
 
-        if use_simhash {
-            // No create-only values available: hash all user-specified attributes
-            for (key, value) in &resource.attributes {
-                if key.starts_with('_') {
-                    continue; // Skip internal attributes like _type, _binding
-                }
-                hash_values.insert(key.as_str(), deterministic_value_string(value));
-            }
-        }
-
         let hash_str = if use_simhash {
             // Use SimHash for locality-sensitive hashing: similar inputs produce
             // similar hashes, enabling Hamming distance reconciliation.
             // Include identity attributes in the hash for provider distinction.
-            let mut simhash_values: BTreeMap<&str, String> = BTreeMap::new();
+            //
+            // Flatten Map/List values into individual features so that changing
+            // a single entry within a map (e.g., one tag) only flips a few bits
+            // in the SimHash, keeping the Hamming distance small.
+            let mut simhash_values: BTreeMap<String, String> = BTreeMap::new();
             for (k, v) in &identity_values {
-                simhash_values.insert(k.as_str(), v.clone());
+                simhash_values.insert(k.clone(), v.clone());
             }
-            for (k, v) in &hash_values {
-                simhash_values.insert(k, v.clone());
+            for (key, value) in &resource.attributes {
+                if key.starts_with('_') {
+                    continue;
+                }
+                flatten_value_for_simhash(key, value, &mut simhash_values);
             }
             let simhash = compute_simhash(&simhash_values);
             format!("{:016x}", simhash)
@@ -1942,6 +1970,114 @@ mod tests {
         assert_eq!(
             resources[0].id.name, original_id,
             "ambiguous partial matches should not reconcile"
+        );
+    }
+
+    #[test]
+    fn test_reconcile_eip_tag_update_with_unset_create_only_props() {
+        // Regression test for #882: EC2 EIP has create-only props in schema
+        // (address, ipam_pool_id, etc.) but user didn't set any. Only tags changed.
+        // SimHash reconciliation should match the resource as an in-place update,
+        // not a replace (delete+create).
+        let schema = ResourceSchema::new("awscc.ec2.eip")
+            .attribute(AttributeSchema::new("domain", AttributeType::String))
+            .attribute(AttributeSchema::new("address", AttributeType::String).create_only())
+            .attribute(AttributeSchema::new("ipam_pool_id", AttributeType::String).create_only())
+            .attribute(
+                AttributeSchema::new("network_border_group", AttributeType::String).create_only(),
+            )
+            .attribute(
+                AttributeSchema::new("transfer_address", AttributeType::String).create_only(),
+            )
+            .attribute(AttributeSchema::new(
+                "tags",
+                AttributeType::Map(Box::new(AttributeType::String)),
+            ));
+        let schemas: HashMap<String, ResourceSchema> = vec![("awscc.ec2.eip".to_string(), schema)]
+            .into_iter()
+            .collect();
+        let providers = vec![ProviderConfig {
+            name: "awscc".to_string(),
+            attributes: vec![(
+                "region".to_string(),
+                Value::String("awscc.Region.ap_northeast_1".to_string()),
+            )]
+            .into_iter()
+            .collect(),
+        }];
+        let identity_fn = |_: &str| -> Vec<String> { vec!["region".to_string()] };
+
+        // Step 1: Create EIP with tags Environment=acceptance-test
+        let mut r1 = Resource::with_provider("awscc", "ec2.eip", "");
+        r1.attributes
+            .insert("domain".to_string(), Value::String("vpc".to_string()));
+        let mut tags1 = std::collections::HashMap::new();
+        tags1.insert(
+            "Environment".to_string(),
+            Value::String("acceptance-test".to_string()),
+        );
+        tags1.insert(
+            "Purpose".to_string(),
+            Value::String("simhash-test".to_string()),
+        );
+        r1.attributes.insert("tags".to_string(), Value::Map(tags1));
+
+        let mut resources1 = vec![r1];
+        compute_anonymous_identifiers(
+            &mut resources1,
+            &providers,
+            &schemas,
+            &schema_key_fn,
+            &identity_fn,
+        )
+        .unwrap();
+        let step1_id = resources1[0].id.name.clone();
+
+        // Step 2: Change tag Environment=staging (only tags changed)
+        let mut r2 = Resource::with_provider("awscc", "ec2.eip", "");
+        r2.attributes
+            .insert("domain".to_string(), Value::String("vpc".to_string()));
+        let mut tags2 = std::collections::HashMap::new();
+        tags2.insert(
+            "Environment".to_string(),
+            Value::String("staging".to_string()),
+        );
+        tags2.insert(
+            "Purpose".to_string(),
+            Value::String("simhash-test".to_string()),
+        );
+        r2.attributes.insert("tags".to_string(), Value::Map(tags2));
+
+        let mut resources2 = vec![r2];
+        compute_anonymous_identifiers(
+            &mut resources2,
+            &providers,
+            &schemas,
+            &schema_key_fn,
+            &identity_fn,
+        )
+        .unwrap();
+        let step2_id = resources2[0].id.name.clone();
+
+        // Identifiers should differ (different tag values)
+        assert_ne!(step1_id, step2_id);
+
+        // Reconcile: state has the step1 identifier
+        let state_entries = vec![AnonymousIdStateInfo {
+            name: step1_id.clone(),
+            create_only_values: HashMap::new(), // No create-only values in state either
+        }];
+        reconcile_anonymous_identifiers(
+            &mut resources2,
+            &schemas,
+            &schema_key_fn,
+            &|_provider, _rt| state_entries.clone(),
+        );
+
+        // After reconciliation, step2 should have step1's identifier (in-place update)
+        assert_eq!(
+            resources2[0].id.name, step1_id,
+            "Tag-only change on EIP with unset create-only props should reconcile to same identifier"
         );
     }
 
