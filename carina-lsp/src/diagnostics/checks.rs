@@ -630,7 +630,7 @@ impl DiagnosticEngine {
                     if !identifier.is_empty()
                         && !property.is_empty()
                         && identifier.chars().all(|c| c.is_alphanumeric() || c == '_')
-                        && !identifier.starts_with(|c: char| c.is_uppercase())
+                        && identifier.starts_with(|c: char| c.is_ascii_lowercase() || c == '_')
                     {
                         // Check if the binding is defined
                         if !defined_bindings.contains(identifier) {
