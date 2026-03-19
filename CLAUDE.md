@@ -179,6 +179,19 @@ git wt
 git wt -d <branch-name>
 ```
 
+### cfn-schema-cache Copy for Worktrees
+
+`carina-provider-awscc/cfn-schema-cache/` is in `.gitignore` and NOT copied to worktrees. You MUST copy it manually using **absolute paths** after creating a worktree. Relative paths cause "are identical (not copied)" errors.
+
+```bash
+MAIN_REPO=/Users/mizzy/src/github.com/carina-rs/carina
+WORKTREE=$MAIN_REPO/.worktrees/<branch>
+mkdir -p $WORKTREE/carina-provider-awscc/cfn-schema-cache
+cp -r $MAIN_REPO/carina-provider-awscc/cfn-schema-cache/* $WORKTREE/carina-provider-awscc/cfn-schema-cache/
+```
+
+**Source MUST be the main repo absolute path. NEVER use relative paths.**
+
 ### Branch Cleanup
 
 After merging a PR, clean up branches:
