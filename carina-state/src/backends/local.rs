@@ -8,6 +8,7 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::PathBuf;
 use std::time::Duration;
+use tokio::time::sleep as async_sleep;
 
 use crate::backend::{BackendConfig, BackendError, BackendResult, StateBackend};
 use crate::lock::LockInfo;
@@ -92,8 +93,8 @@ impl LocalBackend {
             .is_some_and(|elapsed| elapsed < LOCK_WRITE_GRACE_PERIOD)
     }
 
-    fn remove_lock_if_matches(&self, lock_id: &str) -> BackendResult<()> {
-        let content = match std::fs::read_to_string(&self.lock_path) {
+    async fn remove_lock_if_matches(&self, lock_id: &str) -> BackendResult<()> {
+        let content = match tokio::fs::read_to_string(&self.lock_path).await {
             Ok(content) => content,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(err) => {
@@ -110,7 +111,7 @@ impl LocalBackend {
         };
 
         if existing_lock.id == lock_id {
-            match std::fs::remove_file(&self.lock_path) {
+            match tokio::fs::remove_file(&self.lock_path).await {
                 Ok(()) => {}
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
                 Err(err) => {
@@ -125,7 +126,7 @@ impl LocalBackend {
         Ok(())
     }
 
-    fn acquire_recovery_claim(&self) -> BackendResult<Option<RecoveryClaimGuard>> {
+    async fn acquire_recovery_claim(&self) -> BackendResult<Option<RecoveryClaimGuard>> {
         let claim_path = self.recovery_path();
         let claim = LockInfo::with_timeout("recover", RECOVERY_CLAIM_TIMEOUT_SECS);
         let content = serde_json::to_string_pretty(&claim).map_err(|e| {
@@ -144,7 +145,7 @@ impl LocalBackend {
                 }
             }
 
-            let claim_content = match std::fs::read_to_string(&claim_path) {
+            let claim_content = match tokio::fs::read_to_string(&claim_path).await {
                 Ok(content) => content,
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(err) => {
@@ -158,14 +159,14 @@ impl LocalBackend {
             let claim_is_stale = match serde_json::from_str::<LockInfo>(&claim_content) {
                 Ok(claim) => claim.is_expired(),
                 Err(_) if Self::file_written_recently(&claim_path) => {
-                    std::thread::sleep(Duration::from_millis(1));
+                    async_sleep(Duration::from_millis(1)).await;
                     continue;
                 }
                 Err(_) => true,
             };
 
             if claim_is_stale {
-                match std::fs::remove_file(&claim_path) {
+                match tokio::fs::remove_file(&claim_path).await {
                     Ok(()) => continue,
                     Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
                     Err(err) => {
@@ -181,9 +182,9 @@ impl LocalBackend {
         }
     }
 
-    fn has_active_recovery_claim(&self) -> BackendResult<bool> {
+    async fn has_active_recovery_claim(&self) -> BackendResult<bool> {
         let claim_path = self.recovery_path();
-        let claim_content = match std::fs::read_to_string(&claim_path) {
+        let claim_content = match tokio::fs::read_to_string(&claim_path).await {
             Ok(content) => content,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
             Err(err) => {
@@ -204,7 +205,7 @@ impl LocalBackend {
             return Ok(true);
         }
 
-        match std::fs::remove_file(&claim_path) {
+        match tokio::fs::remove_file(&claim_path).await {
             Ok(()) => Ok(false),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
             Err(err) => Err(BackendError::Io(format!(
@@ -224,12 +225,16 @@ impl Default for LocalBackend {
 #[async_trait]
 impl StateBackend for LocalBackend {
     async fn read_state(&self) -> BackendResult<Option<StateFile>> {
-        if !self.state_path.exists() {
-            return Ok(None);
-        }
-
-        let content = std::fs::read_to_string(&self.state_path)
-            .map_err(|e| BackendError::Io(format!("Failed to read state file: {}", e)))?;
+        let content = match tokio::fs::read_to_string(&self.state_path).await {
+            Ok(content) => content,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => {
+                return Err(BackendError::Io(format!(
+                    "Failed to read state file: {}",
+                    err
+                )));
+            }
+        };
 
         let state: StateFile = serde_json::from_str(&content).map_err(|e| {
             BackendError::InvalidState(format!("Failed to parse state file: {}", e))
@@ -246,27 +251,28 @@ impl StateBackend for LocalBackend {
         // Write to a temp file in the same directory, then rename atomically
         let tmp_path = self.state_path.with_extension("json.tmp");
 
-        let mut file = std::fs::File::create(&tmp_path)
-            .map_err(|e| BackendError::Io(format!("Failed to create temp state file: {}", e)))?;
+        tokio::fs::write(&tmp_path, content.as_bytes())
+            .await
+            .map_err(|e| BackendError::Io(format!("Failed to write temp state file: {}", e)))?;
 
-        file.write_all(content.as_bytes()).map_err(|e| {
-            let _ = std::fs::remove_file(&tmp_path);
-            BackendError::Io(format!("Failed to write temp state file: {}", e))
+        // Sync the temp file to disk before renaming
+        let file = tokio::fs::File::open(&tmp_path).await.map_err(|e| {
+            BackendError::Io(format!("Failed to open temp state file for sync: {}", e))
         })?;
-
-        file.sync_all().map_err(|e| {
+        file.sync_all().await.map_err(|e| {
             let _ = std::fs::remove_file(&tmp_path);
             BackendError::Io(format!("Failed to sync temp state file: {}", e))
         })?;
 
-        std::fs::rename(&tmp_path, &self.state_path)
+        tokio::fs::rename(&tmp_path, &self.state_path)
+            .await
             .map_err(|e| BackendError::Io(format!("Failed to rename temp state file: {}", e)))?;
 
         // Fsync the parent directory to ensure the rename is durable
         if let Some(parent) = self.state_path.parent()
-            && let Ok(dir) = std::fs::File::open(parent)
+            && let Ok(dir) = tokio::fs::File::open(parent).await
         {
-            let _ = dir.sync_all();
+            let _ = dir.sync_all().await;
         }
 
         Ok(())
@@ -277,16 +283,16 @@ impl StateBackend for LocalBackend {
         let content = serde_json::to_string_pretty(&lock)
             .map_err(|e| BackendError::Serialization(format!("Failed to serialize lock: {}", e)))?;
         loop {
-            if self.has_active_recovery_claim()? {
-                std::thread::sleep(std::time::Duration::from_millis(1));
+            if self.has_active_recovery_claim().await? {
+                async_sleep(Duration::from_millis(1)).await;
                 continue;
             }
 
             match Self::create_lock_file(&self.lock_path, &content) {
                 Ok(()) => {
-                    if self.has_active_recovery_claim()? {
-                        self.remove_lock_if_matches(&lock.id)?;
-                        std::thread::sleep(Duration::from_millis(1));
+                    if self.has_active_recovery_claim().await? {
+                        self.remove_lock_if_matches(&lock.id).await?;
+                        async_sleep(Duration::from_millis(1)).await;
                         continue;
                     }
                     return Ok(lock);
@@ -300,7 +306,7 @@ impl StateBackend for LocalBackend {
                 }
             }
 
-            let current_content = match std::fs::read_to_string(&self.lock_path) {
+            let current_content = match tokio::fs::read_to_string(&self.lock_path).await {
                 Ok(content) => content,
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(err) => {
@@ -316,18 +322,18 @@ impl StateBackend for LocalBackend {
                     return Err(BackendError::locked(&existing_lock));
                 }
                 Err(_) if Self::file_written_recently(&self.lock_path) => {
-                    std::thread::sleep(Duration::from_millis(1));
+                    async_sleep(Duration::from_millis(1)).await;
                     continue;
                 }
                 _ => {}
             }
 
-            let Some(_claim) = self.acquire_recovery_claim()? else {
-                std::thread::sleep(std::time::Duration::from_millis(1));
+            let Some(_claim) = self.acquire_recovery_claim().await? else {
+                async_sleep(Duration::from_millis(1)).await;
                 continue;
             };
 
-            let current_content = match std::fs::read_to_string(&self.lock_path) {
+            let current_content = match tokio::fs::read_to_string(&self.lock_path).await {
                 Ok(content) => content,
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(err) => {
@@ -343,13 +349,13 @@ impl StateBackend for LocalBackend {
                     return Err(BackendError::locked(&existing_lock));
                 }
                 Err(_) if Self::file_written_recently(&self.lock_path) => {
-                    std::thread::sleep(Duration::from_millis(1));
+                    async_sleep(Duration::from_millis(1)).await;
                     continue;
                 }
                 _ => {}
             }
 
-            match std::fs::remove_file(&self.lock_path) {
+            match tokio::fs::remove_file(&self.lock_path).await {
                 Ok(()) => {}
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(err) => {
@@ -375,7 +381,8 @@ impl StateBackend for LocalBackend {
 
     async fn renew_lock(&self, lock: &LockInfo) -> BackendResult<LockInfo> {
         // Read the current lock file and verify it still belongs to us
-        let content = std::fs::read_to_string(&self.lock_path)
+        let content = tokio::fs::read_to_string(&self.lock_path)
+            .await
             .map_err(|e| BackendError::Io(format!("Failed to read lock file: {}", e)))?;
 
         let existing_lock: LockInfo = serde_json::from_str(&content)
@@ -394,18 +401,21 @@ impl StateBackend for LocalBackend {
             .map_err(|e| BackendError::Serialization(format!("Failed to serialize lock: {}", e)))?;
 
         let tmp_path = self.lock_path.with_extension("lock.renew.tmp");
-        let mut file = std::fs::File::create(&tmp_path)
-            .map_err(|e| BackendError::Io(format!("Failed to create temp lock file: {}", e)))?;
-        file.write_all(new_content.as_bytes()).map_err(|e| {
-            let _ = std::fs::remove_file(&tmp_path);
-            BackendError::Io(format!("Failed to write temp lock file: {}", e))
+
+        tokio::fs::write(&tmp_path, new_content.as_bytes())
+            .await
+            .map_err(|e| BackendError::Io(format!("Failed to write temp lock file: {}", e)))?;
+
+        let file = tokio::fs::File::open(&tmp_path).await.map_err(|e| {
+            BackendError::Io(format!("Failed to open temp lock file for sync: {}", e))
         })?;
-        file.sync_all().map_err(|e| {
+        file.sync_all().await.map_err(|e| {
             let _ = std::fs::remove_file(&tmp_path);
             BackendError::Io(format!("Failed to sync temp lock file: {}", e))
         })?;
 
-        std::fs::rename(&tmp_path, &self.lock_path)
+        tokio::fs::rename(&tmp_path, &self.lock_path)
+            .await
             .map_err(|e| BackendError::Io(format!("Failed to rename temp lock file: {}", e)))?;
 
         Ok(renewed)
@@ -413,7 +423,7 @@ impl StateBackend for LocalBackend {
 
     async fn write_state_locked(&self, state: &StateFile, lock: &LockInfo) -> BackendResult<()> {
         // Verify the lock is still held by us before writing state
-        let content = match std::fs::read_to_string(&self.lock_path) {
+        let content = match tokio::fs::read_to_string(&self.lock_path).await {
             Ok(c) => c,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                 return Err(BackendError::LockNotHeld(
@@ -442,12 +452,18 @@ impl StateBackend for LocalBackend {
     }
 
     async fn release_lock(&self, lock: &LockInfo) -> BackendResult<()> {
-        if !self.lock_path.exists() {
-            return Err(BackendError::LockNotFound(lock.id.clone()));
-        }
-
-        let content = std::fs::read_to_string(&self.lock_path)
-            .map_err(|e| BackendError::Io(format!("Failed to read lock file: {}", e)))?;
+        let content = match tokio::fs::read_to_string(&self.lock_path).await {
+            Ok(c) => c,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Err(BackendError::LockNotFound(lock.id.clone()));
+            }
+            Err(err) => {
+                return Err(BackendError::Io(format!(
+                    "Failed to read lock file: {}",
+                    err
+                )));
+            }
+        };
 
         let existing_lock: LockInfo = serde_json::from_str(&content)
             .map_err(|e| BackendError::InvalidState(format!("Failed to parse lock file: {}", e)))?;
@@ -459,20 +475,26 @@ impl StateBackend for LocalBackend {
             });
         }
 
-        std::fs::remove_file(&self.lock_path)
+        tokio::fs::remove_file(&self.lock_path)
+            .await
             .map_err(|e| BackendError::Io(format!("Failed to remove lock file: {}", e)))?;
 
         Ok(())
     }
 
     async fn force_unlock(&self, lock_id: &str) -> BackendResult<()> {
-        if !self.lock_path.exists() {
-            return Err(BackendError::LockNotFound(lock_id.to_string()));
-        }
-
-        // Verify lock ID matches
-        let content = std::fs::read_to_string(&self.lock_path)
-            .map_err(|e| BackendError::Io(format!("Failed to read lock file: {}", e)))?;
+        let content = match tokio::fs::read_to_string(&self.lock_path).await {
+            Ok(c) => c,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Err(BackendError::LockNotFound(lock_id.to_string()));
+            }
+            Err(err) => {
+                return Err(BackendError::Io(format!(
+                    "Failed to read lock file: {}",
+                    err
+                )));
+            }
+        };
 
         if let Ok(existing_lock) = serde_json::from_str::<LockInfo>(&content)
             && existing_lock.id != lock_id
@@ -483,7 +505,8 @@ impl StateBackend for LocalBackend {
             });
         }
 
-        std::fs::remove_file(&self.lock_path)
+        tokio::fs::remove_file(&self.lock_path)
+            .await
             .map_err(|e| BackendError::Io(format!("Failed to remove lock file: {}", e)))?;
 
         Ok(())
@@ -833,5 +856,88 @@ mod tests {
         assert_eq!(backend.provider_name(), None);
         assert_eq!(backend.resource_type(), None);
         assert_eq!(backend.resource_definition("test"), None);
+    }
+
+    /// Verify that async methods do not block the tokio runtime.
+    ///
+    /// Uses a single-threaded runtime so that any `std::thread::sleep` inside
+    /// the async lock-acquisition loop would starve concurrent tasks.  With
+    /// `tokio::time::sleep` the runtime can schedule other tasks while waiting.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_async_operations_do_not_block_runtime() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::time::{Duration, timeout};
+
+        let dir = tempdir().unwrap();
+        let state_path = dir.path().join("test.state.json");
+        let backend = Arc::new(LocalBackend::with_path(state_path.clone()));
+
+        // Hold a lock so that a second acquire_lock will enter the retry loop
+        let lock = backend.acquire_lock("apply").await.unwrap();
+
+        let concurrent_ran = Arc::new(AtomicBool::new(false));
+        let concurrent_ran_clone = Arc::clone(&concurrent_ran);
+
+        // Spawn a task that tries to acquire the lock (will loop because lock is held)
+        let backend_clone = Arc::clone(&backend);
+        let acquire_handle = tokio::spawn(async move {
+            // This will fail with Locked error, but the important thing is
+            // it must yield to the runtime while retrying
+            let _ = backend_clone.acquire_lock("plan").await;
+        });
+
+        // Spawn a concurrent task that should be able to run
+        let concurrent_handle = tokio::spawn(async move {
+            concurrent_ran_clone.store(true, Ordering::SeqCst);
+        });
+
+        // Wait for the concurrent task to complete - if the runtime is blocked
+        // by std::thread::sleep, this will time out
+        let result = timeout(Duration::from_secs(2), concurrent_handle).await;
+        assert!(
+            result.is_ok(),
+            "concurrent task should complete without being blocked"
+        );
+        assert!(
+            concurrent_ran.load(Ordering::SeqCst),
+            "concurrent task should have executed"
+        );
+
+        // Clean up: abort the acquire task and release the lock
+        acquire_handle.abort();
+        backend.release_lock(&lock).await.unwrap();
+    }
+
+    /// Verify that read_state and write_state use async I/O.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_async_read_write_does_not_block_runtime() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::time::{Duration, timeout};
+
+        let dir = tempdir().unwrap();
+        let state_path = dir.path().join("test.state.json");
+        let backend = Arc::new(LocalBackend::with_path(state_path));
+
+        let concurrent_ran = Arc::new(AtomicBool::new(false));
+        let concurrent_ran_clone = Arc::clone(&concurrent_ran);
+
+        let backend_clone = Arc::clone(&backend);
+        let io_handle = tokio::spawn(async move {
+            let mut state = StateFile::new();
+            state.increment_serial();
+            backend_clone.write_state(&state).await.unwrap();
+            let read = backend_clone.read_state().await.unwrap();
+            assert!(read.is_some());
+        });
+
+        let concurrent_handle = tokio::spawn(async move {
+            concurrent_ran_clone.store(true, Ordering::SeqCst);
+        });
+
+        let result = timeout(Duration::from_secs(2), concurrent_handle).await;
+        assert!(result.is_ok());
+        assert!(concurrent_ran.load(Ordering::SeqCst));
+
+        let _ = timeout(Duration::from_secs(2), io_handle).await;
     }
 }
