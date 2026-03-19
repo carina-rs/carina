@@ -77,6 +77,7 @@ pub fn validate_resource_ref_types_with_ctx(
     .map_err(AppError::Validation)
 }
 
+/// Resolve block name aliases and attribute prefixes in one step.
 pub fn resolve_names_with_ctx(
     ctx: &WiringContext,
     resources: &mut [Resource],
