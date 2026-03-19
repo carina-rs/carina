@@ -88,8 +88,7 @@ function_call = { identifier ~ "(" ~ (expression ~ ("," ~ expression)*)? ~ ")" }
 
 // Primary value
 primary = {
-    env_var
-  | read_resource_expr   // Must come before resource_expr for "read aws..." parsing
+    read_resource_expr   // Must come before resource_expr for "read aws..." parsing
   | resource_expr
   | list
   | map
@@ -110,9 +109,6 @@ map = { "{" ~ (map_entry | nested_block)* ~ "}" }
 
 // Map entry: key = value (with optional trailing comma)
 map_entry = { identifier ~ "=" ~ expression ~ ","? }
-
-// Environment variable: env("VAR_NAME")
-env_var = { "env" ~ "(" ~ string ~ ")" }
 
 // Resource expression: aws.s3_bucket { ... }
 resource_expr = { namespaced_id ~ "{" ~ block_content* ~ "}" }

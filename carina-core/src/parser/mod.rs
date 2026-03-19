@@ -2,12 +2,10 @@
 //!
 //! Convert DSL to AST using pest
 
+use crate::resource::{LifecycleConfig, Resource, ResourceId, Value};
 use pest::Parser;
 use pest_derive::Parser;
 use std::collections::HashMap;
-use std::env;
-
-use crate::resource::{LifecycleConfig, Resource, ResourceId, Value};
 
 #[derive(Parser)]
 #[grammar = "parser/carina.pest"]
@@ -24,9 +22,6 @@ pub enum ParseError {
 
     #[error("Undefined variable: {0}")]
     UndefinedVariable(String),
-
-    #[error("Environment variable not set: {0}")]
-    EnvVarNotSet(String),
 
     #[error("Invalid resource type: {0}")]
     InvalidResourceType(String),
@@ -884,14 +879,6 @@ fn parse_primary_value(
     };
 
     match inner.as_rule() {
-        Rule::env_var => {
-            let mut env_inner = inner.into_inner();
-            let var_name = parse_string(next_pair(&mut env_inner, "variable name", "env() call")?);
-            match env::var(&var_name) {
-                Ok(val) => Ok(Value::String(val)),
-                Err(_) => Err(ParseError::EnvVarNotSet(var_name)),
-            }
-        }
         Rule::resource_expr => {
             // Resource expressions cannot be used as attribute values (only valid in top-level let bindings)
             Err(ParseError::InvalidExpression {
@@ -1263,28 +1250,19 @@ mod tests {
     }
 
     #[test]
-    fn parse_env_var() {
-        // SAFETY: This test runs in isolation
-        unsafe {
-            env::set_var("CARINA_TEST_VAR", "test-value");
-        }
-
+    fn env_function_is_not_recognized() {
         let input = r#"
             let my_bucket = aws.s3_bucket {
-                name = env("CARINA_TEST_VAR")
+                name = env("SOME_VAR")
             }
         "#;
 
-        let result = parse(input).unwrap();
-        assert_eq!(
-            result.resources[0].attributes.get("name"),
-            Some(&Value::String("test-value".to_string()))
+        let result = parse(input);
+        assert!(
+            result.is_err(),
+            "env() should not be recognized by the parser, but got: {:?}",
+            result
         );
-
-        // SAFETY: This test runs in isolation
-        unsafe {
-            env::remove_var("CARINA_TEST_VAR");
-        }
     }
 
     #[test]

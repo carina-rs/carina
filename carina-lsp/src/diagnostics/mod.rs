@@ -685,13 +685,6 @@ fn parse_error_to_diagnostic(error: &ParseError) -> Diagnostic {
             message: format!("Undefined variable: {}", name),
             ..Default::default()
         },
-        ParseError::EnvVarNotSet(name) => Diagnostic {
-            range: Range::default(),
-            severity: Some(DiagnosticSeverity::WARNING),
-            source: Some("carina".to_string()),
-            message: format!("Environment variable not set: {}", name),
-            ..Default::default()
-        },
         ParseError::InvalidResourceType(name) => Diagnostic {
             range: Range::default(),
             severity: Some(DiagnosticSeverity::ERROR),

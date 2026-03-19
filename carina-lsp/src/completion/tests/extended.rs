@@ -239,12 +239,6 @@ fn union_completions_include_member_types() {
         "Should offer 'false' from Bool member. Got: {:?}",
         labels
     );
-    // Should also include env()
-    assert!(
-        labels.contains(&"env"),
-        "Should offer 'env' for Union. Got: {:?}",
-        labels
-    );
 }
 
 #[test]
