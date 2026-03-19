@@ -594,7 +594,7 @@ impl DiagnosticEngine {
         let mut diagnostics = Vec::new();
 
         for (line_idx, line) in text.lines().enumerate() {
-            // Look for patterns like "binding_name.id" or "binding_name.name" after "="
+            // Look for patterns like "binding_name.property" after "="
             if let Some(eq_byte_pos) = line.find('=') {
                 let after_eq = &line[eq_byte_pos + 1..];
                 let after_eq_trimmed = after_eq.trim_start();
