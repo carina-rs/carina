@@ -2535,6 +2535,42 @@ aws.s3.bucket {
     }
 
     #[test]
+    fn forward_reference_in_nested_value() {
+        // Forward references inside list/map values should also be resolved
+        let input = r#"
+            let subnet = awscc.ec2.subnet {
+                vpc_id     = vpc.vpc_id
+                cidr_block = "10.0.1.0/24"
+                tags = [{ vpc_ref = vpc.vpc_id }]
+            }
+
+            let vpc = awscc.ec2.vpc {
+                cidr_block = "10.0.0.0/16"
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+        let subnet = &result.resources[0];
+        // Check nested reference in list > map
+        if let Some(Value::List(items)) = subnet.attributes.get("tags") {
+            if let Some(Value::Map(map)) = items.first() {
+                assert_eq!(
+                    map.get("vpc_ref"),
+                    Some(&Value::ResourceRef {
+                        binding_name: "vpc".to_string(),
+                        attribute_name: "vpc_id".to_string(),
+                    }),
+                    "Nested forward reference should be resolved"
+                );
+            } else {
+                panic!("Expected map in tags list");
+            }
+        } else {
+            panic!("Expected tags to be a list");
+        }
+    }
+
+    #[test]
     fn parse_error_has_internal_error_variant() {
         // Verify the InternalError variant exists and formats correctly
         let err = ParseError::InternalError {
