@@ -473,6 +473,7 @@ pub async fn finalize_apply(
     current_states: &HashMap<ResourceId, State>,
     plan: &Plan,
     backend: &dyn StateBackend,
+    lock: &LockInfo,
 ) -> Result<(), AppError> {
     println!();
     println!("{}", "Saving state...".cyan());
@@ -488,15 +489,28 @@ pub async fn finalize_apply(
         failed_refreshes: &result.failed_refreshes,
     })?;
 
-    // Increment serial and save
-    state.increment_serial();
-    backend
-        .write_state(&state)
-        .await
-        .map_err(AppError::Backend)?;
+    save_state_locked(backend, lock, &mut state).await?;
     println!("  {} State saved (serial: {})", "✓".green(), state.serial);
 
     Ok(())
+}
+
+/// Renew the lock and write state with lock validation.
+///
+/// This ensures that the lock is still held before writing state, preventing
+/// silent state corruption when a lock has expired and been acquired by another
+/// process during a long-running operation.
+pub async fn save_state_locked(
+    backend: &dyn StateBackend,
+    lock: &LockInfo,
+    state: &mut StateFile,
+) -> Result<(), AppError> {
+    let renewed = backend.renew_lock(lock).await.map_err(AppError::Backend)?;
+    state.increment_serial();
+    backend
+        .write_state_locked(state, &renewed)
+        .await
+        .map_err(AppError::Backend)
 }
 
 pub fn queue_state_refresh(
@@ -916,7 +930,7 @@ pub async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), AppErro
 
     // All code after lock acquisition is wrapped so that lock release is guaranteed
     let lock_info = lock.as_ref().expect("lock should have been acquired");
-    let op_result = run_apply_locked(&mut parsed, auto_approve, backend.as_ref()).await;
+    let op_result = run_apply_locked(&mut parsed, auto_approve, backend.as_ref(), lock_info).await;
 
     // Always release lock, regardless of whether the operation succeeded
     let release_result = backend
@@ -936,6 +950,7 @@ async fn run_apply_locked(
     parsed: &mut carina_core::parser::ParsedFile,
     auto_approve: bool,
     backend: &dyn StateBackend,
+    lock: &LockInfo,
 ) -> Result<(), AppError> {
     // Read current state from backend
     let state_file = backend.read_state().await.map_err(AppError::Backend)?;
@@ -1084,6 +1099,7 @@ async fn run_apply_locked(
         &current_states,
         &plan,
         backend,
+        lock,
     )
     .await?;
 
@@ -1165,7 +1181,8 @@ pub async fn run_apply_from_plan(plan_path: &PathBuf, auto_approve: bool) -> Res
         .map_err(map_lock_error)?;
     println!("  {} Lock acquired", "✓".green());
 
-    let op_result = run_apply_from_plan_locked(plan_file, auto_approve, backend.as_ref()).await;
+    let op_result =
+        run_apply_from_plan_locked(plan_file, auto_approve, backend.as_ref(), &lock).await;
 
     // Always release lock, regardless of whether the operation succeeded
     let release_result = backend.release_lock(&lock).await.map_err(AppError::Backend);
@@ -1182,6 +1199,7 @@ async fn run_apply_from_plan_locked(
     plan_file: PlanFile,
     auto_approve: bool,
     backend: &dyn StateBackend,
+    lock: &LockInfo,
 ) -> Result<(), AppError> {
     // Read current state and validate lineage
     let state_file = backend.read_state().await.map_err(AppError::Backend)?;
@@ -1333,6 +1351,7 @@ async fn run_apply_from_plan_locked(
         &current_states,
         plan,
         backend,
+        lock,
     )
     .await?;
 

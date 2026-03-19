@@ -11,7 +11,8 @@ use carina_core::effect::Effect;
 use carina_core::provider::Provider;
 use carina_core::resource::{Resource, ResourceId, State, Value};
 use carina_state::{
-    BackendConfig as StateBackendConfig, StateBackend, create_backend, create_local_backend,
+    BackendConfig as StateBackendConfig, LockInfo, StateBackend, create_backend,
+    create_local_backend,
 };
 
 use super::validate_and_resolve;
@@ -66,6 +67,7 @@ pub async fn run_destroy(path: &PathBuf, auto_approve: bool) -> Result<(), AppEr
         auto_approve,
         backend.as_ref(),
         protected_bucket,
+        &lock,
     )
     .await;
 
@@ -85,6 +87,7 @@ async fn run_destroy_locked(
     auto_approve: bool,
     backend: &dyn StateBackend,
     protected_bucket: Option<String>,
+    lock: &LockInfo,
 ) -> Result<(), AppError> {
     // Read current state from backend
     let state_file = backend.read_state().await.map_err(AppError::Backend)?;
@@ -429,12 +432,8 @@ async fn run_destroy_locked(
         state.remove_resource(&id.provider, &id.resource_type, &id.name);
     }
 
-    // Increment serial and save
-    state.increment_serial();
-    backend
-        .write_state(&state)
-        .await
-        .map_err(AppError::Backend)?;
+    // Renew lock and save with lock validation
+    crate::commands::apply::save_state_locked(backend, lock, &mut state).await?;
     println!("  {} State saved (serial: {})", "✓".green(), state.serial);
 
     println!();

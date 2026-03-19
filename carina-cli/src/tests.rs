@@ -13,7 +13,7 @@ use carina_state::{BackendError, LockInfo, ResourceState, StateBackend, StateFil
 
 use crate::commands::apply::{
     ApplyResult, ApplyStateSave, build_state_after_apply, detect_drift, execute_effects,
-    finalize_apply, queue_state_refresh, refresh_pending_states,
+    finalize_apply, queue_state_refresh, refresh_pending_states, save_state_locked,
 };
 use crate::commands::plan::{CurrentStateEntry, PlanFile};
 use crate::wiring::{
@@ -1355,6 +1355,7 @@ async fn lock_released_on_write_state_failure() {
         &HashMap::new(),
         &Plan::new(),
         &backend,
+        &lock,
     )
     .await;
 
@@ -1368,6 +1369,134 @@ async fn lock_released_on_write_state_failure() {
     assert!(
         lock_released.load(Ordering::SeqCst),
         "Lock should be released even when write_state fails"
+    );
+}
+
+/// A mock StateBackend that tracks which write method was called and whether
+/// renew_lock was invoked.
+struct LockTrackingBackend {
+    renew_lock_called: Arc<AtomicBool>,
+    write_state_called: Arc<AtomicBool>,
+    write_state_locked_called: Arc<AtomicBool>,
+}
+
+impl LockTrackingBackend {
+    fn new() -> Self {
+        Self {
+            renew_lock_called: Arc::new(AtomicBool::new(false)),
+            write_state_called: Arc::new(AtomicBool::new(false)),
+            write_state_locked_called: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl StateBackend for LockTrackingBackend {
+    async fn read_state(&self) -> carina_state::BackendResult<Option<StateFile>> {
+        Ok(Some(StateFile::new()))
+    }
+    async fn write_state(&self, _state: &StateFile) -> carina_state::BackendResult<()> {
+        self.write_state_called.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+    async fn acquire_lock(&self, operation: &str) -> carina_state::BackendResult<LockInfo> {
+        Ok(LockInfo::new(operation))
+    }
+    async fn release_lock(&self, _lock: &LockInfo) -> carina_state::BackendResult<()> {
+        Ok(())
+    }
+    async fn renew_lock(&self, lock: &LockInfo) -> carina_state::BackendResult<LockInfo> {
+        self.renew_lock_called.store(true, Ordering::SeqCst);
+        Ok(lock.renewed())
+    }
+    async fn write_state_locked(
+        &self,
+        _state: &carina_state::StateFile,
+        _lock: &LockInfo,
+    ) -> carina_state::BackendResult<()> {
+        self.write_state_locked_called.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+    async fn force_unlock(&self, _lock_id: &str) -> carina_state::BackendResult<()> {
+        Ok(())
+    }
+    async fn init(&self) -> carina_state::BackendResult<()> {
+        Ok(())
+    }
+    async fn bucket_exists(&self) -> carina_state::BackendResult<bool> {
+        Ok(true)
+    }
+    async fn create_bucket(&self) -> carina_state::BackendResult<()> {
+        Ok(())
+    }
+    fn resource_type(&self) -> Option<&str> {
+        None
+    }
+    fn provider_name(&self) -> Option<&str> {
+        None
+    }
+    fn resource_definition(&self, _bucket_name: &str) -> Option<String> {
+        None
+    }
+}
+
+#[tokio::test]
+async fn save_state_locked_calls_renew_lock_and_write_state_locked() {
+    let backend = LockTrackingBackend::new();
+    let lock = LockInfo::new("apply");
+    let mut state = StateFile::new();
+
+    let result = save_state_locked(&backend, &lock, &mut state).await;
+    assert!(result.is_ok(), "save_state_locked should succeed");
+
+    assert!(
+        backend.renew_lock_called.load(Ordering::SeqCst),
+        "save_state_locked must call renew_lock before writing"
+    );
+    assert!(
+        backend.write_state_locked_called.load(Ordering::SeqCst),
+        "save_state_locked must call write_state_locked, not write_state"
+    );
+    assert!(
+        !backend.write_state_called.load(Ordering::SeqCst),
+        "save_state_locked must NOT call write_state (the unguarded version)"
+    );
+}
+
+#[tokio::test]
+async fn finalize_apply_uses_write_state_locked() {
+    let backend = LockTrackingBackend::new();
+    let lock = LockInfo::new("apply");
+
+    let result = ApplyResult {
+        success_count: 0,
+        failure_count: 0,
+        skip_count: 0,
+        applied_states: HashMap::new(),
+        permanent_name_overrides: HashMap::new(),
+        successfully_deleted: HashSet::new(),
+        failed_refreshes: HashSet::new(),
+    };
+
+    let op_result = finalize_apply(
+        &result,
+        Some(StateFile::new()),
+        &[],
+        &HashMap::new(),
+        &Plan::new(),
+        &backend,
+        &lock,
+    )
+    .await;
+
+    assert!(op_result.is_ok(), "finalize_apply should succeed");
+    assert!(
+        backend.write_state_locked_called.load(Ordering::SeqCst),
+        "finalize_apply must use write_state_locked"
+    );
+    assert!(
+        !backend.write_state_called.load(Ordering::SeqCst),
+        "finalize_apply must NOT use write_state (the unguarded version)"
     );
 }
 

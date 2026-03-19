@@ -9,8 +9,8 @@ use carina_core::provider::{self as provider_mod, Provider, ProviderNormalizer};
 use carina_core::resource::{LifecycleConfig, ResourceId, State, Value};
 use carina_core::value::{format_value, json_to_dsl_value};
 use carina_state::{
-    BackendConfig as StateBackendConfig, BackendError, ResourceState, StateBackend, create_backend,
-    create_local_backend,
+    BackendConfig as StateBackendConfig, BackendError, LockInfo, ResourceState, StateBackend,
+    create_backend, create_local_backend,
 };
 
 use super::validate_and_resolve;
@@ -241,7 +241,7 @@ pub async fn run_state_refresh(path: &PathBuf) -> Result<(), AppError> {
         .map_err(map_lock_error)?;
     println!("  {} Lock acquired", "✓".green());
 
-    let op_result = run_state_refresh_locked(&mut parsed, backend.as_ref()).await;
+    let op_result = run_state_refresh_locked(&mut parsed, backend.as_ref(), &lock).await;
 
     // Always release lock, regardless of whether the operation succeeded
     let release_result = backend.release_lock(&lock).await.map_err(AppError::Backend);
@@ -253,6 +253,7 @@ pub async fn run_state_refresh(path: &PathBuf) -> Result<(), AppError> {
 async fn run_state_refresh_locked(
     parsed: &mut carina_core::parser::ParsedFile,
     backend: &dyn StateBackend,
+    lock: &LockInfo,
 ) -> Result<(), AppError> {
     // Read current state from backend
     let mut state_file = backend.read_state().await.map_err(AppError::Backend)?;
@@ -425,12 +426,8 @@ async fn run_state_refresh_locked(
         }
     }
 
-    // Save updated state
-    state.increment_serial();
-    backend
-        .write_state(&state)
-        .await
-        .map_err(AppError::Backend)?;
+    // Renew lock and save with lock validation
+    crate::commands::apply::save_state_locked(backend, lock, &mut state).await?;
 
     // Summary
     println!(
