@@ -324,6 +324,17 @@ pub fn parse(input: &str) -> Result<ParsedFile, ParseError> {
         }
     }
 
+    // Second pass: resolve forward references.
+    // During parsing, unknown 2-part identifiers (e.g., vpc.vpc_id where vpc is
+    // declared later) become UnresolvedIdent. Now that we have the full binding set,
+    // convert them to ResourceRef.
+    resolve_forward_references(
+        &ctx.resource_bindings,
+        &mut resources,
+        &mut outputs,
+        &mut module_calls,
+    );
+
     Ok(ParsedFile {
         providers,
         resources,
@@ -1052,6 +1063,72 @@ fn parse_string(pair: pest::iterators::Pair<Rule>) -> String {
         .replace("\\t", "\t")
         .replace("\\\"", "\"")
         .replace("\\\\", "\\")
+}
+
+/// Resolve forward references after the full binding set is known.
+///
+/// During single-pass parsing, `identifier.member` forms where `identifier` is
+/// not yet a known binding are stored as `UnresolvedIdent(identifier, Some(member))`.
+/// This function walks all resource attributes, module call arguments, and output
+/// values, converting matching `UnresolvedIdent` to `ResourceRef`.
+fn resolve_forward_references(
+    resource_bindings: &HashMap<String, Resource>,
+    resources: &mut [Resource],
+    outputs: &mut [OutputParameter],
+    module_calls: &mut [ModuleCall],
+) {
+    for resource in resources.iter_mut() {
+        let keys: Vec<String> = resource.attributes.keys().cloned().collect();
+        for key in keys {
+            if let Some(value) = resource.attributes.remove(&key) {
+                let resolved = resolve_forward_ref_in_value(value, resource_bindings);
+                resource.attributes.insert(key, resolved);
+            }
+        }
+    }
+    for output in outputs.iter_mut() {
+        if let Some(value) = output.value.take() {
+            output.value = Some(resolve_forward_ref_in_value(value, resource_bindings));
+        }
+    }
+    for call in module_calls.iter_mut() {
+        let keys: Vec<String> = call.arguments.keys().cloned().collect();
+        for key in keys {
+            if let Some(value) = call.arguments.remove(&key) {
+                let resolved = resolve_forward_ref_in_value(value, resource_bindings);
+                call.arguments.insert(key, resolved);
+            }
+        }
+    }
+}
+
+/// Recursively resolve forward references in a single Value.
+fn resolve_forward_ref_in_value(
+    value: Value,
+    resource_bindings: &HashMap<String, Resource>,
+) -> Value {
+    match value {
+        Value::UnresolvedIdent(ref name, Some(ref member))
+            if resource_bindings.contains_key(name) =>
+        {
+            Value::ResourceRef {
+                binding_name: name.clone(),
+                attribute_name: member.clone(),
+            }
+        }
+        Value::List(items) => Value::List(
+            items
+                .into_iter()
+                .map(|v| resolve_forward_ref_in_value(v, resource_bindings))
+                .collect(),
+        ),
+        Value::Map(map) => Value::Map(
+            map.into_iter()
+                .map(|(k, v)| (k, resolve_forward_ref_in_value(v, resource_bindings)))
+                .collect(),
+        ),
+        other => other,
+    }
 }
 
 /// Resolve resource references in a ParsedFile
@@ -2355,6 +2432,120 @@ aws.s3.bucket {
             err.contains("Pipe operator is not yet supported"),
             "expected 'Pipe operator is not yet supported' error, got: {err}"
         );
+    }
+
+    #[test]
+    fn forward_reference_parsed_as_resource_ref() {
+        // Issue #866: Forward references should be resolved as ResourceRef,
+        // not silently downgraded to UnresolvedIdent.
+        let input = r#"
+            let subnet = awscc.ec2.subnet {
+                vpc_id     = vpc.vpc_id
+                cidr_block = "10.0.1.0/24"
+            }
+
+            let vpc = awscc.ec2.vpc {
+                cidr_block = "10.0.0.0/16"
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+        assert_eq!(result.resources.len(), 2);
+
+        let subnet = &result.resources[0];
+        // Forward reference vpc.vpc_id should be a ResourceRef, not UnresolvedIdent
+        assert_eq!(
+            subnet.attributes.get("vpc_id"),
+            Some(&Value::ResourceRef {
+                binding_name: "vpc".to_string(),
+                attribute_name: "vpc_id".to_string(),
+            }),
+            "Forward reference should be parsed as ResourceRef, got: {:?}",
+            subnet.attributes.get("vpc_id")
+        );
+    }
+
+    #[test]
+    fn forward_reference_resolve_works() {
+        // Issue #866: parse_and_resolve should work with forward references
+        let input = r#"
+            let subnet = awscc.ec2.subnet {
+                vpc_id     = vpc.vpc_id
+                cidr_block = "10.0.1.0/24"
+            }
+
+            let vpc = awscc.ec2.vpc {
+                cidr_block = "10.0.0.0/16"
+            }
+        "#;
+
+        // parse_and_resolve should not error on forward references
+        let result = parse_and_resolve(input);
+        assert!(
+            result.is_ok(),
+            "parse_and_resolve should succeed with forward references, got: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn forward_reference_unused_binding_detection() {
+        // Forward-referenced bindings should be detected as used
+        let input = r#"
+            let subnet = awscc.ec2.subnet {
+                vpc_id     = vpc.vpc_id
+                cidr_block = "10.0.1.0/24"
+            }
+
+            let vpc = awscc.ec2.vpc {
+                cidr_block = "10.0.0.0/16"
+            }
+        "#;
+
+        let parsed = parse(input).unwrap();
+        let unused = crate::validation::check_unused_bindings(&parsed);
+        // vpc is referenced by subnet, so should NOT be unused
+        assert!(
+            !unused.contains(&"vpc".to_string()),
+            "vpc should not be unused, but check_unused_bindings returned: {:?}",
+            unused
+        );
+    }
+
+    #[test]
+    fn forward_reference_in_nested_value() {
+        // Forward references inside list/map values should also be resolved
+        let input = r#"
+            let subnet = awscc.ec2.subnet {
+                vpc_id     = vpc.vpc_id
+                cidr_block = "10.0.1.0/24"
+                tags = [{ vpc_ref = vpc.vpc_id }]
+            }
+
+            let vpc = awscc.ec2.vpc {
+                cidr_block = "10.0.0.0/16"
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+        let subnet = &result.resources[0];
+        // Check nested reference in list > map
+        if let Some(Value::List(items)) = subnet.attributes.get("tags") {
+            if let Some(Value::Map(map)) = items.first() {
+                assert_eq!(
+                    map.get("vpc_ref"),
+                    Some(&Value::ResourceRef {
+                        binding_name: "vpc".to_string(),
+                        attribute_name: "vpc_id".to_string(),
+                    }),
+                    "Nested forward reference should be resolved"
+                );
+            } else {
+                panic!("Expected map in tags list");
+            }
+        } else {
+            panic!("Expected tags to be a list");
+        }
     }
 
     #[test]
