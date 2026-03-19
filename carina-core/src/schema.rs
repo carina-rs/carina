@@ -101,7 +101,13 @@ pub enum AttributeType {
         to_dsl: Option<fn(&str) -> String>,
     },
     /// List
-    List(Box<AttributeType>),
+    /// `ordered`: if true, element order matters (sequential comparison);
+    /// if false, order is ignored (multiset comparison).
+    /// Defaults to true (matching CloudFormation's insertionOrder default).
+    List {
+        inner: Box<AttributeType>,
+        ordered: bool,
+    },
     /// Map
     Map(Box<AttributeType>),
     /// Struct (named object with typed fields)
@@ -114,6 +120,22 @@ pub enum AttributeType {
 }
 
 impl AttributeType {
+    /// Create a List type with default ordering (ordered=true, matching CloudFormation default).
+    pub fn list(inner: AttributeType) -> Self {
+        AttributeType::List {
+            inner: Box::new(inner),
+            ordered: true,
+        }
+    }
+
+    /// Create an unordered List type (insertionOrder=false).
+    pub fn unordered_list(inner: AttributeType) -> Self {
+        AttributeType::List {
+            inner: Box::new(inner),
+            ordered: false,
+        }
+    }
+
     fn resolve_enum_input(
         name: &str,
         namespace: Option<&str>,
@@ -264,7 +286,7 @@ impl AttributeType {
                     .map_err(|msg| TypeError::ValidationFailed { message: msg })
             }
 
-            (AttributeType::List(inner), Value::List(items)) => {
+            (AttributeType::List { inner, .. }, Value::List(items)) => {
                 for (i, item) in items.iter().enumerate() {
                     inner.validate(item).map_err(|e| TypeError::ListItemError {
                         index: i,
@@ -358,7 +380,7 @@ impl AttributeType {
             AttributeType::Bool => "Bool".to_string(),
             AttributeType::StringEnum { name, .. } => name.clone(),
             AttributeType::Custom { name, .. } => name.clone(),
-            AttributeType::List(inner) => format!("List<{}>", inner.type_name()),
+            AttributeType::List { inner, .. } => format!("List<{}>", inner.type_name()),
             AttributeType::Map(inner) => format!("Map<{}>", inner.type_name()),
             AttributeType::Struct { name, .. } => format!("Struct({})", name),
             AttributeType::Union(types) => {
@@ -814,7 +836,7 @@ fn resolve_block_names_in_map(
                     resolve_block_names_in_map(inner_map, inner, resource_id, errors);
                 }
             }
-            AttributeType::List(inner) => {
+            AttributeType::List { inner, .. } => {
                 if let AttributeType::Struct { fields: inner, .. } = inner.as_ref()
                     && let Value::List(items) = value
                 {
@@ -902,7 +924,7 @@ pub fn resolve_block_names(
                         );
                     }
                 }
-                AttributeType::List(inner) => {
+                AttributeType::List { inner, .. } => {
                     if let AttributeType::Struct { fields, .. } = inner.as_ref()
                         && let Value::List(items) = value
                     {
@@ -1620,7 +1642,7 @@ mod tests {
             name: "Ingress".to_string(),
             fields: vec![StructField::new("ip_protocol", AttributeType::String).required()],
         };
-        let list_type = AttributeType::List(Box::new(struct_type));
+        let list_type = AttributeType::list(struct_type);
 
         let mut item = HashMap::new();
         item.insert("ip_protocol".to_string(), Value::String("tcp".to_string()));
@@ -2305,10 +2327,10 @@ mod tests {
     fn struct_field_with_block_name() {
         let field = StructField::new(
             "transitions",
-            AttributeType::List(Box::new(AttributeType::Struct {
+            AttributeType::list(AttributeType::Struct {
                 name: "Transition".to_string(),
                 fields: vec![],
-            })),
+            }),
         )
         .with_block_name("transition");
         assert_eq!(field.block_name.as_deref(), Some("transition"));
@@ -2348,10 +2370,10 @@ mod tests {
                     fields: vec![
                         StructField::new(
                             "transitions",
-                            AttributeType::List(Box::new(AttributeType::Struct {
+                            AttributeType::list(AttributeType::Struct {
                                 name: "Transition".to_string(),
                                 fields: vec![],
-                            })),
+                            }),
                         )
                         .with_block_name("transition"),
                     ],
@@ -2421,10 +2443,10 @@ mod tests {
                         ),
                         StructField::new(
                             "transitions",
-                            AttributeType::List(Box::new(AttributeType::Struct {
+                            AttributeType::list(AttributeType::Struct {
                                 name: "Transition".to_string(),
                                 fields: vec![],
-                            })),
+                            }),
                         )
                         .with_block_name("transition"),
                     ],
@@ -2491,10 +2513,10 @@ mod tests {
                         ),
                         StructField::new(
                             "transitions",
-                            AttributeType::List(Box::new(AttributeType::Struct {
+                            AttributeType::list(AttributeType::Struct {
                                 name: "Transition".to_string(),
                                 fields: vec![],
-                            })),
+                            }),
                         )
                         .with_block_name("transition"),
                     ],

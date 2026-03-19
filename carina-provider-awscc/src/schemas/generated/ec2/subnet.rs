@@ -114,7 +114,7 @@ pub fn ec2_subnet_config() -> AwsccSchemaConfig {
                 .with_provider_name("Ipv6CidrBlock"),
         )
         .attribute(
-            AttributeSchema::new("ipv6_cidr_blocks", AttributeType::List(Box::new(types::ipv6_cidr())))
+            AttributeSchema::new("ipv6_cidr_blocks", AttributeType::list(types::ipv6_cidr()))
                 .read_only()
                 .with_description(" (read-only)")
                 .with_provider_name("Ipv6CidrBlocks"),

@@ -259,7 +259,7 @@ impl CompletionProvider {
     ) -> Option<&'a Vec<StructField>> {
         match attr_type {
             AttributeType::Struct { fields, .. } => Some(fields),
-            AttributeType::List(inner) => match inner.as_ref() {
+            AttributeType::List { inner, .. } => match inner.as_ref() {
                 AttributeType::Struct { fields, .. } => Some(fields),
                 _ => None,
             },

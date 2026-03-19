@@ -61,7 +61,7 @@ pub fn ec2_ipam_pool_config() -> AwsccSchemaConfig {
                 .with_provider_name("AllocationMinNetmaskLength"),
         )
         .attribute(
-            AttributeSchema::new("allocation_resource_tags", AttributeType::List(Box::new(tags_type())))
+            AttributeSchema::new("allocation_resource_tags", AttributeType::unordered_list(tags_type()))
                 .with_description("When specified, an allocation will not be allowed unless a resource has a matching set of tags.")
                 .with_provider_name("AllocationResourceTags"),
         )
@@ -140,12 +140,12 @@ pub fn ec2_ipam_pool_config() -> AwsccSchemaConfig {
                 .with_provider_name("PoolDepth"),
         )
         .attribute(
-            AttributeSchema::new("provisioned_cidrs", AttributeType::List(Box::new(AttributeType::Struct {
+            AttributeSchema::new("provisioned_cidrs", AttributeType::unordered_list(AttributeType::Struct {
                     name: "ProvisionedCidr".to_string(),
                     fields: vec![
                     StructField::new("cidr", types::cidr()).required().with_provider_name("Cidr")
                     ],
-                })))
+                }))
                 .with_description("A list of cidrs representing the address space available for allocation in this pool.")
                 .with_provider_name("ProvisionedCidrs")
                 .with_block_name("provisioned_cidr"),

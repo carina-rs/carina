@@ -45,7 +45,7 @@ pub fn list_struct_attr_names(schema: &ResourceSchema) -> HashSet<String> {
         .filter(|(_, attr_schema)| {
             matches!(
                 &attr_schema.attr_type,
-                AttributeType::List(inner) if matches!(inner.as_ref(), AttributeType::Struct { .. })
+                AttributeType::List { inner, .. } if matches!(inner.as_ref(), AttributeType::Struct { .. })
             )
         })
         .map(|(name, _)| name.clone())
@@ -124,14 +124,14 @@ awscc.ec2.security_group {
         let schema = ResourceSchema::new("ec2.security_group")
             .attribute(crate::schema::AttributeSchema::new(
                 "security_group_ingress",
-                AttributeType::List(Box::new(AttributeType::Struct {
+                AttributeType::list(AttributeType::Struct {
                     name: "Ingress".to_string(),
                     fields: vec![StructField::new("ip_protocol", AttributeType::String)],
-                })),
+                }),
             ))
             .attribute(crate::schema::AttributeSchema::new(
                 "tags",
-                AttributeType::List(Box::new(AttributeType::String)),
+                AttributeType::list(AttributeType::String),
             ))
             .attribute(crate::schema::AttributeSchema::new(
                 "group_description",

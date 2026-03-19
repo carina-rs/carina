@@ -462,7 +462,7 @@ impl DiagnosticEngine {
                                 // Validate List item types (non-Struct items only;
                                 // List<Struct> is handled by validate_struct_value below)
                                 (
-                                    carina_core::schema::AttributeType::List(inner),
+                                    carina_core::schema::AttributeType::List { inner, .. },
                                     Value::List(_),
                                 ) if !matches!(
                                     inner.as_ref(),
@@ -523,7 +523,7 @@ impl DiagnosticEngine {
                                 carina_core::schema::AttributeType::Struct { fields, .. } => {
                                     Some(fields)
                                 }
-                                carina_core::schema::AttributeType::List(inner) => {
+                                carina_core::schema::AttributeType::List { inner, .. } => {
                                     match inner.as_ref() {
                                         carina_core::schema::AttributeType::Struct {
                                             fields,

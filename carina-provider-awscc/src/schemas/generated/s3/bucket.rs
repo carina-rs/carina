@@ -266,7 +266,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                 .with_provider_name("AccessControl"),
         )
         .attribute(
-            AttributeSchema::new("analytics_configurations", AttributeType::List(Box::new(AttributeType::Struct {
+            AttributeSchema::new("analytics_configurations", AttributeType::list(AttributeType::Struct {
                     name: "AnalyticsConfiguration".to_string(),
                     fields: vec![
                     StructField::new("id", AttributeType::String).required().with_description("The ID that identifies the analytics configuration.").with_provider_name("Id"),
@@ -301,9 +301,9 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                 }).with_description("Specifies how data related to the storage class analysis for an Amazon S3 bucket should be exported.").with_provider_name("DataExport")
                     ],
                 }).required().with_description("Contains data related to access patterns to be collected and made available to analyze the tradeoffs between different storage classes.").with_provider_name("StorageClassAnalysis"),
-                    StructField::new("tag_filters", AttributeType::List(Box::new(tags_type()))).with_description("The tags to use when evaluating an analytics filter. The analytics only includes objects that meet the filter's criteria. If no filter is specified, a...").with_provider_name("TagFilters")
+                    StructField::new("tag_filters", AttributeType::list(tags_type())).with_description("The tags to use when evaluating an analytics filter. The analytics only includes objects that meet the filter's criteria. If no filter is specified, a...").with_provider_name("TagFilters")
                     ],
-                })))
+                }))
                 .with_description("Specifies the configuration and any analyses for the analytics filter of an Amazon S3 bucket.")
                 .with_provider_name("AnalyticsConfigurations")
                 .with_block_name("analytics_configuration"),
@@ -318,18 +318,18 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
             AttributeSchema::new("bucket_encryption", AttributeType::Struct {
                     name: "BucketEncryption".to_string(),
                     fields: vec![
-                    StructField::new("server_side_encryption_configuration", AttributeType::List(Box::new(AttributeType::Struct {
+                    StructField::new("server_side_encryption_configuration", AttributeType::list(AttributeType::Struct {
                     name: "ServerSideEncryptionRule".to_string(),
                     fields: vec![
                     StructField::new("blocked_encryption_types", AttributeType::Struct {
                     name: "BlockedEncryptionTypes".to_string(),
                     fields: vec![
-                    StructField::new("encryption_type", AttributeType::List(Box::new(AttributeType::StringEnum {
+                    StructField::new("encryption_type", AttributeType::list(AttributeType::StringEnum {
                 name: "EncryptionType".to_string(),
                 values: vec!["NONE".to_string(), "SSE-C".to_string()],
                 namespace: Some("awscc.s3.bucket".to_string()),
                 to_dsl: Some(|s: &str| s.replace('-', "_")),
-            }))).with_description("The object encryption type that you want to block or unblock for an Amazon S3 general purpose bucket. Currently, this parameter only supports blocking...").with_provider_name("EncryptionType")
+            })).with_description("The object encryption type that you want to block or unblock for an Amazon S3 general purpose bucket. Currently, this parameter only supports blocking...").with_provider_name("EncryptionType")
                     ],
                 }).with_description("A bucket-level setting for Amazon S3 general purpose buckets used to prevent the upload of new objects encrypted with the specified server-side encryp...").with_provider_name("BlockedEncryptionTypes"),
                     StructField::new("bucket_key_enabled", AttributeType::Bool).with_description("Specifies whether Amazon S3 should use an S3 Bucket Key with server-side encryption using KMS (SSE-KMS) for new objects in the bucket. Existing object...").with_provider_name("BucketKeyEnabled"),
@@ -346,7 +346,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                     ],
                 }).with_description("Specifies the default server-side encryption to apply to new objects in the bucket. If a PUT Object request doesn't specify any server-side encryption...").with_provider_name("ServerSideEncryptionByDefault")
                     ],
-                }))).required().with_description("Specifies the default server-side-encryption configuration.").with_provider_name("ServerSideEncryptionConfiguration")
+                })).required().with_description("Specifies the default server-side-encryption configuration.").with_provider_name("ServerSideEncryptionConfiguration")
                     ],
                 })
                 .with_description("Specifies default encryption for a bucket using server-side encryption with Amazon S3-managed keys (SSE-S3), AWS KMS-managed keys (SSE-KMS), or dual-l...")
@@ -362,18 +362,18 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
             AttributeSchema::new("cors_configuration", AttributeType::Struct {
                     name: "CorsConfiguration".to_string(),
                     fields: vec![
-                    StructField::new("cors_rules", AttributeType::List(Box::new(AttributeType::Struct {
+                    StructField::new("cors_rules", AttributeType::list(AttributeType::Struct {
                     name: "CorsRule".to_string(),
                     fields: vec![
-                    StructField::new("allowed_headers", AttributeType::List(Box::new(AttributeType::String))).with_description("Headers that are specified in the ``Access-Control-Request-Headers`` header. These headers are allowed in a preflight OPTIONS request. In response to ...").with_provider_name("AllowedHeaders"),
-                    StructField::new("allowed_methods", AttributeType::List(Box::new(AttributeType::StringEnum {
+                    StructField::new("allowed_headers", AttributeType::list(AttributeType::String)).with_description("Headers that are specified in the ``Access-Control-Request-Headers`` header. These headers are allowed in a preflight OPTIONS request. In response to ...").with_provider_name("AllowedHeaders"),
+                    StructField::new("allowed_methods", AttributeType::list(AttributeType::StringEnum {
                 name: "AllowedMethods".to_string(),
                 values: vec!["GET".to_string(), "PUT".to_string(), "HEAD".to_string(), "POST".to_string(), "DELETE".to_string()],
                 namespace: Some("awscc.s3.bucket".to_string()),
                 to_dsl: None,
-            }))).required().with_description("An HTTP method that you allow the origin to run. *Allowed values*: ``GET`` | ``PUT`` | ``HEAD`` | ``POST`` | ``DELETE``").with_provider_name("AllowedMethods"),
-                    StructField::new("allowed_origins", AttributeType::List(Box::new(AttributeType::String))).required().with_description("One or more origins you want customers to be able to access the bucket from.").with_provider_name("AllowedOrigins"),
-                    StructField::new("exposed_headers", AttributeType::List(Box::new(AttributeType::String))).with_description("One or more headers in the response that you want customers to be able to access from their applications (for example, from a JavaScript ``XMLHttpRequ...").with_provider_name("ExposedHeaders"),
+            })).required().with_description("An HTTP method that you allow the origin to run. *Allowed values*: ``GET`` | ``PUT`` | ``HEAD`` | ``POST`` | ``DELETE``").with_provider_name("AllowedMethods"),
+                    StructField::new("allowed_origins", AttributeType::list(AttributeType::String)).required().with_description("One or more origins you want customers to be able to access the bucket from.").with_provider_name("AllowedOrigins"),
+                    StructField::new("exposed_headers", AttributeType::list(AttributeType::String)).with_description("One or more headers in the response that you want customers to be able to access from their applications (for example, from a JavaScript ``XMLHttpRequ...").with_provider_name("ExposedHeaders"),
                     StructField::new("id", AttributeType::Custom {
                 name: "String(len: ..=255)".to_string(),
                 base: Box::new(AttributeType::String),
@@ -389,7 +389,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                 to_dsl: None,
             }).with_description("The time in seconds that your browser is to cache the preflight response for the specified resource.").with_provider_name("MaxAge")
                     ],
-                }))).required().with_description("A set of origins and methods (cross-origin access that you want to allow). You can add up to 100 rules to the configuration.").with_provider_name("CorsRules").with_block_name("cors_rule")
+                })).required().with_description("A set of origins and methods (cross-origin access that you want to allow). You can add up to 100 rules to the configuration.").with_provider_name("CorsRules").with_block_name("cors_rule")
                     ],
                 })
                 .with_description("Describes the cross-origin access configuration for objects in an Amazon S3 bucket. For more information, see [Enabling Cross-Origin Resource Sharing]...")
@@ -408,7 +408,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                 .with_provider_name("DualStackDomainName"),
         )
         .attribute(
-            AttributeSchema::new("intelligent_tiering_configurations", AttributeType::List(Box::new(AttributeType::Struct {
+            AttributeSchema::new("intelligent_tiering_configurations", AttributeType::list(AttributeType::Struct {
                     name: "IntelligentTieringConfiguration".to_string(),
                     fields: vec![
                     StructField::new("id", AttributeType::String).required().with_description("The ID used to identify the S3 Intelligent-Tiering configuration.").with_provider_name("Id"),
@@ -419,8 +419,8 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                 namespace: Some("awscc.s3.bucket".to_string()),
                 to_dsl: None,
             }).required().with_description("Specifies the status of the configuration.").with_provider_name("Status"),
-                    StructField::new("tag_filters", AttributeType::List(Box::new(tags_type()))).with_description("A container for a key-value pair.").with_provider_name("TagFilters"),
-                    StructField::new("tierings", AttributeType::List(Box::new(AttributeType::Struct {
+                    StructField::new("tag_filters", AttributeType::list(tags_type())).with_description("A container for a key-value pair.").with_provider_name("TagFilters"),
+                    StructField::new("tierings", AttributeType::list(AttributeType::Struct {
                     name: "Tiering".to_string(),
                     fields: vec![
                     StructField::new("access_tier", AttributeType::StringEnum {
@@ -431,15 +431,15 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
             }).required().with_description("S3 Intelligent-Tiering access tier. See [Storage class for automatically optimizing frequently and infrequently accessed objects](https://docs.aws.ama...").with_provider_name("AccessTier"),
                     StructField::new("days", AttributeType::Int).required().with_description("The number of consecutive days of no access after which an object will be eligible to be transitioned to the corresponding tier. The minimum number of...").with_provider_name("Days")
                     ],
-                }))).required().with_description("Specifies a list of S3 Intelligent-Tiering storage class tiers in the configuration. At least one tier must be defined in the list. At most, you can s...").with_provider_name("Tierings").with_block_name("tiering")
+                })).required().with_description("Specifies a list of S3 Intelligent-Tiering storage class tiers in the configuration. At least one tier must be defined in the list. At most, you can s...").with_provider_name("Tierings").with_block_name("tiering")
                     ],
-                })))
+                }))
                 .with_description("Defines how Amazon S3 handles Intelligent-Tiering storage.")
                 .with_provider_name("IntelligentTieringConfigurations")
                 .with_block_name("intelligent_tiering_configuration"),
         )
         .attribute(
-            AttributeSchema::new("inventory_configurations", AttributeType::List(Box::new(AttributeType::Struct {
+            AttributeSchema::new("inventory_configurations", AttributeType::list(AttributeType::Struct {
                     name: "InventoryConfiguration".to_string(),
                     fields: vec![
                     StructField::new("destination", AttributeType::Struct {
@@ -464,12 +464,12 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                 namespace: Some("awscc.s3.bucket".to_string()),
                 to_dsl: None,
             }).required().with_description("Object versions to include in the inventory list. If set to ``All``, the list includes all the object versions, which adds the version-related fields ...").with_provider_name("IncludedObjectVersions"),
-                    StructField::new("optional_fields", AttributeType::List(Box::new(AttributeType::StringEnum {
+                    StructField::new("optional_fields", AttributeType::list(AttributeType::StringEnum {
                 name: "OptionalFields".to_string(),
                 values: vec!["Size".to_string(), "LastModifiedDate".to_string(), "StorageClass".to_string(), "ETag".to_string(), "IsMultipartUploaded".to_string(), "ReplicationStatus".to_string(), "EncryptionStatus".to_string(), "ObjectLockRetainUntilDate".to_string(), "ObjectLockMode".to_string(), "ObjectLockLegalHoldStatus".to_string(), "IntelligentTieringAccessTier".to_string(), "BucketKeyStatus".to_string(), "ChecksumAlgorithm".to_string(), "ObjectAccessControlList".to_string(), "ObjectOwner".to_string(), "LifecycleExpirationDate".to_string()],
                 namespace: Some("awscc.s3.bucket".to_string()),
                 to_dsl: None,
-            }))).with_description("Contains the optional fields that are included in the inventory results.").with_provider_name("OptionalFields"),
+            })).with_description("Contains the optional fields that are included in the inventory results.").with_provider_name("OptionalFields"),
                     StructField::new("prefix", AttributeType::String).with_description("Specifies the inventory filter prefix.").with_provider_name("Prefix"),
                     StructField::new("schedule_frequency", AttributeType::StringEnum {
                 name: "ScheduleFrequency".to_string(),
@@ -478,7 +478,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                 to_dsl: None,
             }).required().with_description("Specifies the schedule for generating inventory results.").with_provider_name("ScheduleFrequency")
                     ],
-                })))
+                }))
                 .with_description("Specifies the S3 Inventory configuration for an Amazon S3 bucket. For more information, see [GET Bucket inventory](https://docs.aws.amazon.com/AmazonS...")
                 .with_provider_name("InventoryConfigurations")
                 .with_block_name("inventory_configuration"),
@@ -487,7 +487,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
             AttributeSchema::new("lifecycle_configuration", AttributeType::Struct {
                     name: "LifecycleConfiguration".to_string(),
                     fields: vec![
-                    StructField::new("rules", AttributeType::List(Box::new(AttributeType::Struct {
+                    StructField::new("rules", AttributeType::list(AttributeType::Struct {
                     name: "Rule".to_string(),
                     fields: vec![
                     StructField::new("abort_incomplete_multipart_upload", AttributeType::Struct {
@@ -539,7 +539,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                     StructField::new("transition_in_days", AttributeType::Int).required().with_description("Specifies the number of days an object is noncurrent before Amazon S3 can perform the associated action. For information about the noncurrent days cal...").with_provider_name("TransitionInDays")
                     ],
                 }).with_description("(Deprecated.) For buckets with versioning enabled (or suspended), specifies when non-current objects transition to a specified storage class. If you s...").with_provider_name("NoncurrentVersionTransition"),
-                    StructField::new("noncurrent_version_transitions", AttributeType::List(Box::new(AttributeType::Struct {
+                    StructField::new("noncurrent_version_transitions", AttributeType::list(AttributeType::Struct {
                     name: "NoncurrentVersionTransition".to_string(),
                     fields: vec![
                     StructField::new("newer_noncurrent_versions", AttributeType::Int).with_description("Specifies how many noncurrent versions S3 will retain. If there are this many more recent noncurrent versions, S3 will take the associated action. For...").with_provider_name("NewerNoncurrentVersions"),
@@ -551,7 +551,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
             }).required().with_description("The class of storage used to store the object.").with_provider_name("StorageClass"),
                     StructField::new("transition_in_days", AttributeType::Int).required().with_description("Specifies the number of days an object is noncurrent before Amazon S3 can perform the associated action. For information about the noncurrent days cal...").with_provider_name("TransitionInDays")
                     ],
-                }))).with_description("For buckets with versioning enabled (or suspended), one or more transition rules that specify when non-current objects transition to a specified stora...").with_provider_name("NoncurrentVersionTransitions").with_block_name("noncurrent_version_transition"),
+                })).with_description("For buckets with versioning enabled (or suspended), one or more transition rules that specify when non-current objects transition to a specified stora...").with_provider_name("NoncurrentVersionTransitions").with_block_name("noncurrent_version_transition"),
                     StructField::new("object_size_greater_than", AttributeType::Custom {
                 name: "NumericString(len: ..=20)".to_string(),
                 base: Box::new(AttributeType::String),
@@ -573,7 +573,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                 namespace: Some("awscc.s3.bucket".to_string()),
                 to_dsl: None,
             }).required().with_description("If ``Enabled``, the rule is currently being applied. If ``Disabled``, the rule is not currently being applied.").with_provider_name("Status"),
-                    StructField::new("tag_filters", AttributeType::List(Box::new(tags_type()))).with_description("Tags to use to identify a subset of objects to which the lifecycle rule applies.").with_provider_name("TagFilters"),
+                    StructField::new("tag_filters", AttributeType::list(tags_type())).with_description("Tags to use to identify a subset of objects to which the lifecycle rule applies.").with_provider_name("TagFilters"),
                     StructField::new("transition", AttributeType::Struct {
                     name: "Transition".to_string(),
                     fields: vec![
@@ -593,7 +593,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                     StructField::new("transition_in_days", AttributeType::Int).with_description("Indicates the number of days after creation when objects are transitioned to the specified storage class. If the specified storage class is ``INTELLIG...").with_provider_name("TransitionInDays")
                     ],
                 }).with_description("(Deprecated.) Specifies when an object transitions to a specified storage class. If you specify an expiration and transition time, you must use the sa...").with_provider_name("Transition"),
-                    StructField::new("transitions", AttributeType::List(Box::new(AttributeType::Struct {
+                    StructField::new("transitions", AttributeType::list(AttributeType::Struct {
                     name: "Transition".to_string(),
                     fields: vec![
                     StructField::new("storage_class", AttributeType::StringEnum {
@@ -611,9 +611,9 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
             }).with_description("Indicates when objects are transitioned to the specified storage class. The date value must be in ISO 8601 format. The time is always midnight UTC.").with_provider_name("TransitionDate"),
                     StructField::new("transition_in_days", AttributeType::Int).with_description("Indicates the number of days after creation when objects are transitioned to the specified storage class. If the specified storage class is ``INTELLIG...").with_provider_name("TransitionInDays")
                     ],
-                }))).with_description("One or more transition rules that specify when an object transitions to a specified storage class. If you specify an expiration and transition time, y...").with_provider_name("Transitions").with_block_name("transition")
+                })).with_description("One or more transition rules that specify when an object transitions to a specified storage class. If you specify an expiration and transition time, y...").with_provider_name("Transitions").with_block_name("transition")
                     ],
-                }))).required().with_description("A lifecycle rule for individual objects in an Amazon S3 bucket.").with_provider_name("Rules").with_block_name("rule"),
+                })).required().with_description("A lifecycle rule for individual objects in an Amazon S3 bucket.").with_provider_name("Rules").with_block_name("rule"),
                     StructField::new("transition_default_minimum_object_size", AttributeType::StringEnum {
                 name: "TransitionDefaultMinimumObjectSize".to_string(),
                 values: vec!["varies_by_storage_class".to_string(), "all_storage_classes_128K".to_string()],
@@ -753,15 +753,15 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                 .with_provider_name("MetadataTableConfiguration"),
         )
         .attribute(
-            AttributeSchema::new("metrics_configurations", AttributeType::List(Box::new(AttributeType::Struct {
+            AttributeSchema::new("metrics_configurations", AttributeType::list(AttributeType::Struct {
                     name: "MetricsConfiguration".to_string(),
                     fields: vec![
                     StructField::new("access_point_arn", super::arn()).with_description("The access point that was used while performing operations on the object. The metrics configuration only includes objects that meet the filter's crite...").with_provider_name("AccessPointArn"),
                     StructField::new("id", AttributeType::String).required().with_description("The ID used to identify the metrics configuration. This can be any value you choose that helps you identify your metrics configuration.").with_provider_name("Id"),
                     StructField::new("prefix", AttributeType::String).with_description("The prefix that an object must have to be included in the metrics results.").with_provider_name("Prefix"),
-                    StructField::new("tag_filters", AttributeType::List(Box::new(tags_type()))).with_description("Specifies a list of tag filters to use as a metrics configuration filter. The metrics configuration includes only objects that meet the filter's crite...").with_provider_name("TagFilters")
+                    StructField::new("tag_filters", AttributeType::list(tags_type())).with_description("Specifies a list of tag filters to use as a metrics configuration filter. The metrics configuration includes only objects that meet the filter's crite...").with_provider_name("TagFilters")
                     ],
-                })))
+                }))
                 .with_description("Specifies a metrics configuration for the CloudWatch request metrics (specified by the metrics configuration ID) from an Amazon S3 bucket. If you're u...")
                 .with_provider_name("MetricsConfigurations")
                 .with_block_name("metrics_configuration"),
@@ -776,7 +776,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                     StructField::new("event_bridge_enabled", AttributeType::Bool).required().with_description("Enables delivery of events to Amazon EventBridge.").with_provider_name("EventBridgeEnabled")
                     ],
                 }).with_description("Enables delivery of events to Amazon EventBridge.").with_provider_name("EventBridgeConfiguration"),
-                    StructField::new("lambda_configurations", AttributeType::List(Box::new(AttributeType::Struct {
+                    StructField::new("lambda_configurations", AttributeType::list(AttributeType::Struct {
                     name: "LambdaConfiguration".to_string(),
                     fields: vec![
                     StructField::new("event", AttributeType::String).required().with_description("The Amazon S3 bucket event for which to invoke the LAMlong function. For more information, see [Supported Event Types](https://docs.aws.amazon.com/Ama...").with_provider_name("Event"),
@@ -786,7 +786,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                     StructField::new("s3_key", AttributeType::Struct {
                     name: "S3KeyFilter".to_string(),
                     fields: vec![
-                    StructField::new("rules", AttributeType::List(Box::new(AttributeType::Struct {
+                    StructField::new("rules", AttributeType::unordered_list(AttributeType::Struct {
                     name: "FilterRule".to_string(),
                     fields: vec![
                     StructField::new("name", AttributeType::Custom {
@@ -798,15 +798,15 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
             }).required().with_description("The object key name prefix or suffix identifying one or more objects to which the filtering rule applies. The maximum length is 1,024 characters. Over...").with_provider_name("Name"),
                     StructField::new("value", AttributeType::String).required().with_description("The value that the filter searches for in object key names.").with_provider_name("Value")
                     ],
-                }))).required().with_description("A list of containers for the key-value pair that defines the criteria for the filter rule.").with_provider_name("Rules").with_block_name("rule")
+                })).required().with_description("A list of containers for the key-value pair that defines the criteria for the filter rule.").with_provider_name("Rules").with_block_name("rule")
                     ],
                 }).required().with_description("A container for object key name prefix and suffix filtering rules.").with_provider_name("S3Key")
                     ],
                 }).with_description("The filtering rules that determine which objects invoke the AWS Lambda function. For example, you can create a filter so that only image files with a ...").with_provider_name("Filter"),
                     StructField::new("function", super::arn()).required().with_description("The Amazon Resource Name (ARN) of the LAMlong function that Amazon S3 invokes when the specified event type occurs.").with_provider_name("Function")
                     ],
-                }))).with_description("Describes the LAMlong functions to invoke and the events for which to invoke them.").with_provider_name("LambdaConfigurations").with_block_name("lambda_configuration"),
-                    StructField::new("queue_configurations", AttributeType::List(Box::new(AttributeType::Struct {
+                })).with_description("Describes the LAMlong functions to invoke and the events for which to invoke them.").with_provider_name("LambdaConfigurations").with_block_name("lambda_configuration"),
+                    StructField::new("queue_configurations", AttributeType::list(AttributeType::Struct {
                     name: "QueueConfiguration".to_string(),
                     fields: vec![
                     StructField::new("event", AttributeType::String).required().with_description("The Amazon S3 bucket event about which you want to publish messages to Amazon SQS. For more information, see [Supported Event Types](https://docs.aws....").with_provider_name("Event"),
@@ -816,7 +816,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                     StructField::new("s3_key", AttributeType::Struct {
                     name: "S3KeyFilter".to_string(),
                     fields: vec![
-                    StructField::new("rules", AttributeType::List(Box::new(AttributeType::Struct {
+                    StructField::new("rules", AttributeType::unordered_list(AttributeType::Struct {
                     name: "FilterRule".to_string(),
                     fields: vec![
                     StructField::new("name", AttributeType::Custom {
@@ -828,15 +828,15 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
             }).required().with_description("The object key name prefix or suffix identifying one or more objects to which the filtering rule applies. The maximum length is 1,024 characters. Over...").with_provider_name("Name"),
                     StructField::new("value", AttributeType::String).required().with_description("The value that the filter searches for in object key names.").with_provider_name("Value")
                     ],
-                }))).required().with_description("A list of containers for the key-value pair that defines the criteria for the filter rule.").with_provider_name("Rules").with_block_name("rule")
+                })).required().with_description("A list of containers for the key-value pair that defines the criteria for the filter rule.").with_provider_name("Rules").with_block_name("rule")
                     ],
                 }).required().with_description("A container for object key name prefix and suffix filtering rules.").with_provider_name("S3Key")
                     ],
                 }).with_description("The filtering rules that determine which objects trigger notifications. For example, you can create a filter so that Amazon S3 sends notifications onl...").with_provider_name("Filter"),
                     StructField::new("queue", super::arn()).required().with_description("The Amazon Resource Name (ARN) of the Amazon SQS queue to which Amazon S3 publishes a message when it detects events of the specified type. FIFO queue...").with_provider_name("Queue")
                     ],
-                }))).with_description("The Amazon Simple Queue Service queues to publish messages to and the events for which to publish messages.").with_provider_name("QueueConfigurations").with_block_name("queue_configuration"),
-                    StructField::new("topic_configurations", AttributeType::List(Box::new(AttributeType::Struct {
+                })).with_description("The Amazon Simple Queue Service queues to publish messages to and the events for which to publish messages.").with_provider_name("QueueConfigurations").with_block_name("queue_configuration"),
+                    StructField::new("topic_configurations", AttributeType::list(AttributeType::Struct {
                     name: "TopicConfiguration".to_string(),
                     fields: vec![
                     StructField::new("event", AttributeType::String).required().with_description("The Amazon S3 bucket event about which to send notifications. For more information, see [Supported Event Types](https://docs.aws.amazon.com/AmazonS3/l...").with_provider_name("Event"),
@@ -846,7 +846,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                     StructField::new("s3_key", AttributeType::Struct {
                     name: "S3KeyFilter".to_string(),
                     fields: vec![
-                    StructField::new("rules", AttributeType::List(Box::new(AttributeType::Struct {
+                    StructField::new("rules", AttributeType::unordered_list(AttributeType::Struct {
                     name: "FilterRule".to_string(),
                     fields: vec![
                     StructField::new("name", AttributeType::Custom {
@@ -858,14 +858,14 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
             }).required().with_description("The object key name prefix or suffix identifying one or more objects to which the filtering rule applies. The maximum length is 1,024 characters. Over...").with_provider_name("Name"),
                     StructField::new("value", AttributeType::String).required().with_description("The value that the filter searches for in object key names.").with_provider_name("Value")
                     ],
-                }))).required().with_description("A list of containers for the key-value pair that defines the criteria for the filter rule.").with_provider_name("Rules").with_block_name("rule")
+                })).required().with_description("A list of containers for the key-value pair that defines the criteria for the filter rule.").with_provider_name("Rules").with_block_name("rule")
                     ],
                 }).required().with_description("A container for object key name prefix and suffix filtering rules.").with_provider_name("S3Key")
                     ],
                 }).with_description("The filtering rules that determine for which objects to send notifications. For example, you can create a filter so that Amazon S3 sends notifications...").with_provider_name("Filter"),
                     StructField::new("topic", super::arn()).required().with_description("The Amazon Resource Name (ARN) of the Amazon SNS topic to which Amazon S3 publishes a message when it detects events of the specified type.").with_provider_name("Topic")
                     ],
-                }))).with_description("The topic to which notifications are sent and the events for which notifications are generated.").with_provider_name("TopicConfigurations").with_block_name("topic_configuration")
+                })).with_description("The topic to which notifications are sent and the events for which notifications are generated.").with_provider_name("TopicConfigurations").with_block_name("topic_configuration")
                     ],
                 })
                 .with_description("Configuration that defines how Amazon S3 handles bucket notifications.")
@@ -913,7 +913,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
             AttributeSchema::new("ownership_controls", AttributeType::Struct {
                     name: "OwnershipControls".to_string(),
                     fields: vec![
-                    StructField::new("rules", AttributeType::List(Box::new(AttributeType::Struct {
+                    StructField::new("rules", AttributeType::list(AttributeType::Struct {
                     name: "OwnershipControlsRule".to_string(),
                     fields: vec![
                     StructField::new("object_ownership", AttributeType::StringEnum {
@@ -923,11 +923,12 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                 to_dsl: None,
             }).with_description("Specifies an object ownership rule.").with_provider_name("ObjectOwnership")
                     ],
-                }))).required().with_description("Specifies the container element for Object Ownership rules.").with_provider_name("Rules").with_block_name("rule")
+                })).required().with_description("Specifies the container element for Object Ownership rules.").with_provider_name("Rules").with_block_name("rule")
                     ],
                 })
                 .with_description("Configuration that defines how Amazon S3 handles Object Ownership rules.")
-                .with_provider_name("OwnershipControls"),
+                .with_provider_name("OwnershipControls")
+                .with_block_name("ownership_control"),
         )
         .attribute(
             AttributeSchema::new("public_access_block_configuration", AttributeType::Struct {
@@ -953,7 +954,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                     name: "ReplicationConfiguration".to_string(),
                     fields: vec![
                     StructField::new("role", super::iam_role_arn()).required().with_description("The Amazon Resource Name (ARN) of the IAMlong (IAM) role that Amazon S3 assumes when replicating objects. For more information, see [How to Set Up Rep...").with_provider_name("Role"),
-                    StructField::new("rules", AttributeType::List(Box::new(AttributeType::Struct {
+                    StructField::new("rules", AttributeType::list(AttributeType::Struct {
                     name: "ReplicationRule".to_string(),
                     fields: vec![
                     StructField::new("delete_marker_replication", AttributeType::Struct {
@@ -1038,7 +1039,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                     name: "ReplicationRuleAndOperator".to_string(),
                     fields: vec![
                     StructField::new("prefix", AttributeType::String).with_description("An object key name prefix that identifies the subset of objects to which the rule applies.").with_provider_name("Prefix"),
-                    StructField::new("tag_filters", AttributeType::List(Box::new(tags_type()))).with_description("An array of tags containing key and value pairs.").with_provider_name("TagFilters")
+                    StructField::new("tag_filters", AttributeType::list(tags_type())).with_description("An array of tags containing key and value pairs.").with_provider_name("TagFilters")
                     ],
                 }).with_description("A container for specifying rule filters. The filters determine the subset of objects to which the rule applies. This element is required only if you s...").with_provider_name("And"),
                     StructField::new("prefix", AttributeType::String).with_description("An object key name prefix that identifies the subset of objects to which the rule applies. Replacement must be made for object keys containing special...").with_provider_name("Prefix"),
@@ -1094,7 +1095,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                 to_dsl: None,
             }).required().with_description("Specifies whether the rule is enabled.").with_provider_name("Status")
                     ],
-                }))).required().with_description("A container for one or more replication rules. A replication configuration must have at least one rule and can contain a maximum of 1,000 rules.").with_provider_name("Rules").with_block_name("rule")
+                })).required().with_description("A container for one or more replication rules. A replication configuration must have at least one rule and can contain a maximum of 1,000 rules.").with_provider_name("Rules").with_block_name("rule")
                     ],
                 })
                 .with_description("Configuration for replicating objects in an S3 bucket. To enable replication, you must also enable versioning by using the ``VersioningConfiguration``...")
@@ -1138,7 +1139,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
             }).with_description("Protocol to use when redirecting requests. The default is the protocol that is used in the original request.").with_provider_name("Protocol")
                     ],
                 }).with_description("The redirect behavior for every request to this bucket's website endpoint. If you specify this property, you can't specify any other property.").with_provider_name("RedirectAllRequestsTo"),
-                    StructField::new("routing_rules", AttributeType::List(Box::new(AttributeType::Struct {
+                    StructField::new("routing_rules", AttributeType::list(AttributeType::Struct {
                     name: "RoutingRule".to_string(),
                     fields: vec![
                     StructField::new("redirect_rule", AttributeType::Struct {
@@ -1164,7 +1165,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                     ],
                 }).with_description("A container for describing a condition that must be met for the specified redirect to apply. For example, 1. If request is for pages in the ``/docs`` ...").with_provider_name("RoutingRuleCondition")
                     ],
-                }))).with_description("Rules that define when a redirect is applied and the redirect behavior.").with_provider_name("RoutingRules").with_block_name("routing_rule")
+                })).with_description("Rules that define when a redirect is applied and the redirect behavior.").with_provider_name("RoutingRules").with_block_name("routing_rule")
                     ],
                 })
                 .with_description("Information used to configure the bucket as a static website. For more information, see [Hosting Websites on Amazon S3](https://docs.aws.amazon.com/Am...")

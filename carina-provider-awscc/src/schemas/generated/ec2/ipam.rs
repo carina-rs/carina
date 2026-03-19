@@ -66,7 +66,7 @@ pub fn ec2_ipam_config() -> AwsccSchemaConfig {
                 .with_provider_name("DefaultResourceDiscoveryId"),
         )
         .attribute(
-            AttributeSchema::new("default_resource_discovery_organizational_unit_exclusions", AttributeType::List(Box::new(AttributeType::Struct {
+            AttributeSchema::new("default_resource_discovery_organizational_unit_exclusions", AttributeType::unordered_list(AttributeType::Struct {
                     name: "IpamOrganizationalUnitExclusion".to_string(),
                     fields: vec![
                     StructField::new("organizations_entity_path", AttributeType::Custom {
@@ -77,7 +77,7 @@ pub fn ec2_ipam_config() -> AwsccSchemaConfig {
                 to_dsl: None,
             }).required().with_description("An AWS Organizations entity path. Build the path for the OU(s) using AWS Organizations IDs separated by a '/'. Include all child OUs by ending the pat...").with_provider_name("OrganizationsEntityPath")
                     ],
-                })))
+                }))
                 .with_description("A set of organizational unit (OU) exclusions for the default resource discovery, created with this IPAM.")
                 .with_provider_name("DefaultResourceDiscoveryOrganizationalUnitExclusions")
                 .with_block_name("default_resource_discovery_organizational_unit_exclusion"),
@@ -108,12 +108,12 @@ pub fn ec2_ipam_config() -> AwsccSchemaConfig {
                 .with_provider_name("MeteredAccount"),
         )
         .attribute(
-            AttributeSchema::new("operating_regions", AttributeType::List(Box::new(AttributeType::Struct {
+            AttributeSchema::new("operating_regions", AttributeType::unordered_list(AttributeType::Struct {
                     name: "IpamOperatingRegion".to_string(),
                     fields: vec![
                     StructField::new("region_name", super::awscc_region()).required().with_description("The name of the region.").with_provider_name("RegionName")
                     ],
-                })))
+                }))
                 .with_description("The regions IPAM is enabled for. Allows pools to be created in these regions, as well as enabling monitoring")
                 .with_provider_name("OperatingRegions")
                 .with_block_name("operating_region"),

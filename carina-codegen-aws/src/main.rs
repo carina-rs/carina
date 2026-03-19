@@ -929,13 +929,10 @@ fn resolve_type(
                     all_enums,
                     all_ranged_ints,
                 );
-                (
-                    format!("AttributeType::List(Box::new({}))", item_type),
-                    None,
-                )
+                (format!("AttributeType::list({})", item_type), None)
             } else {
                 (
-                    "AttributeType::List(Box::new(AttributeType::String))".to_string(),
+                    "AttributeType::list(AttributeType::String)".to_string(),
                     None,
                 )
             }

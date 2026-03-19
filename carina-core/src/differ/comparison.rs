@@ -29,9 +29,9 @@ pub(super) fn type_aware_equal(a: &Value, b: &Value, attr_type: Option<&Attribut
                 *f == (*i as f64) && (*i as f64) as i64 == *i
             }
 
-            // Lists: multiset comparison with inner type awareness
-            (Value::List(la), Value::List(lb), AttributeType::List(inner)) => {
-                type_aware_lists_equal(la, lb, Some(inner))
+            // Lists: ordered or multiset comparison with inner type awareness
+            (Value::List(la), Value::List(lb), AttributeType::List { inner, ordered }) => {
+                type_aware_lists_equal(la, lb, Some(inner), *ordered)
             }
 
             // Maps: recursive comparison with inner value type
@@ -78,26 +78,41 @@ pub(super) fn type_aware_equal(a: &Value, b: &Value, attr_type: Option<&Attribut
     }
 }
 
-/// Multiset comparison for lists with type-aware element comparison.
-fn type_aware_lists_equal(a: &[Value], b: &[Value], inner: Option<&AttributeType>) -> bool {
+/// List comparison with type-aware element comparison.
+/// When `ordered` is true, elements are compared positionally (sequential).
+/// When `ordered` is false, elements are compared as multisets (order-insensitive).
+fn type_aware_lists_equal(
+    a: &[Value],
+    b: &[Value],
+    inner: Option<&AttributeType>,
+    ordered: bool,
+) -> bool {
     if a.len() != b.len() {
         return false;
     }
-    let mut matched = vec![false; b.len()];
-    for item_a in a {
-        let mut found = false;
-        for (j, item_b) in b.iter().enumerate() {
-            if !matched[j] && type_aware_equal(item_a, item_b, inner) {
-                matched[j] = true;
-                found = true;
-                break;
+    if ordered {
+        // Sequential comparison: element order matters
+        a.iter()
+            .zip(b.iter())
+            .all(|(va, vb)| type_aware_equal(va, vb, inner))
+    } else {
+        // Multiset comparison: order-insensitive
+        let mut matched = vec![false; b.len()];
+        for item_a in a {
+            let mut found = false;
+            for (j, item_b) in b.iter().enumerate() {
+                if !matched[j] && type_aware_equal(item_a, item_b, inner) {
+                    matched[j] = true;
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                return false;
             }
         }
-        if !found {
-            return false;
-        }
+        true
     }
-    true
 }
 
 /// Map comparison with per-key type lookup.
@@ -183,7 +198,7 @@ fn is_type_default(value: &Value, attr_type: Option<&AttributeType>) -> bool {
         (Value::Float(f), Some(AttributeType::Float)) if *f == 0.0 => true,
         (Value::String(s), Some(AttributeType::String)) if s.is_empty() => true,
         (Value::String(s), Some(AttributeType::StringEnum { .. })) if s.is_empty() => true,
-        (Value::List(l), Some(AttributeType::List(_))) if l.is_empty() => true,
+        (Value::List(l), Some(AttributeType::List { .. })) if l.is_empty() => true,
         (Value::Map(m), Some(AttributeType::Map(_) | AttributeType::Struct { .. }))
             if m.is_empty() =>
         {

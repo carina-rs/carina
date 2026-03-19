@@ -63,14 +63,14 @@ pub fn ec2_nat_gateway_config() -> AwsccSchemaConfig {
                 .with_provider_name("AvailabilityMode"),
         )
         .attribute(
-            AttributeSchema::new("availability_zone_addresses", AttributeType::List(Box::new(AttributeType::Struct {
+            AttributeSchema::new("availability_zone_addresses", AttributeType::unordered_list(AttributeType::Struct {
                     name: "AvailabilityZoneAddress".to_string(),
                     fields: vec![
-                    StructField::new("allocation_ids", AttributeType::List(Box::new(super::allocation_id()))).required().with_description("The allocation IDs of the Elastic IP addresses (EIPs) to be used for handling outbound NAT traffic in this specific Availability Zone.").with_provider_name("AllocationIds"),
+                    StructField::new("allocation_ids", AttributeType::unordered_list(super::allocation_id())).required().with_description("The allocation IDs of the Elastic IP addresses (EIPs) to be used for handling outbound NAT traffic in this specific Availability Zone.").with_provider_name("AllocationIds"),
                     StructField::new("availability_zone", super::availability_zone()).with_description("For regional NAT gateways only: The Availability Zone where this specific NAT gateway configuration will be active. Each AZ in a regional NAT gateway ...").with_provider_name("AvailabilityZone"),
                     StructField::new("availability_zone_id", super::availability_zone_id()).with_description("For regional NAT gateways only: The ID of the Availability Zone where this specific NAT gateway configuration will be active. Each AZ in a regional NA...").with_provider_name("AvailabilityZoneId")
                     ],
-                })))
+                }))
                 .with_description("For regional NAT gateways only: Specifies which Availability Zones you want the NAT gateway to support and the Elastic IP addresses (EIPs) to use in e...")
                 .with_provider_name("AvailabilityZoneAddresses")
                 .with_block_name("availability_zone_address"),
@@ -116,7 +116,7 @@ pub fn ec2_nat_gateway_config() -> AwsccSchemaConfig {
                 .with_provider_name("RouteTableId"),
         )
         .attribute(
-            AttributeSchema::new("secondary_allocation_ids", AttributeType::List(Box::new(super::allocation_id())))
+            AttributeSchema::new("secondary_allocation_ids", AttributeType::list(super::allocation_id()))
                 .with_description("Secondary EIP allocation IDs. For more information, see [Create a NAT gateway](https://docs.aws.amazon.com/vpc/latest/userguide/nat-gateway-working-wi...")
                 .with_provider_name("SecondaryAllocationIds"),
         )
@@ -132,7 +132,7 @@ pub fn ec2_nat_gateway_config() -> AwsccSchemaConfig {
                 .with_provider_name("SecondaryPrivateIpAddressCount"),
         )
         .attribute(
-            AttributeSchema::new("secondary_private_ip_addresses", AttributeType::List(Box::new(types::ipv4_address())))
+            AttributeSchema::new("secondary_private_ip_addresses", AttributeType::list(types::ipv4_address()))
                 .with_description("Secondary private IPv4 addresses. For more information about secondary addresses, see [Create a NAT gateway](https://docs.aws.amazon.com/vpc/latest/us...")
                 .with_provider_name("SecondaryPrivateIpAddresses"),
         )

@@ -41,7 +41,7 @@ impl CompletionProvider {
                 if let Some(bn) = &attr.block_name
                     && matches!(
                         &attr.attr_type,
-                        AttributeType::List(inner) if matches!(inner.as_ref(), AttributeType::Struct { .. })
+                        AttributeType::List { inner, .. } if matches!(inner.as_ref(), AttributeType::Struct { .. })
                     )
                 {
                     completions.push(CompletionItem {
@@ -201,7 +201,7 @@ impl CompletionProvider {
                 self.availability_zone_completions(namespace.as_deref().unwrap_or(""), name)
             }
             // List(non-Struct): delegate to inner type completions
-            AttributeType::List(inner) => self.completions_for_type(inner),
+            AttributeType::List { inner, .. } => self.completions_for_type(inner),
             // Map: delegate to inner value type completions
             AttributeType::Map(inner) => self.completions_for_type(inner),
             // Union: collect completions from all member types

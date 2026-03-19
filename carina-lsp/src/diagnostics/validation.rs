@@ -110,7 +110,7 @@ impl DiagnosticEngine {
                             carina_core::schema::AttributeType::Struct { fields, .. } => {
                                 Some(fields)
                             }
-                            carina_core::schema::AttributeType::List(inner) => {
+                            carina_core::schema::AttributeType::List { inner, .. } => {
                                 match inner.as_ref() {
                                     carina_core::schema::AttributeType::Struct {
                                         fields, ..
@@ -201,7 +201,7 @@ impl DiagnosticEngine {
             // Only check List<Struct> attributes
             let is_list_struct = matches!(
                 &attr_schema.attr_type,
-                AttributeType::List(inner) if matches!(inner.as_ref(), AttributeType::Struct { .. })
+                AttributeType::List { inner, .. } if matches!(inner.as_ref(), AttributeType::Struct { .. })
             );
             if !is_list_struct {
                 continue;

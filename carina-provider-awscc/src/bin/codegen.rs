@@ -1806,7 +1806,8 @@ pub fn {}() -> AwsccSchemaConfig {{
                 .map(|def| def.def_type.as_deref() == Some("array"))
                 .unwrap_or(false);
             if is_array || is_ref_array {
-                format!("AttributeType::List(Box::new({}))", enum_type)
+                let list_ctor = list_constructor(prop.insertion_order);
+                format!("{}({})", list_ctor, enum_type)
             } else {
                 enum_type
             }
@@ -1869,7 +1870,7 @@ pub fn {}() -> AwsccSchemaConfig {{
         // Even if the singular form conflicts with an existing field name,
         // resolve_block_names distinguishes block syntax (Value::List) from
         // attribute assignment (Value::Map) so the block_name is safe to add.
-        if attr_type.starts_with("AttributeType::List(Box::new(AttributeType::Struct")
+        if attr_type.contains("list(AttributeType::Struct")
             && let Some(singular) = compute_block_name(&attr_name)
         {
             attr_code.push_str(&format!(
@@ -2217,7 +2218,8 @@ fn generate_struct_type(
             // Try composite key "DefName.FieldName" first (for definition-scoped enums),
             // then fall back to plain "FieldName" (for top-level property enums).
             // Check if the original field type was a List (array)
-            let is_list_field = field_type.contains("AttributeType::List");
+            let is_list_field =
+                field_type.contains("::list(") || field_type.contains("::unordered_list(");
             let field_type = if let Some(local_enum_info) = enum_info {
                 let composite_key = format!("{}.{}", def_name, field_name);
                 let enum_type = if let Some(enum_info) =
@@ -2302,7 +2304,8 @@ fn generate_struct_type(
                 };
                 // Wrap in List if the original field type was a List
                 if is_list_field {
-                    format!("AttributeType::List(Box::new({}))", enum_type)
+                    let list_ctor = list_constructor(field_prop.insertion_order);
+                    format!("{}({})", list_ctor, enum_type)
                 } else {
                     enum_type
                 }
@@ -2330,7 +2333,7 @@ fn generate_struct_type(
             // Even if the singular form conflicts with an existing field name,
             // resolve_block_names distinguishes block syntax (Value::List) from
             // attribute assignment (Value::Map) so the block_name is safe to add.
-            if field_type.starts_with("AttributeType::List(Box::new(AttributeType::Struct")
+            if field_type.contains("list(AttributeType::Struct")
                 && let Some(singular) = compute_block_name(&snake_name)
             {
                 field_code.push_str(&format!(".with_block_name(\"{}\")", singular));
@@ -3059,6 +3062,16 @@ fn is_ipam_pool_id_property(prop_name: &str) -> bool {
     lower.ends_with("poolid")
 }
 
+/// Return the correct list constructor based on insertionOrder.
+/// CloudFormation defaults insertionOrder to true when not specified.
+fn list_constructor(insertion_order: Option<bool>) -> &'static str {
+    if insertion_order == Some(false) {
+        "AttributeType::unordered_list"
+    } else {
+        "AttributeType::list"
+    }
+}
+
 /// Returns (type_string, Option<EnumInfo>)
 /// EnumInfo is Some if this property is an enum that should use AttributeType::Custom
 fn cfn_type_to_carina_type_with_enum(
@@ -3157,10 +3170,8 @@ fn cfn_type_to_carina_type_with_enum(
                 } else {
                     item_type
                 };
-                return (
-                    format!("AttributeType::List(Box::new({}))", effective_item_type),
-                    item_enum,
-                );
+                let list_ctor = list_constructor(prop.insertion_order);
+                return (format!("{}({})", list_ctor, effective_item_type), item_enum);
             }
             // Handle string-typed $ref definitions with pattern constraints
             if def.def_type.as_deref() == Some("string")
@@ -3552,6 +3563,7 @@ fn cfn_type_to_carina_type_with_enum(
             }
         }
         Some("array") => {
+            let list_ctor = list_constructor(prop.insertion_order);
             let (list_type, item_enum) = if let Some(items) = &prop.items {
                 // Check if items has a $ref to a definition
                 if let Some(ref_path) = &items.ref_path
@@ -3569,10 +3581,7 @@ fn cfn_type_to_carina_type_with_enum(
                         namespace,
                         enums,
                     );
-                    (
-                        format!("AttributeType::List(Box::new({}))", struct_type),
-                        None,
-                    )
+                    (format!("{}({})", list_ctor, struct_type), None)
                 } else {
                     let (item_type, item_enum) = cfn_type_to_carina_type_with_enum(
                         items, prop_name, schema, namespace, enums,
@@ -3585,16 +3594,10 @@ fn cfn_type_to_carina_type_with_enum(
                     } else {
                         item_type
                     };
-                    (
-                        format!("AttributeType::List(Box::new({}))", effective_item_type),
-                        item_enum,
-                    )
+                    (format!("{}({})", list_ctor, effective_item_type), item_enum)
                 }
             } else {
-                (
-                    "AttributeType::List(Box::new(AttributeType::String))".to_string(),
-                    None,
-                )
+                (format!("{}(AttributeType::String)", list_ctor), None)
             };
             // Wrap in Custom type if minItems/maxItems constraints exist
             if prop.min_items.is_some() || prop.max_items.is_some() {
@@ -6433,8 +6436,8 @@ mod tests {
             &enums,
         );
         assert!(
-            type_str.contains("List"),
-            "array type should produce List: {type_str}"
+            type_str.contains("::list(") || type_str.contains("::unordered_list("),
+            "array type should produce list: {type_str}"
         );
         assert!(
             enum_info.is_some(),
@@ -6549,8 +6552,8 @@ mod tests {
             &enums,
         );
         assert!(
-            type_str.contains("List"),
-            "should produce List type: {type_str}"
+            type_str.contains("::list(") || type_str.contains("::unordered_list("),
+            "should produce list type: {type_str}"
         );
         assert!(
             enum_info.is_some(),
@@ -6596,8 +6599,8 @@ mod tests {
         };
         let generated = generate_schema_code(&schema, "AWS::S3::Bucket").unwrap();
         assert!(
-            generated.contains("AttributeType::List(Box::new(AttributeType::StringEnum"),
-            "array with enum items should generate List(StringEnum): {generated}"
+            generated.contains("AttributeType::list(AttributeType::StringEnum"),
+            "array with enum items should generate list(StringEnum): {generated}"
         );
     }
 
@@ -7472,8 +7475,8 @@ mod tests {
             "array without minItems/maxItems should not produce Custom type: {type_str}"
         );
         assert!(
-            type_str.contains("List"),
-            "should produce plain List type: {type_str}"
+            type_str.contains("::list(") || type_str.contains("::unordered_list("),
+            "should produce plain list type: {type_str}"
         );
     }
 
