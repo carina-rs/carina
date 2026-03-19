@@ -16,12 +16,14 @@ use crate::commands::apply::{
     finalize_apply, queue_state_refresh, refresh_pending_states, save_state_locked,
 };
 use crate::commands::plan::{CurrentStateEntry, PlanFile};
+use crate::commands::state::run_state_refresh_locked;
 use crate::wiring::{
     compute_anonymous_identifiers, reconcile_prefixed_names, resolve_attr_prefixes, resolve_names,
     validate_resources,
 };
 use carina_core::parser::BackendConfig;
 use carina_core::provider::Provider;
+use std::sync::Mutex;
 
 struct TestProvider {
     read_results: HashMap<(String, String), Result<State, String>>,
@@ -1569,6 +1571,119 @@ impl Provider for RecordingProvider {
     }
 }
 
+/// Mock provider where create and delete succeed but update (rename) fails.
+struct RenameFailProvider;
+
+impl Provider for RenameFailProvider {
+    fn name(&self) -> &'static str {
+        "test"
+    }
+
+    fn read(
+        &self,
+        id: &ResourceId,
+        _identifier: Option<&str>,
+    ) -> BoxFuture<'_, ProviderResult<State>> {
+        let id = id.clone();
+        Box::pin(async move { Ok(State::not_found(id)) })
+    }
+
+    fn create(&self, resource: &Resource) -> BoxFuture<'_, ProviderResult<State>> {
+        let state = State::existing(resource.id.clone(), resource.attributes.clone())
+            .with_identifier("temp-name-abc");
+        Box::pin(async move { Ok(state) })
+    }
+
+    fn update(
+        &self,
+        _id: &ResourceId,
+        _identifier: &str,
+        _from: &State,
+        _to: &Resource,
+    ) -> BoxFuture<'_, ProviderResult<State>> {
+        Box::pin(async { Err(ProviderError::new("rename failed: API error")) })
+    }
+
+    fn delete(
+        &self,
+        _id: &ResourceId,
+        _identifier: &str,
+        _lifecycle: &LifecycleConfig,
+    ) -> BoxFuture<'_, ProviderResult<()>> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+/// Regression test for #878: when a create_before_destroy rename fails,
+/// the effect should be counted as a failure, not a success.
+#[tokio::test]
+async fn rename_failure_in_create_before_destroy_counts_as_failure() {
+    use carina_core::effect::TemporaryName;
+
+    let id = ResourceId::with_provider("awscc", "s3.bucket", "my-bucket");
+
+    let old_state = State::existing(
+        id.clone(),
+        HashMap::from([(
+            "bucket_name".to_string(),
+            Value::String("my-bucket".to_string()),
+        )]),
+    )
+    .with_identifier("my-bucket");
+
+    let new_resource = Resource::with_provider("awscc", "s3.bucket", "my-bucket")
+        .with_attribute("bucket_name", Value::String("my-bucket-tmp123".to_string()));
+
+    let mut plan = Plan::new();
+    plan.add(Effect::Replace {
+        id: id.clone(),
+        from: Box::new(old_state.clone()),
+        to: new_resource.clone(),
+        lifecycle: LifecycleConfig {
+            force_delete: false,
+            create_before_destroy: true,
+        },
+        changed_create_only: vec!["bucket_name".to_string()],
+        cascading_updates: vec![],
+        temporary_name: Some(TemporaryName {
+            attribute: "bucket_name".to_string(),
+            original_value: "my-bucket".to_string(),
+            temporary_value: "my-bucket-tmp123".to_string(),
+            can_rename: true,
+        }),
+    });
+
+    let provider = RenameFailProvider;
+    let mut binding_map = HashMap::new();
+    let mut current_states = HashMap::from([(id.clone(), old_state)]);
+    let unresolved_resources = HashMap::from([(id.clone(), new_resource)]);
+
+    let result = execute_effects(
+        &plan,
+        &provider,
+        &mut binding_map,
+        &mut current_states,
+        &unresolved_resources,
+    )
+    .await;
+
+    // The rename failed, so the effect should be counted as a failure
+    assert_eq!(
+        result.failure_count, 1,
+        "Rename failure should increment failure_count"
+    );
+    assert_eq!(
+        result.success_count, 0,
+        "Rename failure should not increment success_count"
+    );
+
+    // The state should still be saved (resource exists with temp name)
+    assert!(
+        result.applied_states.contains_key(&id),
+        "State should still be saved even on rename failure"
+    );
+}
+
 /// Regression test for #865: when a resource is replaced via create_before_destroy
 /// and a dependent resource has its own Update effect, the dependent's `to` state
 /// should reference the new (post-replacement) resource ID, not the old one.
@@ -1713,5 +1828,126 @@ async fn update_effect_resolves_refs_against_post_replacement_binding_map() {
         *vpc_id_in_update,
         Value::String("vpc-NEW".to_string()),
         "Subnet update should reference the NEW vpc_id (vpc-NEW), not the stale old one (vpc-OLD)"
+    );
+}
+
+/// A mock StateBackend that returns a pre-configured state and captures writes.
+struct RefreshTestBackend {
+    initial_state: Option<StateFile>,
+    written_state: Mutex<Option<StateFile>>,
+}
+
+impl RefreshTestBackend {
+    fn new(state: StateFile) -> Self {
+        Self {
+            initial_state: Some(state),
+            written_state: Mutex::new(None),
+        }
+    }
+
+    fn get_written_state(&self) -> Option<StateFile> {
+        self.written_state.lock().unwrap().clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl StateBackend for RefreshTestBackend {
+    async fn read_state(&self) -> carina_state::BackendResult<Option<StateFile>> {
+        Ok(self.initial_state.clone())
+    }
+    async fn write_state(&self, state: &StateFile) -> carina_state::BackendResult<()> {
+        *self.written_state.lock().unwrap() = Some(state.clone());
+        Ok(())
+    }
+    async fn acquire_lock(&self, operation: &str) -> carina_state::BackendResult<LockInfo> {
+        Ok(LockInfo::new(operation))
+    }
+    async fn release_lock(&self, _lock: &LockInfo) -> carina_state::BackendResult<()> {
+        Ok(())
+    }
+    async fn renew_lock(&self, lock: &LockInfo) -> carina_state::BackendResult<LockInfo> {
+        Ok(lock.renewed())
+    }
+    async fn write_state_locked(
+        &self,
+        state: &carina_state::StateFile,
+        _lock: &LockInfo,
+    ) -> carina_state::BackendResult<()> {
+        self.write_state(state).await
+    }
+    async fn force_unlock(&self, _lock_id: &str) -> carina_state::BackendResult<()> {
+        Ok(())
+    }
+    async fn init(&self) -> carina_state::BackendResult<()> {
+        Ok(())
+    }
+    async fn bucket_exists(&self) -> carina_state::BackendResult<bool> {
+        Ok(true)
+    }
+    async fn create_bucket(&self) -> carina_state::BackendResult<()> {
+        Ok(())
+    }
+    fn resource_type(&self) -> Option<&str> {
+        None
+    }
+    fn provider_name(&self) -> Option<&str> {
+        None
+    }
+    fn resource_definition(&self, _bucket_name: &str) -> Option<String> {
+        None
+    }
+}
+
+/// Regression test for #879: state refresh should handle orphaned resources
+/// (resources in state but removed from config).
+#[tokio::test]
+async fn state_refresh_removes_orphaned_resource_deleted_externally() {
+    // State has two resources: "keep-bucket" (in config) and "orphan-bucket" (not in config)
+    let mut state = StateFile::new();
+    state.upsert_resource(
+        ResourceState::new("s3.bucket", "keep-bucket", "")
+            .with_identifier("keep-bucket")
+            .with_attribute("bucket", json!("keep-bucket")),
+    );
+    state.upsert_resource(
+        ResourceState::new("s3.bucket", "orphan-bucket", "")
+            .with_identifier("orphan-bucket")
+            .with_attribute("bucket", json!("orphan-bucket")),
+    );
+
+    let backend = RefreshTestBackend::new(state);
+
+    // Config only has "keep-bucket" -- "orphan-bucket" was removed from .crn
+    let mut parsed = ParsedFile {
+        providers: vec![],
+        backend: None,
+        resources: vec![
+            Resource::new("s3.bucket", "keep-bucket")
+                .with_attribute("bucket", Value::String("keep-bucket".to_string())),
+        ],
+        variables: HashMap::new(),
+        imports: vec![],
+        module_calls: vec![],
+        inputs: vec![],
+        outputs: vec![],
+    };
+
+    // MockProvider returns not_found for both resources (simulates external deletion)
+    let lock = LockInfo::new("state-refresh");
+    let result = run_state_refresh_locked(&mut parsed, &backend, &lock).await;
+    assert!(result.is_ok(), "refresh should succeed: {:?}", result);
+
+    // Verify the written state
+    let written = backend
+        .get_written_state()
+        .expect("state should be written");
+
+    // "orphan-bucket" should have been removed from state since it was deleted externally
+    // and the refresh should have visited it
+    assert!(
+        written
+            .find_resource("", "s3.bucket", "orphan-bucket")
+            .is_none(),
+        "Orphaned resource should be removed from state after refresh (issue #879)"
     );
 }

@@ -6,7 +6,7 @@ use colored::Colorize;
 use carina_core::config_loader::{get_base_dir, load_configuration};
 use carina_core::deps::sort_resources_by_dependencies;
 use carina_core::provider::{self as provider_mod, Provider, ProviderNormalizer};
-use carina_core::resource::{LifecycleConfig, ResourceId, State, Value};
+use carina_core::resource::{LifecycleConfig, Resource, ResourceId, State, Value};
 use carina_core::value::{format_value, json_to_dsl_value};
 use carina_state::{
     BackendConfig as StateBackendConfig, BackendError, LockInfo, ResourceState, StateBackend,
@@ -250,7 +250,7 @@ pub async fn run_state_refresh(path: &PathBuf) -> Result<(), AppError> {
     release_result
 }
 
-async fn run_state_refresh_locked(
+pub(crate) async fn run_state_refresh_locked(
     parsed: &mut carina_core::parser::ParsedFile,
     backend: &dyn StateBackend,
     lock: &LockInfo,
@@ -297,6 +297,32 @@ async fn run_state_refresh_locked(
             .await
             .map_err(AppError::Provider)?;
         current_states.insert(resource.id.clone(), fresh_state);
+    }
+
+    // Also read states for orphaned resources (in state but removed from config)
+    let desired_ids: HashSet<ResourceId> = sorted_resources.iter().map(|r| r.id.clone()).collect();
+    let orphan_ids: Vec<(ResourceId, String)> = state_file
+        .as_ref()
+        .map(|sf| {
+            sf.resources
+                .iter()
+                .filter_map(|rs| {
+                    let id = ResourceId::with_provider(&rs.provider, &rs.resource_type, &rs.name);
+                    if desired_ids.contains(&id) {
+                        return None;
+                    }
+                    rs.identifier.as_ref().map(|ident| (id, ident.clone()))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    for (id, identifier) in &orphan_ids {
+        let fresh_state = provider
+            .read(id, Some(identifier.as_str()))
+            .await
+            .map_err(AppError::Provider)?;
+        current_states.insert(id.clone(), fresh_state);
     }
 
     // Restore unreturned attributes from state file (CloudControl doesn't always return them)
@@ -422,6 +448,121 @@ async fn run_state_refresh_locked(
                 &resource.id.provider,
                 &resource.id.resource_type,
                 &resource.id.name,
+            );
+        }
+    }
+
+    // Process orphaned resources (in state but removed from config)
+    for (orphan_id, _) in &orphan_ids {
+        let fresh_state = match current_states.get(orphan_id) {
+            Some(s) => s,
+            None => continue,
+        };
+
+        let existing = state.find_resource(
+            &orphan_id.provider,
+            &orphan_id.resource_type,
+            &orphan_id.name,
+        );
+
+        let mut has_changes = false;
+        let mut changes: Vec<String> = Vec::new();
+
+        if let Some(existing_rs) = existing {
+            let old_attrs: HashMap<String, Value> = existing_rs
+                .attributes
+                .iter()
+                .filter_map(|(k, v)| json_to_dsl_value(v).map(|val| (k.clone(), val)))
+                .collect();
+
+            if !fresh_state.exists {
+                has_changes = true;
+                changes.push(format!("    {} resource no longer exists", "-".red()));
+            } else {
+                let mut all_keys: HashSet<&String> = old_attrs.keys().collect();
+                all_keys.extend(fresh_state.attributes.keys());
+
+                let mut sorted_keys: Vec<&&String> = all_keys.iter().collect();
+                sorted_keys.sort();
+
+                for key in sorted_keys {
+                    let old_val = old_attrs.get(*key);
+                    let new_val = fresh_state.attributes.get(*key);
+
+                    match (old_val, new_val) {
+                        (Some(old), Some(new)) if old != new => {
+                            has_changes = true;
+                            changes.push(format!(
+                                "    {} {}: {} {} {}",
+                                "~".yellow(),
+                                key,
+                                format_value(old).red(),
+                                "→".dimmed(),
+                                format_value(new).green(),
+                            ));
+                        }
+                        (Some(old), None) => {
+                            has_changes = true;
+                            changes.push(format!(
+                                "    {} {}: {}",
+                                "-".red(),
+                                key,
+                                format_value(old).red(),
+                            ));
+                        }
+                        (None, Some(new)) => {
+                            has_changes = true;
+                            changes.push(format!(
+                                "    {} {}: {}",
+                                "+".green(),
+                                key,
+                                format_value(new).green(),
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        } else {
+            continue;
+        }
+
+        if has_changes {
+            updated_count += 1;
+            println!(
+                "  {} \"{}\" (orphan):",
+                orphan_id.display_type().cyan(),
+                orphan_id.name
+            );
+            for change in &changes {
+                println!("{}", change);
+            }
+            println!();
+        } else {
+            unchanged_count += 1;
+        }
+
+        // Update state with refreshed data
+        if fresh_state.exists {
+            // Construct a minimal Resource from the orphan's state data for from_provider_state
+            let orphan_resource = Resource::with_provider(
+                &orphan_id.provider,
+                &orphan_id.resource_type,
+                &orphan_id.name,
+            );
+            let existing_rs = state.find_resource(
+                &orphan_id.provider,
+                &orphan_id.resource_type,
+                &orphan_id.name,
+            );
+            let resource_state =
+                ResourceState::from_provider_state(&orphan_resource, fresh_state, existing_rs)?;
+            state.upsert_resource(resource_state);
+        } else {
+            state.remove_resource(
+                &orphan_id.provider,
+                &orphan_id.resource_type,
+                &orphan_id.name,
             );
         }
     }
