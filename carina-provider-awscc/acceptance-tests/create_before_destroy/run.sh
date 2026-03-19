@@ -109,13 +109,21 @@ assert_identifiers() {
             return 1
         fi
     else
-        if [ "$ids1" != "$ids2" ]; then
+        # For "different" mode, check that at least one identifier changed.
+        # This handles create_before_destroy with dependent resources: only the
+        # replaced resource's identifier changes while others stay the same.
+        # Use comm to find identifiers unique to either set (not shared).
+        local unique
+        unique=$(comm -3 <(echo "$ids1") <(echo "$ids2"))
+        if [ -n "$unique" ]; then
             echo "OK"
             TOTAL_PASSED=$((TOTAL_PASSED + 1))
             return 0
         else
             echo "FAIL"
-            echo "  ERROR: Identifiers unchanged (expected different): $ids1"
+            echo "  ERROR: No identifier changed (expected at least one to differ):"
+            echo "    before: $ids1"
+            echo "    after:  $ids2"
             TOTAL_FAILED=$((TOTAL_FAILED + 1))
             return 1
         fi
