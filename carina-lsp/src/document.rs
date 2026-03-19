@@ -1,7 +1,7 @@
 use ropey::Rope;
 use tower_lsp::lsp_types::{Position, TextDocumentContentChangeEvent};
 
-use carina_core::parser::{ParseError, ParsedFile, parse};
+use carina_core::parser::{ParseError, ParsedFile, parse_lenient};
 
 pub struct Document {
     content: Rope,
@@ -37,7 +37,7 @@ impl Document {
 
     fn reparse(&mut self) {
         let text = self.content.to_string();
-        match parse(&text) {
+        match parse_lenient(&text) {
             Ok(parsed) => {
                 self.parsed = Some(parsed);
                 self.parse_error = None;
@@ -206,5 +206,27 @@ mod tests {
             character: 4,
         });
         assert_eq!(word, None);
+    }
+
+    #[test]
+    fn test_unset_env_var_preserves_ast() {
+        // With lenient parsing, unset env vars should not prevent AST creation
+        let content = r#"
+            let my_bucket = aws.s3_bucket {
+                name = env("CARINA_DEFINITELY_NOT_SET_VAR_12345")
+            }
+        "#;
+
+        let doc = Document::new(content.to_string());
+        // AST should be present (not dropped due to parse error)
+        assert!(
+            doc.parsed().is_some(),
+            "AST should be preserved when env var is unset in lenient mode"
+        );
+        // No parse error should be recorded
+        assert!(
+            doc.parse_error().is_none(),
+            "No parse error should be recorded for unset env var in lenient mode"
+        );
     }
 }

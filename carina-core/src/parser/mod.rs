@@ -199,6 +199,8 @@ struct ParseContext {
     in_module: bool,
     /// Input parameter names when inside a module
     input_params: HashMap<String, TypeExpr>,
+    /// When true, unresolved env vars produce placeholder values instead of errors
+    allow_unresolved_env: bool,
 }
 
 impl ParseContext {
@@ -209,6 +211,7 @@ impl ParseContext {
             imported_modules: HashMap::new(),
             in_module: false,
             input_params: HashMap::new(),
+            allow_unresolved_env: false,
         }
     }
 
@@ -257,9 +260,24 @@ fn first_inner<'a>(
 
 /// Parse a .crn file
 pub fn parse(input: &str) -> Result<ParsedFile, ParseError> {
+    parse_with_context(input, ParseContext::new())
+}
+
+/// Parse a .crn file in lenient mode.
+///
+/// Unresolved `env()` calls produce placeholder values instead of errors,
+/// allowing the LSP to continue providing completions and diagnostics
+/// even when environment variables are not set.
+pub fn parse_lenient(input: &str) -> Result<ParsedFile, ParseError> {
+    let mut ctx = ParseContext::new();
+    ctx.allow_unresolved_env = true;
+    parse_with_context(input, ctx)
+}
+
+fn parse_with_context(input: &str, ctx: ParseContext) -> Result<ParsedFile, ParseError> {
     let pairs = CarinaParser::parse(Rule::file, input)?;
 
-    let mut ctx = ParseContext::new();
+    let mut ctx = ctx;
     let mut providers = Vec::new();
     let mut resources = Vec::new();
     let mut imports = Vec::new();
@@ -889,6 +907,9 @@ fn parse_primary_value(
             let var_name = parse_string(next_pair(&mut env_inner, "variable name", "env() call")?);
             match env::var(&var_name) {
                 Ok(val) => Ok(Value::String(val)),
+                Err(_) if ctx.allow_unresolved_env => {
+                    Ok(Value::String(format!("<env:{}>", var_name)))
+                }
                 Err(_) => Err(ParseError::EnvVarNotSet(var_name)),
             }
         }
@@ -2391,5 +2412,64 @@ aws.s3.bucket {
             msg.contains("expected identifier in provider block"),
             "InternalError should format with expected and context, got: {msg}"
         );
+    }
+
+    #[test]
+    fn parse_env_var_unset_strict_mode_errors() {
+        let input = r#"
+            let my_bucket = aws.s3_bucket {
+                name = env("CARINA_DEFINITELY_NOT_SET_VAR_12345")
+            }
+        "#;
+
+        let result = parse(input);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, ParseError::EnvVarNotSet(ref name) if name == "CARINA_DEFINITELY_NOT_SET_VAR_12345"),
+            "Expected EnvVarNotSet error, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn parse_lenient_unset_env_var_produces_placeholder() {
+        let input = r#"
+            let my_bucket = aws.s3_bucket {
+                name = env("CARINA_DEFINITELY_NOT_SET_VAR_12345")
+            }
+        "#;
+
+        let result = parse_lenient(input).unwrap();
+        assert_eq!(
+            result.resources[0].attributes.get("name"),
+            Some(&Value::String(
+                "<env:CARINA_DEFINITELY_NOT_SET_VAR_12345>".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn parse_lenient_set_env_var_resolves_normally() {
+        // SAFETY: This test runs in isolation
+        unsafe {
+            env::set_var("CARINA_TEST_LENIENT_VAR", "resolved-value");
+        }
+
+        let input = r#"
+            let my_bucket = aws.s3_bucket {
+                name = env("CARINA_TEST_LENIENT_VAR")
+            }
+        "#;
+
+        let result = parse_lenient(input).unwrap();
+        assert_eq!(
+            result.resources[0].attributes.get("name"),
+            Some(&Value::String("resolved-value".to_string()))
+        );
+
+        // SAFETY: This test runs in isolation
+        unsafe {
+            env::remove_var("CARINA_TEST_LENIENT_VAR");
+        }
     }
 }
