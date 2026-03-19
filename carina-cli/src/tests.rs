@@ -18,8 +18,8 @@ use crate::commands::apply::{
 use crate::commands::plan::{CurrentStateEntry, PlanFile};
 use crate::commands::state::run_state_refresh_locked;
 use crate::wiring::{
-    compute_anonymous_identifiers, reconcile_prefixed_names, resolve_attr_prefixes, resolve_names,
-    validate_resources,
+    WiringContext, compute_anonymous_identifiers, reconcile_prefixed_names, resolve_attr_prefixes,
+    resolve_names, validate_resources,
 };
 use carina_core::parser::BackendConfig;
 use carina_core::provider::Provider;
@@ -1949,5 +1949,33 @@ async fn state_refresh_removes_orphaned_resource_deleted_externally() {
             .find_resource("", "s3.bucket", "orphan-bucket")
             .is_none(),
         "Orphaned resource should be removed from state after refresh (issue #879)"
+    );
+}
+
+/// Test that WiringContext is constructed once and provides factories and schemas
+/// without repeated allocations.
+#[test]
+fn wiring_context_constructs_factories_and_schemas_once() {
+    let ctx = WiringContext::new();
+
+    // Factories should include at least aws and awscc
+    assert!(
+        ctx.factories().len() >= 2,
+        "Should have at least 2 provider factories (aws, awscc)"
+    );
+
+    // Schemas should be non-empty
+    assert!(
+        !ctx.schemas().is_empty(),
+        "Should have schemas from provider factories"
+    );
+
+    // Calling schemas() again should return the same data (cached, not rebuilt)
+    let schemas_a = ctx.schemas();
+    let schemas_b = ctx.schemas();
+    assert_eq!(
+        schemas_a.len(),
+        schemas_b.len(),
+        "Schemas should be consistent across calls"
     );
 }

@@ -10,7 +10,7 @@ use carina_core::module_resolver;
 use carina_core::provider::{self as provider_mod};
 
 use crate::error::AppError;
-use crate::wiring::{get_schemas, provider_factories};
+use crate::wiring::WiringContext;
 
 /// A lint warning with file, line, and message info.
 struct LintWarning {
@@ -28,8 +28,9 @@ pub fn run_lint(path: &PathBuf) -> Result<(), AppError> {
     module_resolver::resolve_modules(&mut parsed, base_dir)
         .map_err(|e| format!("Module resolution error: {}", e))?;
 
-    let factories = provider_factories();
-    let schemas = get_schemas();
+    let ctx = WiringContext::new();
+    let factories = ctx.factories();
+    let schemas = ctx.schemas();
 
     // Collect source texts for each .crn file
     let source_texts: Vec<(PathBuf, String)> = if path.is_file() {
@@ -57,7 +58,7 @@ pub fn run_lint(path: &PathBuf) -> Result<(), AppError> {
     let mut all_list_struct_attrs: HashSet<String> = HashSet::new();
     let mut block_name_suggestions: HashMap<String, String> = HashMap::new();
     for resource in &parsed.resources {
-        let schema_key = provider_mod::schema_key_for_resource(&factories, resource);
+        let schema_key = provider_mod::schema_key_for_resource(factories, resource);
         if let Some(schema) = schemas.get(&schema_key) {
             all_list_struct_attrs.extend(list_struct_attr_names(schema));
             for (attr_name, attr_schema) in &schema.attributes {

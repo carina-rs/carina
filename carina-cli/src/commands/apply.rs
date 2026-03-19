@@ -25,8 +25,8 @@ use crate::commands::state::map_lock_error;
 use crate::display::{format_effect, print_plan};
 use crate::error::AppError;
 use crate::wiring::{
-    create_providers_from_configs, get_provider, get_schemas, provider_factories,
-    reconcile_anonymous_identifiers, reconcile_prefixed_names, resolve_names,
+    WiringContext, create_providers_from_configs, get_provider_with_ctx,
+    reconcile_anonymous_identifiers_with_ctx, reconcile_prefixed_names, resolve_names_with_ctx,
 };
 
 /// Apply permanent name overrides from state to desired resources.
@@ -737,6 +737,7 @@ pub async fn detect_drift(
 }
 
 pub async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), AppError> {
+    let ctx = WiringContext::new();
     let loaded = load_configuration(path)?;
     let mut parsed = loaded.parsed;
     let backend_file = loaded.backend_file;
@@ -798,8 +799,7 @@ pub async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), AppErro
                 let backend_provider_name = backend
                     .provider_name()
                     .ok_or("Backend does not specify a provider name")?;
-                let factories = provider_factories();
-                let factory = provider_mod::find_factory(&factories, backend_provider_name)
+                let factory = provider_mod::find_factory(ctx.factories(), backend_provider_name)
                     .ok_or_else(|| {
                         format!("No provider factory found for '{}'", backend_provider_name)
                     })?;
@@ -902,7 +902,7 @@ pub async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), AppErro
                     {
                         return Err(AppError::Config(format!("Module resolution error: {}", e)));
                     }
-                    resolve_names(&mut parsed.resources)?;
+                    resolve_names_with_ctx(&ctx, &mut parsed.resources)?;
                 } else {
                     return Err(AppError::Config(format!(
                         "Backend bucket '{}' not found and auto_create is disabled",
@@ -945,7 +945,7 @@ pub async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), AppErro
 
     // All code after lock acquisition is wrapped so that lock release is guaranteed
     let lock_info = lock.as_ref().expect("lock should have been acquired");
-    let op_result = run_apply_locked(&mut parsed, auto_approve, backend.as_ref(), lock_info).await;
+    let op_result = run_apply_locked(&ctx, &mut parsed, auto_approve, backend.as_ref(), lock_info).await;
 
     // Always release lock, regardless of whether the operation succeeded
     let release_result = backend
@@ -962,6 +962,7 @@ pub async fn run_apply(path: &PathBuf, auto_approve: bool) -> Result<(), AppErro
 }
 
 async fn run_apply_locked(
+    ctx: &WiringContext,
     parsed: &mut carina_core::parser::ParsedFile,
     auto_approve: bool,
     backend: &dyn StateBackend,
@@ -971,14 +972,16 @@ async fn run_apply_locked(
     let state_file = backend.read_state().await.map_err(AppError::Backend)?;
 
     reconcile_prefixed_names(&mut parsed.resources, &state_file);
-    reconcile_anonymous_identifiers(&mut parsed.resources, &state_file);
+    if let Some(sf) = state_file.as_ref() {
+        reconcile_anonymous_identifiers_with_ctx(ctx, &mut parsed.resources, sf);
+    }
     apply_name_overrides(&mut parsed.resources, &state_file);
 
     // Sort resources by dependencies
     let sorted_resources = sort_resources_by_dependencies(&parsed.resources)?;
 
     // Select appropriate Provider based on configuration
-    let provider = get_provider(parsed).await;
+    let provider = get_provider_with_ctx(ctx, parsed).await;
 
     // Read states for all resources using identifier from state
     // In identifier-based approach, if there's no identifier in state, the resource doesn't exist
@@ -1038,7 +1041,7 @@ async fn run_apply_locked(
         .as_ref()
         .map(|sf| sf.build_lifecycles())
         .unwrap_or_default();
-    let schemas = get_schemas();
+    let schemas = ctx.schemas();
     let prev_desired_keys = state_file
         .as_ref()
         .map(|sf| sf.build_desired_keys())
@@ -1047,7 +1050,7 @@ async fn run_apply_locked(
         &resources_for_plan,
         &current_states,
         &lifecycles,
-        &schemas,
+        schemas,
         &saved_attrs,
         &prev_desired_keys,
     );
