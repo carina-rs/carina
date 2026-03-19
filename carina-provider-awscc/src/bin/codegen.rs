@@ -3062,8 +3062,6 @@ fn is_ipam_pool_id_property(prop_name: &str) -> bool {
     lower.ends_with("poolid")
 }
 
-/// Returns (type_string, Option<EnumInfo>)
-/// EnumInfo is Some if this property is an enum that should use AttributeType::Custom
 /// Return the correct list constructor based on insertionOrder.
 /// CloudFormation defaults insertionOrder to true when not specified.
 fn list_constructor(insertion_order: Option<bool>) -> &'static str {
@@ -3074,6 +3072,8 @@ fn list_constructor(insertion_order: Option<bool>) -> &'static str {
     }
 }
 
+/// Returns (type_string, Option<EnumInfo>)
+/// EnumInfo is Some if this property is an enum that should use AttributeType::Custom
 fn cfn_type_to_carina_type_with_enum(
     prop: &CfnProperty,
     prop_name: &str,
