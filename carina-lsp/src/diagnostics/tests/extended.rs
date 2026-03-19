@@ -657,3 +657,67 @@ output {
         diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
     );
 }
+
+#[test]
+fn undefined_reference_detected_for_non_id_name_properties() {
+    let engine = test_engine();
+    let doc = create_document(
+        r#"provider awscc {
+region = awscc.Region.ap_northeast_1
+}
+
+awscc.ec2.vpc {
+name = "test-vpc"
+cidr_block = "10.0.0.0/16"
+}
+
+awscc.ec2.subnet {
+name = "test-subnet"
+vpc_id = nonexistent_vpc.vpc_id
+cidr_block = "10.0.1.0/24"
+}"#,
+    );
+
+    let diagnostics = engine.analyze(&doc, None);
+
+    let undefined_diag = diagnostics
+        .iter()
+        .find(|d| d.message.contains("Undefined") && d.message.contains("nonexistent_vpc"));
+    assert!(
+        undefined_diag.is_some(),
+        "Should warn about undefined reference 'nonexistent_vpc.vpc_id'. Got diagnostics: {:?}",
+        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn defined_reference_not_flagged_for_non_id_name_properties() {
+    let engine = test_engine();
+    let doc = create_document(
+        r#"provider awscc {
+region = awscc.Region.ap_northeast_1
+}
+
+let main_vpc = awscc.ec2.vpc {
+name = "test-vpc"
+cidr_block = "10.0.0.0/16"
+}
+
+awscc.ec2.subnet {
+name = "test-subnet"
+vpc_id = main_vpc.vpc_id
+cidr_block = "10.0.1.0/24"
+}"#,
+    );
+
+    let diagnostics = engine.analyze(&doc, None);
+
+    let undefined_diag = diagnostics
+        .iter()
+        .find(|d| d.message.contains("Undefined") && d.message.contains("main_vpc"));
+    assert!(
+        undefined_diag.is_none(),
+        "Should NOT warn about defined binding 'main_vpc'. Got diagnostics: {:?}",
+        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}

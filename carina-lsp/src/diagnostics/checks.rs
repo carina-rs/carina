@@ -594,7 +594,7 @@ impl DiagnosticEngine {
         let mut diagnostics = Vec::new();
 
         for (line_idx, line) in text.lines().enumerate() {
-            // Look for patterns like "binding_name.id" or "binding_name.name" after "="
+            // Look for patterns like "binding_name.property" after "="
             if let Some(eq_byte_pos) = line.find('=') {
                 let after_eq = &line[eq_byte_pos + 1..];
                 let after_eq_trimmed = after_eq.trim_start();
@@ -626,11 +626,11 @@ impl DiagnosticEngine {
                         .unwrap_or(after_dot.len());
                     let property = &after_dot[..prop_end];
 
-                    // Check if this looks like a resource reference (e.g., main_vpc.id)
-                    if (property == "id" || property == "name")
-                        && !identifier.is_empty()
+                    // Check if this looks like a resource reference (e.g., main_vpc.id, bucket.arn)
+                    if !identifier.is_empty()
+                        && !property.is_empty()
                         && identifier.chars().all(|c| c.is_alphanumeric() || c == '_')
-                        && !identifier.starts_with(|c: char| c.is_uppercase())
+                        && identifier.starts_with(|c: char| c.is_ascii_lowercase() || c == '_')
                     {
                         // Check if the binding is defined
                         if !defined_bindings.contains(identifier) {
