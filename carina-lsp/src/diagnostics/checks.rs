@@ -626,9 +626,9 @@ impl DiagnosticEngine {
                         .unwrap_or(after_dot.len());
                     let property = &after_dot[..prop_end];
 
-                    // Check if this looks like a resource reference (e.g., main_vpc.id)
-                    if (property == "id" || property == "name")
-                        && !identifier.is_empty()
+                    // Check if this looks like a resource reference (e.g., main_vpc.id, bucket.arn)
+                    if !identifier.is_empty()
+                        && !property.is_empty()
                         && identifier.chars().all(|c| c.is_alphanumeric() || c == '_')
                         && !identifier.starts_with(|c: char| c.is_uppercase())
                     {
