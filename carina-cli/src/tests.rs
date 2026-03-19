@@ -12,8 +12,8 @@ use carina_core::resource::{LifecycleConfig, Resource, ResourceId, State, Value}
 use carina_state::{BackendError, LockInfo, ResourceState, StateBackend, StateFile};
 
 use crate::commands::apply::{
-    ApplyResult, ApplyStateSave, build_state_after_apply, detect_drift, finalize_apply,
-    queue_state_refresh, refresh_pending_states,
+    ApplyResult, ApplyStateSave, build_state_after_apply, detect_drift, execute_effects,
+    finalize_apply, queue_state_refresh, refresh_pending_states,
 };
 use crate::commands::plan::{CurrentStateEntry, PlanFile};
 use crate::wiring::{
@@ -1368,5 +1368,221 @@ async fn lock_released_on_write_state_failure() {
     assert!(
         lock_released.load(Ordering::SeqCst),
         "Lock should be released even when write_state fails"
+    );
+}
+
+/// Mock provider that records update calls for verification.
+/// Used to test that dependents with their own Update effects get the new
+/// (post-replacement) dependency IDs, not stale pre-replacement IDs.
+struct RecordingProvider {
+    /// Tracks the `to` resource passed to each update call, keyed by resource ID string.
+    update_calls: std::sync::Mutex<Vec<(String, Resource)>>,
+}
+
+impl RecordingProvider {
+    fn new() -> Self {
+        Self {
+            update_calls: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    fn get_update_calls(&self) -> Vec<(String, Resource)> {
+        self.update_calls.lock().unwrap().clone()
+    }
+}
+
+impl Provider for RecordingProvider {
+    fn name(&self) -> &'static str {
+        "test"
+    }
+
+    fn read(
+        &self,
+        id: &ResourceId,
+        _identifier: Option<&str>,
+    ) -> BoxFuture<'_, ProviderResult<State>> {
+        let id = id.clone();
+        Box::pin(async move { Ok(State::not_found(id)) })
+    }
+
+    fn create(&self, resource: &Resource) -> BoxFuture<'_, ProviderResult<State>> {
+        // Return a state with a new identifier to simulate resource creation
+        let mut attrs = resource.attributes.clone();
+        // Simulate AWS returning a new ID
+        attrs.insert("vpc_id".to_string(), Value::String("vpc-NEW".to_string()));
+        let state = State::existing(resource.id.clone(), attrs).with_identifier("vpc-NEW");
+        Box::pin(async move { Ok(state) })
+    }
+
+    fn update(
+        &self,
+        id: &ResourceId,
+        _identifier: &str,
+        _from: &State,
+        to: &Resource,
+    ) -> BoxFuture<'_, ProviderResult<State>> {
+        self.update_calls
+            .lock()
+            .unwrap()
+            .push((id.to_string(), to.clone()));
+        let state =
+            State::existing(id.clone(), to.attributes.clone()).with_identifier("subnet-123");
+        Box::pin(async move { Ok(state) })
+    }
+
+    fn delete(
+        &self,
+        _id: &ResourceId,
+        _identifier: &str,
+        _lifecycle: &LifecycleConfig,
+    ) -> BoxFuture<'_, ProviderResult<()>> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+/// Regression test for #865: when a resource is replaced via create_before_destroy
+/// and a dependent resource has its own Update effect, the dependent's `to` state
+/// should reference the new (post-replacement) resource ID, not the old one.
+#[tokio::test]
+async fn update_effect_resolves_refs_against_post_replacement_binding_map() {
+    let vpc_id = ResourceId::new("ec2.vpc", "my-vpc");
+    let subnet_id = ResourceId::new("ec2.subnet", "my-subnet");
+
+    // --- Unresolved resources (before ref resolution) ---
+    let vpc_unresolved = Resource::new("ec2.vpc", "my-vpc")
+        .with_attribute("_binding", Value::String("vpc".to_string()))
+        .with_attribute("cidr_block", Value::String("10.1.0.0/16".to_string()));
+
+    let subnet_unresolved = Resource::new("ec2.subnet", "my-subnet")
+        .with_attribute("_binding", Value::String("subnet".to_string()))
+        .with_attribute(
+            "vpc_id",
+            Value::ResourceRef {
+                binding_name: "vpc".to_string(),
+                attribute_name: "vpc_id".to_string(),
+            },
+        )
+        .with_attribute("cidr_block", Value::String("10.1.2.0/24".to_string()));
+
+    // --- Resolved resources (after ref resolution with old state) ---
+    // The subnet's vpc_id has been eagerly resolved to "vpc-OLD"
+    let subnet_resolved = Resource::new("ec2.subnet", "my-subnet")
+        .with_attribute("_binding", Value::String("subnet".to_string()))
+        .with_attribute("vpc_id", Value::String("vpc-OLD".to_string()))
+        .with_attribute("cidr_block", Value::String("10.1.2.0/24".to_string()));
+
+    // --- Current states ---
+    let mut current_states = HashMap::new();
+
+    let mut vpc_attrs = HashMap::new();
+    vpc_attrs.insert(
+        "cidr_block".to_string(),
+        Value::String("10.0.0.0/16".to_string()),
+    );
+    vpc_attrs.insert("vpc_id".to_string(), Value::String("vpc-OLD".to_string()));
+    current_states.insert(
+        vpc_id.clone(),
+        State::existing(vpc_id.clone(), vpc_attrs).with_identifier("vpc-OLD"),
+    );
+
+    let mut subnet_attrs = HashMap::new();
+    subnet_attrs.insert("vpc_id".to_string(), Value::String("vpc-OLD".to_string()));
+    subnet_attrs.insert(
+        "cidr_block".to_string(),
+        Value::String("10.1.1.0/24".to_string()),
+    );
+    current_states.insert(
+        subnet_id.clone(),
+        State::existing(subnet_id.clone(), subnet_attrs).with_identifier("subnet-123"),
+    );
+
+    // --- Build plan ---
+    // VPC: Replace with create_before_destroy (no cascading updates for subnet
+    //       because subnet already has its own Update effect)
+    // Subnet: Update (cidr_block changed, vpc_id eagerly resolved to old value)
+    let mut plan = Plan::new();
+    plan.add(Effect::Replace {
+        id: vpc_id.clone(),
+        from: Box::new(current_states.get(&vpc_id).unwrap().clone()),
+        to: vpc_unresolved
+            .clone()
+            .with_attribute("_binding", Value::String("vpc".to_string())),
+        lifecycle: LifecycleConfig {
+            force_delete: false,
+            create_before_destroy: true,
+        },
+        changed_create_only: vec!["cidr_block".to_string()],
+        cascading_updates: vec![],
+        temporary_name: None,
+    });
+    plan.add(Effect::Update {
+        id: subnet_id.clone(),
+        from: Box::new(current_states.get(&subnet_id).unwrap().clone()),
+        to: subnet_resolved.clone(), // Has stale "vpc-OLD" in vpc_id
+        changed_attributes: vec!["cidr_block".to_string()],
+    });
+
+    // --- Initial binding map (with old state) ---
+    let mut binding_map: HashMap<String, HashMap<String, Value>> = HashMap::new();
+    binding_map.insert(
+        "vpc".to_string(),
+        HashMap::from([
+            ("vpc_id".to_string(), Value::String("vpc-OLD".to_string())),
+            (
+                "cidr_block".to_string(),
+                Value::String("10.0.0.0/16".to_string()),
+            ),
+            ("_binding".to_string(), Value::String("vpc".to_string())),
+        ]),
+    );
+    binding_map.insert(
+        "subnet".to_string(),
+        HashMap::from([
+            ("vpc_id".to_string(), Value::String("vpc-OLD".to_string())),
+            (
+                "cidr_block".to_string(),
+                Value::String("10.1.1.0/24".to_string()),
+            ),
+            ("_binding".to_string(), Value::String("subnet".to_string())),
+        ]),
+    );
+
+    // --- Unresolved resource map ---
+    let unresolved_resources: HashMap<ResourceId, Resource> = HashMap::from([
+        (vpc_id.clone(), vpc_unresolved),
+        (subnet_id.clone(), subnet_unresolved),
+    ]);
+
+    // --- Execute ---
+    let provider = RecordingProvider::new();
+    let result = execute_effects(
+        &plan,
+        &provider,
+        &mut binding_map,
+        &mut current_states,
+        &unresolved_resources,
+    )
+    .await;
+
+    assert_eq!(result.success_count, 2, "Both effects should succeed");
+    assert_eq!(result.failure_count, 0, "No effects should fail");
+
+    // --- Verify the subnet update received the NEW vpc_id ---
+    let update_calls = provider.get_update_calls();
+    let subnet_update = update_calls
+        .iter()
+        .find(|(id_str, _)| id_str.contains("subnet"))
+        .expect("Should have an update call for subnet");
+
+    let vpc_id_in_update = subnet_update
+        .1
+        .attributes
+        .get("vpc_id")
+        .expect("subnet update should have vpc_id attribute");
+
+    assert_eq!(
+        *vpc_id_in_update,
+        Value::String("vpc-NEW".to_string()),
+        "Subnet update should reference the NEW vpc_id (vpc-NEW), not the stale old one (vpc-OLD)"
     );
 }
