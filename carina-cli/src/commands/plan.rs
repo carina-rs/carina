@@ -60,6 +60,7 @@ pub async fn run_plan(
     path: &PathBuf,
     out: Option<&PathBuf>,
     compact: bool,
+    tui: bool,
 ) -> Result<bool, AppError> {
     let mut parsed = load_configuration(path)?.parsed;
 
@@ -167,7 +168,12 @@ pub async fn run_plan(
 
     let ctx = create_plan_from_parsed(&parsed, &state_file).await?;
     let has_changes = ctx.plan.mutation_count() > 0;
-    print_plan(&ctx.plan, compact);
+
+    if tui {
+        carina_tui::run(&ctx.plan).map_err(|e| AppError::Config(format!("TUI error: {}", e)))?;
+    } else {
+        print_plan(&ctx.plan, compact);
+    }
 
     // Save plan to file if --out was specified
     if let Some(out_path) = out {

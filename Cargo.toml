@@ -10,5 +10,6 @@ members = [
     "carina-provider-mock",
     "carina-smithy",
     "carina-state",
+    "carina-tui",
 ]
 resolver = "2"
