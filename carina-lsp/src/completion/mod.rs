@@ -61,7 +61,13 @@ impl CompletionProvider {
             CompletionContext::AfterEquals {
                 resource_type,
                 attr_name,
-            } => self.value_completions_for_attr(&resource_type, &attr_name, &text),
+                current_binding,
+            } => self.value_completions_for_attr(
+                &resource_type,
+                &attr_name,
+                &text,
+                current_binding.as_deref(),
+            ),
             CompletionContext::InsideStructBlock {
                 resource_type,
                 attr_path,
@@ -119,6 +125,7 @@ impl CompletionProvider {
         // Check if we're inside a resource block or module call and find the type
         let mut brace_depth: i32 = 0;
         let mut resource_type = String::new();
+        let mut current_binding: Option<String> = None;
         let mut module_name: Option<String> = None;
         let mut provider_block_name: Option<String> = None;
         // Track nested block names at each depth level (index 0 = depth 1, etc.)
@@ -136,6 +143,13 @@ impl CompletionProvider {
             {
                 resource_type = rt;
                 module_name = None;
+                // Extract binding name from "let binding_name = resource_type {"
+                current_binding = trimmed
+                    .strip_prefix("let ")
+                    .and_then(|rest| rest.find('=').map(|eq| rest[..eq].trim().to_string()))
+                    .filter(|name| {
+                        !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_')
+                    });
             } else if brace_depth == 0 && trimmed.starts_with("provider ") && trimmed.ends_with('{')
             {
                 // Detect "provider <name> {"
@@ -188,6 +202,7 @@ impl CompletionProvider {
                     brace_depth -= 1;
                     if brace_depth == 0 {
                         resource_type.clear();
+                        current_binding = None;
                         module_name = None;
                         provider_block_name = None;
                         nested_block_names.clear();
@@ -246,6 +261,7 @@ impl CompletionProvider {
                 return CompletionContext::AfterEquals {
                     resource_type: resource_type.clone(),
                     attr_name,
+                    current_binding: current_binding.clone(),
                 };
             }
         }
@@ -421,6 +437,7 @@ enum CompletionContext {
     AfterEquals {
         resource_type: String,
         attr_name: String,
+        current_binding: Option<String>,
     },
     InsideStructBlock {
         resource_type: String,

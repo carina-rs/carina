@@ -346,3 +346,196 @@ fn nested_struct_completions_via_block_name_in_path() {
         field_names
     );
 }
+
+#[test]
+fn type_based_completion_for_route_table_id() {
+    // When editing `route_table_id = ` inside an ec2.route block,
+    // and there's a `let rt = awscc.ec2.route_table { ... }` binding,
+    // completion should suggest `rt.route_table_id` because:
+    // - route_table_id in ec2.route has type Custom("RouteTableId")
+    // - ec2.route_table has attribute route_table_id with type Custom("RouteTableId")
+    let provider = test_provider();
+    let doc = create_document(
+        r#"let rt = awscc.ec2.route_table {
+    vpc_id = "vpc-123"
+}
+
+awscc.ec2.route {
+    route_table_id =
+}"#,
+    );
+    // Cursor after "route_table_id = " (line 5)
+    let position = Position {
+        line: 5,
+        character: 22,
+    };
+
+    let completions = provider.complete(&doc, position, None);
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+
+    // Should suggest rt.route_table_id (type-based match: RouteTableId)
+    assert!(
+        labels.contains(&"rt.route_table_id"),
+        "Should suggest rt.route_table_id for route_table_id attribute (type-based). Got: {:?}",
+        labels
+    );
+}
+
+#[test]
+fn type_based_completion_for_vpc_id() {
+    // When editing `vpc_id = ` inside an ec2.subnet block,
+    // and there's a `let vpc = awscc.ec2.vpc { ... }` binding,
+    // completion should suggest `vpc.vpc_id` because:
+    // - vpc_id in ec2.subnet has type Custom("VpcId")
+    // - ec2.vpc has attribute vpc_id with type Custom("VpcId")
+    let provider = test_provider();
+    let doc = create_document(
+        r#"let vpc = awscc.ec2.vpc {
+    cidr_block = "10.0.0.0/16"
+}
+
+awscc.ec2.subnet {
+    vpc_id =
+}"#,
+    );
+    // Cursor after "vpc_id = " (line 5)
+    let position = Position {
+        line: 5,
+        character: 14,
+    };
+
+    let completions = provider.complete(&doc, position, None);
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+
+    // Should suggest vpc.vpc_id (type-based match: VpcId)
+    assert!(
+        labels.contains(&"vpc.vpc_id"),
+        "Should suggest vpc.vpc_id for vpc_id attribute (type-based). Got: {:?}",
+        labels
+    );
+}
+
+#[test]
+fn type_based_completion_does_not_suggest_wrong_type() {
+    // When editing `vpc_id = ` inside an ec2.subnet block,
+    // a `let rt = awscc.ec2.route_table` binding should NOT be suggested
+    // because route_table has no attribute of type VpcId that matches.
+    // (route_table does have vpc_id, but the test verifies that rt is not
+    // suggested with the wrong attribute like rt.route_table_id)
+    let provider = test_provider();
+    let doc = create_document(
+        r#"let rt = awscc.ec2.route_table {
+    vpc_id = "vpc-123"
+}
+
+awscc.ec2.subnet {
+    vpc_id =
+}"#,
+    );
+    // Cursor after "vpc_id = " (line 5)
+    let position = Position {
+        line: 5,
+        character: 14,
+    };
+
+    let completions = provider.complete(&doc, position, None);
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+
+    // Should NOT suggest rt.route_table_id (wrong type: RouteTableId != VpcId)
+    assert!(
+        !labels.contains(&"rt.route_table_id"),
+        "Should NOT suggest rt.route_table_id for vpc_id attribute (type mismatch). Got: {:?}",
+        labels
+    );
+
+    // rt.vpc_id SHOULD be suggested (route_table has vpc_id of type VpcId)
+    assert!(
+        labels.contains(&"rt.vpc_id"),
+        "Should suggest rt.vpc_id for vpc_id attribute (type-based match). Got: {:?}",
+        labels
+    );
+}
+
+#[test]
+fn type_based_completion_does_not_suggest_region_or_boolean() {
+    // For reference attributes like route_table_id (Custom("RouteTableId")),
+    // completions should NOT include Region values or boolean values.
+    // This is the catch-all fix from #906.
+    let provider = test_provider();
+    let doc = create_document(
+        r#"let rt = awscc.ec2.route_table {
+    vpc_id = "vpc-123"
+}
+
+awscc.ec2.route {
+    route_table_id =
+}"#,
+    );
+    let position = Position {
+        line: 5,
+        character: 22,
+    };
+
+    let completions = provider.complete(&doc, position, None);
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+
+    // Should NOT suggest boolean values
+    assert!(
+        !labels.contains(&"true"),
+        "Should NOT suggest 'true' for route_table_id. Got: {:?}",
+        labels
+    );
+    assert!(
+        !labels.contains(&"false"),
+        "Should NOT suggest 'false' for route_table_id. Got: {:?}",
+        labels
+    );
+
+    // Should NOT suggest Region values
+    let has_region = labels.iter().any(|l| l.contains("Region."));
+    assert!(
+        !has_region,
+        "Should NOT suggest Region values for route_table_id. Got: {:?}",
+        labels
+    );
+}
+
+#[test]
+fn type_based_completion_excludes_self_reference() {
+    // When editing `internet_gateway_id = ` inside a vpc_gateway_attachment block,
+    // and the block itself is bound as `let igw_attachment = awscc.ec2.vpc_gateway_attachment { ... }`,
+    // completion should NOT suggest `igw_attachment.internet_gateway_id` (self-reference).
+    // It should only suggest references from OTHER bindings.
+    let provider = test_provider();
+    let doc = create_document(
+        r#"let igw = awscc.ec2.internet_gateway {
+}
+
+let igw_attachment = awscc.ec2.vpc_gateway_attachment {
+    internet_gateway_id =
+}"#,
+    );
+    // Cursor after "internet_gateway_id = " (line 4)
+    let position = Position {
+        line: 4,
+        character: 27,
+    };
+
+    let completions = provider.complete(&doc, position, None);
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+
+    // Should NOT suggest igw_attachment.internet_gateway_id (self-reference)
+    let has_self_ref = labels.iter().any(|l| l.starts_with("igw_attachment."));
+    assert!(
+        !has_self_ref,
+        "Should NOT suggest self-references (igw_attachment.*). Got: {:?}",
+        labels
+    );
+
+    // Should suggest igw.internet_gateway_id (from another binding)
+    assert!(
+        labels.contains(&"igw.internet_gateway_id"),
+        "Should suggest igw.internet_gateway_id from another binding. Got: {:?}",
+        labels
+    );
+}
