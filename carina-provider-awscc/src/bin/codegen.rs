@@ -1408,6 +1408,13 @@ fn generate_schema_code(schema: &CfnSchema, type_name: &str) -> Result<String> {
     // Determine has_tags from tagging metadata
     let has_tags = schema.tagging.as_ref().map(|t| t.taggable).unwrap_or(false);
 
+    // Check if this resource has mutually exclusive field groups
+    const EXCLUSIVE_FIELDS: &[(&str, &[&[&str]])] = &[(
+        "AWS::EC2::VPCGatewayAttachment",
+        &[&["InternetGatewayId", "VpnGatewayId"]],
+    )];
+    let has_exclusive_fields = EXCLUSIVE_FIELDS.iter().any(|(t, _)| *t == type_name);
+
     // Generate header with conditional imports
     let mut schema_imports = vec!["AttributeSchema", "ResourceSchema"];
     if needs_attribute_type {
@@ -1418,6 +1425,9 @@ fn generate_schema_code(schema: &CfnSchema, type_name: &str) -> Result<String> {
     }
     if needs_types {
         schema_imports.push("types");
+    }
+    if has_exclusive_fields {
+        schema_imports.push("validators");
     }
     let schema_imports_str = schema_imports.join(", ");
     code.push_str(&format!(
@@ -1908,6 +1918,31 @@ pub fn {}() -> AwsccSchemaConfig {{
     const FORCE_REPLACE_TYPES: &[&str] = &["AWS::EC2::InternetGateway", "AWS::EC2::IPAM"];
     if FORCE_REPLACE_TYPES.contains(&type_name) {
         code.push_str("        .force_replace()\n");
+    }
+
+    // Generate validator for mutually exclusive field groups.
+    let exclusive_groups: Vec<&[&str]> = EXCLUSIVE_FIELDS
+        .iter()
+        .filter(|(t, _)| *t == type_name)
+        .flat_map(|(_, groups)| groups.iter().copied())
+        .collect();
+    if !exclusive_groups.is_empty() {
+        code.push_str("        .with_validator(|attrs| {\n");
+        code.push_str("            let mut errors = Vec::new();\n");
+        for group in &exclusive_groups {
+            let fields_str = group
+                .iter()
+                .map(|f| format!("\"{}\"", f.to_snake_case()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            code.push_str(&format!(
+                "            if let Err(mut e) = validators::validate_exclusive_required(attrs, &[{}]) {{\n                errors.append(&mut e);\n            }}\n",
+                fields_str
+            ));
+        }
+        code.push_str(
+            "            if errors.is_empty() { Ok(()) } else { Err(errors) }\n        })\n",
+        );
     }
 
     // Close the schema (ResourceSchema) and the AwsccSchemaConfig struct

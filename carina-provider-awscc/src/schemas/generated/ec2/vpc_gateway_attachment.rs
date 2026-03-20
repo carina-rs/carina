@@ -5,7 +5,7 @@
 //! DO NOT EDIT MANUALLY - regenerate with carina-codegen
 
 use super::AwsccSchemaConfig;
-use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, validators};
 
 /// Returns the schema config for ec2_vpc_gateway_attachment (AWS::EC2::VPCGatewayAttachment)
 pub fn ec2_vpc_gateway_attachment_config() -> AwsccSchemaConfig {
@@ -38,6 +38,13 @@ pub fn ec2_vpc_gateway_attachment_config() -> AwsccSchemaConfig {
                 .with_description("The ID of the virtual private gateway. You must specify either InternetGatewayId or VpnGatewayId, but not both.")
                 .with_provider_name("VpnGatewayId"),
         )
+        .with_validator(|attrs| {
+            let mut errors = Vec::new();
+            if let Err(mut e) = validators::validate_exclusive_required(attrs, &["internet_gateway_id", "vpn_gateway_id"]) {
+                errors.append(&mut e);
+            }
+            if errors.is_empty() { Ok(()) } else { Err(errors) }
+        })
     }
 }
 

@@ -127,4 +127,112 @@ mod tests {
                 .join("\n")
         );
     }
+
+    /// VPCGatewayAttachment requires exactly one of internet_gateway_id or vpn_gateway_id.
+    /// Specifying both should be rejected by the schema validator.
+    /// See: https://github.com/carina-rs/carina/issues/925
+    #[test]
+    fn vpc_gateway_attachment_rejects_both_internet_and_vpn_gateway() {
+        use carina_core::resource::Value;
+        use std::collections::HashMap;
+
+        let config = get_config("ec2.vpc_gateway_attachment").unwrap();
+        let schema = &config.schema;
+
+        // Providing both internet_gateway_id and vpn_gateway_id should fail validation
+        let mut attrs = HashMap::new();
+        attrs.insert(
+            "vpc_id".to_string(),
+            Value::String("vpc-12345678".to_string()),
+        );
+        attrs.insert(
+            "internet_gateway_id".to_string(),
+            Value::String("igw-12345678".to_string()),
+        );
+        attrs.insert(
+            "vpn_gateway_id".to_string(),
+            Value::String("vgw-12345678".to_string()),
+        );
+
+        let result = schema.validate(&attrs);
+        assert!(
+            result.is_err(),
+            "Expected validation error when both internet_gateway_id and vpn_gateway_id are specified"
+        );
+
+        let errors = result.unwrap_err();
+        let error_messages: Vec<String> = errors.iter().map(|e| e.to_string()).collect();
+        assert!(
+            error_messages
+                .iter()
+                .any(|msg| msg.contains("internet_gateway_id") && msg.contains("vpn_gateway_id")),
+            "Expected error mentioning both internet_gateway_id and vpn_gateway_id, got: {:?}",
+            error_messages
+        );
+    }
+
+    /// VPCGatewayAttachment should accept exactly one of internet_gateway_id or vpn_gateway_id.
+    /// See: https://github.com/carina-rs/carina/issues/925
+    #[test]
+    fn vpc_gateway_attachment_accepts_single_gateway() {
+        use carina_core::resource::Value;
+        use std::collections::HashMap;
+
+        let config = get_config("ec2.vpc_gateway_attachment").unwrap();
+        let schema = &config.schema;
+
+        // Only internet_gateway_id - should pass
+        let mut attrs_igw = HashMap::new();
+        attrs_igw.insert(
+            "vpc_id".to_string(),
+            Value::String("vpc-12345678".to_string()),
+        );
+        attrs_igw.insert(
+            "internet_gateway_id".to_string(),
+            Value::String("igw-12345678".to_string()),
+        );
+        assert!(
+            schema.validate(&attrs_igw).is_ok(),
+            "Should accept internet_gateway_id alone"
+        );
+
+        // Only vpn_gateway_id - should pass
+        let mut attrs_vpn = HashMap::new();
+        attrs_vpn.insert(
+            "vpc_id".to_string(),
+            Value::String("vpc-12345678".to_string()),
+        );
+        attrs_vpn.insert(
+            "vpn_gateway_id".to_string(),
+            Value::String("vgw-12345678".to_string()),
+        );
+        assert!(
+            schema.validate(&attrs_vpn).is_ok(),
+            "Should accept vpn_gateway_id alone"
+        );
+    }
+
+    /// VPCGatewayAttachment should reject when neither internet_gateway_id nor vpn_gateway_id is specified.
+    /// See: https://github.com/carina-rs/carina/issues/925
+    #[test]
+    fn vpc_gateway_attachment_rejects_neither_gateway() {
+        use carina_core::resource::Value;
+        use std::collections::HashMap;
+
+        let config = get_config("ec2.vpc_gateway_attachment").unwrap();
+        let schema = &config.schema;
+
+        // Neither gateway specified - should fail
+        let mut attrs = HashMap::new();
+        attrs.insert(
+            "vpc_id".to_string(),
+            Value::String("vpc-12345678".to_string()),
+        );
+
+        let result = schema.validate(&attrs);
+        assert!(
+            result.is_err(),
+            "Expected validation error when neither internet_gateway_id nor vpn_gateway_id is specified"
+        );
+    }
 }
