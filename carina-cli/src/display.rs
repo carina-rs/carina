@@ -189,7 +189,18 @@ fn extract_compact_hint(
         .collect();
     keys.sort();
 
-    // Priority 1: First non-parent ResourceRef attribute (direct or inside a List)
+    // Priority 1: First distinguishing string attribute (most identifying)
+    for key in &keys {
+        if let Some(Value::String(s)) = resource.attributes.get(*key)
+            && !s.is_empty()
+        {
+            let short_key = shorten_attr_name(key);
+            let display_value = shorten_service_name(key, s);
+            return Some(format!("{}: {}", short_key, display_value));
+        }
+    }
+
+    // Priority 2: First non-parent ResourceRef attribute (direct or inside a List)
     for key in &keys {
         match resource.attributes.get(*key) {
             Some(Value::ResourceRef { binding_name, .. }) => {
@@ -211,17 +222,6 @@ fn extract_compact_hint(
                 }
             }
             _ => {}
-        }
-    }
-
-    // Priority 2: First distinguishing string attribute
-    for key in &keys {
-        if let Some(Value::String(s)) = resource.attributes.get(*key)
-            && !s.is_empty()
-        {
-            let short_key = shorten_attr_name(key);
-            let display_value = shorten_service_name(key, s);
-            return Some(format!("{}: {}", short_key, display_value));
         }
     }
 
@@ -1491,9 +1491,9 @@ mod tests {
         assert_eq!(hint, None);
     }
 
-    /// Test that extract_compact_hint prefers ResourceRef over string.
+    /// Test that extract_compact_hint prefers string over ResourceRef.
     #[test]
-    fn test_extract_compact_hint_prefers_resource_ref_over_string() {
+    fn test_extract_compact_hint_prefers_string_over_resource_ref() {
         let mut r = Resource::new("ec2.route", "hash_mixed");
         r.attributes.insert(
             "destination".to_string(),
@@ -1508,8 +1508,8 @@ mod tests {
         );
 
         let hint = extract_compact_hint(&r, None);
-        // ResourceRef takes priority over string
-        assert_eq!(hint, Some("gateway: igw".to_string()));
+        // String takes priority over ResourceRef
+        assert_eq!(hint, Some("destination: 10.0.0.0/8".to_string()));
     }
 
     /// Test that extract_compact_hint shortens service_name values.
@@ -1556,9 +1556,9 @@ mod tests {
         assert_eq!(hint, Some("description: Allow HTTPS from VPC".to_string()));
     }
 
-    /// Test that extract_compact_hint returns only the first non-parent ref, skipping parent.
+    /// Test that extract_compact_hint prefers string over ResourceRef for vpc_endpoint.
     #[test]
-    fn test_extract_compact_hint_first_non_parent_ref() {
+    fn test_extract_compact_hint_prefers_string_for_vpc_endpoint() {
         let mut r = Resource::new("ec2.vpc_endpoint", "hash_ep");
         r.attributes.insert(
             "service_name".to_string(),
@@ -1579,9 +1579,9 @@ mod tests {
             },
         );
 
-        // Parent is vpc, so vpc_id ref is skipped; first non-parent ref is security_group_ids
+        // String attribute (service_name) takes priority over ResourceRef
         let hint = extract_compact_hint(&r, Some("vpc"));
-        assert_eq!(hint, Some("security_group: endpoint_sg".to_string()));
+        assert_eq!(hint, Some("service: ecr.dkr".to_string()));
     }
 
     /// Test that has_binding correctly detects bound vs anonymous resources.
