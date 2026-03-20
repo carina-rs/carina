@@ -9,7 +9,7 @@ provider aws {
 aws.s3.bucket {
   bucket = "carina-acc-test-aws-s3-acl-update"
 
-  acl = aws.s3.bucket.ACL.private
+  acl              = aws.s3.bucket.ACL.private
   object_ownership = aws.s3.bucket.ObjectOwnership.BucketOwnerPreferred
 
   tags = {

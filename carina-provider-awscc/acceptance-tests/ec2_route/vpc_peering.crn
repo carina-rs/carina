@@ -25,7 +25,7 @@ let rt = awscc.ec2.route_table {
 }
 
 awscc.ec2.route {
-  route_table_id             = rt.route_table_id
-  destination_cidr_block     = "10.1.0.0/16"
-  vpc_peering_connection_id  = peering.id
+  route_table_id            = rt.route_table_id
+  destination_cidr_block    = "10.1.0.0/16"
+  vpc_peering_connection_id = peering.id
 }
