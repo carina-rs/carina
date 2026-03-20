@@ -560,7 +560,7 @@ impl Formatter {
             }
         }
 
-        if self.nested_block_has_content(node) {
+        if self.block_has_content(node) {
             self.write(" {");
             self.write_newline();
             self.current_indent += 1;
@@ -574,13 +574,6 @@ impl Formatter {
             self.write(" {}");
         }
         self.write_newline();
-    }
-
-    fn nested_block_has_content(&self, node: &CstNode) -> bool {
-        node.children.iter().any(|child| {
-            matches!(child, CstChild::Node(n) if n.kind == NodeKind::Attribute || n.kind == NodeKind::NestedBlock)
-                || matches!(child, CstChild::Trivia(Trivia::LineComment(_)))
-        })
     }
 
     fn block_has_content(&self, node: &CstNode) -> bool {
