@@ -136,12 +136,19 @@ fn build_single_parent_tree(
         dependents.entry(parent).or_default().push(*idx);
     }
 
-    // Add nested-under-dependent resources as children of their first dependent
+    // Add nested-under-dependent resources as children of the shallowest
+    // referencing resource. This ensures resources like IGW are nested under
+    // igw_attachment (depth 1) rather than route (depth 2+).
     for &idx in &nested_under_dependent {
         let mut children = all_dependents.get(&idx).cloned().unwrap_or_default();
-        children.sort_by_key(|a| sort_key(a));
-        if let Some(&first_dependent) = children.first() {
-            dependents.entry(first_dependent).or_default().push(idx);
+        // Pick the shallowest dependent; break ties by (resource_type, binding_name)
+        children.sort_by(|a, b| {
+            let da = depth.get(a).copied().unwrap_or(usize::MAX);
+            let db = depth.get(b).copied().unwrap_or(usize::MAX);
+            da.cmp(&db).then_with(|| sort_key(a).cmp(&sort_key(b)))
+        });
+        if let Some(&best_dependent) = children.first() {
+            dependents.entry(best_dependent).or_default().push(idx);
         }
     }
 
@@ -1142,6 +1149,70 @@ mod tests {
             "Only vpc should be a root. igw (index 2) is referenced by other resources \
              and should be nested, not a disconnected root. Got roots: {:?}",
             roots
+        );
+    }
+
+    /// Issue #933: A dependency-free resource that is referenced by multiple
+    /// resources should be nested under the shallowest referencing resource.
+    ///
+    /// Scenario:
+    ///   - vpc (root, depth 0)
+    ///   - rt depends on vpc (depth 1)
+    ///   - igw_attachment depends on vpc, igw (depth 1)
+    ///   - route depends on rt, igw (depth 2, under rt)
+    ///   - igw: no deps (referenced by route at depth 2, igw_attachment at depth 1)
+    ///
+    /// IGW should be nested under igw_attachment (depth 1), not route (depth 2).
+    #[test]
+    fn test_dependency_free_resource_nested_under_shallowest_referencing_resource() {
+        let vpc = make_resource("ec2.vpc", "vpc", "vpc", &[]);
+        let rt = make_resource("ec2.route_table", "rt", "rt", &["vpc"]);
+        let igw = make_resource("ec2.internet_gateway", "igw", "igw", &[]);
+        let route = make_resource("ec2.route", "route", "route", &["rt", "igw"]);
+        let igw_attachment = make_resource(
+            "ec2.vpc_gateway_attachment",
+            "igw_attachment",
+            "igw_attachment",
+            &["vpc", "igw"],
+        );
+
+        let mut plan = Plan::new();
+        plan.add(Effect::Create(vpc));
+        plan.add(Effect::Create(rt));
+        plan.add(Effect::Create(igw));
+        plan.add(Effect::Create(route));
+        plan.add(Effect::Create(igw_attachment));
+
+        let (roots, dependents, effect_bindings, _) = build_plan_tree(&plan);
+
+        assert_eq!(roots, vec![0], "Only vpc should be root");
+
+        // igw_attachment is index 4, route is index 3, igw is index 2
+        // igw should be a child of igw_attachment (depth 1), NOT route (depth 2)
+        let igw_attachment_children: Vec<String> = dependents
+            .get(&4)
+            .unwrap()
+            .iter()
+            .filter_map(|&idx| effect_bindings.get(&idx).cloned())
+            .collect();
+        assert!(
+            igw_attachment_children.contains(&"igw".to_string()),
+            "igw should be nested under igw_attachment (shallowest referencing resource at depth 1). \
+             igw_attachment children: {:?}",
+            igw_attachment_children
+        );
+
+        let route_children: Vec<String> = dependents
+            .get(&3)
+            .unwrap()
+            .iter()
+            .filter_map(|&idx| effect_bindings.get(&idx).cloned())
+            .collect();
+        assert!(
+            !route_children.contains(&"igw".to_string()),
+            "igw should NOT be nested under route (deeper at depth 2). \
+             route children: {:?}",
+            route_children
         );
     }
 }
