@@ -1,5 +1,7 @@
 //! Attribute, value, and type-specific completions.
 
+use std::path::Path;
+
 use tower_lsp::lsp_types::{
     Command, CompletionItem, CompletionItemKind, InsertTextFormat, Position, Range, TextEdit,
 };
@@ -66,12 +68,34 @@ impl CompletionProvider {
         resource_type: &str,
         attr_name: &str,
         text: &str,
+        base_path: Option<&Path>,
     ) -> Vec<CompletionItem> {
         let mut completions = Vec::new();
 
         // For attributes ending with _id (like vpc_id, route_table_id), suggest resource bindings
         if attr_name.ends_with("_id") {
-            let bindings = self.extract_resource_bindings(text);
+            let mut bindings = self.extract_resource_bindings(text);
+
+            // Also scan sibling .crn files in the same directory
+            if let Some(base) = base_path
+                && let Some(dir) = base.parent()
+                && let Ok(entries) = std::fs::read_dir(dir)
+            {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.extension().is_some_and(|ext| ext == "crn")
+                        && path != base
+                        && let Ok(sibling_text) = std::fs::read_to_string(&path)
+                    {
+                        for b in self.extract_resource_bindings(&sibling_text) {
+                            if !bindings.contains(&b) {
+                                bindings.push(b);
+                            }
+                        }
+                    }
+                }
+            }
+
             for binding_name in bindings {
                 // Add completion with .id suffix (e.g., main_vpc.id)
                 completions.push(CompletionItem {
@@ -199,7 +223,7 @@ impl CompletionProvider {
                 }
                 completions
             }
-            _ => self.generic_value_completions(),
+            _ => vec![],
         }
     }
 

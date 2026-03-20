@@ -61,7 +61,7 @@ impl CompletionProvider {
             CompletionContext::AfterEquals {
                 resource_type,
                 attr_name,
-            } => self.value_completions_for_attr(&resource_type, &attr_name, &text),
+            } => self.value_completions_for_attr(&resource_type, &attr_name, &text, base_path),
             CompletionContext::InsideStructBlock {
                 resource_type,
                 attr_path,

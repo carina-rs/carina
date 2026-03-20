@@ -346,3 +346,178 @@ fn nested_struct_completions_via_block_name_in_path() {
         field_names
     );
 }
+
+#[test]
+fn route_table_id_completions_should_not_include_region_values() {
+    // Issue #906: When typing a value for `route_table_id` in an `awscc.ec2.route` block,
+    // the LSP should suggest resource reference bindings (e.g., `rt.id`) but NOT
+    // Region values (e.g., `aws.Region.ap_northeast_1`).
+    let provider = test_provider();
+
+    let text = r#"let rt = awscc.ec2.route_table {
+  vpc_id = vpc.id
+}
+
+awscc.ec2.route {
+  route_table_id =
+}
+"#;
+
+    let completions =
+        provider.value_completions_for_attr("awscc.ec2.route", "route_table_id", text, None);
+
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+
+    // Should include resource reference binding completion
+    assert!(
+        labels.contains(&"rt.id"),
+        "Should suggest 'rt.id' as a completion for route_table_id. Got: {:?}",
+        labels
+    );
+
+    // Should NOT include Region values
+    let has_region = labels.iter().any(|l| l.contains("Region"));
+    assert!(
+        !has_region,
+        "Should NOT suggest Region values for route_table_id. Got: {:?}",
+        labels
+    );
+
+    // Should NOT include generic boolean values
+    assert!(
+        !labels.contains(&"true"),
+        "Should NOT suggest 'true' for route_table_id. Got: {:?}",
+        labels
+    );
+    assert!(
+        !labels.contains(&"false"),
+        "Should NOT suggest 'false' for route_table_id. Got: {:?}",
+        labels
+    );
+}
+
+#[test]
+fn vpc_id_completions_should_not_include_region_values() {
+    let provider = test_provider();
+
+    let text = r#"let main_vpc = awscc.ec2.vpc {
+  cidr_block = "10.0.0.0/16"
+}
+
+awscc.ec2.route_table {
+  vpc_id =
+}
+"#;
+
+    let completions =
+        provider.value_completions_for_attr("awscc.ec2.route_table", "vpc_id", text, None);
+
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+
+    assert!(
+        labels.contains(&"main_vpc.id"),
+        "Should suggest 'main_vpc.id' for vpc_id. Got: {:?}",
+        labels
+    );
+
+    let has_region = labels.iter().any(|l| l.contains("Region"));
+    assert!(
+        !has_region,
+        "Should NOT suggest Region values for vpc_id. Got: {:?}",
+        labels
+    );
+
+    assert!(
+        !labels.contains(&"true") && !labels.contains(&"false"),
+        "Should NOT suggest boolean values for vpc_id. Got: {:?}",
+        labels
+    );
+}
+
+#[test]
+fn subnet_id_completions_should_not_include_region_values() {
+    let provider = test_provider();
+
+    let text = r#"let web_subnet = awscc.ec2.subnet {
+  vpc_id = vpc.id
+  cidr_block = "10.0.1.0/24"
+}
+
+awscc.ec2.subnet_route_table_association {
+  subnet_id =
+}
+"#;
+
+    let completions = provider.value_completions_for_attr(
+        "awscc.ec2.subnet_route_table_association",
+        "subnet_id",
+        text,
+        None,
+    );
+
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+
+    assert!(
+        labels.contains(&"web_subnet.id"),
+        "Should suggest 'web_subnet.id' for subnet_id. Got: {:?}",
+        labels
+    );
+
+    let has_region = labels.iter().any(|l| l.contains("Region"));
+    assert!(
+        !has_region,
+        "Should NOT suggest Region values for subnet_id. Got: {:?}",
+        labels
+    );
+}
+
+#[test]
+fn sibling_crn_files_provide_bindings_for_id_completions() {
+    use std::io::Write;
+
+    let provider = test_provider();
+
+    // Create a temp directory with two .crn files
+    let dir = tempfile::tempdir().unwrap();
+
+    let vpc_file = dir.path().join("vpc.crn");
+    let mut f = std::fs::File::create(&vpc_file).unwrap();
+    writeln!(
+        f,
+        "let main_vpc = awscc.ec2.vpc {{\n  cidr_block = \"10.0.0.0/16\"\n}}"
+    )
+    .unwrap();
+
+    let route_file = dir.path().join("route.crn");
+    let mut f = std::fs::File::create(&route_file).unwrap();
+    writeln!(
+        f,
+        "let rt = awscc.ec2.route_table {{\n  vpc_id = main_vpc.id\n}}\n\nawscc.ec2.route {{\n  route_table_id =\n}}"
+    )
+    .unwrap();
+
+    // The current file is route.crn; main_vpc binding is in vpc.crn (sibling)
+    let route_text = std::fs::read_to_string(&route_file).unwrap();
+    let completions = provider.value_completions_for_attr(
+        "awscc.ec2.route",
+        "route_table_id",
+        &route_text,
+        Some(&route_file),
+    );
+
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+
+    // Should include binding from the current file
+    assert!(
+        labels.contains(&"rt.id"),
+        "Should suggest 'rt.id' from current file. Got: {:?}",
+        labels
+    );
+
+    // Should include binding from the sibling file
+    assert!(
+        labels.contains(&"main_vpc.id"),
+        "Should suggest 'main_vpc.id' from sibling vpc.crn. Got: {:?}",
+        labels
+    );
+}
