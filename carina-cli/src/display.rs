@@ -269,11 +269,11 @@ fn format_compact_name(
     parent_binding: Option<&str>,
 ) -> String {
     if has_binding(resource) {
-        format!("\"{}\"", name)
+        name.to_string()
     } else if let Some(hint) = extract_compact_hint(resource, parent_binding) {
         format!("({})", hint)
     } else {
-        format!("\"{}\"", name)
+        name.to_string()
     }
 }
 
@@ -389,7 +389,7 @@ pub fn print_plan(plan: &Plan, compact: bool) {
                     );
                 } else {
                     println!(
-                        "{}{}{} {} \"{}\"",
+                        "{}{}{} {} {}",
                         base_indent,
                         connector,
                         colored_symbol,
@@ -447,7 +447,7 @@ pub fn print_plan(plan: &Plan, compact: bool) {
                     );
                 } else {
                     println!(
-                        "{}{}{} {} \"{}\"",
+                        "{}{}{} {} {}",
                         base_indent,
                         connector,
                         colored_symbol,
@@ -544,7 +544,7 @@ pub fn print_plan(plan: &Plan, compact: bool) {
                     );
                 } else {
                     println!(
-                        "{}{}{} {} \"{}\" {}",
+                        "{}{}{} {} {} {}",
                         base_indent,
                         connector,
                         colored_symbol,
@@ -639,7 +639,7 @@ pub fn print_plan(plan: &Plan, compact: bool) {
                         );
                         for cascade in cascading_updates {
                             println!(
-                                "{}  ~ {} \"{}\"",
+                                "{}  ~ {} {}",
                                 attr_prefix,
                                 cascade.id.display_type().cyan(),
                                 cascade.id.name.magenta()
@@ -650,7 +650,7 @@ pub fn print_plan(plan: &Plan, compact: bool) {
             }
             Effect::Delete { id, .. } => {
                 println!(
-                    "{}{}{} {} \"{}\"",
+                    "{}{}{} {} {}",
                     base_indent,
                     connector,
                     colored_symbol,
@@ -673,7 +673,7 @@ pub fn print_plan(plan: &Plan, compact: bool) {
                     );
                 } else {
                     println!(
-                        "{}{}{} {} \"{}\" {}",
+                        "{}{}{} {} {} {}",
                         base_indent,
                         connector,
                         colored_symbol,
@@ -1597,17 +1597,20 @@ mod tests {
         assert!(!has_binding(&anonymous));
     }
 
-    /// Test that format_compact_name shows quotes for bound resources and
+    /// Test that format_compact_name shows plain identifiers for bound resources and
     /// parenthesized hints for anonymous resources.
     #[test]
     fn test_format_compact_name_bound_resource() {
         let mut r = Resource::new("ec2.vpc", "vpc");
         r.attributes
             .insert("_binding".to_string(), Value::String("vpc".to_string()));
-        // For bound resources, should show "name" in quotes
+        // For bound resources, should show name as plain identifier (no quotes)
         let result = format_compact_name(&r, "vpc", None);
-        assert!(result.contains('"'), "Bound resource name should be quoted");
-        assert!(result.contains("vpc"), "Should contain the binding name");
+        assert!(
+            !result.contains('"'),
+            "Bound resource name should not be quoted"
+        );
+        assert_eq!(result, "vpc", "Should be the plain binding name");
     }
 
     #[test]
