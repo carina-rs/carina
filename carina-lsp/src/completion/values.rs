@@ -22,7 +22,7 @@ impl CompletionProvider {
             arguments: None,
         };
 
-        // Get schema for specific resource type, or fall back to all schemas
+        // Get schema for specific resource type
         if let Some(schema) = self.schemas.get(resource_type) {
             for attr in schema.attributes.values() {
                 let detail = attr.description.clone();
