@@ -504,15 +504,19 @@ impl Formatter {
             }
         }
 
-        self.write(" {");
-        self.write_newline();
-        self.current_indent += 1;
+        if self.block_has_content(node) {
+            self.write(" {");
+            self.write_newline();
+            self.current_indent += 1;
 
-        self.format_block_attributes(node);
+            self.format_block_attributes(node);
 
-        self.current_indent -= 1;
-        self.write_indent();
-        self.write("}");
+            self.current_indent -= 1;
+            self.write_indent();
+            self.write("}");
+        } else {
+            self.write(" {}");
+        }
         self.write_newline();
     }
 
@@ -527,15 +531,25 @@ impl Formatter {
             }
         }
 
-        self.write(" {");
-        self.write_newline();
-        self.current_indent += 1;
+        if self.block_has_content(node) {
+            self.write(" {");
+            self.write_newline();
+            self.current_indent += 1;
 
-        self.format_block_attributes(node);
+            self.format_block_attributes(node);
 
-        self.current_indent -= 1;
-        self.write_indent();
-        self.write("}");
+            self.current_indent -= 1;
+            self.write_indent();
+            self.write("}");
+        } else {
+            self.write(" {}");
+        }
+    }
+
+    fn block_has_content(&self, node: &CstNode) -> bool {
+        node.children
+            .iter()
+            .any(|child| matches!(child, CstChild::Node(n) if n.kind == NodeKind::Attribute))
     }
 
     fn format_block_attributes(&mut self, node: &CstNode) {
@@ -1177,6 +1191,64 @@ mod tests {
         assert!(
             tags_line.trim().starts_with("tags ="),
             "tags should have minimal padding"
+        );
+    }
+
+    #[test]
+    fn test_format_empty_anonymous_resource_block() {
+        // Empty anonymous resource block should be formatted on a single line
+        let input = "awscc.ec2.internet_gateway {\n}\n";
+        let config = FormatConfig::default();
+        let result = format(input, &config).unwrap();
+
+        assert_eq!(
+            result, "awscc.ec2.internet_gateway {}\n",
+            "Empty anonymous resource block should be on a single line, got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_format_empty_let_binding_resource_block() {
+        // Empty let binding resource block should be formatted on a single line
+        let input = "let igw = awscc.ec2.internet_gateway {\n}\n";
+        let config = FormatConfig::default();
+        let result = format(input, &config).unwrap();
+
+        assert_eq!(
+            result, "let igw = awscc.ec2.internet_gateway {}\n",
+            "Empty let binding resource block should be on a single line, got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_format_nonempty_block_remains_multiline() {
+        // Non-empty blocks should remain multi-line
+        let input = "awscc.ec2.vpc {\n  cidr_block = \"10.0.0.0/16\"\n}\n";
+        let config = FormatConfig::default();
+        let result = format(input, &config).unwrap();
+
+        assert_eq!(
+            result, "awscc.ec2.vpc {\n  cidr_block = \"10.0.0.0/16\"\n}\n",
+            "Non-empty block should remain multi-line, got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_format_empty_block_idempotent() {
+        // Formatting an already-formatted empty block should be idempotent
+        let input = "let igw = awscc.ec2.internet_gateway {}\n";
+        let config = FormatConfig::default();
+
+        let first = format(input, &config).unwrap();
+        let second = format(&first, &config).unwrap();
+
+        assert_eq!(first, second, "Empty block formatting should be idempotent");
+        assert_eq!(
+            first, "let igw = awscc.ec2.internet_gateway {}\n",
+            "Empty block should stay on a single line"
         );
     }
 }
