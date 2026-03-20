@@ -13,14 +13,14 @@ awscc.iam.role {
     version = "2012-10-17"
     statement {
       effect    = "Allow"
-      principal = { service = "lambda.amazonaws.com" }
+      principal = {
+        service = "lambda.amazonaws.com"
+      }
       action    = "sts:AssumeRole"
     }
   }
 
-  managed_policy_arns = [
-    "arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess"
-  ]
+  managed_policy_arns = ["arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess"]
 
   tags = {
     Environment = "acceptance-test"

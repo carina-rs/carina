@@ -22,7 +22,7 @@ awscc.s3.bucket {
 
   logging_configuration = {
     destination_bucket_name = log_bucket.bucket_name
-    log_file_prefix        = "access-logs/"
+    log_file_prefix         = "access-logs/"
   }
 
   lifecycle {

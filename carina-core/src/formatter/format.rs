@@ -107,6 +107,7 @@ impl Formatter {
             NodeKind::AnonymousResource => self.format_anonymous_resource(node),
             NodeKind::ResourceExpr => self.format_resource_expr(node),
             NodeKind::Attribute => self.format_attribute(node, 0),
+            NodeKind::NestedBlock => self.format_nested_block(node),
             NodeKind::InputParam => self.format_input_param(node, 0),
             NodeKind::OutputParam => self.format_output_param(node, 0),
             NodeKind::PipeExpr => self.format_pipe_expr(node),
@@ -546,9 +547,38 @@ impl Formatter {
         }
     }
 
+    fn format_nested_block(&mut self, node: &CstNode) {
+        self.write_indent();
+
+        // Find and write block name (identifier)
+        for child in &node.children {
+            if let CstChild::Token(token) = child
+                && self.is_identifier(&token.text)
+            {
+                self.write(&token.text);
+                break;
+            }
+        }
+
+        if self.block_has_content(node) {
+            self.write(" {");
+            self.write_newline();
+            self.current_indent += 1;
+
+            self.format_block_attributes(node);
+
+            self.current_indent -= 1;
+            self.write_indent();
+            self.write("}");
+        } else {
+            self.write(" {}");
+        }
+        self.write_newline();
+    }
+
     fn block_has_content(&self, node: &CstNode) -> bool {
         node.children.iter().any(|child| {
-            matches!(child, CstChild::Node(n) if n.kind == NodeKind::Attribute)
+            matches!(child, CstChild::Node(n) if n.kind == NodeKind::Attribute || n.kind == NodeKind::NestedBlock)
                 || matches!(child, CstChild::Trivia(Trivia::LineComment(_)))
         })
     }
@@ -565,7 +595,9 @@ impl Formatter {
         let mut newline_count = 0;
         for child in &node.children {
             match child {
-                CstChild::Node(n) if n.kind == NodeKind::Attribute => {
+                CstChild::Node(n)
+                    if n.kind == NodeKind::Attribute || n.kind == NodeKind::NestedBlock =>
+                {
                     // Write any pending standalone comments
                     for comment in pending_comments.drain(..) {
                         self.write_indent();
@@ -619,10 +651,11 @@ impl Formatter {
                 self.write_newline();
             }
 
-            // Calculate max key length for this group only
+            // Calculate max key length for this group only (excluding nested blocks)
             let max_key_len = if self.config.align_attributes {
                 group
                     .iter()
+                    .filter(|attr| attr.kind == NodeKind::Attribute)
                     .filter_map(|attr| self.get_attribute_key(attr))
                     .map(|k| k.len())
                     .max()
@@ -631,10 +664,14 @@ impl Formatter {
                 0
             };
 
-            // Format each attribute in this group
+            // Format each attribute/nested block in this group
             for attr in group {
-                let inline_comment = inline_comments.get(&global_attr_index);
-                self.format_attribute_aligned(attr, max_key_len, inline_comment.copied());
+                if attr.kind == NodeKind::NestedBlock {
+                    self.format_nested_block(attr);
+                } else {
+                    let inline_comment = inline_comments.get(&global_attr_index);
+                    self.format_attribute_aligned(attr, max_key_len, inline_comment.copied());
+                }
                 global_attr_index += 1;
             }
         }
@@ -818,13 +855,13 @@ impl Formatter {
     fn format_map(&mut self, node: &CstNode) {
         self.write("{");
 
-        // Collect map entries
-        let entries: Vec<&CstNode> = node
+        // Collect map entries and nested blocks
+        let items: Vec<&CstNode> = node
             .children
             .iter()
             .filter_map(|child| {
                 if let CstChild::Node(n) = child
-                    && n.kind == NodeKind::MapEntry
+                    && (n.kind == NodeKind::MapEntry || n.kind == NodeKind::NestedBlock)
                 {
                     return Some(n);
                 }
@@ -832,7 +869,7 @@ impl Formatter {
             })
             .collect();
 
-        if entries.is_empty() {
+        if items.is_empty() {
             self.write("}");
             return;
         }
@@ -840,10 +877,11 @@ impl Formatter {
         self.write_newline();
         self.current_indent += 1;
 
-        // Calculate max key length for alignment
+        // Calculate max key length for alignment (only map entries)
         let max_key_len = if self.config.align_attributes {
-            entries
+            items
                 .iter()
+                .filter(|item| item.kind == NodeKind::MapEntry)
                 .filter_map(|entry| self.get_map_entry_key(entry))
                 .map(|k| k.len())
                 .max()
@@ -852,9 +890,13 @@ impl Formatter {
             0
         };
 
-        // Format each entry
-        for entry in entries {
-            self.format_map_entry_aligned(entry, max_key_len);
+        // Format each item
+        for item in items {
+            if item.kind == NodeKind::NestedBlock {
+                self.format_nested_block(item);
+            } else {
+                self.format_map_entry_aligned(item, max_key_len);
+            }
         }
 
         self.current_indent -= 1;
@@ -1250,6 +1292,60 @@ mod tests {
         assert_eq!(
             first, "let igw = awscc.ec2.internet_gateway {}\n",
             "Empty block should stay on a single line"
+        );
+    }
+
+    #[test]
+    fn test_format_nested_block() {
+        let input = r#"awscc.ec2.security_group {
+  vpc_id = "vpc-123"
+
+  security_group_ingress {
+    ip_protocol = "tcp"
+    from_port   = 80
+    to_port     = 80
+  }
+}
+"#;
+        let config = FormatConfig::default();
+        let result = format(input, &config).unwrap();
+
+        assert!(result.contains("security_group_ingress {"));
+        assert!(result.contains("    ip_protocol = \"tcp\""));
+        assert!(result.contains("    from_port"));
+        assert!(result.contains("    to_port"));
+
+        // Idempotency
+        let second = format(&result, &config).unwrap();
+        assert_eq!(
+            result, second,
+            "Nested block formatting should be idempotent"
+        );
+    }
+
+    #[test]
+    fn test_format_nested_block_in_map() {
+        let input = r#"awscc.iam.role {
+  assume_role_policy_document = {
+    version = "2012-10-17"
+    statement {
+      effect = "Allow"
+      action = "sts:AssumeRole"
+    }
+  }
+}
+"#;
+        let config = FormatConfig::default();
+        let result = format(input, &config).unwrap();
+
+        assert!(result.contains("statement {"));
+        assert!(result.contains("effect = \"Allow\""));
+
+        // Idempotency
+        let second = format(&result, &config).unwrap();
+        assert_eq!(
+            result, second,
+            "Nested block in map formatting should be idempotent"
         );
     }
 }
