@@ -1,19 +1,183 @@
 //! UI rendering for the TUI plan viewer
 
+use std::collections::{HashMap, HashSet};
+
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
+use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
 
-use crate::app::{App, EffectKind, VisibleRow};
+use crate::app::{App, EffectKind};
 
-/// Draw the main layout with tree view (full width) and help bar (bottom)
+/// Draw the main layout: tree (70%), detail panel (30%), help bar (1 line)
 pub fn draw(frame: &mut Frame, app: &App) {
-    let main_chunks = Layout::default()
+    let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .constraints([
+            Constraint::Percentage(70),
+            Constraint::Percentage(30),
+            Constraint::Length(1),
+        ])
         .split(frame.area());
 
-    draw_tree(frame, app, main_chunks[0]);
+    draw_tree(frame, app, chunks[0]);
+    draw_detail(frame, app, chunks[1]);
+    draw_help(frame, chunks[2]);
+}
 
+/// Draw the tree view (compact, no inline attributes)
+fn draw_tree(frame: &mut Frame, app: &App, area: Rect) {
+    let visible = app.visible_nodes();
+
+    let items: Vec<ListItem> = visible
+        .iter()
+        .enumerate()
+        .map(|(row_idx, &node_idx)| {
+            let node = &app.nodes[node_idx];
+            let connector = build_tree_connector(node_idx, app);
+            let expand_marker = if !node.children.is_empty() {
+                if node.expanded { "[-]" } else { "[+]" }
+            } else {
+                "   "
+            };
+            let effect_color = effect_style(node.kind);
+            let mut spans = vec![
+                Span::raw(connector),
+                Span::styled(format!("{} {} ", expand_marker, node.symbol), effect_color),
+                Span::styled(
+                    node.resource_type.clone(),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(" "),
+                Span::styled(node.name_part.clone(), effect_color),
+            ];
+            if app.selected == row_idx {
+                spans = spans
+                    .into_iter()
+                    .map(|s| {
+                        let mut style = s.style;
+                        style = style.add_modifier(Modifier::BOLD);
+                        Span::styled(s.content, style)
+                    })
+                    .collect();
+            }
+            ListItem::new(Line::from(spans))
+        })
+        .collect();
+
+    let title = format!(" Plan ({}) ", app.summary);
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .title(title)
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::White)),
+        )
+        .highlight_style(
+            Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        );
+
+    let mut state = app.list_state.clone();
+    frame.render_stateful_widget(list, area, &mut state);
+}
+
+/// Draw the detail panel showing attributes of the selected node
+fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
+    let node = match app.selected_node() {
+        Some(n) => n,
+        None => {
+            let block = Block::default()
+                .title(" Details ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::DarkGray));
+            frame.render_widget(block, area);
+            return;
+        }
+    };
+
+    let effect_color = effect_style(node.kind);
+    let mut lines: Vec<Line> = Vec::new();
+
+    // Header: symbol + resource type + name
+    lines.push(Line::from(vec![
+        Span::styled(format!("{} ", node.symbol), effect_color),
+        Span::styled(
+            node.resource_type.clone(),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" "),
+        Span::styled(node.name_part.clone(), effect_color),
+    ]));
+    lines.push(Line::from(""));
+
+    if node.attributes.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "(no attributes)",
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        let changed_set: HashSet<&str> =
+            node.changed_attributes.iter().map(|s| s.as_str()).collect();
+        let from_map: HashMap<&str, &str> = node
+            .from_attributes
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+
+        for (key, value) in &node.attributes {
+            let is_changed = changed_set.contains(key.as_str());
+
+            if is_changed {
+                if let Some(old_value) = from_map.get(key.as_str()) {
+                    lines.push(Line::from(vec![
+                        Span::styled(format!("  {}: ", key), Style::default().fg(Color::DarkGray)),
+                        Span::styled(
+                            old_value.to_string(),
+                            Style::default()
+                                .fg(Color::Red)
+                                .add_modifier(Modifier::CROSSED_OUT),
+                        ),
+                        Span::styled(" -> ", Style::default().fg(Color::DarkGray)),
+                        Span::styled(value.clone(), Style::default().fg(Color::Green)),
+                    ]));
+                } else {
+                    lines.push(Line::from(vec![
+                        Span::styled(format!("  {}: ", key), Style::default().fg(Color::DarkGray)),
+                        Span::styled(value.clone(), Style::default().fg(Color::Green)),
+                    ]));
+                }
+            } else {
+                let is_create = node.kind == EffectKind::Create || node.kind == EffectKind::Read;
+                let value_style = if is_create {
+                    Style::default().fg(Color::Green)
+                } else {
+                    Style::default()
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(format!("  {}: ", key), Style::default().fg(Color::DarkGray)),
+                    Span::styled(value.clone(), value_style),
+                ]));
+            }
+        }
+    }
+
+    let detail = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .title(" Details ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::White)),
+        )
+        .wrap(Wrap { trim: false });
+    frame.render_widget(detail, area);
+}
+
+/// Draw the help bar
+fn draw_help(frame: &mut Frame, area: Rect) {
     let help = Paragraph::new(Line::from(vec![
         Span::styled(
             " j/k",
@@ -65,139 +229,14 @@ pub fn draw(frame: &mut Frame, app: &App) {
         ),
         Span::raw(" quit"),
     ]));
-    frame.render_widget(help, main_chunks[1]);
-}
-
-/// Draw the tree view with inline attributes
-fn draw_tree(frame: &mut Frame, app: &App, area: Rect) {
-    let visible = app.visible_rows();
-
-    let items: Vec<ListItem> = visible
-        .iter()
-        .enumerate()
-        .map(|(row_idx, row)| match row {
-            VisibleRow::Node(idx) => {
-                let node = &app.nodes[*idx];
-                let connector = build_tree_connector(*idx, app);
-                let expand_marker = if !node.children.is_empty() || !node.attributes.is_empty() {
-                    if node.expanded { "[-]" } else { "[+]" }
-                } else {
-                    "   "
-                };
-                let effect_color = effect_style(node.kind);
-                let mut spans = vec![
-                    Span::raw(connector),
-                    Span::styled(format!("{} {} ", expand_marker, node.symbol), effect_color),
-                    Span::styled(
-                        node.resource_type.clone(),
-                        Style::default()
-                            .fg(Color::Cyan)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::raw(" "),
-                    Span::styled(node.name_part.clone(), effect_color),
-                ];
-                if app.selected_row == row_idx {
-                    // Bold the entire line for selected row via highlight_style
-                    spans = spans
-                        .into_iter()
-                        .map(|s| {
-                            let mut style = s.style;
-                            style = style.add_modifier(Modifier::BOLD);
-                            Span::styled(s.content, style)
-                        })
-                        .collect();
-                }
-                ListItem::new(Line::from(spans))
-            }
-            VisibleRow::Attribute {
-                node_idx,
-                key,
-                value,
-            } => {
-                let node = &app.nodes[*node_idx];
-                let attr_prefix = build_attribute_prefix(*node_idx, app);
-
-                let changed_set: std::collections::HashSet<&str> =
-                    node.changed_attributes.iter().map(|s| s.as_str()).collect();
-                let is_changed = changed_set.contains(key.as_str());
-
-                if is_changed {
-                    let from_map: std::collections::HashMap<&str, &str> = node
-                        .from_attributes
-                        .iter()
-                        .map(|(k, v)| (k.as_str(), v.as_str()))
-                        .collect();
-                    if let Some(old_value) = from_map.get(key.as_str()) {
-                        let line = Line::from(vec![
-                            Span::raw(attr_prefix),
-                            Span::styled(
-                                format!("{}: ", key),
-                                Style::default().fg(Color::DarkGray),
-                            ),
-                            Span::styled(
-                                old_value.to_string(),
-                                Style::default()
-                                    .fg(Color::Red)
-                                    .add_modifier(Modifier::CROSSED_OUT),
-                            ),
-                            Span::styled(" -> ", Style::default().fg(Color::DarkGray)),
-                            Span::styled(value.clone(), Style::default().fg(Color::Green)),
-                        ]);
-                        ListItem::new(line)
-                    } else {
-                        let line = Line::from(vec![
-                            Span::raw(attr_prefix),
-                            Span::styled(
-                                format!("{}: ", key),
-                                Style::default().fg(Color::DarkGray),
-                            ),
-                            Span::styled(value.clone(), Style::default().fg(Color::Green)),
-                        ]);
-                        ListItem::new(line)
-                    }
-                } else {
-                    let is_create =
-                        node.kind == EffectKind::Create || node.kind == EffectKind::Read;
-                    let value_style = if is_create {
-                        Style::default().fg(Color::Green)
-                    } else {
-                        Style::default()
-                    };
-                    let line = Line::from(vec![
-                        Span::raw(attr_prefix),
-                        Span::styled(format!("{}: ", key), Style::default().fg(Color::DarkGray)),
-                        Span::styled(value.clone(), value_style),
-                    ]);
-                    ListItem::new(line)
-                }
-            }
-        })
-        .collect();
-
-    let title = format!(" Plan ({}) ", app.summary);
-    let list = List::new(items)
-        .block(
-            Block::default()
-                .title(title)
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::White)),
-        )
-        .highlight_style(
-            Style::default()
-                .bg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD),
-        );
-
-    let mut state = app.list_state.clone();
-    frame.render_stateful_widget(list, area, &mut state);
+    frame.render_widget(help, area);
 }
 
 /// Build the tree connector prefix for a node.
 ///
 /// Each tree level uses exactly 4-character-wide segments:
 /// - Root nodes (depth 0): no connector
-/// - Children: `├── ` or `└── ` with continuation `│   ` or `    `
+/// - Children: `--- ` or `--- ` with continuation `|   ` or `    `
 fn build_tree_connector(idx: usize, app: &App) -> String {
     let node = &app.nodes[idx];
     if node.parent.is_none() {
@@ -241,56 +280,6 @@ fn build_tree_connector(idx: usize, app: &App) -> String {
     parts.reverse();
     // Base indentation (4 spaces) before tree connectors
     format!("    {}", parts.join(""))
-}
-
-/// Build the indentation prefix for attribute lines below a node.
-///
-/// Attributes are indented further than the node line, aligned past the
-/// expand marker and symbol area.
-fn build_attribute_prefix(idx: usize, app: &App) -> String {
-    let node = &app.nodes[idx];
-    if node.parent.is_none() {
-        // Root node: attributes indented past "[-] + " (8 spaces)
-        return "        ".to_string();
-    }
-
-    // For child nodes, the attribute prefix extends the tree connector with
-    // continuation lines (4 chars each), plus extra indentation for the content.
-    let mut parts: Vec<&str> = Vec::new();
-
-    // Continuation for this node's position among siblings (4 chars)
-    if let Some(parent_idx) = node.parent {
-        let siblings = &app.nodes[parent_idx].children;
-        let is_last = siblings.last() == Some(&idx);
-        if is_last {
-            parts.push("    ");
-        } else {
-            parts.push("│   ");
-        }
-    }
-
-    // Walk up ancestors (4 chars each)
-    let mut ancestor = node.parent;
-    while let Some(a_idx) = ancestor {
-        let a_node = &app.nodes[a_idx];
-        if a_node.parent.is_none() {
-            break;
-        }
-        if let Some(grandparent_idx) = a_node.parent {
-            let siblings = &app.nodes[grandparent_idx].children;
-            let is_last = siblings.last() == Some(&a_idx);
-            if is_last {
-                parts.push("    ");
-            } else {
-                parts.push("│   ");
-            }
-        }
-        ancestor = a_node.parent;
-    }
-
-    parts.reverse();
-    // base (4) + continuation segments + extra indent (4) to align past "[-] + "
-    format!("    {}    ", parts.join(""))
 }
 
 /// Return the style for a given effect kind
@@ -383,44 +372,5 @@ mod tests {
         let last_child = children[1];
         assert_eq!(build_tree_connector(first_child, &app), "    ├── ");
         assert_eq!(build_tree_connector(last_child, &app), "    └── ");
-    }
-
-    #[test]
-    fn attribute_prefix_for_root_node() {
-        let mut plan = Plan::new();
-        plan.add(Effect::Create(
-            Resource::new("ec2.vpc", "my-vpc")
-                .with_attribute("_binding", Value::String("vpc".to_string()))
-                .with_attribute("cidr_block", Value::String("10.0.0.0/16".to_string())),
-        ));
-        let app = App::new(&plan);
-        let prefix = build_attribute_prefix(0, &app);
-        assert_eq!(prefix, "        ");
-    }
-
-    #[test]
-    fn attribute_prefix_for_child_node() {
-        let mut plan = Plan::new();
-        plan.add(Effect::Create(
-            Resource::new("ec2.vpc", "my-vpc")
-                .with_attribute("_binding", Value::String("vpc".to_string())),
-        ));
-        plan.add(Effect::Create(
-            Resource::new("ec2.subnet", "my-subnet")
-                .with_attribute("_binding", Value::String("subnet".to_string()))
-                .with_attribute(
-                    "vpc_id",
-                    Value::ResourceRef {
-                        binding_name: "vpc".to_string(),
-                        attribute_name: "vpc_id".to_string(),
-                    },
-                )
-                .with_attribute("cidr_block", Value::String("10.0.1.0/24".to_string())),
-        ));
-        let app = App::new(&plan);
-        // Subnet is last child of VPC
-        let prefix = build_attribute_prefix(1, &app);
-        // Should be: "    " (base) + "    " (last child continuation) + "    " (content indent)
-        assert_eq!(prefix, "            ");
     }
 }
