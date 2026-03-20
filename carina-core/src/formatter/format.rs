@@ -1293,4 +1293,58 @@ mod tests {
             "Empty block should stay on a single line"
         );
     }
+
+    #[test]
+    fn test_format_nested_block() {
+        let input = r#"awscc.ec2.security_group {
+  vpc_id = "vpc-123"
+
+  security_group_ingress {
+    ip_protocol = "tcp"
+    from_port   = 80
+    to_port     = 80
+  }
+}
+"#;
+        let config = FormatConfig::default();
+        let result = format(input, &config).unwrap();
+
+        assert!(result.contains("security_group_ingress {"));
+        assert!(result.contains("    ip_protocol = \"tcp\""));
+        assert!(result.contains("    from_port"));
+        assert!(result.contains("    to_port"));
+
+        // Idempotency
+        let second = format(&result, &config).unwrap();
+        assert_eq!(
+            result, second,
+            "Nested block formatting should be idempotent"
+        );
+    }
+
+    #[test]
+    fn test_format_nested_block_in_map() {
+        let input = r#"awscc.iam.role {
+  assume_role_policy_document = {
+    version = "2012-10-17"
+    statement {
+      effect = "Allow"
+      action = "sts:AssumeRole"
+    }
+  }
+}
+"#;
+        let config = FormatConfig::default();
+        let result = format(input, &config).unwrap();
+
+        assert!(result.contains("statement {"));
+        assert!(result.contains("effect = \"Allow\""));
+
+        // Idempotency
+        let second = format(&result, &config).unwrap();
+        assert_eq!(
+            result, second,
+            "Nested block in map formatting should be idempotent"
+        );
+    }
 }
