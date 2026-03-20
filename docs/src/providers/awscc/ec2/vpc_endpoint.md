@@ -211,9 +211,9 @@ Shorthand formats: `Interface` or `VpcEndpointType.Interface`
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `dns_record_ip_type` | [Enum (DnsRecordIpType)](#dns_record_ip_type-dnsrecordiptype) | No | The DNS records created for the endpoint. |
-| `private_dns_only_for_inbound_resolver_endpoint` | [Enum (PrivateDnsOnlyForInboundResolverEndpoint)](#private_dns_only_for_inbound_resolver_endpoint-privatednsonlyforinboundresolverendpoint) | No | Indicates whether to enable private DNS only for inbound endpoints. This option is available only fo... |
-| `private_dns_preference` | [Enum (PrivateDnsPreference)](#private_dns_preference-privatednspreference) | No | The preference for which private domains have a private hosted zone created for and associated with ... |
-| `private_dns_specified_domains` | `List<String>` (items: 1..=10) | No | Indicates which of the private domains to create private hosted zones for and associate with the spe... |
+| `private_dns_only_for_inbound_resolver_endpoint` | [Enum (PrivateDnsOnlyForInboundResolverEndpoint)](#private_dns_only_for_inbound_resolver_endpoint-privatednsonlyforinboundresolverendpoint) | No | Indicates whether to enable private DNS only for inbound endpoints. This option is available only for services that support both gateway and interface endpoints. It routes traffic that originates from the VPC to the gateway endpoint and traffic that originates from on-premises to the interface endpoint. |
+| `private_dns_preference` | [Enum (PrivateDnsPreference)](#private_dns_preference-privatednspreference) | No | The preference for which private domains have a private hosted zone created for and associated with the specified VPC. Only supported when private DNS is enabled and when the VPC endpoint type is ServiceNetwork or Resource. |
+| `private_dns_specified_domains` | `List<String>` (items: 1..=10) | No | Indicates which of the private domains to create private hosted zones for and associate with the specified VPC. Only supported when private DNS is enabled and the private DNS preference is ``VERIFIED_DOMAINS_AND_SPECIFIED_DOMAINS`` or ``SPECIFIED_DOMAINS_ONLY``. |
 
 ## Attribute Reference
 

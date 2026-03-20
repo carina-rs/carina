@@ -887,13 +887,12 @@ fn generate_markdown(schema: &CfnSchema, type_name: &str) -> Result<String> {
                         .unwrap_or("")
                         .replace('\n', " "),
                 );
-                let truncated = truncate_markdown_aware(&desc, 100);
                 md.push_str(&format!(
                     "| `{}` | {} | {} | {} |\n",
                     snake_name,
                     field_type_display,
                     if is_req { "Yes" } else { "No" },
-                    truncated
+                    desc
                 ));
             }
             md.push('\n');
@@ -1727,9 +1726,14 @@ pub fn {}() -> AwsccSchemaConfig {{
 
     // Add description
     if let Some(desc) = &schema.description {
-        let escaped_desc = desc.replace('"', "\\\"").replace('\n', " ");
-        let truncated = truncate_markdown_aware(&escaped_desc, 200);
-        code.push_str(&format!("        .with_description(\"{}\")\n", truncated));
+        let escaped_desc = desc
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\n', " ");
+        code.push_str(&format!(
+            "        .with_description(\"{}\")\n",
+            escaped_desc
+        ));
     }
 
     // Generate attributes for each property
@@ -1827,12 +1831,16 @@ pub fn {}() -> AwsccSchemaConfig {{
         }
 
         if let Some(desc) = &prop.description {
-            let escaped = collapse_whitespace(&desc.replace('"', "\\\"").replace('\n', " "));
-            let truncated = truncate_markdown_aware(&escaped, 150);
+            let escaped = collapse_whitespace(
+                &desc
+                    .replace('\\', "\\\\")
+                    .replace('"', "\\\"")
+                    .replace('\n', " "),
+            );
             let suffix = if is_read_only { " (read-only)" } else { "" };
             attr_code.push_str(&format!(
                 "\n                .with_description(\"{}{}\")",
-                truncated, suffix
+                escaped, suffix
             ));
         } else if is_read_only {
             attr_code.push_str("\n                .with_description(\"(read-only)\")");
@@ -2307,9 +2315,13 @@ fn generate_struct_type(
                 field_code.push_str(".required()");
             }
             if let Some(desc) = &field_prop.description {
-                let escaped = collapse_whitespace(&desc.replace('"', "\\\"").replace('\n', " "));
-                let truncated = truncate_markdown_aware(&escaped, 150);
-                field_code.push_str(&format!(".with_description(\"{}\")", truncated));
+                let escaped = collapse_whitespace(
+                    &desc
+                        .replace('\\', "\\\\")
+                        .replace('"', "\\\"")
+                        .replace('\n', " "),
+                );
+                field_code.push_str(&format!(".with_description(\"{}\")", escaped));
             }
             field_code.push_str(&format!(".with_provider_name(\"{}\")", field_name));
 
@@ -3750,62 +3762,6 @@ fn collapse_whitespace(s: &str) -> String {
     result
 }
 
-/// Truncate a string to `max_len` characters, appending "..." if truncated.
-/// If naive truncation would cut inside a markdown link `[text](url)`,
-/// truncate before the link starts instead, so links are either fully
-/// included or fully omitted.
-fn truncate_markdown_aware(s: &str, max_len: usize) -> String {
-    if s.len() <= max_len {
-        return s.to_string();
-    }
-
-    // Find the start positions of all markdown links in the string
-    let bytes = s.as_bytes();
-    let len = bytes.len();
-    let mut i = 0;
-    // Collect (link_start, link_end) byte positions for each [text](url) link
-    let mut links: Vec<(usize, usize)> = Vec::new();
-
-    while i < len {
-        if bytes[i] == b'[' {
-            let link_start = i;
-            i += 1;
-            // Find closing ]
-            while i < len && bytes[i] != b']' && bytes[i] != b'\n' {
-                i += 1;
-            }
-            if i >= len || bytes[i] == b'\n' {
-                continue;
-            }
-            i += 1; // skip ]
-            if i < len && bytes[i] == b'(' {
-                i += 1; // skip (
-                while i < len && bytes[i] != b')' && bytes[i] != b'\n' {
-                    i += 1;
-                }
-                if i < len && bytes[i] == b')' {
-                    i += 1; // skip )
-                    links.push((link_start, i));
-                }
-            }
-        } else {
-            i += 1;
-        }
-    }
-
-    // Check if the truncation point (max_len) falls inside any link
-    for &(start, end) in &links {
-        if max_len > start && max_len < end {
-            // Truncation would cut inside this link; truncate before it
-            let truncated = s[..start].trim_end();
-            return format!("{}...", truncated);
-        }
-    }
-
-    // No link is cut; safe to truncate at max_len
-    format!("{}...", &s[..max_len])
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3818,56 +3774,6 @@ mod tests {
         assert_eq!(collapse_whitespace("already fine"), "already fine");
         assert_eq!(collapse_whitespace("            12 spaces"), " 12 spaces");
         assert_eq!(collapse_whitespace(""), "");
-    }
-
-    #[test]
-    fn test_truncate_markdown_aware_no_links() {
-        // Normal string shorter than limit
-        assert_eq!(truncate_markdown_aware("short text", 100), "short text");
-
-        // Normal string longer than limit, no links
-        let long = "a".repeat(200);
-        let result = truncate_markdown_aware(&long, 100);
-        assert_eq!(result.len(), 103); // 100 chars + "..."
-        assert!(result.ends_with("..."));
-    }
-
-    #[test]
-    fn test_truncate_markdown_aware_preserves_complete_links() {
-        // Link fits entirely within the limit
-        let text = "See [docs](https://example.com) for details.";
-        assert_eq!(truncate_markdown_aware(text, 100), text);
-    }
-
-    #[test]
-    fn test_truncate_markdown_aware_truncates_before_link() {
-        // Truncation would cut inside the markdown link URL
-        let text = "Specifies a VPC. To add a CIDR block, see [AWS::EC2::VPCCidrBlock](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-ec2-vpccidrblock.html).";
-        let result = truncate_markdown_aware(text, 100);
-        // Should truncate before the link starts
-        assert!(!result.contains("[AWS::EC2::VPCCidrBlock]("));
-        assert!(result.ends_with("..."));
-        assert!(result.contains("see"));
-        // Should not contain partial URL
-        assert!(!result.contains("https://docs.aws.amazon"));
-    }
-
-    #[test]
-    fn test_truncate_markdown_aware_truncates_before_link_in_text() {
-        // Truncation point falls inside the link text portion [tex|t](url)
-        let text = "Description with [very long link text that exceeds the limit](https://example.com) at the end.";
-        let result = truncate_markdown_aware(text, 30);
-        assert!(!result.contains("[very"));
-        assert!(result.ends_with("..."));
-    }
-
-    #[test]
-    fn test_truncate_markdown_aware_keeps_link_before_cutoff() {
-        // Link ends before the truncation point
-        let text = "See [docs](https://x.com) and then a lot more text that goes beyond the limit of characters allowed.";
-        let result = truncate_markdown_aware(text, 60);
-        assert!(result.contains("[docs](https://x.com)"));
-        assert!(result.ends_with("..."));
     }
 
     #[test]

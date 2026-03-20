@@ -130,7 +130,7 @@ pub fn ec2_ipam_pool_config() -> AwsccSchemaConfig {
         .attribute(
             AttributeSchema::new("locale", super::awscc_region())
                 .create_only()
-                .with_description("The region of this pool. If not set, this will default to \"None\" which will disable non-custom allocations. If the locale has been specified for the...")
+                .with_description("The region of this pool. If not set, this will default to \"None\" which will disable non-custom allocations. If the locale has been specified for the source pool, this value must match.")
                 .with_provider_name("Locale"),
         )
         .attribute(
@@ -194,7 +194,7 @@ pub fn ec2_ipam_pool_config() -> AwsccSchemaConfig {
                 to_dsl: Some(|s: &str| s.replace('-', "_")),
             })
                 .read_only()
-                .with_description("The state of this pool. This can be one of the following values: \"create-in-progress\", \"create-complete\", \"modify-in-progress\", \"modify-complet... (read-only)")
+                .with_description("The state of this pool. This can be one of the following values: \"create-in-progress\", \"create-complete\", \"modify-in-progress\", \"modify-complete\", \"delete-in-progress\", or \"delete-complete\" (read-only)")
                 .with_provider_name("State"),
         )
         .attribute(

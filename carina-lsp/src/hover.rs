@@ -6,10 +6,11 @@ use tower_lsp::lsp_types::{Hover, HoverContents, MarkupContent, MarkupKind, Posi
 use crate::document::Document;
 use carina_core::schema::{CompletionValue, ResourceSchema};
 
-/// Sanitize a description string by removing truncated markdown links.
-/// If a `[text](url` is incomplete (no closing `)`) or the URL ends with `...`,
-/// the entire link syntax is removed, leaving only the link text.
-fn sanitize_truncated_markdown_links(text: &str) -> String {
+/// Convert Markdown links `[text](url)` to plain text `text (url)` for hover display.
+/// LSP hover popups render as plain text in many editors, so raw Markdown link syntax
+/// appears as broken formatting. This converts links to a readable plain-text form
+/// while keeping the URL visible.
+fn convert_markdown_links_to_plain_text(text: &str) -> String {
     let mut result = String::with_capacity(text.len());
     let chars: Vec<char> = text.chars().collect();
     let len = chars.len();
@@ -19,13 +20,13 @@ fn sanitize_truncated_markdown_links(text: &str) -> String {
         if chars[i] == '[' {
             let link_start = i;
             i += 1;
-            // Find closing ]
             let text_start = i;
+            // Find closing ]
             while i < len && chars[i] != ']' && chars[i] != '\n' {
                 i += 1;
             }
             if i >= len || chars[i] == '\n' {
-                // No closing ], output what we have as-is
+                // No closing ], output as-is
                 result.push_str(
                     &chars[link_start..=i.min(len - 1)]
                         .iter()
@@ -46,31 +47,25 @@ fn sanitize_truncated_markdown_links(text: &str) -> String {
                     i += 1;
                 }
                 if i < len && chars[i] == ')' {
-                    // Complete link - check if URL ends with "..."
                     let url: String = chars[url_start..i].iter().collect();
-                    if url.ends_with("...") || url.ends_with("..") {
-                        // Truncated URL - emit just the link text
-                        result.push_str(&link_text);
-                    } else {
-                        // Valid link - keep it as-is
-                        result.push_str(&chars[link_start..=i].iter().collect::<String>());
-                    }
                     i += 1; // skip )
-                } else {
-                    // Incomplete link (no closing paren) - emit just the link text
+                    // Convert [text](url) -> text (url)
                     result.push_str(&link_text);
-                    // Also append any trailing "..." after the broken URL
-                    let remaining: String = chars[url_start..i.min(len)].iter().collect();
-                    if remaining.ends_with("...") {
-                        result.push_str("...");
-                    }
+                    result.push_str(" (");
+                    result.push_str(&url);
+                    result.push(')');
+                } else {
+                    // Incomplete link, output as-is
+                    result.push('[');
+                    result.push_str(&link_text);
+                    result.push_str("](");
+                    result.push_str(&chars[url_start..i.min(len)].iter().collect::<String>());
                 }
             } else {
-                // [text] without ( - just output as-is
+                // [text] without ( - output as-is
                 result.push('[');
                 result.push_str(&link_text);
                 result.push(']');
-                // Don't consume the next char, let the main loop handle it
             }
         } else {
             result.push(chars[i]);
@@ -195,11 +190,12 @@ impl HoverProvider {
     }
 
     fn schema_hover(&self, resource_name: &str, schema: &ResourceSchema) -> Option<Hover> {
-        let description = schema
-            .description
-            .as_deref()
-            .unwrap_or("No description available");
-        let description = sanitize_truncated_markdown_links(description);
+        let description = convert_markdown_links_to_plain_text(
+            schema
+                .description
+                .as_deref()
+                .unwrap_or("No description available"),
+        );
 
         let mut content = format!(
             "## {}\n\n{}\n\n### Attributes\n\n",
@@ -208,7 +204,8 @@ impl HoverProvider {
 
         for attr in schema.attributes.values() {
             let required = if attr.required { " **(required)**" } else { "" };
-            let desc = sanitize_truncated_markdown_links(attr.description.as_deref().unwrap_or(""));
+            let desc =
+                convert_markdown_links_to_plain_text(attr.description.as_deref().unwrap_or(""));
             content.push_str(&format!("- `{}`: {}{}\n", attr.name, desc, required));
         }
 
@@ -225,7 +222,7 @@ impl HoverProvider {
         // Check all schemas for the attribute
         for schema in self.schemas.values() {
             if let Some(attr) = schema.attributes.get(word) {
-                let description = sanitize_truncated_markdown_links(
+                let description = convert_markdown_links_to_plain_text(
                     attr.description.as_deref().unwrap_or("No description"),
                 );
                 let required = if attr.required {
@@ -343,61 +340,6 @@ mod tests {
     use super::*;
     use carina_core::schema::{AttributeSchema, AttributeType};
 
-    /// Helper: returns true if text contains a truncated or malformed markdown link.
-    /// Checks for:
-    /// 1. Links with URLs ending in "..." (truncated by codegen)
-    /// 2. Incomplete links where `[text](url` has no closing `)`
-    fn has_truncated_markdown_link(text: &str) -> bool {
-        let chars: Vec<char> = text.chars().collect();
-        let len = chars.len();
-        let mut i = 0;
-
-        while i < len {
-            // Look for start of markdown link: [
-            if chars[i] == '[' {
-                let link_start = i;
-                i += 1;
-                // Find closing ]
-                while i < len && chars[i] != ']' {
-                    i += 1;
-                }
-                if i >= len {
-                    break;
-                }
-                i += 1; // skip ]
-                // Check for (
-                if i < len && chars[i] == '(' {
-                    i += 1; // skip (
-                    let url_start = i;
-                    // Find closing ) - but only on the same "segment" (no newline-based link)
-                    let mut found_close = false;
-                    while i < len && chars[i] != ')' && chars[i] != '\n' {
-                        i += 1;
-                    }
-                    if i < len && chars[i] == ')' {
-                        // We found a complete link, check if URL ends with "..."
-                        let url: String = chars[url_start..i].iter().collect();
-                        if url.ends_with("...") || url.ends_with("..") {
-                            return true;
-                        }
-                        found_close = true;
-                        i += 1;
-                    }
-                    if !found_close {
-                        // Incomplete link: [text](url-without-closing-paren
-                        // Check if we actually had URL content (not just [text] followed by something else)
-                        let _ = link_start; // suppress unused warning
-                        return true;
-                    }
-                }
-            } else {
-                i += 1;
-            }
-        }
-
-        false
-    }
-
     fn create_hover_provider_with_description(
         resource_type: &str,
         description: &str,
@@ -423,12 +365,32 @@ mod tests {
     }
 
     #[test]
-    fn test_resource_hover_no_truncated_markdown_links() {
-        // This description mirrors the real ec2.vpc description from codegen,
-        // which gets truncated at 200 chars, cutting a markdown link mid-URL.
-        let truncated_desc = "Specifies a virtual private cloud (VPC).  To add an IPv6 CIDR block to the VPC, see [AWS::EC2::VPCCidrBlock](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-ec2-vpccidrbloc...";
+    fn test_convert_markdown_links_to_plain_text() {
+        // Basic link conversion
+        assert_eq!(
+            convert_markdown_links_to_plain_text("[VPC docs](https://docs.aws.amazon.com/vpc/)"),
+            "VPC docs (https://docs.aws.amazon.com/vpc/)"
+        );
 
-        let provider = create_hover_provider_with_description("ec2.vpc", truncated_desc);
+        // Text with no links passes through unchanged
+        assert_eq!(
+            convert_markdown_links_to_plain_text("No links here."),
+            "No links here."
+        );
+
+        // Multiple links in same text
+        assert_eq!(
+            convert_markdown_links_to_plain_text("See [A](https://a.com) and [B](https://b.com)."),
+            "See A (https://a.com) and B (https://b.com)."
+        );
+    }
+
+    #[test]
+    fn test_resource_hover_converts_markdown_links() {
+        // Full description with a markdown link (no truncation)
+        let desc = "Specifies a virtual private cloud (VPC). To add an IPv6 CIDR block to the VPC, see [AWS::EC2::VPCCidrBlock](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-ec2-vpccidrblock.html).";
+
+        let provider = create_hover_provider_with_description("ec2.vpc", desc);
         let schema = provider.schemas.get("ec2.vpc").unwrap();
         let hover = provider.schema_hover("ec2.vpc", schema).unwrap();
 
@@ -437,22 +399,29 @@ mod tests {
             _ => panic!("Expected markup content"),
         };
 
+        // Should NOT contain raw markdown link syntax
         assert!(
-            !has_truncated_markdown_link(content),
-            "Hover content should not contain truncated markdown links, but got:\n{}",
+            !content.contains("[AWS::EC2::VPCCidrBlock]("),
+            "Hover should not contain raw markdown links, but got:\n{}",
+            content
+        );
+        // Should contain the converted plain text form
+        assert!(
+            content.contains("AWS::EC2::VPCCidrBlock (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-ec2-vpccidrblock.html)"),
+            "Hover should contain plain text link, but got:\n{}",
             content
         );
     }
 
     #[test]
-    fn test_attribute_hover_no_truncated_markdown_links() {
-        // This mirrors a real attribute description with a truncated link
-        let truncated_desc = "Secondary EIP allocation IDs. For more information, see [Create a NAT gateway](https://docs.aws.amazon.com/vpc/latest/userguide/nat-gateway-working-wi...";
+    fn test_attribute_hover_converts_markdown_links() {
+        // Attribute description with a markdown link (full, not truncated)
+        let desc = "Secondary EIP allocation IDs. For more information, see [Create a NAT gateway](https://docs.aws.amazon.com/vpc/latest/userguide/nat-gateway-working-with.html) in the Amazon VPC User Guide.";
 
         let provider = create_hover_provider_with_attr_description(
             "ec2.nat_gateway",
             "secondary_allocation_ids",
-            truncated_desc,
+            desc,
         );
 
         let doc = Document::new("secondary_allocation_ids".to_string());
@@ -465,31 +434,16 @@ mod tests {
             _ => panic!("Expected markup content"),
         };
 
+        // Should NOT contain raw markdown link syntax
         assert!(
-            !has_truncated_markdown_link(content),
-            "Attribute hover should not contain truncated markdown links, but got:\n{}",
+            !content.contains("[Create a NAT gateway]("),
+            "Attribute hover should not contain raw markdown links, but got:\n{}",
             content
         );
-    }
-
-    #[test]
-    fn test_hover_description_with_complete_markdown_links_is_ok() {
-        // A description with properly formed markdown links should be fine
-        let good_desc =
-            "See [VPC docs](https://docs.aws.amazon.com/vpc/latest/userguide/) for details.";
-
-        let provider = create_hover_provider_with_description("ec2.vpc", good_desc);
-        let schema = provider.schemas.get("ec2.vpc").unwrap();
-        let hover = provider.schema_hover("ec2.vpc", schema).unwrap();
-
-        let content = match &hover.contents {
-            HoverContents::Markup(m) => &m.value,
-            _ => panic!("Expected markup content"),
-        };
-
+        // Should contain the converted plain text form
         assert!(
-            !has_truncated_markdown_link(content),
-            "Complete markdown links should not be flagged as truncated:\n{}",
+            content.contains("Create a NAT gateway (https://docs.aws.amazon.com/vpc/latest/userguide/nat-gateway-working-with.html)"),
+            "Attribute hover should contain plain text link, but got:\n{}",
             content
         );
     }
