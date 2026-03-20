@@ -69,6 +69,10 @@ pub struct App {
     pub focused_panel: FocusedPanel,
     /// Vertical scroll offset for the detail panel
     pub detail_scroll: u16,
+    /// Scroll offset for the tree panel (index of item at top of visible area)
+    pub tree_scroll_offset: usize,
+    /// Height of the tree panel's inner area (updated each frame)
+    pub tree_area_height: usize,
 }
 
 impl App {
@@ -95,6 +99,8 @@ impl App {
             plan_summary,
             focused_panel: FocusedPanel::Tree,
             detail_scroll: 0,
+            tree_scroll_offset: 0,
+            tree_area_height: 0,
         }
     }
 
@@ -124,7 +130,10 @@ impl App {
     pub fn move_up(&mut self) {
         if self.selected > 0 {
             self.selected -= 1;
-            self.list_state.select(Some(self.selected));
+            if self.selected < self.tree_scroll_offset {
+                self.tree_scroll_offset = self.selected;
+            }
+            self.sync_list_state();
             self.detail_scroll = 0;
         }
     }
@@ -133,9 +142,20 @@ impl App {
         let count = self.visible_count();
         if count > 0 && self.selected < count - 1 {
             self.selected += 1;
-            self.list_state.select(Some(self.selected));
+            if self.tree_area_height > 0
+                && self.selected >= self.tree_scroll_offset + self.tree_area_height
+            {
+                self.tree_scroll_offset = self.selected - self.tree_area_height + 1;
+            }
+            self.sync_list_state();
             self.detail_scroll = 0;
         }
+    }
+
+    /// Sync `list_state` selection and scroll offset to match our manual tracking.
+    fn sync_list_state(&mut self) {
+        self.list_state.select(Some(self.selected));
+        *self.list_state.offset_mut() = self.tree_scroll_offset;
     }
 
     /// Toggle focus between Tree and Detail panels
@@ -918,5 +938,79 @@ mod tests {
         app.detail_scroll = 3;
         app.move_up();
         assert_eq!(app.detail_scroll, 0);
+    }
+
+    #[test]
+    fn tree_scroll_cursor_moves_within_visible_area_before_scrolling() {
+        // Create a plan with 10 items
+        let mut plan = Plan::new();
+        for i in 0..10 {
+            plan.add(Effect::Create(Resource::new(
+                "s3.bucket",
+                format!("bucket-{}", i),
+            )));
+        }
+        let mut app = App::new(&plan);
+        // Simulate a visible area of 5 items
+        app.tree_area_height = 5;
+
+        // Move down from 0 to 4: no scrolling needed (items 0-4 fit in view)
+        for i in 1..=4 {
+            app.move_down();
+            assert_eq!(app.selected, i);
+            assert_eq!(app.tree_scroll_offset, 0, "should not scroll at item {}", i);
+        }
+
+        // Move down to 5: now scroll offset should advance to 1
+        app.move_down();
+        assert_eq!(app.selected, 5);
+        assert_eq!(app.tree_scroll_offset, 1);
+
+        // Move down to 9
+        for _ in 6..=9 {
+            app.move_down();
+        }
+        assert_eq!(app.selected, 9);
+        assert_eq!(app.tree_scroll_offset, 5); // items 5-9 visible
+
+        // Now move up: cursor moves within visible area without scrolling
+        app.move_up(); // selected=8, still in view (5-9)
+        assert_eq!(app.selected, 8);
+        assert_eq!(app.tree_scroll_offset, 5);
+
+        app.move_up(); // selected=7
+        assert_eq!(app.selected, 7);
+        assert_eq!(app.tree_scroll_offset, 5);
+
+        app.move_up(); // selected=6
+        assert_eq!(app.selected, 6);
+        assert_eq!(app.tree_scroll_offset, 5);
+
+        app.move_up(); // selected=5, still at top of view
+        assert_eq!(app.selected, 5);
+        assert_eq!(app.tree_scroll_offset, 5);
+
+        // Move up past the top of visible area: scroll offset decreases
+        app.move_up(); // selected=4, scroll_offset=4
+        assert_eq!(app.selected, 4);
+        assert_eq!(app.tree_scroll_offset, 4);
+
+        app.move_up(); // selected=3, scroll_offset=3
+        assert_eq!(app.selected, 3);
+        assert_eq!(app.tree_scroll_offset, 3);
+    }
+
+    #[test]
+    fn tree_scroll_zero_height_does_not_scroll_on_move_down() {
+        // When tree_area_height is 0 (before first render), move_down should not scroll
+        let mut plan = Plan::new();
+        plan.add(Effect::Create(Resource::new("s3.bucket", "a")));
+        plan.add(Effect::Create(Resource::new("s3.bucket", "b")));
+        let mut app = App::new(&plan);
+        assert_eq!(app.tree_area_height, 0);
+
+        app.move_down();
+        assert_eq!(app.selected, 1);
+        assert_eq!(app.tree_scroll_offset, 0);
     }
 }

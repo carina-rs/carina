@@ -9,7 +9,7 @@ use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
 use crate::app::{App, EffectKind, FocusedPanel};
 
 /// Draw the main layout: tree (70%), detail panel (30%), help bar (1 line)
-pub fn draw(frame: &mut Frame, app: &App) {
+pub fn draw(frame: &mut Frame, app: &mut App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -25,7 +25,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
 }
 
 /// Draw the tree view (compact, no inline attributes)
-fn draw_tree(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_tree(frame: &mut Frame, app: &mut App, area: Rect) {
     let visible = app.visible_nodes();
 
     let items: Vec<ListItem> = visible
@@ -80,7 +80,12 @@ fn draw_tree(frame: &mut Frame, app: &App, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         );
 
+    // Update the tree area height (inner area = total height minus 2 for borders)
+    app.tree_area_height = area.height.saturating_sub(2) as usize;
+
     let mut state = app.list_state.clone();
+    // Force our manually-tracked scroll offset to prevent ratatui's auto-scrolling
+    *state.offset_mut() = app.tree_scroll_offset;
     frame.render_stateful_widget(list, area, &mut state);
 }
 
