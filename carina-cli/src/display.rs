@@ -203,14 +203,30 @@ fn extract_compact_hint(
         }
     }
 
-    // Collect ALL non-parent ResourceRef attributes
+    // Collect ALL non-parent ResourceRef attributes (including refs inside Lists)
     for key in &keys {
-        if let Some(Value::ResourceRef { binding_name, .. }) = resource.attributes.get(*key) {
-            if parent_binding == Some(binding_name.as_str()) {
-                continue;
+        match resource.attributes.get(*key) {
+            Some(Value::ResourceRef { binding_name, .. }) => {
+                if parent_binding == Some(binding_name.as_str()) {
+                    continue;
+                }
+                let short_key = shorten_attr_name(key);
+                parts.push(format!("{}: {}", short_key, binding_name));
             }
-            let short_key = shorten_attr_name(key);
-            parts.push(format!("{}: {}", short_key, binding_name));
+            Some(Value::List(items)) => {
+                // Extract the first ResourceRef from a list (e.g., security_group_ids = [sg.id])
+                for item in items {
+                    if let Value::ResourceRef { binding_name, .. } = item {
+                        if parent_binding == Some(binding_name.as_str()) {
+                            continue;
+                        }
+                        let short_key = shorten_attr_name(key);
+                        parts.push(format!("{}: {}", short_key, binding_name));
+                        break;
+                    }
+                }
+            }
+            _ => {}
         }
     }
 
@@ -225,7 +241,8 @@ fn extract_compact_hint(
 /// e.g., `subnet_id` -> `subnet`, `route_table_id` -> `route_table`,
 ///       `service_name` -> `service`, `group_name` -> `group`
 fn shorten_attr_name(attr: &str) -> &str {
-    attr.strip_suffix("_id")
+    attr.strip_suffix("_ids")
+        .or_else(|| attr.strip_suffix("_id"))
         .or_else(|| attr.strip_suffix("_name"))
         .unwrap_or(attr)
 }
@@ -1564,10 +1581,10 @@ mod tests {
         );
         r.attributes.insert(
             "security_group_ids".to_string(),
-            Value::ResourceRef {
+            Value::List(vec![Value::ResourceRef {
                 binding_name: "endpoint_sg".to_string(),
-                attribute_name: "id".to_string(),
-            },
+                attribute_name: "group_id".to_string(),
+            }]),
         );
         r.attributes.insert(
             "vpc_id".to_string(),
@@ -1577,11 +1594,11 @@ mod tests {
             },
         );
 
-        // Parent is vpc, so vpc_id ref is skipped; service_name (string) first, then sg ref
+        // Parent is vpc, so vpc_id ref is skipped; service_name (string) first, then sg ref from list
         let hint = extract_compact_hint(&r, Some("vpc"));
         assert_eq!(
             hint,
-            Some("service: ecr.dkr, security_group_ids: endpoint_sg".to_string())
+            Some("service: ecr.dkr, security_group: endpoint_sg".to_string())
         );
     }
 
@@ -1670,6 +1687,57 @@ mod tests {
 
         // Should not panic; anonymous resources should show hints
         print_plan(&plan, true);
+    }
+
+    /// Test that extract_compact_hint extracts ResourceRef from inside a List value.
+    /// e.g., security_group_ids = [endpoint_sg.group_id] should produce "security_group: endpoint_sg"
+    #[test]
+    fn test_extract_compact_hint_list_containing_resource_ref() {
+        let mut r = Resource::new("ec2.vpc_endpoint", "hash_list_ref");
+        r.attributes.insert(
+            "security_group_ids".to_string(),
+            Value::List(vec![Value::ResourceRef {
+                binding_name: "endpoint_sg".to_string(),
+                attribute_name: "group_id".to_string(),
+            }]),
+        );
+
+        let hint = extract_compact_hint(&r, None);
+        assert_eq!(
+            hint,
+            Some("security_group: endpoint_sg".to_string()),
+            "Should extract ResourceRef from inside List and strip _ids suffix"
+        );
+    }
+
+    /// Test that extract_compact_hint skips List<ResourceRef> when ref matches parent.
+    #[test]
+    fn test_extract_compact_hint_list_ref_skips_parent() {
+        let mut r = Resource::new("ec2.vpc_endpoint", "hash_list_parent");
+        r.attributes.insert(
+            "security_group_ids".to_string(),
+            Value::List(vec![Value::ResourceRef {
+                binding_name: "endpoint_sg".to_string(),
+                attribute_name: "group_id".to_string(),
+            }]),
+        );
+
+        let hint = extract_compact_hint(&r, Some("endpoint_sg"));
+        assert_eq!(
+            hint, None,
+            "Should skip List<ResourceRef> when ref matches parent"
+        );
+    }
+
+    /// Test that shorten_attr_name handles _ids suffix (plural).
+    #[test]
+    fn test_shorten_attr_name_ids_suffix() {
+        assert_eq!(shorten_attr_name("security_group_ids"), "security_group");
+        assert_eq!(shorten_attr_name("subnet_ids"), "subnet");
+        // _id still works
+        assert_eq!(shorten_attr_name("subnet_id"), "subnet");
+        // _name still works
+        assert_eq!(shorten_attr_name("service_name"), "service");
     }
 
     /// Test that extract_compact_hint skips _-prefixed attributes.
