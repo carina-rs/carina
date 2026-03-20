@@ -28,8 +28,6 @@ pub struct TreeNode {
     pub changed_attributes: Vec<String>,
     /// For Update/Replace effects, the "from" attributes (old values)
     pub from_attributes: Vec<(String, String)>,
-    /// Whether this node's children are expanded
-    pub expanded: bool,
     /// Indices of child nodes in the tree
     pub children: Vec<usize>,
     /// Nesting depth (0 = root)
@@ -74,13 +72,6 @@ impl App {
         // Shorten effect labels: strip provider prefix, use binding or compact hint
         shorten_effect_labels(plan, &mut nodes);
 
-        // Start with root nodes expanded (1 level deep)
-        for node in &mut nodes {
-            if node.parent.is_none() && !node.children.is_empty() {
-                node.expanded = true;
-            }
-        }
-
         let mut list_state = ListState::default();
         if !nodes.is_empty() {
             list_state.select(Some(0));
@@ -94,24 +85,21 @@ impl App {
         }
     }
 
-    /// Returns the list of visible node indices (respecting expand/collapse).
+    /// Returns all node indices in DFS tree order (all nodes always visible).
     pub fn visible_nodes(&self) -> Vec<usize> {
         let mut result = Vec::new();
         for (idx, node) in self.nodes.iter().enumerate() {
             if node.parent.is_none() {
-                self.collect_visible_nodes(idx, &mut result);
+                Self::collect_dfs(idx, &self.nodes, &mut result);
             }
         }
         result
     }
 
-    fn collect_visible_nodes(&self, idx: usize, result: &mut Vec<usize>) {
+    fn collect_dfs(idx: usize, nodes: &[TreeNode], result: &mut Vec<usize>) {
         result.push(idx);
-        let node = &self.nodes[idx];
-        if node.expanded {
-            for &child in &node.children {
-                self.collect_visible_nodes(child, result);
-            }
+        for &child in &nodes[idx].children {
+            Self::collect_dfs(child, nodes, result);
         }
     }
 
@@ -139,78 +127,6 @@ impl App {
     pub fn selected_node_idx(&self) -> Option<usize> {
         let nodes = self.visible_nodes();
         nodes.get(self.selected).copied()
-    }
-
-    pub fn expand(&mut self) {
-        if let Some(idx) = self.selected_node_idx()
-            && !self.nodes[idx].children.is_empty()
-        {
-            self.nodes[idx].expanded = true;
-        }
-    }
-
-    pub fn collapse(&mut self) {
-        if let Some(idx) = self.selected_node_idx() {
-            let node = &self.nodes[idx];
-            if node.expanded {
-                self.nodes[idx].expanded = false;
-            } else if let Some(parent_idx) = node.parent {
-                self.nodes[parent_idx].expanded = false;
-                // Move selection to parent
-                let nodes = self.visible_nodes();
-                if let Some(pos) = nodes.iter().position(|&i| i == parent_idx) {
-                    self.selected = pos;
-                    self.list_state.select(Some(pos));
-                }
-            }
-        }
-    }
-
-    /// Toggle expand/collapse on the selected node (children only)
-    pub fn toggle(&mut self) {
-        if let Some(idx) = self.selected_node_idx()
-            && !self.nodes[idx].children.is_empty()
-        {
-            self.nodes[idx].expanded = !self.nodes[idx].expanded;
-        }
-    }
-
-    /// Expand all nodes
-    pub fn expand_all(&mut self) {
-        for node in &mut self.nodes {
-            if !node.children.is_empty() {
-                node.expanded = true;
-            }
-        }
-    }
-
-    /// Collapse all nodes
-    pub fn collapse_all(&mut self) {
-        for node in &mut self.nodes {
-            node.expanded = false;
-        }
-        // Move selection to a root node if currently on a non-root
-        if let Some(idx) = self.selected_node_idx() {
-            if self.nodes[idx].parent.is_some() {
-                // Find the root ancestor
-                let mut root = idx;
-                while let Some(parent) = self.nodes[root].parent {
-                    root = parent;
-                }
-                let nodes = self.visible_nodes();
-                if let Some(pos) = nodes.iter().position(|&i| i == root) {
-                    self.selected = pos;
-                    self.list_state.select(Some(pos));
-                }
-            } else {
-                // Already on root, just re-sync position
-                let nodes = self.visible_nodes();
-                if let Some(pos) = nodes.iter().position(|&i| i == idx) {
-                    self.selected = pos;
-                    self.list_state.select(Some(pos));
-                }
-            }
-        }
     }
 
     /// Get the currently selected node, if any
@@ -579,7 +495,7 @@ fn effect_to_node(effect: &Effect) -> TreeNode {
             attributes: format_attributes(&resource.attributes),
             changed_attributes: Vec::new(),
             from_attributes: Vec::new(),
-            expanded: false,
+
             children: Vec::new(),
             depth: 0,
             parent: None,
@@ -593,7 +509,7 @@ fn effect_to_node(effect: &Effect) -> TreeNode {
             attributes: format_attributes(&resource.attributes),
             changed_attributes: Vec::new(),
             from_attributes: Vec::new(),
-            expanded: false,
+
             children: Vec::new(),
             depth: 0,
             parent: None,
@@ -612,7 +528,7 @@ fn effect_to_node(effect: &Effect) -> TreeNode {
             attributes: format_attributes(&to.attributes),
             changed_attributes: changed_attributes.clone(),
             from_attributes: format_attributes(&from.attributes),
-            expanded: false,
+
             children: Vec::new(),
             depth: 0,
             parent: None,
@@ -639,7 +555,7 @@ fn effect_to_node(effect: &Effect) -> TreeNode {
                 attributes: format_attributes(&to.attributes),
                 changed_attributes: changed_create_only.clone(),
                 from_attributes: format_attributes(&from.attributes),
-                expanded: false,
+
                 children: Vec::new(),
                 depth: 0,
                 parent: None,
@@ -659,7 +575,7 @@ fn effect_to_node(effect: &Effect) -> TreeNode {
                 attributes: attrs,
                 changed_attributes: Vec::new(),
                 from_attributes: Vec::new(),
-                expanded: false,
+
                 children: Vec::new(),
                 depth: 0,
                 parent: None,
@@ -776,55 +692,6 @@ mod tests {
         // Should not go before start
         app.move_up();
         assert_eq!(app.selected, 0);
-    }
-
-    #[test]
-    fn expand_collapse() {
-        let mut plan = Plan::new();
-        plan.add(Effect::Create(
-            Resource::new("ec2.vpc", "my-vpc")
-                .with_attribute("_binding", Value::String("vpc".to_string())),
-        ));
-        plan.add(Effect::Create(
-            Resource::new("ec2.subnet", "my-subnet")
-                .with_attribute("_binding", Value::String("subnet".to_string()))
-                .with_attribute(
-                    "vpc_id",
-                    Value::ResourceRef {
-                        binding_name: "vpc".to_string(),
-                        attribute_name: "vpc_id".to_string(),
-                    },
-                ),
-        ));
-
-        let mut app = App::new(&plan);
-        // Root with children starts expanded
-        assert!(app.nodes[0].expanded);
-
-        // Toggle should collapse
-        app.toggle();
-        assert!(!app.nodes[0].expanded);
-
-        // Toggle again should expand
-        app.toggle();
-        assert!(app.nodes[0].expanded);
-    }
-
-    #[test]
-    fn toggle_does_nothing_on_leaf() {
-        let mut plan = Plan::new();
-        plan.add(Effect::Create(
-            Resource::new("s3.bucket", "my-bucket")
-                .with_attribute("name", Value::String("test".to_string())),
-        ));
-
-        let mut app = App::new(&plan);
-        assert!(!app.nodes[0].expanded);
-        assert!(app.nodes[0].children.is_empty());
-
-        // Toggle on a leaf (no children) should do nothing
-        app.toggle();
-        assert!(!app.nodes[0].expanded);
     }
 
     #[test]
@@ -954,125 +821,6 @@ mod tests {
         assert_eq!(app.nodes[1].depth, 1);
         assert_eq!(app.nodes[1].parent, Some(0));
         assert!(app.nodes[1].children.is_empty());
-    }
-
-    #[test]
-    fn visible_nodes_with_collapse() {
-        // VPC (root) -> Subnet (child)
-        let mut plan = Plan::new();
-        plan.add(Effect::Create(
-            Resource::new("ec2.vpc", "my-vpc")
-                .with_attribute("_binding", Value::String("vpc".to_string())),
-        ));
-        plan.add(Effect::Create(
-            Resource::new("ec2.subnet", "my-subnet")
-                .with_attribute("_binding", Value::String("subnet".to_string()))
-                .with_attribute(
-                    "vpc_id",
-                    Value::ResourceRef {
-                        binding_name: "vpc".to_string(),
-                        attribute_name: "vpc_id".to_string(),
-                    },
-                ),
-        ));
-
-        let mut app = App::new(&plan);
-
-        // Root nodes start expanded: VPC + subnet visible
-        let nodes = app.visible_nodes();
-        assert_eq!(nodes.len(), 2);
-
-        // Collapse root: only root node visible
-        app.collapse();
-        let nodes = app.visible_nodes();
-        assert_eq!(nodes.len(), 1);
-
-        // Expand root again: both visible
-        app.expand();
-        let nodes = app.visible_nodes();
-        assert_eq!(nodes.len(), 2);
-    }
-
-    #[test]
-    fn navigation_skips_collapsed_children() {
-        // VPC (root) -> Subnet (child), plus another root S3 bucket
-        let mut plan = Plan::new();
-        plan.add(Effect::Create(
-            Resource::new("ec2.vpc", "my-vpc")
-                .with_attribute("_binding", Value::String("vpc".to_string())),
-        ));
-        plan.add(Effect::Create(
-            Resource::new("ec2.subnet", "my-subnet")
-                .with_attribute("_binding", Value::String("subnet".to_string()))
-                .with_attribute(
-                    "vpc_id",
-                    Value::ResourceRef {
-                        binding_name: "vpc".to_string(),
-                        attribute_name: "vpc_id".to_string(),
-                    },
-                ),
-        ));
-        plan.add(Effect::Create(
-            Resource::new("s3.bucket", "my-bucket")
-                .with_attribute("_binding", Value::String("bucket".to_string())),
-        ));
-
-        let mut app = App::new(&plan);
-
-        // VPC root starts expanded, so visible nodes include VPC, Subnet, S3
-        assert_eq!(app.visible_nodes().len(), 3);
-
-        // Collapse VPC to hide subnet
-        app.collapse();
-        assert_eq!(app.visible_nodes().len(), 2); // VPC root + S3 root
-
-        // Navigate down from VPC to S3
-        app.move_down();
-        assert_eq!(app.selected, 1);
-    }
-
-    #[test]
-    fn leaf_node_has_no_expand_marker() {
-        let mut plan = Plan::new();
-        plan.add(Effect::Create(Resource::new("s3.bucket", "my-bucket")));
-
-        let app = App::new(&plan);
-        // Leaf node: no children
-        assert!(app.nodes[0].children.is_empty());
-    }
-
-    #[test]
-    fn collapse_navigates_to_parent() {
-        let mut plan = Plan::new();
-        plan.add(Effect::Create(
-            Resource::new("ec2.vpc", "my-vpc")
-                .with_attribute("_binding", Value::String("vpc".to_string())),
-        ));
-        plan.add(Effect::Create(
-            Resource::new("ec2.subnet", "my-subnet")
-                .with_attribute("_binding", Value::String("subnet".to_string()))
-                .with_attribute(
-                    "vpc_id",
-                    Value::ResourceRef {
-                        binding_name: "vpc".to_string(),
-                        attribute_name: "vpc_id".to_string(),
-                    },
-                ),
-        ));
-
-        let mut app = App::new(&plan);
-
-        // Expand VPC to show subnet
-        app.expand();
-
-        // Navigate to subnet
-        app.move_down();
-        assert_eq!(app.selected_node_idx(), Some(1));
-
-        // Collapse on a leaf with parent -> navigates to parent and collapses it
-        app.collapse();
-        assert_eq!(app.selected_node_idx(), Some(0));
-        assert!(!app.nodes[0].expanded);
     }
 
     #[test]

@@ -34,15 +34,10 @@ fn draw_tree(frame: &mut Frame, app: &App, area: Rect) {
         .map(|(row_idx, &node_idx)| {
             let node = &app.nodes[node_idx];
             let connector = build_tree_connector(node_idx, app);
-            let expand_marker = if !node.children.is_empty() {
-                if node.expanded { "[-]" } else { "[+]" }
-            } else {
-                "   "
-            };
             let effect_color = effect_style(node.kind);
             let mut spans = vec![
                 Span::raw(connector),
-                Span::styled(format!("{} {} ", expand_marker, node.symbol), effect_color),
+                Span::styled(format!("{} ", node.symbol), effect_color),
                 Span::styled(
                     node.resource_type.clone(),
                     Style::default()
@@ -186,41 +181,6 @@ fn draw_help(frame: &mut Frame, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw(" navigate  "),
-        Span::styled(
-            "Enter",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" toggle  "),
-        Span::styled(
-            "l",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" expand  "),
-        Span::styled(
-            "h",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" collapse  "),
-        Span::styled(
-            "e",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" expand all  "),
-        Span::styled(
-            "c",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" collapse all  "),
         Span::styled(
             "q",
             Style::default()
