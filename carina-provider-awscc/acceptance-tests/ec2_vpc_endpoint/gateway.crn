@@ -22,11 +22,11 @@ awscc.ec2.vpc_endpoint {
 
   policy_document = {
     version   = "2012-10-17"
-    statement = [{
+    statement {
       effect    = "Allow"
       principal = "*"
       action    = "s3:GetObject"
       resource  = "arn:aws:s3:::*"
-    }]
+    }
   }
 }

@@ -346,11 +346,12 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                     ],
                 }).with_description("Specifies the default server-side encryption to apply to new objects in the bucket. If a PUT Object request doesn't specify any server-side encryption, this default encryption will be applied.").with_provider_name("ServerSideEncryptionByDefault")
                     ],
-                })).required().with_description("Specifies the default server-side-encryption configuration.").with_provider_name("ServerSideEncryptionConfiguration")
+                })).required().with_description("Specifies the default server-side-encryption configuration.").with_provider_name("ServerSideEncryptionConfiguration").with_block_name("server_side_encryption_configuration")
                     ],
                 })
                 .with_description("Specifies default encryption for a bucket using server-side encryption with Amazon S3-managed keys (SSE-S3), AWS KMS-managed keys (SSE-KMS), or dual-layer server-side encryption with KMS-managed keys (DSSE-KMS). For information about the Amazon S3 default encryption feature, see [Amazon S3 Default Encryption for S3 Buckets](https://docs.aws.amazon.com/AmazonS3/latest/dev/bucket-encryption.html) in the *Amazon S3 User Guide*.")
-                .with_provider_name("BucketEncryption"),
+                .with_provider_name("BucketEncryption")
+                .with_block_name("bucket_encryption"),
         )
         .attribute(
             AttributeSchema::new("bucket_name", AttributeType::String)
@@ -393,7 +394,8 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                     ],
                 })
                 .with_description("Describes the cross-origin access configuration for objects in an Amazon S3 bucket. For more information, see [Enabling Cross-Origin Resource Sharing](https://docs.aws.amazon.com/AmazonS3/latest/dev/cors.html) in the *Amazon S3 User Guide*.")
-                .with_provider_name("CorsConfiguration"),
+                .with_provider_name("CorsConfiguration")
+                .with_block_name("cors_configuration"),
         )
         .attribute(
             AttributeSchema::new("domain_name", AttributeType::String)
@@ -623,7 +625,8 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                     ],
                 })
                 .with_description("Specifies the lifecycle configuration for objects in an Amazon S3 bucket. For more information, see [Object Lifecycle Management](https://docs.aws.amazon.com/AmazonS3/latest/dev/object-lifecycle-mgmt.html) in the *Amazon S3 User Guide*.")
-                .with_provider_name("LifecycleConfiguration"),
+                .with_provider_name("LifecycleConfiguration")
+                .with_block_name("lifecycle_configuration"),
         )
         .attribute(
             AttributeSchema::new("logging_configuration", AttributeType::Struct {
@@ -800,9 +803,9 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                     ],
                 })).required().with_description("A list of containers for the key-value pair that defines the criteria for the filter rule.").with_provider_name("Rules").with_block_name("rule")
                     ],
-                }).required().with_description("A container for object key name prefix and suffix filtering rules.").with_provider_name("S3Key")
+                }).required().with_description("A container for object key name prefix and suffix filtering rules.").with_provider_name("S3Key").with_block_name("s3_key")
                     ],
-                }).with_description("The filtering rules that determine which objects invoke the AWS Lambda function. For example, you can create a filter so that only image files with a ``.jpg`` extension invoke the function when they are added to the Amazon S3 bucket.").with_provider_name("Filter"),
+                }).with_description("The filtering rules that determine which objects invoke the AWS Lambda function. For example, you can create a filter so that only image files with a ``.jpg`` extension invoke the function when they are added to the Amazon S3 bucket.").with_provider_name("Filter").with_block_name("filter"),
                     StructField::new("function", super::arn()).required().with_description("The Amazon Resource Name (ARN) of the LAMlong function that Amazon S3 invokes when the specified event type occurs.").with_provider_name("Function")
                     ],
                 })).with_description("Describes the LAMlong functions to invoke and the events for which to invoke them.").with_provider_name("LambdaConfigurations").with_block_name("lambda_configuration"),
@@ -830,9 +833,9 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                     ],
                 })).required().with_description("A list of containers for the key-value pair that defines the criteria for the filter rule.").with_provider_name("Rules").with_block_name("rule")
                     ],
-                }).required().with_description("A container for object key name prefix and suffix filtering rules.").with_provider_name("S3Key")
+                }).required().with_description("A container for object key name prefix and suffix filtering rules.").with_provider_name("S3Key").with_block_name("s3_key")
                     ],
-                }).with_description("The filtering rules that determine which objects trigger notifications. For example, you can create a filter so that Amazon S3 sends notifications only when image files with a ``.jpg`` extension are added to the bucket. For more information, see [Configuring event notifications using object key name filtering](https://docs.aws.amazon.com/AmazonS3/latest/user-guide/notification-how-to-filtering.html) in the *Amazon S3 User Guide*.").with_provider_name("Filter"),
+                }).with_description("The filtering rules that determine which objects trigger notifications. For example, you can create a filter so that Amazon S3 sends notifications only when image files with a ``.jpg`` extension are added to the bucket. For more information, see [Configuring event notifications using object key name filtering](https://docs.aws.amazon.com/AmazonS3/latest/user-guide/notification-how-to-filtering.html) in the *Amazon S3 User Guide*.").with_provider_name("Filter").with_block_name("filter"),
                     StructField::new("queue", super::arn()).required().with_description("The Amazon Resource Name (ARN) of the Amazon SQS queue to which Amazon S3 publishes a message when it detects events of the specified type. FIFO queues are not allowed when enabling an SQS queue as the event notification destination.").with_provider_name("Queue")
                     ],
                 })).with_description("The Amazon Simple Queue Service queues to publish messages to and the events for which to publish messages.").with_provider_name("QueueConfigurations").with_block_name("queue_configuration"),
@@ -860,16 +863,17 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                     ],
                 })).required().with_description("A list of containers for the key-value pair that defines the criteria for the filter rule.").with_provider_name("Rules").with_block_name("rule")
                     ],
-                }).required().with_description("A container for object key name prefix and suffix filtering rules.").with_provider_name("S3Key")
+                }).required().with_description("A container for object key name prefix and suffix filtering rules.").with_provider_name("S3Key").with_block_name("s3_key")
                     ],
-                }).with_description("The filtering rules that determine for which objects to send notifications. For example, you can create a filter so that Amazon S3 sends notifications only when image files with a ``.jpg`` extension are added to the bucket.").with_provider_name("Filter"),
+                }).with_description("The filtering rules that determine for which objects to send notifications. For example, you can create a filter so that Amazon S3 sends notifications only when image files with a ``.jpg`` extension are added to the bucket.").with_provider_name("Filter").with_block_name("filter"),
                     StructField::new("topic", super::arn()).required().with_description("The Amazon Resource Name (ARN) of the Amazon SNS topic to which Amazon S3 publishes a message when it detects events of the specified type.").with_provider_name("Topic")
                     ],
                 })).with_description("The topic to which notifications are sent and the events for which notifications are generated.").with_provider_name("TopicConfigurations").with_block_name("topic_configuration")
                     ],
                 })
                 .with_description("Configuration that defines how Amazon S3 handles bucket notifications.")
-                .with_provider_name("NotificationConfiguration"),
+                .with_provider_name("NotificationConfiguration")
+                .with_block_name("notification_configuration"),
         )
         .attribute(
             AttributeSchema::new("object_lock_configuration", AttributeType::Struct {
@@ -1099,7 +1103,8 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                     ],
                 })
                 .with_description("Configuration for replicating objects in an S3 bucket. To enable replication, you must also enable versioning by using the ``VersioningConfiguration`` property. Amazon S3 can store replicated objects in a single destination bucket or multiple destination buckets. The destination bucket or buckets must already exist.")
-                .with_provider_name("ReplicationConfiguration"),
+                .with_provider_name("ReplicationConfiguration")
+                .with_block_name("replication_configuration"),
         )
         .attribute(
             AttributeSchema::new("tags", tags_type())
@@ -1169,7 +1174,8 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                     ],
                 })
                 .with_description("Information used to configure the bucket as a static website. For more information, see [Hosting Websites on Amazon S3](https://docs.aws.amazon.com/AmazonS3/latest/dev/WebsiteHosting.html).")
-                .with_provider_name("WebsiteConfiguration"),
+                .with_provider_name("WebsiteConfiguration")
+                .with_block_name("website_configuration"),
         )
         .attribute(
             AttributeSchema::new("website_url", AttributeType::Custom {

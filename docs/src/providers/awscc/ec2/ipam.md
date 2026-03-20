@@ -11,9 +11,9 @@ awscc.ec2.ipam {
   description = "Example IPAM"
   tier        = free
 
-  operating_regions = [{
+  operating_region {
     region_name = "ap-northeast-1"
-  }]
+  }
 
   tags = {
     Environment = "example"

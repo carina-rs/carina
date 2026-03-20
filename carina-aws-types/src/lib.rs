@@ -1187,7 +1187,8 @@ pub fn iam_policy_document() -> AttributeType {
             StructField::new("version", iam_policy_version()).with_provider_name("Version"),
             StructField::new("id", AttributeType::String).with_provider_name("Id"),
             StructField::new("statement", AttributeType::list(iam_policy_statement()))
-                .with_provider_name("Statement"),
+                .with_provider_name("Statement")
+                .with_block_name("statement"),
         ],
     }
 }

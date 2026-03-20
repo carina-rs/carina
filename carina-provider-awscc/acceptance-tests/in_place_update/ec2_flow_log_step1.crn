@@ -19,13 +19,13 @@ let flow_log_role = awscc.iam.role {
   role_name                   = "carina-acc-test-update-flow-log-role"
   assume_role_policy_document = {
     version   = "2012-10-17"
-    statement = [{
+    statement {
       effect    = "Allow"
       principal = {
         service = "vpc-flow-logs.amazonaws.com"
       }
       action    = "sts:AssumeRole"
-    }]
+    }
   }
 }
 

@@ -102,7 +102,8 @@ pub fn ec2_security_group_config() -> AwsccSchemaConfig {
                     ],
                 }))
                 .with_description("[VPC only] The outbound rules associated with the security group. There is a short interruption during which you cannot connect to the security group.")
-                .with_provider_name("SecurityGroupEgress"),
+                .with_provider_name("SecurityGroupEgress")
+                .with_block_name("security_group_egress"),
         )
         .attribute(
             AttributeSchema::new("security_group_ingress", AttributeType::unordered_list(AttributeType::Struct {
@@ -138,7 +139,8 @@ pub fn ec2_security_group_config() -> AwsccSchemaConfig {
                     ],
                 }))
                 .with_description("The inbound rules associated with the security group. There is a short interruption during which you cannot connect to the security group.")
-                .with_provider_name("SecurityGroupIngress"),
+                .with_provider_name("SecurityGroupIngress")
+                .with_block_name("security_group_ingress"),
         )
         .attribute(
             AttributeSchema::new("tags", tags_type())
