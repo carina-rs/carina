@@ -71,7 +71,8 @@ pub fn print_plan(plan: &Plan) {
     for (idx, deps) in &effect_deps {
         let has_dep_in_plan = deps.iter().any(|d| binding_to_effect.contains_key(d));
         if !has_dep_in_plan {
-            let children = dependents.get(idx).cloned().unwrap_or_default();
+            let mut children = dependents.get(idx).cloned().unwrap_or_default();
+            children.sort();
             if !children.is_empty() {
                 // Check if all dependents have at least one other dep in the plan
                 let binding_of_idx = effect_bindings.get(idx).map(|s| s.as_str());
@@ -84,7 +85,7 @@ pub fn print_plan(plan: &Plan) {
                     })
                 });
                 if all_dependents_have_other_deps {
-                    // Nest this resource under its first dependent
+                    // Nest this resource under its first dependent (by index order)
                     let first_dependent = children[0];
                     dependents.entry(first_dependent).or_default().push(*idx);
                     nested_under_dependent.insert(*idx);
