@@ -22,7 +22,7 @@ let tgw = awscc.ec2.transit_gateway {
 }
 
 awscc.ec2.transit_gateway_attachment {
-  transit_gateway_id = tgw.transit_gateway_id
+  transit_gateway_id = tgw.id
   vpc_id             = vpc.vpc_id
   subnet_ids         = [subnet.subnet_id]
 

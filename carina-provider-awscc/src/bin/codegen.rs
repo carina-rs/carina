@@ -1842,8 +1842,6 @@ pub fn {}() -> AwsccSchemaConfig {{
                 "\n                .with_description(\"{}{}\")",
                 escaped, suffix
             ));
-        } else if is_read_only {
-            attr_code.push_str("\n                .with_description(\"(read-only)\")");
         }
 
         // Add provider_name mapping (AWS property name)
@@ -8485,6 +8483,82 @@ mod tests {
         assert_eq!(
             tiering.type_name, "IntelligentTieringConfigurationStatus",
             "Colliding struct field enum should be prefixed with parent struct name"
+        );
+    }
+
+    #[test]
+    fn test_read_only_attribute_preserves_original_description() {
+        let mut properties = BTreeMap::new();
+        properties.insert(
+            "FlowLogId".to_string(),
+            CfnProperty {
+                prop_type: Some(TypeValue::Single("string".to_string())),
+                description: Some("The Flow Log ID".to_string()),
+                ..Default::default()
+            },
+        );
+        properties.insert(
+            "Name".to_string(),
+            CfnProperty {
+                prop_type: Some(TypeValue::Single("string".to_string())),
+                description: Some("The name of the resource.".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let schema = CfnSchema {
+            type_name: "AWS::EC2::FlowLog".to_string(),
+            description: None,
+            properties,
+            required: vec![],
+            read_only_properties: vec!["/properties/FlowLogId".to_string()],
+            create_only_properties: vec![],
+            write_only_properties: vec![],
+            primary_identifier: None,
+            definitions: None,
+            tagging: None,
+        };
+
+        let generated = generate_schema_code(&schema, "AWS::EC2::FlowLog").unwrap();
+
+        // Read-only attribute WITH description should append " (read-only)" to the original
+        assert!(
+            generated.contains(r#".with_description("The Flow Log ID (read-only)")"#),
+            "Read-only attribute with description should have ' (read-only)' appended: {generated}"
+        );
+    }
+
+    #[test]
+    fn test_read_only_attribute_without_description_has_no_read_only_description() {
+        let mut properties = BTreeMap::new();
+        properties.insert(
+            "ResourceId".to_string(),
+            CfnProperty {
+                prop_type: Some(TypeValue::Single("string".to_string())),
+                description: None,
+                ..Default::default()
+            },
+        );
+
+        let schema = CfnSchema {
+            type_name: "AWS::EC2::TestResource".to_string(),
+            description: None,
+            properties,
+            required: vec![],
+            read_only_properties: vec!["/properties/ResourceId".to_string()],
+            create_only_properties: vec![],
+            write_only_properties: vec![],
+            primary_identifier: None,
+            definitions: None,
+            tagging: None,
+        };
+
+        let generated = generate_schema_code(&schema, "AWS::EC2::TestResource").unwrap();
+
+        // A read-only attribute with no description should not get a "(read-only)" description
+        assert!(
+            !generated.contains(r#".with_description("(read-only)")"#),
+            "Read-only attribute without original description should not get a '(read-only)' description: {generated}"
         );
     }
 
