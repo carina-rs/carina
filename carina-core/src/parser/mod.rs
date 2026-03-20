@@ -29,8 +29,8 @@ pub enum ParseError {
     #[error("Duplicate module definition: {0}")]
     DuplicateModule(String),
 
-    #[error("Duplicate binding: {0}")]
-    DuplicateBinding(String),
+    #[error("Duplicate binding at line {line}: {name}")]
+    DuplicateBinding { name: String, line: usize },
 
     #[error("Module not found: {0}")]
     ModuleNotFound(String),
@@ -299,12 +299,13 @@ pub fn parse(input: &str) -> Result<ParsedFile, ParseError> {
                                 outputs.extend(parsed_outputs);
                             }
                             Rule::let_binding => {
+                                let (line, _) = stmt.as_span().start_pos().line_col();
                                 let (name, value, maybe_resource, maybe_module_call) =
                                     parse_let_binding_extended(stmt, &ctx)?;
                                 if ctx.variables.contains_key(&name)
                                     || ctx.resource_bindings.contains_key(&name)
                                 {
-                                    return Err(ParseError::DuplicateBinding(name));
+                                    return Err(ParseError::DuplicateBinding { name, line });
                                 }
                                 ctx.set_variable(name.clone(), value);
                                 if let Some(resource) = maybe_resource {
@@ -2576,10 +2577,21 @@ aws.s3.bucket {
             "Duplicate let binding 'rt' should produce an error, but parsing succeeded: {:?}",
             result.unwrap()
         );
-        let err = result.unwrap_err().to_string();
+        let err = result.unwrap_err();
+        match &err {
+            ParseError::DuplicateBinding { name, line } => {
+                assert_eq!(name, "rt");
+                assert_eq!(
+                    *line, 6,
+                    "Duplicate binding should report the line of the second 'let rt', got line {line}"
+                );
+            }
+            _ => panic!("Expected DuplicateBinding error, got: {err}"),
+        }
+        let err_str = err.to_string();
         assert!(
-            err.contains("Duplicate") && err.contains("rt"),
-            "Error should mention duplicate binding 'rt', got: {err}"
+            err_str.contains("Duplicate") && err_str.contains("rt"),
+            "Error should mention duplicate binding 'rt', got: {err_str}"
         );
     }
 
@@ -2597,10 +2609,21 @@ aws.s3.bucket {
             "Duplicate let binding 'region' should produce an error, but parsing succeeded: {:?}",
             result.unwrap()
         );
-        let err = result.unwrap_err().to_string();
+        let err = result.unwrap_err();
+        match &err {
+            ParseError::DuplicateBinding { name, line } => {
+                assert_eq!(name, "region");
+                assert_eq!(
+                    *line, 3,
+                    "Duplicate binding should report the line of the second 'let region', got line {line}"
+                );
+            }
+            _ => panic!("Expected DuplicateBinding error, got: {err}"),
+        }
+        let err_str = err.to_string();
         assert!(
-            err.contains("Duplicate") && err.contains("region"),
-            "Error should mention duplicate binding 'region', got: {err}"
+            err_str.contains("Duplicate") && err_str.contains("region"),
+            "Error should mention duplicate binding 'region', got: {err_str}"
         );
     }
 

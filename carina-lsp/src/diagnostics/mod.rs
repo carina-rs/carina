@@ -701,8 +701,17 @@ fn parse_error_to_diagnostic(error: &ParseError) -> Diagnostic {
             message: format!("Duplicate module definition: {}", name),
             ..Default::default()
         },
-        ParseError::DuplicateBinding(name) => Diagnostic {
-            range: Range::default(),
+        ParseError::DuplicateBinding { name, line } => Diagnostic {
+            range: Range {
+                start: Position {
+                    line: (line - 1) as u32,
+                    character: 0,
+                },
+                end: Position {
+                    line: (line - 1) as u32,
+                    character: 0,
+                },
+            },
             severity: Some(DiagnosticSeverity::ERROR),
             source: Some("carina".to_string()),
             message: format!("Duplicate binding: {}", name),
