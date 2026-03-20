@@ -55,12 +55,22 @@ pub fn draw(frame: &mut Frame, app: &App) {
 
 /// Draw the tree view in the left panel
 fn draw_tree(frame: &mut Frame, app: &App, area: Rect) {
-    let items: Vec<ListItem> = app
-        .nodes
+    let visible = app.visible_nodes();
+
+    let items: Vec<ListItem> = visible
         .iter()
-        .map(|node| {
-            let expand_marker = if node.expanded { "[-]" } else { "[+]" };
-            let text = format!("{} {} {}", expand_marker, node.symbol, node.effect_label);
+        .map(|&idx| {
+            let node = &app.nodes[idx];
+            let indent = "  ".repeat(node.depth);
+            let expand_marker = if !node.children.is_empty() {
+                if node.expanded { "[-]" } else { "[+]" }
+            } else {
+                "   "
+            };
+            let text = format!(
+                "{}{} {} {}",
+                indent, expand_marker, node.symbol, node.effect_label
+            );
             let style = effect_style(node.kind);
             ListItem::new(Line::from(text).style(style))
         })
