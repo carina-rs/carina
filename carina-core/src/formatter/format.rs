@@ -547,9 +547,10 @@ impl Formatter {
     }
 
     fn block_has_content(&self, node: &CstNode) -> bool {
-        node.children
-            .iter()
-            .any(|child| matches!(child, CstChild::Node(n) if n.kind == NodeKind::Attribute))
+        node.children.iter().any(|child| {
+            matches!(child, CstChild::Node(n) if n.kind == NodeKind::Attribute)
+                || matches!(child, CstChild::Trivia(Trivia::LineComment(_)))
+        })
     }
 
     fn format_block_attributes(&mut self, node: &CstNode) {
