@@ -2592,4 +2592,165 @@ mod tests {
             "expected 'transition' key to be removed (block syntax renamed)"
         );
     }
+
+    #[test]
+    fn resolve_block_names_same_block_and_canonical_name() {
+        // When block_name == canonical attribute name, block syntax should work
+        // without triggering a false "cannot use both" error.
+        // This regression was introduced in PR #913 and fixed in PR #917.
+        let mut resources = vec![{
+            let mut r = Resource::new("ec2.security_group", "my-sg");
+            // Block syntax produces Value::List
+            r.attributes.insert(
+                "ingress".to_string(),
+                Value::List(vec![Value::Map({
+                    let mut m = HashMap::new();
+                    m.insert("ip_protocol".to_string(), Value::String("tcp".to_string()));
+                    m
+                })]),
+            );
+            r
+        }];
+
+        let mut schemas = HashMap::new();
+        schemas.insert(
+            "ec2.security_group".to_string(),
+            ResourceSchema::new("ec2.security_group").attribute(
+                AttributeSchema::new(
+                    "ingress",
+                    AttributeType::list(AttributeType::Struct {
+                        name: "Ingress".to_string(),
+                        fields: vec![StructField::new("ip_protocol", AttributeType::String)],
+                    }),
+                )
+                .with_block_name("ingress"),
+            ),
+        );
+
+        // Should succeed without errors (block_name == canonical name, no rename needed)
+        resolve_block_names(&mut resources, &schemas, |r| r.id.resource_type.clone()).unwrap();
+
+        // Key should remain as "ingress"
+        assert!(resources[0].attributes.contains_key("ingress"));
+        // Value should be unchanged
+        match resources[0].attributes.get("ingress") {
+            Some(Value::List(items)) => assert_eq!(items.len(), 1),
+            other => panic!("expected List, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn resolve_block_names_same_block_and_canonical_name_with_both_syntax_errors() {
+        // When block_name == canonical name and the user provides a List value,
+        // there's no conflict since they map to the same key. The key already
+        // exists (it IS the canonical key), so the `continue` path handles it.
+        // This test verifies the value is preserved correctly.
+        let mut resources = vec![{
+            let mut r = Resource::new("ec2.security_group", "my-sg");
+            r.attributes.insert(
+                "ingress".to_string(),
+                Value::List(vec![
+                    Value::Map({
+                        let mut m = HashMap::new();
+                        m.insert("ip_protocol".to_string(), Value::String("tcp".to_string()));
+                        m
+                    }),
+                    Value::Map({
+                        let mut m = HashMap::new();
+                        m.insert("ip_protocol".to_string(), Value::String("udp".to_string()));
+                        m
+                    }),
+                ]),
+            );
+            r
+        }];
+
+        let mut schemas = HashMap::new();
+        schemas.insert(
+            "ec2.security_group".to_string(),
+            ResourceSchema::new("ec2.security_group").attribute(
+                AttributeSchema::new(
+                    "ingress",
+                    AttributeType::list(AttributeType::Struct {
+                        name: "Ingress".to_string(),
+                        fields: vec![StructField::new("ip_protocol", AttributeType::String)],
+                    }),
+                )
+                .with_block_name("ingress"),
+            ),
+        );
+
+        // Should succeed; block_name == canonical name means no conflict possible
+        resolve_block_names(&mut resources, &schemas, |r| r.id.resource_type.clone()).unwrap();
+
+        assert!(resources[0].attributes.contains_key("ingress"));
+        match resources[0].attributes.get("ingress") {
+            Some(Value::List(items)) => assert_eq!(items.len(), 2),
+            other => panic!("expected List with 2 items, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn resolve_block_names_nested_same_block_and_canonical_name() {
+        // Nested struct field where block_name == canonical field name.
+        // Should resolve without errors.
+        let mut inner_map = HashMap::new();
+        inner_map.insert(
+            "tag".to_string(),
+            Value::List(vec![Value::Map({
+                let mut m = HashMap::new();
+                m.insert("key".to_string(), Value::String("Name".to_string()));
+                m.insert("value".to_string(), Value::String("test".to_string()));
+                m
+            })]),
+        );
+
+        let mut resources = vec![{
+            let mut r = Resource::new("test.resource", "my-resource");
+            r.attributes
+                .insert("config".to_string(), Value::Map(inner_map));
+            r
+        }];
+
+        let mut schemas = HashMap::new();
+        schemas.insert(
+            "test.resource".to_string(),
+            ResourceSchema::new("test.resource").attribute(AttributeSchema::new(
+                "config",
+                AttributeType::Struct {
+                    name: "Config".to_string(),
+                    fields: vec![
+                        StructField::new(
+                            "tag",
+                            AttributeType::list(AttributeType::Struct {
+                                name: "Tag".to_string(),
+                                fields: vec![
+                                    StructField::new("key", AttributeType::String),
+                                    StructField::new("value", AttributeType::String),
+                                ],
+                            }),
+                        )
+                        .with_block_name("tag"),
+                    ],
+                },
+            )),
+        );
+
+        // Should succeed without errors
+        resolve_block_names(&mut resources, &schemas, |r| r.id.resource_type.clone()).unwrap();
+
+        let config = match resources[0].attributes.get("config") {
+            Some(Value::Map(m)) => m,
+            _ => panic!("expected Map"),
+        };
+        // Key should remain as "tag" (no rename needed since block_name == canonical)
+        assert!(
+            config.contains_key("tag"),
+            "expected 'tag' key to remain (block_name == canonical name)"
+        );
+        match config.get("tag") {
+            Some(Value::List(items)) => assert_eq!(items.len(), 1),
+            other => panic!("expected List, got {:?}", other),
+        }
+    }
 }
