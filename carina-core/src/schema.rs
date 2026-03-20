@@ -857,6 +857,10 @@ fn resolve_block_names_in_map(
         .collect();
 
     for (block_key, canon_key) in renames {
+        // When block_name == canonical name, no rename is needed
+        if block_key == canon_key {
+            continue;
+        }
         if map.contains_key(&canon_key) {
             errors.push(format!(
                 "{}: cannot use both '{}' and '{}' (they refer to the same attribute)",
@@ -939,6 +943,10 @@ pub fn resolve_block_names(
             .collect();
 
         for (block_key, canon_key) in renames {
+            // When block_name == canonical name, no rename is needed
+            if block_key == canon_key {
+                continue;
+            }
             if resource.attributes.contains_key(&canon_key) {
                 all_errors.push(format!(
                     "{}: cannot use both '{}' and '{}' (they refer to the same attribute)",
