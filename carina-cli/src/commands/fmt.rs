@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -44,7 +43,7 @@ pub fn run_fmt(
         let content = fs::read_to_string(file)
             .map_err(|e| format!("Failed to read {}: {}", file.display(), e))?;
 
-        match format_with_block_names_or_fallback(&content, &config, &block_names) {
+        match formatter::format_with_block_names(&content, &config, &block_names) {
             Ok(formatted) => {
                 if content != formatted {
                     needs_formatting.push((file.clone(), content.clone(), formatted.clone()));
@@ -101,16 +100,6 @@ pub fn run_fmt(
         }
         Ok(())
     }
-}
-
-/// Format with block_names conversion. If format_with_block_names fails (e.g., parse error),
-/// fall back to regular format which may produce a better error message.
-fn format_with_block_names_or_fallback(
-    content: &str,
-    config: &FormatConfig,
-    block_names: &HashMap<String, String>,
-) -> Result<String, carina_core::formatter::FormatParseError> {
-    formatter::format_with_block_names(content, config, block_names)
 }
 
 fn print_diff(file: &Path, original: &str, formatted: &str) {
