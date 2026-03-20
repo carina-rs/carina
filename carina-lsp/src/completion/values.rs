@@ -69,18 +69,44 @@ impl CompletionProvider {
     ) -> Vec<CompletionItem> {
         let mut completions = Vec::new();
 
-        // For attributes ending with _id (like vpc_id, route_table_id), suggest resource bindings
-        if attr_name.ends_with("_id") {
-            let bindings = self.extract_resource_bindings(text);
-            for binding_name in bindings {
-                // Add completion with .id suffix (e.g., main_vpc.id)
-                completions.push(CompletionItem {
-                    label: format!("{}.id", binding_name),
-                    kind: Some(CompletionItemKind::REFERENCE),
-                    detail: Some(format!("Reference to {}'s ID", binding_name)),
-                    insert_text: Some(format!("{}.id", binding_name)),
-                    ..Default::default()
-                });
+        // Type-based resource reference completions:
+        // Look up the attribute's type from the schema. If it's a Custom type,
+        // find bindings whose resource schema has an attribute with the same Custom type name.
+        if let Some(schema) = self.schemas.get(resource_type)
+            && let Some(attr_schema) = schema.attributes.get(attr_name)
+        {
+            let target_type_name = Self::extract_custom_type_name(&attr_schema.attr_type);
+            if let Some(target_name) = target_type_name {
+                let bindings = self.extract_resource_bindings(text);
+                for (binding_name, binding_resource_type) in &bindings {
+                    if binding_resource_type.is_empty() {
+                        continue;
+                    }
+                    // Look up the binding's resource schema and find attributes
+                    // with matching Custom type name
+                    if let Some(binding_schema) = self.schemas.get(binding_resource_type) {
+                        for binding_attr in binding_schema.attributes.values() {
+                            if let Some(binding_type_name) =
+                                Self::extract_custom_type_name(&binding_attr.attr_type)
+                                && binding_type_name == target_name
+                            {
+                                completions.push(CompletionItem {
+                                    label: format!("{}.{}", binding_name, binding_attr.name),
+                                    kind: Some(CompletionItemKind::REFERENCE),
+                                    detail: Some(format!(
+                                        "Reference to {}'s {} ({})",
+                                        binding_name, binding_attr.name, target_name
+                                    )),
+                                    insert_text: Some(format!(
+                                        "{}.{}",
+                                        binding_name, binding_attr.name
+                                    )),
+                                    ..Default::default()
+                                });
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -138,6 +164,14 @@ impl CompletionProvider {
         // Fall back to generic value completions
         completions.extend(self.generic_value_completions());
         completions
+    }
+
+    /// Extract the Custom type name from an AttributeType, if it is a Custom type.
+    fn extract_custom_type_name(attr_type: &AttributeType) -> Option<&str> {
+        match attr_type {
+            AttributeType::Custom { name, .. } => Some(name),
+            _ => None,
+        }
     }
 
     pub(super) fn completions_for_type(&self, attr_type: &AttributeType) -> Vec<CompletionItem> {
@@ -199,7 +233,7 @@ impl CompletionProvider {
                 }
                 completions
             }
-            _ => self.generic_value_completions(),
+            _ => vec![],
         }
     }
 

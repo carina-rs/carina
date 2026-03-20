@@ -200,12 +200,15 @@ impl CompletionProvider {
         params
     }
 
-    /// Extract resource binding names from text (variables defined with `let binding_name = aws...`)
-    pub(super) fn extract_resource_bindings(&self, text: &str) -> Vec<String> {
+    /// Extract resource binding names and their resource types from text
+    /// (variables defined with `let binding_name = awscc.ec2.vpc {`)
+    /// Returns Vec<(binding_name, resource_type)> where resource_type is the schema key
+    /// (e.g., "awscc.ec2.vpc")
+    pub(super) fn extract_resource_bindings(&self, text: &str) -> Vec<(String, String)> {
         let mut bindings = Vec::new();
         for line in text.lines() {
             let trimmed = line.trim();
-            // Parse: let binding_name = ...
+            // Parse: let binding_name = <resource_type> {
             if let Some(rest) = trimmed.strip_prefix("let ")
                 && let Some(eq_pos) = rest.find('=')
             {
@@ -215,7 +218,14 @@ impl CompletionProvider {
                         .chars()
                         .all(|c| c.is_alphanumeric() || c == '_')
                 {
-                    bindings.push(binding_name.to_string());
+                    // Extract resource type from the part after "="
+                    let after_eq = rest[eq_pos + 1..].trim();
+                    if let Some(resource_type) = self.extract_resource_type(after_eq) {
+                        bindings.push((binding_name.to_string(), resource_type));
+                    } else {
+                        // Fallback: include binding with empty resource type
+                        bindings.push((binding_name.to_string(), String::new()));
+                    }
                 }
             }
         }
