@@ -100,6 +100,12 @@ struct CfnSchema {
     primary_identifier: Option<Vec<String>>,
     definitions: Option<BTreeMap<String, CfnDefinition>>,
     tagging: Option<CfnTagging>,
+    /// Top-level oneOf variants (mutually exclusive required field groups)
+    #[serde(default, rename = "oneOf")]
+    one_of: Vec<CfnOneOfVariant>,
+    /// Top-level anyOf variants
+    #[serde(default, rename = "anyOf")]
+    any_of: Vec<CfnOneOfVariant>,
 }
 
 /// CloudFormation Tagging metadata
@@ -1024,6 +1030,111 @@ fn collect_struct_defs(
     }
 }
 
+/// Detect mutually exclusive field groups from top-level `oneOf` / `anyOf` patterns.
+///
+/// CloudFormation schemas may have top-level `oneOf` or `anyOf` arrays where each variant
+/// has a different `required` field list. When each variant requires exactly one field and
+/// the fields differ across variants, they form a mutually exclusive group.
+fn detect_exclusive_from_oneof(schema: &CfnSchema) -> Vec<Vec<String>> {
+    let mut groups = Vec::new();
+
+    for variants in [&schema.one_of, &schema.any_of] {
+        if variants.len() < 2 {
+            continue;
+        }
+        // Collect the required fields from each variant
+        let required_sets: Vec<&Vec<String>> = variants.iter().map(|v| &v.required).collect();
+
+        // Check that every variant has exactly one required field
+        if required_sets.iter().all(|r| r.len() == 1) {
+            let fields: Vec<String> = required_sets.iter().map(|r| r[0].clone()).collect();
+            // Only create a group if all fields are distinct property names
+            let unique: HashSet<&String> = fields.iter().collect();
+            if unique.len() == fields.len() && fields.len() >= 2 {
+                groups.push(fields);
+            }
+        }
+    }
+
+    groups
+}
+
+/// Regex for detecting "specify either X or Y" patterns in property descriptions.
+/// X and Y can be PascalCase names or ``backtick-quoted`` names.
+static EXCLUSIVE_DESC_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)specify either\s*`*([A-Z][A-Za-z0-9]*)`*\s+or\s+`*([A-Z][A-Za-z0-9]*)`*")
+        .unwrap()
+});
+
+/// Detect mutually exclusive field groups from property description text.
+///
+/// Looks for patterns like:
+/// - "You must specify either InternetGatewayId or VpnGatewayId, but not both"
+/// - "You must specify either``CidrBlock`` or ``Ipv4IpamPoolId``"
+/// - "Specify either X or Y"
+fn detect_exclusive_from_descriptions(schema: &CfnSchema) -> Vec<Vec<String>> {
+    let property_names: HashSet<&String> = schema.properties.keys().collect();
+    let mut seen_groups: HashSet<Vec<String>> = HashSet::new();
+
+    for prop in schema.properties.values() {
+        let desc = match &prop.description {
+            Some(d) => d,
+            None => continue,
+        };
+
+        for cap in EXCLUSIVE_DESC_RE.captures_iter(desc) {
+            let field_a = cap[1].to_string();
+            let field_b = cap[2].to_string();
+
+            // Only include groups where both fields are actual properties of this resource
+            if property_names.contains(&field_a) && property_names.contains(&field_b) {
+                let mut group = vec![field_a, field_b];
+                group.sort();
+                if seen_groups.insert(group.clone()) {
+                    eprintln!("  [exclusive:description] detected: [{}]", group.join(", "));
+                }
+            }
+        }
+    }
+
+    seen_groups.into_iter().collect()
+}
+
+/// Detect all mutually exclusive field groups for a schema, combining both detection methods.
+/// Returns a deduplicated list of groups (each group is a sorted Vec of PascalCase field names).
+fn detect_exclusive_fields(schema: &CfnSchema, type_name: &str) -> Vec<Vec<String>> {
+    let mut all_groups: HashSet<Vec<String>> = HashSet::new();
+
+    // Approach 1: oneOf / anyOf patterns
+    let oneof_groups = detect_exclusive_from_oneof(schema);
+    for mut group in oneof_groups {
+        group.sort();
+        eprintln!(
+            "  [exclusive:oneOf] {}: detected: [{}]",
+            type_name,
+            group.join(", ")
+        );
+        all_groups.insert(group);
+    }
+
+    // Approach 2: description text parsing
+    let desc_groups = detect_exclusive_from_descriptions(schema);
+    for group in desc_groups {
+        // group is already sorted
+        if all_groups.contains(&group) {
+            eprintln!(
+                "  [exclusive:both] {}: detected by both methods: [{}]",
+                type_name,
+                group.join(", ")
+            );
+        } else {
+            all_groups.insert(group);
+        }
+    }
+
+    all_groups.into_iter().collect()
+}
+
 fn generate_schema_code(schema: &CfnSchema, type_name: &str) -> Result<String> {
     let mut code = String::new();
 
@@ -1408,6 +1519,10 @@ fn generate_schema_code(schema: &CfnSchema, type_name: &str) -> Result<String> {
     // Determine has_tags from tagging metadata
     let has_tags = schema.tagging.as_ref().map(|t| t.taggable).unwrap_or(false);
 
+    // Detect mutually exclusive field groups from schema structure and descriptions
+    let exclusive_groups = detect_exclusive_fields(schema, type_name);
+    let has_exclusive_fields = !exclusive_groups.is_empty();
+
     // Generate header with conditional imports
     let mut schema_imports = vec!["AttributeSchema", "ResourceSchema"];
     if needs_attribute_type {
@@ -1418,6 +1533,9 @@ fn generate_schema_code(schema: &CfnSchema, type_name: &str) -> Result<String> {
     }
     if needs_types {
         schema_imports.push("types");
+    }
+    if has_exclusive_fields {
+        schema_imports.push("validators");
     }
     let schema_imports_str = schema_imports.join(", ");
     code.push_str(&format!(
@@ -1908,6 +2026,26 @@ pub fn {}() -> AwsccSchemaConfig {{
     const FORCE_REPLACE_TYPES: &[&str] = &["AWS::EC2::InternetGateway", "AWS::EC2::IPAM"];
     if FORCE_REPLACE_TYPES.contains(&type_name) {
         code.push_str("        .force_replace()\n");
+    }
+
+    // Generate validator for mutually exclusive field groups.
+    if !exclusive_groups.is_empty() {
+        code.push_str("        .with_validator(|attrs| {\n");
+        code.push_str("            let mut errors = Vec::new();\n");
+        for group in &exclusive_groups {
+            let fields_str = group
+                .iter()
+                .map(|f| format!("\"{}\"", f.to_snake_case()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            code.push_str(&format!(
+                "            if let Err(mut e) = validators::validate_exclusive_required(attrs, &[{}]) {{\n                errors.append(&mut e);\n            }}\n",
+                fields_str
+            ));
+        }
+        code.push_str(
+            "            if errors.is_empty() { Ok(()) } else { Err(errors) }\n        })\n",
+        );
     }
 
     // Close the schema (ResourceSchema) and the AwsccSchemaConfig struct
@@ -3956,6 +4094,8 @@ mod tests {
             primary_identifier: None,
             definitions: None,
             tagging: None,
+            one_of: vec![],
+            any_of: vec![],
         };
         let (_, enum_info) =
             cfn_type_to_carina_type_with_enum(&prop, "IpProtocol", &schema, "", &BTreeMap::new());
@@ -4033,6 +4173,8 @@ mod tests {
             primary_identifier: None,
             definitions: None,
             tagging: None,
+            one_of: vec![],
+            any_of: vec![],
         };
         let (type_str, _) =
             cfn_type_to_carina_type_with_enum(&prop, "CidrIp", &schema, "", &BTreeMap::new());
@@ -4077,6 +4219,8 @@ mod tests {
             primary_identifier: None,
             definitions: None,
             tagging: None,
+            one_of: vec![],
+            any_of: vec![],
         };
         let (type_str, _) =
             cfn_type_to_carina_type_with_enum(&prop, "CidrIpv6", &schema, "", &BTreeMap::new());
@@ -4121,6 +4265,8 @@ mod tests {
             primary_identifier: None,
             definitions: None,
             tagging: None,
+            one_of: vec![],
+            any_of: vec![],
         };
         let (type_str, _) = cfn_type_to_carina_type_with_enum(
             &prop,
@@ -4170,6 +4316,8 @@ mod tests {
             primary_identifier: None,
             definitions: None,
             tagging: None,
+            one_of: vec![],
+            any_of: vec![],
         };
         let (type_str, _) =
             cfn_type_to_carina_type_with_enum(&prop, "PublicIp", &schema, "", &BTreeMap::new());
@@ -4214,6 +4362,8 @@ mod tests {
             primary_identifier: None,
             definitions: None,
             tagging: None,
+            one_of: vec![],
+            any_of: vec![],
         };
         let (type_str, _) = cfn_type_to_carina_type_with_enum(
             &prop,
@@ -4262,6 +4412,8 @@ mod tests {
             primary_identifier: None,
             definitions: None,
             tagging: None,
+            one_of: vec![],
+            any_of: vec![],
         };
 
         // AvailabilityZone should use super::availability_zone()
@@ -4557,6 +4709,8 @@ mod tests {
             primary_identifier: None,
             definitions: None,
             tagging: None,
+            one_of: vec![],
+            any_of: vec![],
         };
         let enums = BTreeMap::new();
         assert_eq!(
@@ -4620,6 +4774,8 @@ mod tests {
             primary_identifier: None,
             definitions: None,
             tagging: None,
+            one_of: vec![],
+            any_of: vec![],
         };
         let enums = BTreeMap::new();
         assert_eq!(
@@ -4663,6 +4819,8 @@ mod tests {
             primary_identifier: None,
             definitions: None,
             tagging: None,
+            one_of: vec![],
+            any_of: vec![],
         };
         let enums = BTreeMap::new();
         assert_eq!(
@@ -4731,6 +4889,8 @@ mod tests {
             primary_identifier: None,
             definitions: None,
             tagging: None,
+            one_of: vec![],
+            any_of: vec![],
         };
         let enums = BTreeMap::new();
 
@@ -4941,6 +5101,8 @@ mod tests {
             primary_identifier: None,
             definitions: None,
             tagging: None,
+            one_of: vec![],
+            any_of: vec![],
         };
         let (type_str, _) = cfn_type_to_carina_type_with_enum(
             &prop,
@@ -5000,6 +5162,8 @@ mod tests {
             primary_identifier: None,
             definitions: None,
             tagging: None,
+            one_of: vec![],
+            any_of: vec![],
         };
         let (type_str, _) =
             cfn_type_to_carina_type_with_enum(&prop, "SomeCount", &schema, "", &BTreeMap::new());
@@ -5041,6 +5205,8 @@ mod tests {
             primary_identifier: None,
             definitions: None,
             tagging: None,
+            one_of: vec![],
+            any_of: vec![],
         };
         let (type_str, _) =
             cfn_type_to_carina_type_with_enum(&prop, "SomeCount", &schema, "", &BTreeMap::new());
@@ -5091,6 +5257,8 @@ mod tests {
             primary_identifier: None,
             definitions: None,
             tagging: None,
+            one_of: vec![],
+            any_of: vec![],
         };
         let (type_str, _) =
             cfn_type_to_carina_type_with_enum(&prop, "SomeCount", &schema, "", &BTreeMap::new());
@@ -5147,6 +5315,8 @@ mod tests {
             primary_identifier: None,
             definitions: None,
             tagging: None,
+            one_of: vec![],
+            any_of: vec![],
         };
         let (type_str, _) = cfn_type_to_carina_type_with_enum(
             &prop,
@@ -5206,6 +5376,8 @@ mod tests {
             primary_identifier: None,
             definitions: None,
             tagging: None,
+            one_of: vec![],
+            any_of: vec![],
         };
         let enums = BTreeMap::new();
         let result = type_display_string("SecondaryPrivateIpAddressCount", &prop, &schema, &enums);
@@ -5251,6 +5423,8 @@ mod tests {
             primary_identifier: None,
             definitions: None,
             tagging: None,
+            one_of: vec![],
+            any_of: vec![],
         };
         let enums = BTreeMap::new();
         let result = type_display_string("Priority", &prop, &schema, &enums);
@@ -5296,6 +5470,8 @@ mod tests {
             primary_identifier: None,
             definitions: None,
             tagging: None,
+            one_of: vec![],
+            any_of: vec![],
         };
         let enums = BTreeMap::new();
         // Resource-scoped override takes precedence over schema enum values
@@ -5340,6 +5516,8 @@ mod tests {
             primary_identifier: None,
             definitions: None,
             tagging: None,
+            one_of: vec![],
+            any_of: vec![],
         };
         let enums = BTreeMap::new();
         let result = type_display_string("Ipv4NetmaskLength", &prop, &schema, &enums);
@@ -5418,6 +5596,8 @@ mod tests {
             primary_identifier: None,
             definitions: None,
             tagging: None,
+            one_of: vec![],
+            any_of: vec![],
         };
         let (type_str, _) = cfn_type_to_carina_type_with_enum(
             &prop,
@@ -5464,6 +5644,8 @@ mod tests {
             primary_identifier: None,
             definitions: None,
             tagging: None,
+            one_of: vec![],
+            any_of: vec![],
         };
         let (type_str, _) =
             cfn_type_to_carina_type_with_enum(&prop, "FromPort", &schema, "", &BTreeMap::new());
@@ -5509,6 +5691,8 @@ mod tests {
             primary_identifier: None,
             definitions: None,
             tagging: None,
+            one_of: vec![],
+            any_of: vec![],
         };
         let (type_str, _) =
             cfn_type_to_carina_type_with_enum(&prop, "Arn", &schema, "", &BTreeMap::new());
@@ -5567,6 +5751,8 @@ mod tests {
             primary_identifier: None,
             definitions: None,
             tagging: None,
+            one_of: vec![],
+            any_of: vec![],
         };
         let (type_str, _) =
             cfn_type_to_carina_type_with_enum(&prop, "FromPort", &schema, "", &BTreeMap::new());
@@ -6253,6 +6439,8 @@ mod tests {
             primary_identifier: None,
             definitions: None,
             tagging: None,
+            one_of: vec![],
+            any_of: vec![],
         };
 
         let generated = generate_schema_code(&schema, "AWS::EC2::IPAMPool").unwrap();
@@ -6360,6 +6548,8 @@ mod tests {
             primary_identifier: None,
             definitions: Some(definitions),
             tagging: None,
+            one_of: vec![],
+            any_of: vec![],
         };
 
         let generated = generate_schema_code(&schema, "AWS::EC2::TestResource").unwrap();
@@ -6397,6 +6587,8 @@ mod tests {
             primary_identifier: None,
             definitions: None,
             tagging: None,
+            one_of: vec![],
+            any_of: vec![],
         };
         let enums = BTreeMap::new();
         let (_, enum_info) = cfn_type_to_carina_type_with_enum(
@@ -6440,6 +6632,8 @@ mod tests {
             primary_identifier: None,
             definitions: None,
             tagging: None,
+            one_of: vec![],
+            any_of: vec![],
         };
         let enums = BTreeMap::new();
         let (type_str, enum_info) = cfn_type_to_carina_type_with_enum(
@@ -6497,6 +6691,8 @@ mod tests {
             primary_identifier: None,
             definitions: Some(definitions),
             tagging: None,
+            one_of: vec![],
+            any_of: vec![],
         };
         let enums = BTreeMap::new();
         let (_, enum_info) = cfn_type_to_carina_type_with_enum(
@@ -6556,6 +6752,8 @@ mod tests {
             primary_identifier: None,
             definitions: Some(definitions),
             tagging: None,
+            one_of: vec![],
+            any_of: vec![],
         };
         let enums = BTreeMap::new();
         let (type_str, enum_info) = cfn_type_to_carina_type_with_enum(
@@ -6610,6 +6808,8 @@ mod tests {
             primary_identifier: None,
             definitions: None,
             tagging: None,
+            one_of: vec![],
+            any_of: vec![],
         };
         let generated = generate_schema_code(&schema, "AWS::S3::Bucket").unwrap();
         assert!(
@@ -6667,6 +6867,8 @@ mod tests {
             primary_identifier: None,
             definitions: Some(definitions),
             tagging: None,
+            one_of: vec![],
+            any_of: vec![],
         };
 
         let md = generate_markdown(&schema, "AWS::S3::Bucket").unwrap();
@@ -6745,6 +6947,8 @@ mod tests {
             primary_identifier: None,
             definitions: Some(definitions),
             tagging: None,
+            one_of: vec![],
+            any_of: vec![],
         };
 
         let md = generate_markdown(&schema, "AWS::S3::Bucket").unwrap();
@@ -6862,6 +7066,8 @@ mod tests {
             primary_identifier: None,
             definitions: Some(definitions),
             tagging: None,
+            one_of: vec![],
+            any_of: vec![],
         };
 
         let md = generate_markdown(&schema, "AWS::EC2::SecurityGroup").unwrap();
@@ -6963,6 +7169,8 @@ mod tests {
             primary_identifier: None,
             definitions: Some(definitions),
             tagging: None,
+            one_of: vec![],
+            any_of: vec![],
         };
 
         let md = generate_markdown(&schema, "AWS::Test::Resource").unwrap();
@@ -7055,6 +7263,8 @@ mod tests {
             primary_identifier: None,
             definitions: Some(definitions),
             tagging: None,
+            one_of: vec![],
+            any_of: vec![],
         };
 
         let md = generate_markdown(&schema, "AWS::Test::Resource").unwrap();
@@ -7102,6 +7312,8 @@ mod tests {
             primary_identifier: None,
             definitions: None,
             tagging: None,
+            one_of: vec![],
+            any_of: vec![],
         };
 
         let generated = generate_schema_code(&schema, "AWS::IAM::Role").unwrap();
@@ -7140,6 +7352,8 @@ mod tests {
             primary_identifier: None,
             definitions: None,
             tagging: None,
+            one_of: vec![],
+            any_of: vec![],
         };
 
         let generated = generate_schema_code(&schema, "AWS::Logs::LogGroup").unwrap();
@@ -7174,6 +7388,8 @@ mod tests {
             primary_identifier: None,
             definitions: None,
             tagging: None,
+            one_of: vec![],
+            any_of: vec![],
         };
 
         let generated = generate_schema_code(&schema, "AWS::Test::Resource").unwrap();
@@ -7217,6 +7433,8 @@ mod tests {
             primary_identifier: None,
             definitions: None,
             tagging: None,
+            one_of: vec![],
+            any_of: vec![],
         };
 
         let md = generate_markdown(&schema, "AWS::Test::Resource").unwrap();
@@ -7268,6 +7486,8 @@ mod tests {
             primary_identifier: None,
             definitions: None,
             tagging: None,
+            one_of: vec![],
+            any_of: vec![],
         };
         let (type_str, _) = cfn_type_to_carina_type_with_enum(
             &prop,
@@ -7308,6 +7528,8 @@ mod tests {
             primary_identifier: None,
             definitions: None,
             tagging: None,
+            one_of: vec![],
+            any_of: vec![],
         };
         let (type_str, _) = cfn_type_to_carina_type_with_enum(
             &prop,
@@ -7348,6 +7570,8 @@ mod tests {
             primary_identifier: None,
             definitions: None,
             tagging: None,
+            one_of: vec![],
+            any_of: vec![],
         };
 
         let code = generate_schema_code(&schema, "AWS::Logs::LogGroup").unwrap();
@@ -7387,6 +7611,8 @@ mod tests {
             primary_identifier: None,
             definitions: None,
             tagging: None,
+            one_of: vec![],
+            any_of: vec![],
         };
         let enums = BTreeMap::new();
         let (type_str, _) = cfn_type_to_carina_type_with_enum(
@@ -7433,6 +7659,8 @@ mod tests {
             primary_identifier: None,
             definitions: None,
             tagging: None,
+            one_of: vec![],
+            any_of: vec![],
         };
         let enums = BTreeMap::new();
         let (type_str, _) = cfn_type_to_carina_type_with_enum(
@@ -7475,6 +7703,8 @@ mod tests {
             primary_identifier: None,
             definitions: None,
             tagging: None,
+            one_of: vec![],
+            any_of: vec![],
         };
         let enums = BTreeMap::new();
         let (type_str, _) = cfn_type_to_carina_type_with_enum(
@@ -7549,6 +7779,8 @@ mod tests {
             primary_identifier: None,
             definitions: Some(definitions),
             tagging: None,
+            one_of: vec![],
+            any_of: vec![],
         };
 
         let generated = generate_schema_code(&schema, "AWS::EC2::VPCEndpoint").unwrap();
@@ -7591,6 +7823,8 @@ mod tests {
             primary_identifier: None,
             definitions: None,
             tagging: None,
+            one_of: vec![],
+            any_of: vec![],
         };
 
         let generated = generate_schema_code(&schema, "AWS::Logs::LogGroup").unwrap();
@@ -7638,6 +7872,8 @@ mod tests {
             primary_identifier: None,
             definitions: None,
             tagging: None,
+            one_of: vec![],
+            any_of: vec![],
         };
 
         let generated = generate_schema_code(&schema, "AWS::Test::Resource").unwrap();
@@ -7676,6 +7912,8 @@ mod tests {
             primary_identifier: None,
             definitions: None,
             tagging: None,
+            one_of: vec![],
+            any_of: vec![],
         };
 
         let generated = generate_schema_code(&schema, "AWS::Test::Resource").unwrap();
@@ -7723,6 +7961,8 @@ mod tests {
             primary_identifier: None,
             definitions: Some(definitions),
             tagging: None,
+            one_of: vec![],
+            any_of: vec![],
         };
 
         let (type_str, _) = cfn_type_to_carina_type_with_enum(
@@ -7825,6 +8065,8 @@ mod tests {
             primary_identifier: None,
             definitions: Some(definitions),
             tagging: None,
+            one_of: vec![],
+            any_of: vec![],
         };
 
         let generated = generate_schema_code(&schema, "AWS::S3::Bucket").unwrap();
@@ -7869,6 +8111,8 @@ mod tests {
             primary_identifier: None,
             definitions: Some(definitions),
             tagging: None,
+            one_of: vec![],
+            any_of: vec![],
         };
 
         let generated = generate_schema_code(&schema, "AWS::Test::Resource").unwrap();
@@ -7912,6 +8156,8 @@ mod tests {
             primary_identifier: None,
             definitions: None,
             tagging: None,
+            one_of: vec![],
+            any_of: vec![],
         };
 
         let generated = generate_schema_code(&schema, "AWS::Test::Resource").unwrap();
@@ -7968,6 +8214,8 @@ mod tests {
             primary_identifier: None,
             definitions: None,
             tagging: None,
+            one_of: vec![],
+            any_of: vec![],
         };
 
         let generated = generate_schema_code(&schema, "AWS::Test::Resource").unwrap();
@@ -8015,6 +8263,8 @@ mod tests {
             primary_identifier: None,
             definitions: None,
             tagging: None,
+            one_of: vec![],
+            any_of: vec![],
         };
 
         let generated = generate_schema_code(&schema, "AWS::Test::Resource").unwrap();
@@ -8104,6 +8354,8 @@ mod tests {
             primary_identifier: None,
             definitions: Some(definitions),
             tagging: None,
+            one_of: vec![],
+            any_of: vec![],
         };
 
         let generated = generate_schema_code(&schema, "AWS::Test::Resource").unwrap();
@@ -8146,6 +8398,8 @@ mod tests {
             primary_identifier: None,
             definitions: None,
             tagging: None,
+            one_of: vec![],
+            any_of: vec![],
         };
         let (type_str, _) =
             cfn_type_to_carina_type_with_enum(&prop, "SomeValue", &schema, "", &BTreeMap::new());
@@ -8175,6 +8429,8 @@ mod tests {
             primary_identifier: None,
             definitions: None,
             tagging: None,
+            one_of: vec![],
+            any_of: vec![],
         };
         let display = type_display_string("SomeValue", &prop, &schema, &BTreeMap::new());
         assert!(
@@ -8203,6 +8459,8 @@ mod tests {
             primary_identifier: None,
             definitions: None,
             tagging: None,
+            one_of: vec![],
+            any_of: vec![],
         };
         let (type_str, _) =
             cfn_type_to_carina_type_with_enum(&prop, "Url", &schema, "", &BTreeMap::new());
@@ -8232,6 +8490,8 @@ mod tests {
             primary_identifier: None,
             definitions: None,
             tagging: None,
+            one_of: vec![],
+            any_of: vec![],
         };
         let display = type_display_string("Url", &prop, &schema, &BTreeMap::new());
         assert!(
@@ -8261,6 +8521,8 @@ mod tests {
             primary_identifier: None,
             definitions: None,
             tagging: None,
+            one_of: vec![],
+            any_of: vec![],
         };
         let (type_str, _) = cfn_type_to_carina_type_with_enum(
             &prop,
@@ -8296,6 +8558,8 @@ mod tests {
             primary_identifier: None,
             definitions: None,
             tagging: None,
+            one_of: vec![],
+            any_of: vec![],
         };
         let display =
             type_display_string("ObjectSizeGreaterThan", &prop, &schema, &BTreeMap::new());
@@ -8325,6 +8589,8 @@ mod tests {
             primary_identifier: None,
             definitions: None,
             tagging: None,
+            one_of: vec![],
+            any_of: vec![],
         };
         let display = type_display_string("Value", &prop, &schema, &BTreeMap::new());
         assert!(
@@ -8356,6 +8622,8 @@ mod tests {
             primary_identifier: None,
             definitions: None,
             tagging: None,
+            one_of: vec![],
+            any_of: vec![],
         };
         let (type_str, _) =
             cfn_type_to_carina_type_with_enum(&prop, "BoundedValue", &schema, "", &BTreeMap::new());
@@ -8392,6 +8660,8 @@ mod tests {
             primary_identifier: None,
             definitions: None,
             tagging: None,
+            one_of: vec![],
+            any_of: vec![],
         };
         let (type_str, _) = cfn_type_to_carina_type_with_enum(
             &prop,
@@ -8434,6 +8704,8 @@ mod tests {
             primary_identifier: None,
             definitions: None,
             tagging: None,
+            one_of: vec![],
+            any_of: vec![],
         };
         let (type_str, _) =
             cfn_type_to_carina_type_with_enum(&prop, "SomeName", &schema, "", &BTreeMap::new());
@@ -8517,6 +8789,8 @@ mod tests {
             primary_identifier: None,
             definitions: None,
             tagging: None,
+            one_of: vec![],
+            any_of: vec![],
         };
 
         let generated = generate_schema_code(&schema, "AWS::EC2::FlowLog").unwrap();
@@ -8551,6 +8825,8 @@ mod tests {
             primary_identifier: None,
             definitions: None,
             tagging: None,
+            one_of: vec![],
+            any_of: vec![],
         };
 
         let generated = generate_schema_code(&schema, "AWS::EC2::TestResource").unwrap();
@@ -8572,5 +8848,330 @@ mod tests {
         }"#;
         let prop: CfnProperty = serde_json::from_str(json).unwrap();
         assert_eq!(prop.format, Some("int64".to_string()));
+    }
+
+    // --- Exclusive field detection tests ---
+
+    fn make_schema_with_props(props: BTreeMap<String, CfnProperty>) -> CfnSchema {
+        CfnSchema {
+            type_name: "AWS::Test::Resource".to_string(),
+            description: None,
+            properties: props,
+            required: vec![],
+            read_only_properties: vec![],
+            create_only_properties: vec![],
+            write_only_properties: vec![],
+            primary_identifier: None,
+            definitions: None,
+            tagging: None,
+            one_of: vec![],
+            any_of: vec![],
+        }
+    }
+
+    #[test]
+    fn test_detect_exclusive_from_oneof_two_variants() {
+        let mut schema = make_schema_with_props(BTreeMap::new());
+        schema.one_of = vec![
+            CfnOneOfVariant {
+                properties: None,
+                required: vec!["FieldA".to_string()],
+            },
+            CfnOneOfVariant {
+                properties: None,
+                required: vec!["FieldB".to_string()],
+            },
+        ];
+        let groups = detect_exclusive_from_oneof(&schema);
+        assert_eq!(groups.len(), 1);
+        let mut group = groups[0].clone();
+        group.sort();
+        assert_eq!(group, vec!["FieldA", "FieldB"]);
+    }
+
+    #[test]
+    fn test_detect_exclusive_from_oneof_three_variants() {
+        let mut schema = make_schema_with_props(BTreeMap::new());
+        schema.one_of = vec![
+            CfnOneOfVariant {
+                properties: None,
+                required: vec!["A".to_string()],
+            },
+            CfnOneOfVariant {
+                properties: None,
+                required: vec!["B".to_string()],
+            },
+            CfnOneOfVariant {
+                properties: None,
+                required: vec!["C".to_string()],
+            },
+        ];
+        let groups = detect_exclusive_from_oneof(&schema);
+        assert_eq!(groups.len(), 1);
+        let mut group = groups[0].clone();
+        group.sort();
+        assert_eq!(group, vec!["A", "B", "C"]);
+    }
+
+    #[test]
+    fn test_detect_exclusive_from_oneof_multi_required_ignored() {
+        // Variants with multiple required fields are not simple exclusive groups
+        let mut schema = make_schema_with_props(BTreeMap::new());
+        schema.one_of = vec![
+            CfnOneOfVariant {
+                properties: None,
+                required: vec!["A".to_string(), "B".to_string()],
+            },
+            CfnOneOfVariant {
+                properties: None,
+                required: vec!["C".to_string()],
+            },
+        ];
+        let groups = detect_exclusive_from_oneof(&schema);
+        assert!(groups.is_empty());
+    }
+
+    #[test]
+    fn test_detect_exclusive_from_oneof_empty() {
+        let schema = make_schema_with_props(BTreeMap::new());
+        let groups = detect_exclusive_from_oneof(&schema);
+        assert!(groups.is_empty());
+    }
+
+    #[test]
+    fn test_detect_exclusive_from_anyof() {
+        let mut schema = make_schema_with_props(BTreeMap::new());
+        schema.any_of = vec![
+            CfnOneOfVariant {
+                properties: None,
+                required: vec!["X".to_string()],
+            },
+            CfnOneOfVariant {
+                properties: None,
+                required: vec!["Y".to_string()],
+            },
+        ];
+        let groups = detect_exclusive_from_oneof(&schema);
+        assert_eq!(groups.len(), 1);
+    }
+
+    #[test]
+    fn test_detect_exclusive_from_description_but_not_both() {
+        let mut props = BTreeMap::new();
+        props.insert(
+            "InternetGatewayId".to_string(),
+            CfnProperty {
+                description: Some(
+                    "The ID of the internet gateway. You must specify either InternetGatewayId or VpnGatewayId, but not both.".to_string(),
+                ),
+                ..CfnProperty::default()
+            },
+        );
+        props.insert(
+            "VpnGatewayId".to_string(),
+            CfnProperty {
+                description: Some(
+                    "The ID of the virtual private gateway. You must specify either InternetGatewayId or VpnGatewayId, but not both.".to_string(),
+                ),
+                ..CfnProperty::default()
+            },
+        );
+        let schema = make_schema_with_props(props);
+        let groups = detect_exclusive_from_descriptions(&schema);
+        assert_eq!(groups.len(), 1);
+        let mut group = groups[0].clone();
+        group.sort();
+        assert_eq!(group, vec!["InternetGatewayId", "VpnGatewayId"]);
+    }
+
+    #[test]
+    fn test_detect_exclusive_from_description_backtick_format() {
+        let mut props = BTreeMap::new();
+        props.insert(
+            "CidrBlock".to_string(),
+            CfnProperty {
+                description: Some(
+                    "You must specify either``CidrBlock`` or ``Ipv4IpamPoolId``.".to_string(),
+                ),
+                ..CfnProperty::default()
+            },
+        );
+        props.insert(
+            "Ipv4IpamPoolId".to_string(),
+            CfnProperty {
+                description: Some(
+                    "You must specify either``CidrBlock`` or ``Ipv4IpamPoolId``.".to_string(),
+                ),
+                ..CfnProperty::default()
+            },
+        );
+        let schema = make_schema_with_props(props);
+        let groups = detect_exclusive_from_descriptions(&schema);
+        assert_eq!(groups.len(), 1);
+        let mut group = groups[0].clone();
+        group.sort();
+        assert_eq!(group, vec!["CidrBlock", "Ipv4IpamPoolId"]);
+    }
+
+    #[test]
+    fn test_detect_exclusive_from_description_field_not_in_schema() {
+        // If the referenced field name isn't a property, no group is detected
+        let mut props = BTreeMap::new();
+        props.insert(
+            "FieldA".to_string(),
+            CfnProperty {
+                description: Some(
+                    "You must specify either FieldA or NonExistentField, but not both.".to_string(),
+                ),
+                ..CfnProperty::default()
+            },
+        );
+        let schema = make_schema_with_props(props);
+        let groups = detect_exclusive_from_descriptions(&schema);
+        assert!(groups.is_empty());
+    }
+
+    #[test]
+    fn test_detect_exclusive_from_description_no_pattern() {
+        let mut props = BTreeMap::new();
+        props.insert(
+            "SomeField".to_string(),
+            CfnProperty {
+                description: Some("Just a normal description.".to_string()),
+                ..CfnProperty::default()
+            },
+        );
+        let schema = make_schema_with_props(props);
+        let groups = detect_exclusive_from_descriptions(&schema);
+        assert!(groups.is_empty());
+    }
+
+    #[test]
+    fn test_detect_exclusive_fields_combined() {
+        // Test that detect_exclusive_fields combines both methods and deduplicates
+        let mut props = BTreeMap::new();
+        props.insert(
+            "FieldA".to_string(),
+            CfnProperty {
+                description: Some(
+                    "You must specify either FieldA or FieldB, but not both.".to_string(),
+                ),
+                ..CfnProperty::default()
+            },
+        );
+        props.insert("FieldB".to_string(), CfnProperty::default());
+        let mut schema = make_schema_with_props(props);
+        // Also add oneOf that detects the same group
+        schema.one_of = vec![
+            CfnOneOfVariant {
+                properties: None,
+                required: vec!["FieldA".to_string()],
+            },
+            CfnOneOfVariant {
+                properties: None,
+                required: vec!["FieldB".to_string()],
+            },
+        ];
+        let groups = detect_exclusive_fields(&schema, "AWS::Test::Resource");
+        // Should be deduplicated to 1 group
+        assert_eq!(groups.len(), 1);
+        let mut group = groups[0].clone();
+        group.sort();
+        assert_eq!(group, vec!["FieldA", "FieldB"]);
+    }
+
+    #[test]
+    fn test_vpc_gateway_attachment_detected_via_description() {
+        // Verify VPCGatewayAttachment exclusive fields are detected from descriptions
+        let mut props = BTreeMap::new();
+        props.insert(
+            "InternetGatewayId".to_string(),
+            CfnProperty {
+                description: Some(
+                    "The ID of the internet gateway. You must specify either InternetGatewayId or VpnGatewayId, but not both.".to_string(),
+                ),
+                ..CfnProperty::default()
+            },
+        );
+        props.insert(
+            "VpnGatewayId".to_string(),
+            CfnProperty {
+                description: Some(
+                    "The ID of the virtual private gateway. You must specify either InternetGatewayId or VpnGatewayId, but not both.".to_string(),
+                ),
+                ..CfnProperty::default()
+            },
+        );
+        props.insert(
+            "VpcId".to_string(),
+            CfnProperty {
+                description: Some("The ID of the VPC.".to_string()),
+                ..CfnProperty::default()
+            },
+        );
+        let schema = make_schema_with_props(props);
+        let groups = detect_exclusive_fields(&schema, "AWS::EC2::VPCGatewayAttachment");
+        assert_eq!(groups.len(), 1, "Should detect exactly one exclusive group");
+        let mut group = groups[0].clone();
+        group.sort();
+        assert_eq!(group, vec!["InternetGatewayId", "VpnGatewayId"]);
+    }
+
+    #[test]
+    fn test_generated_code_contains_validator_for_detected_exclusives() {
+        // Full integration: generate_schema_code should produce with_validator for
+        // description-detected exclusive fields
+        let mut props = BTreeMap::new();
+        props.insert(
+            "InternetGatewayId".to_string(),
+            CfnProperty {
+                description: Some(
+                    "The ID of the internet gateway. You must specify either InternetGatewayId or VpnGatewayId, but not both.".to_string(),
+                ),
+                prop_type: Some(TypeValue::Single("string".to_string())),
+                ..CfnProperty::default()
+            },
+        );
+        props.insert(
+            "VpnGatewayId".to_string(),
+            CfnProperty {
+                description: Some(
+                    "The ID of the virtual private gateway. You must specify either InternetGatewayId or VpnGatewayId, but not both.".to_string(),
+                ),
+                prop_type: Some(TypeValue::Single("string".to_string())),
+                ..CfnProperty::default()
+            },
+        );
+        props.insert(
+            "VpcId".to_string(),
+            CfnProperty {
+                description: Some("The ID of the VPC.".to_string()),
+                prop_type: Some(TypeValue::Single("string".to_string())),
+                ..CfnProperty::default()
+            },
+        );
+        let schema = CfnSchema {
+            type_name: "AWS::EC2::VPCGatewayAttachment".to_string(),
+            description: Some("VPC Gateway Attachment".to_string()),
+            properties: props,
+            required: vec!["VpcId".to_string()],
+            read_only_properties: vec![],
+            create_only_properties: vec![],
+            write_only_properties: vec![],
+            primary_identifier: None,
+            definitions: None,
+            tagging: None,
+            one_of: vec![],
+            any_of: vec![],
+        };
+        let code = generate_schema_code(&schema, "AWS::EC2::VPCGatewayAttachment").unwrap();
+        assert!(
+            code.contains("validators::validate_exclusive_required"),
+            "Generated code should contain exclusive validator: {code}"
+        );
+        assert!(
+            code.contains("\"internet_gateway_id\"") && code.contains("\"vpn_gateway_id\""),
+            "Generated code should reference snake_case field names: {code}"
+        );
     }
 }

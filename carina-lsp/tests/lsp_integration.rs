@@ -398,3 +398,48 @@ async fn test_resource_attribute_completion() {
 
     client.shutdown().await;
 }
+
+#[tokio::test]
+async fn test_diagnostics_for_exclusive_required_attrs() {
+    let mut client = TestClient::new().await;
+    client.initialize().await;
+
+    let uri = "file:///tmp/test_exclusive.crn";
+    // vpc_gateway_attachment requires exactly one of internet_gateway_id or vpn_gateway_id,
+    // but here neither is specified.
+    let text = r#"provider awscc {
+    region = awscc.Region.ap_northeast_1
+}
+
+awscc.ec2.vpc_gateway_attachment {
+    vpc_id = "vpc-12345678"
+}"#;
+
+    client.open_document(uri, text).await;
+
+    let notification = client
+        .read_notification("textDocument/publishDiagnostics", Duration::from_secs(5))
+        .await
+        .expect("Should receive publishDiagnostics notification");
+
+    let diagnostics = notification["params"]["diagnostics"]
+        .as_array()
+        .expect("diagnostics should be an array");
+
+    let has_exclusive_error = diagnostics.iter().any(|d| {
+        d["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("Exactly one of"))
+    });
+
+    assert!(
+        has_exclusive_error,
+        "Should have diagnostic about exclusive required attrs. Got: {:?}",
+        diagnostics
+            .iter()
+            .filter_map(|d| d["message"].as_str())
+            .collect::<Vec<_>>()
+    );
+
+    client.shutdown().await;
+}
