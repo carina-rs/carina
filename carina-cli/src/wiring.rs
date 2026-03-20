@@ -288,11 +288,18 @@ pub async fn create_plan_from_parsed(
 
     // Seed current_states with orphaned resources from state file (#844).
     // These are resources tracked in state but removed from the .crn config.
+    // Refresh each orphan via provider.read() to verify it still exists (#931).
     if let Some(sf) = state_file.as_ref() {
         let desired_ids: HashSet<ResourceId> =
             sorted_resources.iter().map(|r| r.id.clone()).collect();
         for (id, state) in sf.build_orphan_states(&desired_ids) {
-            current_states.entry(id).or_insert(state);
+            let refreshed = provider
+                .read(&id, state.identifier.as_deref())
+                .await
+                .map_err(AppError::Provider)?;
+            if refreshed.exists {
+                current_states.entry(id).or_insert(refreshed);
+            }
         }
     }
 
