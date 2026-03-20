@@ -51,6 +51,10 @@ enum Commands {
         /// Show only resource tree structure without attribute details
         #[arg(long)]
         compact: bool,
+
+        /// Display plan in interactive TUI mode
+        #[arg(long)]
+        tui: bool,
     },
     /// Apply changes to reach the desired state
     Apply {
@@ -143,9 +147,10 @@ async fn main() {
         out,
         detailed_exitcode,
         compact,
+        tui,
     } = cli.command
     {
-        match run_plan(&path, out.as_ref(), compact).await {
+        match run_plan(&path, out.as_ref(), compact, tui).await {
             Ok(has_changes) => {
                 if detailed_exitcode && has_changes {
                     std::process::exit(2);

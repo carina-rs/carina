@@ -14,6 +14,7 @@ carina-provider-aws = { path = "../carina-provider-aws" }
 carina-provider-awscc = { path = "../carina-provider-awscc" }
 carina-provider-mock = { path = "../carina-provider-mock" }
 carina-state = { path = "../carina-state" }
+carina-tui = { path = "../carina-tui" }
 chrono = "0.4"
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
