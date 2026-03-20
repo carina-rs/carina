@@ -101,10 +101,11 @@ impl HoverProvider {
         }
 
         // Check for attribute hover (but not in module call context)
-        if !self.is_in_module_call(doc, position)
-            && let Some(hover) = self.attribute_hover(&word)
-        {
-            return Some(hover);
+        if !self.is_in_module_call(doc, position) {
+            let enclosing_resource = self.find_enclosing_resource_type(doc, position);
+            if let Some(hover) = self.attribute_hover(&word, enclosing_resource.as_deref()) {
+                return Some(hover);
+            }
         }
 
         // Check for keyword hover
@@ -218,35 +219,88 @@ impl HoverProvider {
         })
     }
 
-    fn attribute_hover(&self, word: &str) -> Option<Hover> {
-        // Check all schemas for the attribute
+    /// Walk backwards from the cursor position, tracking brace depth, to find
+    /// the enclosing resource block and extract its resource type (schema key).
+    fn find_enclosing_resource_type(&self, doc: &Document, position: Position) -> Option<String> {
+        let text = doc.text();
+        let lines: Vec<&str> = text.lines().collect();
+        let current_line = position.line as usize;
+
+        // Build a list of schema keys sorted longest-first for correct matching
+        let mut schema_keys: Vec<&str> = self.schemas.keys().map(|s| s.as_str()).collect();
+        schema_keys.sort_by_key(|k| std::cmp::Reverse(k.len()));
+
+        let mut brace_depth: i32 = 0;
+
+        // Walk backwards from the current line
+        for line_idx in (0..=current_line).rev() {
+            let line = lines.get(line_idx).unwrap_or(&"");
+
+            // Count braces in reverse character order
+            for ch in line.chars().rev() {
+                if ch == '}' {
+                    brace_depth += 1;
+                } else if ch == '{' {
+                    if brace_depth > 0 {
+                        brace_depth -= 1;
+                    } else {
+                        // Found the opening brace of the enclosing block.
+                        // Check if this line contains a resource type.
+                        for key in &schema_keys {
+                            if line.contains(key) {
+                                return Some(key.to_string());
+                            }
+                        }
+                        return None;
+                    }
+                }
+            }
+        }
+
+        None
+    }
+
+    fn attribute_hover(&self, word: &str, enclosing_resource: Option<&str>) -> Option<Hover> {
+        // If we know the enclosing resource type, look up only that schema
+        if let Some(resource_type) = enclosing_resource
+            && let Some(schema) = self.schemas.get(resource_type)
+            && let Some(attr) = schema.attributes.get(word)
+        {
+            return self.build_attribute_hover(attr);
+        }
+
+        // Fall back to iterating all schemas
         for schema in self.schemas.values() {
             if let Some(attr) = schema.attributes.get(word) {
-                let description = convert_markdown_links_to_plain_text(
-                    attr.description.as_deref().unwrap_or("No description"),
-                );
-                let required = if attr.required {
-                    "Required"
-                } else {
-                    "Optional"
-                };
-                let type_name = format!("{}", attr.attr_type);
-
-                let content = format!(
-                    "## {}\n\n{}\n\n- **Type**: {}\n- **Required**: {}",
-                    attr.name, description, type_name, required
-                );
-
-                return Some(Hover {
-                    contents: HoverContents::Markup(MarkupContent {
-                        kind: MarkupKind::Markdown,
-                        value: content,
-                    }),
-                    range: None,
-                });
+                return self.build_attribute_hover(attr);
             }
         }
         None
+    }
+
+    fn build_attribute_hover(&self, attr: &carina_core::schema::AttributeSchema) -> Option<Hover> {
+        let description = convert_markdown_links_to_plain_text(
+            attr.description.as_deref().unwrap_or("No description"),
+        );
+        let required = if attr.required {
+            "Required"
+        } else {
+            "Optional"
+        };
+        let type_name = format!("{}", attr.attr_type);
+
+        let content = format!(
+            "## {}\n\n{}\n\n- **Type**: {}\n- **Required**: {}",
+            attr.name, description, type_name, required
+        );
+
+        Some(Hover {
+            contents: HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value: content,
+            }),
+            range: None,
+        })
     }
 
     fn keyword_hover(&self, word: &str) -> Option<Hover> {
@@ -500,5 +554,70 @@ mod tests {
     #[test]
     fn test_keyword_hover_unknown_returns_none() {
         assert!(HoverProvider::keyword_description("foobar").is_none());
+    }
+
+    #[test]
+    fn test_attribute_hover_uses_enclosing_resource_context() {
+        // Two schemas both have "internet_gateway_id" but with different descriptions.
+        // When hovering inside a vpc_gateway_attachment block, the hover should show
+        // the description from vpc_gateway_attachment's schema, not internet_gateway's.
+        let mut schemas = HashMap::new();
+
+        let igw_schema = ResourceSchema::new("awscc.ec2.internet_gateway").attribute(
+            AttributeSchema::new("internet_gateway_id", AttributeType::String)
+                .with_description("The ID of the internet gateway (from internet_gateway schema)."),
+        );
+        schemas.insert("awscc.ec2.internet_gateway".to_string(), igw_schema);
+
+        let attachment_schema = ResourceSchema::new("awscc.ec2.vpc_gateway_attachment").attribute(
+            AttributeSchema::new("internet_gateway_id", AttributeType::String)
+                .with_description(
+                    "The ID of the internet gateway attached to the VPC (from vpc_gateway_attachment schema).",
+                ),
+        );
+        schemas.insert(
+            "awscc.ec2.vpc_gateway_attachment".to_string(),
+            attachment_schema,
+        );
+
+        let provider = HoverProvider::new(Arc::new(schemas), vec![]);
+
+        // Document with cursor inside the vpc_gateway_attachment block.
+        // DSL resource lines use the full schema key as the resource type.
+        let doc = Document::new(
+            r#"awscc.ec2.internet_gateway {
+    name = "my-igw"
+}
+
+awscc.ec2.vpc_gateway_attachment {
+    internet_gateway_id = "igw-123"
+}
+"#
+            .to_string(),
+        );
+
+        // Hover over "internet_gateway_id" on line 5 (0-indexed), column 10
+        let hover = provider
+            .hover(&doc, Position::new(5, 10))
+            .expect("Should find hover for internet_gateway_id");
+
+        let content = match &hover.contents {
+            HoverContents::Markup(m) => &m.value,
+            _ => panic!("Expected markup content"),
+        };
+
+        // The description should come from vpc_gateway_attachment, not internet_gateway
+        assert!(
+            content.contains("from vpc_gateway_attachment schema"),
+            "Hover should show description from the enclosing resource (vpc_gateway_attachment), \
+             but got:\n{}",
+            content
+        );
+        assert!(
+            !content.contains("from internet_gateway schema"),
+            "Hover should NOT show description from a different resource (internet_gateway), \
+             but got:\n{}",
+            content
+        );
     }
 }
