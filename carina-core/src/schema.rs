@@ -778,6 +778,50 @@ impl ResourceSchema {
     }
 }
 
+/// Collect all attribute_name -> block_name mappings from all schemas.
+/// This includes both top-level attributes and nested struct fields.
+/// Used by the formatter to convert `= [{...}]` to block syntax.
+pub fn collect_all_block_names(
+    schemas: &HashMap<String, ResourceSchema>,
+) -> HashMap<String, String> {
+    let mut result = HashMap::new();
+    for schema in schemas.values() {
+        for (attr_name, attr_schema) in &schema.attributes {
+            if let Some(bn) = &attr_schema.block_name {
+                result.insert(attr_name.clone(), bn.clone());
+            }
+            // Also collect from nested struct fields
+            collect_block_names_from_type(&attr_schema.attr_type, &mut result);
+        }
+    }
+    result
+}
+
+fn collect_block_names_from_type(attr_type: &AttributeType, result: &mut HashMap<String, String>) {
+    match attr_type {
+        AttributeType::Struct { fields, .. } => {
+            for field in fields {
+                if let Some(bn) = &field.block_name {
+                    result.insert(field.name.clone(), bn.clone());
+                }
+                collect_block_names_from_type(&field.field_type, result);
+            }
+        }
+        AttributeType::List { inner, .. } => {
+            collect_block_names_from_type(inner, result);
+        }
+        AttributeType::Map(inner) => {
+            collect_block_names_from_type(inner, result);
+        }
+        AttributeType::Union(types) => {
+            for t in types {
+                collect_block_names_from_type(t, result);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Resolve block name aliases in a map using struct field definitions.
 ///
 /// For each key in `map` that matches a `block_name` on a struct field,

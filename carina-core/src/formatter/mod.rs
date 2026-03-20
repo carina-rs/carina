@@ -22,5 +22,5 @@ mod format;
 mod parser;
 
 pub use config::FormatConfig;
-pub use format::{format, needs_format};
+pub use format::{format, format_with_block_names, needs_format};
 pub use parser::FormatParseError;

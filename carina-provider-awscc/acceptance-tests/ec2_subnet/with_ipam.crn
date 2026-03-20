@@ -29,9 +29,9 @@ aws.sts.caller_identity {}
 let ipam = awscc.ec2.ipam {
   tier = advanced
 
-  operating_regions = [{
+  operating_region {
     region_name = "ap-northeast-1"
-  }]
+  }
 }
 
 let top_pool = awscc.ec2.ipam_pool {
@@ -39,9 +39,9 @@ let top_pool = awscc.ec2.ipam_pool {
   address_family = "IPv4"
   locale         = "ap-northeast-1"
 
-  provisioned_cidrs = [{
+  provisioned_cidr {
     cidr = "10.0.0.0/8"
-  }]
+  }
 }
 
 let vpc = awscc.ec2.vpc {
@@ -62,9 +62,9 @@ let vpc_pool = awscc.ec2.ipam_pool {
     resource_type   = "vpc"
   }
 
-  provisioned_cidrs = [{
+  provisioned_cidr {
     cidr = vpc.cidr_block
-  }]
+  }
 }
 
 awscc.ec2.subnet {

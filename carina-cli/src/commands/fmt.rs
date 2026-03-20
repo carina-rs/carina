@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -6,8 +7,10 @@ use similar::{ChangeTag, TextDiff};
 
 use carina_core::config_loader::{find_crn_files_in_dir, find_crn_files_recursive};
 use carina_core::formatter::{self, FormatConfig};
+use carina_core::schema::collect_all_block_names;
 
 use crate::error::AppError;
+use crate::wiring::WiringContext;
 
 pub fn run_fmt(
     path: &PathBuf,
@@ -16,6 +19,10 @@ pub fn run_fmt(
     recursive: bool,
 ) -> Result<(), AppError> {
     let config = FormatConfig::default();
+
+    // Load schemas to get block_name mappings for list-to-block conversion
+    let ctx = WiringContext::new();
+    let block_names = collect_all_block_names(ctx.schemas());
 
     let files = if path.is_file() {
         vec![path.clone()]
@@ -37,7 +44,7 @@ pub fn run_fmt(
         let content = fs::read_to_string(file)
             .map_err(|e| format!("Failed to read {}: {}", file.display(), e))?;
 
-        match formatter::format(&content, &config) {
+        match format_with_block_names_or_fallback(&content, &config, &block_names) {
             Ok(formatted) => {
                 if content != formatted {
                     needs_formatting.push((file.clone(), content.clone(), formatted.clone()));
@@ -94,6 +101,16 @@ pub fn run_fmt(
         }
         Ok(())
     }
+}
+
+/// Format with block_names conversion. If format_with_block_names fails (e.g., parse error),
+/// fall back to regular format which may produce a better error message.
+fn format_with_block_names_or_fallback(
+    content: &str,
+    config: &FormatConfig,
+    block_names: &HashMap<String, String>,
+) -> Result<String, carina_core::formatter::FormatParseError> {
+    formatter::format_with_block_names(content, config, block_names)
 }
 
 fn print_diff(file: &Path, original: &str, formatted: &str) {
