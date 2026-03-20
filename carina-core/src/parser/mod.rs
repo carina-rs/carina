@@ -29,6 +29,9 @@ pub enum ParseError {
     #[error("Duplicate module definition: {0}")]
     DuplicateModule(String),
 
+    #[error("Duplicate binding: {0}")]
+    DuplicateBinding(String),
+
     #[error("Module not found: {0}")]
     ModuleNotFound(String),
 
@@ -298,6 +301,11 @@ pub fn parse(input: &str) -> Result<ParsedFile, ParseError> {
                             Rule::let_binding => {
                                 let (name, value, maybe_resource, maybe_module_call) =
                                     parse_let_binding_extended(stmt, &ctx)?;
+                                if ctx.variables.contains_key(&name)
+                                    || ctx.resource_bindings.contains_key(&name)
+                                {
+                                    return Err(ParseError::DuplicateBinding(name));
+                                }
                                 ctx.set_variable(name.clone(), value);
                                 if let Some(resource) = maybe_resource {
                                     ctx.set_resource_binding(name.clone(), resource.clone());
@@ -2546,6 +2554,76 @@ aws.s3.bucket {
         } else {
             panic!("Expected tags to be a list");
         }
+    }
+
+    #[test]
+    fn duplicate_let_binding_resource_produces_error() {
+        // Issue #915: Duplicate let bindings should produce an error,
+        // not silently overwrite the first binding.
+        let input = r#"
+            let rt = awscc.ec2.route_table {
+                vpc_id = "vpc-123"
+            }
+
+            let rt = awscc.ec2.route_table {
+                vpc_id = "vpc-456"
+            }
+        "#;
+
+        let result = parse(input);
+        assert!(
+            result.is_err(),
+            "Duplicate let binding 'rt' should produce an error, but parsing succeeded: {:?}",
+            result.unwrap()
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("Duplicate") && err.contains("rt"),
+            "Error should mention duplicate binding 'rt', got: {err}"
+        );
+    }
+
+    #[test]
+    fn duplicate_let_binding_variable_produces_error() {
+        // Issue #915: Duplicate variable bindings should also produce an error.
+        let input = r#"
+            let region = aws.Region.ap_northeast_1
+            let region = aws.Region.us_east_1
+        "#;
+
+        let result = parse(input);
+        assert!(
+            result.is_err(),
+            "Duplicate let binding 'region' should produce an error, but parsing succeeded: {:?}",
+            result.unwrap()
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("Duplicate") && err.contains("region"),
+            "Error should mention duplicate binding 'region', got: {err}"
+        );
+    }
+
+    #[test]
+    fn distinct_let_bindings_are_accepted() {
+        // Sanity check: different binding names should work fine
+        let input = r#"
+            let rt1 = awscc.ec2.route_table {
+                vpc_id = "vpc-123"
+            }
+
+            let rt2 = awscc.ec2.route_table {
+                vpc_id = "vpc-456"
+            }
+        "#;
+
+        let result = parse(input);
+        assert!(
+            result.is_ok(),
+            "Distinct let bindings should parse successfully, got: {:?}",
+            result.err()
+        );
+        assert_eq!(result.unwrap().resources.len(), 2);
     }
 
     #[test]
