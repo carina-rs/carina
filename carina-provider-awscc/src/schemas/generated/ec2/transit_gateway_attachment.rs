@@ -19,7 +19,6 @@ pub fn ec2_transit_gateway_attachment_config() -> AwsccSchemaConfig {
         .attribute(
             AttributeSchema::new("id", super::transit_gateway_attachment_id())
                 .read_only()
-                .with_description("(read-only)")
                 .with_provider_name("Id"),
         )
         .attribute(
