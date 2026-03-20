@@ -501,6 +501,59 @@ awscc.ec2.route {
 }
 
 #[test]
+fn readonly_attributes_excluded_from_resource_block_completions() {
+    // Read-only attributes (e.g., vpc_id, arn) should NOT appear as completion
+    // candidates inside a resource block, since users cannot set them.
+    let provider = test_provider();
+    let completions = provider.attribute_completions_for_type("awscc.ec2.vpc");
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+
+    // vpc_id is read-only on ec2.vpc — should NOT be suggested
+    assert!(
+        !labels.contains(&"vpc_id"),
+        "Read-only attribute 'vpc_id' should NOT appear in resource block completions. Got: {:?}",
+        labels
+    );
+
+    // cidr_block is writable — should be suggested
+    assert!(
+        labels.contains(&"cidr_block"),
+        "Writable attribute 'cidr_block' should appear in resource block completions. Got: {:?}",
+        labels
+    );
+}
+
+#[test]
+fn readonly_attributes_still_available_for_value_references() {
+    // Read-only attributes should still be suggested when completing a value reference
+    // (e.g., `vpc_id = vpc.vpc_id` on the right-hand side of `=`).
+    let provider = test_provider();
+    let doc = create_document(
+        r#"let vpc = awscc.ec2.vpc {
+    cidr_block = "10.0.0.0/16"
+}
+
+awscc.ec2.subnet {
+    vpc_id =
+}"#,
+    );
+    let position = Position {
+        line: 5,
+        character: 14,
+    };
+
+    let completions = provider.complete(&doc, position, None);
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+
+    // vpc_id on ec2.vpc is read-only, but should be suggested as a reference value
+    assert!(
+        labels.contains(&"vpc.vpc_id"),
+        "Read-only attribute 'vpc.vpc_id' should be available as a value reference. Got: {:?}",
+        labels
+    );
+}
+
+#[test]
 fn type_based_completion_excludes_self_reference() {
     // When editing `internet_gateway_id = ` inside a vpc_gateway_attachment block,
     // and the block itself is bound as `let igw_attachment = awscc.ec2.vpc_gateway_attachment { ... }`,

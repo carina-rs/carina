@@ -24,7 +24,7 @@ impl CompletionProvider {
 
         // Get schema for specific resource type
         if let Some(schema) = self.schemas.get(resource_type) {
-            for attr in schema.attributes.values() {
+            for attr in schema.attributes.values().filter(|a| !a.read_only) {
                 let detail = attr.description.clone();
                 let required_marker = if attr.required { " (required)" } else { "" };
 
