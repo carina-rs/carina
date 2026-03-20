@@ -128,7 +128,7 @@ pub fn ec2_subnet_config() -> AwsccSchemaConfig {
         .attribute(
             AttributeSchema::new("ipv6_native", AttributeType::Bool)
                 .create_only()
-                .with_description("Indicates whether this is an IPv6 only subnet. For more information, see [Subnet basics](https://docs.aws.amazon.com/vpc/latest/userguide/VPC_Subnets....")
+                .with_description("Indicates whether this is an IPv6 only subnet. For more information, see...")
                 .with_provider_name("Ipv6Native"),
         )
         .attribute(

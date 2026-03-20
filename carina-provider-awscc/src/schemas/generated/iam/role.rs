@@ -48,7 +48,7 @@ pub fn iam_role_config() -> AwsccSchemaConfig {
         )
         .attribute(
             AttributeSchema::new("managed_policy_arns", AttributeType::unordered_list(super::iam_policy_arn()))
-                .with_description("A list of Amazon Resource Names (ARNs) of the IAM managed policies that you want to attach to the role. For more information about ARNs, see [Amazon R...")
+                .with_description("A list of Amazon Resource Names (ARNs) of the IAM managed policies that you want to attach to the role. For more information about ARNs, see...")
                 .with_provider_name("ManagedPolicyArns"),
         )
         .attribute(
@@ -71,14 +71,14 @@ pub fn iam_role_config() -> AwsccSchemaConfig {
         )
         .attribute(
             AttributeSchema::new("permissions_boundary", super::iam_policy_arn())
-                .with_description("The ARN of the policy used to set the permissions boundary for the role. For more information about permissions boundaries, see [Permissions boundarie...")
+                .with_description("The ARN of the policy used to set the permissions boundary for the role. For more information about permissions boundaries, see...")
                 .with_provider_name("PermissionsBoundary"),
         )
         .attribute(
             AttributeSchema::new("policies", AttributeType::unordered_list(AttributeType::Struct {
                     name: "Policy".to_string(),
                     fields: vec![
-                    StructField::new("policy_document", super::iam_policy_document()).required().with_description("The entire contents of the policy that defines permissions. For more information, see [Overview of JSON policies](https://docs.aws.amazon.com/IAM/late...").with_provider_name("PolicyDocument"),
+                    StructField::new("policy_document", super::iam_policy_document()).required().with_description("The entire contents of the policy that defines permissions. For more information, see...").with_provider_name("PolicyDocument"),
                     StructField::new("policy_name", AttributeType::String).required().with_description("The friendly name (not ARN) identifying the policy.").with_provider_name("PolicyName")
                     ],
                 }))
@@ -95,12 +95,12 @@ pub fn iam_role_config() -> AwsccSchemaConfig {
         .attribute(
             AttributeSchema::new("role_name", AttributeType::String)
                 .create_only()
-                .with_description("A name for the IAM role, up to 64 characters in length. For valid values, see the ``RoleName`` parameter for the [CreateRole](https://docs.aws.amazon....")
+                .with_description("A name for the IAM role, up to 64 characters in length. For valid values, see the ``RoleName`` parameter for the...")
                 .with_provider_name("RoleName"),
         )
         .attribute(
             AttributeSchema::new("tags", tags_type())
-                .with_description("A list of tags that are attached to the role. For more information about tagging, see [Tagging IAM resources](https://docs.aws.amazon.com/IAM/latest/U...")
+                .with_description("A list of tags that are attached to the role. For more information about tagging, see...")
                 .with_provider_name("Tags"),
         )
         .with_name_attribute("role_name")

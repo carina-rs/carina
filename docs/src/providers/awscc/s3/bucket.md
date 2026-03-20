@@ -557,7 +557,7 @@ Shorthand formats: `Enabled` or `VersioningConfigurationStatus.Enabled`
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `owner` | [Enum (Owner)](#owner-owner) | Yes | Specifies the replica ownership. For default and valid values, see [PUT bucket replication](https://... |
+| `owner` | [Enum (Owner)](#owner-owner) | Yes | Specifies the replica ownership. For default and valid values, see... |
 
 ### AnalyticsConfiguration
 
@@ -690,7 +690,7 @@ Shorthand formats: `Enabled` or `VersioningConfigurationStatus.Enabled`
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `event` | String | Yes | The Amazon S3 bucket event for which to invoke the LAMlong function. For more information, see [Supp... |
+| `event` | String | Yes | The Amazon S3 bucket event for which to invoke the LAMlong function. For more information, see... |
 | `filter` | [Struct(NotificationFilter)](#notificationfilter) | No | The filtering rules that determine which objects invoke the AWS Lambda function. For example, you ca... |
 | `function` | Arn | Yes | The Amazon Resource Name (ARN) of the LAMlong function that Amazon S3 invokes when the specified eve... |
 
@@ -1017,14 +1017,14 @@ Shorthand formats: `Enabled` or `VersioningConfigurationStatus.Enabled`
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `access_tier` | [Enum (AccessTier)](#access_tier-accesstier) | Yes | S3 Intelligent-Tiering access tier. See [Storage class for automatically optimizing frequently and i... |
+| `access_tier` | [Enum (AccessTier)](#access_tier-accesstier) | Yes | S3 Intelligent-Tiering access tier. See... |
 | `days` | Int | Yes | The number of consecutive days of no access after which an object will be eligible to be transitione... |
 
 ### TopicConfiguration
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `event` | String | Yes | The Amazon S3 bucket event about which to send notifications. For more information, see [Supported E... |
+| `event` | String | Yes | The Amazon S3 bucket event about which to send notifications. For more information, see... |
 | `filter` | [Struct(NotificationFilter)](#notificationfilter) | No | The filtering rules that determine for which objects to send notifications. For example, you can cre... |
 | `topic` | Arn | Yes | The Amazon Resource Name (ARN) of the Amazon SNS topic to which Amazon S3 publishes a message when i... |
 

@@ -11,11 +11,9 @@ let ipam = awscc.ec2.ipam {
   description = "Example IPAM"
   tier        = free
 
-  operating_regions = [
-    {
-      region_name = "ap-northeast-1"
-    }
-  ]
+  operating_regions = [{
+    region_name = "ap-northeast-1"
+  }]
 }
 
 awscc.ec2.ipam_pool {
@@ -24,11 +22,9 @@ awscc.ec2.ipam_pool {
   locale         = "ap-northeast-1"
   description    = "Example IPv4 IPAM Pool"
 
-  provisioned_cidrs = [
-    {
-      cidr = "10.0.0.0/8"
-    }
-  ]
+  provisioned_cidrs = [{
+    cidr = "10.0.0.0/8"
+  }]
 
   tags = {
     Environment = "example"

@@ -117,7 +117,7 @@ pub fn ec2_nat_gateway_config() -> AwsccSchemaConfig {
         )
         .attribute(
             AttributeSchema::new("secondary_allocation_ids", AttributeType::list(super::allocation_id()))
-                .with_description("Secondary EIP allocation IDs. For more information, see [Create a NAT gateway](https://docs.aws.amazon.com/vpc/latest/userguide/nat-gateway-working-wi...")
+                .with_description("Secondary EIP allocation IDs. For more information, see...")
                 .with_provider_name("SecondaryAllocationIds"),
         )
         .attribute(
@@ -133,7 +133,7 @@ pub fn ec2_nat_gateway_config() -> AwsccSchemaConfig {
         )
         .attribute(
             AttributeSchema::new("secondary_private_ip_addresses", AttributeType::list(types::ipv4_address()))
-                .with_description("Secondary private IPv4 addresses. For more information about secondary addresses, see [Create a NAT gateway](https://docs.aws.amazon.com/vpc/latest/us...")
+                .with_description("Secondary private IPv4 addresses. For more information about secondary addresses, see...")
                 .with_provider_name("SecondaryPrivateIpAddresses"),
         )
         .attribute(

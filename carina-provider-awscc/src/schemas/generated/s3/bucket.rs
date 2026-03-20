@@ -252,7 +252,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
             }).required().with_description("Specifies the transfer acceleration status of the bucket.").with_provider_name("AccelerationStatus")
                     ],
                 })
-                .with_description("Configures the transfer acceleration state for an Amazon S3 bucket. For more information, see [Amazon S3 Transfer Acceleration](https://docs.aws.amazo...")
+                .with_description("Configures the transfer acceleration state for an Amazon S3 bucket. For more information, see...")
                 .with_provider_name("AccelerateConfiguration"),
         )
         .attribute(
@@ -392,7 +392,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                 })).required().with_description("A set of origins and methods (cross-origin access that you want to allow). You can add up to 100 rules to the configuration.").with_provider_name("CorsRules").with_block_name("cors_rule")
                     ],
                 })
-                .with_description("Describes the cross-origin access configuration for objects in an Amazon S3 bucket. For more information, see [Enabling Cross-Origin Resource Sharing]...")
+                .with_description("Describes the cross-origin access configuration for objects in an Amazon S3 bucket. For more information, see...")
                 .with_provider_name("CorsConfiguration"),
         )
         .attribute(
@@ -428,7 +428,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                 values: vec!["ARCHIVE_ACCESS".to_string(), "DEEP_ARCHIVE_ACCESS".to_string()],
                 namespace: Some("awscc.s3.bucket".to_string()),
                 to_dsl: None,
-            }).required().with_description("S3 Intelligent-Tiering access tier. See [Storage class for automatically optimizing frequently and infrequently accessed objects](https://docs.aws.ama...").with_provider_name("AccessTier"),
+            }).required().with_description("S3 Intelligent-Tiering access tier. See...").with_provider_name("AccessTier"),
                     StructField::new("days", AttributeType::Int).required().with_description("The number of consecutive days of no access after which an object will be eligible to be transitioned to the corresponding tier. The minimum number of...").with_provider_name("Days")
                     ],
                 })).required().with_description("Specifies a list of S3 Intelligent-Tiering storage class tiers in the configuration. At least one tier must be defined in the list. At most, you can s...").with_provider_name("Tierings").with_block_name("tiering")
@@ -479,7 +479,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
             }).required().with_description("Specifies the schedule for generating inventory results.").with_provider_name("ScheduleFrequency")
                     ],
                 }))
-                .with_description("Specifies the S3 Inventory configuration for an Amazon S3 bucket. For more information, see [GET Bucket inventory](https://docs.aws.amazon.com/AmazonS...")
+                .with_description("Specifies the S3 Inventory configuration for an Amazon S3 bucket. For more information, see...")
                 .with_provider_name("InventoryConfigurations")
                 .with_block_name("inventory_configuration"),
         )
@@ -622,7 +622,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
             }).with_description("Indicates which default minimum object size behavior is applied to the lifecycle configuration. This parameter applies to general purpose buckets only...").with_provider_name("TransitionDefaultMinimumObjectSize")
                     ],
                 })
-                .with_description("Specifies the lifecycle configuration for objects in an Amazon S3 bucket. For more information, see [Object Lifecycle Management](https://docs.aws.ama...")
+                .with_description("Specifies the lifecycle configuration for objects in an Amazon S3 bucket. For more information, see...")
                 .with_provider_name("LifecycleConfiguration"),
         )
         .attribute(
@@ -779,7 +779,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                     StructField::new("lambda_configurations", AttributeType::list(AttributeType::Struct {
                     name: "LambdaConfiguration".to_string(),
                     fields: vec![
-                    StructField::new("event", AttributeType::String).required().with_description("The Amazon S3 bucket event for which to invoke the LAMlong function. For more information, see [Supported Event Types](https://docs.aws.amazon.com/Ama...").with_provider_name("Event"),
+                    StructField::new("event", AttributeType::String).required().with_description("The Amazon S3 bucket event for which to invoke the LAMlong function. For more information, see...").with_provider_name("Event"),
                     StructField::new("filter", AttributeType::Struct {
                     name: "NotificationFilter".to_string(),
                     fields: vec![
@@ -809,7 +809,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                     StructField::new("queue_configurations", AttributeType::list(AttributeType::Struct {
                     name: "QueueConfiguration".to_string(),
                     fields: vec![
-                    StructField::new("event", AttributeType::String).required().with_description("The Amazon S3 bucket event about which you want to publish messages to Amazon SQS. For more information, see [Supported Event Types](https://docs.aws....").with_provider_name("Event"),
+                    StructField::new("event", AttributeType::String).required().with_description("The Amazon S3 bucket event about which you want to publish messages to Amazon SQS. For more information, see...").with_provider_name("Event"),
                     StructField::new("filter", AttributeType::Struct {
                     name: "NotificationFilter".to_string(),
                     fields: vec![
@@ -839,7 +839,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                     StructField::new("topic_configurations", AttributeType::list(AttributeType::Struct {
                     name: "TopicConfiguration".to_string(),
                     fields: vec![
-                    StructField::new("event", AttributeType::String).required().with_description("The Amazon S3 bucket event about which to send notifications. For more information, see [Supported Event Types](https://docs.aws.amazon.com/AmazonS3/l...").with_provider_name("Event"),
+                    StructField::new("event", AttributeType::String).required().with_description("The Amazon S3 bucket event about which to send notifications. For more information, see...").with_provider_name("Event"),
                     StructField::new("filter", AttributeType::Struct {
                     name: "NotificationFilter".to_string(),
                     fields: vec![
@@ -953,7 +953,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
             AttributeSchema::new("replication_configuration", AttributeType::Struct {
                     name: "ReplicationConfiguration".to_string(),
                     fields: vec![
-                    StructField::new("role", super::iam_role_arn()).required().with_description("The Amazon Resource Name (ARN) of the IAMlong (IAM) role that Amazon S3 assumes when replicating objects. For more information, see [How to Set Up Rep...").with_provider_name("Role"),
+                    StructField::new("role", super::iam_role_arn()).required().with_description("The Amazon Resource Name (ARN) of the IAMlong (IAM) role that Amazon S3 assumes when replicating objects. For more information, see...").with_provider_name("Role"),
                     StructField::new("rules", AttributeType::list(AttributeType::Struct {
                     name: "ReplicationRule".to_string(),
                     fields: vec![
@@ -979,7 +979,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                 values: vec!["Destination".to_string()],
                 namespace: Some("awscc.s3.bucket".to_string()),
                 to_dsl: None,
-            }).required().with_description("Specifies the replica ownership. For default and valid values, see [PUT bucket replication](https://docs.aws.amazon.com/AmazonS3/latest/API/RESTBucket...").with_provider_name("Owner")
+            }).required().with_description("Specifies the replica ownership. For default and valid values, see...").with_provider_name("Owner")
                     ],
                 }).with_description("Specify this only in a cross-account scenario (where source and destination bucket owners are not the same), and you want to change replica ownership ...").with_provider_name("AccessControlTranslation"),
                     StructField::new("account", super::aws_account_id()).with_description("Destination bucket owner account ID. In a cross-account scenario, if you direct Amazon S3 to change replica ownership to the AWS-account that owns the...").with_provider_name("Account"),
@@ -1168,7 +1168,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                 })).with_description("Rules that define when a redirect is applied and the redirect behavior.").with_provider_name("RoutingRules").with_block_name("routing_rule")
                     ],
                 })
-                .with_description("Information used to configure the bucket as a static website. For more information, see [Hosting Websites on Amazon S3](https://docs.aws.amazon.com/Am...")
+                .with_description("Information used to configure the bucket as a static website. For more information, see...")
                 .with_provider_name("WebsiteConfiguration"),
         )
         .attribute(

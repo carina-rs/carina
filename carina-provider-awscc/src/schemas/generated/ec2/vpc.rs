@@ -30,7 +30,7 @@ pub fn ec2_vpc_config() -> AwsccSchemaConfig {
         resource_type_name: "ec2.vpc",
         has_tags: true,
         schema: ResourceSchema::new("awscc.ec2.vpc")
-        .with_description("Specifies a virtual private cloud (VPC).  To add an IPv6 CIDR block to the VPC, see [AWS::EC2::VPCCidrBlock](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-ec2-vpccidrbloc...")
+        .with_description("Specifies a virtual private cloud (VPC).  To add an IPv6 CIDR block to the VPC, see...")
         .attribute(
             AttributeSchema::new("cidr_block", types::ipv4_cidr())
                 .create_only()
@@ -78,7 +78,7 @@ pub fn ec2_vpc_config() -> AwsccSchemaConfig {
         .attribute(
             AttributeSchema::new("ipv4_ipam_pool_id", super::ipam_pool_id())
                 .create_only()
-                .with_description("The ID of an IPv4 IPAM pool you want to use for allocating this VPC's CIDR. For more information, see [What is IPAM?](https://docs.aws.amazon.com//vpc...")
+                .with_description("The ID of an IPv4 IPAM pool you want to use for allocating this VPC's CIDR. For more information, see...")
                 .with_provider_name("Ipv4IpamPoolId"),
         )
         .attribute(

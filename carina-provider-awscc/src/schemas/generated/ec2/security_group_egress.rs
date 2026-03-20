@@ -105,7 +105,7 @@ pub fn ec2_security_group_egress_config() -> AwsccSchemaConfig {
             })
                 .required()
                 .create_only()
-                .with_description("The IP protocol name (``tcp``, ``udp``, ``icmp``, ``icmpv6``) or number (see [Protocol Numbers](https://docs.aws.amazon.com/http://www.iana.org/assign...")
+                .with_description("The IP protocol name (``tcp``, ``udp``, ``icmp``, ``icmpv6``) or number (see...")
                 .with_provider_name("IpProtocol"),
         )
         .attribute(
