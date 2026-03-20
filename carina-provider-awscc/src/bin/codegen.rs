@@ -3699,10 +3699,12 @@ fn json_default_to_markdown(val: &serde_json::Value) -> Option<String> {
     }
 }
 
-/// Compute singular block name from a plural snake_case attribute name.
+/// Compute block name from a snake_case attribute name.
 ///
-/// Returns `Some(singular)` if the singular differs from the original,
-/// or `None` if the name is already singular or doesn't match known patterns.
+/// For plural names, returns the singular form (e.g., "tags" -> "tag").
+/// For already-singular names (e.g., "statement", "security_group_egress"),
+/// returns the name itself so that `List<Struct>` attributes always have a
+/// `block_name` for the formatter to use.
 fn compute_block_name(name: &str) -> Option<String> {
     let singular = if let Some(stem) = name.strip_suffix("ies") {
         // policies -> policy, entries -> entry
@@ -3718,16 +3720,17 @@ fn compute_block_name(name: &str) -> Option<String> {
         format!("{}s", stem)
     } else if let Some(stem) = name.strip_suffix('s') {
         if name.ends_with("ss") || name.ends_with("us") {
-            // "access" ends in "ss", "status" ends in "us" -> skip
-            return None;
+            // "access" ends in "ss", "status" ends in "us" -> already singular
+            return Some(name.to_string());
         }
         // regions -> region, tags -> tag, sizes -> size
         stem.to_string()
     } else {
-        return None;
+        // Already singular (e.g., "statement", "server_side_encryption_configuration")
+        return Some(name.to_string());
     };
 
-    if singular == name || singular.is_empty() {
+    if singular.is_empty() {
         None
     } else {
         Some(singular)
@@ -6186,11 +6189,28 @@ mod tests {
     }
 
     #[test]
-    fn test_compute_block_name_no_change() {
-        // Already singular or doesn't match patterns
-        assert_eq!(compute_block_name("name"), None);
-        assert_eq!(compute_block_name("status"), None);
-        assert_eq!(compute_block_name("access"), None);
+    fn test_compute_block_name_already_singular() {
+        // Already singular names return the name itself
+        assert_eq!(compute_block_name("name"), Some("name".to_string()));
+        assert_eq!(
+            compute_block_name("statement"),
+            Some("statement".to_string())
+        );
+        assert_eq!(
+            compute_block_name("server_side_encryption_configuration"),
+            Some("server_side_encryption_configuration".to_string())
+        );
+        // "ss" and "us" endings are treated as singular
+        assert_eq!(compute_block_name("status"), Some("status".to_string()));
+        assert_eq!(compute_block_name("access"), Some("access".to_string()));
+        assert_eq!(
+            compute_block_name("security_group_egress"),
+            Some("security_group_egress".to_string())
+        );
+        assert_eq!(
+            compute_block_name("security_group_ingress"),
+            Some("security_group_ingress".to_string())
+        );
     }
 
     #[test]

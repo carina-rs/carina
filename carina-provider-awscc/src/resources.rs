@@ -56,4 +56,75 @@ mod tests {
         let vpc_id_attr = vpc_config.schema.attributes.get("vpc_id").unwrap();
         assert_eq!(vpc_id_attr.provider_name.as_deref(), Some("VpcId"));
     }
+
+    /// Verify that every `List<Struct>` attribute (both top-level and nested)
+    /// has a `block_name` defined. Without `block_name`, the formatter cannot
+    /// convert `= [{...}]` syntax into block syntax.
+    #[test]
+    fn all_list_struct_attributes_have_block_name() {
+        use carina_core::schema::{AttributeSchema, AttributeType, StructField};
+
+        /// Collect missing block_names from an AttributeType, recursing into Structs.
+        fn check_type(attr_type: &AttributeType, path: &str, missing: &mut Vec<String>) {
+            match attr_type {
+                AttributeType::Struct { fields, .. } => {
+                    for field in fields {
+                        check_field(field, path, missing);
+                    }
+                }
+                AttributeType::List { inner, .. } => {
+                    check_type(inner, path, missing);
+                }
+                AttributeType::Map(inner) => {
+                    check_type(inner, path, missing);
+                }
+                _ => {}
+            }
+        }
+
+        /// Check a StructField: if it is List<Struct>, it must have block_name.
+        fn check_field(field: &StructField, parent_path: &str, missing: &mut Vec<String>) {
+            let field_path = format!("{}.{}", parent_path, field.name);
+            if let AttributeType::List { inner, .. } = &field.field_type
+                && matches!(inner.as_ref(), AttributeType::Struct { .. })
+                && field.block_name.is_none()
+            {
+                missing.push(field_path.clone());
+            }
+            // Recurse into the field type regardless
+            check_type(&field.field_type, &field_path, missing);
+        }
+
+        /// Check a top-level AttributeSchema: if it is List<Struct>, it must have block_name.
+        fn check_attr(attr: &AttributeSchema, resource_type: &str, missing: &mut Vec<String>) {
+            let path = format!("{}.{}", resource_type, attr.name);
+            if let AttributeType::List { inner, .. } = &attr.attr_type
+                && matches!(inner.as_ref(), AttributeType::Struct { .. })
+                && attr.block_name.is_none()
+            {
+                missing.push(path.clone());
+            }
+            // Recurse into the attribute type regardless
+            check_type(&attr.attr_type, &path, missing);
+        }
+
+        let mut missing = Vec::new();
+        for config in configs() {
+            let resource_type = &config.schema.resource_type;
+            for attr in config.schema.attributes.values() {
+                check_attr(attr, resource_type, &mut missing);
+            }
+        }
+
+        missing.sort();
+        assert!(
+            missing.is_empty(),
+            "The following List<Struct> attributes are missing block_name:\n{}",
+            missing
+                .iter()
+                .map(|p| format!("  - {}", p))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
 }

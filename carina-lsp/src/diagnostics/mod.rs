@@ -155,7 +155,9 @@ impl DiagnosticEngine {
                             .unwrap_or(attr_name);
 
                         // Check for mixed syntax: both block_name and canonical name present
+                        // Skip when block_name == canonical name (singular names like "statement")
                         if let Some(canon) = bn_map.get(attr_name)
+                            && canon != attr_name
                             && resource.attributes.contains_key(canon)
                         {
                             if let Some((line, col)) = self.find_attribute_position(doc, attr_name)

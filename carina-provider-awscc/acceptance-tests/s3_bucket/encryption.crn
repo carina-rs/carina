@@ -13,11 +13,11 @@ awscc.s3.bucket {
   bucket_name_prefix = "carina-acc-test-"
 
   bucket_encryption = {
-    server_side_encryption_configuration = [{
+    server_side_encryption_configuration {
       server_side_encryption_by_default = {
         sse_algorithm = "AES256"
       }
-    }]
+    }
   }
 
   lifecycle {
