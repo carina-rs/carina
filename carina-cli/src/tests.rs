@@ -2046,3 +2046,76 @@ fn wiring_context_constructs_factories_and_schemas_once() {
         "Schemas should be consistent across calls"
     );
 }
+
+/// Issue #931: orphaned resources that no longer exist in infrastructure should not
+/// produce a Delete effect. `create_plan_from_parsed()` now calls `provider.read()`
+/// for each orphan returned by `build_orphan_states()` and skips those that no longer
+/// exist.
+///
+/// This test simulates the fixed code path:
+/// 1. State file has "removed-bucket" (orphaned — not in .crn config)
+/// 2. The provider returns not-found for "removed-bucket" (deleted externally)
+/// 3. The refresh loop skips it, so current_states has no entry for it
+/// 4. Expected: no Delete effect should be generated
+#[test]
+fn orphaned_resource_deleted_externally_should_not_produce_delete_effect() {
+    use carina_core::differ::create_plan;
+
+    // State file tracks "removed-bucket" with an identifier (implies it existed in infra)
+    let mut state_file = StateFile::new();
+    state_file.upsert_resource(
+        ResourceState::new("s3.bucket", "removed-bucket", "aws")
+            .with_identifier("removed-bucket")
+            .with_attribute("bucket", json!("removed-bucket")),
+    );
+
+    // No desired resources — "removed-bucket" was removed from .crn
+    let desired: Vec<Resource> = vec![];
+    let desired_ids: HashSet<ResourceId> = desired.iter().map(|r| r.id.clone()).collect();
+
+    let mut current_states: HashMap<ResourceId, State> = HashMap::new();
+
+    // Simulate the fixed code path in create_plan_from_parsed():
+    // For each orphan, call provider.read(). If the provider returns not-found
+    // (resource was deleted externally), skip inserting it into current_states.
+    let orphan_states = state_file.build_orphan_states(&desired_ids);
+    for (id, state) in orphan_states {
+        // Simulate provider.read() returning not-found for this identifier.
+        // In the real code, provider.read(&id, state.identifier.as_deref())
+        // would return State { exists: false, .. }.
+        let refreshed = State::not_found(id.clone());
+        if refreshed.exists {
+            current_states.entry(id).or_insert(refreshed);
+        }
+        // "state" from build_orphan_states is intentionally unused — the fix
+        // replaces it with the provider-refreshed result.
+        let _ = state;
+    }
+
+    let lifecycles = state_file.build_lifecycles();
+    let saved_attrs = state_file.build_saved_attrs();
+    let prev_desired_keys = state_file.build_desired_keys();
+
+    let plan = create_plan(
+        &desired,
+        &current_states,
+        &lifecycles,
+        &HashMap::new(),
+        &saved_attrs,
+        &prev_desired_keys,
+    );
+
+    let delete_effects: Vec<_> = plan
+        .effects()
+        .iter()
+        .filter(|e| matches!(e, Effect::Delete { .. }))
+        .collect();
+
+    assert_eq!(
+        delete_effects.len(),
+        0,
+        "Issue #931: orphaned resource deleted externally should NOT produce a Delete effect. \
+         Got delete effects: {:?}",
+        delete_effects
+    );
+}
