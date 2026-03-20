@@ -253,6 +253,24 @@ impl CompletionProvider {
             .collect()
     }
 
+    pub(super) fn region_completions_for_provider(
+        &self,
+        provider_name: &str,
+    ) -> Vec<CompletionItem> {
+        let prefix = format!("{}.Region.", provider_name);
+        self.region_completions_data
+            .iter()
+            .filter(|c| c.value.starts_with(&prefix))
+            .map(|c| CompletionItem {
+                label: c.value.clone(),
+                kind: Some(CompletionItemKind::ENUM_MEMBER),
+                detail: Some(c.description.clone()),
+                insert_text: Some(c.value.clone()),
+                ..Default::default()
+            })
+            .collect()
+    }
+
     pub(super) fn cidr_completions(&self) -> Vec<CompletionItem> {
         let cidrs = vec![
             ("10.0.0.0/16", "VPC CIDR (65,536 IPs)"),

@@ -72,7 +72,9 @@ impl CompletionProvider {
                 field_name,
             } => self.value_completions_for_struct_field(&resource_type, &attr_path, &field_name),
             CompletionContext::InsideProviderBlock { .. } => self.provider_block_completions(),
-            CompletionContext::AfterProviderRegion => self.region_completions(),
+            CompletionContext::AfterProviderRegion { provider_name } => {
+                self.region_completions_for_provider(&provider_name)
+            }
             CompletionContext::AfterRefType => self.ref_type_completions(position, &text),
             CompletionContext::AfterInputDot => self.input_parameter_completions(&text),
             CompletionContext::None => vec![],
@@ -101,7 +103,9 @@ impl CompletionProvider {
             let dot_pattern = format!("{}.Region.", provider_name);
             let end_pattern = format!("{}.Region", provider_name);
             if prefix.contains(&dot_pattern) || prefix.ends_with(&end_pattern) {
-                return CompletionContext::AfterProviderRegion;
+                return CompletionContext::AfterProviderRegion {
+                    provider_name: provider_name.clone(),
+                };
             }
         }
 
@@ -223,7 +227,9 @@ impl CompletionProvider {
         {
             if prefix.contains('=') {
                 // After "region = " inside provider block -> show region completions
-                return CompletionContext::AfterProviderRegion;
+                return CompletionContext::AfterProviderRegion {
+                    provider_name: pname.clone(),
+                };
             }
             return CompletionContext::InsideProviderBlock {
                 provider_name: pname.clone(),
@@ -428,7 +434,9 @@ enum CompletionContext {
     InsideProviderBlock {
         provider_name: String,
     },
-    AfterProviderRegion,
+    AfterProviderRegion {
+        provider_name: String,
+    },
     AfterRefType,
     AfterInputDot,
     None,
