@@ -651,10 +651,11 @@ impl Formatter {
                 self.write_newline();
             }
 
-            // Calculate max key length for this group only
+            // Calculate max key length for this group only (excluding nested blocks)
             let max_key_len = if self.config.align_attributes {
                 group
                     .iter()
+                    .filter(|attr| attr.kind == NodeKind::Attribute)
                     .filter_map(|attr| self.get_attribute_key(attr))
                     .map(|k| k.len())
                     .max()
