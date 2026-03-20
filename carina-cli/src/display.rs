@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use colored::Colorize;
@@ -172,10 +173,16 @@ fn has_binding(resource: &carina_core::resource::Resource) -> bool {
 /// Extract a compact hint for anonymous resources.
 ///
 /// Priority:
-/// 1. `Value::ResourceRef` attributes -> `(attr_name: binding_name)`
-/// 2. String attributes with non-empty values -> `(attr_name: "value")`
+/// 1. `Value::ResourceRef` attributes referencing a different binding than the parent
+/// 2. String attributes with non-empty values (with special shortening for `service_name`)
 /// 3. No hint (returns None)
-fn extract_compact_hint(resource: &carina_core::resource::Resource) -> Option<String> {
+///
+/// `parent_binding` is the binding name of the parent resource in the tree, used to
+/// skip ResourceRef attributes that redundantly reference the parent.
+fn extract_compact_hint(
+    resource: &carina_core::resource::Resource,
+    parent_binding: Option<&str>,
+) -> Option<String> {
     let mut keys: Vec<_> = resource
         .attributes
         .keys()
@@ -183,10 +190,14 @@ fn extract_compact_hint(resource: &carina_core::resource::Resource) -> Option<St
         .collect();
     keys.sort();
 
-    // Priority 1: Look for ResourceRef attributes
+    // Priority 1: Look for ResourceRef attributes that reference a DIFFERENT binding
     for key in &keys {
         if let Some(Value::ResourceRef { binding_name, .. }) = resource.attributes.get(*key) {
-            return Some(format!("{}: {}", key, binding_name));
+            if parent_binding == Some(binding_name.as_str()) {
+                continue;
+            }
+            let short_key = shorten_attr_name(key);
+            return Some(format!("{}: {}", short_key, binding_name));
         }
     }
 
@@ -195,21 +206,54 @@ fn extract_compact_hint(resource: &carina_core::resource::Resource) -> Option<St
         if let Some(Value::String(s)) = resource.attributes.get(*key)
             && !s.is_empty()
         {
-            return Some(format!("{}: \"{}\"", key, s));
+            let short_key = shorten_attr_name(key);
+            let display_value = shorten_service_name(key, s);
+            return Some(format!("{}: \"{}\"", short_key, display_value));
         }
     }
 
     None
 }
 
+/// Shorten common attribute name suffixes for compact display.
+/// e.g., `subnet_id` -> `subnet`, `route_table_id` -> `route_table`
+fn shorten_attr_name(attr: &str) -> &str {
+    attr.strip_suffix("_id").unwrap_or(attr)
+}
+
+/// For `service_name` attributes, extract just the service suffix from AWS endpoint names.
+/// e.g., `com.amazonaws.ap-northeast-1.ecr.dkr` -> `ecr.dkr`
+///       `com.amazonaws.ap-northeast-1.s3` -> `s3`
+fn shorten_service_name<'a>(attr_name: &str, value: &'a str) -> Cow<'a, str> {
+    if attr_name == "service_name" {
+        // Match pattern: com.amazonaws.<region>.<service...>
+        if let Some(rest) = value.strip_prefix("com.amazonaws.") {
+            // Skip the region part (e.g., "ap-northeast-1") and take the rest
+            if let Some(dot_pos) = rest.find('.') {
+                let after_region = &rest[dot_pos + 1..];
+                if !after_region.is_empty() {
+                    return Cow::Borrowed(after_region);
+                }
+            }
+        }
+    }
+    Cow::Borrowed(value)
+}
+
 /// Format a compact resource identifier, showing either the binding name in quotes
 /// or a hint in parentheses for anonymous resources.
 ///
 /// `name` is the display name of the resource (typically `id.name`).
-fn format_compact_name(resource: &carina_core::resource::Resource, name: &str) -> String {
+/// `parent_binding` is the binding name of the parent in the tree, used to skip
+/// redundant ResourceRef hints.
+fn format_compact_name(
+    resource: &carina_core::resource::Resource,
+    name: &str,
+    parent_binding: Option<&str>,
+) -> String {
     if has_binding(resource) {
         format!("\"{}\"", name)
-    } else if let Some(hint) = extract_compact_hint(resource) {
+    } else if let Some(hint) = extract_compact_hint(resource, parent_binding) {
         format!("({})", hint)
     } else {
         format!("\"{}\"", name)
@@ -278,6 +322,7 @@ pub fn print_plan(plan: &Plan, compact: bool) {
         is_last: bool,
         prefix: &str,
         compact: bool,
+        parent_binding: Option<&str>,
     ) {
         if printed.contains(&idx) {
             return;
@@ -316,7 +361,7 @@ pub fn print_plan(plan: &Plan, compact: bool) {
         match effect {
             Effect::Create(r) => {
                 if compact {
-                    let name_part = format_compact_name(r, &r.id.name);
+                    let name_part = format_compact_name(r, &r.id.name, parent_binding);
                     println!(
                         "{}{}{} {} {}",
                         base_indent,
@@ -374,7 +419,7 @@ pub fn print_plan(plan: &Plan, compact: bool) {
                 changed_attributes,
             } => {
                 if compact {
-                    let name_part = format_compact_name(to, &id.name);
+                    let name_part = format_compact_name(to, &id.name, parent_binding);
                     println!(
                         "{}{}{} {} {}",
                         base_indent,
@@ -470,7 +515,7 @@ pub fn print_plan(plan: &Plan, compact: bool) {
                     "(must be replaced)"
                 };
                 if compact {
-                    let name_part = format_compact_name(to, &id.name);
+                    let name_part = format_compact_name(to, &id.name, parent_binding);
                     println!(
                         "{}{}{} {} {} {}",
                         base_indent,
@@ -598,7 +643,8 @@ pub fn print_plan(plan: &Plan, compact: bool) {
             }
             Effect::Read { resource } => {
                 if compact {
-                    let name_part = format_compact_name(resource, &resource.id.name);
+                    let name_part =
+                        format_compact_name(resource, &resource.id.name, parent_binding);
                     println!(
                         "{}{}{} {} {} {}",
                         base_indent,
@@ -621,6 +667,23 @@ pub fn print_plan(plan: &Plan, compact: bool) {
                 }
             }
         }
+
+        // Extract current effect's binding name for children
+        let current_binding = {
+            let resource = match effect {
+                Effect::Create(r) => Some(r),
+                Effect::Update { to, .. } => Some(to),
+                Effect::Replace { to, .. } => Some(to),
+                Effect::Read { resource } => Some(resource),
+                Effect::Delete { .. } => None,
+            };
+            resource.and_then(|r| {
+                r.attributes.get("_binding").and_then(|v| match v {
+                    Value::String(s) => Some(s.clone()),
+                    _ => None,
+                })
+            })
+        };
 
         // Print children (dependents)
         let children = dependents.get(&idx).cloned().unwrap_or_default();
@@ -653,6 +716,7 @@ pub fn print_plan(plan: &Plan, compact: bool) {
                 child_is_last,
                 &new_prefix,
                 compact,
+                current_binding.as_deref(),
             );
         }
     }
@@ -668,6 +732,7 @@ pub fn print_plan(plan: &Plan, compact: bool) {
             i == roots.len() - 1,
             "",
             compact,
+            None,
         );
     }
 
@@ -677,7 +742,17 @@ pub fn print_plan(plan: &Plan, compact: bool) {
         .filter(|idx| !printed.contains(idx))
         .collect();
     for idx in remaining {
-        print_effect_tree(idx, plan, &dependents, &mut printed, 0, true, "", compact);
+        print_effect_tree(
+            idx,
+            plan,
+            &dependents,
+            &mut printed,
+            0,
+            true,
+            "",
+            compact,
+            None,
+        );
     }
 
     println!();
@@ -1349,9 +1424,34 @@ mod tests {
             },
         );
 
-        let hint = extract_compact_hint(&r);
-        // Should pick the first ResourceRef alphabetically (route_table_id)
-        assert_eq!(hint, Some("route_table_id: public_rt".to_string()));
+        let hint = extract_compact_hint(&r, None);
+        // Should pick the first ResourceRef alphabetically (route_table_id),
+        // with _id suffix stripped
+        assert_eq!(hint, Some("route_table: public_rt".to_string()));
+    }
+
+    /// Test that extract_compact_hint skips ResourceRef that matches parent binding.
+    #[test]
+    fn test_extract_compact_hint_skips_parent_ref() {
+        let mut r = Resource::new("ec2.subnet_route_table_association", "hash123");
+        r.attributes.insert(
+            "route_table_id".to_string(),
+            Value::ResourceRef {
+                binding_name: "database_rt".to_string(),
+                attribute_name: "id".to_string(),
+            },
+        );
+        r.attributes.insert(
+            "subnet_id".to_string(),
+            Value::ResourceRef {
+                binding_name: "database_subnet_1a".to_string(),
+                attribute_name: "id".to_string(),
+            },
+        );
+
+        // When parent is database_rt, should skip route_table_id and use subnet_id
+        let hint = extract_compact_hint(&r, Some("database_rt"));
+        assert_eq!(hint, Some("subnet: database_subnet_1a".to_string()));
     }
 
     /// Test that extract_compact_hint falls back to string values when no ResourceRef.
@@ -1363,7 +1463,7 @@ mod tests {
             Value::String("0.0.0.0/0".to_string()),
         );
 
-        let hint = extract_compact_hint(&r);
+        let hint = extract_compact_hint(&r, None);
         assert_eq!(
             hint,
             Some("destination_cidr_block: \"0.0.0.0/0\"".to_string())
@@ -1374,7 +1474,7 @@ mod tests {
     #[test]
     fn test_extract_compact_hint_none() {
         let r = Resource::new("ec2.route", "hash789");
-        let hint = extract_compact_hint(&r);
+        let hint = extract_compact_hint(&r, None);
         assert_eq!(hint, None);
     }
 
@@ -1394,9 +1494,56 @@ mod tests {
             },
         );
 
-        let hint = extract_compact_hint(&r);
-        // ResourceRef should take priority
-        assert_eq!(hint, Some("gateway_id: igw".to_string()));
+        let hint = extract_compact_hint(&r, None);
+        // ResourceRef should take priority, with _id suffix stripped
+        assert_eq!(hint, Some("gateway: igw".to_string()));
+    }
+
+    /// Test that extract_compact_hint shortens service_name values.
+    #[test]
+    fn test_extract_compact_hint_service_name_shortening() {
+        let mut r = Resource::new("ec2.vpc_endpoint", "hash_svc");
+        r.attributes.insert(
+            "service_name".to_string(),
+            Value::String("com.amazonaws.ap-northeast-1.ecr.dkr".to_string()),
+        );
+
+        let hint = extract_compact_hint(&r, None);
+        assert_eq!(hint, Some("service_name: \"ecr.dkr\"".to_string()));
+
+        // Single service component
+        let mut r2 = Resource::new("ec2.vpc_endpoint", "hash_svc2");
+        r2.attributes.insert(
+            "service_name".to_string(),
+            Value::String("com.amazonaws.ap-northeast-1.s3".to_string()),
+        );
+
+        let hint2 = extract_compact_hint(&r2, None);
+        assert_eq!(hint2, Some("service_name: \"s3\"".to_string()));
+    }
+
+    /// Test that extract_compact_hint falls back to string when all ResourceRefs match parent.
+    #[test]
+    fn test_extract_compact_hint_all_refs_match_parent() {
+        let mut r = Resource::new("ec2.security_group_ingress", "hash_sg");
+        r.attributes.insert(
+            "group_id".to_string(),
+            Value::ResourceRef {
+                binding_name: "endpoint_sg".to_string(),
+                attribute_name: "id".to_string(),
+            },
+        );
+        r.attributes.insert(
+            "description".to_string(),
+            Value::String("Allow HTTPS from VPC".to_string()),
+        );
+
+        // When parent is endpoint_sg, should skip group_id and use description
+        let hint = extract_compact_hint(&r, Some("endpoint_sg"));
+        assert_eq!(
+            hint,
+            Some("description: \"Allow HTTPS from VPC\"".to_string())
+        );
     }
 
     /// Test that has_binding correctly detects bound vs anonymous resources.
@@ -1420,7 +1567,7 @@ mod tests {
         r.attributes
             .insert("_binding".to_string(), Value::String("vpc".to_string()));
         // For bound resources, should show "name" in quotes
-        let result = format_compact_name(&r, "vpc");
+        let result = format_compact_name(&r, "vpc", None);
         assert!(result.contains('"'), "Bound resource name should be quoted");
         assert!(result.contains("vpc"), "Should contain the binding name");
     }
@@ -1435,14 +1582,14 @@ mod tests {
                 attribute_name: "id".to_string(),
             },
         );
-        let result = format_compact_name(&r, "hash123");
+        let result = format_compact_name(&r, "hash123", None);
         assert!(
             result.contains('(') && result.contains(')'),
             "Anonymous resource should show hint in parentheses, got: {}",
             result
         );
         assert!(
-            result.contains("subnet_id: database_subnet_1a"),
+            result.contains("subnet: database_subnet_1a"),
             "Should contain the ResourceRef hint, got: {}",
             result
         );
@@ -1495,7 +1642,7 @@ mod tests {
         r.attributes
             .insert("_hash".to_string(), Value::String("abc123".to_string()));
 
-        let hint = extract_compact_hint(&r);
+        let hint = extract_compact_hint(&r, None);
         assert_eq!(hint, None, "Internal attributes should be skipped");
     }
 }
