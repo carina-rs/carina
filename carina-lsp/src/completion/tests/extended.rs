@@ -499,3 +499,43 @@ awscc.ec2.route {
         labels
     );
 }
+
+#[test]
+fn type_based_completion_excludes_self_reference() {
+    // When editing `internet_gateway_id = ` inside a vpc_gateway_attachment block,
+    // and the block itself is bound as `let igw_attachment = awscc.ec2.vpc_gateway_attachment { ... }`,
+    // completion should NOT suggest `igw_attachment.internet_gateway_id` (self-reference).
+    // It should only suggest references from OTHER bindings.
+    let provider = test_provider();
+    let doc = create_document(
+        r#"let igw = awscc.ec2.internet_gateway {
+}
+
+let igw_attachment = awscc.ec2.vpc_gateway_attachment {
+    internet_gateway_id =
+}"#,
+    );
+    // Cursor after "internet_gateway_id = " (line 4)
+    let position = Position {
+        line: 4,
+        character: 27,
+    };
+
+    let completions = provider.complete(&doc, position, None);
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+
+    // Should NOT suggest igw_attachment.internet_gateway_id (self-reference)
+    let has_self_ref = labels.iter().any(|l| l.starts_with("igw_attachment."));
+    assert!(
+        !has_self_ref,
+        "Should NOT suggest self-references (igw_attachment.*). Got: {:?}",
+        labels
+    );
+
+    // Should suggest igw.internet_gateway_id (from another binding)
+    assert!(
+        labels.contains(&"igw.internet_gateway_id"),
+        "Should suggest igw.internet_gateway_id from another binding. Got: {:?}",
+        labels
+    );
+}

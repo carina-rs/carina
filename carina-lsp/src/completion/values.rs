@@ -66,6 +66,7 @@ impl CompletionProvider {
         resource_type: &str,
         attr_name: &str,
         text: &str,
+        current_binding: Option<&str>,
     ) -> Vec<CompletionItem> {
         let mut completions = Vec::new();
 
@@ -80,6 +81,10 @@ impl CompletionProvider {
                 let bindings = self.extract_resource_bindings(text);
                 for (binding_name, binding_resource_type) in &bindings {
                     if binding_resource_type.is_empty() {
+                        continue;
+                    }
+                    // Skip self-references: don't suggest the current resource's own binding
+                    if current_binding.is_some_and(|cb| cb == binding_name) {
                         continue;
                     }
                     // Look up the binding's resource schema and find attributes
