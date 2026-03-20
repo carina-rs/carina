@@ -203,6 +203,23 @@ impl CompletionProvider {
         }
     }
 
+    pub(super) fn provider_block_completions(&self) -> Vec<CompletionItem> {
+        let trigger_suggest = Command {
+            title: "Trigger Suggest".to_string(),
+            command: "editor.action.triggerSuggest".to_string(),
+            arguments: None,
+        };
+
+        vec![CompletionItem {
+            label: "region".to_string(),
+            kind: Some(CompletionItemKind::PROPERTY),
+            detail: Some("Provider region".to_string()),
+            insert_text: Some("region = ".to_string()),
+            command: Some(trigger_suggest),
+            ..Default::default()
+        }]
+    }
+
     pub(super) fn generic_value_completions(&self) -> Vec<CompletionItem> {
         let mut completions = vec![
             CompletionItem {

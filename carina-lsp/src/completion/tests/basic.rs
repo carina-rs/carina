@@ -603,3 +603,75 @@ fn ref_completion_with_empty_parens() {
         panic!("Expected CompletionTextEdit::Edit");
     }
 }
+
+#[test]
+fn provider_block_completion_suggests_region() {
+    let provider = test_provider();
+    let doc = create_document(
+        r#"provider awscc {
+    r
+}"#,
+    );
+    // Cursor after "r" inside provider block (line 1, col 5)
+    let position = Position {
+        line: 1,
+        character: 5,
+    };
+
+    let completions = provider.complete(&doc, position, None);
+
+    // Should have "region" as a completion
+    let region_completion = completions.iter().find(|c| c.label == "region");
+    assert!(
+        region_completion.is_some(),
+        "Should have 'region' attribute completion inside provider block. Got: {:?}",
+        completions.iter().map(|c| &c.label).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn provider_block_region_value_completion() {
+    let provider = test_provider();
+    let doc = create_document(
+        r#"provider awscc {
+    region =
+}"#,
+    );
+    // Cursor after "region = " (line 1, col 12)
+    let position = Position {
+        line: 1,
+        character: 12,
+    };
+
+    let completions = provider.complete(&doc, position, None);
+
+    // Should have region value completions (like awscc.Region.ap_northeast_1)
+    let has_region_value = completions
+        .iter()
+        .any(|c| c.label.contains("Region.ap_northeast_1"));
+    assert!(
+        has_region_value,
+        "Should have region value completions after 'region = '. Got: {:?}",
+        completions.iter().map(|c| &c.label).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn context_detection_inside_provider_block() {
+    let provider = test_provider();
+    let text = r#"provider awscc {
+    r
+}"#;
+    let context = provider.get_completion_context(
+        text,
+        Position {
+            line: 1,
+            character: 5,
+        },
+    );
+    assert!(
+        matches!(context, CompletionContext::InsideProviderBlock { ref provider_name } if provider_name == "awscc"),
+        "Should detect InsideProviderBlock context, got: {:?}",
+        context
+    );
+}
