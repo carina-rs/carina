@@ -71,6 +71,7 @@ impl CompletionProvider {
                 attr_path,
                 field_name,
             } => self.value_completions_for_struct_field(&resource_type, &attr_path, &field_name),
+            CompletionContext::InsideProviderBlock { .. } => self.provider_block_completions(),
             CompletionContext::AfterProviderRegion => self.region_completions(),
             CompletionContext::AfterRefType => self.ref_type_completions(position, &text),
             CompletionContext::AfterInputDot => self.input_parameter_completions(&text),
@@ -115,6 +116,7 @@ impl CompletionProvider {
         let mut brace_depth: i32 = 0;
         let mut resource_type = String::new();
         let mut module_name: Option<String> = None;
+        let mut provider_block_name: Option<String> = None;
         // Track nested block names at each depth level (index 0 = depth 1, etc.)
         let mut nested_block_names: Vec<String> = Vec::new();
 
@@ -130,6 +132,19 @@ impl CompletionProvider {
             {
                 resource_type = rt;
                 module_name = None;
+            } else if brace_depth == 0 && trimmed.starts_with("provider ") && trimmed.ends_with('{')
+            {
+                // Detect "provider <name> {"
+                let name = trimmed
+                    .strip_prefix("provider ")
+                    .unwrap()
+                    .trim_end_matches('{')
+                    .trim();
+                if !name.is_empty() {
+                    provider_block_name = Some(name.to_string());
+                    resource_type.clear();
+                    module_name = None;
+                }
             } else if brace_depth == 0
                 && trimmed.ends_with('{')
                 && !trimmed.starts_with("let ")
@@ -170,6 +185,7 @@ impl CompletionProvider {
                     if brace_depth == 0 {
                         resource_type.clear();
                         module_name = None;
+                        provider_block_name = None;
                         nested_block_names.clear();
                     } else {
                         // Truncate to current depth
@@ -198,6 +214,19 @@ impl CompletionProvider {
             return CompletionContext::InsideStructBlock {
                 resource_type: resource_type.clone(),
                 attr_path: nested_block_names,
+            };
+        }
+
+        // Check if we're inside a provider block
+        if brace_depth > 0
+            && let Some(ref pname) = provider_block_name
+        {
+            if prefix.contains('=') {
+                // After "region = " inside provider block -> show region completions
+                return CompletionContext::AfterProviderRegion;
+            }
+            return CompletionContext::InsideProviderBlock {
+                provider_name: pname.clone(),
             };
         }
 
@@ -395,6 +424,9 @@ enum CompletionContext {
         resource_type: String,
         attr_path: Vec<String>,
         field_name: String,
+    },
+    InsideProviderBlock {
+        provider_name: String,
     },
     AfterProviderRegion,
     AfterRefType,
