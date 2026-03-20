@@ -22,16 +22,16 @@ provider aws {
   region = aws.Region.ap_northeast_1
 }
 
-let identity = read aws.sts.caller_identity {}
+let identity = read
+
+aws.sts.caller_identity {}
 
 let ipam = awscc.ec2.ipam {
   tier = advanced
 
-  operating_regions = [
-    {
-      region_name = "ap-northeast-1"
-    }
-  ]
+  operating_regions = [{
+    region_name = "ap-northeast-1"
+  }]
 }
 
 let top_pool = awscc.ec2.ipam_pool {
@@ -39,11 +39,9 @@ let top_pool = awscc.ec2.ipam_pool {
   address_family = "IPv4"
   locale         = "ap-northeast-1"
 
-  provisioned_cidrs = [
-    {
-      cidr = "10.0.0.0/8"
-    }
-  ]
+  provisioned_cidrs = [{
+    cidr = "10.0.0.0/8"
+  }]
 }
 
 let vpc = awscc.ec2.vpc {
@@ -52,9 +50,9 @@ let vpc = awscc.ec2.vpc {
 }
 
 let vpc_pool = awscc.ec2.ipam_pool {
-  ipam_scope_id      = ipam.private_default_scope_id
-  address_family     = "IPv4"
-  locale             = "ap-northeast-1"
+  ipam_scope_id       = ipam.private_default_scope_id
+  address_family      = "IPv4"
+  locale              = "ap-northeast-1"
   source_ipam_pool_id = top_pool.ipam_pool_id
 
   source_resource = {
@@ -64,11 +62,9 @@ let vpc_pool = awscc.ec2.ipam_pool {
     resource_type   = "vpc"
   }
 
-  provisioned_cidrs = [
-    {
-      cidr = vpc.cidr_block
-    }
-  ]
+  provisioned_cidrs = [{
+    cidr = vpc.cidr_block
+  }]
 }
 
 awscc.ec2.subnet {

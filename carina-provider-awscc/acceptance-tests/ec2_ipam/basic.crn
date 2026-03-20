@@ -10,11 +10,9 @@ awscc.ec2.ipam {
   tier        = advanced
   description = "Acceptance test IPAM"
 
-  operating_regions = [
-    {
-      region_name = "ap-northeast-1"
-    }
-  ]
+  operating_regions = [{
+    region_name = "ap-northeast-1"
+  }]
 
   tags = {
     Environment = "acceptance-test"

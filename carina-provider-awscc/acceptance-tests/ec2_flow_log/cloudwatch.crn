@@ -17,16 +17,16 @@ let log_group = awscc.logs.log_group {
 }
 
 let flow_log_role = awscc.iam.role {
-  role_name = "acceptance-test-flow-log-role"
+  role_name                   = "acceptance-test-flow-log-role"
   assume_role_policy_document = {
-    version = "2012-10-17"
-    statement = [
-      {
-        effect    = "Allow"
-        principal = { service = "vpc-flow-logs.amazonaws.com" }
-        action    = "sts:AssumeRole"
+    version   = "2012-10-17"
+    statement = [{
+      effect    = "Allow"
+      principal = {
+        service = "vpc-flow-logs.amazonaws.com"
       }
-    ]
+      action    = "sts:AssumeRole"
+    }]
   }
 }
 
