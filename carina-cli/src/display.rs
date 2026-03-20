@@ -208,7 +208,7 @@ fn extract_compact_hint(
         {
             let short_key = shorten_attr_name(key);
             let display_value = shorten_service_name(key, s);
-            return Some(format!("{}: \"{}\"", short_key, display_value));
+            return Some(format!("{}: {}", short_key, display_value));
         }
     }
 
@@ -216,9 +216,12 @@ fn extract_compact_hint(
 }
 
 /// Shorten common attribute name suffixes for compact display.
-/// e.g., `subnet_id` -> `subnet`, `route_table_id` -> `route_table`
+/// e.g., `subnet_id` -> `subnet`, `route_table_id` -> `route_table`,
+///       `service_name` -> `service`, `group_name` -> `group`
 fn shorten_attr_name(attr: &str) -> &str {
-    attr.strip_suffix("_id").unwrap_or(attr)
+    attr.strip_suffix("_id")
+        .or_else(|| attr.strip_suffix("_name"))
+        .unwrap_or(attr)
 }
 
 /// For `service_name` attributes, extract just the service suffix from AWS endpoint names.
@@ -1464,10 +1467,7 @@ mod tests {
         );
 
         let hint = extract_compact_hint(&r, None);
-        assert_eq!(
-            hint,
-            Some("destination_cidr_block: \"0.0.0.0/0\"".to_string())
-        );
+        assert_eq!(hint, Some("destination_cidr_block: 0.0.0.0/0".to_string()));
     }
 
     /// Test that extract_compact_hint returns None when no useful attributes.
@@ -1509,7 +1509,7 @@ mod tests {
         );
 
         let hint = extract_compact_hint(&r, None);
-        assert_eq!(hint, Some("service_name: \"ecr.dkr\"".to_string()));
+        assert_eq!(hint, Some("service: ecr.dkr".to_string()));
 
         // Single service component
         let mut r2 = Resource::new("ec2.vpc_endpoint", "hash_svc2");
@@ -1519,7 +1519,7 @@ mod tests {
         );
 
         let hint2 = extract_compact_hint(&r2, None);
-        assert_eq!(hint2, Some("service_name: \"s3\"".to_string()));
+        assert_eq!(hint2, Some("service: s3".to_string()));
     }
 
     /// Test that extract_compact_hint falls back to string when all ResourceRefs match parent.
@@ -1540,10 +1540,7 @@ mod tests {
 
         // When parent is endpoint_sg, should skip group_id and use description
         let hint = extract_compact_hint(&r, Some("endpoint_sg"));
-        assert_eq!(
-            hint,
-            Some("description: \"Allow HTTPS from VPC\"".to_string())
-        );
+        assert_eq!(hint, Some("description: Allow HTTPS from VPC".to_string()));
     }
 
     /// Test that has_binding correctly detects bound vs anonymous resources.
