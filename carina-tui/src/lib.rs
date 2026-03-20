@@ -52,7 +52,8 @@ fn run_loop(
                 KeyCode::Char('q') => return Ok(()),
                 KeyCode::Up | KeyCode::Char('k') => app.move_up(),
                 KeyCode::Down | KeyCode::Char('j') => app.move_down(),
-                KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => app.expand(),
+                KeyCode::Enter => app.toggle(),
+                KeyCode::Right | KeyCode::Char('l') => app.expand(),
                 KeyCode::Left | KeyCode::Char('h') => app.collapse(),
                 _ => {}
             }

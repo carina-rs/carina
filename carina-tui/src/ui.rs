@@ -29,7 +29,14 @@ pub fn draw(frame: &mut Frame, app: &App) {
         ),
         Span::raw(" navigate  "),
         Span::styled(
-            "Enter/l",
+            "Enter",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" toggle  "),
+        Span::styled(
+            "l",
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
