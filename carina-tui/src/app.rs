@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use carina_core::effect::Effect;
 use carina_core::plan::Plan;
 use carina_core::resource::Value;
+use ratatui::widgets::ListState;
 
 /// A node in the tree view representing one effect
 #[derive(Debug)]
@@ -41,6 +42,8 @@ pub struct App {
     pub nodes: Vec<TreeNode>,
     /// Currently selected index in the visible list
     pub selected: usize,
+    /// List state for ratatui scrolling
+    pub list_state: ListState,
     /// Plan summary for display
     pub summary: String,
 }
@@ -49,9 +52,14 @@ impl App {
     pub fn new(plan: &Plan) -> Self {
         let nodes: Vec<TreeNode> = plan.effects().iter().map(effect_to_node).collect();
         let summary = format!("{}", plan.summary());
+        let mut list_state = ListState::default();
+        if !nodes.is_empty() {
+            list_state.select(Some(0));
+        }
         App {
             nodes,
             selected: 0,
+            list_state,
             summary,
         }
     }
@@ -64,6 +72,7 @@ impl App {
     pub fn move_up(&mut self) {
         if self.selected > 0 {
             self.selected -= 1;
+            self.list_state.select(Some(self.selected));
         }
     }
 
@@ -71,6 +80,7 @@ impl App {
         let count = self.visible_count();
         if count > 0 && self.selected < count - 1 {
             self.selected += 1;
+            self.list_state.select(Some(self.selected));
         }
     }
 

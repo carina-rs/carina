@@ -5,15 +5,52 @@ use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
 
 use crate::app::{App, EffectKind};
 
-/// Draw the main layout with tree view (left) and detail panel (right)
+/// Draw the main layout with tree view (left), detail panel (right), and help bar (bottom)
 pub fn draw(frame: &mut Frame, app: &App) {
+    let main_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(frame.area());
+
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
-        .split(frame.area());
+        .split(main_chunks[0]);
 
     draw_tree(frame, app, chunks[0]);
     draw_detail(frame, app, chunks[1]);
+
+    let help = Paragraph::new(Line::from(vec![
+        Span::styled(
+            " j/k",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" navigate  "),
+        Span::styled(
+            "Enter/l",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" expand  "),
+        Span::styled(
+            "h",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" collapse  "),
+        Span::styled(
+            "q",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" quit"),
+    ]));
+    frame.render_widget(help, main_chunks[1]);
 }
 
 /// Draw the tree view in the left panel
@@ -21,31 +58,30 @@ fn draw_tree(frame: &mut Frame, app: &App, area: Rect) {
     let items: Vec<ListItem> = app
         .nodes
         .iter()
-        .enumerate()
-        .map(|(idx, node)| {
+        .map(|node| {
             let expand_marker = if node.expanded { "[-]" } else { "[+]" };
             let text = format!("{} {} {}", expand_marker, node.symbol, node.effect_label);
-
             let style = effect_style(node.kind);
-            let line = if idx == app.selected {
-                Line::from(text).style(style.bg(Color::DarkGray))
-            } else {
-                Line::from(text).style(style)
-            };
-
-            ListItem::new(line)
+            ListItem::new(Line::from(text).style(style))
         })
         .collect();
 
     let title = format!(" Plan ({}) ", app.summary);
-    let list = List::new(items).block(
-        Block::default()
-            .title(title)
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::White)),
-    );
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .title(title)
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::White)),
+        )
+        .highlight_style(
+            Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        );
 
-    frame.render_widget(list, area);
+    let mut state = app.list_state.clone();
+    frame.render_stateful_widget(list, area, &mut state);
 }
 
 /// Draw the detail panel on the right
