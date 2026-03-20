@@ -167,6 +167,7 @@ pub fn print_plan(plan: &Plan) {
     let mut binding_to_effect: HashMap<String, usize> = HashMap::new();
     let mut effect_deps: HashMap<usize, HashSet<String>> = HashMap::new();
     let mut effect_bindings: HashMap<usize, String> = HashMap::new();
+    let mut effect_types: HashMap<usize, String> = HashMap::new();
 
     for (idx, effect) in plan.effects().iter().enumerate() {
         let (resource, deps) = match effect {
@@ -188,23 +189,9 @@ pub fn print_plan(plan: &Plan) {
                 .unwrap_or_else(|| r.id.to_string());
             binding_to_effect.insert(binding.clone(), idx);
             effect_bindings.insert(idx, binding);
-        }
-        effect_deps.insert(idx, deps);
-    }
-
-    // Build effect_types map for sorting
-    let mut effect_types: HashMap<usize, String> = HashMap::new();
-    for (idx, effect) in plan.effects().iter().enumerate() {
-        let resource = match effect {
-            Effect::Create(r) => Some(r),
-            Effect::Update { to, .. } => Some(to),
-            Effect::Replace { to, .. } => Some(to),
-            Effect::Read { resource } => Some(resource),
-            Effect::Delete { .. } => None,
-        };
-        if let Some(r) = resource {
             effect_types.insert(idx, r.id.resource_type.clone());
         }
+        effect_deps.insert(idx, deps);
     }
 
     // Build the single-parent tree with sorted siblings
