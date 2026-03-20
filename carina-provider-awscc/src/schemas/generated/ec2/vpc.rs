@@ -7,7 +7,7 @@
 use super::AwsccSchemaConfig;
 use super::tags_type;
 use carina_core::resource::Value;
-use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, types};
+use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, types, validators};
 
 const VALID_INSTANCE_TENANCY: &[&str] = &["default", "dedicated", "host"];
 
@@ -110,6 +110,13 @@ pub fn ec2_vpc_config() -> AwsccSchemaConfig {
                 .with_description(" (read-only)")
                 .with_provider_name("VpcId"),
         )
+        .with_validator(|attrs| {
+            let mut errors = Vec::new();
+            if let Err(mut e) = validators::validate_exclusive_required(attrs, &["cidr_block", "ipv4_ipam_pool_id"]) {
+                errors.append(&mut e);
+            }
+            if errors.is_empty() { Ok(()) } else { Err(errors) }
+        })
     }
 }
 
