@@ -1089,7 +1089,7 @@ async fn run_apply_locked(
         return Ok(());
     }
 
-    print_plan(&plan);
+    print_plan(&plan, false);
 
     // Confirmation prompt
     if !auto_approve {
@@ -1347,7 +1347,7 @@ async fn run_apply_from_plan_locked(
         return Ok(());
     }
 
-    print_plan(plan);
+    print_plan(plan, false);
 
     // Confirmation prompt
     if !auto_approve {

@@ -164,7 +164,59 @@ fn build_single_parent_tree(
     (sorted_roots, dependents)
 }
 
-pub fn print_plan(plan: &Plan) {
+/// Check if a resource has a `let` binding (i.e., is not anonymous).
+fn has_binding(resource: &carina_core::resource::Resource) -> bool {
+    resource.attributes.contains_key("_binding")
+}
+
+/// Extract a compact hint for anonymous resources.
+///
+/// Priority:
+/// 1. `Value::ResourceRef` attributes -> `(attr_name: binding_name)`
+/// 2. String attributes with non-empty values -> `(attr_name: "value")`
+/// 3. No hint (returns None)
+fn extract_compact_hint(resource: &carina_core::resource::Resource) -> Option<String> {
+    let mut keys: Vec<_> = resource
+        .attributes
+        .keys()
+        .filter(|k| !k.starts_with('_'))
+        .collect();
+    keys.sort();
+
+    // Priority 1: Look for ResourceRef attributes
+    for key in &keys {
+        if let Some(Value::ResourceRef { binding_name, .. }) = resource.attributes.get(*key) {
+            return Some(format!("{}: {}", key, binding_name));
+        }
+    }
+
+    // Priority 2: Look for string attributes with unique values
+    for key in &keys {
+        if let Some(Value::String(s)) = resource.attributes.get(*key)
+            && !s.is_empty()
+        {
+            return Some(format!("{}: \"{}\"", key, s));
+        }
+    }
+
+    None
+}
+
+/// Format a compact resource identifier, showing either the binding name in quotes
+/// or a hint in parentheses for anonymous resources.
+///
+/// `name` is the display name of the resource (typically `id.name`).
+fn format_compact_name(resource: &carina_core::resource::Resource, name: &str) -> String {
+    if has_binding(resource) {
+        format!("\"{}\"", name)
+    } else if let Some(hint) = extract_compact_hint(resource) {
+        format!("({})", hint)
+    } else {
+        format!("\"{}\"", name)
+    }
+}
+
+pub fn print_plan(plan: &Plan, compact: bool) {
     if plan.is_empty() {
         println!("{}", "No changes. Infrastructure is up-to-date.".green());
         return;
@@ -216,6 +268,7 @@ pub fn print_plan(plan: &Plan) {
     // Track printed effects to avoid duplicates
     let mut printed: HashSet<usize> = HashSet::new();
 
+    #[allow(clippy::too_many_arguments)]
     fn print_effect_tree(
         idx: usize,
         plan: &Plan,
@@ -224,6 +277,7 @@ pub fn print_plan(plan: &Plan) {
         indent: usize,
         is_last: bool,
         prefix: &str,
+        compact: bool,
     ) {
         if printed.contains(&idx) {
             return;
@@ -261,43 +315,55 @@ pub fn print_plan(plan: &Plan) {
 
         match effect {
             Effect::Create(r) => {
-                println!(
-                    "{}{}{} {} \"{}\"",
-                    base_indent,
-                    connector,
-                    colored_symbol,
-                    r.id.display_type().cyan().bold(),
-                    r.id.name.white().bold()
-                );
-                // Attribute prefix aligns with the resource content
-                let attr_prefix = if indent == 0 {
-                    format!("{}{}", base_indent, attr_base)
+                if compact {
+                    let name_part = format_compact_name(r, &r.id.name);
+                    println!(
+                        "{}{}{} {} {}",
+                        base_indent,
+                        connector,
+                        colored_symbol,
+                        r.id.display_type().cyan().bold(),
+                        name_part.white().bold()
+                    );
                 } else {
-                    let continuation = if is_last {
-                        format!("{}   ", prefix)
+                    println!(
+                        "{}{}{} {} \"{}\"",
+                        base_indent,
+                        connector,
+                        colored_symbol,
+                        r.id.display_type().cyan().bold(),
+                        r.id.name.white().bold()
+                    );
+                    // Attribute prefix aligns with the resource content
+                    let attr_prefix = if indent == 0 {
+                        format!("{}{}", base_indent, attr_base)
                     } else {
-                        format!("{}│  ", prefix)
+                        let continuation = if is_last {
+                            format!("{}   ", prefix)
+                        } else {
+                            format!("{}│  ", prefix)
+                        };
+                        format!("{}{}   ", base_indent, continuation)
                     };
-                    format!("{}{}   ", base_indent, continuation)
-                };
-                let mut keys: Vec<_> = r
-                    .attributes
-                    .keys()
-                    .filter(|k| !k.starts_with('_'))
-                    .collect();
-                keys.sort();
-                for key in keys {
-                    let value = &r.attributes[key];
-                    if is_list_of_maps(value) {
-                        println!("{}{}:", attr_prefix, key);
-                        println!("{}", format_list_of_maps(value, &attr_prefix));
-                    } else {
-                        println!(
-                            "{}{}: {}",
-                            attr_prefix,
-                            key,
-                            format_value_with_key(value, Some(key)).green()
-                        );
+                    let mut keys: Vec<_> = r
+                        .attributes
+                        .keys()
+                        .filter(|k| !k.starts_with('_'))
+                        .collect();
+                    keys.sort();
+                    for key in keys {
+                        let value = &r.attributes[key];
+                        if is_list_of_maps(value) {
+                            println!("{}{}:", attr_prefix, key);
+                            println!("{}", format_list_of_maps(value, &attr_prefix));
+                        } else {
+                            println!(
+                                "{}{}: {}",
+                                attr_prefix,
+                                key,
+                                format_value_with_key(value, Some(key)).green()
+                            );
+                        }
                     }
                 }
             }
@@ -307,69 +373,84 @@ pub fn print_plan(plan: &Plan) {
                 to,
                 changed_attributes,
             } => {
-                println!(
-                    "{}{}{} {} \"{}\"",
-                    base_indent,
-                    connector,
-                    colored_symbol,
-                    id.display_type().cyan().bold(),
-                    id.name.yellow().bold()
-                );
-                let attr_prefix = if indent == 0 {
-                    format!("{}{}", base_indent, attr_base)
+                if compact {
+                    let name_part = format_compact_name(to, &id.name);
+                    println!(
+                        "{}{}{} {} {}",
+                        base_indent,
+                        connector,
+                        colored_symbol,
+                        id.display_type().cyan().bold(),
+                        name_part.yellow().bold()
+                    );
                 } else {
-                    let continuation = if is_last {
-                        format!("{}   ", prefix)
+                    println!(
+                        "{}{}{} {} \"{}\"",
+                        base_indent,
+                        connector,
+                        colored_symbol,
+                        id.display_type().cyan().bold(),
+                        id.name.yellow().bold()
+                    );
+                    let attr_prefix = if indent == 0 {
+                        format!("{}{}", base_indent, attr_base)
                     } else {
-                        format!("{}│  ", prefix)
-                    };
-                    format!("{}{}   ", base_indent, continuation)
-                };
-                let mut keys: Vec<_> = to
-                    .attributes
-                    .keys()
-                    .filter(|k| !k.starts_with('_'))
-                    .collect();
-                keys.sort();
-                for key in keys {
-                    let new_value = &to.attributes[key];
-                    let old_value = from.attributes.get(key);
-                    let is_same = old_value
-                        .map(|ov| ov.semantically_equal(new_value))
-                        .unwrap_or(false);
-                    if !is_same {
-                        if is_list_of_maps(new_value) {
-                            println!("{}{}:", attr_prefix, key);
-                            println!("{}", format_list_diff(old_value, new_value, &attr_prefix));
+                        let continuation = if is_last {
+                            format!("{}   ", prefix)
                         } else {
-                            let old_str = old_value
-                                .map(|v| format_value_with_key(v, Some(key)))
-                                .unwrap_or_else(|| "(none)".to_string());
+                            format!("{}│  ", prefix)
+                        };
+                        format!("{}{}   ", base_indent, continuation)
+                    };
+                    let mut keys: Vec<_> = to
+                        .attributes
+                        .keys()
+                        .filter(|k| !k.starts_with('_'))
+                        .collect();
+                    keys.sort();
+                    for key in keys {
+                        let new_value = &to.attributes[key];
+                        let old_value = from.attributes.get(key);
+                        let is_same = old_value
+                            .map(|ov| ov.semantically_equal(new_value))
+                            .unwrap_or(false);
+                        if !is_same {
+                            if is_list_of_maps(new_value) {
+                                println!("{}{}:", attr_prefix, key);
+                                println!(
+                                    "{}",
+                                    format_list_diff(old_value, new_value, &attr_prefix)
+                                );
+                            } else {
+                                let old_str = old_value
+                                    .map(|v| format_value_with_key(v, Some(key)))
+                                    .unwrap_or_else(|| "(none)".to_string());
+                                println!(
+                                    "{}{}: {} → {}",
+                                    attr_prefix,
+                                    key,
+                                    old_str.red(),
+                                    format_value_with_key(new_value, Some(key)).green()
+                                );
+                            }
+                        }
+                    }
+                    // Show removed attributes (in changed_attributes but not in to)
+                    let mut removed_keys: Vec<_> = changed_attributes
+                        .iter()
+                        .filter(|k| !to.attributes.contains_key(k.as_str()))
+                        .collect();
+                    removed_keys.sort();
+                    for key in removed_keys {
+                        if let Some(old_value) = from.attributes.get(key.as_str()) {
                             println!(
                                 "{}{}: {} → {}",
                                 attr_prefix,
                                 key,
-                                old_str.red(),
-                                format_value_with_key(new_value, Some(key)).green()
+                                format_value_with_key(old_value, Some(key)).red(),
+                                "(removed)".red()
                             );
                         }
-                    }
-                }
-                // Show removed attributes (in changed_attributes but not in to)
-                let mut removed_keys: Vec<_> = changed_attributes
-                    .iter()
-                    .filter(|k| !to.attributes.contains_key(k.as_str()))
-                    .collect();
-                removed_keys.sort();
-                for key in removed_keys {
-                    if let Some(old_value) = from.attributes.get(key.as_str()) {
-                        println!(
-                            "{}{}: {} → {}",
-                            attr_prefix,
-                            key,
-                            format_value_with_key(old_value, Some(key)).red(),
-                            "(removed)".red()
-                        );
                     }
                 }
             }
@@ -388,104 +469,120 @@ pub fn print_plan(plan: &Plan) {
                 } else {
                     "(must be replaced)"
                 };
-                println!(
-                    "{}{}{} {} \"{}\" {}",
-                    base_indent,
-                    connector,
-                    colored_symbol,
-                    id.display_type().cyan().bold(),
-                    id.name.magenta().bold(),
-                    replace_note.magenta()
-                );
-                let attr_prefix = if indent == 0 {
-                    format!("{}{}", base_indent, attr_base)
+                if compact {
+                    let name_part = format_compact_name(to, &id.name);
+                    println!(
+                        "{}{}{} {} {} {}",
+                        base_indent,
+                        connector,
+                        colored_symbol,
+                        id.display_type().cyan().bold(),
+                        name_part.magenta().bold(),
+                        replace_note.magenta()
+                    );
                 } else {
-                    let continuation = if is_last {
-                        format!("{}   ", prefix)
+                    println!(
+                        "{}{}{} {} \"{}\" {}",
+                        base_indent,
+                        connector,
+                        colored_symbol,
+                        id.display_type().cyan().bold(),
+                        id.name.magenta().bold(),
+                        replace_note.magenta()
+                    );
+                    let attr_prefix = if indent == 0 {
+                        format!("{}{}", base_indent, attr_base)
                     } else {
-                        format!("{}│  ", prefix)
-                    };
-                    format!("{}{}   ", base_indent, continuation)
-                };
-                let mut keys: Vec<_> = to
-                    .attributes
-                    .keys()
-                    .filter(|k| !k.starts_with('_'))
-                    .collect();
-                keys.sort();
-                for key in keys {
-                    let new_value = &to.attributes[key];
-                    let old_value = from.attributes.get(key);
-                    let forces_replacement = changed_create_only.contains(key);
-                    let is_same = old_value
-                        .map(|ov| ov.semantically_equal(new_value))
-                        .unwrap_or(false);
-                    if !is_same {
-                        if is_list_of_maps(new_value) {
-                            let suffix = if forces_replacement {
-                                format!(" {}", "(forces replacement)".magenta())
-                            } else {
-                                String::new()
-                            };
-                            println!("{}{}:{}", attr_prefix, key, suffix);
-                            println!("{}", format_list_diff(old_value, new_value, &attr_prefix));
+                        let continuation = if is_last {
+                            format!("{}   ", prefix)
                         } else {
-                            let old_str = old_value
-                                .map(|v| format_value_with_key(v, Some(key)))
-                                .unwrap_or_else(|| "(none)".to_string());
-                            if forces_replacement {
+                            format!("{}│  ", prefix)
+                        };
+                        format!("{}{}   ", base_indent, continuation)
+                    };
+                    let mut keys: Vec<_> = to
+                        .attributes
+                        .keys()
+                        .filter(|k| !k.starts_with('_'))
+                        .collect();
+                    keys.sort();
+                    for key in keys {
+                        let new_value = &to.attributes[key];
+                        let old_value = from.attributes.get(key);
+                        let forces_replacement = changed_create_only.contains(key);
+                        let is_same = old_value
+                            .map(|ov| ov.semantically_equal(new_value))
+                            .unwrap_or(false);
+                        if !is_same {
+                            if is_list_of_maps(new_value) {
+                                let suffix = if forces_replacement {
+                                    format!(" {}", "(forces replacement)".magenta())
+                                } else {
+                                    String::new()
+                                };
+                                println!("{}{}:{}", attr_prefix, key, suffix);
                                 println!(
-                                    "{}{}: {} → {} {}",
-                                    attr_prefix,
-                                    key,
-                                    old_str.red(),
-                                    format_value_with_key(new_value, Some(key)).green(),
-                                    "(forces replacement)".magenta()
+                                    "{}",
+                                    format_list_diff(old_value, new_value, &attr_prefix)
                                 );
                             } else {
-                                println!(
-                                    "{}{}: {} → {}",
-                                    attr_prefix,
-                                    key,
-                                    old_str.red(),
-                                    format_value_with_key(new_value, Some(key)).green()
-                                );
+                                let old_str = old_value
+                                    .map(|v| format_value_with_key(v, Some(key)))
+                                    .unwrap_or_else(|| "(none)".to_string());
+                                if forces_replacement {
+                                    println!(
+                                        "{}{}: {} → {} {}",
+                                        attr_prefix,
+                                        key,
+                                        old_str.red(),
+                                        format_value_with_key(new_value, Some(key)).green(),
+                                        "(forces replacement)".magenta()
+                                    );
+                                } else {
+                                    println!(
+                                        "{}{}: {} → {}",
+                                        attr_prefix,
+                                        key,
+                                        old_str.red(),
+                                        format_value_with_key(new_value, Some(key)).green()
+                                    );
+                                }
                             }
                         }
                     }
-                }
-                if let Some(temp) = temporary_name {
-                    if temp.can_rename {
-                        println!(
-                            "{}  {} via temporary name \"{}\", will rename back to \"{}\" after old resource is deleted",
-                            attr_prefix,
-                            "note:".magenta().bold(),
-                            temp.temporary_value.magenta(),
-                            temp.original_value.green()
-                        );
-                    } else {
-                        println!(
-                            "{}  {} name will be \"{}\" (cannot rename create-only attribute \"{}\")",
-                            attr_prefix,
-                            "note:".magenta().bold(),
-                            temp.temporary_value.magenta(),
-                            temp.attribute.magenta()
-                        );
+                    if let Some(temp) = temporary_name {
+                        if temp.can_rename {
+                            println!(
+                                "{}  {} via temporary name \"{}\", will rename back to \"{}\" after old resource is deleted",
+                                attr_prefix,
+                                "note:".magenta().bold(),
+                                temp.temporary_value.magenta(),
+                                temp.original_value.green()
+                            );
+                        } else {
+                            println!(
+                                "{}  {} name will be \"{}\" (cannot rename create-only attribute \"{}\")",
+                                attr_prefix,
+                                "note:".magenta().bold(),
+                                temp.temporary_value.magenta(),
+                                temp.attribute.magenta()
+                            );
+                        }
                     }
-                }
-                if !cascading_updates.is_empty() {
-                    println!(
-                        "{}  {} cascading update(s):",
-                        attr_prefix,
-                        cascading_updates.len()
-                    );
-                    for cascade in cascading_updates {
+                    if !cascading_updates.is_empty() {
                         println!(
-                            "{}  ~ {} \"{}\"",
+                            "{}  {} cascading update(s):",
                             attr_prefix,
-                            cascade.id.display_type().cyan(),
-                            cascade.id.name.magenta()
+                            cascading_updates.len()
                         );
+                        for cascade in cascading_updates {
+                            println!(
+                                "{}  ~ {} \"{}\"",
+                                attr_prefix,
+                                cascade.id.display_type().cyan(),
+                                cascade.id.name.magenta()
+                            );
+                        }
                     }
                 }
             }
@@ -500,15 +597,28 @@ pub fn print_plan(plan: &Plan) {
                 );
             }
             Effect::Read { resource } => {
-                println!(
-                    "{}{}{} {} \"{}\" {}",
-                    base_indent,
-                    connector,
-                    colored_symbol,
-                    resource.id.display_type().cyan().bold(),
-                    resource.id.name.cyan().bold(),
-                    "(data source)".dimmed()
-                );
+                if compact {
+                    let name_part = format_compact_name(resource, &resource.id.name);
+                    println!(
+                        "{}{}{} {} {} {}",
+                        base_indent,
+                        connector,
+                        colored_symbol,
+                        resource.id.display_type().cyan().bold(),
+                        name_part.cyan().bold(),
+                        "(data source)".dimmed()
+                    );
+                } else {
+                    println!(
+                        "{}{}{} {} \"{}\" {}",
+                        base_indent,
+                        connector,
+                        colored_symbol,
+                        resource.id.display_type().cyan().bold(),
+                        resource.id.name.cyan().bold(),
+                        "(data source)".dimmed()
+                    );
+                }
             }
         }
 
@@ -542,6 +652,7 @@ pub fn print_plan(plan: &Plan) {
                 indent + 1,
                 child_is_last,
                 &new_prefix,
+                compact,
             );
         }
     }
@@ -556,6 +667,7 @@ pub fn print_plan(plan: &Plan) {
             0,
             i == roots.len() - 1,
             "",
+            compact,
         );
     }
 
@@ -565,7 +677,7 @@ pub fn print_plan(plan: &Plan) {
         .filter(|idx| !printed.contains(idx))
         .collect();
     for idx in remaining {
-        print_effect_tree(idx, plan, &dependents, &mut printed, 0, true, "");
+        print_effect_tree(idx, plan, &dependents, &mut printed, 0, true, "", compact);
     }
 
     println!();
@@ -852,7 +964,7 @@ mod tests {
         plan.add(Effect::Create(b));
 
         // Should not panic
-        print_plan(&plan);
+        print_plan(&plan, false);
     }
 
     /// Test that print_plan handles the dependency graph correctly when
@@ -866,7 +978,7 @@ mod tests {
         plan.add(Effect::Create(b));
 
         // Should not panic
-        print_plan(&plan);
+        print_plan(&plan, false);
     }
 
     /// Helper: compute root indices using the same algorithm as print_plan.
@@ -1214,5 +1326,176 @@ mod tests {
              route children: {:?}",
             route_children
         );
+    }
+
+    // --- Compact mode tests ---
+
+    /// Test that extract_compact_hint returns a ResourceRef hint when available.
+    #[test]
+    fn test_extract_compact_hint_resource_ref() {
+        let mut r = Resource::new("ec2.subnet_route_table_association", "hash123");
+        r.attributes.insert(
+            "route_table_id".to_string(),
+            Value::ResourceRef {
+                binding_name: "public_rt".to_string(),
+                attribute_name: "id".to_string(),
+            },
+        );
+        r.attributes.insert(
+            "subnet_id".to_string(),
+            Value::ResourceRef {
+                binding_name: "public_subnet_1a".to_string(),
+                attribute_name: "id".to_string(),
+            },
+        );
+
+        let hint = extract_compact_hint(&r);
+        // Should pick the first ResourceRef alphabetically (route_table_id)
+        assert_eq!(hint, Some("route_table_id: public_rt".to_string()));
+    }
+
+    /// Test that extract_compact_hint falls back to string values when no ResourceRef.
+    #[test]
+    fn test_extract_compact_hint_string_fallback() {
+        let mut r = Resource::new("ec2.route", "hash456");
+        r.attributes.insert(
+            "destination_cidr_block".to_string(),
+            Value::String("0.0.0.0/0".to_string()),
+        );
+
+        let hint = extract_compact_hint(&r);
+        assert_eq!(
+            hint,
+            Some("destination_cidr_block: \"0.0.0.0/0\"".to_string())
+        );
+    }
+
+    /// Test that extract_compact_hint returns None when no useful attributes.
+    #[test]
+    fn test_extract_compact_hint_none() {
+        let r = Resource::new("ec2.route", "hash789");
+        let hint = extract_compact_hint(&r);
+        assert_eq!(hint, None);
+    }
+
+    /// Test that extract_compact_hint prefers ResourceRef over string attributes.
+    #[test]
+    fn test_extract_compact_hint_prefers_resource_ref() {
+        let mut r = Resource::new("ec2.route", "hash_mixed");
+        r.attributes.insert(
+            "destination".to_string(),
+            Value::String("10.0.0.0/8".to_string()),
+        );
+        r.attributes.insert(
+            "gateway_id".to_string(),
+            Value::ResourceRef {
+                binding_name: "igw".to_string(),
+                attribute_name: "id".to_string(),
+            },
+        );
+
+        let hint = extract_compact_hint(&r);
+        // ResourceRef should take priority
+        assert_eq!(hint, Some("gateway_id: igw".to_string()));
+    }
+
+    /// Test that has_binding correctly detects bound vs anonymous resources.
+    #[test]
+    fn test_has_binding() {
+        let mut bound = Resource::new("ec2.vpc", "vpc");
+        bound
+            .attributes
+            .insert("_binding".to_string(), Value::String("vpc".to_string()));
+        assert!(has_binding(&bound));
+
+        let anonymous = Resource::new("ec2.vpc", "hash123");
+        assert!(!has_binding(&anonymous));
+    }
+
+    /// Test that format_compact_name shows quotes for bound resources and
+    /// parenthesized hints for anonymous resources.
+    #[test]
+    fn test_format_compact_name_bound_resource() {
+        let mut r = Resource::new("ec2.vpc", "vpc");
+        r.attributes
+            .insert("_binding".to_string(), Value::String("vpc".to_string()));
+        // For bound resources, should show "name" in quotes
+        let result = format_compact_name(&r, "vpc");
+        assert!(result.contains('"'), "Bound resource name should be quoted");
+        assert!(result.contains("vpc"), "Should contain the binding name");
+    }
+
+    #[test]
+    fn test_format_compact_name_anonymous_with_hint() {
+        let mut r = Resource::new("ec2.subnet_route_table_association", "hash123");
+        r.attributes.insert(
+            "subnet_id".to_string(),
+            Value::ResourceRef {
+                binding_name: "database_subnet_1a".to_string(),
+                attribute_name: "id".to_string(),
+            },
+        );
+        let result = format_compact_name(&r, "hash123");
+        assert!(
+            result.contains('(') && result.contains(')'),
+            "Anonymous resource should show hint in parentheses, got: {}",
+            result
+        );
+        assert!(
+            result.contains("subnet_id: database_subnet_1a"),
+            "Should contain the ResourceRef hint, got: {}",
+            result
+        );
+    }
+
+    /// Test that print_plan with compact=true does not panic and does not
+    /// print attribute lines.
+    #[test]
+    fn test_print_plan_compact_does_not_panic() {
+        let vpc = make_resource("ec2.vpc", "vpc", "vpc", &[]);
+        let rt = make_resource("ec2.route_table", "rt", "rt", &["vpc"]);
+        let mut plan = Plan::new();
+        plan.add(Effect::Create(vpc));
+        plan.add(Effect::Create(rt));
+
+        // Should not panic
+        print_plan(&plan, true);
+    }
+
+    /// Test compact mode skips attributes by checking that _binding attribute
+    /// keys are not printed (attributes are hidden in compact mode).
+    #[test]
+    fn test_print_plan_compact_with_anonymous_resources() {
+        let mut anon = Resource::new("ec2.route", "hash_anon");
+        anon.attributes.insert(
+            "destination_cidr_block".to_string(),
+            Value::String("0.0.0.0/0".to_string()),
+        );
+        anon.attributes.insert(
+            "route_table_id".to_string(),
+            Value::ResourceRef {
+                binding_name: "public_rt".to_string(),
+                attribute_name: "id".to_string(),
+            },
+        );
+
+        let mut plan = Plan::new();
+        plan.add(Effect::Create(anon));
+
+        // Should not panic; anonymous resources should show hints
+        print_plan(&plan, true);
+    }
+
+    /// Test that extract_compact_hint skips _-prefixed attributes.
+    #[test]
+    fn test_extract_compact_hint_skips_internal_attributes() {
+        let mut r = Resource::new("ec2.vpc", "hash_internal");
+        r.attributes
+            .insert("_binding".to_string(), Value::String("vpc".to_string()));
+        r.attributes
+            .insert("_hash".to_string(), Value::String("abc123".to_string()));
+
+        let hint = extract_compact_hint(&r);
+        assert_eq!(hint, None, "Internal attributes should be skipped");
     }
 }
