@@ -172,10 +172,9 @@ fn has_binding(resource: &carina_core::resource::Resource) -> bool {
 
 /// Extract a compact hint for anonymous resources.
 ///
-/// Priority:
-/// 1. `Value::ResourceRef` attributes referencing a different binding than the parent
-/// 2. String attributes with non-empty values (with special shortening for `service_name`)
-/// 3. No hint (returns None)
+/// Collects the first distinguishing string attribute (like `service_name`) and ALL
+/// non-parent `Value::ResourceRef` attributes, then combines them into a comma-separated
+/// hint. String hints appear first (most identifying), followed by ResourceRef hints.
 ///
 /// `parent_binding` is the binding name of the parent resource in the tree, used to
 /// skip ResourceRef attributes that redundantly reference the parent.
@@ -190,29 +189,36 @@ fn extract_compact_hint(
         .collect();
     keys.sort();
 
-    // Priority 1: Look for ResourceRef attributes that reference a DIFFERENT binding
-    for key in &keys {
-        if let Some(Value::ResourceRef { binding_name, .. }) = resource.attributes.get(*key) {
-            if parent_binding == Some(binding_name.as_str()) {
-                continue;
-            }
-            let short_key = shorten_attr_name(key);
-            return Some(format!("{}: {}", short_key, binding_name));
-        }
-    }
+    let mut parts: Vec<String> = Vec::new();
 
-    // Priority 2: Look for string attributes with unique values
+    // Collect the first distinguishing string attribute
     for key in &keys {
         if let Some(Value::String(s)) = resource.attributes.get(*key)
             && !s.is_empty()
         {
             let short_key = shorten_attr_name(key);
             let display_value = shorten_service_name(key, s);
-            return Some(format!("{}: {}", short_key, display_value));
+            parts.push(format!("{}: {}", short_key, display_value));
+            break;
         }
     }
 
-    None
+    // Collect ALL non-parent ResourceRef attributes
+    for key in &keys {
+        if let Some(Value::ResourceRef { binding_name, .. }) = resource.attributes.get(*key) {
+            if parent_binding == Some(binding_name.as_str()) {
+                continue;
+            }
+            let short_key = shorten_attr_name(key);
+            parts.push(format!("{}: {}", short_key, binding_name));
+        }
+    }
+
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(", "))
+    }
 }
 
 /// Shorten common attribute name suffixes for compact display.
@@ -1408,7 +1414,7 @@ mod tests {
 
     // --- Compact mode tests ---
 
-    /// Test that extract_compact_hint returns a ResourceRef hint when available.
+    /// Test that extract_compact_hint returns ALL ResourceRef hints when available.
     #[test]
     fn test_extract_compact_hint_resource_ref() {
         let mut r = Resource::new("ec2.subnet_route_table_association", "hash123");
@@ -1428,9 +1434,11 @@ mod tests {
         );
 
         let hint = extract_compact_hint(&r, None);
-        // Should pick the first ResourceRef alphabetically (route_table_id),
-        // with _id suffix stripped
-        assert_eq!(hint, Some("route_table: public_rt".to_string()));
+        // Should include ALL ResourceRef attributes alphabetically, with _id suffix stripped
+        assert_eq!(
+            hint,
+            Some("route_table: public_rt, subnet: public_subnet_1a".to_string())
+        );
     }
 
     /// Test that extract_compact_hint skips ResourceRef that matches parent binding.
@@ -1452,7 +1460,7 @@ mod tests {
             },
         );
 
-        // When parent is database_rt, should skip route_table_id and use subnet_id
+        // When parent is database_rt, should skip route_table_id and show only subnet_id
         let hint = extract_compact_hint(&r, Some("database_rt"));
         assert_eq!(hint, Some("subnet: database_subnet_1a".to_string()));
     }
@@ -1478,9 +1486,9 @@ mod tests {
         assert_eq!(hint, None);
     }
 
-    /// Test that extract_compact_hint prefers ResourceRef over string attributes.
+    /// Test that extract_compact_hint includes both string and ResourceRef hints.
     #[test]
-    fn test_extract_compact_hint_prefers_resource_ref() {
+    fn test_extract_compact_hint_string_and_resource_ref() {
         let mut r = Resource::new("ec2.route", "hash_mixed");
         r.attributes.insert(
             "destination".to_string(),
@@ -1495,8 +1503,11 @@ mod tests {
         );
 
         let hint = extract_compact_hint(&r, None);
-        // ResourceRef should take priority, with _id suffix stripped
-        assert_eq!(hint, Some("gateway: igw".to_string()));
+        // String hint first, then ResourceRef hint
+        assert_eq!(
+            hint,
+            Some("destination: 10.0.0.0/8, gateway: igw".to_string())
+        );
     }
 
     /// Test that extract_compact_hint shortens service_name values.
@@ -1541,6 +1552,37 @@ mod tests {
         // When parent is endpoint_sg, should skip group_id and use description
         let hint = extract_compact_hint(&r, Some("endpoint_sg"));
         assert_eq!(hint, Some("description: Allow HTTPS from VPC".to_string()));
+    }
+
+    /// Test that extract_compact_hint shows service name AND non-parent security group ref.
+    #[test]
+    fn test_extract_compact_hint_service_name_with_security_group_ref() {
+        let mut r = Resource::new("ec2.vpc_endpoint", "hash_ep");
+        r.attributes.insert(
+            "service_name".to_string(),
+            Value::String("com.amazonaws.ap-northeast-1.ecr.dkr".to_string()),
+        );
+        r.attributes.insert(
+            "security_group_ids".to_string(),
+            Value::ResourceRef {
+                binding_name: "endpoint_sg".to_string(),
+                attribute_name: "id".to_string(),
+            },
+        );
+        r.attributes.insert(
+            "vpc_id".to_string(),
+            Value::ResourceRef {
+                binding_name: "vpc".to_string(),
+                attribute_name: "id".to_string(),
+            },
+        );
+
+        // Parent is vpc, so vpc_id ref is skipped; service_name (string) first, then sg ref
+        let hint = extract_compact_hint(&r, Some("vpc"));
+        assert_eq!(
+            hint,
+            Some("service: ecr.dkr, security_group_ids: endpoint_sg".to_string())
+        );
     }
 
     /// Test that has_binding correctly detects bound vs anonymous resources.
