@@ -2,6 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use carina_core::plan::PlanSummary;
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
 
@@ -65,11 +66,11 @@ fn draw_tree(frame: &mut Frame, app: &App, area: Rect) {
         })
         .collect();
 
-    let title = format!(" Plan ({}) ", app.summary);
+    let title_line = build_plan_title(&app.plan_summary);
     let list = List::new(items)
         .block(
             Block::default()
-                .title(title)
+                .title(title_line)
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::White)),
         )
@@ -134,31 +135,30 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
             if is_changed {
                 if let Some(old_value) = from_map.get(key.as_str()) {
                     lines.push(Line::from(vec![
-                        Span::styled(format!("  {}: ", key), Style::default().fg(Color::DarkGray)),
+                        Span::raw(format!("  {}: ", key)),
                         Span::styled(
                             old_value.to_string(),
                             Style::default()
                                 .fg(Color::Red)
                                 .add_modifier(Modifier::CROSSED_OUT),
                         ),
-                        Span::styled(" -> ", Style::default().fg(Color::DarkGray)),
+                        Span::raw(" -> "),
                         Span::styled(value.clone(), Style::default().fg(Color::Green)),
                     ]));
                 } else {
                     lines.push(Line::from(vec![
-                        Span::styled(format!("  {}: ", key), Style::default().fg(Color::DarkGray)),
+                        Span::raw(format!("  {}: ", key)),
                         Span::styled(value.clone(), Style::default().fg(Color::Green)),
                     ]));
                 }
             } else {
-                let is_create = node.kind == EffectKind::Create || node.kind == EffectKind::Read;
-                let value_style = if is_create {
+                let value_style = if node.kind == EffectKind::Create {
                     Style::default().fg(Color::Green)
                 } else {
                     Style::default()
                 };
                 lines.push(Line::from(vec![
-                    Span::styled(format!("  {}: ", key), Style::default().fg(Color::DarkGray)),
+                    Span::raw(format!("  {}: ", key)),
                     Span::styled(value.clone(), value_style),
                 ]));
             }
@@ -230,6 +230,76 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         Span::raw(" quit"),
     ]));
     frame.render_widget(help, area);
+}
+
+/// Build the plan title line with colored summary counts.
+///
+/// Matches CLI plan output colors: create=green, update=yellow, replace=magenta,
+/// delete=red, read=cyan.
+fn build_plan_title(summary: &PlanSummary) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = vec![Span::raw(" Plan (Plan: ")];
+
+    let mut parts_added = 0;
+
+    if summary.read > 0 {
+        if parts_added > 0 {
+            spans.push(Span::raw(", "));
+        }
+        spans.push(Span::styled(
+            format!("{}", summary.read),
+            Style::default().fg(Color::Cyan),
+        ));
+        spans.push(Span::raw(" to read"));
+        parts_added += 1;
+    }
+
+    // create is always shown
+    if parts_added > 0 {
+        spans.push(Span::raw(", "));
+    }
+    spans.push(Span::styled(
+        format!("{}", summary.create),
+        Style::default().fg(Color::Green),
+    ));
+    spans.push(Span::raw(" to create"));
+    parts_added += 1;
+
+    // update is always shown
+    if parts_added > 0 {
+        spans.push(Span::raw(", "));
+    }
+    spans.push(Span::styled(
+        format!("{}", summary.update),
+        Style::default().fg(Color::Yellow),
+    ));
+    spans.push(Span::raw(" to update"));
+    parts_added += 1;
+
+    if summary.replace > 0 {
+        if parts_added > 0 {
+            spans.push(Span::raw(", "));
+        }
+        spans.push(Span::styled(
+            format!("{}", summary.replace),
+            Style::default().fg(Color::Magenta),
+        ));
+        spans.push(Span::raw(" to replace"));
+        parts_added += 1;
+    }
+
+    // delete is always shown
+    if parts_added > 0 {
+        spans.push(Span::raw(", "));
+    }
+    spans.push(Span::styled(
+        format!("{}", summary.delete),
+        Style::default().fg(Color::Red),
+    ));
+    spans.push(Span::raw(" to delete"));
+
+    spans.push(Span::raw(") "));
+
+    Line::from(spans)
 }
 
 /// Build the tree connector prefix for a node.

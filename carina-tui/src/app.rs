@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use carina_core::deps::get_resource_dependencies;
 use carina_core::effect::Effect;
-use carina_core::plan::Plan;
+use carina_core::plan::{Plan, PlanSummary};
 use carina_core::resource::Value;
 use ratatui::widgets::ListState;
 
@@ -56,14 +56,17 @@ pub struct App {
     pub selected: usize,
     /// List state for ratatui scrolling
     pub list_state: ListState,
-    /// Plan summary for display
+    /// Plan summary for display (plain text)
     pub summary: String,
+    /// Plan summary counts for colored display
+    pub plan_summary: PlanSummary,
 }
 
 impl App {
     pub fn new(plan: &Plan) -> Self {
         let mut nodes: Vec<TreeNode> = plan.effects().iter().map(effect_to_node).collect();
-        let summary = format!("{}", plan.summary());
+        let plan_summary = plan.summary();
+        let summary = format!("{}", plan_summary);
 
         // Build tree structure from dependency analysis
         build_tree_structure(plan, &mut nodes);
@@ -87,6 +90,7 @@ impl App {
             selected: 0,
             list_state,
             summary,
+            plan_summary,
         }
     }
 
