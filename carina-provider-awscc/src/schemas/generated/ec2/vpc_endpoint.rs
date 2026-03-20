@@ -70,7 +70,7 @@ pub fn ec2_vpc_endpoint_config() -> AwsccSchemaConfig {
         resource_type_name: "ec2.vpc_endpoint",
         has_tags: true,
         schema: ResourceSchema::new("awscc.ec2.vpc_endpoint")
-        .with_description("Specifies a VPC endpoint. A VPC endpoint provides a private connection between your VPC and an endpoint service. You can use an endpoint service provided by AWS, an MKT Partner, or another AWS account...")
+        .with_description("Specifies a VPC endpoint. A VPC endpoint provides a private connection between your VPC and an endpoint service. You can use an endpoint service provided by AWS, an MKT Partner, or another AWS accounts in your organization. For more information, see the [User Guide](https://docs.aws.amazon.com/vpc/latest/privatelink/).  An endpoint of type ``Interface`` establishes connections between the subnets in your VPC and an AWS-service, your own service, or a service hosted by another AWS-account. With an interface VPC endpoint, you specify the subnets in which to create the endpoint and the security groups to associate with the endpoint network interfaces.  An endpoint of type ``gateway`` serves as a target for a route in your route table for traffic destined for S3 or DDB. You can specify an endpoint policy for the endpoint, which controls access to the service from your VPC. You can also specify the VPC route tables that use the endpoint. For more information about connectivity to S3, see [Why can't I connect to an S3 bucket using a gateway VPC endpoint?](https://docs.aws.amazon.com/premiumsupport/knowledge-center/connect-s3-vpc-endpoint)  An endpoint of type ``GatewayLoadBalancer`` provides private connectivity between your VPC and virtual appliances from a service provider.")
         .attribute(
             AttributeSchema::new("creation_timestamp", AttributeType::String)
                 .read_only()
@@ -98,13 +98,13 @@ pub fn ec2_vpc_endpoint_config() -> AwsccSchemaConfig {
                 values: vec!["OnlyInboundResolver".to_string(), "AllResolvers".to_string(), "NotSpecified".to_string()],
                 namespace: Some("awscc.ec2.vpc_endpoint".to_string()),
                 to_dsl: None,
-            }).with_description("Indicates whether to enable private DNS only for inbound endpoints. This option is available only for services that support both gateway and interface...").with_provider_name("PrivateDnsOnlyForInboundResolverEndpoint"),
+            }).with_description("Indicates whether to enable private DNS only for inbound endpoints. This option is available only for services that support both gateway and interface endpoints. It routes traffic that originates from the VPC to the gateway endpoint and traffic that originates from on-premises to the interface endpoint.").with_provider_name("PrivateDnsOnlyForInboundResolverEndpoint"),
                     StructField::new("private_dns_preference", AttributeType::StringEnum {
                 name: "PrivateDnsPreference".to_string(),
                 values: vec!["VERIFIED_DOMAINS_ONLY".to_string(), "ALL_DOMAINS".to_string(), "VERIFIED_DOMAINS_AND_SPECIFIED_DOMAINS".to_string(), "SPECIFIED_DOMAINS_ONLY".to_string()],
                 namespace: Some("awscc.ec2.vpc_endpoint".to_string()),
                 to_dsl: None,
-            }).with_description("The preference for which private domains have a private hosted zone created for and associated with the specified VPC. Only supported when private DNS...").with_provider_name("PrivateDnsPreference"),
+            }).with_description("The preference for which private domains have a private hosted zone created for and associated with the specified VPC. Only supported when private DNS is enabled and when the VPC endpoint type is ServiceNetwork or Resource.").with_provider_name("PrivateDnsPreference"),
                     StructField::new("private_dns_specified_domains", AttributeType::Custom {
                 name: "List(1..=10)".to_string(),
                 base: Box::new(AttributeType::list(AttributeType::Custom {
@@ -117,7 +117,7 @@ pub fn ec2_vpc_endpoint_config() -> AwsccSchemaConfig {
                 validate: validate_list_items_1_10,
                 namespace: None,
                 to_dsl: None,
-            }).with_description("Indicates which of the private domains to create private hosted zones for and associate with the specified VPC. Only supported when private DNS is ena...").with_provider_name("PrivateDnsSpecifiedDomains")
+            }).with_description("Indicates which of the private domains to create private hosted zones for and associate with the specified VPC. Only supported when private DNS is enabled and the private DNS preference is ``VERIFIED_DOMAINS_AND_SPECIFIED_DOMAINS`` or ``SPECIFIED_DOMAINS_ONLY``.").with_provider_name("PrivateDnsSpecifiedDomains")
                     ],
                 })
                 .create_only()
@@ -148,12 +148,12 @@ pub fn ec2_vpc_endpoint_config() -> AwsccSchemaConfig {
         )
         .attribute(
             AttributeSchema::new("policy_document", super::iam_policy_document())
-                .with_description("An endpoint policy, which controls access to the service from the VPC. The default endpoint policy allows full access to the service. Endpoint policie...")
+                .with_description("An endpoint policy, which controls access to the service from the VPC. The default endpoint policy allows full access to the service. Endpoint policies are supported only for gateway and interface endpoints. For CloudFormation templates in YAML, you can provide the policy in JSON or YAML format. For example, if you have a JSON policy, you can convert it to YAML before including it in the YAML template, and CFNlong converts the policy to JSON format before calling the API actions for privatelink. Alternatively, you can include the JSON directly in the YAML, as shown in the following ``Properties`` section: ``Properties: VpcEndpointType: 'Interface' ServiceName: !Sub 'com.amazonaws.${AWS::Region}.logs' PolicyDocument: '{ \"Version\":\"2012-10-17\", \"Statement\": [{ \"Effect\":\"Allow\", \"Principal\":\"*\", \"Action\":[\"logs:Describe*\",\"logs:Get*\",\"logs:List*\",\"logs:FilterLogEvents\"], \"Resource\":\"*\" }] }'``")
                 .with_provider_name("PolicyDocument"),
         )
         .attribute(
             AttributeSchema::new("private_dns_enabled", AttributeType::Bool)
-                .with_description("Indicate whether to associate a private hosted zone with the specified VPC. The private hosted zone contains a record set for the default public DNS n...")
+                .with_description("Indicate whether to associate a private hosted zone with the specified VPC. The private hosted zone contains a record set for the default public DNS name for the service for the Region (for example, ``kinesis.us-east-1.amazonaws.com``), which resolves to the private IP addresses of the endpoint network interfaces in the VPC. This enables you to make requests to the default public DNS name for the service instead of the public DNS names that are automatically generated by the VPC endpoint service. To use a private hosted zone, you must set the following VPC attributes to ``true``: ``enableDnsHostnames`` and ``enableDnsSupport``. This property is supported only for interface endpoints. Default: ``false``")
                 .with_provider_name("PrivateDnsEnabled"),
         )
         .attribute(
@@ -169,7 +169,7 @@ pub fn ec2_vpc_endpoint_config() -> AwsccSchemaConfig {
         )
         .attribute(
             AttributeSchema::new("security_group_ids", AttributeType::unordered_list(super::security_group_id()))
-                .with_description("The IDs of the security groups to associate with the endpoint network interfaces. If this parameter is not specified, we use the default security grou...")
+                .with_description("The IDs of the security groups to associate with the endpoint network interfaces. If this parameter is not specified, we use the default security group for the VPC. Security groups are supported only for interface endpoints.")
                 .with_provider_name("SecurityGroupIds"),
         )
         .attribute(
@@ -192,7 +192,7 @@ pub fn ec2_vpc_endpoint_config() -> AwsccSchemaConfig {
         )
         .attribute(
             AttributeSchema::new("subnet_ids", AttributeType::unordered_list(super::subnet_id()))
-                .with_description("The IDs of the subnets in which to create endpoint network interfaces. You must specify this property for an interface endpoint or a Gateway Load Bala...")
+                .with_description("The IDs of the subnets in which to create endpoint network interfaces. You must specify this property for an interface endpoint or a Gateway Load Balancer endpoint. You can't specify this property for a gateway endpoint. For a Gateway Load Balancer endpoint, you can specify only one subnet.")
                 .with_provider_name("SubnetIds"),
         )
         .attribute(

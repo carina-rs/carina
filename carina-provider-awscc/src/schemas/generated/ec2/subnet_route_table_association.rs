@@ -14,7 +14,7 @@ pub fn ec2_subnet_route_table_association_config() -> AwsccSchemaConfig {
         resource_type_name: "ec2.subnet_route_table_association",
         has_tags: false,
         schema: ResourceSchema::new("awscc.ec2.subnet_route_table_association")
-        .with_description("Associates a subnet with a route table. The subnet and route table must be in the same VPC. This association causes traffic originating from the subnet to be routed according to the routes in the rout...")
+        .with_description("Associates a subnet with a route table. The subnet and route table must be in the same VPC. This association causes traffic originating from the subnet to be routed according to the routes in the route table. A route table can be associated with multiple subnets. To create a route table, see [AWS::EC2::RouteTable](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-ec2-routetable.html).")
         .attribute(
             AttributeSchema::new("id", super::subnet_route_table_association_id())
                 .read_only()

@@ -887,17 +887,12 @@ fn generate_markdown(schema: &CfnSchema, type_name: &str) -> Result<String> {
                         .unwrap_or("")
                         .replace('\n', " "),
                 );
-                let truncated = if desc.len() > 100 {
-                    format!("{}...", &desc[..100])
-                } else {
-                    desc
-                };
                 md.push_str(&format!(
                     "| `{}` | {} | {} | {} |\n",
                     snake_name,
                     field_type_display,
                     if is_req { "Yes" } else { "No" },
-                    truncated
+                    desc
                 ));
             }
             md.push('\n');
@@ -1731,13 +1726,14 @@ pub fn {}() -> AwsccSchemaConfig {{
 
     // Add description
     if let Some(desc) = &schema.description {
-        let escaped_desc = desc.replace('"', "\\\"").replace('\n', " ");
-        let truncated = if escaped_desc.len() > 200 {
-            format!("{}...", &escaped_desc[..200])
-        } else {
+        let escaped_desc = desc
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\n', " ");
+        code.push_str(&format!(
+            "        .with_description(\"{}\")\n",
             escaped_desc
-        };
-        code.push_str(&format!("        .with_description(\"{}\")\n", truncated));
+        ));
     }
 
     // Generate attributes for each property
@@ -1835,16 +1831,16 @@ pub fn {}() -> AwsccSchemaConfig {{
         }
 
         if let Some(desc) = &prop.description {
-            let escaped = collapse_whitespace(&desc.replace('"', "\\\"").replace('\n', " "));
-            let truncated = if escaped.len() > 150 {
-                format!("{}...", &escaped[..150])
-            } else {
-                escaped
-            };
+            let escaped = collapse_whitespace(
+                &desc
+                    .replace('\\', "\\\\")
+                    .replace('"', "\\\"")
+                    .replace('\n', " "),
+            );
             let suffix = if is_read_only { " (read-only)" } else { "" };
             attr_code.push_str(&format!(
                 "\n                .with_description(\"{}{}\")",
-                truncated, suffix
+                escaped, suffix
             ));
         } else if is_read_only {
             attr_code.push_str("\n                .with_description(\"(read-only)\")");
@@ -2319,13 +2315,13 @@ fn generate_struct_type(
                 field_code.push_str(".required()");
             }
             if let Some(desc) = &field_prop.description {
-                let escaped = collapse_whitespace(&desc.replace('"', "\\\"").replace('\n', " "));
-                let truncated = if escaped.len() > 150 {
-                    format!("{}...", &escaped[..150])
-                } else {
-                    escaped
-                };
-                field_code.push_str(&format!(".with_description(\"{}\")", truncated));
+                let escaped = collapse_whitespace(
+                    &desc
+                        .replace('\\', "\\\\")
+                        .replace('"', "\\\"")
+                        .replace('\n', " "),
+                );
+                field_code.push_str(&format!(".with_description(\"{}\")", escaped));
             }
             field_code.push_str(&format!(".with_provider_name(\"{}\")", field_name));
 

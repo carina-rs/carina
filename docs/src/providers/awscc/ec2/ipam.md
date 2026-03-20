@@ -11,11 +11,9 @@ awscc.ec2.ipam {
   description = "Example IPAM"
   tier        = free
 
-  operating_regions = [
-    {
-      region_name = "ap-northeast-1"
-    }
-  ]
+  operating_regions = [{
+    region_name = "ap-northeast-1"
+  }]
 
   tags = {
     Environment = "example"
@@ -104,7 +102,7 @@ Shorthand formats: `free` or `Tier.free`
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `organizations_entity_path` | String(len: 1..) | Yes | An AWS Organizations entity path. Build the path for the OU(s) using AWS Organizations IDs separated... |
+| `organizations_entity_path` | String(len: 1..) | Yes | An AWS Organizations entity path. Build the path for the OU(s) using AWS Organizations IDs separated by a '/'. Include all child OUs by ending the path with '/*'. |
 
 ## Attribute Reference
 

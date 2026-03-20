@@ -75,7 +75,7 @@ pub fn ec2_ipam_config() -> AwsccSchemaConfig {
                 validate: validate_string_length_min_1,
                 namespace: None,
                 to_dsl: None,
-            }).required().with_description("An AWS Organizations entity path. Build the path for the OU(s) using AWS Organizations IDs separated by a '/'. Include all child OUs by ending the pat...").with_provider_name("OrganizationsEntityPath")
+            }).required().with_description("An AWS Organizations entity path. Build the path for the OU(s) using AWS Organizations IDs separated by a '/'. Include all child OUs by ending the path with '/*'.").with_provider_name("OrganizationsEntityPath")
                     ],
                 }))
                 .with_description("A set of organizational unit (OU) exclusions for the default resource discovery, created with this IPAM.")

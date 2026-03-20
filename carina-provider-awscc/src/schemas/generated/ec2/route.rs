@@ -14,7 +14,7 @@ pub fn ec2_route_config() -> AwsccSchemaConfig {
         resource_type_name: "ec2.route",
         has_tags: false,
         schema: ResourceSchema::new("awscc.ec2.route")
-        .with_description("Specifies a route in a route table. For more information, see [Routes](https://docs.aws.amazon.com/vpc/latest/userguide/VPC_Route_Tables.html#route-table-routes) in the *Amazon VPC User Guide*.  You m...")
+        .with_description("Specifies a route in a route table. For more information, see [Routes](https://docs.aws.amazon.com/vpc/latest/userguide/VPC_Route_Tables.html#route-table-routes) in the *Amazon VPC User Guide*.  You must specify either a destination CIDR block or prefix list ID. You must also specify exactly one of the resources as the target.  If you create a route that references a transit gateway in the same template where you create the transit gateway, you must declare a dependency on the transit gateway attachment. The route table cannot use the transit gateway until it has successfully attached to the VPC. Add a [DependsOn Attribute](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-attribute-dependson.html) in the ``AWS::EC2::Route`` resource to explicitly declare a dependency on the ``AWS::EC2::TransitGatewayAttachment`` resource.")
         .attribute(
             AttributeSchema::new("carrier_gateway_id", super::carrier_gateway_id())
                 .with_description("The ID of the carrier gateway. You can only use this option when the VPC contains a subnet which is associated with a Wavelength Zone.")
@@ -34,7 +34,7 @@ pub fn ec2_route_config() -> AwsccSchemaConfig {
         .attribute(
             AttributeSchema::new("destination_cidr_block", types::ipv4_cidr())
                 .create_only()
-                .with_description("The IPv4 CIDR address block used for the destination match. Routing decisions are based on the most specific match. We modify the specified CIDR block...")
+                .with_description("The IPv4 CIDR address block used for the destination match. Routing decisions are based on the most specific match. We modify the specified CIDR block to its canonical form; for example, if you specify ``100.68.0.18/18``, we modify it to ``100.68.0.0/18``.")
                 .with_provider_name("DestinationCidrBlock"),
         )
         .attribute(

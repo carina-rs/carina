@@ -30,7 +30,7 @@ pub fn ec2_vpn_gateway_config() -> AwsccSchemaConfig {
         resource_type_name: "ec2.vpn_gateway",
         has_tags: true,
         schema: ResourceSchema::new("awscc.ec2.vpn_gateway")
-        .with_description("Specifies a virtual private gateway. A virtual private gateway is the endpoint on the VPC side of your VPN connection. You can create a virtual private gateway before creating the VPC itself.  For mor...")
+        .with_description("Specifies a virtual private gateway. A virtual private gateway is the endpoint on the VPC side of your VPN connection. You can create a virtual private gateway before creating the VPC itself.  For more information, see [](https://docs.aws.amazon.com/vpn/latest/s2svpn/VPC_VPN.html) in the *User Guide*.")
         .attribute(
             AttributeSchema::new("amazon_side_asn", AttributeType::Custom {
                 name: "Int(1..=4294967294)".to_string(),

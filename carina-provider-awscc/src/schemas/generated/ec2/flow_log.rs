@@ -53,7 +53,7 @@ pub fn ec2_flow_log_config() -> AwsccSchemaConfig {
         .attribute(
             AttributeSchema::new("deliver_logs_permission_arn", super::iam_role_arn())
                 .create_only()
-                .with_description("The ARN for the IAM role that permits Amazon EC2 to publish flow logs to a CloudWatch Logs log group in your account. If you specify LogDestinationTyp...")
+                .with_description("The ARN for the IAM role that permits Amazon EC2 to publish flow logs to a CloudWatch Logs log group in your account. If you specify LogDestinationType as s3 or kinesis-data-firehose, do not specify DeliverLogsPermissionArn or LogGroupName.")
                 .with_provider_name("DeliverLogsPermissionArn"),
         )
         .attribute(
@@ -82,7 +82,7 @@ pub fn ec2_flow_log_config() -> AwsccSchemaConfig {
         .attribute(
             AttributeSchema::new("log_destination", super::arn())
                 .create_only()
-                .with_description("Specifies the destination to which the flow log data is to be published. Flow log data can be published to a CloudWatch Logs log group, an Amazon S3 b...")
+                .with_description("Specifies the destination to which the flow log data is to be published. Flow log data can be published to a CloudWatch Logs log group, an Amazon S3 bucket, or a Kinesis Firehose stream. The value specified for this parameter depends on the value specified for LogDestinationType.")
                 .with_provider_name("LogDestination"),
         )
         .attribute(
@@ -105,7 +105,7 @@ pub fn ec2_flow_log_config() -> AwsccSchemaConfig {
         .attribute(
             AttributeSchema::new("log_group_name", AttributeType::String)
                 .create_only()
-                .with_description("The name of a new or existing CloudWatch Logs log group where Amazon EC2 publishes your flow logs. If you specify LogDestinationType as s3 or kinesis-...")
+                .with_description("The name of a new or existing CloudWatch Logs log group where Amazon EC2 publishes your flow logs. If you specify LogDestinationType as s3 or kinesis-data-firehose, do not specify DeliverLogsPermissionArn or LogGroupName.")
                 .with_provider_name("LogGroupName"),
         )
         .attribute(
@@ -117,7 +117,7 @@ pub fn ec2_flow_log_config() -> AwsccSchemaConfig {
                 to_dsl: None,
             })
                 .create_only()
-                .with_description("The maximum interval of time during which a flow of packets is captured and aggregated into a flow log record. You can specify 60 seconds (1 minute) o...")
+                .with_description("The maximum interval of time during which a flow of packets is captured and aggregated into a flow log record. You can specify 60 seconds (1 minute) or 600 seconds (10 minutes).")
                 .with_provider_name("MaxAggregationInterval"),
         )
         .attribute(
@@ -136,7 +136,7 @@ pub fn ec2_flow_log_config() -> AwsccSchemaConfig {
             })
                 .required()
                 .create_only()
-                .with_description("The type of resource for which to create the flow log. For example, if you specified a VPC ID for the ResourceId property, specify VPC for this proper...")
+                .with_description("The type of resource for which to create the flow log. For example, if you specified a VPC ID for the ResourceId property, specify VPC for this property.")
                 .with_provider_name("ResourceType"),
         )
         .attribute(

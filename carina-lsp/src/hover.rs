@@ -6,6 +6,76 @@ use tower_lsp::lsp_types::{Hover, HoverContents, MarkupContent, MarkupKind, Posi
 use crate::document::Document;
 use carina_core::schema::{CompletionValue, ResourceSchema};
 
+/// Convert Markdown links `[text](url)` to plain text `text (url)` for hover display.
+/// LSP hover popups render as plain text in many editors, so raw Markdown link syntax
+/// appears as broken formatting. This converts links to a readable plain-text form
+/// while keeping the URL visible.
+fn convert_markdown_links_to_plain_text(text: &str) -> String {
+    let mut result = String::with_capacity(text.len());
+    let chars: Vec<char> = text.chars().collect();
+    let len = chars.len();
+    let mut i = 0;
+
+    while i < len {
+        if chars[i] == '[' {
+            let link_start = i;
+            i += 1;
+            let text_start = i;
+            // Find closing ]
+            while i < len && chars[i] != ']' && chars[i] != '\n' {
+                i += 1;
+            }
+            if i >= len || chars[i] == '\n' {
+                // No closing ], output as-is
+                result.push_str(
+                    &chars[link_start..=i.min(len - 1)]
+                        .iter()
+                        .collect::<String>(),
+                );
+                if i < len {
+                    i += 1;
+                }
+                continue;
+            }
+            let link_text: String = chars[text_start..i].iter().collect();
+            i += 1; // skip ]
+
+            if i < len && chars[i] == '(' {
+                i += 1; // skip (
+                let url_start = i;
+                while i < len && chars[i] != ')' && chars[i] != '\n' {
+                    i += 1;
+                }
+                if i < len && chars[i] == ')' {
+                    let url: String = chars[url_start..i].iter().collect();
+                    i += 1; // skip )
+                    // Convert [text](url) -> text (url)
+                    result.push_str(&link_text);
+                    result.push_str(" (");
+                    result.push_str(&url);
+                    result.push(')');
+                } else {
+                    // Incomplete link, output as-is
+                    result.push('[');
+                    result.push_str(&link_text);
+                    result.push_str("](");
+                    result.push_str(&chars[url_start..i.min(len)].iter().collect::<String>());
+                }
+            } else {
+                // [text] without ( - output as-is
+                result.push('[');
+                result.push_str(&link_text);
+                result.push(']');
+            }
+        } else {
+            result.push(chars[i]);
+            i += 1;
+        }
+    }
+
+    result
+}
+
 pub struct HoverProvider {
     schemas: Arc<HashMap<String, ResourceSchema>>,
     region_completions: Vec<CompletionValue>,
@@ -120,10 +190,12 @@ impl HoverProvider {
     }
 
     fn schema_hover(&self, resource_name: &str, schema: &ResourceSchema) -> Option<Hover> {
-        let description = schema
-            .description
-            .as_deref()
-            .unwrap_or("No description available");
+        let description = convert_markdown_links_to_plain_text(
+            schema
+                .description
+                .as_deref()
+                .unwrap_or("No description available"),
+        );
 
         let mut content = format!(
             "## {}\n\n{}\n\n### Attributes\n\n",
@@ -132,7 +204,8 @@ impl HoverProvider {
 
         for attr in schema.attributes.values() {
             let required = if attr.required { " **(required)**" } else { "" };
-            let desc = attr.description.as_deref().unwrap_or("");
+            let desc =
+                convert_markdown_links_to_plain_text(attr.description.as_deref().unwrap_or(""));
             content.push_str(&format!("- `{}`: {}{}\n", attr.name, desc, required));
         }
 
@@ -149,7 +222,9 @@ impl HoverProvider {
         // Check all schemas for the attribute
         for schema in self.schemas.values() {
             if let Some(attr) = schema.attributes.get(word) {
-                let description = attr.description.as_deref().unwrap_or("No description");
+                let description = convert_markdown_links_to_plain_text(
+                    attr.description.as_deref().unwrap_or("No description"),
+                );
                 let required = if attr.required {
                     "Required"
                 } else {
@@ -263,6 +338,115 @@ impl HoverProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use carina_core::schema::{AttributeSchema, AttributeType};
+
+    fn create_hover_provider_with_description(
+        resource_type: &str,
+        description: &str,
+    ) -> HoverProvider {
+        let mut schemas = HashMap::new();
+        let schema = ResourceSchema::new(resource_type).with_description(description);
+        schemas.insert(resource_type.to_string(), schema);
+        HoverProvider::new(Arc::new(schemas), vec![])
+    }
+
+    fn create_hover_provider_with_attr_description(
+        resource_type: &str,
+        attr_name: &str,
+        attr_description: &str,
+    ) -> HoverProvider {
+        let mut schemas = HashMap::new();
+        let schema = ResourceSchema::new(resource_type).attribute(
+            AttributeSchema::new(attr_name, AttributeType::String)
+                .with_description(attr_description),
+        );
+        schemas.insert(resource_type.to_string(), schema);
+        HoverProvider::new(Arc::new(schemas), vec![])
+    }
+
+    #[test]
+    fn test_convert_markdown_links_to_plain_text() {
+        // Basic link conversion
+        assert_eq!(
+            convert_markdown_links_to_plain_text("[VPC docs](https://docs.aws.amazon.com/vpc/)"),
+            "VPC docs (https://docs.aws.amazon.com/vpc/)"
+        );
+
+        // Text with no links passes through unchanged
+        assert_eq!(
+            convert_markdown_links_to_plain_text("No links here."),
+            "No links here."
+        );
+
+        // Multiple links in same text
+        assert_eq!(
+            convert_markdown_links_to_plain_text("See [A](https://a.com) and [B](https://b.com)."),
+            "See A (https://a.com) and B (https://b.com)."
+        );
+    }
+
+    #[test]
+    fn test_resource_hover_converts_markdown_links() {
+        // Full description with a markdown link (no truncation)
+        let desc = "Specifies a virtual private cloud (VPC). To add an IPv6 CIDR block to the VPC, see [AWS::EC2::VPCCidrBlock](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-ec2-vpccidrblock.html).";
+
+        let provider = create_hover_provider_with_description("ec2.vpc", desc);
+        let schema = provider.schemas.get("ec2.vpc").unwrap();
+        let hover = provider.schema_hover("ec2.vpc", schema).unwrap();
+
+        let content = match &hover.contents {
+            HoverContents::Markup(m) => &m.value,
+            _ => panic!("Expected markup content"),
+        };
+
+        // Should NOT contain raw markdown link syntax
+        assert!(
+            !content.contains("[AWS::EC2::VPCCidrBlock]("),
+            "Hover should not contain raw markdown links, but got:\n{}",
+            content
+        );
+        // Should contain the converted plain text form
+        assert!(
+            content.contains("AWS::EC2::VPCCidrBlock (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-ec2-vpccidrblock.html)"),
+            "Hover should contain plain text link, but got:\n{}",
+            content
+        );
+    }
+
+    #[test]
+    fn test_attribute_hover_converts_markdown_links() {
+        // Attribute description with a markdown link (full, not truncated)
+        let desc = "Secondary EIP allocation IDs. For more information, see [Create a NAT gateway](https://docs.aws.amazon.com/vpc/latest/userguide/nat-gateway-working-with.html) in the Amazon VPC User Guide.";
+
+        let provider = create_hover_provider_with_attr_description(
+            "ec2.nat_gateway",
+            "secondary_allocation_ids",
+            desc,
+        );
+
+        let doc = Document::new("secondary_allocation_ids".to_string());
+        let hover = provider
+            .hover(&doc, Position::new(0, 5))
+            .expect("Should find hover for attribute");
+
+        let content = match &hover.contents {
+            HoverContents::Markup(m) => &m.value,
+            _ => panic!("Expected markup content"),
+        };
+
+        // Should NOT contain raw markdown link syntax
+        assert!(
+            !content.contains("[Create a NAT gateway]("),
+            "Attribute hover should not contain raw markdown links, but got:\n{}",
+            content
+        );
+        // Should contain the converted plain text form
+        assert!(
+            content.contains("Create a NAT gateway (https://docs.aws.amazon.com/vpc/latest/userguide/nat-gateway-working-with.html)"),
+            "Attribute hover should contain plain text link, but got:\n{}",
+            content
+        );
+    }
 
     #[test]
     fn test_keyword_hover_provider() {
