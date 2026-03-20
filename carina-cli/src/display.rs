@@ -59,11 +59,46 @@ pub fn print_plan(plan: &Plan) {
         }
     }
 
-    // Find root resources (no dependencies within the plan)
-    let mut roots: Vec<usize> = Vec::new();
+    // For resources that have no dependencies in the plan but ARE depended upon
+    // by other resources, nest them under their first dependent instead of
+    // showing them as disconnected roots. (Issue #928)
+    //
+    // A no-dep resource can be nested only if every dependent has at least one
+    // other dependency in the plan (besides this resource), ensuring the tree
+    // stays connected without creating cycles.
+    let mut nested_under_dependent: HashSet<usize> = HashSet::new();
+    let effect_binding_set: HashSet<&str> = binding_to_effect.keys().map(|s| s.as_str()).collect();
     for (idx, deps) in &effect_deps {
         let has_dep_in_plan = deps.iter().any(|d| binding_to_effect.contains_key(d));
         if !has_dep_in_plan {
+            let mut children = dependents.get(idx).cloned().unwrap_or_default();
+            children.sort();
+            if !children.is_empty() {
+                // Check if all dependents have at least one other dep in the plan
+                let binding_of_idx = effect_bindings.get(idx).map(|s| s.as_str());
+                let all_dependents_have_other_deps = children.iter().all(|&child_idx| {
+                    effect_deps.get(&child_idx).is_some_and(|child_deps| {
+                        child_deps.iter().any(|d| {
+                            effect_binding_set.contains(d.as_str())
+                                && Some(d.as_str()) != binding_of_idx
+                        })
+                    })
+                });
+                if all_dependents_have_other_deps {
+                    // Nest this resource under its first dependent (by index order)
+                    let first_dependent = children[0];
+                    dependents.entry(first_dependent).or_default().push(*idx);
+                    nested_under_dependent.insert(*idx);
+                }
+            }
+        }
+    }
+
+    // Find root resources: no dependencies within the plan AND not nested under a dependent
+    let mut roots: Vec<usize> = Vec::new();
+    for (idx, deps) in &effect_deps {
+        let has_dep_in_plan = deps.iter().any(|d| binding_to_effect.contains_key(d));
+        if !has_dep_in_plan && !nested_under_dependent.contains(idx) {
             roots.push(*idx);
         }
     }
@@ -726,5 +761,157 @@ mod tests {
 
         // Should not panic
         print_plan(&plan);
+    }
+
+    /// Helper: compute root indices using the same algorithm as print_plan.
+    fn compute_roots(plan: &Plan) -> Vec<usize> {
+        let mut binding_to_effect: HashMap<String, usize> = HashMap::new();
+        let mut effect_deps: HashMap<usize, HashSet<String>> = HashMap::new();
+
+        for (idx, effect) in plan.effects().iter().enumerate() {
+            let (resource, deps) = match effect {
+                Effect::Create(r) => (Some(r), get_resource_dependencies(r)),
+                Effect::Update { to, .. } => (Some(to), get_resource_dependencies(to)),
+                Effect::Replace { to, .. } => (Some(to), get_resource_dependencies(to)),
+                Effect::Read { resource } => (Some(resource), get_resource_dependencies(resource)),
+                Effect::Delete { .. } => (None, HashSet::new()),
+            };
+
+            if let Some(r) = resource {
+                let binding = r
+                    .attributes
+                    .get("_binding")
+                    .and_then(|v| match v {
+                        Value::String(s) => Some(s.clone()),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| r.id.to_string());
+                binding_to_effect.insert(binding, idx);
+            }
+            effect_deps.insert(idx, deps);
+        }
+
+        // Build reverse dependency map
+        let mut dependents: HashMap<usize, Vec<usize>> = HashMap::new();
+        for idx in 0..plan.effects().len() {
+            dependents.insert(idx, Vec::new());
+        }
+        for (idx, deps) in &effect_deps {
+            for dep in deps {
+                if let Some(&dep_idx) = binding_to_effect.get(dep)
+                    && let Some(deps) = dependents.get_mut(&dep_idx)
+                {
+                    deps.push(*idx);
+                }
+            }
+        }
+
+        // Build effect_bindings map for lookup
+        let mut effect_bindings: HashMap<usize, String> = HashMap::new();
+        for (idx, effect) in plan.effects().iter().enumerate() {
+            let resource = match effect {
+                Effect::Create(r) => Some(r),
+                Effect::Update { to, .. } => Some(to),
+                Effect::Replace { to, .. } => Some(to),
+                Effect::Read { resource } => Some(resource),
+                Effect::Delete { .. } => None,
+            };
+            if let Some(r) = resource {
+                let binding = r
+                    .attributes
+                    .get("_binding")
+                    .and_then(|v| match v {
+                        Value::String(s) => Some(s.clone()),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| r.id.to_string());
+                effect_bindings.insert(idx, binding);
+            }
+        }
+
+        // For resources with no deps in plan but depended upon by others,
+        // nest them under their first dependent if all dependents have
+        // other deps in the plan (Issue #928)
+        let mut nested_under_dependent: HashSet<usize> = HashSet::new();
+        let effect_binding_set: HashSet<&str> =
+            binding_to_effect.keys().map(|s| s.as_str()).collect();
+        for (idx, deps) in &effect_deps {
+            let has_dep_in_plan = deps.iter().any(|d| binding_to_effect.contains_key(d));
+            if !has_dep_in_plan {
+                let children = dependents.get(idx).cloned().unwrap_or_default();
+                if !children.is_empty() {
+                    let binding_of_idx = effect_bindings.get(idx).map(|s| s.as_str());
+                    let all_dependents_have_other_deps = children.iter().all(|&child_idx| {
+                        effect_deps.get(&child_idx).is_some_and(|child_deps| {
+                            child_deps.iter().any(|d| {
+                                effect_binding_set.contains(d.as_str())
+                                    && Some(d.as_str()) != binding_of_idx
+                            })
+                        })
+                    });
+                    if all_dependents_have_other_deps {
+                        nested_under_dependent.insert(*idx);
+                    }
+                }
+            }
+        }
+
+        let mut roots: Vec<usize> = Vec::new();
+        for (idx, deps) in &effect_deps {
+            let has_dep_in_plan = deps.iter().any(|d| binding_to_effect.contains_key(d));
+            if !has_dep_in_plan && !nested_under_dependent.contains(idx) {
+                roots.push(*idx);
+            }
+        }
+        roots.sort();
+        roots
+    }
+
+    /// Issue #928: A resource that has no dependencies but IS referenced by
+    /// other resources should NOT appear as a disconnected root-level item.
+    /// It should be nested under the resource that references it.
+    ///
+    /// Scenario (from the issue):
+    ///   - vpc: no deps
+    ///   - rt: depends on vpc
+    ///   - route: depends on rt, igw
+    ///   - igw_attachment: depends on vpc, igw
+    ///   - igw: no deps (but referenced by route and igw_attachment)
+    ///
+    /// Current (buggy): igw appears as a separate root alongside vpc.
+    /// Expected: igw should be nested under igw_attachment (or route),
+    ///           so only vpc is a root.
+    #[test]
+    fn test_referenced_resource_without_deps_should_not_be_root() {
+        let vpc = make_resource("ec2.vpc", "vpc", "vpc", &[]);
+        let rt = make_resource("ec2.route_table", "rt", "rt", &["vpc"]);
+        let igw = make_resource("ec2.internet_gateway", "igw", "igw", &[]);
+        let route = make_resource("ec2.route", "route", "route", &["rt", "igw"]);
+        let igw_attachment = make_resource(
+            "ec2.vpc_gateway_attachment",
+            "igw_attachment",
+            "igw_attachment",
+            &["vpc", "igw"],
+        );
+
+        let mut plan = Plan::new();
+        plan.add(Effect::Create(vpc));
+        plan.add(Effect::Create(rt));
+        plan.add(Effect::Create(igw));
+        plan.add(Effect::Create(route));
+        plan.add(Effect::Create(igw_attachment));
+
+        let roots = compute_roots(&plan);
+
+        // IGW (index 2) should NOT be a root because it is referenced by
+        // other resources in the plan (route and igw_attachment).
+        // Only VPC (index 0) should be a root.
+        assert_eq!(
+            roots,
+            vec![0],
+            "Only vpc should be a root. igw (index 2) is referenced by other resources \
+             and should be nested, not a disconnected root. Got roots: {:?}",
+            roots
+        );
     }
 }
