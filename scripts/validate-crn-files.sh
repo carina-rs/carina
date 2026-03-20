@@ -5,17 +5,19 @@
 # errors without requiring AWS credentials.
 #
 # Usage (from project root):
-#   ./carina-provider-awscc/scripts/validate-crn-files.sh
+#   ./scripts/validate-crn-files.sh
 
 set -e
 
 DIRS=(
+    "carina-provider-aws/acceptance-tests"
+    "carina-provider-aws/examples"
     "carina-provider-awscc/acceptance-tests"
     "carina-provider-awscc/examples"
 )
 
 # Build the CLI binary
-cargo build --bin carina --quiet 2>/dev/null || {
+cargo build --bin carina --quiet || {
     echo "ERROR: Could not build carina binary"
     exit 1
 }

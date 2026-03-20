@@ -2640,11 +2640,11 @@ mod tests {
     }
 
     #[test]
-    fn resolve_block_names_same_block_and_canonical_name_with_both_syntax_errors() {
-        // When block_name == canonical name and the user provides a List value,
-        // there's no conflict since they map to the same key. The key already
-        // exists (it IS the canonical key), so the `continue` path handles it.
-        // This test verifies the value is preserved correctly.
+    fn resolve_block_names_same_block_and_canonical_name_multiple_items() {
+        // When block_name == canonical name and the user provides multiple block
+        // items (Value::List with multiple entries), no conflict should occur.
+        // The key already exists (it IS the canonical key), so the `continue`
+        // path handles it. This test verifies all items are preserved.
         let mut resources = vec![{
             let mut r = Resource::new("ec2.security_group", "my-sg");
             r.attributes.insert(
