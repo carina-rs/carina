@@ -22,7 +22,7 @@ impl CompletionProvider {
             arguments: None,
         };
 
-        // Get schema for specific resource type, or fall back to all schemas
+        // Get schema for specific resource type
         if let Some(schema) = self.schemas.get(resource_type) {
             for attr in schema.attributes.values() {
                 let detail = attr.description.clone();
@@ -54,27 +54,9 @@ impl CompletionProvider {
                     });
                 }
             }
-        } else {
-            // Fall back to all attributes from all schemas
-            let mut seen = std::collections::HashSet::new();
-            for schema in self.schemas.values() {
-                for attr in schema.attributes.values() {
-                    if seen.insert(attr.name.clone()) {
-                        let detail = attr.description.clone();
-                        let required_marker = if attr.required { " (required)" } else { "" };
-
-                        completions.push(CompletionItem {
-                            label: attr.name.clone(),
-                            kind: Some(CompletionItemKind::PROPERTY),
-                            detail: detail.map(|d| format!("{}{}", d, required_marker)),
-                            insert_text: Some(format!("{} = ", attr.name)),
-                            command: Some(trigger_suggest.clone()),
-                            ..Default::default()
-                        });
-                    }
-                }
-            }
         }
+        // When resource type is unknown, return no attribute completions
+        // rather than showing irrelevant attributes from all schemas.
 
         completions
     }
