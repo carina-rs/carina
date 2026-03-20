@@ -46,6 +46,13 @@ pub enum EffectKind {
     Delete,
 }
 
+/// Which panel currently has focus
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FocusedPanel {
+    Tree,
+    Detail,
+}
+
 /// Application state
 pub struct App {
     /// Tree nodes (one per effect)
@@ -58,6 +65,10 @@ pub struct App {
     pub summary: String,
     /// Plan summary counts for colored display
     pub plan_summary: PlanSummary,
+    /// Which panel currently has focus
+    pub focused_panel: FocusedPanel,
+    /// Vertical scroll offset for the detail panel
+    pub detail_scroll: u16,
 }
 
 impl App {
@@ -82,6 +93,8 @@ impl App {
             list_state,
             summary,
             plan_summary,
+            focused_panel: FocusedPanel::Tree,
+            detail_scroll: 0,
         }
     }
 
@@ -112,6 +125,7 @@ impl App {
         if self.selected > 0 {
             self.selected -= 1;
             self.list_state.select(Some(self.selected));
+            self.detail_scroll = 0;
         }
     }
 
@@ -120,7 +134,26 @@ impl App {
         if count > 0 && self.selected < count - 1 {
             self.selected += 1;
             self.list_state.select(Some(self.selected));
+            self.detail_scroll = 0;
         }
+    }
+
+    /// Toggle focus between Tree and Detail panels
+    pub fn toggle_focus(&mut self) {
+        self.focused_panel = match self.focused_panel {
+            FocusedPanel::Tree => FocusedPanel::Detail,
+            FocusedPanel::Detail => FocusedPanel::Tree,
+        };
+    }
+
+    /// Scroll the detail panel up by one line
+    pub fn detail_scroll_up(&mut self) {
+        self.detail_scroll = self.detail_scroll.saturating_sub(1);
+    }
+
+    /// Scroll the detail panel down by one line
+    pub fn detail_scroll_down(&mut self) {
+        self.detail_scroll = self.detail_scroll.saturating_add(1);
     }
 
     /// Get the node index for the currently selected visible row
@@ -836,5 +869,54 @@ mod tests {
         assert_eq!(node.kind, EffectKind::Create);
         // Attributes are always available in the detail panel
         assert!(!node.attributes.is_empty());
+    }
+
+    #[test]
+    fn toggle_focus_switches_panels() {
+        let mut plan = Plan::new();
+        plan.add(Effect::Create(Resource::new("s3.bucket", "a")));
+        let mut app = App::new(&plan);
+
+        assert_eq!(app.focused_panel, FocusedPanel::Tree);
+        app.toggle_focus();
+        assert_eq!(app.focused_panel, FocusedPanel::Detail);
+        app.toggle_focus();
+        assert_eq!(app.focused_panel, FocusedPanel::Tree);
+    }
+
+    #[test]
+    fn detail_scroll_up_down() {
+        let mut plan = Plan::new();
+        plan.add(Effect::Create(Resource::new("s3.bucket", "a")));
+        let mut app = App::new(&plan);
+
+        assert_eq!(app.detail_scroll, 0);
+        app.detail_scroll_down();
+        assert_eq!(app.detail_scroll, 1);
+        app.detail_scroll_down();
+        assert_eq!(app.detail_scroll, 2);
+        app.detail_scroll_up();
+        assert_eq!(app.detail_scroll, 1);
+        app.detail_scroll_up();
+        assert_eq!(app.detail_scroll, 0);
+        // Should not underflow
+        app.detail_scroll_up();
+        assert_eq!(app.detail_scroll, 0);
+    }
+
+    #[test]
+    fn detail_scroll_resets_on_navigation() {
+        let mut plan = Plan::new();
+        plan.add(Effect::Create(Resource::new("s3.bucket", "a")));
+        plan.add(Effect::Create(Resource::new("s3.bucket", "b")));
+        let mut app = App::new(&plan);
+
+        app.detail_scroll = 5;
+        app.move_down();
+        assert_eq!(app.detail_scroll, 0);
+
+        app.detail_scroll = 3;
+        app.move_up();
+        assert_eq!(app.detail_scroll, 0);
     }
 }

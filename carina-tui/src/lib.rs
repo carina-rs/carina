@@ -15,7 +15,7 @@ use ratatui::prelude::*;
 
 use carina_core::plan::Plan;
 
-pub use app::App;
+pub use app::{App, FocusedPanel};
 
 /// Run the TUI with the given plan.
 ///
@@ -50,8 +50,15 @@ fn run_loop(
             }
             match key.code {
                 KeyCode::Char('q') => return Ok(()),
-                KeyCode::Up | KeyCode::Char('k') => app.move_up(),
-                KeyCode::Down | KeyCode::Char('j') => app.move_down(),
+                KeyCode::Tab => app.toggle_focus(),
+                KeyCode::Up | KeyCode::Char('k') => match app.focused_panel {
+                    FocusedPanel::Tree => app.move_up(),
+                    FocusedPanel::Detail => app.detail_scroll_up(),
+                },
+                KeyCode::Down | KeyCode::Char('j') => match app.focused_panel {
+                    FocusedPanel::Tree => app.move_down(),
+                    FocusedPanel::Detail => app.detail_scroll_down(),
+                },
                 _ => {}
             }
         }

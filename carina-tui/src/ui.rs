@@ -6,7 +6,7 @@ use carina_core::plan::PlanSummary;
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
 
-use crate::app::{App, EffectKind};
+use crate::app::{App, EffectKind, FocusedPanel};
 
 /// Draw the main layout: tree (70%), detail panel (30%), help bar (1 line)
 pub fn draw(frame: &mut Frame, app: &App) {
@@ -62,12 +62,17 @@ fn draw_tree(frame: &mut Frame, app: &App, area: Rect) {
         .collect();
 
     let title_line = build_plan_title(&app.plan_summary);
+    let tree_border_color = if app.focused_panel == FocusedPanel::Tree {
+        Color::Cyan
+    } else {
+        Color::DarkGray
+    };
     let list = List::new(items)
         .block(
             Block::default()
                 .title(title_line)
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::White)),
+                .border_style(Style::default().fg(tree_border_color)),
         )
         .highlight_style(
             Style::default()
@@ -81,13 +86,19 @@ fn draw_tree(frame: &mut Frame, app: &App, area: Rect) {
 
 /// Draw the detail panel showing attributes of the selected node
 fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
+    let detail_border_color = if app.focused_panel == FocusedPanel::Detail {
+        Color::Cyan
+    } else {
+        Color::DarkGray
+    };
+
     let node = match app.selected_node() {
         Some(n) => n,
         None => {
             let block = Block::default()
                 .title(" Details ")
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::DarkGray));
+                .border_style(Style::default().fg(detail_border_color));
             frame.render_widget(block, area);
             return;
         }
@@ -165,9 +176,10 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
             Block::default()
                 .title(" Details ")
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::White)),
+                .border_style(Style::default().fg(detail_border_color)),
         )
-        .wrap(Wrap { trim: false });
+        .wrap(Wrap { trim: false })
+        .scroll((app.detail_scroll, 0));
     frame.render_widget(detail, area);
 }
 
@@ -175,12 +187,19 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
 fn draw_help(frame: &mut Frame, area: Rect) {
     let help = Paragraph::new(Line::from(vec![
         Span::styled(
-            " j/k",
+            " Tab",
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::raw(" navigate  "),
+        Span::raw(" switch panel  "),
+        Span::styled(
+            "j/k",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" navigate/scroll  "),
         Span::styled(
             "q",
             Style::default()
