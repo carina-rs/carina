@@ -47,6 +47,10 @@ enum Commands {
         /// Return exit code 2 when changes are present
         #[arg(long = "detailed-exitcode")]
         detailed_exitcode: bool,
+
+        /// Show only resource tree structure without attribute details
+        #[arg(long)]
+        compact: bool,
     },
     /// Apply changes to reach the desired state
     Apply {
@@ -138,9 +142,10 @@ async fn main() {
         path,
         out,
         detailed_exitcode,
+        compact,
     } = cli.command
     {
-        match run_plan(&path, out.as_ref()).await {
+        match run_plan(&path, out.as_ref(), compact).await {
             Ok(has_changes) => {
                 if detailed_exitcode && has_changes {
                     std::process::exit(2);

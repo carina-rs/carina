@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use colored::Colorize;
@@ -164,7 +165,119 @@ fn build_single_parent_tree(
     (sorted_roots, dependents)
 }
 
-pub fn print_plan(plan: &Plan) {
+/// Check if a resource has a `let` binding (i.e., is not anonymous).
+fn has_binding(resource: &carina_core::resource::Resource) -> bool {
+    resource.attributes.contains_key("_binding")
+}
+
+/// Extract a compact hint for anonymous resources.
+///
+/// Collects the first distinguishing string attribute (like `service_name`) and ALL
+/// non-parent `Value::ResourceRef` attributes, then combines them into a comma-separated
+/// hint. String hints appear first (most identifying), followed by ResourceRef hints.
+///
+/// `parent_binding` is the binding name of the parent resource in the tree, used to
+/// skip ResourceRef attributes that redundantly reference the parent.
+fn extract_compact_hint(
+    resource: &carina_core::resource::Resource,
+    parent_binding: Option<&str>,
+) -> Option<String> {
+    let mut keys: Vec<_> = resource
+        .attributes
+        .keys()
+        .filter(|k| !k.starts_with('_'))
+        .collect();
+    keys.sort();
+
+    // Priority 1: First distinguishing string attribute (most identifying)
+    for key in &keys {
+        if let Some(Value::String(s)) = resource.attributes.get(*key)
+            && !s.is_empty()
+        {
+            let short_key = shorten_attr_name(key);
+            let display_value = shorten_service_name(key, s);
+            return Some(format!("{}: {}", short_key, display_value));
+        }
+    }
+
+    // Priority 2: First non-parent ResourceRef attribute (direct or inside a List)
+    for key in &keys {
+        match resource.attributes.get(*key) {
+            Some(Value::ResourceRef { binding_name, .. }) => {
+                if parent_binding == Some(binding_name.as_str()) {
+                    continue;
+                }
+                let short_key = shorten_attr_name(key);
+                return Some(format!("{}: {}", short_key, binding_name));
+            }
+            Some(Value::List(items)) => {
+                for item in items {
+                    if let Value::ResourceRef { binding_name, .. } = item {
+                        if parent_binding == Some(binding_name.as_str()) {
+                            continue;
+                        }
+                        let short_key = shorten_attr_name(key);
+                        return Some(format!("{}: {}", short_key, binding_name));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    None
+}
+
+/// Shorten common attribute name suffixes for compact display.
+/// e.g., `subnet_id` -> `subnet`, `route_table_id` -> `route_table`,
+///       `service_name` -> `service`, `group_name` -> `group`
+fn shorten_attr_name(attr: &str) -> &str {
+    attr.strip_suffix("_ids")
+        .or_else(|| attr.strip_suffix("_id"))
+        .or_else(|| attr.strip_suffix("_name"))
+        .unwrap_or(attr)
+}
+
+/// For `service_name` attributes, extract just the service suffix from AWS endpoint names.
+/// e.g., `com.amazonaws.ap-northeast-1.ecr.dkr` -> `ecr.dkr`
+///       `com.amazonaws.ap-northeast-1.s3` -> `s3`
+fn shorten_service_name<'a>(attr_name: &str, value: &'a str) -> Cow<'a, str> {
+    if attr_name == "service_name" {
+        // Match pattern: com.amazonaws.<region>.<service...>
+        if let Some(rest) = value.strip_prefix("com.amazonaws.") {
+            // Skip the region part (e.g., "ap-northeast-1") and take the rest
+            if let Some(dot_pos) = rest.find('.') {
+                let after_region = &rest[dot_pos + 1..];
+                if !after_region.is_empty() {
+                    return Cow::Borrowed(after_region);
+                }
+            }
+        }
+    }
+    Cow::Borrowed(value)
+}
+
+/// Format a compact resource identifier, showing either the binding name in quotes
+/// or a hint in parentheses for anonymous resources.
+///
+/// `name` is the display name of the resource (typically `id.name`).
+/// `parent_binding` is the binding name of the parent in the tree, used to skip
+/// redundant ResourceRef hints.
+fn format_compact_name(
+    resource: &carina_core::resource::Resource,
+    name: &str,
+    parent_binding: Option<&str>,
+) -> String {
+    if has_binding(resource) {
+        name.to_string()
+    } else if let Some(hint) = extract_compact_hint(resource, parent_binding) {
+        format!("({})", hint)
+    } else {
+        name.to_string()
+    }
+}
+
+pub fn print_plan(plan: &Plan, compact: bool) {
     if plan.is_empty() {
         println!("{}", "No changes. Infrastructure is up-to-date.".green());
         return;
@@ -216,6 +329,7 @@ pub fn print_plan(plan: &Plan) {
     // Track printed effects to avoid duplicates
     let mut printed: HashSet<usize> = HashSet::new();
 
+    #[allow(clippy::too_many_arguments)]
     fn print_effect_tree(
         idx: usize,
         plan: &Plan,
@@ -224,6 +338,8 @@ pub fn print_plan(plan: &Plan) {
         indent: usize,
         is_last: bool,
         prefix: &str,
+        compact: bool,
+        parent_binding: Option<&str>,
     ) {
         if printed.contains(&idx) {
             return;
@@ -261,43 +377,55 @@ pub fn print_plan(plan: &Plan) {
 
         match effect {
             Effect::Create(r) => {
-                println!(
-                    "{}{}{} {} \"{}\"",
-                    base_indent,
-                    connector,
-                    colored_symbol,
-                    r.id.display_type().cyan().bold(),
-                    r.id.name.white().bold()
-                );
-                // Attribute prefix aligns with the resource content
-                let attr_prefix = if indent == 0 {
-                    format!("{}{}", base_indent, attr_base)
+                if compact {
+                    let name_part = format_compact_name(r, &r.id.name, parent_binding);
+                    println!(
+                        "{}{}{} {} {}",
+                        base_indent,
+                        connector,
+                        colored_symbol,
+                        r.id.display_type().cyan().bold(),
+                        name_part.white().bold()
+                    );
                 } else {
-                    let continuation = if is_last {
-                        format!("{}   ", prefix)
+                    println!(
+                        "{}{}{} {} {}",
+                        base_indent,
+                        connector,
+                        colored_symbol,
+                        r.id.display_type().cyan().bold(),
+                        r.id.name.white().bold()
+                    );
+                    // Attribute prefix aligns with the resource content
+                    let attr_prefix = if indent == 0 {
+                        format!("{}{}", base_indent, attr_base)
                     } else {
-                        format!("{}│  ", prefix)
+                        let continuation = if is_last {
+                            format!("{}   ", prefix)
+                        } else {
+                            format!("{}│  ", prefix)
+                        };
+                        format!("{}{}   ", base_indent, continuation)
                     };
-                    format!("{}{}   ", base_indent, continuation)
-                };
-                let mut keys: Vec<_> = r
-                    .attributes
-                    .keys()
-                    .filter(|k| !k.starts_with('_'))
-                    .collect();
-                keys.sort();
-                for key in keys {
-                    let value = &r.attributes[key];
-                    if is_list_of_maps(value) {
-                        println!("{}{}:", attr_prefix, key);
-                        println!("{}", format_list_of_maps(value, &attr_prefix));
-                    } else {
-                        println!(
-                            "{}{}: {}",
-                            attr_prefix,
-                            key,
-                            format_value_with_key(value, Some(key)).green()
-                        );
+                    let mut keys: Vec<_> = r
+                        .attributes
+                        .keys()
+                        .filter(|k| !k.starts_with('_'))
+                        .collect();
+                    keys.sort();
+                    for key in keys {
+                        let value = &r.attributes[key];
+                        if is_list_of_maps(value) {
+                            println!("{}{}:", attr_prefix, key);
+                            println!("{}", format_list_of_maps(value, &attr_prefix));
+                        } else {
+                            println!(
+                                "{}{}: {}",
+                                attr_prefix,
+                                key,
+                                format_value_with_key(value, Some(key)).green()
+                            );
+                        }
                     }
                 }
             }
@@ -307,69 +435,84 @@ pub fn print_plan(plan: &Plan) {
                 to,
                 changed_attributes,
             } => {
-                println!(
-                    "{}{}{} {} \"{}\"",
-                    base_indent,
-                    connector,
-                    colored_symbol,
-                    id.display_type().cyan().bold(),
-                    id.name.yellow().bold()
-                );
-                let attr_prefix = if indent == 0 {
-                    format!("{}{}", base_indent, attr_base)
+                if compact {
+                    let name_part = format_compact_name(to, &id.name, parent_binding);
+                    println!(
+                        "{}{}{} {} {}",
+                        base_indent,
+                        connector,
+                        colored_symbol,
+                        id.display_type().cyan().bold(),
+                        name_part.yellow().bold()
+                    );
                 } else {
-                    let continuation = if is_last {
-                        format!("{}   ", prefix)
+                    println!(
+                        "{}{}{} {} {}",
+                        base_indent,
+                        connector,
+                        colored_symbol,
+                        id.display_type().cyan().bold(),
+                        id.name.yellow().bold()
+                    );
+                    let attr_prefix = if indent == 0 {
+                        format!("{}{}", base_indent, attr_base)
                     } else {
-                        format!("{}│  ", prefix)
-                    };
-                    format!("{}{}   ", base_indent, continuation)
-                };
-                let mut keys: Vec<_> = to
-                    .attributes
-                    .keys()
-                    .filter(|k| !k.starts_with('_'))
-                    .collect();
-                keys.sort();
-                for key in keys {
-                    let new_value = &to.attributes[key];
-                    let old_value = from.attributes.get(key);
-                    let is_same = old_value
-                        .map(|ov| ov.semantically_equal(new_value))
-                        .unwrap_or(false);
-                    if !is_same {
-                        if is_list_of_maps(new_value) {
-                            println!("{}{}:", attr_prefix, key);
-                            println!("{}", format_list_diff(old_value, new_value, &attr_prefix));
+                        let continuation = if is_last {
+                            format!("{}   ", prefix)
                         } else {
-                            let old_str = old_value
-                                .map(|v| format_value_with_key(v, Some(key)))
-                                .unwrap_or_else(|| "(none)".to_string());
+                            format!("{}│  ", prefix)
+                        };
+                        format!("{}{}   ", base_indent, continuation)
+                    };
+                    let mut keys: Vec<_> = to
+                        .attributes
+                        .keys()
+                        .filter(|k| !k.starts_with('_'))
+                        .collect();
+                    keys.sort();
+                    for key in keys {
+                        let new_value = &to.attributes[key];
+                        let old_value = from.attributes.get(key);
+                        let is_same = old_value
+                            .map(|ov| ov.semantically_equal(new_value))
+                            .unwrap_or(false);
+                        if !is_same {
+                            if is_list_of_maps(new_value) {
+                                println!("{}{}:", attr_prefix, key);
+                                println!(
+                                    "{}",
+                                    format_list_diff(old_value, new_value, &attr_prefix)
+                                );
+                            } else {
+                                let old_str = old_value
+                                    .map(|v| format_value_with_key(v, Some(key)))
+                                    .unwrap_or_else(|| "(none)".to_string());
+                                println!(
+                                    "{}{}: {} → {}",
+                                    attr_prefix,
+                                    key,
+                                    old_str.red(),
+                                    format_value_with_key(new_value, Some(key)).green()
+                                );
+                            }
+                        }
+                    }
+                    // Show removed attributes (in changed_attributes but not in to)
+                    let mut removed_keys: Vec<_> = changed_attributes
+                        .iter()
+                        .filter(|k| !to.attributes.contains_key(k.as_str()))
+                        .collect();
+                    removed_keys.sort();
+                    for key in removed_keys {
+                        if let Some(old_value) = from.attributes.get(key.as_str()) {
                             println!(
                                 "{}{}: {} → {}",
                                 attr_prefix,
                                 key,
-                                old_str.red(),
-                                format_value_with_key(new_value, Some(key)).green()
+                                format_value_with_key(old_value, Some(key)).red(),
+                                "(removed)".red()
                             );
                         }
-                    }
-                }
-                // Show removed attributes (in changed_attributes but not in to)
-                let mut removed_keys: Vec<_> = changed_attributes
-                    .iter()
-                    .filter(|k| !to.attributes.contains_key(k.as_str()))
-                    .collect();
-                removed_keys.sort();
-                for key in removed_keys {
-                    if let Some(old_value) = from.attributes.get(key.as_str()) {
-                        println!(
-                            "{}{}: {} → {}",
-                            attr_prefix,
-                            key,
-                            format_value_with_key(old_value, Some(key)).red(),
-                            "(removed)".red()
-                        );
                     }
                 }
             }
@@ -388,110 +531,126 @@ pub fn print_plan(plan: &Plan) {
                 } else {
                     "(must be replaced)"
                 };
-                println!(
-                    "{}{}{} {} \"{}\" {}",
-                    base_indent,
-                    connector,
-                    colored_symbol,
-                    id.display_type().cyan().bold(),
-                    id.name.magenta().bold(),
-                    replace_note.magenta()
-                );
-                let attr_prefix = if indent == 0 {
-                    format!("{}{}", base_indent, attr_base)
+                if compact {
+                    let name_part = format_compact_name(to, &id.name, parent_binding);
+                    println!(
+                        "{}{}{} {} {} {}",
+                        base_indent,
+                        connector,
+                        colored_symbol,
+                        id.display_type().cyan().bold(),
+                        name_part.magenta().bold(),
+                        replace_note.magenta()
+                    );
                 } else {
-                    let continuation = if is_last {
-                        format!("{}   ", prefix)
+                    println!(
+                        "{}{}{} {} {} {}",
+                        base_indent,
+                        connector,
+                        colored_symbol,
+                        id.display_type().cyan().bold(),
+                        id.name.magenta().bold(),
+                        replace_note.magenta()
+                    );
+                    let attr_prefix = if indent == 0 {
+                        format!("{}{}", base_indent, attr_base)
                     } else {
-                        format!("{}│  ", prefix)
-                    };
-                    format!("{}{}   ", base_indent, continuation)
-                };
-                let mut keys: Vec<_> = to
-                    .attributes
-                    .keys()
-                    .filter(|k| !k.starts_with('_'))
-                    .collect();
-                keys.sort();
-                for key in keys {
-                    let new_value = &to.attributes[key];
-                    let old_value = from.attributes.get(key);
-                    let forces_replacement = changed_create_only.contains(key);
-                    let is_same = old_value
-                        .map(|ov| ov.semantically_equal(new_value))
-                        .unwrap_or(false);
-                    if !is_same {
-                        if is_list_of_maps(new_value) {
-                            let suffix = if forces_replacement {
-                                format!(" {}", "(forces replacement)".magenta())
-                            } else {
-                                String::new()
-                            };
-                            println!("{}{}:{}", attr_prefix, key, suffix);
-                            println!("{}", format_list_diff(old_value, new_value, &attr_prefix));
+                        let continuation = if is_last {
+                            format!("{}   ", prefix)
                         } else {
-                            let old_str = old_value
-                                .map(|v| format_value_with_key(v, Some(key)))
-                                .unwrap_or_else(|| "(none)".to_string());
-                            if forces_replacement {
+                            format!("{}│  ", prefix)
+                        };
+                        format!("{}{}   ", base_indent, continuation)
+                    };
+                    let mut keys: Vec<_> = to
+                        .attributes
+                        .keys()
+                        .filter(|k| !k.starts_with('_'))
+                        .collect();
+                    keys.sort();
+                    for key in keys {
+                        let new_value = &to.attributes[key];
+                        let old_value = from.attributes.get(key);
+                        let forces_replacement = changed_create_only.contains(key);
+                        let is_same = old_value
+                            .map(|ov| ov.semantically_equal(new_value))
+                            .unwrap_or(false);
+                        if !is_same {
+                            if is_list_of_maps(new_value) {
+                                let suffix = if forces_replacement {
+                                    format!(" {}", "(forces replacement)".magenta())
+                                } else {
+                                    String::new()
+                                };
+                                println!("{}{}:{}", attr_prefix, key, suffix);
                                 println!(
-                                    "{}{}: {} → {} {}",
-                                    attr_prefix,
-                                    key,
-                                    old_str.red(),
-                                    format_value_with_key(new_value, Some(key)).green(),
-                                    "(forces replacement)".magenta()
+                                    "{}",
+                                    format_list_diff(old_value, new_value, &attr_prefix)
                                 );
                             } else {
-                                println!(
-                                    "{}{}: {} → {}",
-                                    attr_prefix,
-                                    key,
-                                    old_str.red(),
-                                    format_value_with_key(new_value, Some(key)).green()
-                                );
+                                let old_str = old_value
+                                    .map(|v| format_value_with_key(v, Some(key)))
+                                    .unwrap_or_else(|| "(none)".to_string());
+                                if forces_replacement {
+                                    println!(
+                                        "{}{}: {} → {} {}",
+                                        attr_prefix,
+                                        key,
+                                        old_str.red(),
+                                        format_value_with_key(new_value, Some(key)).green(),
+                                        "(forces replacement)".magenta()
+                                    );
+                                } else {
+                                    println!(
+                                        "{}{}: {} → {}",
+                                        attr_prefix,
+                                        key,
+                                        old_str.red(),
+                                        format_value_with_key(new_value, Some(key)).green()
+                                    );
+                                }
                             }
                         }
                     }
-                }
-                if let Some(temp) = temporary_name {
-                    if temp.can_rename {
-                        println!(
-                            "{}  {} via temporary name \"{}\", will rename back to \"{}\" after old resource is deleted",
-                            attr_prefix,
-                            "note:".magenta().bold(),
-                            temp.temporary_value.magenta(),
-                            temp.original_value.green()
-                        );
-                    } else {
-                        println!(
-                            "{}  {} name will be \"{}\" (cannot rename create-only attribute \"{}\")",
-                            attr_prefix,
-                            "note:".magenta().bold(),
-                            temp.temporary_value.magenta(),
-                            temp.attribute.magenta()
-                        );
+                    if let Some(temp) = temporary_name {
+                        if temp.can_rename {
+                            println!(
+                                "{}  {} via temporary name \"{}\", will rename back to \"{}\" after old resource is deleted",
+                                attr_prefix,
+                                "note:".magenta().bold(),
+                                temp.temporary_value.magenta(),
+                                temp.original_value.green()
+                            );
+                        } else {
+                            println!(
+                                "{}  {} name will be \"{}\" (cannot rename create-only attribute \"{}\")",
+                                attr_prefix,
+                                "note:".magenta().bold(),
+                                temp.temporary_value.magenta(),
+                                temp.attribute.magenta()
+                            );
+                        }
                     }
-                }
-                if !cascading_updates.is_empty() {
-                    println!(
-                        "{}  {} cascading update(s):",
-                        attr_prefix,
-                        cascading_updates.len()
-                    );
-                    for cascade in cascading_updates {
+                    if !cascading_updates.is_empty() {
                         println!(
-                            "{}  ~ {} \"{}\"",
+                            "{}  {} cascading update(s):",
                             attr_prefix,
-                            cascade.id.display_type().cyan(),
-                            cascade.id.name.magenta()
+                            cascading_updates.len()
                         );
+                        for cascade in cascading_updates {
+                            println!(
+                                "{}  ~ {} {}",
+                                attr_prefix,
+                                cascade.id.display_type().cyan(),
+                                cascade.id.name.magenta()
+                            );
+                        }
                     }
                 }
             }
             Effect::Delete { id, .. } => {
                 println!(
-                    "{}{}{} {} \"{}\"",
+                    "{}{}{} {} {}",
                     base_indent,
                     connector,
                     colored_symbol,
@@ -500,17 +659,48 @@ pub fn print_plan(plan: &Plan) {
                 );
             }
             Effect::Read { resource } => {
-                println!(
-                    "{}{}{} {} \"{}\" {}",
-                    base_indent,
-                    connector,
-                    colored_symbol,
-                    resource.id.display_type().cyan().bold(),
-                    resource.id.name.cyan().bold(),
-                    "(data source)".dimmed()
-                );
+                if compact {
+                    let name_part =
+                        format_compact_name(resource, &resource.id.name, parent_binding);
+                    println!(
+                        "{}{}{} {} {} {}",
+                        base_indent,
+                        connector,
+                        colored_symbol,
+                        resource.id.display_type().cyan().bold(),
+                        name_part.cyan().bold(),
+                        "(data source)".dimmed()
+                    );
+                } else {
+                    println!(
+                        "{}{}{} {} {} {}",
+                        base_indent,
+                        connector,
+                        colored_symbol,
+                        resource.id.display_type().cyan().bold(),
+                        resource.id.name.cyan().bold(),
+                        "(data source)".dimmed()
+                    );
+                }
             }
         }
+
+        // Extract current effect's binding name for children
+        let current_binding = {
+            let resource = match effect {
+                Effect::Create(r) => Some(r),
+                Effect::Update { to, .. } => Some(to),
+                Effect::Replace { to, .. } => Some(to),
+                Effect::Read { resource } => Some(resource),
+                Effect::Delete { .. } => None,
+            };
+            resource.and_then(|r| {
+                r.attributes.get("_binding").and_then(|v| match v {
+                    Value::String(s) => Some(s.clone()),
+                    _ => None,
+                })
+            })
+        };
 
         // Print children (dependents)
         let children = dependents.get(&idx).cloned().unwrap_or_default();
@@ -542,6 +732,8 @@ pub fn print_plan(plan: &Plan) {
                 indent + 1,
                 child_is_last,
                 &new_prefix,
+                compact,
+                current_binding.as_deref(),
             );
         }
     }
@@ -556,6 +748,8 @@ pub fn print_plan(plan: &Plan) {
             0,
             i == roots.len() - 1,
             "",
+            compact,
+            None,
         );
     }
 
@@ -565,7 +759,17 @@ pub fn print_plan(plan: &Plan) {
         .filter(|idx| !printed.contains(idx))
         .collect();
     for idx in remaining {
-        print_effect_tree(idx, plan, &dependents, &mut printed, 0, true, "");
+        print_effect_tree(
+            idx,
+            plan,
+            &dependents,
+            &mut printed,
+            0,
+            true,
+            "",
+            compact,
+            None,
+        );
     }
 
     println!();
@@ -852,7 +1056,7 @@ mod tests {
         plan.add(Effect::Create(b));
 
         // Should not panic
-        print_plan(&plan);
+        print_plan(&plan, false);
     }
 
     /// Test that print_plan handles the dependency graph correctly when
@@ -866,7 +1070,7 @@ mod tests {
         plan.add(Effect::Create(b));
 
         // Should not panic
-        print_plan(&plan);
+        print_plan(&plan, false);
     }
 
     /// Helper: compute root indices using the same algorithm as print_plan.
@@ -1214,5 +1418,323 @@ mod tests {
              route children: {:?}",
             route_children
         );
+    }
+
+    // --- Compact mode tests ---
+
+    /// Test that extract_compact_hint returns only the first non-parent ResourceRef hint.
+    #[test]
+    fn test_extract_compact_hint_resource_ref() {
+        let mut r = Resource::new("ec2.subnet_route_table_association", "hash123");
+        r.attributes.insert(
+            "route_table_id".to_string(),
+            Value::ResourceRef {
+                binding_name: "public_rt".to_string(),
+                attribute_name: "id".to_string(),
+            },
+        );
+        r.attributes.insert(
+            "subnet_id".to_string(),
+            Value::ResourceRef {
+                binding_name: "public_subnet_1a".to_string(),
+                attribute_name: "id".to_string(),
+            },
+        );
+
+        let hint = extract_compact_hint(&r, None);
+        // Should return only the first ResourceRef alphabetically, with _id suffix stripped
+        assert_eq!(hint, Some("route_table: public_rt".to_string()));
+    }
+
+    /// Test that extract_compact_hint skips ResourceRef that matches parent binding.
+    #[test]
+    fn test_extract_compact_hint_skips_parent_ref() {
+        let mut r = Resource::new("ec2.subnet_route_table_association", "hash123");
+        r.attributes.insert(
+            "route_table_id".to_string(),
+            Value::ResourceRef {
+                binding_name: "database_rt".to_string(),
+                attribute_name: "id".to_string(),
+            },
+        );
+        r.attributes.insert(
+            "subnet_id".to_string(),
+            Value::ResourceRef {
+                binding_name: "database_subnet_1a".to_string(),
+                attribute_name: "id".to_string(),
+            },
+        );
+
+        // When parent is database_rt, should skip route_table_id and show only subnet_id
+        let hint = extract_compact_hint(&r, Some("database_rt"));
+        assert_eq!(hint, Some("subnet: database_subnet_1a".to_string()));
+    }
+
+    /// Test that extract_compact_hint falls back to string values when no ResourceRef.
+    #[test]
+    fn test_extract_compact_hint_string_fallback() {
+        let mut r = Resource::new("ec2.route", "hash456");
+        r.attributes.insert(
+            "destination_cidr_block".to_string(),
+            Value::String("0.0.0.0/0".to_string()),
+        );
+
+        let hint = extract_compact_hint(&r, None);
+        assert_eq!(hint, Some("destination_cidr_block: 0.0.0.0/0".to_string()));
+    }
+
+    /// Test that extract_compact_hint returns None when no useful attributes.
+    #[test]
+    fn test_extract_compact_hint_none() {
+        let r = Resource::new("ec2.route", "hash789");
+        let hint = extract_compact_hint(&r, None);
+        assert_eq!(hint, None);
+    }
+
+    /// Test that extract_compact_hint prefers string over ResourceRef.
+    #[test]
+    fn test_extract_compact_hint_prefers_string_over_resource_ref() {
+        let mut r = Resource::new("ec2.route", "hash_mixed");
+        r.attributes.insert(
+            "destination".to_string(),
+            Value::String("10.0.0.0/8".to_string()),
+        );
+        r.attributes.insert(
+            "gateway_id".to_string(),
+            Value::ResourceRef {
+                binding_name: "igw".to_string(),
+                attribute_name: "id".to_string(),
+            },
+        );
+
+        let hint = extract_compact_hint(&r, None);
+        // String takes priority over ResourceRef
+        assert_eq!(hint, Some("destination: 10.0.0.0/8".to_string()));
+    }
+
+    /// Test that extract_compact_hint shortens service_name values.
+    #[test]
+    fn test_extract_compact_hint_service_name_shortening() {
+        let mut r = Resource::new("ec2.vpc_endpoint", "hash_svc");
+        r.attributes.insert(
+            "service_name".to_string(),
+            Value::String("com.amazonaws.ap-northeast-1.ecr.dkr".to_string()),
+        );
+
+        let hint = extract_compact_hint(&r, None);
+        assert_eq!(hint, Some("service: ecr.dkr".to_string()));
+
+        // Single service component
+        let mut r2 = Resource::new("ec2.vpc_endpoint", "hash_svc2");
+        r2.attributes.insert(
+            "service_name".to_string(),
+            Value::String("com.amazonaws.ap-northeast-1.s3".to_string()),
+        );
+
+        let hint2 = extract_compact_hint(&r2, None);
+        assert_eq!(hint2, Some("service: s3".to_string()));
+    }
+
+    /// Test that extract_compact_hint falls back to string when all ResourceRefs match parent.
+    #[test]
+    fn test_extract_compact_hint_all_refs_match_parent() {
+        let mut r = Resource::new("ec2.security_group_ingress", "hash_sg");
+        r.attributes.insert(
+            "group_id".to_string(),
+            Value::ResourceRef {
+                binding_name: "endpoint_sg".to_string(),
+                attribute_name: "id".to_string(),
+            },
+        );
+        r.attributes.insert(
+            "description".to_string(),
+            Value::String("Allow HTTPS from VPC".to_string()),
+        );
+
+        // When parent is endpoint_sg, should skip group_id and use description
+        let hint = extract_compact_hint(&r, Some("endpoint_sg"));
+        assert_eq!(hint, Some("description: Allow HTTPS from VPC".to_string()));
+    }
+
+    /// Test that extract_compact_hint prefers string over ResourceRef for vpc_endpoint.
+    #[test]
+    fn test_extract_compact_hint_prefers_string_for_vpc_endpoint() {
+        let mut r = Resource::new("ec2.vpc_endpoint", "hash_ep");
+        r.attributes.insert(
+            "service_name".to_string(),
+            Value::String("com.amazonaws.ap-northeast-1.ecr.dkr".to_string()),
+        );
+        r.attributes.insert(
+            "security_group_ids".to_string(),
+            Value::List(vec![Value::ResourceRef {
+                binding_name: "endpoint_sg".to_string(),
+                attribute_name: "group_id".to_string(),
+            }]),
+        );
+        r.attributes.insert(
+            "vpc_id".to_string(),
+            Value::ResourceRef {
+                binding_name: "vpc".to_string(),
+                attribute_name: "id".to_string(),
+            },
+        );
+
+        // String attribute (service_name) takes priority over ResourceRef
+        let hint = extract_compact_hint(&r, Some("vpc"));
+        assert_eq!(hint, Some("service: ecr.dkr".to_string()));
+    }
+
+    /// Test that has_binding correctly detects bound vs anonymous resources.
+    #[test]
+    fn test_has_binding() {
+        let mut bound = Resource::new("ec2.vpc", "vpc");
+        bound
+            .attributes
+            .insert("_binding".to_string(), Value::String("vpc".to_string()));
+        assert!(has_binding(&bound));
+
+        let anonymous = Resource::new("ec2.vpc", "hash123");
+        assert!(!has_binding(&anonymous));
+    }
+
+    /// Test that format_compact_name shows plain identifiers for bound resources and
+    /// parenthesized hints for anonymous resources.
+    #[test]
+    fn test_format_compact_name_bound_resource() {
+        let mut r = Resource::new("ec2.vpc", "vpc");
+        r.attributes
+            .insert("_binding".to_string(), Value::String("vpc".to_string()));
+        // For bound resources, should show name as plain identifier (no quotes)
+        let result = format_compact_name(&r, "vpc", None);
+        assert!(
+            !result.contains('"'),
+            "Bound resource name should not be quoted"
+        );
+        assert_eq!(result, "vpc", "Should be the plain binding name");
+    }
+
+    #[test]
+    fn test_format_compact_name_anonymous_with_hint() {
+        let mut r = Resource::new("ec2.subnet_route_table_association", "hash123");
+        r.attributes.insert(
+            "subnet_id".to_string(),
+            Value::ResourceRef {
+                binding_name: "database_subnet_1a".to_string(),
+                attribute_name: "id".to_string(),
+            },
+        );
+        let result = format_compact_name(&r, "hash123", None);
+        assert!(
+            result.contains('(') && result.contains(')'),
+            "Anonymous resource should show hint in parentheses, got: {}",
+            result
+        );
+        assert!(
+            result.contains("subnet: database_subnet_1a"),
+            "Should contain the ResourceRef hint, got: {}",
+            result
+        );
+    }
+
+    /// Test that print_plan with compact=true does not panic and does not
+    /// print attribute lines.
+    #[test]
+    fn test_print_plan_compact_does_not_panic() {
+        let vpc = make_resource("ec2.vpc", "vpc", "vpc", &[]);
+        let rt = make_resource("ec2.route_table", "rt", "rt", &["vpc"]);
+        let mut plan = Plan::new();
+        plan.add(Effect::Create(vpc));
+        plan.add(Effect::Create(rt));
+
+        // Should not panic
+        print_plan(&plan, true);
+    }
+
+    /// Test compact mode skips attributes by checking that _binding attribute
+    /// keys are not printed (attributes are hidden in compact mode).
+    #[test]
+    fn test_print_plan_compact_with_anonymous_resources() {
+        let mut anon = Resource::new("ec2.route", "hash_anon");
+        anon.attributes.insert(
+            "destination_cidr_block".to_string(),
+            Value::String("0.0.0.0/0".to_string()),
+        );
+        anon.attributes.insert(
+            "route_table_id".to_string(),
+            Value::ResourceRef {
+                binding_name: "public_rt".to_string(),
+                attribute_name: "id".to_string(),
+            },
+        );
+
+        let mut plan = Plan::new();
+        plan.add(Effect::Create(anon));
+
+        // Should not panic; anonymous resources should show hints
+        print_plan(&plan, true);
+    }
+
+    /// Test that extract_compact_hint extracts ResourceRef from inside a List value.
+    /// e.g., security_group_ids = [endpoint_sg.group_id] should produce "security_group: endpoint_sg"
+    #[test]
+    fn test_extract_compact_hint_list_containing_resource_ref() {
+        let mut r = Resource::new("ec2.vpc_endpoint", "hash_list_ref");
+        r.attributes.insert(
+            "security_group_ids".to_string(),
+            Value::List(vec![Value::ResourceRef {
+                binding_name: "endpoint_sg".to_string(),
+                attribute_name: "group_id".to_string(),
+            }]),
+        );
+
+        let hint = extract_compact_hint(&r, None);
+        assert_eq!(
+            hint,
+            Some("security_group: endpoint_sg".to_string()),
+            "Should extract ResourceRef from inside List and strip _ids suffix"
+        );
+    }
+
+    /// Test that extract_compact_hint skips List<ResourceRef> when ref matches parent.
+    #[test]
+    fn test_extract_compact_hint_list_ref_skips_parent() {
+        let mut r = Resource::new("ec2.vpc_endpoint", "hash_list_parent");
+        r.attributes.insert(
+            "security_group_ids".to_string(),
+            Value::List(vec![Value::ResourceRef {
+                binding_name: "endpoint_sg".to_string(),
+                attribute_name: "group_id".to_string(),
+            }]),
+        );
+
+        let hint = extract_compact_hint(&r, Some("endpoint_sg"));
+        assert_eq!(
+            hint, None,
+            "Should skip List<ResourceRef> when ref matches parent"
+        );
+    }
+
+    /// Test that shorten_attr_name handles _ids suffix (plural).
+    #[test]
+    fn test_shorten_attr_name_ids_suffix() {
+        assert_eq!(shorten_attr_name("security_group_ids"), "security_group");
+        assert_eq!(shorten_attr_name("subnet_ids"), "subnet");
+        // _id still works
+        assert_eq!(shorten_attr_name("subnet_id"), "subnet");
+        // _name still works
+        assert_eq!(shorten_attr_name("service_name"), "service");
+    }
+
+    /// Test that extract_compact_hint skips _-prefixed attributes.
+    #[test]
+    fn test_extract_compact_hint_skips_internal_attributes() {
+        let mut r = Resource::new("ec2.vpc", "hash_internal");
+        r.attributes
+            .insert("_binding".to_string(), Value::String("vpc".to_string()));
+        r.attributes
+            .insert("_hash".to_string(), Value::String("abc123".to_string()));
+
+        let hint = extract_compact_hint(&r, None);
+        assert_eq!(hint, None, "Internal attributes should be skipped");
     }
 }

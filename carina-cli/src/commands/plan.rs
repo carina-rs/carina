@@ -56,7 +56,11 @@ pub struct CurrentStateEntry {
     pub state: State,
 }
 
-pub async fn run_plan(path: &PathBuf, out: Option<&PathBuf>) -> Result<bool, AppError> {
+pub async fn run_plan(
+    path: &PathBuf,
+    out: Option<&PathBuf>,
+    compact: bool,
+) -> Result<bool, AppError> {
     let mut parsed = load_configuration(path)?.parsed;
 
     let base_dir = get_base_dir(path);
@@ -163,7 +167,7 @@ pub async fn run_plan(path: &PathBuf, out: Option<&PathBuf>) -> Result<bool, App
 
     let ctx = create_plan_from_parsed(&parsed, &state_file).await?;
     let has_changes = ctx.plan.mutation_count() > 0;
-    print_plan(&ctx.plan);
+    print_plan(&ctx.plan, compact);
 
     // Save plan to file if --out was specified
     if let Some(out_path) = out {
