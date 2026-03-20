@@ -493,7 +493,13 @@ fn format_attributes(attrs: &HashMap<String, Value>) -> Vec<(String, String)> {
 /// Format a Value for display
 fn format_value(value: &Value) -> String {
     match value {
-        Value::String(s) => format!("\"{}\"", s),
+        Value::String(s) => {
+            if carina_core::utils::is_dsl_enum_format(s) {
+                s.clone()
+            } else {
+                format!("\"{}\"", s)
+            }
+        }
         Value::Int(n) => n.to_string(),
         Value::Float(f) => f.to_string(),
         Value::Bool(b) => b.to_string(),
