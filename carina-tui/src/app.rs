@@ -18,7 +18,7 @@ pub struct TreeNode {
     pub symbol: String,
     /// The effect kind for coloring
     pub kind: EffectKind,
-    /// Attributes to show in the detail panel (key -> display value)
+    /// Attributes to show inline when expanded (key -> display value)
     pub attributes: Vec<(String, String)>,
     /// For Update effects, the set of changed attribute names
     pub changed_attributes: Vec<String>,
@@ -44,12 +44,32 @@ pub enum EffectKind {
     Delete,
 }
 
+/// A row in the visible list — either a tree node or an inline attribute line
+#[derive(Debug, Clone)]
+pub enum VisibleRow {
+    /// A tree node (effect)
+    Node(usize),
+    /// An attribute line belonging to an expanded node
+    Attribute {
+        node_idx: usize,
+        key: String,
+        value: String,
+    },
+}
+
+impl VisibleRow {
+    /// Returns true if this row is a selectable node (not an attribute line)
+    pub fn is_node(&self) -> bool {
+        matches!(self, VisibleRow::Node(_))
+    }
+}
+
 /// Application state
 pub struct App {
     /// Tree nodes (one per effect)
     pub nodes: Vec<TreeNode>,
-    /// Currently selected index in the visible list
-    pub selected: usize,
+    /// Currently selected row index in the visible list
+    pub selected_row: usize,
     /// List state for ratatui scrolling
     pub list_state: ListState,
     /// Plan summary for display
@@ -80,88 +100,119 @@ impl App {
         }
         App {
             nodes,
-            selected: 0,
+            selected_row: 0,
             list_state,
             summary,
         }
     }
 
-    /// Returns indices of visible nodes (roots + expanded descendants).
-    pub fn visible_nodes(&self) -> Vec<usize> {
-        let mut visible = Vec::new();
+    /// Returns the list of visible rows: tree nodes plus inline attribute lines
+    /// for expanded nodes.
+    pub fn visible_rows(&self) -> Vec<VisibleRow> {
+        let mut rows = Vec::new();
         for (idx, node) in self.nodes.iter().enumerate() {
             if node.parent.is_none() {
-                self.collect_visible(idx, &mut visible);
+                self.collect_visible_rows(idx, &mut rows);
             }
         }
-        visible
+        rows
     }
 
-    fn collect_visible(&self, idx: usize, visible: &mut Vec<usize>) {
-        visible.push(idx);
-        if self.nodes[idx].expanded {
-            for &child in &self.nodes[idx].children {
-                self.collect_visible(child, visible);
+    fn collect_visible_rows(&self, idx: usize, rows: &mut Vec<VisibleRow>) {
+        let node = &self.nodes[idx];
+        rows.push(VisibleRow::Node(idx));
+
+        if node.expanded {
+            // Show inline attributes when expanded
+            for (key, value) in &node.attributes {
+                rows.push(VisibleRow::Attribute {
+                    node_idx: idx,
+                    key: key.clone(),
+                    value: value.clone(),
+                });
+            }
+            // Then show children
+            for &child in &node.children {
+                self.collect_visible_rows(child, rows);
             }
         }
     }
 
-    /// Number of visible items
+    /// Number of visible rows
     pub fn visible_count(&self) -> usize {
-        self.visible_nodes().len()
+        self.visible_rows().len()
     }
 
     pub fn move_up(&mut self) {
-        let visible = self.visible_nodes();
-        if visible.is_empty() {
+        let rows = self.visible_rows();
+        if rows.is_empty() {
             return;
         }
-        // Find current position in visible list
-        if let Some(pos) = visible
-            .iter()
-            .position(|&idx| idx == self.selected)
-            .filter(|&pos| pos > 0)
-        {
-            self.selected = visible[pos - 1];
-            // Update list_state to match position in visible list
-            self.list_state.select(Some(pos - 1));
+        // Find the previous Node row before current position
+        let current = self.selected_row;
+        for i in (0..current).rev() {
+            if rows[i].is_node() {
+                self.selected_row = i;
+                self.list_state.select(Some(i));
+                return;
+            }
         }
     }
 
     pub fn move_down(&mut self) {
-        let visible = self.visible_nodes();
-        if visible.is_empty() {
+        let rows = self.visible_rows();
+        if rows.is_empty() {
             return;
         }
-        if let Some(pos) = visible
-            .iter()
-            .position(|&idx| idx == self.selected)
-            .filter(|&pos| pos < visible.len() - 1)
-        {
-            self.selected = visible[pos + 1];
-            self.list_state.select(Some(pos + 1));
+        let current = self.selected_row;
+        for (i, row) in rows.iter().enumerate().skip(current + 1) {
+            if row.is_node() {
+                self.selected_row = i;
+                self.list_state.select(Some(i));
+                return;
+            }
+        }
+    }
+
+    /// Get the node index for the currently selected row
+    fn selected_node_idx(&self) -> Option<usize> {
+        let rows = self.visible_rows();
+        match rows.get(self.selected_row) {
+            Some(VisibleRow::Node(idx)) => Some(*idx),
+            _ => None,
         }
     }
 
     pub fn expand(&mut self) {
-        if let Some(node) = self.nodes.get_mut(self.selected)
-            && !node.children.is_empty()
+        if let Some(idx) = self.selected_node_idx()
+            && !self.nodes[idx].children.is_empty()
         {
-            node.expanded = true;
+            self.nodes[idx].expanded = true;
         }
     }
 
     pub fn collapse(&mut self) {
-        if let Some(node) = self.nodes.get(self.selected) {
+        if let Some(idx) = self.selected_node_idx() {
+            let node = &self.nodes[idx];
             if node.expanded {
-                // Collapse this node
-                self.nodes[self.selected].expanded = false;
+                self.nodes[idx].expanded = false;
+                // Re-sync selected_row position since rows changed
+                let rows = self.visible_rows();
+                if let Some(pos) = rows
+                    .iter()
+                    .position(|r| matches!(r, VisibleRow::Node(i) if *i == idx))
+                {
+                    self.selected_row = pos;
+                    self.list_state.select(Some(pos));
+                }
             } else if let Some(parent_idx) = node.parent {
-                // Navigate to parent and collapse it
                 self.nodes[parent_idx].expanded = false;
-                self.selected = parent_idx;
-                let visible = self.visible_nodes();
-                if let Some(pos) = visible.iter().position(|&idx| idx == parent_idx) {
+                let rows = self.visible_rows();
+                if let Some(pos) = rows
+                    .iter()
+                    .position(|r| matches!(r, VisibleRow::Node(i) if *i == parent_idx))
+                {
+                    self.selected_row = pos;
                     self.list_state.select(Some(pos));
                 }
             }
@@ -170,18 +221,27 @@ impl App {
 
     /// Toggle expand/collapse on the selected node
     pub fn toggle(&mut self) {
-        if let Some(node) = self.nodes.get(self.selected)
-            && !node.children.is_empty()
+        if let Some(idx) = self.selected_node_idx()
+            && (!self.nodes[idx].children.is_empty() || !self.nodes[idx].attributes.is_empty())
         {
-            let new_state = !node.expanded;
-            self.nodes[self.selected].expanded = new_state;
+            let new_state = !self.nodes[idx].expanded;
+            self.nodes[idx].expanded = new_state;
+            // Re-sync selected_row since visible rows changed
+            let rows = self.visible_rows();
+            if let Some(pos) = rows
+                .iter()
+                .position(|r| matches!(r, VisibleRow::Node(i) if *i == idx))
+            {
+                self.selected_row = pos;
+                self.list_state.select(Some(pos));
+            }
         }
     }
 
     /// Expand all nodes
     pub fn expand_all(&mut self) {
         for node in &mut self.nodes {
-            if !node.children.is_empty() {
+            if !node.children.is_empty() || !node.attributes.is_empty() {
                 node.expanded = true;
             }
         }
@@ -193,25 +253,38 @@ impl App {
             node.expanded = false;
         }
         // Move selection to a root node if currently on a non-root
-        if let Some(node) = self.nodes.get(self.selected)
-            && node.parent.is_some()
-        {
-            // Find the root ancestor
-            let mut idx = self.selected;
-            while let Some(parent) = self.nodes[idx].parent {
-                idx = parent;
-            }
-            self.selected = idx;
-            let visible = self.visible_nodes();
-            if let Some(pos) = visible.iter().position(|&i| i == idx) {
-                self.list_state.select(Some(pos));
+        if let Some(idx) = self.selected_node_idx() {
+            if self.nodes[idx].parent.is_some() {
+                // Find the root ancestor
+                let mut root = idx;
+                while let Some(parent) = self.nodes[root].parent {
+                    root = parent;
+                }
+                let rows = self.visible_rows();
+                if let Some(pos) = rows
+                    .iter()
+                    .position(|r| matches!(r, VisibleRow::Node(i) if *i == root))
+                {
+                    self.selected_row = pos;
+                    self.list_state.select(Some(pos));
+                }
+            } else {
+                // Already on root, just re-sync position
+                let rows = self.visible_rows();
+                if let Some(pos) = rows
+                    .iter()
+                    .position(|r| matches!(r, VisibleRow::Node(i) if *i == idx))
+                {
+                    self.selected_row = pos;
+                    self.list_state.select(Some(pos));
+                }
             }
         }
     }
 
     /// Get the currently selected node, if any
     pub fn selected_node(&self) -> Option<&TreeNode> {
-        self.nodes.get(self.selected)
+        self.selected_node_idx().map(|idx| &self.nodes[idx])
     }
 }
 
@@ -708,7 +781,7 @@ mod tests {
         let plan = Plan::new();
         let app = App::new(&plan);
         assert_eq!(app.nodes.len(), 0);
-        assert_eq!(app.selected, 0);
+        assert_eq!(app.selected_row, 0);
     }
 
     #[test]
@@ -737,27 +810,32 @@ mod tests {
         plan.add(Effect::Create(Resource::new("s3.bucket", "c")));
 
         let mut app = App::new(&plan);
-        assert_eq!(app.selected, 0);
+        assert_eq!(app.selected_row, 0);
 
         app.move_down();
-        assert_eq!(app.selected, 1);
+        // selected_row should point to the next Node row (skipping attribute rows)
+        let rows = app.visible_rows();
+        assert!(rows[app.selected_row].is_node());
 
         app.move_down();
-        assert_eq!(app.selected, 2);
+        let rows = app.visible_rows();
+        assert!(rows[app.selected_row].is_node());
 
         // Should not go past end
+        let prev = app.selected_row;
         app.move_down();
-        assert_eq!(app.selected, 2);
+        assert_eq!(app.selected_row, prev);
 
         app.move_up();
-        assert_eq!(app.selected, 1);
+        let rows = app.visible_rows();
+        assert!(rows[app.selected_row].is_node());
 
         app.move_up();
-        assert_eq!(app.selected, 0);
+        assert_eq!(app.selected_row, 0);
 
         // Should not go before start
         app.move_up();
-        assert_eq!(app.selected, 0);
+        assert_eq!(app.selected_row, 0);
     }
 
     #[test]
@@ -771,12 +849,12 @@ mod tests {
         let mut app = App::new(&plan);
         assert!(!app.nodes[0].expanded);
 
-        // Expand on a leaf node should be a no-op
-        app.expand();
-        assert!(!app.nodes[0].expanded);
+        // Toggle should expand (has attributes)
+        app.toggle();
+        assert!(app.nodes[0].expanded);
 
-        // But collapse on a root leaf should also be a no-op
-        app.collapse();
+        // Toggle again should collapse
+        app.toggle();
         assert!(!app.nodes[0].expanded);
     }
 
@@ -910,7 +988,7 @@ mod tests {
     }
 
     #[test]
-    fn visible_nodes_with_collapse() {
+    fn visible_rows_with_collapse() {
         // VPC (root) -> Subnet (child)
         let mut plan = Plan::new();
         plan.add(Effect::Create(
@@ -931,19 +1009,56 @@ mod tests {
 
         let mut app = App::new(&plan);
 
-        // Root nodes start expanded: both visible
-        assert_eq!(app.visible_nodes(), vec![0, 1]);
-        assert_eq!(app.visible_count(), 2);
+        // Root nodes start expanded: VPC node + subnet node visible (plus attribute rows)
+        let rows = app.visible_rows();
+        let node_count = rows.iter().filter(|r| r.is_node()).count();
+        assert_eq!(node_count, 2);
 
-        // Collapse root: only root visible
+        // Collapse root: only root node visible
         app.collapse();
-        assert_eq!(app.visible_nodes(), vec![0]);
-        assert_eq!(app.visible_count(), 1);
+        let rows = app.visible_rows();
+        let node_count = rows.iter().filter(|r| r.is_node()).count();
+        assert_eq!(node_count, 1);
 
         // Expand root again: both visible
         app.expand();
-        assert_eq!(app.visible_nodes(), vec![0, 1]);
-        assert_eq!(app.visible_count(), 2);
+        let rows = app.visible_rows();
+        let node_count = rows.iter().filter(|r| r.is_node()).count();
+        assert_eq!(node_count, 2);
+    }
+
+    #[test]
+    fn navigation_skips_attribute_rows() {
+        // Two root nodes, each with an attribute
+        let mut plan = Plan::new();
+        plan.add(Effect::Create(
+            Resource::new("s3.bucket", "bucket-a")
+                .with_attribute("_binding", Value::String("bucket_a".to_string()))
+                .with_attribute("name", Value::String("a".to_string())),
+        ));
+        plan.add(Effect::Create(
+            Resource::new("s3.bucket", "bucket-b")
+                .with_attribute("_binding", Value::String("bucket_b".to_string()))
+                .with_attribute("name", Value::String("b".to_string())),
+        ));
+
+        let mut app = App::new(&plan);
+
+        // Expand first node to show its attributes
+        app.toggle();
+        assert!(app.nodes[0].expanded);
+
+        // Visible rows: Node(0), Attr(0, name, "a"), Node(1)
+        let rows = app.visible_rows();
+        assert!(rows[0].is_node());
+        assert!(!rows[1].is_node()); // attribute row
+        assert!(rows[2].is_node());
+
+        // Navigate down should skip the attribute row and land on Node(1)
+        app.move_down();
+        assert!(app.visible_rows()[app.selected_row].is_node());
+        // Should be at the second node
+        assert_eq!(app.selected_row, 2);
     }
 
     #[test]
@@ -972,23 +1087,21 @@ mod tests {
 
         let mut app = App::new(&plan);
 
-        // VPC root starts expanded, so visible = [vpc_idx, subnet_idx, bucket_idx]
-        let visible = app.visible_nodes();
-        assert_eq!(visible.len(), 3); // VPC root + Subnet child + S3 root
+        // VPC root starts expanded, so visible nodes include VPC, Subnet, S3
+        let rows = app.visible_rows();
+        let node_count = rows.iter().filter(|r| r.is_node()).count();
+        assert_eq!(node_count, 3);
 
         // Collapse VPC to hide subnet
         app.collapse();
-        let visible = app.visible_nodes();
-        assert_eq!(visible.len(), 2); // VPC root + S3 root, subnet hidden
+        let rows = app.visible_rows();
+        let node_count = rows.iter().filter(|r| r.is_node()).count();
+        assert_eq!(node_count, 2); // VPC root + S3 root
 
-        // Navigate down from first to second root
+        // Navigate down from VPC to S3
         app.move_down();
-        let second_root = visible[1];
-        assert_eq!(app.selected, second_root);
-
-        // Navigate back up
-        app.move_up();
-        assert_eq!(app.selected, visible[0]);
+        let rows = app.visible_rows();
+        assert!(rows[app.selected_row].is_node());
     }
 
     #[test]
@@ -1024,16 +1137,45 @@ mod tests {
 
         // Expand VPC to show subnet
         app.expand();
-        assert_eq!(app.visible_nodes(), vec![0, 1]);
 
         // Navigate to subnet
         app.move_down();
-        assert_eq!(app.selected, 1);
+        let rows = app.visible_rows();
+        assert!(matches!(rows[app.selected_row], VisibleRow::Node(1)));
 
         // Collapse on a leaf with parent -> navigates to parent and collapses it
         app.collapse();
-        assert_eq!(app.selected, 0);
+        let rows = app.visible_rows();
+        assert!(matches!(rows[app.selected_row], VisibleRow::Node(0)));
         assert!(!app.nodes[0].expanded);
-        assert_eq!(app.visible_nodes(), vec![0]);
+    }
+
+    #[test]
+    fn toggle_expands_node_with_attributes_only() {
+        // A leaf node (no children) but with attributes should still be toggleable
+        let mut plan = Plan::new();
+        plan.add(Effect::Create(
+            Resource::new("s3.bucket", "my-bucket")
+                .with_attribute("name", Value::String("test".to_string())),
+        ));
+
+        let mut app = App::new(&plan);
+        assert!(!app.nodes[0].expanded);
+        assert!(app.nodes[0].children.is_empty());
+        assert!(!app.nodes[0].attributes.is_empty());
+
+        // Toggle should expand to show attributes
+        app.toggle();
+        assert!(app.nodes[0].expanded);
+
+        let rows = app.visible_rows();
+        assert_eq!(rows.len(), 2); // Node + 1 attribute
+        assert!(rows[0].is_node());
+        assert!(!rows[1].is_node());
+
+        // Toggle again collapses
+        app.toggle();
+        assert!(!app.nodes[0].expanded);
+        assert_eq!(app.visible_rows().len(), 1);
     }
 }
