@@ -80,16 +80,21 @@ let_binding = {
     kw_let ~ trivia+ ~ identifier ~ trivia* ~ equals ~ trivia* ~ expression
 }
 
-// Block content: attributes, trivia, or nested elements
-block_content = _{ trivia | attribute }
+// Block content: attributes, trivia, nested blocks, or nested elements
+block_content = _{ trivia | nested_block | attribute }
+
+// Nested block: identifier { ... } (e.g., lifecycle { ... }, security_group_ingress { ... })
+nested_block = {
+    identifier ~ trivia* ~ open_brace ~ block_content* ~ close_brace
+}
 
 // Attribute: key = value
 attribute = { identifier ~ trivia* ~ equals ~ trivia* ~ expression }
 
 identifier = @{ ASCII_ALPHA ~ (ASCII_ALPHANUMERIC | "_")* }
 
-// Namespaced identifier: aws.s3_bucket, aws.Region.ap_northeast_1
-namespaced_id = @{ identifier ~ ("." ~ identifier)+ }
+// Namespaced identifier: aws.s3_bucket, aws.Region.ap_northeast_1, Type.ipsec.1
+namespaced_id = @{ identifier ~ ("." ~ (identifier | ASCII_DIGIT+))+ }
 
 // Expression
 expression = { pipe_expr }
@@ -126,7 +131,7 @@ map = {
     open_brace ~ map_content* ~ close_brace
 }
 
-map_content = _{ trivia | map_entry }
+map_content = _{ trivia | nested_block | map_entry }
 
 // Map entry: key = value (with optional trailing comma)
 map_entry = { identifier ~ trivia* ~ equals ~ trivia* ~ expression ~ trivia* ~ comma? }

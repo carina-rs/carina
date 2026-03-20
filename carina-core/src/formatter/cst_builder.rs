@@ -94,6 +94,9 @@ impl<'a> CstBuilder<'a> {
                 self.build_node(NodeKind::ResourceExpr, pair),
             )),
             Rule::attribute => Some(CstChild::Node(self.build_node(NodeKind::Attribute, pair))),
+            Rule::nested_block => {
+                Some(CstChild::Node(self.build_node(NodeKind::NestedBlock, pair)))
+            }
 
             // Expressions
             Rule::expression => {

@@ -68,6 +68,7 @@ pub enum NodeKind {
     AnonymousResource,
     ResourceExpr,
     Attribute,
+    NestedBlock,
     Expression,
     PipeExpr,
     FunctionCall,
