@@ -675,3 +675,79 @@ fn context_detection_inside_provider_block() {
         context
     );
 }
+
+#[test]
+fn provider_block_region_completions_use_matching_namespace() {
+    let provider = test_provider();
+
+    // Inside "provider awscc { region = }", completions should only contain awscc.Region.*
+    let doc = create_document(
+        r#"provider awscc {
+    region =
+}"#,
+    );
+    let position = Position {
+        line: 1,
+        character: 12,
+    };
+
+    let completions = provider.complete(&doc, position, None);
+
+    // Should have awscc.Region completions
+    let has_awscc_region = completions
+        .iter()
+        .any(|c| c.label.starts_with("awscc.Region."));
+    assert!(
+        has_awscc_region,
+        "Inside 'provider awscc', should have awscc.Region.* completions. Got: {:?}",
+        completions.iter().map(|c| &c.label).collect::<Vec<_>>()
+    );
+
+    // Should NOT have aws.Region completions
+    let has_aws_region = completions
+        .iter()
+        .any(|c| c.label.starts_with("aws.Region."));
+    assert!(
+        !has_aws_region,
+        "Inside 'provider awscc', should NOT have aws.Region.* completions. Got: {:?}",
+        completions.iter().map(|c| &c.label).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn provider_block_region_completions_use_aws_namespace() {
+    let provider = test_provider();
+
+    // Inside "provider aws { region = }", completions should only contain aws.Region.*
+    let doc = create_document(
+        r#"provider aws {
+    region =
+}"#,
+    );
+    let position = Position {
+        line: 1,
+        character: 12,
+    };
+
+    let completions = provider.complete(&doc, position, None);
+
+    // Should have aws.Region completions
+    let has_aws_region = completions
+        .iter()
+        .any(|c| c.label.starts_with("aws.Region."));
+    assert!(
+        has_aws_region,
+        "Inside 'provider aws', should have aws.Region.* completions. Got: {:?}",
+        completions.iter().map(|c| &c.label).collect::<Vec<_>>()
+    );
+
+    // Should NOT have awscc.Region completions
+    let has_awscc_region = completions
+        .iter()
+        .any(|c| c.label.starts_with("awscc.Region."));
+    assert!(
+        !has_awscc_region,
+        "Inside 'provider aws', should NOT have awscc.Region.* completions. Got: {:?}",
+        completions.iter().map(|c| &c.label).collect::<Vec<_>>()
+    );
+}
