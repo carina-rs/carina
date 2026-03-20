@@ -9,9 +9,9 @@ provider awscc {
 let ipam = awscc.ec2.ipam {
   tier = advanced
 
-  operating_regions = [{
+  operating_region {
     region_name = "ap-northeast-1"
-  }]
+  }
 }
 
 awscc.ec2.ipam_pool {

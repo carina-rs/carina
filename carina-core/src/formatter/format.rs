@@ -13,6 +13,20 @@ pub fn format(source: &str, config: &FormatConfig) -> Result<String, FormatParse
     Ok(formatter.format(&cst))
 }
 
+/// Format a .crn file, converting `= [{...}]` to block syntax for attributes
+/// listed in `block_names`. The map key is the attribute name (e.g., "operating_regions")
+/// and the value is the block name to use (e.g., "operating_region").
+pub fn format_with_block_names(
+    source: &str,
+    config: &FormatConfig,
+    block_names: &std::collections::HashMap<String, String>,
+) -> Result<String, FormatParseError> {
+    let pairs = parser::parse(source)?;
+    let cst = build_cst(source, pairs);
+    let formatter = Formatter::with_block_names(config.clone(), block_names.clone());
+    Ok(formatter.format(&cst))
+}
+
 /// Check if a file needs formatting
 pub fn needs_format(source: &str, config: &FormatConfig) -> Result<bool, FormatParseError> {
     let formatted = format(source, config)?;
@@ -23,6 +37,7 @@ struct Formatter {
     config: FormatConfig,
     output: String,
     current_indent: usize,
+    block_names: std::collections::HashMap<String, String>,
 }
 
 impl Formatter {
@@ -31,6 +46,19 @@ impl Formatter {
             config,
             output: String::new(),
             current_indent: 0,
+            block_names: std::collections::HashMap::new(),
+        }
+    }
+
+    fn with_block_names(
+        config: FormatConfig,
+        block_names: std::collections::HashMap<String, String>,
+    ) -> Self {
+        Self {
+            config,
+            output: String::new(),
+            current_indent: 0,
+            block_names,
         }
     }
 
@@ -651,11 +679,14 @@ impl Formatter {
                 self.write_newline();
             }
 
-            // Calculate max key length for this group only (excluding nested blocks)
+            // Calculate max key length for this group only (excluding nested blocks and block-converted attrs)
             let max_key_len = if self.config.align_attributes {
                 group
                     .iter()
-                    .filter(|attr| attr.kind == NodeKind::Attribute)
+                    .filter(|attr| {
+                        attr.kind == NodeKind::Attribute
+                            && self.should_convert_to_blocks(attr).is_none()
+                    })
                     .filter_map(|attr| self.get_attribute_key(attr))
                     .map(|k| k.len())
                     .max()
@@ -668,6 +699,8 @@ impl Formatter {
             for attr in group {
                 if attr.kind == NodeKind::NestedBlock {
                     self.format_nested_block(attr);
+                } else if let Some(block_name) = self.should_convert_to_blocks(attr) {
+                    self.emit_list_as_blocks(attr, &block_name);
                 } else {
                     let inline_comment = inline_comments.get(&global_attr_index);
                     self.format_attribute_aligned(attr, max_key_len, inline_comment.copied());
@@ -693,6 +726,209 @@ impl Formatter {
             }
         }
         None
+    }
+
+    /// Get the first child node after `=` in any node (Attribute, MapEntry, etc.)
+    fn get_value_after_equals<'a>(&self, node: &'a CstNode) -> Option<&'a CstNode> {
+        let mut found_equals = false;
+        for child in &node.children {
+            match child {
+                CstChild::Token(token) if token.text == "=" => {
+                    found_equals = true;
+                }
+                CstChild::Node(n) if found_equals => {
+                    return Some(n);
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// Check if a List node contains only Map children (possibly wrapped in PipeExpr)
+    fn list_contains_only_maps(&self, list_node: &CstNode) -> bool {
+        let nodes: Vec<&CstNode> = list_node
+            .children
+            .iter()
+            .filter_map(|child| {
+                if let CstChild::Node(n) = child {
+                    Some(n)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        !nodes.is_empty() && nodes.iter().all(|n| self.is_map_node(n))
+    }
+
+    /// Check if a node is a Map, possibly wrapped in a PipeExpr
+    fn is_map_node(&self, node: &CstNode) -> bool {
+        if node.kind == NodeKind::Map {
+            return true;
+        }
+        // A PipeExpr with no pipe operators just wraps a single primary
+        if node.kind == NodeKind::PipeExpr {
+            return node
+                .children
+                .iter()
+                .filter_map(|child| {
+                    if let CstChild::Node(n) = child {
+                        Some(n)
+                    } else {
+                        None
+                    }
+                })
+                .any(|n| n.kind == NodeKind::Map);
+        }
+        false
+    }
+
+    /// Extract Map nodes from a List node (unwrapping PipeExpr wrappers)
+    fn extract_maps_from_list<'a>(&self, list_node: &'a CstNode) -> Vec<&'a CstNode> {
+        list_node
+            .children
+            .iter()
+            .filter_map(|child| {
+                if let CstChild::Node(n) = child {
+                    self.unwrap_to_map(n)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Unwrap a node to get the inner Map, handling PipeExpr wrappers
+    fn unwrap_to_map<'a>(&self, node: &'a CstNode) -> Option<&'a CstNode> {
+        if node.kind == NodeKind::Map {
+            return Some(node);
+        }
+        if node.kind == NodeKind::PipeExpr {
+            for child in &node.children {
+                if let CstChild::Node(n) = child
+                    && n.kind == NodeKind::Map
+                {
+                    return Some(n);
+                }
+            }
+        }
+        None
+    }
+
+    /// Unwrap a node to get the inner List, handling PipeExpr wrappers
+    fn unwrap_to_list<'a>(&self, node: &'a CstNode) -> Option<&'a CstNode> {
+        if node.kind == NodeKind::List {
+            return Some(node);
+        }
+        if node.kind == NodeKind::PipeExpr {
+            for child in &node.children {
+                if let CstChild::Node(n) = child
+                    && n.kind == NodeKind::List
+                {
+                    return Some(n);
+                }
+            }
+        }
+        None
+    }
+
+    /// Check if an attribute should be converted to block syntax
+    fn should_convert_to_blocks(&self, node: &CstNode) -> Option<String> {
+        self.should_convert_to_blocks_generic(node, |s, n| s.get_attribute_key(n))
+    }
+
+    /// Check if a node (Attribute or MapEntry) should be converted to block syntax.
+    /// Returns the block name if the node's key is in block_names and its value
+    /// is a list of maps.
+    fn should_convert_to_blocks_generic(
+        &self,
+        node: &CstNode,
+        key_fn: impl Fn(&Self, &CstNode) -> Option<String>,
+    ) -> Option<String> {
+        let key = key_fn(self, node)?;
+        let block_name = self.block_names.get(&key)?;
+        let value_node = self.get_value_after_equals(node)?;
+        let list_node = self.unwrap_to_list(value_node)?;
+        if self.list_contains_only_maps(list_node) {
+            Some(block_name.clone())
+        } else {
+            None
+        }
+    }
+
+    /// Check if a map entry should be converted to block syntax
+    fn should_convert_map_entry_to_blocks(&self, node: &CstNode) -> Option<String> {
+        self.should_convert_to_blocks_generic(node, |s, n| s.get_map_entry_key(n))
+    }
+
+    /// Emit a node's `= [{...}, {...}]` value as multiple `block_name { ... }` blocks.
+    /// Works for both Attribute and MapEntry nodes.
+    fn emit_list_as_blocks(&mut self, node: &CstNode, block_name: &str) {
+        let value_node = self.get_value_after_equals(node).unwrap();
+        let list_node = self.unwrap_to_list(value_node).unwrap();
+        let maps = self.extract_maps_from_list(list_node);
+
+        for map_node in maps {
+            self.write_indent();
+            self.write(block_name);
+
+            let items: Vec<&CstNode> = map_node
+                .children
+                .iter()
+                .filter_map(|child| {
+                    if let CstChild::Node(n) = child
+                        && (n.kind == NodeKind::MapEntry || n.kind == NodeKind::NestedBlock)
+                    {
+                        Some(n)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            if items.is_empty() {
+                self.write(" {}");
+                self.write_newline();
+            } else {
+                self.write(" {");
+                self.write_newline();
+                self.current_indent += 1;
+                self.format_map_entries_as_block_attrs(&items);
+                self.current_indent -= 1;
+                self.write_indent();
+                self.write("}");
+                self.write_newline();
+            }
+        }
+    }
+
+    /// Format map entries as block attributes (used when converting list-of-maps to blocks)
+    fn format_map_entries_as_block_attrs(&mut self, items: &[&CstNode]) {
+        // Calculate max key length for alignment (excluding entries that will be converted to blocks)
+        let max_key_len = if self.config.align_attributes {
+            items
+                .iter()
+                .filter(|item| {
+                    item.kind == NodeKind::MapEntry
+                        && self.should_convert_map_entry_to_blocks(item).is_none()
+                })
+                .filter_map(|entry| self.get_map_entry_key(entry))
+                .map(|k| k.len())
+                .max()
+                .unwrap_or(0)
+        } else {
+            0
+        };
+
+        for item in items {
+            if item.kind == NodeKind::NestedBlock {
+                self.format_nested_block(item);
+            } else if let Some(block_name) = self.should_convert_map_entry_to_blocks(item) {
+                self.emit_list_as_blocks(item, &block_name);
+            } else {
+                self.format_map_entry_aligned(item, max_key_len);
+            }
+        }
     }
 
     fn format_attribute(&mut self, node: &CstNode, align_to: usize) {
@@ -894,6 +1130,13 @@ impl Formatter {
         for item in items {
             if item.kind == NodeKind::NestedBlock {
                 self.format_nested_block(item);
+            } else if item.kind == NodeKind::MapEntry {
+                // Check if this map entry should be converted to block syntax
+                if let Some(block_name) = self.should_convert_map_entry_to_blocks(item) {
+                    self.emit_list_as_blocks(item, &block_name);
+                } else {
+                    self.format_map_entry_aligned(item, max_key_len);
+                }
             } else {
                 self.format_map_entry_aligned(item, max_key_len);
             }
@@ -1346,6 +1589,147 @@ mod tests {
         assert_eq!(
             result, second,
             "Nested block in map formatting should be idempotent"
+        );
+    }
+
+    #[test]
+    fn test_convert_list_literal_to_block_syntax_simple() {
+        // Issue #908: `attr = [{...}]` should be converted to `attr { ... }` block syntax
+        // when the attribute is known to use block syntax (via block_name mapping).
+        let input = r#"awscc.ec2.ipam {
+  operating_regions = [{
+    region_name = "ap-northeast-1"
+  }]
+}
+"#;
+        let expected = r#"awscc.ec2.ipam {
+  operating_region {
+    region_name = "ap-northeast-1"
+  }
+}
+"#;
+        let config = FormatConfig::default();
+        // block_names maps attribute name -> block name for conversion
+        let block_names: std::collections::HashMap<String, String> = [(
+            "operating_regions".to_string(),
+            "operating_region".to_string(),
+        )]
+        .into_iter()
+        .collect();
+        let result = format_with_block_names(input, &config, &block_names).unwrap();
+
+        assert_eq!(
+            result, expected,
+            "List literal `= [{{...}}]` should be converted to block syntax.\nGot:\n{}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_convert_list_literal_to_block_syntax_multiple_items() {
+        // Multiple items in `= [{...}, {...}]` should become multiple blocks
+        let input = r#"awscc.s3.bucket {
+  lifecycle_configuration = {
+    rules = [{
+      id     = "expire-old-objects"
+      status = "Enabled"
+    }, {
+      id     = "transition-to-glacier"
+      status = "Enabled"
+    }]
+  }
+}
+"#;
+        let expected = r#"awscc.s3.bucket {
+  lifecycle_configuration = {
+    rule {
+      id     = "expire-old-objects"
+      status = "Enabled"
+    }
+    rule {
+      id     = "transition-to-glacier"
+      status = "Enabled"
+    }
+  }
+}
+"#;
+        let config = FormatConfig::default();
+        let block_names: std::collections::HashMap<String, String> =
+            [("rules".to_string(), "rule".to_string())]
+                .into_iter()
+                .collect();
+        let result = format_with_block_names(input, &config, &block_names).unwrap();
+
+        assert_eq!(
+            result, expected,
+            "Multiple list items should become multiple blocks.\nGot:\n{}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_convert_list_literal_to_block_syntax_nested() {
+        // Nested `= [{...}]` within a map should also be converted
+        let input = r#"awscc.s3.bucket {
+  bucket_encryption = {
+    server_side_encryption_configuration = [{
+      bucket_key_enabled                = true
+      server_side_encryption_by_default = {
+        sse_algorithm = "AES256"
+      }
+    }]
+  }
+}
+"#;
+        let expected = r#"awscc.s3.bucket {
+  bucket_encryption = {
+    server_side_encryption_configuration {
+      bucket_key_enabled                = true
+      server_side_encryption_by_default = {
+        sse_algorithm = "AES256"
+      }
+    }
+  }
+}
+"#;
+        let config = FormatConfig::default();
+        let block_names: std::collections::HashMap<String, String> = [(
+            "server_side_encryption_configuration".to_string(),
+            "server_side_encryption_configuration".to_string(),
+        )]
+        .into_iter()
+        .collect();
+        let result = format_with_block_names(input, &config, &block_names).unwrap();
+
+        assert_eq!(
+            result, expected,
+            "Nested list literal should be converted to block syntax.\nGot:\n{}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_convert_block_syntax_is_idempotent() {
+        // Already in block syntax should remain unchanged
+        let input = r#"awscc.ec2.ipam {
+  operating_region {
+    region_name = "ap-northeast-1"
+  }
+}
+"#;
+        let config = FormatConfig::default();
+        let block_names: std::collections::HashMap<String, String> = [(
+            "operating_regions".to_string(),
+            "operating_region".to_string(),
+        )]
+        .into_iter()
+        .collect();
+        let result = format_with_block_names(input, &config, &block_names).unwrap();
+
+        assert_eq!(
+            result, input,
+            "Already-converted block syntax should be idempotent.\nGot:\n{}",
+            result
         );
     }
 }

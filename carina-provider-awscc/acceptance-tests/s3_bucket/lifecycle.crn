@@ -14,18 +14,19 @@ awscc.s3.bucket {
   bucket_name_prefix = "carina-acc-test-"
 
   lifecycle_configuration = {
-    rules = [{
+    rule {
       id                 = "expire-old-objects"
       status             = awscc.s3.bucket.RuleStatus.Enabled
       expiration_in_days = 90
-    }, {
-      id          = "transition-to-glacier"
-      status      = awscc.s3.bucket.RuleStatus.Enabled
-      transitions = [{
+    }
+    rule {
+      id     = "transition-to-glacier"
+      status = awscc.s3.bucket.RuleStatus.Enabled
+      transition {
         storage_class      = awscc.s3.bucket.TransitionStorageClass.GLACIER
         transition_in_days = 30
-      }]
-    }]
+      }
+    }
   }
 
   lifecycle {
