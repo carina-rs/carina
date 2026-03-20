@@ -14,6 +14,10 @@ use ratatui::widgets::ListState;
 pub struct TreeNode {
     /// Effect type label for display
     pub effect_label: String,
+    /// Resource type (e.g., "awscc.ec2.vpc") for display
+    pub resource_type: String,
+    /// Name part (binding name or compact hint) for display
+    pub name_part: String,
     /// Symbol prefix ("+", "~", "-", "+/-", "-/+", "<=")
     pub symbol: String,
     /// The effect kind for coloring
@@ -515,7 +519,7 @@ fn shorten_effect_labels(plan: &Plan, nodes: &mut [TreeNode]) {
         };
 
         if let Some(r) = resource {
-            let resource_type = &r.id.resource_type;
+            let display_type = r.id.display_type();
             let has_binding = r.attributes.contains_key("_binding");
 
             let name_part = if has_binding {
@@ -552,10 +556,14 @@ fn shorten_effect_labels(plan: &Plan, nodes: &mut [TreeNode]) {
                 }
             };
 
-            nodes[idx].effect_label = format!("{} {}", resource_type, name_part);
+            nodes[idx].resource_type = display_type.clone();
+            nodes[idx].name_part = name_part.clone();
+            nodes[idx].effect_label = format!("{} {}", display_type, name_part);
         } else if let Effect::Delete { id, .. } = effect {
-            // For delete effects, just strip provider prefix
-            nodes[idx].effect_label = format!("{} {}", id.resource_type, id.name);
+            let display_type = id.display_type();
+            nodes[idx].resource_type = display_type.clone();
+            nodes[idx].name_part = id.name.clone();
+            nodes[idx].effect_label = format!("{} {}", display_type, id.name);
         }
     }
 }
@@ -637,6 +645,8 @@ fn effect_to_node(effect: &Effect) -> TreeNode {
     match effect {
         Effect::Read { resource } => TreeNode {
             effect_label: format!("{}", resource.id),
+            resource_type: resource.id.display_type(),
+            name_part: resource.id.name.clone(),
             symbol: "<=".to_string(),
             kind: EffectKind::Read,
             attributes: format_attributes(&resource.attributes),
@@ -649,6 +659,8 @@ fn effect_to_node(effect: &Effect) -> TreeNode {
         },
         Effect::Create(resource) => TreeNode {
             effect_label: format!("{}", resource.id),
+            resource_type: resource.id.display_type(),
+            name_part: resource.id.name.clone(),
             symbol: "+".to_string(),
             kind: EffectKind::Create,
             attributes: format_attributes(&resource.attributes),
@@ -666,6 +678,8 @@ fn effect_to_node(effect: &Effect) -> TreeNode {
             changed_attributes,
         } => TreeNode {
             effect_label: format!("{}", id),
+            resource_type: id.display_type(),
+            name_part: id.name.clone(),
             symbol: "~".to_string(),
             kind: EffectKind::Update,
             attributes: format_attributes(&to.attributes),
@@ -691,6 +705,8 @@ fn effect_to_node(effect: &Effect) -> TreeNode {
             };
             TreeNode {
                 effect_label: format!("{}", id),
+                resource_type: id.display_type(),
+                name_part: id.name.clone(),
                 symbol,
                 kind: EffectKind::Replace,
                 attributes: format_attributes(&to.attributes),
@@ -709,6 +725,8 @@ fn effect_to_node(effect: &Effect) -> TreeNode {
             }
             TreeNode {
                 effect_label: format!("{}", id),
+                resource_type: id.display_type(),
+                name_part: id.name.clone(),
                 symbol: "-".to_string(),
                 kind: EffectKind::Delete,
                 attributes: attrs,

@@ -79,21 +79,36 @@ fn draw_tree(frame: &mut Frame, app: &App, area: Rect) {
             VisibleRow::Node(idx) => {
                 let node = &app.nodes[*idx];
                 let connector = build_tree_connector(*idx, app);
-                let expand_marker = if !node.children.is_empty() {
+                let expand_marker = if !node.children.is_empty() || !node.attributes.is_empty() {
                     if node.expanded { "[-]" } else { "[+]" }
                 } else {
                     "   "
                 };
-                let text = format!(
-                    "{}{} {} {}",
-                    connector, expand_marker, node.symbol, node.effect_label
-                );
-                let style = if app.selected_row == row_idx {
-                    effect_style(node.kind).add_modifier(Modifier::BOLD)
-                } else {
-                    effect_style(node.kind)
-                };
-                ListItem::new(Line::from(text).style(style))
+                let effect_color = effect_style(node.kind);
+                let mut spans = vec![
+                    Span::raw(connector),
+                    Span::styled(format!("{} {} ", expand_marker, node.symbol), effect_color),
+                    Span::styled(
+                        node.resource_type.clone(),
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(" "),
+                    Span::styled(node.name_part.clone(), effect_color),
+                ];
+                if app.selected_row == row_idx {
+                    // Bold the entire line for selected row via highlight_style
+                    spans = spans
+                        .into_iter()
+                        .map(|s| {
+                            let mut style = s.style;
+                            style = style.add_modifier(Modifier::BOLD);
+                            Span::styled(s.content, style)
+                        })
+                        .collect();
+                }
+                ListItem::new(Line::from(spans))
             }
             VisibleRow::Attribute {
                 node_idx,
@@ -115,9 +130,10 @@ fn draw_tree(frame: &mut Frame, app: &App, area: Rect) {
                         .collect();
                     if let Some(old_value) = from_map.get(key.as_str()) {
                         let line = Line::from(vec![
+                            Span::raw(attr_prefix),
                             Span::styled(
-                                format!("{}{}: ", attr_prefix, key),
-                                Style::default().fg(Color::Yellow),
+                                format!("{}: ", key),
+                                Style::default().fg(Color::DarkGray),
                             ),
                             Span::styled(
                                 old_value.to_string(),
@@ -125,25 +141,34 @@ fn draw_tree(frame: &mut Frame, app: &App, area: Rect) {
                                     .fg(Color::Red)
                                     .add_modifier(Modifier::CROSSED_OUT),
                             ),
-                            Span::styled(" -> ", Style::default().fg(Color::Yellow)),
+                            Span::styled(" -> ", Style::default().fg(Color::DarkGray)),
                             Span::styled(value.clone(), Style::default().fg(Color::Green)),
                         ]);
                         ListItem::new(line)
                     } else {
                         let line = Line::from(vec![
+                            Span::raw(attr_prefix),
                             Span::styled(
-                                format!("{}{}: ", attr_prefix, key),
-                                Style::default().fg(Color::Yellow),
+                                format!("{}: ", key),
+                                Style::default().fg(Color::DarkGray),
                             ),
                             Span::styled(value.clone(), Style::default().fg(Color::Green)),
                         ]);
                         ListItem::new(line)
                     }
                 } else {
-                    let line = Line::from(Span::styled(
-                        format!("{}{}: {}", attr_prefix, key, value),
-                        Style::default().fg(Color::DarkGray),
-                    ));
+                    let is_create =
+                        node.kind == EffectKind::Create || node.kind == EffectKind::Read;
+                    let value_style = if is_create {
+                        Style::default().fg(Color::Green)
+                    } else {
+                        Style::default()
+                    };
+                    let line = Line::from(vec![
+                        Span::raw(attr_prefix),
+                        Span::styled(format!("{}: ", key), Style::default().fg(Color::DarkGray)),
+                        Span::styled(value.clone(), value_style),
+                    ]);
                     ListItem::new(line)
                 }
             }
@@ -170,9 +195,9 @@ fn draw_tree(frame: &mut Frame, app: &App, area: Rect) {
 
 /// Build the tree connector prefix for a node.
 ///
-/// Mirrors the CLI's indentation scheme:
+/// Each tree level uses exactly 4-character-wide segments:
 /// - Root nodes (depth 0): no connector
-/// - Children: "    ├─ " or "    └─ " with continuation lines "    │  " or "       "
+/// - Children: `├── ` or `└── ` with continuation `│   ` or `    `
 fn build_tree_connector(idx: usize, app: &App) -> String {
     let node = &app.nodes[idx];
     if node.parent.is_none() {
@@ -182,33 +207,31 @@ fn build_tree_connector(idx: usize, app: &App) -> String {
     // Collect prefix segments from current node up to root
     let mut parts: Vec<&str> = Vec::new();
 
-    // This node's own connector
+    // This node's own connector (4 chars each)
     if let Some(parent_idx) = node.parent {
         let siblings = &app.nodes[parent_idx].children;
         let is_last = siblings.last() == Some(&idx);
         if is_last {
-            parts.push("└─ ");
+            parts.push("└── ");
         } else {
-            parts.push("├─ ");
+            parts.push("├── ");
         }
     }
 
-    // Walk up ancestors to build continuation lines
+    // Walk up ancestors to build continuation lines (4 chars each)
     let mut ancestor = node.parent;
     while let Some(a_idx) = ancestor {
         let a_node = &app.nodes[a_idx];
         if a_node.parent.is_none() {
-            // Ancestor is a root node — no continuation line needed
             break;
         }
-        // Non-root ancestor: check if it's the last child of its parent
         if let Some(grandparent_idx) = a_node.parent {
             let siblings = &app.nodes[grandparent_idx].children;
             let is_last = siblings.last() == Some(&a_idx);
             if is_last {
-                parts.push("   ");
+                parts.push("    ");
             } else {
-                parts.push("│  ");
+                parts.push("│   ");
             }
         }
         ancestor = a_node.parent;
@@ -216,59 +239,58 @@ fn build_tree_connector(idx: usize, app: &App) -> String {
 
     // Reverse to get top-down order
     parts.reverse();
-    // Add base indentation (4 spaces, matching CLI's base_indent + attr_base alignment)
+    // Base indentation (4 spaces) before tree connectors
     format!("    {}", parts.join(""))
 }
 
 /// Build the indentation prefix for attribute lines below a node.
 ///
 /// Attributes are indented further than the node line, aligned past the
-/// expand marker and symbol.
+/// expand marker and symbol area.
 fn build_attribute_prefix(idx: usize, app: &App) -> String {
     let node = &app.nodes[idx];
     if node.parent.is_none() {
-        // Root node: attributes indented with spaces to align past "[-] + type name"
-        return "       ".to_string();
+        // Root node: attributes indented past "[-] + " (8 spaces)
+        return "        ".to_string();
     }
 
     // For child nodes, the attribute prefix extends the tree connector with
-    // continuation lines, plus extra indentation for the content.
+    // continuation lines (4 chars each), plus extra indentation for the content.
     let mut parts: Vec<&str> = Vec::new();
 
-    // Continuation for this node's position among siblings
+    // Continuation for this node's position among siblings (4 chars)
     if let Some(parent_idx) = node.parent {
         let siblings = &app.nodes[parent_idx].children;
         let is_last = siblings.last() == Some(&idx);
         if is_last {
-            parts.push("   ");
+            parts.push("    ");
         } else {
-            parts.push("│  ");
+            parts.push("│   ");
         }
     }
 
-    // Walk up ancestors
+    // Walk up ancestors (4 chars each)
     let mut ancestor = node.parent;
     while let Some(a_idx) = ancestor {
         let a_node = &app.nodes[a_idx];
         if a_node.parent.is_none() {
-            // Ancestor is a root node — no continuation line needed
             break;
         }
         if let Some(grandparent_idx) = a_node.parent {
             let siblings = &app.nodes[grandparent_idx].children;
             let is_last = siblings.last() == Some(&a_idx);
             if is_last {
-                parts.push("   ");
+                parts.push("    ");
             } else {
-                parts.push("│  ");
+                parts.push("│   ");
             }
         }
         ancestor = a_node.parent;
     }
 
     parts.reverse();
-    // Extra spaces to align past "[-] + " prefix
-    format!("    {}   ", parts.join(""))
+    // base (4) + continuation segments + extra indent (4) to align past "[-] + "
+    format!("    {}    ", parts.join(""))
 }
 
 /// Return the style for a given effect kind
@@ -320,7 +342,7 @@ mod tests {
 
         // Subnet is the only (last) child of VPC
         let connector = build_tree_connector(1, &app);
-        assert_eq!(connector, "    └─ ");
+        assert_eq!(connector, "    └── ");
     }
 
     #[test]
@@ -359,8 +381,8 @@ mod tests {
         assert_eq!(children.len(), 2);
         let first_child = children[0];
         let last_child = children[1];
-        assert_eq!(build_tree_connector(first_child, &app), "    ├─ ");
-        assert_eq!(build_tree_connector(last_child, &app), "    └─ ");
+        assert_eq!(build_tree_connector(first_child, &app), "    ├── ");
+        assert_eq!(build_tree_connector(last_child, &app), "    └── ");
     }
 
     #[test]
@@ -373,7 +395,7 @@ mod tests {
         ));
         let app = App::new(&plan);
         let prefix = build_attribute_prefix(0, &app);
-        assert_eq!(prefix, "       ");
+        assert_eq!(prefix, "        ");
     }
 
     #[test]
@@ -398,7 +420,7 @@ mod tests {
         let app = App::new(&plan);
         // Subnet is last child of VPC
         let prefix = build_attribute_prefix(1, &app);
-        // Should be: "    " (base) + "   " (last child continuation) + "   " (content indent)
-        assert_eq!(prefix, "          ");
+        // Should be: "    " (base) + "    " (last child continuation) + "    " (content indent)
+        assert_eq!(prefix, "            ");
     }
 }
