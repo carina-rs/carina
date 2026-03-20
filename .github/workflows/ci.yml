@@ -57,6 +57,15 @@ jobs:
       - run: bash carina-provider-aws/scripts/check-examples.sh
       - run: bash carina-provider-awscc/scripts/check-examples.sh
 
+  validate-crn:
+    name: Validate .crn Files
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: bash scripts/validate-crn-files.sh
+
   test:
     name: Test
     runs-on: ubuntu-latest
