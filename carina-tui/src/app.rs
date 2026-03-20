@@ -1,5 +1,6 @@
 //! Application state for the TUI plan viewer
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use carina_core::deps::get_resource_dependencies;
@@ -62,6 +63,16 @@ impl App {
 
         // Build tree structure from dependency analysis
         build_tree_structure(plan, &mut nodes);
+
+        // Shorten effect labels: strip provider prefix, use binding or compact hint
+        shorten_effect_labels(plan, &mut nodes);
+
+        // Start with root nodes expanded (1 level deep)
+        for node in &mut nodes {
+            if node.parent.is_none() && !node.children.is_empty() {
+                node.expanded = true;
+            }
+        }
 
         let mut list_state = ListState::default();
         if !nodes.is_empty() {
@@ -164,6 +175,37 @@ impl App {
         {
             let new_state = !node.expanded;
             self.nodes[self.selected].expanded = new_state;
+        }
+    }
+
+    /// Expand all nodes
+    pub fn expand_all(&mut self) {
+        for node in &mut self.nodes {
+            if !node.children.is_empty() {
+                node.expanded = true;
+            }
+        }
+    }
+
+    /// Collapse all nodes
+    pub fn collapse_all(&mut self) {
+        for node in &mut self.nodes {
+            node.expanded = false;
+        }
+        // Move selection to a root node if currently on a non-root
+        if let Some(node) = self.nodes.get(self.selected)
+            && node.parent.is_some()
+        {
+            // Find the root ancestor
+            let mut idx = self.selected;
+            while let Some(parent) = self.nodes[idx].parent {
+                idx = parent;
+            }
+            self.selected = idx;
+            let visible = self.visible_nodes();
+            if let Some(pos) = visible.iter().position(|&i| i == idx) {
+                self.list_state.select(Some(pos));
+            }
         }
     }
 
@@ -386,6 +428,136 @@ fn build_single_parent_tree(
     sorted_roots.sort_by_key(|a| sort_key(a));
 
     (sorted_roots, dependents)
+}
+
+/// Shorten effect labels: strip provider prefix and use binding name or compact hint.
+fn shorten_effect_labels(plan: &Plan, nodes: &mut [TreeNode]) {
+    for (idx, effect) in plan.effects().iter().enumerate() {
+        let resource = match effect {
+            Effect::Create(r) => Some(r),
+            Effect::Update { to, .. } => Some(to),
+            Effect::Replace { to, .. } => Some(to),
+            Effect::Read { resource } => Some(resource),
+            Effect::Delete { .. } => None,
+        };
+
+        if let Some(r) = resource {
+            let resource_type = &r.id.resource_type;
+            let has_binding = r.attributes.contains_key("_binding");
+
+            let name_part = if has_binding {
+                // For bound resources, show the binding name
+                r.attributes
+                    .get("_binding")
+                    .and_then(|v| match v {
+                        Value::String(s) => Some(s.clone()),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| r.id.name.clone())
+            } else {
+                // For anonymous resources, try to extract a compact hint
+                let parent_binding = nodes[idx].parent.and_then(|p_idx| {
+                    let p_effect = &plan.effects()[p_idx];
+                    let p_resource = match p_effect {
+                        Effect::Create(r) => Some(r),
+                        Effect::Update { to, .. } => Some(to),
+                        Effect::Replace { to, .. } => Some(to),
+                        Effect::Read { resource } => Some(resource),
+                        Effect::Delete { .. } => None,
+                    };
+                    p_resource.and_then(|pr| {
+                        pr.attributes.get("_binding").and_then(|v| match v {
+                            Value::String(s) => Some(s.clone()),
+                            _ => None,
+                        })
+                    })
+                });
+                if let Some(hint) = extract_compact_hint(r, parent_binding.as_deref()) {
+                    format!("({})", hint)
+                } else {
+                    r.id.name.clone()
+                }
+            };
+
+            nodes[idx].effect_label = format!("{} {}", resource_type, name_part);
+        } else if let Effect::Delete { id, .. } = effect {
+            // For delete effects, just strip provider prefix
+            nodes[idx].effect_label = format!("{} {}", id.resource_type, id.name);
+        }
+    }
+}
+
+/// Extract a compact hint for anonymous resources (mirrors CLI logic).
+fn extract_compact_hint(
+    resource: &carina_core::resource::Resource,
+    parent_binding: Option<&str>,
+) -> Option<String> {
+    let mut keys: Vec<_> = resource
+        .attributes
+        .keys()
+        .filter(|k| !k.starts_with('_'))
+        .collect();
+    keys.sort();
+
+    // Priority 1: First distinguishing string attribute
+    for key in &keys {
+        if let Some(Value::String(s)) = resource.attributes.get(*key)
+            && !s.is_empty()
+        {
+            let short_key = shorten_attr_name(key);
+            let display_value = shorten_service_name(key, s);
+            return Some(format!("{}: {}", short_key, display_value));
+        }
+    }
+
+    // Priority 2: First non-parent ResourceRef attribute
+    for key in &keys {
+        match resource.attributes.get(*key) {
+            Some(Value::ResourceRef { binding_name, .. }) => {
+                if parent_binding == Some(binding_name.as_str()) {
+                    continue;
+                }
+                let short_key = shorten_attr_name(key);
+                return Some(format!("{}: {}", short_key, binding_name));
+            }
+            Some(Value::List(items)) => {
+                for item in items {
+                    if let Value::ResourceRef { binding_name, .. } = item {
+                        if parent_binding == Some(binding_name.as_str()) {
+                            continue;
+                        }
+                        let short_key = shorten_attr_name(key);
+                        return Some(format!("{}: {}", short_key, binding_name));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    None
+}
+
+/// Shorten common attribute name suffixes for compact display.
+fn shorten_attr_name(attr: &str) -> &str {
+    attr.strip_suffix("_ids")
+        .or_else(|| attr.strip_suffix("_id"))
+        .or_else(|| attr.strip_suffix("_name"))
+        .unwrap_or(attr)
+}
+
+/// For `service_name` attributes, extract just the service suffix from AWS endpoint names.
+fn shorten_service_name<'a>(attr_name: &str, value: &'a str) -> Cow<'a, str> {
+    if attr_name == "service_name"
+        && let Some(rest) = value.strip_prefix("com.amazonaws.")
+        && let Some(dot_pos) = rest.find('.')
+    {
+        let after_region = &rest[dot_pos + 1..];
+        if !after_region.is_empty() {
+            return Cow::Borrowed(after_region);
+        }
+    }
+    Cow::Borrowed(value)
 }
 
 fn effect_to_node(effect: &Effect) -> TreeNode {
@@ -759,19 +931,19 @@ mod tests {
 
         let mut app = App::new(&plan);
 
-        // Initially collapsed: only root visible
-        assert_eq!(app.visible_nodes(), vec![0]);
-        assert_eq!(app.visible_count(), 1);
-
-        // Expand root: both visible
-        app.expand();
+        // Root nodes start expanded: both visible
         assert_eq!(app.visible_nodes(), vec![0, 1]);
         assert_eq!(app.visible_count(), 2);
 
-        // Collapse root: only root visible again
+        // Collapse root: only root visible
         app.collapse();
         assert_eq!(app.visible_nodes(), vec![0]);
         assert_eq!(app.visible_count(), 1);
+
+        // Expand root again: both visible
+        app.expand();
+        assert_eq!(app.visible_nodes(), vec![0, 1]);
+        assert_eq!(app.visible_count(), 2);
     }
 
     #[test]
@@ -800,8 +972,12 @@ mod tests {
 
         let mut app = App::new(&plan);
 
-        // VPC is collapsed, so visible = [vpc_idx, bucket_idx]
-        // The exact indices depend on sort order. Let's check.
+        // VPC root starts expanded, so visible = [vpc_idx, subnet_idx, bucket_idx]
+        let visible = app.visible_nodes();
+        assert_eq!(visible.len(), 3); // VPC root + Subnet child + S3 root
+
+        // Collapse VPC to hide subnet
+        app.collapse();
         let visible = app.visible_nodes();
         assert_eq!(visible.len(), 2); // VPC root + S3 root, subnet hidden
 

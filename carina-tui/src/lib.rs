@@ -55,6 +55,8 @@ fn run_loop(
                 KeyCode::Enter => app.toggle(),
                 KeyCode::Right | KeyCode::Char('l') => app.expand(),
                 KeyCode::Left | KeyCode::Char('h') => app.collapse(),
+                KeyCode::Char('e') => app.expand_all(),
+                KeyCode::Char('c') => app.collapse_all(),
                 _ => {}
             }
         }

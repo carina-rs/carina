@@ -50,6 +50,20 @@ pub fn draw(frame: &mut Frame, app: &App) {
         ),
         Span::raw(" collapse  "),
         Span::styled(
+            "e",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" expand all  "),
+        Span::styled(
+            "c",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" collapse all  "),
+        Span::styled(
             "q",
             Style::default()
                 .fg(Color::Cyan)
@@ -68,7 +82,7 @@ fn draw_tree(frame: &mut Frame, app: &App, area: Rect) {
         .iter()
         .map(|&idx| {
             let node = &app.nodes[idx];
-            let indent = "  ".repeat(node.depth);
+            let connector = build_tree_connector(idx, app);
             let expand_marker = if !node.children.is_empty() {
                 if node.expanded { "[-]" } else { "[+]" }
             } else {
@@ -76,7 +90,7 @@ fn draw_tree(frame: &mut Frame, app: &App, area: Rect) {
             };
             let text = format!(
                 "{}{} {} {}",
-                indent, expand_marker, node.symbol, node.effect_label
+                connector, expand_marker, node.symbol, node.effect_label
             );
             let style = effect_style(node.kind);
             ListItem::new(Line::from(text).style(style))
@@ -193,6 +207,56 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
         .wrap(Wrap { trim: false });
 
     frame.render_widget(detail, area);
+}
+
+/// Build the tree connector prefix for a node (e.g., "├─ ", "│  └─ ").
+///
+/// Root nodes get no connector. Children get "├─ " or "└─ " depending on whether
+/// they are the last child. Ancestor continuation lines use "│  " or "   ".
+fn build_tree_connector(idx: usize, app: &App) -> String {
+    let node = &app.nodes[idx];
+    if node.parent.is_none() {
+        return String::new();
+    }
+
+    // Collect connectors from current node up to root (excluding root)
+    let mut parts: Vec<&str> = Vec::new();
+
+    // First, determine this node's own connector
+    if let Some(parent_idx) = app.nodes[idx].parent {
+        let siblings = &app.nodes[parent_idx].children;
+        let is_last = siblings.last() == Some(&idx);
+        if is_last {
+            parts.push("└─ ");
+        } else {
+            parts.push("├─ ");
+        }
+    }
+
+    // Then walk up ancestors to build continuation lines
+    let mut ancestor = app.nodes[idx].parent;
+    while let Some(a_idx) = ancestor {
+        let a_node = &app.nodes[a_idx];
+        if a_node.parent.is_none() {
+            // This ancestor is a root; no continuation line needed
+            break;
+        }
+        // Check if this ancestor is the last child of its parent
+        if let Some(grandparent_idx) = a_node.parent {
+            let siblings = &app.nodes[grandparent_idx].children;
+            let is_last = siblings.last() == Some(&a_idx);
+            if is_last {
+                parts.push("   ");
+            } else {
+                parts.push("│  ");
+            }
+        }
+        ancestor = a_node.parent;
+    }
+
+    // Reverse to get top-down order, then join
+    parts.reverse();
+    parts.join("")
 }
 
 /// Return the style for a given effect kind
