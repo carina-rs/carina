@@ -700,7 +700,7 @@ impl Formatter {
                 if attr.kind == NodeKind::NestedBlock {
                     self.format_nested_block(attr);
                 } else if let Some(block_name) = self.should_convert_to_blocks(attr) {
-                    self.format_attribute_as_blocks(attr, &block_name);
+                    self.emit_list_as_blocks(attr, &block_name);
                 } else {
                     let inline_comment = inline_comments.get(&global_attr_index);
                     self.format_attribute_aligned(attr, max_key_len, inline_comment.copied());
@@ -728,8 +728,8 @@ impl Formatter {
         None
     }
 
-    /// Get the value node (the node after `=`) from an attribute
-    fn get_attribute_value_node<'a>(&self, node: &'a CstNode) -> Option<&'a CstNode> {
+    /// Get the first child node after `=` in any node (Attribute, MapEntry, etc.)
+    fn get_value_after_equals<'a>(&self, node: &'a CstNode) -> Option<&'a CstNode> {
         let mut found_equals = false;
         for child in &node.children {
             match child {
@@ -834,104 +834,41 @@ impl Formatter {
 
     /// Check if an attribute should be converted to block syntax
     fn should_convert_to_blocks(&self, node: &CstNode) -> Option<String> {
-        let key = self.get_attribute_key(node)?;
+        self.should_convert_to_blocks_generic(node, |s, n| s.get_attribute_key(n))
+    }
+
+    /// Check if a node (Attribute or MapEntry) should be converted to block syntax.
+    /// Returns the block name if the node's key is in block_names and its value
+    /// is a list of maps.
+    fn should_convert_to_blocks_generic(
+        &self,
+        node: &CstNode,
+        key_fn: impl Fn(&Self, &CstNode) -> Option<String>,
+    ) -> Option<String> {
+        let key = key_fn(self, node)?;
         let block_name = self.block_names.get(&key)?;
-        let value_node = self.get_attribute_value_node(node)?;
+        let value_node = self.get_value_after_equals(node)?;
         let list_node = self.unwrap_to_list(value_node)?;
         if self.list_contains_only_maps(list_node) {
             Some(block_name.clone())
         } else {
             None
-        }
-    }
-
-    /// Format an attribute as block syntax: convert `key = [{...}, {...}]` to multiple `block_name { ... }` blocks
-    fn format_attribute_as_blocks(&mut self, node: &CstNode, block_name: &str) {
-        let value_node = self.get_attribute_value_node(node).unwrap();
-        let list_node = self.unwrap_to_list(value_node).unwrap();
-        let maps = self.extract_maps_from_list(list_node);
-
-        for (i, map_node) in maps.iter().enumerate() {
-            if i > 0 {
-                // No extra blank line between consecutive blocks from the same attribute
-            }
-            self.write_indent();
-            self.write(block_name);
-
-            // Collect items from the map
-            let items: Vec<&CstNode> = map_node
-                .children
-                .iter()
-                .filter_map(|child| {
-                    if let CstChild::Node(n) = child
-                        && (n.kind == NodeKind::MapEntry || n.kind == NodeKind::NestedBlock)
-                    {
-                        Some(n)
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-
-            if items.is_empty() {
-                self.write(" {}");
-                self.write_newline();
-            } else {
-                self.write(" {");
-                self.write_newline();
-                self.current_indent += 1;
-
-                // Format map entries as block attributes
-                self.format_map_entries_as_block_attrs(&items);
-
-                self.current_indent -= 1;
-                self.write_indent();
-                self.write("}");
-                self.write_newline();
-            }
         }
     }
 
     /// Check if a map entry should be converted to block syntax
     fn should_convert_map_entry_to_blocks(&self, node: &CstNode) -> Option<String> {
-        let key = self.get_map_entry_key(node)?;
-        let block_name = self.block_names.get(&key)?;
-        let value_node = self.get_map_entry_value_node(node)?;
-        let list_node = self.unwrap_to_list(value_node)?;
-        if self.list_contains_only_maps(list_node) {
-            Some(block_name.clone())
-        } else {
-            None
-        }
+        self.should_convert_to_blocks_generic(node, |s, n| s.get_map_entry_key(n))
     }
 
-    /// Get the value node from a map entry (after `=`)
-    fn get_map_entry_value_node<'a>(&self, node: &'a CstNode) -> Option<&'a CstNode> {
-        let mut found_equals = false;
-        for child in &node.children {
-            match child {
-                CstChild::Token(token) if token.text == "=" => {
-                    found_equals = true;
-                }
-                CstChild::Node(n) if found_equals => {
-                    return Some(n);
-                }
-                _ => {}
-            }
-        }
-        None
-    }
-
-    /// Format a map entry as block syntax (same logic as format_attribute_as_blocks)
-    fn format_map_entry_as_blocks(&mut self, node: &CstNode, block_name: &str) {
-        let value_node = self.get_map_entry_value_node(node).unwrap();
+    /// Emit a node's `= [{...}, {...}]` value as multiple `block_name { ... }` blocks.
+    /// Works for both Attribute and MapEntry nodes.
+    fn emit_list_as_blocks(&mut self, node: &CstNode, block_name: &str) {
+        let value_node = self.get_value_after_equals(node).unwrap();
         let list_node = self.unwrap_to_list(value_node).unwrap();
         let maps = self.extract_maps_from_list(list_node);
 
-        for (i, map_node) in maps.iter().enumerate() {
-            if i > 0 {
-                // No extra blank line between consecutive blocks
-            }
+        for map_node in maps {
             self.write_indent();
             self.write(block_name);
 
@@ -987,7 +924,7 @@ impl Formatter {
             if item.kind == NodeKind::NestedBlock {
                 self.format_nested_block(item);
             } else if let Some(block_name) = self.should_convert_map_entry_to_blocks(item) {
-                self.format_map_entry_as_blocks(item, &block_name);
+                self.emit_list_as_blocks(item, &block_name);
             } else {
                 self.format_map_entry_aligned(item, max_key_len);
             }
@@ -1196,7 +1133,7 @@ impl Formatter {
             } else if item.kind == NodeKind::MapEntry {
                 // Check if this map entry should be converted to block syntax
                 if let Some(block_name) = self.should_convert_map_entry_to_blocks(item) {
-                    self.format_map_entry_as_blocks(item, &block_name);
+                    self.emit_list_as_blocks(item, &block_name);
                 } else {
                     self.format_map_entry_aligned(item, max_key_len);
                 }
