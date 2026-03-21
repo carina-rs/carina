@@ -242,6 +242,7 @@ async fn run_destroy_locked(
 
     // Confirmation prompt
     if !auto_approve {
+        println!();
         println!(
             "{}",
             "Do you really want to destroy all resources?"
