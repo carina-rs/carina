@@ -13,6 +13,7 @@ use carina_core::deps::{
     sort_resources_by_dependencies,
 };
 use carina_core::effect::Effect;
+use carina_core::plan::Plan;
 use carina_core::provider::Provider;
 use carina_core::resource::{Resource, ResourceId, State, Value};
 use carina_state::{
@@ -23,7 +24,7 @@ use carina_state::{
 use super::validate_and_resolve;
 use crate::commands::apply::{SPINNER_FRAMES, apply_name_overrides, format_duration};
 use crate::commands::state::map_lock_error;
-use crate::display::format_effect;
+use crate::display::{format_destroy_plan, format_effect};
 use crate::error::AppError;
 use crate::wiring::{
     WiringContext, get_provider_with_ctx, reconcile_anonymous_identifiers_with_ctx,
@@ -184,13 +185,29 @@ async fn run_destroy_locked(
         return Ok(());
     }
 
-    // Display destroy plan
-    println!("{}", "Destroy Plan:".red().bold());
-    println!();
-
+    // Build a Plan from the delete effects for tree display
+    let mut destroy_plan = Plan::new();
     for resource in &resources_to_destroy {
-        println!("  {} {}", "-".red().bold(), resource.id);
+        let identifier = current_states
+            .get(&resource.id)
+            .and_then(|s| s.identifier.clone())
+            .unwrap_or_default();
+        let binding = resource.attributes.get("_binding").and_then(|v| match v {
+            Value::String(s) => Some(s.clone()),
+            _ => None,
+        });
+        let dependencies = get_resource_dependencies(resource);
+        destroy_plan.add(Effect::Delete {
+            id: resource.id.clone(),
+            identifier,
+            lifecycle: resource.lifecycle.clone(),
+            binding,
+            dependencies,
+        });
     }
+
+    // Display destroy plan as a dependency tree
+    print!("{}", format_destroy_plan(&destroy_plan));
 
     // Show protected resources
     for resource in &protected_resources {
