@@ -1348,6 +1348,7 @@ async fn lock_released_on_write_state_failure() {
         applied_states: HashMap::new(),
         permanent_name_overrides: HashMap::new(),
         successfully_deleted: HashSet::new(),
+        current_states: HashMap::new(),
         failed_refreshes: HashSet::new(),
     };
 
@@ -1480,6 +1481,7 @@ async fn finalize_apply_uses_write_state_locked() {
         applied_states: HashMap::new(),
         permanent_name_overrides: HashMap::new(),
         successfully_deleted: HashSet::new(),
+        current_states: HashMap::new(),
         failed_refreshes: HashSet::new(),
     };
 
@@ -1995,6 +1997,7 @@ async fn finalize_apply_without_lock_uses_write_state() {
         applied_states: HashMap::new(),
         permanent_name_overrides: HashMap::new(),
         successfully_deleted: HashSet::new(),
+        current_states: HashMap::new(),
         failed_refreshes: HashSet::new(),
     };
 

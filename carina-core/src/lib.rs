@@ -6,6 +6,7 @@ pub mod config_loader;
 pub mod deps;
 pub mod differ;
 pub mod effect;
+pub mod executor;
 pub mod formatter;
 pub mod identifier;
 pub mod lint;
