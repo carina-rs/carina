@@ -792,9 +792,9 @@ pub fn format_plan(plan: &Plan, compact: bool) -> String {
             format!("{}   ", continuation)
         };
 
-        // Insert blank line between attribute block and child resources
+        // Insert tree continuation line between attribute block and child resources
         if has_displayed_attrs && !unprinted_children.is_empty() {
-            writeln!(out).unwrap();
+            writeln!(out, "{}{}│", base_indent, new_prefix).unwrap();
         }
 
         for (i, child_idx) in unprinted_children.iter().enumerate() {
