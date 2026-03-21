@@ -578,27 +578,36 @@ pub fn print_plan(plan: &Plan, compact: bool) {
                         let is_same = old_value
                             .map(|ov| ov.semantically_equal(new_value))
                             .unwrap_or(false);
-                        if !is_same {
-                            if is_list_of_maps(new_value) {
-                                let suffix = format!(" {}", "(forces replacement)".magenta());
-                                println!("{}{}:{}", attr_prefix, key, suffix);
-                                println!(
-                                    "{}",
-                                    format_list_diff(old_value, new_value, &attr_prefix)
-                                );
-                            } else {
-                                let old_str = old_value
-                                    .map(|v| format_value_with_key(v, Some(key)))
-                                    .unwrap_or_else(|| "(none)".to_string());
-                                println!(
-                                    "{}{}: {} → {} {}",
-                                    attr_prefix,
-                                    key,
-                                    old_str.red(),
-                                    format_value_with_key(new_value, Some(key)).green(),
-                                    "(forces replacement)".magenta()
-                                );
-                            }
+                        if is_same {
+                            // Value hasn't visibly changed yet — this is a cascade-triggered
+                            // create-only attr whose new value is unknown until the
+                            // depended-upon resource is replaced.
+                            let old_str = old_value
+                                .map(|v| format_value_with_key(v, Some(key)))
+                                .unwrap_or_else(|| "(none)".to_string());
+                            println!(
+                                "{}{}: {} {}",
+                                attr_prefix,
+                                key,
+                                old_str,
+                                "(forces replacement, known after apply)".magenta()
+                            );
+                        } else if is_list_of_maps(new_value) {
+                            let suffix = format!(" {}", "(forces replacement)".magenta());
+                            println!("{}{}:{}", attr_prefix, key, suffix);
+                            println!("{}", format_list_diff(old_value, new_value, &attr_prefix));
+                        } else {
+                            let old_str = old_value
+                                .map(|v| format_value_with_key(v, Some(key)))
+                                .unwrap_or_else(|| "(none)".to_string());
+                            println!(
+                                "{}{}: {} → {} {}",
+                                attr_prefix,
+                                key,
+                                old_str.red(),
+                                format_value_with_key(new_value, Some(key)).green(),
+                                "(forces replacement)".magenta()
+                            );
                         }
                     }
                     if let Some(temp) = temporary_name {
