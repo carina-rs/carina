@@ -67,7 +67,7 @@ impl<P: Provider> Interpreter<P> {
         self
     }
 
-    /// Execute a Plan, interpreting all Effects and causing side effects
+    /// Execute a Plan, interpreting all Effects and causing side effects.
     pub async fn apply(&self, plan: &Plan) -> ApplyResult {
         let mut outcomes = Vec::new();
         let mut success_count = 0;
