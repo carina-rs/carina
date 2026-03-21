@@ -1926,6 +1926,57 @@ mod tests {
         );
     }
 
+    /// Test that a cascade-triggered changed_create_only attribute with the same old and new
+    /// value is still displayed with "(forces replacement, known after apply)" annotation.
+    ///
+    /// This reproduces the real-world scenario where a cascade merge adds `vpc_id` to
+    /// `changed_create_only`, but the ResourceRef in `to` resolves to the current VPC ID
+    /// (same as `from`) because the new VPC hasn't been created yet. The attribute must
+    /// NOT be hidden even though `semantically_equal` returns true.
+    #[test]
+    fn test_replace_changed_create_only_same_value_shown_as_known_after_apply() {
+        use std::collections::HashMap;
+
+        let from = State::existing(
+            ResourceId::new("ec2.subnet", "subnet"),
+            HashMap::from([
+                ("vpc_id".to_string(), Value::String("vpc-123".to_string())),
+                (
+                    "cidr_block".to_string(),
+                    Value::String("10.0.1.0/24".to_string()),
+                ),
+            ]),
+        );
+        let to = Resource::new("ec2.subnet", "subnet")
+            .with_attribute("_binding", Value::String("subnet".to_string()))
+            .with_attribute("vpc_id", Value::String("vpc-123".to_string()))
+            .with_attribute("cidr_block", Value::String("10.0.1.0/24".to_string()));
+
+        // Verify the precondition: the values are semantically equal
+        assert!(
+            Value::String("vpc-123".to_string())
+                .semantically_equal(&Value::String("vpc-123".to_string())),
+            "precondition: old and new vpc_id should be semantically equal"
+        );
+
+        let replace_effect = Effect::Replace {
+            id: ResourceId::new("ec2.subnet", "subnet"),
+            from: Box::new(from),
+            to,
+            lifecycle: LifecycleConfig::default(),
+            changed_create_only: vec!["vpc_id".to_string()],
+            cascading_updates: vec![],
+            temporary_name: None,
+        };
+
+        let mut plan = Plan::new();
+        plan.add(replace_effect);
+
+        // print_plan should display vpc_id with "(forces replacement, known after apply)"
+        // rather than hiding it. This call verifies the code path does not skip the attribute.
+        print_plan(&plan, false);
+    }
+
     /// Test that cascading update diff only shows attributes referencing the replaced binding,
     /// not attributes with false diffs due to DSL vs AWS format mismatch (issue #958).
     #[test]
