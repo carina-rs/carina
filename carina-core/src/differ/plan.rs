@@ -292,12 +292,25 @@ pub fn create_plan(
         if state.exists && !desired_ids.contains(id) {
             let identifier = state.identifier.clone().unwrap_or_default();
             let lifecycle = lifecycles.get(id).cloned().unwrap_or_default();
+            let binding = state.attributes.get("_binding").and_then(|v| match v {
+                Value::String(s) => Some(s.clone()),
+                _ => None,
+            });
+            // Build a temporary Resource to extract dependencies from state attributes
+            let temp_resource = Resource {
+                id: id.clone(),
+                attributes: state.attributes.clone(),
+                read_only: false,
+                lifecycle: lifecycle.clone(),
+                prefixes: HashMap::new(),
+            };
+            let dependencies = get_resource_dependencies(&temp_resource);
             plan.add(Effect::Delete {
                 id: id.clone(),
                 identifier,
                 lifecycle,
-                binding: None,
-                dependencies: HashSet::new(),
+                binding,
+                dependencies,
             });
         }
     }

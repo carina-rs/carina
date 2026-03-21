@@ -824,3 +824,63 @@ fn diff_works_without_saved_state() {
         result
     );
 }
+
+#[test]
+fn orphan_delete_preserves_binding_and_dependencies() {
+    // Orphan resources (in state but not in desired) should carry
+    // binding and dependencies extracted from the state attributes.
+    let desired = vec![];
+
+    let mut current_states = HashMap::new();
+    let mut orphan_attrs = HashMap::new();
+    orphan_attrs.insert(
+        "_binding".to_string(),
+        Value::String("my_subnet".to_string()),
+    );
+    orphan_attrs.insert(
+        "vpc_id".to_string(),
+        Value::ResourceRef {
+            binding_name: "my_vpc".to_string(),
+            attribute_name: "vpc_id".to_string(),
+        },
+    );
+    current_states.insert(
+        ResourceId::new("subnet", "my-subnet"),
+        State::existing(ResourceId::new("subnet", "my-subnet"), orphan_attrs),
+    );
+
+    let plan = create_plan(
+        &desired,
+        &current_states,
+        &HashMap::new(),
+        &HashMap::new(),
+        &HashMap::new(),
+        &HashMap::new(),
+    );
+
+    let delete_effects: Vec<_> = plan
+        .effects()
+        .iter()
+        .filter(|e| matches!(e, Effect::Delete { .. }))
+        .collect();
+    assert_eq!(delete_effects.len(), 1);
+
+    match &delete_effects[0] {
+        Effect::Delete {
+            binding,
+            dependencies,
+            ..
+        } => {
+            assert_eq!(
+                binding.as_deref(),
+                Some("my_subnet"),
+                "Orphan Delete should preserve _binding from state"
+            );
+            assert!(
+                dependencies.contains("my_vpc"),
+                "Orphan Delete should extract dependencies from ResourceRef values in state"
+            );
+        }
+        _ => unreachable!(),
+    }
+}
