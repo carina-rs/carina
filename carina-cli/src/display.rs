@@ -562,53 +562,14 @@ pub fn print_plan(plan: &Plan, compact: bool) {
                         };
                         format!("{}{}   ", base_indent, continuation)
                     };
-                    // Only show changed_create_only attributes for Replace effects.
-                    // These are the attributes that actually triggered the replacement.
-                    // Other attributes may have false diffs due to DSL vs AWS format
-                    // differences (e.g., UnresolvedIdent vs normalized String) and are
-                    // not the reason for the replacement anyway.
-                    let mut keys: Vec<_> = changed_create_only
-                        .iter()
-                        .filter(|k| to.attributes.contains_key(k.as_str()))
-                        .collect();
-                    keys.sort();
-                    for key in keys {
-                        let new_value = &to.attributes[key.as_str()];
-                        let old_value = from.attributes.get(key.as_str());
-                        let is_same = old_value
-                            .map(|ov| ov.semantically_equal(new_value))
-                            .unwrap_or(false);
-                        if is_same {
-                            // Value hasn't visibly changed yet — this is a cascade-triggered
-                            // create-only attr whose new value is unknown until the
-                            // depended-upon resource is replaced.
-                            let old_str = old_value
-                                .map(|v| format_value_with_key(v, Some(key)))
-                                .unwrap_or_else(|| "(none)".to_string());
-                            println!(
-                                "{}{}: {} {}",
-                                attr_prefix,
-                                key,
-                                old_str,
-                                "(forces replacement, known after apply)".magenta()
-                            );
-                        } else if is_list_of_maps(new_value) {
-                            let suffix = format!(" {}", "(forces replacement)".magenta());
-                            println!("{}{}:{}", attr_prefix, key, suffix);
-                            println!("{}", format_list_diff(old_value, new_value, &attr_prefix));
-                        } else {
-                            let old_str = old_value
-                                .map(|v| format_value_with_key(v, Some(key)))
-                                .unwrap_or_else(|| "(none)".to_string());
-                            println!(
-                                "{}{}: {} → {} {}",
-                                attr_prefix,
-                                key,
-                                old_str.red(),
-                                format_value_with_key(new_value, Some(key)).green(),
-                                "(forces replacement)".magenta()
-                            );
-                        }
+                    let replace_attrs_output = format_replace_changed_attrs(
+                        &from.attributes,
+                        &to.attributes,
+                        changed_create_only,
+                        &attr_prefix,
+                    );
+                    if !replace_attrs_output.is_empty() {
+                        print!("{}", replace_attrs_output);
                     }
                     if let Some(temp) = temporary_name {
                         if temp.can_rename {
@@ -1040,6 +1001,68 @@ pub fn format_list_diff(old_value: Option<&Value>, new_value: &Value, attr_prefi
 /// (or a `Value::List` containing a `ResourceRef`) that references the
 /// `replaced_binding`. This avoids false diffs caused by DSL vs AWS format
 /// mismatches on unrelated attributes (issue #958).
+/// Format the changed_create_only attributes for a Replace effect.
+///
+/// Only shows attributes listed in `changed_create_only` that exist in `to_attrs`.
+/// When the old and new values are semantically equal (cascade-triggered replacement
+/// where the new value is not yet known), the attribute is shown with
+/// "(forces replacement, known after apply)" instead of being hidden.
+fn format_replace_changed_attrs(
+    from_attrs: &std::collections::HashMap<String, Value>,
+    to_attrs: &std::collections::HashMap<String, Value>,
+    changed_create_only: &[String],
+    attr_prefix: &str,
+) -> String {
+    let mut lines = Vec::new();
+    let mut keys: Vec<_> = changed_create_only
+        .iter()
+        .filter(|k| to_attrs.contains_key(k.as_str()))
+        .collect();
+    keys.sort();
+    for key in keys {
+        let new_value = &to_attrs[key.as_str()];
+        let old_value = from_attrs.get(key.as_str());
+        let is_same = old_value
+            .map(|ov| ov.semantically_equal(new_value))
+            .unwrap_or(false);
+        if is_same {
+            // Value hasn't visibly changed yet — this is a cascade-triggered
+            // create-only attr whose new value is unknown until the
+            // depended-upon resource is replaced.
+            let old_str = old_value
+                .map(|v| format_value_with_key(v, Some(key)))
+                .unwrap_or_else(|| "(none)".to_string());
+            lines.push(format!(
+                "{}{}: {} {}\n",
+                attr_prefix,
+                key,
+                old_str,
+                "(forces replacement, known after apply)".magenta()
+            ));
+        } else if is_list_of_maps(new_value) {
+            let suffix = format!(" {}", "(forces replacement)".magenta());
+            lines.push(format!("{}{}:{}\n", attr_prefix, key, suffix));
+            lines.push(format!(
+                "{}\n",
+                format_list_diff(old_value, new_value, attr_prefix)
+            ));
+        } else {
+            let old_str = old_value
+                .map(|v| format_value_with_key(v, Some(key)))
+                .unwrap_or_else(|| "(none)".to_string());
+            lines.push(format!(
+                "{}{}: {} → {} {}\n",
+                attr_prefix,
+                key,
+                old_str.red(),
+                format_value_with_key(new_value, Some(key)).green(),
+                "(forces replacement)".magenta()
+            ));
+        }
+    }
+    lines.concat()
+}
+
 fn format_cascading_update_diff(
     cascade: &CascadingUpdate,
     attr_prefix: &str,
@@ -1937,20 +1960,21 @@ mod tests {
     fn test_replace_changed_create_only_same_value_shown_as_known_after_apply() {
         use std::collections::HashMap;
 
-        let from = State::existing(
-            ResourceId::new("ec2.subnet", "subnet"),
-            HashMap::from([
-                ("vpc_id".to_string(), Value::String("vpc-123".to_string())),
-                (
-                    "cidr_block".to_string(),
-                    Value::String("10.0.1.0/24".to_string()),
-                ),
-            ]),
-        );
-        let to = Resource::new("ec2.subnet", "subnet")
-            .with_attribute("_binding", Value::String("subnet".to_string()))
-            .with_attribute("vpc_id", Value::String("vpc-123".to_string()))
-            .with_attribute("cidr_block", Value::String("10.0.1.0/24".to_string()));
+        let from_attrs = HashMap::from([
+            ("vpc_id".to_string(), Value::String("vpc-123".to_string())),
+            (
+                "cidr_block".to_string(),
+                Value::String("10.0.1.0/24".to_string()),
+            ),
+        ]);
+        let to_attrs = HashMap::from([
+            ("_binding".to_string(), Value::String("subnet".to_string())),
+            ("vpc_id".to_string(), Value::String("vpc-123".to_string())),
+            (
+                "cidr_block".to_string(),
+                Value::String("10.0.1.0/24".to_string()),
+            ),
+        ]);
 
         // Verify the precondition: the values are semantically equal
         assert!(
@@ -1959,22 +1983,33 @@ mod tests {
             "precondition: old and new vpc_id should be semantically equal"
         );
 
-        let replace_effect = Effect::Replace {
-            id: ResourceId::new("ec2.subnet", "subnet"),
-            from: Box::new(from),
-            to,
-            lifecycle: LifecycleConfig::default(),
-            changed_create_only: vec!["vpc_id".to_string()],
-            cascading_updates: vec![],
-            temporary_name: None,
-        };
+        let output =
+            format_replace_changed_attrs(&from_attrs, &to_attrs, &["vpc_id".to_string()], "    ");
 
-        let mut plan = Plan::new();
-        plan.add(replace_effect);
-
-        // print_plan should display vpc_id with "(forces replacement, known after apply)"
-        // rather than hiding it. This call verifies the code path does not skip the attribute.
-        print_plan(&plan, false);
+        // vpc_id must appear in output, not be hidden
+        assert!(
+            output.contains("vpc_id"),
+            "Expected vpc_id in output, got: {}",
+            output
+        );
+        // Must show "known after apply" annotation
+        assert!(
+            output.contains("known after apply"),
+            "Expected 'known after apply' in output, got: {}",
+            output
+        );
+        // Must show "forces replacement" annotation
+        assert!(
+            output.contains("forces replacement"),
+            "Expected 'forces replacement' in output, got: {}",
+            output
+        );
+        // Must show the current value
+        assert!(
+            output.contains("vpc-123"),
+            "Expected current value 'vpc-123' in output, got: {}",
+            output
+        );
     }
 
     /// Test that cascading update diff only shows attributes referencing the replaced binding,
