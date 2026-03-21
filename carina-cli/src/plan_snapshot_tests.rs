@@ -15,7 +15,7 @@ use carina_core::resource::{ResourceId, State};
 use carina_state::StateFile;
 
 use crate::commands::validate_and_resolve;
-use crate::display::format_plan;
+use crate::display::{format_destroy_plan, format_plan};
 use crate::wiring::{
     WiringContext, reconcile_anonymous_identifiers_with_ctx, reconcile_prefixed_names,
 };
@@ -181,6 +181,6 @@ fn snapshot_enum_display() {
 #[test]
 fn snapshot_destroy_full() {
     let plan = build_plan_from_fixture("destroy_full");
-    let output = strip_ansi(&format_plan(&plan, false));
+    let output = strip_ansi(&format_destroy_plan(&plan));
     insta::assert_snapshot!(output);
 }
