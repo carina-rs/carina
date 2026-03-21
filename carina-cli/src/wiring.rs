@@ -13,8 +13,9 @@ use carina_core::provider::{
     self as provider_mod, Provider, ProviderFactory, ProviderNormalizer, ProviderRouter,
 };
 use carina_core::resolver::resolve_refs_with_state;
-use carina_core::resource::{Resource, ResourceId, State};
+use carina_core::resource::{Resource, ResourceId, State, Value};
 use carina_core::schema::{ResourceSchema, resolve_block_names};
+use carina_core::utils;
 use carina_core::validation;
 use carina_provider_aws::AwsProviderFactory;
 use carina_provider_awscc::AwsccProviderFactory;
@@ -180,6 +181,98 @@ pub fn compute_anonymous_identifiers_with_ctx(
         },
     )
     .map_err(AppError::Config)
+}
+
+/// Resolve enum alias values in resources to their canonical AWS form.
+///
+/// After `normalize_desired()` converts DSL identifiers to namespaced strings
+/// (e.g., `IpProtocol.all` -> `"awscc.ec2.security_group_egress.IpProtocol.all"`),
+/// this function resolves aliases to their canonical AWS values
+/// (e.g., `"all"` -> `"-1"`).
+///
+/// This must be called on both desired resources and current states to ensure
+/// the differ sees consistent values and produces no false diffs.
+pub fn resolve_enum_aliases_with_ctx(ctx: &WiringContext, resources: &mut [Resource]) {
+    for resource in resources.iter_mut() {
+        if resource.id.provider.is_empty() {
+            continue;
+        }
+        let factory = match provider_mod::find_factory(ctx.factories(), &resource.id.provider) {
+            Some(f) => f,
+            None => continue,
+        };
+        resolve_attrs_aliases(
+            &mut resource.attributes,
+            &resource.id.resource_type,
+            factory,
+        );
+    }
+}
+
+/// Resolve enum alias values in current states to their canonical AWS form.
+///
+/// Ensures that read-back state attributes use canonical AWS values (e.g., `"-1"`)
+/// instead of DSL aliases (e.g., `"all"`), matching the resolved desired values.
+pub fn resolve_enum_aliases_in_states(
+    ctx: &WiringContext,
+    current_states: &mut HashMap<ResourceId, State>,
+) {
+    for (id, state) in current_states.iter_mut() {
+        if !state.exists || id.provider.is_empty() {
+            continue;
+        }
+        let factory = match provider_mod::find_factory(ctx.factories(), &id.provider) {
+            Some(f) => f,
+            None => continue,
+        };
+        resolve_attrs_aliases(&mut state.attributes, &id.resource_type, factory);
+    }
+}
+
+/// Resolve enum aliases in an attribute map.
+fn resolve_attrs_aliases(
+    attrs: &mut HashMap<String, Value>,
+    resource_type: &str,
+    factory: &dyn ProviderFactory,
+) {
+    let keys: Vec<String> = attrs.keys().cloned().collect();
+    for key in keys {
+        if let Some(value) = attrs.get_mut(&key) {
+            resolve_value_alias(value, resource_type, &key, factory);
+        }
+    }
+}
+
+/// Resolve a single value's enum alias, recursing into lists and maps.
+fn resolve_value_alias(
+    value: &mut Value,
+    resource_type: &str,
+    attr_name: &str,
+    factory: &dyn ProviderFactory,
+) {
+    match value {
+        Value::String(s) if utils::is_dsl_enum_format(s) => {
+            let raw = utils::convert_enum_value(s);
+            if let Some(canonical) = factory.get_enum_alias_reverse(resource_type, attr_name, &raw)
+            {
+                *s = canonical.to_string();
+            }
+        }
+        Value::List(items) => {
+            for item in items.iter_mut() {
+                resolve_value_alias(item, resource_type, attr_name, factory);
+            }
+        }
+        Value::Map(map) => {
+            let map_keys: Vec<String> = map.keys().cloned().collect();
+            for map_key in map_keys {
+                if let Some(v) = map.get_mut(&map_key) {
+                    resolve_value_alias(v, resource_type, &map_key, factory);
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 pub fn check_unused_bindings(parsed: &ParsedFile) -> Vec<String> {
@@ -348,6 +441,11 @@ pub async fn create_plan_from_parsed(
     resolve_refs_with_state(&mut resources, &current_states);
     provider.normalize_desired(&mut resources);
 
+    // Resolve enum aliases (e.g., "all" -> "-1") in both desired resources
+    // and current states so the differ sees canonical AWS values.
+    resolve_enum_aliases_with_ctx(&ctx, &mut resources);
+    resolve_enum_aliases_in_states(&ctx, &mut current_states);
+
     // Build lifecycles map from state file for orphaned resource deletion
     let lifecycles = state_file
         .as_ref()
@@ -407,4 +505,166 @@ pub fn compute_anonymous_identifiers(
 ) -> Result<(), AppError> {
     let ctx = WiringContext::new();
     compute_anonymous_identifiers_with_ctx(&ctx, resources, providers)
+}
+
+#[cfg(test)]
+pub fn resolve_enum_aliases(resources: &mut [Resource]) {
+    let ctx = WiringContext::new();
+    resolve_enum_aliases_with_ctx(&ctx, resources)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_resolve_enum_aliases_ip_protocol_all() {
+        // After normalize_desired, ip_protocol "all" becomes a namespaced DSL value.
+        // resolve_enum_aliases should resolve the alias "all" -> "-1".
+        let mut resource =
+            Resource::with_provider("awscc", "ec2.security_group_egress", "test-rule");
+        resource.attributes.insert(
+            "ip_protocol".to_string(),
+            Value::String("awscc.ec2.security_group_egress.IpProtocol.all".to_string()),
+        );
+
+        let mut resources = vec![resource];
+        resolve_enum_aliases(&mut resources);
+
+        assert_eq!(
+            resources[0].attributes.get("ip_protocol"),
+            Some(&Value::String("-1".to_string())),
+            "Alias 'all' should be resolved to canonical AWS value '-1'"
+        );
+    }
+
+    #[test]
+    fn test_resolve_enum_aliases_no_alias() {
+        // "tcp" has no alias mapping, so it should be converted from DSL enum
+        // to its raw form by convert_enum_value but not further changed.
+        let mut resource =
+            Resource::with_provider("awscc", "ec2.security_group_egress", "test-rule");
+        resource.attributes.insert(
+            "ip_protocol".to_string(),
+            Value::String("awscc.ec2.security_group_egress.IpProtocol.tcp".to_string()),
+        );
+
+        let mut resources = vec![resource];
+        resolve_enum_aliases(&mut resources);
+
+        // "tcp" has no alias, so it remains as the namespaced DSL value
+        assert_eq!(
+            resources[0].attributes.get("ip_protocol"),
+            Some(&Value::String(
+                "awscc.ec2.security_group_egress.IpProtocol.tcp".to_string()
+            )),
+        );
+    }
+
+    #[test]
+    fn test_resolve_enum_aliases_aws_provider() {
+        // Same alias resolution should work for the aws provider
+        let mut resource =
+            Resource::with_provider("aws", "ec2.security_group_ingress", "test-rule");
+        resource.attributes.insert(
+            "ip_protocol".to_string(),
+            Value::String("aws.ec2.security_group_ingress.IpProtocol.all".to_string()),
+        );
+
+        let mut resources = vec![resource];
+        resolve_enum_aliases(&mut resources);
+
+        assert_eq!(
+            resources[0].attributes.get("ip_protocol"),
+            Some(&Value::String("-1".to_string())),
+        );
+    }
+
+    #[test]
+    fn test_resolve_enum_aliases_in_states() {
+        // Current states should also have aliases resolved
+        let ctx = WiringContext::new();
+        let id = ResourceId::with_provider("awscc", "ec2.security_group_egress", "test-rule");
+        let mut attrs = HashMap::new();
+        attrs.insert(
+            "ip_protocol".to_string(),
+            Value::String("awscc.ec2.security_group_egress.IpProtocol.all".to_string()),
+        );
+        let state = State::existing(id.clone(), attrs);
+        let mut current_states = HashMap::new();
+        current_states.insert(id.clone(), state);
+
+        super::resolve_enum_aliases_in_states(&ctx, &mut current_states);
+
+        assert_eq!(
+            current_states[&id].attributes.get("ip_protocol"),
+            Some(&Value::String("-1".to_string())),
+        );
+    }
+
+    #[test]
+    fn test_resolve_enum_aliases_in_struct_field() {
+        // Aliases within struct fields (maps inside lists) should also be resolved
+        let mut resource = Resource::with_provider("awscc", "ec2.security_group", "test-sg");
+        let mut egress_map = HashMap::new();
+        egress_map.insert(
+            "ip_protocol".to_string(),
+            Value::String("awscc.ec2.security_group.IpProtocol.all".to_string()),
+        );
+        egress_map.insert(
+            "cidr_ip".to_string(),
+            Value::String("0.0.0.0/0".to_string()),
+        );
+        resource.attributes.insert(
+            "security_group_egress".to_string(),
+            Value::List(vec![Value::Map(egress_map)]),
+        );
+
+        let mut resources = vec![resource];
+        resolve_enum_aliases(&mut resources);
+
+        if let Value::List(items) = &resources[0].attributes["security_group_egress"] {
+            if let Value::Map(m) = &items[0] {
+                assert_eq!(
+                    m.get("ip_protocol"),
+                    Some(&Value::String("-1".to_string())),
+                    "Alias in struct field should be resolved"
+                );
+                assert_eq!(
+                    m.get("cidr_ip"),
+                    Some(&Value::String("0.0.0.0/0".to_string())),
+                    "Non-alias values should not be changed"
+                );
+            } else {
+                panic!("Expected Map in egress list");
+            }
+        } else {
+            panic!("Expected List for security_group_egress");
+        }
+    }
+
+    #[test]
+    fn test_resolve_enum_aliases_non_enum_values_unchanged() {
+        // Non-DSL-enum strings should not be affected
+        let mut resource = Resource::with_provider("awscc", "ec2.security_group", "test-sg");
+        resource.attributes.insert(
+            "group_description".to_string(),
+            Value::String("My security group".to_string()),
+        );
+        resource
+            .attributes
+            .insert("vpc_id".to_string(), Value::String("vpc-12345".to_string()));
+
+        let mut resources = vec![resource];
+        resolve_enum_aliases(&mut resources);
+
+        assert_eq!(
+            resources[0].attributes.get("group_description"),
+            Some(&Value::String("My security group".to_string())),
+        );
+        assert_eq!(
+            resources[0].attributes.get("vpc_id"),
+            Some(&Value::String("vpc-12345".to_string())),
+        );
+    }
 }
