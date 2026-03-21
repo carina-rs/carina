@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::{IsTerminal, Write as _};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -46,7 +47,31 @@ pub(crate) fn format_duration(d: Duration) -> String {
 }
 
 /// CLI observer that prints colored progress output.
-struct CliObserver;
+///
+/// When stdout is a TTY, it shows an in-flight spinner line before each effect
+/// and overwrites it with the result. When piped, the spinner is skipped.
+struct CliObserver {
+    is_tty: bool,
+    /// Length of the last in-flight line (for overwriting with spaces).
+    last_inflight_len: usize,
+}
+
+impl CliObserver {
+    fn new() -> Self {
+        Self {
+            is_tty: std::io::stdout().is_terminal(),
+            last_inflight_len: 0,
+        }
+    }
+
+    /// Clear the in-flight spinner line and move cursor to the start.
+    fn clear_inflight(&self) {
+        if self.is_tty && self.last_inflight_len > 0 {
+            // Overwrite with spaces, then return to start
+            print!("\r{}\r", " ".repeat(self.last_inflight_len));
+        }
+    }
+}
 
 /// Format a progress counter as a dimmed string like "1/10".
 fn format_progress(progress: &ProgressInfo) -> String {
@@ -56,12 +81,22 @@ fn format_progress(progress: &ProgressInfo) -> String {
 impl ExecutionObserver for CliObserver {
     fn on_event(&mut self, event: &ExecutionEvent) {
         match event {
+            ExecutionEvent::EffectStarted { effect } => {
+                if self.is_tty {
+                    let line = format!("  {} {}...", "⠋".cyan(), format_effect(effect));
+                    self.last_inflight_len = line.len();
+                    print!("\r{}", line);
+                    let _ = std::io::stdout().flush();
+                }
+            }
             ExecutionEvent::EffectSucceeded {
                 effect,
                 duration,
                 progress,
                 ..
             } => {
+                self.clear_inflight();
+                self.last_inflight_len = 0;
                 let timing = format!("[{}]", format_duration(*duration)).dimmed();
                 let counter = format_progress(progress).dimmed();
                 println!(
@@ -78,6 +113,8 @@ impl ExecutionObserver for CliObserver {
                 duration,
                 progress,
             } => {
+                self.clear_inflight();
+                self.last_inflight_len = 0;
                 let timing = format!("[{}]", format_duration(*duration)).dimmed();
                 let counter = format_progress(progress).dimmed();
                 println!(
@@ -94,6 +131,8 @@ impl ExecutionObserver for CliObserver {
                 reason,
                 progress,
             } => {
+                self.clear_inflight();
+                self.last_inflight_len = 0;
                 let counter = format_progress(progress).dimmed();
                 println!(
                     "  {} {} - {} {}",
@@ -103,17 +142,24 @@ impl ExecutionObserver for CliObserver {
                     counter
                 );
             }
-            ExecutionEvent::EffectStarted { .. } => {}
             ExecutionEvent::CascadeUpdateSucceeded { id } => {
+                self.clear_inflight();
+                self.last_inflight_len = 0;
                 println!("  {} Update {} (cascade)", "✓".green(), id);
             }
             ExecutionEvent::CascadeUpdateFailed { id, error } => {
+                self.clear_inflight();
+                self.last_inflight_len = 0;
                 println!("  {} Update {} (cascade) - {}", "✗".red(), id, error);
             }
             ExecutionEvent::RenameSucceeded { id, from, to } => {
+                self.clear_inflight();
+                self.last_inflight_len = 0;
                 println!("  {} Rename {} \"{}\" → \"{}\"", "✓".green(), id, from, to);
             }
             ExecutionEvent::RenameFailed { id, error } => {
+                self.clear_inflight();
+                self.last_inflight_len = 0;
                 println!("  {} Rename {} - {}", "✗".red(), id, error);
             }
             ExecutionEvent::RefreshStarted => {
@@ -178,7 +224,7 @@ pub async fn execute_effects(
         current_states: std::mem::take(current_states),
     };
 
-    let mut observer = CliObserver;
+    let mut observer = CliObserver::new();
     let result = carina_core::executor::execute_plan(provider, input, &mut observer).await;
 
     // Write back the updated current_states so callers see refreshes

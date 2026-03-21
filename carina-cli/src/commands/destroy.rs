@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::io::{IsTerminal, Write as _};
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -264,6 +265,8 @@ async fn run_destroy_locked(
 
     let destroy_total = resources_to_destroy.len();
     let mut destroy_completed: usize = 0;
+    let is_tty = std::io::stdout().is_terminal();
+    let mut last_inflight_len: usize = 0;
 
     for resource in &resources_to_destroy {
         let identifier = current_states
@@ -385,10 +388,24 @@ async fn run_destroy_locked(
             continue;
         }
 
+        // Show in-flight spinner
+        if is_tty {
+            let line = format!("  {} {}...", "⠋".cyan(), format_effect(&effect));
+            last_inflight_len = line.len();
+            print!("\r{}", line);
+            let _ = std::io::stdout().flush();
+        }
+
         let started = Instant::now();
         let delete_result = provider
             .delete(&resource.id, &identifier, &resource.lifecycle)
             .await;
+
+        // Clear in-flight spinner
+        if is_tty && last_inflight_len > 0 {
+            print!("\r{}\r", " ".repeat(last_inflight_len));
+            last_inflight_len = 0;
+        }
 
         let counter = format!("{}/{}", destroy_completed, destroy_total).dimmed();
         match delete_result {
