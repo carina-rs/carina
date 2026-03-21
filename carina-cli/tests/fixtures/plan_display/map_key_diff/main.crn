@@ -1,0 +1,16 @@
+# Map key diff: tag added, tag changed, tag removed (OldTag not in desired)
+
+provider awscc {
+  region = awscc.Region.ap_northeast_1
+}
+
+let vpc = awscc.ec2.vpc {
+  cidr_block           = "10.0.0.0/16"
+  enable_dns_support   = true
+  enable_dns_hostnames = true
+
+  tags = {
+    Name        = "main"
+    Environment = "production"
+  }
+}

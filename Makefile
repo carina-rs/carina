@@ -16,6 +16,12 @@ plan-delete:
 plan-compact:
 	cd $(FIXTURES)/compact && $(CARINA) plan --refresh=false --compact main.crn
 
+plan-map-diff:
+	cd $(FIXTURES)/map_key_diff && $(CARINA) plan --refresh=false main.crn
+
+plan-map-diff-tui:
+	cd $(FIXTURES)/map_key_diff && $(CARINA) plan --refresh=false --tui main.crn
+
 plan-all-create-tui:
 	cd $(FIXTURES)/all_create && $(CARINA) plan --refresh=false --tui main.crn
 
@@ -40,6 +46,10 @@ plan-fixtures:
 	@echo ""
 	@echo "=== compact ==="
 	@$(MAKE) plan-compact
+	@echo ""
+	@echo "=== map_key_diff ==="
+	@$(MAKE) plan-map-diff
 
 .PHONY: plan-all-create plan-no-changes plan-mixed plan-delete plan-compact \
+        plan-map-diff plan-map-diff-tui \
         plan-all-create-tui plan-mixed-tui plan-delete-tui plan-fixtures

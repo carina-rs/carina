@@ -6,6 +6,8 @@ use carina_core::plan::PlanSummary;
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
 
+use carina_core::resource::Value;
+
 use crate::app::{App, EffectKind, FocusedPanel};
 
 /// Draw the main layout: tree (70%), detail panel (30%), help bar (1 line)
@@ -144,7 +146,13 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
             let is_changed = changed_set.contains(key.as_str());
 
             if is_changed {
-                if let Some(old_value) = from_map.get(key.as_str()) {
+                // Check if both old and new values are maps for key-level diff
+                let old_raw = node.raw_from_attrs.get(key);
+                let new_raw = node.raw_to_attrs.get(key);
+                if let (Some(Value::Map(old_map)), Some(Value::Map(new_map))) = (old_raw, new_raw) {
+                    lines.push(Line::from(Span::raw(format!("  {}:", key))));
+                    render_map_key_diff(&mut lines, old_map, new_map);
+                } else if let Some(old_value) = from_map.get(key.as_str()) {
                     lines.push(Line::from(vec![
                         Span::raw(format!("  {}: ", key)),
                         Span::styled(
@@ -186,6 +194,60 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
         .wrap(Wrap { trim: false })
         .scroll((app.detail_scroll, 0));
     frame.render_widget(detail, area);
+}
+
+/// Render map key-level diffs into TUI lines.
+///
+/// Shows only changed keys:
+/// - `+ key: "value"` (green) for added keys
+/// - `- key: "value"` (red) for removed keys
+/// - `~ key: "old" -> "new"` (yellow) for changed keys
+fn render_map_key_diff(
+    lines: &mut Vec<Line>,
+    old_map: &std::collections::HashMap<String, Value>,
+    new_map: &std::collections::HashMap<String, Value>,
+) {
+    use crate::app::format_value;
+
+    let mut all_keys: Vec<&String> = old_map.keys().chain(new_map.keys()).collect();
+    all_keys.sort();
+    all_keys.dedup();
+
+    for key in all_keys {
+        let old_val = old_map.get(key);
+        let new_val = new_map.get(key);
+        match (old_val, new_val) {
+            (Some(ov), Some(nv)) => {
+                if !ov.semantically_equal(nv) {
+                    lines.push(Line::from(vec![
+                        Span::raw("    "),
+                        Span::styled("~ ", Style::default().fg(Color::Yellow)),
+                        Span::raw(format!("{}: ", key)),
+                        Span::styled(format_value(ov), Style::default().fg(Color::Red)),
+                        Span::raw(" -> "),
+                        Span::styled(format_value(nv), Style::default().fg(Color::Green)),
+                    ]));
+                }
+            }
+            (None, Some(nv)) => {
+                lines.push(Line::from(vec![
+                    Span::raw("    "),
+                    Span::styled("+ ", Style::default().fg(Color::Green)),
+                    Span::raw(format!("{}: ", key)),
+                    Span::styled(format_value(nv), Style::default().fg(Color::Green)),
+                ]));
+            }
+            (Some(ov), None) => {
+                lines.push(Line::from(vec![
+                    Span::raw("    "),
+                    Span::styled("- ", Style::default().fg(Color::Red)),
+                    Span::raw(format!("{}: ", key)),
+                    Span::styled(format_value(ov), Style::default().fg(Color::Red)),
+                ]));
+            }
+            (None, None) => {}
+        }
+    }
 }
 
 /// Draw the help bar
