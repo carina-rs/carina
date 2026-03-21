@@ -85,7 +85,7 @@ Carina is a functional infrastructure management tool that treats side effects a
 ### Data Flow
 
 ```
-DSL (.crn) → Parser → Resources → Differ → Plan (Effects) → Interpreter → Provider → Infrastructure
+DSL (.crn) → Parser → Resources → Differ → Plan (Effects) → Provider → Infrastructure
 ```
 
 ### Key Abstractions
@@ -93,7 +93,6 @@ DSL (.crn) → Parser → Resources → Differ → Plan (Effects) → Interprete
 - **Effect** (`carina-core/src/effect.rs`): Enum representing side effects (Create, Update, Delete, Read). Effects are values, not executed operations.
 - **Plan** (`carina-core/src/plan.rs`): Collection of Effects. Immutable, can be inspected before execution.
 - **Provider** trait (`carina-core/src/provider.rs`): Async trait for infrastructure operations. Returns `BoxFuture` for async methods.
-- **Interpreter** (`carina-core/src/interpreter.rs`): Executes a Plan by dispatching Effects to a Provider.
 
 ### Crate Structure
 

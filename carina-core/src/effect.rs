@@ -1,7 +1,7 @@
 //! Effect - Representing side effects as values
 //!
 //! An Effect describes "what to do" without actually performing the side effect.
-//! Side effects only occur when the Interpreter executes the Effect.
+//! Side effects only occur when they are executed via a Provider.
 
 use std::collections::HashSet;
 
