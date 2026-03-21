@@ -2,6 +2,8 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{IsTerminal, Write as _};
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use colored::Colorize;
@@ -46,14 +48,21 @@ pub(crate) fn format_duration(d: Duration) -> String {
     }
 }
 
+/// Braille spinner frames for animated progress display.
+pub(crate) const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
 /// CLI observer that prints colored progress output.
 ///
-/// When stdout is a TTY, it shows an in-flight spinner line before each effect
+/// When stdout is a TTY, it shows an animated spinner before each effect
 /// and overwrites it with the result. When piped, the spinner is skipped.
 struct CliObserver {
     is_tty: bool,
     /// Length of the last in-flight line (for overwriting with spaces).
     last_inflight_len: usize,
+    /// Flag to signal the spinner thread to stop.
+    spinner_stop: Arc<AtomicBool>,
+    /// Handle to the spinner animation thread.
+    spinner_thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl CliObserver {
@@ -61,7 +70,42 @@ impl CliObserver {
         Self {
             is_tty: std::io::stdout().is_terminal(),
             last_inflight_len: 0,
+            spinner_stop: Arc::new(AtomicBool::new(false)),
+            spinner_thread: None,
         }
+    }
+
+    /// Start the spinner animation in a background thread.
+    fn start_spinner(&mut self, desc: String) {
+        if !self.is_tty {
+            return;
+        }
+        self.spinner_stop.store(false, Ordering::Relaxed);
+        let stop = self.spinner_stop.clone();
+        // Estimate line length for clearing (use first frame as reference).
+        // "  " + frame + " " + desc + "..."
+        self.last_inflight_len = 2 + SPINNER_FRAMES[0].len() + 1 + desc.len() + 3;
+        self.spinner_thread = Some(std::thread::spawn(move || {
+            let mut i = 0;
+            while !stop.load(Ordering::Relaxed) {
+                let frame = SPINNER_FRAMES[i % SPINNER_FRAMES.len()];
+                // Use raw ANSI escape for cyan since we're in a spawned thread.
+                print!("\r  \x1b[36m{}\x1b[0m {}...", frame, desc);
+                std::io::stdout().flush().ok();
+                std::thread::sleep(Duration::from_millis(80));
+                i += 1;
+            }
+        }));
+    }
+
+    /// Stop the spinner animation and clear the line.
+    fn stop_spinner(&mut self) {
+        self.spinner_stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.spinner_thread.take() {
+            handle.join().ok();
+        }
+        self.clear_inflight();
+        self.last_inflight_len = 0;
     }
 
     /// Clear the in-flight spinner line and move cursor to the start.
@@ -82,12 +126,7 @@ impl ExecutionObserver for CliObserver {
     fn on_event(&mut self, event: &ExecutionEvent) {
         match event {
             ExecutionEvent::EffectStarted { effect } => {
-                if self.is_tty {
-                    let line = format!("  {} {}...", "⠋".cyan(), format_effect(effect));
-                    self.last_inflight_len = line.len();
-                    print!("\r{}", line);
-                    let _ = std::io::stdout().flush();
-                }
+                self.start_spinner(format_effect(effect).to_string());
             }
             ExecutionEvent::EffectSucceeded {
                 effect,
@@ -95,8 +134,7 @@ impl ExecutionObserver for CliObserver {
                 progress,
                 ..
             } => {
-                self.clear_inflight();
-                self.last_inflight_len = 0;
+                self.stop_spinner();
                 let timing = format!("[{}]", format_duration(*duration)).dimmed();
                 let counter = format_progress(progress).dimmed();
                 println!(
@@ -113,8 +151,7 @@ impl ExecutionObserver for CliObserver {
                 duration,
                 progress,
             } => {
-                self.clear_inflight();
-                self.last_inflight_len = 0;
+                self.stop_spinner();
                 let timing = format!("[{}]", format_duration(*duration)).dimmed();
                 let counter = format_progress(progress).dimmed();
                 println!(
@@ -131,8 +168,7 @@ impl ExecutionObserver for CliObserver {
                 reason,
                 progress,
             } => {
-                self.clear_inflight();
-                self.last_inflight_len = 0;
+                self.stop_spinner();
                 let counter = format_progress(progress).dimmed();
                 println!(
                     "  {} {} - {} {}",
@@ -143,23 +179,19 @@ impl ExecutionObserver for CliObserver {
                 );
             }
             ExecutionEvent::CascadeUpdateSucceeded { id } => {
-                self.clear_inflight();
-                self.last_inflight_len = 0;
+                self.stop_spinner();
                 println!("  {} Update {} (cascade)", "✓".green(), id);
             }
             ExecutionEvent::CascadeUpdateFailed { id, error } => {
-                self.clear_inflight();
-                self.last_inflight_len = 0;
+                self.stop_spinner();
                 println!("  {} Update {} (cascade) - {}", "✗".red(), id, error);
             }
             ExecutionEvent::RenameSucceeded { id, from, to } => {
-                self.clear_inflight();
-                self.last_inflight_len = 0;
+                self.stop_spinner();
                 println!("  {} Rename {} \"{}\" → \"{}\"", "✓".green(), id, from, to);
             }
             ExecutionEvent::RenameFailed { id, error } => {
-                self.clear_inflight();
-                self.last_inflight_len = 0;
+                self.stop_spinner();
                 println!("  {} Rename {} - {}", "✗".red(), id, error);
             }
             ExecutionEvent::RefreshStarted => {

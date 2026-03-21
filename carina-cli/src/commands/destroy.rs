@@ -1,7 +1,9 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{IsTerminal, Write as _};
 use std::path::PathBuf;
-use std::time::Instant;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use colored::Colorize;
 
@@ -19,7 +21,7 @@ use carina_state::{
 };
 
 use super::validate_and_resolve;
-use crate::commands::apply::{apply_name_overrides, format_duration};
+use crate::commands::apply::{SPINNER_FRAMES, apply_name_overrides, format_duration};
 use crate::commands::state::map_lock_error;
 use crate::display::format_effect;
 use crate::error::AppError;
@@ -266,6 +268,8 @@ async fn run_destroy_locked(
     let destroy_total = resources_to_destroy.len();
     let mut destroy_completed: usize = 0;
     let is_tty = std::io::stdout().is_terminal();
+    let spinner_stop = Arc::new(AtomicBool::new(false));
+    let mut spinner_thread: Option<std::thread::JoinHandle<()>> = None;
     let mut last_inflight_len: usize = 0;
 
     for resource in &resources_to_destroy {
@@ -388,12 +392,22 @@ async fn run_destroy_locked(
             continue;
         }
 
-        // Show in-flight spinner
+        // Show animated spinner
         if is_tty {
-            let line = format!("  {} {}...", "⠋".cyan(), format_effect(&effect));
-            last_inflight_len = line.len();
-            print!("\r{}", line);
-            let _ = std::io::stdout().flush();
+            let desc = format_effect(&effect).to_string();
+            last_inflight_len = 2 + SPINNER_FRAMES[0].len() + 1 + desc.len() + 3;
+            spinner_stop.store(false, Ordering::Relaxed);
+            let stop = spinner_stop.clone();
+            spinner_thread = Some(std::thread::spawn(move || {
+                let mut i = 0;
+                while !stop.load(Ordering::Relaxed) {
+                    let frame = SPINNER_FRAMES[i % SPINNER_FRAMES.len()];
+                    print!("\r  \x1b[36m{}\x1b[0m {}...", frame, desc);
+                    std::io::stdout().flush().ok();
+                    std::thread::sleep(Duration::from_millis(80));
+                    i += 1;
+                }
+            }));
         }
 
         let started = Instant::now();
@@ -401,7 +415,11 @@ async fn run_destroy_locked(
             .delete(&resource.id, &identifier, &resource.lifecycle)
             .await;
 
-        // Clear in-flight spinner
+        // Stop spinner and clear line
+        spinner_stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = spinner_thread.take() {
+            handle.join().ok();
+        }
         if is_tty && last_inflight_len > 0 {
             print!("\r{}\r", " ".repeat(last_inflight_len));
             last_inflight_len = 0;
