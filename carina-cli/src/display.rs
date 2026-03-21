@@ -639,12 +639,13 @@ pub fn print_plan(plan: &Plan, compact: bool) {
                         );
                         for cascade in cascading_updates {
                             println!(
-                                "{}  ~ {} {}",
+                                "{}    ~ {} {}",
                                 attr_prefix,
                                 cascade.id.display_type().cyan(),
                                 cascade.id.name.magenta()
                             );
-                            let diff = format_cascading_update_diff(cascade, &attr_prefix);
+                            let cascade_prefix = format!("{}    ", attr_prefix);
+                            let diff = format_cascading_update_diff(cascade, &cascade_prefix);
                             if !diff.is_empty() {
                                 println!("{}", diff);
                             }
