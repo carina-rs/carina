@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::time::Instant;
 
 use colored::Colorize;
 
@@ -17,7 +18,7 @@ use carina_state::{
 };
 
 use super::validate_and_resolve;
-use crate::commands::apply::apply_name_overrides;
+use crate::commands::apply::{apply_name_overrides, format_duration};
 use crate::commands::state::map_lock_error;
 use crate::display::format_effect;
 use crate::error::AppError;
@@ -375,13 +376,15 @@ async fn run_destroy_locked(
             continue;
         }
 
+        let started = Instant::now();
         let delete_result = provider
             .delete(&resource.id, &identifier, &resource.lifecycle)
             .await;
 
         match delete_result {
             Ok(()) => {
-                println!("  {} {}", "✓".green(), format_effect(&effect));
+                let timing = format!("[{}]", format_duration(started.elapsed())).dimmed();
+                println!("  {} {} {}", "✓".green(), format_effect(&effect), timing);
                 success_count += 1;
                 destroyed_ids.push(resource.id.clone());
             }
@@ -395,7 +398,14 @@ async fn run_destroy_locked(
                     .insert(binding.clone(), (resource.id.clone(), identifier.clone()));
             }
             Err(e) => {
-                println!("  {} {} - {}", "✗".red(), format_effect(&effect), e);
+                let timing = format!("[{}]", format_duration(started.elapsed())).dimmed();
+                println!(
+                    "  {} {} - {} {}",
+                    "✗".red(),
+                    format_effect(&effect),
+                    e,
+                    timing
+                );
                 failure_count += 1;
                 failed_bindings.insert(binding.clone());
             }

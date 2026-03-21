@@ -32,7 +32,7 @@ use crate::wiring::{
 };
 
 /// Format a duration as a human-readable string like "3.2s" or "1m 5.3s".
-fn format_duration(d: Duration) -> String {
+pub(crate) fn format_duration(d: Duration) -> String {
     let secs = d.as_secs_f64();
     if secs < 60.0 {
         format!("{:.1}s", secs)
@@ -73,17 +73,6 @@ impl ExecutionObserver for CliObserver {
                 println!("  {} {} - {}", "⊘".yellow(), format_effect(effect), reason);
             }
             ExecutionEvent::EffectStarted { .. } => {}
-            ExecutionEvent::ProgressUpdate { completed, total } => {
-                if *completed < *total {
-                    println!(
-                        "{}",
-                        format!("Applying changes... ({}/{})", completed, total)
-                            .cyan()
-                            .bold()
-                    );
-                    println!();
-                }
-            }
             ExecutionEvent::CascadeUpdateSucceeded { id } => {
                 println!("  {} Update {} (cascade)", "✓".green(), id);
             }

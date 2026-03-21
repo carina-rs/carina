@@ -53,10 +53,6 @@ pub enum ExecutionEvent<'a> {
         effect: &'a Effect,
         reason: &'a str,
     },
-    ProgressUpdate {
-        completed: usize,
-        total: usize,
-    },
     CascadeUpdateSucceeded {
         id: &'a ResourceId,
     },
@@ -323,14 +319,6 @@ fn update_binding_map(
     }
 }
 
-/// Count effects that produce progress updates (excludes Read effects).
-fn count_actionable_effects(effects: &[Effect]) -> usize {
-    effects
-        .iter()
-        .filter(|e| !matches!(e, Effect::Read { .. }))
-        .count()
-}
-
 // ---------------------------------------------------------------------------
 // Effect execution: sequential path
 // ---------------------------------------------------------------------------
@@ -350,9 +338,6 @@ async fn execute_effects_sequential(
     let mut permanent_name_overrides: HashMap<ResourceId, HashMap<String, String>> = HashMap::new();
     let mut pending_refreshes: HashMap<ResourceId, String> = HashMap::new();
 
-    let total = count_actionable_effects(input.plan.effects());
-    let mut completed: usize = 0;
-
     for effect in input.plan.effects() {
         // Check if any dependency has failed - skip this effect if so
         if let Some(failed_dep) = find_failed_dependency(effect, &failed_bindings) {
@@ -365,8 +350,6 @@ async fn execute_effects_sequential(
             if let Some(binding) = effect.binding_name() {
                 failed_bindings.insert(binding);
             }
-            completed += 1;
-            observer.on_event(&ExecutionEvent::ProgressUpdate { completed, total });
             continue;
         }
 
@@ -509,11 +492,6 @@ async fn execute_effects_sequential(
                 }
             },
             Effect::Read { .. } => {}
-        }
-
-        if !matches!(effect, Effect::Read { .. }) {
-            completed += 1;
-            observer.on_event(&ExecutionEvent::ProgressUpdate { completed, total });
         }
     }
 
@@ -814,9 +792,6 @@ async fn execute_effects_phased(
     let mut permanent_name_overrides: HashMap<ResourceId, HashMap<String, String>> = HashMap::new();
     let mut pending_refreshes: HashMap<ResourceId, String> = HashMap::new();
 
-    let total = count_actionable_effects(input.plan.effects());
-    let mut completed: usize = 0;
-
     let effects = input.plan.effects();
     let replace_bindings = collect_replace_bindings(effects);
     let sorted_indices = topological_sort_replaces(effects, &replace_bindings);
@@ -836,8 +811,6 @@ async fn execute_effects_phased(
             if let Some(binding) = effect.binding_name() {
                 failed_bindings.insert(binding);
             }
-            completed += 1;
-            observer.on_event(&ExecutionEvent::ProgressUpdate { completed, total });
             continue;
         }
 
@@ -932,11 +905,6 @@ async fn execute_effects_phased(
             Effect::Read { .. } => {}
             Effect::Replace { .. } => unreachable!(),
         }
-
-        if !matches!(effect, Effect::Read { .. }) {
-            completed += 1;
-            observer.on_event(&ExecutionEvent::ProgressUpdate { completed, total });
-        }
     }
 
     // Phase 2: CBD creates in forward dependency order (parents first)
@@ -961,8 +929,6 @@ async fn execute_effects_phased(
                 if let Some(binding) = effect.binding_name() {
                     failed_bindings.insert(binding);
                 }
-                completed += 1;
-                observer.on_event(&ExecutionEvent::ProgressUpdate { completed, total });
                 continue;
             }
 
@@ -1038,8 +1004,6 @@ async fn execute_effects_phased(
                     if let Some(binding) = effect.binding_name() {
                         failed_bindings.insert(binding);
                     }
-                    completed += 1;
-                    observer.on_event(&ExecutionEvent::ProgressUpdate { completed, total });
                 }
             }
         }
@@ -1063,10 +1027,6 @@ async fn execute_effects_phased(
                 });
                 if let Some(binding) = effect.binding_name() {
                     failed_bindings.insert(binding);
-                }
-                if !lifecycle.create_before_destroy {
-                    completed += 1;
-                    observer.on_event(&ExecutionEvent::ProgressUpdate { completed, total });
                 }
                 continue;
             }
@@ -1104,8 +1064,6 @@ async fn execute_effects_phased(
                     if let Some(binding) = effect.binding_name() {
                         failed_bindings.insert(binding);
                     }
-                    completed += 1;
-                    observer.on_event(&ExecutionEvent::ProgressUpdate { completed, total });
                     // For CBD, save the already-created resource state even though delete failed
                     if lifecycle.create_before_destroy
                         && let Some(state) = cbd_create_states.remove(&idx)
@@ -1175,8 +1133,6 @@ async fn execute_effects_phased(
                         });
                         success_count += 1;
                     }
-                    completed += 1;
-                    observer.on_event(&ExecutionEvent::ProgressUpdate { completed, total });
                 }
             } else {
                 // Non-CBD: create the new resource now (after delete in phase 3)
@@ -1226,8 +1182,6 @@ async fn execute_effects_phased(
                         }
                     }
                 }
-                completed += 1;
-                observer.on_event(&ExecutionEvent::ProgressUpdate { completed, total });
             }
         }
     }
@@ -1390,11 +1344,6 @@ mod tests {
                 }
                 ExecutionEvent::EffectSkipped { effect, reason } => {
                     format!("skipped:{}:{}", effect.resource_id(), reason)
-                }
-                ExecutionEvent::ProgressUpdate {
-                    completed, total, ..
-                } => {
-                    format!("progress:{}/{}", completed, total)
                 }
                 ExecutionEvent::CascadeUpdateSucceeded { id } => {
                     format!("cascade_ok:{}", id)
@@ -1816,10 +1765,9 @@ mod tests {
         let mut observer = MockObserver::default();
         execute_plan(&provider, input, &mut observer).await;
 
-        assert_eq!(observer.events.len(), 3);
+        assert_eq!(observer.events.len(), 2);
         assert!(observer.events[0].starts_with("started:"));
         assert!(observer.events[1].starts_with("succeeded:"));
-        assert_eq!(observer.events[2], "progress:1/1");
     }
 
     #[tokio::test]
