@@ -1064,12 +1064,14 @@ fn format_cascading_update_diff(
         let old_str = old_value
             .map(|v| format_value_with_key(v, Some(key)))
             .unwrap_or_else(|| "(none)".to_string());
+        let new_str = format_value_with_key(new_value, Some(key));
         lines.push(format!(
-            "{}    {}: {} → {}",
+            "{}    {}: {} → {} {}",
             attr_prefix,
             key,
             old_str.red(),
-            format_value_with_key(new_value, Some(key)).green()
+            new_str.green(),
+            "(known after apply)".dimmed()
         ));
     }
     lines.join("\n")
