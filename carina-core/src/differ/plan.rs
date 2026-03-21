@@ -156,6 +156,7 @@ pub fn create_plan(
     schemas: &HashMap<String, ResourceSchema>,
     saved_attrs: &HashMap<ResourceId, HashMap<String, Value>>,
     prev_desired_keys: &HashMap<ResourceId, Vec<String>>,
+    orphan_dependencies: &HashMap<ResourceId, Vec<String>>,
 ) -> Plan {
     let mut plan = Plan::new();
 
@@ -296,15 +297,20 @@ pub fn create_plan(
                 Value::String(s) => Some(s.clone()),
                 _ => None,
             });
-            // Build a temporary Resource to extract dependencies from state attributes
-            let temp_resource = Resource {
-                id: id.clone(),
-                attributes: state.attributes.clone(),
-                read_only: false,
-                lifecycle: lifecycle.clone(),
-                prefixes: HashMap::new(),
+            // Use stored dependency bindings from state file if available,
+            // otherwise fall back to extracting from state attributes
+            let dependencies = if let Some(dep_bindings) = orphan_dependencies.get(id) {
+                dep_bindings.iter().cloned().collect()
+            } else {
+                let temp_resource = Resource {
+                    id: id.clone(),
+                    attributes: state.attributes.clone(),
+                    read_only: false,
+                    lifecycle: lifecycle.clone(),
+                    prefixes: HashMap::new(),
+                };
+                get_resource_dependencies(&temp_resource)
             };
-            let dependencies = get_resource_dependencies(&temp_resource);
             plan.add(Effect::Delete {
                 id: id.clone(),
                 identifier,

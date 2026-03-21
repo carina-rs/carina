@@ -327,6 +327,15 @@ pub async fn create_plan_from_parsed(
         }
     }
 
+    // Build orphan dependency bindings from state file for tree structure
+    let orphan_dependencies = if let Some(sf) = state_file.as_ref() {
+        let desired_ids: HashSet<ResourceId> =
+            sorted_resources.iter().map(|r| r.id.clone()).collect();
+        sf.build_orphan_dependencies(&desired_ids)
+    } else {
+        HashMap::new()
+    };
+
     // Restore unreturned attributes from state file (CloudControl doesn't always return them)
     let saved_attrs = state_file
         .as_ref()
@@ -356,6 +365,7 @@ pub async fn create_plan_from_parsed(
         ctx.schemas(),
         &saved_attrs,
         &prev_desired_keys,
+        &orphan_dependencies,
     );
 
     // Populate cascading updates for Replace effects with create_before_destroy.

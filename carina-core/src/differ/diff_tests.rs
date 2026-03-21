@@ -70,6 +70,7 @@ fn create_plan_from_resources() {
         &HashMap::new(),
         &HashMap::new(),
         &HashMap::new(),
+        &HashMap::new(),
     );
 
     assert_eq!(plan.effects().len(), 2);
@@ -90,6 +91,7 @@ fn create_plan_with_read_only_resource() {
     let plan = create_plan(
         &resources,
         &current_states,
+        &HashMap::new(),
         &HashMap::new(),
         &HashMap::new(),
         &HashMap::new(),
@@ -173,6 +175,7 @@ fn create_plan_detects_orphaned_resources_for_deletion() {
         &HashMap::new(),
         &HashMap::new(),
         &HashMap::new(),
+        &HashMap::new(),
     );
 
     // Should have 1 effect: Delete for orphaned-bucket
@@ -214,6 +217,7 @@ fn read_only_resource_always_generates_read_effect() {
     let plan = create_plan(
         &resources,
         &current_states,
+        &HashMap::new(),
         &HashMap::new(),
         &HashMap::new(),
         &HashMap::new(),
@@ -285,6 +289,7 @@ fn replace_when_create_only_attr_changed() {
         &schemas,
         &HashMap::new(),
         &HashMap::new(),
+        &HashMap::new(),
     );
 
     assert_eq!(plan.effects().len(), 1);
@@ -332,6 +337,7 @@ fn normal_update_when_non_create_only_attr_changed() {
         &current_states,
         &HashMap::new(),
         &schemas,
+        &HashMap::new(),
         &HashMap::new(),
         &HashMap::new(),
     );
@@ -394,6 +400,7 @@ fn replace_when_schema_force_replace() {
         &schemas,
         &HashMap::new(),
         &HashMap::new(),
+        &HashMap::new(),
     );
 
     assert_eq!(plan.effects().len(), 1);
@@ -444,6 +451,7 @@ fn replace_when_mix_of_create_only_and_normal_attrs_changed() {
         &schemas,
         &HashMap::new(),
         &HashMap::new(),
+        &HashMap::new(),
     );
 
     assert_eq!(plan.effects().len(), 1);
@@ -491,6 +499,7 @@ fn replace_carries_create_before_destroy_lifecycle() {
         &current_states,
         &HashMap::new(),
         &schemas,
+        &HashMap::new(),
         &HashMap::new(),
         &HashMap::new(),
     );
@@ -584,6 +593,7 @@ fn replace_with_provider_prefixed_schema_key() {
         &current_states,
         &HashMap::new(),
         &schemas,
+        &HashMap::new(),
         &HashMap::new(),
         &HashMap::new(),
     );
@@ -852,6 +862,7 @@ fn orphan_delete_preserves_binding_and_dependencies() {
     let plan = create_plan(
         &desired,
         &current_states,
+        &HashMap::new(),
         &HashMap::new(),
         &HashMap::new(),
         &HashMap::new(),
