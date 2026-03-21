@@ -7,6 +7,7 @@ use std::collections::{HashMap, HashSet};
 
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
+use ratatui::buffer::Buffer;
 
 use carina_core::effect::Effect;
 use carina_core::plan::Plan;
@@ -15,14 +16,8 @@ use carina_core::resource::{LifecycleConfig, Resource, ResourceId, State, Value}
 use crate::app::App;
 use crate::ui::draw;
 
-/// Render the TUI into a string by drawing onto a TestBackend.
-fn render_tui(plan: &Plan, width: u16, height: u16) -> String {
-    let backend = TestBackend::new(width, height);
-    let mut terminal = Terminal::new(backend).unwrap();
-    let mut app = App::new(plan);
-    terminal.draw(|f| draw(f, &mut app)).unwrap();
-
-    let buffer = terminal.backend().buffer().clone();
+/// Convert a ratatui Buffer to a string, trimming trailing whitespace per line.
+fn buffer_to_string(buffer: &Buffer) -> String {
     let mut output = String::new();
     for y in 0..buffer.area.height {
         for x in 0..buffer.area.width {
@@ -38,7 +33,6 @@ fn render_tui(plan: &Plan, width: u16, height: u16) -> String {
         }
         output.push('\n');
     }
-    // Trim trailing whitespace from each line
     output
         .lines()
         .map(|l| l.trim_end())
@@ -46,40 +40,18 @@ fn render_tui(plan: &Plan, width: u16, height: u16) -> String {
         .join("\n")
 }
 
-/// Render the TUI with a specific node selected.
-fn render_tui_with_selection(plan: &Plan, width: u16, height: u16, selection: usize) -> String {
+/// Render the TUI into a string, optionally selecting a specific node.
+fn render_tui(plan: &Plan, width: u16, height: u16, selection: usize) -> String {
     let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend).unwrap();
     let mut app = App::new(plan);
 
-    // Navigate to the desired selection
     for _ in 0..selection {
         app.move_down();
     }
 
     terminal.draw(|f| draw(f, &mut app)).unwrap();
-
-    let buffer = terminal.backend().buffer().clone();
-    let mut output = String::new();
-    for y in 0..buffer.area.height {
-        for x in 0..buffer.area.width {
-            output.push(
-                buffer
-                    .cell((x, y))
-                    .unwrap()
-                    .symbol()
-                    .chars()
-                    .next()
-                    .unwrap_or(' '),
-            );
-        }
-        output.push('\n');
-    }
-    output
-        .lines()
-        .map(|l| l.trim_end())
-        .collect::<Vec<_>>()
-        .join("\n")
+    buffer_to_string(terminal.backend().buffer())
 }
 
 /// Build a plan with VPC + route table + subnet (all Create effects with dependencies).
@@ -221,21 +193,21 @@ fn build_map_key_diff_plan() -> Plan {
 #[test]
 fn snapshot_all_create() {
     let plan = build_all_create_plan();
-    let output = render_tui(&plan, 120, 40);
+    let output = render_tui(&plan, 120, 40, 0);
     insta::assert_snapshot!(output);
 }
 
 #[test]
 fn snapshot_mixed_operations() {
     let plan = build_mixed_operations_plan();
-    let output = render_tui(&plan, 120, 40);
+    let output = render_tui(&plan, 120, 40, 0);
     insta::assert_snapshot!(output);
 }
 
 #[test]
 fn snapshot_map_key_diff() {
     let plan = build_map_key_diff_plan();
-    let output = render_tui(&plan, 120, 40);
+    let output = render_tui(&plan, 120, 40, 0);
     insta::assert_snapshot!(output);
 }
 
@@ -244,22 +216,15 @@ fn snapshot_map_key_diff() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn snapshot_detail_panel_first_node() {
-    let plan = build_all_create_plan();
-    let output = render_tui_with_selection(&plan, 120, 40, 0);
-    insta::assert_snapshot!(output);
-}
-
-#[test]
 fn snapshot_detail_panel_second_node() {
     let plan = build_all_create_plan();
-    let output = render_tui_with_selection(&plan, 120, 40, 1);
+    let output = render_tui(&plan, 120, 40, 1);
     insta::assert_snapshot!(output);
 }
 
 #[test]
 fn snapshot_detail_panel_third_node() {
     let plan = build_all_create_plan();
-    let output = render_tui_with_selection(&plan, 120, 40, 2);
+    let output = render_tui(&plan, 120, 40, 2);
     insta::assert_snapshot!(output);
 }
