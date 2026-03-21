@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use colored::Colorize;
 
 use carina_core::deps::get_resource_dependencies;
-use carina_core::effect::Effect;
+use carina_core::effect::{CascadingUpdate, Effect};
 use carina_core::plan::Plan;
 use carina_core::resource::Value;
 use carina_core::value::{format_value, format_value_with_key, is_list_of_maps, map_similarity};
@@ -639,11 +639,16 @@ pub fn print_plan(plan: &Plan, compact: bool) {
                         );
                         for cascade in cascading_updates {
                             println!(
-                                "{}  ~ {} {}",
+                                "{}    ~ {} {}",
                                 attr_prefix,
                                 cascade.id.display_type().cyan(),
                                 cascade.id.name.magenta()
                             );
+                            let cascade_prefix = format!("{}    ", attr_prefix);
+                            let diff = format_cascading_update_diff(cascade, &cascade_prefix);
+                            if !diff.is_empty() {
+                                println!("{}", diff);
+                            }
                         }
                     }
                 }
@@ -1019,13 +1024,48 @@ pub fn format_list_diff(old_value: Option<&Value>, new_value: &Value, attr_prefi
     lines.join("\n")
 }
 
+/// Format the attribute diffs for a cascading update.
+///
+/// Compares `cascade.from.attributes` with `cascade.to.attributes` and returns
+/// a string showing changed attributes in `key: old → new` format, one per line.
+fn format_cascading_update_diff(cascade: &CascadingUpdate, attr_prefix: &str) -> String {
+    let mut lines = Vec::new();
+    let mut keys: Vec<_> = cascade
+        .to
+        .attributes
+        .keys()
+        .filter(|k| !k.starts_with('_'))
+        .collect();
+    keys.sort();
+    for key in keys {
+        let new_value = &cascade.to.attributes[key];
+        let old_value = cascade.from.attributes.get(key);
+        let is_same = old_value
+            .map(|ov| ov.semantically_equal(new_value))
+            .unwrap_or(false);
+        if !is_same {
+            let old_str = old_value
+                .map(|v| format_value_with_key(v, Some(key)))
+                .unwrap_or_else(|| "(none)".to_string());
+            lines.push(format!(
+                "{}    {}: {} → {}",
+                attr_prefix,
+                key,
+                old_str.red(),
+                format_value_with_key(new_value, Some(key)).green()
+            ));
+        }
+    }
+    lines.join("\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    use carina_core::effect::Effect;
+    use carina_core::effect::{CascadingUpdate, Effect};
     use carina_core::plan::Plan;
-    use carina_core::resource::{Resource, Value};
+    use carina_core::resource::{LifecycleConfig, Resource, ResourceId, State, Value};
 
     fn make_resource(resource_type: &str, name: &str, binding: &str, deps: &[&str]) -> Resource {
         let mut r = Resource::new(resource_type, name);
@@ -1736,5 +1776,123 @@ mod tests {
 
         let hint = extract_compact_hint(&r, None);
         assert_eq!(hint, None, "Internal attributes should be skipped");
+    }
+
+    #[test]
+    fn test_cascading_update_shows_attribute_diffs() {
+        use std::collections::HashMap;
+
+        // Build a Replace effect with a cascading update that changes vpc_id
+        let vpc_from = State::existing(
+            ResourceId::new("ec2.vpc", "vpc"),
+            HashMap::from([(
+                "cidr_block".to_string(),
+                Value::String("10.0.0.0/16".to_string()),
+            )]),
+        );
+        let vpc_to = Resource::new("ec2.vpc", "vpc")
+            .with_attribute("cidr_block", Value::String("10.1.0.0/16".to_string()));
+
+        let subnet_from = State::existing(
+            ResourceId::new("ec2.subnet", "subnet"),
+            HashMap::from([
+                (
+                    "vpc_id".to_string(),
+                    Value::String("vpc-old123".to_string()),
+                ),
+                (
+                    "cidr_block".to_string(),
+                    Value::String("10.0.1.0/24".to_string()),
+                ),
+            ]),
+        );
+        let subnet_to = Resource::new("ec2.subnet", "subnet")
+            .with_attribute(
+                "vpc_id",
+                Value::ResourceRef {
+                    binding_name: "vpc".to_string(),
+                    attribute_name: "vpc_id".to_string(),
+                },
+            )
+            .with_attribute("cidr_block", Value::String("10.0.1.0/24".to_string()));
+
+        let replace_effect = Effect::Replace {
+            id: ResourceId::new("ec2.vpc", "vpc"),
+            from: Box::new(vpc_from),
+            to: vpc_to,
+            lifecycle: LifecycleConfig {
+                create_before_destroy: true,
+                ..Default::default()
+            },
+            changed_create_only: vec!["cidr_block".to_string()],
+            cascading_updates: vec![CascadingUpdate {
+                id: ResourceId::new("ec2.subnet", "subnet"),
+                from: Box::new(subnet_from),
+                to: subnet_to,
+            }],
+            temporary_name: None,
+        };
+
+        let mut plan = Plan::new();
+        plan.add(replace_effect);
+
+        // Should not panic and should display attribute diffs for cascading updates
+        print_plan(&plan, false);
+    }
+
+    #[test]
+    fn test_format_cascading_update_attr_diff() {
+        use std::collections::HashMap;
+
+        let cascade = CascadingUpdate {
+            id: ResourceId::new("ec2.subnet", "subnet"),
+            from: Box::new(State::existing(
+                ResourceId::new("ec2.subnet", "subnet"),
+                HashMap::from([
+                    (
+                        "vpc_id".to_string(),
+                        Value::String("vpc-old123".to_string()),
+                    ),
+                    (
+                        "cidr_block".to_string(),
+                        Value::String("10.0.1.0/24".to_string()),
+                    ),
+                ]),
+            )),
+            to: Resource::new("ec2.subnet", "subnet")
+                .with_attribute(
+                    "vpc_id",
+                    Value::ResourceRef {
+                        binding_name: "vpc".to_string(),
+                        attribute_name: "vpc_id".to_string(),
+                    },
+                )
+                .with_attribute("cidr_block", Value::String("10.0.1.0/24".to_string())),
+        };
+
+        let output = format_cascading_update_diff(&cascade, "    ");
+        // vpc_id should appear in the diff (it changed)
+        assert!(
+            output.contains("vpc_id"),
+            "Expected vpc_id in diff output, got: {}",
+            output
+        );
+        // cidr_block should NOT appear (it's unchanged)
+        assert!(
+            !output.contains("cidr_block"),
+            "cidr_block should not appear in diff output, got: {}",
+            output
+        );
+        // Should show the old value and new value
+        assert!(
+            output.contains("vpc-old123"),
+            "Expected old value in diff, got: {}",
+            output
+        );
+        assert!(
+            output.contains("vpc.vpc_id"),
+            "Expected new value in diff, got: {}",
+            output
+        );
     }
 }
