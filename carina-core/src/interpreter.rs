@@ -93,6 +93,9 @@ impl<P: Provider> Interpreter<P> {
     }
 
     /// Check if the plan contains multiple Replace effects that depend on each other.
+    ///
+    /// Only checks `to` attributes for `_dependency_bindings` because `from` comes from
+    /// provider.read()/state and does not contain resolver metadata.
     fn has_interdependent_replaces(effects: &[Effect]) -> bool {
         let replace_bindings = Self::collect_replace_bindings(effects);
         if replace_bindings.is_empty() {
@@ -101,10 +104,9 @@ impl<P: Provider> Interpreter<P> {
 
         // Check if any Replace effect depends on another Replace effect's binding
         for effect in effects {
-            if let Effect::Replace { from, to, .. } = effect {
-                let dep_bindings_from = Self::extract_dependency_bindings(&from.attributes);
-                let dep_bindings_to = Self::extract_dependency_bindings(&to.attributes);
-                for dep in dep_bindings_from.iter().chain(dep_bindings_to.iter()) {
+            if let Effect::Replace { to, .. } = effect {
+                let dep_bindings = Self::extract_dependency_bindings(&to.attributes);
+                for dep in &dep_bindings {
                     if replace_bindings.contains(dep) {
                         return true;
                     }
@@ -439,21 +441,13 @@ impl<P: Provider> Interpreter<P> {
         }
 
         // Build adjacency: for each replace effect, find which other replace effects it depends on
+        // Only check `to` attributes because `from` comes from provider.read()/state
+        // and does not contain resolver metadata (_dependency_bindings).
         let mut deps: HashMap<usize, Vec<usize>> = HashMap::new();
         for &idx in &replace_indices {
             let effect = &effects[idx];
-            if let Effect::Replace { from, to, .. } = effect {
-                // Check both from and to for dependency bindings
-                let dep_bindings_from = Self::extract_dependency_bindings(&from.attributes);
-                let dep_bindings_to = Self::extract_dependency_bindings(&to.attributes);
-                let mut all_deps = dep_bindings_from;
-                for d in dep_bindings_to {
-                    if !all_deps.contains(&d) {
-                        all_deps.push(d);
-                    }
-                }
-
-                let dep_indices: Vec<usize> = all_deps
+            if let Effect::Replace { to, .. } = effect {
+                let dep_indices: Vec<usize> = Self::extract_dependency_bindings(&to.attributes)
                     .iter()
                     .filter(|b| replace_bindings.contains(*b))
                     .filter_map(|b| binding_to_idx.get(b))
@@ -1303,18 +1297,17 @@ mod tests {
 
         // Effect 1: VPC Replace with create_before_destroy (added to plan first)
         // VPC cidr_block changed → must be replaced
+        // Note: `from` comes from provider.read()/state and does NOT have _binding/_dependency_bindings.
+        // Only `to` (from resolver) has these metadata attributes.
         plan.add(Effect::Replace {
             id: ResourceId::new("ec2.vpc", "my-vpc"),
             from: Box::new(
                 State::existing(
                     ResourceId::new("ec2.vpc", "my-vpc"),
-                    HashMap::from([
-                        (
-                            "cidr_block".to_string(),
-                            Value::String("10.0.0.0/16".to_string()),
-                        ),
-                        ("_binding".to_string(), Value::String("vpc".to_string())),
-                    ]),
+                    HashMap::from([(
+                        "cidr_block".to_string(),
+                        Value::String("10.0.0.0/16".to_string()),
+                    )]),
                 )
                 .with_identifier("vpc-old-id"),
             ),
@@ -1333,6 +1326,8 @@ mod tests {
 
         // Effect 2: Subnet Replace (non-CBD, default delete-then-create)
         // Subnet's vpc_id is create-only and changed because VPC was replaced
+        // Note: `from` comes from provider.read()/state and does NOT have _binding/_dependency_bindings.
+        // Only `to` (from resolver) has these metadata attributes.
         plan.add(Effect::Replace {
             id: ResourceId::new("ec2.subnet", "my-subnet"),
             from: Box::new(
@@ -1346,11 +1341,6 @@ mod tests {
                         (
                             "cidr_block".to_string(),
                             Value::String("10.0.1.0/24".to_string()),
-                        ),
-                        ("_binding".to_string(), Value::String("subnet".to_string())),
-                        (
-                            "_dependency_bindings".to_string(),
-                            Value::List(vec![Value::String("vpc".to_string())]),
                         ),
                     ]),
                 )
