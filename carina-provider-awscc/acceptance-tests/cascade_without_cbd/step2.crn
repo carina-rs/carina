@@ -1,0 +1,37 @@
+# Cascading update without create_before_destroy (Step 2: Replace SG)
+#
+# Changes group_description (create-only attribute), triggering a Replace
+# of the SG WITHOUT create_before_destroy. The ingress rule depends on
+# sg.group_id, so the plan should show it as a cascading update.
+
+provider awscc {
+  region = awscc.Region.ap_northeast_1
+}
+
+let vpc = awscc.ec2.vpc {
+  cidr_block = "10.220.0.0/16"
+
+  tags = {
+    Name        = "carina-acc-test-cascade"
+    Environment = "acceptance-test"
+  }
+}
+
+let sg = awscc.ec2.security_group {
+  vpc_id            = vpc.vpc_id
+  group_description = "Updated description"
+
+  tags = {
+    Name        = "carina-acc-test-cascade-sg"
+    Environment = "acceptance-test"
+  }
+}
+
+awscc.ec2.security_group_ingress {
+  group_id    = sg.group_id
+  ip_protocol = awscc.ec2.security_group_ingress.IpProtocol.tcp
+  from_port   = 443
+  to_port     = 443
+  cidr_ip     = "10.220.0.0/16"
+  description = "Allow HTTPS from VPC"
+}
