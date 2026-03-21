@@ -262,6 +262,9 @@ async fn run_destroy_locked(
     // timed_out_resources: binding -> (ResourceId, identifier)
     let mut timed_out_resources: HashMap<String, (ResourceId, String)> = HashMap::new();
 
+    let destroy_total = resources_to_destroy.len();
+    let mut destroy_completed: usize = 0;
+
     for resource in &resources_to_destroy {
         let identifier = current_states
             .get(&resource.id)
@@ -289,14 +292,18 @@ async fn run_destroy_locked(
             })
             .unwrap_or_else(|| format!("{}:{}", resource.id.resource_type, resource.id.name));
 
+        destroy_completed += 1;
+
         // Check if any dependent has actually failed (non-timeout)
         if let Some(failed_dep) = find_failed_dependent(&binding, &dependents_map, &failed_bindings)
         {
+            let counter = format!("{}/{}", destroy_completed, destroy_total).dimmed();
             println!(
-                "  {} {} - skipped (dependent {} failed)",
+                "  {} {} - skipped (dependent {} failed) {}",
                 "⊘".yellow(),
                 format_effect(&effect),
-                failed_dep
+                failed_dep,
+                counter
             );
             skip_count += 1;
             continue;
@@ -367,10 +374,12 @@ async fn run_destroy_locked(
         }
 
         if wait_failed {
+            let counter = format!("{}/{}", destroy_completed, destroy_total).dimmed();
             println!(
-                "  {} {} - skipped (dependent deletion did not complete)",
+                "  {} {} - skipped (dependent deletion did not complete) {}",
                 "⊘".yellow(),
-                format_effect(&effect)
+                format_effect(&effect),
+                counter
             );
             skip_count += 1;
             continue;
@@ -381,10 +390,17 @@ async fn run_destroy_locked(
             .delete(&resource.id, &identifier, &resource.lifecycle)
             .await;
 
+        let counter = format!("{}/{}", destroy_completed, destroy_total).dimmed();
         match delete_result {
             Ok(()) => {
                 let timing = format!("[{}]", format_duration(started.elapsed())).dimmed();
-                println!("  {} {} {}", "✓".green(), format_effect(&effect), timing);
+                println!(
+                    "  {} {} {} {}",
+                    "✓".green(),
+                    format_effect(&effect),
+                    timing,
+                    counter
+                );
                 success_count += 1;
                 destroyed_ids.push(resource.id.clone());
             }
@@ -400,11 +416,12 @@ async fn run_destroy_locked(
             Err(e) => {
                 let timing = format!("[{}]", format_duration(started.elapsed())).dimmed();
                 println!(
-                    "  {} {} - {} {}",
+                    "  {} {} - {} {} {}",
                     "✗".red(),
                     format_effect(&effect),
                     e,
-                    timing
+                    timing,
+                    counter
                 );
                 failure_count += 1;
                 failed_bindings.insert(binding.clone());

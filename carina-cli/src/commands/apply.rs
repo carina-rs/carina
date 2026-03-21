@@ -9,7 +9,9 @@ use carina_core::config_loader::{get_base_dir, load_configuration};
 use carina_core::deps::sort_resources_by_dependencies;
 use carina_core::differ::{cascade_dependent_updates, create_plan};
 use carina_core::effect::Effect;
-use carina_core::executor::{ExecutionEvent, ExecutionInput, ExecutionObserver, ExecutionResult};
+use carina_core::executor::{
+    ExecutionEvent, ExecutionInput, ExecutionObserver, ExecutionResult, ProgressInfo,
+};
 use carina_core::module_resolver;
 use carina_core::plan::Plan;
 use carina_core::provider::{self as provider_mod, Provider, ProviderNormalizer};
@@ -46,31 +48,60 @@ pub(crate) fn format_duration(d: Duration) -> String {
 /// CLI observer that prints colored progress output.
 struct CliObserver;
 
+/// Format a progress counter as a dimmed string like "1/10".
+fn format_progress(progress: &ProgressInfo) -> String {
+    format!("{}/{}", progress.completed, progress.total)
+}
+
 impl ExecutionObserver for CliObserver {
     fn on_event(&mut self, event: &ExecutionEvent) {
         match event {
             ExecutionEvent::EffectSucceeded {
-                effect, duration, ..
+                effect,
+                duration,
+                progress,
+                ..
             } => {
                 let timing = format!("[{}]", format_duration(*duration)).dimmed();
-                println!("  {} {} {}", "✓".green(), format_effect(effect), timing);
+                let counter = format_progress(progress).dimmed();
+                println!(
+                    "  {} {} {} {}",
+                    "✓".green(),
+                    format_effect(effect),
+                    timing,
+                    counter
+                );
             }
             ExecutionEvent::EffectFailed {
                 effect,
                 error,
                 duration,
+                progress,
             } => {
                 let timing = format!("[{}]", format_duration(*duration)).dimmed();
+                let counter = format_progress(progress).dimmed();
                 println!(
-                    "  {} {} - {} {}",
+                    "  {} {} - {} {} {}",
                     "✗".red(),
                     format_effect(effect),
                     error,
-                    timing
+                    timing,
+                    counter
                 );
             }
-            ExecutionEvent::EffectSkipped { effect, reason } => {
-                println!("  {} {} - {}", "⊘".yellow(), format_effect(effect), reason);
+            ExecutionEvent::EffectSkipped {
+                effect,
+                reason,
+                progress,
+            } => {
+                let counter = format_progress(progress).dimmed();
+                println!(
+                    "  {} {} - {} {}",
+                    "⊘".yellow(),
+                    format_effect(effect),
+                    reason,
+                    counter
+                );
             }
             ExecutionEvent::EffectStarted { .. } => {}
             ExecutionEvent::CascadeUpdateSucceeded { id } => {
