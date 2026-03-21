@@ -5,11 +5,27 @@ use std::collections::{HashMap, HashSet};
 use crate::effect::Effect;
 use crate::resource::{Resource, Value};
 
-/// Extract binding names that a resource depends on
+/// Extract binding names that a resource depends on.
+///
+/// First checks for `ResourceRef` values in attributes. If none are found,
+/// falls back to `_dependency_bindings` metadata (saved by `resolve_refs_with_state`
+/// before ResourceRef values were resolved to plain strings).
 pub fn get_resource_dependencies(resource: &Resource) -> HashSet<String> {
     let mut deps = HashSet::new();
     for value in resource.attributes.values() {
         collect_dependencies(value, &mut deps);
+    }
+    // Fall back to pre-computed dependency bindings if no ResourceRef deps found.
+    // This handles the case where resolve_refs_with_state() has already replaced
+    // ResourceRef values with plain strings.
+    if deps.is_empty()
+        && let Some(Value::List(bindings)) = resource.attributes.get("_dependency_bindings")
+    {
+        for b in bindings {
+            if let Value::String(name) = b {
+                deps.insert(name.clone());
+            }
+        }
     }
     deps
 }
