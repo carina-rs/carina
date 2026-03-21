@@ -723,6 +723,12 @@ async fn run_apply_locked(
     let mut resources_for_plan = sorted_resources.clone();
     resolve_refs_with_state(&mut resources_for_plan, &current_states);
     provider.normalize_desired(&mut resources_for_plan);
+
+    // Resolve enum aliases (e.g., "all" -> "-1") in both desired resources
+    // and current states so the plan shows canonical AWS values.
+    crate::wiring::resolve_enum_aliases_with_ctx(ctx, &mut resources_for_plan);
+    crate::wiring::resolve_enum_aliases_in_states(ctx, &mut current_states);
+
     let lifecycles = state_file
         .as_ref()
         .map(|sf| sf.build_lifecycles())

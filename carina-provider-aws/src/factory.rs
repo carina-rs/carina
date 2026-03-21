@@ -68,4 +68,13 @@ impl ProviderFactory for AwsProviderFactory {
     fn region_completions(&self) -> Vec<carina_core::schema::CompletionValue> {
         carina_aws_types::region_completions("aws")
     }
+
+    fn get_enum_alias_reverse(
+        &self,
+        resource_type: &str,
+        attr_name: &str,
+        value: &str,
+    ) -> Option<&'static str> {
+        crate::schemas::generated::get_enum_alias_reverse(resource_type, attr_name, value)
+    }
 }

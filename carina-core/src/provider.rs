@@ -321,6 +321,21 @@ pub trait ProviderFactory: Send + Sync {
     fn region_completions(&self) -> Vec<crate::schema::CompletionValue> {
         vec![]
     }
+
+    /// Maps a DSL alias value back to the canonical AWS value.
+    ///
+    /// For example, `("ec2.security_group_ingress", "ip_protocol", "all")` returns
+    /// `Some("-1")` because `"all"` is a DSL alias for the AWS value `"-1"`.
+    ///
+    /// Returns `None` if no alias mapping exists (the value is already canonical).
+    fn get_enum_alias_reverse(
+        &self,
+        _resource_type: &str,
+        _attr_name: &str,
+        _value: &str,
+    ) -> Option<&'static str> {
+        None
+    }
 }
 
 /// Find a factory by provider name.
