@@ -1,0 +1,10 @@
+# Test that enum identifiers display as resolved values in plan output
+
+provider awscc {
+  region = awscc.Region.ap_northeast_1
+}
+
+awscc.ec2.vpc {
+  cidr_block       = "10.0.0.0/16"
+  instance_tenancy = awscc.ec2.vpc.InstanceTenancy.dedicated
+}
