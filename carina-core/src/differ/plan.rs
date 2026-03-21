@@ -295,16 +295,18 @@ pub fn create_plan(
 ///
 /// 1. Finds all Replace effects with create_before_destroy = true
 /// 2. Identifies dependent resources that reference the replaced resource's binding
-/// 3. Adds CascadingUpdate entries to the Replace effect with the unresolved
-///    resource (containing ResourceRef values) so apply can re-resolve using the
-///    new resource's state
+/// 3. If the referencing attribute is create-only on the dependent (per `schemas`),
+///    promotes the dependent to its own Replace effect in the plan
+/// 4. Otherwise, adds a CascadingUpdate entry to the parent Replace effect
 ///
 /// `unresolved_resources` should be the resources BEFORE ref resolution (still containing
 /// ResourceRef values). `current_states` provides the `from` state for each dependent.
+/// `schemas` provides attribute metadata to detect create-only attributes.
 pub fn cascade_dependent_updates(
     plan: &mut Plan,
     unresolved_resources: &[Resource],
     current_states: &HashMap<ResourceId, State>,
+    schemas: &HashMap<String, ResourceSchema>,
 ) {
     // Build binding/key -> unresolved resource mapping.
     // Uses the same key logic as the dependent lookup below so anonymous resources
@@ -373,9 +375,11 @@ pub fn cascade_dependent_updates(
         }
     }
 
-    // Build cascading updates for each Replace effect
-    // We need to collect updates first, then mutate the plan
+    // Build cascading updates for each Replace effect.
+    // Dependents whose affected attributes are create-only get promoted to
+    // their own Replace effect instead of being added as a CascadingUpdate.
     let mut updates_by_replaced_binding: HashMap<String, Vec<CascadingUpdate>> = HashMap::new();
+    let mut promoted_replaces: Vec<Effect> = Vec::new();
 
     for (replaced_binding, dependent_bindings) in &dependents_of_replaced {
         for dep_binding in dependent_bindings {
@@ -385,7 +389,31 @@ pub fn cascade_dependent_updates(
                     .cloned()
                     .unwrap_or_else(|| State::not_found(unresolved.id.clone()));
 
-                if from.exists {
+                if !from.exists {
+                    continue;
+                }
+
+                // Find which attributes on this dependent hold a ResourceRef
+                // pointing to the replaced binding
+                let ref_attrs: Vec<String> = unresolved
+                    .attributes
+                    .iter()
+                    .filter(|(_, v)| {
+                        matches!(v, Value::ResourceRef { binding_name, .. } if binding_name == replaced_binding)
+                    })
+                    .map(|(k, _)| k.clone())
+                    .collect();
+
+                // Check if any of those attributes are create-only
+                let create_only_refs = find_changed_create_only(
+                    &unresolved.id.provider,
+                    &unresolved.id.resource_type,
+                    &ref_attrs,
+                    schemas,
+                );
+
+                if create_only_refs.is_empty() {
+                    // Normal cascading update
                     updates_by_replaced_binding
                         .entry(replaced_binding.clone())
                         .or_default()
@@ -394,6 +422,17 @@ pub fn cascade_dependent_updates(
                             from: Box::new(from),
                             to: (*unresolved).clone(),
                         });
+                } else {
+                    // Promote to a separate Replace effect
+                    promoted_replaces.push(Effect::Replace {
+                        id: unresolved.id.clone(),
+                        from: Box::new(from),
+                        to: (*unresolved).clone(),
+                        lifecycle: unresolved.lifecycle.clone(),
+                        changed_create_only: create_only_refs,
+                        cascading_updates: vec![],
+                        temporary_name: None,
+                    });
                 }
             }
         }
@@ -401,4 +440,9 @@ pub fn cascade_dependent_updates(
 
     // Apply cascading updates to the plan's Replace effects
     plan.set_cascading_updates(&replaced_bindings, &updates_by_replaced_binding);
+
+    // Add promoted Replace effects to the plan
+    for effect in promoted_replaces {
+        plan.add(effect);
+    }
 }

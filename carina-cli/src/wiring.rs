@@ -361,7 +361,7 @@ pub async fn create_plan_from_parsed(
     // Populate cascading updates for Replace effects with create_before_destroy.
     // Uses unresolved resources (sorted_resources) so dependent Update effects
     // retain ResourceRef values for re-resolution at apply time.
-    cascade_dependent_updates(&mut plan, &sorted_resources, &current_states);
+    cascade_dependent_updates(&mut plan, &sorted_resources, &current_states, ctx.schemas());
 
     Ok(PlanContext {
         plan,
