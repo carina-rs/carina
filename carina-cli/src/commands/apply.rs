@@ -450,6 +450,7 @@ pub async fn execute_effects(
                 id,
                 identifier,
                 lifecycle,
+                ..
             } => match provider.delete(id, identifier, lifecycle).await {
                 Ok(()) => {
                     println!("  {} {}", "✓".green(), format_effect(effect));

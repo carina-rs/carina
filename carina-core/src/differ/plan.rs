@@ -271,10 +271,17 @@ pub fn create_plan(
                     .and_then(|s| s.identifier.clone())
                     .unwrap_or_default();
                 let lifecycle = resource.lifecycle.clone();
+                let binding = resource.attributes.get("_binding").and_then(|v| match v {
+                    Value::String(s) => Some(s.clone()),
+                    _ => None,
+                });
+                let dependencies = get_resource_dependencies(resource);
                 plan.add(Effect::Delete {
                     id,
                     identifier,
                     lifecycle,
+                    binding,
+                    dependencies,
                 });
             }
         }
@@ -289,6 +296,8 @@ pub fn create_plan(
                 id: id.clone(),
                 identifier,
                 lifecycle,
+                binding: None,
+                dependencies: HashSet::new(),
             });
         }
     }

@@ -3,6 +3,8 @@
 //! An Effect describes "what to do" without actually performing the side effect.
 //! Side effects only occur when the Interpreter executes the Effect.
 
+use std::collections::HashSet;
+
 use serde::{Deserialize, Serialize};
 
 use crate::resource::{LifecycleConfig, Resource, ResourceId, State};
@@ -83,6 +85,12 @@ pub enum Effect {
         identifier: String,
         #[serde(default)]
         lifecycle: LifecycleConfig,
+        /// The binding name of the deleted resource (for plan tree display)
+        #[serde(default)]
+        binding: Option<String>,
+        /// Binding names this resource depended on (for plan tree display)
+        #[serde(default)]
+        dependencies: HashSet<String>,
     },
 }
 
@@ -129,6 +137,9 @@ impl Effect {
     /// Returns the binding name for this effect's resource, if it has one.
     pub fn binding_name(&self) -> Option<String> {
         use crate::resource::Value;
+        if let Effect::Delete { binding, .. } = self {
+            return binding.clone();
+        }
         self.resource().and_then(|r| {
             r.attributes.get("_binding").and_then(|v| match v {
                 Value::String(s) => Some(s.clone()),
@@ -178,6 +189,8 @@ mod tests {
             id: ResourceId::new("test", "a"),
             identifier: "id-123".to_string(),
             lifecycle: LifecycleConfig::default(),
+            binding: None,
+            dependencies: HashSet::new(),
         };
         assert!(effect.resource().is_none());
     }
@@ -244,6 +257,8 @@ mod tests {
                 id: ResourceId::new("s3.bucket", "old-bucket"),
                 identifier: "old-bucket".to_string(),
                 lifecycle: LifecycleConfig::default(),
+                binding: None,
+                dependencies: HashSet::new(),
             },
         ];
 

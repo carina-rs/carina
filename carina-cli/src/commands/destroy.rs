@@ -5,7 +5,8 @@ use colored::Colorize;
 
 use carina_core::config_loader::{get_base_dir, load_configuration};
 use carina_core::deps::{
-    build_dependents_map, find_failed_dependent, sort_resources_by_dependencies,
+    build_dependents_map, find_failed_dependent, get_resource_dependencies,
+    sort_resources_by_dependencies,
 };
 use carina_core::effect::Effect;
 use carina_core::provider::Provider;
@@ -265,10 +266,17 @@ async fn run_destroy_locked(
             .get(&resource.id)
             .and_then(|s| s.identifier.clone())
             .unwrap_or_default();
+        let binding = resource.attributes.get("_binding").and_then(|v| match v {
+            Value::String(s) => Some(s.clone()),
+            _ => None,
+        });
+        let dependencies = get_resource_dependencies(resource);
         let effect = Effect::Delete {
             id: resource.id.clone(),
             identifier: identifier.clone(),
             lifecycle: resource.lifecycle.clone(),
+            binding,
+            dependencies,
         };
 
         let binding = resource

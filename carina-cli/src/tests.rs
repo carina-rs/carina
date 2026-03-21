@@ -249,6 +249,8 @@ fn plan_file_serde_round_trip() {
         id: ResourceId::with_provider("aws", "s3.bucket", "old-bucket"),
         identifier: "old-bucket".to_string(),
         lifecycle: LifecycleConfig::default(),
+        binding: None,
+        dependencies: HashSet::new(),
     });
 
     let sorted_resources = vec![

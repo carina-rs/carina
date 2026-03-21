@@ -211,7 +211,25 @@ fn build_tree_structure(plan: &Plan, nodes: &mut [TreeNode]) {
             Effect::Update { to, .. } => (Some(to), get_resource_dependencies(to)),
             Effect::Replace { to, .. } => (Some(to), get_resource_dependencies(to)),
             Effect::Read { resource } => (Some(resource), get_resource_dependencies(resource)),
-            Effect::Delete { .. } => (None, HashSet::new()),
+            Effect::Delete {
+                id,
+                binding,
+                dependencies,
+                ..
+            } => {
+                let deps = dependencies.clone();
+                if let Some(b) = binding {
+                    binding_to_effect.insert(b.clone(), idx);
+                    effect_bindings.insert(idx, b.clone());
+                } else {
+                    let fallback = id.to_string();
+                    binding_to_effect.insert(fallback.clone(), idx);
+                    effect_bindings.insert(idx, fallback);
+                }
+                effect_types.insert(idx, id.resource_type.clone());
+                effect_deps.insert(idx, deps);
+                continue;
+            }
         };
 
         if let Some(r) = resource {
@@ -706,6 +724,8 @@ mod tests {
             id: ResourceId::new("s3.bucket", "old-bucket"),
             identifier: "old-bucket-id".to_string(),
             lifecycle: LifecycleConfig::default(),
+            binding: None,
+            dependencies: HashSet::new(),
         });
 
         let app = App::new(&plan);
