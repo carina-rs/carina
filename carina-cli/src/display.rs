@@ -637,6 +637,14 @@ pub fn print_plan(plan: &Plan, compact: bool) {
                             attr_prefix,
                             cascading_updates.len()
                         );
+                        let replaced_binding = to
+                            .attributes
+                            .get("_binding")
+                            .and_then(|v| match v {
+                                Value::String(s) => Some(s.as_str()),
+                                _ => None,
+                            })
+                            .unwrap_or("");
                         for cascade in cascading_updates {
                             println!(
                                 "{}    ~ {} {}",
@@ -645,7 +653,11 @@ pub fn print_plan(plan: &Plan, compact: bool) {
                                 cascade.id.name.magenta()
                             );
                             let cascade_prefix = format!("{}    ", attr_prefix);
-                            let diff = format_cascading_update_diff(cascade, &cascade_prefix);
+                            let diff = format_cascading_update_diff(
+                                cascade,
+                                &cascade_prefix,
+                                replaced_binding,
+                            );
                             if !diff.is_empty() {
                                 println!("{}", diff);
                             }
@@ -1026,9 +1038,15 @@ pub fn format_list_diff(old_value: Option<&Value>, new_value: &Value, attr_prefi
 
 /// Format the attribute diffs for a cascading update.
 ///
-/// Compares `cascade.from.attributes` with `cascade.to.attributes` and returns
-/// a string showing changed attributes in `key: old → new` format, one per line.
-fn format_cascading_update_diff(cascade: &CascadingUpdate, attr_prefix: &str) -> String {
+/// Only shows attributes whose value in `cascade.to` is a `Value::ResourceRef`
+/// (or a `Value::List` containing a `ResourceRef`) that references the
+/// `replaced_binding`. This avoids false diffs caused by DSL vs AWS format
+/// mismatches on unrelated attributes (issue #958).
+fn format_cascading_update_diff(
+    cascade: &CascadingUpdate,
+    attr_prefix: &str,
+    replaced_binding: &str,
+) -> String {
     let mut lines = Vec::new();
     let mut keys: Vec<_> = cascade
         .to
@@ -1039,24 +1057,35 @@ fn format_cascading_update_diff(cascade: &CascadingUpdate, attr_prefix: &str) ->
     keys.sort();
     for key in keys {
         let new_value = &cascade.to.attributes[key];
-        let old_value = cascade.from.attributes.get(key);
-        let is_same = old_value
-            .map(|ov| ov.semantically_equal(new_value))
-            .unwrap_or(false);
-        if !is_same {
-            let old_str = old_value
-                .map(|v| format_value_with_key(v, Some(key)))
-                .unwrap_or_else(|| "(none)".to_string());
-            lines.push(format!(
-                "{}    {}: {} → {}",
-                attr_prefix,
-                key,
-                old_str.red(),
-                format_value_with_key(new_value, Some(key)).green()
-            ));
+        if !value_references_binding(new_value, replaced_binding) {
+            continue;
         }
+        let old_value = cascade.from.attributes.get(key);
+        let old_str = old_value
+            .map(|v| format_value_with_key(v, Some(key)))
+            .unwrap_or_else(|| "(none)".to_string());
+        lines.push(format!(
+            "{}    {}: {} → {}",
+            attr_prefix,
+            key,
+            old_str.red(),
+            format_value_with_key(new_value, Some(key)).green()
+        ));
     }
     lines.join("\n")
+}
+
+/// Check whether a Value references the given binding name.
+///
+/// Returns true for `Value::ResourceRef` with matching `binding_name`,
+/// or `Value::List` / `Value::Map` containing such a reference.
+fn value_references_binding(value: &Value, binding: &str) -> bool {
+    match value {
+        Value::ResourceRef { binding_name, .. } => binding_name == binding,
+        Value::List(items) => items.iter().any(|v| value_references_binding(v, binding)),
+        Value::Map(map) => map.values().any(|v| value_references_binding(v, binding)),
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -1870,14 +1899,14 @@ mod tests {
                 .with_attribute("cidr_block", Value::String("10.0.1.0/24".to_string())),
         };
 
-        let output = format_cascading_update_diff(&cascade, "    ");
-        // vpc_id should appear in the diff (it changed)
+        let output = format_cascading_update_diff(&cascade, "    ", "vpc");
+        // vpc_id references the replaced binding "vpc", so it should appear
         assert!(
             output.contains("vpc_id"),
             "Expected vpc_id in diff output, got: {}",
             output
         );
-        // cidr_block should NOT appear (it's unchanged)
+        // cidr_block does not reference the replaced binding, so it should NOT appear
         assert!(
             !output.contains("cidr_block"),
             "cidr_block should not appear in diff output, got: {}",
@@ -1892,6 +1921,107 @@ mod tests {
         assert!(
             output.contains("vpc.vpc_id"),
             "Expected new value in diff, got: {}",
+            output
+        );
+    }
+
+    /// Test that cascading update diff only shows attributes referencing the replaced binding,
+    /// not attributes with false diffs due to DSL vs AWS format mismatch (issue #958).
+    #[test]
+    fn test_format_cascading_update_diff_excludes_non_ref_attributes() {
+        use std::collections::HashMap;
+
+        let cascade = CascadingUpdate {
+            id: ResourceId::new("ec2.subnet", "subnet"),
+            from: Box::new(State::existing(
+                ResourceId::new("ec2.subnet", "subnet"),
+                HashMap::from([
+                    (
+                        "vpc_id".to_string(),
+                        Value::String("vpc-old123".to_string()),
+                    ),
+                    (
+                        "availability_zone".to_string(),
+                        Value::String("ap-northeast-1a".to_string()),
+                    ),
+                    (
+                        "cidr_block".to_string(),
+                        Value::String("10.0.1.0/24".to_string()),
+                    ),
+                ]),
+            )),
+            to: Resource::new("ec2.subnet", "subnet")
+                .with_attribute(
+                    "vpc_id",
+                    Value::ResourceRef {
+                        binding_name: "vpc".to_string(),
+                        attribute_name: "vpc_id".to_string(),
+                    },
+                )
+                .with_attribute(
+                    "availability_zone",
+                    Value::UnresolvedIdent(
+                        "awscc.AvailabilityZone.ap_northeast_1a".to_string(),
+                        None,
+                    ),
+                )
+                .with_attribute("cidr_block", Value::String("10.0.1.0/24".to_string())),
+        };
+
+        let replaced_binding = "vpc";
+        let output = format_cascading_update_diff(&cascade, "    ", replaced_binding);
+
+        // vpc_id references the replaced binding "vpc", so it SHOULD appear
+        assert!(
+            output.contains("vpc_id"),
+            "Expected vpc_id in diff output, got: {}",
+            output
+        );
+        // availability_zone does NOT reference the replaced binding, so it should NOT appear
+        // (this was the false diff in issue #958)
+        assert!(
+            !output.contains("availability_zone"),
+            "availability_zone should not appear in diff (false diff), got: {}",
+            output
+        );
+        // cidr_block does NOT reference the replaced binding, so it should NOT appear
+        assert!(
+            !output.contains("cidr_block"),
+            "cidr_block should not appear in diff, got: {}",
+            output
+        );
+    }
+
+    /// Test that cascading update diff shows List attributes containing ResourceRef
+    /// to the replaced binding (e.g., security_group_ids = [sg.group_id]).
+    #[test]
+    fn test_format_cascading_update_diff_includes_list_with_ref() {
+        use std::collections::HashMap;
+
+        let cascade = CascadingUpdate {
+            id: ResourceId::new("ec2.instance", "instance"),
+            from: Box::new(State::existing(
+                ResourceId::new("ec2.instance", "instance"),
+                HashMap::from([(
+                    "security_group_ids".to_string(),
+                    Value::List(vec![Value::String("sg-old123".to_string())]),
+                )]),
+            )),
+            to: Resource::new("ec2.instance", "instance").with_attribute(
+                "security_group_ids",
+                Value::List(vec![Value::ResourceRef {
+                    binding_name: "sg".to_string(),
+                    attribute_name: "group_id".to_string(),
+                }]),
+            ),
+        };
+
+        let replaced_binding = "sg";
+        let output = format_cascading_update_diff(&cascade, "    ", replaced_binding);
+
+        assert!(
+            output.contains("security_group_ids"),
+            "Expected security_group_ids in diff output, got: {}",
             output
         );
     }
