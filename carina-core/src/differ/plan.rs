@@ -325,14 +325,12 @@ pub fn cascade_dependent_updates(
     // Build reverse dependency map: replaced_binding -> [dependent_bindings]
     let mut dependents_of_replaced: HashMap<String, Vec<String>> = HashMap::new();
 
-    // Collect binding names of resources being replaced with create_before_destroy
+    // Collect binding names of resources being replaced
     let replaced_bindings: HashSet<String> = plan
         .effects()
         .iter()
         .filter_map(|e| {
-            if let Effect::Replace { lifecycle, .. } = e
-                && lifecycle.create_before_destroy
-            {
+            if let Effect::Replace { .. } = e {
                 return e.binding_name();
             }
             None

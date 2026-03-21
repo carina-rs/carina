@@ -1,0 +1,29 @@
+# Cascading update without create_before_destroy (Step 1: Initial)
+#
+# Creates a VPC and a subnet. Step 2 changes cidr_block (create-only),
+# triggering a Replace of the VPC. The subnet depends on the VPC via
+# vpc_id, so it should appear as a cascading update in the plan.
+
+provider awscc {
+  region = awscc.Region.ap_northeast_1
+}
+
+let vpc = awscc.ec2.vpc {
+  cidr_block = "10.220.0.0/16"
+
+  tags = {
+    Name        = "carina-acc-test-cascade-vpc"
+    Environment = "acceptance-test"
+  }
+}
+
+let subnet = awscc.ec2.subnet {
+  vpc_id            = vpc.vpc_id
+  cidr_block        = "10.220.1.0/24"
+  availability_zone = "ap-northeast-1a"
+
+  tags = {
+    Name        = "carina-acc-test-cascade-subnet"
+    Environment = "acceptance-test"
+  }
+}

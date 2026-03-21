@@ -43,11 +43,9 @@ impl Plan {
         for effect in &mut self.effects {
             if let Effect::Replace {
                 to,
-                lifecycle,
                 cascading_updates,
                 ..
             } = effect
-                && lifecycle.create_before_destroy
             {
                 let binding = to.attributes.get("_binding").and_then(|v| match v {
                     Value::String(s) => Some(s.clone()),
