@@ -562,26 +562,25 @@ pub fn print_plan(plan: &Plan, compact: bool) {
                         };
                         format!("{}{}   ", base_indent, continuation)
                     };
-                    let mut keys: Vec<_> = to
-                        .attributes
-                        .keys()
-                        .filter(|k| !k.starts_with('_'))
+                    // Only show changed_create_only attributes for Replace effects.
+                    // These are the attributes that actually triggered the replacement.
+                    // Other attributes may have false diffs due to DSL vs AWS format
+                    // differences (e.g., UnresolvedIdent vs normalized String) and are
+                    // not the reason for the replacement anyway.
+                    let mut keys: Vec<_> = changed_create_only
+                        .iter()
+                        .filter(|k| to.attributes.contains_key(k.as_str()))
                         .collect();
                     keys.sort();
                     for key in keys {
-                        let new_value = &to.attributes[key];
-                        let old_value = from.attributes.get(key);
-                        let forces_replacement = changed_create_only.contains(key);
+                        let new_value = &to.attributes[key.as_str()];
+                        let old_value = from.attributes.get(key.as_str());
                         let is_same = old_value
                             .map(|ov| ov.semantically_equal(new_value))
                             .unwrap_or(false);
                         if !is_same {
                             if is_list_of_maps(new_value) {
-                                let suffix = if forces_replacement {
-                                    format!(" {}", "(forces replacement)".magenta())
-                                } else {
-                                    String::new()
-                                };
+                                let suffix = format!(" {}", "(forces replacement)".magenta());
                                 println!("{}{}:{}", attr_prefix, key, suffix);
                                 println!(
                                     "{}",
@@ -591,24 +590,14 @@ pub fn print_plan(plan: &Plan, compact: bool) {
                                 let old_str = old_value
                                     .map(|v| format_value_with_key(v, Some(key)))
                                     .unwrap_or_else(|| "(none)".to_string());
-                                if forces_replacement {
-                                    println!(
-                                        "{}{}: {} → {} {}",
-                                        attr_prefix,
-                                        key,
-                                        old_str.red(),
-                                        format_value_with_key(new_value, Some(key)).green(),
-                                        "(forces replacement)".magenta()
-                                    );
-                                } else {
-                                    println!(
-                                        "{}{}: {} → {}",
-                                        attr_prefix,
-                                        key,
-                                        old_str.red(),
-                                        format_value_with_key(new_value, Some(key)).green()
-                                    );
-                                }
+                                println!(
+                                    "{}{}: {} → {} {}",
+                                    attr_prefix,
+                                    key,
+                                    old_str.red(),
+                                    format_value_with_key(new_value, Some(key)).green(),
+                                    "(forces replacement)".magenta()
+                                );
                             }
                         }
                     }
