@@ -1820,6 +1820,7 @@ mod tests {
             )]),
         );
         let vpc_to = Resource::new("ec2.vpc", "vpc")
+            .with_attribute("_binding", Value::String("vpc".to_string()))
             .with_attribute("cidr_block", Value::String("10.1.0.0/16".to_string()));
 
         let subnet_from = State::existing(
