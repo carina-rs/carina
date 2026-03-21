@@ -1101,7 +1101,7 @@ fn value_references_binding(value: &Value, binding: &str) -> bool {
 /// - Are NOT in `changed_create_only` (not the reason for replacement), AND
 /// - Have a `to` value that is `UnresolvedIdent` (DSL format, not yet normalized)
 fn should_show_replace_attr(key: &str, to_value: &Value, changed_create_only: &[String]) -> bool {
-    if changed_create_only.contains(&key.to_string()) {
+    if changed_create_only.iter().any(|k| k == key) {
         return true;
     }
     !matches!(to_value, Value::UnresolvedIdent(..))
