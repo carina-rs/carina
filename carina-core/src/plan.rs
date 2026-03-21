@@ -74,7 +74,12 @@ impl Plan {
                 Effect::Read { .. } => summary.read += 1,
                 Effect::Create(_) => summary.create += 1,
                 Effect::Update { .. } => summary.update += 1,
-                Effect::Replace { .. } => summary.replace += 1,
+                Effect::Replace {
+                    cascading_updates, ..
+                } => {
+                    summary.replace += 1;
+                    summary.update += cascading_updates.len();
+                }
                 Effect::Delete { .. } => summary.delete += 1,
             }
         }
@@ -389,6 +394,83 @@ mod tests {
                 .unwrap()
                 .len(),
             1
+        );
+    }
+
+    #[test]
+    fn plan_summary_counts_cascading_updates() {
+        use crate::effect::CascadingUpdate;
+        use crate::resource::State;
+        use crate::resource::{LifecycleConfig, ResourceId};
+
+        let mut plan = Plan::new();
+
+        // A Replace effect with one cascading update
+        let from = State::not_found(ResourceId::new("ec2.vpc", "vpc")).with_identifier("vpc-123");
+        let to = Resource::new("ec2.vpc", "vpc");
+        let cascading = CascadingUpdate {
+            id: ResourceId::new("ec2.subnet", "subnet"),
+            from: Box::new(
+                State::not_found(ResourceId::new("ec2.subnet", "subnet"))
+                    .with_identifier("subnet-123"),
+            ),
+            to: Resource::new("ec2.subnet", "subnet"),
+        };
+        plan.add(Effect::Replace {
+            id: ResourceId::new("ec2.vpc", "vpc"),
+            from: Box::new(from),
+            to,
+            lifecycle: LifecycleConfig::default(),
+            changed_create_only: vec!["cidr_block".to_string()],
+            cascading_updates: vec![cascading],
+            temporary_name: None,
+        });
+
+        let summary = plan.summary();
+        assert_eq!(summary.replace, 1);
+        assert_eq!(summary.update, 1, "cascading updates should be counted");
+        assert_eq!(summary.create, 0);
+        assert_eq!(summary.delete, 0);
+    }
+
+    #[test]
+    fn plan_summary_display_includes_cascading_updates() {
+        use crate::effect::CascadingUpdate;
+        use crate::resource::State;
+        use crate::resource::{LifecycleConfig, ResourceId};
+
+        let mut plan = Plan::new();
+
+        let from = State::not_found(ResourceId::new("ec2.vpc", "vpc")).with_identifier("vpc-123");
+        let to = Resource::new("ec2.vpc", "vpc");
+        let cascading = CascadingUpdate {
+            id: ResourceId::new("ec2.subnet", "subnet"),
+            from: Box::new(
+                State::not_found(ResourceId::new("ec2.subnet", "subnet"))
+                    .with_identifier("subnet-123"),
+            ),
+            to: Resource::new("ec2.subnet", "subnet"),
+        };
+        plan.add(Effect::Replace {
+            id: ResourceId::new("ec2.vpc", "vpc"),
+            from: Box::new(from),
+            to,
+            lifecycle: LifecycleConfig::default(),
+            changed_create_only: vec!["cidr_block".to_string()],
+            cascading_updates: vec![cascading],
+            temporary_name: None,
+        });
+
+        let display = format!("{}", plan.summary());
+        assert!(
+            display.contains("1 to update"),
+            "display should show cascading updates: {}",
+            display
+        );
+        assert!(
+            display.contains("1 to replace"),
+            "display should show replace: {}",
+            display
         );
     }
 
