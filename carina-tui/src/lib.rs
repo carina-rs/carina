@@ -6,6 +6,9 @@
 mod app;
 mod ui;
 
+#[cfg(test)]
+mod tui_snapshot_tests;
+
 use std::io;
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
