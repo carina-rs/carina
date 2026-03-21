@@ -39,7 +39,7 @@ echo "════════════════════════�
 echo ""
 
 # Step 1: Apply initial state (VPC + SG + Ingress)
-run_step "apply step1 (create SG + ingress)" "$CARINA apply $STEP1"
+run_step "apply step1 (create SG + ingress)" "$CARINA apply --auto-approve $STEP1"
 
 # Step 2: Plan with changed group_description
 # The plan should show:
@@ -59,7 +59,7 @@ else
 fi
 
 # Cleanup: destroy
-run_step "destroy (cleanup)" "$CARINA destroy $STEP1"
+run_step "destroy (cleanup)" "$CARINA destroy --auto-approve $STEP1"
 
 echo ""
 echo "════════════════════════════════════════"
