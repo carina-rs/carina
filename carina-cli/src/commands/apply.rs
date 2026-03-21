@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use colored::Colorize;
 
@@ -30,22 +31,59 @@ use crate::wiring::{
     reconcile_anonymous_identifiers_with_ctx, reconcile_prefixed_names, resolve_names_with_ctx,
 };
 
+/// Format a duration as a human-readable string like "3.2s" or "1m 5.3s".
+fn format_duration(d: Duration) -> String {
+    let secs = d.as_secs_f64();
+    if secs < 60.0 {
+        format!("{:.1}s", secs)
+    } else {
+        let mins = secs as u64 / 60;
+        let remaining = secs - (mins as f64 * 60.0);
+        format!("{}m {:.1}s", mins, remaining)
+    }
+}
+
 /// CLI observer that prints colored progress output.
 struct CliObserver;
 
 impl ExecutionObserver for CliObserver {
     fn on_event(&mut self, event: &ExecutionEvent) {
         match event {
-            ExecutionEvent::EffectSucceeded { effect, .. } => {
-                println!("  {} {}", "✓".green(), format_effect(effect));
+            ExecutionEvent::EffectSucceeded {
+                effect, duration, ..
+            } => {
+                let timing = format!("[{}]", format_duration(*duration)).dimmed();
+                println!("  {} {} {}", "✓".green(), format_effect(effect), timing);
             }
-            ExecutionEvent::EffectFailed { effect, error } => {
-                println!("  {} {} - {}", "✗".red(), format_effect(effect), error);
+            ExecutionEvent::EffectFailed {
+                effect,
+                error,
+                duration,
+            } => {
+                let timing = format!("[{}]", format_duration(*duration)).dimmed();
+                println!(
+                    "  {} {} - {} {}",
+                    "✗".red(),
+                    format_effect(effect),
+                    error,
+                    timing
+                );
             }
             ExecutionEvent::EffectSkipped { effect, reason } => {
                 println!("  {} {} - {}", "⊘".yellow(), format_effect(effect), reason);
             }
             ExecutionEvent::EffectStarted { .. } => {}
+            ExecutionEvent::ProgressUpdate { completed, total } => {
+                if *completed < *total {
+                    println!(
+                        "{}",
+                        format!("Applying changes... ({}/{})", completed, total)
+                            .cyan()
+                            .bold()
+                    );
+                    println!();
+                }
+            }
             ExecutionEvent::CascadeUpdateSucceeded { id } => {
                 println!("  {} Update {} (cascade)", "✓".green(), id);
             }
@@ -1111,5 +1149,34 @@ async fn run_apply_from_plan_locked(
             "Apply failed. {}.",
             parts.join(", ")
         )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_duration_sub_second() {
+        let d = Duration::from_millis(500);
+        assert_eq!(format_duration(d), "0.5s");
+    }
+
+    #[test]
+    fn format_duration_seconds() {
+        let d = Duration::from_secs_f64(3.25);
+        assert_eq!(format_duration(d), "3.2s");
+    }
+
+    #[test]
+    fn format_duration_minutes() {
+        let d = Duration::from_secs_f64(65.3);
+        assert_eq!(format_duration(d), "1m 5.3s");
+    }
+
+    #[test]
+    fn format_duration_zero() {
+        let d = Duration::from_secs(0);
+        assert_eq!(format_duration(d), "0.0s");
     }
 }

@@ -5,6 +5,7 @@
 //! colored progress output while keeping the execution logic testable.
 
 use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 
 use crate::deps::find_failed_dependency;
 use crate::effect::Effect;
@@ -41,14 +42,20 @@ pub enum ExecutionEvent<'a> {
     EffectSucceeded {
         effect: &'a Effect,
         state: Option<&'a State>,
+        duration: Duration,
     },
     EffectFailed {
         effect: &'a Effect,
         error: &'a str,
+        duration: Duration,
     },
     EffectSkipped {
         effect: &'a Effect,
         reason: &'a str,
+    },
+    ProgressUpdate {
+        completed: usize,
+        total: usize,
     },
     CascadeUpdateSucceeded {
         id: &'a ResourceId,
@@ -316,6 +323,14 @@ fn update_binding_map(
     }
 }
 
+/// Count effects that produce progress updates (excludes Read effects).
+fn count_actionable_effects(effects: &[Effect]) -> usize {
+    effects
+        .iter()
+        .filter(|e| !matches!(e, Effect::Read { .. }))
+        .count()
+}
+
 // ---------------------------------------------------------------------------
 // Effect execution: sequential path
 // ---------------------------------------------------------------------------
@@ -335,6 +350,9 @@ async fn execute_effects_sequential(
     let mut permanent_name_overrides: HashMap<ResourceId, HashMap<String, String>> = HashMap::new();
     let mut pending_refreshes: HashMap<ResourceId, String> = HashMap::new();
 
+    let total = count_actionable_effects(input.plan.effects());
+    let mut completed: usize = 0;
+
     for effect in input.plan.effects() {
         // Check if any dependency has failed - skip this effect if so
         if let Some(failed_dep) = find_failed_dependency(effect, &failed_bindings) {
@@ -350,6 +368,9 @@ async fn execute_effects_sequential(
             continue;
         }
 
+        let started = Instant::now();
+        observer.on_event(&ExecutionEvent::EffectStarted { effect });
+
         match effect {
             Effect::Create(resource) => {
                 let resolved = resolve_resource(resource, &input.binding_map);
@@ -358,6 +379,7 @@ async fn execute_effects_sequential(
                         observer.on_event(&ExecutionEvent::EffectSucceeded {
                             effect,
                             state: Some(&state),
+                            duration: started.elapsed(),
                         });
                         success_count += 1;
                         applied_states.insert(resource.id.clone(), state.clone());
@@ -368,6 +390,7 @@ async fn execute_effects_sequential(
                         observer.on_event(&ExecutionEvent::EffectFailed {
                             effect,
                             error: &error_str,
+                            duration: started.elapsed(),
                         });
                         failure_count += 1;
                         if let Some(binding) = effect.binding_name() {
@@ -386,6 +409,7 @@ async fn execute_effects_sequential(
                         observer.on_event(&ExecutionEvent::EffectSucceeded {
                             effect,
                             state: Some(&state),
+                            duration: started.elapsed(),
                         });
                         success_count += 1;
                         applied_states.insert(id.clone(), state.clone());
@@ -396,6 +420,7 @@ async fn execute_effects_sequential(
                         observer.on_event(&ExecutionEvent::EffectFailed {
                             effect,
                             error: &error_str,
+                            duration: started.elapsed(),
                         });
                         failure_count += 1;
                         queue_state_refresh(&mut pending_refreshes, id, Some(identifier));
@@ -431,6 +456,7 @@ async fn execute_effects_sequential(
                         &mut pending_refreshes,
                         &mut success_count,
                         &mut failure_count,
+                        started,
                         observer,
                     )
                     .await;
@@ -448,6 +474,7 @@ async fn execute_effects_sequential(
                         &mut pending_refreshes,
                         &mut success_count,
                         &mut failure_count,
+                        started,
                         observer,
                     )
                     .await;
@@ -463,6 +490,7 @@ async fn execute_effects_sequential(
                     observer.on_event(&ExecutionEvent::EffectSucceeded {
                         effect,
                         state: None,
+                        duration: started.elapsed(),
                     });
                     success_count += 1;
                     successfully_deleted.insert(id.clone());
@@ -472,12 +500,18 @@ async fn execute_effects_sequential(
                     observer.on_event(&ExecutionEvent::EffectFailed {
                         effect,
                         error: &error_str,
+                        duration: started.elapsed(),
                     });
                     failure_count += 1;
                     queue_state_refresh(&mut pending_refreshes, id, Some(identifier));
                 }
             },
             Effect::Read { .. } => {}
+        }
+
+        if !matches!(effect, Effect::Read { .. }) {
+            completed += 1;
+            observer.on_event(&ExecutionEvent::ProgressUpdate { completed, total });
         }
     }
 
@@ -522,6 +556,7 @@ async fn execute_cbd_replace_sequential(
     pending_refreshes: &mut HashMap<ResourceId, String>,
     success_count: &mut usize,
     failure_count: &mut usize,
+    started: Instant,
     observer: &mut dyn ExecutionObserver,
 ) {
     let resolved = resolve_resource(to, binding_map);
@@ -589,6 +624,7 @@ async fn execute_cbd_replace_sequential(
                             observer.on_event(&ExecutionEvent::EffectFailed {
                                 effect,
                                 error: "rename failed",
+                                duration: started.elapsed(),
                             });
                             *failure_count += 1;
                             if let Some(binding) = effect.binding_name() {
@@ -598,6 +634,7 @@ async fn execute_cbd_replace_sequential(
                             observer.on_event(&ExecutionEvent::EffectSucceeded {
                                 effect,
                                 state: None,
+                                duration: started.elapsed(),
                             });
                             *success_count += 1;
                         }
@@ -607,6 +644,7 @@ async fn execute_cbd_replace_sequential(
                         observer.on_event(&ExecutionEvent::EffectFailed {
                             effect,
                             error: &error_str,
+                            duration: started.elapsed(),
                         });
                         *failure_count += 1;
                         queue_state_refresh(pending_refreshes, &to.id, state.identifier.as_deref());
@@ -622,6 +660,7 @@ async fn execute_cbd_replace_sequential(
             observer.on_event(&ExecutionEvent::EffectFailed {
                 effect,
                 error: &error_str,
+                duration: started.elapsed(),
             });
             *failure_count += 1;
             if let Some(binding) = effect.binding_name() {
@@ -699,6 +738,7 @@ async fn execute_dbd_replace(
     pending_refreshes: &mut HashMap<ResourceId, String>,
     success_count: &mut usize,
     failure_count: &mut usize,
+    started: Instant,
     observer: &mut dyn ExecutionObserver,
 ) {
     let identifier = from.identifier.as_deref().unwrap_or("");
@@ -710,6 +750,7 @@ async fn execute_dbd_replace(
                     observer.on_event(&ExecutionEvent::EffectSucceeded {
                         effect,
                         state: Some(&state),
+                        duration: started.elapsed(),
                     });
                     *success_count += 1;
                     applied_states.insert(to.id.clone(), state.clone());
@@ -720,6 +761,7 @@ async fn execute_dbd_replace(
                     observer.on_event(&ExecutionEvent::EffectFailed {
                         effect,
                         error: &error_str,
+                        duration: started.elapsed(),
                     });
                     *failure_count += 1;
                     queue_state_refresh(pending_refreshes, &to.id, Some(identifier));
@@ -734,6 +776,7 @@ async fn execute_dbd_replace(
             observer.on_event(&ExecutionEvent::EffectFailed {
                 effect,
                 error: &error_str,
+                duration: started.elapsed(),
             });
             *failure_count += 1;
             queue_state_refresh(pending_refreshes, id, Some(identifier));
@@ -769,6 +812,9 @@ async fn execute_effects_phased(
     let mut permanent_name_overrides: HashMap<ResourceId, HashMap<String, String>> = HashMap::new();
     let mut pending_refreshes: HashMap<ResourceId, String> = HashMap::new();
 
+    let total = count_actionable_effects(input.plan.effects());
+    let mut completed: usize = 0;
+
     let effects = input.plan.effects();
     let replace_bindings = collect_replace_bindings(effects);
     let sorted_indices = topological_sort_replaces(effects, &replace_bindings);
@@ -788,8 +834,13 @@ async fn execute_effects_phased(
             if let Some(binding) = effect.binding_name() {
                 failed_bindings.insert(binding);
             }
+            completed += 1;
+            observer.on_event(&ExecutionEvent::ProgressUpdate { completed, total });
             continue;
         }
+
+        let started = Instant::now();
+        observer.on_event(&ExecutionEvent::EffectStarted { effect });
 
         match effect {
             Effect::Create(resource) => {
@@ -799,6 +850,7 @@ async fn execute_effects_phased(
                         observer.on_event(&ExecutionEvent::EffectSucceeded {
                             effect,
                             state: Some(&state),
+                            duration: started.elapsed(),
                         });
                         success_count += 1;
                         applied_states.insert(resource.id.clone(), state.clone());
@@ -809,6 +861,7 @@ async fn execute_effects_phased(
                         observer.on_event(&ExecutionEvent::EffectFailed {
                             effect,
                             error: &error_str,
+                            duration: started.elapsed(),
                         });
                         failure_count += 1;
                         if let Some(binding) = effect.binding_name() {
@@ -827,6 +880,7 @@ async fn execute_effects_phased(
                         observer.on_event(&ExecutionEvent::EffectSucceeded {
                             effect,
                             state: Some(&state),
+                            duration: started.elapsed(),
                         });
                         success_count += 1;
                         applied_states.insert(id.clone(), state.clone());
@@ -837,6 +891,7 @@ async fn execute_effects_phased(
                         observer.on_event(&ExecutionEvent::EffectFailed {
                             effect,
                             error: &error_str,
+                            duration: started.elapsed(),
                         });
                         failure_count += 1;
                         queue_state_refresh(&mut pending_refreshes, id, Some(identifier));
@@ -856,6 +911,7 @@ async fn execute_effects_phased(
                     observer.on_event(&ExecutionEvent::EffectSucceeded {
                         effect,
                         state: None,
+                        duration: started.elapsed(),
                     });
                     success_count += 1;
                     successfully_deleted.insert(id.clone());
@@ -865,6 +921,7 @@ async fn execute_effects_phased(
                     observer.on_event(&ExecutionEvent::EffectFailed {
                         effect,
                         error: &error_str,
+                        duration: started.elapsed(),
                     });
                     failure_count += 1;
                     queue_state_refresh(&mut pending_refreshes, id, Some(identifier));
@@ -873,10 +930,16 @@ async fn execute_effects_phased(
             Effect::Read { .. } => {}
             Effect::Replace { .. } => unreachable!(),
         }
+
+        if !matches!(effect, Effect::Read { .. }) {
+            completed += 1;
+            observer.on_event(&ExecutionEvent::ProgressUpdate { completed, total });
+        }
     }
 
     // Phase 2: CBD creates in forward dependency order (parents first)
     let mut cbd_create_states: HashMap<usize, State> = HashMap::new();
+    let mut replace_start_times: HashMap<usize, Instant> = HashMap::new();
     for &idx in &sorted_indices {
         let effect = &effects[idx];
         if let Effect::Replace {
@@ -896,8 +959,14 @@ async fn execute_effects_phased(
                 if let Some(binding) = effect.binding_name() {
                     failed_bindings.insert(binding);
                 }
+                completed += 1;
+                observer.on_event(&ExecutionEvent::ProgressUpdate { completed, total });
                 continue;
             }
+
+            let started = Instant::now();
+            replace_start_times.insert(idx, started);
+            observer.on_event(&ExecutionEvent::EffectStarted { effect });
 
             let resolve_source = input.unresolved_resources.get(&to.id).unwrap_or(to);
             let resolved = resolve_resource_with_source(to, resolve_source, &input.binding_map);
@@ -961,11 +1030,14 @@ async fn execute_effects_phased(
                     observer.on_event(&ExecutionEvent::EffectFailed {
                         effect,
                         error: &error_str,
+                        duration: started.elapsed(),
                     });
                     failure_count += 1;
                     if let Some(binding) = effect.binding_name() {
                         failed_bindings.insert(binding);
                     }
+                    completed += 1;
+                    observer.on_event(&ExecutionEvent::ProgressUpdate { completed, total });
                 }
             }
         }
@@ -990,6 +1062,10 @@ async fn execute_effects_phased(
                 if let Some(binding) = effect.binding_name() {
                     failed_bindings.insert(binding);
                 }
+                if !lifecycle.create_before_destroy {
+                    completed += 1;
+                    observer.on_event(&ExecutionEvent::ProgressUpdate { completed, total });
+                }
                 continue;
             }
 
@@ -998,22 +1074,36 @@ async fn execute_effects_phased(
                 continue;
             }
 
+            // For non-CBD replaces, this is where the effect starts
+            if !lifecycle.create_before_destroy {
+                let started = Instant::now();
+                replace_start_times.insert(idx, started);
+                observer.on_event(&ExecutionEvent::EffectStarted { effect });
+            }
+
             let identifier = from.identifier.as_deref().unwrap_or("");
             match provider.delete(id, identifier, lifecycle).await {
                 Ok(()) => {
                     // Delete succeeded
                 }
                 Err(e) => {
+                    let started = replace_start_times
+                        .get(&idx)
+                        .copied()
+                        .unwrap_or_else(Instant::now);
                     let error_str = e.to_string();
                     observer.on_event(&ExecutionEvent::EffectFailed {
                         effect,
                         error: &error_str,
+                        duration: started.elapsed(),
                     });
                     failure_count += 1;
                     queue_state_refresh(&mut pending_refreshes, id, Some(identifier));
                     if let Some(binding) = effect.binding_name() {
                         failed_bindings.insert(binding);
                     }
+                    completed += 1;
+                    observer.on_event(&ExecutionEvent::ProgressUpdate { completed, total });
                     // For CBD, save the already-created resource state even though delete failed
                     if lifecycle.create_before_destroy
                         && let Some(state) = cbd_create_states.remove(&idx)
@@ -1044,6 +1134,11 @@ async fn execute_effects_phased(
             ..
         } = effect
         {
+            let started = replace_start_times
+                .get(&idx)
+                .copied()
+                .unwrap_or_else(Instant::now);
+
             if lifecycle.create_before_destroy {
                 // CBD: already created in phase 2, handle rename and finalize
                 if let Some(state) = cbd_create_states.remove(&idx) {
@@ -1064,6 +1159,7 @@ async fn execute_effects_phased(
                         observer.on_event(&ExecutionEvent::EffectFailed {
                             effect,
                             error: "rename failed",
+                            duration: started.elapsed(),
                         });
                         failure_count += 1;
                         if let Some(binding) = effect.binding_name() {
@@ -1073,9 +1169,12 @@ async fn execute_effects_phased(
                         observer.on_event(&ExecutionEvent::EffectSucceeded {
                             effect,
                             state: None,
+                            duration: started.elapsed(),
                         });
                         success_count += 1;
                     }
+                    completed += 1;
+                    observer.on_event(&ExecutionEvent::ProgressUpdate { completed, total });
                 }
             } else {
                 // Non-CBD: create the new resource now (after delete in phase 3)
@@ -1106,6 +1205,7 @@ async fn execute_effects_phased(
                         observer.on_event(&ExecutionEvent::EffectSucceeded {
                             effect,
                             state: Some(&state),
+                            duration: started.elapsed(),
                         });
                         success_count += 1;
                         applied_states.insert(to.id.clone(), state.clone());
@@ -1116,6 +1216,7 @@ async fn execute_effects_phased(
                         observer.on_event(&ExecutionEvent::EffectFailed {
                             effect,
                             error: &error_str,
+                            duration: started.elapsed(),
                         });
                         failure_count += 1;
                         if let Some(binding) = effect.binding_name() {
@@ -1123,6 +1224,8 @@ async fn execute_effects_phased(
                         }
                     }
                 }
+                completed += 1;
+                observer.on_event(&ExecutionEvent::ProgressUpdate { completed, total });
             }
         }
     }
@@ -1280,11 +1383,16 @@ mod tests {
                 ExecutionEvent::EffectSucceeded { effect, .. } => {
                     format!("succeeded:{}", effect.resource_id())
                 }
-                ExecutionEvent::EffectFailed { effect, error } => {
+                ExecutionEvent::EffectFailed { effect, error, .. } => {
                     format!("failed:{}:{}", effect.resource_id(), error)
                 }
                 ExecutionEvent::EffectSkipped { effect, reason } => {
                     format!("skipped:{}:{}", effect.resource_id(), reason)
+                }
+                ExecutionEvent::ProgressUpdate {
+                    completed, total, ..
+                } => {
+                    format!("progress:{}/{}", completed, total)
                 }
                 ExecutionEvent::CascadeUpdateSucceeded { id } => {
                     format!("cascade_ok:{}", id)
@@ -1706,8 +1814,10 @@ mod tests {
         let mut observer = MockObserver::default();
         execute_plan(&provider, input, &mut observer).await;
 
-        assert_eq!(observer.events.len(), 1);
-        assert!(observer.events[0].starts_with("succeeded:"));
+        assert_eq!(observer.events.len(), 3);
+        assert!(observer.events[0].starts_with("started:"));
+        assert!(observer.events[1].starts_with("succeeded:"));
+        assert_eq!(observer.events[2], "progress:1/1");
     }
 
     #[tokio::test]
