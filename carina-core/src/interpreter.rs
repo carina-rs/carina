@@ -85,7 +85,7 @@ impl<P: Provider> Interpreter<P> {
         let effects = plan.effects();
 
         // Check if we have multiple Replace effects with dependency relationships
-        if self.has_interdependent_replaces(effects) {
+        if Self::has_interdependent_replaces(effects) {
             self.apply_with_dependency_order(effects).await
         } else {
             self.apply_sequential(effects).await
@@ -93,7 +93,7 @@ impl<P: Provider> Interpreter<P> {
     }
 
     /// Check if the plan contains multiple Replace effects that depend on each other.
-    fn has_interdependent_replaces(&self, effects: &[Effect]) -> bool {
+    fn has_interdependent_replaces(effects: &[Effect]) -> bool {
         let replace_bindings = Self::collect_replace_bindings(effects);
         if replace_bindings.is_empty() {
             return false;
@@ -101,9 +101,10 @@ impl<P: Provider> Interpreter<P> {
 
         // Check if any Replace effect depends on another Replace effect's binding
         for effect in effects {
-            if let Effect::Replace { from, .. } = effect {
-                let dep_bindings = Self::extract_dependency_bindings(&from.attributes);
-                for dep in &dep_bindings {
+            if let Effect::Replace { from, to, .. } = effect {
+                let dep_bindings_from = Self::extract_dependency_bindings(&from.attributes);
+                let dep_bindings_to = Self::extract_dependency_bindings(&to.attributes);
+                for dep in dep_bindings_from.iter().chain(dep_bindings_to.iter()) {
                     if replace_bindings.contains(dep) {
                         return true;
                     }
@@ -185,11 +186,11 @@ impl<P: Provider> Interpreter<P> {
         let replace_bindings = Self::collect_replace_bindings(effects);
 
         // Topologically sort Replace effects by dependency order
-        let sorted_indices = self.topological_sort_replaces(effects, &replace_bindings);
+        let sorted_indices = Self::topological_sort_replaces(effects, &replace_bindings);
 
         // Phase 1: Execute non-Replace effects and CBD creates (forward dependency order)
         // First, non-Replace effects in original order
-        for (idx, effect) in effects.iter().enumerate() {
+        for effect in effects {
             if !matches!(effect, Effect::Replace { .. }) {
                 let result = self.execute_effect(effect).await;
                 match &result {
@@ -207,9 +208,6 @@ impl<P: Provider> Interpreter<P> {
                     }
                 }
                 outcomes.push(result);
-            } else {
-                // Placeholder for Replace effects - will be filled later
-                let _ = idx;
             }
         }
 
@@ -424,7 +422,6 @@ impl<P: Provider> Interpreter<P> {
     /// Topologically sort Replace effects by dependency order.
     /// Returns indices in forward dependency order (parents before dependents).
     fn topological_sort_replaces(
-        &self,
         effects: &[Effect],
         replace_bindings: &HashSet<String>,
     ) -> Vec<usize> {
