@@ -530,6 +530,14 @@ pub fn format_plan(plan: &Plan, compact: bool) -> String {
                                     format_list_diff(old_value, new_value, &attr_prefix)
                                 )
                                 .unwrap();
+                            } else if is_both_maps(old_value, new_value) {
+                                writeln!(out, "{}{}:", attr_prefix, key).unwrap();
+                                writeln!(
+                                    out,
+                                    "{}",
+                                    format_map_diff(old_value, new_value, &attr_prefix)
+                                )
+                                .unwrap();
                             } else {
                                 let old_str = old_value
                                     .map(|v| format_value_with_key(v, Some(key)))
@@ -902,6 +910,96 @@ pub fn format_list_of_maps(value: &Value, attr_prefix: &str) -> String {
     lines.join("\n")
 }
 
+/// Check if both old and new values are `Value::Map`.
+fn is_both_maps(old_value: Option<&Value>, new_value: &Value) -> bool {
+    matches!((old_value, new_value), (Some(Value::Map(_)), Value::Map(_)))
+}
+
+/// Format a key-level diff between two map values.
+///
+/// Shows only the keys that changed:
+/// - `+ key: "value"` for added keys
+/// - `- key: "value"` for removed keys
+/// - `~ key: "old" -> "new"` for changed keys
+///
+/// Unchanged keys are not shown.
+pub fn format_map_diff(old_value: Option<&Value>, new_value: &Value, attr_prefix: &str) -> String {
+    let new_map = match new_value {
+        Value::Map(m) => m,
+        _ => return format_value(new_value),
+    };
+    let old_map = match old_value {
+        Some(Value::Map(m)) => m,
+        _ => {
+            // No old map; treat all new keys as added
+            let mut keys: Vec<_> = new_map.keys().collect();
+            keys.sort();
+            let mut lines = Vec::new();
+            for key in keys {
+                lines.push(format!(
+                    "{}  {} {}: {}",
+                    attr_prefix,
+                    "+".green(),
+                    key,
+                    format_value_with_key(&new_map[key], Some(key)).green()
+                ));
+            }
+            return lines.join("\n");
+        }
+    };
+
+    let mut lines = Vec::new();
+
+    // Collect all keys from both maps
+    let mut all_keys: Vec<&String> = old_map.keys().chain(new_map.keys()).collect();
+    all_keys.sort();
+    all_keys.dedup();
+
+    for key in all_keys {
+        let old_val = old_map.get(key);
+        let new_val = new_map.get(key);
+        match (old_val, new_val) {
+            (Some(ov), Some(nv)) => {
+                if !ov.semantically_equal(nv) {
+                    // Changed
+                    lines.push(format!(
+                        "{}  {} {}: {} → {}",
+                        attr_prefix,
+                        "~".yellow(),
+                        key,
+                        format_value_with_key(ov, Some(key)).red(),
+                        format_value_with_key(nv, Some(key)).green()
+                    ));
+                }
+                // Unchanged: skip
+            }
+            (None, Some(nv)) => {
+                // Added
+                lines.push(format!(
+                    "{}  {} {}: {}",
+                    attr_prefix,
+                    "+".green(),
+                    key,
+                    format_value_with_key(nv, Some(key)).green()
+                ));
+            }
+            (Some(ov), None) => {
+                // Removed
+                lines.push(format!(
+                    "{}  {} {}: {}",
+                    attr_prefix,
+                    "-".red(),
+                    key,
+                    format_value_with_key(ov, Some(key)).red()
+                ));
+            }
+            (None, None) => {}
+        }
+    }
+
+    lines.join("\n")
+}
+
 /// Format a list-of-maps diff for Update effect display.
 /// Uses content-matched comparison (multiset matching) instead of index-based.
 /// 1. Find exact matches between old and new items
@@ -1132,6 +1230,13 @@ fn format_replace_changed_attrs(
             lines.push(format!(
                 "{}\n",
                 format_list_diff(old_value, new_value, attr_prefix)
+            ));
+        } else if is_both_maps(old_value, new_value) {
+            let suffix = format!(" {}", "(forces replacement)".magenta());
+            lines.push(format!("{}{}:{}\n", attr_prefix, key, suffix));
+            lines.push(format!(
+                "{}\n",
+                format_map_diff(old_value, new_value, attr_prefix)
             ));
         } else {
             let old_str = old_value

@@ -10,7 +10,8 @@ Execution Plan:
       tags: {Name: "test-sg"}
       vpc_id: "vpc-0123456789abcdef0"
   ~ awscc.ec2.vpc vpc
-      tags: {Name: "test-vpc"} → {Environment: "staging", Name: "test-vpc"}
+      tags:
+        + Environment: "staging"
         └─ - awscc.ec2.subnet my_subnet
 
 Plan: 1 to add, 1 to change, 1 to destroy.

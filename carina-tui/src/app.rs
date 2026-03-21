@@ -28,6 +28,10 @@ pub struct TreeNode {
     pub changed_attributes: Vec<String>,
     /// For Update/Replace effects, the "from" attributes (old values)
     pub from_attributes: Vec<(String, String)>,
+    /// Raw "from" attribute values for map key-level diffs in the detail panel
+    pub raw_from_attrs: HashMap<String, Value>,
+    /// Raw "to" attribute values for map key-level diffs in the detail panel
+    pub raw_to_attrs: HashMap<String, Value>,
     /// Indices of child nodes in the tree
     pub children: Vec<usize>,
     /// Nesting depth (0 = root)
@@ -569,6 +573,8 @@ fn effect_to_node(effect: &Effect) -> TreeNode {
             attributes: format_attributes(&resource.attributes),
             changed_attributes: Vec::new(),
             from_attributes: Vec::new(),
+            raw_from_attrs: HashMap::new(),
+            raw_to_attrs: HashMap::new(),
 
             children: Vec::new(),
             depth: 0,
@@ -583,6 +589,8 @@ fn effect_to_node(effect: &Effect) -> TreeNode {
             attributes: format_attributes(&resource.attributes),
             changed_attributes: Vec::new(),
             from_attributes: Vec::new(),
+            raw_from_attrs: HashMap::new(),
+            raw_to_attrs: HashMap::new(),
 
             children: Vec::new(),
             depth: 0,
@@ -602,6 +610,8 @@ fn effect_to_node(effect: &Effect) -> TreeNode {
             attributes: format_attributes(&to.attributes),
             changed_attributes: changed_attributes.clone(),
             from_attributes: format_attributes(&from.attributes),
+            raw_from_attrs: from.attributes.clone(),
+            raw_to_attrs: to.attributes.clone(),
 
             children: Vec::new(),
             depth: 0,
@@ -629,6 +639,8 @@ fn effect_to_node(effect: &Effect) -> TreeNode {
                 attributes: format_attributes(&to.attributes),
                 changed_attributes: changed_create_only.clone(),
                 from_attributes: format_attributes(&from.attributes),
+                raw_from_attrs: from.attributes.clone(),
+                raw_to_attrs: to.attributes.clone(),
 
                 children: Vec::new(),
                 depth: 0,
@@ -649,6 +661,8 @@ fn effect_to_node(effect: &Effect) -> TreeNode {
                 attributes: attrs,
                 changed_attributes: Vec::new(),
                 from_attributes: Vec::new(),
+                raw_from_attrs: HashMap::new(),
+                raw_to_attrs: HashMap::new(),
 
                 children: Vec::new(),
                 depth: 0,
@@ -671,7 +685,7 @@ fn format_attributes(attrs: &HashMap<String, Value>) -> Vec<(String, String)> {
 }
 
 /// Format a Value for display
-fn format_value(value: &Value) -> String {
+pub fn format_value(value: &Value) -> String {
     match value {
         Value::String(s) => {
             if carina_core::utils::is_dsl_enum_format(s) {

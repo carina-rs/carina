@@ -163,3 +163,10 @@ fn snapshot_compact() {
     let output = strip_ansi(&format_plan(&plan, true));
     insta::assert_snapshot!(output);
 }
+
+#[test]
+fn snapshot_map_key_diff() {
+    let plan = build_plan_from_fixture("map_key_diff");
+    let output = strip_ansi(&format_plan(&plan, false));
+    insta::assert_snapshot!(output);
+}
