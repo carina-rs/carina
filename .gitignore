@@ -4,6 +4,8 @@
 # Carina state files
 .carina/
 carina.state.json
+# Allow state files in test fixtures
+!carina-cli/tests/fixtures/**/carina.state.json
 
 # IDE
 .idea/

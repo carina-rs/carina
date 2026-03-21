@@ -1,0 +1,10 @@
+---
+source: carina-cli/src/plan_snapshot_tests.rs
+assertion_line: 157
+expression: output
+---
+Execution Plan:
+
+  - awscc.ec2.subnet my_subnet
+
+Plan: 0 to add, 0 to change, 1 to destroy.

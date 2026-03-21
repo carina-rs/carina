@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::fmt::Write;
 
 use colored::Colorize;
 
@@ -278,9 +279,24 @@ fn format_compact_name(
 }
 
 pub fn print_plan(plan: &Plan, compact: bool) {
+    print!("{}", format_plan(plan, compact));
+}
+
+/// Format a plan as a string for display.
+///
+/// This is the core formatting logic used by `print_plan`. Returning a `String`
+/// enables snapshot testing and other programmatic uses of the plan output.
+pub fn format_plan(plan: &Plan, compact: bool) -> String {
+    let mut out = String::new();
+
     if plan.is_empty() {
-        println!("{}", "No changes. Infrastructure is up-to-date.".green());
-        return;
+        writeln!(
+            out,
+            "{}",
+            "No changes. Infrastructure is up-to-date.".green()
+        )
+        .unwrap();
+        return out;
     }
 
     // Build dependency graph from effects
@@ -341,14 +357,15 @@ pub fn print_plan(plan: &Plan, compact: bool) {
         &effect_types,
     );
 
-    println!("{}", "Execution Plan:".cyan().bold());
-    println!();
+    writeln!(out, "{}", "Execution Plan:".cyan().bold()).unwrap();
+    writeln!(out).unwrap();
 
     // Track printed effects to avoid duplicates
     let mut printed: HashSet<usize> = HashSet::new();
 
     #[allow(clippy::too_many_arguments)]
-    fn print_effect_tree(
+    fn format_effect_tree(
+        out: &mut String,
         idx: usize,
         plan: &Plan,
         dependents: &HashMap<usize, Vec<usize>>,
@@ -397,23 +414,27 @@ pub fn print_plan(plan: &Plan, compact: bool) {
             Effect::Create(r) => {
                 if compact {
                     let name_part = format_compact_name(r, &r.id.name, parent_binding);
-                    println!(
+                    writeln!(
+                        out,
                         "{}{}{} {} {}",
                         base_indent,
                         connector,
                         colored_symbol,
                         r.id.display_type().cyan().bold(),
                         name_part.white().bold()
-                    );
+                    )
+                    .unwrap();
                 } else {
-                    println!(
+                    writeln!(
+                        out,
                         "{}{}{} {} {}",
                         base_indent,
                         connector,
                         colored_symbol,
                         r.id.display_type().cyan().bold(),
                         r.id.name.white().bold()
-                    );
+                    )
+                    .unwrap();
                     // Attribute prefix aligns with the resource content
                     let attr_prefix = if indent == 0 {
                         format!("{}{}", base_indent, attr_base)
@@ -434,15 +455,17 @@ pub fn print_plan(plan: &Plan, compact: bool) {
                     for key in keys {
                         let value = &r.attributes[key];
                         if is_list_of_maps(value) {
-                            println!("{}{}:", attr_prefix, key);
-                            println!("{}", format_list_of_maps(value, &attr_prefix));
+                            writeln!(out, "{}{}:", attr_prefix, key).unwrap();
+                            writeln!(out, "{}", format_list_of_maps(value, &attr_prefix)).unwrap();
                         } else {
-                            println!(
+                            writeln!(
+                                out,
                                 "{}{}: {}",
                                 attr_prefix,
                                 key,
                                 format_value_with_key(value, Some(key)).green()
-                            );
+                            )
+                            .unwrap();
                         }
                     }
                 }
@@ -455,23 +478,27 @@ pub fn print_plan(plan: &Plan, compact: bool) {
             } => {
                 if compact {
                     let name_part = format_compact_name(to, &id.name, parent_binding);
-                    println!(
+                    writeln!(
+                        out,
                         "{}{}{} {} {}",
                         base_indent,
                         connector,
                         colored_symbol,
                         id.display_type().cyan().bold(),
                         name_part.yellow().bold()
-                    );
+                    )
+                    .unwrap();
                 } else {
-                    println!(
+                    writeln!(
+                        out,
                         "{}{}{} {} {}",
                         base_indent,
                         connector,
                         colored_symbol,
                         id.display_type().cyan().bold(),
                         id.name.yellow().bold()
-                    );
+                    )
+                    .unwrap();
                     let attr_prefix = if indent == 0 {
                         format!("{}{}", base_indent, attr_base)
                     } else {
@@ -496,22 +523,26 @@ pub fn print_plan(plan: &Plan, compact: bool) {
                             .unwrap_or(false);
                         if !is_same {
                             if is_list_of_maps(new_value) {
-                                println!("{}{}:", attr_prefix, key);
-                                println!(
+                                writeln!(out, "{}{}:", attr_prefix, key).unwrap();
+                                writeln!(
+                                    out,
                                     "{}",
                                     format_list_diff(old_value, new_value, &attr_prefix)
-                                );
+                                )
+                                .unwrap();
                             } else {
                                 let old_str = old_value
                                     .map(|v| format_value_with_key(v, Some(key)))
                                     .unwrap_or_else(|| "(none)".to_string());
-                                println!(
+                                writeln!(
+                                    out,
                                     "{}{}: {} → {}",
                                     attr_prefix,
                                     key,
                                     old_str.red(),
                                     format_value_with_key(new_value, Some(key)).green()
-                                );
+                                )
+                                .unwrap();
                             }
                         }
                     }
@@ -523,13 +554,15 @@ pub fn print_plan(plan: &Plan, compact: bool) {
                     removed_keys.sort();
                     for key in removed_keys {
                         if let Some(old_value) = from.attributes.get(key.as_str()) {
-                            println!(
+                            writeln!(
+                                out,
                                 "{}{}: {} → {}",
                                 attr_prefix,
                                 key,
                                 format_value_with_key(old_value, Some(key)).red(),
                                 "(removed)".red()
-                            );
+                            )
+                            .unwrap();
                         }
                     }
                 }
@@ -551,7 +584,8 @@ pub fn print_plan(plan: &Plan, compact: bool) {
                 };
                 if compact {
                     let name_part = format_compact_name(to, &id.name, parent_binding);
-                    println!(
+                    writeln!(
+                        out,
                         "{}{}{} {} {} {}",
                         base_indent,
                         connector,
@@ -559,9 +593,11 @@ pub fn print_plan(plan: &Plan, compact: bool) {
                         id.display_type().cyan().bold(),
                         name_part.magenta().bold(),
                         replace_note.magenta()
-                    );
+                    )
+                    .unwrap();
                 } else {
-                    println!(
+                    writeln!(
+                        out,
                         "{}{}{} {} {} {}",
                         base_indent,
                         connector,
@@ -569,7 +605,8 @@ pub fn print_plan(plan: &Plan, compact: bool) {
                         id.display_type().cyan().bold(),
                         id.name.magenta().bold(),
                         replace_note.magenta()
-                    );
+                    )
+                    .unwrap();
                     let attr_prefix = if indent == 0 {
                         format!("{}{}", base_indent, attr_base)
                     } else {
@@ -588,33 +625,39 @@ pub fn print_plan(plan: &Plan, compact: bool) {
                         cascade_ref_hints,
                     );
                     if !replace_attrs_output.is_empty() {
-                        print!("{}", replace_attrs_output);
+                        write!(out, "{}", replace_attrs_output).unwrap();
                     }
                     if let Some(temp) = temporary_name {
                         if temp.can_rename {
-                            println!(
+                            writeln!(
+                                out,
                                 "{}  {} via temporary name \"{}\", will rename back to \"{}\" after old resource is deleted",
                                 attr_prefix,
                                 "note:".magenta().bold(),
                                 temp.temporary_value.magenta(),
                                 temp.original_value.green()
-                            );
+                            )
+                            .unwrap();
                         } else {
-                            println!(
+                            writeln!(
+                                out,
                                 "{}  {} name will be \"{}\" (cannot rename create-only attribute \"{}\")",
                                 attr_prefix,
                                 "note:".magenta().bold(),
                                 temp.temporary_value.magenta(),
                                 temp.attribute.magenta()
-                            );
+                            )
+                            .unwrap();
                         }
                     }
                     if !cascading_updates.is_empty() {
-                        println!(
+                        writeln!(
+                            out,
                             "{}  {} cascading update(s):",
                             attr_prefix,
                             cascading_updates.len()
-                        );
+                        )
+                        .unwrap();
                         let replaced_binding = to
                             .attributes
                             .get("_binding")
@@ -624,12 +667,14 @@ pub fn print_plan(plan: &Plan, compact: bool) {
                             })
                             .unwrap_or("");
                         for cascade in cascading_updates {
-                            println!(
+                            writeln!(
+                                out,
                                 "{}    ~ {} {}",
                                 attr_prefix,
                                 cascade.id.display_type().cyan(),
                                 cascade.id.name.magenta()
-                            );
+                            )
+                            .unwrap();
                             let cascade_prefix = format!("{}    ", attr_prefix);
                             let diff = format_cascading_update_diff(
                                 cascade,
@@ -637,27 +682,30 @@ pub fn print_plan(plan: &Plan, compact: bool) {
                                 replaced_binding,
                             );
                             if !diff.is_empty() {
-                                println!("{}", diff);
+                                writeln!(out, "{}", diff).unwrap();
                             }
                         }
                     }
                 }
             }
             Effect::Delete { id, .. } => {
-                println!(
+                writeln!(
+                    out,
                     "{}{}{} {} {}",
                     base_indent,
                     connector,
                     colored_symbol,
                     id.display_type().cyan().bold(),
                     id.name.red().bold()
-                );
+                )
+                .unwrap();
             }
             Effect::Read { resource } => {
                 if compact {
                     let name_part =
                         format_compact_name(resource, &resource.id.name, parent_binding);
-                    println!(
+                    writeln!(
+                        out,
                         "{}{}{} {} {} {}",
                         base_indent,
                         connector,
@@ -665,9 +713,11 @@ pub fn print_plan(plan: &Plan, compact: bool) {
                         resource.id.display_type().cyan().bold(),
                         name_part.cyan().bold(),
                         "(data source)".dimmed()
-                    );
+                    )
+                    .unwrap();
                 } else {
-                    println!(
+                    writeln!(
+                        out,
                         "{}{}{} {} {} {}",
                         base_indent,
                         connector,
@@ -675,7 +725,8 @@ pub fn print_plan(plan: &Plan, compact: bool) {
                         resource.id.display_type().cyan().bold(),
                         resource.id.name.cyan().bold(),
                         "(data source)".dimmed()
-                    );
+                    )
+                    .unwrap();
                 }
             }
         }
@@ -723,7 +774,8 @@ pub fn print_plan(plan: &Plan, compact: bool) {
 
         for (i, child_idx) in unprinted_children.iter().enumerate() {
             let child_is_last = i == unprinted_children.len() - 1;
-            print_effect_tree(
+            format_effect_tree(
+                out,
                 *child_idx,
                 plan,
                 dependents,
@@ -739,7 +791,8 @@ pub fn print_plan(plan: &Plan, compact: bool) {
 
     // Print from roots
     for (i, root_idx) in roots.iter().enumerate() {
-        print_effect_tree(
+        format_effect_tree(
+            &mut out,
             *root_idx,
             plan,
             &dependents,
@@ -758,7 +811,8 @@ pub fn print_plan(plan: &Plan, compact: bool) {
         .filter(|idx| !printed.contains(idx))
         .collect();
     for idx in remaining {
-        print_effect_tree(
+        format_effect_tree(
+            &mut out,
             idx,
             plan,
             &dependents,
@@ -771,7 +825,7 @@ pub fn print_plan(plan: &Plan, compact: bool) {
         );
     }
 
-    println!();
+    writeln!(out).unwrap();
     let summary = plan.summary();
     let mut parts = Vec::new();
     if summary.read > 0 {
@@ -786,7 +840,9 @@ pub fn print_plan(plan: &Plan, compact: bool) {
         ));
     }
     parts.push(format!("{} to destroy", summary.delete.to_string().red()));
-    println!("Plan: {}.", parts.join(", "));
+    writeln!(out, "Plan: {}.", parts.join(", ")).unwrap();
+
+    out
 }
 
 pub fn format_effect(effect: &Effect) -> String {

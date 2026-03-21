@@ -211,4 +211,6 @@ async fn main() {
 }
 
 #[cfg(test)]
+mod plan_snapshot_tests;
+#[cfg(test)]
 mod tests;

@@ -27,6 +27,37 @@ cargo run -- apply example.crn
 aws-vault exec <profile> -- cargo run -- plan example.crn
 ```
 
+### Plan Display Testing
+
+When modifying plan display code (`display.rs`, `carina-tui`), use fixture-based testing:
+
+```bash
+# Visual confirmation with fixture data (no AWS needed)
+make plan-all-create      # All resources new (Create only)
+make plan-mixed           # Mixed: Create + Update + Delete
+make plan-delete          # Orphan resource deletion
+make plan-compact         # Compact mode
+make plan-mixed-tui       # TUI mode
+make plan-fixtures        # Run all patterns
+
+# Snapshot tests (automated, runs in CI)
+cargo test -p carina-cli plan_snapshot
+```
+
+Fixture files are in `carina-cli/tests/fixtures/plan_display/`. Each directory contains a `.crn` file and optionally a `carina.state.json` (state v3 with binding/dependency_bindings). When adding new plan display features, add a fixture and snapshot test to cover the new behavior.
+
+When plan output changes (intentionally), update snapshots:
+
+```bash
+# Review and accept snapshot changes interactively
+cargo insta review
+
+# Or accept all pending snapshots
+cargo insta accept
+```
+
+If snapshots are not updated after a display change, CI will fail on the `Test` job.
+
 ### Incremental Build Strategy
 
 When working on a specific crate, always use crate-specific commands to avoid unnecessary compilation:
