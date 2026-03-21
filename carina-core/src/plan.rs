@@ -61,6 +61,56 @@ impl Plan {
         }
     }
 
+    /// Merge cascade-triggered create-only attributes into existing effects.
+    ///
+    /// For a resource already in the plan:
+    /// - If it is a Replace, add the new create-only attrs to `changed_create_only`
+    /// - If it is an Update, upgrade it to a Replace with the cascade attrs as `changed_create_only`
+    /// - Other effect types (Create, Delete, Read) are left unchanged
+    pub fn merge_cascade_create_only(
+        &mut self,
+        resource_id: &crate::resource::ResourceId,
+        cascade_attrs: Vec<String>,
+        lifecycle: crate::resource::LifecycleConfig,
+    ) {
+        for effect in &mut self.effects {
+            match effect {
+                Effect::Replace {
+                    id,
+                    changed_create_only,
+                    ..
+                } if id == resource_id => {
+                    for attr in &cascade_attrs {
+                        if !changed_create_only.contains(attr) {
+                            changed_create_only.push(attr.clone());
+                        }
+                    }
+                    return;
+                }
+                Effect::Update { id, .. } if id == resource_id => {
+                    // Take ownership of the Update fields and upgrade to Replace
+                    let old = std::mem::replace(
+                        effect,
+                        Effect::Create(crate::resource::Resource::new("", "")),
+                    );
+                    if let Effect::Update { id, from, to, .. } = old {
+                        *effect = Effect::Replace {
+                            id,
+                            from,
+                            to,
+                            lifecycle,
+                            changed_create_only: cascade_attrs,
+                            cascading_updates: vec![],
+                            temporary_name: None,
+                        };
+                    }
+                    return;
+                }
+                _ => {}
+            }
+        }
+    }
+
     /// Number of mutating Effects
     pub fn mutation_count(&self) -> usize {
         self.effects.iter().filter(|e| e.is_mutating()).count()

@@ -344,12 +344,16 @@ pub fn cascade_dependent_updates(
     }
 
     // Collect resource IDs that already have effects in the plan
-    let planned_ids: HashSet<&ResourceId> =
-        plan.effects().iter().map(|e| e.resource_id()).collect();
+    let planned_ids: HashSet<ResourceId> = plan
+        .effects()
+        .iter()
+        .map(|e| e.resource_id().clone())
+        .collect();
 
     // For each unresolved resource, check if it depends on a replaced binding
     for resource in unresolved_resources {
-        // Skip resources that already have effects in the plan
+        // Skip resources that already have effects in the plan, UNLESS
+        // cascade analysis finds create-only attributes to merge
         if planned_ids.contains(&resource.id) {
             continue;
         }
@@ -373,6 +377,55 @@ pub fn cascade_dependent_updates(
                     .push(binding);
             }
         }
+    }
+
+    // For resources already in the plan, check if cascade-triggered create-only
+    // attributes need to be merged into their existing effects.
+    let mut merge_operations: Vec<(ResourceId, Vec<String>, LifecycleConfig)> = Vec::new();
+
+    for resource in unresolved_resources {
+        if !planned_ids.contains(&resource.id) {
+            continue;
+        }
+
+        let deps = get_resource_dependencies(resource);
+        for dep in &deps {
+            if !replaced_bindings.contains(dep) {
+                continue;
+            }
+
+            // Find which attributes on this resource hold a ResourceRef
+            // pointing to the replaced binding
+            let ref_attrs: Vec<String> = resource
+                .attributes
+                .iter()
+                .filter(|(_, v)| {
+                    matches!(v, Value::ResourceRef { binding_name, .. } if binding_name == dep)
+                })
+                .map(|(k, _)| k.clone())
+                .collect();
+
+            // Check if any of those attributes are create-only
+            let create_only_refs = find_changed_create_only(
+                &resource.id.provider,
+                &resource.id.resource_type,
+                &ref_attrs,
+                schemas,
+            );
+
+            if !create_only_refs.is_empty() {
+                merge_operations.push((
+                    resource.id.clone(),
+                    create_only_refs,
+                    resource.lifecycle.clone(),
+                ));
+            }
+        }
+    }
+
+    // Apply merge operations to existing effects
+    for (id, attrs, lifecycle) in merge_operations {
+        plan.merge_cascade_create_only(&id, attrs, lifecycle);
     }
 
     // Build cascading updates for each Replace effect.
