@@ -1,0 +1,12 @@
+---
+source: carina-cli/src/plan_snapshot_tests.rs
+assertion_line: 164
+expression: output
+---
+Execution Plan:
+
+  + awscc.ec2.vpc vpc
+        ├─ + awscc.ec2.route_table ec2_route_table_d8d0c86b
+        └─ + awscc.ec2.subnet subnet
+
+Plan: 3 to add, 0 to change, 0 to destroy.

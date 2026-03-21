@@ -105,9 +105,11 @@ pub fn format_value_with_key(value: &Value, _key: Option<&str>) -> String {
             format!("[{}]", strs.join(", "))
         }
         Value::Map(map) => {
-            let strs: Vec<_> = map
+            let mut keys: Vec<_> = map.keys().collect();
+            keys.sort();
+            let strs: Vec<_> = keys
                 .iter()
-                .map(|(k, v)| format!("{}: {}", k, format_value(v)))
+                .map(|k| format!("{}: {}", k, format_value(&map[*k])))
                 .collect();
             format!("{{{}}}", strs.join(", "))
         }

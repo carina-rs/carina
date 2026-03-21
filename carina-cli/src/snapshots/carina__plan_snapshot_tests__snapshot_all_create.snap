@@ -1,0 +1,22 @@
+---
+source: carina-cli/src/plan_snapshot_tests.rs
+assertion_line: 136
+expression: output
+---
+Execution Plan:
+
+  + awscc.ec2.vpc vpc
+      cidr_block: "10.0.0.0/16"
+      enable_dns_hostnames: true
+      enable_dns_support: true
+      tags: {Name: "test-vpc"}
+        ├─ + awscc.ec2.route_table ec2_route_table_d8d0c86b
+        │     tags: {Name: "test-route-table"}
+        │     vpc_id: vpc.vpc_id
+        └─ + awscc.ec2.subnet subnet
+              availability_zone: "ap-northeast-1a"
+              cidr_block: "10.0.1.0/24"
+              tags: {Name: "test-subnet"}
+              vpc_id: vpc.vpc_id
+
+Plan: 3 to add, 0 to change, 0 to destroy.
