@@ -19,6 +19,9 @@ plan-compact:
 plan-map-diff:
 	cd $(FIXTURES)/map_key_diff && $(CARINA) plan --refresh=false main.crn
 
+plan-enum-display:
+	cd $(FIXTURES)/enum_display && $(CARINA) plan --refresh=false main.crn
+
 plan-map-diff-tui:
 	cd $(FIXTURES)/map_key_diff && $(CARINA) plan --refresh=false --tui main.crn
 
@@ -49,7 +52,10 @@ plan-fixtures:
 	@echo ""
 	@echo "=== map_key_diff ==="
 	@$(MAKE) plan-map-diff
+	@echo ""
+	@echo "=== enum_display ==="
+	@$(MAKE) plan-enum-display
 
 .PHONY: plan-all-create plan-no-changes plan-mixed plan-delete plan-compact \
-        plan-map-diff plan-map-diff-tui \
+        plan-map-diff plan-enum-display plan-map-diff-tui \
         plan-all-create-tui plan-mixed-tui plan-delete-tui plan-fixtures
