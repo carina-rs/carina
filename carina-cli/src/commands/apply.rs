@@ -1082,7 +1082,7 @@ async fn run_apply_locked(
 
     // Populate cascading updates for create_before_destroy Replace effects.
     // Uses unresolved resources (sorted_resources) so dependents retain ResourceRef values.
-    cascade_dependent_updates(&mut plan, &sorted_resources, &current_states);
+    cascade_dependent_updates(&mut plan, &sorted_resources, &current_states, schemas);
 
     if plan.is_empty() {
         println!("{}", "No changes needed.".green());
