@@ -682,19 +682,23 @@ pub fn print_plan(plan: &Plan, compact: bool) {
 
         // Extract current effect's binding name for children
         let current_binding = {
-            let resource = match effect {
-                Effect::Create(r) => Some(r),
-                Effect::Update { to, .. } => Some(to),
-                Effect::Replace { to, .. } => Some(to),
-                Effect::Read { resource } => Some(resource),
-                Effect::Delete { .. } => None,
-            };
-            resource.and_then(|r| {
-                r.attributes.get("_binding").and_then(|v| match v {
-                    Value::String(s) => Some(s.clone()),
-                    _ => None,
+            if let Effect::Delete { binding, .. } = effect {
+                binding.clone()
+            } else {
+                let resource = match effect {
+                    Effect::Create(r) => Some(r),
+                    Effect::Update { to, .. } => Some(to),
+                    Effect::Replace { to, .. } => Some(to),
+                    Effect::Read { resource } => Some(resource),
+                    Effect::Delete { .. } => None,
+                };
+                resource.and_then(|r| {
+                    r.attributes.get("_binding").and_then(|v| match v {
+                        Value::String(s) => Some(s.clone()),
+                        _ => None,
+                    })
                 })
-            })
+            }
         };
 
         // Print children (dependents)

@@ -449,6 +449,9 @@ fn shorten_effect_labels(plan: &Plan, nodes: &mut [TreeNode]) {
                 // For anonymous resources, try to extract a compact hint
                 let parent_binding = nodes[idx].parent.and_then(|p_idx| {
                     let p_effect = &plan.effects()[p_idx];
+                    if let Effect::Delete { binding, .. } = p_effect {
+                        return binding.clone();
+                    }
                     let p_resource = match p_effect {
                         Effect::Create(r) => Some(r),
                         Effect::Update { to, .. } => Some(to),
