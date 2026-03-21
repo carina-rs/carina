@@ -350,10 +350,9 @@ pub fn cascade_dependent_updates(
         .map(|e| e.resource_id().clone())
         .collect();
 
-    // For each unresolved resource, check if it depends on a replaced binding
+    // For each unresolved resource, check if it depends on a replaced binding.
+    // Resources already in the plan are handled separately below.
     for resource in unresolved_resources {
-        // Skip resources that already have effects in the plan, UNLESS
-        // cascade analysis finds create-only attributes to merge
         if planned_ids.contains(&resource.id) {
             continue;
         }
