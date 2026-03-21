@@ -12,6 +12,7 @@ Execution Plan:
         │     group_description: "Test security group"
         │     tags: {Name: "test-sg"}
         │     vpc_id: "vpc-0123456789abcdef0"
+        │
         └─ - awscc.ec2.subnet my_subnet
 
 Plan: 1 to add, 1 to change, 1 to destroy.
