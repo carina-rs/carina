@@ -706,6 +706,117 @@ fn cascade_merges_with_existing_replace_direct_change_plus_cascade() {
 }
 
 #[test]
+fn auto_detect_create_before_destroy_when_resource_has_dependents() {
+    // Issue #947: When a resource being replaced is referenced by other resources,
+    // automatically use create_before_destroy strategy instead of the default
+    // delete-then-create.
+    //
+    // VPC cidr_block changes (create-only) → VPC Replace with default lifecycle
+    // Subnet depends on VPC via vpc_id (ResourceRef)
+    // Expected: VPC Replace should auto-detect create_before_destroy = true
+    // because the subnet references it.
+
+    use crate::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
+    let vpc_id = ResourceId::new("ec2.vpc", "my-vpc");
+    let subnet_id = ResourceId::new("ec2.subnet", "my-subnet");
+
+    // Unresolved resources (before ref resolution)
+    let vpc = Resource::new("ec2.vpc", "my-vpc")
+        .with_attribute("_binding", Value::String("vpc".to_string()))
+        .with_attribute("cidr_block", Value::String("10.1.0.0/16".to_string()));
+
+    let subnet = Resource::new("ec2.subnet", "my-subnet")
+        .with_attribute("_binding", Value::String("subnet".to_string()))
+        .with_attribute(
+            "vpc_id",
+            Value::ResourceRef {
+                binding_name: "vpc".to_string(),
+                attribute_name: "vpc_id".to_string(),
+            },
+        )
+        .with_attribute("cidr_block", Value::String("10.1.1.0/24".to_string()));
+
+    let unresolved_resources = vec![vpc.clone(), subnet.clone()];
+
+    // Current states
+    let mut current_states = HashMap::new();
+    let mut vpc_attrs = HashMap::new();
+    vpc_attrs.insert(
+        "cidr_block".to_string(),
+        Value::String("10.0.0.0/16".to_string()),
+    );
+    vpc_attrs.insert("vpc_id".to_string(), Value::String("vpc-old".to_string()));
+    current_states.insert(
+        vpc_id.clone(),
+        State::existing(vpc_id.clone(), vpc_attrs).with_identifier("vpc-old"),
+    );
+
+    let mut subnet_attrs = HashMap::new();
+    subnet_attrs.insert("vpc_id".to_string(), Value::String("vpc-old".to_string()));
+    subnet_attrs.insert(
+        "cidr_block".to_string(),
+        Value::String("10.1.1.0/24".to_string()),
+    );
+    current_states.insert(
+        subnet_id.clone(),
+        State::existing(subnet_id.clone(), subnet_attrs).with_identifier("subnet-123"),
+    );
+
+    // Schema: cidr_block is create-only on ec2.vpc
+    let vpc_schema = ResourceSchema::new("ec2.vpc")
+        .attribute(AttributeSchema::new("cidr_block", AttributeType::String).create_only());
+    let subnet_schema = ResourceSchema::new("ec2.subnet")
+        .attribute(
+            AttributeSchema::new("vpc_id", AttributeType::String)
+                .required()
+                .create_only(),
+        )
+        .attribute(AttributeSchema::new("cidr_block", AttributeType::String).required());
+
+    let mut schemas = HashMap::new();
+    schemas.insert("ec2.vpc".to_string(), vpc_schema);
+    schemas.insert("ec2.subnet".to_string(), subnet_schema);
+
+    // Build a plan with Replace for VPC using DEFAULT lifecycle (no explicit CBD)
+    let mut plan = Plan::new();
+    plan.add(Effect::Replace {
+        id: vpc_id.clone(),
+        from: Box::new(current_states.get(&vpc_id).unwrap().clone()),
+        to: vpc
+            .clone()
+            .with_attribute("_binding", Value::String("vpc".to_string())),
+        lifecycle: LifecycleConfig::default(), // create_before_destroy = false (user didn't set it)
+        changed_create_only: vec!["cidr_block".to_string()],
+        cascading_updates: vec![],
+        temporary_name: None,
+        cascade_ref_hints: vec![],
+    });
+
+    // Apply cascade — this should auto-detect that VPC has dependents and
+    // promote it to create_before_destroy
+    cascade_dependent_updates(&mut plan, &unresolved_resources, &current_states, &schemas);
+
+    // The VPC Replace should now have create_before_destroy = true
+    // because the subnet references it
+    let vpc_effect = plan
+        .effects()
+        .iter()
+        .find(|e| *e.resource_id() == vpc_id)
+        .expect("VPC Replace effect should exist");
+
+    if let Effect::Replace { lifecycle, .. } = vpc_effect {
+        assert!(
+            lifecycle.create_before_destroy,
+            "VPC Replace should have create_before_destroy auto-detected \
+             because subnet references it, but got create_before_destroy = false"
+        );
+    } else {
+        panic!("Expected Replace effect for VPC");
+    }
+}
+
+#[test]
 fn cascade_upgrades_update_to_replace_when_ref_is_create_only() {
     // Pattern 3: Direct non-create-only change + cascade
     //

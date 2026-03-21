@@ -361,10 +361,45 @@ pub fn cascade_dependent_updates(
         binding_to_unresolved.insert(key, resource);
     }
 
+    // Auto-detect create_before_destroy: if a Replace effect has dependents
+    // among the unresolved resources, promote it to create_before_destroy.
+    // This must happen before collecting replaced_bindings so that the
+    // promoted effects are picked up by the existing cascade logic.
+    {
+        // Collect all Replace bindings (regardless of CBD flag) with their resource IDs
+        let all_replace_bindings: HashMap<String, ResourceId> = plan
+            .effects()
+            .iter()
+            .filter_map(|e| {
+                if let Effect::Replace { id, lifecycle, .. } = e {
+                    // Only consider Replace effects that are NOT already CBD
+                    if !lifecycle.create_before_destroy {
+                        e.binding_name().map(|b| (b, id.clone()))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        if !all_replace_bindings.is_empty() {
+            for resource in unresolved_resources {
+                let deps = get_resource_dependencies(resource);
+                for dep in &deps {
+                    if let Some(resource_id) = all_replace_bindings.get(dep) {
+                        plan.promote_to_create_before_destroy(resource_id);
+                    }
+                }
+            }
+        }
+    }
+
     // Build reverse dependency map: replaced_binding -> [dependent_bindings]
     let mut dependents_of_replaced: HashMap<String, Vec<String>> = HashMap::new();
 
-    // Collect binding names of resources being replaced
+    // Collect binding names of resources being replaced (now includes auto-promoted ones)
     let replaced_bindings: HashSet<String> = plan
         .effects()
         .iter()

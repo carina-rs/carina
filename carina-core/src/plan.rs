@@ -119,6 +119,22 @@ impl Plan {
         }
     }
 
+    /// Promote a Replace effect to create_before_destroy.
+    ///
+    /// This is used by auto-detection: when a resource being replaced is
+    /// referenced by other resources, it should use create_before_destroy
+    /// to avoid breaking dependents during replacement.
+    pub fn promote_to_create_before_destroy(&mut self, resource_id: &crate::resource::ResourceId) {
+        for effect in &mut self.effects {
+            if let Effect::Replace { id, lifecycle, .. } = effect
+                && id == resource_id
+            {
+                lifecycle.create_before_destroy = true;
+                return;
+            }
+        }
+    }
+
     /// Number of mutating Effects
     pub fn mutation_count(&self) -> usize {
         self.effects.iter().filter(|e| e.is_mutating()).count()
