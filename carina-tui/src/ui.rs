@@ -223,7 +223,12 @@ fn render_map_key_diff(
                         Span::raw("    "),
                         Span::styled("~ ", Style::default().fg(Color::Yellow)),
                         Span::raw(format!("{}: ", key)),
-                        Span::styled(format_value(ov), Style::default().fg(Color::Red)),
+                        Span::styled(
+                            format_value(ov),
+                            Style::default()
+                                .fg(Color::Red)
+                                .add_modifier(Modifier::CROSSED_OUT),
+                        ),
                         Span::raw(" -> "),
                         Span::styled(format_value(nv), Style::default().fg(Color::Green)),
                     ]));
@@ -240,9 +245,24 @@ fn render_map_key_diff(
             (Some(ov), None) => {
                 lines.push(Line::from(vec![
                     Span::raw("    "),
-                    Span::styled("- ", Style::default().fg(Color::Red)),
-                    Span::raw(format!("{}: ", key)),
-                    Span::styled(format_value(ov), Style::default().fg(Color::Red)),
+                    Span::styled(
+                        "- ",
+                        Style::default()
+                            .fg(Color::Red)
+                            .add_modifier(Modifier::CROSSED_OUT),
+                    ),
+                    Span::styled(
+                        format!("{}: ", key),
+                        Style::default()
+                            .fg(Color::Red)
+                            .add_modifier(Modifier::CROSSED_OUT),
+                    ),
+                    Span::styled(
+                        format_value(ov),
+                        Style::default()
+                            .fg(Color::Red)
+                            .add_modifier(Modifier::CROSSED_OUT),
+                    ),
                 ]));
             }
             (None, None) => {}
