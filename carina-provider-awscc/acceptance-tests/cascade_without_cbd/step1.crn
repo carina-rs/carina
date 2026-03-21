@@ -1,9 +1,8 @@
 # Cascading update without create_before_destroy (Step 1: Initial)
 #
-# Creates a security group and an ingress rule referencing it.
-# Step 2 changes group_description (create-only), triggering a Replace
-# of the SG. The ingress rule depends on the SG via group_id, so it
-# should appear as a cascading update in the plan.
+# Creates a VPC and a subnet. Step 2 changes cidr_block (create-only),
+# triggering a Replace of the VPC. The subnet depends on the VPC via
+# vpc_id, so it should appear as a cascading update in the plan.
 
 provider awscc {
   region = awscc.Region.ap_northeast_1
@@ -13,26 +12,18 @@ let vpc = awscc.ec2.vpc {
   cidr_block = "10.220.0.0/16"
 
   tags = {
-    Name        = "carina-acc-test-cascade"
+    Name        = "carina-acc-test-cascade-vpc"
     Environment = "acceptance-test"
   }
 }
 
-let sg = awscc.ec2.security_group {
+let subnet = awscc.ec2.subnet {
   vpc_id            = vpc.vpc_id
-  group_description = "Initial description"
+  cidr_block        = "10.220.1.0/24"
+  availability_zone = "ap-northeast-1a"
 
   tags = {
-    Name        = "carina-acc-test-cascade-sg"
+    Name        = "carina-acc-test-cascade-subnet"
     Environment = "acceptance-test"
   }
-}
-
-awscc.ec2.security_group_ingress {
-  group_id    = sg.group_id
-  ip_protocol = awscc.ec2.security_group_ingress.IpProtocol.tcp
-  from_port   = 443
-  to_port     = 443
-  cidr_ip     = "10.220.0.0/16"
-  description = "Allow HTTPS from VPC"
 }

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Cascading update without create_before_destroy test
 #
-# Tests that when a security group is replaced (without CBD),
-# dependent resources (ingress rule) appear as cascading updates in the plan.
+# Tests that when a VPC is replaced (without CBD),
+# dependent resources (subnet) appear as cascading updates in the plan.
 #
 # Usage:
 #   aws-vault exec carina-test-000 -- ./carina-provider-awscc/acceptance-tests/cascade_without_cbd/run.sh
@@ -39,7 +39,7 @@ echo "════════════════════════�
 echo ""
 
 # Step 1: Apply initial state (VPC + SG + Ingress)
-run_step "apply step1 (create SG + ingress)" "$CARINA apply --auto-approve $STEP1"
+run_step "apply step1 (create VPC + subnet)" "$CARINA apply --auto-approve $STEP1"
 
 # Step 2: Plan with changed group_description
 # The plan should show:
