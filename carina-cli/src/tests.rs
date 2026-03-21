@@ -2119,3 +2119,170 @@ fn orphaned_resource_deleted_externally_should_not_produce_delete_effect() {
         delete_effects
     );
 }
+
+/// Issue #950: --refresh=false should use cached state from state file
+/// instead of calling provider.read().
+///
+/// This test simulates the refresh=false code path:
+/// 1. State file has "my-bucket" with known attributes
+/// 2. With refresh=false, current_states are built from state file
+/// 3. No provider.read() calls are made
+#[test]
+fn refresh_false_uses_cached_state_from_state_file() {
+    use carina_core::differ::create_plan;
+
+    let mut state_file = StateFile::new();
+    state_file.upsert_resource(
+        ResourceState::new("s3.bucket", "my-bucket", "awscc")
+            .with_identifier("my-bucket-id")
+            .with_attribute("bucket_name", json!("my-bucket"))
+            .with_attribute("region", json!("ap-northeast-1")),
+    );
+
+    let mut resource = Resource::with_provider("awscc", "s3.bucket", "my-bucket");
+    resource.attributes.insert(
+        "bucket_name".to_string(),
+        Value::String("my-bucket".to_string()),
+    );
+    resource.attributes.insert(
+        "region".to_string(),
+        Value::String("ap-northeast-1".to_string()),
+    );
+
+    let desired = vec![resource];
+
+    // Simulate refresh=false code path: build current_states from state file
+    let mut current_states: HashMap<ResourceId, State> = HashMap::new();
+    for res in &desired {
+        let state = state_file.build_state_for_resource(res);
+        current_states.insert(res.id.clone(), state);
+    }
+
+    // Verify state was loaded from state file
+    let id = ResourceId::with_provider("awscc", "s3.bucket", "my-bucket");
+    let cached_state = current_states.get(&id).unwrap();
+    assert!(cached_state.exists, "State should exist from state file");
+    assert_eq!(
+        cached_state.identifier,
+        Some("my-bucket-id".to_string()),
+        "Identifier should come from state file"
+    );
+    assert_eq!(
+        cached_state.attributes.get("bucket_name"),
+        Some(&Value::String("my-bucket".to_string())),
+        "Attributes should come from state file"
+    );
+
+    let lifecycles = state_file.build_lifecycles();
+    let saved_attrs = state_file.build_saved_attrs();
+    let prev_desired_keys = state_file.build_desired_keys();
+
+    let plan = create_plan(
+        &desired,
+        &current_states,
+        &lifecycles,
+        &HashMap::new(),
+        &saved_attrs,
+        &prev_desired_keys,
+    );
+
+    // No changes expected since desired matches cached state
+    assert_eq!(
+        plan.mutation_count(),
+        0,
+        "No changes expected when desired state matches cached state"
+    );
+}
+
+/// Issue #950: --refresh=false with orphaned resources should use state file data
+/// directly without calling provider.read().
+#[test]
+fn refresh_false_includes_orphaned_resources_from_state_file() {
+    use carina_core::differ::create_plan;
+
+    let mut state_file = StateFile::new();
+    state_file.upsert_resource(
+        ResourceState::new("s3.bucket", "orphaned-bucket", "awscc")
+            .with_identifier("orphaned-bucket-id")
+            .with_attribute("bucket_name", json!("orphaned-bucket")),
+    );
+
+    // No desired resources — the bucket was removed from .crn
+    let desired: Vec<Resource> = vec![];
+    let desired_ids: HashSet<ResourceId> = desired.iter().map(|r| r.id.clone()).collect();
+
+    let mut current_states: HashMap<ResourceId, State> = HashMap::new();
+
+    // Simulate refresh=false code path: include orphans directly from state file
+    for (id, state) in state_file.build_orphan_states(&desired_ids) {
+        current_states.entry(id).or_insert(state);
+    }
+
+    let lifecycles = state_file.build_lifecycles();
+    let saved_attrs = state_file.build_saved_attrs();
+    let prev_desired_keys = state_file.build_desired_keys();
+
+    let plan = create_plan(
+        &desired,
+        &current_states,
+        &lifecycles,
+        &HashMap::new(),
+        &saved_attrs,
+        &prev_desired_keys,
+    );
+
+    // With refresh=false, orphaned resources are assumed to still exist,
+    // so a Delete effect should be generated
+    let delete_effects: Vec<_> = plan
+        .effects()
+        .iter()
+        .filter(|e| matches!(e, Effect::Delete { .. }))
+        .collect();
+
+    assert_eq!(
+        delete_effects.len(),
+        1,
+        "Issue #950: orphaned resource with refresh=false should produce Delete effect"
+    );
+}
+
+/// Issue #950: --refresh=false without a state file should treat all resources as new.
+#[test]
+fn refresh_false_without_state_file_treats_resources_as_new() {
+    use carina_core::differ::create_plan;
+
+    let mut resource = Resource::with_provider("awscc", "s3.bucket", "new-bucket");
+    resource.attributes.insert(
+        "bucket_name".to_string(),
+        Value::String("new-bucket".to_string()),
+    );
+
+    let desired = vec![resource];
+
+    // Simulate refresh=false with no state file
+    let mut current_states: HashMap<ResourceId, State> = HashMap::new();
+    for res in &desired {
+        current_states.insert(res.id.clone(), State::not_found(res.id.clone()));
+    }
+
+    let plan = create_plan(
+        &desired,
+        &current_states,
+        &HashMap::new(),
+        &HashMap::new(),
+        &HashMap::new(),
+        &HashMap::new(),
+    );
+
+    let create_effects: Vec<_> = plan
+        .effects()
+        .iter()
+        .filter(|e| matches!(e, Effect::Create { .. }))
+        .collect();
+
+    assert_eq!(
+        create_effects.len(),
+        1,
+        "Without state file, all resources should be created"
+    );
+}

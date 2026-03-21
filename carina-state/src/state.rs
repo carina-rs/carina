@@ -145,6 +145,31 @@ impl StateFile {
         result
     }
 
+    /// Build a `State` for a resource from the state file data.
+    /// Returns a non-existing state if the resource is not found in the state file.
+    pub fn build_state_for_resource(&self, resource: &Resource) -> State {
+        let rs = self.find_resource(
+            &resource.id.provider,
+            &resource.id.resource_type,
+            &resource.id.name,
+        );
+        if let Some(identifier) = rs.and_then(|r| r.identifier.as_deref()) {
+            let attrs: HashMap<String, Value> = rs
+                .unwrap()
+                .attributes
+                .iter()
+                .filter_map(|(k, v)| json_to_dsl_value(v).map(|val| (k.clone(), val)))
+                .collect();
+            return State {
+                id: resource.id.clone(),
+                identifier: Some(identifier.to_string()),
+                attributes: attrs,
+                exists: true,
+            };
+        }
+        State::not_found(resource.id.clone())
+    }
+
     /// Build state entries for resources tracked in the state file but absent from the
     /// desired resource set.  These "orphan" entries are injected into `current_states`
     /// so that `create_plan()` can detect them and emit Delete effects.
@@ -673,5 +698,56 @@ mod tests {
             saved.get(&awscc_id).unwrap().get("region"),
             Some(&Value::String("ap-northeast-1".to_string()))
         );
+    }
+
+    #[test]
+    fn test_build_state_for_resource_existing() {
+        use carina_core::resource::{Resource, Value};
+
+        let mut state = StateFile::new();
+        state.upsert_resource(
+            ResourceState::new("s3.bucket", "my-bucket", "awscc")
+                .with_identifier("my-bucket-id")
+                .with_attribute("region".to_string(), serde_json::json!("ap-northeast-1")),
+        );
+
+        let resource = Resource::with_provider("awscc", "s3.bucket", "my-bucket");
+        let result = state.build_state_for_resource(&resource);
+
+        assert!(result.exists);
+        assert_eq!(result.identifier, Some("my-bucket-id".to_string()));
+        assert_eq!(
+            result.attributes.get("region"),
+            Some(&Value::String("ap-northeast-1".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_build_state_for_resource_not_found() {
+        let state = StateFile::new();
+        let resource =
+            carina_core::resource::Resource::with_provider("awscc", "s3.bucket", "missing");
+        let result = state.build_state_for_resource(&resource);
+
+        assert!(!result.exists);
+        assert!(result.identifier.is_none());
+        assert!(result.attributes.is_empty());
+    }
+
+    #[test]
+    fn test_build_state_for_resource_without_identifier() {
+        let mut state = StateFile::new();
+        // Resource in state but without identifier (not yet created)
+        state.upsert_resource(
+            ResourceState::new("s3.bucket", "pending", "awscc")
+                .with_attribute("region".to_string(), serde_json::json!("us-east-1")),
+        );
+
+        let resource =
+            carina_core::resource::Resource::with_provider("awscc", "s3.bucket", "pending");
+        let result = state.build_state_for_resource(&resource);
+
+        assert!(!result.exists);
+        assert!(result.identifier.is_none());
     }
 }
