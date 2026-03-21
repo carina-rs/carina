@@ -61,6 +61,7 @@ pub async fn run_plan(
     out: Option<&PathBuf>,
     compact: bool,
     tui: bool,
+    refresh: bool,
 ) -> Result<bool, AppError> {
     let mut parsed = load_configuration(path)?.parsed;
 
@@ -166,7 +167,14 @@ pub async fn run_plan(
     }
     apply_name_overrides(&mut parsed.resources, &state_file);
 
-    let ctx = create_plan_from_parsed(&parsed, &state_file).await?;
+    if !refresh {
+        eprintln!(
+            "{}",
+            "Warning: using cached state (--refresh=false). Plan may not reflect actual infrastructure.".yellow()
+        );
+    }
+
+    let ctx = create_plan_from_parsed(&parsed, &state_file, refresh).await?;
     let has_changes = ctx.plan.mutation_count() > 0;
 
     if tui {

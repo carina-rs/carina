@@ -264,6 +264,7 @@ pub async fn create_providers_from_configs(configs: &[ProviderConfig]) -> Provid
 pub async fn create_plan_from_parsed(
     parsed: &ParsedFile,
     state_file: &Option<StateFile>,
+    refresh: bool,
 ) -> Result<PlanContext, AppError> {
     let ctx = WiringContext::new();
     let sorted_resources =
@@ -272,33 +273,56 @@ pub async fn create_plan_from_parsed(
     // Select appropriate Provider based on configuration
     let provider = get_provider_with_ctx(&ctx, parsed).await;
 
-    // Read states for all resources using identifier from state
-    // In identifier-based approach, if there's no identifier in state, the resource doesn't exist
     let mut current_states: HashMap<ResourceId, State> = HashMap::new();
-    for resource in &sorted_resources {
-        let identifier = state_file
-            .as_ref()
-            .and_then(|sf| sf.get_identifier_for_resource(resource));
-        let state = provider
-            .read(&resource.id, identifier.as_deref())
-            .await
-            .map_err(AppError::Provider)?;
-        current_states.insert(resource.id.clone(), state);
-    }
 
-    // Seed current_states with orphaned resources from state file (#844).
-    // These are resources tracked in state but removed from the .crn config.
-    // Refresh each orphan via provider.read() to verify it still exists (#931).
-    if let Some(sf) = state_file.as_ref() {
-        let desired_ids: HashSet<ResourceId> =
-            sorted_resources.iter().map(|r| r.id.clone()).collect();
-        for (id, state) in sf.build_orphan_states(&desired_ids) {
-            let refreshed = provider
-                .read(&id, state.identifier.as_deref())
+    if refresh {
+        // Read states for all resources using identifier from state
+        // In identifier-based approach, if there's no identifier in state, the resource doesn't exist
+        for resource in &sorted_resources {
+            let identifier = state_file
+                .as_ref()
+                .and_then(|sf| sf.get_identifier_for_resource(resource));
+            let state = provider
+                .read(&resource.id, identifier.as_deref())
                 .await
                 .map_err(AppError::Provider)?;
-            if refreshed.exists {
-                current_states.entry(id).or_insert(refreshed);
+            current_states.insert(resource.id.clone(), state);
+        }
+
+        // Seed current_states with orphaned resources from state file (#844).
+        // These are resources tracked in state but removed from the .crn config.
+        // Refresh each orphan via provider.read() to verify it still exists (#931).
+        if let Some(sf) = state_file.as_ref() {
+            let desired_ids: HashSet<ResourceId> =
+                sorted_resources.iter().map(|r| r.id.clone()).collect();
+            for (id, state) in sf.build_orphan_states(&desired_ids) {
+                let refreshed = provider
+                    .read(&id, state.identifier.as_deref())
+                    .await
+                    .map_err(AppError::Provider)?;
+                if refreshed.exists {
+                    current_states.entry(id).or_insert(refreshed);
+                }
+            }
+        }
+    } else {
+        // --refresh=false: use cached state from state file instead of calling provider.read()
+        if let Some(sf) = state_file.as_ref() {
+            for resource in &sorted_resources {
+                let state = sf.build_state_for_resource(resource);
+                current_states.insert(resource.id.clone(), state);
+            }
+
+            // Also include orphaned resources from state file
+            let desired_ids: HashSet<ResourceId> =
+                sorted_resources.iter().map(|r| r.id.clone()).collect();
+            for (id, state) in sf.build_orphan_states(&desired_ids) {
+                current_states.entry(id).or_insert(state);
+            }
+        } else {
+            // No state file: all resources are new (not found)
+            for resource in &sorted_resources {
+                current_states.insert(resource.id.clone(), State::not_found(resource.id.clone()));
             }
         }
     }

@@ -55,6 +55,10 @@ enum Commands {
         /// Display plan in interactive TUI mode
         #[arg(long)]
         tui: bool,
+
+        /// Refresh state from provider before planning (default: true)
+        #[arg(long, default_value = "true", action = clap::ArgAction::Set)]
+        refresh: bool,
     },
     /// Apply changes to reach the desired state
     Apply {
@@ -148,9 +152,10 @@ async fn main() {
         detailed_exitcode,
         compact,
         tui,
+        refresh,
     } = cli.command
     {
-        match run_plan(&path, out.as_ref(), compact, tui).await {
+        match run_plan(&path, out.as_ref(), compact, tui, refresh).await {
             Ok(has_changes) => {
                 if detailed_exitcode && has_changes {
                     std::process::exit(2);
