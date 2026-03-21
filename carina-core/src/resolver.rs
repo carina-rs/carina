@@ -5,16 +5,34 @@
 
 use std::collections::HashMap;
 
+use crate::deps::get_resource_dependencies;
 use crate::resource::{Resource, ResourceId, State, Value};
 
 /// Resolve all ResourceRef values in resources using current state.
 ///
 /// Builds a binding map from resource attributes and state, then resolves
 /// all ResourceRef values across all resources.
+///
+/// Before resolving, saves dependency binding names as `_dependency_bindings`
+/// metadata on each resource. This preserves dependency information that would
+/// otherwise be lost when ResourceRef values are replaced with plain strings.
 pub fn resolve_refs_with_state(
     resources: &mut [Resource],
     current_states: &HashMap<ResourceId, State>,
 ) {
+    // Save dependency bindings before resolution destroys ResourceRef values.
+    // This metadata is used by plan tree building to recover parent-child
+    // relationships (see build_plan_tree in display.rs and app.rs).
+    for resource in resources.iter_mut() {
+        let deps = get_resource_dependencies(resource);
+        if !deps.is_empty() {
+            let dep_list: Vec<Value> = deps.into_iter().map(Value::String).collect();
+            resource
+                .attributes
+                .insert("_dependency_bindings".to_string(), Value::List(dep_list));
+        }
+    }
+
     // Build a map of binding_name -> attributes (merged from DSL and AWS state)
     let mut binding_map: HashMap<String, HashMap<String, Value>> = HashMap::new();
 

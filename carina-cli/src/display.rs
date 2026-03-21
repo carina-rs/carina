@@ -2484,4 +2484,88 @@ mod tests {
             roots
         );
     }
+
+    /// Issue #972: When ResourceRef values are resolved to literal strings
+    /// (as happens with --refresh=false), the tree algorithm loses dependency
+    /// information and places the resource as a top-level root instead of
+    /// nesting it under its parent.
+    ///
+    /// Scenario (mixed_operations fixture):
+    ///   - VPC: Update effect (existing, tags changed)
+    ///   - SG: Create effect with vpc_id = "vpc-0123456789abcdef0"
+    ///     (resolved from vpc.vpc_id by resolve_refs_with_state)
+    ///
+    /// The SG should be nested under VPC because in the DSL it has
+    /// `vpc_id = vpc.vpc_id`, but after resolve_refs_with_state() the
+    /// ResourceRef is replaced with a plain string, so
+    /// get_resource_dependencies() finds no dependencies.
+    #[test]
+    fn test_resolved_ref_loses_dependency_for_tree_nesting() {
+        // VPC: Update effect (tags changed)
+        let vpc_to = make_resource("ec2.vpc", "vpc", "vpc", &[]);
+        let vpc_from = State::existing(
+            ResourceId::new("ec2.vpc", "vpc"),
+            HashMap::from([(
+                "cidr_block".to_string(),
+                Value::String("10.0.0.0/16".to_string()),
+            )]),
+        );
+
+        // SG: Create effect with RESOLVED ref (string instead of ResourceRef).
+        // This is what happens after resolve_refs_with_state() runs:
+        // vpc_id = vpc.vpc_id becomes vpc_id = "vpc-0123456789abcdef0"
+        let mut sg = Resource::new("ec2.security_group", "sg");
+        sg.attributes
+            .insert("_binding".to_string(), Value::String("sg".to_string()));
+        // This is the resolved value — a plain string, NOT a ResourceRef
+        sg.attributes.insert(
+            "vpc_id".to_string(),
+            Value::String("vpc-0123456789abcdef0".to_string()),
+        );
+        sg.attributes.insert(
+            "group_description".to_string(),
+            Value::String("Test security group".to_string()),
+        );
+        // _dependency_bindings is saved by resolve_refs_with_state() before
+        // ResourceRef values are resolved to strings.
+        sg.attributes.insert(
+            "_dependency_bindings".to_string(),
+            Value::List(vec![Value::String("vpc".to_string())]),
+        );
+
+        let mut plan = Plan::new();
+        plan.add(Effect::Update {
+            id: ResourceId::new("ec2.vpc", "vpc"),
+            from: Box::new(vpc_from),
+            to: vpc_to,
+            changed_attributes: vec!["tags".to_string()],
+        });
+        plan.add(Effect::Create(sg));
+
+        let (roots, dependents, effect_bindings, _effect_types) = build_plan_tree(&plan);
+
+        // VPC (idx 0) should be the only root.
+        // SG has _dependency_bindings metadata that preserves the dependency
+        // on "vpc", so get_resource_dependencies() recovers it.
+        assert_eq!(
+            roots,
+            vec![0],
+            "VPC should be the only root. SG should be nested under VPC \
+             because it references vpc.vpc_id in the DSL. Got roots: {:?} \
+             (bindings: {:?})",
+            roots,
+            roots
+                .iter()
+                .filter_map(|i| effect_bindings.get(i))
+                .collect::<Vec<_>>()
+        );
+
+        // SG (idx 1) should be a child of VPC (idx 0)
+        let vpc_children: Vec<usize> = dependents.get(&0).cloned().unwrap_or_default();
+        assert!(
+            vpc_children.contains(&1),
+            "SG (idx 1) should be a child of VPC. VPC children: {:?}",
+            vpc_children
+        );
+    }
 }
