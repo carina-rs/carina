@@ -295,12 +295,13 @@ pub fn create_plan(
 ///
 /// 1. Finds all Replace effects with create_before_destroy = true
 /// 2. Identifies dependent resources that reference the replaced resource's binding
-/// 3. Adds CascadingUpdate entries to the Replace effect with the unresolved
-///    resource (containing ResourceRef values) so apply can re-resolve using the
-///    new resource's state
+/// 3. If the referencing attribute is create-only on the dependent (per `schemas`),
+///    promotes the dependent to its own Replace effect in the plan
+/// 4. Otherwise, adds a CascadingUpdate entry to the parent Replace effect
 ///
 /// `unresolved_resources` should be the resources BEFORE ref resolution (still containing
 /// ResourceRef values). `current_states` provides the `from` state for each dependent.
+/// `schemas` provides attribute metadata to detect create-only attributes.
 pub fn cascade_dependent_updates(
     plan: &mut Plan,
     unresolved_resources: &[Resource],
