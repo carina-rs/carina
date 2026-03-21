@@ -295,7 +295,25 @@ pub fn print_plan(plan: &Plan, compact: bool) {
             Effect::Update { to, .. } => (Some(to), get_resource_dependencies(to)),
             Effect::Replace { to, .. } => (Some(to), get_resource_dependencies(to)),
             Effect::Read { resource } => (Some(resource), get_resource_dependencies(resource)),
-            Effect::Delete { .. } => (None, HashSet::new()),
+            Effect::Delete {
+                id,
+                binding,
+                dependencies,
+                ..
+            } => {
+                let deps = dependencies.clone();
+                if let Some(b) = binding {
+                    binding_to_effect.insert(b.clone(), idx);
+                    effect_bindings.insert(idx, b.clone());
+                } else {
+                    let fallback = id.to_string();
+                    binding_to_effect.insert(fallback.clone(), idx);
+                    effect_bindings.insert(idx, fallback);
+                }
+                effect_types.insert(idx, id.resource_type.clone());
+                effect_deps.insert(idx, deps);
+                continue;
+            }
         };
 
         if let Some(r) = resource {
@@ -664,19 +682,23 @@ pub fn print_plan(plan: &Plan, compact: bool) {
 
         // Extract current effect's binding name for children
         let current_binding = {
-            let resource = match effect {
-                Effect::Create(r) => Some(r),
-                Effect::Update { to, .. } => Some(to),
-                Effect::Replace { to, .. } => Some(to),
-                Effect::Read { resource } => Some(resource),
-                Effect::Delete { .. } => None,
-            };
-            resource.and_then(|r| {
-                r.attributes.get("_binding").and_then(|v| match v {
-                    Value::String(s) => Some(s.clone()),
-                    _ => None,
+            if let Effect::Delete { binding, .. } = effect {
+                binding.clone()
+            } else {
+                let resource = match effect {
+                    Effect::Create(r) => Some(r),
+                    Effect::Update { to, .. } => Some(to),
+                    Effect::Replace { to, .. } => Some(to),
+                    Effect::Read { resource } => Some(resource),
+                    Effect::Delete { .. } => None,
+                };
+                resource.and_then(|r| {
+                    r.attributes.get("_binding").and_then(|v| match v {
+                        Value::String(s) => Some(s.clone()),
+                        _ => None,
+                    })
                 })
-            })
+            }
         };
 
         // Print children (dependents)
@@ -1203,7 +1225,25 @@ mod tests {
                 Effect::Update { to, .. } => (Some(to), get_resource_dependencies(to)),
                 Effect::Replace { to, .. } => (Some(to), get_resource_dependencies(to)),
                 Effect::Read { resource } => (Some(resource), get_resource_dependencies(resource)),
-                Effect::Delete { .. } => (None, HashSet::new()),
+                Effect::Delete {
+                    id,
+                    binding,
+                    dependencies,
+                    ..
+                } => {
+                    let deps = dependencies.clone();
+                    if let Some(b) = binding {
+                        binding_to_effect.insert(b.clone(), idx);
+                        effect_bindings.insert(idx, b.clone());
+                    } else {
+                        let fallback = id.to_string();
+                        binding_to_effect.insert(fallback.clone(), idx);
+                        effect_bindings.insert(idx, fallback);
+                    }
+                    effect_types.insert(idx, id.resource_type.clone());
+                    effect_deps.insert(idx, deps);
+                    continue;
+                }
             };
 
             if let Some(r) = resource {
@@ -2170,6 +2210,115 @@ mod tests {
             output.contains("security_group_ids"),
             "Expected security_group_ids in diff output, got: {}",
             output
+        );
+    }
+
+    /// Issue #949: Plan tree structure is lost for mixed effect plans.
+    ///
+    /// When a plan contains Delete effects, they have no resource (only `id`
+    /// and `identifier`), so:
+    /// - No binding is registered in `binding_to_effect`
+    /// - No dependencies are extracted
+    /// - No `effect_bindings` or `effect_types` entry is created
+    ///
+    /// This means Delete effects are invisible to the tree algorithm and
+    /// cannot participate as roots or children. The tree degrades to a flat
+    /// list for any plan containing Delete effects.
+    ///
+    /// Scenario:
+    ///   - VPC (Update) — root, no dependencies
+    ///   - SG (Replace) — depends on VPC via ResourceRef
+    ///   - Subnet (Delete) — should be child of VPC, but Delete has no resource
+    ///
+    /// Expected tree:
+    ///   vpc (update)
+    ///   ├── sg (replace)
+    ///   └── subnet (delete)
+    ///
+    /// Actual: Delete effect for subnet is either missing from the tree or
+    /// appears as a disconnected root because it has no binding or dependency info.
+    #[test]
+    fn test_mixed_plan_tree_with_delete_effect() {
+        // VPC: Update effect (has `to` resource with binding)
+        let vpc_to = make_resource("ec2.vpc", "vpc", "vpc", &[]);
+        let vpc_from = State::existing(
+            ResourceId::new("ec2.vpc", "vpc"),
+            HashMap::from([(
+                "cidr_block".to_string(),
+                Value::String("10.0.0.0/16".to_string()),
+            )]),
+        );
+
+        // SG: Replace effect (has `to` resource that depends on VPC)
+        let sg_to = make_resource("ec2.security_group", "sg", "sg", &["vpc"]);
+        let sg_from = State::existing(
+            ResourceId::new("ec2.security_group", "sg"),
+            HashMap::from([(
+                "ref_vpc".to_string(),
+                Value::String("vpc-old123".to_string()),
+            )]),
+        );
+
+        // Subnet: Delete effect (only has id and identifier — no resource, no deps)
+        // In the original DSL, subnet depends on VPC, but Delete loses that info.
+        let subnet_delete = Effect::Delete {
+            id: ResourceId::new("ec2.subnet", "subnet"),
+            identifier: "subnet-12345".to_string(),
+            lifecycle: LifecycleConfig::default(),
+            binding: Some("subnet".to_string()),
+            dependencies: HashSet::from(["vpc".to_string()]),
+        };
+
+        let mut plan = Plan::new();
+        plan.add(Effect::Update {
+            id: ResourceId::new("ec2.vpc", "vpc"),
+            from: Box::new(vpc_from),
+            to: vpc_to,
+            changed_attributes: vec!["cidr_block".to_string()],
+        });
+        plan.add(Effect::Replace {
+            id: ResourceId::new("ec2.security_group", "sg"),
+            from: Box::new(sg_from),
+            to: sg_to,
+            lifecycle: LifecycleConfig::default(),
+            changed_create_only: vec!["ref_vpc".to_string()],
+            cascading_updates: vec![],
+            temporary_name: None,
+            cascade_ref_hints: vec![],
+        });
+        plan.add(subnet_delete);
+
+        let (roots, dependents, effect_bindings, _effect_types) = build_plan_tree(&plan);
+
+        // VPC (idx 0) should be the only root
+        assert_eq!(
+            roots,
+            vec![0],
+            "VPC should be the only root. Got roots: {:?} (bindings: {:?})",
+            roots,
+            roots
+                .iter()
+                .filter_map(|i| effect_bindings.get(i))
+                .collect::<Vec<_>>()
+        );
+
+        // SG (idx 1) should be a child of VPC
+        let vpc_children: Vec<usize> = dependents.get(&0).cloned().unwrap_or_default();
+        assert!(
+            vpc_children.contains(&1),
+            "SG (idx 1) should be a child of VPC. VPC children: {:?}",
+            vpc_children
+        );
+
+        // Subnet Delete (idx 2) should also be a child of VPC.
+        // Currently fails because Delete effects have no binding/dependency info.
+        assert!(
+            vpc_children.contains(&2),
+            "Subnet Delete (idx 2) should be a child of VPC, but Delete effects \
+             have no resource/binding/dependency info so the tree cannot place them. \
+             VPC children: {:?}, all roots: {:?}",
+            vpc_children,
+            roots
         );
     }
 }

@@ -249,6 +249,8 @@ fn plan_file_serde_round_trip() {
         id: ResourceId::with_provider("aws", "s3.bucket", "old-bucket"),
         identifier: "old-bucket".to_string(),
         lifecycle: LifecycleConfig::default(),
+        binding: None,
+        dependencies: HashSet::new(),
     });
 
     let sorted_resources = vec![
@@ -1233,6 +1235,7 @@ fn orphaned_state_resource_produces_delete_effect() {
         &HashMap::new(),
         &saved_attrs,
         &prev_desired_keys,
+        &HashMap::new(),
     );
 
     // The plan should contain a Delete effect for "removed-bucket"
@@ -2105,6 +2108,7 @@ fn orphaned_resource_deleted_externally_should_not_produce_delete_effect() {
         &HashMap::new(),
         &saved_attrs,
         &prev_desired_keys,
+        &HashMap::new(),
     );
 
     let delete_effects: Vec<_> = plan
@@ -2186,6 +2190,7 @@ fn refresh_false_uses_cached_state_from_state_file() {
         &HashMap::new(),
         &saved_attrs,
         &prev_desired_keys,
+        &HashMap::new(),
     );
 
     // No changes expected since desired matches cached state
@@ -2231,6 +2236,7 @@ fn refresh_false_includes_orphaned_resources_from_state_file() {
         &HashMap::new(),
         &saved_attrs,
         &prev_desired_keys,
+        &HashMap::new(),
     );
 
     // With refresh=false, orphaned resources are assumed to still exist,
@@ -2270,6 +2276,7 @@ fn refresh_false_without_state_file_treats_resources_as_new() {
     let plan = create_plan(
         &desired,
         &current_states,
+        &HashMap::new(),
         &HashMap::new(),
         &HashMap::new(),
         &HashMap::new(),

@@ -294,6 +294,8 @@ mod tests {
             id: ResourceId::new("test", "a"),
             identifier: "id-123".to_string(),
             lifecycle: LifecycleConfig::default(),
+            binding: None,
+            dependencies: HashSet::new(),
         };
 
         let mut failed = HashSet::new();

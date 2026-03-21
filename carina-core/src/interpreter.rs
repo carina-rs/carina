@@ -189,6 +189,7 @@ impl<P: Provider> Interpreter<P> {
                 id,
                 identifier,
                 lifecycle,
+                ..
             } => {
                 self.provider.delete(id, identifier, lifecycle).await?;
                 Ok(EffectOutcome::Deleted)

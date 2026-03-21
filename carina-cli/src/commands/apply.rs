@@ -450,6 +450,7 @@ pub async fn execute_effects(
                 id,
                 identifier,
                 lifecycle,
+                ..
             } => match provider.delete(id, identifier, lifecycle).await {
                 Ok(()) => {
                     println!("  {} {}", "✓".green(), format_effect(effect));
@@ -1024,12 +1025,14 @@ async fn run_apply_locked(
 
     // Seed current_states with orphaned resources from state file (#844).
     // These are resources tracked in state but removed from the .crn config.
+    let mut orphan_dependencies: HashMap<ResourceId, Vec<String>> = HashMap::new();
     if let Some(sf) = state_file.as_ref() {
         let desired_ids: HashSet<ResourceId> =
             sorted_resources.iter().map(|r| r.id.clone()).collect();
         for (id, state) in sf.build_orphan_states(&desired_ids) {
             current_states.entry(id).or_insert(state);
         }
+        orphan_dependencies = sf.build_orphan_dependencies(&desired_ids);
     }
 
     // Restore unreturned attributes from state file (CloudControl doesn't always return them)
@@ -1078,6 +1081,7 @@ async fn run_apply_locked(
         schemas,
         &saved_attrs,
         &prev_desired_keys,
+        &orphan_dependencies,
     );
 
     // Populate cascading updates for create_before_destroy Replace effects.

@@ -41,6 +41,7 @@ fn create_before_destroy_generates_temporary_name_for_name_attribute() {
         &schemas,
         &HashMap::new(),
         &HashMap::new(),
+        &HashMap::new(),
     );
 
     assert_eq!(plan.effects().len(), 1);
@@ -119,6 +120,7 @@ fn create_before_destroy_generates_temporary_name_with_can_rename() {
         &schemas,
         &HashMap::new(),
         &HashMap::new(),
+        &HashMap::new(),
     );
 
     assert_eq!(plan.effects().len(), 1);
@@ -173,6 +175,7 @@ fn no_temporary_name_without_create_before_destroy() {
         &current_states,
         &HashMap::new(),
         &schemas,
+        &HashMap::new(),
         &HashMap::new(),
         &HashMap::new(),
     );
@@ -234,6 +237,7 @@ fn no_temporary_name_when_name_prefix_is_used() {
         &schemas,
         &HashMap::new(),
         &HashMap::new(),
+        &HashMap::new(),
     );
 
     assert_eq!(plan.effects().len(), 1);
@@ -282,6 +286,7 @@ fn no_temporary_name_without_name_attribute_in_schema() {
         &current_states,
         &HashMap::new(),
         &schemas,
+        &HashMap::new(),
         &HashMap::new(),
         &HashMap::new(),
     );
@@ -339,6 +344,7 @@ fn no_temporary_name_when_name_attribute_changes() {
         &current_states,
         &HashMap::new(),
         &schemas,
+        &HashMap::new(),
         &HashMap::new(),
         &HashMap::new(),
     );
@@ -499,6 +505,7 @@ fn create_plan_detects_attribute_removal() {
         &HashMap::new(),
         &HashMap::new(),
         &prev_desired_keys,
+        &HashMap::new(),
     );
 
     assert_eq!(plan.effects().len(), 1);
@@ -563,6 +570,7 @@ fn create_plan_filters_non_removable_attribute_removal() {
         &schemas,
         &HashMap::new(),
         &prev_desired_keys,
+        &HashMap::new(),
     );
 
     assert_eq!(plan.effects().len(), 1);
@@ -627,6 +635,7 @@ fn create_plan_skips_update_when_only_non_removable_removal() {
         &schemas,
         &HashMap::new(),
         &prev_desired_keys,
+        &HashMap::new(),
     );
 
     assert!(

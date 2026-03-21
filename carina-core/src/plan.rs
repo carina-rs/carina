@@ -386,6 +386,8 @@ mod tests {
             id: crate::resource::ResourceId::new("s3.bucket", "c"),
             identifier: String::new(),
             lifecycle: crate::resource::LifecycleConfig::default(),
+            binding: None,
+            dependencies: std::collections::HashSet::new(),
         });
 
         let summary = plan.summary();
@@ -544,6 +546,8 @@ mod tests {
             id: ResourceId::new("s3.bucket", "b"),
             identifier: "b-id".to_string(),
             lifecycle: crate::resource::LifecycleConfig::default(),
+            binding: None,
+            dependencies: std::collections::HashSet::new(),
         });
 
         let json = serde_json::to_string(&plan).unwrap();

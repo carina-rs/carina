@@ -156,6 +156,7 @@ pub fn create_plan(
     schemas: &HashMap<String, ResourceSchema>,
     saved_attrs: &HashMap<ResourceId, HashMap<String, Value>>,
     prev_desired_keys: &HashMap<ResourceId, Vec<String>>,
+    orphan_dependencies: &HashMap<ResourceId, Vec<String>>,
 ) -> Plan {
     let mut plan = Plan::new();
 
@@ -271,10 +272,17 @@ pub fn create_plan(
                     .and_then(|s| s.identifier.clone())
                     .unwrap_or_default();
                 let lifecycle = resource.lifecycle.clone();
+                let binding = resource.attributes.get("_binding").and_then(|v| match v {
+                    Value::String(s) => Some(s.clone()),
+                    _ => None,
+                });
+                let dependencies = get_resource_dependencies(resource);
                 plan.add(Effect::Delete {
                     id,
                     identifier,
                     lifecycle,
+                    binding,
+                    dependencies,
                 });
             }
         }
@@ -285,10 +293,30 @@ pub fn create_plan(
         if state.exists && !desired_ids.contains(id) {
             let identifier = state.identifier.clone().unwrap_or_default();
             let lifecycle = lifecycles.get(id).cloned().unwrap_or_default();
+            let binding = state.attributes.get("_binding").and_then(|v| match v {
+                Value::String(s) => Some(s.clone()),
+                _ => None,
+            });
+            // Use stored dependency bindings from state file if available,
+            // otherwise fall back to extracting from state attributes
+            let dependencies = if let Some(dep_bindings) = orphan_dependencies.get(id) {
+                dep_bindings.iter().cloned().collect()
+            } else {
+                let temp_resource = Resource {
+                    id: id.clone(),
+                    attributes: state.attributes.clone(),
+                    read_only: false,
+                    lifecycle: lifecycle.clone(),
+                    prefixes: HashMap::new(),
+                };
+                get_resource_dependencies(&temp_resource)
+            };
             plan.add(Effect::Delete {
                 id: id.clone(),
                 identifier,
                 lifecycle,
+                binding,
+                dependencies,
             });
         }
     }

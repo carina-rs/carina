@@ -1,5 +1,6 @@
 //! State file structures for persisting infrastructure state
 
+use carina_core::deps::get_resource_dependencies;
 use carina_core::resource::{LifecycleConfig, Resource, ResourceId, State, Value};
 use carina_core::value::{json_to_dsl_value, value_to_json};
 use serde::{Deserialize, Serialize};
@@ -23,7 +24,8 @@ pub struct StateFile {
 impl StateFile {
     /// Current state file format version
     /// v2: Added identifier field to ResourceState
-    pub const CURRENT_VERSION: u32 = 2;
+    /// v3: Added binding and dependency_bindings fields to ResourceState
+    pub const CURRENT_VERSION: u32 = 3;
 
     /// Create a new empty state file
     pub fn new() -> Self {
@@ -185,11 +187,15 @@ impl StateFile {
             }
             // Only include resources that actually have an identifier (i.e. exist in infra)
             if let Some(ref identifier) = rs.identifier {
-                let attrs: HashMap<String, Value> = rs
+                let mut attrs: HashMap<String, Value> = rs
                     .attributes
                     .iter()
                     .filter_map(|(k, v)| json_to_dsl_value(v).map(|val| (k.clone(), val)))
                     .collect();
+                // Inject _binding so orphan Delete effects can have tree structure
+                if let Some(ref binding) = rs.binding {
+                    attrs.insert("_binding".to_string(), Value::String(binding.clone()));
+                }
                 let state = State {
                     id: id.clone(),
                     identifier: Some(identifier.clone()),
@@ -197,6 +203,25 @@ impl StateFile {
                     exists: true,
                 };
                 result.insert(id, state);
+            }
+        }
+        result
+    }
+
+    /// Build a map of ResourceId -> dependency binding names for orphaned resources.
+    /// Used by the differ to set dependencies on orphan Delete effects.
+    pub fn build_orphan_dependencies(
+        &self,
+        desired_ids: &std::collections::HashSet<ResourceId>,
+    ) -> HashMap<ResourceId, Vec<String>> {
+        let mut result = HashMap::new();
+        for rs in &self.resources {
+            let id = ResourceId::with_provider(&rs.provider, &rs.resource_type, &rs.name);
+            if desired_ids.contains(&id) {
+                continue;
+            }
+            if rs.identifier.is_some() && !rs.dependency_bindings.is_empty() {
+                result.insert(id, rs.dependency_bindings.clone());
             }
         }
         result
@@ -271,6 +296,12 @@ pub struct ResourceState {
     /// from the desired state, it means the user intentionally removed it.
     #[serde(default)]
     pub desired_keys: Vec<String>,
+    /// The binding name for this resource (from `let` bindings in DSL).
+    /// Stored so orphan Delete effects can have tree structure.
+    pub binding: Option<String>,
+    /// Binding names of resources this resource depends on (via ResourceRef).
+    /// Stored so orphan Delete effects can have tree structure.
+    pub dependency_bindings: Vec<String>,
 }
 
 impl ResourceState {
@@ -291,6 +322,8 @@ impl ResourceState {
             prefixes: HashMap::new(),
             name_overrides: HashMap::new(),
             desired_keys: Vec::new(),
+            binding: None,
+            dependency_bindings: Vec::new(),
         }
     }
 
@@ -346,6 +379,18 @@ impl ResourceState {
             .cloned()
             .collect();
         rs.desired_keys.sort();
+        // Store binding name for tree structure in orphan Delete effects
+        rs.binding = resource.attributes.get("_binding").and_then(|v| match v {
+            Value::String(s) => Some(s.clone()),
+            _ => None,
+        });
+        // Store dependency bindings for tree structure in orphan Delete effects
+        let deps = get_resource_dependencies(resource);
+        if !deps.is_empty() {
+            let mut dep_list: Vec<String> = deps.into_iter().collect();
+            dep_list.sort();
+            rs.dependency_bindings = dep_list;
+        }
         Ok(rs)
     }
 }
@@ -513,18 +558,24 @@ mod tests {
     }
 
     #[test]
-    fn test_resource_state_backward_compatibility_without_prefixes() {
-        // Simulate an old state file without the prefixes field
+    fn test_resource_state_serialization_with_binding_and_deps() {
         let json = r#"{
             "resource_type": "s3.bucket",
             "name": "my-bucket",
             "provider": "aws",
             "attributes": {"region": "ap-northeast-1"},
-            "protected": false
+            "protected": false,
+            "lifecycle": {},
+            "prefixes": {},
+            "name_overrides": {},
+            "desired_keys": [],
+            "binding": "my_bucket",
+            "dependency_bindings": ["vpc", "subnet"]
         }"#;
 
         let deserialized: ResourceState = serde_json::from_str(json).unwrap();
-        assert!(deserialized.prefixes.is_empty());
+        assert_eq!(deserialized.binding, Some("my_bucket".to_string()));
+        assert_eq!(deserialized.dependency_bindings, vec!["vpc", "subnet"]);
     }
 
     #[test]
@@ -749,5 +800,95 @@ mod tests {
 
         assert!(!result.exists);
         assert!(result.identifier.is_none());
+    }
+
+    #[test]
+    fn test_from_provider_state_stores_binding_and_dependencies() {
+        use carina_core::resource::{Resource, State as ProviderState, Value};
+
+        let mut resource = Resource::with_provider("awscc", "ec2.subnet", "my-subnet");
+        resource.attributes.insert(
+            "_binding".to_string(),
+            Value::String("my_subnet".to_string()),
+        );
+        resource.attributes.insert(
+            "vpc_id".to_string(),
+            Value::ResourceRef {
+                binding_name: "my_vpc".to_string(),
+                attribute_name: "vpc_id".to_string(),
+            },
+        );
+
+        let provider_state = ProviderState {
+            id: resource.id.clone(),
+            identifier: Some("subnet-123".to_string()),
+            attributes: [("vpc_id".to_string(), Value::String("vpc-abc".to_string()))]
+                .into_iter()
+                .collect(),
+            exists: true,
+        };
+
+        let rs = ResourceState::from_provider_state(&resource, &provider_state, None).unwrap();
+        assert_eq!(rs.binding, Some("my_subnet".to_string()));
+        assert_eq!(rs.dependency_bindings, vec!["my_vpc".to_string()]);
+    }
+
+    #[test]
+    fn test_build_orphan_states_injects_binding() {
+        use carina_core::resource::{ResourceId, Value};
+
+        let mut state = StateFile::new();
+        let mut rs = ResourceState::new("ec2.subnet", "orphan-subnet", "awscc")
+            .with_identifier("subnet-123");
+        rs.binding = Some("my_subnet".to_string());
+        rs.dependency_bindings = vec!["my_vpc".to_string()];
+        state.upsert_resource(rs);
+
+        let desired_ids = std::collections::HashSet::new();
+        let orphans = state.build_orphan_states(&desired_ids);
+
+        let id = ResourceId::with_provider("awscc", "ec2.subnet", "orphan-subnet");
+        let orphan_state = orphans.get(&id).unwrap();
+        assert!(orphan_state.exists);
+        assert_eq!(
+            orphan_state.attributes.get("_binding"),
+            Some(&Value::String("my_subnet".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_build_orphan_dependencies() {
+        use carina_core::resource::ResourceId;
+
+        let mut state = StateFile::new();
+        let mut rs = ResourceState::new("ec2.subnet", "orphan-subnet", "awscc")
+            .with_identifier("subnet-123");
+        rs.binding = Some("my_subnet".to_string());
+        rs.dependency_bindings = vec!["my_vpc".to_string()];
+        state.upsert_resource(rs);
+
+        let desired_ids = std::collections::HashSet::new();
+        let deps = state.build_orphan_dependencies(&desired_ids);
+
+        let id = ResourceId::with_provider("awscc", "ec2.subnet", "orphan-subnet");
+        assert_eq!(deps.get(&id).unwrap(), &vec!["my_vpc".to_string()]);
+    }
+
+    #[test]
+    fn test_build_orphan_dependencies_excludes_desired() {
+        use carina_core::resource::ResourceId;
+
+        let mut state = StateFile::new();
+        let mut rs =
+            ResourceState::new("ec2.subnet", "kept-subnet", "awscc").with_identifier("subnet-456");
+        rs.dependency_bindings = vec!["my_vpc".to_string()];
+        state.upsert_resource(rs);
+
+        let id = ResourceId::with_provider("awscc", "ec2.subnet", "kept-subnet");
+        let mut desired_ids = std::collections::HashSet::new();
+        desired_ids.insert(id.clone());
+
+        let deps = state.build_orphan_dependencies(&desired_ids);
+        assert!(deps.is_empty());
     }
 }
