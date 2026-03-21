@@ -897,7 +897,6 @@ async fn run_apply_locked(
 
     // Confirmation prompt
     if !auto_approve {
-        println!();
         println!(
             "{}",
             "Do you want to perform these actions?".yellow().bold()
@@ -1156,7 +1155,6 @@ async fn run_apply_from_plan_locked(
 
     // Confirmation prompt
     if !auto_approve {
-        println!();
         println!(
             "{}",
             "Do you want to perform these actions?".yellow().bold()

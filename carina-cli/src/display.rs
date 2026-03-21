@@ -320,6 +320,7 @@ pub fn format_plan(plan: &Plan, compact: bool) -> String {
     }
     parts.push(format!("{} to destroy", summary.delete.to_string().red()));
     writeln!(out, "Plan: {}.", parts.join(", ")).unwrap();
+    writeln!(out).unwrap();
 
     out
 }
