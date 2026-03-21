@@ -50,11 +50,11 @@ echo "── plan step2 (expect cascade) ──"
 PLAN_OUTPUT=$($CARINA plan "$STEP2" 2>&1) || true
 echo "$PLAN_OUTPUT"
 
-if echo "$PLAN_OUTPUT" | grep -q "cascading update"; then
-    echo "  ✓ cascading update detected in plan"
+if echo "$PLAN_OUTPUT" | grep -q "create before destroy"; then
+    echo "  ✓ create_before_destroy auto-detected in plan"
     PASS=$((PASS + 1))
 else
-    echo "  ✗ cascading update NOT detected in plan"
+    echo "  ✗ create_before_destroy NOT auto-detected in plan"
     FAIL=$((FAIL + 1))
 fi
 
