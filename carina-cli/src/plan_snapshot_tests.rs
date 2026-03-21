@@ -170,3 +170,10 @@ fn snapshot_map_key_diff() {
     let output = strip_ansi(&format_plan(&plan, false));
     insta::assert_snapshot!(output);
 }
+
+#[test]
+fn snapshot_enum_display() {
+    let plan = build_plan_from_fixture("enum_display");
+    let output = strip_ansi(&format_plan(&plan, false));
+    insta::assert_snapshot!(output);
+}

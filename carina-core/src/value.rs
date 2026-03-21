@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 
 use crate::resource::Value;
-use crate::utils::is_dsl_enum_format;
+use crate::utils::{convert_enum_value, is_dsl_enum_format};
 
 /// Convert `Value` to `serde_json::Value`.
 ///
@@ -84,9 +84,10 @@ pub fn format_value(value: &Value) -> String {
 pub fn format_value_with_key(value: &Value, _key: Option<&str>) -> String {
     match value {
         Value::String(s) => {
-            // DSL enum format (namespaced identifiers) - display without quotes
+            // DSL enum format (namespaced identifiers) - resolve to provider value
             if is_dsl_enum_format(s) {
-                return s.clone();
+                let resolved = convert_enum_value(s);
+                return format!("\"{}\"", resolved);
             }
             format!("\"{}\"", s)
         }
@@ -119,8 +120,12 @@ pub fn format_value_with_key(value: &Value, _key: Option<&str>) -> String {
             ..
         } => format!("{}.{}", binding_name, attribute_name),
         Value::UnresolvedIdent(name, member) => match member {
-            Some(m) => format!("{}.{}", name, m),
-            None => name.clone(),
+            Some(m) => {
+                let full = format!("{}.{}", name, m);
+                let resolved = convert_enum_value(&full);
+                format!("\"{}\"", resolved)
+            }
+            None => format!("\"{}\"", name),
         },
     }
 }
@@ -333,7 +338,32 @@ mod tests {
     #[test]
     fn test_format_value_dsl_enum() {
         let v = Value::String("aws.s3.VersioningStatus.Enabled".to_string());
-        assert_eq!(format_value(&v), "aws.s3.VersioningStatus.Enabled");
+        assert_eq!(format_value(&v), "\"Enabled\"");
+    }
+
+    #[test]
+    fn test_format_value_dsl_enum_region() {
+        let v = Value::String("aws.Region.ap_northeast_1".to_string());
+        assert_eq!(format_value(&v), "\"ap-northeast-1\"");
+    }
+
+    #[test]
+    fn test_format_value_dsl_enum_5_part() {
+        let v = Value::String("awscc.ec2.vpc.InstanceTenancy.dedicated".to_string());
+        assert_eq!(format_value(&v), "\"dedicated\"");
+    }
+
+    #[test]
+    fn test_format_value_unresolved_ident_with_member() {
+        let v =
+            Value::UnresolvedIdent("InstanceTenancy".to_string(), Some("dedicated".to_string()));
+        assert_eq!(format_value(&v), "\"dedicated\"");
+    }
+
+    #[test]
+    fn test_format_value_unresolved_ident_bare() {
+        let v = Value::UnresolvedIdent("dedicated".to_string(), None);
+        assert_eq!(format_value(&v), "\"dedicated\"");
     }
 
     #[test]
