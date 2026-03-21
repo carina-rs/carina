@@ -547,7 +547,7 @@ pub fn format_plan(plan: &Plan, compact: bool) -> String {
                                     "{}{}: {} → {}",
                                     attr_prefix,
                                     key,
-                                    old_str.red(),
+                                    old_str.red().strikethrough(),
                                     format_value_with_key(new_value, Some(key)).green()
                                 )
                                 .unwrap();
@@ -567,8 +567,10 @@ pub fn format_plan(plan: &Plan, compact: bool) -> String {
                                 "{}{}: {} → {}",
                                 attr_prefix,
                                 key,
-                                format_value_with_key(old_value, Some(key)).red(),
-                                "(removed)".red()
+                                format_value_with_key(old_value, Some(key))
+                                    .red()
+                                    .strikethrough(),
+                                "(removed)".red().strikethrough()
                             )
                             .unwrap();
                         }
@@ -704,7 +706,7 @@ pub fn format_plan(plan: &Plan, compact: bool) -> String {
                     connector,
                     colored_symbol,
                     id.display_type().cyan().bold(),
-                    id.name.red().bold()
+                    id.name.red().bold().strikethrough()
                 )
                 .unwrap();
             }
@@ -967,7 +969,7 @@ pub fn format_map_diff(old_value: Option<&Value>, new_value: &Value, attr_prefix
                         attr_prefix,
                         "~".yellow(),
                         key,
-                        format_value_with_key(ov, Some(key)).red(),
+                        format_value_with_key(ov, Some(key)).red().strikethrough(),
                         format_value_with_key(nv, Some(key)).green()
                     ));
                 }
@@ -988,9 +990,9 @@ pub fn format_map_diff(old_value: Option<&Value>, new_value: &Value, attr_prefix
                 lines.push(format!(
                     "{}  {} {}: {}",
                     attr_prefix,
-                    "-".red(),
+                    "-".red().strikethrough(),
                     key,
-                    format_value_with_key(ov, Some(key)).red()
+                    format_value_with_key(ov, Some(key)).red().strikethrough()
                 ));
             }
             (None, None) => {}
@@ -1118,7 +1120,7 @@ pub fn format_list_diff(old_value: Option<&Value>, new_value: &Value, attr_prefi
                             .get(*k)
                             .map(format_value)
                             .unwrap_or_else(|| "(none)".to_string());
-                        format!("{}: {} → {}", k, old_v.red(), new_v.green())
+                        format!("{}: {} → {}", k, old_v.red().strikethrough(), new_v.green())
                     } else {
                         format!("{}: {}", k, new_v)
                     }
@@ -1163,8 +1165,8 @@ pub fn format_list_diff(old_value: Option<&Value>, new_value: &Value, attr_prefi
             lines.push(format!(
                 "{}  {} {{{}}}",
                 attr_prefix,
-                "-".red().bold(),
-                fields.join(", ")
+                "-".red().bold().strikethrough(),
+                fields.join(", ").red().strikethrough()
             ));
         }
     }
@@ -1220,7 +1222,7 @@ fn format_replace_changed_attrs(
                 "{}{}: {} → {} {}\n",
                 attr_prefix,
                 key,
-                old_str.red(),
+                old_str.red().strikethrough(),
                 new_str.green(),
                 "(forces replacement, known after apply)".magenta()
             ));
@@ -1246,7 +1248,7 @@ fn format_replace_changed_attrs(
                 "{}{}: {} → {} {}\n",
                 attr_prefix,
                 key,
-                old_str.red(),
+                old_str.red().strikethrough(),
                 format_value_with_key(new_value, Some(key)).green(),
                 "(forces replacement)".magenta()
             ));
@@ -1282,7 +1284,7 @@ fn format_cascading_update_diff(
             "{}    {}: {} → {} {}",
             attr_prefix,
             key,
-            old_str.red(),
+            old_str.red().strikethrough(),
             new_str.green(),
             "(known after apply)".dimmed()
         ));
