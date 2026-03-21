@@ -1651,6 +1651,7 @@ async fn rename_failure_in_create_before_destroy_counts_as_failure() {
             temporary_value: "my-bucket-tmp123".to_string(),
             can_rename: true,
         }),
+        cascade_ref_hints: vec![],
     });
 
     let provider = RenameFailProvider;
@@ -1758,6 +1759,7 @@ async fn update_effect_resolves_refs_against_post_replacement_binding_map() {
         changed_create_only: vec!["cidr_block".to_string()],
         cascading_updates: vec![],
         temporary_name: None,
+        cascade_ref_hints: vec![],
     });
     plan.add(Effect::Update {
         id: subnet_id.clone(),

@@ -524,7 +524,7 @@ pub fn print_plan(plan: &Plan, compact: bool) {
                 lifecycle,
                 cascading_updates,
                 temporary_name,
-                ..
+                cascade_ref_hints,
             } => {
                 let replace_note = if lifecycle.create_before_destroy {
                     "(must be replaced, create before destroy)"
@@ -567,6 +567,7 @@ pub fn print_plan(plan: &Plan, compact: bool) {
                         &to.attributes,
                         changed_create_only,
                         &attr_prefix,
+                        cascade_ref_hints,
                     );
                     if !replace_attrs_output.is_empty() {
                         print!("{}", replace_attrs_output);
@@ -1012,6 +1013,7 @@ fn format_replace_changed_attrs(
     to_attrs: &std::collections::HashMap<String, Value>,
     changed_create_only: &[String],
     attr_prefix: &str,
+    cascade_ref_hints: &[(String, String)],
 ) -> String {
     let mut lines = Vec::new();
     let mut keys: Vec<_> = changed_create_only
@@ -1032,11 +1034,18 @@ fn format_replace_changed_attrs(
             let old_str = old_value
                 .map(|v| format_value_with_key(v, Some(key)))
                 .unwrap_or_else(|| "(none)".to_string());
+            // Use the original ResourceRef hint if available, otherwise show the resolved value
+            let new_str = cascade_ref_hints
+                .iter()
+                .find(|(attr, _)| attr == key)
+                .map(|(_, hint)| hint.clone())
+                .unwrap_or_else(|| format_value_with_key(new_value, Some(key)));
             lines.push(format!(
-                "{}{}: {} {}\n",
+                "{}{}: {} → {} {}\n",
                 attr_prefix,
                 key,
-                old_str,
+                old_str.red(),
+                new_str.green(),
                 "(forces replacement, known after apply)".magenta()
             ));
         } else if is_list_of_maps(new_value) {
@@ -1884,6 +1893,7 @@ mod tests {
                 to: subnet_to,
             }],
             temporary_name: None,
+            cascade_ref_hints: vec![],
         };
 
         let mut plan = Plan::new();
@@ -1983,8 +1993,13 @@ mod tests {
             "precondition: old and new vpc_id should be semantically equal"
         );
 
-        let output =
-            format_replace_changed_attrs(&from_attrs, &to_attrs, &["vpc_id".to_string()], "    ");
+        let output = format_replace_changed_attrs(
+            &from_attrs,
+            &to_attrs,
+            &["vpc_id".to_string()],
+            "    ",
+            &[],
+        );
 
         // vpc_id must appear in output, not be hidden
         assert!(
@@ -2008,6 +2023,51 @@ mod tests {
         assert!(
             output.contains("vpc-123"),
             "Expected current value 'vpc-123' in output, got: {}",
+            output
+        );
+    }
+
+    /// Test that cascade_ref_hints causes the display to show the original ResourceRef
+    /// binding instead of the resolved value for cascade-triggered same-value attributes.
+    #[test]
+    fn test_replace_cascade_ref_hints_show_binding() {
+        use std::collections::HashMap;
+
+        let from_attrs = HashMap::from([(
+            "vpc_id".to_string(),
+            Value::String("vpc-0bf023ff87bf1aa0c".to_string()),
+        )]);
+        let to_attrs = HashMap::from([(
+            "vpc_id".to_string(),
+            Value::String("vpc-0bf023ff87bf1aa0c".to_string()),
+        )]);
+
+        let hints = vec![("vpc_id".to_string(), "vpc.vpc_id".to_string())];
+
+        let output = format_replace_changed_attrs(
+            &from_attrs,
+            &to_attrs,
+            &["vpc_id".to_string()],
+            "    ",
+            &hints,
+        );
+
+        // Must show the ResourceRef hint instead of the resolved value on the right side
+        assert!(
+            output.contains("vpc.vpc_id"),
+            "Expected 'vpc.vpc_id' hint in output, got: {}",
+            output
+        );
+        // Must still show the old resolved value
+        assert!(
+            output.contains("vpc-0bf023ff87bf1aa0c"),
+            "Expected old value in output, got: {}",
+            output
+        );
+        // Must show forces replacement annotation
+        assert!(
+            output.contains("forces replacement, known after apply"),
+            "Expected 'forces replacement, known after apply' in output, got: {}",
             output
         );
     }

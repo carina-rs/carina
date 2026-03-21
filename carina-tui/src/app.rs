@@ -824,6 +824,7 @@ mod tests {
             changed_create_only: vec!["cidr".to_string()],
             cascading_updates: vec![],
             temporary_name: None,
+            cascade_ref_hints: vec![],
         });
 
         // create_before_destroy = false -> "-/+"
@@ -835,6 +836,7 @@ mod tests {
             changed_create_only: vec!["cidr".to_string()],
             cascading_updates: vec![],
             temporary_name: None,
+            cascade_ref_hints: vec![],
         });
 
         let app = App::new(&plan);

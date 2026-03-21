@@ -72,17 +72,24 @@ impl Plan {
         resource_id: &crate::resource::ResourceId,
         cascade_attrs: Vec<String>,
         lifecycle: crate::resource::LifecycleConfig,
+        ref_hints: Vec<(String, String)>,
     ) {
         for effect in &mut self.effects {
             match effect {
                 Effect::Replace {
                     id,
                     changed_create_only,
+                    cascade_ref_hints,
                     ..
                 } if id == resource_id => {
                     for attr in &cascade_attrs {
                         if !changed_create_only.contains(attr) {
                             changed_create_only.push(attr.clone());
+                        }
+                    }
+                    for hint in &ref_hints {
+                        if !cascade_ref_hints.contains(hint) {
+                            cascade_ref_hints.push(hint.clone());
                         }
                     }
                     return;
@@ -102,6 +109,7 @@ impl Plan {
                             changed_create_only: cascade_attrs,
                             cascading_updates: vec![],
                             temporary_name: None,
+                            cascade_ref_hints: ref_hints,
                         };
                     }
                     return;
@@ -474,6 +482,7 @@ mod tests {
             changed_create_only: vec!["cidr_block".to_string()],
             cascading_updates: vec![cascading],
             temporary_name: None,
+            cascade_ref_hints: vec![],
         });
 
         let summary = plan.summary();
@@ -509,6 +518,7 @@ mod tests {
             changed_create_only: vec!["cidr_block".to_string()],
             cascading_updates: vec![cascading],
             temporary_name: None,
+            cascade_ref_hints: vec![],
         });
 
         let display = format!("{}", plan.summary());

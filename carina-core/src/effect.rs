@@ -70,6 +70,11 @@ pub enum Effect {
         /// Temporary name for create-before-destroy when the resource has a unique name constraint
         #[serde(default)]
         temporary_name: Option<TemporaryName>,
+        /// Hints mapping attribute names to their original ResourceRef expressions
+        /// (e.g., `("vpc_id", "vpc.vpc_id")`). Used by display to show the binding
+        /// reference instead of the resolved value for cascade-triggered replacements.
+        #[serde(default)]
+        cascade_ref_hints: Vec<(String, String)>,
     },
 
     /// Delete a resource
@@ -233,6 +238,7 @@ mod tests {
                 changed_create_only: vec!["cidr_block".to_string()],
                 cascading_updates: vec![],
                 temporary_name: None,
+                cascade_ref_hints: vec![],
             },
             Effect::Delete {
                 id: ResourceId::new("s3.bucket", "old-bucket"),

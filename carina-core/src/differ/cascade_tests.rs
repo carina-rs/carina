@@ -66,6 +66,7 @@ fn cascade_dependent_updates_adds_update_for_dependent() {
         changed_create_only: vec!["cidr_block".to_string()],
         cascading_updates: vec![],
         temporary_name: None,
+        cascade_ref_hints: vec![],
     });
 
     // Apply cascade
@@ -155,6 +156,7 @@ fn cascade_skips_resources_already_in_plan() {
         changed_create_only: vec!["cidr_block".to_string()],
         cascading_updates: vec![],
         temporary_name: None,
+        cascade_ref_hints: vec![],
     });
     plan.add(Effect::Update {
         id: subnet_id.clone(),
@@ -222,6 +224,7 @@ fn cascade_no_op_without_create_before_destroy() {
         changed_create_only: vec!["cidr_block".to_string()],
         cascading_updates: vec![],
         temporary_name: None,
+        cascade_ref_hints: vec![],
     });
 
     let schemas = HashMap::new();
@@ -313,6 +316,7 @@ fn cascade_transitive_dependencies() {
         changed_create_only: vec!["cidr_block".to_string()],
         cascading_updates: vec![],
         temporary_name: None,
+        cascade_ref_hints: vec![],
     });
 
     let schemas = HashMap::new();
@@ -385,6 +389,7 @@ fn cascade_anonymous_resource_dependent() {
         changed_create_only: vec!["cidr_block".to_string()],
         cascading_updates: vec![],
         temporary_name: None,
+        cascade_ref_hints: vec![],
     });
 
     let schemas = HashMap::new();
@@ -487,6 +492,7 @@ fn cascade_generates_replace_when_dependent_attribute_is_create_only() {
         changed_create_only: vec!["cidr_block".to_string()],
         cascading_updates: vec![],
         temporary_name: None,
+        cascade_ref_hints: vec![],
     });
 
     // Apply cascade with schemas so it can detect create-only attributes
@@ -529,6 +535,7 @@ fn cascade_generates_replace_when_dependent_attribute_is_create_only() {
     if let Effect::Replace {
         id,
         changed_create_only,
+        cascade_ref_hints,
         ..
     } = &effects[1]
     {
@@ -536,6 +543,11 @@ fn cascade_generates_replace_when_dependent_attribute_is_create_only() {
         assert!(
             changed_create_only.contains(&"vpc_id".to_string()),
             "Subnet Replace should list vpc_id as a changed create-only attribute"
+        );
+        assert!(
+            cascade_ref_hints.contains(&("vpc_id".to_string(), "vpc.vpc_id".to_string())),
+            "Subnet Replace should have cascade_ref_hint for vpc_id → vpc.vpc_id, got: {:?}",
+            cascade_ref_hints
         );
     } else {
         panic!(
@@ -641,6 +653,7 @@ fn cascade_merges_with_existing_replace_direct_change_plus_cascade() {
         changed_create_only: vec!["cidr_block".to_string()],
         cascading_updates: vec![],
         temporary_name: None,
+        cascade_ref_hints: vec![],
     });
     plan.add(Effect::Replace {
         id: subnet_id.clone(),
@@ -652,6 +665,7 @@ fn cascade_merges_with_existing_replace_direct_change_plus_cascade() {
         changed_create_only: vec!["availability_zone".to_string()],
         cascading_updates: vec![],
         temporary_name: None,
+        cascade_ref_hints: vec![],
     });
 
     // Apply cascade
@@ -667,6 +681,7 @@ fn cascade_merges_with_existing_replace_direct_change_plus_cascade() {
 
     if let Effect::Replace {
         changed_create_only,
+        cascade_ref_hints,
         ..
     } = subnet_effect.unwrap()
     {
@@ -679,6 +694,11 @@ fn cascade_merges_with_existing_replace_direct_change_plus_cascade() {
             changed_create_only.contains(&"vpc_id".to_string()),
             "changed_create_only should contain vpc_id (cascade from VPC replace), got: {:?}",
             changed_create_only
+        );
+        assert!(
+            cascade_ref_hints.contains(&("vpc_id".to_string(), "vpc.vpc_id".to_string())),
+            "cascade_ref_hints should contain vpc_id → vpc.vpc_id, got: {:?}",
+            cascade_ref_hints
         );
     } else {
         panic!("Expected subnet to be a Replace effect");
@@ -774,6 +794,7 @@ fn cascade_upgrades_update_to_replace_when_ref_is_create_only() {
         changed_create_only: vec!["cidr_block".to_string()],
         cascading_updates: vec![],
         temporary_name: None,
+        cascade_ref_hints: vec![],
     });
     plan.add(Effect::Update {
         id: subnet_id.clone(),
