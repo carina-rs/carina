@@ -11,6 +11,14 @@ use crate::schema::ResourceSchema;
 
 use super::{Diff, diff};
 
+/// A pending merge operation: cascade-triggered create-only attributes to add to an existing effect.
+struct CascadeMerge {
+    resource_id: ResourceId,
+    create_only_attrs: Vec<String>,
+    lifecycle: LifecycleConfig,
+    ref_hints: Vec<(String, String)>,
+}
+
 /// Check which changed attributes are create-only according to the schema
 fn find_changed_create_only(
     provider: &str,
@@ -252,6 +260,7 @@ pub fn create_plan(
                         changed_create_only,
                         cascading_updates: vec![],
                         temporary_name,
+                        cascade_ref_hints: vec![],
                     });
                 }
             }
@@ -344,12 +353,15 @@ pub fn cascade_dependent_updates(
     }
 
     // Collect resource IDs that already have effects in the plan
-    let planned_ids: HashSet<&ResourceId> =
-        plan.effects().iter().map(|e| e.resource_id()).collect();
+    let planned_ids: HashSet<ResourceId> = plan
+        .effects()
+        .iter()
+        .map(|e| e.resource_id().clone())
+        .collect();
 
-    // For each unresolved resource, check if it depends on a replaced binding
+    // For each unresolved resource, check if it depends on a replaced binding.
+    // Resources already in the plan are handled separately below.
     for resource in unresolved_resources {
-        // Skip resources that already have effects in the plan
         if planned_ids.contains(&resource.id) {
             continue;
         }
@@ -373,6 +385,80 @@ pub fn cascade_dependent_updates(
                     .push(binding);
             }
         }
+    }
+
+    // For resources already in the plan, check if cascade-triggered create-only
+    // attributes need to be merged into their existing effects.
+    let mut merge_operations: Vec<CascadeMerge> = Vec::new();
+
+    for resource in unresolved_resources {
+        if !planned_ids.contains(&resource.id) {
+            continue;
+        }
+
+        let deps = get_resource_dependencies(resource);
+        for dep in &deps {
+            if !replaced_bindings.contains(dep) {
+                continue;
+            }
+
+            // Find which attributes on this resource hold a ResourceRef
+            // pointing to the replaced binding, and extract ref hints
+            let ref_attrs: Vec<String> = resource
+                .attributes
+                .iter()
+                .filter(|(_, v)| {
+                    matches!(v, Value::ResourceRef { binding_name, .. } if binding_name == dep)
+                })
+                .map(|(k, _)| k.clone())
+                .collect();
+
+            let ref_hints: Vec<(String, String)> = resource
+                .attributes
+                .iter()
+                .filter_map(|(k, v)| match v {
+                    Value::ResourceRef {
+                        binding_name,
+                        attribute_name,
+                    } if binding_name == dep => {
+                        Some((k.clone(), format!("{}.{}", binding_name, attribute_name)))
+                    }
+                    _ => None,
+                })
+                .collect();
+
+            // Check if any of those attributes are create-only
+            let create_only_refs = find_changed_create_only(
+                &resource.id.provider,
+                &resource.id.resource_type,
+                &ref_attrs,
+                schemas,
+            );
+
+            if !create_only_refs.is_empty() {
+                // Only keep hints for attributes that are actually create-only
+                let filtered_hints: Vec<(String, String)> = ref_hints
+                    .into_iter()
+                    .filter(|(attr, _)| create_only_refs.contains(attr))
+                    .collect();
+                merge_operations.push(CascadeMerge {
+                    resource_id: resource.id.clone(),
+                    create_only_attrs: create_only_refs,
+                    lifecycle: resource.lifecycle.clone(),
+                    ref_hints: filtered_hints,
+                });
+            }
+        }
+    }
+
+    // Apply merge operations to existing effects
+    for merge in merge_operations {
+        plan.merge_cascade_create_only(
+            &merge.resource_id,
+            merge.create_only_attrs,
+            merge.lifecycle,
+            merge.ref_hints,
+        );
     }
 
     // Build cascading updates for each Replace effect.
@@ -423,6 +509,23 @@ pub fn cascade_dependent_updates(
                             to: (*unresolved).clone(),
                         });
                 } else {
+                    // Extract ref hints for attributes being promoted
+                    let ref_hints: Vec<(String, String)> = unresolved
+                        .attributes
+                        .iter()
+                        .filter_map(|(k, v)| match v {
+                            Value::ResourceRef {
+                                binding_name,
+                                attribute_name,
+                            } if binding_name == replaced_binding
+                                && create_only_refs.contains(k) =>
+                            {
+                                Some((k.clone(), format!("{}.{}", binding_name, attribute_name)))
+                            }
+                            _ => None,
+                        })
+                        .collect();
+
                     // Promote to a separate Replace effect
                     promoted_replaces.push(Effect::Replace {
                         id: unresolved.id.clone(),
@@ -432,6 +535,7 @@ pub fn cascade_dependent_updates(
                         changed_create_only: create_only_refs,
                         cascading_updates: vec![],
                         temporary_name: None,
+                        cascade_ref_hints: ref_hints,
                     });
                 }
             }

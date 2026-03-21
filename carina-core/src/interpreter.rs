@@ -290,6 +290,7 @@ mod tests {
             changed_create_only: vec!["key".to_string()],
             cascading_updates: vec![],
             temporary_name: None,
+            cascade_ref_hints: vec![],
         });
 
         let result = interpreter.apply(&plan).await;
@@ -395,6 +396,7 @@ mod tests {
             changed_create_only: vec!["key".to_string()],
             cascading_updates: vec![],
             temporary_name: None,
+            cascade_ref_hints: vec![],
         });
 
         let result = interpreter.apply(&plan).await;
@@ -432,6 +434,7 @@ mod tests {
             changed_create_only: vec!["key".to_string()],
             cascading_updates: vec![],
             temporary_name: None,
+            cascade_ref_hints: vec![],
         });
 
         let result = interpreter.apply(&plan).await;
@@ -487,6 +490,7 @@ mod tests {
                     .with_attribute("vpc_id", Value::String("vpc-new".to_string())),
             }],
             temporary_name: None,
+            cascade_ref_hints: vec![],
         });
 
         let result = interpreter.apply(&plan).await;
@@ -541,6 +545,7 @@ mod tests {
                 temporary_value: "my-bucket-abc12345".to_string(),
                 can_rename: true, // name is updatable
             }),
+            cascade_ref_hints: vec![],
         });
 
         let result = interpreter.apply(&plan).await;
@@ -600,6 +605,7 @@ mod tests {
             changed_create_only: vec!["key".to_string()],
             cascading_updates: vec![],
             temporary_name: None,
+            cascade_ref_hints: vec![],
         });
 
         let result = interpreter.apply(&plan).await;
@@ -635,6 +641,7 @@ mod tests {
             changed_create_only: vec!["key".to_string()],
             cascading_updates: vec![],
             temporary_name: None,
+            cascade_ref_hints: vec![],
         });
 
         let result = interpreter.apply(&plan).await;
@@ -739,6 +746,7 @@ mod tests {
                 temporary_value: "my-bucket-abc12345".to_string(),
                 can_rename: true,
             }),
+            cascade_ref_hints: vec![],
         });
 
         let result = interpreter.apply(&plan).await;
@@ -801,6 +809,7 @@ mod tests {
                 temporary_value: "my-bucket-abc12345".to_string(),
                 can_rename: false, // name is create-only, cannot rename
             }),
+            cascade_ref_hints: vec![],
         });
 
         let result = interpreter.apply(&plan).await;
