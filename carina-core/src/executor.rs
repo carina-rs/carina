@@ -365,6 +365,8 @@ async fn execute_effects_sequential(
             if let Some(binding) = effect.binding_name() {
                 failed_bindings.insert(binding);
             }
+            completed += 1;
+            observer.on_event(&ExecutionEvent::ProgressUpdate { completed, total });
             continue;
         }
 
