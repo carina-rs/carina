@@ -304,13 +304,8 @@ DSL File (.crn)
 └────┬────┘
      │
      ▼
-┌─────────────┐
-│ Interpreter │  Execute Effects through Provider
-└──────┬──────┘
-       │
-       ▼
 ┌──────────┐
-│ Provider │  AWS, GCP, etc.
+│ Provider │  Execute Effects (AWS, GCP, etc.)
 └──────────┘
 ```
 
@@ -321,7 +316,6 @@ DSL File (.crn)
 - **Effect**: Represents a side effect (Create, Update, Delete, Read)
 - **Plan**: Collection of Effects to be executed
 - **Provider**: Abstraction for infrastructure operations
-- **Interpreter**: Executes Plan through Provider
 
 ## Project Structure
 
@@ -334,7 +328,6 @@ carina/
 │   │   ├── plan.rs          # Plan (collection of Effects)
 │   │   ├── resource.rs      # Resource and State types
 │   │   ├── provider.rs      # Provider trait
-│   │   ├── interpreter.rs   # Effect interpreter
 │   │   ├── differ.rs        # State comparison
 │   │   ├── parser/          # DSL parser (pest-based)
 │   │   ├── schema.rs        # Type validation (generic types only)
