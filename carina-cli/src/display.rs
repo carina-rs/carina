@@ -375,9 +375,9 @@ pub fn format_plan(plan: &Plan, compact: bool) -> String {
         prefix: &str,
         compact: bool,
         parent_binding: Option<&str>,
-    ) {
+    ) -> bool {
         if printed.contains(&idx) {
-            return;
+            return false;
         }
         printed.insert(idx);
 
@@ -409,6 +409,8 @@ pub fn format_plan(plan: &Plan, compact: bool) -> String {
         let base_indent = "  ";
         // Attribute indentation (4 spaces from resource line)
         let attr_base = "    ";
+
+        let mut has_displayed_attrs = false;
 
         match effect {
             Effect::Create(r) => {
@@ -452,6 +454,9 @@ pub fn format_plan(plan: &Plan, compact: bool) -> String {
                         .filter(|k| !k.starts_with('_'))
                         .collect();
                     keys.sort();
+                    if !keys.is_empty() {
+                        has_displayed_attrs = true;
+                    }
                     for key in keys {
                         let value = &r.attributes[key];
                         if is_list_of_maps(value) {
@@ -522,6 +527,7 @@ pub fn format_plan(plan: &Plan, compact: bool) -> String {
                             .map(|ov| ov.semantically_equal(new_value))
                             .unwrap_or(false);
                         if !is_same {
+                            has_displayed_attrs = true;
                             if is_list_of_maps(new_value) {
                                 writeln!(out, "{}{}:", attr_prefix, key).unwrap();
                                 writeln!(
@@ -562,6 +568,7 @@ pub fn format_plan(plan: &Plan, compact: bool) -> String {
                     removed_keys.sort();
                     for key in removed_keys {
                         if let Some(old_value) = from.attributes.get(key.as_str()) {
+                            has_displayed_attrs = true;
                             writeln!(
                                 out,
                                 "{}{}: {} → {}",
@@ -635,9 +642,11 @@ pub fn format_plan(plan: &Plan, compact: bool) -> String {
                         cascade_ref_hints,
                     );
                     if !replace_attrs_output.is_empty() {
+                        has_displayed_attrs = true;
                         write!(out, "{}", replace_attrs_output).unwrap();
                     }
                     if let Some(temp) = temporary_name {
+                        has_displayed_attrs = true;
                         if temp.can_rename {
                             writeln!(
                                 out,
@@ -661,6 +670,7 @@ pub fn format_plan(plan: &Plan, compact: bool) -> String {
                         }
                     }
                     if !cascading_updates.is_empty() {
+                        has_displayed_attrs = true;
                         writeln!(
                             out,
                             "{}  {} cascading update(s):",
@@ -782,9 +792,14 @@ pub fn format_plan(plan: &Plan, compact: bool) -> String {
             format!("{}   ", continuation)
         };
 
+        // Insert tree continuation line between attribute block and child resources
+        if has_displayed_attrs && !unprinted_children.is_empty() {
+            writeln!(out, "{}{}│", base_indent, new_prefix).unwrap();
+        }
+
         for (i, child_idx) in unprinted_children.iter().enumerate() {
             let child_is_last = i == unprinted_children.len() - 1;
-            format_effect_tree(
+            let child_had_attrs = format_effect_tree(
                 out,
                 *child_idx,
                 plan,
@@ -796,7 +811,26 @@ pub fn format_plan(plan: &Plan, compact: bool) -> String {
                 compact,
                 current_binding.as_deref(),
             );
+            // Add separator line between siblings when previous sibling displayed attributes
+            if child_had_attrs && !child_is_last {
+                let separator_continuation = if is_last {
+                    format!("{}   ", prefix)
+                } else {
+                    format!("{}│  ", prefix)
+                };
+                let separator_prefix = if indent == 0 {
+                    format!("{}  ", attr_base)
+                } else {
+                    format!("{}   ", separator_continuation)
+                };
+                writeln!(out, "{}{}│", base_indent, separator_prefix).unwrap();
+            }
+            if child_had_attrs {
+                has_displayed_attrs = true;
+            }
         }
+
+        has_displayed_attrs
     }
 
     // Print from roots
