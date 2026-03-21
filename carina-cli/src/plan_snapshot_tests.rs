@@ -8,16 +8,14 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use carina_core::config_loader::{get_base_dir, load_configuration};
-use carina_core::deps::{get_resource_dependencies, sort_resources_by_dependencies};
+use carina_core::deps::sort_resources_by_dependencies;
 use carina_core::differ::{cascade_dependent_updates, create_plan};
-use carina_core::effect::Effect;
-use carina_core::plan::Plan;
 use carina_core::resolver::resolve_refs_with_state;
-use carina_core::resource::{ResourceId, State, Value};
+use carina_core::resource::{ResourceId, State};
 use carina_state::StateFile;
 
 use crate::commands::validate_and_resolve;
-use crate::display::{format_destroy_plan, format_plan};
+use crate::display::format_plan;
 use crate::wiring::{
     WiringContext, reconcile_anonymous_identifiers_with_ctx, reconcile_prefixed_names,
 };
@@ -180,88 +178,9 @@ fn snapshot_enum_display() {
     insta::assert_snapshot!(output);
 }
 
-/// Build a destroy plan from a fixture: loads resources + state, creates Delete
-/// effects in reverse dependency order (same logic as the destroy command).
-fn build_destroy_plan_from_fixture(fixture_dir: &str) -> Plan {
-    let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let crn_path = PathBuf::from(format!(
-        "{}/tests/fixtures/plan_display/{}/main.crn",
-        manifest_dir, fixture_dir
-    ));
-    let state_path = PathBuf::from(format!(
-        "{}/tests/fixtures/plan_display/{}/carina.state.json",
-        manifest_dir, fixture_dir
-    ));
-
-    let mut parsed = load_configuration(&crn_path).unwrap().parsed;
-    let base_dir = get_base_dir(&crn_path);
-    validate_and_resolve(&mut parsed, base_dir, true).unwrap();
-
-    let state_file: Option<StateFile> = if state_path.exists() {
-        let json = std::fs::read_to_string(&state_path).unwrap();
-        Some(serde_json::from_str(&json).unwrap())
-    } else {
-        None
-    };
-
-    let wiring = WiringContext::new();
-    reconcile_prefixed_names(&mut parsed.resources, &state_file);
-    if let Some(sf) = state_file.as_ref() {
-        reconcile_anonymous_identifiers_with_ctx(&wiring, &mut parsed.resources, sf);
-    }
-
-    let sorted_resources = sort_resources_by_dependencies(&parsed.resources).unwrap();
-    // Reverse for destruction order (dependents first)
-    let destroy_order: Vec<_> = sorted_resources.into_iter().rev().collect();
-
-    // Build current states from state file
-    let mut current_states: HashMap<ResourceId, State> = HashMap::new();
-    if let Some(sf) = state_file.as_ref() {
-        for resource in &destroy_order {
-            if resource.read_only {
-                continue;
-            }
-            let state = sf.build_state_for_resource(resource);
-            current_states.insert(resource.id.clone(), state);
-        }
-    }
-
-    let mut plan = Plan::new();
-    for resource in &destroy_order {
-        if resource.read_only {
-            continue;
-        }
-        if !current_states
-            .get(&resource.id)
-            .map(|s| s.exists)
-            .unwrap_or(false)
-        {
-            continue;
-        }
-        let identifier = current_states
-            .get(&resource.id)
-            .and_then(|s| s.identifier.clone())
-            .unwrap_or_default();
-        let binding = resource.attributes.get("_binding").and_then(|v| match v {
-            Value::String(s) => Some(s.clone()),
-            _ => None,
-        });
-        let dependencies = get_resource_dependencies(resource);
-        plan.add(Effect::Delete {
-            id: resource.id.clone(),
-            identifier,
-            lifecycle: resource.lifecycle.clone(),
-            binding,
-            dependencies,
-        });
-    }
-
-    plan
-}
-
 #[test]
 fn snapshot_destroy_full() {
-    let plan = build_destroy_plan_from_fixture("destroy_full");
-    let output = strip_ansi(&format_destroy_plan(&plan));
+    let plan = build_plan_from_fixture("destroy_full");
+    let output = strip_ansi(&format_plan(&plan, false));
     insta::assert_snapshot!(output);
 }
