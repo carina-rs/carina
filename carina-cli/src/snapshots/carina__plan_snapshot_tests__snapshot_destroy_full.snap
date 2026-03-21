@@ -1,0 +1,8 @@
+---
+source: carina-cli/src/plan_snapshot_tests.rs
+expression: output
+---
+Destroy Plan:
+
+  - awscc.ec2.vpc vpc
+        └─ - awscc.ec2.subnet subnet

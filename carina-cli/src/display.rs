@@ -299,6 +299,54 @@ pub fn format_plan(plan: &Plan, compact: bool) -> String {
         return out;
     }
 
+    writeln!(out, "{}", "Execution Plan:".cyan().bold()).unwrap();
+    writeln!(out).unwrap();
+
+    out.push_str(&format_plan_tree(plan, compact));
+
+    writeln!(out).unwrap();
+    let summary = plan.summary();
+    let mut parts = Vec::new();
+    if summary.read > 0 {
+        parts.push(format!("{} to read", summary.read.to_string().cyan()));
+    }
+    parts.push(format!("{} to add", summary.create.to_string().green()));
+    parts.push(format!("{} to change", summary.update.to_string().yellow()));
+    if summary.replace > 0 {
+        parts.push(format!(
+            "{} to replace",
+            summary.replace.to_string().magenta()
+        ));
+    }
+    parts.push(format!("{} to destroy", summary.delete.to_string().red()));
+    writeln!(out, "Plan: {}.", parts.join(", ")).unwrap();
+
+    out
+}
+
+/// Format a destroy plan for display.
+///
+/// Uses the same tree-building logic as `format_plan` but with a
+/// "Destroy Plan:" header and a destroy-specific summary.
+pub fn format_destroy_plan(plan: &Plan) -> String {
+    let mut out = String::new();
+
+    if plan.is_empty() {
+        return out;
+    }
+
+    writeln!(out, "{}", "Destroy Plan:".red().bold()).unwrap();
+    writeln!(out).unwrap();
+
+    out.push_str(&format_plan_tree(plan, false));
+
+    out
+}
+
+/// Format the tree body of a plan (no header, no summary).
+fn format_plan_tree(plan: &Plan, compact: bool) -> String {
+    let mut out = String::new();
+
     // Build dependency graph from effects
     let mut binding_to_effect: HashMap<String, usize> = HashMap::new();
     let mut effect_deps: HashMap<usize, HashSet<String>> = HashMap::new();
@@ -356,9 +404,6 @@ pub fn format_plan(plan: &Plan, compact: bool) -> String {
         &effect_bindings,
         &effect_types,
     );
-
-    writeln!(out, "{}", "Execution Plan:".cyan().bold()).unwrap();
-    writeln!(out).unwrap();
 
     // Track printed effects to avoid duplicates
     let mut printed: HashSet<usize> = HashSet::new();
@@ -868,23 +913,6 @@ pub fn format_plan(plan: &Plan, compact: bool) -> String {
             None,
         );
     }
-
-    writeln!(out).unwrap();
-    let summary = plan.summary();
-    let mut parts = Vec::new();
-    if summary.read > 0 {
-        parts.push(format!("{} to read", summary.read.to_string().cyan()));
-    }
-    parts.push(format!("{} to add", summary.create.to_string().green()));
-    parts.push(format!("{} to change", summary.update.to_string().yellow()));
-    if summary.replace > 0 {
-        parts.push(format!(
-            "{} to replace",
-            summary.replace.to_string().magenta()
-        ));
-    }
-    parts.push(format!("{} to destroy", summary.delete.to_string().red()));
-    writeln!(out, "Plan: {}.", parts.join(", ")).unwrap();
 
     out
 }
