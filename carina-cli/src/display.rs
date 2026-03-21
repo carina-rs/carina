@@ -575,7 +575,8 @@ pub fn print_plan(plan: &Plan, compact: bool) {
                         let is_same = old_value
                             .map(|ov| ov.semantically_equal(new_value))
                             .unwrap_or(false);
-                        if !is_same {
+                        if !is_same && should_show_replace_attr(key, new_value, changed_create_only)
+                        {
                             if is_list_of_maps(new_value) {
                                 let suffix = if forces_replacement {
                                     format!(" {}", "(forces replacement)".magenta())
@@ -1088,6 +1089,22 @@ fn value_references_binding(value: &Value, binding: &str) -> bool {
         Value::Map(map) => map.values().any(|v| value_references_binding(v, binding)),
         _ => false,
     }
+}
+
+/// Check whether an attribute should be shown in a Replace effect diff.
+///
+/// For cascade-generated Replace effects, the `to` resource contains unresolved
+/// DSL values (e.g., `UnresolvedIdent`) that haven't been normalized by
+/// `provider.read()`. This creates false diffs against the AWS-format `from` state.
+///
+/// To avoid false diffs, skip attributes that:
+/// - Are NOT in `changed_create_only` (not the reason for replacement), AND
+/// - Have a `to` value that is `UnresolvedIdent` (DSL format, not yet normalized)
+fn should_show_replace_attr(key: &str, to_value: &Value, changed_create_only: &[String]) -> bool {
+    if changed_create_only.contains(&key.to_string()) {
+        return true;
+    }
+    !matches!(to_value, Value::UnresolvedIdent(..))
 }
 
 #[cfg(test)]
@@ -1992,6 +2009,68 @@ mod tests {
             !output.contains("cidr_block"),
             "cidr_block should not appear in diff, got: {}",
             output
+        );
+    }
+
+    /// Test that cascade-generated Replace effects skip false diffs from
+    /// DSL vs AWS format mismatch (issue #961).
+    ///
+    /// Attributes NOT in `changed_create_only` whose `to` value is `UnresolvedIdent`
+    /// should be skipped, because the mismatch is a format artifact, not a real change.
+    #[test]
+    fn test_should_show_replace_attr_skips_unresolved_ident_not_in_changed() {
+        // vpc_id is in changed_create_only with ResourceRef -> should show
+        let vpc_id_value = Value::ResourceRef {
+            binding_name: "vpc".to_string(),
+            attribute_name: "vpc_id".to_string(),
+        };
+        let changed = vec!["vpc_id".to_string()];
+        assert!(
+            should_show_replace_attr("vpc_id", &vpc_id_value, &changed),
+            "vpc_id should be shown (in changed_create_only)"
+        );
+
+        // availability_zone is NOT in changed_create_only and is UnresolvedIdent -> should skip
+        let az_value =
+            Value::UnresolvedIdent("awscc.AvailabilityZone.ap_northeast_1a".to_string(), None);
+        assert!(
+            !should_show_replace_attr("availability_zone", &az_value, &changed),
+            "availability_zone should be skipped (UnresolvedIdent, not in changed_create_only)"
+        );
+
+        // cidr_block is NOT in changed_create_only but is a plain String -> should show
+        // (the semantically_equal check in the caller handles this case)
+        let cidr_value = Value::String("10.0.1.0/24".to_string());
+        assert!(
+            should_show_replace_attr("cidr_block", &cidr_value, &changed),
+            "cidr_block should be shown (plain String, caller handles equality check)"
+        );
+    }
+
+    /// Test that UnresolvedIdent in changed_create_only IS shown (not skipped).
+    #[test]
+    fn test_should_show_replace_attr_shows_unresolved_ident_in_changed() {
+        let value =
+            Value::UnresolvedIdent("awscc.AvailabilityZone.ap_northeast_1a".to_string(), None);
+        let changed = vec!["availability_zone".to_string()];
+        assert!(
+            should_show_replace_attr("availability_zone", &value, &changed),
+            "UnresolvedIdent in changed_create_only should be shown"
+        );
+    }
+
+    /// Test that ResourceRef NOT in changed_create_only is still shown
+    /// (ResourceRef is a real reference to another resource, not a format artifact).
+    #[test]
+    fn test_should_show_replace_attr_shows_resource_ref_not_in_changed() {
+        let value = Value::ResourceRef {
+            binding_name: "vpc".to_string(),
+            attribute_name: "vpc_id".to_string(),
+        };
+        let changed: Vec<String> = vec![];
+        assert!(
+            should_show_replace_attr("vpc_id", &value, &changed),
+            "ResourceRef should always be shown"
         );
     }
 
