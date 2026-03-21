@@ -58,8 +58,25 @@ else
     FAIL=$((FAIL + 1))
 fi
 
+# Step 2: Apply (VPC CBD replace + subnet replace)
+run_step "apply step2 (replace VPC + subnet)" "$CARINA apply --auto-approve $STEP2"
+
+# Step 2: Plan verify (should show no changes after apply)
+echo ""
+echo "── plan-verify step2 ──"
+VERIFY_OUTPUT=$($CARINA plan "$STEP2" 2>&1) || true
+echo "$VERIFY_OUTPUT"
+
+if echo "$VERIFY_OUTPUT" | grep -q "No changes"; then
+    echo "  ✓ plan-verify: no changes (idempotent)"
+    PASS=$((PASS + 1))
+else
+    echo "  ✗ plan-verify: unexpected changes detected"
+    FAIL=$((FAIL + 1))
+fi
+
 # Cleanup: destroy
-run_step "destroy (cleanup)" "$CARINA destroy --auto-approve $STEP1"
+run_step "destroy (cleanup)" "$CARINA destroy --auto-approve $STEP2"
 
 echo ""
 echo "════════════════════════════════════════"
