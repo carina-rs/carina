@@ -6,6 +6,6 @@ Execution Plan:
 
   + awscc.ec2.vpc vpc
         ├─ + awscc.ec2.route_table ec2_route_table_d8d0c86b
-        └─ + awscc.ec2.subnet (availability_zone: awscc.AvailabilityZone.ap_northeast_1a)
+        └─ + awscc.ec2.subnet (availability_zone: ap-northeast-1a)
 
 Plan: 3 to add, 0 to change, 0 to destroy.

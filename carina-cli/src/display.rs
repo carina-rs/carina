@@ -16,6 +16,7 @@ use carina_core::effect::Effect;
 use carina_core::plan::Plan;
 use carina_core::resource::{ResourceId, Value};
 use carina_core::schema::ResourceSchema;
+use carina_core::utils::{convert_enum_value, is_dsl_enum_format};
 #[cfg(test)]
 use carina_core::value::{format_value, format_value_with_key, is_list_of_maps, map_similarity};
 
@@ -207,7 +208,13 @@ fn extract_compact_hint(
             && !s.is_empty()
         {
             let short_key = shorten_attr_name(key);
-            let display_value = shorten_service_name(key, s);
+            // Resolve DSL enum identifiers (e.g., awscc.AvailabilityZone.ap_northeast_1a -> "ap-northeast-1a")
+            let resolved = if is_dsl_enum_format(s) {
+                Cow::Owned(convert_enum_value(s))
+            } else {
+                Cow::Borrowed(s.as_str())
+            };
+            let display_value = shorten_service_name(key, &resolved);
             return Some(format!("{}: {}", short_key, display_value));
         }
     }
@@ -2224,6 +2231,23 @@ mod tests {
         assert_eq!(shorten_attr_name("subnet_id"), "subnet");
         // _name still works
         assert_eq!(shorten_attr_name("service_name"), "service");
+    }
+
+    /// Test that extract_compact_hint resolves DSL enum identifiers.
+    #[test]
+    fn test_extract_compact_hint_resolves_dsl_enum() {
+        let mut r = Resource::new("ec2.subnet", "hash_enum");
+        r.attributes.insert(
+            "availability_zone".to_string(),
+            Value::String("awscc.AvailabilityZone.ap_northeast_1a".to_string()),
+        );
+
+        let hint = extract_compact_hint(&r, None);
+        assert_eq!(
+            hint,
+            Some("availability_zone: ap-northeast-1a".to_string()),
+            "DSL enum identifiers should be resolved to provider values"
+        );
     }
 
     /// Test that extract_compact_hint skips _-prefixed attributes.
