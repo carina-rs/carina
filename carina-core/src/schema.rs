@@ -735,6 +735,16 @@ impl ResourceSchema {
             .collect()
     }
 
+    /// Returns attributes that have default values and are not read-only.
+    /// Each entry is (attribute_name, default_value).
+    pub fn default_value_attributes(&self) -> Vec<(&str, &Value)> {
+        self.attributes
+            .iter()
+            .filter(|(_, schema)| schema.default.is_some() && !schema.read_only)
+            .map(|(name, schema)| (name.as_str(), schema.default.as_ref().unwrap()))
+            .collect()
+    }
+
     /// Returns the names of create-only (immutable) attributes
     pub fn create_only_attributes(&self) -> Vec<&str> {
         self.attributes

@@ -557,12 +557,36 @@ fn format_plan_tree(
                             .unwrap();
                         }
                     }
-                    // Show read-only attributes with (known after apply) placeholder
                     if let Some(schema_map) = schemas {
                         let schema_key = r.id.display_type();
                         if let Some(schema) = schema_map.get(&schema_key) {
                             let user_keys: HashSet<&str> =
                                 keys.iter().map(|k| k.as_str()).collect();
+
+                            // Show default-value attributes (not specified by user)
+                            let mut default_attrs: Vec<(&str, &Value)> = schema
+                                .default_value_attributes()
+                                .into_iter()
+                                .filter(|(a, _)| !user_keys.contains(a))
+                                .collect();
+                            default_attrs.sort_by_key(|(a, _)| *a);
+                            if !default_attrs.is_empty() {
+                                has_displayed_attrs = true;
+                            }
+                            for (attr, default_val) in default_attrs {
+                                let formatted = format_value_with_key(default_val, Some(attr));
+                                writeln!(
+                                    out,
+                                    "{}{}: {}  {}",
+                                    attr_prefix,
+                                    attr.dimmed(),
+                                    formatted.dimmed(),
+                                    "# default".dimmed()
+                                )
+                                .unwrap();
+                            }
+
+                            // Show read-only attributes with (known after apply) placeholder
                             let mut ro_attrs: Vec<&str> = schema
                                 .read_only_attributes()
                                 .into_iter()

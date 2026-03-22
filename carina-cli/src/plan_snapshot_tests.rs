@@ -257,6 +257,13 @@ fn snapshot_destroy_orphans() {
 }
 
 #[test]
+fn snapshot_default_values() {
+    let (plan, schemas) = build_plan_from_fixture("default_values");
+    let output = strip_ansi(&format_plan(&plan, false, &HashMap::new(), Some(&schemas)));
+    insta::assert_snapshot!(output);
+}
+
+#[test]
 fn snapshot_read_only_attrs() {
     let (plan, schemas) = build_plan_from_fixture("read_only_attrs");
     let output = strip_ansi(&format_plan(&plan, false, &HashMap::new(), Some(&schemas)));

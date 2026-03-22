@@ -1,0 +1,10 @@
+# Test default attribute values display with # default annotation
+
+provider awscc {
+  region = awscc.Region.ap_northeast_1
+}
+
+awscc.logs.log_group {
+  log_group_name = "my-app-logs"
+  retention_in_days = 30
+}
