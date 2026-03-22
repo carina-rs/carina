@@ -261,42 +261,39 @@ fn render_map_key_diff(
     old_map: &std::collections::HashMap<String, Value>,
     new_map: &std::collections::HashMap<String, Value>,
 ) {
+    use carina_core::diff_helpers::{MapDiffItem, compute_map_diff};
     use carina_core::value::format_value;
 
-    let mut all_keys: Vec<&String> = old_map.keys().chain(new_map.keys()).collect();
-    all_keys.sort();
-    all_keys.dedup();
-
-    for key in all_keys {
-        let old_val = old_map.get(key);
-        let new_val = new_map.get(key);
-        match (old_val, new_val) {
-            (Some(ov), Some(nv)) => {
-                if !ov.semantically_equal(nv) {
-                    lines.push(Line::from(vec![
-                        Span::raw("    "),
-                        Span::styled("~ ", Style::default().fg(Color::Yellow)),
-                        Span::raw(format!("{}: ", key)),
-                        Span::styled(
-                            format_value(ov),
-                            Style::default()
-                                .fg(Color::Red)
-                                .add_modifier(Modifier::CROSSED_OUT),
-                        ),
-                        Span::raw(" -> "),
-                        Span::styled(format_value(nv), Style::default().fg(Color::Green)),
-                    ]));
-                }
+    let diff = compute_map_diff(old_map, new_map);
+    for item in diff.iter_by_key() {
+        match item {
+            MapDiffItem::Changed(e) => {
+                lines.push(Line::from(vec![
+                    Span::raw("    "),
+                    Span::styled("~ ", Style::default().fg(Color::Yellow)),
+                    Span::raw(format!("{}: ", e.key)),
+                    Span::styled(
+                        format_value(&e.old_value),
+                        Style::default()
+                            .fg(Color::Red)
+                            .add_modifier(Modifier::CROSSED_OUT),
+                    ),
+                    Span::raw(" -> "),
+                    Span::styled(
+                        format_value(&e.new_value),
+                        Style::default().fg(Color::Green),
+                    ),
+                ]));
             }
-            (None, Some(nv)) => {
+            MapDiffItem::Added(e) => {
                 lines.push(Line::from(vec![
                     Span::raw("    "),
                     Span::styled("+ ", Style::default().fg(Color::Green)),
-                    Span::raw(format!("{}: ", key)),
-                    Span::styled(format_value(nv), Style::default().fg(Color::Green)),
+                    Span::raw(format!("{}: ", e.key)),
+                    Span::styled(format_value(&e.value), Style::default().fg(Color::Green)),
                 ]));
             }
-            (Some(ov), None) => {
+            MapDiffItem::Removed(e) => {
                 lines.push(Line::from(vec![
                     Span::raw("    "),
                     Span::styled(
@@ -306,20 +303,19 @@ fn render_map_key_diff(
                             .add_modifier(Modifier::CROSSED_OUT),
                     ),
                     Span::styled(
-                        format!("{}: ", key),
+                        format!("{}: ", e.key),
                         Style::default()
                             .fg(Color::Red)
                             .add_modifier(Modifier::CROSSED_OUT),
                     ),
                     Span::styled(
-                        format_value(ov),
+                        format_value(&e.value),
                         Style::default()
                             .fg(Color::Red)
                             .add_modifier(Modifier::CROSSED_OUT),
                     ),
                 ]));
             }
-            (None, None) => {}
         }
     }
 }
