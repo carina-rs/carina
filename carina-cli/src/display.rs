@@ -7,7 +7,7 @@ use colored::Colorize;
 use carina_core::deps::get_resource_dependencies;
 use carina_core::effect::{CascadingUpdate, Effect};
 use carina_core::plan::Plan;
-use carina_core::resource::Value;
+use carina_core::resource::{ResourceId, Value};
 use carina_core::value::{format_value, format_value_with_key, is_list_of_maps, map_similarity};
 
 /// Build a single-parent tree from the dependency graph.
@@ -302,7 +302,7 @@ pub fn format_plan(plan: &Plan, compact: bool) -> String {
     writeln!(out, "{}", "Execution Plan:".cyan().bold()).unwrap();
     writeln!(out).unwrap();
 
-    out.push_str(&format_plan_tree(plan, compact));
+    out.push_str(&format_plan_tree(plan, compact, None));
 
     writeln!(out).unwrap();
     let summary = plan.summary();
@@ -328,8 +328,15 @@ pub fn format_plan(plan: &Plan, compact: bool) -> String {
 /// Format a destroy plan for display.
 ///
 /// Uses the same tree-building logic as `format_plan` but with a
-/// "Destroy Plan:" header and a destroy-specific summary.
-pub fn format_destroy_plan(plan: &Plan) -> String {
+/// "Destroy Plan:" header and no summary line.
+///
+/// `delete_attributes` maps each resource's `ResourceId` to its current state
+/// attributes, so the display can show what will be deleted.
+pub fn format_destroy_plan(
+    plan: &Plan,
+    compact: bool,
+    delete_attributes: &HashMap<ResourceId, HashMap<String, Value>>,
+) -> String {
     let mut out = String::new();
 
     if plan.is_empty() {
@@ -339,13 +346,20 @@ pub fn format_destroy_plan(plan: &Plan) -> String {
     writeln!(out, "{}", "Destroy Plan:".red().bold()).unwrap();
     writeln!(out).unwrap();
 
-    out.push_str(&format_plan_tree(plan, false));
+    out.push_str(&format_plan_tree(plan, compact, Some(delete_attributes)));
 
     out
 }
 
 /// Format the tree body of a plan (no header, no summary).
-fn format_plan_tree(plan: &Plan, compact: bool) -> String {
+///
+/// `delete_attributes` optionally provides current state attributes for Delete
+/// effects, allowing the display to show what will be deleted.
+fn format_plan_tree(
+    plan: &Plan,
+    compact: bool,
+    delete_attributes: Option<&HashMap<ResourceId, HashMap<String, Value>>>,
+) -> String {
     let mut out = String::new();
 
     // Build dependency graph from effects
@@ -421,6 +435,7 @@ fn format_plan_tree(plan: &Plan, compact: bool) -> String {
         prefix: &str,
         compact: bool,
         parent_binding: Option<&str>,
+        delete_attributes: Option<&HashMap<ResourceId, HashMap<String, Value>>>,
     ) -> bool {
         if printed.contains(&idx) {
             return false;
@@ -765,6 +780,36 @@ fn format_plan_tree(plan: &Plan, compact: bool) -> String {
                     id.name.red().bold().strikethrough()
                 )
                 .unwrap();
+                if !compact && let Some(attrs) = delete_attributes.and_then(|da| da.get(id)) {
+                    let attr_prefix = if indent == 0 {
+                        format!("{}{}", base_indent, attr_base)
+                    } else {
+                        let continuation = if is_last {
+                            format!("{}   ", prefix)
+                        } else {
+                            format!("{}│  ", prefix)
+                        };
+                        format!("{}{}   ", base_indent, continuation)
+                    };
+                    let mut keys: Vec<_> = attrs.keys().filter(|k| !k.starts_with('_')).collect();
+                    keys.sort();
+                    if !keys.is_empty() {
+                        has_displayed_attrs = true;
+                    }
+                    for key in keys {
+                        let value = &attrs[key];
+                        writeln!(
+                            out,
+                            "{}{}: {}",
+                            attr_prefix,
+                            key,
+                            format_value_with_key(value, Some(key))
+                                .red()
+                                .strikethrough()
+                        )
+                        .unwrap();
+                    }
+                }
             }
             Effect::Read { resource } => {
                 if compact {
@@ -856,6 +901,7 @@ fn format_plan_tree(plan: &Plan, compact: bool) -> String {
                 &new_prefix,
                 compact,
                 current_binding.as_deref(),
+                delete_attributes,
             );
             // Add separator line between siblings when previous sibling displayed attributes
             if child_had_attrs && !child_is_last {
@@ -892,6 +938,7 @@ fn format_plan_tree(plan: &Plan, compact: bool) -> String {
             "",
             compact,
             None,
+            delete_attributes,
         );
     }
 
@@ -912,6 +959,7 @@ fn format_plan_tree(plan: &Plan, compact: bool) -> String {
             "",
             compact,
             None,
+            delete_attributes,
         );
     }
 

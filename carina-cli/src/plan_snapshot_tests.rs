@@ -30,6 +30,13 @@ fn strip_ansi(s: &str) -> String {
 
 /// Build a plan from a .crn fixture and optional state file, mimicking `--refresh=false`.
 fn build_plan_from_fixture(fixture_dir: &str) -> carina_core::plan::Plan {
+    let (plan, _) = build_plan_and_states_from_fixture(fixture_dir);
+    plan
+}
+
+fn build_plan_and_states_from_fixture(
+    fixture_dir: &str,
+) -> (carina_core::plan::Plan, HashMap<ResourceId, State>) {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let crn_path = PathBuf::from(format!(
         "{}/tests/fixtures/plan_display/{}/main.crn",
@@ -138,7 +145,7 @@ fn build_plan_from_fixture(fixture_dir: &str) -> carina_core::plan::Plan {
         wiring.schemas(),
     );
 
-    plan
+    (plan, current_states)
 }
 
 #[test]
@@ -199,8 +206,14 @@ fn snapshot_no_changes_enum() {
 
 #[test]
 fn snapshot_destroy_full() {
-    let plan = build_plan_from_fixture("destroy_full");
-    let output = strip_ansi(&format_destroy_plan(&plan));
+    use carina_core::resource::Value;
+    let (plan, current_states) = build_plan_and_states_from_fixture("destroy_full");
+    let delete_attributes: HashMap<ResourceId, HashMap<String, Value>> = current_states
+        .into_iter()
+        .filter(|(_, state)| state.exists)
+        .map(|(id, state)| (id, state.attributes))
+        .collect();
+    let output = strip_ansi(&format_destroy_plan(&plan, false, &delete_attributes));
     insta::assert_snapshot!(output);
 }
 
