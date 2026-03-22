@@ -294,6 +294,16 @@ impl App {
         } else {
             self.selected = 0;
         }
+        // Adjust scroll so the selected item is visible
+        if self.selected < self.tree_scroll_offset {
+            self.tree_scroll_offset = self.selected;
+        } else if self.tree_area_height > 0
+            && self.selected >= self.tree_scroll_offset + self.tree_area_height
+        {
+            self.tree_scroll_offset = self.selected - self.tree_area_height + 1;
+        }
+        self.sync_list_state();
+        self.detail_scroll = 0;
     }
 
     /// Update search matches based on the current query.
