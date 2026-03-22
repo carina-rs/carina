@@ -9,6 +9,7 @@ use carina_core::effect::Effect;
 use carina_core::plan::{Plan, PlanSummary};
 use carina_core::resource::Value;
 use carina_core::schema::ResourceSchema;
+use carina_core::utils::{convert_enum_value, is_dsl_enum_format};
 use ratatui::widgets::ListState;
 
 /// A node in the tree view representing one effect
@@ -844,7 +845,13 @@ fn extract_compact_hint(
             && !s.is_empty()
         {
             let short_key = shorten_attr_name(key);
-            let display_value = shorten_service_name(key, s);
+            // Resolve DSL enum identifiers (e.g., awscc.AvailabilityZone.ap_northeast_1a -> "ap-northeast-1a")
+            let resolved = if is_dsl_enum_format(s) {
+                Cow::Owned(convert_enum_value(s))
+            } else {
+                Cow::Borrowed(s.as_str())
+            };
+            let display_value = shorten_service_name(key, &resolved);
             return Some(format!("{}: {}", short_key, display_value));
         }
     }
