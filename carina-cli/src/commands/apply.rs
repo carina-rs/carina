@@ -910,7 +910,7 @@ async fn run_apply_locked(
         })
         .collect();
 
-    print_plan(&plan, false, &delete_attributes, Some(ctx.schemas()));
+    print_plan(&plan, false, false, &delete_attributes, Some(ctx.schemas()));
 
     // Confirmation prompt
     if !auto_approve {
@@ -1183,7 +1183,7 @@ async fn run_apply_from_plan_locked(
         })
         .collect();
 
-    print_plan(plan, false, &delete_attributes, None);
+    print_plan(plan, false, false, &delete_attributes, None);
 
     // Confirmation prompt
     if !auto_approve {

@@ -62,6 +62,7 @@ pub async fn run_plan(
     path: &PathBuf,
     out: Option<&PathBuf>,
     compact: bool,
+    verbose: bool,
     tui: bool,
     refresh: bool,
 ) -> Result<bool, AppError> {
@@ -201,6 +202,7 @@ pub async fn run_plan(
         print_plan(
             &ctx.plan,
             compact,
+            verbose,
             &delete_attributes,
             Some(wiring.schemas()),
         );

@@ -282,10 +282,14 @@ fn format_compact_name(
 pub fn print_plan(
     plan: &Plan,
     compact: bool,
+    verbose: bool,
     delete_attributes: &HashMap<ResourceId, HashMap<String, Value>>,
     schemas: Option<&HashMap<String, ResourceSchema>>,
 ) {
-    print!("{}", format_plan(plan, compact, delete_attributes, schemas));
+    print!(
+        "{}",
+        format_plan(plan, compact, verbose, delete_attributes, schemas)
+    );
 }
 
 /// Format a plan as a string for display.
@@ -295,6 +299,7 @@ pub fn print_plan(
 pub fn format_plan(
     plan: &Plan,
     compact: bool,
+    verbose: bool,
     delete_attributes: &HashMap<ResourceId, HashMap<String, Value>>,
     schemas: Option<&HashMap<String, ResourceSchema>>,
 ) -> String {
@@ -318,7 +323,7 @@ pub fn format_plan(
     } else {
         Some(delete_attributes)
     };
-    out.push_str(&format_plan_tree(plan, compact, attrs, schemas));
+    out.push_str(&format_plan_tree(plan, compact, verbose, attrs, schemas));
 
     writeln!(out).unwrap();
     let summary = plan.summary();
@@ -365,6 +370,7 @@ pub fn format_destroy_plan(
     out.push_str(&format_plan_tree(
         plan,
         compact,
+        false,
         Some(delete_attributes),
         None,
     ));
@@ -379,6 +385,7 @@ pub fn format_destroy_plan(
 fn format_plan_tree(
     plan: &Plan,
     compact: bool,
+    verbose: bool,
     delete_attributes: Option<&HashMap<ResourceId, HashMap<String, Value>>>,
     schemas: Option<&HashMap<String, ResourceSchema>>,
 ) -> String {
@@ -456,6 +463,7 @@ fn format_plan_tree(
         is_last: bool,
         prefix: &str,
         compact: bool,
+        verbose: bool,
         parent_binding: Option<&str>,
         delete_attributes: Option<&HashMap<ResourceId, HashMap<String, Value>>>,
         schemas: Option<&HashMap<String, ResourceSchema>>,
@@ -661,7 +669,20 @@ fn format_plan_tree(
                         let is_same = old_value
                             .map(|ov| ov.semantically_equal(new_value))
                             .unwrap_or(false);
-                        if !is_same {
+                        if is_same {
+                            if verbose {
+                                has_displayed_attrs = true;
+                                let formatted = format_value_with_key(new_value, Some(key));
+                                writeln!(
+                                    out,
+                                    "{}{}: {}",
+                                    attr_prefix,
+                                    key.dimmed(),
+                                    formatted.dimmed()
+                                )
+                                .unwrap();
+                            }
+                        } else {
                             has_displayed_attrs = true;
                             if is_list_of_maps(new_value) {
                                 writeln!(out, "{}{}:", attr_prefix, key).unwrap();
@@ -718,32 +739,35 @@ fn format_plan_tree(
                         }
                     }
 
-                    // Count unchanged attributes hidden from display
-                    let unchanged_count = from
-                        .attributes
-                        .iter()
-                        .filter(|(k, v)| {
-                            !k.starts_with('_')
-                                && to
-                                    .attributes
-                                    .get(k.as_str())
-                                    .map(|nv| nv.semantically_equal(v))
-                                    .unwrap_or(false)
-                        })
-                        .count();
-                    if unchanged_count > 0 {
-                        let noun = if unchanged_count == 1 {
-                            "attribute"
-                        } else {
-                            "attributes"
-                        };
-                        writeln!(
-                            out,
-                            "{}{}",
-                            attr_prefix,
-                            format!("# ({} unchanged {} hidden)", unchanged_count, noun).dimmed()
-                        )
-                        .unwrap();
+                    // Count unchanged attributes hidden from display (skip in verbose mode)
+                    if !verbose {
+                        let unchanged_count = from
+                            .attributes
+                            .iter()
+                            .filter(|(k, v)| {
+                                !k.starts_with('_')
+                                    && to
+                                        .attributes
+                                        .get(k.as_str())
+                                        .map(|nv| nv.semantically_equal(v))
+                                        .unwrap_or(false)
+                            })
+                            .count();
+                        if unchanged_count > 0 {
+                            let noun = if unchanged_count == 1 {
+                                "attribute"
+                            } else {
+                                "attributes"
+                            };
+                            writeln!(
+                                out,
+                                "{}{}",
+                                attr_prefix,
+                                format!("# ({} unchanged {} hidden)", unchanged_count, noun)
+                                    .dimmed()
+                            )
+                            .unwrap();
+                        }
                     }
                 }
             }
@@ -832,6 +856,41 @@ fn format_plan_tree(
                             .unwrap();
                         }
                     }
+                    // In verbose mode, show unchanged attributes dimmed
+                    if verbose {
+                        let changed_set: HashSet<&str> =
+                            changed_create_only.iter().map(|s| s.as_str()).collect();
+                        let mut all_keys: Vec<_> = from
+                            .attributes
+                            .keys()
+                            .chain(to.attributes.keys())
+                            .filter(|k| !k.starts_with('_') && !changed_set.contains(k.as_str()))
+                            .collect::<HashSet<_>>()
+                            .into_iter()
+                            .collect();
+                        all_keys.sort();
+                        for key in all_keys {
+                            let new_value = to.attributes.get(key.as_str());
+                            let old_value = from.attributes.get(key.as_str());
+                            let is_same = match (old_value, new_value) {
+                                (Some(ov), Some(nv)) => ov.semantically_equal(nv),
+                                _ => false,
+                            };
+                            if is_same {
+                                has_displayed_attrs = true;
+                                let formatted =
+                                    format_value_with_key(new_value.unwrap(), Some(key.as_str()));
+                                writeln!(
+                                    out,
+                                    "{}{}: {}",
+                                    attr_prefix,
+                                    key.dimmed(),
+                                    formatted.dimmed()
+                                )
+                                .unwrap();
+                            }
+                        }
+                    }
                     if !cascading_updates.is_empty() {
                         has_displayed_attrs = true;
                         writeln!(
@@ -870,32 +929,35 @@ fn format_plan_tree(
                         }
                     }
 
-                    // Count unchanged attributes hidden from display
-                    let unchanged_count = from
-                        .attributes
-                        .iter()
-                        .filter(|(k, v)| {
-                            !k.starts_with('_')
-                                && to
-                                    .attributes
-                                    .get(k.as_str())
-                                    .map(|nv| nv.semantically_equal(v))
-                                    .unwrap_or(false)
-                        })
-                        .count();
-                    if unchanged_count > 0 {
-                        let noun = if unchanged_count == 1 {
-                            "attribute"
-                        } else {
-                            "attributes"
-                        };
-                        writeln!(
-                            out,
-                            "{}{}",
-                            attr_prefix,
-                            format!("# ({} unchanged {} hidden)", unchanged_count, noun).dimmed()
-                        )
-                        .unwrap();
+                    // Count unchanged attributes hidden from display (skip in verbose mode)
+                    if !verbose {
+                        let unchanged_count = from
+                            .attributes
+                            .iter()
+                            .filter(|(k, v)| {
+                                !k.starts_with('_')
+                                    && to
+                                        .attributes
+                                        .get(k.as_str())
+                                        .map(|nv| nv.semantically_equal(v))
+                                        .unwrap_or(false)
+                            })
+                            .count();
+                        if unchanged_count > 0 {
+                            let noun = if unchanged_count == 1 {
+                                "attribute"
+                            } else {
+                                "attributes"
+                            };
+                            writeln!(
+                                out,
+                                "{}{}",
+                                attr_prefix,
+                                format!("# ({} unchanged {} hidden)", unchanged_count, noun)
+                                    .dimmed()
+                            )
+                            .unwrap();
+                        }
                     }
                 }
             }
@@ -1031,6 +1093,7 @@ fn format_plan_tree(
                 child_is_last,
                 &new_prefix,
                 compact,
+                verbose,
                 current_binding.as_deref(),
                 delete_attributes,
                 schemas,
@@ -1069,6 +1132,7 @@ fn format_plan_tree(
             i == roots.len() - 1,
             "",
             compact,
+            verbose,
             None,
             delete_attributes,
             schemas,
@@ -1091,6 +1155,7 @@ fn format_plan_tree(
             true,
             "",
             compact,
+            verbose,
             None,
             delete_attributes,
             schemas,
@@ -1590,7 +1655,7 @@ mod tests {
         plan.add(Effect::Create(b));
 
         // Should not panic
-        print_plan(&plan, false, &HashMap::new(), None);
+        print_plan(&plan, false, false, &HashMap::new(), None);
     }
 
     /// Test that print_plan handles the dependency graph correctly when
@@ -1604,7 +1669,7 @@ mod tests {
         plan.add(Effect::Create(b));
 
         // Should not panic
-        print_plan(&plan, false, &HashMap::new(), None);
+        print_plan(&plan, false, false, &HashMap::new(), None);
     }
 
     /// Helper: compute root indices using the same algorithm as print_plan.
@@ -2199,7 +2264,7 @@ mod tests {
         plan.add(Effect::Create(rt));
 
         // Should not panic
-        print_plan(&plan, true, &HashMap::new(), None);
+        print_plan(&plan, true, false, &HashMap::new(), None);
     }
 
     /// Test compact mode skips attributes by checking that _binding attribute
@@ -2223,7 +2288,7 @@ mod tests {
         plan.add(Effect::Create(anon));
 
         // Should not panic; anonymous resources should show hints
-        print_plan(&plan, true, &HashMap::new(), None);
+        print_plan(&plan, true, false, &HashMap::new(), None);
     }
 
     /// Test that extract_compact_hint extracts ResourceRef from inside a List value.
@@ -2351,7 +2416,7 @@ mod tests {
         plan.add(replace_effect);
 
         // Should not panic and should display attribute diffs for cascading updates
-        print_plan(&plan, false, &HashMap::new(), None);
+        print_plan(&plan, false, false, &HashMap::new(), None);
     }
 
     #[test]

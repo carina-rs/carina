@@ -49,8 +49,12 @@ enum Commands {
         detailed_exitcode: bool,
 
         /// Show only resource tree structure without attribute details
-        #[arg(long)]
+        #[arg(long, conflicts_with = "verbose")]
         compact: bool,
+
+        /// Show all attributes for update effects (including unchanged)
+        #[arg(long, conflicts_with = "compact")]
+        verbose: bool,
 
         /// Display plan in interactive TUI mode
         #[arg(long)]
@@ -155,11 +159,12 @@ async fn main() {
         out,
         detailed_exitcode,
         compact,
+        verbose,
         tui,
         refresh,
     } = cli.command
     {
-        match run_plan(&path, out.as_ref(), compact, tui, refresh).await {
+        match run_plan(&path, out.as_ref(), compact, verbose, tui, refresh).await {
             Ok(has_changes) => {
                 if detailed_exitcode && has_changes {
                     std::process::exit(2);

@@ -1,0 +1,23 @@
+---
+source: carina-cli/src/plan_snapshot_tests.rs
+expression: output
+---
+Execution Plan:
+
+  ~ awscc.ec2.vpc vpc
+      cidr_block: "10.0.0.0/16"
+      enable_dns_hostnames: true
+      enable_dns_support: true
+      tags:
+        + Environment: "staging"
+        │
+        ├─ + awscc.ec2.security_group ec2_security_group_712c54ef
+        │     group_description: "Test security group"
+        │     tags: {Name: "test-sg"}
+        │     vpc_id: "vpc-0123456789abcdef0"
+        │     group_id: (known after apply)
+        │     id: (known after apply)
+        │
+        └─ - awscc.ec2.subnet my_subnet
+
+Plan: 1 to add, 1 to change, 1 to destroy.
