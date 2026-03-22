@@ -182,6 +182,42 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
                 ]));
             }
         }
+
+        // Show default value attributes for Create effects
+        if !node.default_attributes.is_empty() {
+            let dim_style = Style::default().fg(Color::DarkGray);
+            for (key, value) in &node.default_attributes {
+                lines.push(Line::from(vec![
+                    Span::styled(format!("  {}: ", key), dim_style),
+                    Span::styled(value.clone(), dim_style),
+                    Span::styled("  # default", dim_style),
+                ]));
+            }
+        }
+
+        // Show read-only attributes for Create effects
+        if !node.read_only_attributes.is_empty() {
+            let dim_style = Style::default().fg(Color::DarkGray);
+            for attr in &node.read_only_attributes {
+                lines.push(Line::from(vec![
+                    Span::styled(format!("  {}: ", attr), dim_style),
+                    Span::styled("(known after apply)", dim_style),
+                ]));
+            }
+        }
+
+        // Show unchanged attribute count for Update/Replace effects
+        if node.unchanged_count > 0 {
+            let noun = if node.unchanged_count == 1 {
+                "attribute"
+            } else {
+                "attributes"
+            };
+            lines.push(Line::from(Span::styled(
+                format!("  # ({} unchanged {} hidden)", node.unchanged_count, noun),
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
     }
 
     let detail = Paragraph::new(lines)
@@ -440,7 +476,7 @@ mod tests {
     fn tree_connector_root_has_no_prefix() {
         let mut plan = Plan::new();
         plan.add(Effect::Create(Resource::new("s3.bucket", "my-bucket")));
-        let app = App::new(&plan);
+        let app = App::new(&plan, &std::collections::HashMap::new());
         assert_eq!(build_tree_connector(0, &app), "");
     }
 
@@ -463,7 +499,7 @@ mod tests {
                     },
                 ),
         ));
-        let app = App::new(&plan);
+        let app = App::new(&plan, &std::collections::HashMap::new());
 
         // Subnet is the only (last) child of VPC
         let connector = build_tree_connector(1, &app);
@@ -499,7 +535,7 @@ mod tests {
                     },
                 ),
         ));
-        let app = App::new(&plan);
+        let app = App::new(&plan, &std::collections::HashMap::new());
 
         // First child gets ├─, last child gets └─
         let children = &app.nodes[0].children;

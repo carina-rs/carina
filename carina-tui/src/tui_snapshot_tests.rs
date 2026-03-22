@@ -12,6 +12,7 @@ use ratatui::buffer::Buffer;
 use carina_core::effect::Effect;
 use carina_core::plan::Plan;
 use carina_core::resource::{LifecycleConfig, Resource, ResourceId, State, Value};
+use carina_core::schema::ResourceSchema;
 
 use crate::app::App;
 use crate::ui::draw;
@@ -42,9 +43,20 @@ fn buffer_to_string(buffer: &Buffer) -> String {
 
 /// Render the TUI into a string, optionally selecting a specific node.
 fn render_tui(plan: &Plan, width: u16, height: u16, selection: usize) -> String {
+    render_tui_with_schemas(plan, &HashMap::new(), width, height, selection)
+}
+
+/// Render the TUI into a string with schemas, optionally selecting a specific node.
+fn render_tui_with_schemas(
+    plan: &Plan,
+    schemas: &HashMap<String, ResourceSchema>,
+    width: u16,
+    height: u16,
+    selection: usize,
+) -> String {
     let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend).unwrap();
-    let mut app = App::new(plan);
+    let mut app = App::new(plan, schemas);
 
     for _ in 0..selection {
         app.move_down();
@@ -207,6 +219,51 @@ fn snapshot_mixed_operations() {
 #[test]
 fn snapshot_map_key_diff() {
     let plan = build_map_key_diff_plan();
+    let output = render_tui(&plan, 120, 40, 0);
+    insta::assert_snapshot!(output);
+}
+
+// ---------------------------------------------------------------------------
+// Schema-aware tests: Create effects with defaults and read-only attributes
+// ---------------------------------------------------------------------------
+
+#[test]
+fn snapshot_create_with_schema() {
+    let mut plan = Plan::new();
+    plan.add(Effect::Create(
+        Resource::new("ec2.vpc", "my-vpc")
+            .with_attribute("_binding", Value::String("vpc".to_string()))
+            .with_attribute("cidr_block", Value::String("10.0.0.0/16".to_string())),
+    ));
+
+    use carina_core::schema::{AttributeSchema, AttributeType};
+
+    let schema = ResourceSchema::new("ec2.vpc")
+        .attribute(AttributeSchema::new("cidr_block", AttributeType::String).required())
+        .attribute(
+            AttributeSchema::new("enable_dns_support", AttributeType::Bool)
+                .with_default(Value::Bool(true)),
+        )
+        .attribute(
+            AttributeSchema::new("enable_dns_hostnames", AttributeType::Bool)
+                .with_default(Value::Bool(false)),
+        )
+        .attribute(AttributeSchema::new("vpc_id", AttributeType::String).read_only())
+        .attribute(
+            AttributeSchema::new("default_security_group_id", AttributeType::String).read_only(),
+        );
+
+    let schemas: HashMap<String, ResourceSchema> =
+        [("ec2.vpc".to_string(), schema)].into_iter().collect();
+
+    let output = render_tui_with_schemas(&plan, &schemas, 120, 40, 0);
+    insta::assert_snapshot!(output);
+}
+
+#[test]
+fn snapshot_update_unchanged_count() {
+    let plan = build_mixed_operations_plan();
+    // Select the VPC (first node, Update effect with 1 unchanged attribute)
     let output = render_tui(&plan, 120, 40, 0);
     insta::assert_snapshot!(output);
 }
