@@ -41,4 +41,4 @@ expression: output
 │                                                                                                                      │
 │                                                                                                                      │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
- q/Esc quit  / search  ↑↓/jk navigate  Tab focus
+ / search  ↑↓/jk navigate  Tab focus  q/Esc quit

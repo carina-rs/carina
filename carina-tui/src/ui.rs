@@ -355,14 +355,7 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
         // Filter active: show filter-related help
         vec![
             Span::styled(
-                " q/Esc",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" clear filter  "),
-            Span::styled(
-                "n/N",
+                " n/N",
                 Style::default()
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
@@ -374,20 +367,20 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::raw(" search"),
+            Span::raw(" search  "),
+            Span::styled(
+                "q/Esc",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" clear filter"),
         ]
     } else {
         // Normal mode: no filter active
         vec![
             Span::styled(
-                " q/Esc",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" quit  "),
-            Span::styled(
-                "/",
+                " /",
                 Style::default()
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
@@ -406,7 +399,14 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::raw(" focus"),
+            Span::raw(" focus  "),
+            Span::styled(
+                "q/Esc",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" quit"),
         ]
     };
 

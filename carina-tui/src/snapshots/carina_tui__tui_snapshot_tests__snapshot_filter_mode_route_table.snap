@@ -41,4 +41,4 @@ expression: output
 │                                                                                                                      │
 │                                                                                                                      │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
- q/Esc clear filter  n/N next/prev match  / search
+ n/N next/prev match  / search  q/Esc clear filter
