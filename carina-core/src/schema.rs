@@ -726,6 +726,15 @@ impl ResourceSchema {
             .collect()
     }
 
+    /// Returns the names of read-only attributes (set by the provider after creation)
+    pub fn read_only_attributes(&self) -> Vec<&str> {
+        self.attributes
+            .iter()
+            .filter(|(_, schema)| schema.read_only)
+            .map(|(name, _)| name.as_str())
+            .collect()
+    }
+
     /// Returns the names of create-only (immutable) attributes
     pub fn create_only_attributes(&self) -> Vec<&str> {
         self.attributes

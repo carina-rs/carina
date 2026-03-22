@@ -198,7 +198,12 @@ pub async fn run_plan(
     if tui {
         carina_tui::run(&ctx.plan).map_err(|e| AppError::Config(format!("TUI error: {}", e)))?;
     } else {
-        print_plan(&ctx.plan, compact, &delete_attributes);
+        print_plan(
+            &ctx.plan,
+            compact,
+            &delete_attributes,
+            Some(wiring.schemas()),
+        );
     }
 
     // Save plan to file if --out was specified

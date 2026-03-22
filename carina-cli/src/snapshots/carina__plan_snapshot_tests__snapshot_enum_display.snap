@@ -7,5 +7,10 @@ Execution Plan:
   + awscc.ec2.vpc ec2_vpc_fb75c929
       cidr_block: "10.0.0.0/16"
       instance_tenancy: "dedicated"
+      cidr_block_associations: (known after apply)
+      default_network_acl: (known after apply)
+      default_security_group: (known after apply)
+      ipv6_cidr_blocks: (known after apply)
+      vpc_id: (known after apply)
 
 Plan: 1 to add, 0 to change, 0 to destroy.
