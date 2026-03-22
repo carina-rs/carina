@@ -667,18 +667,7 @@ fn format_plan_tree(
                             .map(|ov| ov.semantically_equal(new_value))
                             .unwrap_or(false);
                         if is_same {
-                            if detail == DetailLevel::Full {
-                                has_displayed_attrs = true;
-                                let formatted = format_value_with_key(new_value, Some(key));
-                                writeln!(
-                                    out,
-                                    "{}{}: {}",
-                                    attr_prefix,
-                                    key.dimmed(),
-                                    formatted.dimmed()
-                                )
-                                .unwrap();
-                            }
+                            // Skip unchanged attributes (they are counted below for Full mode)
                         } else {
                             has_displayed_attrs = true;
                             if is_list_of_maps(new_value) {
@@ -731,6 +720,36 @@ fn format_plan_tree(
                                     .red()
                                     .strikethrough(),
                                 "(removed)".red().strikethrough()
+                            )
+                            .unwrap();
+                        }
+                    }
+                    // In Full mode, show count of unchanged attributes hidden
+                    if detail == DetailLevel::Full {
+                        let unchanged_count = from
+                            .attributes
+                            .iter()
+                            .filter(|(k, v)| {
+                                !k.starts_with('_')
+                                    && to
+                                        .attributes
+                                        .get(k.as_str())
+                                        .map(|nv| nv.semantically_equal(v))
+                                        .unwrap_or(false)
+                            })
+                            .count();
+                        if unchanged_count > 0 {
+                            let noun = if unchanged_count == 1 {
+                                "attribute"
+                            } else {
+                                "attributes"
+                            };
+                            writeln!(
+                                out,
+                                "{}{}",
+                                attr_prefix,
+                                format!("# ({} unchanged {} hidden)", unchanged_count, noun)
+                                    .dimmed()
                             )
                             .unwrap();
                         }
@@ -822,39 +841,37 @@ fn format_plan_tree(
                             .unwrap();
                         }
                     }
-                    // In Full mode, show unchanged attributes dimmed
+                    // In Full mode, show count of unchanged attributes hidden
                     if detail == DetailLevel::Full {
                         let changed_set: HashSet<&str> =
                             changed_create_only.iter().map(|s| s.as_str()).collect();
-                        let mut all_keys: Vec<_> = from
+                        let unchanged_count = from
                             .attributes
-                            .keys()
-                            .chain(to.attributes.keys())
-                            .filter(|k| !k.starts_with('_') && !changed_set.contains(k.as_str()))
-                            .collect::<HashSet<_>>()
-                            .into_iter()
-                            .collect();
-                        all_keys.sort();
-                        for key in all_keys {
-                            let new_value = to.attributes.get(key.as_str());
-                            let old_value = from.attributes.get(key.as_str());
-                            let is_same = match (old_value, new_value) {
-                                (Some(ov), Some(nv)) => ov.semantically_equal(nv),
-                                _ => false,
+                            .iter()
+                            .filter(|(k, v)| {
+                                !k.starts_with('_')
+                                    && !changed_set.contains(k.as_str())
+                                    && to
+                                        .attributes
+                                        .get(k.as_str())
+                                        .map(|nv| nv.semantically_equal(v))
+                                        .unwrap_or(false)
+                            })
+                            .count();
+                        if unchanged_count > 0 {
+                            let noun = if unchanged_count == 1 {
+                                "attribute"
+                            } else {
+                                "attributes"
                             };
-                            if is_same {
-                                has_displayed_attrs = true;
-                                let formatted =
-                                    format_value_with_key(new_value.unwrap(), Some(key.as_str()));
-                                writeln!(
-                                    out,
-                                    "{}{}: {}",
-                                    attr_prefix,
-                                    key.dimmed(),
-                                    formatted.dimmed()
-                                )
-                                .unwrap();
-                            }
+                            writeln!(
+                                out,
+                                "{}{}",
+                                attr_prefix,
+                                format!("# ({} unchanged {} hidden)", unchanged_count, noun)
+                                    .dimmed()
+                            )
+                            .unwrap();
                         }
                     }
                     if !cascading_updates.is_empty() {

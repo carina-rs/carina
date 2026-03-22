@@ -5,11 +5,9 @@ expression: output
 Execution Plan:
 
   ~ awscc.ec2.vpc vpc
-      cidr_block: "10.0.0.0/16"
-      enable_dns_hostnames: true
-      enable_dns_support: true
       tags:
         + Environment: "staging"
+      # (3 unchanged attributes hidden)
         │
         ├─ + awscc.ec2.security_group ec2_security_group_712c54ef
         │     group_description: "Test security group"
