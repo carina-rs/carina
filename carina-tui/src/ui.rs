@@ -324,7 +324,7 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         ),
         Span::raw(" navigate/scroll  "),
         Span::styled(
-            "q",
+            "q/Esc",
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
