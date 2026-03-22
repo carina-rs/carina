@@ -1017,7 +1017,8 @@ pub fn format_value(value: &Value) -> String {
     match value {
         Value::String(s) => {
             if carina_core::utils::is_dsl_enum_format(s) {
-                s.clone()
+                let resolved = carina_core::utils::convert_enum_value(s);
+                format!("\"{}\"", resolved)
             } else {
                 format!("\"{}\"", s)
             }
@@ -1608,5 +1609,83 @@ mod tests {
             "expected query to contain 'ec2', got '{}'",
             app.search_query
         );
+    }
+
+    #[test]
+    fn format_value_resolves_dsl_enum_identifiers() {
+        // 5-part DSL enum: should resolve to quoted value
+        assert_eq!(
+            format_value(&Value::String(
+                "awscc.ec2.vpc_endpoint.VpcEndpointType.Interface".to_string()
+            )),
+            "\"Interface\""
+        );
+
+        // 4-part DSL enum
+        assert_eq!(
+            format_value(&Value::String(
+                "aws.s3.VersioningStatus.Enabled".to_string()
+            )),
+            "\"Enabled\""
+        );
+
+        // 3-part DSL enum with underscore-to-hyphen conversion
+        assert_eq!(
+            format_value(&Value::String("aws.Region.ap_northeast_1".to_string())),
+            "\"ap-northeast-1\""
+        );
+
+        // Regular string should be quoted as-is
+        assert_eq!(
+            format_value(&Value::String("my-bucket".to_string())),
+            "\"my-bucket\""
+        );
+
+        // ResourceRef should NOT be resolved (not a DSL enum)
+        assert_eq!(
+            format_value(&Value::ResourceRef {
+                binding_name: "vpc".to_string(),
+                attribute_name: "vpc_id".to_string(),
+            }),
+            "vpc.vpc_id"
+        );
+    }
+
+    #[test]
+    fn create_effect_attributes_resolve_enum_values() {
+        let mut plan = Plan::new();
+        plan.add(Effect::Create(
+            Resource::new("ec2.vpc_endpoint", "my-endpoint")
+                .with_attribute(
+                    "vpc_endpoint_type",
+                    Value::String("awscc.ec2.vpc_endpoint.VpcEndpointType.Interface".to_string()),
+                )
+                .with_attribute(
+                    "vpc_id",
+                    Value::ResourceRef {
+                        binding_name: "vpc".to_string(),
+                        attribute_name: "vpc_id".to_string(),
+                    },
+                ),
+        ));
+
+        let app = App::new(&plan, &HashMap::new());
+        let node = &app.nodes[0];
+
+        // Enum value should be resolved
+        let enum_attr = node
+            .attributes
+            .iter()
+            .find(|(k, _)| k == "vpc_endpoint_type")
+            .expect("vpc_endpoint_type attribute should exist");
+        assert_eq!(enum_attr.1, "\"Interface\"");
+
+        // ResourceRef should remain unresolved
+        let ref_attr = node
+            .attributes
+            .iter()
+            .find(|(k, _)| k == "vpc_id")
+            .expect("vpc_id attribute should exist");
+        assert_eq!(ref_attr.1, "vpc.vpc_id");
     }
 }
