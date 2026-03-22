@@ -782,7 +782,8 @@ fn format_plan_tree(
                     }
                 }
             }
-            Effect::Delete { id, .. } => {
+            Effect::Delete { id, binding, .. } => {
+                let display_name = binding.as_deref().unwrap_or(&id.name);
                 writeln!(
                     out,
                     "{}{}{} {} {}",
@@ -790,7 +791,7 @@ fn format_plan_tree(
                     connector,
                     colored_symbol,
                     id.display_type().cyan().bold(),
-                    id.name.red().bold().strikethrough()
+                    display_name.red().bold().strikethrough()
                 )
                 .unwrap();
                 if !compact && let Some(attrs) = delete_attributes.and_then(|da| da.get(id)) {
