@@ -36,8 +36,83 @@ pub enum KeyAction {
 /// Returns `KeyAction::Quit` if the application should exit,
 /// or `KeyAction::Continue` otherwise.
 pub fn handle_key(app: &mut App, code: KeyCode) -> KeyAction {
+    // Search mode: capture input for the search query
+    if app.search_active {
+        match code {
+            KeyCode::Esc => {
+                // Cancel search and restore full tree view
+                app.search_active = false;
+                app.search_query.clear();
+                app.search_matches.clear();
+                app.current_match = 0;
+                // Clamp selected to the (now unfiltered) visible count
+                let count = app.visible_count();
+                if count > 0 && app.selected >= count {
+                    app.selected = count - 1;
+                }
+                return KeyAction::Continue;
+            }
+            KeyCode::Enter => {
+                // Confirm search and jump to first match
+                app.search_active = false;
+                if !app.search_matches.is_empty() {
+                    app.jump_to_current_match();
+                }
+                return KeyAction::Continue;
+            }
+            KeyCode::Backspace => {
+                app.search_query.pop();
+                app.update_search_matches();
+                if !app.search_matches.is_empty() {
+                    app.jump_to_current_match();
+                }
+                return KeyAction::Continue;
+            }
+            KeyCode::Tab => {
+                app.tab_complete();
+                return KeyAction::Continue;
+            }
+            KeyCode::Char(c) => {
+                app.search_query.push(c);
+                app.update_search_matches();
+                if !app.search_matches.is_empty() {
+                    app.jump_to_current_match();
+                }
+                return KeyAction::Continue;
+            }
+            _ => return KeyAction::Continue,
+        }
+    }
+
+    // Normal mode
     match code {
+        KeyCode::Char('q') | KeyCode::Esc if !app.search_matches.is_empty() => {
+            // Clear active search filter before quitting
+            app.search_query.clear();
+            app.search_matches.clear();
+            app.current_match = 0;
+            let count = app.visible_count();
+            if count > 0 && app.selected >= count {
+                app.selected = count - 1;
+            }
+            KeyAction::Continue
+        }
         KeyCode::Char('q') | KeyCode::Esc => KeyAction::Quit,
+        KeyCode::Char('/') => {
+            app.search_active = true;
+            app.search_query.clear();
+            app.search_matches.clear();
+            app.current_match = 0;
+            KeyAction::Continue
+        }
+        KeyCode::Char('n') if !app.search_matches.is_empty() => {
+            app.next_match();
+            KeyAction::Continue
+        }
+        KeyCode::Char('N') if !app.search_matches.is_empty() => {
+            app.prev_match();
+            KeyAction::Continue
+        }
         KeyCode::Tab => {
             app.toggle_focus();
             KeyAction::Continue
@@ -150,5 +225,348 @@ mod tests {
             KeyAction::Continue
         );
         assert_eq!(handle_key(&mut app, KeyCode::Tab), KeyAction::Continue);
+    }
+
+    fn make_search_app() -> App {
+        let mut plan = Plan::new();
+        plan.add(Effect::Create(
+            Resource::new("s3.bucket", "my-bucket").with_attribute(
+                "_binding",
+                carina_core::resource::Value::String("bucket".to_string()),
+            ),
+        ));
+        plan.add(Effect::Create(
+            Resource::new("ec2.vpc", "my-vpc").with_attribute(
+                "_binding",
+                carina_core::resource::Value::String("vpc".to_string()),
+            ),
+        ));
+        plan.add(Effect::Create(
+            Resource::new("ec2.subnet", "my-subnet")
+                .with_attribute(
+                    "_binding",
+                    carina_core::resource::Value::String("subnet".to_string()),
+                )
+                .with_attribute(
+                    "vpc_id",
+                    carina_core::resource::Value::ResourceRef {
+                        binding_name: "vpc".to_string(),
+                        attribute_name: "vpc_id".to_string(),
+                    },
+                ),
+        ));
+        App::new(&plan, &HashMap::new())
+    }
+
+    #[test]
+    fn slash_enters_search_mode() {
+        let mut app = make_search_app();
+        assert!(!app.search_active);
+        handle_key(&mut app, KeyCode::Char('/'));
+        assert!(app.search_active);
+        assert!(app.search_query.is_empty());
+    }
+
+    #[test]
+    fn search_typing_builds_query() {
+        let mut app = make_search_app();
+        handle_key(&mut app, KeyCode::Char('/'));
+        handle_key(&mut app, KeyCode::Char('v'));
+        handle_key(&mut app, KeyCode::Char('p'));
+        handle_key(&mut app, KeyCode::Char('c'));
+        assert_eq!(app.search_query, "vpc");
+        assert!(!app.search_matches.is_empty());
+    }
+
+    #[test]
+    fn search_esc_cancels() {
+        let mut app = make_search_app();
+        handle_key(&mut app, KeyCode::Char('/'));
+        handle_key(&mut app, KeyCode::Char('v'));
+        assert_eq!(handle_key(&mut app, KeyCode::Esc), KeyAction::Continue);
+        assert!(!app.search_active);
+        assert!(app.search_query.is_empty());
+        assert!(app.search_matches.is_empty());
+    }
+
+    #[test]
+    fn esc_in_search_mode_does_not_quit() {
+        let mut app = make_search_app();
+        handle_key(&mut app, KeyCode::Char('/'));
+        let action = handle_key(&mut app, KeyCode::Esc);
+        assert_eq!(action, KeyAction::Continue);
+    }
+
+    #[test]
+    fn search_enter_confirms_and_jumps() {
+        let mut app = make_search_app();
+        handle_key(&mut app, KeyCode::Char('/'));
+        handle_key(&mut app, KeyCode::Char('s'));
+        handle_key(&mut app, KeyCode::Char('u'));
+        handle_key(&mut app, KeyCode::Char('b'));
+        // "sub" should match "subnet"
+        assert!(!app.search_matches.is_empty());
+        let action = handle_key(&mut app, KeyCode::Enter);
+        assert_eq!(action, KeyAction::Continue);
+        assert!(!app.search_active);
+        // Matches should remain for n/N navigation
+        assert!(!app.search_matches.is_empty());
+    }
+
+    #[test]
+    fn search_backspace_removes_char() {
+        let mut app = make_search_app();
+        handle_key(&mut app, KeyCode::Char('/'));
+        handle_key(&mut app, KeyCode::Char('v'));
+        handle_key(&mut app, KeyCode::Char('p'));
+        handle_key(&mut app, KeyCode::Char('x'));
+        assert_eq!(app.search_query, "vpx");
+        handle_key(&mut app, KeyCode::Backspace);
+        assert_eq!(app.search_query, "vp");
+    }
+
+    #[test]
+    fn n_and_shift_n_cycle_matches() {
+        let mut app = make_search_app();
+        // Search for "ec2" which should match vpc and subnet
+        handle_key(&mut app, KeyCode::Char('/'));
+        handle_key(&mut app, KeyCode::Char('e'));
+        handle_key(&mut app, KeyCode::Char('c'));
+        handle_key(&mut app, KeyCode::Char('2'));
+        handle_key(&mut app, KeyCode::Enter);
+
+        assert!(app.search_matches.len() >= 2);
+        let first_selected = app.selected;
+
+        // n -> next match
+        handle_key(&mut app, KeyCode::Char('n'));
+        let second_selected = app.selected;
+        assert_ne!(first_selected, second_selected);
+
+        // N -> previous match
+        handle_key(&mut app, KeyCode::Char('N'));
+        assert_eq!(app.selected, first_selected);
+    }
+
+    #[test]
+    fn search_case_insensitive() {
+        let mut app = make_search_app();
+        handle_key(&mut app, KeyCode::Char('/'));
+        handle_key(&mut app, KeyCode::Char('V'));
+        handle_key(&mut app, KeyCode::Char('P'));
+        handle_key(&mut app, KeyCode::Char('C'));
+        // Should still match "vpc" case-insensitively
+        assert!(!app.search_matches.is_empty());
+    }
+
+    #[test]
+    fn search_no_matches() {
+        let mut app = make_search_app();
+        handle_key(&mut app, KeyCode::Char('/'));
+        handle_key(&mut app, KeyCode::Char('z'));
+        handle_key(&mut app, KeyCode::Char('z'));
+        handle_key(&mut app, KeyCode::Char('z'));
+        assert!(app.search_matches.is_empty());
+    }
+
+    #[test]
+    fn n_without_matches_does_nothing() {
+        let mut app = make_search_app();
+        let initial_selected = app.selected;
+        handle_key(&mut app, KeyCode::Char('n'));
+        assert_eq!(app.selected, initial_selected);
+    }
+
+    #[test]
+    fn q_in_search_mode_appends_to_query() {
+        let mut app = make_search_app();
+        handle_key(&mut app, KeyCode::Char('/'));
+        let action = handle_key(&mut app, KeyCode::Char('q'));
+        assert_eq!(action, KeyAction::Continue);
+        assert_eq!(app.search_query, "q");
+        assert!(app.search_active);
+    }
+
+    #[test]
+    fn tab_in_search_mode_completes() {
+        let mut app = make_search_app();
+        handle_key(&mut app, KeyCode::Char('/'));
+        handle_key(&mut app, KeyCode::Char('s'));
+        handle_key(&mut app, KeyCode::Char('u'));
+        handle_key(&mut app, KeyCode::Char('b'));
+
+        // Tab should autocomplete "sub" — matches "ec2.subnet" (resource type)
+        // and "subnet" (binding); sorted alphabetically, "ec2.subnet" first
+        handle_key(&mut app, KeyCode::Tab);
+        assert_eq!(app.search_query, "ec2.subnet");
+        assert!(app.search_active);
+    }
+
+    #[test]
+    fn tab_in_normal_mode_toggles_focus() {
+        let mut app = make_search_app();
+        assert_eq!(app.focused_panel, FocusedPanel::Tree);
+        handle_key(&mut app, KeyCode::Tab);
+        assert_eq!(app.focused_panel, FocusedPanel::Detail);
+    }
+
+    #[test]
+    fn esc_cancels_search_restores_all_nodes() {
+        let mut app = make_search_app();
+        handle_key(&mut app, KeyCode::Char('/'));
+        handle_key(&mut app, KeyCode::Char('s'));
+        handle_key(&mut app, KeyCode::Char('u'));
+        handle_key(&mut app, KeyCode::Char('b'));
+
+        // With search active, only matching + ancestors visible
+        let filtered_count = app.visible_count();
+        assert!(filtered_count < 3);
+
+        // Esc restores full tree
+        handle_key(&mut app, KeyCode::Esc);
+        assert_eq!(app.visible_count(), 3);
+        assert!(!app.search_active);
+    }
+
+    #[test]
+    fn enter_confirms_search_keeps_filter() {
+        let mut app = make_search_app();
+        handle_key(&mut app, KeyCode::Char('/'));
+        handle_key(&mut app, KeyCode::Char('v'));
+        handle_key(&mut app, KeyCode::Char('p'));
+        handle_key(&mut app, KeyCode::Char('c'));
+        handle_key(&mut app, KeyCode::Enter);
+
+        // Filter should remain (query is not cleared)
+        assert!(!app.search_active);
+        assert_eq!(app.search_query, "vpc");
+        assert!(!app.search_matches.is_empty());
+    }
+
+    fn make_provider_prefixed_app() -> App {
+        let mut plan = Plan::new();
+        plan.add(Effect::Create(
+            Resource::with_provider("awscc", "ec2.vpc", "my-vpc").with_attribute(
+                "_binding",
+                carina_core::resource::Value::String("vpc".to_string()),
+            ),
+        ));
+        plan.add(Effect::Create(
+            Resource::with_provider("awscc", "ec2.subnet", "my-subnet").with_attribute(
+                "_binding",
+                carina_core::resource::Value::String("subnet".to_string()),
+            ),
+        ));
+        plan.add(Effect::Create(
+            Resource::with_provider("awscc", "s3.bucket", "my-bucket").with_attribute(
+                "_binding",
+                carina_core::resource::Value::String("bucket".to_string()),
+            ),
+        ));
+        App::new(&plan, &HashMap::new())
+    }
+
+    #[test]
+    fn tab_complete_with_provider_prefix() {
+        // When resource_type is "awscc.ec2.vpc", typing "ec" then Tab
+        // should complete to the full resource type containing "ec"
+        let mut app = make_provider_prefixed_app();
+        handle_key(&mut app, KeyCode::Char('/'));
+        handle_key(&mut app, KeyCode::Char('e'));
+        handle_key(&mut app, KeyCode::Char('c'));
+
+        handle_key(&mut app, KeyCode::Tab);
+        // Should complete to a resource type containing "ec"
+        assert!(
+            app.search_query.contains("ec2"),
+            "expected query to contain 'ec2', got '{}'",
+            app.search_query
+        );
+        assert!(app.search_active);
+    }
+
+    #[test]
+    fn esc_clears_filter_before_quitting() {
+        let mut app = make_search_app();
+        // Search for "vpc" and confirm with Enter
+        handle_key(&mut app, KeyCode::Char('/'));
+        handle_key(&mut app, KeyCode::Char('v'));
+        handle_key(&mut app, KeyCode::Char('p'));
+        handle_key(&mut app, KeyCode::Char('c'));
+        handle_key(&mut app, KeyCode::Enter);
+
+        // Filter is active (search_matches not empty)
+        assert!(!app.search_matches.is_empty());
+        assert!(!app.search_active);
+
+        // First Esc should clear filter, not quit
+        let action = handle_key(&mut app, KeyCode::Esc);
+        assert_eq!(action, KeyAction::Continue);
+        assert!(app.search_matches.is_empty());
+        assert!(app.search_query.is_empty());
+        // All nodes should be visible again
+        assert_eq!(app.visible_count(), 3);
+
+        // Second Esc should quit
+        let action = handle_key(&mut app, KeyCode::Esc);
+        assert_eq!(action, KeyAction::Quit);
+    }
+
+    #[test]
+    fn q_clears_filter_before_quitting() {
+        let mut app = make_search_app();
+        // Search for "vpc" and confirm with Enter
+        handle_key(&mut app, KeyCode::Char('/'));
+        handle_key(&mut app, KeyCode::Char('v'));
+        handle_key(&mut app, KeyCode::Char('p'));
+        handle_key(&mut app, KeyCode::Char('c'));
+        handle_key(&mut app, KeyCode::Enter);
+
+        // Filter is active (search_matches not empty)
+        assert!(!app.search_matches.is_empty());
+        assert!(!app.search_active);
+
+        // First q should clear filter, not quit
+        let action = handle_key(&mut app, KeyCode::Char('q'));
+        assert_eq!(action, KeyAction::Continue);
+        assert!(app.search_matches.is_empty());
+        assert!(app.search_query.is_empty());
+        // All nodes should be visible again
+        assert_eq!(app.visible_count(), 3);
+
+        // Second q should quit
+        let action = handle_key(&mut app, KeyCode::Char('q'));
+        assert_eq!(action, KeyAction::Quit);
+    }
+
+    #[test]
+    fn esc_quits_immediately_without_filter() {
+        let mut app = make_search_app();
+        // No search active, no filter
+        assert!(app.search_matches.is_empty());
+        let action = handle_key(&mut app, KeyCode::Esc);
+        assert_eq!(action, KeyAction::Quit);
+    }
+
+    #[test]
+    fn n_navigates_only_matching_nodes_in_filter_mode() {
+        let mut app = make_search_app();
+        // Search for "ec2" which matches vpc and subnet
+        handle_key(&mut app, KeyCode::Char('/'));
+        handle_key(&mut app, KeyCode::Char('e'));
+        handle_key(&mut app, KeyCode::Char('c'));
+        handle_key(&mut app, KeyCode::Char('2'));
+        handle_key(&mut app, KeyCode::Enter);
+
+        assert!(app.search_matches.len() >= 2);
+        let first_match = app.search_matches[0];
+        let second_match = app.search_matches[1];
+
+        // Jump to first match
+        assert_eq!(app.selected, first_match);
+
+        // n -> next match (skips ancestor-only nodes)
+        handle_key(&mut app, KeyCode::Char('n'));
+        assert_eq!(app.selected, second_match);
     }
 }

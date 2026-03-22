@@ -10,7 +10,7 @@ use carina_core::resource::Value;
 
 use crate::app::{App, EffectKind, FocusedPanel};
 
-/// Draw the main layout: tree (70%), detail panel (30%), help bar (1 line)
+/// Draw the main layout: tree (70%), detail panel (30%), help/search bar (1 line)
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -23,29 +23,47 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     draw_tree(frame, app, chunks[0]);
     draw_detail(frame, app, chunks[1]);
-    draw_help(frame, chunks[2]);
+
+    if app.search_active {
+        draw_search_bar(frame, app, chunks[2]);
+    } else {
+        draw_help(frame, app, chunks[2]);
+    }
 }
 
 /// Draw the tree view (compact, no inline attributes)
 fn draw_tree(frame: &mut Frame, app: &mut App, area: Rect) {
     let visible = app.visible_nodes();
+    let visible_set: HashSet<usize> = visible.iter().copied().collect();
 
     let items: Vec<ListItem> = visible
         .iter()
         .enumerate()
         .map(|(row_idx, &node_idx)| {
             let node = &app.nodes[node_idx];
-            let connector = build_tree_connector(node_idx, app);
-            let effect_color = effect_style(node.kind);
+            let connector = build_tree_connector_filtered(node_idx, app, &visible_set);
+            let is_ancestor_only = app.is_ancestor_only(node_idx);
+            let effect_color = if is_ancestor_only {
+                Style::default().fg(Color::DarkGray)
+            } else {
+                effect_style(node.kind)
+            };
+            let type_style = if is_ancestor_only {
+                Style::default().fg(Color::DarkGray)
+            } else {
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            };
+            let connector_style = if is_ancestor_only {
+                Style::default().fg(Color::DarkGray)
+            } else {
+                Style::default()
+            };
             let mut spans = vec![
-                Span::raw(connector),
+                Span::styled(connector, connector_style),
                 Span::styled(format!("{} ", node.symbol), effect_color),
-                Span::styled(
-                    node.resource_type.clone(),
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                ),
+                Span::styled(node.resource_type.clone(), type_style),
                 Span::raw(" "),
                 Span::styled(node.name_part.clone(), effect_color),
             ];
@@ -306,31 +324,93 @@ fn render_map_key_diff(
     }
 }
 
-/// Draw the help bar
-fn draw_help(frame: &mut Frame, area: Rect) {
-    let help = Paragraph::new(Line::from(vec![
+/// Draw the search input bar at the bottom of the screen
+fn draw_search_bar(frame: &mut Frame, app: &App, area: Rect) {
+    let match_info = if app.search_query.is_empty() {
+        String::new()
+    } else if app.search_matches.is_empty() {
+        " [no matches]".to_string()
+    } else {
+        format!(" [{}/{}]", app.current_match + 1, app.search_matches.len())
+    };
+    let help_text = "  Enter confirm  Esc cancel  Tab complete";
+    let search = Paragraph::new(Line::from(vec![
         Span::styled(
-            " Tab",
+            "/",
             Style::default()
-                .fg(Color::Cyan)
+                .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::raw(" switch panel  "),
-        Span::styled(
-            "j/k",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" navigate/scroll  "),
-        Span::styled(
-            "q/Esc",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" quit"),
+        Span::raw(&app.search_query),
+        Span::styled("_", Style::default().add_modifier(Modifier::SLOW_BLINK)),
+        Span::styled(match_info, Style::default().fg(Color::DarkGray)),
+        Span::styled(help_text, Style::default().fg(Color::DarkGray)),
     ]));
+    frame.render_widget(search, area);
+}
+
+/// Draw the help bar (search mode shows its own help via draw_search_bar)
+fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
+    let spans = if !app.search_matches.is_empty() {
+        // Filter active: show filter-related help
+        vec![
+            Span::styled(
+                " n/N",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" next/prev match  "),
+            Span::styled(
+                "/",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" search  "),
+            Span::styled(
+                "q/Esc",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" clear filter"),
+        ]
+    } else {
+        // Normal mode: no filter active
+        vec![
+            Span::styled(
+                " /",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" search  "),
+            Span::styled(
+                "\u{2191}\u{2193}/jk",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" navigate  "),
+            Span::styled(
+                "Tab",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" switch panel  "),
+            Span::styled(
+                "q/Esc",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" quit"),
+        ]
+    };
+
+    let help = Paragraph::new(Line::from(spans));
     frame.render_widget(help, area);
 }
 
@@ -404,24 +484,28 @@ fn build_plan_title(summary: &PlanSummary) -> Line<'static> {
     Line::from(spans)
 }
 
-/// Build the tree connector prefix for a node.
+/// Build the tree connector prefix for a node, considering filtered visibility.
 ///
-/// Each tree level uses exactly 4-character-wide segments:
-/// - Root nodes (depth 0): no connector
-/// - Children: `--- ` or `--- ` with continuation `|   ` or `    `
-fn build_tree_connector(idx: usize, app: &App) -> String {
+/// When nodes are filtered, the connector uses the visible children of each
+/// parent rather than all children, so `└──` / `├──` are correct for the
+/// filtered tree.
+fn build_tree_connector_filtered(idx: usize, app: &App, visible_set: &HashSet<usize>) -> String {
     let node = &app.nodes[idx];
     if node.parent.is_none() {
         return String::new();
     }
 
-    // Collect prefix segments from current node up to root
     let mut parts: Vec<&str> = Vec::new();
 
-    // This node's own connector (4 chars each)
+    // This node's own connector
     if let Some(parent_idx) = node.parent {
-        let siblings = &app.nodes[parent_idx].children;
-        let is_last = siblings.last() == Some(&idx);
+        let visible_siblings: Vec<usize> = app.nodes[parent_idx]
+            .children
+            .iter()
+            .copied()
+            .filter(|c| visible_set.contains(c))
+            .collect();
+        let is_last = visible_siblings.last() == Some(&idx);
         if is_last {
             parts.push("└── ");
         } else {
@@ -429,7 +513,7 @@ fn build_tree_connector(idx: usize, app: &App) -> String {
         }
     }
 
-    // Walk up ancestors to build continuation lines (4 chars each)
+    // Walk up ancestors
     let mut ancestor = node.parent;
     while let Some(a_idx) = ancestor {
         let a_node = &app.nodes[a_idx];
@@ -437,8 +521,13 @@ fn build_tree_connector(idx: usize, app: &App) -> String {
             break;
         }
         if let Some(grandparent_idx) = a_node.parent {
-            let siblings = &app.nodes[grandparent_idx].children;
-            let is_last = siblings.last() == Some(&a_idx);
+            let visible_siblings: Vec<usize> = app.nodes[grandparent_idx]
+                .children
+                .iter()
+                .copied()
+                .filter(|c| visible_set.contains(c))
+                .collect();
+            let is_last = visible_siblings.last() == Some(&a_idx);
             if is_last {
                 parts.push("    ");
             } else {
@@ -448,10 +537,15 @@ fn build_tree_connector(idx: usize, app: &App) -> String {
         ancestor = a_node.parent;
     }
 
-    // Reverse to get top-down order
     parts.reverse();
-    // Base indentation (4 spaces) before tree connectors
     format!("    {}", parts.join(""))
+}
+
+/// Build the tree connector prefix for a node (unfiltered, for tests).
+#[cfg(test)]
+fn build_tree_connector(idx: usize, app: &App) -> String {
+    let all_nodes: HashSet<usize> = (0..app.nodes.len()).collect();
+    build_tree_connector_filtered(idx, app, &all_nodes)
 }
 
 /// Return the style for a given effect kind

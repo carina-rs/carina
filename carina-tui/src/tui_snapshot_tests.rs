@@ -285,3 +285,43 @@ fn snapshot_detail_panel_third_node() {
     let output = render_tui(&plan, 120, 40, 2);
     insta::assert_snapshot!(output);
 }
+
+// ---------------------------------------------------------------------------
+// Filter mode snapshot: search query active, non-matching nodes hidden
+// ---------------------------------------------------------------------------
+
+/// Render the TUI with an active search query for filter mode testing.
+fn render_tui_with_search(plan: &Plan, width: u16, height: u16, query: &str) -> String {
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let mut app = App::new(plan, &HashMap::new());
+
+    // Simulate typing the search query and confirming with Enter
+    app.search_active = true;
+    app.search_query = query.to_string();
+    app.update_search_matches();
+    if !app.search_matches.is_empty() {
+        app.jump_to_current_match();
+    }
+    // Confirm search (keeps filter active)
+    app.search_active = false;
+
+    terminal.draw(|f| draw(f, &mut app)).unwrap();
+    buffer_to_string(terminal.backend().buffer())
+}
+
+#[test]
+fn snapshot_filter_mode_subnet() {
+    let plan = build_all_create_plan();
+    // Search for "subnet" - should show vpc (dimmed ancestor) and subnet (match)
+    let output = render_tui_with_search(&plan, 120, 40, "subnet");
+    insta::assert_snapshot!(output);
+}
+
+#[test]
+fn snapshot_filter_mode_route_table() {
+    let plan = build_all_create_plan();
+    // Search for "rt" - should show vpc (dimmed ancestor) and route table (match)
+    let output = render_tui_with_search(&plan, 120, 40, "rt");
+    insta::assert_snapshot!(output);
+}

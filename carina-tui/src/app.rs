@@ -84,6 +84,20 @@ pub struct App {
     pub tree_scroll_offset: usize,
     /// Height of the tree panel's inner area (updated each frame)
     pub tree_area_height: usize,
+    /// Whether search mode is active (user is typing a query)
+    pub search_active: bool,
+    /// Current search query string
+    pub search_query: String,
+    /// Indices of visible nodes that match the search query
+    pub search_matches: Vec<usize>,
+    /// Index into `search_matches` for the current match
+    pub current_match: usize,
+    /// Tab completion candidates (sorted, unique)
+    tab_candidates: Vec<String>,
+    /// Current index into tab_candidates for cycling
+    tab_index: usize,
+    /// The query prefix that was used for the current tab completion cycle
+    tab_prefix: String,
 }
 
 impl App {
@@ -115,11 +129,50 @@ impl App {
             detail_scroll: 0,
             tree_scroll_offset: 0,
             tree_area_height: 0,
+            search_active: false,
+            search_query: String::new(),
+            search_matches: Vec::new(),
+            current_match: 0,
+            tab_candidates: Vec::new(),
+            tab_index: 0,
+            tab_prefix: String::new(),
         }
     }
 
-    /// Returns all node indices in DFS tree order (all nodes always visible).
+    /// Returns all node indices in DFS tree order.
+    ///
+    /// When a search query is active, only matching nodes and their ancestors
+    /// are included (filter mode). Otherwise, all nodes are returned.
     pub fn visible_nodes(&self) -> Vec<usize> {
+        let all_dfs = self.all_nodes_dfs();
+        if self.search_query.is_empty() {
+            return all_dfs;
+        }
+        // Compute the set of matching node indices and their ancestors
+        let match_set = self.matching_node_indices();
+        if match_set.is_empty() {
+            return all_dfs;
+        }
+        let mut visible_set: HashSet<usize> = HashSet::new();
+        for &idx in &match_set {
+            visible_set.insert(idx);
+            // Walk up ancestors
+            let mut cur = self.nodes[idx].parent;
+            while let Some(p) = cur {
+                if !visible_set.insert(p) {
+                    break; // already added this ancestor chain
+                }
+                cur = self.nodes[p].parent;
+            }
+        }
+        all_dfs
+            .into_iter()
+            .filter(|idx| visible_set.contains(idx))
+            .collect()
+    }
+
+    /// Returns all node indices in DFS order (unfiltered).
+    fn all_nodes_dfs(&self) -> Vec<usize> {
         let mut result = Vec::new();
         for (idx, node) in self.nodes.iter().enumerate() {
             if node.parent.is_none() {
@@ -139,6 +192,36 @@ impl App {
     /// Number of visible nodes
     pub fn visible_count(&self) -> usize {
         self.visible_nodes().len()
+    }
+
+    /// Returns the set of node indices whose effect_label matches the search query.
+    fn matching_node_indices(&self) -> HashSet<usize> {
+        let mut result = HashSet::new();
+        if self.search_query.is_empty() {
+            return result;
+        }
+        let query_lower = self.search_query.to_lowercase();
+        for (idx, node) in self.nodes.iter().enumerate() {
+            if node.effect_label.to_lowercase().contains(&query_lower) {
+                result.insert(idx);
+            }
+        }
+        result
+    }
+
+    /// Returns whether a node index is an "ancestor-only" node (shown dimmed).
+    ///
+    /// A node is ancestor-only if it's visible only because it's an ancestor
+    /// of a matching node, but doesn't match the query itself.
+    pub fn is_ancestor_only(&self, node_idx: usize) -> bool {
+        if self.search_query.is_empty() {
+            return false;
+        }
+        let query_lower = self.search_query.to_lowercase();
+        !self.nodes[node_idx]
+            .effect_label
+            .to_lowercase()
+            .contains(&query_lower)
     }
 
     pub fn move_up(&mut self) {
@@ -199,6 +282,142 @@ impl App {
     /// Get the currently selected node, if any
     pub fn selected_node(&self) -> Option<&TreeNode> {
         self.selected_node_idx().map(|idx| &self.nodes[idx])
+    }
+
+    /// Update search matches based on the current query.
+    ///
+    /// Matches against each node's `effect_label` (which contains both
+    /// the resource type and the name), case-insensitively.
+    /// In filter mode, search_matches contains indices into the filtered
+    /// visible_nodes() list, pointing only to actual matches (not ancestors).
+    pub fn update_search_matches(&mut self) {
+        self.search_matches.clear();
+        self.current_match = 0;
+        // Reset tab completion state when query changes
+        self.tab_candidates.clear();
+        self.tab_index = 0;
+        self.tab_prefix.clear();
+        if self.search_query.is_empty() {
+            return;
+        }
+        let query_lower = self.search_query.to_lowercase();
+        let visible = self.visible_nodes();
+        for (vis_idx, &node_idx) in visible.iter().enumerate() {
+            let node = &self.nodes[node_idx];
+            if node.effect_label.to_lowercase().contains(&query_lower) {
+                self.search_matches.push(vis_idx);
+            }
+        }
+    }
+
+    /// Jump to the match at `current_match` index, updating selection and scroll.
+    pub fn jump_to_current_match(&mut self) {
+        if let Some(&vis_idx) = self.search_matches.get(self.current_match) {
+            self.select_visible_index(vis_idx);
+        }
+    }
+
+    /// Jump to the next search match. Wraps around to the first match.
+    pub fn next_match(&mut self) {
+        if self.search_matches.is_empty() {
+            return;
+        }
+        self.current_match = (self.current_match + 1) % self.search_matches.len();
+        self.jump_to_current_match();
+    }
+
+    /// Jump to the previous search match. Wraps around to the last match.
+    pub fn prev_match(&mut self) {
+        if self.search_matches.is_empty() {
+            return;
+        }
+        if self.current_match == 0 {
+            self.current_match = self.search_matches.len() - 1;
+        } else {
+            self.current_match -= 1;
+        }
+        self.jump_to_current_match();
+    }
+
+    /// Select a specific visible index and adjust scroll.
+    fn select_visible_index(&mut self, vis_idx: usize) {
+        self.selected = vis_idx;
+        // Adjust scroll so the selected item is visible
+        if self.selected < self.tree_scroll_offset {
+            self.tree_scroll_offset = self.selected;
+        } else if self.tree_area_height > 0
+            && self.selected >= self.tree_scroll_offset + self.tree_area_height
+        {
+            self.tree_scroll_offset = self.selected - self.tree_area_height + 1;
+        }
+        self.sync_list_state();
+        self.detail_scroll = 0;
+    }
+
+    /// Perform tab completion on the current search query.
+    ///
+    /// Collects unique resource type names and binding/display names from all
+    /// tree nodes, then completes from matching candidates. Subsequent Tab
+    /// presses cycle through candidates.
+    pub fn tab_complete(&mut self) {
+        // Check if we're in an active tab-cycling session.
+        // We're cycling if candidates exist and the current query matches
+        // the last completed candidate (meaning user hasn't typed anything new).
+        let is_cycling = !self.tab_candidates.is_empty()
+            && self
+                .tab_candidates
+                .get(self.tab_index)
+                .map(|c| *c == self.search_query)
+                .unwrap_or(false);
+
+        if is_cycling {
+            // Cycle to next candidate
+            self.tab_index = (self.tab_index + 1) % self.tab_candidates.len();
+        } else {
+            // Build new candidate list from current query
+            self.tab_prefix = self.search_query.clone();
+            self.tab_index = 0;
+
+            let prefix_lower = self.search_query.to_lowercase();
+            if prefix_lower.is_empty() {
+                self.tab_candidates.clear();
+                return;
+            }
+
+            let mut candidates: Vec<String> = Vec::new();
+            let mut seen: HashSet<String> = HashSet::new();
+            for node in &self.nodes {
+                // Resource type name (e.g., "ec2.vpc" or "awscc.ec2.vpc")
+                // Use contains() to match anywhere in the dotted name,
+                // consistent with how update_search_matches uses contains()
+                let rt_lower = node.resource_type.to_lowercase();
+                if rt_lower.contains(&prefix_lower) && seen.insert(rt_lower) {
+                    candidates.push(node.resource_type.clone());
+                }
+                // Binding/display name (e.g., "vpc", "subnet")
+                let np_lower = node.name_part.to_lowercase();
+                if np_lower.contains(&prefix_lower) && seen.insert(np_lower) {
+                    candidates.push(node.name_part.clone());
+                }
+            }
+            candidates.sort_by_key(|a| a.to_lowercase());
+            self.tab_candidates = candidates;
+        }
+
+        if let Some(candidate) = self.tab_candidates.get(self.tab_index) {
+            self.search_query = candidate.clone();
+            // Don't reset tab state when updating matches for tab completion
+            let saved_candidates = std::mem::take(&mut self.tab_candidates);
+            let saved_index = self.tab_index;
+            let saved_prefix = std::mem::take(&mut self.tab_prefix);
+            self.update_search_matches();
+            self.tab_candidates = saved_candidates;
+            self.tab_index = saved_index;
+            self.tab_prefix = saved_prefix;
+            if !self.search_matches.is_empty() {
+                self.jump_to_current_match();
+            }
+        }
     }
 }
 
@@ -1160,5 +1379,234 @@ mod tests {
         app.move_down();
         assert_eq!(app.selected, 1);
         assert_eq!(app.tree_scroll_offset, 0);
+    }
+
+    /// Helper to build a plan with vpc -> subnet dependency tree for filter tests.
+    fn make_tree_plan() -> Plan {
+        let mut plan = Plan::new();
+        plan.add(Effect::Create(
+            Resource::new("ec2.vpc", "my-vpc")
+                .with_attribute("_binding", Value::String("vpc".to_string()))
+                .with_attribute("cidr_block", Value::String("10.0.0.0/16".to_string())),
+        ));
+        plan.add(Effect::Create(
+            Resource::new("ec2.subnet", "my-subnet")
+                .with_attribute("_binding", Value::String("subnet".to_string()))
+                .with_attribute(
+                    "vpc_id",
+                    Value::ResourceRef {
+                        binding_name: "vpc".to_string(),
+                        attribute_name: "vpc_id".to_string(),
+                    },
+                ),
+        ));
+        plan.add(Effect::Create(
+            Resource::new("s3.bucket", "my-bucket")
+                .with_attribute("_binding", Value::String("bucket".to_string())),
+        ));
+        plan
+    }
+
+    #[test]
+    fn filter_mode_hides_non_matching_nodes() {
+        let plan = make_tree_plan();
+        let mut app = App::new(&plan, &HashMap::new());
+
+        // Before search, all 3 nodes visible
+        assert_eq!(app.visible_count(), 3);
+
+        // Search for "subnet" - should show subnet + its parent vpc
+        app.search_query = "subnet".to_string();
+        app.update_search_matches();
+
+        let visible = app.visible_nodes();
+        assert_eq!(visible.len(), 2); // vpc (ancestor) + subnet (match)
+
+        // The s3.bucket should not be visible
+        for &idx in &visible {
+            assert_ne!(app.nodes[idx].resource_type, "s3.bucket");
+        }
+    }
+
+    #[test]
+    fn filter_mode_ancestor_shown_dimmed() {
+        let plan = make_tree_plan();
+        let mut app = App::new(&plan, &HashMap::new());
+
+        app.search_query = "subnet".to_string();
+        app.update_search_matches();
+
+        let visible = app.visible_nodes();
+        // vpc is ancestor-only (dimmed)
+        let vpc_idx = visible
+            .iter()
+            .find(|&&idx| app.nodes[idx].resource_type == "ec2.vpc")
+            .unwrap();
+        assert!(app.is_ancestor_only(*vpc_idx));
+
+        // subnet is a match (not dimmed)
+        let subnet_idx = visible
+            .iter()
+            .find(|&&idx| app.nodes[idx].resource_type == "ec2.subnet")
+            .unwrap();
+        assert!(!app.is_ancestor_only(*subnet_idx));
+    }
+
+    #[test]
+    fn filter_mode_clear_query_restores_all() {
+        let plan = make_tree_plan();
+        let mut app = App::new(&plan, &HashMap::new());
+
+        app.search_query = "subnet".to_string();
+        app.update_search_matches();
+        assert_eq!(app.visible_count(), 2);
+
+        // Clear query
+        app.search_query.clear();
+        app.update_search_matches();
+        assert_eq!(app.visible_count(), 3);
+    }
+
+    #[test]
+    fn filter_mode_no_matches_shows_all() {
+        let plan = make_tree_plan();
+        let mut app = App::new(&plan, &HashMap::new());
+
+        app.search_query = "zzz_nonexistent".to_string();
+        app.update_search_matches();
+
+        // When nothing matches, show all nodes (don't hide everything)
+        assert_eq!(app.visible_count(), 3);
+    }
+
+    #[test]
+    fn filter_mode_search_matches_are_non_ancestor_indices() {
+        let plan = make_tree_plan();
+        let mut app = App::new(&plan, &HashMap::new());
+
+        app.search_query = "subnet".to_string();
+        app.update_search_matches();
+
+        // search_matches should contain only the visible index of the subnet node
+        assert_eq!(app.search_matches.len(), 1);
+        let visible = app.visible_nodes();
+        let match_vis_idx = app.search_matches[0];
+        let match_node_idx = visible[match_vis_idx];
+        assert_eq!(app.nodes[match_node_idx].resource_type, "ec2.subnet");
+    }
+
+    #[test]
+    fn tab_complete_basic() {
+        let plan = make_tree_plan();
+        let mut app = App::new(&plan, &HashMap::new());
+        app.search_active = true;
+        app.search_query = "sub".to_string();
+
+        app.tab_complete();
+
+        // "sub" matches both "ec2.subnet" (resource type) and "subnet" (binding);
+        // sorted alphabetically, "ec2.subnet" comes first
+        assert_eq!(app.search_query, "ec2.subnet");
+    }
+
+    #[test]
+    fn tab_complete_cycles_candidates() {
+        let plan = make_tree_plan();
+        let mut app = App::new(&plan, &HashMap::new());
+        app.search_active = true;
+        app.search_query = "ec2".to_string();
+
+        // First tab: should complete to first candidate starting with "ec2"
+        app.tab_complete();
+        let first = app.search_query.clone();
+
+        // Second tab: should cycle to next candidate
+        app.tab_complete();
+        let second = app.search_query.clone();
+
+        // There are two resource types: ec2.subnet and ec2.vpc
+        assert!(first.starts_with("ec2"));
+        assert!(second.starts_with("ec2"));
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn tab_complete_no_match() {
+        let plan = make_tree_plan();
+        let mut app = App::new(&plan, &HashMap::new());
+        app.search_active = true;
+        app.search_query = "zzz".to_string();
+
+        app.tab_complete();
+
+        // No candidates match, query unchanged
+        assert_eq!(app.search_query, "zzz");
+    }
+
+    #[test]
+    fn tab_complete_empty_query() {
+        let plan = make_tree_plan();
+        let mut app = App::new(&plan, &HashMap::new());
+        app.search_active = true;
+        app.search_query = String::new();
+
+        app.tab_complete();
+
+        // Empty query should not complete
+        assert!(app.search_query.is_empty());
+    }
+
+    #[test]
+    fn tab_complete_case_insensitive() {
+        let plan = make_tree_plan();
+        let mut app = App::new(&plan, &HashMap::new());
+        app.search_active = true;
+        app.search_query = "SUB".to_string();
+
+        app.tab_complete();
+
+        // "SUB" matches "ec2.subnet" and "subnet" case-insensitively;
+        // sorted alphabetically, "ec2.subnet" comes first
+        assert_eq!(app.search_query, "ec2.subnet");
+    }
+
+    #[test]
+    fn tab_complete_matches_middle_of_word() {
+        let plan = make_tree_plan();
+        let mut app = App::new(&plan, &HashMap::new());
+        app.search_active = true;
+        app.search_query = "net".to_string();
+
+        app.tab_complete();
+
+        // "net" matches "ec2.subnet" (resource type) and "subnet" (binding)
+        // via contains; sorted alphabetically, "ec2.subnet" comes first
+        assert_eq!(app.search_query, "ec2.subnet");
+    }
+
+    #[test]
+    fn tab_complete_with_provider_prefix() {
+        // Resource types with provider prefix (e.g., "awscc.ec2.vpc")
+        let mut plan = Plan::new();
+        plan.add(Effect::Create(
+            Resource::with_provider("awscc", "ec2.vpc", "my-vpc")
+                .with_attribute("_binding", Value::String("vpc".to_string())),
+        ));
+        plan.add(Effect::Create(
+            Resource::with_provider("awscc", "ec2.subnet", "my-subnet")
+                .with_attribute("_binding", Value::String("subnet".to_string())),
+        ));
+        let mut app = App::new(&plan, &HashMap::new());
+        app.search_active = true;
+        app.search_query = "ec".to_string();
+
+        app.tab_complete();
+
+        // Should match resource types containing "ec" even with provider prefix
+        assert!(
+            app.search_query.contains("ec2"),
+            "expected query to contain 'ec2', got '{}'",
+            app.search_query
+        );
     }
 }
