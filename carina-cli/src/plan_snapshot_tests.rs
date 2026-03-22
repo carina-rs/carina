@@ -231,6 +231,19 @@ fn snapshot_destroy_full() {
     insta::assert_snapshot!(output);
 }
 
+#[test]
+fn snapshot_destroy_orphans() {
+    use carina_core::resource::Value;
+    let (plan, current_states) = build_plan_and_states_from_fixture("destroy_orphans");
+    let delete_attributes: HashMap<ResourceId, HashMap<String, Value>> = current_states
+        .into_iter()
+        .filter(|(_, state)| state.exists)
+        .map(|(id, state)| (id, state.attributes))
+        .collect();
+    let output = strip_ansi(&format_destroy_plan(&plan, false, &delete_attributes));
+    insta::assert_snapshot!(output);
+}
+
 /// Ensure no fixture .crn file has unused `let` bindings.
 ///
 /// `let` should only be used when a binding is referenced by another resource.
