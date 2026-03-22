@@ -193,6 +193,15 @@ impl App {
         self.visible_nodes().len()
     }
 
+    /// Count all descendant nodes (recursively) under the given node index.
+    pub fn descendant_count(&self, idx: usize) -> usize {
+        let mut count = 0;
+        for &child in &self.nodes[idx].children {
+            count += 1 + self.descendant_count(child);
+        }
+        count
+    }
+
     /// Returns the set of node indices whose effect_label matches the search query.
     fn matching_node_indices(&self) -> HashSet<usize> {
         let mut result = HashSet::new();
@@ -1629,5 +1638,56 @@ mod tests {
             .find(|r| matches!(r, DetailRow::Attribute { key, .. } if key == "vpc_id"))
             .expect("vpc_id detail row should exist");
         assert!(matches!(ref_row, DetailRow::Attribute { value, .. } if value == "vpc.vpc_id"));
+    }
+
+    #[test]
+    fn descendant_count_root_with_children() {
+        let mut plan = Plan::new();
+        plan.add(Effect::Create(
+            Resource::new("ec2.vpc", "my-vpc")
+                .with_attribute("_binding", Value::String("vpc".to_string()))
+                .with_attribute("cidr_block", Value::String("10.0.0.0/16".to_string())),
+        ));
+        plan.add(Effect::Create(
+            Resource::new("ec2.subnet", "subnet-a")
+                .with_attribute("_binding", Value::String("subnet_a".to_string()))
+                .with_attribute(
+                    "vpc_id",
+                    Value::ResourceRef {
+                        binding_name: "vpc".to_string(),
+                        attribute_name: "vpc_id".to_string(),
+                    },
+                ),
+        ));
+        plan.add(Effect::Create(
+            Resource::new("ec2.subnet", "subnet-b")
+                .with_attribute("_binding", Value::String("subnet_b".to_string()))
+                .with_attribute(
+                    "vpc_id",
+                    Value::ResourceRef {
+                        binding_name: "vpc".to_string(),
+                        attribute_name: "vpc_id".to_string(),
+                    },
+                ),
+        ));
+
+        let app = App::new(&plan, &HashMap::new());
+
+        // Root node (vpc) has 2 descendants
+        assert_eq!(app.descendant_count(0), 2);
+        // Leaf nodes have 0 descendants
+        assert_eq!(app.descendant_count(1), 0);
+        assert_eq!(app.descendant_count(2), 0);
+    }
+
+    #[test]
+    fn descendant_count_standalone_root() {
+        let mut plan = Plan::new();
+        plan.add(Effect::Create(Resource::new("s3.bucket", "my-bucket")));
+
+        let app = App::new(&plan, &HashMap::new());
+
+        // Standalone root has no descendants
+        assert_eq!(app.descendant_count(0), 0);
     }
 }

@@ -68,6 +68,17 @@ fn draw_tree(frame: &mut Frame, app: &mut App, area: Rect) {
                 Span::raw(" "),
                 Span::styled(node.name_part.clone(), effect_color),
             ];
+            // Show descendant resource count on root nodes
+            if node.parent.is_none() {
+                let count = app.descendant_count(node_idx);
+                if count > 0 {
+                    let noun = if count == 1 { "resource" } else { "resources" };
+                    spans.push(Span::styled(
+                        format!(" ({} {})", count, noun),
+                        Style::default().fg(Color::DarkGray),
+                    ));
+                }
+            }
             if app.selected == row_idx {
                 spans = spans
                     .into_iter()

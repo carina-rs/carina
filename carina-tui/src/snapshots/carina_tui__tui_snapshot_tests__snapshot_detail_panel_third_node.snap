@@ -3,7 +3,7 @@ source: carina-tui/src/tui_snapshot_tests.rs
 expression: output
 ---
 ┌ Plan (Plan: 3 to create, 0 to update, 0 to delete) ──────────────────────────────────────────────────────────────────┐
-│+ ec2.vpc vpc                                                                                                         │
+│+ ec2.vpc vpc (2 resources)                                                                                           │
 │    ├── + ec2.route_table rt                                                                                          │
 │    └── + ec2.subnet subnet                                                                                           │
 │                                                                                                                      │
