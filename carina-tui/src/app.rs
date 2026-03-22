@@ -79,6 +79,10 @@ pub struct App {
     pub search_matches: Vec<usize>,
     /// Index into `search_matches` for the current match
     pub current_match: usize,
+    /// Selected row index in the detail panel (for attribute navigation)
+    pub detail_selected: usize,
+    /// Navigation history stack (stores absolute node indices for back navigation)
+    pub nav_stack: Vec<usize>,
     /// Tab completion candidates (sorted, unique)
     tab_candidates: Vec<String>,
     /// Current index into tab_candidates for cycling
@@ -122,6 +126,8 @@ impl App {
             detail_scroll: 0,
             tree_scroll_offset: 0,
             tree_area_height: 0,
+            detail_selected: 0,
+            nav_stack: Vec::new(),
             search_active: false,
             search_query: String::new(),
             search_matches: Vec::new(),
@@ -225,6 +231,7 @@ impl App {
             }
             self.sync_list_state();
             self.detail_scroll = 0;
+            self.detail_selected = 0;
         }
     }
 
@@ -239,7 +246,14 @@ impl App {
             }
             self.sync_list_state();
             self.detail_scroll = 0;
+            self.detail_selected = 0;
         }
+    }
+
+    /// Sync `list_state` selection and scroll offset to match our manual tracking (public for tests).
+    #[cfg(test)]
+    pub fn sync_list_state_pub(&mut self) {
+        self.sync_list_state();
     }
 
     /// Sync `list_state` selection and scroll offset to match our manual tracking.
@@ -264,6 +278,77 @@ impl App {
     /// Scroll the detail panel down by one line
     pub fn detail_scroll_down(&mut self) {
         self.detail_scroll = self.detail_scroll.saturating_add(1);
+    }
+
+    /// Move detail selection up by one row
+    pub fn detail_select_up(&mut self) {
+        if self.detail_selected > 0 {
+            self.detail_selected -= 1;
+        }
+    }
+
+    /// Move detail selection down by one row
+    pub fn detail_select_down(&mut self) {
+        if let Some(node) = self.selected_node() {
+            let max = node.detail_rows.len().saturating_sub(1);
+            if self.detail_selected < max {
+                self.detail_selected += 1;
+            }
+        }
+    }
+
+    /// Get the ref_binding of the currently selected detail row, if any
+    pub fn selected_detail_ref_binding(&self) -> Option<String> {
+        let node = self.selected_node()?;
+        let row = node.detail_rows.get(self.detail_selected)?;
+        match row {
+            DetailRow::Attribute { ref_binding, .. } => ref_binding.clone(),
+            _ => None,
+        }
+    }
+
+    /// Follow a ResourceRef: find the node with the given binding name,
+    /// push current node onto nav_stack, and jump to the referenced node.
+    /// Returns true if the jump was successful.
+    pub fn follow_ref(&mut self, binding: &str) -> bool {
+        // Find the node whose binding matches
+        let target_node_idx = self.nodes.iter().enumerate().find_map(|(idx, node)| {
+            // Check if this node's name_part matches the binding
+            if node.name_part == binding {
+                Some(idx)
+            } else {
+                None
+            }
+        });
+
+        if let Some(target_idx) = target_node_idx {
+            // Push current node onto nav_stack
+            if let Some(current_idx) = self.selected_node_idx() {
+                self.nav_stack.push(current_idx);
+            }
+            // Find the target in the visible list and jump to it
+            let visible = self.visible_nodes();
+            if let Some(vis_pos) = visible.iter().position(|&idx| idx == target_idx) {
+                self.select_visible_index(vis_pos);
+                self.detail_selected = 0;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Navigate back to the previous node in the nav_stack.
+    /// Returns true if the jump was successful.
+    pub fn nav_back(&mut self) -> bool {
+        if let Some(prev_idx) = self.nav_stack.pop() {
+            let visible = self.visible_nodes();
+            if let Some(vis_pos) = visible.iter().position(|&idx| idx == prev_idx) {
+                self.select_visible_index(vis_pos);
+                self.detail_selected = 0;
+                return true;
+            }
+        }
+        false
     }
 
     /// Get the node index for the currently selected visible row
@@ -374,6 +459,7 @@ impl App {
         }
         self.sync_list_state();
         self.detail_scroll = 0;
+        self.detail_selected = 0;
     }
 
     /// Perform tab completion on the current search query.
@@ -876,6 +962,7 @@ fn effect_to_node(effect: &Effect, schemas: Option<&HashMap<String, ResourceSche
                 rows.push(DetailRow::Attribute {
                     key: "identifier".to_string(),
                     value: identifier.clone(),
+                    ref_binding: None,
                 });
             }
             TreeNode {

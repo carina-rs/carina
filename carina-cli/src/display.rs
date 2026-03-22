@@ -794,7 +794,7 @@ fn format_plan_tree(
 /// Render a single `DetailRow` into the output string with ANSI colors.
 fn render_detail_row(out: &mut String, row: &DetailRow, effect: &Effect, attr_prefix: &str) {
     match row {
-        DetailRow::Attribute { key, value } => {
+        DetailRow::Attribute { key, value, .. } => {
             let colored_value = match effect {
                 Effect::Create(_) => value.green().to_string(),
                 Effect::Delete { .. } => value.red().strikethrough().to_string(),

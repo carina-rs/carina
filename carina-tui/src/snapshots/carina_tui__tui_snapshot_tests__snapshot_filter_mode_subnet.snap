@@ -33,7 +33,7 @@ expression: output
 │+ ec2.subnet subnet                                                                                                   │
 │                                                                                                                      │
 │  cidr_block: "10.0.1.0/24"                                                                                           │
-│  vpc_id: vpc.vpc_id                                                                                                  │
+│  vpc_id: vpc.vpc_id →                                                                                                │
 │                                                                                                                      │
 │                                                                                                                      │
 │                                                                                                                      │

@@ -28,7 +28,12 @@ pub enum DetailLevel {
 #[derive(Debug, Clone, PartialEq)]
 pub enum DetailRow {
     /// A normal attribute value (for Create/Delete effects)
-    Attribute { key: String, value: String },
+    Attribute {
+        key: String,
+        value: String,
+        /// If this attribute is a ResourceRef, stores the binding name for navigation
+        ref_binding: Option<String>,
+    },
     /// A list-of-maps attribute (for Create effects)
     ListOfMaps {
         key: String,
@@ -225,9 +230,14 @@ fn build_create_rows(
         if is_list_of_maps(value) {
             rows.push(build_list_of_maps_row(key, value));
         } else {
+            let ref_binding = match value {
+                Value::ResourceRef { binding_name, .. } => Some(binding_name.clone()),
+                _ => None,
+            };
             rows.push(DetailRow::Attribute {
                 key: key.to_string(),
                 value: format_value_with_key(value, Some(key)),
+                ref_binding,
             });
         }
     }
@@ -263,6 +273,7 @@ fn build_list_of_maps_row(key: &str, value: &Value) -> DetailRow {
             return DetailRow::Attribute {
                 key: key.to_string(),
                 value: format_value(value),
+                ref_binding: None,
             };
         }
     };
@@ -514,9 +525,14 @@ fn build_delete_rows(
         keys.sort();
         for key in keys {
             let value = &attrs[key];
+            let ref_binding = match value {
+                Value::ResourceRef { binding_name, .. } => Some(binding_name.clone()),
+                _ => None,
+            };
             rows.push(DetailRow::Attribute {
                 key: key.to_string(),
                 value: format_value_with_key(value, Some(key)),
+                ref_binding,
             });
         }
     }

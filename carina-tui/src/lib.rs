@@ -117,15 +117,25 @@ pub fn handle_key(app: &mut App, code: KeyCode) -> KeyAction {
         KeyCode::Up | KeyCode::Char('k') => {
             match app.focused_panel {
                 FocusedPanel::Tree => app.move_up(),
-                FocusedPanel::Detail => app.detail_scroll_up(),
+                FocusedPanel::Detail => app.detail_select_up(),
             }
             KeyAction::Continue
         }
         KeyCode::Down | KeyCode::Char('j') => {
             match app.focused_panel {
                 FocusedPanel::Tree => app.move_down(),
-                FocusedPanel::Detail => app.detail_scroll_down(),
+                FocusedPanel::Detail => app.detail_select_down(),
             }
+            KeyAction::Continue
+        }
+        KeyCode::Enter if app.focused_panel == FocusedPanel::Detail => {
+            if let Some(binding) = app.selected_detail_ref_binding() {
+                app.follow_ref(&binding);
+            }
+            KeyAction::Continue
+        }
+        KeyCode::Backspace if !app.search_active => {
+            app.nav_back();
             KeyAction::Continue
         }
         _ => KeyAction::Continue,
@@ -627,5 +637,176 @@ mod tests {
             new_node_idx, subnet_node_idx,
             "selection should point to the same node after q clears filter"
         );
+    }
+
+    #[test]
+    fn detail_select_up_down() {
+        let mut app = make_search_app();
+        // Navigate to subnet node which has 2 detail rows (vpc_id as ResourceRef)
+        // Actually, subnet has only vpc_id. Let's find a node with multiple rows.
+        // Navigate to subnet (ec2.subnet) - it has vpc_id attribute
+        let visible = app.visible_nodes();
+        let subnet_pos = visible
+            .iter()
+            .position(|&idx| app.nodes[idx].effect_label.contains("subnet"))
+            .expect("subnet should be visible");
+        app.selected = subnet_pos;
+
+        // Verify it has at least 1 detail row
+        let detail_row_count = app.selected_node().unwrap().detail_rows.len();
+        assert!(detail_row_count > 0, "subnet should have detail rows");
+
+        // Focus detail panel
+        handle_key(&mut app, KeyCode::Tab);
+        assert_eq!(app.focused_panel, FocusedPanel::Detail);
+        assert_eq!(app.detail_selected, 0);
+
+        // Should not go below 0
+        handle_key(&mut app, KeyCode::Up);
+        assert_eq!(app.detail_selected, 0);
+
+        // If we have more than 1 row, test down
+        if detail_row_count > 1 {
+            handle_key(&mut app, KeyCode::Down);
+            assert_eq!(app.detail_selected, 1);
+            handle_key(&mut app, KeyCode::Up);
+            assert_eq!(app.detail_selected, 0);
+        }
+    }
+
+    #[test]
+    fn detail_selected_resets_on_tree_navigation() {
+        let mut app = make_search_app();
+        // Navigate to subnet which has a detail row
+        let visible = app.visible_nodes();
+        let subnet_pos = visible
+            .iter()
+            .position(|&idx| app.nodes[idx].effect_label.contains("subnet"))
+            .expect("subnet should be visible");
+        app.selected = subnet_pos;
+
+        // Focus detail
+        handle_key(&mut app, KeyCode::Tab);
+        // detail_selected starts at 0, that's fine
+
+        // Switch to tree panel and navigate
+        handle_key(&mut app, KeyCode::Tab);
+        handle_key(&mut app, KeyCode::Down);
+
+        // detail_selected should reset
+        assert_eq!(app.detail_selected, 0);
+    }
+
+    #[test]
+    fn enter_follows_ref_in_detail_panel() {
+        let mut app = make_search_app();
+        // Navigate to subnet (node index 2 in the visible list)
+        // The tree is: vpc (0), subnet (1 - child of vpc), bucket (2 - root)
+        // Actually let's find subnet
+        let visible = app.visible_nodes();
+        let subnet_pos = visible
+            .iter()
+            .position(|&idx| app.nodes[idx].effect_label.contains("subnet"))
+            .expect("subnet should be visible");
+        app.selected = subnet_pos;
+        app.sync_list_state_pub();
+
+        // Focus detail panel
+        handle_key(&mut app, KeyCode::Tab);
+        assert_eq!(app.focused_panel, FocusedPanel::Detail);
+
+        // The subnet has vpc_id: vpc.vpc_id as first attribute
+        // Check that it's navigable
+        let ref_binding = app.selected_detail_ref_binding();
+        assert_eq!(ref_binding, Some("vpc".to_string()));
+
+        // Press Enter to follow the ref
+        handle_key(&mut app, KeyCode::Enter);
+
+        // Should now be on the vpc node
+        let current_node = app.selected_node().unwrap();
+        assert!(
+            current_node.effect_label.contains("vpc"),
+            "should be on vpc, got '{}'",
+            current_node.effect_label
+        );
+
+        // Nav stack should have the subnet node
+        assert_eq!(app.nav_stack.len(), 1);
+    }
+
+    #[test]
+    fn backspace_navigates_back() {
+        let mut app = make_search_app();
+        // Navigate to subnet
+        let visible = app.visible_nodes();
+        let subnet_pos = visible
+            .iter()
+            .position(|&idx| app.nodes[idx].effect_label.contains("subnet"))
+            .expect("subnet should be visible");
+        app.selected = subnet_pos;
+        app.sync_list_state_pub();
+        let subnet_node_idx = app.selected_node_idx().unwrap();
+
+        // Focus detail and follow ref
+        handle_key(&mut app, KeyCode::Tab);
+        handle_key(&mut app, KeyCode::Enter);
+        assert_eq!(app.nav_stack.len(), 1);
+
+        // Press Backspace to go back
+        handle_key(&mut app, KeyCode::Backspace);
+        assert_eq!(app.nav_stack.len(), 0);
+
+        // Should be back on subnet
+        let current_idx = app.selected_node_idx().unwrap();
+        assert_eq!(current_idx, subnet_node_idx);
+    }
+
+    #[test]
+    fn nav_stack_supports_multiple_jumps() {
+        let mut app = make_search_app();
+        // Navigate to subnet
+        let visible = app.visible_nodes();
+        let subnet_pos = visible
+            .iter()
+            .position(|&idx| app.nodes[idx].effect_label.contains("subnet"))
+            .expect("subnet should be visible");
+        app.selected = subnet_pos;
+        app.sync_list_state_pub();
+        let subnet_node_idx = app.selected_node_idx().unwrap();
+
+        // Follow ref from subnet -> vpc
+        handle_key(&mut app, KeyCode::Tab);
+        handle_key(&mut app, KeyCode::Enter);
+        assert_eq!(app.nav_stack.len(), 1);
+
+        // Back to subnet
+        handle_key(&mut app, KeyCode::Backspace);
+        assert_eq!(app.nav_stack.len(), 0);
+        assert_eq!(app.selected_node_idx().unwrap(), subnet_node_idx);
+
+        // Backspace with empty stack does nothing
+        handle_key(&mut app, KeyCode::Backspace);
+        assert_eq!(app.nav_stack.len(), 0);
+    }
+
+    #[test]
+    fn enter_on_non_ref_attribute_does_nothing() {
+        let mut app = make_search_app();
+        // Select vpc node (has cidr_block attribute, not a ref)
+        // vpc should be the first visible node
+        app.selected = 0;
+
+        // Focus detail panel
+        handle_key(&mut app, KeyCode::Tab);
+
+        // Should not be navigable (cidr_block is a string, not a ref)
+        assert!(app.selected_detail_ref_binding().is_none());
+
+        // Press Enter should do nothing
+        let prev_selected = app.selected;
+        handle_key(&mut app, KeyCode::Enter);
+        assert_eq!(app.selected, prev_selected);
+        assert!(app.nav_stack.is_empty());
     }
 }
