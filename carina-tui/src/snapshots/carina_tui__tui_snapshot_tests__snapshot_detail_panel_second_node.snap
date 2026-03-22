@@ -41,4 +41,4 @@ expression: output
 │                                                                                                                      │
 │                                                                                                                      │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
- Tab switch panel  j/k navigate/scroll  / search  q/Esc quit
+ q/Esc quit  / search  ↑↓/jk navigate  Tab focus

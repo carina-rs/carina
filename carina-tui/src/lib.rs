@@ -86,7 +86,7 @@ pub fn handle_key(app: &mut App, code: KeyCode) -> KeyAction {
 
     // Normal mode
     match code {
-        KeyCode::Esc if !app.search_matches.is_empty() => {
+        KeyCode::Char('q') | KeyCode::Esc if !app.search_matches.is_empty() => {
             // Clear active search filter before quitting
             app.search_query.clear();
             app.search_matches.clear();
@@ -509,6 +509,33 @@ mod tests {
 
         // Second Esc should quit
         let action = handle_key(&mut app, KeyCode::Esc);
+        assert_eq!(action, KeyAction::Quit);
+    }
+
+    #[test]
+    fn q_clears_filter_before_quitting() {
+        let mut app = make_search_app();
+        // Search for "vpc" and confirm with Enter
+        handle_key(&mut app, KeyCode::Char('/'));
+        handle_key(&mut app, KeyCode::Char('v'));
+        handle_key(&mut app, KeyCode::Char('p'));
+        handle_key(&mut app, KeyCode::Char('c'));
+        handle_key(&mut app, KeyCode::Enter);
+
+        // Filter is active (search_matches not empty)
+        assert!(!app.search_matches.is_empty());
+        assert!(!app.search_active);
+
+        // First q should clear filter, not quit
+        let action = handle_key(&mut app, KeyCode::Char('q'));
+        assert_eq!(action, KeyAction::Continue);
+        assert!(app.search_matches.is_empty());
+        assert!(app.search_query.is_empty());
+        // All nodes should be visible again
+        assert_eq!(app.visible_count(), 3);
+
+        // Second q should quit
+        let action = handle_key(&mut app, KeyCode::Char('q'));
         assert_eq!(action, KeyAction::Quit);
     }
 

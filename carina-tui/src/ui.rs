@@ -333,6 +333,7 @@ fn draw_search_bar(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         format!(" [{}/{}]", app.current_match + 1, app.search_matches.len())
     };
+    let help_text = "  Enter confirm  Esc cancel  Tab complete";
     let search = Paragraph::new(Line::from(vec![
         Span::styled(
             "/",
@@ -343,51 +344,71 @@ fn draw_search_bar(frame: &mut Frame, app: &App, area: Rect) {
         Span::raw(&app.search_query),
         Span::styled("_", Style::default().add_modifier(Modifier::SLOW_BLINK)),
         Span::styled(match_info, Style::default().fg(Color::DarkGray)),
+        Span::styled(help_text, Style::default().fg(Color::DarkGray)),
     ]));
     frame.render_widget(search, area);
 }
 
-/// Draw the help bar
+/// Draw the help bar (search mode shows its own help via draw_search_bar)
 fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
-    let mut spans = vec![
-        Span::styled(
-            " Tab",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" switch panel  "),
-        Span::styled(
-            "j/k",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" navigate/scroll  "),
-        Span::styled(
-            "/",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" search  "),
-    ];
-    if !app.search_matches.is_empty() {
-        spans.push(Span::styled(
-            "n/N",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ));
-        spans.push(Span::raw(" next/prev match  "));
-    }
-    spans.push(Span::styled(
-        "q/Esc",
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
-    ));
-    spans.push(Span::raw(" quit"));
+    let spans = if !app.search_matches.is_empty() {
+        // Filter active: show filter-related help
+        vec![
+            Span::styled(
+                " q/Esc",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" clear filter  "),
+            Span::styled(
+                "n/N",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" next/prev match  "),
+            Span::styled(
+                "/",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" search"),
+        ]
+    } else {
+        // Normal mode: no filter active
+        vec![
+            Span::styled(
+                " q/Esc",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" quit  "),
+            Span::styled(
+                "/",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" search  "),
+            Span::styled(
+                "\u{2191}\u{2193}/jk",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" navigate  "),
+            Span::styled(
+                "Tab",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" focus"),
+        ]
+    };
 
     let help = Paragraph::new(Line::from(spans));
     frame.render_widget(help, area);
