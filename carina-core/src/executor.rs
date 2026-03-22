@@ -1978,6 +1978,22 @@ mod tests {
             "Expected waiting event for 'b' with dependency 'a', got: {:?}",
             observer.events
         );
+        // Waiting event should appear before the started event for "b"
+        let waiting_pos = observer
+            .events
+            .iter()
+            .position(|e| e == "waiting:test.b:a")
+            .unwrap();
+        let started_pos = observer
+            .events
+            .iter()
+            .position(|e| e == "started:test.b")
+            .unwrap();
+        assert!(
+            waiting_pos < started_pos,
+            "Waiting event should appear before started event, got: {:?}",
+            observer.events
+        );
         // "a" should NOT have a waiting event (no dependencies)
         assert!(
             !observer
