@@ -656,6 +656,34 @@ fn format_plan_tree(
                             .unwrap();
                         }
                     }
+
+                    // Count unchanged attributes hidden from display
+                    let unchanged_count = from
+                        .attributes
+                        .iter()
+                        .filter(|(k, v)| {
+                            !k.starts_with('_')
+                                && to
+                                    .attributes
+                                    .get(k.as_str())
+                                    .map(|nv| nv.semantically_equal(v))
+                                    .unwrap_or(false)
+                        })
+                        .count();
+                    if unchanged_count > 0 {
+                        let noun = if unchanged_count == 1 {
+                            "attribute"
+                        } else {
+                            "attributes"
+                        };
+                        writeln!(
+                            out,
+                            "{}{}",
+                            attr_prefix,
+                            format!("# ({} unchanged {} hidden)", unchanged_count, noun).dimmed()
+                        )
+                        .unwrap();
+                    }
                 }
             }
             Effect::Replace {
@@ -779,6 +807,34 @@ fn format_plan_tree(
                                 writeln!(out, "{}", diff).unwrap();
                             }
                         }
+                    }
+
+                    // Count unchanged attributes hidden from display
+                    let unchanged_count = from
+                        .attributes
+                        .iter()
+                        .filter(|(k, v)| {
+                            !k.starts_with('_')
+                                && to
+                                    .attributes
+                                    .get(k.as_str())
+                                    .map(|nv| nv.semantically_equal(v))
+                                    .unwrap_or(false)
+                        })
+                        .count();
+                    if unchanged_count > 0 {
+                        let noun = if unchanged_count == 1 {
+                            "attribute"
+                        } else {
+                            "attributes"
+                        };
+                        writeln!(
+                            out,
+                            "{}{}",
+                            attr_prefix,
+                            format!("# ({} unchanged {} hidden)", unchanged_count, noun).dimmed()
+                        )
+                        .unwrap();
                     }
                 }
             }

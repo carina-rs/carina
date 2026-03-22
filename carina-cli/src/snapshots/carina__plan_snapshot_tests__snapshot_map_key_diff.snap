@@ -8,5 +8,6 @@ Execution Plan:
       tags:
         ~ Environment: "staging" → "production"
         - OldTag: "remove-me"
+      # (3 unchanged attributes hidden)
 
 Plan: 0 to add, 1 to change, 0 to destroy.
