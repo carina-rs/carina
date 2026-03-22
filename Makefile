@@ -26,7 +26,7 @@ plan-no-changes-enum:
 	cd $(FIXTURES)/no_changes_enum && $(CARINA) plan --refresh=false main.crn
 
 plan-destroy-full:
-	cd $(FIXTURES)/destroy_full && $(CARINA) plan --refresh=false main.crn
+	cd $(FIXTURES)/destroy_full && $(CARINA) destroy --refresh=false --lock=false main.crn
 
 plan-map-diff-tui:
 	cd $(FIXTURES)/map_key_diff && $(CARINA) plan --refresh=false --tui main.crn
