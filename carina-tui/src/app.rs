@@ -4,12 +4,11 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use carina_core::deps::get_resource_dependencies;
-use carina_core::diff_helpers::compute_unchanged_count;
+use carina_core::detail_rows::{DetailLevel, DetailRow, build_detail_rows};
 use carina_core::effect::Effect;
 use carina_core::plan::{Plan, PlanSummary};
 use carina_core::resource::Value;
 use carina_core::schema::ResourceSchema;
-use carina_core::value::format_value;
 use ratatui::widgets::ListState;
 
 /// A node in the tree view representing one effect
@@ -25,22 +24,8 @@ pub struct TreeNode {
     pub symbol: String,
     /// The effect kind for coloring
     pub kind: EffectKind,
-    /// Attributes to show in the detail panel (key -> display value)
-    pub attributes: Vec<(String, String)>,
-    /// For Update effects, the set of changed attribute names
-    pub changed_attributes: Vec<String>,
-    /// For Update/Replace effects, the "from" attributes (old values)
-    pub from_attributes: Vec<(String, String)>,
-    /// Raw "from" attribute values for map key-level diffs in the detail panel
-    pub raw_from_attrs: HashMap<String, Value>,
-    /// Raw "to" attribute values for map key-level diffs in the detail panel
-    pub raw_to_attrs: HashMap<String, Value>,
-    /// Default value attributes from schema (attr_name, formatted_value) for Create effects
-    pub default_attributes: Vec<(String, String)>,
-    /// Read-only attributes from schema (attr_name) for Create effects
-    pub read_only_attributes: Vec<String>,
-    /// Count of unchanged attributes for Update/Replace effects
-    pub unchanged_count: usize,
+    /// Detail rows for the detail panel, computed from `build_detail_rows()`
+    pub detail_rows: Vec<DetailRow>,
     /// Indices of child nodes in the tree
     pub children: Vec<usize>,
     /// Nesting depth (0 = root)
@@ -104,12 +89,18 @@ pub struct App {
 
 impl App {
     pub fn new(plan: &Plan, schemas: &HashMap<String, ResourceSchema>) -> Self {
-        let mut nodes: Vec<TreeNode> = plan.effects().iter().map(effect_to_node).collect();
+        let schemas_opt = if schemas.is_empty() {
+            None
+        } else {
+            Some(schemas)
+        };
+        let mut nodes: Vec<TreeNode> = plan
+            .effects()
+            .iter()
+            .map(|e| effect_to_node(e, schemas_opt))
+            .collect();
         let plan_summary = plan.summary();
         let summary = format!("{}", plan_summary);
-
-        // Populate schema-derived attributes
-        populate_schema_attributes(plan, &mut nodes, schemas);
 
         // Build tree structure from dependency analysis
         build_tree_structure(plan, &mut nodes);
@@ -793,52 +784,9 @@ fn shorten_service_name<'a>(attr_name: &str, value: &'a str) -> Cow<'a, str> {
     Cow::Borrowed(value)
 }
 
-/// Populate schema-derived attributes (defaults, read-only, unchanged count) on tree nodes.
-fn populate_schema_attributes(
-    plan: &Plan,
-    nodes: &mut [TreeNode],
-    schemas: &HashMap<String, ResourceSchema>,
-) {
-    for (idx, effect) in plan.effects().iter().enumerate() {
-        match effect {
-            Effect::Create(r) => {
-                let schema_key = r.id.display_type();
-                if let Some(schema) = schemas.get(&schema_key) {
-                    let user_keys: HashSet<&str> = r
-                        .attributes
-                        .keys()
-                        .filter(|k| !k.starts_with('_'))
-                        .map(|k| k.as_str())
-                        .collect();
+fn effect_to_node(effect: &Effect, schemas: Option<&HashMap<String, ResourceSchema>>) -> TreeNode {
+    let detail_rows = build_detail_rows(effect, schemas, DetailLevel::Full, None);
 
-                    // Default value attributes not specified by user
-                    nodes[idx].default_attributes = schema.compute_default_attrs(&user_keys);
-
-                    // Read-only attributes not specified by user
-                    nodes[idx].read_only_attributes = schema.compute_read_only_attrs(&user_keys);
-                }
-            }
-            Effect::Update { from, to, .. } => {
-                nodes[idx].unchanged_count =
-                    compute_unchanged_count(&from.attributes, &to.attributes, None);
-            }
-            Effect::Replace {
-                from,
-                to,
-                changed_create_only,
-                ..
-            } => {
-                let changed_set: HashSet<&str> =
-                    changed_create_only.iter().map(|s| s.as_str()).collect();
-                nodes[idx].unchanged_count =
-                    compute_unchanged_count(&from.attributes, &to.attributes, Some(&changed_set));
-            }
-            _ => {}
-        }
-    }
-}
-
-fn effect_to_node(effect: &Effect) -> TreeNode {
     match effect {
         Effect::Read { resource } => TreeNode {
             effect_label: format!("{}", resource.id),
@@ -846,15 +794,7 @@ fn effect_to_node(effect: &Effect) -> TreeNode {
             name_part: resource.id.name.clone(),
             symbol: "<=".to_string(),
             kind: EffectKind::Read,
-            attributes: format_attributes(&resource.attributes),
-            changed_attributes: Vec::new(),
-            from_attributes: Vec::new(),
-            raw_from_attrs: HashMap::new(),
-            raw_to_attrs: HashMap::new(),
-            default_attributes: Vec::new(),
-            read_only_attributes: Vec::new(),
-            unchanged_count: 0,
-
+            detail_rows,
             children: Vec::new(),
             depth: 0,
             parent: None,
@@ -865,51 +805,23 @@ fn effect_to_node(effect: &Effect) -> TreeNode {
             name_part: resource.id.name.clone(),
             symbol: "+".to_string(),
             kind: EffectKind::Create,
-            attributes: format_attributes(&resource.attributes),
-            changed_attributes: Vec::new(),
-            from_attributes: Vec::new(),
-            raw_from_attrs: HashMap::new(),
-            raw_to_attrs: HashMap::new(),
-            default_attributes: Vec::new(),
-            read_only_attributes: Vec::new(),
-            unchanged_count: 0,
-
+            detail_rows,
             children: Vec::new(),
             depth: 0,
             parent: None,
         },
-        Effect::Update {
-            id,
-            from,
-            to,
-            changed_attributes,
-        } => TreeNode {
+        Effect::Update { id, .. } => TreeNode {
             effect_label: format!("{}", id),
             resource_type: id.display_type(),
             name_part: id.name.clone(),
             symbol: "~".to_string(),
             kind: EffectKind::Update,
-            attributes: format_attributes(&to.attributes),
-            changed_attributes: changed_attributes.clone(),
-            from_attributes: format_attributes(&from.attributes),
-            raw_from_attrs: from.attributes.clone(),
-            raw_to_attrs: to.attributes.clone(),
-            default_attributes: Vec::new(),
-            read_only_attributes: Vec::new(),
-            unchanged_count: 0,
-
+            detail_rows,
             children: Vec::new(),
             depth: 0,
             parent: None,
         },
-        Effect::Replace {
-            id,
-            from,
-            to,
-            lifecycle,
-            changed_create_only,
-            ..
-        } => {
+        Effect::Replace { id, lifecycle, .. } => {
             let symbol = if lifecycle.create_before_destroy {
                 "+/-".to_string()
             } else {
@@ -921,24 +833,21 @@ fn effect_to_node(effect: &Effect) -> TreeNode {
                 name_part: id.name.clone(),
                 symbol,
                 kind: EffectKind::Replace,
-                attributes: format_attributes(&to.attributes),
-                changed_attributes: changed_create_only.clone(),
-                from_attributes: format_attributes(&from.attributes),
-                raw_from_attrs: from.attributes.clone(),
-                raw_to_attrs: to.attributes.clone(),
-                default_attributes: Vec::new(),
-                read_only_attributes: Vec::new(),
-                unchanged_count: 0,
-
+                detail_rows,
                 children: Vec::new(),
                 depth: 0,
                 parent: None,
             }
         }
         Effect::Delete { id, identifier, .. } => {
-            let mut attrs = Vec::new();
-            if !identifier.is_empty() {
-                attrs.push(("identifier".to_string(), identifier.clone()));
+            // build_detail_rows returns empty for Delete without delete_attributes,
+            // so add the identifier as a manual attribute row
+            let mut rows = detail_rows;
+            if rows.is_empty() && !identifier.is_empty() {
+                rows.push(DetailRow::Attribute {
+                    key: "identifier".to_string(),
+                    value: identifier.clone(),
+                });
             }
             TreeNode {
                 effect_label: format!("{}", id),
@@ -946,15 +855,7 @@ fn effect_to_node(effect: &Effect) -> TreeNode {
                 name_part: id.name.clone(),
                 symbol: "-".to_string(),
                 kind: EffectKind::Delete,
-                attributes: attrs,
-                changed_attributes: Vec::new(),
-                from_attributes: Vec::new(),
-                raw_from_attrs: HashMap::new(),
-                raw_to_attrs: HashMap::new(),
-                default_attributes: Vec::new(),
-                read_only_attributes: Vec::new(),
-                unchanged_count: 0,
-
+                detail_rows: rows,
                 children: Vec::new(),
                 depth: 0,
                 parent: None,
@@ -963,22 +864,11 @@ fn effect_to_node(effect: &Effect) -> TreeNode {
     }
 }
 
-/// Format resource attributes into displayable key-value pairs.
-/// Filters out internal attributes (prefixed with "_").
-fn format_attributes(attrs: &HashMap<String, Value>) -> Vec<(String, String)> {
-    let mut result: Vec<(String, String)> = attrs
-        .iter()
-        .filter(|(k, _)| !k.starts_with('_'))
-        .map(|(k, v)| (k.clone(), format_value(v)))
-        .collect();
-    result.sort_by(|a, b| a.0.cmp(&b.0));
-    result
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use carina_core::resource::{LifecycleConfig, Resource, ResourceId, State};
+    use carina_core::value::format_value;
 
     #[test]
     fn app_from_empty_plan() {
@@ -1040,7 +930,7 @@ mod tests {
     }
 
     #[test]
-    fn update_effect_shows_changed_attributes() {
+    fn update_effect_has_detail_rows() {
         let mut plan = Plan::new();
         plan.add(Effect::Update {
             id: ResourceId::new("s3.bucket", "my-bucket"),
@@ -1060,8 +950,13 @@ mod tests {
 
         let app = App::new(&plan, &HashMap::new());
         assert_eq!(app.nodes[0].kind, EffectKind::Update);
-        assert_eq!(app.nodes[0].changed_attributes, vec!["versioning"]);
-        assert!(!app.nodes[0].from_attributes.is_empty());
+        // Should have a Changed detail row for versioning
+        assert!(
+            app.nodes[0]
+                .detail_rows
+                .iter()
+                .any(|r| matches!(r, DetailRow::Changed { key, .. } if key == "versioning"))
+        );
     }
 
     #[test]
@@ -1076,8 +971,13 @@ mod tests {
 
         let app = App::new(&plan, &HashMap::new());
         // Only "name" should appear (not _binding or _module)
-        assert_eq!(app.nodes[0].attributes.len(), 1);
-        assert_eq!(app.nodes[0].attributes[0].0, "name");
+        let attr_rows: Vec<_> = app.nodes[0]
+            .detail_rows
+            .iter()
+            .filter(|r| matches!(r, DetailRow::Attribute { .. }))
+            .collect();
+        assert_eq!(attr_rows.len(), 1);
+        assert!(matches!(&attr_rows[0], DetailRow::Attribute { key, .. } if key == "name"));
     }
 
     #[test]
@@ -1181,8 +1081,8 @@ mod tests {
         let app = App::new(&plan, &HashMap::new());
         let node = app.selected_node().unwrap();
         assert_eq!(node.kind, EffectKind::Create);
-        // Attributes are always available in the detail panel
-        assert!(!node.attributes.is_empty());
+        // Detail rows should contain the name attribute
+        assert!(!node.detail_rows.is_empty());
     }
 
     #[test]
@@ -1598,20 +1498,20 @@ mod tests {
         let app = App::new(&plan, &HashMap::new());
         let node = &app.nodes[0];
 
-        // Enum value should be resolved
-        let enum_attr = node
-            .attributes
+        // Enum value should be resolved in detail rows
+        let enum_row = node
+            .detail_rows
             .iter()
-            .find(|(k, _)| k == "vpc_endpoint_type")
-            .expect("vpc_endpoint_type attribute should exist");
-        assert_eq!(enum_attr.1, "\"Interface\"");
+            .find(|r| matches!(r, DetailRow::Attribute { key, .. } if key == "vpc_endpoint_type"))
+            .expect("vpc_endpoint_type detail row should exist");
+        assert!(matches!(enum_row, DetailRow::Attribute { value, .. } if value == "\"Interface\""));
 
         // ResourceRef should remain unresolved
-        let ref_attr = node
-            .attributes
+        let ref_row = node
+            .detail_rows
             .iter()
-            .find(|(k, _)| k == "vpc_id")
-            .expect("vpc_id attribute should exist");
-        assert_eq!(ref_attr.1, "vpc.vpc_id");
+            .find(|r| matches!(r, DetailRow::Attribute { key, .. } if key == "vpc_id"))
+            .expect("vpc_id detail row should exist");
+        assert!(matches!(ref_row, DetailRow::Attribute { value, .. } if value == "vpc.vpc_id"));
     }
 }

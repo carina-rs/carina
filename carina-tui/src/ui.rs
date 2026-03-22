@@ -1,12 +1,13 @@
 //! UI rendering for the TUI plan viewer
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
+use carina_core::detail_rows::{
+    DetailRow, ListOfMapsDiffField, ListOfMapsDiffModified, MapDiffEntryIR,
+};
 use carina_core::plan::PlanSummary;
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
-
-use carina_core::resource::Value;
 
 use crate::app::{App, EffectKind, FocusedPanel};
 
@@ -146,95 +147,14 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
     ]));
     lines.push(Line::from(""));
 
-    if node.attributes.is_empty() {
+    if node.detail_rows.is_empty() {
         lines.push(Line::from(Span::styled(
             "(no attributes)",
             Style::default().fg(Color::DarkGray),
         )));
     } else {
-        let changed_set: HashSet<&str> =
-            node.changed_attributes.iter().map(|s| s.as_str()).collect();
-        let from_map: HashMap<&str, &str> = node
-            .from_attributes
-            .iter()
-            .map(|(k, v)| (k.as_str(), v.as_str()))
-            .collect();
-
-        for (key, value) in &node.attributes {
-            let is_changed = changed_set.contains(key.as_str());
-
-            if is_changed {
-                // Check if both old and new values are maps for key-level diff
-                let old_raw = node.raw_from_attrs.get(key);
-                let new_raw = node.raw_to_attrs.get(key);
-                if let (Some(Value::Map(old_map)), Some(Value::Map(new_map))) = (old_raw, new_raw) {
-                    lines.push(Line::from(Span::raw(format!("  {}:", key))));
-                    render_map_key_diff(&mut lines, old_map, new_map);
-                } else if let Some(old_value) = from_map.get(key.as_str()) {
-                    lines.push(Line::from(vec![
-                        Span::raw(format!("  {}: ", key)),
-                        Span::styled(
-                            old_value.to_string(),
-                            Style::default()
-                                .fg(Color::Red)
-                                .add_modifier(Modifier::CROSSED_OUT),
-                        ),
-                        Span::raw(" -> "),
-                        Span::styled(value.clone(), Style::default().fg(Color::Green)),
-                    ]));
-                } else {
-                    lines.push(Line::from(vec![
-                        Span::raw(format!("  {}: ", key)),
-                        Span::styled(value.clone(), Style::default().fg(Color::Green)),
-                    ]));
-                }
-            } else {
-                let value_style = if node.kind == EffectKind::Create {
-                    Style::default().fg(Color::Green)
-                } else {
-                    Style::default()
-                };
-                lines.push(Line::from(vec![
-                    Span::raw(format!("  {}: ", key)),
-                    Span::styled(value.clone(), value_style),
-                ]));
-            }
-        }
-
-        // Show default value attributes for Create effects
-        if !node.default_attributes.is_empty() {
-            let dim_style = Style::default().fg(Color::DarkGray);
-            for (key, value) in &node.default_attributes {
-                lines.push(Line::from(vec![
-                    Span::styled(format!("  {}: ", key), dim_style),
-                    Span::styled(value.clone(), dim_style),
-                    Span::styled("  # default", dim_style),
-                ]));
-            }
-        }
-
-        // Show read-only attributes for Create effects
-        if !node.read_only_attributes.is_empty() {
-            let dim_style = Style::default().fg(Color::DarkGray);
-            for attr in &node.read_only_attributes {
-                lines.push(Line::from(vec![
-                    Span::styled(format!("  {}: ", attr), dim_style),
-                    Span::styled("(known after apply)", dim_style),
-                ]));
-            }
-        }
-
-        // Show unchanged attribute count for Update/Replace effects
-        if node.unchanged_count > 0 {
-            let noun = if node.unchanged_count == 1 {
-                "attribute"
-            } else {
-                "attributes"
-            };
-            lines.push(Line::from(Span::styled(
-                format!("  # ({} unchanged {} hidden)", node.unchanged_count, noun),
-                Style::default().fg(Color::DarkGray),
-            )));
+        for row in &node.detail_rows {
+            render_detail_row_to_lines(&mut lines, row, node.kind);
         }
     }
 
@@ -250,50 +170,233 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(detail, area);
 }
 
-/// Render map key-level diffs into TUI lines.
-///
-/// Shows only changed keys:
-/// - `+ key: "value"` (green) for added keys
-/// - `- key: "value"` (red) for removed keys
-/// - `~ key: "old" -> "new"` (yellow) for changed keys
-fn render_map_key_diff(
-    lines: &mut Vec<Line>,
-    old_map: &std::collections::HashMap<String, Value>,
-    new_map: &std::collections::HashMap<String, Value>,
-) {
-    use carina_core::diff_helpers::{MapDiffItem, compute_map_diff};
-    use carina_core::value::format_value;
+/// Render a single `DetailRow` into TUI `Line`s.
+fn render_detail_row_to_lines(lines: &mut Vec<Line>, row: &DetailRow, kind: EffectKind) {
+    let dim_style = Style::default().fg(Color::DarkGray);
 
-    let diff = compute_map_diff(old_map, new_map);
-    for item in diff.iter_by_key() {
-        match item {
-            MapDiffItem::Changed(e) => {
+    match row {
+        DetailRow::Attribute { key, value } => {
+            let value_style = if kind == EffectKind::Create {
+                Style::default().fg(Color::Green)
+            } else {
+                Style::default()
+            };
+            lines.push(Line::from(vec![
+                Span::raw(format!("  {}: ", key)),
+                Span::styled(value.clone(), value_style),
+            ]));
+        }
+        DetailRow::ListOfMaps { key, items } => {
+            let value_style = if kind == EffectKind::Create {
+                Style::default().fg(Color::Green)
+            } else {
+                Style::default()
+            };
+            lines.push(Line::from(vec![
+                Span::raw(format!("  {}: ", key)),
+                Span::styled("[", value_style),
+            ]));
+            for item in items {
+                lines.push(Line::from(vec![
+                    Span::raw("    "),
+                    Span::styled(format!("{{{}}}", item.fields), value_style),
+                ]));
+            }
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled("]", value_style),
+            ]));
+        }
+        DetailRow::Changed { key, old, new } => {
+            lines.push(Line::from(vec![
+                Span::raw(format!("  {}: ", key)),
+                Span::styled(
+                    old.clone(),
+                    Style::default()
+                        .fg(Color::Red)
+                        .add_modifier(Modifier::CROSSED_OUT),
+                ),
+                Span::raw(" -> "),
+                Span::styled(new.clone(), Style::default().fg(Color::Green)),
+            ]));
+        }
+        DetailRow::MapDiff { key, entries } => {
+            lines.push(Line::from(Span::raw(format!("  {}:", key))));
+            render_map_diff_entries(lines, entries);
+        }
+        DetailRow::ListOfMapsDiff {
+            key,
+            unchanged,
+            modified,
+            added,
+            removed,
+        } => {
+            render_list_of_maps_diff(lines, key, unchanged, modified, added, removed);
+        }
+        DetailRow::Removed { key, old } => {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("  {}: ", key),
+                    Style::default()
+                        .fg(Color::Red)
+                        .add_modifier(Modifier::CROSSED_OUT),
+                ),
+                Span::styled(
+                    old.clone(),
+                    Style::default()
+                        .fg(Color::Red)
+                        .add_modifier(Modifier::CROSSED_OUT),
+                ),
+            ]));
+        }
+        DetailRow::Default { key, value } => {
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {}: ", key), dim_style),
+                Span::styled(value.clone(), dim_style),
+                Span::styled("  # default", dim_style),
+            ]));
+        }
+        DetailRow::ReadOnly { key } => {
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {}: ", key), dim_style),
+                Span::styled("(known after apply)", dim_style),
+            ]));
+        }
+        DetailRow::HiddenUnchanged { count } => {
+            let noun = if *count == 1 {
+                "attribute"
+            } else {
+                "attributes"
+            };
+            lines.push(Line::from(Span::styled(
+                format!("  # ({} unchanged {} hidden)", count, noun),
+                dim_style,
+            )));
+        }
+        DetailRow::ReplaceChanged { key, old, new } => {
+            lines.push(Line::from(vec![
+                Span::raw(format!("  {}: ", key)),
+                Span::styled(
+                    old.clone(),
+                    Style::default()
+                        .fg(Color::Red)
+                        .add_modifier(Modifier::CROSSED_OUT),
+                ),
+                Span::raw(" -> "),
+                Span::styled(new.clone(), Style::default().fg(Color::Yellow)),
+            ]));
+        }
+        DetailRow::ReplaceCascade { key, old, new } => {
+            lines.push(Line::from(vec![
+                Span::raw(format!("  {}: ", key)),
+                Span::styled(
+                    old.clone(),
+                    Style::default()
+                        .fg(Color::Red)
+                        .add_modifier(Modifier::CROSSED_OUT),
+                ),
+                Span::raw(" -> "),
+                Span::styled(new.clone(), Style::default().fg(Color::Yellow)),
+            ]));
+        }
+        DetailRow::ReplaceListOfMapsDiff {
+            key,
+            unchanged,
+            modified,
+            added,
+            removed,
+        } => {
+            render_list_of_maps_diff(lines, key, unchanged, modified, added, removed);
+        }
+        DetailRow::ReplaceMapDiff { key, entries } => {
+            lines.push(Line::from(Span::raw(format!("  {}:", key))));
+            render_map_diff_entries(lines, entries);
+        }
+        DetailRow::TemporaryNameNote {
+            can_rename,
+            temporary_value,
+            original_value,
+            attribute,
+        } => {
+            if *can_rename {
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "  # New resource created with {attribute} = \"{temporary_value}\", \
+                         then renamed to \"{original_value}\" after old resource is deleted"
+                    ),
+                    dim_style,
+                )));
+            } else {
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "  # {attribute} = \"{temporary_value}\" (temporary); \
+                         original \"{original_value}\" reused after old resource deleted"
+                    ),
+                    dim_style,
+                )));
+            }
+        }
+        DetailRow::CascadingUpdates { count, updates } => {
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "  # Cascading updates ({} dependent {}):",
+                    count,
+                    if *count == 1 { "resource" } else { "resources" }
+                ),
+                dim_style,
+            )));
+            for update in updates {
+                lines.push(Line::from(Span::styled(
+                    format!("  #   ~ {} {}", update.display_type, update.name),
+                    dim_style,
+                )));
+                for attr in &update.changed_attrs {
+                    lines.push(Line::from(vec![
+                        Span::styled("  #       ", dim_style),
+                        Span::styled(format!("{}: ", attr.key), dim_style),
+                        Span::styled(
+                            attr.old.clone(),
+                            Style::default()
+                                .fg(Color::Red)
+                                .add_modifier(Modifier::CROSSED_OUT),
+                        ),
+                        Span::raw(" -> "),
+                        Span::styled(attr.new.clone(), Style::default().fg(Color::Yellow)),
+                    ]));
+                }
+            }
+        }
+    }
+}
+
+/// Render map diff entries into TUI lines.
+fn render_map_diff_entries(lines: &mut Vec<Line>, entries: &[MapDiffEntryIR]) {
+    for entry in entries {
+        match entry {
+            MapDiffEntryIR::Changed { key, old, new } => {
                 lines.push(Line::from(vec![
                     Span::raw("    "),
                     Span::styled("~ ", Style::default().fg(Color::Yellow)),
-                    Span::raw(format!("{}: ", e.key)),
+                    Span::raw(format!("{}: ", key)),
                     Span::styled(
-                        format_value(&e.old_value),
+                        old.clone(),
                         Style::default()
                             .fg(Color::Red)
                             .add_modifier(Modifier::CROSSED_OUT),
                     ),
                     Span::raw(" -> "),
-                    Span::styled(
-                        format_value(&e.new_value),
-                        Style::default().fg(Color::Green),
-                    ),
+                    Span::styled(new.clone(), Style::default().fg(Color::Green)),
                 ]));
             }
-            MapDiffItem::Added(e) => {
+            MapDiffEntryIR::Added { key, value } => {
                 lines.push(Line::from(vec![
                     Span::raw("    "),
                     Span::styled("+ ", Style::default().fg(Color::Green)),
-                    Span::raw(format!("{}: ", e.key)),
-                    Span::styled(format_value(&e.value), Style::default().fg(Color::Green)),
+                    Span::raw(format!("{}: ", key)),
+                    Span::styled(value.clone(), Style::default().fg(Color::Green)),
                 ]));
             }
-            MapDiffItem::Removed(e) => {
+            MapDiffEntryIR::Removed { key, value } => {
                 lines.push(Line::from(vec![
                     Span::raw("    "),
                     Span::styled(
@@ -303,13 +406,13 @@ fn render_map_key_diff(
                             .add_modifier(Modifier::CROSSED_OUT),
                     ),
                     Span::styled(
-                        format!("{}: ", e.key),
+                        format!("{}: ", key),
                         Style::default()
                             .fg(Color::Red)
                             .add_modifier(Modifier::CROSSED_OUT),
                     ),
                     Span::styled(
-                        format_value(&e.value),
+                        value.clone(),
                         Style::default()
                             .fg(Color::Red)
                             .add_modifier(Modifier::CROSSED_OUT),
@@ -318,6 +421,65 @@ fn render_map_key_diff(
             }
         }
     }
+}
+
+/// Render list-of-maps diff into TUI lines.
+fn render_list_of_maps_diff(
+    lines: &mut Vec<Line>,
+    key: &str,
+    unchanged: &[String],
+    modified: &[ListOfMapsDiffModified],
+    added: &[String],
+    removed: &[String],
+) {
+    lines.push(Line::from(Span::raw(format!("  {}: [", key))));
+    for item in unchanged {
+        lines.push(Line::from(Span::styled(
+            format!("    {}", item),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    for m in modified {
+        let mut spans = vec![Span::raw("    {")];
+        for (i, field) in m.fields.iter().enumerate() {
+            if i > 0 {
+                spans.push(Span::raw(", "));
+            }
+            match field {
+                ListOfMapsDiffField::Unchanged { key, value } => {
+                    spans.push(Span::raw(format!("{}: {}", key, value)));
+                }
+                ListOfMapsDiffField::Changed { key, old, new } => {
+                    spans.push(Span::raw(format!("{}: ", key)));
+                    spans.push(Span::styled(
+                        old.clone(),
+                        Style::default()
+                            .fg(Color::Red)
+                            .add_modifier(Modifier::CROSSED_OUT),
+                    ));
+                    spans.push(Span::raw(" -> "));
+                    spans.push(Span::styled(new.clone(), Style::default().fg(Color::Green)));
+                }
+            }
+        }
+        spans.push(Span::raw("}"));
+        lines.push(Line::from(spans));
+    }
+    for item in added {
+        lines.push(Line::from(Span::styled(
+            format!("    {}", item),
+            Style::default().fg(Color::Green),
+        )));
+    }
+    for item in removed {
+        lines.push(Line::from(Span::styled(
+            format!("    {}", item),
+            Style::default()
+                .fg(Color::Red)
+                .add_modifier(Modifier::CROSSED_OUT),
+        )));
+    }
+    lines.push(Line::from(Span::raw("  ]")));
 }
 
 /// Draw the search input bar at the bottom of the screen
