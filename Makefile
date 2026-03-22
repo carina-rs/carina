@@ -14,7 +14,7 @@ plan-delete:
 	cd $(FIXTURES)/delete_orphan && $(CARINA) plan --refresh=false main.crn
 
 plan-compact:
-	cd $(FIXTURES)/compact && $(CARINA) plan --refresh=false --compact main.crn
+	cd $(FIXTURES)/compact && $(CARINA) plan --refresh=false --detail none main.crn
 
 plan-map-diff:
 	cd $(FIXTURES)/map_key_diff && $(CARINA) plan --refresh=false main.crn
@@ -36,6 +36,9 @@ plan-read-only-attrs:
 
 plan-default-values:
 	cd $(FIXTURES)/default_values && $(CARINA) plan --refresh=false main.crn
+
+plan-explicit:
+	cd $(FIXTURES)/explicit && $(CARINA) plan --refresh=false --detail explicit main.crn
 
 plan-map-diff-tui:
 	cd $(FIXTURES)/map_key_diff && $(CARINA) plan --refresh=false --tui main.crn
@@ -85,8 +88,11 @@ plan-fixtures:
 	@echo ""
 	@echo "=== default_values ==="
 	@$(MAKE) plan-default-values
+	@echo ""
+	@echo "=== explicit ==="
+	@$(MAKE) plan-explicit
 
 .PHONY: plan-all-create plan-no-changes plan-no-changes-enum plan-mixed plan-delete plan-compact \
         plan-map-diff plan-enum-display plan-destroy-full plan-destroy-orphans plan-read-only-attrs \
-        plan-default-values \
+        plan-default-values plan-explicit \
         plan-map-diff-tui plan-all-create-tui plan-mixed-tui plan-delete-tui plan-fixtures

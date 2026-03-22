@@ -5,7 +5,7 @@ mod wiring;
 
 use std::path::PathBuf;
 
-use clap::{CommandFactory, Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::{Shell, generate};
 use colored::Colorize;
 
@@ -17,6 +17,17 @@ use commands::module::{ModuleCommands, run_module_command};
 use commands::plan::run_plan;
 use commands::state::{StateCommands, run_force_unlock, run_state_command};
 use commands::validate::run_validate;
+
+/// Controls how much detail is shown in plan output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum DetailLevel {
+    /// Show all attributes: user-specified, defaults, read-only, and unchanged (dimmed)
+    Full,
+    /// Show only attributes explicitly specified in .crn file
+    Explicit,
+    /// Show resource names only (no attributes)
+    None,
+}
 
 #[derive(Parser)]
 #[command(name = "carina")]
@@ -48,9 +59,9 @@ enum Commands {
         #[arg(long = "detailed-exitcode")]
         detailed_exitcode: bool,
 
-        /// Show only resource tree structure without attribute details
-        #[arg(long)]
-        compact: bool,
+        /// Detail level for plan output: full (default), explicit, none
+        #[arg(long, value_enum, default_value = "full")]
+        detail: DetailLevel,
 
         /// Display plan in interactive TUI mode
         #[arg(long)]
@@ -154,12 +165,12 @@ async fn main() {
         path,
         out,
         detailed_exitcode,
-        compact,
+        detail,
         tui,
         refresh,
     } = cli.command
     {
-        match run_plan(&path, out.as_ref(), compact, tui, refresh).await {
+        match run_plan(&path, out.as_ref(), detail, tui, refresh).await {
             Ok(has_changes) => {
                 if detailed_exitcode && has_changes {
                     std::process::exit(2);

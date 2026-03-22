@@ -11,6 +11,8 @@ use carina_core::resource::{ResourceId, Value};
 use carina_core::schema::ResourceSchema;
 use carina_core::value::{format_value, format_value_with_key, is_list_of_maps, map_similarity};
 
+use crate::DetailLevel;
+
 /// Build a single-parent tree from the dependency graph.
 ///
 /// Each resource is assigned to exactly one parent (or is a root). When a
@@ -281,11 +283,11 @@ fn format_compact_name(
 
 pub fn print_plan(
     plan: &Plan,
-    compact: bool,
+    detail: DetailLevel,
     delete_attributes: &HashMap<ResourceId, HashMap<String, Value>>,
     schemas: Option<&HashMap<String, ResourceSchema>>,
 ) {
-    print!("{}", format_plan(plan, compact, delete_attributes, schemas));
+    print!("{}", format_plan(plan, detail, delete_attributes, schemas));
 }
 
 /// Format a plan as a string for display.
@@ -294,7 +296,7 @@ pub fn print_plan(
 /// enables snapshot testing and other programmatic uses of the plan output.
 pub fn format_plan(
     plan: &Plan,
-    compact: bool,
+    detail: DetailLevel,
     delete_attributes: &HashMap<ResourceId, HashMap<String, Value>>,
     schemas: Option<&HashMap<String, ResourceSchema>>,
 ) -> String {
@@ -318,7 +320,7 @@ pub fn format_plan(
     } else {
         Some(delete_attributes)
     };
-    out.push_str(&format_plan_tree(plan, compact, attrs, schemas));
+    out.push_str(&format_plan_tree(plan, detail, attrs, schemas));
 
     writeln!(out).unwrap();
     let summary = plan.summary();
@@ -350,7 +352,7 @@ pub fn format_plan(
 /// attributes, so the display can show what will be deleted.
 pub fn format_destroy_plan(
     plan: &Plan,
-    compact: bool,
+    detail: DetailLevel,
     delete_attributes: &HashMap<ResourceId, HashMap<String, Value>>,
 ) -> String {
     let mut out = String::new();
@@ -364,7 +366,7 @@ pub fn format_destroy_plan(
 
     out.push_str(&format_plan_tree(
         plan,
-        compact,
+        detail,
         Some(delete_attributes),
         None,
     ));
@@ -378,7 +380,7 @@ pub fn format_destroy_plan(
 /// effects, allowing the display to show what will be deleted.
 fn format_plan_tree(
     plan: &Plan,
-    compact: bool,
+    detail: DetailLevel,
     delete_attributes: Option<&HashMap<ResourceId, HashMap<String, Value>>>,
     schemas: Option<&HashMap<String, ResourceSchema>>,
 ) -> String {
@@ -455,7 +457,7 @@ fn format_plan_tree(
         indent: usize,
         is_last: bool,
         prefix: &str,
-        compact: bool,
+        detail: DetailLevel,
         parent_binding: Option<&str>,
         delete_attributes: Option<&HashMap<ResourceId, HashMap<String, Value>>>,
         schemas: Option<&HashMap<String, ResourceSchema>>,
@@ -498,7 +500,7 @@ fn format_plan_tree(
 
         match effect {
             Effect::Create(r) => {
-                if compact {
+                if detail == DetailLevel::None {
                     let name_part = format_compact_name(r, &r.id.name, parent_binding);
                     writeln!(
                         out,
@@ -557,7 +559,10 @@ fn format_plan_tree(
                             .unwrap();
                         }
                     }
-                    if let Some(schema_map) = schemas {
+                    // In Full mode, show defaults and read-only attributes
+                    if detail == DetailLevel::Full
+                        && let Some(schema_map) = schemas
+                    {
                         let schema_key = r.id.display_type();
                         if let Some(schema) = schema_map.get(&schema_key) {
                             let user_keys: HashSet<&str> =
@@ -616,7 +621,7 @@ fn format_plan_tree(
                 to,
                 changed_attributes,
             } => {
-                if compact {
+                if detail == DetailLevel::None {
                     let name_part = format_compact_name(to, &id.name, parent_binding);
                     writeln!(
                         out,
@@ -661,7 +666,9 @@ fn format_plan_tree(
                         let is_same = old_value
                             .map(|ov| ov.semantically_equal(new_value))
                             .unwrap_or(false);
-                        if !is_same {
+                        if is_same {
+                            // Skip unchanged attributes (they are counted below for Full mode)
+                        } else {
                             has_displayed_attrs = true;
                             if is_list_of_maps(new_value) {
                                 writeln!(out, "{}{}:", attr_prefix, key).unwrap();
@@ -717,33 +724,35 @@ fn format_plan_tree(
                             .unwrap();
                         }
                     }
-
-                    // Count unchanged attributes hidden from display
-                    let unchanged_count = from
-                        .attributes
-                        .iter()
-                        .filter(|(k, v)| {
-                            !k.starts_with('_')
-                                && to
-                                    .attributes
-                                    .get(k.as_str())
-                                    .map(|nv| nv.semantically_equal(v))
-                                    .unwrap_or(false)
-                        })
-                        .count();
-                    if unchanged_count > 0 {
-                        let noun = if unchanged_count == 1 {
-                            "attribute"
-                        } else {
-                            "attributes"
-                        };
-                        writeln!(
-                            out,
-                            "{}{}",
-                            attr_prefix,
-                            format!("# ({} unchanged {} hidden)", unchanged_count, noun).dimmed()
-                        )
-                        .unwrap();
+                    // In Full mode, show count of unchanged attributes hidden
+                    if detail == DetailLevel::Full {
+                        let unchanged_count = from
+                            .attributes
+                            .iter()
+                            .filter(|(k, v)| {
+                                !k.starts_with('_')
+                                    && to
+                                        .attributes
+                                        .get(k.as_str())
+                                        .map(|nv| nv.semantically_equal(v))
+                                        .unwrap_or(false)
+                            })
+                            .count();
+                        if unchanged_count > 0 {
+                            let noun = if unchanged_count == 1 {
+                                "attribute"
+                            } else {
+                                "attributes"
+                            };
+                            writeln!(
+                                out,
+                                "{}{}",
+                                attr_prefix,
+                                format!("# ({} unchanged {} hidden)", unchanged_count, noun)
+                                    .dimmed()
+                            )
+                            .unwrap();
+                        }
                     }
                 }
             }
@@ -762,7 +771,7 @@ fn format_plan_tree(
                 } else {
                     "(must be replaced)"
                 };
-                if compact {
+                if detail == DetailLevel::None {
                     let name_part = format_compact_name(to, &id.name, parent_binding);
                     writeln!(
                         out,
@@ -832,6 +841,39 @@ fn format_plan_tree(
                             .unwrap();
                         }
                     }
+                    // In Full mode, show count of unchanged attributes hidden
+                    if detail == DetailLevel::Full {
+                        let changed_set: HashSet<&str> =
+                            changed_create_only.iter().map(|s| s.as_str()).collect();
+                        let unchanged_count = from
+                            .attributes
+                            .iter()
+                            .filter(|(k, v)| {
+                                !k.starts_with('_')
+                                    && !changed_set.contains(k.as_str())
+                                    && to
+                                        .attributes
+                                        .get(k.as_str())
+                                        .map(|nv| nv.semantically_equal(v))
+                                        .unwrap_or(false)
+                            })
+                            .count();
+                        if unchanged_count > 0 {
+                            let noun = if unchanged_count == 1 {
+                                "attribute"
+                            } else {
+                                "attributes"
+                            };
+                            writeln!(
+                                out,
+                                "{}{}",
+                                attr_prefix,
+                                format!("# ({} unchanged {} hidden)", unchanged_count, noun)
+                                    .dimmed()
+                            )
+                            .unwrap();
+                        }
+                    }
                     if !cascading_updates.is_empty() {
                         has_displayed_attrs = true;
                         writeln!(
@@ -869,34 +911,6 @@ fn format_plan_tree(
                             }
                         }
                     }
-
-                    // Count unchanged attributes hidden from display
-                    let unchanged_count = from
-                        .attributes
-                        .iter()
-                        .filter(|(k, v)| {
-                            !k.starts_with('_')
-                                && to
-                                    .attributes
-                                    .get(k.as_str())
-                                    .map(|nv| nv.semantically_equal(v))
-                                    .unwrap_or(false)
-                        })
-                        .count();
-                    if unchanged_count > 0 {
-                        let noun = if unchanged_count == 1 {
-                            "attribute"
-                        } else {
-                            "attributes"
-                        };
-                        writeln!(
-                            out,
-                            "{}{}",
-                            attr_prefix,
-                            format!("# ({} unchanged {} hidden)", unchanged_count, noun).dimmed()
-                        )
-                        .unwrap();
-                    }
                 }
             }
             Effect::Delete { id, binding, .. } => {
@@ -911,7 +925,9 @@ fn format_plan_tree(
                     display_name.red().bold().strikethrough()
                 )
                 .unwrap();
-                if !compact && let Some(attrs) = delete_attributes.and_then(|da| da.get(id)) {
+                if detail != DetailLevel::None
+                    && let Some(attrs) = delete_attributes.and_then(|da| da.get(id))
+                {
                     let attr_prefix = if indent == 0 {
                         format!("{}{}", base_indent, attr_base)
                     } else {
@@ -943,7 +959,7 @@ fn format_plan_tree(
                 }
             }
             Effect::Read { resource } => {
-                if compact {
+                if detail == DetailLevel::None {
                     let name_part =
                         format_compact_name(resource, &resource.id.name, parent_binding);
                     writeln!(
@@ -1030,7 +1046,7 @@ fn format_plan_tree(
                 indent + 1,
                 child_is_last,
                 &new_prefix,
-                compact,
+                detail,
                 current_binding.as_deref(),
                 delete_attributes,
                 schemas,
@@ -1068,7 +1084,7 @@ fn format_plan_tree(
             0,
             i == roots.len() - 1,
             "",
-            compact,
+            detail,
             None,
             delete_attributes,
             schemas,
@@ -1090,7 +1106,7 @@ fn format_plan_tree(
             0,
             true,
             "",
-            compact,
+            detail,
             None,
             delete_attributes,
             schemas,
@@ -1590,7 +1606,7 @@ mod tests {
         plan.add(Effect::Create(b));
 
         // Should not panic
-        print_plan(&plan, false, &HashMap::new(), None);
+        print_plan(&plan, DetailLevel::Full, &HashMap::new(), None);
     }
 
     /// Test that print_plan handles the dependency graph correctly when
@@ -1604,7 +1620,7 @@ mod tests {
         plan.add(Effect::Create(b));
 
         // Should not panic
-        print_plan(&plan, false, &HashMap::new(), None);
+        print_plan(&plan, DetailLevel::Full, &HashMap::new(), None);
     }
 
     /// Helper: compute root indices using the same algorithm as print_plan.
@@ -2199,7 +2215,7 @@ mod tests {
         plan.add(Effect::Create(rt));
 
         // Should not panic
-        print_plan(&plan, true, &HashMap::new(), None);
+        print_plan(&plan, DetailLevel::None, &HashMap::new(), None);
     }
 
     /// Test compact mode skips attributes by checking that _binding attribute
@@ -2223,7 +2239,7 @@ mod tests {
         plan.add(Effect::Create(anon));
 
         // Should not panic; anonymous resources should show hints
-        print_plan(&plan, true, &HashMap::new(), None);
+        print_plan(&plan, DetailLevel::None, &HashMap::new(), None);
     }
 
     /// Test that extract_compact_hint extracts ResourceRef from inside a List value.
@@ -2351,7 +2367,7 @@ mod tests {
         plan.add(replace_effect);
 
         // Should not panic and should display attribute diffs for cascading updates
-        print_plan(&plan, false, &HashMap::new(), None);
+        print_plan(&plan, DetailLevel::Full, &HashMap::new(), None);
     }
 
     #[test]

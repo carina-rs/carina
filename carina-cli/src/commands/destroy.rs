@@ -22,6 +22,7 @@ use carina_state::{
 };
 
 use super::validate_and_resolve;
+use crate::DetailLevel;
 use crate::commands::apply::{SPINNER_FRAMES, apply_name_overrides, format_duration};
 use crate::commands::state::map_lock_error;
 use crate::display::{format_destroy_plan, format_effect};
@@ -278,7 +279,7 @@ async fn run_destroy_locked(
     // Display destroy plan as a dependency tree
     print!(
         "{}",
-        format_destroy_plan(&destroy_plan, false, &delete_attributes)
+        format_destroy_plan(&destroy_plan, DetailLevel::Full, &delete_attributes)
     );
 
     // Show protected resources
