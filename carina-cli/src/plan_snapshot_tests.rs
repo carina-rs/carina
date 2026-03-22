@@ -12,6 +12,7 @@ use carina_core::deps::sort_resources_by_dependencies;
 use carina_core::differ::{cascade_dependent_updates, create_plan};
 use carina_core::resolver::resolve_refs_with_state;
 use carina_core::resource::{ResourceId, State};
+use carina_core::schema::ResourceSchema;
 use carina_state::StateFile;
 
 use crate::commands::validate_and_resolve;
@@ -29,14 +30,20 @@ fn strip_ansi(s: &str) -> String {
 }
 
 /// Build a plan from a .crn fixture and optional state file, mimicking `--refresh=false`.
-fn build_plan_from_fixture(fixture_dir: &str) -> carina_core::plan::Plan {
-    let (plan, _) = build_plan_and_states_from_fixture(fixture_dir);
-    plan
+fn build_plan_from_fixture(
+    fixture_dir: &str,
+) -> (carina_core::plan::Plan, HashMap<String, ResourceSchema>) {
+    let (plan, _, schemas) = build_plan_and_states_from_fixture(fixture_dir);
+    (plan, schemas)
 }
 
 fn build_plan_and_states_from_fixture(
     fixture_dir: &str,
-) -> (carina_core::plan::Plan, HashMap<ResourceId, State>) {
+) -> (
+    carina_core::plan::Plan,
+    HashMap<ResourceId, State>,
+    HashMap<String, ResourceSchema>,
+) {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let crn_path = PathBuf::from(format!(
         "{}/tests/fixtures/plan_display/{}/main.crn",
@@ -145,34 +152,34 @@ fn build_plan_and_states_from_fixture(
         wiring.schemas(),
     );
 
-    (plan, current_states)
+    (plan, current_states, wiring.schemas().clone())
 }
 
 #[test]
 fn snapshot_all_create() {
-    let plan = build_plan_from_fixture("all_create");
-    let output = strip_ansi(&format_plan(&plan, false, &HashMap::new()));
+    let (plan, schemas) = build_plan_from_fixture("all_create");
+    let output = strip_ansi(&format_plan(&plan, false, &HashMap::new(), Some(&schemas)));
     insta::assert_snapshot!(output);
 }
 
 #[test]
 fn snapshot_no_changes() {
-    let plan = build_plan_from_fixture("no_changes");
-    let output = strip_ansi(&format_plan(&plan, false, &HashMap::new()));
+    let (plan, _schemas) = build_plan_from_fixture("no_changes");
+    let output = strip_ansi(&format_plan(&plan, false, &HashMap::new(), None));
     insta::assert_snapshot!(output);
 }
 
 #[test]
 fn snapshot_mixed_operations() {
-    let plan = build_plan_from_fixture("mixed_operations");
-    let output = strip_ansi(&format_plan(&plan, false, &HashMap::new()));
+    let (plan, schemas) = build_plan_from_fixture("mixed_operations");
+    let output = strip_ansi(&format_plan(&plan, false, &HashMap::new(), Some(&schemas)));
     insta::assert_snapshot!(output);
 }
 
 #[test]
 fn snapshot_delete_orphan() {
     use carina_core::resource::Value;
-    let (plan, current_states) = build_plan_and_states_from_fixture("delete_orphan");
+    let (plan, current_states, schemas) = build_plan_and_states_from_fixture("delete_orphan");
     let delete_attributes: HashMap<ResourceId, HashMap<String, Value>> = plan
         .effects()
         .iter()
@@ -186,42 +193,47 @@ fn snapshot_delete_orphan() {
             }
         })
         .collect();
-    let output = strip_ansi(&format_plan(&plan, false, &delete_attributes));
+    let output = strip_ansi(&format_plan(
+        &plan,
+        false,
+        &delete_attributes,
+        Some(&schemas),
+    ));
     insta::assert_snapshot!(output);
 }
 
 #[test]
 fn snapshot_compact() {
-    let plan = build_plan_from_fixture("compact");
-    let output = strip_ansi(&format_plan(&plan, true, &HashMap::new()));
+    let (plan, _schemas) = build_plan_from_fixture("compact");
+    let output = strip_ansi(&format_plan(&plan, true, &HashMap::new(), None));
     insta::assert_snapshot!(output);
 }
 
 #[test]
 fn snapshot_map_key_diff() {
-    let plan = build_plan_from_fixture("map_key_diff");
-    let output = strip_ansi(&format_plan(&plan, false, &HashMap::new()));
+    let (plan, schemas) = build_plan_from_fixture("map_key_diff");
+    let output = strip_ansi(&format_plan(&plan, false, &HashMap::new(), Some(&schemas)));
     insta::assert_snapshot!(output);
 }
 
 #[test]
 fn snapshot_enum_display() {
-    let plan = build_plan_from_fixture("enum_display");
-    let output = strip_ansi(&format_plan(&plan, false, &HashMap::new()));
+    let (plan, schemas) = build_plan_from_fixture("enum_display");
+    let output = strip_ansi(&format_plan(&plan, false, &HashMap::new(), Some(&schemas)));
     insta::assert_snapshot!(output);
 }
 
 #[test]
 fn snapshot_no_changes_enum() {
-    let plan = build_plan_from_fixture("no_changes_enum");
-    let output = strip_ansi(&format_plan(&plan, false, &HashMap::new()));
+    let (plan, _schemas) = build_plan_from_fixture("no_changes_enum");
+    let output = strip_ansi(&format_plan(&plan, false, &HashMap::new(), None));
     insta::assert_snapshot!(output);
 }
 
 #[test]
 fn snapshot_destroy_full() {
     use carina_core::resource::Value;
-    let (plan, current_states) = build_plan_and_states_from_fixture("destroy_full");
+    let (plan, current_states, _schemas) = build_plan_and_states_from_fixture("destroy_full");
     let delete_attributes: HashMap<ResourceId, HashMap<String, Value>> = current_states
         .into_iter()
         .filter(|(_, state)| state.exists)
@@ -234,13 +246,20 @@ fn snapshot_destroy_full() {
 #[test]
 fn snapshot_destroy_orphans() {
     use carina_core::resource::Value;
-    let (plan, current_states) = build_plan_and_states_from_fixture("destroy_orphans");
+    let (plan, current_states, _schemas) = build_plan_and_states_from_fixture("destroy_orphans");
     let delete_attributes: HashMap<ResourceId, HashMap<String, Value>> = current_states
         .into_iter()
         .filter(|(_, state)| state.exists)
         .map(|(id, state)| (id, state.attributes))
         .collect();
     let output = strip_ansi(&format_destroy_plan(&plan, false, &delete_attributes));
+    insta::assert_snapshot!(output);
+}
+
+#[test]
+fn snapshot_read_only_attrs() {
+    let (plan, schemas) = build_plan_from_fixture("read_only_attrs");
+    let output = strip_ansi(&format_plan(&plan, false, &HashMap::new(), Some(&schemas)));
     insta::assert_snapshot!(output);
 }
 

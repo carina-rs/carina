@@ -8,6 +8,7 @@ use carina_core::deps::get_resource_dependencies;
 use carina_core::effect::{CascadingUpdate, Effect};
 use carina_core::plan::Plan;
 use carina_core::resource::{ResourceId, Value};
+use carina_core::schema::ResourceSchema;
 use carina_core::value::{format_value, format_value_with_key, is_list_of_maps, map_similarity};
 
 /// Build a single-parent tree from the dependency graph.
@@ -282,8 +283,9 @@ pub fn print_plan(
     plan: &Plan,
     compact: bool,
     delete_attributes: &HashMap<ResourceId, HashMap<String, Value>>,
+    schemas: Option<&HashMap<String, ResourceSchema>>,
 ) {
-    print!("{}", format_plan(plan, compact, delete_attributes));
+    print!("{}", format_plan(plan, compact, delete_attributes, schemas));
 }
 
 /// Format a plan as a string for display.
@@ -294,6 +296,7 @@ pub fn format_plan(
     plan: &Plan,
     compact: bool,
     delete_attributes: &HashMap<ResourceId, HashMap<String, Value>>,
+    schemas: Option<&HashMap<String, ResourceSchema>>,
 ) -> String {
     let mut out = String::new();
 
@@ -315,7 +318,7 @@ pub fn format_plan(
     } else {
         Some(delete_attributes)
     };
-    out.push_str(&format_plan_tree(plan, compact, attrs));
+    out.push_str(&format_plan_tree(plan, compact, attrs, schemas));
 
     writeln!(out).unwrap();
     let summary = plan.summary();
@@ -359,7 +362,12 @@ pub fn format_destroy_plan(
     writeln!(out, "{}", "Destroy Plan:".red().bold()).unwrap();
     writeln!(out).unwrap();
 
-    out.push_str(&format_plan_tree(plan, compact, Some(delete_attributes)));
+    out.push_str(&format_plan_tree(
+        plan,
+        compact,
+        Some(delete_attributes),
+        None,
+    ));
 
     out
 }
@@ -372,6 +380,7 @@ fn format_plan_tree(
     plan: &Plan,
     compact: bool,
     delete_attributes: Option<&HashMap<ResourceId, HashMap<String, Value>>>,
+    schemas: Option<&HashMap<String, ResourceSchema>>,
 ) -> String {
     let mut out = String::new();
 
@@ -449,6 +458,7 @@ fn format_plan_tree(
         compact: bool,
         parent_binding: Option<&str>,
         delete_attributes: Option<&HashMap<ResourceId, HashMap<String, Value>>>,
+        schemas: Option<&HashMap<String, ResourceSchema>>,
     ) -> bool {
         if printed.contains(&idx) {
             return false;
@@ -531,8 +541,8 @@ fn format_plan_tree(
                     if !keys.is_empty() {
                         has_displayed_attrs = true;
                     }
-                    for key in keys {
-                        let value = &r.attributes[key];
+                    for key in &keys {
+                        let value = &r.attributes[*key];
                         if is_list_of_maps(value) {
                             writeln!(out, "{}{}:", attr_prefix, key).unwrap();
                             writeln!(out, "{}", format_list_of_maps(value, &attr_prefix)).unwrap();
@@ -545,6 +555,33 @@ fn format_plan_tree(
                                 format_value_with_key(value, Some(key)).green()
                             )
                             .unwrap();
+                        }
+                    }
+                    // Show read-only attributes with (known after apply) placeholder
+                    if let Some(schema_map) = schemas {
+                        let schema_key = r.id.display_type();
+                        if let Some(schema) = schema_map.get(&schema_key) {
+                            let user_keys: HashSet<&str> =
+                                keys.iter().map(|k| k.as_str()).collect();
+                            let mut ro_attrs: Vec<&str> = schema
+                                .read_only_attributes()
+                                .into_iter()
+                                .filter(|a| !user_keys.contains(a))
+                                .collect();
+                            ro_attrs.sort();
+                            if !ro_attrs.is_empty() {
+                                has_displayed_attrs = true;
+                            }
+                            for attr in ro_attrs {
+                                writeln!(
+                                    out,
+                                    "{}{}: {}",
+                                    attr_prefix,
+                                    attr.dimmed(),
+                                    "(known after apply)".dimmed()
+                                )
+                                .unwrap();
+                            }
                         }
                     }
                 }
@@ -972,6 +1009,7 @@ fn format_plan_tree(
                 compact,
                 current_binding.as_deref(),
                 delete_attributes,
+                schemas,
             );
             // Add separator line between siblings when previous sibling displayed attributes
             if child_had_attrs && !child_is_last {
@@ -1009,6 +1047,7 @@ fn format_plan_tree(
             compact,
             None,
             delete_attributes,
+            schemas,
         );
     }
 
@@ -1030,6 +1069,7 @@ fn format_plan_tree(
             compact,
             None,
             delete_attributes,
+            schemas,
         );
     }
 
@@ -1526,7 +1566,7 @@ mod tests {
         plan.add(Effect::Create(b));
 
         // Should not panic
-        print_plan(&plan, false, &HashMap::new());
+        print_plan(&plan, false, &HashMap::new(), None);
     }
 
     /// Test that print_plan handles the dependency graph correctly when
@@ -1540,7 +1580,7 @@ mod tests {
         plan.add(Effect::Create(b));
 
         // Should not panic
-        print_plan(&plan, false, &HashMap::new());
+        print_plan(&plan, false, &HashMap::new(), None);
     }
 
     /// Helper: compute root indices using the same algorithm as print_plan.
@@ -2135,7 +2175,7 @@ mod tests {
         plan.add(Effect::Create(rt));
 
         // Should not panic
-        print_plan(&plan, true, &HashMap::new());
+        print_plan(&plan, true, &HashMap::new(), None);
     }
 
     /// Test compact mode skips attributes by checking that _binding attribute
@@ -2159,7 +2199,7 @@ mod tests {
         plan.add(Effect::Create(anon));
 
         // Should not panic; anonymous resources should show hints
-        print_plan(&plan, true, &HashMap::new());
+        print_plan(&plan, true, &HashMap::new(), None);
     }
 
     /// Test that extract_compact_hint extracts ResourceRef from inside a List value.
@@ -2287,7 +2327,7 @@ mod tests {
         plan.add(replace_effect);
 
         // Should not panic and should display attribute diffs for cascading updates
-        print_plan(&plan, false, &HashMap::new());
+        print_plan(&plan, false, &HashMap::new(), None);
     }
 
     #[test]
