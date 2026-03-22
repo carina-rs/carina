@@ -12,7 +12,7 @@ mod tui_snapshot_tests;
 use std::collections::HashMap;
 use std::io;
 
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::{ExecutableCommand, execute};
 use ratatui::prelude::*;
@@ -31,23 +31,11 @@ pub enum KeyAction {
     Continue,
 }
 
-/// Handle a key event and apply the corresponding action to the app.
+/// Handle a key code and apply the corresponding action to the app.
 ///
 /// Returns `KeyAction::Quit` if the application should exit,
 /// or `KeyAction::Continue` otherwise.
 pub fn handle_key(app: &mut App, code: KeyCode) -> KeyAction {
-    handle_key_with_modifiers(app, code, KeyModifiers::NONE)
-}
-
-/// Handle a key event with modifiers.
-///
-/// This is the main key handling function. `handle_key` delegates here
-/// with `KeyModifiers::NONE` for backward compatibility.
-pub fn handle_key_with_modifiers(
-    app: &mut App,
-    code: KeyCode,
-    modifiers: KeyModifiers,
-) -> KeyAction {
     // Search mode: capture input for the search query
     if app.search_active {
         match code {
@@ -102,12 +90,6 @@ pub fn handle_key_with_modifiers(
             KeyAction::Continue
         }
         KeyCode::Char('N') if !app.search_matches.is_empty() => {
-            app.prev_match();
-            KeyAction::Continue
-        }
-        KeyCode::Char('n')
-            if modifiers.contains(KeyModifiers::SHIFT) && !app.search_matches.is_empty() =>
-        {
             app.prev_match();
             KeyAction::Continue
         }
@@ -168,7 +150,7 @@ fn run_loop(
             if key.kind != KeyEventKind::Press {
                 continue;
             }
-            if handle_key_with_modifiers(app, key.code, key.modifiers) == KeyAction::Quit {
+            if handle_key(app, key.code) == KeyAction::Quit {
                 return Ok(());
             }
         }
