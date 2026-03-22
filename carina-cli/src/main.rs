@@ -87,6 +87,10 @@ enum Commands {
         /// Enable/disable state locking (default: true)
         #[arg(long, default_value = "true", action = clap::ArgAction::Set)]
         lock: bool,
+
+        /// Refresh state from provider before destroying (default: true)
+        #[arg(long, default_value = "true", action = clap::ArgAction::Set)]
+        refresh: bool,
     },
     /// Format .crn files
     Fmt {
@@ -187,7 +191,8 @@ async fn main() {
             path,
             auto_approve,
             lock,
-        } => run_destroy(&path, auto_approve, lock).await,
+            refresh,
+        } => run_destroy(&path, auto_approve, lock, refresh).await,
         Commands::Fmt {
             path,
             check,
