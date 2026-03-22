@@ -1,0 +1,7 @@
+# Destroy orphans: .crn is empty, state has VPC + subnet (subnet depends on VPC)
+# Both resources are orphans and should be destroyed in dependency order
+# (subnet first, then VPC)
+
+provider awscc {
+  region = awscc.Region.ap_northeast_1
+}

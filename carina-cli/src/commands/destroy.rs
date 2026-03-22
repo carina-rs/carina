@@ -42,13 +42,8 @@ pub async fn run_destroy(
     let base_dir = get_base_dir(path);
     validate_and_resolve(&mut parsed, base_dir, true)?;
 
-    // When refresh=true, exit early if no resources defined (orphans not supported
-    // in refresh mode). When refresh=false, skip this check because orphaned
-    // resources in the state file may still need to be shown/destroyed.
-    if refresh && parsed.resources.is_empty() {
-        println!("{}", "No resources defined in configuration.".yellow());
-        return Ok(());
-    }
+    // Don't exit early when resources are empty -- orphaned resources in the
+    // state file may still need to be destroyed.
 
     // Check for backend configuration - use local backend by default
     let backend_config = parsed.backend.as_ref();
@@ -169,6 +164,24 @@ async fn run_destroy_locked(
                 .map_err(AppError::Provider)?;
             current_states.insert(resource.id.clone(), state);
         }
+
+        // Include orphaned resources (in state but not in .crn).
+        // Refresh each orphan via provider.read() to verify it still exists.
+        if let Some(sf) = state_file.as_ref() {
+            let desired_ids: HashSet<ResourceId> =
+                destroy_order.iter().map(|r| r.id.clone()).collect();
+            for (id, state) in sf.build_orphan_states(&desired_ids) {
+                let refreshed = provider
+                    .read(&id, state.identifier.as_deref())
+                    .await
+                    .map_err(AppError::Provider)?;
+                if refreshed.exists {
+                    current_states.insert(id.clone(), refreshed);
+                    let orphan_resource = build_orphan_resource(sf, &id);
+                    destroy_order.push(orphan_resource);
+                }
+            }
+        }
     } else if let Some(sf) = state_file.as_ref() {
         // --refresh=false: build states from state file without AWS calls
         for resource in &destroy_order {
@@ -183,41 +196,18 @@ async fn run_destroy_locked(
         let desired_ids: HashSet<ResourceId> = destroy_order.iter().map(|r| r.id.clone()).collect();
         for (id, state) in sf.build_orphan_states(&desired_ids) {
             current_states.insert(id.clone(), state);
-            // Build a minimal Resource for the orphan so it appears in destroy_order
-            let rs = sf
-                .find_resource(&id.provider, &id.resource_type, &id.name)
-                .expect("orphan must exist in state file");
-            let mut attributes: HashMap<String, Value> = rs
-                .attributes
-                .iter()
-                .filter_map(|(k, v)| {
-                    carina_core::value::json_to_dsl_value(v).map(|val| (k.clone(), val))
-                })
-                .collect();
-            if let Some(ref binding) = rs.binding {
-                attributes.insert("_binding".to_string(), Value::String(binding.clone()));
-            }
-            if !rs.dependency_bindings.is_empty() {
-                attributes.insert(
-                    "_dependency_bindings".to_string(),
-                    Value::List(
-                        rs.dependency_bindings
-                            .iter()
-                            .map(|b| Value::String(b.clone()))
-                            .collect(),
-                    ),
-                );
-            }
-            let orphan_resource = Resource {
-                id: id.clone(),
-                attributes,
-                read_only: false,
-                lifecycle: rs.lifecycle.clone(),
-                prefixes: rs.prefixes.clone(),
-            };
+            let orphan_resource = build_orphan_resource(sf, &id);
             destroy_order.push(orphan_resource);
         }
     }
+
+    // Re-sort destroy_order (including orphans) by dependencies to ensure
+    // dependents are deleted before their dependencies.
+    destroy_order = sort_resources_by_dependencies(&destroy_order)
+        .map_err(AppError::Config)?
+        .into_iter()
+        .rev()
+        .collect();
 
     // Collect resources that exist and will be destroyed
     // Skip the state bucket if it matches the backend bucket
@@ -645,6 +635,43 @@ async fn run_destroy_locked(
             "Destroy failed. {} succeeded, {} failed, {} skipped.",
             success_count, failure_count, skip_count
         )))
+    }
+}
+
+/// Build a minimal `Resource` for an orphaned resource from the state file.
+///
+/// This creates a Resource with attributes reconstructed from state data,
+/// including `_binding` and `_dependency_bindings` so that dependency ordering
+/// and tree display work correctly.
+fn build_orphan_resource(sf: &carina_state::StateFile, id: &ResourceId) -> Resource {
+    let rs = sf
+        .find_resource(&id.provider, &id.resource_type, &id.name)
+        .expect("orphan must exist in state file");
+    let mut attributes: HashMap<String, Value> = rs
+        .attributes
+        .iter()
+        .filter_map(|(k, v)| carina_core::value::json_to_dsl_value(v).map(|val| (k.clone(), val)))
+        .collect();
+    if let Some(ref binding) = rs.binding {
+        attributes.insert("_binding".to_string(), Value::String(binding.clone()));
+    }
+    if !rs.dependency_bindings.is_empty() {
+        attributes.insert(
+            "_dependency_bindings".to_string(),
+            Value::List(
+                rs.dependency_bindings
+                    .iter()
+                    .map(|b| Value::String(b.clone()))
+                    .collect(),
+            ),
+        );
+    }
+    Resource {
+        id: id.clone(),
+        attributes,
+        read_only: false,
+        lifecycle: rs.lifecycle.clone(),
+        prefixes: rs.prefixes.clone(),
     }
 }
 

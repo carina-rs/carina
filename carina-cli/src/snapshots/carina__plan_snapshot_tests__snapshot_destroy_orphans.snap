@@ -1,0 +1,19 @@
+---
+source: carina-cli/src/plan_snapshot_tests.rs
+expression: output
+---
+Destroy Plan:
+
+  - awscc.ec2.vpc ec2_vpc_fb75c929
+      cidr_block: "10.0.0.0/16"
+      enable_dns_hostnames: true
+      enable_dns_support: true
+      tags: {Name: "test-vpc"}
+      vpc_id: "vpc-0123456789abcdef0"
+        │
+        └─ - awscc.ec2.subnet ec2_subnet_f5269366
+              availability_zone: "ap-northeast-1a"
+              cidr_block: "10.0.1.0/24"
+              subnet_id: "subnet-0123456789abcdef0"
+              tags: {Name: "test-subnet"}
+              vpc_id: "vpc-0123456789abcdef0"

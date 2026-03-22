@@ -28,6 +28,9 @@ plan-no-changes-enum:
 plan-destroy-full:
 	cd $(FIXTURES)/destroy_full && $(CARINA) destroy --refresh=false --lock=false main.crn
 
+plan-destroy-orphans:
+	cd $(FIXTURES)/destroy_orphans && $(CARINA) destroy --refresh=false --lock=false main.crn
+
 plan-map-diff-tui:
 	cd $(FIXTURES)/map_key_diff && $(CARINA) plan --refresh=false --tui main.crn
 
@@ -67,7 +70,10 @@ plan-fixtures:
 	@echo ""
 	@echo "=== destroy_full ==="
 	@$(MAKE) plan-destroy-full
+	@echo ""
+	@echo "=== destroy_orphans ==="
+	@$(MAKE) plan-destroy-orphans
 
 .PHONY: plan-all-create plan-no-changes plan-no-changes-enum plan-mixed plan-delete plan-compact \
-        plan-map-diff plan-enum-display plan-destroy-full plan-map-diff-tui \
+        plan-map-diff plan-enum-display plan-destroy-full plan-destroy-orphans plan-map-diff-tui \
         plan-all-create-tui plan-mixed-tui plan-delete-tui plan-fixtures
