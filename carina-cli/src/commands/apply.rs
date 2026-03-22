@@ -51,6 +51,24 @@ pub(crate) fn format_duration(d: Duration) -> String {
 /// Braille spinner frames for animated progress display.
 pub(crate) const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
+/// Estimate the visible length of a string by stripping ANSI escape sequences.
+fn strip_ansi_len(s: &str) -> usize {
+    let mut len = 0;
+    let mut in_escape = false;
+    for c in s.chars() {
+        if in_escape {
+            if c.is_ascii_alphabetic() {
+                in_escape = false;
+            }
+        } else if c == '\x1b' {
+            in_escape = true;
+        } else {
+            len += 1;
+        }
+    }
+    len
+}
+
 /// CLI observer that prints colored progress output.
 ///
 /// When stdout is a TTY, it shows an animated spinner before each effect
@@ -126,7 +144,31 @@ impl ExecutionObserver for CliObserver {
     fn on_event(&mut self, event: &ExecutionEvent) {
         match event {
             ExecutionEvent::EffectStarted { effect } => {
+                self.stop_spinner();
                 self.start_spinner(format_effect(effect).to_string());
+            }
+            ExecutionEvent::WaitingForDependency {
+                effect,
+                dependencies,
+                progress,
+            } => {
+                self.stop_spinner();
+                let deps = dependencies.join(", ");
+                let counter = format_progress(progress).dimmed();
+                let line = format!(
+                    "  {} {} {} {}",
+                    "⊘".yellow(),
+                    format_effect(effect),
+                    format!("[waiting for: {}]", deps).dimmed(),
+                    counter
+                );
+                if self.is_tty {
+                    self.last_inflight_len = strip_ansi_len(&line);
+                    print!("\r{}", line);
+                    std::io::stdout().flush().ok();
+                } else {
+                    println!("{}", line);
+                }
             }
             ExecutionEvent::EffectSucceeded {
                 effect,
@@ -1308,5 +1350,16 @@ mod tests {
     fn format_duration_zero() {
         let d = Duration::from_secs(0);
         assert_eq!(format_duration(d), "0.0s");
+    }
+
+    #[test]
+    fn strip_ansi_len_plain_text() {
+        assert_eq!(strip_ansi_len("hello"), 5);
+    }
+
+    #[test]
+    fn strip_ansi_len_with_escapes() {
+        // "\x1b[36m" is cyan, "\x1b[0m" is reset
+        assert_eq!(strip_ansi_len("\x1b[36mhello\x1b[0m world"), 11);
     }
 }

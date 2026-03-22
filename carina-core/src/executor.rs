@@ -48,6 +48,12 @@ pub enum ExecutionEvent<'a> {
     EffectStarted {
         effect: &'a Effect,
     },
+    WaitingForDependency {
+        effect: &'a Effect,
+        /// Binding names of the dependencies this effect is waiting for.
+        dependencies: Vec<String>,
+        progress: ProgressInfo,
+    },
     EffectSucceeded {
         effect: &'a Effect,
         state: Option<&'a State>,
@@ -335,6 +341,20 @@ fn update_binding_map(
 // Effect execution: sequential path
 // ---------------------------------------------------------------------------
 
+/// Extract dependency binding names from an effect.
+///
+/// For Create/Update/Replace effects, dependencies are extracted from the resource.
+/// For Delete effects, they come from the stored `dependencies` field.
+fn get_effect_dependencies(effect: &Effect) -> HashSet<String> {
+    if let Some(resource) = effect.resource() {
+        crate::deps::get_resource_dependencies(resource)
+    } else if let Effect::Delete { dependencies, .. } = effect {
+        dependencies.clone()
+    } else {
+        HashSet::new()
+    }
+}
+
 /// Count the number of actionable effects (excluding Read).
 fn count_actionable_effects(effects: &[Effect]) -> usize {
     effects
@@ -376,6 +396,21 @@ async fn execute_effects_sequential(
                 failed_bindings.insert(binding);
             }
             continue;
+        }
+
+        // Emit waiting event for effects that have dependencies
+        let deps = get_effect_dependencies(effect);
+        if !deps.is_empty() {
+            let mut dep_list: Vec<String> = deps.into_iter().collect();
+            dep_list.sort();
+            observer.on_event(&ExecutionEvent::WaitingForDependency {
+                effect,
+                dependencies: dep_list,
+                progress: ProgressInfo {
+                    completed: completed + 1,
+                    total,
+                },
+            });
         }
 
         let started = Instant::now();
@@ -874,6 +909,18 @@ async fn execute_effects_phased(
             continue;
         }
 
+        // Emit waiting event for effects that have dependencies
+        let deps = get_effect_dependencies(effect);
+        if !deps.is_empty() {
+            let mut dep_list: Vec<String> = deps.into_iter().collect();
+            dep_list.sort();
+            observer.on_event(&ExecutionEvent::WaitingForDependency {
+                effect,
+                dependencies: dep_list,
+                progress: ProgressInfo { completed, total },
+            });
+        }
+
         let started = Instant::now();
         let progress = ProgressInfo { completed, total };
         observer.on_event(&ExecutionEvent::EffectStarted { effect });
@@ -1004,6 +1051,18 @@ async fn execute_effects_phased(
                     failed_bindings.insert(binding);
                 }
                 continue;
+            }
+
+            // Emit waiting event for replace effects that have dependencies
+            let deps = get_effect_dependencies(effect);
+            if !deps.is_empty() {
+                let mut dep_list: Vec<String> = deps.into_iter().collect();
+                dep_list.sort();
+                observer.on_event(&ExecutionEvent::WaitingForDependency {
+                    effect,
+                    dependencies: dep_list,
+                    progress,
+                });
             }
 
             let started = Instant::now();
@@ -1448,6 +1507,14 @@ mod tests {
                 ExecutionEvent::RefreshFailed { id, error } => {
                     format!("refresh_fail:{}:{}", id, error)
                 }
+                ExecutionEvent::WaitingForDependency {
+                    effect,
+                    dependencies,
+                    ..
+                } => {
+                    let id = effect.resource_id();
+                    format!("waiting:{}:{}", id, dependencies.join(","))
+                }
             };
             self.events.push(msg);
         }
@@ -1875,5 +1942,79 @@ mod tests {
         assert_eq!(result.success_count, 0);
         assert_eq!(result.failure_count, 0);
         assert!(provider.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_waiting_for_dependency_event_emitted() {
+        // When resource "b" depends on "a", a WaitingForDependency event
+        // should be emitted for "b" before it starts.
+        let provider = MockProvider::new();
+        let ra = make_resource("a", &[]);
+        let rb = make_resource("b", &["a"]);
+        let rid_a = ra.id.clone();
+        let rid_b = rb.id.clone();
+
+        let mut plan = Plan::new();
+        plan.add(Effect::Create(ra));
+        plan.add(Effect::Create(rb));
+
+        provider.push_create(Ok(ok_state(&rid_a)));
+        provider.push_create(Ok(ok_state(&rid_b)));
+
+        let input = ExecutionInput {
+            plan: &plan,
+            unresolved_resources: &HashMap::new(),
+            binding_map: HashMap::new(),
+            current_states: HashMap::new(),
+        };
+
+        let mut observer = MockObserver::default();
+        let result = execute_plan(&provider, input, &mut observer).await;
+
+        assert_eq!(result.success_count, 2);
+        // "b" should have a waiting event for dependency "a"
+        assert!(
+            observer.events.iter().any(|e| e == "waiting:test.b:a"),
+            "Expected waiting event for 'b' with dependency 'a', got: {:?}",
+            observer.events
+        );
+        // "a" should NOT have a waiting event (no dependencies)
+        assert!(
+            !observer
+                .events
+                .iter()
+                .any(|e| e.starts_with("waiting:test.a")),
+            "Resource 'a' should not have a waiting event, got: {:?}",
+            observer.events
+        );
+    }
+
+    #[tokio::test]
+    async fn test_no_waiting_event_for_independent_resources() {
+        // Independent resources (no dependencies) should not emit waiting events.
+        let provider = MockProvider::new();
+        let ra = make_resource("a", &[]);
+        let rid_a = ra.id.clone();
+
+        let mut plan = Plan::new();
+        plan.add(Effect::Create(ra));
+
+        provider.push_create(Ok(ok_state(&rid_a)));
+
+        let input = ExecutionInput {
+            plan: &plan,
+            unresolved_resources: &HashMap::new(),
+            binding_map: HashMap::new(),
+            current_states: HashMap::new(),
+        };
+
+        let mut observer = MockObserver::default();
+        let _result = execute_plan(&provider, input, &mut observer).await;
+
+        assert!(
+            !observer.events.iter().any(|e| e.contains("waiting:")),
+            "No waiting event should be emitted for independent resources, got: {:?}",
+            observer.events
+        );
     }
 }
