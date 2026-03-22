@@ -4,6 +4,7 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use carina_core::deps::get_resource_dependencies;
+use carina_core::diff_helpers::compute_unchanged_count;
 use carina_core::effect::Effect;
 use carina_core::plan::{Plan, PlanSummary};
 use carina_core::resource::Value;
@@ -818,19 +819,8 @@ fn populate_schema_attributes(
                 }
             }
             Effect::Update { from, to, .. } => {
-                let unchanged_count = from
-                    .attributes
-                    .iter()
-                    .filter(|(k, v)| {
-                        !k.starts_with('_')
-                            && to
-                                .attributes
-                                .get(k.as_str())
-                                .map(|nv| nv.semantically_equal(v))
-                                .unwrap_or(false)
-                    })
-                    .count();
-                nodes[idx].unchanged_count = unchanged_count;
+                nodes[idx].unchanged_count =
+                    compute_unchanged_count(&from.attributes, &to.attributes, None);
             }
             Effect::Replace {
                 from,
@@ -840,20 +830,8 @@ fn populate_schema_attributes(
             } => {
                 let changed_set: HashSet<&str> =
                     changed_create_only.iter().map(|s| s.as_str()).collect();
-                let unchanged_count = from
-                    .attributes
-                    .iter()
-                    .filter(|(k, v)| {
-                        !k.starts_with('_')
-                            && !changed_set.contains(k.as_str())
-                            && to
-                                .attributes
-                                .get(k.as_str())
-                                .map(|nv| nv.semantically_equal(v))
-                                .unwrap_or(false)
-                    })
-                    .count();
-                nodes[idx].unchanged_count = unchanged_count;
+                nodes[idx].unchanged_count =
+                    compute_unchanged_count(&from.attributes, &to.attributes, Some(&changed_set));
             }
             _ => {}
         }

@@ -5,6 +5,7 @@ use std::fmt::Write;
 use colored::Colorize;
 
 use carina_core::deps::get_resource_dependencies;
+use carina_core::diff_helpers::{compute_map_diff, compute_unchanged_count};
 use carina_core::effect::{CascadingUpdate, Effect};
 use carina_core::plan::Plan;
 use carina_core::resource::{ResourceId, Value};
@@ -715,18 +716,8 @@ fn format_plan_tree(
                     }
                     // In Full mode, show count of unchanged attributes hidden
                     if detail == DetailLevel::Full {
-                        let unchanged_count = from
-                            .attributes
-                            .iter()
-                            .filter(|(k, v)| {
-                                !k.starts_with('_')
-                                    && to
-                                        .attributes
-                                        .get(k.as_str())
-                                        .map(|nv| nv.semantically_equal(v))
-                                        .unwrap_or(false)
-                            })
-                            .count();
+                        let unchanged_count =
+                            compute_unchanged_count(&from.attributes, &to.attributes, None);
                         if unchanged_count > 0 {
                             let noun = if unchanged_count == 1 {
                                 "attribute"
@@ -834,19 +825,11 @@ fn format_plan_tree(
                     if detail == DetailLevel::Full {
                         let changed_set: HashSet<&str> =
                             changed_create_only.iter().map(|s| s.as_str()).collect();
-                        let unchanged_count = from
-                            .attributes
-                            .iter()
-                            .filter(|(k, v)| {
-                                !k.starts_with('_')
-                                    && !changed_set.contains(k.as_str())
-                                    && to
-                                        .attributes
-                                        .get(k.as_str())
-                                        .map(|nv| nv.semantically_equal(v))
-                                        .unwrap_or(false)
-                            })
-                            .count();
+                        let unchanged_count = compute_unchanged_count(
+                            &from.attributes,
+                            &to.attributes,
+                            Some(&changed_set),
+                        );
                         if unchanged_count > 0 {
                             let noun = if unchanged_count == 1 {
                                 "attribute"
@@ -1187,68 +1170,60 @@ pub fn format_map_diff(old_value: Option<&Value>, new_value: &Value, attr_prefix
         Some(Value::Map(m)) => m,
         _ => {
             // No old map; treat all new keys as added
-            let mut keys: Vec<_> = new_map.keys().collect();
-            keys.sort();
+            let empty = HashMap::new();
+            let diff = compute_map_diff(&empty, new_map);
             let mut lines = Vec::new();
-            for key in keys {
+            for entry in &diff.added {
                 lines.push(format!(
                     "{}  {} {}: {}",
                     attr_prefix,
                     "+".green(),
-                    key,
-                    format_value_with_key(&new_map[key], Some(key)).green()
+                    entry.key,
+                    format_value_with_key(&entry.value, Some(&entry.key)).green()
                 ));
             }
             return lines.join("\n");
         }
     };
 
+    let diff = compute_map_diff(old_map, new_map);
     let mut lines = Vec::new();
 
-    // Collect all keys from both maps
-    let mut all_keys: Vec<&String> = old_map.keys().chain(new_map.keys()).collect();
-    all_keys.sort();
-    all_keys.dedup();
-
-    for key in all_keys {
-        let old_val = old_map.get(key);
-        let new_val = new_map.get(key);
-        match (old_val, new_val) {
-            (Some(ov), Some(nv)) => {
-                if !ov.semantically_equal(nv) {
-                    // Changed
-                    lines.push(format!(
-                        "{}  {} {}: {} → {}",
-                        attr_prefix,
-                        "~".yellow(),
-                        key,
-                        format_value_with_key(ov, Some(key)).red().strikethrough(),
-                        format_value_with_key(nv, Some(key)).green()
-                    ));
-                }
-                // Unchanged: skip
+    // Merge all entries into a single list sorted by key (preserving original ordering)
+    for entry in diff.iter_by_key() {
+        match entry {
+            carina_core::diff_helpers::MapDiffItem::Changed(e) => {
+                lines.push(format!(
+                    "{}  {} {}: {} → {}",
+                    attr_prefix,
+                    "~".yellow(),
+                    e.key,
+                    format_value_with_key(&e.old_value, Some(&e.key))
+                        .red()
+                        .strikethrough(),
+                    format_value_with_key(&e.new_value, Some(&e.key)).green()
+                ));
             }
-            (None, Some(nv)) => {
-                // Added
+            carina_core::diff_helpers::MapDiffItem::Added(e) => {
                 lines.push(format!(
                     "{}  {} {}: {}",
                     attr_prefix,
                     "+".green(),
-                    key,
-                    format_value_with_key(nv, Some(key)).green()
+                    e.key,
+                    format_value_with_key(&e.value, Some(&e.key)).green()
                 ));
             }
-            (Some(ov), None) => {
-                // Removed
+            carina_core::diff_helpers::MapDiffItem::Removed(e) => {
                 lines.push(format!(
                     "{}  {} {}: {}",
                     attr_prefix,
                     "-".red().strikethrough(),
-                    key,
-                    format_value_with_key(ov, Some(key)).red().strikethrough()
+                    e.key,
+                    format_value_with_key(&e.value, Some(&e.key))
+                        .red()
+                        .strikethrough()
                 ));
             }
-            (None, None) => {}
         }
     }
 
