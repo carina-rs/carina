@@ -7,6 +7,7 @@ Execution Plan:
   ~ awscc.ec2.vpc vpc
       tags:
         + Environment: "staging"
+      # (3 unchanged attributes hidden)
         │
         ├─ + awscc.ec2.security_group ec2_security_group_712c54ef
         │     group_description: "Test security group"
