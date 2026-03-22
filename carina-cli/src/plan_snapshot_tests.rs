@@ -15,6 +15,7 @@ use carina_core::resource::{ResourceId, State};
 use carina_core::schema::ResourceSchema;
 use carina_state::StateFile;
 
+use crate::DetailLevel;
 use crate::commands::validate_and_resolve;
 use crate::display::{format_destroy_plan, format_plan};
 use crate::wiring::{
@@ -160,8 +161,7 @@ fn snapshot_all_create() {
     let (plan, schemas) = build_plan_from_fixture("all_create");
     let output = strip_ansi(&format_plan(
         &plan,
-        false,
-        false,
+        DetailLevel::Full,
         &HashMap::new(),
         Some(&schemas),
     ));
@@ -171,7 +171,12 @@ fn snapshot_all_create() {
 #[test]
 fn snapshot_no_changes() {
     let (plan, _schemas) = build_plan_from_fixture("no_changes");
-    let output = strip_ansi(&format_plan(&plan, false, false, &HashMap::new(), None));
+    let output = strip_ansi(&format_plan(
+        &plan,
+        DetailLevel::Full,
+        &HashMap::new(),
+        None,
+    ));
     insta::assert_snapshot!(output);
 }
 
@@ -180,8 +185,7 @@ fn snapshot_mixed_operations() {
     let (plan, schemas) = build_plan_from_fixture("mixed_operations");
     let output = strip_ansi(&format_plan(
         &plan,
-        false,
-        false,
+        DetailLevel::Full,
         &HashMap::new(),
         Some(&schemas),
     ));
@@ -207,8 +211,7 @@ fn snapshot_delete_orphan() {
         .collect();
     let output = strip_ansi(&format_plan(
         &plan,
-        false,
-        false,
+        DetailLevel::Full,
         &delete_attributes,
         Some(&schemas),
     ));
@@ -218,7 +221,12 @@ fn snapshot_delete_orphan() {
 #[test]
 fn snapshot_compact() {
     let (plan, _schemas) = build_plan_from_fixture("compact");
-    let output = strip_ansi(&format_plan(&plan, true, false, &HashMap::new(), None));
+    let output = strip_ansi(&format_plan(
+        &plan,
+        DetailLevel::None,
+        &HashMap::new(),
+        None,
+    ));
     insta::assert_snapshot!(output);
 }
 
@@ -227,8 +235,7 @@ fn snapshot_map_key_diff() {
     let (plan, schemas) = build_plan_from_fixture("map_key_diff");
     let output = strip_ansi(&format_plan(
         &plan,
-        false,
-        false,
+        DetailLevel::Full,
         &HashMap::new(),
         Some(&schemas),
     ));
@@ -240,8 +247,7 @@ fn snapshot_enum_display() {
     let (plan, schemas) = build_plan_from_fixture("enum_display");
     let output = strip_ansi(&format_plan(
         &plan,
-        false,
-        false,
+        DetailLevel::Full,
         &HashMap::new(),
         Some(&schemas),
     ));
@@ -251,7 +257,12 @@ fn snapshot_enum_display() {
 #[test]
 fn snapshot_no_changes_enum() {
     let (plan, _schemas) = build_plan_from_fixture("no_changes_enum");
-    let output = strip_ansi(&format_plan(&plan, false, false, &HashMap::new(), None));
+    let output = strip_ansi(&format_plan(
+        &plan,
+        DetailLevel::Full,
+        &HashMap::new(),
+        None,
+    ));
     insta::assert_snapshot!(output);
 }
 
@@ -264,7 +275,11 @@ fn snapshot_destroy_full() {
         .filter(|(_, state)| state.exists)
         .map(|(id, state)| (id, state.attributes))
         .collect();
-    let output = strip_ansi(&format_destroy_plan(&plan, false, &delete_attributes));
+    let output = strip_ansi(&format_destroy_plan(
+        &plan,
+        DetailLevel::Full,
+        &delete_attributes,
+    ));
     insta::assert_snapshot!(output);
 }
 
@@ -277,7 +292,11 @@ fn snapshot_destroy_orphans() {
         .filter(|(_, state)| state.exists)
         .map(|(id, state)| (id, state.attributes))
         .collect();
-    let output = strip_ansi(&format_destroy_plan(&plan, false, &delete_attributes));
+    let output = strip_ansi(&format_destroy_plan(
+        &plan,
+        DetailLevel::Full,
+        &delete_attributes,
+    ));
     insta::assert_snapshot!(output);
 }
 
@@ -286,8 +305,7 @@ fn snapshot_default_values() {
     let (plan, schemas) = build_plan_from_fixture("default_values");
     let output = strip_ansi(&format_plan(
         &plan,
-        false,
-        false,
+        DetailLevel::Full,
         &HashMap::new(),
         Some(&schemas),
     ));
@@ -299,8 +317,7 @@ fn snapshot_read_only_attrs() {
     let (plan, schemas) = build_plan_from_fixture("read_only_attrs");
     let output = strip_ansi(&format_plan(
         &plan,
-        false,
-        false,
+        DetailLevel::Full,
         &HashMap::new(),
         Some(&schemas),
     ));
@@ -312,8 +329,19 @@ fn snapshot_verbose() {
     let (plan, schemas) = build_plan_from_fixture("verbose");
     let output = strip_ansi(&format_plan(
         &plan,
-        false,
-        true,
+        DetailLevel::Full,
+        &HashMap::new(),
+        Some(&schemas),
+    ));
+    insta::assert_snapshot!(output);
+}
+
+#[test]
+fn snapshot_explicit() {
+    let (plan, schemas) = build_plan_from_fixture("verbose");
+    let output = strip_ansi(&format_plan(
+        &plan,
+        DetailLevel::Explicit,
         &HashMap::new(),
         Some(&schemas),
     ));

@@ -14,7 +14,7 @@ plan-delete:
 	cd $(FIXTURES)/delete_orphan && $(CARINA) plan --refresh=false main.crn
 
 plan-compact:
-	cd $(FIXTURES)/compact && $(CARINA) plan --refresh=false --compact main.crn
+	cd $(FIXTURES)/compact && $(CARINA) plan --refresh=false --detail none main.crn
 
 plan-map-diff:
 	cd $(FIXTURES)/map_key_diff && $(CARINA) plan --refresh=false main.crn
@@ -38,7 +38,7 @@ plan-default-values:
 	cd $(FIXTURES)/default_values && $(CARINA) plan --refresh=false main.crn
 
 plan-verbose:
-	cd $(FIXTURES)/verbose && $(CARINA) plan --refresh=false --verbose main.crn
+	cd $(FIXTURES)/verbose && $(CARINA) plan --refresh=false main.crn
 
 plan-map-diff-tui:
 	cd $(FIXTURES)/map_key_diff && $(CARINA) plan --refresh=false --tui main.crn

@@ -16,6 +16,7 @@ use carina_state::{
 };
 
 use super::validate_and_resolve;
+use crate::DetailLevel;
 use crate::commands::apply::apply_name_overrides;
 use crate::display::print_plan;
 use crate::error::AppError;
@@ -61,8 +62,7 @@ pub struct CurrentStateEntry {
 pub async fn run_plan(
     path: &PathBuf,
     out: Option<&PathBuf>,
-    compact: bool,
-    verbose: bool,
+    detail: DetailLevel,
     tui: bool,
     refresh: bool,
 ) -> Result<bool, AppError> {
@@ -201,8 +201,7 @@ pub async fn run_plan(
     } else {
         print_plan(
             &ctx.plan,
-            compact,
-            verbose,
+            detail,
             &delete_attributes,
             Some(wiring.schemas()),
         );

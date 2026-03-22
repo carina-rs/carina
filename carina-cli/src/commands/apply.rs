@@ -27,6 +27,7 @@ use carina_state::{
 };
 
 use super::validate_and_resolve;
+use crate::DetailLevel;
 use crate::commands::plan::PlanFile;
 use crate::commands::state::map_lock_error;
 use crate::display::{format_effect, print_plan};
@@ -910,7 +911,12 @@ async fn run_apply_locked(
         })
         .collect();
 
-    print_plan(&plan, false, false, &delete_attributes, Some(ctx.schemas()));
+    print_plan(
+        &plan,
+        DetailLevel::Full,
+        &delete_attributes,
+        Some(ctx.schemas()),
+    );
 
     // Confirmation prompt
     if !auto_approve {
@@ -1183,7 +1189,7 @@ async fn run_apply_from_plan_locked(
         })
         .collect();
 
-    print_plan(plan, false, false, &delete_attributes, None);
+    print_plan(plan, DetailLevel::Full, &delete_attributes, None);
 
     // Confirmation prompt
     if !auto_approve {
