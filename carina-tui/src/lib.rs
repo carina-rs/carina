@@ -128,6 +128,11 @@ pub fn handle_key(app: &mut App, code: KeyCode) -> KeyAction {
             }
             KeyAction::Continue
         }
+        KeyCode::Enter if app.focused_panel == FocusedPanel::Tree => {
+            app.focused_panel = FocusedPanel::Detail;
+            app.detail_selected = 0;
+            KeyAction::Continue
+        }
         KeyCode::Enter if app.focused_panel == FocusedPanel::Detail => {
             if let Some(binding) = app.selected_detail_ref_binding() {
                 app.follow_ref(&binding);
