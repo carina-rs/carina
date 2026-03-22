@@ -1004,7 +1004,10 @@ pub fn format_effect(effect: &Effect) -> String {
                 format!("Replace {}", id)
             }
         }
-        Effect::Delete { id, .. } => format!("Delete {}", id),
+        Effect::Delete { id, binding, .. } => {
+            let display_name = binding.as_deref().unwrap_or(&id.name);
+            format!("Delete {}.{}", id.display_type(), display_name)
+        }
         Effect::Read { resource } => {
             format!("Read {}", resource.id)
         }
@@ -2691,6 +2694,33 @@ mod tests {
             vpc_children.contains(&1),
             "SG (idx 1) should be a child of VPC. VPC children: {:?}",
             vpc_children
+        );
+    }
+
+    #[test]
+    fn format_effect_delete_uses_binding_name() {
+        let effect = Effect::Delete {
+            id: ResourceId::with_provider("awscc", "ec2.vpc", "ec2_vpc_fb75c929"),
+            identifier: "vpc-12345".to_string(),
+            lifecycle: LifecycleConfig::default(),
+            binding: Some("my_vpc".to_string()),
+            dependencies: HashSet::new(),
+        };
+        assert_eq!(format_effect(&effect), "Delete awscc.ec2.vpc.my_vpc");
+    }
+
+    #[test]
+    fn format_effect_delete_falls_back_to_id_name() {
+        let effect = Effect::Delete {
+            id: ResourceId::with_provider("awscc", "ec2.vpc", "ec2_vpc_fb75c929"),
+            identifier: "vpc-12345".to_string(),
+            lifecycle: LifecycleConfig::default(),
+            binding: None,
+            dependencies: HashSet::new(),
+        };
+        assert_eq!(
+            format_effect(&effect),
+            "Delete awscc.ec2.vpc.ec2_vpc_fb75c929"
         );
     }
 }
