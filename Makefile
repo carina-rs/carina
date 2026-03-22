@@ -34,6 +34,9 @@ plan-destroy-orphans:
 plan-read-only-attrs:
 	cd $(FIXTURES)/read_only_attrs && $(CARINA) plan --refresh=false main.crn
 
+plan-default-values:
+	cd $(FIXTURES)/default_values && $(CARINA) plan --refresh=false main.crn
+
 plan-map-diff-tui:
 	cd $(FIXTURES)/map_key_diff && $(CARINA) plan --refresh=false --tui main.crn
 
@@ -79,7 +82,11 @@ plan-fixtures:
 	@echo ""
 	@echo "=== read_only_attrs ==="
 	@$(MAKE) plan-read-only-attrs
+	@echo ""
+	@echo "=== default_values ==="
+	@$(MAKE) plan-default-values
 
 .PHONY: plan-all-create plan-no-changes plan-no-changes-enum plan-mixed plan-delete plan-compact \
         plan-map-diff plan-enum-display plan-destroy-full plan-destroy-orphans plan-read-only-attrs \
+        plan-default-values \
         plan-map-diff-tui plan-all-create-tui plan-mixed-tui plan-delete-tui plan-fixtures
