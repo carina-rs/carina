@@ -5,11 +5,18 @@ use std::fmt::Write;
 use colored::Colorize;
 
 use carina_core::deps::get_resource_dependencies;
-use carina_core::diff_helpers::{compute_map_diff, compute_unchanged_count};
-use carina_core::effect::{CascadingUpdate, Effect};
+use carina_core::detail_rows::{
+    DetailRow, ListOfMapsDiffField, ListOfMapsDiffModified, MapDiffEntryIR, build_detail_rows,
+};
+#[cfg(test)]
+use carina_core::diff_helpers::compute_map_diff;
+#[cfg(test)]
+use carina_core::effect::CascadingUpdate;
+use carina_core::effect::Effect;
 use carina_core::plan::Plan;
 use carina_core::resource::{ResourceId, Value};
 use carina_core::schema::ResourceSchema;
+#[cfg(test)]
 use carina_core::value::{format_value, format_value_with_key, is_list_of_maps, map_similarity};
 
 use crate::DetailLevel;
@@ -499,6 +506,7 @@ fn format_plan_tree(
 
         let mut has_displayed_attrs = false;
 
+        // --- Resource header line ---
         match effect {
             Effect::Create(r) => {
                 if detail == DetailLevel::None {
@@ -524,93 +532,9 @@ fn format_plan_tree(
                         r.id.name.white().bold()
                     )
                     .unwrap();
-                    // Attribute prefix aligns with the resource content
-                    let attr_prefix = if indent == 0 {
-                        format!("{}{}", base_indent, attr_base)
-                    } else {
-                        let continuation = if is_last {
-                            format!("{}   ", prefix)
-                        } else {
-                            format!("{}│  ", prefix)
-                        };
-                        format!("{}{}   ", base_indent, continuation)
-                    };
-                    let mut keys: Vec<_> = r
-                        .attributes
-                        .keys()
-                        .filter(|k| !k.starts_with('_'))
-                        .collect();
-                    keys.sort();
-                    if !keys.is_empty() {
-                        has_displayed_attrs = true;
-                    }
-                    for key in &keys {
-                        let value = &r.attributes[*key];
-                        if is_list_of_maps(value) {
-                            writeln!(out, "{}{}:", attr_prefix, key).unwrap();
-                            writeln!(out, "{}", format_list_of_maps(value, &attr_prefix)).unwrap();
-                        } else {
-                            writeln!(
-                                out,
-                                "{}{}: {}",
-                                attr_prefix,
-                                key,
-                                format_value_with_key(value, Some(key)).green()
-                            )
-                            .unwrap();
-                        }
-                    }
-                    // In Full mode, show defaults and read-only attributes
-                    if detail == DetailLevel::Full
-                        && let Some(schema_map) = schemas
-                    {
-                        let schema_key = r.id.display_type();
-                        if let Some(schema) = schema_map.get(&schema_key) {
-                            let user_keys: HashSet<&str> =
-                                keys.iter().map(|k| k.as_str()).collect();
-
-                            // Show default-value attributes (not specified by user)
-                            let default_attrs = schema.compute_default_attrs(&user_keys);
-                            if !default_attrs.is_empty() {
-                                has_displayed_attrs = true;
-                            }
-                            for (attr, formatted) in &default_attrs {
-                                writeln!(
-                                    out,
-                                    "{}{}: {}  {}",
-                                    attr_prefix,
-                                    attr.dimmed(),
-                                    formatted.dimmed(),
-                                    "# default".dimmed()
-                                )
-                                .unwrap();
-                            }
-
-                            // Show read-only attributes with (known after apply) placeholder
-                            let ro_attrs = schema.compute_read_only_attrs(&user_keys);
-                            if !ro_attrs.is_empty() {
-                                has_displayed_attrs = true;
-                            }
-                            for attr in &ro_attrs {
-                                writeln!(
-                                    out,
-                                    "{}{}: {}",
-                                    attr_prefix,
-                                    attr.dimmed(),
-                                    "(known after apply)".dimmed()
-                                )
-                                .unwrap();
-                            }
-                        }
-                    }
                 }
             }
-            Effect::Update {
-                id,
-                from,
-                to,
-                changed_attributes,
-            } => {
+            Effect::Update { id, to, .. } => {
                 if detail == DetailLevel::None {
                     let name_part = format_compact_name(to, &id.name, parent_binding);
                     writeln!(
@@ -634,117 +558,10 @@ fn format_plan_tree(
                         id.name.yellow().bold()
                     )
                     .unwrap();
-                    let attr_prefix = if indent == 0 {
-                        format!("{}{}", base_indent, attr_base)
-                    } else {
-                        let continuation = if is_last {
-                            format!("{}   ", prefix)
-                        } else {
-                            format!("{}│  ", prefix)
-                        };
-                        format!("{}{}   ", base_indent, continuation)
-                    };
-                    let mut keys: Vec<_> = to
-                        .attributes
-                        .keys()
-                        .filter(|k| !k.starts_with('_'))
-                        .collect();
-                    keys.sort();
-                    for key in keys {
-                        let new_value = &to.attributes[key];
-                        let old_value = from.attributes.get(key);
-                        let is_same = old_value
-                            .map(|ov| ov.semantically_equal(new_value))
-                            .unwrap_or(false);
-                        if is_same {
-                            // Skip unchanged attributes (they are counted below for Full mode)
-                        } else {
-                            has_displayed_attrs = true;
-                            if is_list_of_maps(new_value) {
-                                writeln!(out, "{}{}:", attr_prefix, key).unwrap();
-                                writeln!(
-                                    out,
-                                    "{}",
-                                    format_list_diff(old_value, new_value, &attr_prefix)
-                                )
-                                .unwrap();
-                            } else if is_both_maps(old_value, new_value) {
-                                writeln!(out, "{}{}:", attr_prefix, key).unwrap();
-                                writeln!(
-                                    out,
-                                    "{}",
-                                    format_map_diff(old_value, new_value, &attr_prefix)
-                                )
-                                .unwrap();
-                            } else {
-                                let old_str = old_value
-                                    .map(|v| format_value_with_key(v, Some(key)))
-                                    .unwrap_or_else(|| "(none)".to_string());
-                                writeln!(
-                                    out,
-                                    "{}{}: {} → {}",
-                                    attr_prefix,
-                                    key,
-                                    old_str.red().strikethrough(),
-                                    format_value_with_key(new_value, Some(key)).green()
-                                )
-                                .unwrap();
-                            }
-                        }
-                    }
-                    // Show removed attributes (in changed_attributes but not in to)
-                    let mut removed_keys: Vec<_> = changed_attributes
-                        .iter()
-                        .filter(|k| !to.attributes.contains_key(k.as_str()))
-                        .collect();
-                    removed_keys.sort();
-                    for key in removed_keys {
-                        if let Some(old_value) = from.attributes.get(key.as_str()) {
-                            has_displayed_attrs = true;
-                            writeln!(
-                                out,
-                                "{}{}: {} → {}",
-                                attr_prefix,
-                                key,
-                                format_value_with_key(old_value, Some(key))
-                                    .red()
-                                    .strikethrough(),
-                                "(removed)".red().strikethrough()
-                            )
-                            .unwrap();
-                        }
-                    }
-                    // In Full mode, show count of unchanged attributes hidden
-                    if detail == DetailLevel::Full {
-                        let unchanged_count =
-                            compute_unchanged_count(&from.attributes, &to.attributes, None);
-                        if unchanged_count > 0 {
-                            let noun = if unchanged_count == 1 {
-                                "attribute"
-                            } else {
-                                "attributes"
-                            };
-                            writeln!(
-                                out,
-                                "{}{}",
-                                attr_prefix,
-                                format!("# ({} unchanged {} hidden)", unchanged_count, noun)
-                                    .dimmed()
-                            )
-                            .unwrap();
-                        }
-                    }
                 }
             }
             Effect::Replace {
-                id,
-                from,
-                to,
-                changed_create_only,
-                lifecycle,
-                cascading_updates,
-                temporary_name,
-                cascade_ref_hints,
+                id, to, lifecycle, ..
             } => {
                 let replace_note = if lifecycle.create_before_destroy {
                     "(must be replaced, create before destroy)"
@@ -776,113 +593,6 @@ fn format_plan_tree(
                         replace_note.magenta()
                     )
                     .unwrap();
-                    let attr_prefix = if indent == 0 {
-                        format!("{}{}", base_indent, attr_base)
-                    } else {
-                        let continuation = if is_last {
-                            format!("{}   ", prefix)
-                        } else {
-                            format!("{}│  ", prefix)
-                        };
-                        format!("{}{}   ", base_indent, continuation)
-                    };
-                    let replace_attrs_output = format_replace_changed_attrs(
-                        &from.attributes,
-                        &to.attributes,
-                        changed_create_only,
-                        &attr_prefix,
-                        cascade_ref_hints,
-                    );
-                    if !replace_attrs_output.is_empty() {
-                        has_displayed_attrs = true;
-                        write!(out, "{}", replace_attrs_output).unwrap();
-                    }
-                    if let Some(temp) = temporary_name {
-                        has_displayed_attrs = true;
-                        if temp.can_rename {
-                            writeln!(
-                                out,
-                                "{}  {} via temporary name \"{}\", will rename back to \"{}\" after old resource is deleted",
-                                attr_prefix,
-                                "note:".magenta().bold(),
-                                temp.temporary_value.magenta(),
-                                temp.original_value.green()
-                            )
-                            .unwrap();
-                        } else {
-                            writeln!(
-                                out,
-                                "{}  {} name will be \"{}\" (cannot rename create-only attribute \"{}\")",
-                                attr_prefix,
-                                "note:".magenta().bold(),
-                                temp.temporary_value.magenta(),
-                                temp.attribute.magenta()
-                            )
-                            .unwrap();
-                        }
-                    }
-                    // In Full mode, show count of unchanged attributes hidden
-                    if detail == DetailLevel::Full {
-                        let changed_set: HashSet<&str> =
-                            changed_create_only.iter().map(|s| s.as_str()).collect();
-                        let unchanged_count = compute_unchanged_count(
-                            &from.attributes,
-                            &to.attributes,
-                            Some(&changed_set),
-                        );
-                        if unchanged_count > 0 {
-                            let noun = if unchanged_count == 1 {
-                                "attribute"
-                            } else {
-                                "attributes"
-                            };
-                            writeln!(
-                                out,
-                                "{}{}",
-                                attr_prefix,
-                                format!("# ({} unchanged {} hidden)", unchanged_count, noun)
-                                    .dimmed()
-                            )
-                            .unwrap();
-                        }
-                    }
-                    if !cascading_updates.is_empty() {
-                        has_displayed_attrs = true;
-                        writeln!(
-                            out,
-                            "{}  {} cascading update(s):",
-                            attr_prefix,
-                            cascading_updates.len()
-                        )
-                        .unwrap();
-                        let replaced_binding = to
-                            .attributes
-                            .get("_binding")
-                            .and_then(|v| match v {
-                                Value::String(s) => Some(s.as_str()),
-                                _ => None,
-                            })
-                            .unwrap_or("");
-                        for cascade in cascading_updates {
-                            writeln!(
-                                out,
-                                "{}    ~ {} {}",
-                                attr_prefix,
-                                cascade.id.display_type().cyan(),
-                                cascade.id.name.magenta()
-                            )
-                            .unwrap();
-                            let cascade_prefix = format!("{}    ", attr_prefix);
-                            let diff = format_cascading_update_diff(
-                                cascade,
-                                &cascade_prefix,
-                                replaced_binding,
-                            );
-                            if !diff.is_empty() {
-                                writeln!(out, "{}", diff).unwrap();
-                            }
-                        }
-                    }
                 }
             }
             Effect::Delete { id, binding, .. } => {
@@ -897,38 +607,6 @@ fn format_plan_tree(
                     display_name.red().bold().strikethrough()
                 )
                 .unwrap();
-                if detail != DetailLevel::None
-                    && let Some(attrs) = delete_attributes.and_then(|da| da.get(id))
-                {
-                    let attr_prefix = if indent == 0 {
-                        format!("{}{}", base_indent, attr_base)
-                    } else {
-                        let continuation = if is_last {
-                            format!("{}   ", prefix)
-                        } else {
-                            format!("{}│  ", prefix)
-                        };
-                        format!("{}{}   ", base_indent, continuation)
-                    };
-                    let mut keys: Vec<_> = attrs.keys().filter(|k| !k.starts_with('_')).collect();
-                    keys.sort();
-                    if !keys.is_empty() {
-                        has_displayed_attrs = true;
-                    }
-                    for key in keys {
-                        let value = &attrs[key];
-                        writeln!(
-                            out,
-                            "{}{}: {}",
-                            attr_prefix,
-                            key,
-                            format_value_with_key(value, Some(key))
-                                .red()
-                                .strikethrough()
-                        )
-                        .unwrap();
-                    }
-                }
             }
             Effect::Read { resource } => {
                 if detail == DetailLevel::None {
@@ -958,6 +636,31 @@ fn format_plan_tree(
                     )
                     .unwrap();
                 }
+            }
+        }
+
+        // --- Detail rows (attributes) ---
+        if detail != DetailLevel::None {
+            let attr_prefix = if indent == 0 {
+                format!("{}{}", base_indent, attr_base)
+            } else {
+                let continuation = if is_last {
+                    format!("{}   ", prefix)
+                } else {
+                    format!("{}│  ", prefix)
+                };
+                format!("{}{}   ", base_indent, continuation)
+            };
+
+            let detail_rows =
+                build_detail_rows(effect, schemas, detail.to_core(), delete_attributes);
+
+            if !detail_rows.is_empty() {
+                has_displayed_attrs = true;
+            }
+
+            for row in &detail_rows {
+                render_detail_row(out, row, effect, &attr_prefix);
             }
         }
 
@@ -1088,6 +791,298 @@ fn format_plan_tree(
     out
 }
 
+/// Render a single `DetailRow` into the output string with ANSI colors.
+fn render_detail_row(out: &mut String, row: &DetailRow, effect: &Effect, attr_prefix: &str) {
+    match row {
+        DetailRow::Attribute { key, value } => {
+            let colored_value = match effect {
+                Effect::Create(_) => value.green().to_string(),
+                Effect::Delete { .. } => value.red().strikethrough().to_string(),
+                _ => value.to_string(),
+            };
+            writeln!(out, "{}{}: {}", attr_prefix, key, colored_value).unwrap();
+        }
+        DetailRow::ListOfMaps { key, items } => {
+            writeln!(out, "{}{}:", attr_prefix, key).unwrap();
+            for item in items {
+                writeln!(
+                    out,
+                    "{}  {} {{{}}}",
+                    attr_prefix,
+                    "+".green().bold(),
+                    item.fields
+                )
+                .unwrap();
+            }
+        }
+        DetailRow::Changed { key, old, new } => {
+            writeln!(
+                out,
+                "{}{}: {} → {}",
+                attr_prefix,
+                key,
+                old.red().strikethrough(),
+                new.green()
+            )
+            .unwrap();
+        }
+        DetailRow::MapDiff { key, entries } => {
+            writeln!(out, "{}{}:", attr_prefix, key).unwrap();
+            render_map_diff_entries(out, entries, attr_prefix);
+        }
+        DetailRow::ListOfMapsDiff {
+            key,
+            unchanged,
+            modified,
+            added,
+            removed,
+        } => {
+            writeln!(out, "{}{}:", attr_prefix, key).unwrap();
+            render_list_of_maps_diff(out, unchanged, modified, added, removed, attr_prefix);
+        }
+        DetailRow::Removed { key, old } => {
+            writeln!(
+                out,
+                "{}{}: {} → {}",
+                attr_prefix,
+                key,
+                old.red().strikethrough(),
+                "(removed)".red().strikethrough()
+            )
+            .unwrap();
+        }
+        DetailRow::Default { key, value } => {
+            writeln!(
+                out,
+                "{}{}: {}  {}",
+                attr_prefix,
+                key.dimmed(),
+                value.dimmed(),
+                "# default".dimmed()
+            )
+            .unwrap();
+        }
+        DetailRow::ReadOnly { key } => {
+            writeln!(
+                out,
+                "{}{}: {}",
+                attr_prefix,
+                key.dimmed(),
+                "(known after apply)".dimmed()
+            )
+            .unwrap();
+        }
+        DetailRow::HiddenUnchanged { count } => {
+            let noun = if *count == 1 {
+                "attribute"
+            } else {
+                "attributes"
+            };
+            writeln!(
+                out,
+                "{}{}",
+                attr_prefix,
+                format!("# ({} unchanged {} hidden)", count, noun).dimmed()
+            )
+            .unwrap();
+        }
+        DetailRow::ReplaceChanged { key, old, new } => {
+            writeln!(
+                out,
+                "{}{}: {} → {} {}",
+                attr_prefix,
+                key,
+                old.red().strikethrough(),
+                new.green(),
+                "(forces replacement)".magenta()
+            )
+            .unwrap();
+        }
+        DetailRow::ReplaceCascade { key, old, new } => {
+            writeln!(
+                out,
+                "{}{}: {} → {} {}",
+                attr_prefix,
+                key,
+                old.red().strikethrough(),
+                new.green(),
+                "(forces replacement, known after apply)".magenta()
+            )
+            .unwrap();
+        }
+        DetailRow::ReplaceListOfMapsDiff {
+            key,
+            unchanged,
+            modified,
+            added,
+            removed,
+        } => {
+            let suffix = format!(" {}", "(forces replacement)".magenta());
+            writeln!(out, "{}{}:{}", attr_prefix, key, suffix).unwrap();
+            render_list_of_maps_diff(out, unchanged, modified, added, removed, attr_prefix);
+        }
+        DetailRow::ReplaceMapDiff { key, entries } => {
+            let suffix = format!(" {}", "(forces replacement)".magenta());
+            writeln!(out, "{}{}:{}", attr_prefix, key, suffix).unwrap();
+            render_map_diff_entries(out, entries, attr_prefix);
+        }
+        DetailRow::TemporaryNameNote {
+            can_rename,
+            temporary_value,
+            original_value,
+            attribute,
+        } => {
+            if *can_rename {
+                writeln!(
+                    out,
+                    "{}  {} via temporary name \"{}\", will rename back to \"{}\" after old resource is deleted",
+                    attr_prefix,
+                    "note:".magenta().bold(),
+                    temporary_value.magenta(),
+                    original_value.green()
+                )
+                .unwrap();
+            } else {
+                writeln!(
+                    out,
+                    "{}  {} name will be \"{}\" (cannot rename create-only attribute \"{}\")",
+                    attr_prefix,
+                    "note:".magenta().bold(),
+                    temporary_value.magenta(),
+                    attribute.magenta()
+                )
+                .unwrap();
+            }
+        }
+        DetailRow::CascadingUpdates { count, updates } => {
+            writeln!(out, "{}  {} cascading update(s):", attr_prefix, count).unwrap();
+            for update in updates {
+                writeln!(
+                    out,
+                    "{}    ~ {} {}",
+                    attr_prefix,
+                    update.display_type.as_str().cyan(),
+                    update.name.as_str().magenta()
+                )
+                .unwrap();
+                for attr in &update.changed_attrs {
+                    writeln!(
+                        out,
+                        "{}        {}: {} → {} {}",
+                        attr_prefix,
+                        attr.key,
+                        attr.old.as_str().red().strikethrough(),
+                        attr.new.as_str().green(),
+                        "(known after apply)".dimmed()
+                    )
+                    .unwrap();
+                }
+            }
+        }
+    }
+}
+
+/// Render map diff entries with ANSI colors.
+fn render_map_diff_entries(out: &mut String, entries: &[MapDiffEntryIR], attr_prefix: &str) {
+    for entry in entries {
+        match entry {
+            MapDiffEntryIR::Changed { key, old, new } => {
+                writeln!(
+                    out,
+                    "{}  {} {}: {} → {}",
+                    attr_prefix,
+                    "~".yellow(),
+                    key,
+                    old.red().strikethrough(),
+                    new.green()
+                )
+                .unwrap();
+            }
+            MapDiffEntryIR::Added { key, value } => {
+                writeln!(
+                    out,
+                    "{}  {} {}: {}",
+                    attr_prefix,
+                    "+".green(),
+                    key,
+                    value.green()
+                )
+                .unwrap();
+            }
+            MapDiffEntryIR::Removed { key, value } => {
+                writeln!(
+                    out,
+                    "{}  {} {}: {}",
+                    attr_prefix,
+                    "-".red().strikethrough(),
+                    key,
+                    value.red().strikethrough()
+                )
+                .unwrap();
+            }
+        }
+    }
+}
+
+/// Render a list-of-maps diff with ANSI colors.
+fn render_list_of_maps_diff(
+    out: &mut String,
+    unchanged: &[String],
+    modified: &[ListOfMapsDiffModified],
+    added: &[String],
+    removed: &[String],
+    attr_prefix: &str,
+) {
+    for item in unchanged {
+        writeln!(out, "{}    {}", attr_prefix, item).unwrap();
+    }
+    for item in modified {
+        let rendered_fields = render_modified_fields(&item.fields);
+        writeln!(
+            out,
+            "{}  {} {{{}}}",
+            attr_prefix,
+            "~".yellow().bold(),
+            rendered_fields
+        )
+        .unwrap();
+    }
+    for item in added {
+        writeln!(out, "{}  {} {}", attr_prefix, "+".green().bold(), item).unwrap();
+    }
+    for item in removed {
+        writeln!(
+            out,
+            "{}  {} {}",
+            attr_prefix,
+            "-".red().bold().strikethrough(),
+            item.red().strikethrough()
+        )
+        .unwrap();
+    }
+}
+
+/// Render modified fields from structured IR into colored output.
+fn render_modified_fields(fields: &[ListOfMapsDiffField]) -> String {
+    let mut result_parts = Vec::new();
+    for field in fields {
+        match field {
+            ListOfMapsDiffField::Unchanged { key, value } => {
+                result_parts.push(format!("{}: {}", key, value));
+            }
+            ListOfMapsDiffField::Changed { key, old, new } => {
+                result_parts.push(format!(
+                    "{}: {} → {}",
+                    key,
+                    old.red().strikethrough(),
+                    new.green()
+                ));
+            }
+        }
+    }
+    result_parts.join(", ")
+}
+
 pub fn format_effect(effect: &Effect) -> String {
     match effect {
         Effect::Create(r) => format!("Create {}", r.id),
@@ -1122,33 +1117,8 @@ pub fn format_effect(effect: &Effect) -> String {
     }
 }
 
-/// Format a list-of-maps for Create effect display (multi-line with + prefix)
-pub fn format_list_of_maps(value: &Value, attr_prefix: &str) -> String {
-    let items = match value {
-        Value::List(items) => items,
-        _ => return format_value(value),
-    };
-    let mut lines = Vec::new();
-    for item in items {
-        if let Value::Map(map) = item {
-            let mut keys: Vec<_> = map.keys().collect();
-            keys.sort();
-            let fields: Vec<String> = keys
-                .iter()
-                .map(|k| format!("{}: {}", k, format_value(&map[*k])))
-                .collect();
-            lines.push(format!(
-                "{}  {} {{{}}}",
-                attr_prefix,
-                "+".green().bold(),
-                fields.join(", ")
-            ));
-        }
-    }
-    lines.join("\n")
-}
-
 /// Check if both old and new values are `Value::Map`.
+#[cfg(test)]
 fn is_both_maps(old_value: Option<&Value>, new_value: &Value) -> bool {
     matches!((old_value, new_value), (Some(Value::Map(_)), Value::Map(_)))
 }
@@ -1161,7 +1131,8 @@ fn is_both_maps(old_value: Option<&Value>, new_value: &Value) -> bool {
 /// - `~ key: "old" -> "new"` for changed keys
 ///
 /// Unchanged keys are not shown.
-pub fn format_map_diff(old_value: Option<&Value>, new_value: &Value, attr_prefix: &str) -> String {
+#[cfg(test)]
+fn format_map_diff(old_value: Option<&Value>, new_value: &Value, attr_prefix: &str) -> String {
     let new_map = match new_value {
         Value::Map(m) => m,
         _ => return format_value(new_value),
@@ -1235,7 +1206,8 @@ pub fn format_map_diff(old_value: Option<&Value>, new_value: &Value, attr_prefix
 /// 1. Find exact matches between old and new items
 /// 2. Pair remaining unmatched items by similarity for field-level diffs
 /// 3. Display unchanged, modified (~), added (+), and removed (-) items
-pub fn format_list_diff(old_value: Option<&Value>, new_value: &Value, attr_prefix: &str) -> String {
+#[cfg(test)]
+fn format_list_diff(old_value: Option<&Value>, new_value: &Value, attr_prefix: &str) -> String {
     let new_items = match new_value {
         Value::List(items) => items,
         _ => return format_value(new_value),
@@ -1402,18 +1374,13 @@ pub fn format_list_diff(old_value: Option<&Value>, new_value: &Value, attr_prefi
     lines.join("\n")
 }
 
-/// Format the attribute diffs for a cascading update.
-///
-/// Only shows attributes whose value in `cascade.to` is a `Value::ResourceRef`
-/// (or a `Value::List` containing a `ResourceRef`) that references the
-/// `replaced_binding`. This avoids false diffs caused by DSL vs AWS format
-/// mismatches on unrelated attributes (issue #958).
 /// Format the changed_create_only attributes for a Replace effect.
 ///
 /// Only shows attributes listed in `changed_create_only` that exist in `to_attrs`.
 /// When the old and new values are semantically equal (cascade-triggered replacement
 /// where the new value is not yet known), the attribute is shown with
 /// "(forces replacement, known after apply)" instead of being hidden.
+#[cfg(test)]
 fn format_replace_changed_attrs(
     from_attrs: &std::collections::HashMap<String, Value>,
     to_attrs: &std::collections::HashMap<String, Value>,
@@ -1485,6 +1452,7 @@ fn format_replace_changed_attrs(
     lines.concat()
 }
 
+#[cfg(test)]
 fn format_cascading_update_diff(
     cascade: &CascadingUpdate,
     attr_prefix: &str,
@@ -1524,6 +1492,7 @@ fn format_cascading_update_diff(
 ///
 /// Returns true for `Value::ResourceRef` with matching `binding_name`,
 /// or `Value::List` / `Value::Map` containing such a reference.
+#[cfg(test)]
 fn value_references_binding(value: &Value, binding: &str) -> bool {
     match value {
         Value::ResourceRef { binding_name, .. } => binding_name == binding,

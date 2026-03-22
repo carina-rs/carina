@@ -4,6 +4,7 @@
 
 pub mod config_loader;
 pub mod deps;
+pub mod detail_rows;
 pub mod diff_helpers;
 pub mod differ;
 pub mod effect;
