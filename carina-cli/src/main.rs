@@ -88,7 +88,7 @@ enum Commands {
         #[arg(long, default_value = "true", action = clap::ArgAction::Set)]
         lock: bool,
 
-        /// Refresh state from provider before planning (default: true)
+        /// Refresh state from provider before destroying (default: true)
         #[arg(long, default_value = "true", action = clap::ArgAction::Set)]
         refresh: bool,
     },
