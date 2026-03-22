@@ -1,10 +1,14 @@
 ---
 source: carina-cli/src/plan_snapshot_tests.rs
-assertion_line: 157
 expression: output
 ---
 Execution Plan:
 
   - awscc.ec2.subnet my_subnet
+      availability_zone: "ap-northeast-1a"
+      cidr_block: "10.0.1.0/24"
+      subnet_id: "subnet-0123456789abcdef0"
+      tags: {Name: "test-subnet"}
+      vpc_id: "vpc-0123456789abcdef0"
 
 Plan: 0 to add, 0 to change, 1 to destroy.

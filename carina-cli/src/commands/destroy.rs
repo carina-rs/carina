@@ -206,8 +206,21 @@ async fn run_destroy_locked(
         });
     }
 
+    // Build delete attributes map from current states for display
+    let delete_attributes: HashMap<ResourceId, HashMap<String, Value>> = resources_to_destroy
+        .iter()
+        .filter_map(|r| {
+            current_states
+                .get(&r.id)
+                .map(|s| (r.id.clone(), s.attributes.clone()))
+        })
+        .collect();
+
     // Display destroy plan as a dependency tree
-    print!("{}", format_destroy_plan(&destroy_plan));
+    print!(
+        "{}",
+        format_destroy_plan(&destroy_plan, false, &delete_attributes)
+    );
 
     // Show protected resources
     for resource in &protected_resources {

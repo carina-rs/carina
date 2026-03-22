@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 
@@ -5,6 +6,7 @@ use colored::Colorize;
 use serde::{Deserialize, Serialize};
 
 use carina_core::config_loader::{get_base_dir, load_configuration};
+use carina_core::effect::Effect;
 use carina_core::parser::{BackendConfig, ProviderConfig};
 use carina_core::plan::Plan;
 use carina_core::resource::{Resource, ResourceId, State, Value};
@@ -177,10 +179,26 @@ pub async fn run_plan(
     let ctx = create_plan_from_parsed(&parsed, &state_file, refresh).await?;
     let has_changes = ctx.plan.mutation_count() > 0;
 
+    // Build delete attributes map from current states for display
+    let delete_attributes: HashMap<ResourceId, HashMap<String, Value>> = ctx
+        .plan
+        .effects()
+        .iter()
+        .filter_map(|e| {
+            if let Effect::Delete { id, .. } = e {
+                ctx.current_states
+                    .get(id)
+                    .map(|s| (id.clone(), s.attributes.clone()))
+            } else {
+                None
+            }
+        })
+        .collect();
+
     if tui {
         carina_tui::run(&ctx.plan).map_err(|e| AppError::Config(format!("TUI error: {}", e)))?;
     } else {
-        print_plan(&ctx.plan, compact);
+        print_plan(&ctx.plan, compact, &delete_attributes);
     }
 
     // Save plan to file if --out was specified
