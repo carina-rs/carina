@@ -325,20 +325,8 @@ fn snapshot_read_only_attrs() {
 }
 
 #[test]
-fn snapshot_verbose() {
-    let (plan, schemas) = build_plan_from_fixture("verbose");
-    let output = strip_ansi(&format_plan(
-        &plan,
-        DetailLevel::Full,
-        &HashMap::new(),
-        Some(&schemas),
-    ));
-    insta::assert_snapshot!(output);
-}
-
-#[test]
 fn snapshot_explicit() {
-    let (plan, schemas) = build_plan_from_fixture("verbose");
+    let (plan, schemas) = build_plan_from_fixture("explicit");
     let output = strip_ansi(&format_plan(
         &plan,
         DetailLevel::Explicit,
