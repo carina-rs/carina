@@ -445,21 +445,22 @@ async fn run_destroy_locked(
                         success_count += 1;
                     }
                     WaitResult::ReadError(msg) => {
+                        println!("  {} Delete {}", "✗".red(), dep_id);
                         println!(
-                            "  {} {} - read error during wait: {}",
-                            "✗".red(),
-                            dep_id,
-                            msg
+                            "      {} {}",
+                            "→".red(),
+                            format!("read error during wait: {}", msg).red()
                         );
                         failed_bindings.insert(dep_binding.clone());
                         failure_count += 1;
                         wait_failed = true;
                     }
                     WaitResult::TimedOut => {
+                        println!("  {} Delete {}", "✗".red(), dep_id);
                         println!(
-                            "  {} {} - still exists after extended wait",
-                            "✗".red(),
-                            dep_id
+                            "      {} {}",
+                            "→".red(),
+                            "still exists after extended wait".red()
                         );
                         failed_bindings.insert(dep_binding.clone());
                         failure_count += 1;
@@ -540,13 +541,13 @@ async fn run_destroy_locked(
             Err(e) => {
                 let timing = format!("[{}]", format_duration(started.elapsed())).dimmed();
                 println!(
-                    "  {} {} - {} {} {}",
+                    "  {} {} {} {}",
                     "✗".red(),
                     format_effect(&effect),
-                    e,
                     timing,
                     counter
                 );
+                println!("      {} {}", "→".red(), e.to_string().red());
                 failure_count += 1;
                 failed_bindings.insert(binding.clone());
             }
@@ -580,20 +581,21 @@ async fn run_destroy_locked(
                 success_count += 1;
             }
             WaitResult::ReadError(msg) => {
+                println!("  {} Delete {}", "✗".red(), dep_id);
                 println!(
-                    "  {} {} - read error during wait: {}",
-                    "✗".red(),
-                    dep_id,
-                    msg
+                    "      {} {}",
+                    "→".red(),
+                    format!("read error during wait: {}", msg).red()
                 );
                 failed_bindings.insert(dep_binding.clone());
                 failure_count += 1;
             }
             WaitResult::TimedOut => {
+                println!("  {} Delete {}", "✗".red(), dep_id);
                 println!(
-                    "  {} {} - still exists after extended wait",
-                    "✗".red(),
-                    dep_id
+                    "      {} {}",
+                    "→".red(),
+                    "still exists after extended wait".red()
                 );
                 failed_bindings.insert(dep_binding.clone());
                 failure_count += 1;

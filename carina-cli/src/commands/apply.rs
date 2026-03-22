@@ -155,13 +155,13 @@ impl ExecutionObserver for CliObserver {
                 let timing = format!("[{}]", format_duration(*duration)).dimmed();
                 let counter = format_progress(progress).dimmed();
                 println!(
-                    "  {} {} - {} {} {}",
+                    "  {} {} {} {}",
                     "✗".red(),
                     format_effect(effect),
-                    error,
                     timing,
                     counter
                 );
+                println!("      {} {}", "→".red(), error.red());
             }
             ExecutionEvent::EffectSkipped {
                 effect,
@@ -184,7 +184,8 @@ impl ExecutionObserver for CliObserver {
             }
             ExecutionEvent::CascadeUpdateFailed { id, error } => {
                 self.stop_spinner();
-                println!("  {} Update {} (cascade) - {}", "✗".red(), id, error);
+                println!("  {} Update {} (cascade)", "✗".red(), id);
+                println!("      {} {}", "→".red(), error.red());
             }
             ExecutionEvent::RenameSucceeded { id, from, to } => {
                 self.stop_spinner();
@@ -192,7 +193,8 @@ impl ExecutionObserver for CliObserver {
             }
             ExecutionEvent::RenameFailed { id, error } => {
                 self.stop_spinner();
-                println!("  {} Rename {} - {}", "✗".red(), id, error);
+                println!("  {} Rename {}", "✗".red(), id);
+                println!("      {} {}", "→".red(), error.red());
             }
             ExecutionEvent::RefreshStarted => {
                 println!();
