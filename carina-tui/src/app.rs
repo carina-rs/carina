@@ -387,14 +387,16 @@ impl App {
             let mut candidates: Vec<String> = Vec::new();
             let mut seen: HashSet<String> = HashSet::new();
             for node in &self.nodes {
-                // Resource type name (e.g., "ec2.vpc")
+                // Resource type name (e.g., "ec2.vpc" or "awscc.ec2.vpc")
+                // Use contains() to match anywhere in the dotted name,
+                // consistent with how update_search_matches uses contains()
                 let rt_lower = node.resource_type.to_lowercase();
-                if rt_lower.starts_with(&prefix_lower) && seen.insert(rt_lower) {
+                if rt_lower.contains(&prefix_lower) && seen.insert(rt_lower) {
                     candidates.push(node.resource_type.clone());
                 }
                 // Binding/display name (e.g., "vpc", "subnet")
                 let np_lower = node.name_part.to_lowercase();
-                if np_lower.starts_with(&prefix_lower) && seen.insert(np_lower) {
+                if np_lower.contains(&prefix_lower) && seen.insert(np_lower) {
                     candidates.push(node.name_part.clone());
                 }
             }
@@ -1502,8 +1504,9 @@ mod tests {
 
         app.tab_complete();
 
-        // Should complete to "subnet" (the binding name)
-        assert_eq!(app.search_query, "subnet");
+        // "sub" matches both "ec2.subnet" (resource type) and "subnet" (binding);
+        // sorted alphabetically, "ec2.subnet" comes first
+        assert_eq!(app.search_query, "ec2.subnet");
     }
 
     #[test]
@@ -1562,7 +1565,48 @@ mod tests {
 
         app.tab_complete();
 
-        // Should match "subnet" case-insensitively
-        assert_eq!(app.search_query, "subnet");
+        // "SUB" matches "ec2.subnet" and "subnet" case-insensitively;
+        // sorted alphabetically, "ec2.subnet" comes first
+        assert_eq!(app.search_query, "ec2.subnet");
+    }
+
+    #[test]
+    fn tab_complete_matches_middle_of_word() {
+        let plan = make_tree_plan();
+        let mut app = App::new(&plan, &HashMap::new());
+        app.search_active = true;
+        app.search_query = "net".to_string();
+
+        app.tab_complete();
+
+        // "net" matches "ec2.subnet" (resource type) and "subnet" (binding)
+        // via contains; sorted alphabetically, "ec2.subnet" comes first
+        assert_eq!(app.search_query, "ec2.subnet");
+    }
+
+    #[test]
+    fn tab_complete_with_provider_prefix() {
+        // Resource types with provider prefix (e.g., "awscc.ec2.vpc")
+        let mut plan = Plan::new();
+        plan.add(Effect::Create(
+            Resource::with_provider("awscc", "ec2.vpc", "my-vpc")
+                .with_attribute("_binding", Value::String("vpc".to_string())),
+        ));
+        plan.add(Effect::Create(
+            Resource::with_provider("awscc", "ec2.subnet", "my-subnet")
+                .with_attribute("_binding", Value::String("subnet".to_string())),
+        ));
+        let mut app = App::new(&plan, &HashMap::new());
+        app.search_active = true;
+        app.search_query = "ec".to_string();
+
+        app.tab_complete();
+
+        // Should match resource types containing "ec" even with provider prefix
+        assert!(
+            app.search_query.contains("ec2"),
+            "expected query to contain 'ec2', got '{}'",
+            app.search_query
+        );
     }
 }

@@ -86,6 +86,17 @@ pub fn handle_key(app: &mut App, code: KeyCode) -> KeyAction {
 
     // Normal mode
     match code {
+        KeyCode::Esc if !app.search_matches.is_empty() => {
+            // Clear active search filter before quitting
+            app.search_query.clear();
+            app.search_matches.clear();
+            app.current_match = 0;
+            let count = app.visible_count();
+            if count > 0 && app.selected >= count {
+                app.selected = count - 1;
+            }
+            KeyAction::Continue
+        }
         KeyCode::Char('q') | KeyCode::Esc => KeyAction::Quit,
         KeyCode::Char('/') => {
             app.search_active = true;
@@ -384,9 +395,10 @@ mod tests {
         handle_key(&mut app, KeyCode::Char('u'));
         handle_key(&mut app, KeyCode::Char('b'));
 
-        // Tab should autocomplete "sub" to "subnet"
+        // Tab should autocomplete "sub" — matches "ec2.subnet" (resource type)
+        // and "subnet" (binding); sorted alphabetically, "ec2.subnet" first
         handle_key(&mut app, KeyCode::Tab);
-        assert_eq!(app.search_query, "subnet");
+        assert_eq!(app.search_query, "ec2.subnet");
         assert!(app.search_active);
     }
 
@@ -429,6 +441,84 @@ mod tests {
         assert!(!app.search_active);
         assert_eq!(app.search_query, "vpc");
         assert!(!app.search_matches.is_empty());
+    }
+
+    fn make_provider_prefixed_app() -> App {
+        let mut plan = Plan::new();
+        plan.add(Effect::Create(
+            Resource::with_provider("awscc", "ec2.vpc", "my-vpc").with_attribute(
+                "_binding",
+                carina_core::resource::Value::String("vpc".to_string()),
+            ),
+        ));
+        plan.add(Effect::Create(
+            Resource::with_provider("awscc", "ec2.subnet", "my-subnet").with_attribute(
+                "_binding",
+                carina_core::resource::Value::String("subnet".to_string()),
+            ),
+        ));
+        plan.add(Effect::Create(
+            Resource::with_provider("awscc", "s3.bucket", "my-bucket").with_attribute(
+                "_binding",
+                carina_core::resource::Value::String("bucket".to_string()),
+            ),
+        ));
+        App::new(&plan, &HashMap::new())
+    }
+
+    #[test]
+    fn tab_complete_with_provider_prefix() {
+        // When resource_type is "awscc.ec2.vpc", typing "ec" then Tab
+        // should complete to the full resource type containing "ec"
+        let mut app = make_provider_prefixed_app();
+        handle_key(&mut app, KeyCode::Char('/'));
+        handle_key(&mut app, KeyCode::Char('e'));
+        handle_key(&mut app, KeyCode::Char('c'));
+
+        handle_key(&mut app, KeyCode::Tab);
+        // Should complete to a resource type containing "ec"
+        assert!(
+            app.search_query.contains("ec2"),
+            "expected query to contain 'ec2', got '{}'",
+            app.search_query
+        );
+        assert!(app.search_active);
+    }
+
+    #[test]
+    fn esc_clears_filter_before_quitting() {
+        let mut app = make_search_app();
+        // Search for "vpc" and confirm with Enter
+        handle_key(&mut app, KeyCode::Char('/'));
+        handle_key(&mut app, KeyCode::Char('v'));
+        handle_key(&mut app, KeyCode::Char('p'));
+        handle_key(&mut app, KeyCode::Char('c'));
+        handle_key(&mut app, KeyCode::Enter);
+
+        // Filter is active (search_matches not empty)
+        assert!(!app.search_matches.is_empty());
+        assert!(!app.search_active);
+
+        // First Esc should clear filter, not quit
+        let action = handle_key(&mut app, KeyCode::Esc);
+        assert_eq!(action, KeyAction::Continue);
+        assert!(app.search_matches.is_empty());
+        assert!(app.search_query.is_empty());
+        // All nodes should be visible again
+        assert_eq!(app.visible_count(), 3);
+
+        // Second Esc should quit
+        let action = handle_key(&mut app, KeyCode::Esc);
+        assert_eq!(action, KeyAction::Quit);
+    }
+
+    #[test]
+    fn esc_quits_immediately_without_filter() {
+        let mut app = make_search_app();
+        // No search active, no filter
+        assert!(app.search_matches.is_empty());
+        let action = handle_key(&mut app, KeyCode::Esc);
+        assert_eq!(action, KeyAction::Quit);
     }
 
     #[test]
