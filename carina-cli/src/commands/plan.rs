@@ -197,7 +197,8 @@ pub async fn run_plan(
         .collect();
 
     if tui {
-        carina_tui::run(&ctx.plan).map_err(|e| AppError::Config(format!("TUI error: {}", e)))?;
+        carina_tui::run(&ctx.plan, wiring.schemas())
+            .map_err(|e| AppError::Config(format!("TUI error: {}", e)))?;
     } else {
         print_plan(
             &ctx.plan,

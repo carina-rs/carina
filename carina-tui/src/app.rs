@@ -7,6 +7,7 @@ use carina_core::deps::get_resource_dependencies;
 use carina_core::effect::Effect;
 use carina_core::plan::{Plan, PlanSummary};
 use carina_core::resource::Value;
+use carina_core::schema::ResourceSchema;
 use ratatui::widgets::ListState;
 
 /// A node in the tree view representing one effect
@@ -32,6 +33,12 @@ pub struct TreeNode {
     pub raw_from_attrs: HashMap<String, Value>,
     /// Raw "to" attribute values for map key-level diffs in the detail panel
     pub raw_to_attrs: HashMap<String, Value>,
+    /// Default value attributes from schema (attr_name, formatted_value) for Create effects
+    pub default_attributes: Vec<(String, String)>,
+    /// Read-only attributes from schema (attr_name) for Create effects
+    pub read_only_attributes: Vec<String>,
+    /// Count of unchanged attributes for Update/Replace effects
+    pub unchanged_count: usize,
     /// Indices of child nodes in the tree
     pub children: Vec<usize>,
     /// Nesting depth (0 = root)
@@ -80,10 +87,13 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(plan: &Plan) -> Self {
+    pub fn new(plan: &Plan, schemas: &HashMap<String, ResourceSchema>) -> Self {
         let mut nodes: Vec<TreeNode> = plan.effects().iter().map(effect_to_node).collect();
         let plan_summary = plan.summary();
         let summary = format!("{}", plan_summary);
+
+        // Populate schema-derived attributes
+        populate_schema_attributes(plan, &mut nodes, schemas);
 
         // Build tree structure from dependency analysis
         build_tree_structure(plan, &mut nodes);
@@ -562,6 +572,90 @@ fn shorten_service_name<'a>(attr_name: &str, value: &'a str) -> Cow<'a, str> {
     Cow::Borrowed(value)
 }
 
+/// Populate schema-derived attributes (defaults, read-only, unchanged count) on tree nodes.
+fn populate_schema_attributes(
+    plan: &Plan,
+    nodes: &mut [TreeNode],
+    schemas: &HashMap<String, ResourceSchema>,
+) {
+    for (idx, effect) in plan.effects().iter().enumerate() {
+        match effect {
+            Effect::Create(r) => {
+                let schema_key = r.id.display_type();
+                if let Some(schema) = schemas.get(&schema_key) {
+                    let user_keys: HashSet<&str> = r
+                        .attributes
+                        .keys()
+                        .filter(|k| !k.starts_with('_'))
+                        .map(|k| k.as_str())
+                        .collect();
+
+                    // Default value attributes not specified by user
+                    let mut default_attrs: Vec<(&str, &Value)> = schema
+                        .default_value_attributes()
+                        .into_iter()
+                        .filter(|(a, _)| !user_keys.contains(a))
+                        .collect();
+                    default_attrs.sort_by_key(|(a, _)| *a);
+                    nodes[idx].default_attributes = default_attrs
+                        .into_iter()
+                        .map(|(name, val)| (name.to_string(), format_value(val)))
+                        .collect();
+
+                    // Read-only attributes not specified by user
+                    let mut ro_attrs: Vec<&str> = schema
+                        .read_only_attributes()
+                        .into_iter()
+                        .filter(|a| !user_keys.contains(a))
+                        .collect();
+                    ro_attrs.sort();
+                    nodes[idx].read_only_attributes =
+                        ro_attrs.into_iter().map(|a| a.to_string()).collect();
+                }
+            }
+            Effect::Update { from, to, .. } => {
+                let unchanged_count = from
+                    .attributes
+                    .iter()
+                    .filter(|(k, v)| {
+                        !k.starts_with('_')
+                            && to
+                                .attributes
+                                .get(k.as_str())
+                                .map(|nv| nv.semantically_equal(v))
+                                .unwrap_or(false)
+                    })
+                    .count();
+                nodes[idx].unchanged_count = unchanged_count;
+            }
+            Effect::Replace {
+                from,
+                to,
+                changed_create_only,
+                ..
+            } => {
+                let changed_set: HashSet<&str> =
+                    changed_create_only.iter().map(|s| s.as_str()).collect();
+                let unchanged_count = from
+                    .attributes
+                    .iter()
+                    .filter(|(k, v)| {
+                        !k.starts_with('_')
+                            && !changed_set.contains(k.as_str())
+                            && to
+                                .attributes
+                                .get(k.as_str())
+                                .map(|nv| nv.semantically_equal(v))
+                                .unwrap_or(false)
+                    })
+                    .count();
+                nodes[idx].unchanged_count = unchanged_count;
+            }
+            _ => {}
+        }
+    }
+}
+
 fn effect_to_node(effect: &Effect) -> TreeNode {
     match effect {
         Effect::Read { resource } => TreeNode {
@@ -575,6 +669,9 @@ fn effect_to_node(effect: &Effect) -> TreeNode {
             from_attributes: Vec::new(),
             raw_from_attrs: HashMap::new(),
             raw_to_attrs: HashMap::new(),
+            default_attributes: Vec::new(),
+            read_only_attributes: Vec::new(),
+            unchanged_count: 0,
 
             children: Vec::new(),
             depth: 0,
@@ -591,6 +688,9 @@ fn effect_to_node(effect: &Effect) -> TreeNode {
             from_attributes: Vec::new(),
             raw_from_attrs: HashMap::new(),
             raw_to_attrs: HashMap::new(),
+            default_attributes: Vec::new(),
+            read_only_attributes: Vec::new(),
+            unchanged_count: 0,
 
             children: Vec::new(),
             depth: 0,
@@ -612,6 +712,9 @@ fn effect_to_node(effect: &Effect) -> TreeNode {
             from_attributes: format_attributes(&from.attributes),
             raw_from_attrs: from.attributes.clone(),
             raw_to_attrs: to.attributes.clone(),
+            default_attributes: Vec::new(),
+            read_only_attributes: Vec::new(),
+            unchanged_count: 0,
 
             children: Vec::new(),
             depth: 0,
@@ -641,6 +744,9 @@ fn effect_to_node(effect: &Effect) -> TreeNode {
                 from_attributes: format_attributes(&from.attributes),
                 raw_from_attrs: from.attributes.clone(),
                 raw_to_attrs: to.attributes.clone(),
+                default_attributes: Vec::new(),
+                read_only_attributes: Vec::new(),
+                unchanged_count: 0,
 
                 children: Vec::new(),
                 depth: 0,
@@ -663,6 +769,9 @@ fn effect_to_node(effect: &Effect) -> TreeNode {
                 from_attributes: Vec::new(),
                 raw_from_attrs: HashMap::new(),
                 raw_to_attrs: HashMap::new(),
+                default_attributes: Vec::new(),
+                read_only_attributes: Vec::new(),
+                unchanged_count: 0,
 
                 children: Vec::new(),
                 depth: 0,
@@ -728,7 +837,7 @@ mod tests {
     #[test]
     fn app_from_empty_plan() {
         let plan = Plan::new();
-        let app = App::new(&plan);
+        let app = App::new(&plan, &HashMap::new());
         assert_eq!(app.nodes.len(), 0);
         assert_eq!(app.selected, 0);
     }
@@ -745,7 +854,7 @@ mod tests {
             dependencies: HashSet::new(),
         });
 
-        let app = App::new(&plan);
+        let app = App::new(&plan, &HashMap::new());
         assert_eq!(app.nodes.len(), 2);
         assert_eq!(app.nodes[0].symbol, "+");
         assert_eq!(app.nodes[0].kind, EffectKind::Create);
@@ -760,7 +869,7 @@ mod tests {
         plan.add(Effect::Create(Resource::new("s3.bucket", "b")));
         plan.add(Effect::Create(Resource::new("s3.bucket", "c")));
 
-        let mut app = App::new(&plan);
+        let mut app = App::new(&plan, &HashMap::new());
         assert_eq!(app.selected, 0);
 
         app.move_down();
@@ -803,7 +912,7 @@ mod tests {
             changed_attributes: vec!["versioning".to_string()],
         });
 
-        let app = App::new(&plan);
+        let app = App::new(&plan, &HashMap::new());
         assert_eq!(app.nodes[0].kind, EffectKind::Update);
         assert_eq!(app.nodes[0].changed_attributes, vec!["versioning"]);
         assert!(!app.nodes[0].from_attributes.is_empty());
@@ -819,7 +928,7 @@ mod tests {
                 .with_attribute("_module", Value::String("web".to_string())),
         ));
 
-        let app = App::new(&plan);
+        let app = App::new(&plan, &HashMap::new());
         // Only "name" should appear (not _binding or _module)
         assert_eq!(app.nodes[0].attributes.len(), 1);
         assert_eq!(app.nodes[0].attributes[0].0, "name");
@@ -876,7 +985,7 @@ mod tests {
             cascade_ref_hints: vec![],
         });
 
-        let app = App::new(&plan);
+        let app = App::new(&plan, &HashMap::new());
         assert_eq!(app.nodes[0].symbol, "+/-");
         assert_eq!(app.nodes[1].symbol, "-/+");
     }
@@ -902,7 +1011,7 @@ mod tests {
                 ),
         ));
 
-        let app = App::new(&plan);
+        let app = App::new(&plan, &HashMap::new());
 
         // VPC should be root (depth 0) with subnet as child
         assert_eq!(app.nodes[0].depth, 0);
@@ -923,7 +1032,7 @@ mod tests {
                 .with_attribute("name", Value::String("test".to_string())),
         ));
 
-        let app = App::new(&plan);
+        let app = App::new(&plan, &HashMap::new());
         let node = app.selected_node().unwrap();
         assert_eq!(node.kind, EffectKind::Create);
         // Attributes are always available in the detail panel
@@ -934,7 +1043,7 @@ mod tests {
     fn toggle_focus_switches_panels() {
         let mut plan = Plan::new();
         plan.add(Effect::Create(Resource::new("s3.bucket", "a")));
-        let mut app = App::new(&plan);
+        let mut app = App::new(&plan, &HashMap::new());
 
         assert_eq!(app.focused_panel, FocusedPanel::Tree);
         app.toggle_focus();
@@ -947,7 +1056,7 @@ mod tests {
     fn detail_scroll_up_down() {
         let mut plan = Plan::new();
         plan.add(Effect::Create(Resource::new("s3.bucket", "a")));
-        let mut app = App::new(&plan);
+        let mut app = App::new(&plan, &HashMap::new());
 
         assert_eq!(app.detail_scroll, 0);
         app.detail_scroll_down();
@@ -968,7 +1077,7 @@ mod tests {
         let mut plan = Plan::new();
         plan.add(Effect::Create(Resource::new("s3.bucket", "a")));
         plan.add(Effect::Create(Resource::new("s3.bucket", "b")));
-        let mut app = App::new(&plan);
+        let mut app = App::new(&plan, &HashMap::new());
 
         app.detail_scroll = 5;
         app.move_down();
@@ -989,7 +1098,7 @@ mod tests {
                 format!("bucket-{}", i),
             )));
         }
-        let mut app = App::new(&plan);
+        let mut app = App::new(&plan, &HashMap::new());
         // Simulate a visible area of 5 items
         app.tree_area_height = 5;
 
@@ -1045,7 +1154,7 @@ mod tests {
         let mut plan = Plan::new();
         plan.add(Effect::Create(Resource::new("s3.bucket", "a")));
         plan.add(Effect::Create(Resource::new("s3.bucket", "b")));
-        let mut app = App::new(&plan);
+        let mut app = App::new(&plan, &HashMap::new());
         assert_eq!(app.tree_area_height, 0);
 
         app.move_down();
