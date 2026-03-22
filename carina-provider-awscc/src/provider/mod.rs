@@ -29,7 +29,9 @@ use aws_sdk_cloudcontrol::Client as CloudControlClient;
 use crate::schemas::generated::AwsccSchemaConfig;
 
 // Re-export public API
-pub use normalizer::{resolve_enum_identifiers_impl, restore_unreturned_attrs_impl};
+pub use normalizer::{
+    normalize_state_enums_impl, resolve_enum_identifiers_impl, restore_unreturned_attrs_impl,
+};
 pub(crate) use update::parse_resource_properties;
 
 /// Maximum number of retry attempts for retryable create errors

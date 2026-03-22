@@ -17,8 +17,9 @@ use carina_state::StateFile;
 use crate::commands::validate_and_resolve;
 use crate::display::{format_destroy_plan, format_plan};
 use crate::wiring::{
-    WiringContext, normalize_desired_with_ctx, reconcile_anonymous_identifiers_with_ctx,
-    reconcile_prefixed_names, resolve_enum_aliases_in_states, resolve_enum_aliases_with_ctx,
+    WiringContext, normalize_desired_with_ctx, normalize_state_with_ctx,
+    reconcile_anonymous_identifiers_with_ctx, reconcile_prefixed_names,
+    resolve_enum_aliases_in_states, resolve_enum_aliases_with_ctx,
 };
 
 /// Strip ANSI escape codes from a string for snapshot readability.
@@ -88,6 +89,9 @@ fn build_plan_from_fixture(fixture_dir: &str) -> carina_core::plan::Plan {
 
     // Normalize desired resources (resolve enum identifiers)
     normalize_desired_with_ctx(&wiring, &mut resources);
+
+    // Normalize state enum values to match DSL format
+    normalize_state_with_ctx(&wiring, &mut current_states);
 
     // Resolve enum aliases (e.g., "all" -> "-1") in both desired and current states
     resolve_enum_aliases_with_ctx(&wiring, &mut resources);
@@ -182,6 +186,13 @@ fn snapshot_map_key_diff() {
 #[test]
 fn snapshot_enum_display() {
     let plan = build_plan_from_fixture("enum_display");
+    let output = strip_ansi(&format_plan(&plan, false));
+    insta::assert_snapshot!(output);
+}
+
+#[test]
+fn snapshot_no_changes_enum() {
+    let plan = build_plan_from_fixture("no_changes_enum");
     let output = strip_ansi(&format_plan(&plan, false));
     insta::assert_snapshot!(output);
 }

@@ -134,6 +134,72 @@ fn resolve_struct_enum_values(value: &Value, fields: &[StructField]) -> Value {
     }
 }
 
+/// Normalize enum values in current states to their fully-qualified DSL format.
+///
+/// State files store raw AWS values (e.g., `"ap-northeast-1a"`, `"default"`).
+/// After `normalize_desired()` converts desired values to DSL enum format
+/// (e.g., `"awscc.ec2.subnet.AvailabilityZone.ap_northeast_1a"`), the differ
+/// would see a false diff. This function normalizes state values the same way
+/// so that both sides use the same representation.
+pub fn normalize_state_enums_impl(current_states: &mut HashMap<ResourceId, State>) {
+    let awscc_configs = crate::schemas::generated::configs();
+
+    for (resource_id, state) in current_states.iter_mut() {
+        if !state.exists || resource_id.provider != "awscc" {
+            continue;
+        }
+
+        let config = awscc_configs
+            .iter()
+            .find(|c| c.resource_type_name == resource_id.resource_type);
+        let config = match config {
+            Some(c) => c,
+            None => continue,
+        };
+
+        let mut resolved_attrs = HashMap::new();
+        for (key, value) in &state.attributes {
+            if let Some(attr_schema) = config.schema.attributes.get(key.as_str())
+                && let Some((type_name, ns, to_dsl)) = attr_schema.attr_type.namespaced_enum_parts()
+            {
+                let resolved = match value {
+                    Value::String(s) if !s.contains('.') => {
+                        let dsl_val = to_dsl.map_or_else(|| s.clone(), |f| f(s));
+                        Value::String(format!("{}.{}.{}", ns, type_name, dsl_val))
+                    }
+                    _ => value.clone(),
+                };
+                resolved_attrs.insert(key.clone(), resolved);
+                continue;
+            }
+
+            // Handle struct fields containing schema-level string enums.
+            if let Some(attr_schema) = config.schema.attributes.get(key.as_str()) {
+                let struct_fields = match &attr_schema.attr_type {
+                    AttributeType::List { inner, .. } => {
+                        if let AttributeType::Struct { fields, .. } = inner.as_ref() {
+                            Some(fields)
+                        } else {
+                            None
+                        }
+                    }
+                    AttributeType::Struct { fields, .. } => Some(fields),
+                    _ => None,
+                };
+
+                if let Some(fields) = struct_fields {
+                    let resolved = resolve_struct_enum_values(value, fields);
+                    resolved_attrs.insert(key.clone(), resolved);
+                    continue;
+                }
+            }
+
+            resolved_attrs.insert(key.clone(), value.clone());
+        }
+        state.attributes = resolved_attrs;
+    }
+}
+
 /// Restore unreturned attributes from saved state into current read states.
 ///
 /// CloudControl API doesn't always return all properties in GetResource responses

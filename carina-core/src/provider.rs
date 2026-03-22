@@ -137,6 +137,16 @@ pub trait ProviderNormalizer: Send + Sync {
     /// Default implementation is a no-op for providers without enum types.
     fn normalize_desired(&self, _resources: &mut [Resource]) {}
 
+    /// Normalize current state values before diffing.
+    ///
+    /// Converts raw values in current state (e.g., `"ap-northeast-1a"`) to
+    /// the same DSL enum format that `normalize_desired` produces
+    /// (e.g., `"awscc.ec2.subnet.AvailabilityZone.ap_northeast_1a"`).
+    /// This prevents false diffs when state stores raw AWS values but
+    /// desired state has been normalized.
+    /// Default implementation is a no-op.
+    fn normalize_state(&self, _current_states: &mut HashMap<ResourceId, State>) {}
+
     /// Hydrate read state with saved attributes that APIs don't return.
     ///
     /// Some APIs (e.g., CloudControl) don't return certain properties in read
@@ -246,6 +256,12 @@ impl ProviderNormalizer for ProviderRouter {
     fn normalize_desired(&self, resources: &mut [Resource]) {
         for ext in &self.normalizers {
             ext.normalize_desired(resources);
+        }
+    }
+
+    fn normalize_state(&self, current_states: &mut HashMap<ResourceId, State>) {
+        for ext in &self.normalizers {
+            ext.normalize_state(current_states);
         }
     }
 

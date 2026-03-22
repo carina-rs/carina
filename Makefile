@@ -22,6 +22,9 @@ plan-map-diff:
 plan-enum-display:
 	cd $(FIXTURES)/enum_display && $(CARINA) plan --refresh=false main.crn
 
+plan-no-changes-enum:
+	cd $(FIXTURES)/no_changes_enum && $(CARINA) plan --refresh=false main.crn
+
 plan-destroy-full:
 	cd $(FIXTURES)/destroy_full && $(CARINA) plan --refresh=false main.crn
 
@@ -59,9 +62,12 @@ plan-fixtures:
 	@echo "=== enum_display ==="
 	@$(MAKE) plan-enum-display
 	@echo ""
+	@echo "=== no_changes_enum ==="
+	@$(MAKE) plan-no-changes-enum
+	@echo ""
 	@echo "=== destroy_full ==="
 	@$(MAKE) plan-destroy-full
 
-.PHONY: plan-all-create plan-no-changes plan-mixed plan-delete plan-compact \
+.PHONY: plan-all-create plan-no-changes plan-no-changes-enum plan-mixed plan-delete plan-compact \
         plan-map-diff plan-enum-display plan-destroy-full plan-map-diff-tui \
         plan-all-create-tui plan-mixed-tui plan-delete-tui plan-fixtures
