@@ -8,6 +8,7 @@ use carina_core::effect::Effect;
 use carina_core::plan::{Plan, PlanSummary};
 use carina_core::resource::Value;
 use carina_core::schema::ResourceSchema;
+use carina_core::value::format_value;
 use ratatui::widgets::ListState;
 
 /// A node in the tree view representing one effect
@@ -1010,43 +1011,6 @@ fn format_attributes(attrs: &HashMap<String, Value>) -> Vec<(String, String)> {
         .collect();
     result.sort_by(|a, b| a.0.cmp(&b.0));
     result
-}
-
-/// Format a Value for display
-pub fn format_value(value: &Value) -> String {
-    match value {
-        Value::String(s) => {
-            if carina_core::utils::is_dsl_enum_format(s) {
-                let resolved = carina_core::utils::convert_enum_value(s);
-                format!("\"{}\"", resolved)
-            } else {
-                format!("\"{}\"", s)
-            }
-        }
-        Value::Int(n) => n.to_string(),
-        Value::Float(f) => f.to_string(),
-        Value::Bool(b) => b.to_string(),
-        Value::List(items) => {
-            let inner: Vec<String> = items.iter().map(format_value).collect();
-            format!("[{}]", inner.join(", "))
-        }
-        Value::Map(map) => {
-            let mut entries: Vec<String> = map
-                .iter()
-                .map(|(k, v)| format!("{}: {}", k, format_value(v)))
-                .collect();
-            entries.sort();
-            format!("{{{}}}", entries.join(", "))
-        }
-        Value::ResourceRef {
-            binding_name,
-            attribute_name,
-        } => format!("{}.{}", binding_name, attribute_name),
-        Value::UnresolvedIdent(name, member) => match member {
-            Some(m) => format!("{}.{}", name, m),
-            None => name.clone(),
-        },
-    }
 }
 
 #[cfg(test)]
