@@ -569,17 +569,11 @@ fn format_plan_tree(
                                 keys.iter().map(|k| k.as_str()).collect();
 
                             // Show default-value attributes (not specified by user)
-                            let mut default_attrs: Vec<(&str, &Value)> = schema
-                                .default_value_attributes()
-                                .into_iter()
-                                .filter(|(a, _)| !user_keys.contains(a))
-                                .collect();
-                            default_attrs.sort_by_key(|(a, _)| *a);
+                            let default_attrs = schema.compute_default_attrs(&user_keys);
                             if !default_attrs.is_empty() {
                                 has_displayed_attrs = true;
                             }
-                            for (attr, default_val) in default_attrs {
-                                let formatted = format_value_with_key(default_val, Some(attr));
+                            for (attr, formatted) in &default_attrs {
                                 writeln!(
                                     out,
                                     "{}{}: {}  {}",
@@ -592,16 +586,11 @@ fn format_plan_tree(
                             }
 
                             // Show read-only attributes with (known after apply) placeholder
-                            let mut ro_attrs: Vec<&str> = schema
-                                .read_only_attributes()
-                                .into_iter()
-                                .filter(|a| !user_keys.contains(a))
-                                .collect();
-                            ro_attrs.sort();
+                            let ro_attrs = schema.compute_read_only_attrs(&user_keys);
                             if !ro_attrs.is_empty() {
                                 has_displayed_attrs = true;
                             }
-                            for attr in ro_attrs {
+                            for attr in &ro_attrs {
                                 writeln!(
                                     out,
                                     "{}{}: {}",

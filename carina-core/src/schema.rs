@@ -3,11 +3,12 @@
 //! Providers define schemas for each resource type,
 //! enabling type validation at parse time.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use crate::resource::{Resource, Value};
 use crate::utils::{extract_enum_value_with_values, validate_enum_namespace};
+use crate::value::format_value_with_key;
 
 /// Type alias for resource validator functions
 pub type ResourceValidator = fn(&HashMap<String, Value>) -> Result<(), Vec<TypeError>>;
@@ -743,6 +744,32 @@ impl ResourceSchema {
             .filter(|(_, schema)| schema.default.is_some() && !schema.read_only)
             .map(|(name, schema)| (name.as_str(), schema.default.as_ref().unwrap()))
             .collect()
+    }
+
+    /// Returns default-value attributes not specified by the user, sorted by name.
+    /// Each entry is (attribute_name, formatted_default_value).
+    pub fn compute_default_attrs(&self, user_keys: &HashSet<&str>) -> Vec<(String, String)> {
+        let mut default_attrs: Vec<(&str, &Value)> = self
+            .default_value_attributes()
+            .into_iter()
+            .filter(|(a, _)| !user_keys.contains(a))
+            .collect();
+        default_attrs.sort_by_key(|(a, _)| *a);
+        default_attrs
+            .into_iter()
+            .map(|(name, val)| (name.to_string(), format_value_with_key(val, Some(name))))
+            .collect()
+    }
+
+    /// Returns read-only attribute names not specified by the user, sorted.
+    pub fn compute_read_only_attrs(&self, user_keys: &HashSet<&str>) -> Vec<String> {
+        let mut ro_attrs: Vec<&str> = self
+            .read_only_attributes()
+            .into_iter()
+            .filter(|a| !user_keys.contains(a))
+            .collect();
+        ro_attrs.sort();
+        ro_attrs.into_iter().map(|a| a.to_string()).collect()
     }
 
     /// Returns the names of create-only (immutable) attributes
