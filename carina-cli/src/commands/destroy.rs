@@ -197,6 +197,17 @@ async fn run_destroy_locked(
             if let Some(ref binding) = rs.binding {
                 attributes.insert("_binding".to_string(), Value::String(binding.clone()));
             }
+            if !rs.dependency_bindings.is_empty() {
+                attributes.insert(
+                    "_dependency_bindings".to_string(),
+                    Value::List(
+                        rs.dependency_bindings
+                            .iter()
+                            .map(|b| Value::String(b.clone()))
+                            .collect(),
+                    ),
+                );
+            }
             let orphan_resource = Resource {
                 id: id.clone(),
                 attributes,
