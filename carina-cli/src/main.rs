@@ -18,7 +18,7 @@ use commands::plan::run_plan;
 use commands::state::{StateCommands, run_force_unlock, run_state_command};
 use commands::validate::run_validate;
 
-/// Controls how much detail is shown in plan output.
+/// Controls how much detail is shown in plan output (CLI-facing enum with clap support).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum DetailLevel {
     /// Show all attributes: user-specified, defaults, read-only, and unchanged (dimmed)
@@ -27,6 +27,17 @@ pub enum DetailLevel {
     Explicit,
     /// Show resource names only (no attributes)
     None,
+}
+
+impl DetailLevel {
+    /// Convert to the core `DetailLevel` enum used by `build_detail_rows`.
+    pub fn to_core(self) -> carina_core::detail_rows::DetailLevel {
+        match self {
+            DetailLevel::Full => carina_core::detail_rows::DetailLevel::Full,
+            DetailLevel::Explicit => carina_core::detail_rows::DetailLevel::Explicit,
+            DetailLevel::None => carina_core::detail_rows::DetailLevel::NamesOnly,
+        }
+    }
 }
 
 #[derive(Parser)]
