@@ -811,26 +811,10 @@ fn populate_schema_attributes(
                         .collect();
 
                     // Default value attributes not specified by user
-                    let mut default_attrs: Vec<(&str, &Value)> = schema
-                        .default_value_attributes()
-                        .into_iter()
-                        .filter(|(a, _)| !user_keys.contains(a))
-                        .collect();
-                    default_attrs.sort_by_key(|(a, _)| *a);
-                    nodes[idx].default_attributes = default_attrs
-                        .into_iter()
-                        .map(|(name, val)| (name.to_string(), format_value(val)))
-                        .collect();
+                    nodes[idx].default_attributes = schema.compute_default_attrs(&user_keys);
 
                     // Read-only attributes not specified by user
-                    let mut ro_attrs: Vec<&str> = schema
-                        .read_only_attributes()
-                        .into_iter()
-                        .filter(|a| !user_keys.contains(a))
-                        .collect();
-                    ro_attrs.sort();
-                    nodes[idx].read_only_attributes =
-                        ro_attrs.into_iter().map(|a| a.to_string()).collect();
+                    nodes[idx].read_only_attributes = schema.compute_read_only_attrs(&user_keys);
                 }
             }
             Effect::Update { from, to, .. } => {
