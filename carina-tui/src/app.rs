@@ -84,6 +84,14 @@ pub struct App {
     pub tree_scroll_offset: usize,
     /// Height of the tree panel's inner area (updated each frame)
     pub tree_area_height: usize,
+    /// Whether search mode is active (user is typing a query)
+    pub search_active: bool,
+    /// Current search query string
+    pub search_query: String,
+    /// Indices of visible nodes that match the search query
+    pub search_matches: Vec<usize>,
+    /// Index into `search_matches` for the current match
+    pub current_match: usize,
 }
 
 impl App {
@@ -115,6 +123,10 @@ impl App {
             detail_scroll: 0,
             tree_scroll_offset: 0,
             tree_area_height: 0,
+            search_active: false,
+            search_query: String::new(),
+            search_matches: Vec::new(),
+            current_match: 0,
         }
     }
 
@@ -199,6 +211,70 @@ impl App {
     /// Get the currently selected node, if any
     pub fn selected_node(&self) -> Option<&TreeNode> {
         self.selected_node_idx().map(|idx| &self.nodes[idx])
+    }
+
+    /// Update search matches based on the current query.
+    ///
+    /// Matches against each node's `effect_label` (which contains both
+    /// the resource type and the name), case-insensitively.
+    pub fn update_search_matches(&mut self) {
+        self.search_matches.clear();
+        self.current_match = 0;
+        if self.search_query.is_empty() {
+            return;
+        }
+        let query_lower = self.search_query.to_lowercase();
+        let visible = self.visible_nodes();
+        for (vis_idx, &node_idx) in visible.iter().enumerate() {
+            let node = &self.nodes[node_idx];
+            if node.effect_label.to_lowercase().contains(&query_lower) {
+                self.search_matches.push(vis_idx);
+            }
+        }
+    }
+
+    /// Jump to the match at `current_match` index, updating selection and scroll.
+    pub fn jump_to_current_match(&mut self) {
+        if let Some(&vis_idx) = self.search_matches.get(self.current_match) {
+            self.select_visible_index(vis_idx);
+        }
+    }
+
+    /// Jump to the next search match. Wraps around to the first match.
+    pub fn next_match(&mut self) {
+        if self.search_matches.is_empty() {
+            return;
+        }
+        self.current_match = (self.current_match + 1) % self.search_matches.len();
+        self.jump_to_current_match();
+    }
+
+    /// Jump to the previous search match. Wraps around to the last match.
+    pub fn prev_match(&mut self) {
+        if self.search_matches.is_empty() {
+            return;
+        }
+        if self.current_match == 0 {
+            self.current_match = self.search_matches.len() - 1;
+        } else {
+            self.current_match -= 1;
+        }
+        self.jump_to_current_match();
+    }
+
+    /// Select a specific visible index and adjust scroll.
+    fn select_visible_index(&mut self, vis_idx: usize) {
+        self.selected = vis_idx;
+        // Adjust scroll so the selected item is visible
+        if self.selected < self.tree_scroll_offset {
+            self.tree_scroll_offset = self.selected;
+        } else if self.tree_area_height > 0
+            && self.selected >= self.tree_scroll_offset + self.tree_area_height
+        {
+            self.tree_scroll_offset = self.selected - self.tree_area_height + 1;
+        }
+        self.sync_list_state();
+        self.detail_scroll = 0;
     }
 }
 

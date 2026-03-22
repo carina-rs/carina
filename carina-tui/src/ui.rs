@@ -10,7 +10,7 @@ use carina_core::resource::Value;
 
 use crate::app::{App, EffectKind, FocusedPanel};
 
-/// Draw the main layout: tree (70%), detail panel (30%), help bar (1 line)
+/// Draw the main layout: tree (70%), detail panel (30%), help/search bar (1 line)
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -23,12 +23,18 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     draw_tree(frame, app, chunks[0]);
     draw_detail(frame, app, chunks[1]);
-    draw_help(frame, chunks[2]);
+
+    if app.search_active {
+        draw_search_bar(frame, app, chunks[2]);
+    } else {
+        draw_help(frame, app, chunks[2]);
+    }
 }
 
 /// Draw the tree view (compact, no inline attributes)
 fn draw_tree(frame: &mut Frame, app: &mut App, area: Rect) {
     let visible = app.visible_nodes();
+    let match_set: HashSet<usize> = app.search_matches.iter().copied().collect();
 
     let items: Vec<ListItem> = visible
         .iter()
@@ -37,6 +43,7 @@ fn draw_tree(frame: &mut Frame, app: &mut App, area: Rect) {
             let node = &app.nodes[node_idx];
             let connector = build_tree_connector(node_idx, app);
             let effect_color = effect_style(node.kind);
+            let is_match = match_set.contains(&row_idx);
             let mut spans = vec![
                 Span::raw(connector),
                 Span::styled(format!("{} ", node.symbol), effect_color),
@@ -49,6 +56,16 @@ fn draw_tree(frame: &mut Frame, app: &mut App, area: Rect) {
                 Span::raw(" "),
                 Span::styled(node.name_part.clone(), effect_color),
             ];
+            if is_match {
+                spans = spans
+                    .into_iter()
+                    .map(|s| {
+                        let mut style = s.style;
+                        style = style.bg(Color::DarkGray);
+                        Span::styled(s.content, style)
+                    })
+                    .collect();
+            }
             if app.selected == row_idx {
                 spans = spans
                     .into_iter()
@@ -306,9 +323,32 @@ fn render_map_key_diff(
     }
 }
 
+/// Draw the search input bar at the bottom of the screen
+fn draw_search_bar(frame: &mut Frame, app: &App, area: Rect) {
+    let match_info = if app.search_query.is_empty() {
+        String::new()
+    } else if app.search_matches.is_empty() {
+        " [no matches]".to_string()
+    } else {
+        format!(" [{}/{}]", app.current_match + 1, app.search_matches.len())
+    };
+    let search = Paragraph::new(Line::from(vec![
+        Span::styled(
+            "/",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(&app.search_query),
+        Span::styled("_", Style::default().add_modifier(Modifier::SLOW_BLINK)),
+        Span::styled(match_info, Style::default().fg(Color::DarkGray)),
+    ]));
+    frame.render_widget(search, area);
+}
+
 /// Draw the help bar
-fn draw_help(frame: &mut Frame, area: Rect) {
-    let help = Paragraph::new(Line::from(vec![
+fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
+    let mut spans = vec![
         Span::styled(
             " Tab",
             Style::default()
@@ -324,13 +364,31 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         ),
         Span::raw(" navigate/scroll  "),
         Span::styled(
-            "q/Esc",
+            "/",
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::raw(" quit"),
-    ]));
+        Span::raw(" search  "),
+    ];
+    if !app.search_matches.is_empty() {
+        spans.push(Span::styled(
+            "n/N",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::raw(" next/prev match  "));
+    }
+    spans.push(Span::styled(
+        "q/Esc",
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    ));
+    spans.push(Span::raw(" quit"));
+
+    let help = Paragraph::new(Line::from(spans));
     frame.render_widget(help, area);
 }
 
