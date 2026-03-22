@@ -32,7 +32,6 @@
       "attributes": {
         "vpc_id": "vpc-0123456789abcdef0",
         "cidr_block": "10.0.1.0/24",
-        "availability_zone": "ap-northeast-1a",
         "subnet_id": "subnet-0123456789abcdef0",
         "tags": { "Name": "test-subnet" }
       },
@@ -40,7 +39,7 @@
       "lifecycle": {},
       "prefixes": {},
       "name_overrides": {},
-      "desired_keys": ["vpc_id", "cidr_block", "availability_zone", "tags"],
+      "desired_keys": ["vpc_id", "cidr_block", "tags"],
       "binding": "my_subnet",
       "dependency_bindings": ["vpc"]
     }

@@ -17,7 +17,8 @@ use carina_state::StateFile;
 use crate::commands::validate_and_resolve;
 use crate::display::{format_destroy_plan, format_plan};
 use crate::wiring::{
-    WiringContext, reconcile_anonymous_identifiers_with_ctx, reconcile_prefixed_names,
+    WiringContext, normalize_desired_with_ctx, reconcile_anonymous_identifiers_with_ctx,
+    reconcile_prefixed_names, resolve_enum_aliases_in_states, resolve_enum_aliases_with_ctx,
 };
 
 /// Strip ANSI escape codes from a string for snapshot readability.
@@ -84,6 +85,13 @@ fn build_plan_from_fixture(fixture_dir: &str) -> carina_core::plan::Plan {
     // Resolve ResourceRef values using state
     let mut resources = sorted_resources.clone();
     resolve_refs_with_state(&mut resources, &current_states);
+
+    // Normalize desired resources (resolve enum identifiers)
+    normalize_desired_with_ctx(&wiring, &mut resources);
+
+    // Resolve enum aliases (e.g., "all" -> "-1") in both desired and current states
+    resolve_enum_aliases_with_ctx(&wiring, &mut resources);
+    resolve_enum_aliases_in_states(&wiring, &mut current_states);
 
     // Build plan
     let lifecycles = state_file
