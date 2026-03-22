@@ -1,0 +1,24 @@
+# No changes - state matches desired (with enum Custom type attribute)
+
+provider awscc {
+  region = awscc.Region.ap_northeast_1
+}
+
+let vpc = awscc.ec2.vpc {
+  cidr_block           = "10.0.0.0/16"
+  instance_tenancy     = default
+
+  tags = {
+    Name = "test-vpc"
+  }
+}
+
+let my_subnet = awscc.ec2.subnet {
+  vpc_id            = vpc.vpc_id
+  cidr_block        = "10.0.1.0/24"
+  availability_zone = "ap-northeast-1a"
+
+  tags = {
+    Name = "test-subnet"
+  }
+}

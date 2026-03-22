@@ -204,6 +204,30 @@ pub fn normalize_desired_with_ctx(ctx: &WiringContext, resources: &mut [Resource
     router.normalize_desired(resources);
 }
 
+/// Normalize enum values in current states to match DSL format.
+///
+/// Creates normalizers from all registered provider factories and applies
+/// `normalize_state()` to the current states. This converts raw AWS enum
+/// values (e.g., `"ap-northeast-1a"`) to the same DSL format that
+/// `normalize_desired` produces, preventing false diffs.
+#[cfg(test)]
+pub fn normalize_state_with_ctx(
+    ctx: &WiringContext,
+    current_states: &mut HashMap<ResourceId, State>,
+) {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("failed to build tokio runtime for normalize_state");
+    let mut router = ProviderRouter::new();
+    for factory in ctx.factories() {
+        let attrs = HashMap::new();
+        if let Some(normalizer) = rt.block_on(factory.create_normalizer(&attrs)) {
+            router.add_normalizer(normalizer);
+        }
+    }
+    router.normalize_state(current_states);
+}
+
 /// Resolve enum alias values in resources to their canonical AWS form.
 ///
 /// After `normalize_desired()` converts DSL identifiers to namespaced strings
@@ -461,6 +485,11 @@ pub async fn create_plan_from_parsed(
     let mut resources = sorted_resources.clone();
     resolve_refs_with_state(&mut resources, &current_states);
     provider.normalize_desired(&mut resources);
+
+    // Normalize state enum values to match the DSL format produced by normalize_desired.
+    // Without this, raw AWS values (e.g., "ap-northeast-1a") in state would diff against
+    // normalized desired values (e.g., "awscc.ec2.subnet.AvailabilityZone.ap_northeast_1a").
+    provider.normalize_state(&mut current_states);
 
     // Resolve enum aliases (e.g., "all" -> "-1") in both desired resources
     // and current states so the differ sees canonical AWS values.

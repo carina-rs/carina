@@ -33,6 +33,10 @@ impl ProviderNormalizer for AwsccNormalizer {
         crate::provider::resolve_enum_identifiers_impl(resources);
     }
 
+    fn normalize_state(&self, current_states: &mut HashMap<ResourceId, State>) {
+        crate::provider::normalize_state_enums_impl(current_states);
+    }
+
     fn hydrate_read_state(
         &self,
         current_states: &mut HashMap<ResourceId, State>,
