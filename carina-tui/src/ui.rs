@@ -261,7 +261,7 @@ fn render_map_key_diff(
     old_map: &std::collections::HashMap<String, Value>,
     new_map: &std::collections::HashMap<String, Value>,
 ) {
-    use crate::app::format_value;
+    use carina_core::value::format_value;
 
     let mut all_keys: Vec<&String> = old_map.keys().chain(new_map.keys()).collect();
     all_keys.sort();
