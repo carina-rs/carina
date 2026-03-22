@@ -399,7 +399,7 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::raw(" focus  "),
+            Span::raw(" switch panel  "),
             Span::styled(
                 "q/Esc",
                 Style::default()
