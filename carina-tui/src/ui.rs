@@ -633,9 +633,16 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
             ),
             Span::raw(" switch panel  "),
         ];
-        // Show ref navigation hints when relevant
-        if app.focused_panel == FocusedPanel::Detail && app.selected_detail_ref_binding().is_some()
-        {
+        // Show Enter hint based on focused panel
+        if app.focused_panel == FocusedPanel::Tree {
+            spans.push(Span::styled(
+                "Enter",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::raw(" detail  "));
+        } else if app.selected_detail_ref_binding().is_some() {
             spans.push(Span::styled(
                 "Enter",
                 Style::default()
