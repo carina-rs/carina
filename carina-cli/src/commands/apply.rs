@@ -893,7 +893,22 @@ async fn run_apply_locked(
         return Ok(());
     }
 
-    print_plan(&plan, false);
+    // Build delete attributes map from current states for display
+    let delete_attributes: HashMap<ResourceId, HashMap<String, Value>> = plan
+        .effects()
+        .iter()
+        .filter_map(|e| {
+            if let Effect::Delete { id, .. } = e {
+                current_states
+                    .get(id)
+                    .map(|s| (id.clone(), s.attributes.clone()))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    print_plan(&plan, false, &delete_attributes);
 
     // Confirmation prompt
     if !auto_approve {
@@ -1151,7 +1166,22 @@ async fn run_apply_from_plan_locked(
         return Ok(());
     }
 
-    print_plan(plan, false);
+    // Build delete attributes map from current states for display
+    let delete_attributes: HashMap<ResourceId, HashMap<String, Value>> = plan
+        .effects()
+        .iter()
+        .filter_map(|e| {
+            if let Effect::Delete { id, .. } = e {
+                current_states
+                    .get(id)
+                    .map(|s| (id.clone(), s.attributes.clone()))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    print_plan(plan, false, &delete_attributes);
 
     // Confirmation prompt
     if !auto_approve {

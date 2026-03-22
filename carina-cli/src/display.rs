@@ -278,15 +278,23 @@ fn format_compact_name(
     }
 }
 
-pub fn print_plan(plan: &Plan, compact: bool) {
-    print!("{}", format_plan(plan, compact));
+pub fn print_plan(
+    plan: &Plan,
+    compact: bool,
+    delete_attributes: &HashMap<ResourceId, HashMap<String, Value>>,
+) {
+    print!("{}", format_plan(plan, compact, delete_attributes));
 }
 
 /// Format a plan as a string for display.
 ///
 /// This is the core formatting logic used by `print_plan`. Returning a `String`
 /// enables snapshot testing and other programmatic uses of the plan output.
-pub fn format_plan(plan: &Plan, compact: bool) -> String {
+pub fn format_plan(
+    plan: &Plan,
+    compact: bool,
+    delete_attributes: &HashMap<ResourceId, HashMap<String, Value>>,
+) -> String {
     let mut out = String::new();
 
     if plan.is_empty() {
@@ -302,7 +310,12 @@ pub fn format_plan(plan: &Plan, compact: bool) -> String {
     writeln!(out, "{}", "Execution Plan:".cyan().bold()).unwrap();
     writeln!(out).unwrap();
 
-    out.push_str(&format_plan_tree(plan, compact, None));
+    let attrs = if delete_attributes.is_empty() {
+        None
+    } else {
+        Some(delete_attributes)
+    };
+    out.push_str(&format_plan_tree(plan, compact, attrs));
 
     writeln!(out).unwrap();
     let summary = plan.summary();
@@ -1453,7 +1466,7 @@ mod tests {
         plan.add(Effect::Create(b));
 
         // Should not panic
-        print_plan(&plan, false);
+        print_plan(&plan, false, &HashMap::new());
     }
 
     /// Test that print_plan handles the dependency graph correctly when
@@ -1467,7 +1480,7 @@ mod tests {
         plan.add(Effect::Create(b));
 
         // Should not panic
-        print_plan(&plan, false);
+        print_plan(&plan, false, &HashMap::new());
     }
 
     /// Helper: compute root indices using the same algorithm as print_plan.
@@ -2062,7 +2075,7 @@ mod tests {
         plan.add(Effect::Create(rt));
 
         // Should not panic
-        print_plan(&plan, true);
+        print_plan(&plan, true, &HashMap::new());
     }
 
     /// Test compact mode skips attributes by checking that _binding attribute
@@ -2086,7 +2099,7 @@ mod tests {
         plan.add(Effect::Create(anon));
 
         // Should not panic; anonymous resources should show hints
-        print_plan(&plan, true);
+        print_plan(&plan, true, &HashMap::new());
     }
 
     /// Test that extract_compact_hint extracts ResourceRef from inside a List value.
@@ -2214,7 +2227,7 @@ mod tests {
         plan.add(replace_effect);
 
         // Should not panic and should display attribute diffs for cascading updates
-        print_plan(&plan, false);
+        print_plan(&plan, false, &HashMap::new());
     }
 
     #[test]
