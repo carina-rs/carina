@@ -26,7 +26,7 @@
     },
     {
       "resource_type": "ec2.subnet",
-      "name": "my_subnet",
+      "name": "ec2_subnet_aac7c86b",
       "provider": "awscc",
       "identifier": "subnet-0123456789abcdef0",
       "attributes": {
@@ -40,7 +40,7 @@
       "prefixes": {},
       "name_overrides": {},
       "desired_keys": ["vpc_id", "cidr_block", "tags"],
-      "binding": "my_subnet",
+      "binding": "ec2_subnet_aac7c86b",
       "dependency_bindings": ["vpc"]
     }
   ]

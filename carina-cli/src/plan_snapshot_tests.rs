@@ -203,3 +203,47 @@ fn snapshot_destroy_full() {
     let output = strip_ansi(&format_destroy_plan(&plan));
     insta::assert_snapshot!(output);
 }
+
+/// Ensure no fixture .crn file has unused `let` bindings.
+///
+/// `let` should only be used when a binding is referenced by another resource.
+/// This test prevents regressions where unnecessary `let` bindings are added
+/// to fixture files.
+#[test]
+fn no_unused_let_bindings_in_fixtures() {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let fixtures_dir = format!("{}/tests/fixtures/plan_display", manifest_dir);
+
+    let mut failures: Vec<(String, Vec<String>)> = Vec::new();
+
+    for entry in std::fs::read_dir(&fixtures_dir).unwrap() {
+        let entry = entry.unwrap();
+        if !entry.file_type().unwrap().is_dir() {
+            continue;
+        }
+        let fixture_name = entry.file_name().to_string_lossy().to_string();
+        let crn_path = PathBuf::from(format!("{}/{}/main.crn", fixtures_dir, fixture_name));
+        if !crn_path.exists() {
+            continue;
+        }
+
+        let loaded = load_configuration(&crn_path).unwrap();
+        let unused = crate::wiring::check_unused_bindings(&loaded.unresolved_parsed);
+        if !unused.is_empty() {
+            failures.push((fixture_name, unused));
+        }
+    }
+
+    if !failures.is_empty() {
+        let msg: Vec<String> = failures
+            .iter()
+            .map(|(name, bindings)| {
+                format!("  {}: unused let bindings: {}", name, bindings.join(", "))
+            })
+            .collect();
+        panic!(
+            "Fixture .crn files must not have unused let bindings:\n{}",
+            msg.join("\n")
+        );
+    }
+}
