@@ -41,15 +41,13 @@ pub fn handle_key(app: &mut App, code: KeyCode) -> KeyAction {
         match code {
             KeyCode::Esc => {
                 // Cancel search and restore full tree view
+                let saved_node = app.selected_node_idx();
                 app.search_active = false;
                 app.search_query.clear();
                 app.search_matches.clear();
                 app.current_match = 0;
-                // Clamp selected to the (now unfiltered) visible count
-                let count = app.visible_count();
-                if count > 0 && app.selected >= count {
-                    app.selected = count - 1;
-                }
+                // Restore selection to the same node in the unfiltered list
+                app.restore_selection(saved_node);
                 return KeyAction::Continue;
             }
             KeyCode::Enter => {
@@ -88,13 +86,12 @@ pub fn handle_key(app: &mut App, code: KeyCode) -> KeyAction {
     match code {
         KeyCode::Char('q') | KeyCode::Esc if !app.search_matches.is_empty() => {
             // Clear active search filter before quitting
+            let saved_node = app.selected_node_idx();
             app.search_query.clear();
             app.search_matches.clear();
             app.current_match = 0;
-            let count = app.visible_count();
-            if count > 0 && app.selected >= count {
-                app.selected = count - 1;
-            }
+            // Restore selection to the same node in the unfiltered list
+            app.restore_selection(saved_node);
             KeyAction::Continue
         }
         KeyCode::Char('q') | KeyCode::Esc => KeyAction::Quit,
@@ -568,5 +565,67 @@ mod tests {
         // n -> next match (skips ancestor-only nodes)
         handle_key(&mut app, KeyCode::Char('n'));
         assert_eq!(app.selected, second_match);
+    }
+
+    #[test]
+    fn esc_in_search_preserves_selection() {
+        let mut app = make_search_app();
+        // Search for "sub" to filter to subnet
+        handle_key(&mut app, KeyCode::Char('/'));
+        handle_key(&mut app, KeyCode::Char('s'));
+        handle_key(&mut app, KeyCode::Char('u'));
+        handle_key(&mut app, KeyCode::Char('b'));
+
+        // Select the subnet node in the filtered list
+        let filtered_visible = app.visible_nodes();
+        // Find subnet's position in the filtered list
+        let subnet_pos = filtered_visible
+            .iter()
+            .position(|&idx| app.nodes[idx].effect_label.contains("subnet"))
+            .expect("subnet should be visible");
+        app.selected = subnet_pos;
+
+        // Remember which absolute node was selected
+        let subnet_node_idx = app.selected_node_idx().unwrap();
+
+        // Esc clears the filter
+        handle_key(&mut app, KeyCode::Esc);
+
+        // After clearing, the same node should still be selected
+        let new_node_idx = app.selected_node_idx().unwrap();
+        assert_eq!(
+            new_node_idx, subnet_node_idx,
+            "selection should point to the same node after clearing filter"
+        );
+    }
+
+    #[test]
+    fn q_clear_filter_preserves_selection() {
+        let mut app = make_search_app();
+        // Search for "sub" and confirm with Enter
+        handle_key(&mut app, KeyCode::Char('/'));
+        handle_key(&mut app, KeyCode::Char('s'));
+        handle_key(&mut app, KeyCode::Char('u'));
+        handle_key(&mut app, KeyCode::Char('b'));
+        handle_key(&mut app, KeyCode::Enter);
+
+        // Navigate to subnet in the filtered list
+        let filtered_visible = app.visible_nodes();
+        let subnet_pos = filtered_visible
+            .iter()
+            .position(|&idx| app.nodes[idx].effect_label.contains("subnet"))
+            .expect("subnet should be visible");
+        app.selected = subnet_pos;
+        let subnet_node_idx = app.selected_node_idx().unwrap();
+
+        // q clears the filter (first press)
+        handle_key(&mut app, KeyCode::Char('q'));
+
+        // Selection should still point to subnet
+        let new_node_idx = app.selected_node_idx().unwrap();
+        assert_eq!(
+            new_node_idx, subnet_node_idx,
+            "selection should point to the same node after q clears filter"
+        );
     }
 }

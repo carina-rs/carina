@@ -277,6 +277,35 @@ impl App {
         self.selected_node_idx().map(|idx| &self.nodes[idx])
     }
 
+    /// Restore the selection to a previously saved absolute node index.
+    ///
+    /// Finds the position of `saved_node` in the current `visible_nodes()` list
+    /// and sets `selected` accordingly. Falls back to clamping if the node is
+    /// not found.
+    pub fn restore_selection(&mut self, saved_node: Option<usize>) {
+        let visible = self.visible_nodes();
+        if let Some(node_idx) = saved_node {
+            if let Some(pos) = visible.iter().position(|&idx| idx == node_idx) {
+                self.selected = pos;
+            } else {
+                // Node not in visible list; clamp to last
+                self.selected = visible.len().saturating_sub(1);
+            }
+        } else {
+            self.selected = 0;
+        }
+        // Adjust scroll so the selected item is visible
+        if self.selected < self.tree_scroll_offset {
+            self.tree_scroll_offset = self.selected;
+        } else if self.tree_area_height > 0
+            && self.selected >= self.tree_scroll_offset + self.tree_area_height
+        {
+            self.tree_scroll_offset = self.selected - self.tree_area_height + 1;
+        }
+        self.sync_list_state();
+        self.detail_scroll = 0;
+    }
+
     /// Update search matches based on the current query.
     ///
     /// Matches against each node's `effect_label` (which contains both
