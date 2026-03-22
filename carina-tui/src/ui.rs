@@ -34,38 +34,39 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 /// Draw the tree view (compact, no inline attributes)
 fn draw_tree(frame: &mut Frame, app: &mut App, area: Rect) {
     let visible = app.visible_nodes();
-    let match_set: HashSet<usize> = app.search_matches.iter().copied().collect();
+    let visible_set: HashSet<usize> = visible.iter().copied().collect();
 
     let items: Vec<ListItem> = visible
         .iter()
         .enumerate()
         .map(|(row_idx, &node_idx)| {
             let node = &app.nodes[node_idx];
-            let connector = build_tree_connector(node_idx, app);
-            let effect_color = effect_style(node.kind);
-            let is_match = match_set.contains(&row_idx);
+            let connector = build_tree_connector_filtered(node_idx, app, &visible_set);
+            let is_ancestor_only = app.is_ancestor_only(node_idx);
+            let effect_color = if is_ancestor_only {
+                Style::default().fg(Color::DarkGray)
+            } else {
+                effect_style(node.kind)
+            };
+            let type_style = if is_ancestor_only {
+                Style::default().fg(Color::DarkGray)
+            } else {
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            };
+            let connector_style = if is_ancestor_only {
+                Style::default().fg(Color::DarkGray)
+            } else {
+                Style::default()
+            };
             let mut spans = vec![
-                Span::raw(connector),
+                Span::styled(connector, connector_style),
                 Span::styled(format!("{} ", node.symbol), effect_color),
-                Span::styled(
-                    node.resource_type.clone(),
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                ),
+                Span::styled(node.resource_type.clone(), type_style),
                 Span::raw(" "),
                 Span::styled(node.name_part.clone(), effect_color),
             ];
-            if is_match {
-                spans = spans
-                    .into_iter()
-                    .map(|s| {
-                        let mut style = s.style;
-                        style = style.bg(Color::DarkGray);
-                        Span::styled(s.content, style)
-                    })
-                    .collect();
-            }
             if app.selected == row_idx {
                 spans = spans
                     .into_iter()
@@ -462,24 +463,28 @@ fn build_plan_title(summary: &PlanSummary) -> Line<'static> {
     Line::from(spans)
 }
 
-/// Build the tree connector prefix for a node.
+/// Build the tree connector prefix for a node, considering filtered visibility.
 ///
-/// Each tree level uses exactly 4-character-wide segments:
-/// - Root nodes (depth 0): no connector
-/// - Children: `--- ` or `--- ` with continuation `|   ` or `    `
-fn build_tree_connector(idx: usize, app: &App) -> String {
+/// When nodes are filtered, the connector uses the visible children of each
+/// parent rather than all children, so `└──` / `├──` are correct for the
+/// filtered tree.
+fn build_tree_connector_filtered(idx: usize, app: &App, visible_set: &HashSet<usize>) -> String {
     let node = &app.nodes[idx];
     if node.parent.is_none() {
         return String::new();
     }
 
-    // Collect prefix segments from current node up to root
     let mut parts: Vec<&str> = Vec::new();
 
-    // This node's own connector (4 chars each)
+    // This node's own connector
     if let Some(parent_idx) = node.parent {
-        let siblings = &app.nodes[parent_idx].children;
-        let is_last = siblings.last() == Some(&idx);
+        let visible_siblings: Vec<usize> = app.nodes[parent_idx]
+            .children
+            .iter()
+            .copied()
+            .filter(|c| visible_set.contains(c))
+            .collect();
+        let is_last = visible_siblings.last() == Some(&idx);
         if is_last {
             parts.push("└── ");
         } else {
@@ -487,7 +492,7 @@ fn build_tree_connector(idx: usize, app: &App) -> String {
         }
     }
 
-    // Walk up ancestors to build continuation lines (4 chars each)
+    // Walk up ancestors
     let mut ancestor = node.parent;
     while let Some(a_idx) = ancestor {
         let a_node = &app.nodes[a_idx];
@@ -495,8 +500,13 @@ fn build_tree_connector(idx: usize, app: &App) -> String {
             break;
         }
         if let Some(grandparent_idx) = a_node.parent {
-            let siblings = &app.nodes[grandparent_idx].children;
-            let is_last = siblings.last() == Some(&a_idx);
+            let visible_siblings: Vec<usize> = app.nodes[grandparent_idx]
+                .children
+                .iter()
+                .copied()
+                .filter(|c| visible_set.contains(c))
+                .collect();
+            let is_last = visible_siblings.last() == Some(&a_idx);
             if is_last {
                 parts.push("    ");
             } else {
@@ -506,10 +516,15 @@ fn build_tree_connector(idx: usize, app: &App) -> String {
         ancestor = a_node.parent;
     }
 
-    // Reverse to get top-down order
     parts.reverse();
-    // Base indentation (4 spaces) before tree connectors
     format!("    {}", parts.join(""))
+}
+
+/// Build the tree connector prefix for a node (unfiltered, for tests).
+#[cfg(test)]
+fn build_tree_connector(idx: usize, app: &App) -> String {
+    let all_nodes: HashSet<usize> = (0..app.nodes.len()).collect();
+    build_tree_connector_filtered(idx, app, &all_nodes)
 }
 
 /// Return the style for a given effect kind

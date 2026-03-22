@@ -40,11 +40,16 @@ pub fn handle_key(app: &mut App, code: KeyCode) -> KeyAction {
     if app.search_active {
         match code {
             KeyCode::Esc => {
-                // Cancel search
+                // Cancel search and restore full tree view
                 app.search_active = false;
                 app.search_query.clear();
                 app.search_matches.clear();
                 app.current_match = 0;
+                // Clamp selected to the (now unfiltered) visible count
+                let count = app.visible_count();
+                if count > 0 && app.selected >= count {
+                    app.selected = count - 1;
+                }
                 return KeyAction::Continue;
             }
             KeyCode::Enter => {
@@ -61,6 +66,10 @@ pub fn handle_key(app: &mut App, code: KeyCode) -> KeyAction {
                 if !app.search_matches.is_empty() {
                     app.jump_to_current_match();
                 }
+                return KeyAction::Continue;
+            }
+            KeyCode::Tab => {
+                app.tab_complete();
                 return KeyAction::Continue;
             }
             KeyCode::Char(c) => {
@@ -365,5 +374,82 @@ mod tests {
         assert_eq!(action, KeyAction::Continue);
         assert_eq!(app.search_query, "q");
         assert!(app.search_active);
+    }
+
+    #[test]
+    fn tab_in_search_mode_completes() {
+        let mut app = make_search_app();
+        handle_key(&mut app, KeyCode::Char('/'));
+        handle_key(&mut app, KeyCode::Char('s'));
+        handle_key(&mut app, KeyCode::Char('u'));
+        handle_key(&mut app, KeyCode::Char('b'));
+
+        // Tab should autocomplete "sub" to "subnet"
+        handle_key(&mut app, KeyCode::Tab);
+        assert_eq!(app.search_query, "subnet");
+        assert!(app.search_active);
+    }
+
+    #[test]
+    fn tab_in_normal_mode_toggles_focus() {
+        let mut app = make_search_app();
+        assert_eq!(app.focused_panel, FocusedPanel::Tree);
+        handle_key(&mut app, KeyCode::Tab);
+        assert_eq!(app.focused_panel, FocusedPanel::Detail);
+    }
+
+    #[test]
+    fn esc_cancels_search_restores_all_nodes() {
+        let mut app = make_search_app();
+        handle_key(&mut app, KeyCode::Char('/'));
+        handle_key(&mut app, KeyCode::Char('s'));
+        handle_key(&mut app, KeyCode::Char('u'));
+        handle_key(&mut app, KeyCode::Char('b'));
+
+        // With search active, only matching + ancestors visible
+        let filtered_count = app.visible_count();
+        assert!(filtered_count < 3);
+
+        // Esc restores full tree
+        handle_key(&mut app, KeyCode::Esc);
+        assert_eq!(app.visible_count(), 3);
+        assert!(!app.search_active);
+    }
+
+    #[test]
+    fn enter_confirms_search_keeps_filter() {
+        let mut app = make_search_app();
+        handle_key(&mut app, KeyCode::Char('/'));
+        handle_key(&mut app, KeyCode::Char('v'));
+        handle_key(&mut app, KeyCode::Char('p'));
+        handle_key(&mut app, KeyCode::Char('c'));
+        handle_key(&mut app, KeyCode::Enter);
+
+        // Filter should remain (query is not cleared)
+        assert!(!app.search_active);
+        assert_eq!(app.search_query, "vpc");
+        assert!(!app.search_matches.is_empty());
+    }
+
+    #[test]
+    fn n_navigates_only_matching_nodes_in_filter_mode() {
+        let mut app = make_search_app();
+        // Search for "ec2" which matches vpc and subnet
+        handle_key(&mut app, KeyCode::Char('/'));
+        handle_key(&mut app, KeyCode::Char('e'));
+        handle_key(&mut app, KeyCode::Char('c'));
+        handle_key(&mut app, KeyCode::Char('2'));
+        handle_key(&mut app, KeyCode::Enter);
+
+        assert!(app.search_matches.len() >= 2);
+        let first_match = app.search_matches[0];
+        let second_match = app.search_matches[1];
+
+        // Jump to first match
+        assert_eq!(app.selected, first_match);
+
+        // n -> next match (skips ancestor-only nodes)
+        handle_key(&mut app, KeyCode::Char('n'));
+        assert_eq!(app.selected, second_match);
     }
 }
