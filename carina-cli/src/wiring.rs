@@ -183,6 +183,27 @@ pub fn compute_anonymous_identifiers_with_ctx(
     .map_err(AppError::Config)
 }
 
+/// Run provider-specific normalization on desired resources.
+///
+/// Creates normalizers from all registered provider factories and applies
+/// `normalize_desired()` to the resources. This resolves enum identifiers
+/// (e.g., `UnresolvedIdent` -> namespaced enum strings) without requiring
+/// actual provider instances or network access.
+#[cfg(test)]
+pub fn normalize_desired_with_ctx(ctx: &WiringContext, resources: &mut [Resource]) {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("failed to build tokio runtime for normalize_desired");
+    let mut router = ProviderRouter::new();
+    for factory in ctx.factories() {
+        let attrs = HashMap::new();
+        if let Some(normalizer) = rt.block_on(factory.create_normalizer(&attrs)) {
+            router.add_normalizer(normalizer);
+        }
+    }
+    router.normalize_desired(resources);
+}
+
 /// Resolve enum alias values in resources to their canonical AWS form.
 ///
 /// After `normalize_desired()` converts DSL identifiers to namespaced strings
