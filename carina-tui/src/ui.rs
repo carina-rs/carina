@@ -153,8 +153,10 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(Color::DarkGray),
         )));
     } else {
-        for row in &node.detail_rows {
-            render_detail_row_to_lines(&mut lines, row, node.kind);
+        let is_detail_focused = app.focused_panel == FocusedPanel::Detail;
+        for (row_idx, row) in node.detail_rows.iter().enumerate() {
+            let is_selected = is_detail_focused && row_idx == app.detail_selected;
+            render_detail_row_to_lines(&mut lines, row, node.kind, is_selected);
         }
     }
 
@@ -171,20 +173,43 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 /// Render a single `DetailRow` into TUI `Line`s.
-fn render_detail_row_to_lines(lines: &mut Vec<Line>, row: &DetailRow, kind: EffectKind) {
+fn render_detail_row_to_lines(
+    lines: &mut Vec<Line>,
+    row: &DetailRow,
+    kind: EffectKind,
+    is_selected: bool,
+) {
     let dim_style = Style::default().fg(Color::DarkGray);
 
     match row {
-        DetailRow::Attribute { key, value } => {
-            let value_style = if kind == EffectKind::Create {
+        DetailRow::Attribute {
+            key,
+            value,
+            ref_binding,
+        } => {
+            let is_navigable = ref_binding.is_some();
+            let value_style = if is_navigable {
+                Style::default().fg(Color::Cyan)
+            } else if kind == EffectKind::Create {
                 Style::default().fg(Color::Green)
             } else {
                 Style::default()
             };
-            lines.push(Line::from(vec![
+            let mut spans = vec![
                 Span::raw(format!("  {}: ", key)),
                 Span::styled(value.clone(), value_style),
-            ]));
+            ];
+            if is_navigable {
+                spans.push(Span::styled(
+                    " \u{2192}",
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+            let mut line = Line::from(spans);
+            if is_selected {
+                line = line.style(Style::default().bg(Color::DarkGray));
+            }
+            lines.push(line);
         }
         DetailRow::ListOfMaps { key, items } => {
             let value_style = if kind == EffectKind::Create {
@@ -192,10 +217,14 @@ fn render_detail_row_to_lines(lines: &mut Vec<Line>, row: &DetailRow, kind: Effe
             } else {
                 Style::default()
             };
-            lines.push(Line::from(vec![
+            let mut first_line = Line::from(vec![
                 Span::raw(format!("  {}: ", key)),
                 Span::styled("[", value_style),
-            ]));
+            ]);
+            if is_selected {
+                first_line = first_line.style(Style::default().bg(Color::DarkGray));
+            }
+            lines.push(first_line);
             for item in items {
                 lines.push(Line::from(vec![
                     Span::raw("    "),
@@ -208,7 +237,7 @@ fn render_detail_row_to_lines(lines: &mut Vec<Line>, row: &DetailRow, kind: Effe
             ]));
         }
         DetailRow::Changed { key, old, new } => {
-            lines.push(Line::from(vec![
+            let mut line = Line::from(vec![
                 Span::raw(format!("  {}: ", key)),
                 Span::styled(
                     old.clone(),
@@ -218,10 +247,18 @@ fn render_detail_row_to_lines(lines: &mut Vec<Line>, row: &DetailRow, kind: Effe
                 ),
                 Span::raw(" -> "),
                 Span::styled(new.clone(), Style::default().fg(Color::Green)),
-            ]));
+            ]);
+            if is_selected {
+                line = line.style(Style::default().bg(Color::DarkGray));
+            }
+            lines.push(line);
         }
         DetailRow::MapDiff { key, entries } => {
-            lines.push(Line::from(Span::raw(format!("  {}:", key))));
+            let mut first_line = Line::from(Span::raw(format!("  {}:", key)));
+            if is_selected {
+                first_line = first_line.style(Style::default().bg(Color::DarkGray));
+            }
+            lines.push(first_line);
             render_map_diff_entries(lines, entries);
         }
         DetailRow::ListOfMapsDiff {
@@ -231,10 +268,10 @@ fn render_detail_row_to_lines(lines: &mut Vec<Line>, row: &DetailRow, kind: Effe
             added,
             removed,
         } => {
-            render_list_of_maps_diff(lines, key, unchanged, modified, added, removed);
+            render_list_of_maps_diff(lines, key, unchanged, modified, added, removed, is_selected);
         }
         DetailRow::Removed { key, old } => {
-            lines.push(Line::from(vec![
+            let mut line = Line::from(vec![
                 Span::styled(
                     format!("  {}: ", key),
                     Style::default()
@@ -247,20 +284,32 @@ fn render_detail_row_to_lines(lines: &mut Vec<Line>, row: &DetailRow, kind: Effe
                         .fg(Color::Red)
                         .add_modifier(Modifier::CROSSED_OUT),
                 ),
-            ]));
+            ]);
+            if is_selected {
+                line = line.style(Style::default().bg(Color::DarkGray));
+            }
+            lines.push(line);
         }
         DetailRow::Default { key, value } => {
-            lines.push(Line::from(vec![
+            let mut line = Line::from(vec![
                 Span::styled(format!("  {}: ", key), dim_style),
                 Span::styled(value.clone(), dim_style),
                 Span::styled("  # default", dim_style),
-            ]));
+            ]);
+            if is_selected {
+                line = line.style(Style::default().bg(Color::DarkGray));
+            }
+            lines.push(line);
         }
         DetailRow::ReadOnly { key } => {
-            lines.push(Line::from(vec![
+            let mut line = Line::from(vec![
                 Span::styled(format!("  {}: ", key), dim_style),
                 Span::styled("(known after apply)", dim_style),
-            ]));
+            ]);
+            if is_selected {
+                line = line.style(Style::default().bg(Color::DarkGray));
+            }
+            lines.push(line);
         }
         DetailRow::HiddenUnchanged { count } => {
             let noun = if *count == 1 {
@@ -268,13 +317,17 @@ fn render_detail_row_to_lines(lines: &mut Vec<Line>, row: &DetailRow, kind: Effe
             } else {
                 "attributes"
             };
-            lines.push(Line::from(Span::styled(
+            let mut line = Line::from(Span::styled(
                 format!("  # ({} unchanged {} hidden)", count, noun),
                 dim_style,
-            )));
+            ));
+            if is_selected {
+                line = line.style(Style::default().bg(Color::DarkGray));
+            }
+            lines.push(line);
         }
         DetailRow::ReplaceChanged { key, old, new } => {
-            lines.push(Line::from(vec![
+            let mut line = Line::from(vec![
                 Span::raw(format!("  {}: ", key)),
                 Span::styled(
                     old.clone(),
@@ -284,10 +337,14 @@ fn render_detail_row_to_lines(lines: &mut Vec<Line>, row: &DetailRow, kind: Effe
                 ),
                 Span::raw(" -> "),
                 Span::styled(new.clone(), Style::default().fg(Color::Yellow)),
-            ]));
+            ]);
+            if is_selected {
+                line = line.style(Style::default().bg(Color::DarkGray));
+            }
+            lines.push(line);
         }
         DetailRow::ReplaceCascade { key, old, new } => {
-            lines.push(Line::from(vec![
+            let mut line = Line::from(vec![
                 Span::raw(format!("  {}: ", key)),
                 Span::styled(
                     old.clone(),
@@ -297,7 +354,11 @@ fn render_detail_row_to_lines(lines: &mut Vec<Line>, row: &DetailRow, kind: Effe
                 ),
                 Span::raw(" -> "),
                 Span::styled(new.clone(), Style::default().fg(Color::Yellow)),
-            ]));
+            ]);
+            if is_selected {
+                line = line.style(Style::default().bg(Color::DarkGray));
+            }
+            lines.push(line);
         }
         DetailRow::ReplaceListOfMapsDiff {
             key,
@@ -306,10 +367,14 @@ fn render_detail_row_to_lines(lines: &mut Vec<Line>, row: &DetailRow, kind: Effe
             added,
             removed,
         } => {
-            render_list_of_maps_diff(lines, key, unchanged, modified, added, removed);
+            render_list_of_maps_diff(lines, key, unchanged, modified, added, removed, is_selected);
         }
         DetailRow::ReplaceMapDiff { key, entries } => {
-            lines.push(Line::from(Span::raw(format!("  {}:", key))));
+            let mut first_line = Line::from(Span::raw(format!("  {}:", key)));
+            if is_selected {
+                first_line = first_line.style(Style::default().bg(Color::DarkGray));
+            }
+            lines.push(first_line);
             render_map_diff_entries(lines, entries);
         }
         DetailRow::TemporaryNameNote {
@@ -318,23 +383,27 @@ fn render_detail_row_to_lines(lines: &mut Vec<Line>, row: &DetailRow, kind: Effe
             original_value,
             attribute,
         } => {
-            if *can_rename {
-                lines.push(Line::from(Span::styled(
+            let mut line = if *can_rename {
+                Line::from(Span::styled(
                     format!(
                         "  # New resource created with {attribute} = \"{temporary_value}\", \
                          then renamed to \"{original_value}\" after old resource is deleted"
                     ),
                     dim_style,
-                )));
+                ))
             } else {
-                lines.push(Line::from(Span::styled(
+                Line::from(Span::styled(
                     format!(
                         "  # {attribute} = \"{temporary_value}\" (temporary); \
                          original \"{original_value}\" reused after old resource deleted"
                     ),
                     dim_style,
-                )));
+                ))
+            };
+            if is_selected {
+                line = line.style(Style::default().bg(Color::DarkGray));
             }
+            lines.push(line);
         }
         DetailRow::CascadingUpdates { count, updates } => {
             lines.push(Line::from(Span::styled(
@@ -431,8 +500,13 @@ fn render_list_of_maps_diff(
     modified: &[ListOfMapsDiffModified],
     added: &[String],
     removed: &[String],
+    is_selected: bool,
 ) {
-    lines.push(Line::from(Span::raw(format!("  {}: [", key))));
+    let mut first_line = Line::from(Span::raw(format!("  {}: [", key)));
+    if is_selected {
+        first_line = first_line.style(Style::default().bg(Color::DarkGray));
+    }
+    lines.push(first_line);
     for item in unchanged {
         lines.push(Line::from(Span::styled(
             format!("    {}", item),
@@ -536,7 +610,7 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
         ]
     } else {
         // Normal mode: no filter active
-        vec![
+        let mut spans = vec![
             Span::styled(
                 " /",
                 Style::default()
@@ -558,14 +632,42 @@ fn draw_help(frame: &mut Frame, app: &App, area: Rect) {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw(" switch panel  "),
-            Span::styled(
-                "q/Esc",
+        ];
+        // Show Enter hint based on focused panel
+        if app.focused_panel == FocusedPanel::Tree {
+            spans.push(Span::styled(
+                "Enter",
                 Style::default()
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" quit"),
-        ]
+            ));
+            spans.push(Span::raw(" detail  "));
+        } else if app.selected_detail_ref_binding().is_some() {
+            spans.push(Span::styled(
+                "Enter",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::raw(" follow ref  "));
+        }
+        if !app.nav_stack.is_empty() {
+            spans.push(Span::styled(
+                "Backspace",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::raw(" go back  "));
+        }
+        spans.push(Span::styled(
+            "q/Esc",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::raw(" quit"));
+        spans
     };
 
     let help = Paragraph::new(Line::from(spans));
