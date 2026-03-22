@@ -172,6 +172,40 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(detail, area);
 }
 
+/// Infer a color for a rendered attribute value based on its string form.
+///
+/// - Quoted strings (`"..."`) → Green
+/// - Booleans (`true` / `false`) → Yellow
+/// - Numbers (integer or float) → default (White)
+/// - DSL identifiers (dot-separated, e.g. `awscc.Region.ap_northeast_1`) → Magenta
+/// - Everything else → None (caller decides)
+fn value_color(rendered: &str) -> Option<Color> {
+    if rendered.starts_with('"') && rendered.ends_with('"') {
+        return Some(Color::Green);
+    }
+    if rendered == "true" || rendered == "false" {
+        return Some(Color::Yellow);
+    }
+    // Integer or float
+    if !rendered.is_empty()
+        && rendered
+            .chars()
+            .all(|c| c.is_ascii_digit() || c == '.' || c == '-')
+    {
+        // Must start with a digit or '-'
+        let first = rendered.chars().next().unwrap();
+        if first.is_ascii_digit() || first == '-' {
+            return Some(Color::White);
+        }
+    }
+    // DSL identifier: contains dots, no quotes, no spaces (e.g. binding.attr or awscc.Region.x)
+    // ResourceRef is handled separately (cyan), so this catches remaining dot-notation identifiers
+    if rendered.contains('.') && !rendered.contains(' ') && !rendered.starts_with('{') {
+        return Some(Color::Magenta);
+    }
+    None
+}
+
 /// Render a single `DetailRow` into TUI `Line`s.
 fn render_detail_row_to_lines(
     lines: &mut Vec<Line>,
@@ -192,6 +226,8 @@ fn render_detail_row_to_lines(
                 Style::default().fg(Color::Cyan)
             } else if kind == EffectKind::Create {
                 Style::default().fg(Color::Green)
+            } else if let Some(color) = value_color(value) {
+                Style::default().fg(color)
             } else {
                 Style::default()
             };
@@ -237,6 +273,11 @@ fn render_detail_row_to_lines(
             ]));
         }
         DetailRow::Changed { key, old, new } => {
+            let new_style = if let Some(color) = value_color(new) {
+                Style::default().fg(color)
+            } else {
+                Style::default().fg(Color::Green)
+            };
             let mut line = Line::from(vec![
                 Span::raw(format!("  {}: ", key)),
                 Span::styled(
@@ -246,7 +287,7 @@ fn render_detail_row_to_lines(
                         .add_modifier(Modifier::CROSSED_OUT),
                 ),
                 Span::raw(" -> "),
-                Span::styled(new.clone(), Style::default().fg(Color::Green)),
+                Span::styled(new.clone(), new_style),
             ]);
             if is_selected {
                 line = line.style(Style::default().bg(Color::DarkGray));
@@ -291,9 +332,14 @@ fn render_detail_row_to_lines(
             lines.push(line);
         }
         DetailRow::Default { key, value } => {
+            let value_style = if let Some(color) = value_color(value) {
+                Style::default().fg(color).add_modifier(Modifier::DIM)
+            } else {
+                dim_style
+            };
             let mut line = Line::from(vec![
                 Span::styled(format!("  {}: ", key), dim_style),
-                Span::styled(value.clone(), dim_style),
+                Span::styled(value.clone(), value_style),
                 Span::styled("  # default", dim_style),
             ]);
             if is_selected {
@@ -898,5 +944,46 @@ mod tests {
         let last_child = children[1];
         assert_eq!(build_tree_connector(first_child, &app), "    ├── ");
         assert_eq!(build_tree_connector(last_child, &app), "    └── ");
+    }
+
+    #[test]
+    fn value_color_quoted_string_is_green() {
+        assert_eq!(value_color("\"hello\""), Some(Color::Green));
+        assert_eq!(value_color("\"10.0.0.0/16\""), Some(Color::Green));
+        assert_eq!(value_color("\"\""), Some(Color::Green));
+    }
+
+    #[test]
+    fn value_color_boolean_is_yellow() {
+        assert_eq!(value_color("true"), Some(Color::Yellow));
+        assert_eq!(value_color("false"), Some(Color::Yellow));
+    }
+
+    #[test]
+    fn value_color_number_is_white() {
+        assert_eq!(value_color("42"), Some(Color::White));
+        assert_eq!(value_color("3.14"), Some(Color::White));
+        assert_eq!(value_color("-1"), Some(Color::White));
+        assert_eq!(value_color("0"), Some(Color::White));
+    }
+
+    #[test]
+    fn value_color_dsl_identifier_is_magenta() {
+        // DSL identifiers with dots (not quoted, not ResourceRef which is handled separately)
+        assert_eq!(
+            value_color("awscc.Region.ap_northeast_1"),
+            Some(Color::Magenta)
+        );
+        assert_eq!(
+            value_color("aws.s3.VersioningStatus.Enabled"),
+            Some(Color::Magenta)
+        );
+    }
+
+    #[test]
+    fn value_color_other_values_return_none() {
+        assert_eq!(value_color("[1, 2, 3]"), None);
+        assert_eq!(value_color("{key: val}"), None);
+        assert_eq!(value_color(""), None);
     }
 }
