@@ -128,8 +128,21 @@ pub enum MapDiffEntryIR {
 /// A modified item in a list-of-maps diff
 #[derive(Debug, Clone, PartialEq)]
 pub struct ListOfMapsDiffModified {
-    /// Pre-formatted fields string with per-field diffs
-    pub fields: String,
+    /// Ordered list of fields, each either unchanged or changed
+    pub fields: Vec<ListOfMapsDiffField>,
+}
+
+/// A single field in a modified list-of-maps item
+#[derive(Debug, Clone, PartialEq)]
+pub enum ListOfMapsDiffField {
+    /// Field value is unchanged
+    Unchanged { key: String, value: String },
+    /// Field value changed
+    Changed {
+        key: String,
+        old: String,
+        new: String,
+    },
 }
 
 /// A cascading update entry
@@ -690,7 +703,7 @@ fn compute_list_of_maps_diff_parts(
         if let (Value::Map(old_map), Value::Map(new_map)) = (&old_items[oi], &new_items[ni]) {
             let mut keys: Vec<_> = new_map.keys().collect();
             keys.sort();
-            let fields: Vec<String> = keys
+            let fields: Vec<ListOfMapsDiffField> = keys
                 .iter()
                 .map(|k| {
                     let new_v = format_value(&new_map[*k]);
@@ -703,15 +716,20 @@ fn compute_list_of_maps_diff_parts(
                             .get(*k)
                             .map(format_value)
                             .unwrap_or_else(|| "(none)".to_string());
-                        format!("CHANGED:{}:{}:{}", k, old_v, new_v)
+                        ListOfMapsDiffField::Changed {
+                            key: k.to_string(),
+                            old: old_v,
+                            new: new_v,
+                        }
                     } else {
-                        format!("{}: {}", k, new_v)
+                        ListOfMapsDiffField::Unchanged {
+                            key: k.to_string(),
+                            value: new_v,
+                        }
                     }
                 })
                 .collect();
-            modified.push(ListOfMapsDiffModified {
-                fields: fields.join(", "),
-            });
+            modified.push(ListOfMapsDiffModified { fields });
         }
     }
 

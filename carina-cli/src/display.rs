@@ -6,7 +6,7 @@ use colored::Colorize;
 
 use carina_core::deps::get_resource_dependencies;
 use carina_core::detail_rows::{
-    DetailRow, ListOfMapsDiffModified, MapDiffEntryIR, build_detail_rows,
+    DetailRow, ListOfMapsDiffField, ListOfMapsDiffModified, MapDiffEntryIR, build_detail_rows,
 };
 #[cfg(test)]
 use carina_core::diff_helpers::compute_map_diff;
@@ -1037,7 +1037,6 @@ fn render_list_of_maps_diff(
         writeln!(out, "{}    {}", attr_prefix, item).unwrap();
     }
     for item in modified {
-        // Parse the fields string to apply per-field coloring
         let rendered_fields = render_modified_fields(&item.fields);
         writeln!(
             out,
@@ -1063,65 +1062,25 @@ fn render_list_of_maps_diff(
     }
 }
 
-/// Render modified fields from the IR format back into colored output.
-///
-/// Fields in the IR use the format "CHANGED:key:old:new" for changed fields
-/// and "key: value" for unchanged fields.
-fn render_modified_fields(fields_str: &str) -> String {
+/// Render modified fields from structured IR into colored output.
+fn render_modified_fields(fields: &[ListOfMapsDiffField]) -> String {
     let mut result_parts = Vec::new();
-    // Split by ", " but we need to be careful about commas inside values
-    // The IR uses "CHANGED:key:old:new" format for changed fields
-    for field in split_fields(fields_str) {
-        if let Some(rest) = field.strip_prefix("CHANGED:") {
-            // Parse "key:old:new" - split on first two colons
-            let parts: Vec<&str> = rest.splitn(3, ':').collect();
-            if parts.len() == 3 {
-                let key = parts[0];
-                let old_v = parts[1];
-                let new_v = parts[2];
+    for field in fields {
+        match field {
+            ListOfMapsDiffField::Unchanged { key, value } => {
+                result_parts.push(format!("{}: {}", key, value));
+            }
+            ListOfMapsDiffField::Changed { key, old, new } => {
                 result_parts.push(format!(
                     "{}: {} → {}",
                     key,
-                    old_v.red().strikethrough(),
-                    new_v.green()
+                    old.red().strikethrough(),
+                    new.green()
                 ));
-            } else {
-                result_parts.push(field.to_string());
             }
-        } else {
-            result_parts.push(field.to_string());
         }
     }
     result_parts.join(", ")
-}
-
-/// Split a comma-separated fields string, respecting the CHANGED: prefix marker.
-fn split_fields(s: &str) -> Vec<&str> {
-    let mut results = Vec::new();
-    let mut start = 0;
-    let mut depth = 0;
-
-    for (i, ch) in s.char_indices() {
-        match ch {
-            '{' | '[' => depth += 1,
-            '}' | ']' => depth -= 1,
-            ',' if depth == 0 => {
-                let part = s[start..i].trim();
-                if !part.is_empty() {
-                    results.push(part);
-                }
-                start = i + 1;
-            }
-            _ => {}
-        }
-    }
-
-    let part = s[start..].trim();
-    if !part.is_empty() {
-        results.push(part);
-    }
-
-    results
 }
 
 pub fn format_effect(effect: &Effect) -> String {
