@@ -6,7 +6,7 @@
   "resources": [
     {
       "resource_type": "ec2.vpc",
-      "name": "vpc",
+      "name": "ec2_vpc_fb75c929",
       "provider": "awscc",
       "identifier": "vpc-0123456789abcdef0",
       "attributes": {
@@ -21,12 +21,12 @@
       "prefixes": {},
       "name_overrides": {},
       "desired_keys": ["cidr_block", "enable_dns_support", "enable_dns_hostnames", "tags"],
-      "binding": "vpc",
+      "binding": "ec2_vpc_fb75c929",
       "dependency_bindings": []
     },
     {
       "resource_type": "ec2.subnet",
-      "name": "subnet",
+      "name": "ec2_subnet_f5269366",
       "provider": "awscc",
       "identifier": "subnet-0123456789abcdef0",
       "attributes": {
@@ -41,8 +41,8 @@
       "prefixes": {},
       "name_overrides": {},
       "desired_keys": ["vpc_id", "cidr_block", "availability_zone", "tags"],
-      "binding": "subnet",
-      "dependency_bindings": ["vpc"]
+      "binding": "ec2_subnet_f5269366",
+      "dependency_bindings": ["ec2_vpc_fb75c929"]
     }
   ]
 }

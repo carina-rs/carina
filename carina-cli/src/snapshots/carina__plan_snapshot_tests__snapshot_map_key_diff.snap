@@ -1,11 +1,10 @@
 ---
 source: carina-cli/src/plan_snapshot_tests.rs
-assertion_line: 171
 expression: output
 ---
 Execution Plan:
 
-  ~ awscc.ec2.vpc vpc
+  ~ awscc.ec2.vpc ec2_vpc_fb75c929
       tags:
         ~ Environment: "staging" → "production"
         - OldTag: "remove-me"

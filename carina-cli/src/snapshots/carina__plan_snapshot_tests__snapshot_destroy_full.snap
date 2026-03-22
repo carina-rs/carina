@@ -4,5 +4,5 @@ expression: output
 ---
 Destroy Plan:
 
-  - awscc.ec2.vpc vpc
-        └─ - awscc.ec2.subnet subnet
+  - awscc.ec2.vpc ec2_vpc_fb75c929
+        └─ - awscc.ec2.subnet ec2_subnet_f5269366

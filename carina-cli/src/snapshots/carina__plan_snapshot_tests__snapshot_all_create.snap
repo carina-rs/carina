@@ -14,7 +14,7 @@ Execution Plan:
         │     tags: {Name: "test-route-table"}
         │     vpc_id: vpc.vpc_id
         │
-        └─ + awscc.ec2.subnet subnet
+        └─ + awscc.ec2.subnet ec2_subnet_f5269366
               availability_zone: "ap-northeast-1a"
               cidr_block: "10.0.1.0/24"
               tags: {Name: "test-subnet"}

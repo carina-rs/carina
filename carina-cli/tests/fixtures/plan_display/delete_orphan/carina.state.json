@@ -6,7 +6,7 @@
   "resources": [
     {
       "resource_type": "ec2.vpc",
-      "name": "vpc",
+      "name": "ec2_vpc_fb75c929",
       "provider": "awscc",
       "identifier": "vpc-0123456789abcdef0",
       "attributes": {
@@ -21,7 +21,7 @@
       "prefixes": {},
       "name_overrides": {},
       "desired_keys": ["cidr_block", "enable_dns_support", "enable_dns_hostnames", "tags"],
-      "binding": "vpc",
+      "binding": "ec2_vpc_fb75c929",
       "dependency_bindings": []
     },
     {
@@ -42,7 +42,7 @@
       "name_overrides": {},
       "desired_keys": ["vpc_id", "cidr_block", "availability_zone", "tags"],
       "binding": "my_subnet",
-      "dependency_bindings": ["vpc"]
+      "dependency_bindings": ["ec2_vpc_fb75c929"]
     }
   ]
 }
