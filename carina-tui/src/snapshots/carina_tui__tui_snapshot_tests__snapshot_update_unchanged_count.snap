@@ -32,9 +32,9 @@ expression: output
 ┌ Details ─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │~ ec2.vpc vpc                                                                                                         │
 │                                                                                                                      │
-│  cidr_block: "10.0.0.0/16"                                                                                           │
-│  enable_dns_support: true                                                                                            │
+│  enable_dns_support: (none) -> true                                                                                  │
 │  # (1 unchanged attribute hidden)                                                                                    │
+│                                                                                                                      │
 │                                                                                                                      │
 │                                                                                                                      │
 │                                                                                                                      │
