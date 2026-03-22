@@ -224,8 +224,6 @@ fn render_detail_row_to_lines(
             let is_navigable = ref_binding.is_some();
             let value_style = if is_navigable {
                 Style::default().fg(Color::Cyan)
-            } else if kind == EffectKind::Create {
-                Style::default().fg(Color::Green)
             } else if let Some(color) = value_color(value) {
                 Style::default().fg(color)
             } else {
