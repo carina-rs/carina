@@ -10,7 +10,7 @@ use carina_core::resource::{LifecycleConfig, Resource, ResourceId, State, Value}
 use carina_core::value::{format_value, json_to_dsl_value};
 use carina_state::{
     BackendConfig as StateBackendConfig, BackendError, LockInfo, ResourceState, StateBackend,
-    create_backend, create_local_backend,
+    StateFile, create_backend, create_local_backend,
 };
 
 use super::validate_and_resolve;
@@ -65,6 +65,25 @@ pub enum StateCommands {
         #[arg(long, default_value = "true", action = clap::ArgAction::Set)]
         lock: bool,
     },
+    /// List all managed resources from the state file
+    List {
+        /// Path to .crn file or directory
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
+    /// Look up resource attributes from the state file
+    Lookup {
+        /// Query: <binding_or_name> for full resource, <binding_or_name>.<attribute> for specific attribute
+        query: String,
+
+        /// Path to .crn file or directory
+        #[arg(default_value = ".")]
+        path: PathBuf,
+
+        /// Always output as JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// Run state subcommands
@@ -76,6 +95,8 @@ pub async fn run_state_command(command: StateCommands) -> Result<(), AppError> {
             path,
         } => run_state_bucket_delete(&bucket_name, force, &path).await,
         StateCommands::Refresh { path, lock } => run_state_refresh(&path, lock).await,
+        StateCommands::List { path } => run_state_list(&path).await,
+        StateCommands::Lookup { query, path, json } => run_state_lookup(&query, &path, json).await,
     }
 }
 
@@ -110,6 +131,105 @@ pub async fn run_force_unlock(lock_id: &str, path: &PathBuf) -> Result<(), AppEr
             expected, actual
         ))),
         Err(e) => Err(AppError::Backend(e)),
+    }
+}
+
+/// Load the state file from the backend (or local file), without acquiring a lock.
+async fn load_state_file(path: &PathBuf) -> Result<StateFile, AppError> {
+    let loaded = load_configuration(path)?;
+    let parsed = loaded.parsed;
+
+    let backend: Box<dyn StateBackend> = if let Some(config) = parsed.backend.as_ref() {
+        let state_config = StateBackendConfig::from(config);
+        create_backend(&state_config)
+            .await
+            .map_err(AppError::Backend)?
+    } else {
+        create_local_backend()
+    };
+
+    let state_file = backend.read_state().await.map_err(AppError::Backend)?;
+    state_file.ok_or_else(|| AppError::Config("No state file found.".to_string()))
+}
+
+/// Find a resource by binding name first, then fall back to resource name.
+fn find_resource_by_query<'a>(state: &'a StateFile, name: &str) -> Option<&'a ResourceState> {
+    // Search by binding first
+    state
+        .resources
+        .iter()
+        .find(|r| r.binding.as_deref() == Some(name))
+        .or_else(|| {
+            // Fall back to name
+            state.resources.iter().find(|r| r.name == name)
+        })
+}
+
+/// Run state list command
+async fn run_state_list(path: &PathBuf) -> Result<(), AppError> {
+    let state = load_state_file(path).await?;
+
+    if state.resources.is_empty() {
+        println!("No resources in state.");
+        return Ok(());
+    }
+
+    for rs in &state.resources {
+        let display_name = rs.binding.as_deref().unwrap_or(&rs.name);
+        println!("{}.{} {}", rs.provider, rs.resource_type, display_name);
+    }
+
+    Ok(())
+}
+
+/// Run state lookup command
+async fn run_state_lookup(query: &str, path: &PathBuf, json_output: bool) -> Result<(), AppError> {
+    let state = load_state_file(path).await?;
+
+    // Parse query: "binding" or "binding.attribute"
+    let (resource_name, attribute) = match query.split_once('.') {
+        Some((name, attr)) => (name, Some(attr)),
+        None => (query, None),
+    };
+
+    let rs = find_resource_by_query(&state, resource_name).ok_or_else(|| {
+        AppError::Config(format!("Resource '{}' not found in state.", resource_name))
+    })?;
+
+    match attribute {
+        Some(attr) => {
+            let value = rs.attributes.get(attr).ok_or_else(|| {
+                AppError::Config(format!(
+                    "Attribute '{}' not found on resource '{}'.",
+                    attr, resource_name
+                ))
+            })?;
+            if json_output {
+                println!("{}", serde_json::to_string_pretty(value).unwrap());
+            } else {
+                // Raw value output (no quotes for strings)
+                print_raw_value(value);
+            }
+        }
+        None => {
+            // Full resource: output all attributes as JSON object
+            let json = serde_json::to_string_pretty(&rs.attributes).unwrap();
+            println!("{}", json);
+        }
+    }
+
+    Ok(())
+}
+
+/// Print a JSON value in raw format (no quotes for strings, suitable for shell usage).
+fn print_raw_value(value: &serde_json::Value) {
+    match value {
+        serde_json::Value::String(s) => println!("{}", s),
+        serde_json::Value::Bool(b) => println!("{}", b),
+        serde_json::Value::Number(n) => println!("{}", n),
+        serde_json::Value::Null => println!("null"),
+        // Arrays and objects get JSON output
+        _ => println!("{}", serde_json::to_string_pretty(value).unwrap()),
     }
 }
 
@@ -535,4 +655,186 @@ fn diff_display_update_resource(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn sample_state() -> StateFile {
+        let json = r#"{
+          "version": 3,
+          "serial": 2,
+          "lineage": "test-lineage",
+          "carina_version": "0.1.0",
+          "resources": [
+            {
+              "resource_type": "ec2.vpc",
+              "name": "my-vpc",
+              "provider": "awscc",
+              "identifier": "vpc-abc",
+              "attributes": {
+                "cidr_block": "10.0.0.0/16",
+                "enable_dns_support": true,
+                "vpc_id": "vpc-abc"
+              },
+              "protected": false,
+              "lifecycle": {},
+              "prefixes": {},
+              "name_overrides": {},
+              "desired_keys": [],
+              "binding": "vpc",
+              "dependency_bindings": []
+            },
+            {
+              "resource_type": "ec2.subnet",
+              "name": "my-subnet",
+              "provider": "awscc",
+              "identifier": "subnet-123",
+              "attributes": {
+                "vpc_id": "vpc-abc",
+                "cidr_block": "10.0.1.0/24",
+                "tags": { "Name": "test-subnet" }
+              },
+              "protected": false,
+              "lifecycle": {},
+              "prefixes": {},
+              "name_overrides": {},
+              "desired_keys": [],
+              "binding": "subnet",
+              "dependency_bindings": ["vpc"]
+            },
+            {
+              "resource_type": "ec2.route_table",
+              "name": "main-rt",
+              "provider": "awscc",
+              "identifier": "rtb-xyz",
+              "attributes": {
+                "vpc_id": "vpc-abc",
+                "route_table_id": "rtb-xyz"
+              },
+              "protected": false,
+              "lifecycle": {},
+              "prefixes": {},
+              "name_overrides": {},
+              "desired_keys": [],
+              "binding": null,
+              "dependency_bindings": ["vpc"]
+            }
+          ]
+        }"#;
+        serde_json::from_str(json).unwrap()
+    }
+
+    #[test]
+    fn find_resource_by_binding() {
+        let state = sample_state();
+        let found = find_resource_by_query(&state, "vpc").unwrap();
+        assert_eq!(found.name, "my-vpc");
+        assert_eq!(found.resource_type, "ec2.vpc");
+    }
+
+    #[test]
+    fn find_resource_by_name_fallback() {
+        let state = sample_state();
+        // "main-rt" has no binding, so lookup by name should work
+        let found = find_resource_by_query(&state, "main-rt").unwrap();
+        assert_eq!(found.resource_type, "ec2.route_table");
+    }
+
+    #[test]
+    fn find_resource_not_found() {
+        let state = sample_state();
+        assert!(find_resource_by_query(&state, "nonexistent").is_none());
+    }
+
+    #[test]
+    fn print_raw_value_string() {
+        let val = json!("hello");
+        print_raw_value(&val);
+    }
+
+    #[test]
+    fn print_raw_value_bool() {
+        let val = json!(true);
+        print_raw_value(&val);
+    }
+
+    #[test]
+    fn print_raw_value_number() {
+        let val = json!(42);
+        print_raw_value(&val);
+    }
+
+    #[test]
+    fn print_raw_value_null() {
+        let val = json!(null);
+        print_raw_value(&val);
+    }
+
+    #[test]
+    fn print_raw_value_object() {
+        let val = json!({"key": "value"});
+        print_raw_value(&val);
+    }
+
+    #[test]
+    fn binding_takes_precedence_over_name() {
+        let mut state = StateFile::new();
+        let mut rs1 = ResourceState::new("ec2.vpc", "vpc", "awscc");
+        rs1.binding = Some("my_vpc".to_string());
+        let mut rs2 = ResourceState::new("ec2.subnet", "my_vpc", "awscc");
+        rs2.binding = None;
+        state.upsert_resource(rs1);
+        state.upsert_resource(rs2);
+
+        let found = find_resource_by_query(&state, "my_vpc").unwrap();
+        // Should find the one with binding="my_vpc", not name="my_vpc"
+        assert_eq!(found.resource_type, "ec2.vpc");
+    }
+
+    #[test]
+    fn state_list_display_names() {
+        let state = sample_state();
+
+        let display_names: Vec<String> = state
+            .resources
+            .iter()
+            .map(|rs| {
+                let name = rs.binding.as_deref().unwrap_or(&rs.name);
+                format!("{}.{} {}", rs.provider, rs.resource_type, name)
+            })
+            .collect();
+
+        assert_eq!(display_names.len(), 3);
+        assert_eq!(display_names[0], "awscc.ec2.vpc vpc");
+        assert_eq!(display_names[1], "awscc.ec2.subnet subnet");
+        // route_table has no binding, should fall back to name
+        assert_eq!(display_names[2], "awscc.ec2.route_table main-rt");
+    }
+
+    #[test]
+    fn state_lookup_full_resource_attributes() {
+        let state = sample_state();
+        let rs = find_resource_by_query(&state, "vpc").unwrap();
+        assert_eq!(rs.attributes.get("cidr_block"), Some(&json!("10.0.0.0/16")));
+        assert_eq!(rs.attributes.get("vpc_id"), Some(&json!("vpc-abc")));
+        assert_eq!(rs.attributes.get("enable_dns_support"), Some(&json!(true)));
+    }
+
+    #[test]
+    fn state_lookup_specific_attribute() {
+        let state = sample_state();
+        let rs = find_resource_by_query(&state, "subnet").unwrap();
+        let tags = rs.attributes.get("tags").unwrap();
+        assert_eq!(tags, &json!({"Name": "test-subnet"}));
+    }
+
+    #[test]
+    fn state_lookup_attribute_not_found() {
+        let state = sample_state();
+        let rs = find_resource_by_query(&state, "vpc").unwrap();
+        assert!(!rs.attributes.contains_key("nonexistent_attr"));
+    }
 }

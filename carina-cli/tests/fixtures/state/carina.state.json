@@ -1,0 +1,63 @@
+{
+  "version": 3,
+  "serial": 2,
+  "lineage": "test-lineage-state",
+  "carina_version": "0.1.0",
+  "resources": [
+    {
+      "resource_type": "ec2.vpc",
+      "name": "my-vpc",
+      "provider": "awscc",
+      "identifier": "vpc-0123456789abcdef0",
+      "attributes": {
+        "cidr_block": "10.0.0.0/16",
+        "enable_dns_support": true,
+        "vpc_id": "vpc-0123456789abcdef0"
+      },
+      "protected": false,
+      "lifecycle": {},
+      "prefixes": {},
+      "name_overrides": {},
+      "desired_keys": ["cidr_block", "enable_dns_support"],
+      "binding": "vpc",
+      "dependency_bindings": []
+    },
+    {
+      "resource_type": "ec2.subnet",
+      "name": "my-subnet",
+      "provider": "awscc",
+      "identifier": "subnet-0123456789abcdef0",
+      "attributes": {
+        "vpc_id": "vpc-0123456789abcdef0",
+        "cidr_block": "10.0.1.0/24",
+        "availability_zone": "ap-northeast-1a",
+        "subnet_id": "subnet-0123456789abcdef0",
+        "tags": { "Name": "test-subnet" }
+      },
+      "protected": false,
+      "lifecycle": {},
+      "prefixes": {},
+      "name_overrides": {},
+      "desired_keys": ["vpc_id", "cidr_block", "availability_zone", "tags"],
+      "binding": "subnet",
+      "dependency_bindings": ["vpc"]
+    },
+    {
+      "resource_type": "ec2.route_table",
+      "name": "main-rt",
+      "provider": "awscc",
+      "identifier": "rtb-0123456789abcdef0",
+      "attributes": {
+        "vpc_id": "vpc-0123456789abcdef0",
+        "route_table_id": "rtb-0123456789abcdef0"
+      },
+      "protected": false,
+      "lifecycle": {},
+      "prefixes": {},
+      "name_overrides": {},
+      "desired_keys": ["vpc_id"],
+      "binding": null,
+      "dependency_bindings": ["vpc"]
+    }
+  ]
+}
