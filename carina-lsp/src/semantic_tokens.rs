@@ -79,7 +79,7 @@ impl SemanticTokensProvider {
         }
 
         // Comment
-        if trimmed.starts_with("//") {
+        if trimmed.starts_with("//") || trimmed.starts_with('#') {
             tokens.push((indent, position::char_len(line) - indent, 7)); // COMMENT
             return tokens;
         }
@@ -883,5 +883,35 @@ mod tests {
         let (start, len, _) = var_token.unwrap();
         assert_eq!(*len, 6, "Variable 'bucket' should have length 6");
         assert_eq!(*start, 7, "Variable 'bucket' should start at column 7");
+    }
+
+    #[test]
+    fn test_hash_comment_highlighted() {
+        let provider = SemanticTokensProvider::new(&[]);
+        let tokens = provider.tokenize_line("# shell-style comment", 0);
+        let comment_token = tokens.iter().find(|(_, _, typ)| *typ == 7);
+        assert!(
+            comment_token.is_some(),
+            "Should highlight # comment as COMMENT. Got: {:?}",
+            tokens
+        );
+        let (start, len, _) = comment_token.unwrap();
+        assert_eq!(*start, 0);
+        assert_eq!(*len, "# shell-style comment".chars().count() as u32);
+    }
+
+    #[test]
+    fn test_indented_hash_comment_highlighted() {
+        let provider = SemanticTokensProvider::new(&[]);
+        let tokens = provider.tokenize_line("    # indented comment", 0);
+        let comment_token = tokens.iter().find(|(_, _, typ)| *typ == 7);
+        assert!(
+            comment_token.is_some(),
+            "Should highlight indented # comment as COMMENT. Got: {:?}",
+            tokens
+        );
+        let (start, len, _) = comment_token.unwrap();
+        assert_eq!(*start, 4);
+        assert_eq!(*len, "# indented comment".chars().count() as u32);
     }
 }
