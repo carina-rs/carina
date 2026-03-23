@@ -256,8 +256,8 @@ impl AwsccProvider {
 
     /// Returns the max polling attempts for a given resource type and operation.
     ///
-    /// Some resource types (e.g., IPAM Pool) take significantly longer to delete
-    /// via the CloudControl API than the default timeout allows.
+    /// Some resource types (e.g., IPAM Pool, VPCGatewayAttachment) take significantly
+    /// longer to delete via the CloudControl API than the default timeout allows.
     pub(crate) fn max_polling_attempts(type_name: &str, operation: &str) -> u32 {
         if operation == "delete" {
             // IPAM Pool deletions can take 15-30 minutes via CloudControl API
