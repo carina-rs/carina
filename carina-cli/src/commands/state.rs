@@ -10,7 +10,7 @@ use carina_core::resource::{LifecycleConfig, Resource, ResourceId, State, Value}
 use carina_core::value::{format_value, json_to_dsl_value};
 use carina_state::{
     BackendConfig as StateBackendConfig, BackendError, LockInfo, ResourceState, StateBackend,
-    create_backend, create_local_backend,
+    StateFile, create_backend, create_local_backend,
 };
 
 use super::validate_and_resolve;
@@ -65,6 +65,25 @@ pub enum StateCommands {
         #[arg(long, default_value = "true", action = clap::ArgAction::Set)]
         lock: bool,
     },
+    /// List all managed resources from the state file
+    List {
+        /// Path to .crn file or directory
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
+    /// Look up resource attributes from the state file
+    Lookup {
+        /// Query: <binding_or_name> for full resource, <binding_or_name>.<attribute> for specific attribute
+        query: String,
+
+        /// Path to .crn file or directory
+        #[arg(default_value = ".")]
+        path: PathBuf,
+
+        /// Always output as JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// Run state subcommands
@@ -76,6 +95,8 @@ pub async fn run_state_command(command: StateCommands) -> Result<(), AppError> {
             path,
         } => run_state_bucket_delete(&bucket_name, force, &path).await,
         StateCommands::Refresh { path, lock } => run_state_refresh(&path, lock).await,
+        StateCommands::List { path } => run_state_list(&path).await,
+        StateCommands::Lookup { query, path, json } => run_state_lookup(&query, &path, json).await,
     }
 }
 
@@ -110,6 +131,124 @@ pub async fn run_force_unlock(lock_id: &str, path: &PathBuf) -> Result<(), AppEr
             expected, actual
         ))),
         Err(e) => Err(AppError::Backend(e)),
+    }
+}
+
+/// Load the state file from the backend (or local file), without acquiring a lock.
+async fn load_state_file(path: &PathBuf) -> Result<StateFile, AppError> {
+    let loaded = load_configuration(path)?;
+    let parsed = loaded.parsed;
+
+    let backend: Box<dyn StateBackend> = if let Some(config) = parsed.backend.as_ref() {
+        let state_config = StateBackendConfig::from(config);
+        create_backend(&state_config)
+            .await
+            .map_err(AppError::Backend)?
+    } else {
+        create_local_backend()
+    };
+
+    let state_file = backend.read_state().await.map_err(AppError::Backend)?;
+    state_file.ok_or_else(|| AppError::Config("No state file found.".to_string()))
+}
+
+/// Find a resource by binding name first, then fall back to resource name.
+fn find_resource_by_query<'a>(state: &'a StateFile, name: &str) -> Option<&'a ResourceState> {
+    // Search by binding first
+    state
+        .resources
+        .iter()
+        .find(|r| r.binding.as_deref() == Some(name))
+        .or_else(|| {
+            // Fall back to name
+            state.resources.iter().find(|r| r.name == name)
+        })
+}
+
+/// Format state list output. Returns each line as a string.
+fn format_state_list(state: &StateFile) -> Vec<String> {
+    state
+        .resources
+        .iter()
+        .map(|rs| {
+            let display_name = rs.binding.as_deref().unwrap_or(&rs.name);
+            format!("{}.{} {}", rs.provider, rs.resource_type, display_name)
+        })
+        .collect()
+}
+
+/// Run state list command
+async fn run_state_list(path: &PathBuf) -> Result<(), AppError> {
+    let state = load_state_file(path).await?;
+
+    if state.resources.is_empty() {
+        println!("No resources in state.");
+        return Ok(());
+    }
+
+    for line in format_state_list(&state) {
+        println!("{}", line);
+    }
+
+    Ok(())
+}
+
+/// Format lookup output for a query against a state file.
+/// Returns the formatted output string on success, or an error.
+fn format_state_lookup(
+    state: &StateFile,
+    query: &str,
+    json_output: bool,
+) -> Result<String, AppError> {
+    // Parse query: "binding" or "binding.attribute"
+    let (resource_name, attribute) = match query.split_once('.') {
+        Some((name, attr)) => (name, Some(attr)),
+        None => (query, None),
+    };
+
+    let rs = find_resource_by_query(state, resource_name).ok_or_else(|| {
+        AppError::Config(format!("Resource '{}' not found in state.", resource_name))
+    })?;
+
+    match attribute {
+        Some(attr) => {
+            let value = rs.attributes.get(attr).ok_or_else(|| {
+                AppError::Config(format!(
+                    "Attribute '{}' not found on resource '{}'.",
+                    attr, resource_name
+                ))
+            })?;
+            if json_output {
+                Ok(serde_json::to_string_pretty(value).unwrap())
+            } else {
+                Ok(format_raw_value(value))
+            }
+        }
+        None => {
+            // Full resource: output all attributes as JSON object (sorted keys for deterministic output)
+            let sorted: std::collections::BTreeMap<_, _> = rs.attributes.iter().collect();
+            Ok(serde_json::to_string_pretty(&sorted).unwrap())
+        }
+    }
+}
+
+/// Run state lookup command
+async fn run_state_lookup(query: &str, path: &PathBuf, json_output: bool) -> Result<(), AppError> {
+    let state = load_state_file(path).await?;
+    let output = format_state_lookup(&state, query, json_output)?;
+    println!("{}", output);
+    Ok(())
+}
+
+/// Format a JSON value in raw format (no quotes for strings, suitable for shell usage).
+fn format_raw_value(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(s) => s.to_string(),
+        serde_json::Value::Bool(b) => b.to_string(),
+        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::Null => "null".to_string(),
+        // Arrays and objects get JSON output
+        _ => serde_json::to_string_pretty(value).unwrap(),
     }
 }
 
@@ -535,4 +674,185 @@ fn diff_display_update_resource(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::path::PathBuf;
+
+    /// Load the fixture state file from `tests/fixtures/state_lookup/`.
+    fn load_fixture_state() -> StateFile {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let path = PathBuf::from(format!(
+            "{}/tests/fixtures/state_lookup/carina.state.json",
+            manifest_dir
+        ));
+        let contents = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("Failed to read fixture {}: {}", path.display(), e));
+        serde_json::from_str(&contents)
+            .unwrap_or_else(|e| panic!("Failed to parse fixture {}: {}", path.display(), e))
+    }
+
+    // --- find_resource_by_query tests ---
+
+    #[test]
+    fn find_resource_by_binding() {
+        let state = load_fixture_state();
+        let found = find_resource_by_query(&state, "vpc").unwrap();
+        assert_eq!(found.name, "my-vpc");
+        assert_eq!(found.resource_type, "ec2.vpc");
+    }
+
+    #[test]
+    fn find_resource_by_name_fallback() {
+        let state = load_fixture_state();
+        // "main-rt" has no binding, so lookup by name should work
+        let found = find_resource_by_query(&state, "main-rt").unwrap();
+        assert_eq!(found.resource_type, "ec2.route_table");
+    }
+
+    #[test]
+    fn find_resource_not_found() {
+        let state = load_fixture_state();
+        assert!(find_resource_by_query(&state, "nonexistent").is_none());
+    }
+
+    #[test]
+    fn binding_takes_precedence_over_name() {
+        let mut state = StateFile::new();
+        let mut rs1 = ResourceState::new("ec2.vpc", "vpc", "awscc");
+        rs1.binding = Some("my_vpc".to_string());
+        let mut rs2 = ResourceState::new("ec2.subnet", "my_vpc", "awscc");
+        rs2.binding = None;
+        state.upsert_resource(rs1);
+        state.upsert_resource(rs2);
+
+        let found = find_resource_by_query(&state, "my_vpc").unwrap();
+        // Should find the one with binding="my_vpc", not name="my_vpc"
+        assert_eq!(found.resource_type, "ec2.vpc");
+    }
+
+    // --- format_raw_value tests ---
+
+    #[test]
+    fn format_raw_value_string() {
+        assert_eq!(format_raw_value(&json!("hello")), "hello");
+    }
+
+    #[test]
+    fn format_raw_value_bool() {
+        assert_eq!(format_raw_value(&json!(true)), "true");
+    }
+
+    #[test]
+    fn format_raw_value_number() {
+        assert_eq!(format_raw_value(&json!(42)), "42");
+    }
+
+    #[test]
+    fn format_raw_value_null() {
+        assert_eq!(format_raw_value(&json!(null)), "null");
+    }
+
+    #[test]
+    fn format_raw_value_object() {
+        let result = format_raw_value(&json!({"key": "value"}));
+        assert!(result.contains("\"key\""));
+        assert!(result.contains("\"value\""));
+    }
+
+    // --- format_state_list fixture tests ---
+
+    #[test]
+    fn state_list_shows_all_resources() {
+        let state = load_fixture_state();
+        let lines = format_state_list(&state);
+        let output = lines.join("\n");
+        insta::assert_snapshot!(output);
+    }
+
+    // --- format_state_lookup fixture tests ---
+
+    #[test]
+    fn lookup_full_resource_returns_json() {
+        let state = load_fixture_state();
+        let output = format_state_lookup(&state, "vpc", false).unwrap();
+        insta::assert_snapshot!(output);
+    }
+
+    #[test]
+    fn lookup_attribute_returns_raw_value() {
+        let state = load_fixture_state();
+        let output = format_state_lookup(&state, "vpc.vpc_id", false).unwrap();
+        insta::assert_snapshot!(output);
+    }
+
+    #[test]
+    fn lookup_attribute_json_returns_quoted_value() {
+        let state = load_fixture_state();
+        let output = format_state_lookup(&state, "vpc.vpc_id", true).unwrap();
+        insta::assert_snapshot!(output);
+    }
+
+    #[test]
+    fn lookup_boolean_attribute_raw() {
+        let state = load_fixture_state();
+        let output = format_state_lookup(&state, "vpc.enable_dns_support", false).unwrap();
+        insta::assert_snapshot!(output);
+    }
+
+    #[test]
+    fn lookup_boolean_attribute_json() {
+        let state = load_fixture_state();
+        let output = format_state_lookup(&state, "vpc.enable_dns_support", true).unwrap();
+        insta::assert_snapshot!(output);
+    }
+
+    #[test]
+    fn lookup_object_attribute() {
+        let state = load_fixture_state();
+        let output = format_state_lookup(&state, "subnet.tags", false).unwrap();
+        insta::assert_snapshot!(output);
+    }
+
+    #[test]
+    fn lookup_nonexistent_resource_returns_error() {
+        let state = load_fixture_state();
+        let err = format_state_lookup(&state, "nonexistent", false).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Resource 'nonexistent' not found"),
+            "unexpected error: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn lookup_nonexistent_attribute_returns_error() {
+        let state = load_fixture_state();
+        let err = format_state_lookup(&state, "vpc.nonexistent_attr", false).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Attribute 'nonexistent_attr' not found"),
+            "unexpected error: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn lookup_resource_without_binding_by_name() {
+        let state = load_fixture_state();
+        // route_table has no binding, look up by name
+        let output = format_state_lookup(&state, "main-rt", false).unwrap();
+        insta::assert_snapshot!(output);
+    }
+
+    #[test]
+    fn lookup_resource_without_binding_attribute() {
+        let state = load_fixture_state();
+        let output = format_state_lookup(&state, "main-rt.route_table_id", false).unwrap();
+        insta::assert_snapshot!(output);
+    }
 }
