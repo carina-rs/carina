@@ -52,6 +52,15 @@ fn collect_dependencies(value: &Value, deps: &mut HashSet<String>) {
 
 /// Sort resources topologically based on dependencies.
 ///
+/// Resources are ordered so that dependencies come before dependents (creation order).
+/// When reversed, this gives a valid destroy order (dependents before dependencies).
+///
+/// To ensure stable destroy ordering for independent branches, resources are
+/// pre-sorted by dependency depth (distance from root) before DFS traversal.
+/// Shallower resources (closer to root, like an internet gateway at depth 1)
+/// are visited first and emitted early in creation order, placing them late
+/// in destroy order -- after deeper chains have been deleted.
+///
 /// Returns an error if a circular dependency is detected, with a message
 /// showing the cycle path (e.g., "Circular dependency detected: a -> b -> c -> a").
 pub fn sort_resources_by_dependencies(resources: &[Resource]) -> Result<Vec<Resource>, String> {
@@ -62,6 +71,85 @@ pub fn sort_resources_by_dependencies(resources: &[Resource]) -> Result<Vec<Reso
             binding_to_resource.insert(binding_name.clone(), resource);
         }
     }
+
+    // Compute the dependency depth for each resource: the length of the longest
+    // chain from a root (resource with no dependencies) to this resource.
+    // Used to pre-sort the DFS input so that shallower resources (closer to root)
+    // are visited first.
+    let mut depth_cache: HashMap<String, usize> = HashMap::new();
+    fn compute_depth(
+        binding: &str,
+        binding_to_resource: &HashMap<String, &Resource>,
+        cache: &mut HashMap<String, usize>,
+        visiting: &mut HashSet<String>,
+    ) -> usize {
+        if let Some(&cached) = cache.get(binding) {
+            return cached;
+        }
+        // Guard against circular dependencies
+        if visiting.contains(binding) {
+            return 0;
+        }
+        visiting.insert(binding.to_string());
+        let depth = if let Some(resource) = binding_to_resource.get(binding) {
+            let deps = get_resource_dependencies(resource);
+            deps.iter()
+                .map(|d| 1 + compute_depth(d, binding_to_resource, cache, visiting))
+                .max()
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        visiting.remove(binding);
+        cache.insert(binding.to_string(), depth);
+        depth
+    }
+
+    let mut depth_visiting: HashSet<String> = HashSet::new();
+    for resource in resources {
+        let binding = resource
+            .attributes
+            .get("_binding")
+            .and_then(|v| match v {
+                Value::String(s) => Some(s.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| format!("{}:{}", resource.id.resource_type, resource.id.name));
+        compute_depth(
+            &binding,
+            &binding_to_resource,
+            &mut depth_cache,
+            &mut depth_visiting,
+        );
+    }
+
+    // Pre-sort resources by dependency depth (ascending) so DFS visits
+    // shallower resources first. This ensures that "leaf" resources like
+    // an internet gateway (depth 1, no dependents) are emitted early in
+    // creation order, placing them late in destroy order -- after deeper
+    // chains (like nat_gw → route) have been destroyed.
+    let mut presorted: Vec<&Resource> = resources.iter().collect();
+    presorted.sort_by(|a, b| {
+        let a_binding = a
+            .attributes
+            .get("_binding")
+            .and_then(|v| match v {
+                Value::String(s) => Some(s.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| format!("{}:{}", a.id.resource_type, a.id.name));
+        let b_binding = b
+            .attributes
+            .get("_binding")
+            .and_then(|v| match v {
+                Value::String(s) => Some(s.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| format!("{}:{}", b.id.resource_type, b.id.name));
+        let a_depth = depth_cache.get(&a_binding).copied().unwrap_or(0);
+        let b_depth = depth_cache.get(&b_binding).copied().unwrap_or(0);
+        a_depth.cmp(&b_depth) // Ascending: shallower first
+    });
 
     // Build dependency graph
     let mut sorted = Vec::new();
@@ -115,7 +203,7 @@ pub fn sort_resources_by_dependencies(resources: &[Resource]) -> Result<Vec<Reso
         Ok(())
     }
 
-    for resource in resources {
+    for resource in &presorted {
         visit(
             resource,
             &binding_to_resource,
@@ -363,14 +451,167 @@ mod tests {
     #[test]
     fn test_sort_resources_transitive_circular_dependency() {
         // A depends on C, B depends on A, C depends on B
-        // Traversal: a -> c -> b -> a (cycle)
         let a = make_resource("a", &["c"]);
         let b = make_resource("b", &["a"]);
         let c = make_resource("c", &["b"]);
         let result = sort_resources_by_dependencies(&[a, b, c]);
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert_eq!(err, "Circular dependency detected: a -> c -> b -> a");
+        assert!(
+            err.starts_with("Circular dependency detected:"),
+            "Expected circular dependency error, got: {}",
+            err
+        );
+    }
+
+    /// Reproduces the destroy ordering issue from #1067:
+    /// When IGW and NAT gateway both depend on VPC but are independent of each other,
+    /// the destroy order must delete NAT gateway (and its route) before IGW.
+    ///
+    /// Dependency graph (from nat_gateway.crn):
+    ///   vpc (root)
+    ///   igw -> vpc
+    ///   subnet -> vpc
+    ///   eip (no deps)
+    ///   nat_gw -> eip, subnet
+    ///   rt -> vpc
+    ///   route -> rt, nat_gw
+    ///
+    /// In destroy order (reversed creation), IGW must come after route and nat_gw
+    /// because AWS requires the NAT gateway to be deleted before the IGW can be detached.
+    #[test]
+    fn test_destroy_order_igw_after_nat_gateway() {
+        let vpc = make_resource("vpc", &[]);
+        let igw = make_resource("igw", &["vpc"]);
+        let subnet = make_resource("subnet", &["vpc"]);
+        let eip = make_resource("eip", &[]);
+        let nat_gw = make_resource("nat_gw", &["eip", "subnet"]);
+        let rt = make_resource("rt", &["vpc"]);
+        let route = make_resource("route", &["rt", "nat_gw"]);
+
+        // Single sort + reverse (the correct approach).
+        // The previous double-sort-reverse pattern (sort → reverse → sort → reverse)
+        // could produce incorrect ordering for independent branches (#1067).
+        //
+        // Test with multiple input orderings to ensure the result is correct
+        // regardless of declaration order in the .crn file.
+        let orderings: Vec<Vec<Resource>> = vec![
+            // Original .crn order
+            vec![
+                vpc.clone(),
+                igw.clone(),
+                subnet.clone(),
+                eip.clone(),
+                nat_gw.clone(),
+                rt.clone(),
+                route.clone(),
+            ],
+            // nat_gw before igw
+            vec![
+                vpc.clone(),
+                subnet.clone(),
+                eip.clone(),
+                nat_gw.clone(),
+                rt.clone(),
+                route.clone(),
+                igw.clone(),
+            ],
+            // igw last
+            vec![
+                eip.clone(),
+                vpc.clone(),
+                subnet.clone(),
+                nat_gw.clone(),
+                rt.clone(),
+                route.clone(),
+                igw.clone(),
+            ],
+        ];
+
+        for (i, input) in orderings.iter().enumerate() {
+            let sorted = sort_resources_by_dependencies(input).unwrap();
+            let destroy_order: Vec<&str> = sorted
+                .iter()
+                .rev()
+                .filter_map(|r| match r.attributes.get("_binding") {
+                    Some(Value::String(s)) => Some(s.as_str()),
+                    _ => None,
+                })
+                .collect();
+
+            // IGW must come after route and nat_gw in destroy order
+            let igw_pos = destroy_order.iter().position(|&b| b == "igw").unwrap();
+            let route_pos = destroy_order.iter().position(|&b| b == "route").unwrap();
+            let nat_gw_pos = destroy_order.iter().position(|&b| b == "nat_gw").unwrap();
+
+            assert!(
+                igw_pos > route_pos,
+                "Ordering {}: IGW (pos {}) must be destroyed after route (pos {}). Destroy order: {:?}",
+                i,
+                igw_pos,
+                route_pos,
+                destroy_order
+            );
+            assert!(
+                igw_pos > nat_gw_pos,
+                "Ordering {}: IGW (pos {}) must be destroyed after nat_gw (pos {}). Destroy order: {:?}",
+                i,
+                igw_pos,
+                nat_gw_pos,
+                destroy_order
+            );
+        }
+    }
+
+    /// Regression test: the double-sort-reverse pattern that previously
+    /// caused IGW to be destroyed before NAT gateway (#1067).
+    /// This test verifies that even with orphans appended after the initial sort,
+    /// a single sort+reverse produces correct destroy ordering.
+    #[test]
+    fn test_destroy_order_with_orphans_appended() {
+        let vpc = make_resource("vpc", &[]);
+        let igw = make_resource("igw", &["vpc"]);
+        let subnet = make_resource("subnet", &["vpc"]);
+        let eip = make_resource("eip", &[]);
+        let nat_gw = make_resource("nat_gw", &["eip", "subnet"]);
+        let rt = make_resource("rt", &["vpc"]);
+        let route = make_resource("route", &["rt", "nat_gw"]);
+        // Simulate an orphan resource that depends on vpc
+        let orphan = make_resource("orphan", &["vpc"]);
+
+        // Append orphan after initial resources (simulating orphan discovery)
+        let all = vec![vpc, igw, subnet, eip, nat_gw, rt, route, orphan];
+
+        let sorted = sort_resources_by_dependencies(&all).unwrap();
+        let destroy_order: Vec<&str> = sorted
+            .iter()
+            .rev()
+            .filter_map(|r| match r.attributes.get("_binding") {
+                Some(Value::String(s)) => Some(s.as_str()),
+                _ => None,
+            })
+            .collect();
+
+        let igw_pos = destroy_order.iter().position(|&b| b == "igw").unwrap();
+        let route_pos = destroy_order.iter().position(|&b| b == "route").unwrap();
+        let nat_gw_pos = destroy_order.iter().position(|&b| b == "nat_gw").unwrap();
+        let vpc_pos = destroy_order.iter().position(|&b| b == "vpc").unwrap();
+
+        assert!(
+            igw_pos > route_pos,
+            "IGW must be destroyed after route. Destroy order: {:?}",
+            destroy_order
+        );
+        assert!(
+            igw_pos > nat_gw_pos,
+            "IGW must be destroyed after nat_gw. Destroy order: {:?}",
+            destroy_order
+        );
+        assert!(
+            igw_pos < vpc_pos,
+            "IGW must be destroyed before vpc. Destroy order: {:?}",
+            destroy_order
+        );
     }
 
     #[test]

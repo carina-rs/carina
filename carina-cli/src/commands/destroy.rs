@@ -130,11 +130,9 @@ async fn run_destroy_locked(
     }
     apply_name_overrides(&mut parsed.resources, &state_file);
 
-    // Sort resources by dependencies (for creation order)
-    let sorted_resources = sort_resources_by_dependencies(&parsed.resources)?;
-
-    // Reverse the order for destruction (dependents first, then dependencies)
-    let mut destroy_order: Vec<Resource> = sorted_resources.into_iter().rev().collect();
+    // Collect all resources (managed + orphans) before sorting.
+    // We use the unsorted list for state reads, then sort once at the end.
+    let mut all_resources: Vec<Resource> = parsed.resources.clone();
 
     if !refresh {
         eprintln!(
@@ -152,7 +150,7 @@ async fn run_destroy_locked(
     if refresh {
         // Read states for managed resources using identifier from state
         // Skip data sources (read-only) -- they won't be destroyed
-        for resource in &destroy_order {
+        for resource in &all_resources {
             if resource.read_only {
                 continue;
             }
@@ -170,7 +168,7 @@ async fn run_destroy_locked(
         // Refresh each orphan via provider.read() to verify it still exists.
         if let Some(sf) = state_file.as_ref() {
             let desired_ids: HashSet<ResourceId> =
-                destroy_order.iter().map(|r| r.id.clone()).collect();
+                all_resources.iter().map(|r| r.id.clone()).collect();
             for (id, state) in sf.build_orphan_states(&desired_ids) {
                 let refreshed = provider
                     .read(&id, state.identifier.as_deref())
@@ -179,13 +177,13 @@ async fn run_destroy_locked(
                 if refreshed.exists {
                     current_states.insert(id.clone(), refreshed);
                     let orphan_resource = build_orphan_resource(sf, &id);
-                    destroy_order.push(orphan_resource);
+                    all_resources.push(orphan_resource);
                 }
             }
         }
     } else if let Some(sf) = state_file.as_ref() {
         // --refresh=false: build states from state file without AWS calls
-        for resource in &destroy_order {
+        for resource in &all_resources {
             if resource.read_only {
                 continue;
             }
@@ -194,17 +192,21 @@ async fn run_destroy_locked(
         }
 
         // Include orphaned resources (in state but not in .crn)
-        let desired_ids: HashSet<ResourceId> = destroy_order.iter().map(|r| r.id.clone()).collect();
+        let desired_ids: HashSet<ResourceId> = all_resources.iter().map(|r| r.id.clone()).collect();
         for (id, state) in sf.build_orphan_states(&desired_ids) {
             current_states.insert(id.clone(), state);
             let orphan_resource = build_orphan_resource(sf, &id);
-            destroy_order.push(orphan_resource);
+            all_resources.push(orphan_resource);
         }
     }
 
-    // Re-sort destroy_order (including orphans) by dependencies to ensure
-    // dependents are deleted before their dependencies.
-    destroy_order = sort_resources_by_dependencies(&destroy_order)
+    // Sort all resources (managed + orphans) by dependencies once,
+    // then reverse for destroy order (dependents deleted before dependencies).
+    //
+    // Previously this was done with a double sort-reverse pattern
+    // (sort → reverse → add orphans → sort → reverse) which could produce
+    // incorrect destroy ordering for independent resource branches (#1067).
+    let destroy_order: Vec<Resource> = sort_resources_by_dependencies(&all_resources)
         .map_err(AppError::Config)?
         .into_iter()
         .rev()
