@@ -55,11 +55,11 @@ fn collect_dependencies(value: &Value, deps: &mut HashSet<String>) {
 /// Resources are ordered so that dependencies come before dependents (creation order).
 /// When reversed, this gives a valid destroy order (dependents before dependencies).
 ///
-/// To ensure stable destroy ordering for independent branches, resources with
-/// deeper transitive dependency chains are visited first. This places "leaf"
-/// resources (like an internet gateway with no dependents) later in creation
-/// order and thus later in destroy order -- after resources with longer
-/// dependency chains have been deleted.
+/// To ensure stable destroy ordering for independent branches, resources are
+/// pre-sorted by dependency depth (distance from root) before DFS traversal.
+/// Shallower resources (closer to root, like an internet gateway at depth 1)
+/// are visited first and emitted early in creation order, placing them late
+/// in destroy order -- after deeper chains have been deleted.
 ///
 /// Returns an error if a circular dependency is detected, with a message
 /// showing the cycle path (e.g., "Circular dependency detected: a -> b -> c -> a").
