@@ -17,7 +17,7 @@ carina-state = { path = "../carina-state" }
 carina-tui = { path = "../carina-tui" }
 chrono = "0.4"
 clap = { version = "4", features = ["derive"] }
-clap_complete = "4"
+clap_complete = { version = "4", features = ["unstable-dynamic"] }
 colored = "3"
 env_logger = "0.11"
 serde = { version = "1", features = ["derive"] }

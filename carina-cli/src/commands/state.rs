@@ -1,6 +1,8 @@
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsStr;
 use std::path::PathBuf;
 
+use clap_complete::engine::{ArgValueCompleter, CompletionCandidate};
 use colored::Colorize;
 
 use carina_core::config_loader::{get_base_dir, load_configuration};
@@ -40,6 +42,64 @@ pub fn map_lock_error(e: BackendError) -> AppError {
     }
 }
 
+/// Read local state file for shell completion.
+///
+/// Tries `carina.state.json` in the current directory. Returns `None` if the
+/// file does not exist or cannot be parsed (completion simply produces no
+/// candidates in that case).
+fn read_local_state_for_completion() -> Option<StateFile> {
+    let path = std::path::Path::new("carina.state.json");
+    let contents = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&contents).ok()
+}
+
+/// Shell completion function for `state lookup` queries.
+///
+/// Before the first `.`: completes binding names / resource names.
+/// After the `.`: completes attribute names for the matched resource.
+fn complete_state_lookup(current: &OsStr) -> Vec<CompletionCandidate> {
+    let current = match current.to_str() {
+        Some(s) => s,
+        None => return vec![],
+    };
+
+    let state = match read_local_state_for_completion() {
+        Some(s) => s,
+        None => return vec![],
+    };
+
+    complete_state_lookup_from(&state, current)
+}
+
+/// Compute completion candidates from a state file and a partial query string.
+fn complete_state_lookup_from(state: &StateFile, current: &str) -> Vec<CompletionCandidate> {
+    if let Some((resource_name, _attr_prefix)) = current.split_once('.') {
+        // Complete attribute names for the matched resource
+        let rs = match find_resource_by_query(state, resource_name) {
+            Some(rs) => rs,
+            None => return vec![],
+        };
+        rs.attributes
+            .keys()
+            .filter(|key| {
+                let full = format!("{}.{}", resource_name, key);
+                full.starts_with(current)
+            })
+            .map(|key| CompletionCandidate::new(format!("{}.{}", resource_name, key)))
+            .collect()
+    } else {
+        // Complete resource binding names / resource names
+        let mut candidates = Vec::new();
+        for rs in &state.resources {
+            let display_name = rs.binding.as_deref().unwrap_or(&rs.name);
+            if display_name.starts_with(current) {
+                candidates.push(CompletionCandidate::new(display_name));
+            }
+        }
+        candidates
+    }
+}
+
 #[derive(clap::Subcommand)]
 pub enum StateCommands {
     /// Delete state bucket (requires --force flag)
@@ -74,6 +134,7 @@ pub enum StateCommands {
     /// Look up resource attributes from the state file
     Lookup {
         /// Query: <binding_or_name> for full resource, <binding_or_name>.<attribute> for specific attribute
+        #[arg(add = ArgValueCompleter::new(complete_state_lookup))]
         query: String,
 
         /// Path to .crn file or directory
@@ -854,5 +915,74 @@ mod tests {
         let state = load_fixture_state();
         let output = format_state_lookup(&state, "main-rt.route_table_id", false).unwrap();
         insta::assert_snapshot!(output);
+    }
+
+    // --- complete_state_lookup_from tests ---
+
+    fn candidate_values(candidates: &[CompletionCandidate]) -> Vec<String> {
+        let mut values: Vec<String> = candidates
+            .iter()
+            .map(|c| c.get_value().to_string_lossy().into_owned())
+            .collect();
+        values.sort();
+        values
+    }
+
+    #[test]
+    fn completion_empty_input_returns_all_resource_names() {
+        let state = load_fixture_state();
+        let candidates = complete_state_lookup_from(&state, "");
+        let values = candidate_values(&candidates);
+        // vpc (binding), subnet (binding), main-rt (name, no binding)
+        assert_eq!(values, vec!["main-rt", "subnet", "vpc"]);
+    }
+
+    #[test]
+    fn completion_partial_resource_name() {
+        let state = load_fixture_state();
+        let candidates = complete_state_lookup_from(&state, "v");
+        let values = candidate_values(&candidates);
+        assert_eq!(values, vec!["vpc"]);
+    }
+
+    #[test]
+    fn completion_no_match() {
+        let state = load_fixture_state();
+        let candidates = complete_state_lookup_from(&state, "nonexistent");
+        assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn completion_attribute_names_after_dot() {
+        let state = load_fixture_state();
+        let candidates = complete_state_lookup_from(&state, "vpc.");
+        let values = candidate_values(&candidates);
+        assert_eq!(
+            values,
+            vec!["vpc.cidr_block", "vpc.enable_dns_support", "vpc.vpc_id"]
+        );
+    }
+
+    #[test]
+    fn completion_attribute_partial_match() {
+        let state = load_fixture_state();
+        let candidates = complete_state_lookup_from(&state, "vpc.v");
+        let values = candidate_values(&candidates);
+        assert_eq!(values, vec!["vpc.vpc_id"]);
+    }
+
+    #[test]
+    fn completion_attribute_unknown_resource() {
+        let state = load_fixture_state();
+        let candidates = complete_state_lookup_from(&state, "unknown.");
+        assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn completion_resource_without_binding_by_name() {
+        let state = load_fixture_state();
+        let candidates = complete_state_lookup_from(&state, "main-rt.");
+        let values = candidate_values(&candidates);
+        assert_eq!(values, vec!["main-rt.route_table_id", "main-rt.vpc_id"]);
     }
 }
