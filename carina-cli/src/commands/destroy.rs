@@ -10,7 +10,7 @@ use colored::Colorize;
 use carina_core::config_loader::{get_base_dir, load_configuration};
 use carina_core::deps::{
     build_dependents_map, find_failed_dependent, get_resource_dependencies,
-    sort_resources_by_dependencies,
+    sort_resources_for_destroy,
 };
 use carina_core::effect::Effect;
 use carina_core::plan::Plan;
@@ -200,17 +200,11 @@ async fn run_destroy_locked(
         }
     }
 
-    // Sort all resources (managed + orphans) by dependencies once,
-    // then reverse for destroy order (dependents deleted before dependencies).
-    //
-    // Previously this was done with a double sort-reverse pattern
-    // (sort → reverse → add orphans → sort → reverse) which could produce
-    // incorrect destroy ordering for independent resource branches (#1067).
-    let destroy_order: Vec<Resource> = sort_resources_by_dependencies(&all_resources)
-        .map_err(AppError::Config)?
-        .into_iter()
-        .rev()
-        .collect();
+    // Sort all resources (managed + orphans) for destroy ordering.
+    // Uses depth-based pre-sorting to ensure stable ordering for independent
+    // branches, then reverses for destroy order (dependents before dependencies).
+    let destroy_order: Vec<Resource> =
+        sort_resources_for_destroy(&all_resources).map_err(AppError::Config)?;
 
     // Collect resources that exist and will be destroyed
     // Skip the state bucket if it matches the backend bucket
