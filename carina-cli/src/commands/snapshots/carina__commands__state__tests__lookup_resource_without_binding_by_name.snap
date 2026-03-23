@@ -1,0 +1,8 @@
+---
+source: carina-cli/src/commands/state.rs
+expression: output
+---
+{
+  "route_table_id": "rtb-0123456789abcdef0",
+  "vpc_id": "vpc-0123456789abcdef0"
+}

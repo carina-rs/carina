@@ -1,0 +1,7 @@
+---
+source: carina-cli/src/commands/state.rs
+expression: output
+---
+awscc.ec2.vpc vpc
+awscc.ec2.subnet subnet
+awscc.ec2.route_table main-rt

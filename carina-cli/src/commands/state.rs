@@ -225,8 +225,9 @@ fn format_state_lookup(
             }
         }
         None => {
-            // Full resource: output all attributes as JSON object
-            Ok(serde_json::to_string_pretty(&rs.attributes).unwrap())
+            // Full resource: output all attributes as JSON object (sorted keys for deterministic output)
+            let sorted: std::collections::BTreeMap<_, _> = rs.attributes.iter().collect();
+            Ok(serde_json::to_string_pretty(&sorted).unwrap())
         }
     }
 }
@@ -768,12 +769,8 @@ mod tests {
     fn state_list_shows_all_resources() {
         let state = load_fixture_state();
         let lines = format_state_list(&state);
-
-        assert_eq!(lines.len(), 3);
-        assert_eq!(lines[0], "awscc.ec2.vpc vpc");
-        assert_eq!(lines[1], "awscc.ec2.subnet subnet");
-        // route_table has no binding, should fall back to name
-        assert_eq!(lines[2], "awscc.ec2.route_table main-rt");
+        let output = lines.join("\n");
+        insta::assert_snapshot!(output);
     }
 
     // --- format_state_lookup fixture tests ---
@@ -782,47 +779,42 @@ mod tests {
     fn lookup_full_resource_returns_json() {
         let state = load_fixture_state();
         let output = format_state_lookup(&state, "vpc", false).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
-
-        assert_eq!(parsed["cidr_block"], json!("10.0.0.0/16"));
-        assert_eq!(parsed["vpc_id"], json!("vpc-0123456789abcdef0"));
-        assert_eq!(parsed["enable_dns_support"], json!(true));
+        insta::assert_snapshot!(output);
     }
 
     #[test]
     fn lookup_attribute_returns_raw_value() {
         let state = load_fixture_state();
         let output = format_state_lookup(&state, "vpc.vpc_id", false).unwrap();
-        assert_eq!(output, "vpc-0123456789abcdef0");
+        insta::assert_snapshot!(output);
     }
 
     #[test]
     fn lookup_attribute_json_returns_quoted_value() {
         let state = load_fixture_state();
         let output = format_state_lookup(&state, "vpc.vpc_id", true).unwrap();
-        assert_eq!(output, "\"vpc-0123456789abcdef0\"");
+        insta::assert_snapshot!(output);
     }
 
     #[test]
     fn lookup_boolean_attribute_raw() {
         let state = load_fixture_state();
         let output = format_state_lookup(&state, "vpc.enable_dns_support", false).unwrap();
-        assert_eq!(output, "true");
+        insta::assert_snapshot!(output);
     }
 
     #[test]
     fn lookup_boolean_attribute_json() {
         let state = load_fixture_state();
         let output = format_state_lookup(&state, "vpc.enable_dns_support", true).unwrap();
-        assert_eq!(output, "true");
+        insta::assert_snapshot!(output);
     }
 
     #[test]
     fn lookup_object_attribute() {
         let state = load_fixture_state();
         let output = format_state_lookup(&state, "subnet.tags", false).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
-        assert_eq!(parsed, json!({"Name": "test-subnet"}));
+        insta::assert_snapshot!(output);
     }
 
     #[test]
@@ -854,14 +846,13 @@ mod tests {
         let state = load_fixture_state();
         // route_table has no binding, look up by name
         let output = format_state_lookup(&state, "main-rt", false).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
-        assert_eq!(parsed["route_table_id"], json!("rtb-0123456789abcdef0"));
+        insta::assert_snapshot!(output);
     }
 
     #[test]
     fn lookup_resource_without_binding_attribute() {
         let state = load_fixture_state();
         let output = format_state_lookup(&state, "main-rt.route_table_id", false).unwrap();
-        assert_eq!(output, "rtb-0123456789abcdef0");
+        insta::assert_snapshot!(output);
     }
 }

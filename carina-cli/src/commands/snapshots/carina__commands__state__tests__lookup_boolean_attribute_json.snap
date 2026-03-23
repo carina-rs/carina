@@ -1,0 +1,5 @@
+---
+source: carina-cli/src/commands/state.rs
+expression: output
+---
+true
