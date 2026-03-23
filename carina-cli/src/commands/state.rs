@@ -7,6 +7,8 @@ use colored::Colorize;
 
 use carina_core::config_loader::{get_base_dir, load_configuration};
 use carina_core::deps::sort_resources_by_dependencies;
+use carina_core::effect::Effect;
+use carina_core::plan::Plan;
 use carina_core::provider::{self as provider_mod, Provider, ProviderNormalizer};
 use carina_core::resource::{LifecycleConfig, Resource, ResourceId, State, Value};
 use carina_core::value::{format_value, json_to_dsl_value};
@@ -145,6 +147,16 @@ pub enum StateCommands {
         #[arg(long)]
         json: bool,
     },
+    /// Show all managed resources with full attributes
+    Show {
+        /// Path to .crn file or directory
+        #[arg(default_value = ".")]
+        path: PathBuf,
+
+        /// Display state in interactive TUI mode
+        #[arg(long)]
+        tui: bool,
+    },
 }
 
 /// Run state subcommands
@@ -158,6 +170,7 @@ pub async fn run_state_command(command: StateCommands) -> Result<(), AppError> {
         StateCommands::Refresh { path, lock } => run_state_refresh(&path, lock).await,
         StateCommands::List { path } => run_state_list(&path).await,
         StateCommands::Lookup { query, path, json } => run_state_lookup(&query, &path, json).await,
+        StateCommands::Show { path, tui } => run_state_show(&path, tui).await,
     }
 }
 
@@ -298,6 +311,97 @@ async fn run_state_lookup(query: &str, path: &PathBuf, json_output: bool) -> Res
     let state = load_state_file(path).await?;
     let output = format_state_lookup(&state, query, json_output)?;
     println!("{}", output);
+    Ok(())
+}
+
+/// Build a synthetic `Plan` from a state file for TUI display.
+///
+/// Each resource in the state becomes a `Read` effect so the TUI can
+/// render it with all attributes in the detail panel.
+fn build_plan_from_state(state: &StateFile) -> Plan {
+    let mut plan = Plan::new();
+    for rs in &state.resources {
+        let mut resource = Resource::with_provider(&rs.provider, &rs.resource_type, &rs.name);
+
+        // Set binding as _binding attribute so TUI can display it
+        if let Some(binding) = &rs.binding {
+            resource
+                .attributes
+                .insert("_binding".to_string(), Value::String(binding.clone()));
+        }
+
+        // Set dependency bindings as _dependency_bindings so TUI tree works
+        if !rs.dependency_bindings.is_empty() {
+            resource.attributes.insert(
+                "_dependency_bindings".to_string(),
+                Value::List(
+                    rs.dependency_bindings
+                        .iter()
+                        .map(|b| Value::String(b.clone()))
+                        .collect(),
+                ),
+            );
+        }
+
+        // Convert JSON attributes to DSL values
+        for (key, json_val) in &rs.attributes {
+            if let Some(dsl_val) = json_to_dsl_value(json_val) {
+                resource.attributes.insert(key.clone(), dsl_val);
+            }
+        }
+
+        resource.read_only = true;
+        plan.add(Effect::Read { resource });
+    }
+    plan
+}
+
+/// Format state show output (non-TUI mode).
+///
+/// Shows all resources with their type, name/binding, and full attributes.
+fn format_state_show(state: &StateFile) -> String {
+    let mut output = String::new();
+    for (i, rs) in state.resources.iter().enumerate() {
+        if i > 0 {
+            output.push('\n');
+        }
+        let display_name = rs.binding.as_deref().unwrap_or(&rs.name);
+        output.push_str(&format!(
+            "# {}.{} ({})\n",
+            rs.provider, rs.resource_type, display_name
+        ));
+
+        // Sort attributes for deterministic output
+        let mut keys: Vec<&String> = rs.attributes.keys().collect();
+        keys.sort();
+        for key in keys {
+            let value = &rs.attributes[key];
+            if let Some(dsl_val) = json_to_dsl_value(value) {
+                output.push_str(&format!("  {} = {}\n", key, format_value(&dsl_val)));
+            }
+        }
+    }
+    output
+}
+
+/// Run state show command
+async fn run_state_show(path: &PathBuf, tui: bool) -> Result<(), AppError> {
+    let state = load_state_file(path).await?;
+
+    if state.resources.is_empty() {
+        println!("No resources in state.");
+        return Ok(());
+    }
+
+    if tui {
+        let plan = build_plan_from_state(&state);
+        carina_tui::run(&plan, &HashMap::new())
+            .map_err(|e| AppError::Config(format!("TUI error: {}", e)))?;
+    } else {
+        let output = format_state_show(&state);
+        print!("{}", output);
+    }
+
     Ok(())
 }
 
@@ -984,5 +1088,71 @@ mod tests {
         let candidates = complete_state_lookup_from(&state, "main-rt.");
         let values = candidate_values(&candidates);
         assert_eq!(values, vec!["main-rt.route_table_id", "main-rt.vpc_id"]);
+    }
+
+    // --- format_state_show tests ---
+
+    #[test]
+    fn state_show_displays_all_resources_with_attributes() {
+        let state = load_fixture_state();
+        let output = format_state_show(&state);
+        insta::assert_snapshot!(output);
+    }
+
+    // --- build_plan_from_state tests ---
+
+    #[test]
+    fn build_plan_from_state_creates_read_effects() {
+        let state = load_fixture_state();
+        let plan = build_plan_from_state(&state);
+
+        assert_eq!(plan.effects().len(), 3);
+        for effect in plan.effects() {
+            assert_eq!(effect.kind(), "read");
+        }
+    }
+
+    #[test]
+    fn build_plan_from_state_preserves_bindings() {
+        let state = load_fixture_state();
+        let plan = build_plan_from_state(&state);
+
+        let vpc_effect = &plan.effects()[0];
+        assert_eq!(vpc_effect.binding_name(), Some("vpc".to_string()),);
+    }
+
+    #[test]
+    fn build_plan_from_state_preserves_attributes() {
+        let state = load_fixture_state();
+        let plan = build_plan_from_state(&state);
+
+        let vpc_resource = plan.effects()[0].resource().unwrap();
+        assert!(vpc_resource.attributes.contains_key("cidr_block"));
+        assert!(vpc_resource.attributes.contains_key("vpc_id"));
+    }
+
+    #[test]
+    fn build_plan_from_state_empty() {
+        let state = StateFile::new();
+        let plan = build_plan_from_state(&state);
+        assert!(plan.is_empty());
+    }
+
+    #[test]
+    fn build_plan_from_state_preserves_dependency_bindings() {
+        let state = load_fixture_state();
+        let plan = build_plan_from_state(&state);
+
+        // subnet depends on vpc
+        let subnet_resource = plan.effects()[1].resource().unwrap();
+        let deps = subnet_resource.attributes.get("_dependency_bindings");
+        assert!(deps.is_some());
+        match deps.unwrap() {
+            Value::List(items) => {
+                assert_eq!(items.len(), 1);
+                assert_eq!(items[0], Value::String("vpc".to_string()));
+            }
+            _ => panic!("expected List"),
+        }
     }
 }
