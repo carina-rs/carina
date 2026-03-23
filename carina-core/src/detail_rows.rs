@@ -207,7 +207,7 @@ pub fn build_detail_rows(
             detail,
         ),
         Effect::Delete { id, .. } => build_delete_rows(id, delete_attributes),
-        Effect::Read { .. } => Vec::new(),
+        Effect::Read { resource } => build_create_rows(resource, schemas, detail),
     }
 }
 
