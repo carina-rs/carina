@@ -6,7 +6,7 @@ mod wiring;
 use std::path::PathBuf;
 
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
-use clap_complete::{Shell, generate};
+use clap_complete::{CompleteEnv, Shell, generate};
 use colored::Colorize;
 
 use commands::apply::{run_apply, run_apply_from_plan};
@@ -167,6 +167,8 @@ enum Commands {
 
 #[tokio::main]
 async fn main() {
+    CompleteEnv::with_factory(Cli::command).complete();
+
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
 
     let cli = Cli::parse();
