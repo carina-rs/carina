@@ -2662,4 +2662,53 @@ aws.s3.bucket {
             "InternalError should format with expected and context, got: {msg}"
         );
     }
+
+    #[test]
+    fn parse_slash_slash_comment_standalone() {
+        let input = r#"
+            // This is a C-style comment
+            provider aws {
+                region = aws.Region.ap_northeast_1
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+        assert_eq!(result.providers.len(), 1);
+        assert_eq!(result.providers[0].name, "aws");
+    }
+
+    #[test]
+    fn parse_slash_slash_comment_inline() {
+        let input = r#"
+            let vpc = awscc.ec2.vpc {
+                cidr_block = "10.0.0.0/16"  // inline comment
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+        assert_eq!(result.resources.len(), 1);
+        assert_eq!(
+            result.resources[0].attributes.get("cidr_block"),
+            Some(&Value::String("10.0.0.0/16".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_mixed_comment_styles() {
+        let input = r#"
+            # shell-style comment
+            // C-style comment
+            let vpc = awscc.ec2.vpc {
+                cidr_block = "10.0.0.0/16"  // inline C-style
+                tags = { Name = "main" }    # inline shell-style
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+        assert_eq!(result.resources.len(), 1);
+        assert_eq!(
+            result.resources[0].attributes.get("cidr_block"),
+            Some(&Value::String("10.0.0.0/16".to_string()))
+        );
+    }
 }

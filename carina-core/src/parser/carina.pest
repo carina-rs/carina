@@ -134,4 +134,4 @@ char = {
 WHITESPACE = _{ " " | "\t" | NEWLINE }
 
 // Comment (auto-skip)
-COMMENT = _{ "#" ~ (!NEWLINE ~ ANY)* }
+COMMENT = _{ ("//" | "#") ~ (!NEWLINE ~ ANY)* }
