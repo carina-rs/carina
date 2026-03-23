@@ -38,9 +38,14 @@ impl SemanticTokensProvider {
         let mut tokens = Vec::new();
         let mut prev_line = 0u32;
         let mut prev_start = 0u32;
+        let mut block_comment_depth: usize = 0;
 
         for (line_idx, line) in text.lines().enumerate() {
-            let line_tokens = self.tokenize_line(line, line_idx as u32);
+            let line_tokens = self.tokenize_line_with_block_comments(
+                line,
+                line_idx as u32,
+                &mut block_comment_depth,
+            );
 
             for (start, length, token_type) in line_tokens {
                 let delta_line = line_idx as u32 - prev_line;
@@ -64,6 +69,122 @@ impl SemanticTokensProvider {
         }
 
         tokens
+    }
+
+    /// Tokenize a single line with block comment tracking across lines.
+    /// `block_comment_depth` is updated in place to track nesting depth.
+    fn tokenize_line_with_block_comments(
+        &self,
+        line: &str,
+        line_idx: u32,
+        block_comment_depth: &mut usize,
+    ) -> Vec<(u32, u32, u32)> {
+        let chars: Vec<char> = line.chars().collect();
+        let char_len = chars.len() as u32;
+
+        // If we're entirely inside a block comment, scan for nested /* and */
+        if *block_comment_depth > 0 {
+            let mut i = 0;
+            while i < chars.len() {
+                if i + 1 < chars.len() && chars[i] == '/' && chars[i + 1] == '*' {
+                    *block_comment_depth += 1;
+                    i += 2;
+                } else if i + 1 < chars.len() && chars[i] == '*' && chars[i + 1] == '/' {
+                    *block_comment_depth -= 1;
+                    i += 2;
+                    if *block_comment_depth == 0 {
+                        // Block comment ended mid-line.
+                        // Highlight comment portion, then tokenize the rest.
+                        let comment_end = i as u32;
+                        let mut tokens = vec![(0u32, comment_end, 7u32)]; // COMMENT
+                        let rest: String = chars[i..].iter().collect();
+                        if !rest.trim().is_empty() {
+                            let rest_tokens = self.tokenize_line_with_block_comments(
+                                &rest,
+                                line_idx,
+                                block_comment_depth,
+                            );
+                            for (start, len, typ) in rest_tokens {
+                                tokens.push((start + comment_end, len, typ));
+                            }
+                        }
+                        return tokens;
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+            // Entire line is inside block comment
+            if char_len > 0 {
+                return vec![(0, char_len, 7)]; // COMMENT
+            }
+            return vec![];
+        }
+
+        // Not inside a block comment. Check if this line starts one.
+        // Scan for /* to find inline block comments.
+        let mut i = 0;
+        while i < chars.len() {
+            if i + 1 < chars.len() && chars[i] == '/' && chars[i + 1] == '*' {
+                *block_comment_depth = 1;
+                let comment_start = i as u32;
+                i += 2;
+                // Scan for end of block comment on same line
+                while i < chars.len() {
+                    if i + 1 < chars.len() && chars[i] == '/' && chars[i + 1] == '*' {
+                        *block_comment_depth += 1;
+                        i += 2;
+                    } else if i + 1 < chars.len() && chars[i] == '*' && chars[i + 1] == '/' {
+                        *block_comment_depth -= 1;
+                        i += 2;
+                        if *block_comment_depth == 0 {
+                            break;
+                        }
+                    } else {
+                        i += 1;
+                    }
+                }
+                let comment_end = i as u32;
+
+                // Tokenize part before the block comment
+                let before: String = chars[..comment_start as usize].iter().collect();
+                let mut tokens = if !before.trim().is_empty() {
+                    self.tokenize_line(&before, line_idx)
+                } else {
+                    vec![]
+                };
+
+                // Add the block comment token
+                tokens.push((comment_start, comment_end - comment_start, 7)); // COMMENT
+
+                // If comment closed on this line, tokenize the rest
+                if *block_comment_depth == 0 {
+                    let rest: String = chars[i..].iter().collect();
+                    if !rest.trim().is_empty() {
+                        let rest_tokens = self.tokenize_line_with_block_comments(
+                            &rest,
+                            line_idx,
+                            block_comment_depth,
+                        );
+                        for (start, len, typ) in rest_tokens {
+                            tokens.push((start + comment_end, len, typ));
+                        }
+                    }
+                } else if comment_end < char_len {
+                    // Comment extends beyond this line but there's content after /*
+                    // Already included in the comment token above
+                }
+
+                // Sort and dedup
+                tokens.sort_by_key(|(start, _, _)| *start);
+                tokens.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1 && a.2 == b.2);
+                return tokens;
+            }
+            i += 1;
+        }
+
+        // No block comment on this line, use normal tokenization
+        self.tokenize_line(line, line_idx)
     }
 
     /// Tokenize a single line, returning (start_col, length, token_type_index)
@@ -913,5 +1034,56 @@ mod tests {
         let (start, len, _) = comment_token.unwrap();
         assert_eq!(*start, 4);
         assert_eq!(*len, "# indented comment".chars().count() as u32);
+    }
+
+    #[test]
+    fn test_block_comment_single_line() {
+        let provider = SemanticTokensProvider::new(&[]);
+        let tokens = provider.tokenize("/* single line block comment */");
+        let comment_tokens: Vec<_> = tokens.iter().filter(|t| t.token_type == 7).collect();
+        assert!(
+            !comment_tokens.is_empty(),
+            "Should highlight single-line block comment as COMMENT. Got: {:?}",
+            tokens
+        );
+    }
+
+    #[test]
+    fn test_block_comment_multi_line() {
+        let provider = SemanticTokensProvider::new(&[]);
+        let content = "/*\n  Multi-line block comment.\n*/";
+        let tokens = provider.tokenize(content);
+        let comment_tokens: Vec<_> = tokens.iter().filter(|t| t.token_type == 7).collect();
+        // Each line within the block comment should be highlighted
+        assert!(
+            comment_tokens.len() >= 3,
+            "Should highlight all lines of multi-line block comment as COMMENT. Got: {:?}",
+            tokens
+        );
+    }
+
+    #[test]
+    fn test_block_comment_inline_with_code() {
+        let provider = SemanticTokensProvider::new(&[]);
+        let tokens = provider.tokenize("name = /* comment */ \"test\"");
+        let comment_tokens: Vec<_> = tokens.iter().filter(|t| t.token_type == 7).collect();
+        assert!(
+            !comment_tokens.is_empty(),
+            "Should highlight inline block comment as COMMENT. Got: {:?}",
+            tokens
+        );
+    }
+
+    #[test]
+    fn test_block_comment_nested() {
+        let provider = SemanticTokensProvider::new(&[]);
+        let content = "/* outer /* inner */ still commented */";
+        let tokens = provider.tokenize(content);
+        let comment_tokens: Vec<_> = tokens.iter().filter(|t| t.token_type == 7).collect();
+        assert!(
+            !comment_tokens.is_empty(),
+            "Should highlight nested block comment as COMMENT. Got: {:?}",
+            tokens
+        );
     }
 }
