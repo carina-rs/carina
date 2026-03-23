@@ -259,9 +259,17 @@ impl AwsccProvider {
     /// Some resource types (e.g., IPAM Pool) take significantly longer to delete
     /// via the CloudControl API than the default timeout allows.
     pub(crate) fn max_polling_attempts(type_name: &str, operation: &str) -> u32 {
-        // IPAM Pool deletions can take 15-30 minutes via CloudControl API
-        if operation == "delete" && (type_name.contains("IPAMPool") || type_name.contains("IPAM")) {
-            return 360; // 30 minutes (360 * 5s)
+        if operation == "delete" {
+            // IPAM Pool deletions can take 15-30 minutes via CloudControl API
+            if type_name.contains("IPAMPool") || type_name.contains("IPAM") {
+                return 360; // 30 minutes (360 * 5s)
+            }
+            // VPCGatewayAttachment deletion via CloudControl can be slow when
+            // dependent resources (e.g., NAT gateways) are still being cleaned up.
+            // The default 10-minute timeout is often insufficient. (issue #1066)
+            if type_name.contains("VPCGatewayAttachment") {
+                return 360; // 30 minutes (360 * 5s)
+            }
         }
         120 // Default: 10 minutes (120 * 5s)
     }
@@ -777,6 +785,27 @@ mod tests {
     fn test_max_polling_attempts_ipam_create() {
         assert_eq!(
             AwsccProvider::max_polling_attempts("AWS::EC2::IPAMPool", "create"),
+            120
+        );
+    }
+
+    #[test]
+    fn test_max_polling_attempts_vpc_gateway_attachment_delete() {
+        // VPCGatewayAttachment deletion via CloudControl API can be slow,
+        // especially when dependent resources (NAT gateways) are still
+        // being cleaned up. Extended timeout prevents premature timeout
+        // failures. (issue #1066)
+        assert_eq!(
+            AwsccProvider::max_polling_attempts("AWS::EC2::VPCGatewayAttachment", "delete"),
+            360
+        );
+    }
+
+    #[test]
+    fn test_max_polling_attempts_vpc_gateway_attachment_create() {
+        // Create operations use the default timeout
+        assert_eq!(
+            AwsccProvider::max_polling_attempts("AWS::EC2::VPCGatewayAttachment", "create"),
             120
         );
     }
