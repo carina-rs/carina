@@ -165,6 +165,18 @@ fn find_resource_by_query<'a>(state: &'a StateFile, name: &str) -> Option<&'a Re
         })
 }
 
+/// Format state list output. Returns each line as a string.
+fn format_state_list(state: &StateFile) -> Vec<String> {
+    state
+        .resources
+        .iter()
+        .map(|rs| {
+            let display_name = rs.binding.as_deref().unwrap_or(&rs.name);
+            format!("{}.{} {}", rs.provider, rs.resource_type, display_name)
+        })
+        .collect()
+}
+
 /// Run state list command
 async fn run_state_list(path: &PathBuf) -> Result<(), AppError> {
     let state = load_state_file(path).await?;
@@ -174,25 +186,27 @@ async fn run_state_list(path: &PathBuf) -> Result<(), AppError> {
         return Ok(());
     }
 
-    for rs in &state.resources {
-        let display_name = rs.binding.as_deref().unwrap_or(&rs.name);
-        println!("{}.{} {}", rs.provider, rs.resource_type, display_name);
+    for line in format_state_list(&state) {
+        println!("{}", line);
     }
 
     Ok(())
 }
 
-/// Run state lookup command
-async fn run_state_lookup(query: &str, path: &PathBuf, json_output: bool) -> Result<(), AppError> {
-    let state = load_state_file(path).await?;
-
+/// Format lookup output for a query against a state file.
+/// Returns the formatted output string on success, or an error.
+fn format_state_lookup(
+    state: &StateFile,
+    query: &str,
+    json_output: bool,
+) -> Result<String, AppError> {
     // Parse query: "binding" or "binding.attribute"
     let (resource_name, attribute) = match query.split_once('.') {
         Some((name, attr)) => (name, Some(attr)),
         None => (query, None),
     };
 
-    let rs = find_resource_by_query(&state, resource_name).ok_or_else(|| {
+    let rs = find_resource_by_query(state, resource_name).ok_or_else(|| {
         AppError::Config(format!("Resource '{}' not found in state.", resource_name))
     })?;
 
@@ -205,31 +219,35 @@ async fn run_state_lookup(query: &str, path: &PathBuf, json_output: bool) -> Res
                 ))
             })?;
             if json_output {
-                println!("{}", serde_json::to_string_pretty(value).unwrap());
+                Ok(serde_json::to_string_pretty(value).unwrap())
             } else {
-                // Raw value output (no quotes for strings)
-                print_raw_value(value);
+                Ok(format_raw_value(value))
             }
         }
         None => {
             // Full resource: output all attributes as JSON object
-            let json = serde_json::to_string_pretty(&rs.attributes).unwrap();
-            println!("{}", json);
+            Ok(serde_json::to_string_pretty(&rs.attributes).unwrap())
         }
     }
+}
 
+/// Run state lookup command
+async fn run_state_lookup(query: &str, path: &PathBuf, json_output: bool) -> Result<(), AppError> {
+    let state = load_state_file(path).await?;
+    let output = format_state_lookup(&state, query, json_output)?;
+    println!("{}", output);
     Ok(())
 }
 
-/// Print a JSON value in raw format (no quotes for strings, suitable for shell usage).
-fn print_raw_value(value: &serde_json::Value) {
+/// Format a JSON value in raw format (no quotes for strings, suitable for shell usage).
+fn format_raw_value(value: &serde_json::Value) -> String {
     match value {
-        serde_json::Value::String(s) => println!("{}", s),
-        serde_json::Value::Bool(b) => println!("{}", b),
-        serde_json::Value::Number(n) => println!("{}", n),
-        serde_json::Value::Null => println!("null"),
+        serde_json::Value::String(s) => s.to_string(),
+        serde_json::Value::Bool(b) => b.to_string(),
+        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::Null => "null".to_string(),
         // Arrays and objects get JSON output
-        _ => println!("{}", serde_json::to_string_pretty(value).unwrap()),
+        _ => serde_json::to_string_pretty(value).unwrap(),
     }
 }
 
@@ -661,75 +679,26 @@ fn diff_display_update_resource(
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::path::PathBuf;
 
-    fn sample_state() -> StateFile {
-        let json = r#"{
-          "version": 3,
-          "serial": 2,
-          "lineage": "test-lineage",
-          "carina_version": "0.1.0",
-          "resources": [
-            {
-              "resource_type": "ec2.vpc",
-              "name": "my-vpc",
-              "provider": "awscc",
-              "identifier": "vpc-abc",
-              "attributes": {
-                "cidr_block": "10.0.0.0/16",
-                "enable_dns_support": true,
-                "vpc_id": "vpc-abc"
-              },
-              "protected": false,
-              "lifecycle": {},
-              "prefixes": {},
-              "name_overrides": {},
-              "desired_keys": [],
-              "binding": "vpc",
-              "dependency_bindings": []
-            },
-            {
-              "resource_type": "ec2.subnet",
-              "name": "my-subnet",
-              "provider": "awscc",
-              "identifier": "subnet-123",
-              "attributes": {
-                "vpc_id": "vpc-abc",
-                "cidr_block": "10.0.1.0/24",
-                "tags": { "Name": "test-subnet" }
-              },
-              "protected": false,
-              "lifecycle": {},
-              "prefixes": {},
-              "name_overrides": {},
-              "desired_keys": [],
-              "binding": "subnet",
-              "dependency_bindings": ["vpc"]
-            },
-            {
-              "resource_type": "ec2.route_table",
-              "name": "main-rt",
-              "provider": "awscc",
-              "identifier": "rtb-xyz",
-              "attributes": {
-                "vpc_id": "vpc-abc",
-                "route_table_id": "rtb-xyz"
-              },
-              "protected": false,
-              "lifecycle": {},
-              "prefixes": {},
-              "name_overrides": {},
-              "desired_keys": [],
-              "binding": null,
-              "dependency_bindings": ["vpc"]
-            }
-          ]
-        }"#;
-        serde_json::from_str(json).unwrap()
+    /// Load the fixture state file from `tests/fixtures/state_lookup/`.
+    fn load_fixture_state() -> StateFile {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let path = PathBuf::from(format!(
+            "{}/tests/fixtures/state_lookup/carina.state.json",
+            manifest_dir
+        ));
+        let contents = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("Failed to read fixture {}: {}", path.display(), e));
+        serde_json::from_str(&contents)
+            .unwrap_or_else(|e| panic!("Failed to parse fixture {}: {}", path.display(), e))
     }
+
+    // --- find_resource_by_query tests ---
 
     #[test]
     fn find_resource_by_binding() {
-        let state = sample_state();
+        let state = load_fixture_state();
         let found = find_resource_by_query(&state, "vpc").unwrap();
         assert_eq!(found.name, "my-vpc");
         assert_eq!(found.resource_type, "ec2.vpc");
@@ -737,7 +706,7 @@ mod tests {
 
     #[test]
     fn find_resource_by_name_fallback() {
-        let state = sample_state();
+        let state = load_fixture_state();
         // "main-rt" has no binding, so lookup by name should work
         let found = find_resource_by_query(&state, "main-rt").unwrap();
         assert_eq!(found.resource_type, "ec2.route_table");
@@ -745,38 +714,8 @@ mod tests {
 
     #[test]
     fn find_resource_not_found() {
-        let state = sample_state();
+        let state = load_fixture_state();
         assert!(find_resource_by_query(&state, "nonexistent").is_none());
-    }
-
-    #[test]
-    fn print_raw_value_string() {
-        let val = json!("hello");
-        print_raw_value(&val);
-    }
-
-    #[test]
-    fn print_raw_value_bool() {
-        let val = json!(true);
-        print_raw_value(&val);
-    }
-
-    #[test]
-    fn print_raw_value_number() {
-        let val = json!(42);
-        print_raw_value(&val);
-    }
-
-    #[test]
-    fn print_raw_value_null() {
-        let val = json!(null);
-        print_raw_value(&val);
-    }
-
-    #[test]
-    fn print_raw_value_object() {
-        let val = json!({"key": "value"});
-        print_raw_value(&val);
     }
 
     #[test]
@@ -794,47 +733,135 @@ mod tests {
         assert_eq!(found.resource_type, "ec2.vpc");
     }
 
+    // --- format_raw_value tests ---
+
     #[test]
-    fn state_list_display_names() {
-        let state = sample_state();
+    fn format_raw_value_string() {
+        assert_eq!(format_raw_value(&json!("hello")), "hello");
+    }
 
-        let display_names: Vec<String> = state
-            .resources
-            .iter()
-            .map(|rs| {
-                let name = rs.binding.as_deref().unwrap_or(&rs.name);
-                format!("{}.{} {}", rs.provider, rs.resource_type, name)
-            })
-            .collect();
+    #[test]
+    fn format_raw_value_bool() {
+        assert_eq!(format_raw_value(&json!(true)), "true");
+    }
 
-        assert_eq!(display_names.len(), 3);
-        assert_eq!(display_names[0], "awscc.ec2.vpc vpc");
-        assert_eq!(display_names[1], "awscc.ec2.subnet subnet");
+    #[test]
+    fn format_raw_value_number() {
+        assert_eq!(format_raw_value(&json!(42)), "42");
+    }
+
+    #[test]
+    fn format_raw_value_null() {
+        assert_eq!(format_raw_value(&json!(null)), "null");
+    }
+
+    #[test]
+    fn format_raw_value_object() {
+        let result = format_raw_value(&json!({"key": "value"}));
+        assert!(result.contains("\"key\""));
+        assert!(result.contains("\"value\""));
+    }
+
+    // --- format_state_list fixture tests ---
+
+    #[test]
+    fn state_list_shows_all_resources() {
+        let state = load_fixture_state();
+        let lines = format_state_list(&state);
+
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0], "awscc.ec2.vpc vpc");
+        assert_eq!(lines[1], "awscc.ec2.subnet subnet");
         // route_table has no binding, should fall back to name
-        assert_eq!(display_names[2], "awscc.ec2.route_table main-rt");
+        assert_eq!(lines[2], "awscc.ec2.route_table main-rt");
+    }
+
+    // --- format_state_lookup fixture tests ---
+
+    #[test]
+    fn lookup_full_resource_returns_json() {
+        let state = load_fixture_state();
+        let output = format_state_lookup(&state, "vpc", false).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
+
+        assert_eq!(parsed["cidr_block"], json!("10.0.0.0/16"));
+        assert_eq!(parsed["vpc_id"], json!("vpc-0123456789abcdef0"));
+        assert_eq!(parsed["enable_dns_support"], json!(true));
     }
 
     #[test]
-    fn state_lookup_full_resource_attributes() {
-        let state = sample_state();
-        let rs = find_resource_by_query(&state, "vpc").unwrap();
-        assert_eq!(rs.attributes.get("cidr_block"), Some(&json!("10.0.0.0/16")));
-        assert_eq!(rs.attributes.get("vpc_id"), Some(&json!("vpc-abc")));
-        assert_eq!(rs.attributes.get("enable_dns_support"), Some(&json!(true)));
+    fn lookup_attribute_returns_raw_value() {
+        let state = load_fixture_state();
+        let output = format_state_lookup(&state, "vpc.vpc_id", false).unwrap();
+        assert_eq!(output, "vpc-0123456789abcdef0");
     }
 
     #[test]
-    fn state_lookup_specific_attribute() {
-        let state = sample_state();
-        let rs = find_resource_by_query(&state, "subnet").unwrap();
-        let tags = rs.attributes.get("tags").unwrap();
-        assert_eq!(tags, &json!({"Name": "test-subnet"}));
+    fn lookup_attribute_json_returns_quoted_value() {
+        let state = load_fixture_state();
+        let output = format_state_lookup(&state, "vpc.vpc_id", true).unwrap();
+        assert_eq!(output, "\"vpc-0123456789abcdef0\"");
     }
 
     #[test]
-    fn state_lookup_attribute_not_found() {
-        let state = sample_state();
-        let rs = find_resource_by_query(&state, "vpc").unwrap();
-        assert!(!rs.attributes.contains_key("nonexistent_attr"));
+    fn lookup_boolean_attribute_raw() {
+        let state = load_fixture_state();
+        let output = format_state_lookup(&state, "vpc.enable_dns_support", false).unwrap();
+        assert_eq!(output, "true");
+    }
+
+    #[test]
+    fn lookup_boolean_attribute_json() {
+        let state = load_fixture_state();
+        let output = format_state_lookup(&state, "vpc.enable_dns_support", true).unwrap();
+        assert_eq!(output, "true");
+    }
+
+    #[test]
+    fn lookup_object_attribute() {
+        let state = load_fixture_state();
+        let output = format_state_lookup(&state, "subnet.tags", false).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(parsed, json!({"Name": "test-subnet"}));
+    }
+
+    #[test]
+    fn lookup_nonexistent_resource_returns_error() {
+        let state = load_fixture_state();
+        let err = format_state_lookup(&state, "nonexistent", false).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Resource 'nonexistent' not found"),
+            "unexpected error: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn lookup_nonexistent_attribute_returns_error() {
+        let state = load_fixture_state();
+        let err = format_state_lookup(&state, "vpc.nonexistent_attr", false).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Attribute 'nonexistent_attr' not found"),
+            "unexpected error: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn lookup_resource_without_binding_by_name() {
+        let state = load_fixture_state();
+        // route_table has no binding, look up by name
+        let output = format_state_lookup(&state, "main-rt", false).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(parsed["route_table_id"], json!("rtb-0123456789abcdef0"));
+    }
+
+    #[test]
+    fn lookup_resource_without_binding_attribute() {
+        let state = load_fixture_state();
+        let output = format_state_lookup(&state, "main-rt.route_table_id", false).unwrap();
+        assert_eq!(output, "rtb-0123456789abcdef0");
     }
 }
