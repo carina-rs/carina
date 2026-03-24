@@ -970,6 +970,7 @@ fn effect_to_node(effect: &Effect, schemas: Option<&HashMap<String, ResourceSche
                     key: "identifier".to_string(),
                     value: identifier.clone(),
                     ref_binding: None,
+                    annotation: None,
                 });
             }
             TreeNode {

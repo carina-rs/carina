@@ -361,24 +361,37 @@ pub fn merge_default_tags(
         }
 
         // Merge default_tags into the resource's tags
+        let mut default_tag_keys: Vec<String> = Vec::new();
         match resource.attributes.get_mut("tags") {
             Some(Value::Map(existing_tags)) => {
                 // Resource-level tags take precedence: only insert defaults for missing keys
                 for (key, value) in default_tags {
-                    existing_tags
-                        .entry(key.clone())
-                        .or_insert_with(|| value.clone());
+                    if !existing_tags.contains_key(key) {
+                        existing_tags.insert(key.clone(), value.clone());
+                        default_tag_keys.push(key.clone());
+                    }
                 }
             }
             None => {
                 // No tags on the resource: use default_tags as-is
+                default_tag_keys = default_tags.keys().cloned().collect();
                 resource
                     .attributes
                     .insert("tags".to_string(), Value::Map(default_tags.clone()));
             }
             _ => {
                 // tags is some other value type (unexpected), skip
+                continue;
             }
+        }
+
+        // Store which tag keys came from default_tags as internal metadata
+        if !default_tag_keys.is_empty() {
+            default_tag_keys.sort();
+            resource.attributes.insert(
+                "_default_tag_keys".to_string(),
+                Value::List(default_tag_keys.into_iter().map(Value::String).collect()),
+            );
         }
     }
 }
@@ -835,6 +848,20 @@ mod tests {
         } else {
             panic!("Expected tags to be a Map");
         }
+
+        // Only "Team" should be recorded as a default_tag_key (Environment was overridden)
+        if let Some(Value::List(keys)) = resources[0].attributes.get("_default_tag_keys") {
+            let key_strs: Vec<&str> = keys
+                .iter()
+                .filter_map(|v| match v {
+                    Value::String(s) => Some(s.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(key_strs, vec!["Team"]);
+        } else {
+            panic!("Expected _default_tag_keys to be set");
+        }
     }
 
     #[test]
@@ -870,6 +897,20 @@ mod tests {
         } else {
             panic!("Expected tags to be set from default_tags");
         }
+
+        // All tags came from defaults
+        if let Some(Value::List(keys)) = resources[0].attributes.get("_default_tag_keys") {
+            let key_strs: Vec<&str> = keys
+                .iter()
+                .filter_map(|v| match v {
+                    Value::String(s) => Some(s.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(key_strs, vec!["Environment"]);
+        } else {
+            panic!("Expected _default_tag_keys to be set");
+        }
     }
 
     #[test]
@@ -901,6 +942,7 @@ mod tests {
 
         // Should not have tags since ec2.route schema doesn't support tags
         assert!(!resources[0].attributes.contains_key("tags"));
+        assert!(!resources[0].attributes.contains_key("_default_tag_keys"));
     }
 
     #[test]
@@ -933,5 +975,7 @@ mod tests {
         } else {
             panic!("Expected tags to be unchanged");
         }
+        // No _default_tag_keys when there are no default_tags
+        assert!(!resources[0].attributes.contains_key("_default_tag_keys"));
     }
 }

@@ -801,13 +801,53 @@ fn format_plan_tree(
 /// Render a single `DetailRow` into the output string with ANSI colors.
 fn render_detail_row(out: &mut String, row: &DetailRow, effect: &Effect, attr_prefix: &str) {
     match row {
-        DetailRow::Attribute { key, value, .. } => {
+        DetailRow::Attribute {
+            key,
+            value,
+            annotation,
+            ..
+        } => {
             let colored_value = match effect {
                 Effect::Create(_) => value.green().to_string(),
                 Effect::Delete { .. } => value.red().strikethrough().to_string(),
                 _ => value.to_string(),
             };
-            writeln!(out, "{}{}: {}", attr_prefix, key, colored_value).unwrap();
+            if let Some(ann) = annotation {
+                writeln!(
+                    out,
+                    "{}{}: {}  {}",
+                    attr_prefix,
+                    key,
+                    colored_value,
+                    ann.dimmed()
+                )
+                .unwrap();
+            } else {
+                writeln!(out, "{}{}: {}", attr_prefix, key, colored_value).unwrap();
+            }
+        }
+        DetailRow::MapExpanded { key, entries } => {
+            writeln!(out, "{}{}:", attr_prefix, key).unwrap();
+            for entry in entries {
+                let colored_value = match effect {
+                    Effect::Create(_) => entry.value.green().to_string(),
+                    Effect::Delete { .. } => entry.value.red().strikethrough().to_string(),
+                    _ => entry.value.to_string(),
+                };
+                if let Some(ann) = &entry.annotation {
+                    writeln!(
+                        out,
+                        "{}  {}: {}  {}",
+                        attr_prefix,
+                        entry.key,
+                        colored_value,
+                        ann.dimmed()
+                    )
+                    .unwrap();
+                } else {
+                    writeln!(out, "{}  {}: {}", attr_prefix, entry.key, colored_value).unwrap();
+                }
+            }
         }
         DetailRow::ListOfMaps { key, items } => {
             writeln!(out, "{}{}:", attr_prefix, key).unwrap();
