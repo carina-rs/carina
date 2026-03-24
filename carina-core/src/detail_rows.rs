@@ -36,6 +36,11 @@ pub enum DetailRow {
         /// Optional annotation (e.g., "# default_tags") shown after the value
         annotation: Option<String>,
     },
+    /// An expanded map attribute with per-entry annotations (e.g., tags with default_tags)
+    MapExpanded {
+        key: String,
+        entries: Vec<MapExpandedEntry>,
+    },
     /// A list-of-maps attribute (for Create effects)
     ListOfMaps {
         key: String,
@@ -112,6 +117,15 @@ pub enum DetailRow {
 pub struct ListOfMapsItem {
     /// Pre-formatted fields string: "key1: val1, key2: val2"
     pub fields: String,
+}
+
+/// A single entry in an expanded map (e.g., tags with default_tags annotation)
+#[derive(Debug, Clone, PartialEq)]
+pub struct MapExpandedEntry {
+    pub key: String,
+    pub value: String,
+    /// Optional annotation (e.g., "# default_tags") shown after the value
+    pub annotation: Option<String>,
 }
 
 /// A map diff entry (key-level diff)
@@ -252,7 +266,7 @@ fn build_create_rows(
             && !default_tag_keys.is_empty()
             && let Value::Map(map) = value
         {
-            rows.extend(build_expanded_tags_rows(map, &default_tag_keys));
+            rows.push(build_expanded_tags_row(map, &default_tag_keys));
             continue;
         }
         if is_list_of_maps(value) {
@@ -295,30 +309,33 @@ fn build_create_rows(
     rows
 }
 
-/// Expand a tags map into individual `DetailRow::Attribute` rows,
-/// annotating entries that came from `default_tags`.
-fn build_expanded_tags_rows(
+/// Build a `DetailRow::MapExpanded` for tags with `default_tags` annotations.
+fn build_expanded_tags_row(
     map: &HashMap<String, Value>,
     default_tag_keys: &HashSet<String>,
-) -> Vec<DetailRow> {
-    let mut rows = Vec::new();
+) -> DetailRow {
     let mut keys: Vec<_> = map.keys().collect();
     keys.sort();
-    for key in keys {
-        let value = &map[key];
-        let annotation = if default_tag_keys.contains(key) {
-            Some("# default_tags".to_string())
-        } else {
-            None
-        };
-        rows.push(DetailRow::Attribute {
-            key: format!("tags.{}", key),
-            value: format_value_with_key(value, Some(key)),
-            ref_binding: None,
-            annotation,
-        });
+    let entries = keys
+        .into_iter()
+        .map(|key| {
+            let value = &map[key];
+            let annotation = if default_tag_keys.contains(key) {
+                Some("# default_tags".to_string())
+            } else {
+                None
+            };
+            MapExpandedEntry {
+                key: key.clone(),
+                value: format_value_with_key(value, Some(key)),
+                annotation,
+            }
+        })
+        .collect();
+    DetailRow::MapExpanded {
+        key: "tags".to_string(),
+        entries,
     }
-    rows
 }
 
 fn build_list_of_maps_row(key: &str, value: &Value) -> DetailRow {

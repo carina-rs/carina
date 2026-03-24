@@ -252,6 +252,31 @@ fn render_detail_row_to_lines(
             }
             lines.push(line);
         }
+        DetailRow::MapExpanded { key, entries } => {
+            let mut header_line = Line::from(vec![Span::raw(format!("  {}:", key))]);
+            if is_selected {
+                header_line = header_line.style(Style::default().bg(Color::DarkGray));
+            }
+            lines.push(header_line);
+            for entry in entries {
+                let entry_value_style = if let Some(color) = value_color(&entry.value) {
+                    Style::default().fg(color)
+                } else {
+                    Style::default()
+                };
+                let mut spans = vec![
+                    Span::raw(format!("    {}: ", entry.key)),
+                    Span::styled(entry.value.clone(), entry_value_style),
+                ];
+                if let Some(ann) = &entry.annotation {
+                    spans.push(Span::styled(
+                        format!("  {}", ann),
+                        Style::default().fg(Color::DarkGray),
+                    ));
+                }
+                lines.push(Line::from(spans));
+            }
+        }
         DetailRow::ListOfMaps { key, items } => {
             let value_style = if kind == EffectKind::Create {
                 Style::default().fg(Color::Green)
