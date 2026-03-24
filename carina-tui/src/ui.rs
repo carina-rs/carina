@@ -220,6 +220,7 @@ fn render_detail_row_to_lines(
             key,
             value,
             ref_binding,
+            annotation,
         } => {
             let is_navigable = ref_binding.is_some();
             let value_style = if is_navigable {
@@ -236,6 +237,12 @@ fn render_detail_row_to_lines(
             if is_navigable {
                 spans.push(Span::styled(
                     " \u{2192}",
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+            if let Some(ann) = annotation {
+                spans.push(Span::styled(
+                    format!("  {}", ann),
                     Style::default().fg(Color::DarkGray),
                 ));
             }

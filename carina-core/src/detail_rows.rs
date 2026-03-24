@@ -33,6 +33,8 @@ pub enum DetailRow {
         value: String,
         /// If this attribute is a ResourceRef, stores the binding name for navigation
         ref_binding: Option<String>,
+        /// Optional annotation (e.g., "# default_tags") shown after the value
+        annotation: Option<String>,
     },
     /// A list-of-maps attribute (for Create effects)
     ListOfMaps {
@@ -218,6 +220,24 @@ fn build_create_rows(
 ) -> Vec<DetailRow> {
     let mut rows = Vec::new();
 
+    // Collect default_tag_keys for annotation
+    let default_tag_keys: HashSet<String> = r
+        .attributes
+        .get("_default_tag_keys")
+        .and_then(|v| match v {
+            Value::List(items) => Some(
+                items
+                    .iter()
+                    .filter_map(|item| match item {
+                        Value::String(s) => Some(s.clone()),
+                        _ => None,
+                    })
+                    .collect(),
+            ),
+            _ => None,
+        })
+        .unwrap_or_default();
+
     let mut keys: Vec<_> = r
         .attributes
         .keys()
@@ -227,6 +247,14 @@ fn build_create_rows(
 
     for key in &keys {
         let value = &r.attributes[*key];
+        // Expand tags map into individual rows with default_tags annotation
+        if key.as_str() == "tags"
+            && !default_tag_keys.is_empty()
+            && let Value::Map(map) = value
+        {
+            rows.extend(build_expanded_tags_rows(map, &default_tag_keys));
+            continue;
+        }
         if is_list_of_maps(value) {
             rows.push(build_list_of_maps_row(key, value));
         } else {
@@ -238,6 +266,7 @@ fn build_create_rows(
                 key: key.to_string(),
                 value: format_value_with_key(value, Some(key)),
                 ref_binding,
+                annotation: None,
             });
         }
     }
@@ -266,6 +295,32 @@ fn build_create_rows(
     rows
 }
 
+/// Expand a tags map into individual `DetailRow::Attribute` rows,
+/// annotating entries that came from `default_tags`.
+fn build_expanded_tags_rows(
+    map: &HashMap<String, Value>,
+    default_tag_keys: &HashSet<String>,
+) -> Vec<DetailRow> {
+    let mut rows = Vec::new();
+    let mut keys: Vec<_> = map.keys().collect();
+    keys.sort();
+    for key in keys {
+        let value = &map[key];
+        let annotation = if default_tag_keys.contains(key) {
+            Some("# default_tags".to_string())
+        } else {
+            None
+        };
+        rows.push(DetailRow::Attribute {
+            key: format!("tags.{}", key),
+            value: format_value_with_key(value, Some(key)),
+            ref_binding: None,
+            annotation,
+        });
+    }
+    rows
+}
+
 fn build_list_of_maps_row(key: &str, value: &Value) -> DetailRow {
     let items = match value {
         Value::List(items) => items,
@@ -274,6 +329,7 @@ fn build_list_of_maps_row(key: &str, value: &Value) -> DetailRow {
                 key: key.to_string(),
                 value: format_value(value),
                 ref_binding: None,
+                annotation: None,
             };
         }
     };
@@ -533,6 +589,7 @@ fn build_delete_rows(
                 key: key.to_string(),
                 value: format_value_with_key(value, Some(key)),
                 ref_binding,
+                annotation: None,
             });
         }
     }

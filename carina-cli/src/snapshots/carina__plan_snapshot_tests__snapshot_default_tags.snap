@@ -6,7 +6,9 @@ Execution Plan:
 
   + awscc.ec2.vpc vpc
       cidr_block: "10.0.0.0/16"
-      tags: {Environment: "staging", ManagedBy: "carina", Name: "main-vpc"}
+      tags.Environment: "staging"
+      tags.ManagedBy: "carina"  # default_tags
+      tags.Name: "main-vpc"
       cidr_block_associations: (known after apply)
       default_network_acl: (known after apply)
       default_security_group: (known after apply)
@@ -14,7 +16,8 @@ Execution Plan:
       vpc_id: (known after apply)
         │
         └─ + awscc.ec2.route_table ec2_route_table_d8d0c86b
-              tags: {Environment: "production", ManagedBy: "carina"}
+              tags.Environment: "production"  # default_tags
+              tags.ManagedBy: "carina"  # default_tags
               vpc_id: vpc.vpc_id
               route_table_id: (known after apply)
 
