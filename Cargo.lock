@@ -691,6 +691,7 @@ dependencies = [
  "clap_complete",
  "colored",
  "env_logger",
+ "futures",
  "insta",
  "regex-lite",
  "serde",
