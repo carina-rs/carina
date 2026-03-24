@@ -5,9 +5,10 @@
 //! colored progress output while keeping the execution logic testable.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::deps::find_failed_dependency;
+use crate::deps::{find_failed_dependency, get_resource_dependencies};
 use crate::effect::Effect;
 use crate::plan::Plan;
 use crate::provider::Provider;
@@ -92,8 +93,11 @@ pub enum ExecutionEvent<'a> {
 }
 
 /// Observer trait for UI separation during plan execution.
-pub trait ExecutionObserver {
-    fn on_event(&mut self, event: &ExecutionEvent);
+///
+/// Implementations must handle concurrent calls from parallel effect execution.
+/// Use interior mutability (e.g., `Mutex`) if mutable state is needed.
+pub trait ExecutionObserver: Send + Sync {
+    fn on_event(&self, event: &ExecutionEvent);
 }
 
 /// Execute a plan by dispatching effects to a provider.
@@ -108,7 +112,7 @@ pub trait ExecutionObserver {
 pub async fn execute_plan(
     provider: &dyn Provider,
     mut input: ExecutionInput<'_>,
-    observer: &mut dyn ExecutionObserver,
+    observer: &dyn ExecutionObserver,
 ) -> ExecutionResult {
     if has_interdependent_replaces(input.plan.effects()) {
         execute_effects_phased(provider, &mut input, observer).await
@@ -255,7 +259,7 @@ async fn refresh_pending_states(
     provider: &dyn Provider,
     current_states: &mut HashMap<ResourceId, State>,
     pending_refreshes: &HashMap<ResourceId, String>,
-    observer: &mut dyn ExecutionObserver,
+    observer: &dyn ExecutionObserver,
 ) -> HashSet<ResourceId> {
     if pending_refreshes.is_empty() {
         return HashSet::new();
@@ -343,11 +347,133 @@ fn count_actionable_effects(effects: &[Effect]) -> usize {
         .count()
 }
 
-/// Execute effects sequentially (no dependency reordering).
+/// Build dependency levels from effects.
+///
+/// Groups effects into levels where all effects in a level have their
+/// dependencies satisfied by effects in earlier levels. Effects within
+/// the same level can be executed concurrently.
+fn build_dependency_levels(
+    effects: &[Effect],
+    unresolved_resources: &HashMap<ResourceId, Resource>,
+) -> Vec<Vec<usize>> {
+    // Build binding -> effect index mapping
+    let mut binding_to_idx: HashMap<String, usize> = HashMap::new();
+    for (idx, effect) in effects.iter().enumerate() {
+        if let Some(binding) = effect.binding_name() {
+            binding_to_idx.insert(binding, idx);
+        }
+    }
+
+    // For each effect, compute which other effect indices it depends on.
+    // Check both the effect's resource and the unresolved resource (which may
+    // still have ResourceRef values before they were resolved to plain strings).
+    let mut deps_of: HashMap<usize, HashSet<usize>> = HashMap::new();
+    for (idx, effect) in effects.iter().enumerate() {
+        let mut dep_indices = HashSet::new();
+        if let Some(resource) = effect.resource() {
+            let dep_bindings = get_resource_dependencies(resource);
+            for dep_binding in &dep_bindings {
+                if let Some(&dep_idx) = binding_to_idx.get(dep_binding) {
+                    dep_indices.insert(dep_idx);
+                }
+            }
+            // Also check unresolved source for dependencies (ResourceRef values
+            // may have been resolved to plain strings in the effect's resource)
+            if let Some(unresolved) = unresolved_resources.get(effect.resource_id()) {
+                let unresolved_deps = get_resource_dependencies(unresolved);
+                for dep_binding in &unresolved_deps {
+                    if let Some(&dep_idx) = binding_to_idx.get(dep_binding) {
+                        dep_indices.insert(dep_idx);
+                    }
+                }
+            }
+        }
+        deps_of.insert(idx, dep_indices);
+    }
+
+    // Assign levels: each effect's level is max(deps' levels) + 1, or 0 if no deps
+    let mut levels: HashMap<usize, usize> = HashMap::new();
+    let mut assigned = HashSet::new();
+
+    // Iteratively assign levels (handle forward references)
+    loop {
+        let mut progress = false;
+        for idx in 0..effects.len() {
+            if assigned.contains(&idx) {
+                continue;
+            }
+            let deps = &deps_of[&idx];
+            if deps.iter().all(|d| assigned.contains(d)) {
+                let level = deps.iter().map(|d| levels[d] + 1).max().unwrap_or(0);
+                levels.insert(idx, level);
+                assigned.insert(idx);
+                progress = true;
+            }
+        }
+        if !progress {
+            // Remaining effects (cycles or Read) get assigned to level 0
+            for idx in 0..effects.len() {
+                if !assigned.contains(&idx) {
+                    levels.insert(idx, 0);
+                    assigned.insert(idx);
+                }
+            }
+            break;
+        }
+        if assigned.len() == effects.len() {
+            break;
+        }
+    }
+
+    // Group by level
+    let max_level = levels.values().copied().max().unwrap_or(0);
+    let mut result: Vec<Vec<usize>> = vec![Vec::new(); max_level + 1];
+    for (idx, &level) in &levels {
+        result[level].push(*idx);
+    }
+
+    // Sort indices within each level for deterministic ordering
+    for group in &mut result {
+        group.sort();
+    }
+
+    result
+}
+
+/// Result of executing a single effect.
+enum SingleEffectResult {
+    Success {
+        state: Option<State>,
+        resource_id: ResourceId,
+        resolved_attrs: Option<HashMap<String, Value>>,
+    },
+    Failure {
+        binding: Option<String>,
+        refresh: Option<(ResourceId, String)>,
+    },
+    Deleted {
+        resource_id: ResourceId,
+    },
+    Replace {
+        success: bool,
+        state: Option<State>,
+        resource_id: ResourceId,
+        resolved_attrs: Option<HashMap<String, Value>>,
+        binding: Option<String>,
+        refreshes: Vec<(ResourceId, String)>,
+        permanent_overrides: Option<(ResourceId, HashMap<String, String>)>,
+    },
+    ReadNoOp,
+}
+
+/// Execute effects with parallel execution of independent resources.
+///
+/// Groups effects into dependency levels. Effects within the same level
+/// (no dependency relationship between them) are executed concurrently.
 async fn execute_effects_sequential(
     provider: &dyn Provider,
     input: &mut ExecutionInput<'_>,
-    observer: &mut dyn ExecutionObserver,
+    observer: &dyn ExecutionObserver,
 ) -> ExecutionResult {
     let mut success_count = 0;
     let mut failure_count = 0;
@@ -358,181 +484,294 @@ async fn execute_effects_sequential(
     let mut permanent_name_overrides: HashMap<ResourceId, HashMap<String, String>> = HashMap::new();
     let mut pending_refreshes: HashMap<ResourceId, String> = HashMap::new();
 
-    let total = count_actionable_effects(input.plan.effects());
-    let mut completed: usize = 0;
+    let effects = input.plan.effects();
+    let total = count_actionable_effects(effects);
+    let completed = AtomicUsize::new(0);
 
-    for effect in input.plan.effects() {
-        // Check if any dependency has failed - skip this effect if so
-        if let Some(failed_dep) = find_failed_dependency(effect, &failed_bindings) {
-            completed += 1;
-            let reason = format!("dependency '{}' failed", failed_dep);
-            observer.on_event(&ExecutionEvent::EffectSkipped {
-                effect,
-                reason: &reason,
-                progress: ProgressInfo { completed, total },
-            });
-            skip_count += 1;
-            if let Some(binding) = effect.binding_name() {
-                failed_bindings.insert(binding);
+    let levels = build_dependency_levels(effects, input.unresolved_resources);
+
+    for level_indices in &levels {
+        // Partition into skipped and executable effects
+        let mut to_execute: Vec<usize> = Vec::new();
+        for &idx in level_indices {
+            let effect = &effects[idx];
+            if matches!(effect, Effect::Read { .. }) {
+                continue;
             }
+            if let Some(failed_dep) = find_failed_dependency(effect, &failed_bindings) {
+                let c = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                let reason = format!("dependency '{}' failed", failed_dep);
+                observer.on_event(&ExecutionEvent::EffectSkipped {
+                    effect,
+                    reason: &reason,
+                    progress: ProgressInfo {
+                        completed: c,
+                        total,
+                    },
+                });
+                skip_count += 1;
+                if let Some(binding) = effect.binding_name() {
+                    failed_bindings.insert(binding);
+                }
+                continue;
+            }
+            to_execute.push(idx);
+        }
+
+        if to_execute.is_empty() {
             continue;
         }
 
-        let started = Instant::now();
-        observer.on_event(&ExecutionEvent::EffectStarted { effect });
+        // Snapshot binding_map for this level (all effects in same level
+        // resolve against the same snapshot, since they are independent)
+        let binding_snapshot = input.binding_map.clone();
 
-        match effect {
-            Effect::Create(resource) => {
-                completed += 1;
-                let resolved = resolve_resource(resource, &input.binding_map);
-                match provider.create(&resolved).await {
-                    Ok(state) => {
-                        observer.on_event(&ExecutionEvent::EffectSucceeded {
-                            effect,
-                            state: Some(&state),
-                            duration: started.elapsed(),
-                            progress: ProgressInfo { completed, total },
-                        });
-                        success_count += 1;
-                        applied_states.insert(resource.id.clone(), state.clone());
-                        update_binding_map(&mut input.binding_map, &resolved.attributes, &state);
+        // Execute all effects in this level concurrently
+        let futures: Vec<_> = to_execute
+            .iter()
+            .map(|&idx| {
+                let effect = &effects[idx];
+                let binding_map = &binding_snapshot;
+                let unresolved = &input.unresolved_resources;
+                let completed_ref = &completed;
+
+                async move {
+                    match effect {
+                        Effect::Create(resource) => {
+                            let c = completed_ref.fetch_add(1, Ordering::Relaxed) + 1;
+                            let started = Instant::now();
+                            observer.on_event(&ExecutionEvent::EffectStarted { effect });
+                            let resolved = resolve_resource(resource, binding_map);
+                            match provider.create(&resolved).await {
+                                Ok(state) => {
+                                    observer.on_event(&ExecutionEvent::EffectSucceeded {
+                                        effect,
+                                        state: Some(&state),
+                                        duration: started.elapsed(),
+                                        progress: ProgressInfo {
+                                            completed: c,
+                                            total,
+                                        },
+                                    });
+                                    SingleEffectResult::Success {
+                                        state: Some(state),
+                                        resource_id: resource.id.clone(),
+                                        resolved_attrs: Some(resolved.attributes),
+                                    }
+                                }
+                                Err(e) => {
+                                    let error_str = e.to_string();
+                                    observer.on_event(&ExecutionEvent::EffectFailed {
+                                        effect,
+                                        error: &error_str,
+                                        duration: started.elapsed(),
+                                        progress: ProgressInfo {
+                                            completed: c,
+                                            total,
+                                        },
+                                    });
+                                    SingleEffectResult::Failure {
+                                        binding: effect.binding_name(),
+                                        refresh: None,
+                                    }
+                                }
+                            }
+                        }
+                        Effect::Update { id, from, to, .. } => {
+                            let c = completed_ref.fetch_add(1, Ordering::Relaxed) + 1;
+                            let started = Instant::now();
+                            observer.on_event(&ExecutionEvent::EffectStarted { effect });
+                            let resolve_source = unresolved.get(id).unwrap_or(to);
+                            let resolved_to =
+                                resolve_resource_with_source(to, resolve_source, binding_map);
+                            let identifier = from.identifier.as_deref().unwrap_or("");
+                            match provider.update(id, identifier, from, &resolved_to).await {
+                                Ok(state) => {
+                                    observer.on_event(&ExecutionEvent::EffectSucceeded {
+                                        effect,
+                                        state: Some(&state),
+                                        duration: started.elapsed(),
+                                        progress: ProgressInfo {
+                                            completed: c,
+                                            total,
+                                        },
+                                    });
+                                    SingleEffectResult::Success {
+                                        state: Some(state),
+                                        resource_id: id.clone(),
+                                        resolved_attrs: Some(resolved_to.attributes),
+                                    }
+                                }
+                                Err(e) => {
+                                    let error_str = e.to_string();
+                                    observer.on_event(&ExecutionEvent::EffectFailed {
+                                        effect,
+                                        error: &error_str,
+                                        duration: started.elapsed(),
+                                        progress: ProgressInfo {
+                                            completed: c,
+                                            total,
+                                        },
+                                    });
+                                    SingleEffectResult::Failure {
+                                        binding: effect.binding_name(),
+                                        refresh: Some((id.clone(), identifier.to_string())),
+                                    }
+                                }
+                            }
+                        }
+                        Effect::Delete {
+                            id,
+                            identifier,
+                            lifecycle,
+                            ..
+                        } => {
+                            let c = completed_ref.fetch_add(1, Ordering::Relaxed) + 1;
+                            let started = Instant::now();
+                            let progress = ProgressInfo {
+                                completed: c,
+                                total,
+                            };
+                            observer.on_event(&ExecutionEvent::EffectStarted { effect });
+                            match provider.delete(id, identifier, lifecycle).await {
+                                Ok(()) => {
+                                    observer.on_event(&ExecutionEvent::EffectSucceeded {
+                                        effect,
+                                        state: None,
+                                        duration: started.elapsed(),
+                                        progress,
+                                    });
+                                    SingleEffectResult::Deleted {
+                                        resource_id: id.clone(),
+                                    }
+                                }
+                                Err(e) => {
+                                    let error_str = e.to_string();
+                                    observer.on_event(&ExecutionEvent::EffectFailed {
+                                        effect,
+                                        error: &error_str,
+                                        duration: started.elapsed(),
+                                        progress,
+                                    });
+                                    SingleEffectResult::Failure {
+                                        binding: None,
+                                        refresh: Some((id.clone(), identifier.clone())),
+                                    }
+                                }
+                            }
+                        }
+                        Effect::Replace {
+                            id,
+                            from,
+                            to,
+                            lifecycle,
+                            cascading_updates,
+                            temporary_name,
+                            ..
+                        } => {
+                            let c = completed_ref.fetch_add(1, Ordering::Relaxed) + 1;
+                            let started = Instant::now();
+                            let progress = ProgressInfo {
+                                completed: c,
+                                total,
+                            };
+                            observer.on_event(&ExecutionEvent::EffectStarted { effect });
+
+                            execute_replace_parallel(
+                                provider,
+                                effect,
+                                id,
+                                from,
+                                to,
+                                lifecycle,
+                                cascading_updates,
+                                temporary_name.as_ref(),
+                                binding_map,
+                                unresolved,
+                                started,
+                                progress,
+                                observer,
+                            )
+                            .await
+                        }
+                        Effect::Read { .. } => SingleEffectResult::ReadNoOp,
                     }
-                    Err(e) => {
-                        let error_str = e.to_string();
-                        observer.on_event(&ExecutionEvent::EffectFailed {
-                            effect,
-                            error: &error_str,
-                            duration: started.elapsed(),
-                            progress: ProgressInfo { completed, total },
-                        });
-                        failure_count += 1;
-                        if let Some(binding) = effect.binding_name() {
-                            failed_bindings.insert(binding);
+                }
+            })
+            .collect();
+
+        let results = futures::future::join_all(futures).await;
+
+        // Process results: update shared state after the level completes
+        for result in results {
+            match result {
+                SingleEffectResult::Success {
+                    state,
+                    resource_id,
+                    resolved_attrs,
+                    ..
+                } => {
+                    success_count += 1;
+                    if let Some(state) = &state {
+                        applied_states.insert(resource_id, state.clone());
+                        if let Some(attrs) = &resolved_attrs {
+                            update_binding_map(&mut input.binding_map, attrs, state);
                         }
                     }
                 }
-            }
-            Effect::Update { id, from, to, .. } => {
-                completed += 1;
-                let resolve_source = input.unresolved_resources.get(id).unwrap_or(to);
-                let resolved_to =
-                    resolve_resource_with_source(to, resolve_source, &input.binding_map);
-                let identifier = from.identifier.as_deref().unwrap_or("");
-                match provider.update(id, identifier, from, &resolved_to).await {
-                    Ok(state) => {
-                        observer.on_event(&ExecutionEvent::EffectSucceeded {
-                            effect,
-                            state: Some(&state),
-                            duration: started.elapsed(),
-                            progress: ProgressInfo { completed, total },
-                        });
-                        success_count += 1;
-                        applied_states.insert(id.clone(), state.clone());
-                        update_binding_map(&mut input.binding_map, &resolved_to.attributes, &state);
+                SingleEffectResult::Failure {
+                    binding, refresh, ..
+                } => {
+                    failure_count += 1;
+                    if let Some(binding) = binding {
+                        failed_bindings.insert(binding);
                     }
-                    Err(e) => {
-                        let error_str = e.to_string();
-                        observer.on_event(&ExecutionEvent::EffectFailed {
-                            effect,
-                            error: &error_str,
-                            duration: started.elapsed(),
-                            progress: ProgressInfo { completed, total },
-                        });
+                    if let Some((id, identifier)) = refresh
+                        && !identifier.is_empty()
+                    {
+                        pending_refreshes.insert(id, identifier);
+                    }
+                }
+                SingleEffectResult::Deleted { resource_id, .. } => {
+                    success_count += 1;
+                    successfully_deleted.insert(resource_id);
+                }
+                SingleEffectResult::Replace {
+                    success,
+                    state,
+                    resource_id,
+                    resolved_attrs,
+                    binding,
+                    refreshes,
+                    permanent_overrides,
+                } => {
+                    // Save state even on failure (e.g., CBD rename failure:
+                    // the resource was created but rename failed, state must be saved)
+                    if let Some(state) = &state {
+                        applied_states.insert(resource_id, state.clone());
+                        if let Some(attrs) = &resolved_attrs {
+                            update_binding_map(&mut input.binding_map, attrs, state);
+                        }
+                    }
+                    if success {
+                        success_count += 1;
+                        if let Some((id, overrides)) = permanent_overrides {
+                            permanent_name_overrides.insert(id, overrides);
+                        }
+                    } else {
                         failure_count += 1;
-                        queue_state_refresh(&mut pending_refreshes, id, Some(identifier));
-                        if let Some(binding) = effect.binding_name() {
+                        if let Some(binding) = binding {
                             failed_bindings.insert(binding);
                         }
                     }
-                }
-            }
-            Effect::Replace {
-                id,
-                from,
-                to,
-                lifecycle,
-                cascading_updates,
-                temporary_name,
-                ..
-            } => {
-                completed += 1;
-                let progress = ProgressInfo { completed, total };
-                if lifecycle.create_before_destroy {
-                    execute_cbd_replace_sequential(
-                        provider,
-                        effect,
-                        id,
-                        from,
-                        to,
-                        lifecycle,
-                        cascading_updates,
-                        temporary_name.as_ref(),
-                        &mut input.binding_map,
-                        &mut applied_states,
-                        &mut failed_bindings,
-                        &mut permanent_name_overrides,
-                        &mut pending_refreshes,
-                        &mut success_count,
-                        &mut failure_count,
-                        started,
-                        progress,
-                        observer,
-                    )
-                    .await;
-                } else {
-                    execute_dbd_replace(
-                        provider,
-                        effect,
-                        id,
-                        from,
-                        to,
-                        lifecycle,
-                        &mut input.binding_map,
-                        &mut applied_states,
-                        &mut failed_bindings,
-                        &mut pending_refreshes,
-                        &mut success_count,
-                        &mut failure_count,
-                        started,
-                        progress,
-                        observer,
-                    )
-                    .await;
-                }
-            }
-            Effect::Delete {
-                id,
-                identifier,
-                lifecycle,
-                ..
-            } => {
-                completed += 1;
-                let progress = ProgressInfo { completed, total };
-                match provider.delete(id, identifier, lifecycle).await {
-                    Ok(()) => {
-                        observer.on_event(&ExecutionEvent::EffectSucceeded {
-                            effect,
-                            state: None,
-                            duration: started.elapsed(),
-                            progress,
-                        });
-                        success_count += 1;
-                        successfully_deleted.insert(id.clone());
-                    }
-                    Err(e) => {
-                        let error_str = e.to_string();
-                        observer.on_event(&ExecutionEvent::EffectFailed {
-                            effect,
-                            error: &error_str,
-                            duration: started.elapsed(),
-                            progress,
-                        });
-                        failure_count += 1;
-                        queue_state_refresh(&mut pending_refreshes, id, Some(identifier));
+                    for (id, identifier) in refreshes {
+                        if !identifier.is_empty() {
+                            pending_refreshes.insert(id, identifier);
+                        }
                     }
                 }
+                SingleEffectResult::ReadNoOp => {}
             }
-            Effect::Read { .. } => {}
         }
     }
 
@@ -556,146 +795,6 @@ async fn execute_effects_sequential(
     }
 }
 
-// ---------------------------------------------------------------------------
-// CBD Replace (create-before-destroy) - sequential path
-// ---------------------------------------------------------------------------
-
-#[allow(clippy::too_many_arguments)]
-async fn execute_cbd_replace_sequential(
-    provider: &dyn Provider,
-    effect: &Effect,
-    id: &ResourceId,
-    from: &State,
-    to: &Resource,
-    lifecycle: &crate::resource::LifecycleConfig,
-    cascading_updates: &[crate::effect::CascadingUpdate],
-    temporary_name: Option<&crate::effect::TemporaryName>,
-    binding_map: &mut HashMap<String, HashMap<String, Value>>,
-    applied_states: &mut HashMap<ResourceId, State>,
-    failed_bindings: &mut HashSet<String>,
-    permanent_name_overrides: &mut HashMap<ResourceId, HashMap<String, String>>,
-    pending_refreshes: &mut HashMap<ResourceId, String>,
-    success_count: &mut usize,
-    failure_count: &mut usize,
-    started: Instant,
-    progress: ProgressInfo,
-    observer: &mut dyn ExecutionObserver,
-) {
-    let resolved = resolve_resource(to, binding_map);
-    match provider.create(&resolved).await {
-        Ok(state) => {
-            update_binding_map(binding_map, &resolved.attributes, &state);
-
-            // Execute cascading updates
-            let mut cascade_failed = false;
-            for cascade in cascading_updates {
-                let resolved_to = resolve_resource(&cascade.to, binding_map);
-                let cascade_identifier = cascade.from.identifier.as_deref().unwrap_or("");
-                match provider
-                    .update(&cascade.id, cascade_identifier, &cascade.from, &resolved_to)
-                    .await
-                {
-                    Ok(cascade_state) => {
-                        observer
-                            .on_event(&ExecutionEvent::CascadeUpdateSucceeded { id: &cascade.id });
-                        applied_states.insert(cascade.id.clone(), cascade_state.clone());
-                        update_binding_map(binding_map, &resolved_to.attributes, &cascade_state);
-                    }
-                    Err(e) => {
-                        let error_str = e.to_string();
-                        observer.on_event(&ExecutionEvent::CascadeUpdateFailed {
-                            id: &cascade.id,
-                            error: &error_str,
-                        });
-                        queue_state_refresh(
-                            pending_refreshes,
-                            &cascade.id,
-                            Some(cascade_identifier),
-                        );
-                        cascade_failed = true;
-                        *failure_count += 1;
-                        break;
-                    }
-                }
-            }
-
-            if cascade_failed {
-                queue_state_refresh(pending_refreshes, &to.id, state.identifier.as_deref());
-                if let Some(binding) = effect.binding_name() {
-                    failed_bindings.insert(binding);
-                }
-            } else {
-                // Delete the old resource
-                let identifier = from.identifier.as_deref().unwrap_or("");
-                match provider.delete(id, identifier, lifecycle).await {
-                    Ok(()) => {
-                        let (final_state, rename_failed) = finalize_cbd_rename(
-                            provider,
-                            id,
-                            to,
-                            &state,
-                            temporary_name,
-                            permanent_name_overrides,
-                            observer,
-                        )
-                        .await;
-
-                        applied_states.insert(to.id.clone(), final_state);
-
-                        if rename_failed {
-                            observer.on_event(&ExecutionEvent::EffectFailed {
-                                effect,
-                                error: "rename failed",
-                                duration: started.elapsed(),
-                                progress,
-                            });
-                            *failure_count += 1;
-                            if let Some(binding) = effect.binding_name() {
-                                failed_bindings.insert(binding);
-                            }
-                        } else {
-                            observer.on_event(&ExecutionEvent::EffectSucceeded {
-                                effect,
-                                state: None,
-                                duration: started.elapsed(),
-                                progress,
-                            });
-                            *success_count += 1;
-                        }
-                    }
-                    Err(e) => {
-                        let error_str = e.to_string();
-                        observer.on_event(&ExecutionEvent::EffectFailed {
-                            effect,
-                            error: &error_str,
-                            duration: started.elapsed(),
-                            progress,
-                        });
-                        *failure_count += 1;
-                        queue_state_refresh(pending_refreshes, &to.id, state.identifier.as_deref());
-                        if let Some(binding) = effect.binding_name() {
-                            failed_bindings.insert(binding);
-                        }
-                    }
-                }
-            }
-        }
-        Err(e) => {
-            let error_str = e.to_string();
-            observer.on_event(&ExecutionEvent::EffectFailed {
-                effect,
-                error: &error_str,
-                duration: started.elapsed(),
-                progress,
-            });
-            *failure_count += 1;
-            if let Some(binding) = effect.binding_name() {
-                failed_bindings.insert(binding);
-            }
-        }
-    }
-}
-
 /// Handle CBD rename after delete succeeds.
 async fn finalize_cbd_rename(
     provider: &dyn Provider,
@@ -704,7 +803,7 @@ async fn finalize_cbd_rename(
     state: &State,
     temporary_name: Option<&crate::effect::TemporaryName>,
     permanent_name_overrides: &mut HashMap<ResourceId, HashMap<String, String>>,
-    observer: &mut dyn ExecutionObserver,
+    observer: &dyn ExecutionObserver,
 ) -> (State, bool) {
     if let Some(temp) = temporary_name
         && temp.can_rename
@@ -747,42 +846,217 @@ async fn finalize_cbd_rename(
 }
 
 // ---------------------------------------------------------------------------
-// DBD Replace (delete-before-destroy) - sequential path
+// Replace execution for parallel path
 // ---------------------------------------------------------------------------
 
+/// Execute a Replace effect, returning a `SingleEffectResult`.
+///
+/// This handles both CBD and DBD replace within the parallel execution path.
+/// It does not mutate shared state directly; instead returns all data needed
+/// for the caller to update shared state after the level completes.
 #[allow(clippy::too_many_arguments)]
-async fn execute_dbd_replace(
+async fn execute_replace_parallel(
     provider: &dyn Provider,
     effect: &Effect,
     id: &ResourceId,
     from: &State,
     to: &Resource,
     lifecycle: &crate::resource::LifecycleConfig,
-    binding_map: &mut HashMap<String, HashMap<String, Value>>,
-    applied_states: &mut HashMap<ResourceId, State>,
-    failed_bindings: &mut HashSet<String>,
-    pending_refreshes: &mut HashMap<ResourceId, String>,
-    success_count: &mut usize,
-    failure_count: &mut usize,
+    cascading_updates: &[crate::effect::CascadingUpdate],
+    temporary_name: Option<&crate::effect::TemporaryName>,
+    binding_map: &HashMap<String, HashMap<String, Value>>,
+    unresolved: &HashMap<ResourceId, Resource>,
     started: Instant,
     progress: ProgressInfo,
-    observer: &mut dyn ExecutionObserver,
-) {
-    let identifier = from.identifier.as_deref().unwrap_or("");
-    match provider.delete(id, identifier, lifecycle).await {
-        Ok(()) => {
-            let resolved = resolve_resource(to, binding_map);
-            match provider.create(&resolved).await {
-                Ok(state) => {
-                    observer.on_event(&ExecutionEvent::EffectSucceeded {
-                        effect,
-                        state: Some(&state),
-                        duration: started.elapsed(),
-                        progress,
-                    });
-                    *success_count += 1;
-                    applied_states.insert(to.id.clone(), state.clone());
-                    update_binding_map(binding_map, &resolved.attributes, &state);
+    observer: &dyn ExecutionObserver,
+) -> SingleEffectResult {
+    if lifecycle.create_before_destroy {
+        execute_cbd_replace_parallel(
+            provider,
+            effect,
+            id,
+            from,
+            to,
+            lifecycle,
+            cascading_updates,
+            temporary_name,
+            binding_map,
+            unresolved,
+            started,
+            progress,
+            observer,
+        )
+        .await
+    } else {
+        execute_dbd_replace_parallel(
+            provider,
+            effect,
+            id,
+            from,
+            to,
+            lifecycle,
+            binding_map,
+            unresolved,
+            started,
+            progress,
+            observer,
+        )
+        .await
+    }
+}
+
+/// CBD Replace for the parallel execution path.
+#[allow(clippy::too_many_arguments)]
+async fn execute_cbd_replace_parallel(
+    provider: &dyn Provider,
+    effect: &Effect,
+    id: &ResourceId,
+    from: &State,
+    to: &Resource,
+    lifecycle: &crate::resource::LifecycleConfig,
+    cascading_updates: &[crate::effect::CascadingUpdate],
+    temporary_name: Option<&crate::effect::TemporaryName>,
+    binding_map: &HashMap<String, HashMap<String, Value>>,
+    _unresolved: &HashMap<ResourceId, Resource>,
+    started: Instant,
+    progress: ProgressInfo,
+    observer: &dyn ExecutionObserver,
+) -> SingleEffectResult {
+    let resolved = resolve_resource(to, binding_map);
+    let mut refreshes = Vec::new();
+
+    match provider.create(&resolved).await {
+        Ok(state) => {
+            // Build a local binding map update for cascade resolution
+            let mut local_binding_map = binding_map.clone();
+            update_binding_map(&mut local_binding_map, &resolved.attributes, &state);
+
+            // Execute cascading updates
+            let mut cascade_failed = false;
+            for cascade in cascading_updates {
+                let resolved_to = resolve_resource(&cascade.to, &local_binding_map);
+                let cascade_identifier = cascade.from.identifier.as_deref().unwrap_or("");
+                match provider
+                    .update(&cascade.id, cascade_identifier, &cascade.from, &resolved_to)
+                    .await
+                {
+                    Ok(cascade_state) => {
+                        observer
+                            .on_event(&ExecutionEvent::CascadeUpdateSucceeded { id: &cascade.id });
+                        update_binding_map(
+                            &mut local_binding_map,
+                            &resolved_to.attributes,
+                            &cascade_state,
+                        );
+                    }
+                    Err(e) => {
+                        let error_str = e.to_string();
+                        observer.on_event(&ExecutionEvent::CascadeUpdateFailed {
+                            id: &cascade.id,
+                            error: &error_str,
+                        });
+                        refreshes.push((cascade.id.clone(), cascade_identifier.to_string()));
+                        cascade_failed = true;
+                        break;
+                    }
+                }
+            }
+
+            if cascade_failed {
+                refreshes.push((to.id.clone(), state.identifier.clone().unwrap_or_default()));
+                return SingleEffectResult::Replace {
+                    success: false,
+                    state: None,
+                    resource_id: to.id.clone(),
+                    resolved_attrs: None,
+                    binding: effect.binding_name(),
+                    refreshes,
+                    permanent_overrides: None,
+                };
+            }
+
+            // Delete the old resource
+            let identifier = from.identifier.as_deref().unwrap_or("");
+            match provider.delete(id, identifier, lifecycle).await {
+                Ok(()) => {
+                    // Handle rename
+                    let mut permanent_overrides = None;
+                    let mut final_state = state.clone();
+                    let mut rename_failed = false;
+
+                    if let Some(temp) = temporary_name
+                        && temp.can_rename
+                    {
+                        let new_identifier = state.identifier.as_deref().unwrap_or("");
+                        let mut rename_to = to.clone();
+                        rename_to.attributes.insert(
+                            temp.attribute.clone(),
+                            Value::String(temp.original_value.clone()),
+                        );
+                        match provider
+                            .update(id, new_identifier, &state, &rename_to)
+                            .await
+                        {
+                            Ok(renamed_state) => {
+                                observer.on_event(&ExecutionEvent::RenameSucceeded {
+                                    id,
+                                    from: &temp.temporary_value,
+                                    to: &temp.original_value,
+                                });
+                                final_state = renamed_state;
+                            }
+                            Err(e) => {
+                                let error_str = e.to_string();
+                                observer.on_event(&ExecutionEvent::RenameFailed {
+                                    id,
+                                    error: &error_str,
+                                });
+                                rename_failed = true;
+                            }
+                        }
+                    } else if let Some(temp) = temporary_name
+                        && !temp.can_rename
+                    {
+                        let mut overrides = HashMap::new();
+                        overrides.insert(temp.attribute.clone(), temp.temporary_value.clone());
+                        permanent_overrides = Some((to.id.clone(), overrides));
+                    }
+
+                    if rename_failed {
+                        observer.on_event(&ExecutionEvent::EffectFailed {
+                            effect,
+                            error: "rename failed",
+                            duration: started.elapsed(),
+                            progress,
+                        });
+                        SingleEffectResult::Replace {
+                            success: false,
+                            state: Some(final_state),
+                            resource_id: to.id.clone(),
+                            resolved_attrs: Some(resolved.attributes),
+                            binding: effect.binding_name(),
+                            refreshes,
+
+                            permanent_overrides,
+                        }
+                    } else {
+                        observer.on_event(&ExecutionEvent::EffectSucceeded {
+                            effect,
+                            state: None,
+                            duration: started.elapsed(),
+                            progress,
+                        });
+                        SingleEffectResult::Replace {
+                            success: true,
+                            state: Some(final_state),
+                            resource_id: to.id.clone(),
+                            resolved_attrs: Some(resolved.attributes),
+                            binding: None,
+                            refreshes,
+
+                            permanent_overrides,
+                        }
+                    }
                 }
                 Err(e) => {
                     let error_str = e.to_string();
@@ -792,10 +1066,16 @@ async fn execute_dbd_replace(
                         duration: started.elapsed(),
                         progress,
                     });
-                    *failure_count += 1;
-                    queue_state_refresh(pending_refreshes, &to.id, Some(identifier));
-                    if let Some(binding) = effect.binding_name() {
-                        failed_bindings.insert(binding);
+                    refreshes.push((to.id.clone(), state.identifier.clone().unwrap_or_default()));
+                    SingleEffectResult::Replace {
+                        success: false,
+                        state: None,
+                        resource_id: to.id.clone(),
+                        resolved_attrs: None,
+                        binding: effect.binding_name(),
+                        refreshes,
+
+                        permanent_overrides: None,
                     }
                 }
             }
@@ -808,10 +1088,101 @@ async fn execute_dbd_replace(
                 duration: started.elapsed(),
                 progress,
             });
-            *failure_count += 1;
-            queue_state_refresh(pending_refreshes, id, Some(identifier));
-            if let Some(binding) = effect.binding_name() {
-                failed_bindings.insert(binding);
+            SingleEffectResult::Replace {
+                success: false,
+                state: None,
+                resource_id: to.id.clone(),
+                resolved_attrs: None,
+                binding: effect.binding_name(),
+                refreshes,
+
+                permanent_overrides: None,
+            }
+        }
+    }
+}
+
+/// DBD Replace for the parallel execution path.
+#[allow(clippy::too_many_arguments)]
+async fn execute_dbd_replace_parallel(
+    provider: &dyn Provider,
+    effect: &Effect,
+    id: &ResourceId,
+    from: &State,
+    to: &Resource,
+    lifecycle: &crate::resource::LifecycleConfig,
+    binding_map: &HashMap<String, HashMap<String, Value>>,
+    unresolved: &HashMap<ResourceId, Resource>,
+    started: Instant,
+    progress: ProgressInfo,
+    observer: &dyn ExecutionObserver,
+) -> SingleEffectResult {
+    let identifier = from.identifier.as_deref().unwrap_or("");
+    let mut refreshes = Vec::new();
+
+    match provider.delete(id, identifier, lifecycle).await {
+        Ok(()) => {
+            let resolve_source = unresolved.get(&to.id).unwrap_or(to);
+            let resolved = resolve_resource_with_source(to, resolve_source, binding_map);
+            match provider.create(&resolved).await {
+                Ok(state) => {
+                    observer.on_event(&ExecutionEvent::EffectSucceeded {
+                        effect,
+                        state: Some(&state),
+                        duration: started.elapsed(),
+                        progress,
+                    });
+                    SingleEffectResult::Replace {
+                        success: true,
+                        state: Some(state),
+                        resource_id: to.id.clone(),
+                        resolved_attrs: Some(resolved.attributes),
+                        binding: None,
+                        refreshes,
+
+                        permanent_overrides: None,
+                    }
+                }
+                Err(e) => {
+                    let error_str = e.to_string();
+                    observer.on_event(&ExecutionEvent::EffectFailed {
+                        effect,
+                        error: &error_str,
+                        duration: started.elapsed(),
+                        progress,
+                    });
+                    refreshes.push((to.id.clone(), identifier.to_string()));
+                    SingleEffectResult::Replace {
+                        success: false,
+                        state: None,
+                        resource_id: to.id.clone(),
+                        resolved_attrs: None,
+                        binding: effect.binding_name(),
+                        refreshes,
+
+                        permanent_overrides: None,
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            let error_str = e.to_string();
+            observer.on_event(&ExecutionEvent::EffectFailed {
+                effect,
+                error: &error_str,
+                duration: started.elapsed(),
+                progress,
+            });
+            refreshes.push((id.clone(), identifier.to_string()));
+            SingleEffectResult::Replace {
+                success: false,
+                state: None,
+                resource_id: to.id.clone(),
+                resolved_attrs: None,
+                binding: effect.binding_name(),
+                refreshes,
+
+                permanent_overrides: None,
             }
         }
     }
@@ -831,7 +1202,7 @@ async fn execute_dbd_replace(
 async fn execute_effects_phased(
     provider: &dyn Provider,
     input: &mut ExecutionInput<'_>,
-    observer: &mut dyn ExecutionObserver,
+    observer: &dyn ExecutionObserver,
 ) -> ExecutionResult {
     let mut success_count = 0;
     let mut failure_count = 0;
@@ -1409,13 +1780,24 @@ mod tests {
     // Mock Observer
     // -----------------------------------------------------------------------
 
-    #[derive(Default)]
     struct MockObserver {
-        events: Vec<String>,
+        events: Mutex<Vec<String>>,
+    }
+
+    impl MockObserver {
+        fn new() -> Self {
+            Self {
+                events: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn events(&self) -> Vec<String> {
+            self.events.lock().unwrap().clone()
+        }
     }
 
     impl ExecutionObserver for MockObserver {
-        fn on_event(&mut self, event: &ExecutionEvent) {
+        fn on_event(&self, event: &ExecutionEvent) {
             let msg = match event {
                 ExecutionEvent::EffectStarted { effect } => {
                     format!("started:{}", effect.resource_id())
@@ -1449,7 +1831,7 @@ mod tests {
                     format!("refresh_fail:{}:{}", id, error)
                 }
             };
-            self.events.push(msg);
+            self.events.lock().unwrap().push(msg);
         }
     }
 
@@ -1505,12 +1887,17 @@ mod tests {
             current_states: HashMap::new(),
         };
 
-        let mut observer = MockObserver::default();
-        let result = execute_plan(&provider, input, &mut observer).await;
+        let observer = MockObserver::new();
+        let result = execute_plan(&provider, input, &observer).await;
 
         assert_eq!(result.success_count, 1);
         assert_eq!(result.failure_count, 0);
-        assert!(observer.events.iter().any(|e| e.starts_with("succeeded:")));
+        assert!(
+            observer
+                .events()
+                .iter()
+                .any(|e| e.starts_with("succeeded:"))
+        );
     }
 
     #[tokio::test]
@@ -1536,8 +1923,8 @@ mod tests {
             current_states: HashMap::new(),
         };
 
-        let mut observer = MockObserver::default();
-        let result = execute_plan(&provider, input, &mut observer).await;
+        let observer = MockObserver::new();
+        let result = execute_plan(&provider, input, &observer).await;
 
         assert_eq!(result.success_count, 1);
         assert!(result.successfully_deleted.contains(&rid));
@@ -1564,15 +1951,15 @@ mod tests {
             current_states: HashMap::new(),
         };
 
-        let mut observer = MockObserver::default();
-        let result = execute_plan(&provider, input, &mut observer).await;
+        let observer = MockObserver::new();
+        let result = execute_plan(&provider, input, &observer).await;
 
         assert_eq!(result.failure_count, 1);
         assert_eq!(result.skip_count, 1);
-        assert!(observer.events.iter().any(|e| e.contains("failed:")));
+        assert!(observer.events().iter().any(|e| e.contains("failed:")));
         assert!(
             observer
-                .events
+                .events()
                 .iter()
                 .any(|e| e.contains("skipped:") && e.contains("dependency 'a' failed"))
         );
@@ -1611,8 +1998,8 @@ mod tests {
             current_states: HashMap::new(),
         };
 
-        let mut observer = MockObserver::default();
-        let result = execute_plan(&provider, input, &mut observer).await;
+        let observer = MockObserver::new();
+        let result = execute_plan(&provider, input, &observer).await;
 
         assert_eq!(result.success_count, 1);
         assert_eq!(result.failure_count, 0);
@@ -1652,8 +2039,8 @@ mod tests {
             current_states: HashMap::new(),
         };
 
-        let mut observer = MockObserver::default();
-        let result = execute_plan(&provider, input, &mut observer).await;
+        let observer = MockObserver::new();
+        let result = execute_plan(&provider, input, &observer).await;
 
         assert_eq!(result.success_count, 1);
         assert_eq!(result.failure_count, 0);
@@ -1733,8 +2120,8 @@ mod tests {
             current_states: HashMap::new(),
         };
 
-        let mut observer = MockObserver::default();
-        let result = execute_plan(&provider, input, &mut observer).await;
+        let observer = MockObserver::new();
+        let result = execute_plan(&provider, input, &observer).await;
 
         assert_eq!(result.success_count, 2);
         assert_eq!(result.failure_count, 0);
@@ -1813,8 +2200,8 @@ mod tests {
             current_states: HashMap::new(),
         };
 
-        let mut observer = MockObserver::default();
-        let result = execute_plan(&provider, input, &mut observer).await;
+        let observer = MockObserver::new();
+        let result = execute_plan(&provider, input, &observer).await;
 
         assert_eq!(result.success_count, 2);
         assert_eq!(result.failure_count, 0);
@@ -1846,12 +2233,13 @@ mod tests {
             current_states: HashMap::new(),
         };
 
-        let mut observer = MockObserver::default();
-        execute_plan(&provider, input, &mut observer).await;
+        let observer = MockObserver::new();
+        execute_plan(&provider, input, &observer).await;
 
-        assert_eq!(observer.events.len(), 2);
-        assert!(observer.events[0].starts_with("started:"));
-        assert!(observer.events[1].starts_with("succeeded:"));
+        let events = observer.events();
+        assert_eq!(events.len(), 2);
+        assert!(events[0].starts_with("started:"));
+        assert!(events[1].starts_with("succeeded:"));
     }
 
     #[tokio::test]
@@ -1869,11 +2257,168 @@ mod tests {
             current_states: HashMap::new(),
         };
 
-        let mut observer = MockObserver::default();
-        let result = execute_plan(&provider, input, &mut observer).await;
+        let observer = MockObserver::new();
+        let result = execute_plan(&provider, input, &observer).await;
 
         assert_eq!(result.success_count, 0);
         assert_eq!(result.failure_count, 0);
         assert!(provider.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_independent_effects_run_in_parallel() {
+        // vpc has no deps, subnet_a and subnet_b both depend on vpc.
+        // Expected: vpc runs first (level 0), then subnet_a and subnet_b
+        // run concurrently (level 1).
+        let provider = MockProvider::new();
+        let vpc = make_resource("vpc", &[]);
+        let subnet_a = make_resource("subnet_a", &["vpc"]);
+        let subnet_b = make_resource("subnet_b", &["vpc"]);
+        let vpc_id = vpc.id.clone();
+        let subnet_a_id = subnet_a.id.clone();
+        let subnet_b_id = subnet_b.id.clone();
+
+        let mut plan = Plan::new();
+        plan.add(Effect::Create(vpc));
+        plan.add(Effect::Create(subnet_a));
+        plan.add(Effect::Create(subnet_b));
+
+        provider.push_create(Ok(ok_state(&vpc_id)));
+        provider.push_create(Ok(ok_state(&subnet_a_id)));
+        provider.push_create(Ok(ok_state(&subnet_b_id)));
+
+        let input = ExecutionInput {
+            plan: &plan,
+            unresolved_resources: &HashMap::new(),
+            binding_map: HashMap::new(),
+            current_states: HashMap::new(),
+        };
+
+        let observer = MockObserver::new();
+        let result = execute_plan(&provider, input, &observer).await;
+
+        assert_eq!(result.success_count, 3);
+        assert_eq!(result.failure_count, 0);
+
+        // vpc should be created first (level 0), before either subnet
+        let calls = provider.calls();
+        assert_eq!(calls[0], ("create".to_string(), vpc_id.to_string()));
+
+        // Both subnets should be created (level 1), order may vary
+        let remaining: HashSet<String> = calls[1..].iter().map(|(_, id)| id.clone()).collect();
+        assert!(remaining.contains(&subnet_a_id.to_string()));
+        assert!(remaining.contains(&subnet_b_id.to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_parallel_failure_skips_dependents() {
+        // vpc (level 0), subnet_a depends on vpc, subnet_b depends on vpc.
+        // vpc succeeds. subnet_a fails. subnet_c depends on subnet_a => skipped.
+        let provider = MockProvider::new();
+        let vpc = make_resource("vpc", &[]);
+        let subnet_a = make_resource("subnet_a", &["vpc"]);
+        let subnet_b = make_resource("subnet_b", &["vpc"]);
+        let subnet_c = make_resource("subnet_c", &["subnet_a"]);
+        let vpc_id = vpc.id.clone();
+        let _subnet_a_id = subnet_a.id.clone();
+        let subnet_b_id = subnet_b.id.clone();
+
+        let mut plan = Plan::new();
+        plan.add(Effect::Create(vpc));
+        plan.add(Effect::Create(subnet_a));
+        plan.add(Effect::Create(subnet_b));
+        plan.add(Effect::Create(subnet_c));
+
+        provider.push_create(Ok(ok_state(&vpc_id)));
+        // subnet_a fails, subnet_b succeeds
+        provider.push_create(Err(ProviderError::new("create failed")));
+        provider.push_create(Ok(ok_state(&subnet_b_id)));
+
+        let input = ExecutionInput {
+            plan: &plan,
+            unresolved_resources: &HashMap::new(),
+            binding_map: HashMap::new(),
+            current_states: HashMap::new(),
+        };
+
+        let observer = MockObserver::new();
+        let result = execute_plan(&provider, input, &observer).await;
+
+        // vpc + subnet_b succeed, subnet_a fails, subnet_c skipped
+        assert_eq!(result.success_count, 2);
+        assert_eq!(result.failure_count, 1);
+        assert_eq!(result.skip_count, 1);
+
+        // Verify subnet_c was skipped due to subnet_a failure
+        assert!(
+            observer
+                .events()
+                .iter()
+                .any(|e| e.contains("skipped:") && e.contains("dependency 'subnet_a' failed"))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_dependency_levels_sequential_chain() {
+        // a -> b -> c: should be 3 levels, executed sequentially
+        let provider = MockProvider::new();
+        let a = make_resource("a", &[]);
+        let b = make_resource("b", &["a"]);
+        let c = make_resource("c", &["b"]);
+        let a_id = a.id.clone();
+        let b_id = b.id.clone();
+        let c_id = c.id.clone();
+
+        let mut plan = Plan::new();
+        plan.add(Effect::Create(a));
+        plan.add(Effect::Create(b));
+        plan.add(Effect::Create(c));
+
+        provider.push_create(Ok(ok_state(&a_id)));
+        provider.push_create(Ok(ok_state(&b_id)));
+        provider.push_create(Ok(ok_state(&c_id)));
+
+        let input = ExecutionInput {
+            plan: &plan,
+            unresolved_resources: &HashMap::new(),
+            binding_map: HashMap::new(),
+            current_states: HashMap::new(),
+        };
+
+        let observer = MockObserver::new();
+        let result = execute_plan(&provider, input, &observer).await;
+
+        assert_eq!(result.success_count, 3);
+
+        // Calls should be in order: a, b, c
+        let calls = provider.calls();
+        assert_eq!(calls[0], ("create".to_string(), a_id.to_string()));
+        assert_eq!(calls[1], ("create".to_string(), b_id.to_string()));
+        assert_eq!(calls[2], ("create".to_string(), c_id.to_string()));
+    }
+
+    #[test]
+    fn test_build_dependency_levels() {
+        // a (no deps), b depends on a, c depends on a, d depends on b and c
+        let a = make_resource("a", &[]);
+        let b = make_resource("b", &["a"]);
+        let c = make_resource("c", &["a"]);
+        let d = make_resource("d", &["b", "c"]);
+
+        let mut plan = Plan::new();
+        plan.add(Effect::Create(a));
+        plan.add(Effect::Create(b));
+        plan.add(Effect::Create(c));
+        plan.add(Effect::Create(d));
+
+        let levels = build_dependency_levels(plan.effects(), &HashMap::new());
+
+        // Level 0: a (index 0)
+        // Level 1: b (index 1), c (index 2)
+        // Level 2: d (index 3)
+        assert_eq!(levels.len(), 3);
+        assert_eq!(levels[0], vec![0]);
+        assert_eq!(levels[1], vec![1, 2]);
+        assert_eq!(levels[2], vec![3]);
     }
 }

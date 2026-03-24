@@ -5,6 +5,7 @@ edition = "2024"
 license = "MIT"
 
 [dependencies]
+futures = "0.3"
 pest = "2"
 pest_derive = "2"
 serde = { version = "1", features = ["derive"] }
