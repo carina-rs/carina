@@ -8,6 +8,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+use futures::stream::{FuturesUnordered, StreamExt};
+
 use crate::deps::{find_failed_dependency, get_resource_dependencies};
 use crate::effect::Effect;
 use crate::plan::Plan;
@@ -352,6 +354,7 @@ fn count_actionable_effects(effects: &[Effect]) -> usize {
 /// Groups effects into levels where all effects in a level have their
 /// dependencies satisfied by effects in earlier levels. Effects within
 /// the same level can be executed concurrently.
+#[cfg(test)]
 fn build_dependency_levels(
     effects: &[Effect],
     unresolved_resources: &HashMap<ResourceId, Resource>,
@@ -466,10 +469,50 @@ enum SingleEffectResult {
     ReadNoOp,
 }
 
-/// Execute effects with parallel execution of independent resources.
+/// Build a dependency map: for each effect index, which other effect indices it depends on.
+fn build_dependency_map(
+    effects: &[Effect],
+    unresolved_resources: &HashMap<ResourceId, Resource>,
+) -> HashMap<usize, HashSet<usize>> {
+    // Build binding -> effect index mapping
+    let mut binding_to_idx: HashMap<String, usize> = HashMap::new();
+    for (idx, effect) in effects.iter().enumerate() {
+        if let Some(binding) = effect.binding_name() {
+            binding_to_idx.insert(binding, idx);
+        }
+    }
+
+    let mut deps_of: HashMap<usize, HashSet<usize>> = HashMap::new();
+    for (idx, effect) in effects.iter().enumerate() {
+        let mut dep_indices = HashSet::new();
+        if let Some(resource) = effect.resource() {
+            let dep_bindings = get_resource_dependencies(resource);
+            for dep_binding in &dep_bindings {
+                if let Some(&dep_idx) = binding_to_idx.get(dep_binding) {
+                    dep_indices.insert(dep_idx);
+                }
+            }
+            if let Some(unresolved) = unresolved_resources.get(effect.resource_id()) {
+                let unresolved_deps = get_resource_dependencies(unresolved);
+                for dep_binding in &unresolved_deps {
+                    if let Some(&dep_idx) = binding_to_idx.get(dep_binding) {
+                        dep_indices.insert(dep_idx);
+                    }
+                }
+            }
+        }
+        deps_of.insert(idx, dep_indices);
+    }
+    deps_of
+}
+
+/// Execute effects with fine-grained scheduling.
 ///
-/// Groups effects into dependency levels. Effects within the same level
-/// (no dependency relationship between them) are executed concurrently.
+/// Instead of grouping effects into dependency levels and waiting for all
+/// effects in a level to complete, this spawns each effect as soon as all
+/// its dependencies have completed. This allows dependent effects to start
+/// immediately when their specific dependencies finish, even if other
+/// independent effects in the same "level" are still running.
 async fn execute_effects_sequential(
     provider: &dyn Provider,
     input: &mut ExecutionInput<'_>,
@@ -488,16 +531,47 @@ async fn execute_effects_sequential(
     let total = count_actionable_effects(effects);
     let completed = AtomicUsize::new(0);
 
-    let levels = build_dependency_levels(effects, input.unresolved_resources);
+    let deps_of = build_dependency_map(effects, input.unresolved_resources);
 
-    for level_indices in &levels {
-        // Partition into skipped and executable effects
-        let mut to_execute: Vec<usize> = Vec::new();
-        for &idx in level_indices {
-            let effect = &effects[idx];
-            if matches!(effect, Effect::Read { .. }) {
+    // Track which effect indices have completed (successfully or not)
+    let mut completed_indices: HashSet<usize> = HashSet::new();
+    // Track which effect indices have been dispatched (spawned or skipped)
+    let mut dispatched: HashSet<usize> = HashSet::new();
+    // All actionable effect indices (excluding Read)
+    let actionable_indices: Vec<usize> = (0..effects.len())
+        .filter(|&idx| !matches!(&effects[idx], Effect::Read { .. }))
+        .collect();
+
+    // Mark Read effects as completed (they are no-ops but may be dependencies)
+    for (idx, effect) in effects.iter().enumerate() {
+        if matches!(effect, Effect::Read { .. }) {
+            completed_indices.insert(idx);
+            dispatched.insert(idx);
+        }
+    }
+
+    let mut in_flight = FuturesUnordered::new();
+
+    loop {
+        // Find newly ready effects: all deps completed and not yet dispatched
+        let mut newly_ready: Vec<usize> = Vec::new();
+        for &idx in &actionable_indices {
+            if dispatched.contains(&idx) {
                 continue;
             }
+            let deps = &deps_of[&idx];
+            if deps.iter().all(|d| completed_indices.contains(d)) {
+                newly_ready.push(idx);
+            }
+        }
+        // Sort for deterministic ordering
+        newly_ready.sort();
+
+        // Process newly ready effects: skip those with failed deps, spawn the rest
+        for idx in newly_ready {
+            dispatched.insert(idx);
+            let effect = &effects[idx];
+
             if let Some(failed_dep) = find_failed_dependency(effect, &failed_bindings) {
                 let c = completed.fetch_add(1, Ordering::Relaxed) + 1;
                 let reason = format!("dependency '{}' failed", failed_dep);
@@ -513,265 +587,255 @@ async fn execute_effects_sequential(
                 if let Some(binding) = effect.binding_name() {
                     failed_bindings.insert(binding);
                 }
+                completed_indices.insert(idx);
                 continue;
             }
-            to_execute.push(idx);
-        }
 
-        if to_execute.is_empty() {
-            continue;
-        }
+            // Snapshot binding_map for this effect's resolution
+            let binding_snapshot = input.binding_map.clone();
+            let unresolved = &input.unresolved_resources;
+            let completed_ref = &completed;
 
-        // Snapshot binding_map for this level (all effects in same level
-        // resolve against the same snapshot, since they are independent)
-        let binding_snapshot = input.binding_map.clone();
-
-        // Execute all effects in this level concurrently
-        let futures: Vec<_> = to_execute
-            .iter()
-            .map(|&idx| {
-                let effect = &effects[idx];
-                let binding_map = &binding_snapshot;
-                let unresolved = &input.unresolved_resources;
-                let completed_ref = &completed;
-
-                async move {
-                    match effect {
-                        Effect::Create(resource) => {
-                            let c = completed_ref.fetch_add(1, Ordering::Relaxed) + 1;
-                            let started = Instant::now();
-                            observer.on_event(&ExecutionEvent::EffectStarted { effect });
-                            let resolved = resolve_resource(resource, binding_map);
-                            match provider.create(&resolved).await {
-                                Ok(state) => {
-                                    observer.on_event(&ExecutionEvent::EffectSucceeded {
-                                        effect,
-                                        state: Some(&state),
-                                        duration: started.elapsed(),
-                                        progress: ProgressInfo {
-                                            completed: c,
-                                            total,
-                                        },
-                                    });
-                                    SingleEffectResult::Success {
-                                        state: Some(state),
-                                        resource_id: resource.id.clone(),
-                                        resolved_attrs: Some(resolved.attributes),
-                                    }
+            in_flight.push(async move {
+                let result = match effect {
+                    Effect::Create(resource) => {
+                        let c = completed_ref.fetch_add(1, Ordering::Relaxed) + 1;
+                        let started = Instant::now();
+                        observer.on_event(&ExecutionEvent::EffectStarted { effect });
+                        let resolved = resolve_resource(resource, &binding_snapshot);
+                        match provider.create(&resolved).await {
+                            Ok(state) => {
+                                observer.on_event(&ExecutionEvent::EffectSucceeded {
+                                    effect,
+                                    state: Some(&state),
+                                    duration: started.elapsed(),
+                                    progress: ProgressInfo {
+                                        completed: c,
+                                        total,
+                                    },
+                                });
+                                SingleEffectResult::Success {
+                                    state: Some(state),
+                                    resource_id: resource.id.clone(),
+                                    resolved_attrs: Some(resolved.attributes),
                                 }
-                                Err(e) => {
-                                    let error_str = e.to_string();
-                                    observer.on_event(&ExecutionEvent::EffectFailed {
-                                        effect,
-                                        error: &error_str,
-                                        duration: started.elapsed(),
-                                        progress: ProgressInfo {
-                                            completed: c,
-                                            total,
-                                        },
-                                    });
-                                    SingleEffectResult::Failure {
-                                        binding: effect.binding_name(),
-                                        refresh: None,
-                                    }
+                            }
+                            Err(e) => {
+                                let error_str = e.to_string();
+                                observer.on_event(&ExecutionEvent::EffectFailed {
+                                    effect,
+                                    error: &error_str,
+                                    duration: started.elapsed(),
+                                    progress: ProgressInfo {
+                                        completed: c,
+                                        total,
+                                    },
+                                });
+                                SingleEffectResult::Failure {
+                                    binding: effect.binding_name(),
+                                    refresh: None,
                                 }
                             }
                         }
-                        Effect::Update { id, from, to, .. } => {
-                            let c = completed_ref.fetch_add(1, Ordering::Relaxed) + 1;
-                            let started = Instant::now();
-                            observer.on_event(&ExecutionEvent::EffectStarted { effect });
-                            let resolve_source = unresolved.get(id).unwrap_or(to);
-                            let resolved_to =
-                                resolve_resource_with_source(to, resolve_source, binding_map);
-                            let identifier = from.identifier.as_deref().unwrap_or("");
-                            match provider.update(id, identifier, from, &resolved_to).await {
-                                Ok(state) => {
-                                    observer.on_event(&ExecutionEvent::EffectSucceeded {
-                                        effect,
-                                        state: Some(&state),
-                                        duration: started.elapsed(),
-                                        progress: ProgressInfo {
-                                            completed: c,
-                                            total,
-                                        },
-                                    });
-                                    SingleEffectResult::Success {
-                                        state: Some(state),
-                                        resource_id: id.clone(),
-                                        resolved_attrs: Some(resolved_to.attributes),
-                                    }
+                    }
+                    Effect::Update { id, from, to, .. } => {
+                        let c = completed_ref.fetch_add(1, Ordering::Relaxed) + 1;
+                        let started = Instant::now();
+                        observer.on_event(&ExecutionEvent::EffectStarted { effect });
+                        let resolve_source = unresolved.get(id).unwrap_or(to);
+                        let resolved_to =
+                            resolve_resource_with_source(to, resolve_source, &binding_snapshot);
+                        let identifier = from.identifier.as_deref().unwrap_or("");
+                        match provider.update(id, identifier, from, &resolved_to).await {
+                            Ok(state) => {
+                                observer.on_event(&ExecutionEvent::EffectSucceeded {
+                                    effect,
+                                    state: Some(&state),
+                                    duration: started.elapsed(),
+                                    progress: ProgressInfo {
+                                        completed: c,
+                                        total,
+                                    },
+                                });
+                                SingleEffectResult::Success {
+                                    state: Some(state),
+                                    resource_id: id.clone(),
+                                    resolved_attrs: Some(resolved_to.attributes),
                                 }
-                                Err(e) => {
-                                    let error_str = e.to_string();
-                                    observer.on_event(&ExecutionEvent::EffectFailed {
-                                        effect,
-                                        error: &error_str,
-                                        duration: started.elapsed(),
-                                        progress: ProgressInfo {
-                                            completed: c,
-                                            total,
-                                        },
-                                    });
-                                    SingleEffectResult::Failure {
-                                        binding: effect.binding_name(),
-                                        refresh: Some((id.clone(), identifier.to_string())),
-                                    }
+                            }
+                            Err(e) => {
+                                let error_str = e.to_string();
+                                observer.on_event(&ExecutionEvent::EffectFailed {
+                                    effect,
+                                    error: &error_str,
+                                    duration: started.elapsed(),
+                                    progress: ProgressInfo {
+                                        completed: c,
+                                        total,
+                                    },
+                                });
+                                SingleEffectResult::Failure {
+                                    binding: effect.binding_name(),
+                                    refresh: Some((id.clone(), identifier.to_string())),
                                 }
                             }
                         }
-                        Effect::Delete {
-                            id,
-                            identifier,
-                            lifecycle,
-                            ..
-                        } => {
-                            let c = completed_ref.fetch_add(1, Ordering::Relaxed) + 1;
-                            let started = Instant::now();
-                            let progress = ProgressInfo {
-                                completed: c,
-                                total,
-                            };
-                            observer.on_event(&ExecutionEvent::EffectStarted { effect });
-                            match provider.delete(id, identifier, lifecycle).await {
-                                Ok(()) => {
-                                    observer.on_event(&ExecutionEvent::EffectSucceeded {
-                                        effect,
-                                        state: None,
-                                        duration: started.elapsed(),
-                                        progress,
-                                    });
-                                    SingleEffectResult::Deleted {
-                                        resource_id: id.clone(),
-                                    }
+                    }
+                    Effect::Delete {
+                        id,
+                        identifier,
+                        lifecycle,
+                        ..
+                    } => {
+                        let c = completed_ref.fetch_add(1, Ordering::Relaxed) + 1;
+                        let started = Instant::now();
+                        let progress = ProgressInfo {
+                            completed: c,
+                            total,
+                        };
+                        observer.on_event(&ExecutionEvent::EffectStarted { effect });
+                        match provider.delete(id, identifier, lifecycle).await {
+                            Ok(()) => {
+                                observer.on_event(&ExecutionEvent::EffectSucceeded {
+                                    effect,
+                                    state: None,
+                                    duration: started.elapsed(),
+                                    progress,
+                                });
+                                SingleEffectResult::Deleted {
+                                    resource_id: id.clone(),
                                 }
-                                Err(e) => {
-                                    let error_str = e.to_string();
-                                    observer.on_event(&ExecutionEvent::EffectFailed {
-                                        effect,
-                                        error: &error_str,
-                                        duration: started.elapsed(),
-                                        progress,
-                                    });
-                                    SingleEffectResult::Failure {
-                                        binding: None,
-                                        refresh: Some((id.clone(), identifier.clone())),
-                                    }
+                            }
+                            Err(e) => {
+                                let error_str = e.to_string();
+                                observer.on_event(&ExecutionEvent::EffectFailed {
+                                    effect,
+                                    error: &error_str,
+                                    duration: started.elapsed(),
+                                    progress,
+                                });
+                                SingleEffectResult::Failure {
+                                    binding: None,
+                                    refresh: Some((id.clone(), identifier.clone())),
                                 }
                             }
                         }
-                        Effect::Replace {
+                    }
+                    Effect::Replace {
+                        id,
+                        from,
+                        to,
+                        lifecycle,
+                        cascading_updates,
+                        temporary_name,
+                        ..
+                    } => {
+                        let c = completed_ref.fetch_add(1, Ordering::Relaxed) + 1;
+                        let started = Instant::now();
+                        let progress = ProgressInfo {
+                            completed: c,
+                            total,
+                        };
+                        observer.on_event(&ExecutionEvent::EffectStarted { effect });
+
+                        execute_replace_parallel(
+                            provider,
+                            effect,
                             id,
                             from,
                             to,
                             lifecycle,
                             cascading_updates,
-                            temporary_name,
-                            ..
-                        } => {
-                            let c = completed_ref.fetch_add(1, Ordering::Relaxed) + 1;
-                            let started = Instant::now();
-                            let progress = ProgressInfo {
-                                completed: c,
-                                total,
-                            };
-                            observer.on_event(&ExecutionEvent::EffectStarted { effect });
+                            temporary_name.as_ref(),
+                            &binding_snapshot,
+                            unresolved,
+                            started,
+                            progress,
+                            observer,
+                        )
+                        .await
+                    }
+                    Effect::Read { .. } => SingleEffectResult::ReadNoOp,
+                };
+                (idx, result)
+            });
+        }
 
-                            execute_replace_parallel(
-                                provider,
-                                effect,
-                                id,
-                                from,
-                                to,
-                                lifecycle,
-                                cascading_updates,
-                                temporary_name.as_ref(),
-                                binding_map,
-                                unresolved,
-                                started,
-                                progress,
-                                observer,
-                            )
-                            .await
-                        }
-                        Effect::Read { .. } => SingleEffectResult::ReadNoOp,
+        // If nothing is in flight and all actionable effects are dispatched, we're done
+        if in_flight.is_empty() {
+            break;
+        }
+
+        // Wait for the next effect to complete
+        let (finished_idx, result) = in_flight.next().await.unwrap();
+        completed_indices.insert(finished_idx);
+
+        // Process the result and update shared state immediately
+        match result {
+            SingleEffectResult::Success {
+                state,
+                resource_id,
+                resolved_attrs,
+                ..
+            } => {
+                success_count += 1;
+                if let Some(state) = &state {
+                    applied_states.insert(resource_id, state.clone());
+                    if let Some(attrs) = &resolved_attrs {
+                        update_binding_map(&mut input.binding_map, attrs, state);
                     }
                 }
-            })
-            .collect();
-
-        let results = futures::future::join_all(futures).await;
-
-        // Process results: update shared state after the level completes
-        for result in results {
-            match result {
-                SingleEffectResult::Success {
-                    state,
-                    resource_id,
-                    resolved_attrs,
-                    ..
-                } => {
+            }
+            SingleEffectResult::Failure {
+                binding, refresh, ..
+            } => {
+                failure_count += 1;
+                if let Some(binding) = binding {
+                    failed_bindings.insert(binding);
+                }
+                if let Some((id, identifier)) = refresh
+                    && !identifier.is_empty()
+                {
+                    pending_refreshes.insert(id, identifier);
+                }
+            }
+            SingleEffectResult::Deleted { resource_id, .. } => {
+                success_count += 1;
+                successfully_deleted.insert(resource_id);
+            }
+            SingleEffectResult::Replace {
+                success,
+                state,
+                resource_id,
+                resolved_attrs,
+                binding,
+                refreshes,
+                permanent_overrides,
+            } => {
+                if let Some(state) = &state {
+                    applied_states.insert(resource_id, state.clone());
+                    if let Some(attrs) = &resolved_attrs {
+                        update_binding_map(&mut input.binding_map, attrs, state);
+                    }
+                }
+                if success {
                     success_count += 1;
-                    if let Some(state) = &state {
-                        applied_states.insert(resource_id, state.clone());
-                        if let Some(attrs) = &resolved_attrs {
-                            update_binding_map(&mut input.binding_map, attrs, state);
-                        }
+                    if let Some((id, overrides)) = permanent_overrides {
+                        permanent_name_overrides.insert(id, overrides);
                     }
-                }
-                SingleEffectResult::Failure {
-                    binding, refresh, ..
-                } => {
+                } else {
                     failure_count += 1;
                     if let Some(binding) = binding {
                         failed_bindings.insert(binding);
                     }
-                    if let Some((id, identifier)) = refresh
-                        && !identifier.is_empty()
-                    {
+                }
+                for (id, identifier) in refreshes {
+                    if !identifier.is_empty() {
                         pending_refreshes.insert(id, identifier);
                     }
                 }
-                SingleEffectResult::Deleted { resource_id, .. } => {
-                    success_count += 1;
-                    successfully_deleted.insert(resource_id);
-                }
-                SingleEffectResult::Replace {
-                    success,
-                    state,
-                    resource_id,
-                    resolved_attrs,
-                    binding,
-                    refreshes,
-                    permanent_overrides,
-                } => {
-                    // Save state even on failure (e.g., CBD rename failure:
-                    // the resource was created but rename failed, state must be saved)
-                    if let Some(state) = &state {
-                        applied_states.insert(resource_id, state.clone());
-                        if let Some(attrs) = &resolved_attrs {
-                            update_binding_map(&mut input.binding_map, attrs, state);
-                        }
-                    }
-                    if success {
-                        success_count += 1;
-                        if let Some((id, overrides)) = permanent_overrides {
-                            permanent_name_overrides.insert(id, overrides);
-                        }
-                    } else {
-                        failure_count += 1;
-                        if let Some(binding) = binding {
-                            failed_bindings.insert(binding);
-                        }
-                    }
-                    for (id, identifier) in refreshes {
-                        if !identifier.is_empty() {
-                            pending_refreshes.insert(id, identifier);
-                        }
-                    }
-                }
-                SingleEffectResult::ReadNoOp => {}
             }
+            SingleEffectResult::ReadNoOp => {}
         }
     }
 
@@ -2515,6 +2579,125 @@ mod tests {
             route_level,
             tgw_attach_level,
             levels
+        );
+    }
+
+    /// Verify fine-grained scheduling: effect C (depends on A) starts before
+    /// effect B (independent, slow) completes.
+    ///
+    /// Setup:
+    ///   A (no deps, fast), B (no deps, slow), C (depends on A, fast)
+    ///
+    /// With level-based execution:
+    ///   Level 0: A and B run concurrently, wait for both.
+    ///   Level 1: C starts after B finishes (~100ms total).
+    ///
+    /// With fine-grained scheduling:
+    ///   A and B start concurrently. A finishes quickly (~5ms).
+    ///   C starts immediately (A is done), while B is still running.
+    ///   C should start (and finish) before B completes.
+    #[tokio::test]
+    async fn test_fine_grained_scheduling_starts_dependent_before_slow_peer_completes() {
+        use std::time::Duration;
+
+        // A provider that delays certain resources
+        struct DelayedProvider {
+            delays: HashMap<String, Duration>,
+            call_log: Arc<Mutex<Vec<(String, String, Instant)>>>,
+        }
+
+        impl Provider for DelayedProvider {
+            fn name(&self) -> &'static str {
+                "delayed"
+            }
+
+            fn read(
+                &self,
+                _id: &ResourceId,
+                _identifier: Option<&str>,
+            ) -> BoxFuture<'_, ProviderResult<State>> {
+                Box::pin(async { Err(ProviderError::new("not implemented")) })
+            }
+
+            fn create(&self, resource: &Resource) -> BoxFuture<'_, ProviderResult<State>> {
+                let id = resource.id.clone();
+                let name = resource.id.name.clone();
+                let delay = self.delays.get(&name).copied().unwrap_or(Duration::ZERO);
+                let log = self.call_log.clone();
+                Box::pin(async move {
+                    tokio::time::sleep(delay).await;
+                    log.lock()
+                        .unwrap()
+                        .push(("create".to_string(), name, Instant::now()));
+                    Ok(State::existing(id, HashMap::new()).with_identifier("id-123"))
+                })
+            }
+
+            fn update(
+                &self,
+                _id: &ResourceId,
+                _identifier: &str,
+                _from: &State,
+                _to: &Resource,
+            ) -> BoxFuture<'_, ProviderResult<State>> {
+                Box::pin(async { Err(ProviderError::new("not implemented")) })
+            }
+
+            fn delete(
+                &self,
+                _id: &ResourceId,
+                _identifier: &str,
+                _lifecycle: &LifecycleConfig,
+            ) -> BoxFuture<'_, ProviderResult<()>> {
+                Box::pin(async { Err(ProviderError::new("not implemented")) })
+            }
+        }
+
+        let mut delays = HashMap::new();
+        delays.insert("a".to_string(), Duration::from_millis(5));
+        delays.insert("b".to_string(), Duration::from_millis(200));
+        delays.insert("c".to_string(), Duration::from_millis(5));
+
+        let call_log = Arc::new(Mutex::new(Vec::new()));
+        let provider = DelayedProvider {
+            delays,
+            call_log: call_log.clone(),
+        };
+
+        let a = make_resource("a", &[]);
+        let b = make_resource("b", &[]);
+        let c = make_resource("c", &["a"]);
+
+        let mut plan = Plan::new();
+        plan.add(Effect::Create(a));
+        plan.add(Effect::Create(b));
+        plan.add(Effect::Create(c));
+
+        let input = ExecutionInput {
+            plan: &plan,
+            unresolved_resources: &HashMap::new(),
+            binding_map: HashMap::new(),
+            current_states: HashMap::new(),
+        };
+
+        let observer = MockObserver::new();
+        let result = execute_plan(&provider, input, &observer).await;
+
+        assert_eq!(result.success_count, 3);
+        assert_eq!(result.failure_count, 0);
+
+        // Verify C completed before B.
+        // With fine-grained scheduling, C starts right after A completes
+        // (while B is still sleeping), so C should finish before B.
+        let log = call_log.lock().unwrap();
+        let c_time = log.iter().find(|(_, name, _)| name == "c").unwrap().2;
+        let b_time = log.iter().find(|(_, name, _)| name == "b").unwrap().2;
+        assert!(
+            c_time < b_time,
+            "C should complete before B with fine-grained scheduling. \
+             C completed at {:?}, B completed at {:?}",
+            c_time,
+            b_time,
         );
     }
 }
