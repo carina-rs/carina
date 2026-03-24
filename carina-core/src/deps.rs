@@ -7,9 +7,13 @@ use crate::resource::{Resource, Value};
 
 /// Extract binding names that a resource depends on.
 ///
-/// First checks for `ResourceRef` values in attributes. If none are found,
-/// falls back to `_dependency_bindings` metadata (saved by `resolve_refs_with_state`
-/// before ResourceRef values were resolved to plain strings).
+/// Collects dependencies from two sources and merges them:
+/// 1. `ResourceRef` values found in attributes
+/// 2. `_dependency_bindings` metadata (saved by `resolve_refs_with_state`
+///    before ResourceRef values were resolved to plain strings)
+///
+/// Both sources are always merged because partial resolution can cause
+/// ResourceRef bindings to differ from the original direct dependencies.
 pub fn get_resource_dependencies(resource: &Resource) -> HashSet<String> {
     let mut deps = HashSet::new();
     for value in resource.attributes.values() {
