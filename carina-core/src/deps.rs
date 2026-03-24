@@ -53,17 +53,36 @@ fn collect_dependencies(value: &Value, deps: &mut HashSet<String>) {
 /// Sort resources topologically based on dependencies.
 ///
 /// Resources are ordered so that dependencies come before dependents (creation order).
-/// When reversed, this gives a valid destroy order (dependents before dependencies).
-///
-/// To ensure stable destroy ordering for independent branches, resources are
-/// pre-sorted by dependency depth (distance from root) before DFS traversal.
-/// Shallower resources (closer to root, like an internet gateway at depth 1)
-/// are visited first and emitted early in creation order, placing them late
-/// in destroy order -- after deeper chains have been deleted.
+/// The DFS traversal respects the input order for resources at the same level,
+/// preserving the declaration order from the .crn file.
 ///
 /// Returns an error if a circular dependency is detected, with a message
 /// showing the cycle path (e.g., "Circular dependency detected: a -> b -> c -> a").
 pub fn sort_resources_by_dependencies(resources: &[Resource]) -> Result<Vec<Resource>, String> {
+    topological_sort(resources, false)
+}
+
+/// Sort resources for destroy ordering.
+///
+/// Like `sort_resources_by_dependencies`, but pre-sorts resources by dependency
+/// depth (ascending) before DFS traversal, then reverses the result. This ensures
+/// that shallower independent resources (like an internet gateway at depth 1)
+/// appear late in destroy order -- after deeper chains have been deleted.
+///
+/// The depth-based pre-sorting is only needed for destroy ordering. For apply
+/// (creation) ordering, the plain topological sort preserves the declaration
+/// order from the .crn file, which is the expected behavior (#1071).
+pub fn sort_resources_for_destroy(resources: &[Resource]) -> Result<Vec<Resource>, String> {
+    let sorted = topological_sort(resources, true)?;
+    Ok(sorted.into_iter().rev().collect())
+}
+
+/// Internal topological sort with optional depth-based pre-sorting.
+///
+/// When `depth_presort` is true, resources are pre-sorted by dependency depth
+/// (ascending) before DFS traversal. This makes the sort input-order-independent,
+/// ensuring stable results for independent branches.
+fn topological_sort(resources: &[Resource], depth_presort: bool) -> Result<Vec<Resource>, String> {
     // Build binding name to resource mapping
     let mut binding_to_resource: HashMap<String, &Resource> = HashMap::new();
     for resource in resources {
@@ -72,84 +91,85 @@ pub fn sort_resources_by_dependencies(resources: &[Resource]) -> Result<Vec<Reso
         }
     }
 
-    // Compute the dependency depth for each resource: the length of the longest
-    // chain from a root (resource with no dependencies) to this resource.
-    // Used to pre-sort the DFS input so that shallower resources (closer to root)
-    // are visited first.
-    let mut depth_cache: HashMap<String, usize> = HashMap::new();
-    fn compute_depth(
-        binding: &str,
-        binding_to_resource: &HashMap<String, &Resource>,
-        cache: &mut HashMap<String, usize>,
-        visiting: &mut HashSet<String>,
-    ) -> usize {
-        if let Some(&cached) = cache.get(binding) {
-            return cached;
-        }
-        // Guard against circular dependencies
-        if visiting.contains(binding) {
-            return 0;
-        }
-        visiting.insert(binding.to_string());
-        let depth = if let Some(resource) = binding_to_resource.get(binding) {
-            let deps = get_resource_dependencies(resource);
-            deps.iter()
-                .map(|d| 1 + compute_depth(d, binding_to_resource, cache, visiting))
-                .max()
-                .unwrap_or(0)
-        } else {
-            0
-        };
-        visiting.remove(binding);
-        cache.insert(binding.to_string(), depth);
-        depth
-    }
-
-    let mut depth_visiting: HashSet<String> = HashSet::new();
-    for resource in resources {
-        let binding = resource
-            .attributes
-            .get("_binding")
-            .and_then(|v| match v {
-                Value::String(s) => Some(s.clone()),
-                _ => None,
-            })
-            .unwrap_or_else(|| format!("{}:{}", resource.id.resource_type, resource.id.name));
-        compute_depth(
-            &binding,
-            &binding_to_resource,
-            &mut depth_cache,
-            &mut depth_visiting,
-        );
-    }
-
-    // Pre-sort resources by dependency depth (ascending) so DFS visits
-    // shallower resources first. This ensures that "leaf" resources like
-    // an internet gateway (depth 1, no dependents) are emitted early in
-    // creation order, placing them late in destroy order -- after deeper
-    // chains (like nat_gw → route) have been destroyed.
     let mut presorted: Vec<&Resource> = resources.iter().collect();
-    presorted.sort_by(|a, b| {
-        let a_binding = a
-            .attributes
-            .get("_binding")
-            .and_then(|v| match v {
-                Value::String(s) => Some(s.clone()),
-                _ => None,
-            })
-            .unwrap_or_else(|| format!("{}:{}", a.id.resource_type, a.id.name));
-        let b_binding = b
-            .attributes
-            .get("_binding")
-            .and_then(|v| match v {
-                Value::String(s) => Some(s.clone()),
-                _ => None,
-            })
-            .unwrap_or_else(|| format!("{}:{}", b.id.resource_type, b.id.name));
-        let a_depth = depth_cache.get(&a_binding).copied().unwrap_or(0);
-        let b_depth = depth_cache.get(&b_binding).copied().unwrap_or(0);
-        a_depth.cmp(&b_depth) // Ascending: shallower first
-    });
+
+    if depth_presort {
+        // Compute the dependency depth for each resource: the length of the longest
+        // chain from a root (resource with no dependencies) to this resource.
+        let mut depth_cache: HashMap<String, usize> = HashMap::new();
+        fn compute_depth(
+            binding: &str,
+            binding_to_resource: &HashMap<String, &Resource>,
+            cache: &mut HashMap<String, usize>,
+            visiting: &mut HashSet<String>,
+        ) -> usize {
+            if let Some(&cached) = cache.get(binding) {
+                return cached;
+            }
+            // Guard against circular dependencies
+            if visiting.contains(binding) {
+                return 0;
+            }
+            visiting.insert(binding.to_string());
+            let depth = if let Some(resource) = binding_to_resource.get(binding) {
+                let deps = get_resource_dependencies(resource);
+                deps.iter()
+                    .map(|d| 1 + compute_depth(d, binding_to_resource, cache, visiting))
+                    .max()
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+            visiting.remove(binding);
+            cache.insert(binding.to_string(), depth);
+            depth
+        }
+
+        let mut depth_visiting: HashSet<String> = HashSet::new();
+        for resource in resources {
+            let binding = resource
+                .attributes
+                .get("_binding")
+                .and_then(|v| match v {
+                    Value::String(s) => Some(s.clone()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| format!("{}:{}", resource.id.resource_type, resource.id.name));
+            compute_depth(
+                &binding,
+                &binding_to_resource,
+                &mut depth_cache,
+                &mut depth_visiting,
+            );
+        }
+
+        // Pre-sort resources by dependency depth (ascending) so DFS visits
+        // shallower resources first. This ensures that "leaf" resources like
+        // an internet gateway (depth 1, no dependents) are emitted early in
+        // creation order, placing them late in destroy order -- after deeper
+        // chains (like nat_gw -> route) have been destroyed.
+        presorted.sort_by(|a, b| {
+            let a_binding = a
+                .attributes
+                .get("_binding")
+                .and_then(|v| match v {
+                    Value::String(s) => Some(s.clone()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| format!("{}:{}", a.id.resource_type, a.id.name));
+            let b_binding = b
+                .attributes
+                .get("_binding")
+                .and_then(|v| match v {
+                    Value::String(s) => Some(s.clone()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| format!("{}:{}", b.id.resource_type, b.id.name));
+            let a_depth = depth_cache.get(&a_binding).copied().unwrap_or(0);
+            let b_depth = depth_cache.get(&b_binding).copied().unwrap_or(0);
+            a_depth.cmp(&b_depth) // Ascending: shallower first
+        });
+    }
 
     // Build dependency graph
     let mut sorted = Vec::new();
@@ -529,10 +549,9 @@ mod tests {
         ];
 
         for (i, input) in orderings.iter().enumerate() {
-            let sorted = sort_resources_by_dependencies(input).unwrap();
-            let destroy_order: Vec<&str> = sorted
+            let destroy_order_resources = sort_resources_for_destroy(input).unwrap();
+            let destroy_order: Vec<&str> = destroy_order_resources
                 .iter()
-                .rev()
                 .filter_map(|r| match r.attributes.get("_binding") {
                     Some(Value::String(s)) => Some(s.as_str()),
                     _ => None,
@@ -582,10 +601,9 @@ mod tests {
         // Append orphan after initial resources (simulating orphan discovery)
         let all = vec![vpc, igw, subnet, eip, nat_gw, rt, route, orphan];
 
-        let sorted = sort_resources_by_dependencies(&all).unwrap();
-        let destroy_order: Vec<&str> = sorted
+        let destroy_order_resources = sort_resources_for_destroy(&all).unwrap();
+        let destroy_order: Vec<&str> = destroy_order_resources
             .iter()
-            .rev()
             .filter_map(|r| match r.attributes.get("_binding") {
                 Some(Value::String(s)) => Some(s.as_str()),
                 _ => None,
@@ -611,6 +629,169 @@ mod tests {
             igw_pos < vpc_pos,
             "IGW must be destroyed before vpc. Destroy order: {:?}",
             destroy_order
+        );
+    }
+
+    /// Regression test for #1071: depth-based pre-sorting must not change
+    /// creation (apply) order for resources with explicit dependencies.
+    ///
+    /// Models igw.crn (parsed from DSL, including anonymous resource):
+    ///   vpc (no deps)
+    ///   igw (no deps)
+    ///   igw_attachment -> vpc, igw
+    ///   rt -> vpc
+    ///   route (anonymous) -> rt, igw_attachment
+    ///
+    /// The route must always come AFTER igw_attachment in creation order.
+    #[test]
+    fn test_apply_order_route_after_gateway_attachment() {
+        use crate::parser::parse;
+
+        let input = r#"
+            provider awscc {
+              region = awscc.Region.ap_northeast_1
+            }
+
+            let vpc = awscc.ec2.vpc {
+              cidr_block = "10.0.0.0/16"
+            }
+
+            let igw = awscc.ec2.internet_gateway {}
+
+            let igw_attachment = awscc.ec2.vpc_gateway_attachment {
+              vpc_id              = vpc.vpc_id
+              internet_gateway_id = igw.internet_gateway_id
+            }
+
+            let rt = awscc.ec2.route_table {
+              vpc_id = vpc.vpc_id
+            }
+
+            awscc.ec2.route {
+              route_table_id         = rt.route_table_id
+              destination_cidr_block = "0.0.0.0/0"
+              gateway_id             = igw_attachment.internet_gateway_id
+            }
+        "#;
+
+        let parsed = parse(input).unwrap();
+        let sorted = sort_resources_by_dependencies(&parsed.resources).unwrap();
+        let creation_order: Vec<String> = sorted
+            .iter()
+            .map(|r| {
+                r.attributes
+                    .get("_binding")
+                    .and_then(|v| match v {
+                        Value::String(s) => Some(s.clone()),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| format!("{}:{}", r.id.resource_type, r.id.name))
+            })
+            .collect();
+
+        let route_pos = creation_order
+            .iter()
+            .position(|b| b.contains("route") && !b.contains("route_table"))
+            .unwrap();
+        let attachment_pos = creation_order
+            .iter()
+            .position(|b| b == "igw_attachment")
+            .unwrap();
+        let rt_pos = creation_order.iter().position(|b| b == "rt").unwrap();
+
+        assert!(
+            route_pos > attachment_pos,
+            "route (pos {}) must come AFTER igw_attachment (pos {}) in creation order. Order: {:?}",
+            route_pos,
+            attachment_pos,
+            creation_order
+        );
+        assert!(
+            route_pos > rt_pos,
+            "route (pos {}) must come AFTER rt (pos {}) in creation order. Order: {:?}",
+            route_pos,
+            rt_pos,
+            creation_order
+        );
+    }
+
+    /// Regression test for #1071: models transit_gateway.crn
+    ///   vpc (no deps)
+    ///   subnet -> vpc
+    ///   tgw (no deps)
+    ///   tgw_attach -> tgw, vpc, subnet
+    ///   rt -> vpc
+    ///   route (anonymous) -> rt, tgw_attach
+    #[test]
+    fn test_apply_order_route_after_tgw_attachment() {
+        use crate::parser::parse;
+
+        let input = r#"
+            provider awscc {
+              region = awscc.Region.ap_northeast_1
+            }
+
+            let vpc = awscc.ec2.vpc {
+              cidr_block = "10.0.0.0/16"
+            }
+
+            let subnet = awscc.ec2.subnet {
+              vpc_id            = vpc.vpc_id
+              cidr_block        = "10.0.1.0/24"
+              availability_zone = "ap-northeast-1a"
+            }
+
+            let tgw = awscc.ec2.transit_gateway {
+              description = "Transit Gateway for route test"
+            }
+
+            let tgw_attach = awscc.ec2.transit_gateway_attachment {
+              transit_gateway_id = tgw.id
+              vpc_id             = vpc.vpc_id
+              subnet_ids         = [subnet.subnet_id]
+            }
+
+            let rt = awscc.ec2.route_table {
+              vpc_id = vpc.vpc_id
+            }
+
+            awscc.ec2.route {
+              route_table_id         = rt.route_table_id
+              destination_cidr_block = "10.1.0.0/16"
+              transit_gateway_id     = tgw_attach.transit_gateway_id
+            }
+        "#;
+
+        let parsed = parse(input).unwrap();
+        let sorted = sort_resources_by_dependencies(&parsed.resources).unwrap();
+        let creation_order: Vec<String> = sorted
+            .iter()
+            .map(|r| {
+                r.attributes
+                    .get("_binding")
+                    .and_then(|v| match v {
+                        Value::String(s) => Some(s.clone()),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| format!("{}:{}", r.id.resource_type, r.id.name))
+            })
+            .collect();
+
+        let route_pos = creation_order
+            .iter()
+            .position(|b| b.contains("route") && !b.contains("route_table"))
+            .unwrap();
+        let attach_pos = creation_order
+            .iter()
+            .position(|b| b == "tgw_attach")
+            .unwrap();
+
+        assert!(
+            route_pos > attach_pos,
+            "route (pos {}) must come AFTER tgw_attach (pos {}) in creation order. Order: {:?}",
+            route_pos,
+            attach_pos,
+            creation_order
         );
     }
 
