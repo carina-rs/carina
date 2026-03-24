@@ -276,6 +276,7 @@ fn plan_file_serde_round_trip() {
                 "region".to_string(),
                 Value::String("aws.Region.ap_northeast_1".to_string()),
             )]),
+            default_tags: HashMap::new(),
         }],
         backend_config: Some(BackendConfig {
             backend_type: "s3".to_string(),
@@ -536,6 +537,7 @@ fn make_awscc_provider(region_dsl: &str) -> ProviderConfig {
     ProviderConfig {
         name: "awscc".to_string(),
         attributes: attrs,
+        default_tags: HashMap::new(),
     }
 }
 

@@ -741,6 +741,7 @@ mod tests {
         let providers = vec![ProviderConfig {
             name: "awscc".to_string(),
             attributes: HashMap::new(),
+            default_tags: HashMap::new(),
         }];
         let identity_fn = |_: &str| -> Vec<String> { vec![] };
 
@@ -950,6 +951,7 @@ mod tests {
             )]
             .into_iter()
             .collect(),
+            default_tags: HashMap::new(),
         }];
         let identity_fn = |_: &str| -> Vec<String> { vec!["region".to_string()] };
 
@@ -988,6 +990,7 @@ mod tests {
             )]
             .into_iter()
             .collect(),
+            default_tags: HashMap::new(),
         }];
         let identity_fn = |_: &str| -> Vec<String> { vec!["region".to_string()] };
 
@@ -1031,6 +1034,7 @@ mod tests {
         let providers = vec![ProviderConfig {
             name: "awscc".to_string(),
             attributes: HashMap::new(),
+            default_tags: HashMap::new(),
         }];
         let identity_fn = |_: &str| -> Vec<String> { vec![] };
 
@@ -1134,6 +1138,7 @@ mod tests {
             )]
             .into_iter()
             .collect(),
+            default_tags: HashMap::new(),
         }];
         let identity_fn = |_: &str| -> Vec<String> { vec!["region".to_string()] };
 
@@ -1245,6 +1250,7 @@ mod tests {
         let providers = vec![ProviderConfig {
             name: "awscc".to_string(),
             attributes: HashMap::new(),
+            default_tags: HashMap::new(),
         }];
         let identity_fn = |_: &str| -> Vec<String> { vec![] };
 
@@ -1434,6 +1440,7 @@ mod tests {
         let providers = vec![ProviderConfig {
             name: "awscc".to_string(),
             attributes: HashMap::new(),
+            default_tags: HashMap::new(),
         }];
         let identity_fn = |_: &str| -> Vec<String> { vec![] };
 
@@ -1540,6 +1547,7 @@ mod tests {
         let providers = vec![ProviderConfig {
             name: "awscc".to_string(),
             attributes: HashMap::new(),
+            default_tags: HashMap::new(),
         }];
         let identity_fn = |_: &str| -> Vec<String> { vec![] };
 
@@ -1613,6 +1621,7 @@ mod tests {
         let providers = vec![ProviderConfig {
             name: "awscc".to_string(),
             attributes: HashMap::new(),
+            default_tags: HashMap::new(),
         }];
         let identity_fn = |_: &str| -> Vec<String> { vec![] };
 
@@ -1670,6 +1679,7 @@ mod tests {
         let providers = vec![ProviderConfig {
             name: "awscc".to_string(),
             attributes: HashMap::new(),
+            default_tags: HashMap::new(),
         }];
         let identity_fn = |_: &str| -> Vec<String> { vec![] };
 
@@ -1769,6 +1779,7 @@ mod tests {
         let providers = vec![ProviderConfig {
             name: "awscc".to_string(),
             attributes: HashMap::new(),
+            default_tags: HashMap::new(),
         }];
         let identity_fn = |_: &str| -> Vec<String> { vec![] };
 
@@ -1810,6 +1821,7 @@ mod tests {
         let providers = vec![ProviderConfig {
             name: "awscc".to_string(),
             attributes: HashMap::new(),
+            default_tags: HashMap::new(),
         }];
         let identity_fn = |_: &str| -> Vec<String> { vec![] };
 
@@ -2004,6 +2016,7 @@ mod tests {
             )]
             .into_iter()
             .collect(),
+            default_tags: HashMap::new(),
         }];
         let identity_fn = |_: &str| -> Vec<String> { vec!["region".to_string()] };
 

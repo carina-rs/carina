@@ -142,6 +142,10 @@ pub struct ModuleCall {
 pub struct ProviderConfig {
     pub name: String,
     pub attributes: HashMap<String, Value>,
+    /// Default tags to apply to all resources that support tags.
+    /// Extracted from `default_tags = { ... }` in the provider block.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub default_tags: HashMap<String, Value>,
 }
 
 /// Backend configuration for state storage
@@ -609,7 +613,18 @@ fn parse_provider_block(
         }
     }
 
-    Ok(ProviderConfig { name, attributes })
+    // Extract default_tags from attributes if present
+    let default_tags = if let Some(Value::Map(tags)) = attributes.remove("default_tags") {
+        tags
+    } else {
+        HashMap::new()
+    };
+
+    Ok(ProviderConfig {
+        name,
+        attributes,
+        default_tags,
+    })
 }
 
 fn parse_backend_block(
@@ -2790,5 +2805,51 @@ aws.s3.bucket {
 
         let result = parse(input).unwrap();
         assert_eq!(result.resources.len(), 1);
+    }
+
+    #[test]
+    fn parse_provider_block_with_default_tags() {
+        let input = r#"
+            provider awscc {
+                region = awscc.Region.ap_northeast_1
+                default_tags = {
+                    Environment = "production"
+                    Team        = "platform"
+                    ManagedBy   = "carina"
+                }
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+        assert_eq!(result.providers.len(), 1);
+        assert_eq!(result.providers[0].name, "awscc");
+        // default_tags should be extracted from attributes
+        assert!(!result.providers[0].attributes.contains_key("default_tags"));
+        assert_eq!(result.providers[0].default_tags.len(), 3);
+        assert_eq!(
+            result.providers[0].default_tags.get("Environment"),
+            Some(&Value::String("production".to_string()))
+        );
+        assert_eq!(
+            result.providers[0].default_tags.get("Team"),
+            Some(&Value::String("platform".to_string()))
+        );
+        assert_eq!(
+            result.providers[0].default_tags.get("ManagedBy"),
+            Some(&Value::String("carina".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_provider_block_without_default_tags() {
+        let input = r#"
+            provider awscc {
+                region = awscc.Region.ap_northeast_1
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+        assert_eq!(result.providers.len(), 1);
+        assert!(result.providers[0].default_tags.is_empty());
     }
 }
