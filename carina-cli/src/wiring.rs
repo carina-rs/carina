@@ -320,6 +320,69 @@ fn resolve_value_alias(
     }
 }
 
+/// Merge default_tags from provider configs into resources that support tags.
+///
+/// For each resource whose schema includes a `tags` attribute:
+/// - If the resource has no `tags`, set it to `default_tags`
+/// - If the resource has `tags`, merge default_tags into it (resource-level tags win on conflict)
+///
+/// Resources whose schema does not include `tags` are skipped.
+pub fn merge_default_tags(
+    ctx: &WiringContext,
+    resources: &mut [Resource],
+    providers: &[ProviderConfig],
+) {
+    // Build a map of provider name -> default_tags for quick lookup
+    let provider_tags: HashMap<&str, &HashMap<String, Value>> = providers
+        .iter()
+        .filter(|p| !p.default_tags.is_empty())
+        .map(|p| (p.name.as_str(), &p.default_tags))
+        .collect();
+
+    if provider_tags.is_empty() {
+        return;
+    }
+
+    for resource in resources.iter_mut() {
+        let default_tags = match provider_tags.get(resource.id.provider.as_str()) {
+            Some(tags) => *tags,
+            None => continue,
+        };
+
+        // Check if the resource schema has a `tags` attribute
+        let schema_key = provider_mod::schema_key_for_resource(ctx.factories(), resource);
+        let has_tags = ctx
+            .schemas()
+            .get(&schema_key)
+            .is_some_and(|s| s.attributes.contains_key("tags"));
+
+        if !has_tags {
+            continue;
+        }
+
+        // Merge default_tags into the resource's tags
+        match resource.attributes.get_mut("tags") {
+            Some(Value::Map(existing_tags)) => {
+                // Resource-level tags take precedence: only insert defaults for missing keys
+                for (key, value) in default_tags {
+                    existing_tags
+                        .entry(key.clone())
+                        .or_insert_with(|| value.clone());
+                }
+            }
+            None => {
+                // No tags on the resource: use default_tags as-is
+                resource
+                    .attributes
+                    .insert("tags".to_string(), Value::Map(default_tags.clone()));
+            }
+            _ => {
+                // tags is some other value type (unexpected), skip
+            }
+        }
+    }
+}
+
 pub fn check_unused_bindings(parsed: &ParsedFile) -> Vec<String> {
     validation::check_unused_bindings(parsed)
 }
@@ -490,6 +553,10 @@ pub async fn create_plan_from_parsed(
     // Without this, raw AWS values (e.g., "ap-northeast-1a") in state would diff against
     // normalized desired values (e.g., "awscc.ec2.subnet.AvailabilityZone.ap_northeast_1a").
     provider.normalize_state(&mut current_states);
+
+    // Merge default_tags from provider configs into resources that support tags.
+    // Done after normalize_desired so enum values in tags are already resolved.
+    merge_default_tags(&ctx, &mut resources, &parsed.providers);
 
     // Resolve enum aliases (e.g., "all" -> "-1") in both desired resources
     // and current states so the differ sees canonical AWS values.
@@ -716,5 +783,155 @@ mod tests {
             resources[0].attributes.get("vpc_id"),
             Some(&Value::String("vpc-12345".to_string())),
         );
+    }
+
+    #[test]
+    fn test_merge_default_tags_resource_tags_win() {
+        let ctx = WiringContext::new();
+        let mut resource = Resource::with_provider("awscc", "ec2.vpc", "test-vpc");
+        resource.attributes.insert(
+            "cidr_block".to_string(),
+            Value::String("10.0.0.0/16".to_string()),
+        );
+        let mut resource_tags = HashMap::new();
+        resource_tags.insert("Name".to_string(), Value::String("my-vpc".to_string()));
+        resource_tags.insert(
+            "Environment".to_string(),
+            Value::String("staging".to_string()),
+        );
+        resource
+            .attributes
+            .insert("tags".to_string(), Value::Map(resource_tags));
+
+        let mut default_tags = HashMap::new();
+        default_tags.insert(
+            "Environment".to_string(),
+            Value::String("production".to_string()),
+        );
+        default_tags.insert("Team".to_string(), Value::String("platform".to_string()));
+
+        let providers = vec![ProviderConfig {
+            name: "awscc".to_string(),
+            attributes: HashMap::new(),
+            default_tags,
+        }];
+
+        let mut resources = vec![resource];
+        merge_default_tags(&ctx, &mut resources, &providers);
+
+        if let Some(Value::Map(tags)) = resources[0].attributes.get("tags") {
+            // Resource-level "Environment" should win
+            assert_eq!(
+                tags.get("Environment"),
+                Some(&Value::String("staging".to_string()))
+            );
+            // Resource-level "Name" preserved
+            assert_eq!(tags.get("Name"), Some(&Value::String("my-vpc".to_string())));
+            // Default "Team" added
+            assert_eq!(
+                tags.get("Team"),
+                Some(&Value::String("platform".to_string()))
+            );
+        } else {
+            panic!("Expected tags to be a Map");
+        }
+    }
+
+    #[test]
+    fn test_merge_default_tags_no_explicit_tags() {
+        let ctx = WiringContext::new();
+        let mut resource = Resource::with_provider("awscc", "ec2.vpc", "test-vpc");
+        resource.attributes.insert(
+            "cidr_block".to_string(),
+            Value::String("10.0.0.0/16".to_string()),
+        );
+        // No tags attribute on the resource
+
+        let mut default_tags = HashMap::new();
+        default_tags.insert(
+            "Environment".to_string(),
+            Value::String("production".to_string()),
+        );
+
+        let providers = vec![ProviderConfig {
+            name: "awscc".to_string(),
+            attributes: HashMap::new(),
+            default_tags,
+        }];
+
+        let mut resources = vec![resource];
+        merge_default_tags(&ctx, &mut resources, &providers);
+
+        if let Some(Value::Map(tags)) = resources[0].attributes.get("tags") {
+            assert_eq!(
+                tags.get("Environment"),
+                Some(&Value::String("production".to_string()))
+            );
+        } else {
+            panic!("Expected tags to be set from default_tags");
+        }
+    }
+
+    #[test]
+    fn test_merge_default_tags_skips_no_tag_schema() {
+        let ctx = WiringContext::new();
+        // iam.role does not have a "tags" attribute in schema (it uses "tags" but let's
+        // use a resource type that definitely doesn't have tags to test skip behavior).
+        // ec2.route has no tags attribute.
+        let mut resource = Resource::with_provider("awscc", "ec2.route", "test-route");
+        resource.attributes.insert(
+            "route_table_id".to_string(),
+            Value::String("rtb-123".to_string()),
+        );
+
+        let mut default_tags = HashMap::new();
+        default_tags.insert(
+            "Environment".to_string(),
+            Value::String("production".to_string()),
+        );
+
+        let providers = vec![ProviderConfig {
+            name: "awscc".to_string(),
+            attributes: HashMap::new(),
+            default_tags,
+        }];
+
+        let mut resources = vec![resource];
+        merge_default_tags(&ctx, &mut resources, &providers);
+
+        // Should not have tags since ec2.route schema doesn't support tags
+        assert!(!resources[0].attributes.contains_key("tags"));
+    }
+
+    #[test]
+    fn test_merge_default_tags_no_default_tags() {
+        let ctx = WiringContext::new();
+        let mut resource = Resource::with_provider("awscc", "ec2.vpc", "test-vpc");
+        resource.attributes.insert(
+            "cidr_block".to_string(),
+            Value::String("10.0.0.0/16".to_string()),
+        );
+        let mut resource_tags = HashMap::new();
+        resource_tags.insert("Name".to_string(), Value::String("my-vpc".to_string()));
+        resource
+            .attributes
+            .insert("tags".to_string(), Value::Map(resource_tags));
+
+        let providers = vec![ProviderConfig {
+            name: "awscc".to_string(),
+            attributes: HashMap::new(),
+            default_tags: HashMap::new(),
+        }];
+
+        let mut resources = vec![resource];
+        merge_default_tags(&ctx, &mut resources, &providers);
+
+        // Tags should be unchanged since there are no default_tags
+        if let Some(Value::Map(tags)) = resources[0].attributes.get("tags") {
+            assert_eq!(tags.len(), 1);
+            assert_eq!(tags.get("Name"), Some(&Value::String("my-vpc".to_string())));
+        } else {
+            panic!("Expected tags to be unchanged");
+        }
     }
 }

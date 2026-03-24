@@ -108,6 +108,9 @@ fn build_plan_and_states_from_fixture(
     // Normalize state enum values to match DSL format
     normalize_state_with_ctx(&wiring, &mut current_states);
 
+    // Merge default_tags from provider configs into resources that support tags
+    crate::wiring::merge_default_tags(&wiring, &mut resources, &parsed.providers);
+
     // Resolve enum aliases (e.g., "all" -> "-1") in both desired and current states
     resolve_enum_aliases_with_ctx(&wiring, &mut resources);
     resolve_enum_aliases_in_states(&wiring, &mut current_states);
@@ -330,6 +333,18 @@ fn snapshot_explicit() {
     let output = strip_ansi(&format_plan(
         &plan,
         DetailLevel::Explicit,
+        &HashMap::new(),
+        Some(&schemas),
+    ));
+    insta::assert_snapshot!(output);
+}
+
+#[test]
+fn snapshot_default_tags() {
+    let (plan, schemas) = build_plan_from_fixture("default_tags");
+    let output = strip_ansi(&format_plan(
+        &plan,
+        DetailLevel::Full,
         &HashMap::new(),
         Some(&schemas),
     ));

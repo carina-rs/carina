@@ -1,0 +1,21 @@
+---
+source: carina-cli/src/plan_snapshot_tests.rs
+expression: output
+---
+Execution Plan:
+
+  + awscc.ec2.vpc vpc
+      cidr_block: "10.0.0.0/16"
+      tags: {Environment: "staging", ManagedBy: "carina", Name: "main-vpc"}
+      cidr_block_associations: (known after apply)
+      default_network_acl: (known after apply)
+      default_security_group: (known after apply)
+      ipv6_cidr_blocks: (known after apply)
+      vpc_id: (known after apply)
+        │
+        └─ + awscc.ec2.route_table ec2_route_table_d8d0c86b
+              tags: {Environment: "production", ManagedBy: "carina"}
+              vpc_id: vpc.vpc_id
+              route_table_id: (known after apply)
+
+Plan: 2 to add, 0 to change, 0 to destroy.
