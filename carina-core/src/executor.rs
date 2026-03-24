@@ -874,56 +874,6 @@ async fn execute_effects_sequential(
     }
 }
 
-/// Handle CBD rename after delete succeeds.
-async fn finalize_cbd_rename(
-    provider: &dyn Provider,
-    id: &ResourceId,
-    to: &Resource,
-    state: &State,
-    temporary_name: Option<&crate::effect::TemporaryName>,
-    permanent_name_overrides: &mut HashMap<ResourceId, HashMap<String, String>>,
-    observer: &dyn ExecutionObserver,
-) -> (State, bool) {
-    if let Some(temp) = temporary_name
-        && temp.can_rename
-    {
-        let new_identifier = state.identifier.as_deref().unwrap_or("");
-        let mut rename_to = to.clone();
-        rename_to.attributes.insert(
-            temp.attribute.clone(),
-            Value::String(temp.original_value.clone()),
-        );
-        match provider.update(id, new_identifier, state, &rename_to).await {
-            Ok(renamed_state) => {
-                observer.on_event(&ExecutionEvent::RenameSucceeded {
-                    id,
-                    from: &temp.temporary_value,
-                    to: &temp.original_value,
-                });
-                (renamed_state, false)
-            }
-            Err(e) => {
-                let error_str = e.to_string();
-                observer.on_event(&ExecutionEvent::RenameFailed {
-                    id,
-                    error: &error_str,
-                });
-                (state.clone(), true)
-            }
-        }
-    } else {
-        // Track permanent name override for can_rename=false
-        if let Some(temp) = temporary_name
-            && !temp.can_rename
-        {
-            let mut overrides = HashMap::new();
-            overrides.insert(temp.attribute.clone(), temp.temporary_value.clone());
-            permanent_name_overrides.insert(to.id.clone(), overrides);
-        }
-        (state.clone(), false)
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Replace execution for parallel path
 // ---------------------------------------------------------------------------
@@ -1271,13 +1221,116 @@ async fn execute_dbd_replace_parallel(
 // Effect execution: phased path (interdependent replaces)
 // ---------------------------------------------------------------------------
 
+/// Build a dependency map for a subset of effects identified by their indices.
+///
+/// Only considers dependencies between effects in the given subset. Dependencies
+/// on effects outside the subset are ignored (assumed already completed).
+fn build_phase_dependency_map(
+    effects: &[Effect],
+    phase_indices: &[usize],
+    unresolved_resources: &HashMap<ResourceId, Resource>,
+) -> HashMap<usize, HashSet<usize>> {
+    // Build binding -> effect index mapping for effects in this phase
+    let phase_set: HashSet<usize> = phase_indices.iter().copied().collect();
+    let mut binding_to_idx: HashMap<String, usize> = HashMap::new();
+    for &idx in phase_indices {
+        if let Some(binding) = effects[idx].binding_name() {
+            binding_to_idx.insert(binding, idx);
+        }
+    }
+
+    let mut deps_of: HashMap<usize, HashSet<usize>> = HashMap::new();
+    for &idx in phase_indices {
+        let mut dep_indices = HashSet::new();
+        let effect = &effects[idx];
+        if let Some(resource) = effect.resource() {
+            let dep_bindings = get_resource_dependencies(resource);
+            for dep_binding in &dep_bindings {
+                if let Some(&dep_idx) = binding_to_idx.get(dep_binding)
+                    && phase_set.contains(&dep_idx)
+                {
+                    dep_indices.insert(dep_idx);
+                }
+            }
+            if let Some(unresolved) = unresolved_resources.get(effect.resource_id()) {
+                let unresolved_deps = get_resource_dependencies(unresolved);
+                for dep_binding in &unresolved_deps {
+                    if let Some(&dep_idx) = binding_to_idx.get(dep_binding)
+                        && phase_set.contains(&dep_idx)
+                    {
+                        dep_indices.insert(dep_idx);
+                    }
+                }
+            }
+        }
+        deps_of.insert(idx, dep_indices);
+    }
+    deps_of
+}
+
+/// Result of a phased effect operation within a single phase.
+enum PhaseEffectResult {
+    /// Phase 1: Non-replace effect succeeded (Create/Update)
+    Success {
+        state: Option<State>,
+        resource_id: ResourceId,
+        resolved_attrs: Option<HashMap<String, Value>>,
+    },
+    /// Phase 1: Non-replace effect failed
+    Failure {
+        binding: Option<String>,
+        refresh: Option<(ResourceId, String)>,
+    },
+    /// Phase 1: Delete succeeded
+    Deleted { resource_id: ResourceId },
+    /// Phase 2: CBD create succeeded
+    CbdCreateSuccess {
+        idx: usize,
+        state: State,
+        cascade_states: Vec<(ResourceId, State, HashMap<String, Value>)>,
+    },
+    /// Phase 2: CBD create failed
+    CbdCreateFailure {
+        binding: Option<String>,
+        refreshes: Vec<(ResourceId, String)>,
+    },
+    /// Phase 3: Replace delete succeeded
+    ReplaceDeleteSuccess,
+    /// Phase 3: Replace delete failed
+    ReplaceDeleteFailure {
+        binding: Option<String>,
+        refresh: Option<(ResourceId, String)>,
+        cbd_refresh: Option<(ResourceId, String)>,
+    },
+    /// Phase 4: Non-CBD create succeeded
+    NonCbdCreateSuccess {
+        state: State,
+        resource_id: ResourceId,
+        resolved_attrs: HashMap<String, Value>,
+    },
+    /// Phase 4: Non-CBD create failed
+    NonCbdCreateFailure { binding: Option<String> },
+    /// Phase 4: CBD finalization succeeded
+    CbdFinalizeSuccess {
+        state: State,
+        resource_id: ResourceId,
+        permanent_overrides: Option<(ResourceId, HashMap<String, String>)>,
+    },
+    /// Phase 4: CBD finalization failed (rename failed)
+    CbdFinalizeFailed {
+        state: State,
+        resource_id: ResourceId,
+        binding: Option<String>,
+    },
+}
+
 /// Execute effects with dependency-aware ordering for interdependent Replace effects.
 ///
 /// Decomposes Replace effects into phases:
-/// 1. Non-Replace effects in original order
-/// 2. CBD creates in forward dependency order (parents first)
-/// 3. All deletes in reverse dependency order (dependents first)
-/// 4. Non-CBD creates in forward dependency order (parents first)
+/// 1. Non-Replace effects — independent effects run concurrently
+/// 2. CBD creates in forward dependency order — independent creates run concurrently
+/// 3. All deletes in reverse dependency order — independent deletes run concurrently
+/// 4. Non-CBD creates and CBD finalization — independent creates run concurrently
 async fn execute_effects_phased(
     provider: &dyn Provider,
     input: &mut ExecutionInput<'_>,
@@ -1285,7 +1338,7 @@ async fn execute_effects_phased(
 ) -> ExecutionResult {
     let mut success_count = 0;
     let mut failure_count = 0;
-    let skip_count = 0;
+    let mut skip_count = 0;
     let mut applied_states: HashMap<ResourceId, State> = HashMap::new();
     let mut failed_bindings: HashSet<String> = HashSet::new();
     let mut successfully_deleted: HashSet<ResourceId> = HashSet::new();
@@ -1293,380 +1346,301 @@ async fn execute_effects_phased(
     let mut pending_refreshes: HashMap<ResourceId, String> = HashMap::new();
 
     let total = count_actionable_effects(input.plan.effects());
-    let mut completed: usize = 0;
+    let completed = AtomicUsize::new(0);
 
     let effects = input.plan.effects();
     let replace_bindings = collect_replace_bindings(effects);
     let sorted_indices = topological_sort_replaces(effects, &replace_bindings);
 
-    // Phase 1: Non-Replace effects in original order
-    for effect in effects {
-        if matches!(effect, Effect::Replace { .. }) {
-            continue;
-        }
+    // -----------------------------------------------------------------------
+    // Phase 1: Non-Replace effects with parallel execution
+    // -----------------------------------------------------------------------
+    {
+        let phase1_indices: Vec<usize> = (0..effects.len())
+            .filter(|&idx| !matches!(&effects[idx], Effect::Replace { .. } | Effect::Read { .. }))
+            .collect();
 
-        if matches!(effect, Effect::Read { .. }) {
-            continue;
-        }
+        let deps_of =
+            build_phase_dependency_map(effects, &phase1_indices, input.unresolved_resources);
+        let mut completed_indices: HashSet<usize> = HashSet::new();
+        let mut dispatched: HashSet<usize> = HashSet::new();
+        let mut in_flight = FuturesUnordered::new();
 
-        completed += 1;
-
-        if let Some(failed_dep) = find_failed_dependency(effect, &failed_bindings) {
-            let reason = format!("dependency '{}' failed", failed_dep);
-            observer.on_event(&ExecutionEvent::EffectSkipped {
-                effect,
-                reason: &reason,
-                progress: ProgressInfo { completed, total },
-            });
-            if let Some(binding) = effect.binding_name() {
-                failed_bindings.insert(binding);
-            }
-            continue;
-        }
-
-        let started = Instant::now();
-        let progress = ProgressInfo { completed, total };
-        observer.on_event(&ExecutionEvent::EffectStarted { effect });
-
-        match effect {
-            Effect::Create(resource) => {
-                let resolved = resolve_resource(resource, &input.binding_map);
-                match provider.create(&resolved).await {
-                    Ok(state) => {
-                        observer.on_event(&ExecutionEvent::EffectSucceeded {
-                            effect,
-                            state: Some(&state),
-                            duration: started.elapsed(),
-                            progress,
-                        });
-                        success_count += 1;
-                        applied_states.insert(resource.id.clone(), state.clone());
-                        update_binding_map(&mut input.binding_map, &resolved.attributes, &state);
-                    }
-                    Err(e) => {
-                        let error_str = e.to_string();
-                        observer.on_event(&ExecutionEvent::EffectFailed {
-                            effect,
-                            error: &error_str,
-                            duration: started.elapsed(),
-                            progress,
-                        });
-                        failure_count += 1;
-                        if let Some(binding) = effect.binding_name() {
-                            failed_bindings.insert(binding);
-                        }
-                    }
+        loop {
+            let mut newly_ready: Vec<usize> = Vec::new();
+            for &idx in &phase1_indices {
+                if dispatched.contains(&idx) {
+                    continue;
+                }
+                let deps = &deps_of[&idx];
+                if deps.iter().all(|d| completed_indices.contains(d)) {
+                    newly_ready.push(idx);
                 }
             }
-            Effect::Update { id, from, to, .. } => {
-                let resolve_source = input.unresolved_resources.get(id).unwrap_or(to);
-                let resolved_to =
-                    resolve_resource_with_source(to, resolve_source, &input.binding_map);
-                let identifier = from.identifier.as_deref().unwrap_or("");
-                match provider.update(id, identifier, from, &resolved_to).await {
-                    Ok(state) => {
-                        observer.on_event(&ExecutionEvent::EffectSucceeded {
-                            effect,
-                            state: Some(&state),
-                            duration: started.elapsed(),
-                            progress,
-                        });
-                        success_count += 1;
-                        applied_states.insert(id.clone(), state.clone());
-                        update_binding_map(&mut input.binding_map, &resolved_to.attributes, &state);
-                    }
-                    Err(e) => {
-                        let error_str = e.to_string();
-                        observer.on_event(&ExecutionEvent::EffectFailed {
-                            effect,
-                            error: &error_str,
-                            duration: started.elapsed(),
-                            progress,
-                        });
-                        failure_count += 1;
-                        queue_state_refresh(&mut pending_refreshes, id, Some(identifier));
-                        if let Some(binding) = effect.binding_name() {
-                            failed_bindings.insert(binding);
-                        }
-                    }
-                }
-            }
-            Effect::Delete {
-                id,
-                identifier,
-                lifecycle,
-                ..
-            } => match provider.delete(id, identifier, lifecycle).await {
-                Ok(()) => {
-                    observer.on_event(&ExecutionEvent::EffectSucceeded {
+            newly_ready.sort();
+
+            for idx in newly_ready {
+                dispatched.insert(idx);
+                let effect = &effects[idx];
+
+                if let Some(failed_dep) = find_failed_dependency(effect, &failed_bindings) {
+                    let c = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                    let reason = format!("dependency '{}' failed", failed_dep);
+                    observer.on_event(&ExecutionEvent::EffectSkipped {
                         effect,
-                        state: None,
-                        duration: started.elapsed(),
-                        progress,
+                        reason: &reason,
+                        progress: ProgressInfo {
+                            completed: c,
+                            total,
+                        },
                     });
+                    skip_count += 1;
+                    if let Some(binding) = effect.binding_name() {
+                        failed_bindings.insert(binding);
+                    }
+                    completed_indices.insert(idx);
+                    continue;
+                }
+
+                let binding_snapshot = input.binding_map.clone();
+                let unresolved = &input.unresolved_resources;
+                let completed_ref = &completed;
+
+                in_flight.push(async move {
+                    let result = match effect {
+                        Effect::Create(resource) => {
+                            let c = completed_ref.fetch_add(1, Ordering::Relaxed) + 1;
+                            let started = Instant::now();
+                            observer.on_event(&ExecutionEvent::EffectStarted { effect });
+                            let resolved = resolve_resource(resource, &binding_snapshot);
+                            match provider.create(&resolved).await {
+                                Ok(state) => {
+                                    observer.on_event(&ExecutionEvent::EffectSucceeded {
+                                        effect,
+                                        state: Some(&state),
+                                        duration: started.elapsed(),
+                                        progress: ProgressInfo {
+                                            completed: c,
+                                            total,
+                                        },
+                                    });
+                                    PhaseEffectResult::Success {
+                                        state: Some(state),
+                                        resource_id: resource.id.clone(),
+                                        resolved_attrs: Some(resolved.attributes),
+                                    }
+                                }
+                                Err(e) => {
+                                    let error_str = e.to_string();
+                                    observer.on_event(&ExecutionEvent::EffectFailed {
+                                        effect,
+                                        error: &error_str,
+                                        duration: started.elapsed(),
+                                        progress: ProgressInfo {
+                                            completed: c,
+                                            total,
+                                        },
+                                    });
+                                    PhaseEffectResult::Failure {
+                                        binding: effect.binding_name(),
+                                        refresh: None,
+                                    }
+                                }
+                            }
+                        }
+                        Effect::Update { id, from, to, .. } => {
+                            let c = completed_ref.fetch_add(1, Ordering::Relaxed) + 1;
+                            let started = Instant::now();
+                            observer.on_event(&ExecutionEvent::EffectStarted { effect });
+                            let resolve_source = unresolved.get(id).unwrap_or(to);
+                            let resolved_to =
+                                resolve_resource_with_source(to, resolve_source, &binding_snapshot);
+                            let identifier = from.identifier.as_deref().unwrap_or("");
+                            match provider.update(id, identifier, from, &resolved_to).await {
+                                Ok(state) => {
+                                    observer.on_event(&ExecutionEvent::EffectSucceeded {
+                                        effect,
+                                        state: Some(&state),
+                                        duration: started.elapsed(),
+                                        progress: ProgressInfo {
+                                            completed: c,
+                                            total,
+                                        },
+                                    });
+                                    PhaseEffectResult::Success {
+                                        state: Some(state),
+                                        resource_id: id.clone(),
+                                        resolved_attrs: Some(resolved_to.attributes),
+                                    }
+                                }
+                                Err(e) => {
+                                    let error_str = e.to_string();
+                                    observer.on_event(&ExecutionEvent::EffectFailed {
+                                        effect,
+                                        error: &error_str,
+                                        duration: started.elapsed(),
+                                        progress: ProgressInfo {
+                                            completed: c,
+                                            total,
+                                        },
+                                    });
+                                    PhaseEffectResult::Failure {
+                                        binding: effect.binding_name(),
+                                        refresh: Some((id.clone(), identifier.to_string())),
+                                    }
+                                }
+                            }
+                        }
+                        Effect::Delete {
+                            id,
+                            identifier,
+                            lifecycle,
+                            ..
+                        } => {
+                            let c = completed_ref.fetch_add(1, Ordering::Relaxed) + 1;
+                            let started = Instant::now();
+                            observer.on_event(&ExecutionEvent::EffectStarted { effect });
+                            match provider.delete(id, identifier, lifecycle).await {
+                                Ok(()) => {
+                                    observer.on_event(&ExecutionEvent::EffectSucceeded {
+                                        effect,
+                                        state: None,
+                                        duration: started.elapsed(),
+                                        progress: ProgressInfo {
+                                            completed: c,
+                                            total,
+                                        },
+                                    });
+                                    PhaseEffectResult::Deleted {
+                                        resource_id: id.clone(),
+                                    }
+                                }
+                                Err(e) => {
+                                    let error_str = e.to_string();
+                                    observer.on_event(&ExecutionEvent::EffectFailed {
+                                        effect,
+                                        error: &error_str,
+                                        duration: started.elapsed(),
+                                        progress: ProgressInfo {
+                                            completed: c,
+                                            total,
+                                        },
+                                    });
+                                    PhaseEffectResult::Failure {
+                                        binding: None,
+                                        refresh: Some((id.clone(), identifier.clone())),
+                                    }
+                                }
+                            }
+                        }
+                        _ => unreachable!(),
+                    };
+                    (idx, result)
+                });
+            }
+
+            if in_flight.is_empty() {
+                break;
+            }
+
+            let (finished_idx, result) = in_flight.next().await.unwrap();
+            completed_indices.insert(finished_idx);
+
+            match result {
+                PhaseEffectResult::Success {
+                    state,
+                    resource_id,
+                    resolved_attrs,
+                } => {
                     success_count += 1;
-                    successfully_deleted.insert(id.clone());
+                    if let Some(state) = &state {
+                        applied_states.insert(resource_id, state.clone());
+                        if let Some(attrs) = &resolved_attrs {
+                            update_binding_map(&mut input.binding_map, attrs, state);
+                        }
+                    }
                 }
-                Err(e) => {
-                    let error_str = e.to_string();
-                    observer.on_event(&ExecutionEvent::EffectFailed {
-                        effect,
-                        error: &error_str,
-                        duration: started.elapsed(),
-                        progress,
-                    });
+                PhaseEffectResult::Failure {
+                    binding, refresh, ..
+                } => {
                     failure_count += 1;
-                    queue_state_refresh(&mut pending_refreshes, id, Some(identifier));
+                    if let Some(binding) = binding {
+                        failed_bindings.insert(binding);
+                    }
+                    if let Some((id, identifier)) = refresh
+                        && !identifier.is_empty()
+                    {
+                        pending_refreshes.insert(id, identifier);
+                    }
                 }
-            },
-            Effect::Read { .. } | Effect::Replace { .. } => unreachable!(),
+                PhaseEffectResult::Deleted { resource_id, .. } => {
+                    success_count += 1;
+                    successfully_deleted.insert(resource_id);
+                }
+                _ => unreachable!(),
+            }
         }
     }
 
-    // Phase 2: CBD creates in forward dependency order (parents first)
+    // -----------------------------------------------------------------------
+    // Phase 2: CBD creates with parallel execution (forward dependency order)
+    // -----------------------------------------------------------------------
     let mut cbd_create_states: HashMap<usize, State> = HashMap::new();
     let mut replace_start_times: HashMap<usize, Instant> = HashMap::new();
+
+    // Assign progress numbers to all Replace effects upfront.
+    // We use AtomicUsize so we just advance for each replace effect.
+    // But to maintain consistent total progress, advance the counter for all replaces.
+    let replace_progress_base = completed.load(Ordering::Relaxed);
     let mut replace_progress: HashMap<usize, ProgressInfo> = HashMap::new();
-    // Assign progress numbers to all Replace effects upfront (in sorted order)
-    for &idx in &sorted_indices {
-        completed += 1;
-        replace_progress.insert(idx, ProgressInfo { completed, total });
+    for (i, &idx) in sorted_indices.iter().enumerate() {
+        let c = replace_progress_base + i + 1;
+        replace_progress.insert(
+            idx,
+            ProgressInfo {
+                completed: c,
+                total,
+            },
+        );
     }
-    for &idx in &sorted_indices {
-        let effect = &effects[idx];
-        let progress = replace_progress[&idx];
-        if let Effect::Replace {
-            to,
-            lifecycle,
-            cascading_updates,
-            ..
-        } = effect
-            && lifecycle.create_before_destroy
-        {
-            if let Some(failed_dep) = find_failed_dependency(effect, &failed_bindings) {
-                let reason = format!("dependency '{}' failed", failed_dep);
-                observer.on_event(&ExecutionEvent::EffectSkipped {
-                    effect,
-                    reason: &reason,
-                    progress,
-                });
-                if let Some(binding) = effect.binding_name() {
-                    failed_bindings.insert(binding);
+    // Advance the counter past all replace effects
+    completed.store(
+        replace_progress_base + sorted_indices.len(),
+        Ordering::Relaxed,
+    );
+
+    {
+        let cbd_indices: Vec<usize> = sorted_indices
+            .iter()
+            .copied()
+            .filter(|&idx| {
+                matches!(&effects[idx], Effect::Replace { lifecycle, .. } if lifecycle.create_before_destroy)
+            })
+            .collect();
+
+        let deps_of = build_phase_dependency_map(effects, &cbd_indices, input.unresolved_resources);
+        let mut completed_indices: HashSet<usize> = HashSet::new();
+        let mut dispatched: HashSet<usize> = HashSet::new();
+        let mut in_flight = FuturesUnordered::new();
+
+        loop {
+            let mut newly_ready: Vec<usize> = Vec::new();
+            for &idx in &cbd_indices {
+                if dispatched.contains(&idx) {
+                    continue;
                 }
-                continue;
-            }
-
-            let started = Instant::now();
-            replace_start_times.insert(idx, started);
-            observer.on_event(&ExecutionEvent::EffectStarted { effect });
-
-            let resolve_source = input.unresolved_resources.get(&to.id).unwrap_or(to);
-            let resolved = resolve_resource_with_source(to, resolve_source, &input.binding_map);
-
-            match provider.create(&resolved).await {
-                Ok(state) => {
-                    update_binding_map(&mut input.binding_map, &resolved.attributes, &state);
-
-                    let mut cascade_failed = false;
-                    for cascade in cascading_updates {
-                        let resolved_to = resolve_resource(&cascade.to, &input.binding_map);
-                        let cascade_identifier = cascade.from.identifier.as_deref().unwrap_or("");
-                        match provider
-                            .update(&cascade.id, cascade_identifier, &cascade.from, &resolved_to)
-                            .await
-                        {
-                            Ok(cascade_state) => {
-                                observer.on_event(&ExecutionEvent::CascadeUpdateSucceeded {
-                                    id: &cascade.id,
-                                });
-                                applied_states.insert(cascade.id.clone(), cascade_state.clone());
-                                update_binding_map(
-                                    &mut input.binding_map,
-                                    &resolved_to.attributes,
-                                    &cascade_state,
-                                );
-                            }
-                            Err(e) => {
-                                let error_str = e.to_string();
-                                observer.on_event(&ExecutionEvent::CascadeUpdateFailed {
-                                    id: &cascade.id,
-                                    error: &error_str,
-                                });
-                                queue_state_refresh(
-                                    &mut pending_refreshes,
-                                    &cascade.id,
-                                    Some(cascade_identifier),
-                                );
-                                cascade_failed = true;
-                                failure_count += 1;
-                                break;
-                            }
-                        }
-                    }
-
-                    if cascade_failed {
-                        queue_state_refresh(
-                            &mut pending_refreshes,
-                            &to.id,
-                            state.identifier.as_deref(),
-                        );
-                        if let Some(binding) = effect.binding_name() {
-                            failed_bindings.insert(binding);
-                        }
-                    } else {
-                        cbd_create_states.insert(idx, state);
-                    }
-                }
-                Err(e) => {
-                    let error_str = e.to_string();
-                    observer.on_event(&ExecutionEvent::EffectFailed {
-                        effect,
-                        error: &error_str,
-                        duration: started.elapsed(),
-                        progress,
-                    });
-                    failure_count += 1;
-                    if let Some(binding) = effect.binding_name() {
-                        failed_bindings.insert(binding);
-                    }
+                let deps = &deps_of[&idx];
+                if deps.iter().all(|d| completed_indices.contains(d)) {
+                    newly_ready.push(idx);
                 }
             }
-        }
-    }
+            newly_ready.sort();
 
-    // Phase 3: All deletes in reverse dependency order (dependents first)
-    for &idx in sorted_indices.iter().rev() {
-        let effect = &effects[idx];
-        let progress = replace_progress[&idx];
-        if let Effect::Replace {
-            id,
-            from,
-            lifecycle,
-            ..
-        } = effect
-        {
-            if let Some(failed_dep) = find_failed_dependency(effect, &failed_bindings) {
-                let reason = format!("dependency '{}' failed", failed_dep);
-                observer.on_event(&ExecutionEvent::EffectSkipped {
-                    effect,
-                    reason: &reason,
-                    progress,
-                });
-                if let Some(binding) = effect.binding_name() {
-                    failed_bindings.insert(binding);
-                }
-                continue;
-            }
+            for idx in newly_ready {
+                dispatched.insert(idx);
+                let effect = &effects[idx];
+                let progress = replace_progress[&idx];
 
-            // For CBD effects, skip delete if the create phase failed
-            if lifecycle.create_before_destroy && !cbd_create_states.contains_key(&idx) {
-                continue;
-            }
-
-            // For non-CBD replaces, this is where the effect starts
-            if !lifecycle.create_before_destroy {
-                let started = Instant::now();
-                replace_start_times.insert(idx, started);
-                observer.on_event(&ExecutionEvent::EffectStarted { effect });
-            }
-
-            let identifier = from.identifier.as_deref().unwrap_or("");
-            match provider.delete(id, identifier, lifecycle).await {
-                Ok(()) => {
-                    // Delete succeeded
-                }
-                Err(e) => {
-                    let started = replace_start_times
-                        .get(&idx)
-                        .copied()
-                        .unwrap_or_else(Instant::now);
-                    let error_str = e.to_string();
-                    observer.on_event(&ExecutionEvent::EffectFailed {
-                        effect,
-                        error: &error_str,
-                        duration: started.elapsed(),
-                        progress,
-                    });
-                    failure_count += 1;
-                    queue_state_refresh(&mut pending_refreshes, id, Some(identifier));
-                    if let Some(binding) = effect.binding_name() {
-                        failed_bindings.insert(binding);
-                    }
-                    // For CBD, save the already-created resource state even though delete failed
-                    if lifecycle.create_before_destroy
-                        && let Some(state) = cbd_create_states.remove(&idx)
-                    {
-                        let to = match effect {
-                            Effect::Replace { to, .. } => to,
-                            _ => unreachable!(),
-                        };
-                        queue_state_refresh(
-                            &mut pending_refreshes,
-                            &to.id,
-                            state.identifier.as_deref(),
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    // Phase 4: Non-CBD creates and CBD finalization in forward dependency order
-    for &idx in &sorted_indices {
-        let effect = &effects[idx];
-        let progress = replace_progress[&idx];
-        if let Effect::Replace {
-            id,
-            to,
-            lifecycle,
-            temporary_name,
-            ..
-        } = effect
-        {
-            let started = replace_start_times
-                .get(&idx)
-                .copied()
-                .unwrap_or_else(Instant::now);
-
-            if lifecycle.create_before_destroy {
-                // CBD: already created in phase 2, handle rename and finalize
-                if let Some(state) = cbd_create_states.remove(&idx) {
-                    let (final_state, rename_failed) = finalize_cbd_rename(
-                        provider,
-                        id,
-                        to,
-                        &state,
-                        temporary_name.as_ref(),
-                        &mut permanent_name_overrides,
-                        observer,
-                    )
-                    .await;
-
-                    applied_states.insert(to.id.clone(), final_state);
-
-                    if rename_failed {
-                        observer.on_event(&ExecutionEvent::EffectFailed {
-                            effect,
-                            error: "rename failed",
-                            duration: started.elapsed(),
-                            progress,
-                        });
-                        failure_count += 1;
-                        if let Some(binding) = effect.binding_name() {
-                            failed_bindings.insert(binding);
-                        }
-                    } else {
-                        observer.on_event(&ExecutionEvent::EffectSucceeded {
-                            effect,
-                            state: None,
-                            duration: started.elapsed(),
-                            progress,
-                        });
-                        success_count += 1;
-                    }
-                }
-            } else {
-                // Non-CBD: create the new resource now (after delete in phase 3)
                 if let Some(failed_dep) = find_failed_dependency(effect, &failed_bindings) {
                     let reason = format!("dependency '{}' failed", failed_dep);
                     observer.on_event(&ExecutionEvent::EffectSkipped {
@@ -1677,45 +1651,641 @@ async fn execute_effects_phased(
                     if let Some(binding) = effect.binding_name() {
                         failed_bindings.insert(binding);
                     }
+                    completed_indices.insert(idx);
                     continue;
                 }
 
-                // Check if this effect's own delete failed
-                if let Some(binding) = effect.binding_name()
-                    && failed_bindings.contains(&binding)
-                {
-                    continue;
-                }
+                let binding_snapshot = input.binding_map.clone();
+                let unresolved = &input.unresolved_resources;
 
-                let resolve_source = input.unresolved_resources.get(&to.id).unwrap_or(to);
-                let resolved = resolve_resource_with_source(to, resolve_source, &input.binding_map);
+                in_flight.push(async move {
+                    if let Effect::Replace {
+                        to,
+                        cascading_updates,
+                        ..
+                    } = effect
+                    {
+                        let started = Instant::now();
+                        observer.on_event(&ExecutionEvent::EffectStarted { effect });
 
-                match provider.create(&resolved).await {
-                    Ok(state) => {
-                        observer.on_event(&ExecutionEvent::EffectSucceeded {
-                            effect,
-                            state: Some(&state),
-                            duration: started.elapsed(),
-                            progress,
-                        });
-                        success_count += 1;
-                        applied_states.insert(to.id.clone(), state.clone());
-                        update_binding_map(&mut input.binding_map, &resolved.attributes, &state);
+                        let resolve_source = unresolved.get(&to.id).unwrap_or(to);
+                        let resolved =
+                            resolve_resource_with_source(to, resolve_source, &binding_snapshot);
+
+                        match provider.create(&resolved).await {
+                            Ok(state) => {
+                                let mut local_binding_map = binding_snapshot.clone();
+                                update_binding_map(
+                                    &mut local_binding_map,
+                                    &resolved.attributes,
+                                    &state,
+                                );
+
+                                let mut cascade_failed = false;
+                                let mut refreshes = Vec::new();
+                                let mut cascade_states = Vec::new();
+                                for cascade in cascading_updates {
+                                    let resolved_to =
+                                        resolve_resource(&cascade.to, &local_binding_map);
+                                    let cascade_identifier =
+                                        cascade.from.identifier.as_deref().unwrap_or("");
+                                    match provider
+                                        .update(
+                                            &cascade.id,
+                                            cascade_identifier,
+                                            &cascade.from,
+                                            &resolved_to,
+                                        )
+                                        .await
+                                    {
+                                        Ok(cascade_state) => {
+                                            observer.on_event(
+                                                &ExecutionEvent::CascadeUpdateSucceeded {
+                                                    id: &cascade.id,
+                                                },
+                                            );
+                                            update_binding_map(
+                                                &mut local_binding_map,
+                                                &resolved_to.attributes,
+                                                &cascade_state,
+                                            );
+                                            cascade_states.push((
+                                                cascade.id.clone(),
+                                                cascade_state,
+                                                resolved_to.attributes,
+                                            ));
+                                        }
+                                        Err(e) => {
+                                            let error_str = e.to_string();
+                                            observer.on_event(
+                                                &ExecutionEvent::CascadeUpdateFailed {
+                                                    id: &cascade.id,
+                                                    error: &error_str,
+                                                },
+                                            );
+                                            refreshes.push((
+                                                cascade.id.clone(),
+                                                cascade_identifier.to_string(),
+                                            ));
+                                            cascade_failed = true;
+                                            break;
+                                        }
+                                    }
+                                }
+
+                                if cascade_failed {
+                                    refreshes.push((
+                                        to.id.clone(),
+                                        state.identifier.clone().unwrap_or_default(),
+                                    ));
+                                    (
+                                        idx,
+                                        started,
+                                        PhaseEffectResult::CbdCreateFailure {
+                                            binding: effect.binding_name(),
+                                            refreshes,
+                                        },
+                                    )
+                                } else {
+                                    (
+                                        idx,
+                                        started,
+                                        PhaseEffectResult::CbdCreateSuccess {
+                                            idx,
+                                            state,
+                                            cascade_states,
+                                        },
+                                    )
+                                }
+                            }
+                            Err(e) => {
+                                let error_str = e.to_string();
+                                observer.on_event(&ExecutionEvent::EffectFailed {
+                                    effect,
+                                    error: &error_str,
+                                    duration: started.elapsed(),
+                                    progress,
+                                });
+                                (
+                                    idx,
+                                    started,
+                                    PhaseEffectResult::CbdCreateFailure {
+                                        binding: effect.binding_name(),
+                                        refreshes: Vec::new(),
+                                    },
+                                )
+                            }
+                        }
+                    } else {
+                        unreachable!()
                     }
-                    Err(e) => {
-                        let error_str = e.to_string();
-                        observer.on_event(&ExecutionEvent::EffectFailed {
-                            effect,
-                            error: &error_str,
-                            duration: started.elapsed(),
-                            progress,
-                        });
-                        failure_count += 1;
-                        if let Some(binding) = effect.binding_name() {
-                            failed_bindings.insert(binding);
+                });
+            }
+
+            if in_flight.is_empty() {
+                break;
+            }
+
+            let (finished_idx, started, result) = in_flight.next().await.unwrap();
+            completed_indices.insert(finished_idx);
+
+            match result {
+                PhaseEffectResult::CbdCreateSuccess {
+                    idx,
+                    state,
+                    cascade_states,
+                } => {
+                    let effect = &effects[idx];
+                    if let Effect::Replace { to, .. } = effect {
+                        update_binding_map(&mut input.binding_map, &to.attributes, &state);
+                    }
+                    for (cascade_id, cascade_state, cascade_attrs) in cascade_states {
+                        applied_states.insert(cascade_id, cascade_state.clone());
+                        update_binding_map(&mut input.binding_map, &cascade_attrs, &cascade_state);
+                    }
+                    replace_start_times.insert(idx, started);
+                    cbd_create_states.insert(idx, state);
+                }
+                PhaseEffectResult::CbdCreateFailure {
+                    binding, refreshes, ..
+                } => {
+                    failure_count += 1;
+                    if let Some(binding) = binding {
+                        failed_bindings.insert(binding);
+                    }
+                    for (id, identifier) in refreshes {
+                        queue_state_refresh(&mut pending_refreshes, &id, Some(&identifier));
+                    }
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 3: All deletes with parallel execution (reverse dependency order)
+    // -----------------------------------------------------------------------
+    {
+        // Collect indices for deletes that should execute: all Replace effects
+        // that haven't been failed/skipped. For CBD, skip if create phase failed.
+        let delete_indices: Vec<usize> = sorted_indices
+            .iter()
+            .rev()
+            .copied()
+            .filter(|&idx| {
+                let effect = &effects[idx];
+                if let Effect::Replace { lifecycle, .. } = effect {
+                    // Skip if dependency failed
+                    if find_failed_dependency(effect, &failed_bindings).is_some() {
+                        return false;
+                    }
+                    // For CBD, skip if create didn't succeed
+                    if lifecycle.create_before_destroy && !cbd_create_states.contains_key(&idx) {
+                        return false;
+                    }
+                    true
+                } else {
+                    false
+                }
+            })
+            .collect();
+
+        // For phase 3, dependencies are reversed: dependents should delete before parents.
+        // Build a reverse dependency map for the delete phase.
+        let phase_set: HashSet<usize> = delete_indices.iter().copied().collect();
+        let mut binding_to_idx: HashMap<String, usize> = HashMap::new();
+        for &idx in &delete_indices {
+            if let Some(binding) = effects[idx].binding_name() {
+                binding_to_idx.insert(binding, idx);
+            }
+        }
+        let mut deps_of: HashMap<usize, HashSet<usize>> = HashMap::new();
+        for &idx in &delete_indices {
+            let effect = &effects[idx];
+            let mut dep_indices = HashSet::new();
+            if let Some(resource) = effect.resource() {
+                let dep_bindings = get_resource_dependencies(resource);
+                for dep_binding in &dep_bindings {
+                    if let Some(&dep_idx) = binding_to_idx.get(dep_binding)
+                        && phase_set.contains(&dep_idx)
+                    {
+                        dep_indices.insert(dep_idx);
+                    }
+                }
+                if let Some(unresolved) = input.unresolved_resources.get(effect.resource_id()) {
+                    let unresolved_deps = get_resource_dependencies(unresolved);
+                    for dep_binding in &unresolved_deps {
+                        if let Some(&dep_idx) = binding_to_idx.get(dep_binding)
+                            && phase_set.contains(&dep_idx)
+                        {
+                            dep_indices.insert(dep_idx);
                         }
                     }
                 }
+            }
+            deps_of.insert(idx, dep_indices);
+        }
+
+        // For reverse order: swap the dependency direction.
+        // In forward order, parent has no deps, child depends on parent.
+        // In reverse (delete) order, child has no deps, parent depends on child.
+        let mut reverse_deps: HashMap<usize, HashSet<usize>> = HashMap::new();
+        for &idx in &delete_indices {
+            reverse_deps.insert(idx, HashSet::new());
+        }
+        for (&idx, deps) in &deps_of {
+            for &dep_idx in deps {
+                // idx depends on dep_idx in forward order
+                // So dep_idx should wait for idx in reverse order
+                reverse_deps.entry(dep_idx).or_default().insert(idx);
+            }
+        }
+
+        let mut completed_indices: HashSet<usize> = HashSet::new();
+        let mut dispatched: HashSet<usize> = HashSet::new();
+        let mut in_flight = FuturesUnordered::new();
+
+        loop {
+            let mut newly_ready: Vec<usize> = Vec::new();
+            for &idx in &delete_indices {
+                if dispatched.contains(&idx) {
+                    continue;
+                }
+                let deps = &reverse_deps[&idx];
+                if deps.iter().all(|d| completed_indices.contains(d)) {
+                    newly_ready.push(idx);
+                }
+            }
+            newly_ready.sort();
+
+            for idx in newly_ready {
+                dispatched.insert(idx);
+                let effect = &effects[idx];
+                let progress = replace_progress[&idx];
+                let is_cbd = matches!(effect, Effect::Replace { lifecycle, .. } if lifecycle.create_before_destroy);
+
+                // For non-CBD replaces, this is where the effect starts
+                if !is_cbd {
+                    let started = Instant::now();
+                    replace_start_times.insert(idx, started);
+                    observer.on_event(&ExecutionEvent::EffectStarted { effect });
+                }
+
+                // Pre-compute values needed in the async block
+                let effect_started = replace_start_times
+                    .get(&idx)
+                    .copied()
+                    .unwrap_or_else(Instant::now);
+                let cbd_refresh_info: Option<(ResourceId, String)> = if is_cbd {
+                    if let Effect::Replace { to, .. } = effect {
+                        cbd_create_states.get(&idx).map(|state| {
+                            (to.id.clone(), state.identifier.clone().unwrap_or_default())
+                        })
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                in_flight.push(async move {
+                    if let Effect::Replace {
+                        id,
+                        from,
+                        lifecycle,
+                        ..
+                    } = effect
+                    {
+                        let identifier = from.identifier.as_deref().unwrap_or("");
+                        match provider.delete(id, identifier, lifecycle).await {
+                            Ok(()) => (idx, PhaseEffectResult::ReplaceDeleteSuccess),
+                            Err(e) => {
+                                let error_str = e.to_string();
+                                observer.on_event(&ExecutionEvent::EffectFailed {
+                                    effect,
+                                    error: &error_str,
+                                    duration: effect_started.elapsed(),
+                                    progress,
+                                });
+                                (
+                                    idx,
+                                    PhaseEffectResult::ReplaceDeleteFailure {
+                                        binding: effect.binding_name(),
+                                        refresh: Some((id.clone(), identifier.to_string())),
+                                        cbd_refresh: cbd_refresh_info,
+                                    },
+                                )
+                            }
+                        }
+                    } else {
+                        unreachable!()
+                    }
+                });
+            }
+
+            if in_flight.is_empty() {
+                break;
+            }
+
+            let (finished_idx, result) = in_flight.next().await.unwrap();
+            completed_indices.insert(finished_idx);
+
+            match result {
+                PhaseEffectResult::ReplaceDeleteSuccess => {
+                    // Delete succeeded, will be finalized in phase 4
+                }
+                PhaseEffectResult::ReplaceDeleteFailure {
+                    binding,
+                    refresh,
+                    cbd_refresh,
+                } => {
+                    failure_count += 1;
+                    if let Some(binding) = binding {
+                        failed_bindings.insert(binding);
+                    }
+                    if let Some((id, identifier)) = refresh {
+                        queue_state_refresh(&mut pending_refreshes, &id, Some(&identifier));
+                    }
+                    if let Some((id, identifier)) = cbd_refresh {
+                        queue_state_refresh(&mut pending_refreshes, &id, Some(&identifier));
+                    }
+                    // Remove from cbd_create_states since delete failed
+                    cbd_create_states.remove(&finished_idx);
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 4: Non-CBD creates and CBD finalization with parallel execution
+    // -----------------------------------------------------------------------
+    {
+        let phase4_indices: Vec<usize> = sorted_indices.clone();
+
+        let deps_of =
+            build_phase_dependency_map(effects, &phase4_indices, input.unresolved_resources);
+        let mut completed_indices: HashSet<usize> = HashSet::new();
+        let mut dispatched: HashSet<usize> = HashSet::new();
+        type PhaseFuture<'a> =
+            std::pin::Pin<Box<dyn std::future::Future<Output = (usize, PhaseEffectResult)> + 'a>>;
+        let mut in_flight: FuturesUnordered<PhaseFuture<'_>> = FuturesUnordered::new();
+
+        loop {
+            let mut newly_ready: Vec<usize> = Vec::new();
+            for &idx in &phase4_indices {
+                if dispatched.contains(&idx) {
+                    continue;
+                }
+                let deps = &deps_of[&idx];
+                if deps.iter().all(|d| completed_indices.contains(d)) {
+                    newly_ready.push(idx);
+                }
+            }
+            newly_ready.sort();
+
+            for idx in newly_ready {
+                dispatched.insert(idx);
+                let effect = &effects[idx];
+                let progress = replace_progress[&idx];
+
+                if let Some(failed_dep) = find_failed_dependency(effect, &failed_bindings) {
+                    let reason = format!("dependency '{}' failed", failed_dep);
+                    observer.on_event(&ExecutionEvent::EffectSkipped {
+                        effect,
+                        reason: &reason,
+                        progress,
+                    });
+                    if let Some(binding) = effect.binding_name() {
+                        failed_bindings.insert(binding);
+                    }
+                    completed_indices.insert(idx);
+                    continue;
+                }
+
+                let binding_snapshot = input.binding_map.clone();
+                let unresolved = &input.unresolved_resources;
+
+                if let Effect::Replace {
+                    id,
+                    to,
+                    lifecycle,
+                    temporary_name,
+                    ..
+                } = effect
+                {
+                    let effect_started = replace_start_times
+                        .get(&idx)
+                        .copied()
+                        .unwrap_or_else(Instant::now);
+
+                    if lifecycle.create_before_destroy {
+                        // CBD finalization: skip if create phase failed
+                        let Some(state) = cbd_create_states.remove(&idx) else {
+                            completed_indices.insert(idx);
+                            continue;
+                        };
+                        let id = id.clone();
+                        let to = to.clone();
+                        let temporary_name = temporary_name.clone();
+
+                        in_flight.push(Box::pin(async move {
+                            let started = effect_started;
+
+                            if let Some(temp) = temporary_name.as_ref()
+                                && temp.can_rename
+                            {
+                                let new_identifier = state.identifier.as_deref().unwrap_or("");
+                                let mut rename_to = to.clone();
+                                rename_to.attributes.insert(
+                                    temp.attribute.clone(),
+                                    Value::String(temp.original_value.clone()),
+                                );
+                                match provider
+                                    .update(&id, new_identifier, &state, &rename_to)
+                                    .await
+                                {
+                                    Ok(renamed_state) => {
+                                        observer.on_event(&ExecutionEvent::RenameSucceeded {
+                                            id: &id,
+                                            from: &temp.temporary_value,
+                                            to: &temp.original_value,
+                                        });
+                                        observer.on_event(&ExecutionEvent::EffectSucceeded {
+                                            effect,
+                                            state: None,
+                                            duration: started.elapsed(),
+                                            progress,
+                                        });
+                                        (
+                                            idx,
+                                            PhaseEffectResult::CbdFinalizeSuccess {
+                                                state: renamed_state,
+                                                resource_id: to.id.clone(),
+                                                permanent_overrides: None,
+                                            },
+                                        )
+                                    }
+                                    Err(e) => {
+                                        let error_str = e.to_string();
+                                        observer.on_event(&ExecutionEvent::RenameFailed {
+                                            id: &id,
+                                            error: &error_str,
+                                        });
+                                        observer.on_event(&ExecutionEvent::EffectFailed {
+                                            effect,
+                                            error: "rename failed",
+                                            duration: started.elapsed(),
+                                            progress,
+                                        });
+                                        (
+                                            idx,
+                                            PhaseEffectResult::CbdFinalizeFailed {
+                                                state,
+                                                resource_id: to.id.clone(),
+                                                binding: effect.binding_name(),
+                                            },
+                                        )
+                                    }
+                                }
+                            } else {
+                                // No rename needed or can_rename=false
+                                let permanent_overrides =
+                                    temporary_name.as_ref().and_then(|temp| {
+                                        if !temp.can_rename {
+                                            let mut overrides = HashMap::new();
+                                            overrides.insert(
+                                                temp.attribute.clone(),
+                                                temp.temporary_value.clone(),
+                                            );
+                                            Some((to.id.clone(), overrides))
+                                        } else {
+                                            None
+                                        }
+                                    });
+                                observer.on_event(&ExecutionEvent::EffectSucceeded {
+                                    effect,
+                                    state: None,
+                                    duration: started.elapsed(),
+                                    progress,
+                                });
+                                (
+                                    idx,
+                                    PhaseEffectResult::CbdFinalizeSuccess {
+                                        state,
+                                        resource_id: to.id.clone(),
+                                        permanent_overrides,
+                                    },
+                                )
+                            }
+                        }));
+                    } else {
+                        // Non-CBD: skip if own delete failed
+                        if let Some(binding) = effect.binding_name()
+                            && failed_bindings.contains(&binding)
+                        {
+                            completed_indices.insert(idx);
+                            continue;
+                        }
+
+                        // Non-CBD: create new resource
+                        in_flight.push(Box::pin(async move {
+                            if let Effect::Replace { to, .. } = effect {
+                                let started = effect_started;
+                                let resolve_source = unresolved.get(&to.id).unwrap_or(to);
+                                let resolved = resolve_resource_with_source(
+                                    to,
+                                    resolve_source,
+                                    &binding_snapshot,
+                                );
+
+                                match provider.create(&resolved).await {
+                                    Ok(state) => {
+                                        observer.on_event(&ExecutionEvent::EffectSucceeded {
+                                            effect,
+                                            state: Some(&state),
+                                            duration: started.elapsed(),
+                                            progress,
+                                        });
+                                        (
+                                            idx,
+                                            PhaseEffectResult::NonCbdCreateSuccess {
+                                                state,
+                                                resource_id: to.id.clone(),
+                                                resolved_attrs: resolved.attributes,
+                                            },
+                                        )
+                                    }
+                                    Err(e) => {
+                                        let error_str = e.to_string();
+                                        observer.on_event(&ExecutionEvent::EffectFailed {
+                                            effect,
+                                            error: &error_str,
+                                            duration: started.elapsed(),
+                                            progress,
+                                        });
+                                        (
+                                            idx,
+                                            PhaseEffectResult::NonCbdCreateFailure {
+                                                binding: effect.binding_name(),
+                                            },
+                                        )
+                                    }
+                                }
+                            } else {
+                                unreachable!()
+                            }
+                        }));
+                    }
+                }
+            }
+
+            if in_flight.is_empty() {
+                break;
+            }
+
+            let (finished_idx, result) = in_flight.next().await.unwrap();
+            completed_indices.insert(finished_idx);
+
+            match result {
+                PhaseEffectResult::CbdFinalizeSuccess {
+                    state,
+                    resource_id,
+                    permanent_overrides,
+                } => {
+                    success_count += 1;
+                    applied_states.insert(resource_id, state);
+                    if let Some((id, overrides)) = permanent_overrides {
+                        permanent_name_overrides.insert(id, overrides);
+                    }
+                }
+                PhaseEffectResult::CbdFinalizeFailed {
+                    state,
+                    resource_id,
+                    binding,
+                } => {
+                    failure_count += 1;
+                    applied_states.insert(resource_id, state);
+                    if let Some(binding) = binding {
+                        failed_bindings.insert(binding);
+                    }
+                }
+                PhaseEffectResult::NonCbdCreateSuccess {
+                    state,
+                    resource_id,
+                    resolved_attrs,
+                } => {
+                    success_count += 1;
+                    applied_states.insert(resource_id, state.clone());
+                    update_binding_map(&mut input.binding_map, &resolved_attrs, &state);
+                }
+                PhaseEffectResult::NonCbdCreateFailure { binding } => {
+                    failure_count += 1;
+                    if let Some(binding) = binding {
+                        failed_bindings.insert(binding);
+                    }
+                }
+                _ => unreachable!(),
             }
         }
     }
