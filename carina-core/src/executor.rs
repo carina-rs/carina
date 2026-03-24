@@ -761,8 +761,23 @@ async fn execute_effects_sequential(
             });
         }
 
-        // If nothing is in flight and all actionable effects are dispatched, we're done
+        // If nothing is in flight, we're done (or stuck in a cycle)
         if in_flight.is_empty() {
+            // Check for undispatched effects (would indicate a dependency cycle)
+            let remaining = actionable_indices
+                .iter()
+                .filter(|idx| !dispatched.contains(idx))
+                .count();
+            if remaining > 0 {
+                // Cycle detected: skip remaining effects as failures
+                for &idx in &actionable_indices {
+                    if !dispatched.contains(&idx) {
+                        dispatched.insert(idx);
+                        completed_indices.insert(idx);
+                        failure_count += 1;
+                    }
+                }
+            }
             break;
         }
 
