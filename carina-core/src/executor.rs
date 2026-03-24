@@ -1284,7 +1284,11 @@ enum PhaseEffectResult {
     /// Phase 1: Delete succeeded
     Deleted { resource_id: ResourceId },
     /// Phase 2: CBD create succeeded
-    CbdCreateSuccess { idx: usize, state: State },
+    CbdCreateSuccess {
+        idx: usize,
+        state: State,
+        cascade_states: Vec<(ResourceId, State, HashMap<String, Value>)>,
+    },
     /// Phase 2: CBD create failed
     CbdCreateFailure {
         binding: Option<String>,
@@ -1679,6 +1683,7 @@ async fn execute_effects_phased(
 
                                 let mut cascade_failed = false;
                                 let mut refreshes = Vec::new();
+                                let mut cascade_states = Vec::new();
                                 for cascade in cascading_updates {
                                     let resolved_to =
                                         resolve_resource(&cascade.to, &local_binding_map);
@@ -1704,6 +1709,11 @@ async fn execute_effects_phased(
                                                 &resolved_to.attributes,
                                                 &cascade_state,
                                             );
+                                            cascade_states.push((
+                                                cascade.id.clone(),
+                                                cascade_state,
+                                                resolved_to.attributes,
+                                            ));
                                         }
                                         Err(e) => {
                                             let error_str = e.to_string();
@@ -1740,7 +1750,11 @@ async fn execute_effects_phased(
                                     (
                                         idx,
                                         started,
-                                        PhaseEffectResult::CbdCreateSuccess { idx, state },
+                                        PhaseEffectResult::CbdCreateSuccess {
+                                            idx,
+                                            state,
+                                            cascade_states,
+                                        },
                                     )
                                 }
                             }
@@ -1776,10 +1790,18 @@ async fn execute_effects_phased(
             completed_indices.insert(finished_idx);
 
             match result {
-                PhaseEffectResult::CbdCreateSuccess { idx, state } => {
+                PhaseEffectResult::CbdCreateSuccess {
+                    idx,
+                    state,
+                    cascade_states,
+                } => {
                     let effect = &effects[idx];
                     if let Effect::Replace { to, .. } = effect {
                         update_binding_map(&mut input.binding_map, &to.attributes, &state);
+                    }
+                    for (cascade_id, cascade_state, cascade_attrs) in cascade_states {
+                        applied_states.insert(cascade_id, cascade_state.clone());
+                        update_binding_map(&mut input.binding_map, &cascade_attrs, &cascade_state);
                     }
                     replace_start_times.insert(idx, started);
                     cbd_create_states.insert(idx, state);
@@ -1993,46 +2015,13 @@ async fn execute_effects_phased(
                 _ => unreachable!(),
             }
         }
-
-        // Handle skipped effects (dependency failures detected before phase 3 dispatch)
-        for &idx in sorted_indices.iter().rev() {
-            let effect = &effects[idx];
-            if !matches!(effect, Effect::Replace { .. }) {
-                continue;
-            }
-            if delete_indices.contains(&idx) || dispatched.contains(&idx) {
-                continue;
-            }
-            // Already handled by failed_bindings propagation
-        }
     }
 
     // -----------------------------------------------------------------------
     // Phase 4: Non-CBD creates and CBD finalization with parallel execution
     // -----------------------------------------------------------------------
     {
-        let phase4_indices: Vec<usize> = sorted_indices
-            .iter()
-            .copied()
-            .filter(|&idx| {
-                let effect = &effects[idx];
-                if let Effect::Replace { lifecycle, .. } = effect {
-                    if lifecycle.create_before_destroy {
-                        // CBD: only finalize if create succeeded
-                        cbd_create_states.contains_key(&idx)
-                    } else {
-                        // Non-CBD: only create if not failed
-                        if let Some(binding) = effect.binding_name() {
-                            !failed_bindings.contains(&binding)
-                        } else {
-                            find_failed_dependency(effect, &failed_bindings).is_none()
-                        }
-                    }
-                } else {
-                    false
-                }
-            })
-            .collect();
+        let phase4_indices: Vec<usize> = sorted_indices.clone();
 
         let deps_of =
             build_phase_dependency_map(effects, &phase4_indices, input.unresolved_resources);
@@ -2091,8 +2080,11 @@ async fn execute_effects_phased(
                         .unwrap_or_else(Instant::now);
 
                     if lifecycle.create_before_destroy {
-                        // CBD finalization: rename
-                        let state = cbd_create_states.remove(&idx).unwrap();
+                        // CBD finalization: skip if create phase failed
+                        let Some(state) = cbd_create_states.remove(&idx) else {
+                            completed_indices.insert(idx);
+                            continue;
+                        };
                         let id = id.clone();
                         let to = to.clone();
                         let temporary_name = temporary_name.clone();
@@ -2188,6 +2180,14 @@ async fn execute_effects_phased(
                             }
                         }));
                     } else {
+                        // Non-CBD: skip if own delete failed
+                        if let Some(binding) = effect.binding_name()
+                            && failed_bindings.contains(&binding)
+                        {
+                            completed_indices.insert(idx);
+                            continue;
+                        }
+
                         // Non-CBD: create new resource
                         in_flight.push(Box::pin(async move {
                             if let Effect::Replace { to, .. } = effect {
