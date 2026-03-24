@@ -2421,4 +2421,100 @@ mod tests {
         assert_eq!(levels[1], vec![1, 2]);
         assert_eq!(levels[2], vec![3]);
     }
+
+    /// Regression test for #1078: route must depend on tgw_attach even when
+    /// resolve_refs_with_state partially resolves `tgw_attach.transit_gateway_id`
+    /// to `ResourceRef { binding: "tgw", attr: "id" }`.
+    ///
+    /// Before the fix, the route and tgw_attach were placed at the same dependency
+    /// level and executed in parallel, causing an AWS API error.
+    #[test]
+    fn test_build_dependency_levels_transitive_ref_preserves_direct_dep() {
+        use crate::plan::Plan;
+
+        // Simulate the resources as they appear in the effects after
+        // resolve_refs_with_state: ResourceRef values are partially resolved,
+        // but _dependency_bindings records the original direct dependencies.
+
+        // tgw_attach depends on tgw, vpc, subnet
+        let mut tgw_attach = Resource::new("ec2.transit_gateway_attachment", "tgw_attach");
+        tgw_attach.attributes.insert(
+            "_binding".to_string(),
+            Value::String("tgw_attach".to_string()),
+        );
+        tgw_attach.attributes.insert(
+            "_dependency_bindings".to_string(),
+            Value::List(vec![
+                Value::String("tgw".to_string()),
+                Value::String("vpc".to_string()),
+                Value::String("subnet".to_string()),
+            ]),
+        );
+
+        // route depends on rt and tgw_attach (but after partial resolution,
+        // transit_gateway_id points to ResourceRef { binding: "tgw" })
+        let mut route = Resource::new("ec2.route", "my-route");
+        route.attributes.insert(
+            "transit_gateway_id".to_string(),
+            Value::ResourceRef {
+                binding_name: "tgw".to_string(),
+                attribute_name: "id".to_string(),
+            },
+        );
+        route.attributes.insert(
+            "_dependency_bindings".to_string(),
+            Value::List(vec![
+                Value::String("rt".to_string()),
+                Value::String("tgw_attach".to_string()),
+            ]),
+        );
+
+        // Other resources
+        let mut vpc = Resource::new("ec2.vpc", "vpc");
+        vpc.attributes
+            .insert("_binding".to_string(), Value::String("vpc".to_string()));
+
+        let mut tgw = Resource::new("ec2.transit_gateway", "tgw");
+        tgw.attributes
+            .insert("_binding".to_string(), Value::String("tgw".to_string()));
+
+        let mut subnet = Resource::new("ec2.subnet", "subnet");
+        subnet
+            .attributes
+            .insert("_binding".to_string(), Value::String("subnet".to_string()));
+        subnet.attributes.insert(
+            "_dependency_bindings".to_string(),
+            Value::List(vec![Value::String("vpc".to_string())]),
+        );
+
+        let mut rt = Resource::new("ec2.route_table", "rt");
+        rt.attributes
+            .insert("_binding".to_string(), Value::String("rt".to_string()));
+        rt.attributes.insert(
+            "_dependency_bindings".to_string(),
+            Value::List(vec![Value::String("vpc".to_string())]),
+        );
+
+        let mut plan = Plan::new();
+        plan.add(Effect::Create(vpc)); // idx 0
+        plan.add(Effect::Create(tgw)); // idx 1
+        plan.add(Effect::Create(subnet)); // idx 2
+        plan.add(Effect::Create(tgw_attach)); // idx 3
+        plan.add(Effect::Create(rt)); // idx 4
+        plan.add(Effect::Create(route)); // idx 5
+
+        let levels = build_dependency_levels(plan.effects(), &HashMap::new());
+
+        // Find the level of tgw_attach (idx 3) and route (idx 5)
+        let tgw_attach_level = levels.iter().position(|group| group.contains(&3)).unwrap();
+        let route_level = levels.iter().position(|group| group.contains(&5)).unwrap();
+
+        assert!(
+            route_level > tgw_attach_level,
+            "route (level {}) must be at a higher level than tgw_attach (level {}). levels: {:?}",
+            route_level,
+            tgw_attach_level,
+            levels
+        );
+    }
 }

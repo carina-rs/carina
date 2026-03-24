@@ -1158,6 +1158,19 @@ fn resolve_forward_ref_in_value(
 /// Resolve resource references in a ParsedFile
 /// This replaces ResourceRef values with the actual attribute values from referenced resources
 pub fn resolve_resource_refs(parsed: &mut ParsedFile) -> Result<(), ParseError> {
+    // Save dependency bindings before resolution may change ResourceRef binding names.
+    // This preserves direct dependencies that would be lost by recursive resolution
+    // (e.g., tgw_attach.transit_gateway_id resolves to tgw.id, losing the tgw_attach dep).
+    for resource in &mut parsed.resources {
+        let deps = crate::deps::get_resource_dependencies(resource);
+        if !deps.is_empty() {
+            let dep_list: Vec<Value> = deps.into_iter().map(Value::String).collect();
+            resource
+                .attributes
+                .insert("_dependency_bindings".to_string(), Value::List(dep_list));
+        }
+    }
+
     // Build a map of binding_name -> attributes for quick lookup
     let mut binding_map: HashMap<String, HashMap<String, Value>> = HashMap::new();
     for resource in &parsed.resources {

@@ -7,20 +7,26 @@ use crate::resource::{Resource, Value};
 
 /// Extract binding names that a resource depends on.
 ///
-/// First checks for `ResourceRef` values in attributes. If none are found,
-/// falls back to `_dependency_bindings` metadata (saved by `resolve_refs_with_state`
-/// before ResourceRef values were resolved to plain strings).
+/// Collects dependencies from two sources and merges them:
+/// 1. `ResourceRef` values found in attributes
+/// 2. `_dependency_bindings` metadata (saved by `resolve_refs_with_state`
+///    before ResourceRef values were resolved to plain strings)
+///
+/// Both sources are always merged because partial resolution can cause
+/// ResourceRef bindings to differ from the original direct dependencies.
 pub fn get_resource_dependencies(resource: &Resource) -> HashSet<String> {
     let mut deps = HashSet::new();
     for value in resource.attributes.values() {
         collect_dependencies(value, &mut deps);
     }
-    // Fall back to pre-computed dependency bindings if no ResourceRef deps found.
-    // This handles the case where resolve_refs_with_state() has already replaced
-    // ResourceRef values with plain strings.
-    if deps.is_empty()
-        && let Some(Value::List(bindings)) = resource.attributes.get("_dependency_bindings")
-    {
+    // Always merge pre-computed dependency bindings.
+    // After resolve_refs_with_state(), some ResourceRef values may have been
+    // partially resolved: e.g., `tgw_attach.transit_gateway_id` becomes
+    // `ResourceRef { binding: "tgw", attr: "id" }` because tgw_attach's
+    // transit_gateway_id is itself `tgw.id`. In this case, collect_dependencies
+    // finds "tgw" but misses "tgw_attach". The _dependency_bindings metadata
+    // (saved before resolution) correctly records the original direct dependency.
+    if let Some(Value::List(bindings)) = resource.attributes.get("_dependency_bindings") {
         for b in bindings {
             if let Value::String(name) = b {
                 deps.insert(name.clone());
@@ -322,6 +328,56 @@ mod tests {
         assert!(deps.contains("b"));
         assert!(deps.contains("c"));
         assert_eq!(deps.len(), 2);
+    }
+
+    /// Regression test for #1078: when resolve_refs_with_state partially resolves
+    /// a transitive reference (e.g., `tgw_attach.transit_gateway_id` resolves to
+    /// `ResourceRef { binding: "tgw", attr: "id" }` because tgw_attach's
+    /// transit_gateway_id is itself `tgw.id`), the resolved resource has a
+    /// ResourceRef pointing to "tgw" instead of "tgw_attach".
+    ///
+    /// `_dependency_bindings` correctly records the original dependency ("tgw_attach"),
+    /// but the fallback only triggers when deps is empty. Since the ResourceRef to
+    /// "tgw" makes deps non-empty, the fallback is skipped, and "tgw_attach" is lost.
+    #[test]
+    fn test_dependency_bindings_merged_when_resourceref_partially_resolved() {
+        let mut resource = Resource::new("ec2.route", "my-route");
+        // After partial resolution: transit_gateway_id resolved to a ResourceRef
+        // pointing at "tgw" (the transitive target), not "tgw_attach" (the direct dep)
+        resource.attributes.insert(
+            "transit_gateway_id".to_string(),
+            Value::ResourceRef {
+                binding_name: "tgw".to_string(),
+                attribute_name: "id".to_string(),
+            },
+        );
+        // route_table_id resolved to a ResourceRef pointing at "rt"
+        resource.attributes.insert(
+            "route_table_id".to_string(),
+            Value::ResourceRef {
+                binding_name: "rt".to_string(),
+                attribute_name: "route_table_id".to_string(),
+            },
+        );
+        // _dependency_bindings was saved before resolution with the CORRECT deps
+        resource.attributes.insert(
+            "_dependency_bindings".to_string(),
+            Value::List(vec![
+                Value::String("rt".to_string()),
+                Value::String("tgw_attach".to_string()),
+            ]),
+        );
+
+        let deps = get_resource_dependencies(&resource);
+        // Must include "tgw_attach" from _dependency_bindings
+        assert!(
+            deps.contains("tgw_attach"),
+            "Expected deps to contain 'tgw_attach' but got: {:?}",
+            deps
+        );
+        // Must also include "rt" and "tgw"
+        assert!(deps.contains("rt"));
+        assert!(deps.contains("tgw"));
     }
 
     #[test]
