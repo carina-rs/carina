@@ -108,11 +108,50 @@ fn format_progress(progress: &ProgressInfo) -> String {
     format!("{}/{}", progress.completed, progress.total)
 }
 
+/// Style for a static waiting indicator (no animation).
+fn waiting_style() -> ProgressStyle {
+    ProgressStyle::with_template("  {msg}").unwrap()
+}
+
 impl ExecutionObserver for CliObserver {
     fn on_event(&self, event: &ExecutionEvent) {
         match event {
+            ExecutionEvent::Waiting {
+                effect,
+                pending_dependencies,
+            } => {
+                let key = format_effect(effect).to_string();
+                let dep_list = pending_dependencies.join(", ");
+                let msg = format!(
+                    "{} {} {}",
+                    "⏳",
+                    format_effect(effect),
+                    format!("[waiting for: {}]", dep_list).dimmed()
+                );
+                let mut spinners = self.spinners.lock().unwrap();
+                if let Some(pb) = spinners.get(&key) {
+                    // Update existing waiting indicator
+                    pb.set_message(msg);
+                } else {
+                    // Create new waiting indicator (static, no animation)
+                    let pb = self.multi.add(ProgressBar::new_spinner());
+                    pb.set_style(waiting_style());
+                    pb.set_message(msg);
+                    spinners.insert(key, pb);
+                }
+            }
             ExecutionEvent::EffectStarted { effect } => {
-                self.start_spinner(format_effect(effect).to_string());
+                let key = format_effect(effect).to_string();
+                let spinners = self.spinners.lock().unwrap();
+                if let Some(pb) = spinners.get(&key) {
+                    // Transition from waiting indicator to spinner
+                    pb.set_style(spinner_style());
+                    pb.set_message(key);
+                    pb.enable_steady_tick(Duration::from_millis(80));
+                } else {
+                    drop(spinners);
+                    self.start_spinner(key);
+                }
             }
             ExecutionEvent::EffectSucceeded {
                 effect,

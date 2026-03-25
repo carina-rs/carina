@@ -422,6 +422,8 @@ async fn run_destroy_locked(
     // Track completed and dispatched indices
     let mut completed_indices: HashSet<usize> = HashSet::new();
     let mut dispatched: HashSet<usize> = HashSet::new();
+    // Track which effects have had a waiting indicator shown
+    let mut waiting_spinners: HashMap<usize, ProgressBar> = HashMap::new();
     let all_indices: Vec<usize> = (0..resources_to_destroy.len()).collect();
 
     // Track retry counts for dependency-violation retries
@@ -448,9 +450,53 @@ async fn run_destroy_locked(
         }
         newly_ready.sort();
 
+        // Show waiting indicators for effects with unmet dependencies
+        for &idx in &all_indices {
+            if dispatched.contains(&idx)
+                || retry_pending.contains(&idx)
+                || newly_ready.contains(&idx)
+            {
+                continue;
+            }
+            let deps = &deletion_deps[&idx];
+            let pending: Vec<String> = deps
+                .iter()
+                .filter(|d| !completed_indices.contains(d))
+                .map(|d| resource_info[*d].0.clone())
+                .collect();
+            if !pending.is_empty() {
+                let (_, _, effect) = &resource_info[idx];
+                let dep_list = pending.join(", ");
+                let msg = format!(
+                    "{} {} {}",
+                    "⏳",
+                    format_effect(effect),
+                    format!("[waiting for: {}]", dep_list).dimmed()
+                );
+                if let Some(pb) = waiting_spinners.get(&idx) {
+                    pb.set_message(msg);
+                } else {
+                    let pb = multi.add(ProgressBar::new_spinner());
+                    pb.set_style(ProgressStyle::with_template("  {msg}").unwrap());
+                    pb.set_message(msg);
+                    waiting_spinners.insert(idx, pb);
+                }
+            }
+        }
+
         // Process newly ready resources
         for idx in newly_ready {
             dispatched.insert(idx);
+
+            // Transition waiting indicator to spinner if it exists
+            if let Some(pb) = waiting_spinners.remove(&idx) {
+                let (_, _, effect) = &resource_info[idx];
+                pb.set_style(spinner_style());
+                pb.set_message(format_effect(effect).to_string());
+                pb.enable_steady_tick(Duration::from_millis(80));
+                spinners.insert(idx, pb);
+            }
+
             let (binding, identifier, effect) = &resource_info[idx];
             let resource = resources_to_destroy[idx];
 
@@ -460,15 +506,19 @@ async fn run_destroy_locked(
             {
                 let c = completed_counter.fetch_add(1, Ordering::Relaxed) + 1;
                 let counter = format!("{}/{}", c, destroy_total).dimmed();
-                multi
-                    .println(format!(
-                        "  {} {} - skipped (dependent {} failed) {}",
-                        "⊘".yellow(),
-                        format_effect(effect),
-                        failed_dep,
-                        counter
-                    ))
-                    .ok();
+                let msg = format!(
+                    "{} {} - skipped (dependent {} failed) {}",
+                    "⊘".yellow(),
+                    format_effect(effect),
+                    failed_dep,
+                    counter
+                );
+                if let Some(pb) = spinners.remove(&idx) {
+                    pb.set_style(ProgressStyle::with_template("  {msg}").unwrap());
+                    pb.finish_with_message(msg);
+                } else {
+                    multi.println(format!("  {}", msg)).ok();
+                }
                 skip_count += 1;
                 failed_bindings.insert(binding.clone());
                 completed_indices.insert(idx);
@@ -556,26 +606,32 @@ async fn run_destroy_locked(
             if wait_failed {
                 let c = completed_counter.fetch_add(1, Ordering::Relaxed) + 1;
                 let counter = format!("{}/{}", c, destroy_total).dimmed();
-                multi
-                    .println(format!(
-                        "  {} {} - skipped (dependent deletion did not complete) {}",
-                        "⊘".yellow(),
-                        format_effect(effect),
-                        counter
-                    ))
-                    .ok();
+                let msg = format!(
+                    "{} {} - skipped (dependent deletion did not complete) {}",
+                    "⊘".yellow(),
+                    format_effect(effect),
+                    counter
+                );
+                if let Some(pb) = spinners.remove(&idx) {
+                    pb.set_style(ProgressStyle::with_template("  {msg}").unwrap());
+                    pb.finish_with_message(msg);
+                } else {
+                    multi.println(format!("  {}", msg)).ok();
+                }
                 skip_count += 1;
                 failed_bindings.insert(binding.clone());
                 completed_indices.insert(idx);
                 continue;
             }
 
-            // Create spinner for this in-flight deletion
-            let pb = multi.add(ProgressBar::new_spinner());
-            pb.set_style(spinner_style());
-            pb.set_message(format_effect(effect).to_string());
-            pb.enable_steady_tick(Duration::from_millis(80));
-            spinners.insert(idx, pb);
+            // Create spinner for this in-flight deletion (reuse if already transitioned from waiting)
+            spinners.entry(idx).or_insert_with(|| {
+                let pb = multi.add(ProgressBar::new_spinner());
+                pb.set_style(spinner_style());
+                pb.set_message(format_effect(effect).to_string());
+                pb.enable_steady_tick(Duration::from_millis(80));
+                pb
+            });
 
             // Spawn the deletion as a concurrent future
             let resource_id = resource.id.clone();

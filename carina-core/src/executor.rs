@@ -48,6 +48,12 @@ pub struct ProgressInfo {
 
 /// Events emitted during plan execution.
 pub enum ExecutionEvent<'a> {
+    /// An effect is waiting for dependencies to complete before it can start.
+    Waiting {
+        effect: &'a Effect,
+        /// Binding names of the dependencies that have not yet completed.
+        pending_dependencies: Vec<String>,
+    },
     EffectStarted {
         effect: &'a Effect,
     },
@@ -533,6 +539,13 @@ async fn execute_effects_sequential(
 
     let deps_of = build_dependency_map(effects, input.unresolved_resources);
 
+    // Build effect index -> binding name mapping for resolving dependency names
+    let idx_to_binding: HashMap<usize, String> = effects
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, effect)| effect.binding_name().map(|b| (idx, b)))
+        .collect();
+
     // Track which effect indices have completed (successfully or not)
     let mut completed_indices: HashSet<usize> = HashSet::new();
     // Track which effect indices have been dispatched (spawned or skipped)
@@ -566,6 +579,26 @@ async fn execute_effects_sequential(
         }
         // Sort for deterministic ordering
         newly_ready.sort();
+
+        // Emit Waiting events for effects that have unmet dependencies
+        for &idx in &actionable_indices {
+            if dispatched.contains(&idx) || newly_ready.contains(&idx) {
+                continue;
+            }
+            let deps = &deps_of[&idx];
+            let pending: Vec<String> = deps
+                .iter()
+                .filter(|d| !completed_indices.contains(d))
+                .filter_map(|d| idx_to_binding.get(d).cloned())
+                .collect();
+            if !pending.is_empty() {
+                // Emit on every iteration to update the pending dependency list
+                observer.on_event(&ExecutionEvent::Waiting {
+                    effect: &effects[idx],
+                    pending_dependencies: pending,
+                });
+            }
+        }
 
         // Process newly ready effects: skip those with failed deps, spawn the rest
         for idx in newly_ready {
@@ -2448,6 +2481,16 @@ mod tests {
     impl ExecutionObserver for MockObserver {
         fn on_event(&self, event: &ExecutionEvent) {
             let msg = match event {
+                ExecutionEvent::Waiting {
+                    effect,
+                    pending_dependencies,
+                } => {
+                    format!(
+                        "waiting:{}:[{}]",
+                        effect.resource_id(),
+                        pending_dependencies.join(",")
+                    )
+                }
                 ExecutionEvent::EffectStarted { effect } => {
                     format!("started:{}", effect.resource_id())
                 }
@@ -3283,6 +3326,62 @@ mod tests {
              C completed at {:?}, B completed at {:?}",
             c_time,
             b_time,
+        );
+    }
+
+    #[tokio::test]
+    async fn test_waiting_events_emitted_for_dependent_effects() {
+        // Setup: A has no deps, C depends on A.
+        // C should get a Waiting event before A completes.
+        let a = make_resource("a", &[]);
+        let c = make_resource("c", &["a"]);
+
+        let mut plan = Plan::new();
+        plan.add(Effect::Create(a));
+        plan.add(Effect::Create(c));
+
+        let input = ExecutionInput {
+            plan: &plan,
+            unresolved_resources: &HashMap::new(),
+            binding_map: HashMap::new(),
+            current_states: HashMap::new(),
+        };
+
+        let observer = MockObserver::new();
+        let provider = MockProvider::new();
+        // Push create results for both resources
+        let a_id = ResourceId::new("test", "a");
+        let c_id = ResourceId::new("test", "c");
+        provider.push_create(Ok(
+            State::existing(a_id, HashMap::new()).with_identifier("id-a")
+        ));
+        provider.push_create(Ok(
+            State::existing(c_id, HashMap::new()).with_identifier("id-c")
+        ));
+        let result = execute_plan(&provider, input, &observer).await;
+
+        assert_eq!(result.success_count, 2);
+
+        let events = observer.events.lock().unwrap();
+        // C should have a waiting event before it starts
+        let waiting_events: Vec<_> = events
+            .iter()
+            .filter(|e| e.starts_with("waiting:"))
+            .collect();
+        assert!(
+            !waiting_events.is_empty(),
+            "Expected at least one waiting event, got events: {:?}",
+            *events
+        );
+        // The waiting event for C should mention dependency "a"
+        let c_waiting = waiting_events
+            .iter()
+            .find(|e| e.contains("test.c"))
+            .expect("Expected a waiting event for resource C");
+        assert!(
+            c_waiting.contains("[a]"),
+            "Waiting event should list 'a' as pending dependency, got: {}",
+            c_waiting
         );
     }
 }
