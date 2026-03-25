@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::time::Duration;
 
 use colored::Colorize;
 use futures::stream::{self, StreamExt};
@@ -11,7 +12,8 @@ use carina_core::module_resolver;
 use carina_core::parser::{ParsedFile, ProviderConfig};
 use carina_core::plan::Plan;
 use carina_core::provider::{
-    self as provider_mod, Provider, ProviderFactory, ProviderNormalizer, ProviderRouter,
+    self as provider_mod, Provider, ProviderError, ProviderFactory, ProviderNormalizer,
+    ProviderRouter,
 };
 use carina_core::resolver::resolve_refs_with_state;
 use carina_core::resource::{Resource, ResourceId, State, Value};
@@ -505,15 +507,14 @@ pub async fn create_plan_from_parsed(
                     .as_ref()
                     .and_then(|sf| sf.get_identifier_for_resource(resource));
                 async move {
-                    let state = provider_ref
-                        .read(&resource.id, identifier.as_deref())
+                    let state = read_with_retry(provider_ref, &resource.id, identifier.as_deref())
                         .await
                         .map_err(AppError::Provider)?;
                     progress.finish();
                     Ok((resource.id.clone(), state))
                 }
             })
-            .buffer_unordered(10)
+            .buffer_unordered(5)
             .collect()
             .await;
         for result in results {
@@ -534,15 +535,15 @@ pub async fn create_plan_from_parsed(
                     .map(|(id, state)| {
                         let progress = RefreshProgress::begin_multi(&multi, &id);
                         async move {
-                            let refreshed = provider_ref
-                                .read(&id, state.identifier.as_deref())
-                                .await
-                                .map_err(AppError::Provider)?;
+                            let refreshed =
+                                read_with_retry(provider_ref, &id, state.identifier.as_deref())
+                                    .await
+                                    .map_err(AppError::Provider)?;
                             progress.finish();
                             Ok((id, refreshed))
                         }
                     })
-                    .buffer_unordered(10)
+                    .buffer_unordered(5)
                     .collect()
                     .await;
             for result in orphan_results {
@@ -639,6 +640,40 @@ pub async fn create_plan_from_parsed(
         sorted_resources,
         current_states,
     })
+}
+
+/// Check whether a `ProviderError` is an AWS throttling error that should be retried.
+fn is_throttling_error(err: &ProviderError) -> bool {
+    let msg = err.to_string();
+    msg.contains("ThrottlingException") || msg.contains("Rate exceeded")
+}
+
+/// Read a resource via the provider with retry and exponential backoff for throttling errors.
+///
+/// Retries up to 3 times with delays of 1s, 2s, 4s when the error looks like an
+/// AWS throttling / rate-limit response.
+pub async fn read_with_retry(
+    provider: &dyn Provider,
+    id: &ResourceId,
+    identifier: Option<&str>,
+) -> Result<State, ProviderError> {
+    let max_retries = 3;
+    for attempt in 0..=max_retries {
+        match provider.read(id, identifier).await {
+            Ok(state) => return Ok(state),
+            Err(e) if attempt < max_retries && is_throttling_error(&e) => {
+                let delay = Duration::from_secs(1 << attempt); // 1s, 2s, 4s
+                eprintln!(
+                    "  Throttled reading {}, retrying in {}s...",
+                    id,
+                    delay.as_secs()
+                );
+                tokio::time::sleep(delay).await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    unreachable!()
 }
 
 /// Convenience wrappers for tests. Each creates a fresh `WiringContext` internally,
