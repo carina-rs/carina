@@ -118,7 +118,7 @@ fn module_parameter_completion_with_directory_module() {
     // Create main.crn with argument parameters
     let module_content = r#"
 arguments {
-vpc: ref(aws.ec2.vpc)
+vpc: aws.ec2.vpc
 cidr_blocks: list(cidr)
 enable_https: bool = true
 }
@@ -509,31 +509,31 @@ security_group_ingress {
 }
 
 #[test]
-fn context_detection_uses_last_ref_on_line() {
+fn context_detection_type_position_in_arguments() {
     let provider = test_provider();
-    let text = r#"value = ref(aws.ec2.vpc) other = ref("#;
+    let text = "arguments {\nvpc: aws.";
     let context = provider.get_completion_context(
         text,
         Position {
-            line: 0,
-            character: text.len() as u32,
+            line: 1,
+            character: 9, // cursor after "vpc: aws."
         },
     );
     assert!(
-        matches!(context, CompletionContext::AfterRefType),
-        "Should detect AfterRefType for the last unclosed ref(), got: {:?}",
+        matches!(context, CompletionContext::InTypePosition),
+        "Should detect InTypePosition for type annotation after colon, got: {:?}",
         context
     );
 }
 
 #[test]
-fn ref_completion_uses_text_edit_to_replace_from_ref_open_paren() {
+fn type_completion_uses_text_edit_to_replace_from_colon() {
     let provider = test_provider();
-    // User has typed "ref(aws." and wants completion for a resource type
-    let doc = create_document("ref(aws.");
+    // User has typed "vpc: aws." inside arguments block
+    let doc = create_document("arguments {\nvpc: aws.");
     let position = Position {
-        line: 0,
-        character: 8, // cursor after "ref(aws."
+        line: 1,
+        character: 9, // cursor after "vpc: aws."
     };
 
     let completions = provider.complete(&doc, position, None);
@@ -542,27 +542,27 @@ fn ref_completion_uses_text_edit_to_replace_from_ref_open_paren() {
     let s3_completion = completions
         .iter()
         .find(|c| c.label == "aws.s3.bucket")
-        .expect("Should have aws.s3.bucket ref completion");
+        .expect("Should have aws.s3.bucket type completion");
 
     // Must use text_edit (not insert_text) to avoid duplication with dotted identifiers
     assert!(
         s3_completion.text_edit.is_some(),
-        "ref() completion should use text_edit to handle dotted identifiers correctly"
+        "Type completion should use text_edit to handle dotted identifiers correctly"
     );
 
-    // The text_edit range should start right after "ref(" (column 4) and end at cursor (column 8)
+    // The text_edit range should start right after "vpc: " (column 5) and end at cursor (column 9)
     if let Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(edit)) = &s3_completion.text_edit {
         assert_eq!(
-            edit.range.start.character, 4,
-            "Should replace from right after 'ref('"
+            edit.range.start.character, 5,
+            "Should replace from right after colon and space"
         );
         assert_eq!(
-            edit.range.end.character, 8,
+            edit.range.end.character, 9,
             "Should replace up to cursor position"
         );
         assert_eq!(
-            edit.new_text, "aws.s3.bucket)",
-            "Insert text should include closing paren"
+            edit.new_text, "aws.s3.bucket",
+            "Insert text should be the resource type"
         );
     } else {
         panic!("Expected CompletionTextEdit::Edit");
@@ -570,13 +570,13 @@ fn ref_completion_uses_text_edit_to_replace_from_ref_open_paren() {
 }
 
 #[test]
-fn ref_completion_with_empty_parens() {
+fn type_completion_with_empty_type() {
     let provider = test_provider();
-    // User has typed "ref(" with nothing after
-    let doc = create_document("ref(");
+    // User has typed "vpc: " inside arguments block
+    let doc = create_document("arguments {\nvpc: ");
     let position = Position {
-        line: 0,
-        character: 4, // cursor right after "ref("
+        line: 1,
+        character: 5, // cursor right after "vpc: "
     };
 
     let completions = provider.complete(&doc, position, None);
@@ -584,20 +584,20 @@ fn ref_completion_with_empty_parens() {
     let s3_completion = completions
         .iter()
         .find(|c| c.label == "aws.s3.bucket")
-        .expect("Should have aws.s3.bucket ref completion");
+        .expect("Should have aws.s3.bucket type completion");
 
     if let Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(edit)) = &s3_completion.text_edit {
         assert_eq!(
-            edit.range.start.character, 4,
-            "Should replace from right after 'ref('"
+            edit.range.start.character, 5,
+            "Should replace from right after colon and space"
         );
         assert_eq!(
-            edit.range.end.character, 4,
+            edit.range.end.character, 5,
             "Should replace up to cursor position"
         );
         assert_eq!(
-            edit.new_text, "aws.s3.bucket)",
-            "Insert text should include closing paren"
+            edit.new_text, "aws.s3.bucket",
+            "Insert text should be the resource type"
         );
     } else {
         panic!("Expected CompletionTextEdit::Edit");

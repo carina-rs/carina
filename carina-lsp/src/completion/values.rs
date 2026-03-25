@@ -372,18 +372,20 @@ impl CompletionProvider {
         position: Position,
         text: &str,
     ) -> Vec<CompletionItem> {
-        // Calculate the replacement range: from right after "ref(" to the cursor position.
+        // Calculate the replacement range: from right after ":" to the cursor position.
         // This ensures dotted identifiers like "aws.ec2.vpc" are replaced correctly
         // without duplication from LSP word-boundary-based insertion.
         let lines: Vec<&str> = text.lines().collect();
         let line_idx = position.line as usize;
         let col = position.character as usize;
 
-        let ref_content_start = if line_idx < lines.len() {
+        let type_start = if line_idx < lines.len() {
             let prefix: String = lines[line_idx].chars().take(col).collect();
-            // Find the last unclosed "ref(" and position right after the "("
-            if let Some(ref_pos) = prefix.rfind("ref(") {
-                (ref_pos + 4) as u32
+            // Find the colon and position right after it (plus any whitespace)
+            if let Some(colon_pos) = prefix.rfind(':') {
+                let after_colon = &prefix[colon_pos + 1..];
+                let whitespace_len = after_colon.len() - after_colon.trim_start().len();
+                (colon_pos + 1 + whitespace_len) as u32
             } else {
                 position.character
             }
@@ -394,7 +396,7 @@ impl CompletionProvider {
         let replacement_range = Range {
             start: Position {
                 line: position.line,
-                character: ref_content_start,
+                character: type_start,
             },
             end: position,
         };
@@ -414,7 +416,7 @@ impl CompletionProvider {
                     detail: Some(format!("{} reference", description)),
                     text_edit: Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(TextEdit {
                         range: replacement_range,
-                        new_text: format!("{})", resource_type),
+                        new_text: resource_type.clone(),
                     })),
                     ..Default::default()
                 }

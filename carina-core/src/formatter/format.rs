@@ -461,7 +461,7 @@ impl Formatter {
     }
 
     fn format_type_expr(&mut self, node: &CstNode) {
-        // Type expressions: ref(aws.vpc), list(cidr), map(string), string, bool, int, cidr
+        // Type expressions: aws.vpc, list(cidr), map(string), string, bool, int, cidr
         for child in &node.children {
             match child {
                 CstChild::Token(token) => {

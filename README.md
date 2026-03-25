@@ -224,13 +224,13 @@ Modules enable reusable infrastructure components with typed inputs and outputs.
 
 ```hcl
 input {
-  vpc: ref(aws.vpc)
+  vpc: aws.vpc
   cidr_blocks: list(cidr)
   enable_https: bool = true
 }
 
 output {
-  security_group: ref(aws.security_group) = web_sg.id
+  security_group: aws.security_group = web_sg.id
 }
 
 let web_sg = aws.security_group {
@@ -264,20 +264,20 @@ Module: web_tier
 
 === REQUIRES ===
 
-  vpc: ref(aws.vpc)  (required)
+  vpc: aws.vpc  (required)
   cidr_blocks: list(cidr)  (required)
   enable_https: bool = true
 
 === CREATES ===
 
-  input { vpc: ref(aws.vpc) }
+  input { vpc: aws.vpc }
     └── web_sg: aws.security_group
        ├── http: aws.security_group.ingress_rule
        └── https: aws.security_group.ingress_rule
 
 === EXPOSES ===
 
-  security_group: ref(aws.security_group)
+  security_group: aws.security_group
     <- from: web_sg
 ```
 

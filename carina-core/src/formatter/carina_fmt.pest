@@ -62,7 +62,7 @@ attributes_param = {
     identifier ~ trivia* ~ colon ~ trivia* ~ type_expr ~ trivia* ~ equals ~ trivia* ~ expression
 }
 
-// Type expression: string, bool, int, cidr, list(type), map(type), ref(aws.resource)
+// Type expression: string, bool, int, cidr, list(type), map(type), aws.resource (resource ref)
 type_expr = {
     type_ref | type_list | type_map | type_primitive
 }
@@ -73,7 +73,7 @@ type_list = { kw_list ~ trivia* ~ open_paren ~ trivia* ~ type_expr ~ trivia* ~ c
 
 type_map = { kw_map ~ trivia* ~ open_paren ~ trivia* ~ type_expr ~ trivia* ~ close_paren }
 
-type_ref = { kw_ref ~ trivia* ~ open_paren ~ trivia* ~ namespaced_id ~ trivia* ~ close_paren }
+type_ref = { namespaced_id }
 
 // Variable/resource definition: let name = value
 let_binding = {
@@ -175,6 +175,5 @@ kw_as = { "as" }
 kw_let = { "let" }
 kw_arguments = { "arguments" }
 kw_attributes = { "attributes" }
-kw_ref = { "ref" }
 kw_list = { "list" }
 kw_map = { "map" }

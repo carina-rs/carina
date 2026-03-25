@@ -87,7 +87,7 @@ pub enum TypeExpr {
     Cidr,
     List(Box<TypeExpr>),
     Map(Box<TypeExpr>),
-    /// Reference to a resource type (e.g., ref(aws.vpc))
+    /// Reference to a resource type (e.g., aws.vpc)
     Ref(ResourceTypePath),
 }
 
@@ -101,7 +101,7 @@ impl std::fmt::Display for TypeExpr {
             TypeExpr::Cidr => write!(f, "cidr"),
             TypeExpr::List(inner) => write!(f, "list({})", inner),
             TypeExpr::Map(inner) => write!(f, "map({})", inner),
-            TypeExpr::Ref(path) => write!(f, "ref({})", path),
+            TypeExpr::Ref(path) => write!(f, "{}", path),
         }
     }
 }
@@ -460,7 +460,7 @@ fn parse_type_expr(pair: pest::iterators::Pair<Rule>) -> Result<TypeExpr, ParseE
             }
         }
         Rule::type_ref => {
-            // Parse ref(resource_type_path)
+            // Parse resource_type_path directly (e.g., aws.vpc)
             let mut ref_inner = inner.into_inner();
             let path_str = next_pair(&mut ref_inner, "resource type path", "type ref")?.as_str();
             let path = ResourceTypePath::parse(path_str).ok_or_else(|| {
@@ -1769,12 +1769,12 @@ mod tests {
     fn parse_ref_type_expression() {
         let input = r#"
             arguments {
-                vpc: ref(aws.vpc)
+                vpc: aws.vpc
                 enable_https: bool = true
             }
 
             attributes {
-                security_group_id: ref(aws.security_group) = web_sg.id
+                security_group_id: aws.security_group = web_sg.id
             }
 
             let web_sg = aws.security_group {
@@ -1805,8 +1805,8 @@ mod tests {
     fn parse_ref_type_with_nested_resource_type() {
         let input = r#"
             arguments {
-                sg: ref(aws.security_group)
-                rule: ref(aws.security_group.ingress_rule)
+                sg: aws.security_group
+                rule: aws.security_group.ingress_rule
             }
 
             attributes {
@@ -1865,7 +1865,7 @@ mod tests {
         );
         assert_eq!(
             TypeExpr::Ref(ResourceTypePath::new("aws", "vpc")).to_string(),
-            "ref(aws.vpc)"
+            "aws.vpc"
         );
     }
 

@@ -156,7 +156,6 @@ impl<'a> CstBuilder<'a> {
             Rule::kw_attributes => {
                 Some(CstChild::Token(Token::new("attributes".to_string(), span)))
             }
-            Rule::kw_ref => Some(CstChild::Token(Token::new("ref".to_string(), span))),
             Rule::kw_list => Some(CstChild::Token(Token::new("list".to_string(), span))),
             Rule::kw_map => Some(CstChild::Token(Token::new("map".to_string(), span))),
 
