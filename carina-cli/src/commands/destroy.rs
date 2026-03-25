@@ -414,6 +414,10 @@ async fn run_destroy_locked(
     let mut dispatched: HashSet<usize> = HashSet::new();
     let all_indices: Vec<usize> = (0..resources_to_destroy.len()).collect();
 
+    // Track retry counts for dependency-violation retries
+    let max_retries: usize = 3;
+    let mut retry_counts: HashMap<usize, usize> = HashMap::new();
+
     let mut in_flight = FuturesUnordered::new();
 
     loop {
@@ -559,21 +563,44 @@ async fn run_destroy_locked(
             });
         }
 
-        // If nothing is in flight, we're done (or stuck in a cycle)
+        // If nothing is in flight, we're done (or stuck)
         if in_flight.is_empty() {
-            let remaining = all_indices
+            let remaining: Vec<usize> = all_indices
                 .iter()
-                .filter(|idx| !dispatched.contains(idx))
-                .count();
-            if remaining > 0 {
-                // Cycle detected: skip remaining
-                for &idx in &all_indices {
-                    if !dispatched.contains(&idx) {
-                        dispatched.insert(idx);
-                        completed_indices.insert(idx);
-                        failure_count += 1;
-                    }
+                .filter(|idx| !dispatched.contains(idx) && !completed_indices.contains(idx))
+                .copied()
+                .collect();
+            if remaining.is_empty() {
+                break;
+            }
+            // Check if all remaining are retry-pending items (deadlock: no
+            // progress possible because every pending item needs something
+            // else to complete first, but nothing else is running).
+            let all_retried = remaining.iter().all(|idx| retry_counts.contains_key(idx));
+            if all_retried {
+                for &idx in &remaining {
+                    let (_, _, effect) = &resource_info[idx];
+                    let c = completed_counter.fetch_add(1, Ordering::Relaxed) + 1;
+                    let counter = format!("{}/{}", c, destroy_total).dimmed();
+                    println!(
+                        "  {} {} - retries exhausted (no progress possible) {}",
+                        "✗".red(),
+                        format_effect(effect),
+                        counter
+                    );
+                    let binding = &resource_info[idx].0;
+                    failed_bindings.insert(binding.clone());
+                    dispatched.insert(idx);
+                    completed_indices.insert(idx);
+                    failure_count += 1;
                 }
+                break;
+            }
+            // Non-retry cycle: skip remaining
+            for &idx in &remaining {
+                dispatched.insert(idx);
+                completed_indices.insert(idx);
+                failure_count += 1;
             }
             break;
         }
@@ -609,17 +636,42 @@ async fn run_destroy_locked(
                 timed_out_resources.insert(binding.clone(), (resource_id, identifier));
             }
             Err(e) => {
-                let timing = format!("[{}]", format_duration(started.elapsed())).dimmed();
-                println!(
-                    "  {} {} {} {}",
-                    "✗".red(),
-                    format_effect(effect),
-                    timing,
-                    counter
-                );
-                println!("      {} {}", "→".red(), e.to_string().red());
-                failure_count += 1;
-                failed_bindings.insert(binding.clone());
+                let retries = retry_counts.get(&finished_idx).copied().unwrap_or(0);
+                let has_pending_or_in_flight = !in_flight.is_empty()
+                    || all_indices
+                        .iter()
+                        .any(|idx| !dispatched.contains(idx) && !completed_indices.contains(idx));
+                if is_retryable_delete_error(&e)
+                    && retries < max_retries
+                    && has_pending_or_in_flight
+                {
+                    // Put back as pending for retry after other deletions complete
+                    *retry_counts.entry(finished_idx).or_insert(0) += 1;
+                    completed_indices.remove(&finished_idx);
+                    dispatched.remove(&finished_idx);
+                    // Undo the counter increment since this isn't truly completed
+                    completed_counter.fetch_sub(1, Ordering::Relaxed);
+                    let retry_num = retry_counts[&finished_idx];
+                    println!(
+                        "  {} {} - dependency violation, will retry ({}/{})",
+                        "↻".yellow(),
+                        format_effect(effect),
+                        retry_num,
+                        max_retries
+                    );
+                } else {
+                    let timing = format!("[{}]", format_duration(started.elapsed())).dimmed();
+                    println!(
+                        "  {} {} {} {}",
+                        "✗".red(),
+                        format_effect(effect),
+                        timing,
+                        counter
+                    );
+                    println!("      {} {}", "→".red(), e.to_string().red());
+                    failure_count += 1;
+                    failed_bindings.insert(binding.clone());
+                }
             }
         }
     }
@@ -747,6 +799,26 @@ fn build_orphan_resource(sf: &carina_state::StateFile, id: &ResourceId) -> Resou
     }
 }
 
+/// Check if a delete error is retryable due to implicit dependency ordering.
+///
+/// Some AWS errors indicate that a resource cannot be deleted yet because
+/// another resource still depends on it, even though there is no explicit
+/// ResourceRef dependency. These errors are retryable: once the blocker is
+/// deleted, the retry will succeed.
+fn is_retryable_delete_error(e: &carina_core::provider::ProviderError) -> bool {
+    if e.is_timeout {
+        return false;
+    }
+    let msg = e.to_string();
+    let retryable_patterns = [
+        "DependencyViolation",
+        "has dependent object",
+        "has a dependent object",
+        "resource has dependencies",
+    ];
+    retryable_patterns.iter().any(|p| msg.contains(p))
+}
+
 /// Result of waiting for a resource deletion to complete.
 #[derive(Debug, PartialEq)]
 enum WaitResult {
@@ -854,6 +926,32 @@ mod tests {
         ) -> BoxFuture<'_, ProviderResult<()>> {
             Box::pin(async { unreachable!() })
         }
+    }
+
+    #[test]
+    fn is_retryable_detects_dependency_violation() {
+        let err = ProviderError::new(
+            "DependencyViolation: Network vpc-xxx has some mapped public address(es)",
+        );
+        assert!(is_retryable_delete_error(&err));
+    }
+
+    #[test]
+    fn is_retryable_detects_has_dependent_object() {
+        let err = ProviderError::new("resource has a dependent object");
+        assert!(is_retryable_delete_error(&err));
+    }
+
+    #[test]
+    fn is_retryable_returns_false_for_generic_error() {
+        let err = ProviderError::new("AccessDenied: not authorized");
+        assert!(!is_retryable_delete_error(&err));
+    }
+
+    #[test]
+    fn is_retryable_returns_false_for_timeout() {
+        let err = ProviderError::new("DependencyViolation: something").timeout();
+        assert!(!is_retryable_delete_error(&err));
     }
 
     #[tokio::test]
