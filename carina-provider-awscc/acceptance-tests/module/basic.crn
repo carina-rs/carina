@@ -1,0 +1,15 @@
+# Module - Basic test
+#
+# Tests: module import, argument passing, intra-module resource references
+
+provider awscc {
+  region = awscc.Region.ap_northeast_1
+}
+
+import "./modules/network" as network
+
+network {
+  cidr_block  = "10.0.0.0/16"
+  subnet_cidr = "10.0.1.0/24"
+  az          = "ap-northeast-1a"
+}

@@ -42,7 +42,7 @@ for dir in "${DIRS[@]}"; do
             echo ""
             FAILED=$((FAILED + 1))
         fi
-    done < <(find "$dir" -name '*.crn' -print0)
+    done < <(find "$dir" -name '*.crn' -not -path '*/modules/*' -print0)
 done
 
 echo ""
