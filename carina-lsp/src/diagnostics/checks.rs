@@ -462,7 +462,7 @@ impl DiagnosticEngine {
         &self,
         type_expr: &TypeExpr,
         value: &Value,
-        output_name: &str,
+        attr_name: &str,
     ) -> Option<String> {
         match (type_expr, value) {
             // ResourceRef is always allowed (type is resolved at runtime)
@@ -470,42 +470,42 @@ impl DiagnosticEngine {
             // String type checks
             (TypeExpr::String, Value::Bool(b)) => Some(format!(
                 "Type mismatch in attributes '{}': expected string, got bool ({})",
-                output_name, b
+                attr_name, b
             )),
             (TypeExpr::String, Value::Int(n)) => Some(format!(
                 "Type mismatch in attributes '{}': expected string, got int ({})",
-                output_name, n
+                attr_name, n
             )),
             (TypeExpr::String, Value::Float(f)) => Some(format!(
                 "Type mismatch in attributes '{}': expected string, got float ({})",
-                output_name, f
+                attr_name, f
             )),
             // Bool type checks
             (TypeExpr::Bool, Value::String(s)) => Some(format!(
                 "Type mismatch in attributes '{}': expected bool, got string \"{}\". Use true or false.",
-                output_name, s
+                attr_name, s
             )),
             (TypeExpr::Bool, Value::Int(n)) => Some(format!(
                 "Type mismatch in attributes '{}': expected bool, got int ({})",
-                output_name, n
+                attr_name, n
             )),
             // Int type checks
             (TypeExpr::Int, Value::String(s)) => Some(format!(
                 "Type mismatch in attributes '{}': expected int, got string \"{}\"",
-                output_name, s
+                attr_name, s
             )),
             (TypeExpr::Int, Value::Bool(b)) => Some(format!(
                 "Type mismatch in attributes '{}': expected int, got bool ({})",
-                output_name, b
+                attr_name, b
             )),
             // Float type checks
             (TypeExpr::Float, Value::String(s)) => Some(format!(
                 "Type mismatch in attributes '{}': expected float, got string \"{}\"",
-                output_name, s
+                attr_name, s
             )),
             (TypeExpr::Float, Value::Bool(b)) => Some(format!(
                 "Type mismatch in attributes '{}': expected float, got bool ({})",
-                output_name, b
+                attr_name, b
             )),
             _ => None,
         }

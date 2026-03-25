@@ -966,13 +966,13 @@ impl ModuleSignature {
         if self.exposes.is_empty() {
             output.push_str(&format!("  {}(none){}\n", c.dim, c.reset));
         } else {
-            for output_param in &self.exposes {
-                let type_str = self.format_type_expr(&output_param.type_expr, &c);
+            for attr_param in &self.exposes {
+                let type_str = self.format_type_expr(&attr_param.type_expr, &c);
                 output.push_str(&format!(
                     "  {}{}{}: {}\n",
-                    c.white, output_param.name, c.reset, type_str
+                    c.white, attr_param.name, c.reset, type_str
                 ));
-                if let Some(source) = &output_param.source_binding {
+                if let Some(source) = &attr_param.source_binding {
                     output.push_str(&format!(
                         "    {}<- from:{} {}{}{}\n",
                         c.dim, c.reset, c.cyan, source, c.reset

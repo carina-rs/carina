@@ -283,8 +283,8 @@ impl CompletionProvider {
         let mut completions = Vec::new();
 
         // Extract argument parameters from text (works even with incomplete code)
-        let input_params = self.extract_argument_parameters(text);
-        for (name, type_hint) in input_params {
+        let argument_params = self.extract_argument_parameters(text);
+        for (name, type_hint) in argument_params {
             let required_marker = if type_hint.contains('=') {
                 ""
             } else {
