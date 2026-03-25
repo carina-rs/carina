@@ -59,6 +59,47 @@ pub(crate) fn spinner_style() -> ProgressStyle {
         .tick_strings(SPINNER_FRAMES)
 }
 
+/// Spinner for tracking state refresh progress per resource.
+///
+/// Shows a spinner while each resource is being read, then displays timing
+/// when done. Uses `indicatif` for animated terminal output.
+pub(crate) struct RefreshProgress {
+    pb: ProgressBar,
+    start: std::time::Instant,
+}
+
+impl RefreshProgress {
+    /// Print the "Refreshing state..." header and prepare for per-resource spinners.
+    pub fn start_header() {
+        println!("{}", "Refreshing state...".cyan());
+    }
+
+    /// Begin tracking a resource read. Shows a spinner with the resource ID.
+    pub fn begin(id: &ResourceId) -> Self {
+        let pb = ProgressBar::new_spinner();
+        if !std::io::stdout().is_terminal() {
+            pb.set_draw_target(indicatif::ProgressDrawTarget::hidden());
+        }
+        pb.set_style(spinner_style());
+        pb.set_message(format!("{}", id));
+        pb.enable_steady_tick(Duration::from_millis(80));
+        Self {
+            pb,
+            start: std::time::Instant::now(),
+        }
+    }
+
+    /// Finish the spinner with a success checkmark and elapsed time.
+    pub fn finish(self) {
+        let elapsed = self.start.elapsed();
+        let timing = format!("[{}]", format_duration(elapsed)).dimmed();
+        let msg = format!("{} {} {}", "✓".green(), self.pb.message(), timing);
+        self.pb
+            .set_style(ProgressStyle::with_template("  {msg}").unwrap());
+        self.pb.finish_with_message(msg);
+    }
+}
+
 /// CLI observer that prints colored progress output using `indicatif`.
 ///
 /// Uses dynamic display: resources appear only when they start executing or
@@ -828,8 +869,10 @@ async fn run_apply_locked(
 
     // Read states for all resources using identifier from state
     // In identifier-based approach, if there's no identifier in state, the resource doesn't exist
+    RefreshProgress::start_header();
     let mut current_states: HashMap<ResourceId, State> = HashMap::new();
     for resource in &sorted_resources {
+        let progress = RefreshProgress::begin(&resource.id);
         let identifier = state_file
             .as_ref()
             .and_then(|sf| sf.get_identifier_for_resource(resource));
@@ -837,6 +880,7 @@ async fn run_apply_locked(
             .read(&resource.id, identifier.as_deref())
             .await
             .map_err(AppError::Provider)?;
+        progress.finish();
         current_states.insert(resource.id.clone(), state);
     }
 

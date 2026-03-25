@@ -24,7 +24,9 @@ use carina_state::{
 
 use super::validate_and_resolve;
 use crate::DetailLevel;
-use crate::commands::apply::{apply_name_overrides, format_duration, spinner_style};
+use crate::commands::apply::{
+    RefreshProgress, apply_name_overrides, format_duration, spinner_style,
+};
 use crate::commands::state::map_lock_error;
 use crate::display::{format_destroy_plan, format_effect};
 use crate::error::AppError;
@@ -149,12 +151,15 @@ async fn run_destroy_locked(
     let mut current_states: HashMap<ResourceId, State> = HashMap::new();
 
     if refresh {
+        RefreshProgress::start_header();
+
         // Read states for managed resources using identifier from state
         // Skip data sources (read-only) -- they won't be destroyed
         for resource in &all_resources {
             if resource.read_only {
                 continue;
             }
+            let progress = RefreshProgress::begin(&resource.id);
             let identifier = state_file
                 .as_ref()
                 .and_then(|sf| sf.get_identifier_for_resource(resource));
@@ -162,6 +167,7 @@ async fn run_destroy_locked(
                 .read(&resource.id, identifier.as_deref())
                 .await
                 .map_err(AppError::Provider)?;
+            progress.finish();
             current_states.insert(resource.id.clone(), state);
         }
 
@@ -171,10 +177,12 @@ async fn run_destroy_locked(
             let desired_ids: HashSet<ResourceId> =
                 all_resources.iter().map(|r| r.id.clone()).collect();
             for (id, state) in sf.build_orphan_states(&desired_ids) {
+                let progress = RefreshProgress::begin(&id);
                 let refreshed = provider
                     .read(&id, state.identifier.as_deref())
                     .await
                     .map_err(AppError::Provider)?;
+                progress.finish();
                 if refreshed.exists {
                     current_states.insert(id.clone(), refreshed);
                     let orphan_resource = build_orphan_resource(sf, &id);

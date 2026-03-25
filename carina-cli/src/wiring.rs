@@ -22,6 +22,7 @@ use carina_provider_awscc::AwsccProviderFactory;
 use carina_provider_mock::MockProvider;
 use carina_state::StateFile;
 
+use crate::commands::apply::RefreshProgress;
 use crate::error::AppError;
 
 /// Result of creating a plan, with context needed for saving
@@ -490,9 +491,12 @@ pub async fn create_plan_from_parsed(
     let mut current_states: HashMap<ResourceId, State> = HashMap::new();
 
     if refresh {
+        RefreshProgress::start_header();
+
         // Read states for all resources using identifier from state
         // In identifier-based approach, if there's no identifier in state, the resource doesn't exist
         for resource in &sorted_resources {
+            let progress = RefreshProgress::begin(&resource.id);
             let identifier = state_file
                 .as_ref()
                 .and_then(|sf| sf.get_identifier_for_resource(resource));
@@ -500,6 +504,7 @@ pub async fn create_plan_from_parsed(
                 .read(&resource.id, identifier.as_deref())
                 .await
                 .map_err(AppError::Provider)?;
+            progress.finish();
             current_states.insert(resource.id.clone(), state);
         }
 
@@ -510,10 +515,12 @@ pub async fn create_plan_from_parsed(
             let desired_ids: HashSet<ResourceId> =
                 sorted_resources.iter().map(|r| r.id.clone()).collect();
             for (id, state) in sf.build_orphan_states(&desired_ids) {
+                let progress = RefreshProgress::begin(&id);
                 let refreshed = provider
                     .read(&id, state.identifier.as_deref())
                     .await
                     .map_err(AppError::Provider)?;
+                progress.finish();
                 if refreshed.exists {
                     current_states.entry(id).or_insert(refreshed);
                 }
