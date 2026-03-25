@@ -271,6 +271,8 @@ fn build_create_rows(
         }
         if is_list_of_maps(value) {
             rows.push(build_list_of_maps_row(key, value));
+        } else if let Value::Map(map) = value {
+            rows.push(build_expanded_map_row(key, map));
         } else {
             let ref_binding = match value {
                 Value::ResourceRef { binding_name, .. } => Some(binding_name.clone()),
@@ -307,6 +309,24 @@ fn build_create_rows(
     }
 
     rows
+}
+
+/// Build a `DetailRow::MapExpanded` for a map attribute (no annotations).
+fn build_expanded_map_row(key: &str, map: &HashMap<String, Value>) -> DetailRow {
+    let mut keys: Vec<_> = map.keys().collect();
+    keys.sort();
+    let entries = keys
+        .into_iter()
+        .map(|k| MapExpandedEntry {
+            key: k.clone(),
+            value: format_value_with_key(&map[k], Some(k)),
+            annotation: None,
+        })
+        .collect();
+    DetailRow::MapExpanded {
+        key: key.to_string(),
+        entries,
+    }
 }
 
 /// Build a `DetailRow::MapExpanded` for tags with `default_tags` annotations.
@@ -598,16 +618,20 @@ fn build_delete_rows(
         keys.sort();
         for key in keys {
             let value = &attrs[key];
-            let ref_binding = match value {
-                Value::ResourceRef { binding_name, .. } => Some(binding_name.clone()),
-                _ => None,
-            };
-            rows.push(DetailRow::Attribute {
-                key: key.to_string(),
-                value: format_value_with_key(value, Some(key)),
-                ref_binding,
-                annotation: None,
-            });
+            if let Value::Map(map) = value {
+                rows.push(build_expanded_map_row(key, map));
+            } else {
+                let ref_binding = match value {
+                    Value::ResourceRef { binding_name, .. } => Some(binding_name.clone()),
+                    _ => None,
+                };
+                rows.push(DetailRow::Attribute {
+                    key: key.to_string(),
+                    value: format_value_with_key(value, Some(key)),
+                    ref_binding,
+                    annotation: None,
+                });
+            }
         }
     }
 
@@ -1000,6 +1024,63 @@ mod tests {
         let rows = build_detail_rows(&effect, None, DetailLevel::Explicit, None);
         assert_eq!(rows.len(), 1);
         assert!(matches!(&rows[0], DetailRow::Removed { key, .. } if key == "removed_attr"));
+    }
+
+    #[test]
+    fn test_create_map_expanded() {
+        let mut tags = HashMap::new();
+        tags.insert("Name".to_string(), Value::String("test".to_string()));
+        tags.insert("Environment".to_string(), Value::String("prod".to_string()));
+        let resource =
+            Resource::new("s3.bucket", "my-bucket").with_attribute("tags", Value::Map(tags));
+        let effect = Effect::Create(resource);
+        let rows = build_detail_rows(&effect, None, DetailLevel::Explicit, None);
+        assert_eq!(rows.len(), 1);
+        match &rows[0] {
+            DetailRow::MapExpanded { key, entries } => {
+                assert_eq!(key, "tags");
+                assert_eq!(entries.len(), 2);
+                assert_eq!(entries[0].key, "Environment");
+                assert_eq!(entries[0].value, "\"prod\"");
+                assert!(entries[0].annotation.is_none());
+                assert_eq!(entries[1].key, "Name");
+                assert_eq!(entries[1].value, "\"test\"");
+                assert!(entries[1].annotation.is_none());
+            }
+            other => panic!("expected MapExpanded, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_delete_map_expanded() {
+        let id = ResourceId::new("s3.bucket", "old-bucket");
+        let effect = Effect::Delete {
+            id: id.clone(),
+            identifier: "old-bucket".to_string(),
+            lifecycle: crate::resource::LifecycleConfig::default(),
+            binding: None,
+            dependencies: HashSet::new(),
+        };
+        let mut tags = HashMap::new();
+        tags.insert("Name".to_string(), Value::String("test".to_string()));
+        let mut delete_attrs: HashMap<ResourceId, HashMap<String, Value>> = HashMap::new();
+        delete_attrs.insert(
+            id.clone(),
+            [("tags".to_string(), Value::Map(tags))]
+                .into_iter()
+                .collect(),
+        );
+        let rows = build_detail_rows(&effect, None, DetailLevel::Full, Some(&delete_attrs));
+        assert_eq!(rows.len(), 1);
+        match &rows[0] {
+            DetailRow::MapExpanded { key, entries } => {
+                assert_eq!(key, "tags");
+                assert_eq!(entries.len(), 1);
+                assert_eq!(entries[0].key, "Name");
+                assert_eq!(entries[0].value, "\"test\"");
+            }
+            other => panic!("expected MapExpanded, got {:?}", other),
+        }
     }
 
     #[test]

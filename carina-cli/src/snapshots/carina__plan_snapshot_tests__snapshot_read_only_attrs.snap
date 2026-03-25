@@ -6,7 +6,8 @@ Execution Plan:
 
   + awscc.ec2.vpc vpc
       cidr_block: "10.0.0.0/16"
-      tags: {Name: "read-only-test"}
+      tags:
+        Name: "read-only-test"
       cidr_block_associations: (known after apply)
       default_network_acl: (known after apply)
       default_security_group: (known after apply)

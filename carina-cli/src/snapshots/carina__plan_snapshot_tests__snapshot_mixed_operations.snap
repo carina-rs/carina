@@ -11,7 +11,8 @@ Execution Plan:
         │
         ├─ + awscc.ec2.security_group ec2_security_group_712c54ef
         │     group_description: "Test security group"
-        │     tags: {Name: "test-sg"}
+        │     tags:
+        │       Name: "test-sg"
         │     vpc_id: "vpc-0123456789abcdef0"
         │     group_id: (known after apply)
         │     id: (known after apply)
