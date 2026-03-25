@@ -64,10 +64,8 @@ pub(crate) fn spinner_style() -> ProgressStyle {
 /// Spinner for tracking state refresh progress per resource.
 ///
 /// Shows a spinner while each resource is being read, then displays timing
-/// when done. Uses `indicatif` for animated terminal output.
-///
-/// Supports both standalone mode (single spinner) and grouped mode
-/// (multiple concurrent spinners under a shared `MultiProgress`).
+/// when done. Uses `indicatif` for animated terminal output with a shared
+/// `MultiProgress` to support concurrent spinners.
 pub(crate) struct RefreshProgress {
     pb: ProgressBar,
     start: std::time::Instant,
