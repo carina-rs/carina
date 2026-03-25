@@ -4,7 +4,7 @@ expression: display
 ---
 Module: module_info
 
-=== REQUIRES ===
+=== ARGUMENTS ===
 
   vpc_id: ref(awscc.ec2.vpc)  (required)
   environment: string  (required)
@@ -17,7 +17,7 @@ Module: module_info
     └── web_sg: awscc.ec2.security_group
        └── web_instance: awscc.ec2.instance
 
-=== EXPOSES ===
+=== ATTRIBUTES ===
 
   security_group_id: ref(awscc.ec2.security_group)
     <- from: web_sg

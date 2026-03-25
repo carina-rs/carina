@@ -900,8 +900,8 @@ impl ModuleSignature {
             c.bold, c.reset, c.cyan, self.name, c.reset
         ));
 
-        // REQUIRES section
-        output.push_str(&format!("{}=== REQUIRES ==={}\n\n", c.bold, c.reset));
+        // ARGUMENTS section
+        output.push_str(&format!("{}=== ARGUMENTS ==={}\n\n", c.bold, c.reset));
         if self.requires.is_empty() {
             output.push_str(&format!("  {}(none){}\n", c.dim, c.reset));
         } else {
@@ -961,8 +961,8 @@ impl ModuleSignature {
         }
         output.push('\n');
 
-        // EXPOSES section
-        output.push_str(&format!("{}=== EXPOSES ==={}\n\n", c.bold, c.reset));
+        // ATTRIBUTES section
+        output.push_str(&format!("{}=== ATTRIBUTES ==={}\n\n", c.bold, c.reset));
         if self.exposes.is_empty() {
             output.push_str(&format!("  {}(none){}\n", c.dim, c.reset));
         } else {
@@ -1247,9 +1247,9 @@ mod tests {
 
         // Check sections are present
         assert!(display.contains("Module: web_tier"));
-        assert!(display.contains("=== REQUIRES ==="));
+        assert!(display.contains("=== ARGUMENTS ==="));
         assert!(display.contains("=== CREATES ==="));
-        assert!(display.contains("=== EXPOSES ==="));
+        assert!(display.contains("=== ATTRIBUTES ==="));
 
         // Check ref types are displayed correctly
         assert!(display.contains("ref(aws.vpc)"));
