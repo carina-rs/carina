@@ -8,6 +8,8 @@ use std::time::Duration;
 use colored::Colorize;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 
+use futures::stream::{self, StreamExt};
+
 use carina_core::config_loader::{get_base_dir, load_configuration};
 use carina_core::deps::sort_resources_by_dependencies;
 use carina_core::differ::{cascade_dependent_updates, create_plan};
@@ -62,7 +64,8 @@ pub(crate) fn spinner_style() -> ProgressStyle {
 /// Spinner for tracking state refresh progress per resource.
 ///
 /// Shows a spinner while each resource is being read, then displays timing
-/// when done. Uses `indicatif` for animated terminal output.
+/// when done. Uses `indicatif` for animated terminal output with a shared
+/// `MultiProgress` to support concurrent spinners.
 pub(crate) struct RefreshProgress {
     pb: ProgressBar,
     start: std::time::Instant,
@@ -74,12 +77,9 @@ impl RefreshProgress {
         println!("{}", "Refreshing state...".cyan());
     }
 
-    /// Begin tracking a resource read. Shows a spinner with the resource ID.
-    pub fn begin(id: &ResourceId) -> Self {
-        let pb = ProgressBar::new_spinner();
-        if !std::io::stdout().is_terminal() {
-            pb.set_draw_target(indicatif::ProgressDrawTarget::hidden());
-        }
+    /// Begin tracking a resource read under a shared `MultiProgress`.
+    pub fn begin_multi(multi: &MultiProgress, id: &ResourceId) -> Self {
+        let pb = multi.add(ProgressBar::new_spinner());
         pb.set_style(spinner_style());
         pb.set_message(format!("{}", id));
         pb.enable_steady_tick(Duration::from_millis(80));
@@ -98,6 +98,17 @@ impl RefreshProgress {
             .set_style(ProgressStyle::with_template("  {msg}").unwrap());
         self.pb.finish_with_message(msg);
     }
+}
+
+/// Create a `MultiProgress` for concurrent refresh spinners.
+///
+/// Hides the draw target when stdout is not a terminal (e.g., in CI).
+pub(crate) fn refresh_multi_progress() -> MultiProgress {
+    let multi = MultiProgress::new();
+    if !std::io::stdout().is_terminal() {
+        multi.set_draw_target(indicatif::ProgressDrawTarget::hidden());
+    }
+    multi
 }
 
 /// CLI observer that prints colored progress output using `indicatif`.
@@ -870,22 +881,38 @@ async fn run_apply_locked(
     // Read states for all resources using identifier from state
     // In identifier-based approach, if there's no identifier in state, the resource doesn't exist
     RefreshProgress::start_header();
-    let mut current_states: HashMap<ResourceId, State> = HashMap::new();
-    for resource in &sorted_resources {
-        let progress = RefreshProgress::begin(&resource.id);
-        let identifier = state_file
-            .as_ref()
-            .and_then(|sf| sf.get_identifier_for_resource(resource));
-        let state = provider
-            .read(&resource.id, identifier.as_deref())
-            .await
-            .map_err(AppError::Provider)?;
-        progress.finish();
-        current_states.insert(resource.id.clone(), state);
-    }
+    let multi = refresh_multi_progress();
+    let current_states: HashMap<ResourceId, State> = {
+        let provider_ref = &provider;
+        let results: Vec<Result<(ResourceId, State), AppError>> = stream::iter(&sorted_resources)
+            .map(|resource| {
+                let progress = RefreshProgress::begin_multi(&multi, &resource.id);
+                let identifier = state_file
+                    .as_ref()
+                    .and_then(|sf| sf.get_identifier_for_resource(resource));
+                async move {
+                    let state = provider_ref
+                        .read(&resource.id, identifier.as_deref())
+                        .await
+                        .map_err(AppError::Provider)?;
+                    progress.finish();
+                    Ok((resource.id.clone(), state))
+                }
+            })
+            .buffer_unordered(10)
+            .collect()
+            .await;
+        let mut states = HashMap::new();
+        for result in results {
+            let (id, state) = result?;
+            states.insert(id, state);
+        }
+        states
+    };
 
     // Seed current_states with orphaned resources from state file (#844).
     // These are resources tracked in state but removed from the .crn config.
+    let mut current_states = current_states;
     let mut orphan_dependencies: HashMap<ResourceId, Vec<String>> = HashMap::new();
     if let Some(sf) = state_file.as_ref() {
         let desired_ids: HashSet<ResourceId> =
