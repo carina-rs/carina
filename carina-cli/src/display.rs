@@ -402,61 +402,15 @@ fn format_plan_tree(
     let mut out = String::new();
 
     // Build dependency graph from effects
-    let mut binding_to_effect: HashMap<String, usize> = HashMap::new();
-    let mut effect_deps: HashMap<usize, HashSet<String>> = HashMap::new();
-    let mut effect_bindings: HashMap<usize, String> = HashMap::new();
-    let mut effect_types: HashMap<usize, String> = HashMap::new();
-
-    for (idx, effect) in plan.effects().iter().enumerate() {
-        let (resource, deps) = match effect {
-            Effect::Create(r) => (Some(r), get_resource_dependencies(r)),
-            Effect::Update { to, .. } => (Some(to), get_resource_dependencies(to)),
-            Effect::Replace { to, .. } => (Some(to), get_resource_dependencies(to)),
-            Effect::Read { resource } => (Some(resource), get_resource_dependencies(resource)),
-            Effect::Delete {
-                id,
-                binding,
-                dependencies,
-                ..
-            } => {
-                let deps = dependencies.clone();
-                if let Some(b) = binding {
-                    binding_to_effect.insert(b.clone(), idx);
-                    effect_bindings.insert(idx, b.clone());
-                } else {
-                    let fallback = id.to_string();
-                    binding_to_effect.insert(fallback.clone(), idx);
-                    effect_bindings.insert(idx, fallback);
-                }
-                effect_types.insert(idx, id.resource_type.clone());
-                effect_deps.insert(idx, deps);
-                continue;
-            }
-        };
-
-        if let Some(r) = resource {
-            let binding = r
-                .attributes
-                .get("_binding")
-                .and_then(|v| match v {
-                    Value::String(s) => Some(s.clone()),
-                    _ => None,
-                })
-                .unwrap_or_else(|| r.id.to_string());
-            binding_to_effect.insert(binding.clone(), idx);
-            effect_bindings.insert(idx, binding);
-            effect_types.insert(idx, r.id.resource_type.clone());
-        }
-        effect_deps.insert(idx, deps);
-    }
+    let graph = build_dependency_graph(plan);
 
     // Build the single-parent tree with sorted siblings
     let (roots, dependents) = build_single_parent_tree(
         plan,
-        &binding_to_effect,
-        &effect_deps,
-        &effect_bindings,
-        &effect_types,
+        &graph.binding_to_effect,
+        &graph.effect_deps,
+        &graph.effect_bindings,
+        &graph.effect_types,
     );
 
     // Track printed effects to avoid duplicates
@@ -1162,6 +1116,178 @@ pub fn format_effect(effect: &Effect) -> String {
             format!("Read {}", resource.id)
         }
     }
+}
+
+/// Intermediate data for tree-building: maps from effect indices to their
+/// bindings, dependency sets, and resource types.
+struct DependencyGraph {
+    binding_to_effect: HashMap<String, usize>,
+    effect_deps: HashMap<usize, HashSet<String>>,
+    effect_bindings: HashMap<usize, String>,
+    effect_types: HashMap<usize, String>,
+}
+
+/// Build the dependency graph maps from a plan's effects.
+fn build_dependency_graph(plan: &Plan) -> DependencyGraph {
+    let mut binding_to_effect: HashMap<String, usize> = HashMap::new();
+    let mut effect_deps: HashMap<usize, HashSet<String>> = HashMap::new();
+    let mut effect_bindings: HashMap<usize, String> = HashMap::new();
+    let mut effect_types: HashMap<usize, String> = HashMap::new();
+
+    for (idx, effect) in plan.effects().iter().enumerate() {
+        let (resource, deps) = match effect {
+            Effect::Create(r) => (Some(r), get_resource_dependencies(r)),
+            Effect::Update { to, .. } => (Some(to), get_resource_dependencies(to)),
+            Effect::Replace { to, .. } => (Some(to), get_resource_dependencies(to)),
+            Effect::Read { resource } => (Some(resource), get_resource_dependencies(resource)),
+            Effect::Delete {
+                id,
+                binding,
+                dependencies,
+                ..
+            } => {
+                let deps = dependencies.clone();
+                if let Some(b) = binding {
+                    binding_to_effect.insert(b.clone(), idx);
+                    effect_bindings.insert(idx, b.clone());
+                } else {
+                    let fallback = id.to_string();
+                    binding_to_effect.insert(fallback.clone(), idx);
+                    effect_bindings.insert(idx, fallback);
+                }
+                effect_types.insert(idx, id.resource_type.clone());
+                effect_deps.insert(idx, deps);
+                continue;
+            }
+        };
+
+        if let Some(r) = resource {
+            let binding = r
+                .attributes
+                .get("_binding")
+                .and_then(|v| match v {
+                    Value::String(s) => Some(s.clone()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| r.id.to_string());
+            binding_to_effect.insert(binding.clone(), idx);
+            effect_bindings.insert(idx, binding);
+            effect_types.insert(idx, r.id.resource_type.clone());
+        }
+        effect_deps.insert(idx, deps);
+    }
+
+    DependencyGraph {
+        binding_to_effect,
+        effect_deps,
+        effect_bindings,
+        effect_types,
+    }
+}
+
+/// An entry in the tree-ordered list of effects with its tree prefix.
+pub struct TreeEffectEntry {
+    /// Index into the plan's effects vector.
+    pub effect_idx: usize,
+    /// Tree connector prefix string (e.g., "├─ ", "└─ ", "│  ├─ ").
+    pub prefix: String,
+}
+
+/// Build a tree-ordered list of effects with tree connector prefixes.
+///
+/// This uses the same tree-building logic as the plan display, producing entries
+/// in depth-first order with the appropriate `├─`/`└─` connectors.
+pub fn build_effect_tree_entries(plan: &Plan) -> Vec<TreeEffectEntry> {
+    let graph = build_dependency_graph(plan);
+
+    let (roots, dependents) = build_single_parent_tree(
+        plan,
+        &graph.binding_to_effect,
+        &graph.effect_deps,
+        &graph.effect_bindings,
+        &graph.effect_types,
+    );
+
+    let mut entries = Vec::new();
+    let mut visited: HashSet<usize> = HashSet::new();
+
+    fn walk_tree(
+        idx: usize,
+        dependents: &HashMap<usize, Vec<usize>>,
+        visited: &mut HashSet<usize>,
+        entries: &mut Vec<TreeEffectEntry>,
+        indent: usize,
+        is_last: bool,
+        prefix: &str,
+    ) {
+        if visited.contains(&idx) {
+            return;
+        }
+        visited.insert(idx);
+
+        let connector = if indent == 0 {
+            String::new()
+        } else if is_last {
+            format!("{}└─ ", prefix)
+        } else {
+            format!("{}├─ ", prefix)
+        };
+
+        entries.push(TreeEffectEntry {
+            effect_idx: idx,
+            prefix: connector,
+        });
+
+        let children = dependents.get(&idx).cloned().unwrap_or_default();
+        let unvisited: Vec<_> = children
+            .iter()
+            .filter(|c| !visited.contains(c))
+            .cloned()
+            .collect();
+
+        let new_prefix = if indent == 0 {
+            String::new()
+        } else if is_last {
+            format!("{}   ", prefix)
+        } else {
+            format!("{}│  ", prefix)
+        };
+
+        for (i, child_idx) in unvisited.iter().enumerate() {
+            let child_is_last = i == unvisited.len() - 1;
+            walk_tree(
+                *child_idx,
+                dependents,
+                visited,
+                entries,
+                indent + 1,
+                child_is_last,
+                &new_prefix,
+            );
+        }
+    }
+
+    for (i, root_idx) in roots.iter().enumerate() {
+        walk_tree(
+            *root_idx,
+            &dependents,
+            &mut visited,
+            &mut entries,
+            0,
+            i == roots.len() - 1,
+            "",
+        );
+    }
+
+    // Any remaining effects not reachable from roots
+    let remaining: Vec<_> = (0..plan.effects().len())
+        .filter(|idx| !visited.contains(idx))
+        .collect();
+    for idx in remaining {
+        walk_tree(idx, &dependents, &mut visited, &mut entries, 0, true, "");
+    }
+
+    entries
 }
 
 /// Check if both old and new values are `Value::Map`.

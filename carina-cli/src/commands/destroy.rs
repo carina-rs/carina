@@ -26,7 +26,7 @@ use super::validate_and_resolve;
 use crate::DetailLevel;
 use crate::commands::apply::{apply_name_overrides, format_duration, spinner_style};
 use crate::commands::state::map_lock_error;
-use crate::display::{format_destroy_plan, format_effect};
+use crate::display::{build_effect_tree_entries, format_destroy_plan, format_effect};
 use crate::error::AppError;
 use crate::wiring::{
     WiringContext, get_provider_with_ctx, reconcile_anonymous_identifiers_with_ctx,
@@ -346,6 +346,14 @@ async fn run_destroy_locked(
     if !std::io::stdout().is_terminal() {
         multi.set_draw_target(indicatif::ProgressDrawTarget::hidden());
     }
+
+    // Build tree entries and prefixes from the destroy plan
+    let tree_entries = build_effect_tree_entries(&destroy_plan);
+    let mut tree_prefixes: HashMap<usize, String> = HashMap::new();
+    for entry in &tree_entries {
+        tree_prefixes.insert(entry.effect_idx, entry.prefix.clone());
+    }
+
     // Map from resource index to its spinner
     let mut spinners: HashMap<usize, ProgressBar> = HashMap::new();
 
@@ -397,6 +405,18 @@ async fn run_destroy_locked(
         })
         .collect();
 
+    // Pre-create all progress bars in tree order (static tree display)
+    for entry in &tree_entries {
+        let idx = entry.effect_idx;
+        let (_, _, effect) = &resource_info[idx];
+        let prefix = &entry.prefix;
+        let pb = multi.add(ProgressBar::new_spinner());
+        pb.set_style(ProgressStyle::with_template("  {msg}").unwrap());
+        let msg = format!("{} {}{}", "⏳", prefix, format_effect(effect));
+        pb.set_message(msg);
+        spinners.insert(idx, pb);
+    }
+
     // Build binding -> index mapping for ready-queue scheduling
     let mut binding_to_idx: HashMap<String, usize> = HashMap::new();
     for (idx, (binding, _, _)) in resource_info.iter().enumerate() {
@@ -422,8 +442,6 @@ async fn run_destroy_locked(
     // Track completed and dispatched indices
     let mut completed_indices: HashSet<usize> = HashSet::new();
     let mut dispatched: HashSet<usize> = HashSet::new();
-    // Track which effects have had a waiting indicator shown
-    let mut waiting_spinners: HashMap<usize, ProgressBar> = HashMap::new();
     let all_indices: Vec<usize> = (0..resources_to_destroy.len()).collect();
 
     // Track retry counts for dependency-violation retries
@@ -450,7 +468,7 @@ async fn run_destroy_locked(
         }
         newly_ready.sort();
 
-        // Show waiting indicators for effects with unmet dependencies
+        // Update waiting indicators for effects with unmet dependencies
         for &idx in &all_indices {
             if dispatched.contains(&idx)
                 || retry_pending.contains(&idx)
@@ -466,20 +484,17 @@ async fn run_destroy_locked(
                 .collect();
             if !pending.is_empty() {
                 let (_, _, effect) = &resource_info[idx];
+                let prefix = tree_prefixes.get(&idx).map(|s| s.as_str()).unwrap_or("");
                 let dep_list = pending.join(", ");
                 let msg = format!(
-                    "{} {} {}",
+                    "{} {}{} {}",
                     "⏳",
+                    prefix,
                     format_effect(effect),
                     format!("[waiting for: {}]", dep_list).dimmed()
                 );
-                if let Some(pb) = waiting_spinners.get(&idx) {
+                if let Some(pb) = spinners.get(&idx) {
                     pb.set_message(msg);
-                } else {
-                    let pb = multi.add(ProgressBar::new_spinner());
-                    pb.set_style(ProgressStyle::with_template("  {msg}").unwrap());
-                    pb.set_message(msg);
-                    waiting_spinners.insert(idx, pb);
                 }
             }
         }
@@ -488,14 +503,7 @@ async fn run_destroy_locked(
         for idx in newly_ready {
             dispatched.insert(idx);
 
-            // Transition waiting indicator to spinner if it exists
-            if let Some(pb) = waiting_spinners.remove(&idx) {
-                let (_, _, effect) = &resource_info[idx];
-                pb.set_style(spinner_style());
-                pb.set_message(format_effect(effect).to_string());
-                pb.enable_steady_tick(Duration::from_millis(80));
-                spinners.insert(idx, pb);
-            }
+            let prefix = tree_prefixes.get(&idx).map(|s| s.as_str()).unwrap_or("");
 
             let (binding, identifier, effect) = &resource_info[idx];
             let resource = resources_to_destroy[idx];
@@ -507,8 +515,9 @@ async fn run_destroy_locked(
                 let c = completed_counter.fetch_add(1, Ordering::Relaxed) + 1;
                 let counter = format!("{}/{}", c, destroy_total).dimmed();
                 let msg = format!(
-                    "{} {} - skipped (dependent {} failed) {}",
+                    "{} {}{} - skipped (dependent {} failed) {}",
                     "⊘".yellow(),
+                    prefix,
                     format_effect(effect),
                     failed_dep,
                     counter
@@ -607,8 +616,9 @@ async fn run_destroy_locked(
                 let c = completed_counter.fetch_add(1, Ordering::Relaxed) + 1;
                 let counter = format!("{}/{}", c, destroy_total).dimmed();
                 let msg = format!(
-                    "{} {} - skipped (dependent deletion did not complete) {}",
+                    "{} {}{} - skipped (dependent deletion did not complete) {}",
                     "⊘".yellow(),
+                    prefix,
                     format_effect(effect),
                     counter
                 );
@@ -624,14 +634,12 @@ async fn run_destroy_locked(
                 continue;
             }
 
-            // Create spinner for this in-flight deletion (reuse if already transitioned from waiting)
-            spinners.entry(idx).or_insert_with(|| {
-                let pb = multi.add(ProgressBar::new_spinner());
+            // Transition pre-created progress bar to spinner for in-flight deletion
+            if let Some(pb) = spinners.get(&idx) {
                 pb.set_style(spinner_style());
-                pb.set_message(format_effect(effect).to_string());
+                pb.set_message(format!("{}{}", prefix, format_effect(effect)));
                 pb.enable_steady_tick(Duration::from_millis(80));
-                pb
-            });
+            }
 
             // Spawn the deletion as a concurrent future
             let resource_id = resource.id.clone();
@@ -673,11 +681,13 @@ async fn run_destroy_locked(
             if all_retried {
                 for &idx in &remaining {
                     let (_, _, effect) = &resource_info[idx];
+                    let prefix = tree_prefixes.get(&idx).map(|s| s.as_str()).unwrap_or("");
                     let c = completed_counter.fetch_add(1, Ordering::Relaxed) + 1;
                     let counter = format!("{}/{}", c, destroy_total).dimmed();
                     let msg = format!(
-                        "{} {} - retries exhausted (no progress possible) {}",
+                        "{} {}{} - retries exhausted (no progress possible) {}",
                         "✗".red(),
+                        prefix,
                         format_effect(effect),
                         counter
                     );
@@ -716,6 +726,10 @@ async fn run_destroy_locked(
         let c = completed_counter.fetch_add(1, Ordering::Relaxed) + 1;
         let counter = format!("{}/{}", c, destroy_total).dimmed();
         let effect = &resource_info[finished_idx].2;
+        let prefix = tree_prefixes
+            .get(&finished_idx)
+            .map(|s| s.as_str())
+            .unwrap_or("");
 
         // Helper to finish the spinner for the completed effect
         let finish_spinner =
@@ -732,8 +746,9 @@ async fn run_destroy_locked(
             Ok(()) => {
                 let timing = format!("[{}]", format_duration(started.elapsed())).dimmed();
                 let msg = format!(
-                    "{} {} {} {}",
+                    "{} {}{} {} {}",
                     "✓".green(),
+                    prefix,
                     format_effect(effect),
                     timing,
                     counter
@@ -744,8 +759,9 @@ async fn run_destroy_locked(
             }
             Err(e) if e.is_timeout => {
                 let msg = format!(
-                    "{} {} - Operation timed out, waiting for completion...",
+                    "{} {}{} - Operation timed out, waiting for completion...",
                     "⏳".yellow(),
+                    prefix,
                     format_effect(effect)
                 );
                 finish_spinner(&mut spinners, finished_idx, msg);
@@ -761,20 +777,16 @@ async fn run_destroy_locked(
                     && retries < max_retries
                     && has_pending_or_in_flight
                 {
-                    // Put back as pending for retry, but gate it: the index
-                    // stays in `retry_pending` until at least one other
-                    // in-flight effect completes, preventing immediate
-                    // re-dispatch that would fail again instantly.
                     *retry_counts.entry(finished_idx).or_insert(0) += 1;
                     completed_indices.remove(&finished_idx);
                     dispatched.remove(&finished_idx);
                     retry_pending.insert(finished_idx);
-                    // Undo the counter increment since this isn't truly completed
                     completed_counter.fetch_sub(1, Ordering::Relaxed);
                     let retry_num = retry_counts[&finished_idx];
                     let msg = format!(
-                        "{} {} - dependency violation, will retry ({}/{})",
+                        "{} {}{} - dependency violation, will retry ({}/{})",
                         "↻".yellow(),
+                        prefix,
                         format_effect(effect),
                         retry_num,
                         max_retries
@@ -783,8 +795,9 @@ async fn run_destroy_locked(
                 } else {
                     let timing = format!("[{}]", format_duration(started.elapsed())).dimmed();
                     let msg = format!(
-                        "{} {} {} {}\n      {} {}",
+                        "{} {}{} {} {}\n      {} {}",
                         "✗".red(),
+                        prefix,
                         format_effect(effect),
                         timing,
                         counter,

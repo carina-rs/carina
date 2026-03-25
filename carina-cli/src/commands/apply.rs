@@ -30,7 +30,7 @@ use super::validate_and_resolve;
 use crate::DetailLevel;
 use crate::commands::plan::PlanFile;
 use crate::commands::state::map_lock_error;
-use crate::display::{format_effect, print_plan};
+use crate::display::{build_effect_tree_entries, format_effect, print_plan};
 use crate::error::AppError;
 use crate::wiring::{
     WiringContext, create_providers_from_configs, get_provider_with_ctx,
@@ -61,56 +61,61 @@ pub(crate) fn spinner_style() -> ProgressStyle {
 
 /// CLI observer that prints colored progress output using `indicatif`.
 ///
-/// When stdout is a TTY, it shows animated spinners for each in-flight effect.
-/// When piped, spinners are hidden automatically by `indicatif`.
+/// Shows a static dependency tree with all effects visible from the start.
+/// Each line is an indicatif ProgressBar that gets updated in place as
+/// effects transition through waiting -> in-progress -> completed/failed.
 struct CliObserver {
     multi: MultiProgress,
-    /// Map from effect description to its spinner, guarded by a Mutex for
-    /// concurrent access from parallel effect execution.
-    spinners: Mutex<HashMap<String, ProgressBar>>,
+    /// Map from effect description to its pre-created ProgressBar, guarded by
+    /// a Mutex for concurrent access from parallel effect execution.
+    bars: Mutex<HashMap<String, ProgressBar>>,
+    /// Map from effect description to its tree prefix string.
+    prefixes: HashMap<String, String>,
 }
 
 impl CliObserver {
-    fn new() -> Self {
+    /// Create a new observer with pre-built tree structure from the plan.
+    fn new(plan: &Plan) -> Self {
         let multi = MultiProgress::new();
         if !std::io::stdout().is_terminal() {
             multi.set_draw_target(indicatif::ProgressDrawTarget::hidden());
         }
+
+        let tree_entries = build_effect_tree_entries(plan);
+        let mut bars = HashMap::new();
+        let mut prefixes = HashMap::new();
+
+        for entry in &tree_entries {
+            let effect = &plan.effects()[entry.effect_idx];
+            let key = format_effect(effect);
+            let prefix = &entry.prefix;
+
+            // Create a progress bar in waiting state
+            let pb = multi.add(ProgressBar::new_spinner());
+            pb.set_style(ProgressStyle::with_template("  {msg}").unwrap());
+            let msg = format!("{}{} {}", "⏳ ", prefix, format_effect(effect));
+            pb.set_message(msg);
+
+            bars.insert(key.clone(), pb);
+            prefixes.insert(key, prefix.clone());
+        }
+
         Self {
             multi,
-            spinners: Mutex::new(HashMap::new()),
+            bars: Mutex::new(bars),
+            prefixes,
         }
     }
 
-    /// Start a new spinner for an in-flight effect.
-    fn start_spinner(&self, key: String) {
-        let pb = self.multi.add(ProgressBar::new_spinner());
-        pb.set_style(spinner_style());
-        pb.set_message(key.clone());
-        pb.enable_steady_tick(Duration::from_millis(80));
-        self.spinners.lock().unwrap().insert(key, pb);
-    }
-
-    /// Finish and remove the spinner for a completed effect.
-    fn finish_spinner(&self, key: &str, final_message: String) {
-        let mut spinners = self.spinners.lock().unwrap();
-        if let Some(pb) = spinners.remove(key) {
-            pb.set_style(ProgressStyle::with_template("  {msg}").unwrap());
-            pb.finish_with_message(final_message);
-        } else {
-            self.multi.println(format!("  {}", final_message)).ok();
-        }
+    /// Get the tree prefix for an effect key, defaulting to empty string.
+    fn prefix_for(&self, key: &str) -> &str {
+        self.prefixes.get(key).map(|s| s.as_str()).unwrap_or("")
     }
 }
 
 /// Format a progress counter as a dimmed string like "1/10".
 fn format_progress(progress: &ProgressInfo) -> String {
     format!("{}/{}", progress.completed, progress.total)
-}
-
-/// Style for a static waiting indicator (no animation).
-fn waiting_style() -> ProgressStyle {
-    ProgressStyle::with_template("  {msg}").unwrap()
 }
 
 impl ExecutionObserver for CliObserver {
@@ -120,37 +125,30 @@ impl ExecutionObserver for CliObserver {
                 effect,
                 pending_dependencies,
             } => {
-                let key = format_effect(effect).to_string();
+                let key = format_effect(effect);
+                let prefix = self.prefix_for(&key);
                 let dep_list = pending_dependencies.join(", ");
                 let msg = format!(
-                    "{} {} {}",
+                    "{} {}{} {}",
                     "⏳",
+                    prefix,
                     format_effect(effect),
                     format!("[waiting for: {}]", dep_list).dimmed()
                 );
-                let mut spinners = self.spinners.lock().unwrap();
-                if let Some(pb) = spinners.get(&key) {
-                    // Update existing waiting indicator
+                let bars = self.bars.lock().unwrap();
+                if let Some(pb) = bars.get(&key) {
                     pb.set_message(msg);
-                } else {
-                    // Create new waiting indicator (static, no animation)
-                    let pb = self.multi.add(ProgressBar::new_spinner());
-                    pb.set_style(waiting_style());
-                    pb.set_message(msg);
-                    spinners.insert(key, pb);
                 }
             }
             ExecutionEvent::EffectStarted { effect } => {
-                let key = format_effect(effect).to_string();
-                let spinners = self.spinners.lock().unwrap();
-                if let Some(pb) = spinners.get(&key) {
-                    // Transition from waiting indicator to spinner
+                let key = format_effect(effect);
+                let prefix = self.prefix_for(&key);
+                let bars = self.bars.lock().unwrap();
+                if let Some(pb) = bars.get(&key) {
                     pb.set_style(spinner_style());
-                    pb.set_message(key);
+                    let msg = format!("{}{}", prefix, key);
+                    pb.set_message(msg);
                     pb.enable_steady_tick(Duration::from_millis(80));
-                } else {
-                    drop(spinners);
-                    self.start_spinner(key);
                 }
             }
             ExecutionEvent::EffectSucceeded {
@@ -159,16 +157,23 @@ impl ExecutionObserver for CliObserver {
                 progress,
                 ..
             } => {
+                let key = format_effect(effect);
+                let prefix = self.prefix_for(&key);
                 let timing = format!("[{}]", format_duration(*duration)).dimmed();
                 let counter = format_progress(progress).dimmed();
                 let msg = format!(
-                    "{} {} {} {}",
+                    "{} {}{} {} {}",
                     "✓".green(),
+                    prefix,
                     format_effect(effect),
                     timing,
                     counter
                 );
-                self.finish_spinner(&format_effect(effect).to_string(), msg);
+                let bars = self.bars.lock().unwrap();
+                if let Some(pb) = bars.get(&key) {
+                    pb.set_style(ProgressStyle::with_template("  {msg}").unwrap());
+                    pb.finish_with_message(msg);
+                }
             }
             ExecutionEvent::EffectFailed {
                 effect,
@@ -176,33 +181,47 @@ impl ExecutionObserver for CliObserver {
                 duration,
                 progress,
             } => {
+                let key = format_effect(effect);
+                let prefix = self.prefix_for(&key);
                 let timing = format!("[{}]", format_duration(*duration)).dimmed();
                 let counter = format_progress(progress).dimmed();
                 let msg = format!(
-                    "{} {} {} {}\n      {} {}",
+                    "{} {}{} {} {}\n      {} {}",
                     "✗".red(),
+                    prefix,
                     format_effect(effect),
                     timing,
                     counter,
                     "→".red(),
                     error.red()
                 );
-                self.finish_spinner(&format_effect(effect).to_string(), msg);
+                let bars = self.bars.lock().unwrap();
+                if let Some(pb) = bars.get(&key) {
+                    pb.set_style(ProgressStyle::with_template("  {msg}").unwrap());
+                    pb.finish_with_message(msg);
+                }
             }
             ExecutionEvent::EffectSkipped {
                 effect,
                 reason,
                 progress,
             } => {
+                let key = format_effect(effect);
+                let prefix = self.prefix_for(&key);
                 let counter = format_progress(progress).dimmed();
                 let msg = format!(
-                    "{} {} - {} {}",
+                    "{} {}{} - {} {}",
                     "⊘".yellow(),
+                    prefix,
                     format_effect(effect),
                     reason,
                     counter
                 );
-                self.finish_spinner(&format_effect(effect).to_string(), msg);
+                let bars = self.bars.lock().unwrap();
+                if let Some(pb) = bars.get(&key) {
+                    pb.set_style(ProgressStyle::with_template("  {msg}").unwrap());
+                    pb.finish_with_message(msg);
+                }
             }
             ExecutionEvent::CascadeUpdateSucceeded { id } => {
                 self.multi
@@ -307,7 +326,7 @@ pub async fn execute_effects(
         current_states: std::mem::take(current_states),
     };
 
-    let observer = CliObserver::new();
+    let observer = CliObserver::new(plan);
     let result = carina_core::executor::execute_plan(provider, input, &observer).await;
 
     // Write back the updated current_states so callers see refreshes
