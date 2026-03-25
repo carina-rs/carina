@@ -275,17 +275,19 @@ impl ModuleResolver {
     }
 }
 
-/// Substitute arguments references with actual values
+/// Substitute arguments references with actual values.
+///
+/// Argument parameter names are registered as lexical bindings in the parser,
+/// so they appear as `ResourceRef { binding_name: "<param_name>", attribute_name: ... }`.
+/// We match when `binding_name` is one of the argument keys.
 fn substitute_arguments(value: &Value, arguments: &HashMap<String, Value>) -> Value {
     match value {
-        Value::ResourceRef {
-            binding_name,
-            attribute_name,
-            ..
-        } if binding_name == "arguments" => arguments
-            .get(attribute_name)
-            .cloned()
-            .unwrap_or_else(|| value.clone()),
+        Value::ResourceRef { binding_name, .. } if arguments.contains_key(binding_name) => {
+            arguments
+                .get(binding_name)
+                .cloned()
+                .unwrap_or_else(|| value.clone())
+        }
         Value::List(items) => Value::List(
             items
                 .iter()
@@ -519,8 +521,8 @@ mod tests {
                     attrs.insert(
                         "vpc_id".to_string(),
                         Value::ResourceRef {
-                            binding_name: "arguments".to_string(),
-                            attribute_name: "vpc_id".to_string(),
+                            binding_name: "vpc_id".to_string(),
+                            attribute_name: String::new(),
                         },
                     );
                     attrs.insert(
@@ -558,9 +560,10 @@ mod tests {
         let mut inputs = HashMap::new();
         inputs.insert("vpc_id".to_string(), Value::String("vpc-123".to_string()));
 
+        // Argument params are lexically scoped: binding_name is the param name itself
         let value = Value::ResourceRef {
-            binding_name: "arguments".to_string(),
-            attribute_name: "vpc_id".to_string(),
+            binding_name: "vpc_id".to_string(),
+            attribute_name: String::new(),
         };
         let result = substitute_arguments(&value, &inputs);
 
@@ -574,8 +577,8 @@ mod tests {
 
         let value = Value::List(vec![
             Value::ResourceRef {
-                binding_name: "arguments".to_string(),
-                attribute_name: "port".to_string(),
+                binding_name: "port".to_string(),
+                attribute_name: String::new(),
             },
             Value::Int(443),
         ]);
@@ -638,8 +641,8 @@ mod tests {
                         attrs.insert(
                             "cidr_block".to_string(),
                             Value::ResourceRef {
-                                binding_name: "arguments".to_string(),
-                                attribute_name: "cidr".to_string(),
+                                binding_name: "cidr".to_string(),
+                                attribute_name: String::new(),
                             },
                         );
                         attrs

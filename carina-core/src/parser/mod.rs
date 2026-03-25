@@ -197,10 +197,6 @@ struct ParseContext {
     resource_bindings: HashMap<String, Resource>,
     /// Imported modules (alias -> path)
     imported_modules: HashMap<String, String>,
-    /// Whether we're inside a module (for arguments.* references)
-    in_module: bool,
-    /// Argument parameter names when inside a module
-    argument_params: HashMap<String, TypeExpr>,
 }
 
 impl ParseContext {
@@ -209,8 +205,6 @@ impl ParseContext {
             variables: HashMap::new(),
             resource_bindings: HashMap::new(),
             imported_modules: HashMap::new(),
-            in_module: false,
-            argument_params: HashMap::new(),
         }
     }
 
@@ -292,10 +286,18 @@ pub fn parse(input: &str) -> Result<ParsedFile, ParseError> {
                             Rule::arguments_block => {
                                 let parsed_arguments = parse_arguments_block(stmt)?;
                                 for arg in &parsed_arguments {
-                                    ctx.argument_params
-                                        .insert(arg.name.clone(), arg.type_expr.clone());
+                                    // Register argument names as lexical bindings so that
+                                    // `vpc.vpc_id` resolves as ResourceRef and `cidr_block`
+                                    // resolves as a variable reference during parsing.
+                                    // No `arguments.` prefix needed.
+                                    let placeholder_ref = Value::ResourceRef {
+                                        binding_name: arg.name.clone(),
+                                        attribute_name: String::new(),
+                                    };
+                                    ctx.set_variable(arg.name.clone(), placeholder_ref);
+                                    let placeholder = Resource::new("_argument", &arg.name);
+                                    ctx.set_resource_binding(arg.name.clone(), placeholder);
                                 }
-                                ctx.in_module = true;
                                 arguments.extend(parsed_arguments);
                             }
                             Rule::attributes_block => {
@@ -974,16 +976,8 @@ fn parse_primary_value(
             let parts: Vec<&str> = full_str.split('.').collect();
 
             if parts.len() == 2 {
-                // Two-part identifier: could be arguments reference, resource reference or variable access
-                if parts[0] == "arguments" && ctx.in_module {
-                    // Arguments reference in module context (arguments.vpc_id)
-                    // Treat as a special ResourceRef with "arguments" as the binding name
-                    Ok(Value::ResourceRef {
-                        binding_name: "arguments".to_string(),
-                        attribute_name: parts[1].to_string(),
-                    })
-                } else if ctx.get_variable(parts[0]).is_some() && !ctx.is_resource_binding(parts[0])
-                {
+                // Two-part identifier: could be resource reference or variable access
+                if ctx.get_variable(parts[0]).is_some() && !ctx.is_resource_binding(parts[0]) {
                     // Variable exists but trying to access attribute on non-resource
                     Err(ParseError::InvalidExpression {
                         line: 0,
@@ -1045,16 +1039,8 @@ fn parse_primary_value(
             let first_ident = next_pair(&mut parts, "identifier", "variable reference")?.as_str();
 
             if let Some(second_part) = parts.next() {
-                // Member access: resource.attribute or arguments.param
+                // Member access: resource.attribute (argument params are also resource bindings)
                 let attr_name = second_part.as_str();
-
-                // Handle arguments reference in module context
-                if first_ident == "arguments" && ctx.in_module {
-                    return Ok(Value::ResourceRef {
-                        binding_name: "arguments".to_string(),
-                        attribute_name: attr_name.to_string(),
-                    });
-                }
 
                 // Return a ResourceRef that will be resolved/validated later
                 Ok(Value::ResourceRef {
@@ -1686,7 +1672,7 @@ mod tests {
 
             let web_sg = aws.security_group {
                 name   = "web-sg"
-                vpc_id = arguments.vpc_id
+                vpc_id = vpc_id
             }
         "#;
 
@@ -1707,14 +1693,14 @@ mod tests {
         assert_eq!(result.attribute_params[0].name, "sg_id");
         assert_eq!(result.attribute_params[0].type_expr, TypeExpr::String);
 
-        // Check resource has arguments reference
+        // Check resource has argument reference (lexically scoped)
         assert_eq!(result.resources.len(), 1);
         let sg = &result.resources[0];
         assert_eq!(
             sg.attributes.get("vpc_id"),
             Some(&Value::ResourceRef {
-                binding_name: "arguments".to_string(),
-                attribute_name: "vpc_id".to_string(),
+                binding_name: "vpc_id".to_string(),
+                attribute_name: String::new(),
             })
         );
     }
@@ -1779,7 +1765,7 @@ mod tests {
 
             let web_sg = aws.security_group {
                 name   = "web-sg"
-                vpc_id = arguments.vpc
+                vpc_id = vpc
             }
         "#;
 

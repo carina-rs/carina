@@ -13,9 +13,10 @@ Module: module_info
 
 === CREATES ===
 
-  arguments { vpc_id: awscc.ec2.vpc }
+  instance_type
+    └── web_instance: awscc.ec2.instance
+  vpc_id
     └── web_sg: awscc.ec2.security_group
-       └── web_instance: awscc.ec2.instance
 
 === ATTRIBUTES ===
 
