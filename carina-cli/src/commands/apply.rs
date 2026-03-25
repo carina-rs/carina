@@ -87,13 +87,21 @@ impl CliObserver {
 
         for entry in &tree_entries {
             let effect = &plan.effects()[entry.effect_idx];
+
+            // Skip Read effects - they are no-ops completed immediately by the
+            // executor without emitting events, so a progress bar would never
+            // transition away from waiting state.
+            if matches!(effect, Effect::Read { .. }) {
+                continue;
+            }
+
             let key = format_effect(effect);
             let prefix = &entry.prefix;
 
             // Create a progress bar in waiting state
             let pb = multi.add(ProgressBar::new_spinner());
             pb.set_style(ProgressStyle::with_template("  {msg}").unwrap());
-            let msg = format!("{}{} {}", "⏳ ", prefix, format_effect(effect));
+            let msg = format!("{} {}{}", "⏳", prefix, format_effect(effect));
             pb.set_message(msg);
 
             bars.insert(key.clone(), pb);
