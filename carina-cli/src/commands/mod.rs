@@ -7,6 +7,7 @@ pub mod plan;
 pub mod state;
 pub mod validate;
 
+use std::collections::HashSet;
 use std::path::Path;
 
 use carina_core::module_resolver;
@@ -54,7 +55,9 @@ pub fn validate_and_resolve(
 
     if !skip_resource_validation {
         validate_resources_with_ctx(&ctx, &parsed.resources)?;
-        validate_resource_ref_types_with_ctx(&ctx, &parsed.resources)?;
+        let argument_names: HashSet<String> =
+            parsed.arguments.iter().map(|a| a.name.clone()).collect();
+        validate_resource_ref_types_with_ctx(&ctx, &parsed.resources, &argument_names)?;
     }
 
     // Compute anonymous identifiers

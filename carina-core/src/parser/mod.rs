@@ -1167,6 +1167,11 @@ pub fn resolve_resource_refs(parsed: &mut ParsedFile) -> Result<(), ParseError> 
         }
     }
 
+    // Register argument parameters so they're recognized as valid bindings
+    for arg in &parsed.arguments {
+        binding_map.entry(arg.name.clone()).or_default();
+    }
+
     // Resolve references in each resource
     for resource in &mut parsed.resources {
         let mut resolved_attrs: HashMap<String, Value> = HashMap::new();
@@ -2852,5 +2857,38 @@ aws.s3.bucket {
         let result = parse(input).unwrap();
         assert_eq!(result.providers.len(), 1);
         assert!(result.providers[0].default_tags.is_empty());
+    }
+
+    #[test]
+    fn resolve_resource_refs_with_argument_parameters() {
+        let input = r#"
+            arguments {
+                cidr_block: string
+                subnet_cidr: string
+                az: string
+            }
+
+            let vpc = awscc.ec2.vpc {
+                cidr_block = cidr_block
+            }
+
+            let subnet = awscc.ec2.subnet {
+                vpc_id = vpc.vpc_id
+                cidr_block = subnet_cidr
+                availability_zone = az
+            }
+
+            attributes {
+                vpc_id: awscc.ec2.vpc = vpc.vpc_id
+            }
+        "#;
+
+        // parse_and_resolve should succeed without "Undefined variable" errors
+        let result = parse_and_resolve(input);
+        assert!(result.is_ok(), "Expected Ok, got: {:?}", result.err());
+
+        let parsed = result.unwrap();
+        assert_eq!(parsed.resources.len(), 2);
+        assert_eq!(parsed.arguments.len(), 3);
     }
 }
