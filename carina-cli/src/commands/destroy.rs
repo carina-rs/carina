@@ -347,14 +347,14 @@ async fn run_destroy_locked(
         multi.set_draw_target(indicatif::ProgressDrawTarget::hidden());
     }
 
-    // Build tree entries and prefixes from the destroy plan
+    // Build tree entries and prefixes from the destroy plan for indentation
     let tree_entries = build_effect_tree_entries(&destroy_plan);
     let mut tree_prefixes: HashMap<usize, String> = HashMap::new();
     for entry in &tree_entries {
         tree_prefixes.insert(entry.effect_idx, entry.prefix.clone());
     }
 
-    // Map from resource index to its spinner
+    // Map from resource index to its spinner (populated lazily on dispatch)
     let mut spinners: HashMap<usize, ProgressBar> = HashMap::new();
 
     // Build reverse dependency map: binding -> {bindings that depend on it}.
@@ -404,18 +404,6 @@ async fn run_destroy_locked(
             (binding, identifier, effect)
         })
         .collect();
-
-    // Pre-create all progress bars in tree order (static tree display)
-    for entry in &tree_entries {
-        let idx = entry.effect_idx;
-        let (_, _, effect) = &resource_info[idx];
-        let prefix = &entry.prefix;
-        let pb = multi.add(ProgressBar::new_spinner());
-        pb.set_style(ProgressStyle::with_template("  {msg}").unwrap());
-        let msg = format!("{} {}{}", "⏳", prefix, format_effect(effect));
-        pb.set_message(msg);
-        spinners.insert(idx, pb);
-    }
 
     // Build binding -> index mapping for ready-queue scheduling
     let mut binding_to_idx: HashMap<String, usize> = HashMap::new();
@@ -467,37 +455,6 @@ async fn run_destroy_locked(
             }
         }
         newly_ready.sort();
-
-        // Update waiting indicators for effects with unmet dependencies
-        for &idx in &all_indices {
-            if dispatched.contains(&idx)
-                || retry_pending.contains(&idx)
-                || newly_ready.contains(&idx)
-            {
-                continue;
-            }
-            let deps = &deletion_deps[&idx];
-            let pending: Vec<String> = deps
-                .iter()
-                .filter(|d| !completed_indices.contains(d))
-                .map(|d| resource_info[*d].0.clone())
-                .collect();
-            if !pending.is_empty() {
-                let (_, _, effect) = &resource_info[idx];
-                let prefix = tree_prefixes.get(&idx).map(|s| s.as_str()).unwrap_or("");
-                let dep_list = pending.join(", ");
-                let msg = format!(
-                    "{} {}{} {}",
-                    "⏳",
-                    prefix,
-                    format_effect(effect),
-                    format!("[waiting for: {}]", dep_list).dimmed()
-                );
-                if let Some(pb) = spinners.get(&idx) {
-                    pb.set_message(msg);
-                }
-            }
-        }
 
         // Process newly ready resources
         for idx in newly_ready {
@@ -634,12 +591,12 @@ async fn run_destroy_locked(
                 continue;
             }
 
-            // Transition pre-created progress bar to spinner for in-flight deletion
-            if let Some(pb) = spinners.get(&idx) {
-                pb.set_style(spinner_style());
-                pb.set_message(format!("{}{}", prefix, format_effect(effect)));
-                pb.enable_steady_tick(Duration::from_millis(80));
-            }
+            // Create a spinner for the in-flight deletion
+            let pb = multi.add(ProgressBar::new_spinner());
+            pb.set_style(spinner_style());
+            pb.set_message(format!("{}{}", prefix, format_effect(effect)));
+            pb.enable_steady_tick(Duration::from_millis(80));
+            spinners.insert(idx, pb);
 
             // Spawn the deletion as a concurrent future
             let resource_id = resource.id.clone();

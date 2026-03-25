@@ -61,20 +61,21 @@ pub(crate) fn spinner_style() -> ProgressStyle {
 
 /// CLI observer that prints colored progress output using `indicatif`.
 ///
-/// Shows a static dependency tree with all effects visible from the start.
-/// Each line is an indicatif ProgressBar that gets updated in place as
-/// effects transition through waiting -> in-progress -> completed/failed.
+/// Uses dynamic display: resources appear only when they start executing or
+/// complete. No upfront tree is shown. Spinners are created lazily on
+/// `EffectStarted` and finished on `EffectSucceeded`/`EffectFailed`.
 struct CliObserver {
     multi: MultiProgress,
-    /// Map from effect description to its pre-created ProgressBar, guarded by
-    /// a Mutex for concurrent access from parallel effect execution.
+    /// Map from effect description to its ProgressBar, created lazily when
+    /// the effect starts executing. Guarded by a Mutex for concurrent access.
     bars: Mutex<HashMap<String, ProgressBar>>,
     /// Map from effect description to its tree prefix string.
     prefixes: HashMap<String, String>,
 }
 
 impl CliObserver {
-    /// Create a new observer with pre-built tree structure from the plan.
+    /// Create a new observer. Computes tree prefixes from the plan but does
+    /// NOT create any progress bars upfront.
     fn new(plan: &Plan) -> Self {
         let multi = MultiProgress::new();
         if !std::io::stdout().is_terminal() {
@@ -82,35 +83,20 @@ impl CliObserver {
         }
 
         let tree_entries = build_effect_tree_entries(plan);
-        let mut bars = HashMap::new();
         let mut prefixes = HashMap::new();
 
         for entry in &tree_entries {
             let effect = &plan.effects()[entry.effect_idx];
-
-            // Skip Read effects - they are no-ops completed immediately by the
-            // executor without emitting events, so a progress bar would never
-            // transition away from waiting state.
             if matches!(effect, Effect::Read { .. }) {
                 continue;
             }
-
             let key = format_effect(effect);
-            let prefix = &entry.prefix;
-
-            // Create a progress bar in waiting state
-            let pb = multi.add(ProgressBar::new_spinner());
-            pb.set_style(ProgressStyle::with_template("  {msg}").unwrap());
-            let msg = format!("{} {}{}", "⏳", prefix, format_effect(effect));
-            pb.set_message(msg);
-
-            bars.insert(key.clone(), pb);
-            prefixes.insert(key, prefix.clone());
+            prefixes.insert(key, entry.prefix.clone());
         }
 
         Self {
             multi,
-            bars: Mutex::new(bars),
+            bars: Mutex::new(HashMap::new()),
             prefixes,
         }
     }
@@ -129,35 +115,19 @@ fn format_progress(progress: &ProgressInfo) -> String {
 impl ExecutionObserver for CliObserver {
     fn on_event(&self, event: &ExecutionEvent) {
         match event {
-            ExecutionEvent::Waiting {
-                effect,
-                pending_dependencies,
-            } => {
-                let key = format_effect(effect);
-                let prefix = self.prefix_for(&key);
-                let dep_list = pending_dependencies.join(", ");
-                let msg = format!(
-                    "{} {}{} {}",
-                    "⏳",
-                    prefix,
-                    format_effect(effect),
-                    format!("[waiting for: {}]", dep_list).dimmed()
-                );
-                let bars = self.bars.lock().unwrap();
-                if let Some(pb) = bars.get(&key) {
-                    pb.set_message(msg);
-                }
+            ExecutionEvent::Waiting { .. } => {
+                // Dynamic display: don't show waiting resources.
+                // They will appear when they start executing.
             }
             ExecutionEvent::EffectStarted { effect } => {
                 let key = format_effect(effect);
                 let prefix = self.prefix_for(&key);
-                let bars = self.bars.lock().unwrap();
-                if let Some(pb) = bars.get(&key) {
-                    pb.set_style(spinner_style());
-                    let msg = format!("{}{}", prefix, key);
-                    pb.set_message(msg);
-                    pb.enable_steady_tick(Duration::from_millis(80));
-                }
+                let pb = self.multi.add(ProgressBar::new_spinner());
+                pb.set_style(spinner_style());
+                let msg = format!("{}{}", prefix, key);
+                pb.set_message(msg);
+                pb.enable_steady_tick(Duration::from_millis(80));
+                self.bars.lock().unwrap().insert(key, pb);
             }
             ExecutionEvent::EffectSucceeded {
                 effect,
@@ -177,8 +147,8 @@ impl ExecutionObserver for CliObserver {
                     timing,
                     counter
                 );
-                let bars = self.bars.lock().unwrap();
-                if let Some(pb) = bars.get(&key) {
+                let mut bars = self.bars.lock().unwrap();
+                if let Some(pb) = bars.remove(&key) {
                     pb.set_style(ProgressStyle::with_template("  {msg}").unwrap());
                     pb.finish_with_message(msg);
                 }
@@ -203,8 +173,8 @@ impl ExecutionObserver for CliObserver {
                     "→".red(),
                     error.red()
                 );
-                let bars = self.bars.lock().unwrap();
-                if let Some(pb) = bars.get(&key) {
+                let mut bars = self.bars.lock().unwrap();
+                if let Some(pb) = bars.remove(&key) {
                     pb.set_style(ProgressStyle::with_template("  {msg}").unwrap());
                     pb.finish_with_message(msg);
                 }
@@ -225,10 +195,14 @@ impl ExecutionObserver for CliObserver {
                     reason,
                     counter
                 );
-                let bars = self.bars.lock().unwrap();
-                if let Some(pb) = bars.get(&key) {
+                // Skipped effects may not have a spinner (they were never started),
+                // so print directly via multi.println().
+                let mut bars = self.bars.lock().unwrap();
+                if let Some(pb) = bars.remove(&key) {
                     pb.set_style(ProgressStyle::with_template("  {msg}").unwrap());
                     pb.finish_with_message(msg);
+                } else {
+                    self.multi.println(format!("  {}", msg)).ok();
                 }
             }
             ExecutionEvent::CascadeUpdateSucceeded { id } => {
