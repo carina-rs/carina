@@ -13,6 +13,51 @@ use carina_core::schema::validate_ipv4_cidr;
 use super::DiagnosticEngine;
 
 impl DiagnosticEngine {
+    /// Check that provider blocks are not defined inside modules.
+    pub(super) fn check_provider_in_module(
+        &self,
+        doc: &Document,
+        parsed: &ParsedFile,
+    ) -> Vec<Diagnostic> {
+        let is_module = !parsed.arguments.is_empty() || !parsed.attribute_params.is_empty();
+        if !is_module || parsed.providers.is_empty() {
+            return Vec::new();
+        }
+
+        let mut diagnostics = Vec::new();
+        let text = doc.text();
+
+        for (line_idx, line) in text.lines().enumerate() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("provider ") {
+                let col = position::leading_whitespace_chars(line);
+                // Highlight "provider <name>" portion
+                let end_col = trimmed
+                    .find('{')
+                    .map(|p| col + p as u32)
+                    .unwrap_or(col + trimmed.len() as u32);
+                diagnostics.push(Diagnostic {
+                    range: Range {
+                        start: Position {
+                            line: line_idx as u32,
+                            character: col,
+                        },
+                        end: Position {
+                            line: line_idx as u32,
+                            character: end_col,
+                        },
+                    },
+                    severity: Some(DiagnosticSeverity::ERROR),
+                    source: Some("carina".to_string()),
+                    message: "provider blocks are not allowed inside modules. Define providers at the root configuration level.".to_string(),
+                    ..Default::default()
+                });
+            }
+        }
+
+        diagnostics
+    }
+
     /// Check provider region attribute using factory validate_config
     pub(super) fn check_provider_region(
         &self,

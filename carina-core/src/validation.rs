@@ -152,6 +152,20 @@ pub fn is_string_compatible_type(attr_type: &AttributeType) -> bool {
     }
 }
 
+/// Check that a module file does not contain provider blocks.
+///
+/// Provider configuration should only be defined at the root configuration level,
+/// not inside modules (files with `arguments` or `attributes` blocks).
+pub fn validate_no_provider_in_module(parsed: &ParsedFile) -> Result<(), String> {
+    let is_module = !parsed.arguments.is_empty() || !parsed.attribute_params.is_empty();
+    if is_module && !parsed.providers.is_empty() {
+        return Err(
+            "provider blocks are not allowed inside modules. Define providers at the root configuration level.".to_string(),
+        );
+    }
+    Ok(())
+}
+
 /// Validate provider configuration attributes via `ProviderFactory::validate_config()`.
 pub fn validate_provider_config(
     parsed: &ParsedFile,
@@ -610,5 +624,73 @@ let route = awscc.ec2.route {
             result.unwrap_err(),
             "awscc.ec2.subnet.web-subnet: unknown attribute 'nonexistent_attr' on 'vpc' in reference vpc.nonexistent_attr"
         );
+    }
+
+    #[test]
+    fn provider_in_module_with_arguments_errors() {
+        let mut parsed = empty_parsed();
+        parsed.providers.push(crate::parser::ProviderConfig {
+            name: "awscc".to_string(),
+            attributes: HashMap::new(),
+            default_tags: HashMap::new(),
+        });
+        parsed.arguments.push(crate::parser::ArgumentParameter {
+            name: "vpc_cidr".to_string(),
+            type_expr: TypeExpr::String,
+            default: None,
+        });
+
+        let result = validate_no_provider_in_module(&parsed);
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err(),
+            "provider blocks are not allowed inside modules. Define providers at the root configuration level."
+        );
+    }
+
+    #[test]
+    fn provider_in_module_with_attributes_errors() {
+        let mut parsed = empty_parsed();
+        parsed.providers.push(crate::parser::ProviderConfig {
+            name: "awscc".to_string(),
+            attributes: HashMap::new(),
+            default_tags: HashMap::new(),
+        });
+        parsed
+            .attribute_params
+            .push(crate::parser::AttributeParameter {
+                name: "vpc_id".to_string(),
+                type_expr: TypeExpr::String,
+                value: None,
+            });
+
+        let result = validate_no_provider_in_module(&parsed);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn provider_without_module_markers_ok() {
+        let mut parsed = empty_parsed();
+        parsed.providers.push(crate::parser::ProviderConfig {
+            name: "awscc".to_string(),
+            attributes: HashMap::new(),
+            default_tags: HashMap::new(),
+        });
+
+        let result = validate_no_provider_in_module(&parsed);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn module_without_provider_ok() {
+        let mut parsed = empty_parsed();
+        parsed.arguments.push(crate::parser::ArgumentParameter {
+            name: "vpc_cidr".to_string(),
+            type_expr: TypeExpr::String,
+            default: None,
+        });
+
+        let result = validate_no_provider_in_module(&parsed);
+        assert!(result.is_ok());
     }
 }

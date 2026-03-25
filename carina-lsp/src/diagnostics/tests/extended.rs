@@ -721,3 +721,61 @@ cidr_block = "10.0.1.0/24"
         diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
     );
 }
+
+#[test]
+fn provider_in_module_emits_error() {
+    let engine = test_engine();
+    let doc = create_document(
+        r#"arguments {
+    vpc_cidr: string
+}
+
+provider awscc {
+    region = awscc.Region.ap_northeast_1
+}
+
+awscc.ec2.vpc {
+    cidr_block = args.vpc_cidr
+}"#,
+    );
+
+    let diagnostics = engine.analyze(&doc, None);
+
+    let provider_diag = diagnostics.iter().find(|d| {
+        d.message
+            .contains("provider blocks are not allowed inside modules")
+    });
+    assert!(
+        provider_diag.is_some(),
+        "Should error about provider block in module. Got diagnostics: {:?}",
+        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+    let diag = provider_diag.unwrap();
+    assert_eq!(diag.severity, Some(DiagnosticSeverity::ERROR));
+}
+
+#[test]
+fn provider_without_module_markers_no_error() {
+    let engine = test_engine();
+    let doc = create_document(
+        r#"provider awscc {
+    region = awscc.Region.ap_northeast_1
+}
+
+awscc.ec2.vpc {
+    cidr_block = "10.0.0.0/16"
+}"#,
+    );
+
+    let diagnostics = engine.analyze(&doc, None);
+
+    let provider_diag = diagnostics.iter().find(|d| {
+        d.message
+            .contains("provider blocks are not allowed inside modules")
+    });
+    assert!(
+        provider_diag.is_none(),
+        "Should NOT error about provider in non-module file. Got diagnostics: {:?}",
+        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}

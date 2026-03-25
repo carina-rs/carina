@@ -40,6 +40,11 @@ pub enum ModuleError {
 
     #[error("Unknown module: {0}")]
     UnknownModule(String),
+
+    #[error(
+        "provider blocks are not allowed inside modules. Define providers at the root configuration level."
+    )]
+    ProviderInModule,
 }
 
 /// Context for module resolution
@@ -93,6 +98,12 @@ impl ModuleResolver {
         // Verify it's a module (has arguments or attributes)
         if parsed.arguments.is_empty() && parsed.attribute_params.is_empty() {
             return Err(ModuleError::NotFound(path.to_string()));
+        }
+
+        // Reject provider blocks inside modules
+        if !parsed.providers.is_empty() {
+            self.resolving.remove(&full_path);
+            return Err(ModuleError::ProviderInModule);
         }
 
         // Remove from resolving set

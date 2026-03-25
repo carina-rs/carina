@@ -53,6 +53,9 @@ impl DiagnosticEngine {
 
         // Semantic analysis on parsed file
         if let Some(parsed) = doc.parsed() {
+            // Check provider in module
+            diagnostics.extend(self.check_provider_in_module(doc, parsed));
+
             // Check provider region
             diagnostics.extend(self.check_provider_region(doc, parsed));
 
