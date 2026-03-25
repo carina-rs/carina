@@ -270,30 +270,6 @@ impl CompletionProvider {
         completions
     }
 
-    /// Provide completions for argument parameters in the current file (after "arguments.")
-    pub(super) fn argument_parameter_completions(&self, text: &str) -> Vec<CompletionItem> {
-        let mut completions = Vec::new();
-
-        // Extract argument parameters from text (works even with incomplete code)
-        let argument_params = self.extract_argument_parameters(text);
-        for (name, type_hint) in argument_params {
-            let required_marker = if type_hint.contains('=') {
-                ""
-            } else {
-                " (required)"
-            };
-            completions.push(CompletionItem {
-                label: name.clone(),
-                kind: Some(CompletionItemKind::FIELD),
-                detail: Some(format!("{}{}", type_hint, required_marker)),
-                insert_text: Some(name),
-                ..Default::default()
-            });
-        }
-
-        completions
-    }
-
     pub(super) fn format_type_expr(&self, type_expr: &parser::TypeExpr) -> String {
         match type_expr {
             parser::TypeExpr::String => "string".to_string(),

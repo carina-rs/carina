@@ -156,7 +156,13 @@ fn format_value(value: &Value) -> String {
             binding_name,
             attribute_name,
             ..
-        } => format!("{}.{}", binding_name, attribute_name),
+        } => {
+            if attribute_name.is_empty() {
+                binding_name.clone()
+            } else {
+                format!("{}.{}", binding_name, attribute_name)
+            }
+        }
         Value::UnresolvedIdent(name, member) => match member {
             Some(m) => format!("{}.{}", name, m),
             None => name.clone(),
@@ -202,7 +208,7 @@ pub struct TypedAttributeParam {
 /// Typed dependency representing a reference from one resource to another
 #[derive(Debug, Clone)]
 pub struct TypedDependency {
-    /// Target binding name (e.g., "vpc", "arguments")
+    /// Target binding name (e.g., "vpc", "cidr_block")
     pub target: String,
     /// Target resource type (if known)
     pub target_type: Option<ResourceTypePath>,
@@ -835,14 +841,13 @@ impl ModuleSignature {
                 binding_name,
                 attribute_name,
             } => {
-                let target_type = if binding_name == "arguments" {
-                    argument_types.get(attribute_name).and_then(|t| {
-                        if let TypeExpr::Ref(path) = t {
-                            Some(path.clone())
-                        } else {
-                            None
-                        }
-                    })
+                let target_type = if let Some(arg_type) = argument_types.get(binding_name) {
+                    // Argument parameter reference (lexically scoped)
+                    if let TypeExpr::Ref(path) = arg_type {
+                        Some(path.clone())
+                    } else {
+                        None
+                    }
                 } else {
                     binding_types.get(binding_name).cloned()
                 };
@@ -1034,46 +1039,16 @@ impl ModuleSignature {
         };
 
         // Format the node with its type
-        let node_display = if node == "arguments" {
-            // Show arguments with ref types
-            let ref_inputs: Vec<String> = self
-                .requires
-                .iter()
-                .filter_map(|r| {
-                    if let TypeExpr::Ref(path) = &r.type_expr {
-                        Some(format!(
-                            "{}{}{}: {}{}{}",
-                            c.white, r.name, c.reset, c.yellow, path, c.reset
-                        ))
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            if ref_inputs.is_empty() {
-                format!("{}arguments{}", c.blue, c.reset)
-            } else {
-                format!(
-                    "{}arguments{} {}{{ {} }}{}",
-                    c.blue,
-                    c.reset,
-                    c.dim,
-                    ref_inputs.join(", "),
-                    c.reset
-                )
-            }
-        } else {
+        let node_display = if let Some(cr) = self.creates.iter().find(|cr| cr.binding_name == node)
+        {
             // Show resource with its type
-            self.creates
-                .iter()
-                .find(|cr| cr.binding_name == node)
-                .map(|cr| {
-                    format!(
-                        "{}{}{}: {}{}{}",
-                        c.white, cr.binding_name, c.reset, c.yellow, cr.resource_type, c.reset
-                    )
-                })
-                .unwrap_or_else(|| node.to_string())
+            format!(
+                "{}{}{}: {}{}{}",
+                c.white, cr.binding_name, c.reset, c.yellow, cr.resource_type, c.reset
+            )
+        } else {
+            // Argument parameter name (lexically scoped)
+            node.to_string()
         };
 
         output.push_str(&format!("{}{}{}\n", prefix, connector, node_display));
@@ -1138,13 +1113,7 @@ impl ModuleSignature {
         }
 
         // Roots are targets that are not sources (leaf nodes in reverse direction)
-        // or sources that are not targets of anything (true roots)
         let mut roots: Vec<String> = all_targets.difference(&all_sources).cloned().collect();
-
-        // Also include "arguments" if referenced
-        if all_targets.contains("arguments") && !roots.contains(&"arguments".to_string()) {
-            roots.push("arguments".to_string());
-        }
 
         roots.sort();
         roots
@@ -1230,7 +1199,7 @@ mod tests {
 
             let web_sg = aws.security_group {
                 name   = "web-sg"
-                vpc_id = arguments.vpc
+                vpc_id = vpc
             }
 
             let http_rule = aws.security_group.ingress_rule {
@@ -1269,17 +1238,17 @@ mod tests {
         graph.add_edge(
             "web_sg".to_string(),
             TypedDependency {
-                target: "arguments".to_string(),
+                target: "vpc".to_string(),
                 target_type: Some(ResourceTypePath::new("aws", "vpc")),
-                attribute: "vpc".to_string(),
+                attribute: String::new(),
                 used_in: "vpc_id".to_string(),
             },
         );
 
         let deps = graph.dependencies_of("web_sg");
         assert_eq!(deps.len(), 1);
-        assert_eq!(deps[0].target, "arguments");
-        assert_eq!(deps[0].attribute, "vpc");
+        assert_eq!(deps[0].target, "vpc");
+        assert_eq!(deps[0].attribute, "");
         assert!(deps[0].target_type.is_some());
     }
 
@@ -1300,7 +1269,7 @@ mod tests {
 
             let web_sg = aws.security_group {
                 name   = "web-sg"
-                vpc_id = arguments.vpc
+                vpc_id = vpc
             }
         "#;
 

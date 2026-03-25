@@ -82,7 +82,7 @@ impl CompletionProvider {
                 self.region_completions_for_provider(&provider_name)
             }
             CompletionContext::InTypePosition => self.ref_type_completions(position, &text),
-            CompletionContext::AfterArgumentsDot => self.argument_parameter_completions(&text),
+            CompletionContext::AfterArgumentsDot => vec![],
             CompletionContext::None => vec![],
         }
     }
@@ -98,11 +98,6 @@ impl CompletionProvider {
         let current_line = lines[line_idx];
         let col = position.character as usize;
         let prefix: String = current_line.chars().take(col).collect();
-
-        // Check if we're typing after "arguments."
-        if prefix.contains("arguments.") || prefix.ends_with("arguments") {
-            return CompletionContext::AfterArgumentsDot;
-        }
 
         // Check if we're typing after "<provider>.Region." or "<provider>.Region"
         for provider_name in &self.provider_names {

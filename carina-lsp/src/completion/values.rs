@@ -115,35 +115,16 @@ impl CompletionProvider {
             }
         }
 
-        // Add argument parameter references if this file has arguments defined
+        // Add argument parameter references (lexically scoped — direct name access)
         let argument_params = self.extract_argument_parameters(text);
-        if !argument_params.is_empty() {
-            // Add "arguments" keyword with trigger for further completion
-            let trigger_suggest = Command {
-                title: "Trigger Suggest".to_string(),
-                command: "editor.action.triggerSuggest".to_string(),
-                arguments: None,
-            };
-
+        for (name, type_hint) in &argument_params {
             completions.push(CompletionItem {
-                label: "arguments".to_string(),
-                kind: Some(CompletionItemKind::KEYWORD),
-                detail: Some("Reference to module argument parameters".to_string()),
-                insert_text: Some("arguments.".to_string()),
-                command: Some(trigger_suggest),
+                label: name.clone(),
+                kind: Some(CompletionItemKind::VARIABLE),
+                detail: Some(format!("argument: {}", type_hint)),
+                insert_text: Some(name.clone()),
                 ..Default::default()
             });
-
-            // Also add direct arguments.xxx completions
-            for (name, type_hint) in &argument_params {
-                completions.push(CompletionItem {
-                    label: format!("arguments.{}", name),
-                    kind: Some(CompletionItemKind::FIELD),
-                    detail: Some(type_hint.to_string()),
-                    insert_text: Some(format!("arguments.{}", name)),
-                    ..Default::default()
-                });
-            }
         }
 
         // Look up the attribute type from schema
