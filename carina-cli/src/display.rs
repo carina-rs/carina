@@ -752,41 +752,91 @@ fn format_plan_tree(
     out
 }
 
+/// Determine ANSI color for a rendered value string based on its type.
+///
+/// Mirrors the `value_color()` logic in `carina-tui/src/ui.rs`:
+/// - Quoted strings (`"..."`) → green
+/// - Booleans (`true`/`false`) → yellow
+/// - Numbers → white
+/// - DSL identifiers (dot-notation, e.g. `awscc.Region.ap_northeast_1`) → magenta
+/// - ResourceRef values → cyan (handled separately via `ref_binding`)
+fn colored_value(rendered: &str, ref_binding: bool) -> String {
+    if ref_binding {
+        return rendered.cyan().to_string();
+    }
+    if rendered.starts_with('"') && rendered.ends_with('"') {
+        return rendered.green().to_string();
+    }
+    if rendered == "true" || rendered == "false" {
+        return rendered.yellow().to_string();
+    }
+    // Integer or float
+    if !rendered.is_empty()
+        && rendered
+            .chars()
+            .all(|c| c.is_ascii_digit() || c == '.' || c == '-')
+    {
+        let first = rendered.chars().next().unwrap();
+        if first.is_ascii_digit() || first == '-' {
+            return rendered.white().to_string();
+        }
+    }
+    // DSL identifier: contains dots, no quotes, no spaces
+    if rendered.contains('.') && !rendered.contains(' ') && !rendered.starts_with('{') {
+        return rendered.magenta().to_string();
+    }
+    rendered.to_string()
+}
+
+/// Apply type-based coloring to a value, with dimmed modifier for default values.
+fn colored_value_dimmed(rendered: &str) -> String {
+    if rendered.starts_with('"') && rendered.ends_with('"') {
+        return rendered.green().dimmed().to_string();
+    }
+    if rendered == "true" || rendered == "false" {
+        return rendered.yellow().dimmed().to_string();
+    }
+    if !rendered.is_empty()
+        && rendered
+            .chars()
+            .all(|c| c.is_ascii_digit() || c == '.' || c == '-')
+    {
+        let first = rendered.chars().next().unwrap();
+        if first.is_ascii_digit() || first == '-' {
+            return rendered.white().dimmed().to_string();
+        }
+    }
+    if rendered.contains('.') && !rendered.contains(' ') && !rendered.starts_with('{') {
+        return rendered.magenta().dimmed().to_string();
+    }
+    rendered.dimmed().to_string()
+}
+
 /// Render a single `DetailRow` into the output string with ANSI colors.
 fn render_detail_row(out: &mut String, row: &DetailRow, effect: &Effect, attr_prefix: &str) {
     match row {
         DetailRow::Attribute {
             key,
             value,
+            ref_binding,
             annotation,
-            ..
         } => {
-            let colored_value = match effect {
-                Effect::Create(_) => value.green().to_string(),
+            let cv = match effect {
                 Effect::Delete { .. } => value.red().strikethrough().to_string(),
-                _ => value.to_string(),
+                _ => colored_value(value, ref_binding.is_some()),
             };
             if let Some(ann) = annotation {
-                writeln!(
-                    out,
-                    "{}{}: {}  {}",
-                    attr_prefix,
-                    key,
-                    colored_value,
-                    ann.dimmed()
-                )
-                .unwrap();
+                writeln!(out, "{}{}: {}  {}", attr_prefix, key, cv, ann.dimmed()).unwrap();
             } else {
-                writeln!(out, "{}{}: {}", attr_prefix, key, colored_value).unwrap();
+                writeln!(out, "{}{}: {}", attr_prefix, key, cv).unwrap();
             }
         }
         DetailRow::MapExpanded { key, entries } => {
             writeln!(out, "{}{}:", attr_prefix, key).unwrap();
             for entry in entries {
-                let colored_value = match effect {
-                    Effect::Create(_) => entry.value.green().to_string(),
+                let cv = match effect {
                     Effect::Delete { .. } => entry.value.red().strikethrough().to_string(),
-                    _ => entry.value.to_string(),
+                    _ => colored_value(&entry.value, false),
                 };
                 if let Some(ann) = &entry.annotation {
                     writeln!(
@@ -794,12 +844,12 @@ fn render_detail_row(out: &mut String, row: &DetailRow, effect: &Effect, attr_pr
                         "{}  {}: {}  {}",
                         attr_prefix,
                         entry.key,
-                        colored_value,
+                        cv,
                         ann.dimmed()
                     )
                     .unwrap();
                 } else {
-                    writeln!(out, "{}  {}: {}", attr_prefix, entry.key, colored_value).unwrap();
+                    writeln!(out, "{}  {}: {}", attr_prefix, entry.key, cv).unwrap();
                 }
             }
         }
@@ -817,13 +867,14 @@ fn render_detail_row(out: &mut String, row: &DetailRow, effect: &Effect, attr_pr
             }
         }
         DetailRow::Changed { key, old, new } => {
+            let new_colored = colored_value(new, false);
             writeln!(
                 out,
                 "{}{}: {} → {}",
                 attr_prefix,
                 key,
                 old.red().strikethrough(),
-                new.green()
+                new_colored
             )
             .unwrap();
         }
@@ -858,7 +909,7 @@ fn render_detail_row(out: &mut String, row: &DetailRow, effect: &Effect, attr_pr
                 "{}{}: {}  {}",
                 attr_prefix,
                 key.dimmed(),
-                value.dimmed(),
+                colored_value_dimmed(value),
                 "# default".dimmed()
             )
             .unwrap();
@@ -995,7 +1046,7 @@ fn render_map_diff_entries(out: &mut String, entries: &[MapDiffEntryIR], attr_pr
                     "~".yellow(),
                     key,
                     old.red().strikethrough(),
-                    new.green()
+                    colored_value(new, false)
                 )
                 .unwrap();
             }
@@ -1006,7 +1057,7 @@ fn render_map_diff_entries(out: &mut String, entries: &[MapDiffEntryIR], attr_pr
                     attr_prefix,
                     "+".green(),
                     key,
-                    value.green()
+                    colored_value(value, false)
                 )
                 .unwrap();
             }
