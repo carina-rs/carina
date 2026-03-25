@@ -11,7 +11,7 @@ ws = @{ (" " | "\t")+ }
 newline = @{ NEWLINE }
 comment = @{ "#" ~ (!NEWLINE ~ ANY)* }
 
-statement = { import_stmt | backend_block | provider_block | input_block | output_block | let_binding | module_call | anonymous_resource }
+statement = { import_stmt | backend_block | provider_block | arguments_block | attributes_block | let_binding | module_call | anonymous_resource }
 
 // Import statement: import "./path/to/module.crn" as name
 import_stmt = {
@@ -38,27 +38,27 @@ provider_block = {
     kw_provider ~ trivia+ ~ identifier ~ trivia* ~ open_brace ~ block_content* ~ close_brace
 }
 
-// Input block: input { name: type, name: type = default }
-input_block = {
-    kw_input ~ trivia* ~ open_brace ~ input_block_content* ~ close_brace
+// Arguments block: arguments { name: type, name: type = default }
+arguments_block = {
+    kw_arguments ~ trivia* ~ open_brace ~ arguments_block_content* ~ close_brace
 }
 
-input_block_content = _{ trivia | input_param }
+arguments_block_content = _{ trivia | arguments_param }
 
-// Input parameter: name: type or name: type = default
-input_param = {
+// Arguments parameter: name: type or name: type = default
+arguments_param = {
     identifier ~ trivia* ~ colon ~ trivia* ~ type_expr ~ (trivia* ~ equals ~ trivia* ~ expression)?
 }
 
-// Output block: output { name: type = value }
-output_block = {
-    kw_output ~ trivia* ~ open_brace ~ output_block_content* ~ close_brace
+// Attributes block: attributes { name: type = value }
+attributes_block = {
+    kw_attributes ~ trivia* ~ open_brace ~ attributes_block_content* ~ close_brace
 }
 
-output_block_content = _{ trivia | output_param }
+attributes_block_content = _{ trivia | attributes_param }
 
-// Output parameter: name: type = value
-output_param = {
+// Attributes parameter: name: type = value
+attributes_param = {
     identifier ~ trivia* ~ colon ~ trivia* ~ type_expr ~ trivia* ~ equals ~ trivia* ~ expression
 }
 
@@ -173,8 +173,8 @@ kw_backend = { "backend" }
 kw_import = { "import" }
 kw_as = { "as" }
 kw_let = { "let" }
-kw_input = { "input" }
-kw_output = { "output" }
+kw_arguments = { "arguments" }
+kw_attributes = { "attributes" }
 kw_ref = { "ref" }
 kw_list = { "list" }
 kw_map = { "map" }

@@ -82,7 +82,7 @@ impl CompletionProvider {
                 self.region_completions_for_provider(&provider_name)
             }
             CompletionContext::AfterRefType => self.ref_type_completions(position, &text),
-            CompletionContext::AfterInputDot => self.input_parameter_completions(&text),
+            CompletionContext::AfterArgumentsDot => self.argument_parameter_completions(&text),
             CompletionContext::None => vec![],
         }
     }
@@ -99,9 +99,9 @@ impl CompletionProvider {
         let col = position.character as usize;
         let prefix: String = current_line.chars().take(col).collect();
 
-        // Check if we're typing after "input."
-        if prefix.contains("input.") || prefix.ends_with("input") {
-            return CompletionContext::AfterInputDot;
+        // Check if we're typing after "arguments."
+        if prefix.contains("arguments.") || prefix.ends_with("arguments") {
+            return CompletionContext::AfterArgumentsDot;
         }
 
         // Check if we're typing after "<provider>.Region." or "<provider>.Region"
@@ -168,8 +168,8 @@ impl CompletionProvider {
                 && !trimmed.starts_with("let ")
                 && !self.starts_with_provider_prefix(trimmed)
                 && !trimmed.starts_with("provider ")
-                && !trimmed.starts_with("input ")
-                && !trimmed.starts_with("output ")
+                && !trimmed.starts_with("arguments ")
+                && !trimmed.starts_with("attributes ")
                 && !trimmed.starts_with('#')
             {
                 // This is a module call: "module_name {"
@@ -455,6 +455,6 @@ enum CompletionContext {
         provider_name: String,
     },
     AfterRefType,
-    AfterInputDot,
+    AfterArgumentsDot,
     None,
 }

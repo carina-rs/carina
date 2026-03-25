@@ -273,10 +273,10 @@ impl SemanticTokensProvider {
                     }
                 }
             }
-        } else if trimmed.starts_with("output ") || trimmed == "output{" {
-            tokens.push((indent, 6, 0)); // KEYWORD: output
-        } else if trimmed.starts_with("input ") || trimmed == "input{" {
-            tokens.push((indent, 5, 0)); // KEYWORD: input
+        } else if trimmed.starts_with("attributes ") || trimmed == "attributes{" {
+            tokens.push((indent, 10, 0)); // KEYWORD: attributes
+        } else if trimmed.starts_with("arguments ") || trimmed == "arguments{" {
+            tokens.push((indent, 9, 0)); // KEYWORD: arguments
         }
 
         // Nested block names: "identifier {" without "=" (e.g., "security_group_ingress {")
@@ -285,10 +285,10 @@ impl SemanticTokensProvider {
             && !trimmed.starts_with("backend ")
             && !trimmed.starts_with("let ")
             && !trimmed.starts_with("import ")
-            && !trimmed.starts_with("output ")
-            && !trimmed.starts_with("output{")
-            && !trimmed.starts_with("input ")
-            && !trimmed.starts_with("input{")
+            && !trimmed.starts_with("attributes ")
+            && !trimmed.starts_with("attributes{")
+            && !trimmed.starts_with("arguments ")
+            && !trimmed.starts_with("arguments{")
             && !trimmed.contains('=')
             && !trimmed.contains('.')
             && trimmed.ends_with('{')
@@ -763,35 +763,35 @@ mod tests {
     }
 
     #[test]
-    fn test_output_keyword_highlighted() {
+    fn test_attributes_keyword_highlighted() {
         let provider = SemanticTokensProvider::new(&[]);
-        let tokens = provider.tokenize_line("output {", 0);
+        let tokens = provider.tokenize_line("attributes {", 0);
         let keyword_token = tokens
             .iter()
             .find(|(start, _, typ)| *start == 0 && *typ == 0);
         assert!(
             keyword_token.is_some(),
-            "Should highlight 'output' as KEYWORD. Got: {:?}",
+            "Should highlight 'attributes' as KEYWORD. Got: {:?}",
             tokens
         );
         let (_, len, _) = keyword_token.unwrap();
-        assert_eq!(*len, 6, "output keyword length should be 6");
+        assert_eq!(*len, 10, "attributes keyword length should be 10");
     }
 
     #[test]
-    fn test_input_keyword_highlighted() {
+    fn test_arguments_keyword_highlighted() {
         let provider = SemanticTokensProvider::new(&[]);
-        let tokens = provider.tokenize_line("input {", 0);
+        let tokens = provider.tokenize_line("arguments {", 0);
         let keyword_token = tokens
             .iter()
             .find(|(start, _, typ)| *start == 0 && *typ == 0);
         assert!(
             keyword_token.is_some(),
-            "Should highlight 'input' as KEYWORD. Got: {:?}",
+            "Should highlight 'arguments' as KEYWORD. Got: {:?}",
             tokens
         );
         let (_, len, _) = keyword_token.unwrap();
-        assert_eq!(*len, 5, "input keyword length should be 5");
+        assert_eq!(*len, 9, "arguments keyword length should be 9");
     }
 
     #[test]

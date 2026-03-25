@@ -73,19 +73,19 @@ impl CompletionProvider {
                 ..Default::default()
             },
             CompletionItem {
-                label: "input".to_string(),
+                label: "arguments".to_string(),
                 kind: Some(CompletionItemKind::KEYWORD),
-                insert_text: Some("input {\n    ${1:param}: ${2:type}\n}".to_string()),
+                insert_text: Some("arguments {\n    ${1:param}: ${2:type}\n}".to_string()),
                 insert_text_format: Some(InsertTextFormat::SNIPPET),
-                detail: Some("Define module input parameters".to_string()),
+                detail: Some("Define module argument parameters".to_string()),
                 ..Default::default()
             },
             CompletionItem {
-                label: "output".to_string(),
+                label: "attributes".to_string(),
                 kind: Some(CompletionItemKind::KEYWORD),
-                insert_text: Some("output {\n    ${1:name}: ${2:type} = ${3:value}\n}".to_string()),
+                insert_text: Some("attributes {\n    ${1:name}: ${2:type} = ${3:value}\n}".to_string()),
                 insert_text_format: Some(InsertTextFormat::SNIPPET),
-                detail: Some("Define module output values".to_string()),
+                detail: Some("Define module attribute values".to_string()),
                 ..Default::default()
             },
             CompletionItem {
@@ -149,29 +149,29 @@ impl CompletionProvider {
         completions
     }
 
-    pub(super) fn extract_input_parameters(&self, text: &str) -> Vec<(String, String)> {
+    pub(super) fn extract_argument_parameters(&self, text: &str) -> Vec<(String, String)> {
         let mut params = Vec::new();
-        let mut in_input_block = false;
+        let mut in_arguments_block = false;
         let mut brace_depth = 0;
 
         for line in text.lines() {
             let trimmed = line.trim();
 
-            // Check for "input {" block start
-            if trimmed.starts_with("input ") && trimmed.contains('{') {
-                in_input_block = true;
+            // Check for "arguments {" block start
+            if trimmed.starts_with("arguments ") && trimmed.contains('{') {
+                in_arguments_block = true;
                 brace_depth = 1;
                 continue;
             }
 
-            if in_input_block {
+            if in_arguments_block {
                 for ch in trimmed.chars() {
                     if ch == '{' {
                         brace_depth += 1;
                     } else if ch == '}' {
                         brace_depth -= 1;
                         if brace_depth == 0 {
-                            in_input_block = false;
+                            in_arguments_block = false;
                             break;
                         }
                     }
@@ -248,8 +248,8 @@ impl CompletionProvider {
         {
             let module_path = base.join(&import_path);
             if let Some(parsed) = carina_core::module_resolver::load_module(&module_path) {
-                // Extract input parameters from the module
-                for input in &parsed.inputs {
+                // Extract argument parameters from the module
+                for input in &parsed.arguments {
                     let type_str = self.format_type_expr(&input.type_expr);
                     let required_marker = if input.default.is_some() {
                         ""
@@ -278,13 +278,13 @@ impl CompletionProvider {
         completions
     }
 
-    /// Provide completions for input parameters in the current file (after "input.")
-    pub(super) fn input_parameter_completions(&self, text: &str) -> Vec<CompletionItem> {
+    /// Provide completions for argument parameters in the current file (after "arguments.")
+    pub(super) fn argument_parameter_completions(&self, text: &str) -> Vec<CompletionItem> {
         let mut completions = Vec::new();
 
-        // Extract input parameters from text (works even with incomplete code)
-        let input_params = self.extract_input_parameters(text);
-        for (name, type_hint) in input_params {
+        // Extract argument parameters from text (works even with incomplete code)
+        let argument_params = self.extract_argument_parameters(text);
+        for (name, type_hint) in argument_params {
             let required_marker = if type_hint.contains('=') {
                 ""
             } else {

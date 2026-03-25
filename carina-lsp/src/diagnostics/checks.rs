@@ -6,7 +6,7 @@ use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
 
 use crate::document::Document;
 use crate::position;
-use carina_core::parser::{InputParameter, ParsedFile, TypeExpr};
+use carina_core::parser::{ArgumentParameter, ParsedFile, TypeExpr};
 use carina_core::resource::Value;
 use carina_core::schema::validate_ipv4_cidr;
 
@@ -86,34 +86,34 @@ impl DiagnosticEngine {
     ) -> Vec<Diagnostic> {
         let mut diagnostics = Vec::new();
 
-        // Build a map of imported modules: alias -> input parameters
-        let mut imported_modules: HashMap<String, Vec<InputParameter>> = HashMap::new();
+        // Build a map of imported modules: alias -> argument parameters
+        let mut imported_modules: HashMap<String, Vec<ArgumentParameter>> = HashMap::new();
 
         for import in &parsed.imports {
             let module_path = base_path.join(&import.path);
             if let Some(module_parsed) = carina_core::module_resolver::load_module(&module_path) {
-                imported_modules.insert(import.alias.clone(), module_parsed.inputs);
+                imported_modules.insert(import.alias.clone(), module_parsed.arguments);
             }
         }
 
         // Check each module call
         for call in &parsed.module_calls {
-            if let Some(module_inputs) = imported_modules.get(&call.module_name) {
+            if let Some(module_args) = imported_modules.get(&call.module_name) {
                 // Check for unknown parameters
                 for (arg_name, arg_value) in &call.arguments {
-                    let matching_input = module_inputs.iter().find(|input| &input.name == arg_name);
+                    let matching_arg = module_args.iter().find(|arg| &arg.name == arg_name);
 
-                    if matching_input.is_none() {
+                    if matching_arg.is_none() {
                         if let Some((line, col)) =
                             self.find_module_call_arg_position(doc, &call.module_name, arg_name)
                         {
                             // Find similar parameter names for suggestion
-                            let suggestion = module_inputs
+                            let suggestion = module_args
                                 .iter()
-                                .find(|input| {
-                                    input.name.contains(arg_name) || arg_name.contains(&input.name)
+                                .find(|arg| {
+                                    arg.name.contains(arg_name) || arg_name.contains(&arg.name)
                                 })
-                                .map(|input| format!(". Did you mean '{}'?", input.name))
+                                .map(|arg| format!(". Did you mean '{}'?", arg.name))
                                 .unwrap_or_default();
 
                             diagnostics.push(Diagnostic {
@@ -140,9 +140,9 @@ impl DiagnosticEngine {
                     }
 
                     // Type validation for known parameters
-                    let input = matching_input.unwrap();
+                    let arg = matching_arg.unwrap();
                     if let Some(type_error) =
-                        self.validate_module_arg_type(&input.type_expr, arg_value)
+                        self.validate_module_arg_type(&arg.type_expr, arg_value)
                         && let Some((line, col)) =
                             self.find_module_call_arg_position(doc, &call.module_name, arg_name)
                     {
@@ -166,9 +166,9 @@ impl DiagnosticEngine {
                 }
 
                 // Check for missing required parameters
-                for input in module_inputs {
-                    if input.default.is_none()
-                        && !call.arguments.contains_key(&input.name)
+                for arg in module_args {
+                    if arg.default.is_none()
+                        && !call.arguments.contains_key(&arg.name)
                         && let Some((line, col)) =
                             self.find_module_call_position(doc, &call.module_name)
                     {
@@ -187,7 +187,7 @@ impl DiagnosticEngine {
                             source: Some("carina".to_string()),
                             message: format!(
                                 "Missing required parameter '{}' for module '{}'",
-                                input.name, call.module_name
+                                arg.name, call.module_name
                             ),
                             ..Default::default()
                         });
@@ -383,8 +383,8 @@ impl DiagnosticEngine {
         bindings
     }
 
-    /// Check output blocks for type mismatches and undefined binding references.
-    pub(super) fn check_output_blocks(
+    /// Check attributes blocks for type mismatches and undefined binding references.
+    pub(super) fn check_attributes_blocks(
         &self,
         doc: &Document,
         parsed: &ParsedFile,
@@ -399,12 +399,13 @@ impl DiagnosticEngine {
             }
         }
 
-        for output in &parsed.outputs {
-            if let Some(value) = &output.value {
+        for attr_param in &parsed.attribute_params {
+            if let Some(value) = &attr_param.value {
                 // Check for undefined binding references
                 if let Value::ResourceRef { binding_name, .. } = value
                     && !defined_bindings.contains(binding_name.as_str())
-                    && let Some((line, col)) = self.find_output_value_position(doc, &output.name)
+                    && let Some((line, col)) =
+                        self.find_attributes_value_position(doc, &attr_param.name)
                 {
                     diagnostics.push(Diagnostic {
                         range: Range {
@@ -420,8 +421,8 @@ impl DiagnosticEngine {
                         severity: Some(DiagnosticSeverity::ERROR),
                         source: Some("carina".to_string()),
                         message: format!(
-                            "Undefined resource '{}' in output '{}'. Define it with 'let {} = ...'",
-                            binding_name, output.name, binding_name
+                            "Undefined resource '{}' in attributes '{}'. Define it with 'let {} = ...'",
+                            binding_name, attr_param.name, binding_name
                         ),
                         ..Default::default()
                     });
@@ -429,8 +430,9 @@ impl DiagnosticEngine {
 
                 // Type validation
                 if let Some(type_error) =
-                    self.validate_output_type(&output.type_expr, value, &output.name)
-                    && let Some((line, col)) = self.find_output_param_position(doc, &output.name)
+                    self.validate_attributes_type(&attr_param.type_expr, value, &attr_param.name)
+                    && let Some((line, col)) =
+                        self.find_attributes_param_position(doc, &attr_param.name)
                 {
                     diagnostics.push(Diagnostic {
                         range: Range {
@@ -440,7 +442,7 @@ impl DiagnosticEngine {
                             },
                             end: Position {
                                 line,
-                                character: col + output.name.len() as u32,
+                                character: col + attr_param.name.len() as u32,
                             },
                         },
                         severity: Some(DiagnosticSeverity::WARNING),
@@ -455,76 +457,80 @@ impl DiagnosticEngine {
         diagnostics
     }
 
-    /// Validate an output value against its declared type.
-    fn validate_output_type(
+    /// Validate an attributes value against its declared type.
+    fn validate_attributes_type(
         &self,
         type_expr: &TypeExpr,
         value: &Value,
-        output_name: &str,
+        attr_name: &str,
     ) -> Option<String> {
         match (type_expr, value) {
             // ResourceRef is always allowed (type is resolved at runtime)
             (_, Value::ResourceRef { .. }) => None,
             // String type checks
             (TypeExpr::String, Value::Bool(b)) => Some(format!(
-                "Type mismatch in output '{}': expected string, got bool ({})",
-                output_name, b
+                "Type mismatch in attributes '{}': expected string, got bool ({})",
+                attr_name, b
             )),
             (TypeExpr::String, Value::Int(n)) => Some(format!(
-                "Type mismatch in output '{}': expected string, got int ({})",
-                output_name, n
+                "Type mismatch in attributes '{}': expected string, got int ({})",
+                attr_name, n
             )),
             (TypeExpr::String, Value::Float(f)) => Some(format!(
-                "Type mismatch in output '{}': expected string, got float ({})",
-                output_name, f
+                "Type mismatch in attributes '{}': expected string, got float ({})",
+                attr_name, f
             )),
             // Bool type checks
             (TypeExpr::Bool, Value::String(s)) => Some(format!(
-                "Type mismatch in output '{}': expected bool, got string \"{}\". Use true or false.",
-                output_name, s
+                "Type mismatch in attributes '{}': expected bool, got string \"{}\". Use true or false.",
+                attr_name, s
             )),
             (TypeExpr::Bool, Value::Int(n)) => Some(format!(
-                "Type mismatch in output '{}': expected bool, got int ({})",
-                output_name, n
+                "Type mismatch in attributes '{}': expected bool, got int ({})",
+                attr_name, n
             )),
             // Int type checks
             (TypeExpr::Int, Value::String(s)) => Some(format!(
-                "Type mismatch in output '{}': expected int, got string \"{}\"",
-                output_name, s
+                "Type mismatch in attributes '{}': expected int, got string \"{}\"",
+                attr_name, s
             )),
             (TypeExpr::Int, Value::Bool(b)) => Some(format!(
-                "Type mismatch in output '{}': expected int, got bool ({})",
-                output_name, b
+                "Type mismatch in attributes '{}': expected int, got bool ({})",
+                attr_name, b
             )),
             // Float type checks
             (TypeExpr::Float, Value::String(s)) => Some(format!(
-                "Type mismatch in output '{}': expected float, got string \"{}\"",
-                output_name, s
+                "Type mismatch in attributes '{}': expected float, got string \"{}\"",
+                attr_name, s
             )),
             (TypeExpr::Float, Value::Bool(b)) => Some(format!(
-                "Type mismatch in output '{}': expected float, got bool ({})",
-                output_name, b
+                "Type mismatch in attributes '{}': expected float, got bool ({})",
+                attr_name, b
             )),
             _ => None,
         }
     }
 
-    /// Find the position of an output parameter name in the document.
-    fn find_output_param_position(&self, doc: &Document, param_name: &str) -> Option<(u32, u32)> {
+    /// Find the position of an attributes parameter name in the document.
+    fn find_attributes_param_position(
+        &self,
+        doc: &Document,
+        param_name: &str,
+    ) -> Option<(u32, u32)> {
         let text = doc.text();
-        let mut in_output_block = false;
+        let mut in_attributes_block = false;
 
         for (line_idx, line) in text.lines().enumerate() {
             let trimmed = line.trim();
 
-            if trimmed.starts_with("output ") && trimmed.contains('{') {
-                in_output_block = true;
+            if trimmed.starts_with("attributes ") && trimmed.contains('{') {
+                in_attributes_block = true;
                 continue;
             }
 
-            if in_output_block {
+            if in_attributes_block {
                 if trimmed == "}" {
-                    in_output_block = false;
+                    in_attributes_block = false;
                     continue;
                 }
 
@@ -542,22 +548,26 @@ impl DiagnosticEngine {
         None
     }
 
-    /// Find the position of the value expression in an output parameter line.
-    fn find_output_value_position(&self, doc: &Document, param_name: &str) -> Option<(u32, u32)> {
+    /// Find the position of the value expression in an attributes parameter line.
+    fn find_attributes_value_position(
+        &self,
+        doc: &Document,
+        param_name: &str,
+    ) -> Option<(u32, u32)> {
         let text = doc.text();
-        let mut in_output_block = false;
+        let mut in_attributes_block = false;
 
         for (line_idx, line) in text.lines().enumerate() {
             let trimmed = line.trim();
 
-            if trimmed.starts_with("output ") && trimmed.contains('{') {
-                in_output_block = true;
+            if trimmed.starts_with("attributes ") && trimmed.contains('{') {
+                in_attributes_block = true;
                 continue;
             }
 
-            if in_output_block {
+            if in_attributes_block {
                 if trimmed == "}" {
-                    in_output_block = false;
+                    in_attributes_block = false;
                     continue;
                 }
 

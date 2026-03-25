@@ -164,14 +164,14 @@ fn format_value(value: &Value) -> String {
     }
 }
 
-/// Typed input parameter for module signature
+/// Typed argument parameter for module signature
 #[derive(Debug, Clone)]
-pub struct TypedInput {
-    /// Input parameter name
+pub struct TypedArgument {
+    /// Argument parameter name
     pub name: String,
     /// Type expression (including ref types)
     pub type_expr: TypeExpr,
-    /// Whether this input is required (no default)
+    /// Whether this argument is required (no default)
     pub required: bool,
     /// Default value as a display string
     pub default: Option<String>,
@@ -184,14 +184,14 @@ pub struct ResourceCreation {
     pub binding_name: String,
     /// Full resource type path (e.g., aws.security_group)
     pub resource_type: ResourceTypePath,
-    /// Dependencies on other resources or inputs
+    /// Dependencies on other resources or arguments
     pub dependencies: Vec<TypedDependency>,
 }
 
-/// Typed output parameter for module signature
+/// Typed attribute parameter for module signature
 #[derive(Debug, Clone)]
-pub struct TypedOutput {
-    /// Output parameter name
+pub struct TypedAttributeParam {
+    /// Attribute parameter name
     pub name: String,
     /// Type expression (including ref types)
     pub type_expr: TypeExpr,
@@ -202,7 +202,7 @@ pub struct TypedOutput {
 /// Typed dependency representing a reference from one resource to another
 #[derive(Debug, Clone)]
 pub struct TypedDependency {
-    /// Target binding name (e.g., "vpc", "input")
+    /// Target binding name (e.g., "vpc", "arguments")
     pub target: String,
     /// Target resource type (if known)
     pub target_type: Option<ResourceTypePath>,
@@ -647,11 +647,11 @@ pub enum FileSignature {
 
 impl FileSignature {
     /// Create from a parsed file
-    /// For directory-based modules (files with top-level input/output blocks),
+    /// For directory-based modules (files with top-level arguments/attributes blocks),
     /// the module name is derived from the directory name or file name.
     pub fn from_parsed_file(parsed: &ParsedFile, file_name: &str) -> Self {
-        // Check for directory-based module (has top-level inputs or outputs)
-        if !parsed.inputs.is_empty() || !parsed.outputs.is_empty() {
+        // Check for directory-based module (has top-level arguments or attribute_params)
+        if !parsed.arguments.is_empty() || !parsed.attribute_params.is_empty() {
             return FileSignature::Module(ModuleSignature::from_directory_module(
                 parsed, file_name,
             ));
@@ -664,8 +664,8 @@ impl FileSignature {
     /// Create from a parsed file with a specific module name
     /// Use this when you know the module name (e.g., from directory structure)
     pub fn from_parsed_file_with_name(parsed: &ParsedFile, module_name: &str) -> Self {
-        // Check for directory-based module (has top-level inputs or outputs)
-        if !parsed.inputs.is_empty() || !parsed.outputs.is_empty() {
+        // Check for directory-based module (has top-level arguments or attribute_params)
+        if !parsed.arguments.is_empty() || !parsed.attribute_params.is_empty() {
             return FileSignature::Module(ModuleSignature::from_directory_module(
                 parsed,
                 module_name,
@@ -690,24 +690,24 @@ impl FileSignature {
 pub struct ModuleSignature {
     /// Module name
     pub name: String,
-    /// Required inputs with types
-    pub requires: Vec<TypedInput>,
+    /// Required arguments with types
+    pub requires: Vec<TypedArgument>,
     /// Resources created by this module
     pub creates: Vec<ResourceCreation>,
-    /// Exposed outputs with types
-    pub exposes: Vec<TypedOutput>,
+    /// Exposed attribute params with types
+    pub exposes: Vec<TypedAttributeParam>,
     /// Typed dependency graph
     pub dependency_graph: TypedDependencyGraph,
 }
 
 impl ModuleSignature {
-    /// Build a module signature from a directory-based module (ParsedFile with top-level inputs/outputs)
+    /// Build a module signature from a directory-based module (ParsedFile with top-level arguments/attributes)
     pub fn from_directory_module(parsed: &ParsedFile, module_name: &str) -> Self {
         // Build requires (typed inputs)
-        let requires: Vec<TypedInput> = parsed
-            .inputs
+        let requires: Vec<TypedArgument> = parsed
+            .arguments
             .iter()
-            .map(|input| TypedInput {
+            .map(|input| TypedArgument {
                 name: input.name.clone(),
                 type_expr: input.type_expr.clone(),
                 required: input.default.is_none(),
@@ -716,8 +716,8 @@ impl ModuleSignature {
             .collect();
 
         // Build input type map for dependency type inference
-        let input_types: HashMap<String, TypeExpr> = parsed
-            .inputs
+        let argument_types: HashMap<String, TypeExpr> = parsed
+            .arguments
             .iter()
             .map(|i| (i.name.clone(), i.type_expr.clone()))
             .collect();
@@ -783,7 +783,7 @@ impl ModuleSignature {
                     value,
                     &mut typed_graph,
                     &binding_types,
-                    &input_types,
+                    &argument_types,
                 );
             }
         }
@@ -795,19 +795,19 @@ impl ModuleSignature {
             }
         }
 
-        // Build exposes (typed outputs)
-        let exposes: Vec<TypedOutput> = parsed
-            .outputs
+        // Build exposes (typed attribute params)
+        let exposes: Vec<TypedAttributeParam> = parsed
+            .attribute_params
             .iter()
-            .map(|output| {
-                let source_binding = output.value.as_ref().and_then(|v| match v {
+            .map(|attr_param| {
+                let source_binding = attr_param.value.as_ref().and_then(|v| match v {
                     Value::ResourceRef { binding_name, .. } => Some(binding_name.clone()),
                     _ => None,
                 });
 
-                TypedOutput {
-                    name: output.name.clone(),
-                    type_expr: output.type_expr.clone(),
+                TypedAttributeParam {
+                    name: attr_param.name.clone(),
+                    type_expr: attr_param.type_expr.clone(),
                     source_binding,
                 }
             })
@@ -828,15 +828,15 @@ impl ModuleSignature {
         value: &Value,
         graph: &mut TypedDependencyGraph,
         binding_types: &HashMap<String, ResourceTypePath>,
-        input_types: &HashMap<String, TypeExpr>,
+        argument_types: &HashMap<String, TypeExpr>,
     ) {
         match value {
             Value::ResourceRef {
                 binding_name,
                 attribute_name,
             } => {
-                let target_type = if binding_name == "input" {
-                    input_types.get(attribute_name).and_then(|t| {
+                let target_type = if binding_name == "arguments" {
+                    argument_types.get(attribute_name).and_then(|t| {
                         if let TypeExpr::Ref(path) = t {
                             Some(path.clone())
                         } else {
@@ -865,13 +865,20 @@ impl ModuleSignature {
                         item,
                         graph,
                         binding_types,
-                        input_types,
+                        argument_types,
                     );
                 }
             }
             Value::Map(map) => {
                 for (k, v) in map {
-                    Self::collect_typed_dependencies(from, k, v, graph, binding_types, input_types);
+                    Self::collect_typed_dependencies(
+                        from,
+                        k,
+                        v,
+                        graph,
+                        binding_types,
+                        argument_types,
+                    );
                 }
             }
             _ => {}
@@ -893,8 +900,8 @@ impl ModuleSignature {
             c.bold, c.reset, c.cyan, self.name, c.reset
         ));
 
-        // REQUIRES section
-        output.push_str(&format!("{}=== REQUIRES ==={}\n\n", c.bold, c.reset));
+        // ARGUMENTS section
+        output.push_str(&format!("{}=== ARGUMENTS ==={}\n\n", c.bold, c.reset));
         if self.requires.is_empty() {
             output.push_str(&format!("  {}(none){}\n", c.dim, c.reset));
         } else {
@@ -954,18 +961,18 @@ impl ModuleSignature {
         }
         output.push('\n');
 
-        // EXPOSES section
-        output.push_str(&format!("{}=== EXPOSES ==={}\n\n", c.bold, c.reset));
+        // ATTRIBUTES section
+        output.push_str(&format!("{}=== ATTRIBUTES ==={}\n\n", c.bold, c.reset));
         if self.exposes.is_empty() {
             output.push_str(&format!("  {}(none){}\n", c.dim, c.reset));
         } else {
-            for output_param in &self.exposes {
-                let type_str = self.format_type_expr(&output_param.type_expr, &c);
+            for attr_param in &self.exposes {
+                let type_str = self.format_type_expr(&attr_param.type_expr, &c);
                 output.push_str(&format!(
                     "  {}{}{}: {}\n",
-                    c.white, output_param.name, c.reset, type_str
+                    c.white, attr_param.name, c.reset, type_str
                 ));
-                if let Some(source) = &output_param.source_binding {
+                if let Some(source) = &attr_param.source_binding {
                     output.push_str(&format!(
                         "    {}<- from:{} {}{}{}\n",
                         c.dim, c.reset, c.cyan, source, c.reset
@@ -1027,8 +1034,8 @@ impl ModuleSignature {
         };
 
         // Format the node with its type
-        let node_display = if node == "input" {
-            // Show input with ref types
+        let node_display = if node == "arguments" {
+            // Show arguments with ref types
             let ref_inputs: Vec<String> = self
                 .requires
                 .iter()
@@ -1044,10 +1051,10 @@ impl ModuleSignature {
                 })
                 .collect();
             if ref_inputs.is_empty() {
-                format!("{}input{}", c.blue, c.reset)
+                format!("{}arguments{}", c.blue, c.reset)
             } else {
                 format!(
-                    "{}input{} {}{{ {} }}{}",
+                    "{}arguments{} {}{{ {} }}{}",
                     c.blue,
                     c.reset,
                     c.dim,
@@ -1134,9 +1141,9 @@ impl ModuleSignature {
         // or sources that are not targets of anything (true roots)
         let mut roots: Vec<String> = all_targets.difference(&all_sources).cloned().collect();
 
-        // Also include "input" if referenced
-        if all_targets.contains("input") && !roots.contains(&"input".to_string()) {
-            roots.push("input".to_string());
+        // Also include "arguments" if referenced
+        if all_targets.contains("arguments") && !roots.contains(&"arguments".to_string()) {
+            roots.push("arguments".to_string());
         }
 
         roots.sort();
@@ -1212,18 +1219,18 @@ mod tests {
         use crate::parser::parse;
 
         let input = r#"
-            input {
+            arguments {
                 vpc: ref(aws.vpc)
                 enable_https: bool = true
             }
 
-            output {
+            attributes {
                 security_group: ref(aws.security_group) = web_sg.id
             }
 
             let web_sg = aws.security_group {
                 name   = "web-sg"
-                vpc_id = input.vpc
+                vpc_id = arguments.vpc
             }
 
             let http_rule = aws.security_group.ingress_rule {
@@ -1240,9 +1247,9 @@ mod tests {
 
         // Check sections are present
         assert!(display.contains("Module: web_tier"));
-        assert!(display.contains("=== REQUIRES ==="));
+        assert!(display.contains("=== ARGUMENTS ==="));
         assert!(display.contains("=== CREATES ==="));
-        assert!(display.contains("=== EXPOSES ==="));
+        assert!(display.contains("=== ATTRIBUTES ==="));
 
         // Check ref types are displayed correctly
         assert!(display.contains("ref(aws.vpc)"));
@@ -1262,7 +1269,7 @@ mod tests {
         graph.add_edge(
             "web_sg".to_string(),
             TypedDependency {
-                target: "input".to_string(),
+                target: "arguments".to_string(),
                 target_type: Some(ResourceTypePath::new("aws", "vpc")),
                 attribute: "vpc".to_string(),
                 used_in: "vpc_id".to_string(),
@@ -1271,7 +1278,7 @@ mod tests {
 
         let deps = graph.dependencies_of("web_sg");
         assert_eq!(deps.len(), 1);
-        assert_eq!(deps[0].target, "input");
+        assert_eq!(deps[0].target, "arguments");
         assert_eq!(deps[0].attribute, "vpc");
         assert!(deps[0].target_type.is_some());
     }
@@ -1282,26 +1289,26 @@ mod tests {
 
         // Parse a directory-based module (no module {} wrapper)
         let input = r#"
-            input {
+            arguments {
                 vpc: ref(aws.vpc)
                 enable_https: bool = true
             }
 
-            output {
+            attributes {
                 security_group: ref(aws.security_group) = web_sg.id
             }
 
             let web_sg = aws.security_group {
                 name   = "web-sg"
-                vpc_id = input.vpc
+                vpc_id = arguments.vpc
             }
         "#;
 
         let parsed = parse(input).unwrap();
 
         // Verify parsed file has top-level inputs and outputs
-        assert_eq!(parsed.inputs.len(), 2);
-        assert_eq!(parsed.outputs.len(), 1);
+        assert_eq!(parsed.arguments.len(), 2);
+        assert_eq!(parsed.attribute_params.len(), 1);
 
         // Create signature from directory-based module
         let signature = ModuleSignature::from_directory_module(&parsed, "web_tier");
@@ -1327,12 +1334,12 @@ mod tests {
     fn test_file_signature_from_directory_module() {
         use crate::parser::parse;
 
-        // Directory-based module (top-level input/output)
+        // Directory-based module (top-level arguments/attributes)
         let input = r#"
-            input {
+            arguments {
                 vpc: ref(aws.vpc)
             }
-            output {
+            attributes {
                 sg: ref(aws.security_group)
             }
         "#;
@@ -1354,7 +1361,7 @@ mod tests {
     fn test_file_signature_from_root_config() {
         use crate::parser::parse;
 
-        // Root config (no input/output, no module wrapper)
+        // Root config (no arguments/attributes, no module wrapper)
         let input = r#"
             provider aws {
                 region = aws.Region.ap_northeast_1

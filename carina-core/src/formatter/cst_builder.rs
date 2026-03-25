@@ -70,14 +70,18 @@ impl<'a> CstBuilder<'a> {
             Rule::provider_block => Some(CstChild::Node(
                 self.build_node(NodeKind::ProviderBlock, pair),
             )),
-            Rule::input_block => Some(CstChild::Node(self.build_node(NodeKind::InputBlock, pair))),
-            Rule::output_block => {
-                Some(CstChild::Node(self.build_node(NodeKind::OutputBlock, pair)))
-            }
-            Rule::input_param => Some(CstChild::Node(self.build_node(NodeKind::InputParam, pair))),
-            Rule::output_param => {
-                Some(CstChild::Node(self.build_node(NodeKind::OutputParam, pair)))
-            }
+            Rule::arguments_block => Some(CstChild::Node(
+                self.build_node(NodeKind::ArgumentsBlock, pair),
+            )),
+            Rule::attributes_block => Some(CstChild::Node(
+                self.build_node(NodeKind::AttributesBlock, pair),
+            )),
+            Rule::arguments_param => Some(CstChild::Node(
+                self.build_node(NodeKind::ArgumentsParam, pair),
+            )),
+            Rule::attributes_param => Some(CstChild::Node(
+                self.build_node(NodeKind::AttributesParam, pair),
+            )),
             Rule::type_expr => Some(CstChild::Node(self.build_node(NodeKind::TypeExpr, pair))),
             Rule::type_primitive => {
                 Some(CstChild::Token(Token::new(pair.as_str().to_string(), span)))
@@ -148,8 +152,10 @@ impl<'a> CstBuilder<'a> {
             Rule::kw_backend => Some(CstChild::Token(Token::new("backend".to_string(), span))),
             Rule::kw_provider => Some(CstChild::Token(Token::new("provider".to_string(), span))),
             Rule::kw_let => Some(CstChild::Token(Token::new("let".to_string(), span))),
-            Rule::kw_input => Some(CstChild::Token(Token::new("input".to_string(), span))),
-            Rule::kw_output => Some(CstChild::Token(Token::new("output".to_string(), span))),
+            Rule::kw_arguments => Some(CstChild::Token(Token::new("arguments".to_string(), span))),
+            Rule::kw_attributes => {
+                Some(CstChild::Token(Token::new("attributes".to_string(), span)))
+            }
             Rule::kw_ref => Some(CstChild::Token(Token::new("ref".to_string(), span))),
             Rule::kw_list => Some(CstChild::Token(Token::new("list".to_string(), span))),
             Rule::kw_map => Some(CstChild::Token(Token::new("map".to_string(), span))),
@@ -157,8 +163,8 @@ impl<'a> CstBuilder<'a> {
             // Skip file_content (it's a silent rule wrapper)
             Rule::file_content => None,
             Rule::block_content => None,
-            Rule::input_block_content => None,
-            Rule::output_block_content => None,
+            Rule::arguments_block_content => None,
+            Rule::attributes_block_content => None,
 
             Rule::file => None,
         }

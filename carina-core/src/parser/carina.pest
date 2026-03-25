@@ -3,25 +3,25 @@
 // Entry point
 file = { SOI ~ statement* ~ EOI }
 
-statement = { import_stmt | backend_block | provider_block | input_block | output_block | let_binding | module_call | anonymous_resource }
+statement = { import_stmt | backend_block | provider_block | arguments_block | attributes_block | let_binding | module_call | anonymous_resource }
 
-// Input block: input { vpc_id: string, ... }
-input_block = {
-    "input" ~ "{" ~ input_param* ~ "}"
+// Arguments block: arguments { vpc_id: string, ... }
+arguments_block = {
+    "arguments" ~ "{" ~ arguments_param* ~ "}"
 }
 
-// Input parameter: name: type or name: type = default
-input_param = {
+// Arguments parameter: name: type or name: type = default
+arguments_param = {
     identifier ~ ":" ~ type_expr ~ ("=" ~ expression)?
 }
 
-// Output block: output { subnet_ids: list(string), ... }
-output_block = {
-    "output" ~ "{" ~ output_param* ~ "}"
+// Attributes block: attributes { subnet_ids: list(string), ... }
+attributes_block = {
+    "attributes" ~ "{" ~ attributes_param* ~ "}"
 }
 
-// Output parameter: name: type or name: type = expression
-output_param = {
+// Attributes parameter: name: type or name: type = expression
+attributes_param = {
     identifier ~ ":" ~ type_expr ~ ("=" ~ expression)?
 }
 
