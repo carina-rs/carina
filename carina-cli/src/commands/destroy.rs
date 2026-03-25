@@ -26,7 +26,7 @@ use super::validate_and_resolve;
 use crate::DetailLevel;
 use crate::commands::apply::{apply_name_overrides, format_duration, spinner_style};
 use crate::commands::state::map_lock_error;
-use crate::display::{build_effect_tree_entries, format_destroy_plan, format_effect};
+use crate::display::{format_destroy_plan, format_effect};
 use crate::error::AppError;
 use crate::wiring::{
     WiringContext, get_provider_with_ctx, reconcile_anonymous_identifiers_with_ctx,
@@ -347,13 +347,6 @@ async fn run_destroy_locked(
         multi.set_draw_target(indicatif::ProgressDrawTarget::hidden());
     }
 
-    // Build tree entries and prefixes from the destroy plan for indentation
-    let tree_entries = build_effect_tree_entries(&destroy_plan);
-    let mut tree_prefixes: HashMap<usize, String> = HashMap::new();
-    for entry in &tree_entries {
-        tree_prefixes.insert(entry.effect_idx, entry.prefix.clone());
-    }
-
     // Map from resource index to its spinner (populated lazily on dispatch)
     let mut spinners: HashMap<usize, ProgressBar> = HashMap::new();
 
@@ -460,8 +453,6 @@ async fn run_destroy_locked(
         for idx in newly_ready {
             dispatched.insert(idx);
 
-            let prefix = tree_prefixes.get(&idx).map(|s| s.as_str()).unwrap_or("");
-
             let (binding, identifier, effect) = &resource_info[idx];
             let resource = resources_to_destroy[idx];
 
@@ -472,9 +463,8 @@ async fn run_destroy_locked(
                 let c = completed_counter.fetch_add(1, Ordering::Relaxed) + 1;
                 let counter = format!("{}/{}", c, destroy_total).dimmed();
                 let msg = format!(
-                    "{} {}{} - skipped (dependent {} failed) {}",
+                    "{} {} - skipped (dependent {} failed) {}",
                     "⊘".yellow(),
-                    prefix,
                     format_effect(effect),
                     failed_dep,
                     counter
@@ -573,9 +563,8 @@ async fn run_destroy_locked(
                 let c = completed_counter.fetch_add(1, Ordering::Relaxed) + 1;
                 let counter = format!("{}/{}", c, destroy_total).dimmed();
                 let msg = format!(
-                    "{} {}{} - skipped (dependent deletion did not complete) {}",
+                    "{} {} - skipped (dependent deletion did not complete) {}",
                     "⊘".yellow(),
-                    prefix,
                     format_effect(effect),
                     counter
                 );
@@ -594,7 +583,7 @@ async fn run_destroy_locked(
             // Create a spinner for the in-flight deletion
             let pb = multi.add(ProgressBar::new_spinner());
             pb.set_style(spinner_style());
-            pb.set_message(format!("{}{}", prefix, format_effect(effect)));
+            pb.set_message(format_effect(effect));
             pb.enable_steady_tick(Duration::from_millis(80));
             spinners.insert(idx, pb);
 
@@ -638,13 +627,11 @@ async fn run_destroy_locked(
             if all_retried {
                 for &idx in &remaining {
                     let (_, _, effect) = &resource_info[idx];
-                    let prefix = tree_prefixes.get(&idx).map(|s| s.as_str()).unwrap_or("");
                     let c = completed_counter.fetch_add(1, Ordering::Relaxed) + 1;
                     let counter = format!("{}/{}", c, destroy_total).dimmed();
                     let msg = format!(
-                        "{} {}{} - retries exhausted (no progress possible) {}",
+                        "{} {} - retries exhausted (no progress possible) {}",
                         "✗".red(),
-                        prefix,
                         format_effect(effect),
                         counter
                     );
@@ -683,10 +670,6 @@ async fn run_destroy_locked(
         let c = completed_counter.fetch_add(1, Ordering::Relaxed) + 1;
         let counter = format!("{}/{}", c, destroy_total).dimmed();
         let effect = &resource_info[finished_idx].2;
-        let prefix = tree_prefixes
-            .get(&finished_idx)
-            .map(|s| s.as_str())
-            .unwrap_or("");
 
         // Helper to finish the spinner for the completed effect
         let finish_spinner =
@@ -703,9 +686,8 @@ async fn run_destroy_locked(
             Ok(()) => {
                 let timing = format!("[{}]", format_duration(started.elapsed())).dimmed();
                 let msg = format!(
-                    "{} {}{} {} {}",
+                    "{} {} {} {}",
                     "✓".green(),
-                    prefix,
                     format_effect(effect),
                     timing,
                     counter
@@ -716,9 +698,8 @@ async fn run_destroy_locked(
             }
             Err(e) if e.is_timeout => {
                 let msg = format!(
-                    "{} {}{} - Operation timed out, waiting for completion...",
+                    "{} {} - Operation timed out, waiting for completion...",
                     "⏳".yellow(),
-                    prefix,
                     format_effect(effect)
                 );
                 finish_spinner(&mut spinners, finished_idx, msg);
@@ -741,9 +722,8 @@ async fn run_destroy_locked(
                     completed_counter.fetch_sub(1, Ordering::Relaxed);
                     let retry_num = retry_counts[&finished_idx];
                     let msg = format!(
-                        "{} {}{} - dependency violation, will retry ({}/{})",
+                        "{} {} - dependency violation, will retry ({}/{})",
                         "↻".yellow(),
-                        prefix,
                         format_effect(effect),
                         retry_num,
                         max_retries
@@ -752,9 +732,8 @@ async fn run_destroy_locked(
                 } else {
                     let timing = format!("[{}]", format_duration(started.elapsed())).dimmed();
                     let msg = format!(
-                        "{} {}{} {} {}\n      {} {}",
+                        "{} {} {} {}\n      {} {}",
                         "✗".red(),
-                        prefix,
                         format_effect(effect),
                         timing,
                         counter,

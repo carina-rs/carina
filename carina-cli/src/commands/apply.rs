@@ -30,7 +30,7 @@ use super::validate_and_resolve;
 use crate::DetailLevel;
 use crate::commands::plan::PlanFile;
 use crate::commands::state::map_lock_error;
-use crate::display::{build_effect_tree_entries, format_effect, print_plan};
+use crate::display::{format_effect, print_plan};
 use crate::error::AppError;
 use crate::wiring::{
     WiringContext, create_providers_from_configs, get_provider_with_ctx,
@@ -69,41 +69,20 @@ struct CliObserver {
     /// Map from effect description to its ProgressBar, created lazily when
     /// the effect starts executing. Guarded by a Mutex for concurrent access.
     bars: Mutex<HashMap<String, ProgressBar>>,
-    /// Map from effect description to its tree prefix string.
-    prefixes: HashMap<String, String>,
 }
 
 impl CliObserver {
-    /// Create a new observer. Computes tree prefixes from the plan but does
-    /// NOT create any progress bars upfront.
-    fn new(plan: &Plan) -> Self {
+    /// Create a new observer.
+    fn new(_plan: &Plan) -> Self {
         let multi = MultiProgress::new();
         if !std::io::stdout().is_terminal() {
             multi.set_draw_target(indicatif::ProgressDrawTarget::hidden());
         }
 
-        let tree_entries = build_effect_tree_entries(plan);
-        let mut prefixes = HashMap::new();
-
-        for entry in &tree_entries {
-            let effect = &plan.effects()[entry.effect_idx];
-            if matches!(effect, Effect::Read { .. }) {
-                continue;
-            }
-            let key = format_effect(effect);
-            prefixes.insert(key, entry.prefix.clone());
-        }
-
         Self {
             multi,
             bars: Mutex::new(HashMap::new()),
-            prefixes,
         }
-    }
-
-    /// Get the tree prefix for an effect key, defaulting to empty string.
-    fn prefix_for(&self, key: &str) -> &str {
-        self.prefixes.get(key).map(|s| s.as_str()).unwrap_or("")
     }
 }
 
@@ -121,11 +100,9 @@ impl ExecutionObserver for CliObserver {
             }
             ExecutionEvent::EffectStarted { effect } => {
                 let key = format_effect(effect);
-                let prefix = self.prefix_for(&key);
                 let pb = self.multi.add(ProgressBar::new_spinner());
                 pb.set_style(spinner_style());
-                let msg = format!("{}{}", prefix, key);
-                pb.set_message(msg);
+                pb.set_message(key.clone());
                 pb.enable_steady_tick(Duration::from_millis(80));
                 self.bars.lock().unwrap().insert(key, pb);
             }
@@ -136,13 +113,11 @@ impl ExecutionObserver for CliObserver {
                 ..
             } => {
                 let key = format_effect(effect);
-                let prefix = self.prefix_for(&key);
                 let timing = format!("[{}]", format_duration(*duration)).dimmed();
                 let counter = format_progress(progress).dimmed();
                 let msg = format!(
-                    "{} {}{} {} {}",
+                    "{} {} {} {}",
                     "✓".green(),
-                    prefix,
                     format_effect(effect),
                     timing,
                     counter
@@ -160,13 +135,11 @@ impl ExecutionObserver for CliObserver {
                 progress,
             } => {
                 let key = format_effect(effect);
-                let prefix = self.prefix_for(&key);
                 let timing = format!("[{}]", format_duration(*duration)).dimmed();
                 let counter = format_progress(progress).dimmed();
                 let msg = format!(
-                    "{} {}{} {} {}\n      {} {}",
+                    "{} {} {} {}\n      {} {}",
                     "✗".red(),
-                    prefix,
                     format_effect(effect),
                     timing,
                     counter,
@@ -185,12 +158,10 @@ impl ExecutionObserver for CliObserver {
                 progress,
             } => {
                 let key = format_effect(effect);
-                let prefix = self.prefix_for(&key);
                 let counter = format_progress(progress).dimmed();
                 let msg = format!(
-                    "{} {}{} - {} {}",
+                    "{} {} - {} {}",
                     "⊘".yellow(),
-                    prefix,
                     format_effect(effect),
                     reason,
                     counter
