@@ -6,20 +6,20 @@ Module: module_info
 
 === ARGUMENTS ===
 
-  vpc_id: ref(awscc.ec2.vpc)  (required)
+  vpc_id: awscc.ec2.vpc  (required)
   environment: string  (required)
   instance_type: string = "t3.micro"  
   enable_monitoring: bool = true  
 
 === CREATES ===
 
-  arguments { vpc_id: ref(awscc.ec2.vpc) }
+  arguments { vpc_id: awscc.ec2.vpc }
     └── web_sg: awscc.ec2.security_group
        └── web_instance: awscc.ec2.instance
 
 === ATTRIBUTES ===
 
-  security_group_id: ref(awscc.ec2.security_group)
+  security_group_id: awscc.ec2.security_group
     <- from: web_sg
-  instance_id: ref(awscc.ec2.instance)
+  instance_id: awscc.ec2.instance
     <- from: web_instance

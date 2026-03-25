@@ -104,14 +104,6 @@ impl CompletionProvider {
                 detail: Some("Configure state backend (S3)".to_string()),
                 ..Default::default()
             },
-            CompletionItem {
-                label: "ref".to_string(),
-                kind: Some(CompletionItemKind::TYPE_PARAMETER),
-                insert_text: Some("ref(${1:aws.ec2.vpc})".to_string()),
-                insert_text_format: Some(InsertTextFormat::SNIPPET),
-                detail: Some("Typed resource reference".to_string()),
-                ..Default::default()
-            },
         ];
 
         // Generate resource type completions from schemas
@@ -312,10 +304,7 @@ impl CompletionProvider {
             parser::TypeExpr::List(inner) => format!("list({})", self.format_type_expr(inner)),
             parser::TypeExpr::Map(inner) => format!("map({})", self.format_type_expr(inner)),
             parser::TypeExpr::Ref(resource_path) => {
-                format!(
-                    "ref({}.{})",
-                    resource_path.provider, resource_path.resource_type
-                )
+                format!("{}.{}", resource_path.provider, resource_path.resource_type)
             }
         }
     }

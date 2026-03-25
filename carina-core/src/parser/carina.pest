@@ -25,11 +25,11 @@ attributes_param = {
     identifier ~ ":" ~ type_expr ~ ("=" ~ expression)?
 }
 
-// Type expression: string, bool, int, float, list(type), map(type), ref(resource_type)
+// Type expression: string, bool, int, float, list(type), map(type), aws.vpc (resource ref)
 type_expr = { type_ref | type_generic | type_simple }
 type_simple = @{ "string" | "bool" | "int" | "float" | "cidr" }
 type_generic = { ("list" | "map") ~ "(" ~ type_expr ~ ")" }
-type_ref = { "ref" ~ "(" ~ resource_type_path ~ ")" }
+type_ref = { resource_type_path }
 resource_type_path = @{ identifier ~ ("." ~ identifier)+ }
 
 // Import statement: import "./path/to/module.crn" as name

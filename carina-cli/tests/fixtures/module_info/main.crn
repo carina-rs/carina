@@ -1,13 +1,13 @@
 arguments {
-    vpc_id: ref(awscc.ec2.vpc)
+    vpc_id: awscc.ec2.vpc
     environment: string
     instance_type: string = "t3.micro"
     enable_monitoring: bool = true
 }
 
 attributes {
-    security_group_id: ref(awscc.ec2.security_group) = web_sg.id
-    instance_id: ref(awscc.ec2.instance) = web_instance.id
+    security_group_id: awscc.ec2.security_group = web_sg.id
+    instance_id: awscc.ec2.instance = web_instance.id
 }
 
 let web_sg = awscc.ec2.security_group {

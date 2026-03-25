@@ -81,7 +81,7 @@ impl CompletionProvider {
             CompletionContext::AfterProviderRegion { provider_name } => {
                 self.region_completions_for_provider(&provider_name)
             }
-            CompletionContext::AfterRefType => self.ref_type_completions(position, &text),
+            CompletionContext::InTypePosition => self.ref_type_completions(position, &text),
             CompletionContext::AfterArgumentsDot => self.argument_parameter_completions(&text),
             CompletionContext::None => vec![],
         }
@@ -115,12 +115,10 @@ impl CompletionProvider {
             }
         }
 
-        // Check if we're typing after an unclosed "ref(" on this line.
-        if let Some(ref_pos) = prefix.rfind("ref(")
-            && !prefix[ref_pos..].contains(')')
-        {
-            return CompletionContext::AfterRefType;
-        }
+        // Check if we're in a type position after ":" in arguments/attributes blocks.
+        // e.g., "vpc: aws." or "vpc: " — detect by checking if the line has a colon
+        // but no equals sign, and we're inside arguments/attributes blocks.
+        // This is checked later after determining block context.
 
         // Check if we're inside a resource block or module call and find the type
         let mut brace_depth: i32 = 0;
@@ -128,6 +126,7 @@ impl CompletionProvider {
         let mut current_binding: Option<String> = None;
         let mut module_name: Option<String> = None;
         let mut provider_block_name: Option<String> = None;
+        let mut in_args_or_attrs_block = false;
         // Track nested block names at each depth level (index 0 = depth 1, etc.)
         let mut nested_block_names: Vec<String> = Vec::new();
 
@@ -163,6 +162,13 @@ impl CompletionProvider {
                     resource_type.clear();
                     module_name = None;
                 }
+            } else if brace_depth == 0
+                && (trimmed.starts_with("arguments") || trimmed.starts_with("attributes"))
+                && trimmed.ends_with('{')
+            {
+                in_args_or_attrs_block = true;
+                resource_type.clear();
+                module_name = None;
             } else if brace_depth == 0
                 && trimmed.ends_with('{')
                 && !trimmed.starts_with("let ")
@@ -205,6 +211,7 @@ impl CompletionProvider {
                         current_binding = None;
                         module_name = None;
                         provider_block_name = None;
+                        in_args_or_attrs_block = false;
                         nested_block_names.clear();
                     } else {
                         // Truncate to current depth
@@ -214,6 +221,17 @@ impl CompletionProvider {
                         }
                     }
                 }
+            }
+        }
+
+        // Check if we're in a type position inside arguments/attributes block
+        // e.g., "vpc: " or "vpc: aws." — after colon, before any equals sign
+        if in_args_or_attrs_block && brace_depth > 0 && prefix.contains(':') {
+            // Check we're after the colon part, not after an equals sign
+            let after_colon = prefix.rsplit(':').next().unwrap_or("").trim();
+            let has_equals_after_colon = after_colon.contains('=');
+            if !has_equals_after_colon {
+                return CompletionContext::InTypePosition;
             }
         }
 
@@ -454,7 +472,7 @@ enum CompletionContext {
     AfterProviderRegion {
         provider_name: String,
     },
-    AfterRefType,
+    InTypePosition,
     AfterArgumentsDot,
     None,
 }

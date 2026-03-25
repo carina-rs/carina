@@ -987,7 +987,7 @@ impl ModuleSignature {
     fn format_type_expr(&self, type_expr: &TypeExpr, c: &Colors) -> String {
         match type_expr {
             TypeExpr::Ref(path) => {
-                format!("{}ref({}{}{}){}", c.green, c.yellow, path, c.green, c.reset)
+                format!("{}{}{}", c.yellow, path, c.reset)
             }
             TypeExpr::List(inner) => {
                 format!(
@@ -1042,8 +1042,8 @@ impl ModuleSignature {
                 .filter_map(|r| {
                     if let TypeExpr::Ref(path) = &r.type_expr {
                         Some(format!(
-                            "{}{}{}: {}ref({}{}{}){}",
-                            c.white, r.name, c.reset, c.green, c.yellow, path, c.green, c.reset
+                            "{}{}{}: {}{}{}",
+                            c.white, r.name, c.reset, c.yellow, path, c.reset
                         ))
                     } else {
                         None
@@ -1220,12 +1220,12 @@ mod tests {
 
         let input = r#"
             arguments {
-                vpc: ref(aws.vpc)
+                vpc: aws.vpc
                 enable_https: bool = true
             }
 
             attributes {
-                security_group: ref(aws.security_group) = web_sg.id
+                security_group: aws.security_group = web_sg.id
             }
 
             let web_sg = aws.security_group {
@@ -1252,8 +1252,8 @@ mod tests {
         assert!(display.contains("=== ATTRIBUTES ==="));
 
         // Check ref types are displayed correctly
-        assert!(display.contains("ref(aws.vpc)"));
-        assert!(display.contains("ref(aws.security_group)"));
+        assert!(display.contains("aws.vpc"));
+        assert!(display.contains("aws.security_group"));
 
         // Check tree structure shows resources
         assert!(display.contains("web_sg: aws.security_group"));
@@ -1290,12 +1290,12 @@ mod tests {
         // Parse a directory-based module (no module {} wrapper)
         let input = r#"
             arguments {
-                vpc: ref(aws.vpc)
+                vpc: aws.vpc
                 enable_https: bool = true
             }
 
             attributes {
-                security_group: ref(aws.security_group) = web_sg.id
+                security_group: aws.security_group = web_sg.id
             }
 
             let web_sg = aws.security_group {
@@ -1337,10 +1337,10 @@ mod tests {
         // Directory-based module (top-level arguments/attributes)
         let input = r#"
             arguments {
-                vpc: ref(aws.vpc)
+                vpc: aws.vpc
             }
             attributes {
-                sg: ref(aws.security_group)
+                sg: aws.security_group
             }
         "#;
 
