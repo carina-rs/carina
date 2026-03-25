@@ -1,12 +1,12 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::{IsTerminal, Write as _};
+use std::io::IsTerminal;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use colored::Colorize;
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 
 use carina_core::config_loader::{get_base_dir, load_configuration};
 use carina_core::deps::sort_resources_by_dependencies;
@@ -52,78 +52,53 @@ pub(crate) fn format_duration(d: Duration) -> String {
 /// Braille spinner frames for animated progress display.
 pub(crate) const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
-/// CLI observer that prints colored progress output.
-///
-/// When stdout is a TTY, it shows an animated spinner before each effect
-/// and overwrites it with the result. When piped, the spinner is skipped.
-struct CliObserver {
-    is_tty: bool,
-    /// Mutable state protected by a Mutex for concurrent access.
-    inner: Mutex<CliObserverInner>,
+/// Create the spinner style used by both apply and destroy.
+pub(crate) fn spinner_style() -> ProgressStyle {
+    ProgressStyle::with_template("  {spinner:.cyan} {msg}...")
+        .unwrap()
+        .tick_strings(SPINNER_FRAMES)
 }
 
-/// Mutable state for the CLI observer, guarded by a Mutex.
-struct CliObserverInner {
-    /// Length of the last in-flight line (for overwriting with spaces).
-    last_inflight_len: usize,
-    /// Flag to signal the spinner thread to stop.
-    spinner_stop: Arc<AtomicBool>,
-    /// Handle to the spinner animation thread.
-    spinner_thread: Option<std::thread::JoinHandle<()>>,
+/// CLI observer that prints colored progress output using `indicatif`.
+///
+/// When stdout is a TTY, it shows animated spinners for each in-flight effect.
+/// When piped, spinners are hidden automatically by `indicatif`.
+struct CliObserver {
+    multi: MultiProgress,
+    /// Map from effect description to its spinner, guarded by a Mutex for
+    /// concurrent access from parallel effect execution.
+    spinners: Mutex<HashMap<String, ProgressBar>>,
 }
 
 impl CliObserver {
     fn new() -> Self {
+        let multi = MultiProgress::new();
+        if !std::io::stdout().is_terminal() {
+            multi.set_draw_target(indicatif::ProgressDrawTarget::hidden());
+        }
         Self {
-            is_tty: std::io::stdout().is_terminal(),
-            inner: Mutex::new(CliObserverInner {
-                last_inflight_len: 0,
-                spinner_stop: Arc::new(AtomicBool::new(false)),
-                spinner_thread: None,
-            }),
+            multi,
+            spinners: Mutex::new(HashMap::new()),
         }
     }
 
-    /// Start the spinner animation in a background thread.
-    fn start_spinner(&self, desc: String) {
-        if !self.is_tty {
-            return;
-        }
-        let mut inner = self.inner.lock().unwrap();
-        inner.spinner_stop.store(false, Ordering::Relaxed);
-        let stop = inner.spinner_stop.clone();
-        // Estimate line length for clearing (use first frame as reference).
-        // "  " + frame + " " + desc + "..."
-        inner.last_inflight_len = 2 + SPINNER_FRAMES[0].len() + 1 + desc.len() + 3;
-        inner.spinner_thread = Some(std::thread::spawn(move || {
-            let mut i = 0;
-            while !stop.load(Ordering::Relaxed) {
-                let frame = SPINNER_FRAMES[i % SPINNER_FRAMES.len()];
-                // Use raw ANSI escape for cyan since we're in a spawned thread.
-                print!("\r  \x1b[36m{}\x1b[0m {}...", frame, desc);
-                std::io::stdout().flush().ok();
-                std::thread::sleep(Duration::from_millis(80));
-                i += 1;
-            }
-        }));
+    /// Start a new spinner for an in-flight effect.
+    fn start_spinner(&self, key: String) {
+        let pb = self.multi.add(ProgressBar::new_spinner());
+        pb.set_style(spinner_style());
+        pb.set_message(key.clone());
+        pb.enable_steady_tick(Duration::from_millis(80));
+        self.spinners.lock().unwrap().insert(key, pb);
     }
 
-    /// Stop the spinner animation and clear the line.
-    fn stop_spinner(&self) {
-        let mut inner = self.inner.lock().unwrap();
-        inner.spinner_stop.store(true, Ordering::Relaxed);
-        if let Some(handle) = inner.spinner_thread.take() {
-            handle.join().ok();
-        }
-        Self::clear_inflight_inner(&inner, self.is_tty);
-        inner.last_inflight_len = 0;
-    }
-
-    /// Clear the in-flight spinner line and move cursor to the start.
-    fn clear_inflight_inner(inner: &CliObserverInner, is_tty: bool) {
-        if is_tty && inner.last_inflight_len > 0 {
-            // Overwrite with spaces, then return to start
-            print!("\r{}\r", " ".repeat(inner.last_inflight_len));
+    /// Finish and remove the spinner for a completed effect.
+    fn finish_spinner(&self, key: &str, final_message: String) {
+        let mut spinners = self.spinners.lock().unwrap();
+        if let Some(pb) = spinners.remove(key) {
+            pb.set_style(ProgressStyle::with_template("  {msg}").unwrap());
+            pb.finish_with_message(final_message);
+        } else {
+            self.multi.println(format!("  {}", final_message)).ok();
         }
     }
 }
@@ -145,16 +120,16 @@ impl ExecutionObserver for CliObserver {
                 progress,
                 ..
             } => {
-                self.stop_spinner();
                 let timing = format!("[{}]", format_duration(*duration)).dimmed();
                 let counter = format_progress(progress).dimmed();
-                println!(
-                    "  {} {} {} {}",
+                let msg = format!(
+                    "{} {} {} {}",
                     "✓".green(),
                     format_effect(effect),
                     timing,
                     counter
                 );
+                self.finish_spinner(&format_effect(effect).to_string(), msg);
             }
             ExecutionEvent::EffectFailed {
                 effect,
@@ -162,60 +137,84 @@ impl ExecutionObserver for CliObserver {
                 duration,
                 progress,
             } => {
-                self.stop_spinner();
                 let timing = format!("[{}]", format_duration(*duration)).dimmed();
                 let counter = format_progress(progress).dimmed();
-                println!(
-                    "  {} {} {} {}",
+                let msg = format!(
+                    "{} {} {} {}\n      {} {}",
                     "✗".red(),
                     format_effect(effect),
                     timing,
-                    counter
+                    counter,
+                    "→".red(),
+                    error.red()
                 );
-                println!("      {} {}", "→".red(), error.red());
+                self.finish_spinner(&format_effect(effect).to_string(), msg);
             }
             ExecutionEvent::EffectSkipped {
                 effect,
                 reason,
                 progress,
             } => {
-                self.stop_spinner();
                 let counter = format_progress(progress).dimmed();
-                println!(
-                    "  {} {} - {} {}",
+                let msg = format!(
+                    "{} {} - {} {}",
                     "⊘".yellow(),
                     format_effect(effect),
                     reason,
                     counter
                 );
+                self.finish_spinner(&format_effect(effect).to_string(), msg);
             }
             ExecutionEvent::CascadeUpdateSucceeded { id } => {
-                self.stop_spinner();
-                println!("  {} Update {} (cascade)", "✓".green(), id);
+                self.multi
+                    .println(format!("  {} Update {} (cascade)", "✓".green(), id))
+                    .ok();
             }
             ExecutionEvent::CascadeUpdateFailed { id, error } => {
-                self.stop_spinner();
-                println!("  {} Update {} (cascade)", "✗".red(), id);
-                println!("      {} {}", "→".red(), error.red());
+                self.multi
+                    .println(format!("  {} Update {} (cascade)", "✗".red(), id))
+                    .ok();
+                self.multi
+                    .println(format!("      {} {}", "→".red(), error.red()))
+                    .ok();
             }
             ExecutionEvent::RenameSucceeded { id, from, to } => {
-                self.stop_spinner();
-                println!("  {} Rename {} \"{}\" → \"{}\"", "✓".green(), id, from, to);
+                self.multi
+                    .println(format!(
+                        "  {} Rename {} \"{}\" → \"{}\"",
+                        "✓".green(),
+                        id,
+                        from,
+                        to
+                    ))
+                    .ok();
             }
             ExecutionEvent::RenameFailed { id, error } => {
-                self.stop_spinner();
-                println!("  {} Rename {}", "✗".red(), id);
-                println!("      {} {}", "→".red(), error.red());
+                self.multi
+                    .println(format!("  {} Rename {}", "✗".red(), id))
+                    .ok();
+                self.multi
+                    .println(format!("      {} {}", "→".red(), error.red()))
+                    .ok();
             }
             ExecutionEvent::RefreshStarted => {
-                println!();
-                println!("{}", "Refreshing uncertain resource states...".cyan());
+                self.multi.println("").ok();
+                self.multi
+                    .println(format!(
+                        "{}",
+                        "Refreshing uncertain resource states...".cyan()
+                    ))
+                    .ok();
             }
             ExecutionEvent::RefreshSucceeded { id } => {
-                println!("  {} Refresh {}", "✓".green(), id);
+                self.multi
+                    .println(format!("  {} Refresh {}", "✓".green(), id))
+                    .ok();
             }
             ExecutionEvent::RefreshFailed { id, error } => {
-                println!("  {} Refresh {} - {}", "!".yellow(), id, error);
+                self.multi
+                    .println(format!("  {} Refresh {} - {}", "!".yellow(), id, error))
+                    .ok();
             }
         }
     }
