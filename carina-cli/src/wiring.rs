@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use colored::Colorize;
+use futures::stream::{self, StreamExt};
 
 use carina_core::deps::sort_resources_by_dependencies;
 use carina_core::differ::{cascade_dependent_updates, create_plan};
@@ -22,7 +23,7 @@ use carina_provider_awscc::AwsccProviderFactory;
 use carina_provider_mock::MockProvider;
 use carina_state::StateFile;
 
-use crate::commands::apply::RefreshProgress;
+use crate::commands::apply::{RefreshProgress, refresh_multi_progress};
 use crate::error::AppError;
 
 /// Result of creating a plan, with context needed for saving
@@ -492,35 +493,60 @@ pub async fn create_plan_from_parsed(
 
     if refresh {
         RefreshProgress::start_header();
+        let multi = refresh_multi_progress();
 
-        // Read states for all resources using identifier from state
-        // In identifier-based approach, if there's no identifier in state, the resource doesn't exist
-        for resource in &sorted_resources {
-            let progress = RefreshProgress::begin(&resource.id);
-            let identifier = state_file
-                .as_ref()
-                .and_then(|sf| sf.get_identifier_for_resource(resource));
-            let state = provider
-                .read(&resource.id, identifier.as_deref())
-                .await
-                .map_err(AppError::Provider)?;
-            progress.finish();
-            current_states.insert(resource.id.clone(), state);
+        // Read states for all resources concurrently using identifier from state.
+        // In identifier-based approach, if there's no identifier in state, the resource doesn't exist.
+        let provider_ref = &provider;
+        let results: Vec<Result<(ResourceId, State), AppError>> = stream::iter(&sorted_resources)
+            .map(|resource| {
+                let progress = RefreshProgress::begin_multi(&multi, &resource.id);
+                let identifier = state_file
+                    .as_ref()
+                    .and_then(|sf| sf.get_identifier_for_resource(resource));
+                async move {
+                    let state = provider_ref
+                        .read(&resource.id, identifier.as_deref())
+                        .await
+                        .map_err(AppError::Provider)?;
+                    progress.finish();
+                    Ok((resource.id.clone(), state))
+                }
+            })
+            .buffer_unordered(10)
+            .collect()
+            .await;
+        for result in results {
+            let (id, state) = result?;
+            current_states.insert(id, state);
         }
 
         // Seed current_states with orphaned resources from state file (#844).
         // These are resources tracked in state but removed from the .crn config.
-        // Refresh each orphan via provider.read() to verify it still exists (#931).
+        // Refresh each orphan via provider.read() concurrently to verify it still exists (#931).
         if let Some(sf) = state_file.as_ref() {
             let desired_ids: HashSet<ResourceId> =
                 sorted_resources.iter().map(|r| r.id.clone()).collect();
-            for (id, state) in sf.build_orphan_states(&desired_ids) {
-                let progress = RefreshProgress::begin(&id);
-                let refreshed = provider
-                    .read(&id, state.identifier.as_deref())
-                    .await
-                    .map_err(AppError::Provider)?;
-                progress.finish();
+            let orphan_states: Vec<(ResourceId, State)> =
+                sf.build_orphan_states(&desired_ids).into_iter().collect();
+            let orphan_results: Vec<Result<(ResourceId, State), AppError>> =
+                stream::iter(orphan_states)
+                    .map(|(id, state)| {
+                        let progress = RefreshProgress::begin_multi(&multi, &id);
+                        async move {
+                            let refreshed = provider_ref
+                                .read(&id, state.identifier.as_deref())
+                                .await
+                                .map_err(AppError::Provider)?;
+                            progress.finish();
+                            Ok((id, refreshed))
+                        }
+                    })
+                    .buffer_unordered(10)
+                    .collect()
+                    .await;
+            for result in orphan_results {
+                let (id, refreshed) = result?;
                 if refreshed.exists {
                     current_states.entry(id).or_insert(refreshed);
                 }
