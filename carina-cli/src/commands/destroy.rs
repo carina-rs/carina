@@ -417,14 +417,18 @@ async fn run_destroy_locked(
     // Track retry counts for dependency-violation retries
     let max_retries: usize = 3;
     let mut retry_counts: HashMap<usize, usize> = HashMap::new();
+    // Indices waiting for at least one other effect to complete before retrying.
+    // They are moved back to the ready pool when `in_flight.next()` returns.
+    let mut retry_pending: HashSet<usize> = HashSet::new();
 
     let mut in_flight = FuturesUnordered::new();
 
     loop {
-        // Find newly ready resources: all deletion deps completed and not yet dispatched
+        // Find newly ready resources: all deletion deps completed, not yet
+        // dispatched, and not waiting for a retry gate.
         let mut newly_ready: Vec<usize> = Vec::new();
         for &idx in &all_indices {
-            if dispatched.contains(&idx) {
+            if dispatched.contains(&idx) || retry_pending.contains(&idx) {
                 continue;
             }
             let deps = &deletion_deps[&idx];
@@ -610,6 +614,10 @@ async fn run_destroy_locked(
             in_flight.next().await.unwrap();
         completed_indices.insert(finished_idx);
 
+        // An effect completed — release all retry-pending indices so they
+        // become eligible in the next iteration's ready-check.
+        retry_pending.clear();
+
         let c = completed_counter.fetch_add(1, Ordering::Relaxed) + 1;
         let counter = format!("{}/{}", c, destroy_total).dimmed();
         let effect = &resource_info[finished_idx].2;
@@ -645,10 +653,14 @@ async fn run_destroy_locked(
                     && retries < max_retries
                     && has_pending_or_in_flight
                 {
-                    // Put back as pending for retry after other deletions complete
+                    // Put back as pending for retry, but gate it: the index
+                    // stays in `retry_pending` until at least one other
+                    // in-flight effect completes, preventing immediate
+                    // re-dispatch that would fail again instantly.
                     *retry_counts.entry(finished_idx).or_insert(0) += 1;
                     completed_indices.remove(&finished_idx);
                     dispatched.remove(&finished_idx);
+                    retry_pending.insert(finished_idx);
                     // Undo the counter increment since this isn't truly completed
                     completed_counter.fetch_sub(1, Ordering::Relaxed);
                     let retry_num = retry_counts[&finished_idx];
@@ -815,6 +827,8 @@ fn is_retryable_delete_error(e: &carina_core::provider::ProviderError) -> bool {
         "has dependent object",
         "has a dependent object",
         "resource has dependencies",
+        "mapped public address",
+        "Failed to detach",
     ];
     retryable_patterns.iter().any(|p| msg.contains(p))
 }
