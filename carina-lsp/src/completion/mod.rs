@@ -82,7 +82,6 @@ impl CompletionProvider {
                 self.region_completions_for_provider(&provider_name)
             }
             CompletionContext::InTypePosition => self.ref_type_completions(position, &text),
-            CompletionContext::AfterArgumentsDot => vec![],
             CompletionContext::None => vec![],
         }
     }
@@ -468,6 +467,5 @@ enum CompletionContext {
         provider_name: String,
     },
     InTypePosition,
-    AfterArgumentsDot,
     None,
 }
