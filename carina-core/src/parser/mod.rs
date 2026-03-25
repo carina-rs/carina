@@ -197,10 +197,6 @@ struct ParseContext {
     resource_bindings: HashMap<String, Resource>,
     /// Imported modules (alias -> path)
     imported_modules: HashMap<String, String>,
-    /// Whether we're inside a module (for arguments.* references)
-    in_module: bool,
-    /// Argument parameter names when inside a module
-    argument_params: HashMap<String, TypeExpr>,
 }
 
 impl ParseContext {
@@ -209,8 +205,6 @@ impl ParseContext {
             variables: HashMap::new(),
             resource_bindings: HashMap::new(),
             imported_modules: HashMap::new(),
-            in_module: false,
-            argument_params: HashMap::new(),
         }
     }
 
@@ -292,8 +286,6 @@ pub fn parse(input: &str) -> Result<ParsedFile, ParseError> {
                             Rule::arguments_block => {
                                 let parsed_arguments = parse_arguments_block(stmt)?;
                                 for arg in &parsed_arguments {
-                                    ctx.argument_params
-                                        .insert(arg.name.clone(), arg.type_expr.clone());
                                     // Register argument names as lexical bindings so that
                                     // `vpc.vpc_id` resolves as ResourceRef and `cidr_block`
                                     // resolves as a variable reference during parsing.
@@ -306,7 +298,6 @@ pub fn parse(input: &str) -> Result<ParsedFile, ParseError> {
                                     let placeholder = Resource::new("_argument", &arg.name);
                                     ctx.set_resource_binding(arg.name.clone(), placeholder);
                                 }
-                                ctx.in_module = true;
                                 arguments.extend(parsed_arguments);
                             }
                             Rule::attributes_block => {
