@@ -8,10 +8,6 @@ arguments {
   az: string
 }
 
-provider awscc {
-  region = awscc.Region.ap_northeast_1
-}
-
 let vpc = awscc.ec2.vpc {
   cidr_block = arguments.cidr_block
   tags = { Name = "module-test" }
