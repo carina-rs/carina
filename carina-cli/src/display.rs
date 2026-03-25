@@ -1185,18 +1185,18 @@ fn build_dependency_graph(plan: &Plan) -> DependencyGraph {
     }
 }
 
-/// An entry in the tree-ordered list of effects with its tree prefix.
+/// An entry in the tree-ordered list of effects with its indentation prefix.
 pub struct TreeEffectEntry {
     /// Index into the plan's effects vector.
     pub effect_idx: usize,
-    /// Tree connector prefix string (e.g., "├─ ", "└─ ", "│  ├─ ").
+    /// Indentation prefix string (2 spaces per depth level).
     pub prefix: String,
 }
 
-/// Build a tree-ordered list of effects with tree connector prefixes.
+/// Build a tree-ordered list of effects with indentation prefixes.
 ///
 /// This uses the same tree-building logic as the plan display, producing entries
-/// in depth-first order with the appropriate `├─`/`└─` connectors.
+/// in depth-first order with simple indentation (2 spaces per level).
 pub fn build_effect_tree_entries(plan: &Plan) -> Vec<TreeEffectEntry> {
     let graph = build_dependency_graph(plan);
 
@@ -1216,26 +1216,16 @@ pub fn build_effect_tree_entries(plan: &Plan) -> Vec<TreeEffectEntry> {
         dependents: &HashMap<usize, Vec<usize>>,
         visited: &mut HashSet<usize>,
         entries: &mut Vec<TreeEffectEntry>,
-        indent: usize,
-        is_last: bool,
-        prefix: &str,
+        depth: usize,
     ) {
         if visited.contains(&idx) {
             return;
         }
         visited.insert(idx);
 
-        let connector = if indent == 0 {
-            String::new()
-        } else if is_last {
-            format!("{}└─ ", prefix)
-        } else {
-            format!("{}├─ ", prefix)
-        };
-
         entries.push(TreeEffectEntry {
             effect_idx: idx,
-            prefix: connector,
+            prefix: "  ".repeat(depth),
         });
 
         let children = dependents.get(&idx).cloned().unwrap_or_default();
@@ -1245,38 +1235,13 @@ pub fn build_effect_tree_entries(plan: &Plan) -> Vec<TreeEffectEntry> {
             .cloned()
             .collect();
 
-        let new_prefix = if indent == 0 {
-            String::new()
-        } else if is_last {
-            format!("{}   ", prefix)
-        } else {
-            format!("{}│  ", prefix)
-        };
-
-        for (i, child_idx) in unvisited.iter().enumerate() {
-            let child_is_last = i == unvisited.len() - 1;
-            walk_tree(
-                *child_idx,
-                dependents,
-                visited,
-                entries,
-                indent + 1,
-                child_is_last,
-                &new_prefix,
-            );
+        for child_idx in &unvisited {
+            walk_tree(*child_idx, dependents, visited, entries, depth + 1);
         }
     }
 
-    for (i, root_idx) in roots.iter().enumerate() {
-        walk_tree(
-            *root_idx,
-            &dependents,
-            &mut visited,
-            &mut entries,
-            0,
-            i == roots.len() - 1,
-            "",
-        );
+    for root_idx in &roots {
+        walk_tree(*root_idx, &dependents, &mut visited, &mut entries, 0);
     }
 
     // Any remaining effects not reachable from roots
@@ -1284,7 +1249,7 @@ pub fn build_effect_tree_entries(plan: &Plan) -> Vec<TreeEffectEntry> {
         .filter(|idx| !visited.contains(idx))
         .collect();
     for idx in remaining {
-        walk_tree(idx, &dependents, &mut visited, &mut entries, 0, true, "");
+        walk_tree(idx, &dependents, &mut visited, &mut entries, 0);
     }
 
     entries
