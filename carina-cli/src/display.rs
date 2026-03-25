@@ -752,15 +752,40 @@ fn format_plan_tree(
     out
 }
 
-/// Determine ANSI color for a rendered value string based on its type.
-///
-/// Mirrors the `value_color()` logic in `carina-tui/src/ui.rs`:
-/// - Quoted strings (`"..."`) → green
-/// - Booleans (`true`/`false`) → yellow
-/// - Numbers → white
-/// - DSL identifiers (dot-notation, e.g. `awscc.Region.ap_northeast_1`) → magenta
-/// - ResourceRef values → cyan (handled separately via `ref_binding`)
-fn colored_value(rendered: &str, ref_binding: bool) -> String {
+/// Split a string by `, ` at the top level, respecting nested brackets, braces, and quotes.
+fn split_top_level(s: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth = 0;
+    let mut in_quote = false;
+    let mut start = 0;
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => in_quote = !in_quote,
+            b'[' | b'{' if !in_quote => depth += 1,
+            b']' | b'}' if !in_quote => depth -= 1,
+            b',' if !in_quote && depth == 0 => {
+                // Check for ", " pattern
+                if i + 1 < bytes.len() && bytes[i + 1] == b' ' {
+                    parts.push(&s[start..i]);
+                    start = i + 2;
+                    i += 2;
+                    continue;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    if start < s.len() {
+        parts.push(&s[start..]);
+    }
+    parts
+}
+
+/// Color a single atomic value (not a list or map).
+fn color_atom(rendered: &str, ref_binding: bool) -> String {
     if ref_binding {
         return rendered.cyan().to_string();
     }
@@ -770,7 +795,6 @@ fn colored_value(rendered: &str, ref_binding: bool) -> String {
     if rendered == "true" || rendered == "false" {
         return rendered.yellow().to_string();
     }
-    // Integer or float
     if !rendered.is_empty()
         && rendered
             .chars()
@@ -781,15 +805,14 @@ fn colored_value(rendered: &str, ref_binding: bool) -> String {
             return rendered.white().to_string();
         }
     }
-    // DSL identifier: contains dots, no quotes, no spaces
     if rendered.contains('.') && !rendered.contains(' ') && !rendered.starts_with('{') {
         return rendered.magenta().to_string();
     }
     rendered.to_string()
 }
 
-/// Apply type-based coloring to a value, with dimmed modifier for default values.
-fn colored_value_dimmed(rendered: &str) -> String {
+/// Color a single atomic value with dimmed modifier.
+fn color_atom_dimmed(rendered: &str) -> String {
     if rendered.starts_with('"') && rendered.ends_with('"') {
         return rendered.green().dimmed().to_string();
     }
@@ -810,6 +833,108 @@ fn colored_value_dimmed(rendered: &str) -> String {
         return rendered.magenta().dimmed().to_string();
     }
     rendered.dimmed().to_string()
+}
+
+/// Determine ANSI color for a rendered value string based on its type.
+///
+/// Mirrors the `value_color()` logic in `carina-tui/src/ui.rs`:
+/// - Quoted strings (`"..."`) → green
+/// - Booleans (`true`/`false`) → yellow
+/// - Numbers → white
+/// - DSL identifiers (dot-notation, e.g. `awscc.Region.ap_northeast_1`) → magenta
+/// - ResourceRef values → cyan (handled separately via `ref_binding`)
+/// - Lists (`[...]`) → each element colored individually
+/// - Maps (`{...}`) → each value colored individually
+fn colored_value(rendered: &str, ref_binding: bool) -> String {
+    // List: color each element individually
+    if rendered.starts_with('[') && rendered.ends_with(']') {
+        let inner = &rendered[1..rendered.len() - 1];
+        if inner.is_empty() {
+            return rendered.to_string();
+        }
+        let elements = split_top_level(inner);
+        let colored_elements: Vec<String> = elements
+            .iter()
+            .map(|e| colored_value(e.trim(), ref_binding))
+            .collect();
+        return format!("[{}]", colored_elements.join(", "));
+    }
+    // Map: color each value individually
+    if rendered.starts_with('{') && rendered.ends_with('}') {
+        let inner = &rendered[1..rendered.len() - 1];
+        if inner.is_empty() {
+            return rendered.to_string();
+        }
+        let entries = split_top_level(inner);
+        let colored_entries: Vec<String> = entries
+            .iter()
+            .map(|entry| {
+                if let Some(colon_pos) = entry.find(": ") {
+                    let key = &entry[..colon_pos];
+                    let val = &entry[colon_pos + 2..];
+                    format!("{}: {}", key, colored_value(val, false))
+                } else {
+                    entry.to_string()
+                }
+            })
+            .collect();
+        return format!("{{{}}}", colored_entries.join(", "));
+    }
+    color_atom(rendered, ref_binding)
+}
+
+/// Apply type-based coloring to a value, with dimmed modifier for default values.
+fn colored_value_dimmed(rendered: &str) -> String {
+    // List: color each element individually
+    if rendered.starts_with('[') && rendered.ends_with(']') {
+        let inner = &rendered[1..rendered.len() - 1];
+        if inner.is_empty() {
+            return rendered.dimmed().to_string();
+        }
+        let elements = split_top_level(inner);
+        let colored_elements: Vec<String> = elements
+            .iter()
+            .map(|e| colored_value_dimmed(e.trim()))
+            .collect();
+        return format!(
+            "{}{}{}",
+            "[".dimmed(),
+            colored_elements.join(&", ".dimmed().to_string()),
+            "]".dimmed()
+        );
+    }
+    // Map: color each value individually
+    if rendered.starts_with('{') && rendered.ends_with('}') {
+        let inner = &rendered[1..rendered.len() - 1];
+        if inner.is_empty() {
+            return rendered.dimmed().to_string();
+        }
+        let entries = split_top_level(inner);
+        let colored_entries: Vec<String> = entries
+            .iter()
+            .map(|entry| {
+                if let Some(colon_pos) = entry.find(": ") {
+                    let key = &entry[..colon_pos];
+                    let val = &entry[colon_pos + 2..];
+                    format!(
+                        "{}{} {}",
+                        key.dimmed(),
+                        ":".dimmed(),
+                        colored_value_dimmed(val)
+                    )
+                } else {
+                    entry.dimmed().to_string()
+                }
+            })
+            .collect();
+        return format!(
+            "{}{}{}",
+            "{".dimmed(),
+            colored_entries.join(&", ".dimmed().to_string()),
+            "}".dimmed()
+        );
+    }
+    color_atom_dimmed(rendered)
 }
 
 /// Render a single `DetailRow` into the output string with ANSI colors.
@@ -2927,5 +3052,88 @@ mod tests {
             format_effect(&effect),
             "Delete awscc.ec2.vpc.ec2_vpc_fb75c929"
         );
+    }
+
+    #[test]
+    fn split_top_level_simple_elements() {
+        assert_eq!(
+            split_top_level(r#""a", "b", "c""#),
+            vec![r#""a""#, r#""b""#, r#""c""#]
+        );
+    }
+
+    #[test]
+    fn split_top_level_nested_brackets() {
+        assert_eq!(split_top_level("[1, 2], [3, 4]"), vec!["[1, 2]", "[3, 4]"]);
+    }
+
+    #[test]
+    fn split_top_level_nested_braces() {
+        assert_eq!(
+            split_top_level("{a: 1, b: 2}, {c: 3}"),
+            vec!["{a: 1, b: 2}", "{c: 3}"]
+        );
+    }
+
+    #[test]
+    fn split_top_level_quoted_commas() {
+        assert_eq!(
+            split_top_level(r#""a, b", "c""#),
+            vec![r#""a, b""#, r#""c""#]
+        );
+    }
+
+    #[test]
+    fn colored_value_list_elements_colored_individually() {
+        // Each element in a list should be colored by its type
+        let result = colored_value(r#"["hello", "world"]"#, false);
+        // Each quoted string should be green, not the whole list
+        assert!(result.contains('['));
+        assert!(result.contains(']'));
+        // The individual strings should have color codes
+        let green_hello = "\"hello\"".green().to_string();
+        assert!(
+            result.contains(&green_hello),
+            "Expected green-colored hello in: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn colored_value_list_ref_binding_cyan() {
+        let result = colored_value("[binding.attr]", true);
+        let cyan_elem = "binding.attr".cyan().to_string();
+        assert!(
+            result.contains(&cyan_elem),
+            "Expected cyan ref in: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn colored_value_map_values_colored() {
+        let result = colored_value(r#"{Name: "test-vpc", count: 42}"#, false);
+        let green_val = "\"test-vpc\"".green().to_string();
+        let white_val = "42".white().to_string();
+        assert!(
+            result.contains(&green_val),
+            "Expected green string value in: {}",
+            result
+        );
+        assert!(
+            result.contains(&white_val),
+            "Expected white number in: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn colored_value_empty_list() {
+        assert_eq!(colored_value("[]", false), "[]");
+    }
+
+    #[test]
+    fn colored_value_empty_map() {
+        assert_eq!(colored_value("{}", false), "{}");
     }
 }
