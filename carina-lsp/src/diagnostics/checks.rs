@@ -31,6 +31,11 @@ impl DiagnosticEngine {
             let trimmed = line.trim();
             if trimmed.starts_with("provider ") {
                 let col = position::leading_whitespace_chars(line);
+                // Highlight "provider <name>" portion
+                let end_col = trimmed
+                    .find('{')
+                    .map(|p| col + p as u32)
+                    .unwrap_or(col + trimmed.len() as u32);
                 diagnostics.push(Diagnostic {
                     range: Range {
                         start: Position {
@@ -39,7 +44,7 @@ impl DiagnosticEngine {
                         },
                         end: Position {
                             line: line_idx as u32,
-                            character: col + trimmed.split_whitespace().take(2).map(|s| s.len() as u32 + 1).sum::<u32>() - 1,
+                            character: end_col,
                         },
                     },
                     severity: Some(DiagnosticSeverity::ERROR),

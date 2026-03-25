@@ -102,6 +102,7 @@ impl ModuleResolver {
 
         // Reject provider blocks inside modules
         if !parsed.providers.is_empty() {
+            self.resolving.remove(&full_path);
             return Err(ModuleError::ProviderInModule);
         }
 
