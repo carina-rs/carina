@@ -31,8 +31,8 @@ use crate::commands::state::map_lock_error;
 use crate::display::{format_destroy_plan, format_effect};
 use crate::error::AppError;
 use crate::wiring::{
-    WiringContext, get_provider_with_ctx, reconcile_anonymous_identifiers_with_ctx,
-    reconcile_prefixed_names,
+    WiringContext, get_provider_with_ctx, read_with_retry,
+    reconcile_anonymous_identifiers_with_ctx, reconcile_prefixed_names,
 };
 
 pub async fn run_destroy(
@@ -166,15 +166,14 @@ async fn run_destroy_locked(
                     .as_ref()
                     .and_then(|sf| sf.get_identifier_for_resource(resource));
                 async move {
-                    let state = provider_ref
-                        .read(&resource.id, identifier.as_deref())
+                    let state = read_with_retry(provider_ref, &resource.id, identifier.as_deref())
                         .await
                         .map_err(AppError::Provider)?;
                     progress.finish();
                     Ok((resource.id.clone(), state))
                 }
             })
-            .buffer_unordered(10)
+            .buffer_unordered(5)
             .collect()
             .await;
         for result in results {
@@ -194,15 +193,15 @@ async fn run_destroy_locked(
                     .map(|(id, state)| {
                         let progress = RefreshProgress::begin_multi(&multi, &id);
                         async move {
-                            let refreshed = provider_ref
-                                .read(&id, state.identifier.as_deref())
-                                .await
-                                .map_err(AppError::Provider)?;
+                            let refreshed =
+                                read_with_retry(provider_ref, &id, state.identifier.as_deref())
+                                    .await
+                                    .map_err(AppError::Provider)?;
                             progress.finish();
                             Ok((id, refreshed))
                         }
                     })
-                    .buffer_unordered(10)
+                    .buffer_unordered(5)
                     .collect()
                     .await;
             for result in orphan_results {

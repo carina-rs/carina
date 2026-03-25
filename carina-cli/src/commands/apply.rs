@@ -35,7 +35,7 @@ use crate::commands::state::map_lock_error;
 use crate::display::{format_effect, print_plan};
 use crate::error::AppError;
 use crate::wiring::{
-    WiringContext, create_providers_from_configs, get_provider_with_ctx,
+    WiringContext, create_providers_from_configs, get_provider_with_ctx, read_with_retry,
     reconcile_anonymous_identifiers_with_ctx, reconcile_prefixed_names, resolve_names_with_ctx,
 };
 
@@ -377,7 +377,7 @@ pub async fn refresh_pending_states(
     let mut failed_refreshes = HashSet::new();
 
     for (id, identifier) in refreshes {
-        match provider.read(id, Some(identifier)).await {
+        match read_with_retry(provider, id, Some(identifier)).await {
             Ok(state) => {
                 println!("  {} Refresh {}", "✓".green(), id);
                 current_states.insert(id.clone(), state);
@@ -891,15 +891,14 @@ async fn run_apply_locked(
                     .as_ref()
                     .and_then(|sf| sf.get_identifier_for_resource(resource));
                 async move {
-                    let state = provider_ref
-                        .read(&resource.id, identifier.as_deref())
+                    let state = read_with_retry(provider_ref, &resource.id, identifier.as_deref())
                         .await
                         .map_err(AppError::Provider)?;
                     progress.finish();
                     Ok((resource.id.clone(), state))
                 }
             })
-            .buffer_unordered(10)
+            .buffer_unordered(5)
             .collect()
             .await;
         let mut states = HashMap::new();
