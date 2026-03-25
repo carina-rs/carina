@@ -56,6 +56,7 @@ pub fn validate_resource_ref_types(
     resources: &[Resource],
     schemas: &HashMap<String, ResourceSchema>,
     schema_key_fn: &dyn Fn(&Resource) -> String,
+    argument_names: &HashSet<String>,
 ) -> Result<(), String> {
     let mut all_errors = Vec::new();
 
@@ -93,6 +94,11 @@ pub fn validate_resource_ref_types(
                 continue;
             };
             let expected_type_name = attr_schema.attr_type.type_name();
+
+            // Skip type checking for argument parameter references (resolved at call site)
+            if argument_names.contains(ref_binding.as_str()) {
+                continue;
+            }
 
             // Look up the referenced binding's schema to get the type of the referenced attribute
             let Some(ref_resource) = binding_map.get(ref_binding.as_str()) else {
@@ -586,7 +592,8 @@ let route = awscc.ec2.route {
             },
         );
 
-        let result = validate_resource_ref_types(&[subnet], &schemas, &test_schema_key_fn);
+        let result =
+            validate_resource_ref_types(&[subnet], &schemas, &test_schema_key_fn, &HashSet::new());
         assert_eq!(
             result.unwrap_err(),
             "awscc.ec2.subnet.web-subnet: unknown binding 'vpc' in reference vpc.vpc_id"
@@ -619,7 +626,12 @@ let route = awscc.ec2.route {
             },
         );
 
-        let result = validate_resource_ref_types(&[vpc, subnet], &schemas, &test_schema_key_fn);
+        let result = validate_resource_ref_types(
+            &[vpc, subnet],
+            &schemas,
+            &test_schema_key_fn,
+            &HashSet::new(),
+        );
         assert_eq!(
             result.unwrap_err(),
             "awscc.ec2.subnet.web-subnet: unknown attribute 'nonexistent_attr' on 'vpc' in reference vpc.nonexistent_attr"
