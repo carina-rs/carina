@@ -550,8 +550,6 @@ async fn execute_effects_sequential(
     let mut completed_indices: HashSet<usize> = HashSet::new();
     // Track which effect indices have been dispatched (spawned or skipped)
     let mut dispatched: HashSet<usize> = HashSet::new();
-    // Track which effects have had a Waiting event emitted
-    let mut waiting_emitted: HashSet<usize> = HashSet::new();
     // All actionable effect indices (excluding Read)
     let actionable_indices: Vec<usize> = (0..effects.len())
         .filter(|&idx| !matches!(&effects[idx], Effect::Read { .. }))
@@ -594,15 +592,11 @@ async fn execute_effects_sequential(
                 .filter_map(|d| idx_to_binding.get(d).cloned())
                 .collect();
             if !pending.is_empty() {
-                let already_emitted = waiting_emitted.contains(&idx);
-                // Always emit to update the list of pending dependencies
+                // Emit on every iteration to update the pending dependency list
                 observer.on_event(&ExecutionEvent::Waiting {
                     effect: &effects[idx],
                     pending_dependencies: pending,
                 });
-                if !already_emitted {
-                    waiting_emitted.insert(idx);
-                }
             }
         }
 
