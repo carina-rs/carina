@@ -3,7 +3,7 @@
 //! This module handles:
 //! - Resolving import paths to module definitions
 //! - Detecting circular dependencies between modules
-//! - Validating module input parameters
+//! - Validating module argument parameters
 //! - Expanding module calls into resources
 
 use std::collections::{HashMap, HashSet};
@@ -22,13 +22,13 @@ pub enum ModuleError {
     #[error("Circular import detected: {0}")]
     CircularImport(String),
 
-    #[error("Missing required input '{input}' for module '{module}'")]
-    MissingInput { module: String, input: String },
+    #[error("Missing required argument '{argument}' for module '{module}'")]
+    MissingArgument { module: String, argument: String },
 
-    #[error("Invalid input type for '{input}' in module '{module}': expected {expected}")]
-    InvalidInputType {
+    #[error("Invalid argument type for '{argument}' in module '{module}': expected {expected}")]
+    InvalidArgumentType {
         module: String,
-        input: String,
+        argument: String,
         expected: String,
     },
 
@@ -90,8 +90,8 @@ impl ModuleResolver {
             crate::parser::parse(&content)?
         };
 
-        // Verify it's a module (has inputs or outputs)
-        if parsed.inputs.is_empty() && parsed.outputs.is_empty() {
+        // Verify it's a module (has arguments or attributes)
+        if parsed.arguments.is_empty() && parsed.attribute_params.is_empty() {
             return Err(ModuleError::NotFound(path.to_string()));
         }
 
@@ -112,8 +112,8 @@ impl ModuleResolver {
             variables: HashMap::new(),
             imports: vec![],
             module_calls: vec![],
-            inputs: vec![],
-            outputs: vec![],
+            arguments: vec![],
+            attribute_params: vec![],
             backend: None,
         };
 
@@ -137,8 +137,8 @@ impl ModuleResolver {
             merged.variables.extend(parsed.variables);
             merged.imports.extend(parsed.imports);
             merged.module_calls.extend(parsed.module_calls);
-            merged.inputs.extend(parsed.inputs);
-            merged.outputs.extend(parsed.outputs);
+            merged.arguments.extend(parsed.arguments);
+            merged.attribute_params.extend(parsed.attribute_params);
         }
 
         Ok(merged)
@@ -179,26 +179,26 @@ impl ModuleResolver {
             .get(&call.module_name)
             .ok_or_else(|| ModuleError::UnknownModule(call.module_name.clone()))?;
 
-        // Validate required inputs
-        for input in &module.inputs {
-            if input.default.is_none() && !call.arguments.contains_key(&input.name) {
-                return Err(ModuleError::MissingInput {
+        // Validate required arguments
+        for arg in &module.arguments {
+            if arg.default.is_none() && !call.arguments.contains_key(&arg.name) {
+                return Err(ModuleError::MissingArgument {
                     module: call.module_name.clone(),
-                    input: input.name.clone(),
+                    argument: arg.name.clone(),
                 });
             }
         }
 
-        // Build input value map
-        let mut input_values: HashMap<String, Value> = HashMap::new();
-        for input in &module.inputs {
+        // Build argument value map
+        let mut argument_values: HashMap<String, Value> = HashMap::new();
+        for arg in &module.arguments {
             let value = call
                 .arguments
-                .get(&input.name)
+                .get(&arg.name)
                 .cloned()
-                .or_else(|| input.default.clone())
+                .or_else(|| arg.default.clone())
                 .unwrap();
-            input_values.insert(input.name.clone(), value);
+            argument_values.insert(arg.name.clone(), value);
         }
 
         // Collect intra-module binding names so we can rewrite ResourceRefs
@@ -252,7 +252,7 @@ impl ModuleResolver {
             for (key, value) in &new_resource.attributes {
                 let rewritten =
                     rewrite_intra_module_refs(value, instance_prefix, &intra_module_bindings);
-                let substituted = substitute_inputs(&rewritten, &input_values);
+                let substituted = substitute_arguments(&rewritten, &argument_values);
                 substituted_attrs.insert(key.clone(), substituted);
             }
             new_resource.attributes = substituted_attrs;
@@ -264,23 +264,26 @@ impl ModuleResolver {
     }
 }
 
-/// Substitute input references with actual values
-fn substitute_inputs(value: &Value, inputs: &HashMap<String, Value>) -> Value {
+/// Substitute arguments references with actual values
+fn substitute_arguments(value: &Value, arguments: &HashMap<String, Value>) -> Value {
     match value {
         Value::ResourceRef {
             binding_name,
             attribute_name,
             ..
-        } if binding_name == "input" => inputs
+        } if binding_name == "arguments" => arguments
             .get(attribute_name)
             .cloned()
             .unwrap_or_else(|| value.clone()),
-        Value::List(items) => {
-            Value::List(items.iter().map(|v| substitute_inputs(v, inputs)).collect())
-        }
+        Value::List(items) => Value::List(
+            items
+                .iter()
+                .map(|v| substitute_arguments(v, arguments))
+                .collect(),
+        ),
         Value::Map(map) => Value::Map(
             map.iter()
-                .map(|(k, v)| (k.clone(), substitute_inputs(v, inputs)))
+                .map(|(k, v)| (k.clone(), substitute_arguments(v, arguments)))
                 .collect(),
         ),
         _ => value.clone(),
@@ -375,7 +378,7 @@ pub fn load_module(path: &Path) -> Option<ParsedFile> {
 
 /// Load all `.crn` files from a directory and merge them into a single `ParsedFile`.
 ///
-/// Returns `None` if no module definitions (inputs/outputs) are found.
+/// Returns `None` if no module definitions (arguments/attributes) are found.
 pub fn load_directory_module(dir_path: &Path) -> Option<ParsedFile> {
     let entries = fs::read_dir(dir_path).ok()?;
     let mut merged = ParsedFile {
@@ -384,8 +387,8 @@ pub fn load_directory_module(dir_path: &Path) -> Option<ParsedFile> {
         variables: HashMap::new(),
         imports: vec![],
         module_calls: vec![],
-        inputs: vec![],
-        outputs: vec![],
+        arguments: vec![],
+        attribute_params: vec![],
         backend: None,
     };
 
@@ -400,12 +403,12 @@ pub fn load_directory_module(dir_path: &Path) -> Option<ParsedFile> {
             merged.variables.extend(parsed.variables);
             merged.imports.extend(parsed.imports);
             merged.module_calls.extend(parsed.module_calls);
-            merged.inputs.extend(parsed.inputs);
-            merged.outputs.extend(parsed.outputs);
+            merged.arguments.extend(parsed.arguments);
+            merged.attribute_params.extend(parsed.attribute_params);
         }
     }
 
-    if merged.inputs.is_empty() && merged.outputs.is_empty() {
+    if merged.arguments.is_empty() && merged.attribute_params.is_empty() {
         None
     } else {
         Some(merged)
@@ -459,8 +462,8 @@ pub fn load_module_from_directory(dir: &Path) -> Result<ParsedFile, String> {
         variables: HashMap::new(),
         imports: vec![],
         module_calls: vec![],
-        inputs: vec![],
-        outputs: vec![],
+        arguments: vec![],
+        attribute_params: vec![],
         backend: None,
     };
 
@@ -480,8 +483,8 @@ pub fn load_module_from_directory(dir: &Path) -> Result<ParsedFile, String> {
             merged.variables.extend(parsed.variables);
             merged.imports.extend(parsed.imports);
             merged.module_calls.extend(parsed.module_calls);
-            merged.inputs.extend(parsed.inputs);
-            merged.outputs.extend(parsed.outputs);
+            merged.arguments.extend(parsed.arguments);
+            merged.attribute_params.extend(parsed.attribute_params);
         }
     }
 
@@ -491,7 +494,7 @@ pub fn load_module_from_directory(dir: &Path) -> Result<ParsedFile, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parser::{InputParameter, TypeExpr};
+    use crate::parser::{ArgumentParameter, TypeExpr};
     use crate::resource::LifecycleConfig;
 
     fn create_test_module() -> ParsedFile {
@@ -505,7 +508,7 @@ mod tests {
                     attrs.insert(
                         "vpc_id".to_string(),
                         Value::ResourceRef {
-                            binding_name: "input".to_string(),
+                            binding_name: "arguments".to_string(),
                             attribute_name: "vpc_id".to_string(),
                         },
                     );
@@ -522,50 +525,50 @@ mod tests {
             variables: HashMap::new(),
             imports: vec![],
             module_calls: vec![],
-            inputs: vec![
-                InputParameter {
+            arguments: vec![
+                ArgumentParameter {
                     name: "vpc_id".to_string(),
                     type_expr: TypeExpr::String,
                     default: None,
                 },
-                InputParameter {
+                ArgumentParameter {
                     name: "enable_flag".to_string(),
                     type_expr: TypeExpr::Bool,
                     default: Some(Value::Bool(true)),
                 },
             ],
-            outputs: vec![],
+            attribute_params: vec![],
             backend: None,
         }
     }
 
     #[test]
-    fn test_substitute_inputs() {
+    fn test_substitute_arguments() {
         let mut inputs = HashMap::new();
         inputs.insert("vpc_id".to_string(), Value::String("vpc-123".to_string()));
 
         let value = Value::ResourceRef {
-            binding_name: "input".to_string(),
+            binding_name: "arguments".to_string(),
             attribute_name: "vpc_id".to_string(),
         };
-        let result = substitute_inputs(&value, &inputs);
+        let result = substitute_arguments(&value, &inputs);
 
         assert_eq!(result, Value::String("vpc-123".to_string()));
     }
 
     #[test]
-    fn test_substitute_inputs_nested() {
+    fn test_substitute_arguments_nested() {
         let mut inputs = HashMap::new();
         inputs.insert("port".to_string(), Value::Int(8080));
 
         let value = Value::List(vec![
             Value::ResourceRef {
-                binding_name: "input".to_string(),
+                binding_name: "arguments".to_string(),
                 attribute_name: "port".to_string(),
             },
             Value::Int(443),
         ]);
-        let result = substitute_inputs(&value, &inputs);
+        let result = substitute_arguments(&value, &inputs);
 
         match result {
             Value::List(items) => {
@@ -624,7 +627,7 @@ mod tests {
                         attrs.insert(
                             "cidr_block".to_string(),
                             Value::ResourceRef {
-                                binding_name: "input".to_string(),
+                                binding_name: "arguments".to_string(),
                                 attribute_name: "cidr".to_string(),
                             },
                         );
@@ -656,12 +659,12 @@ mod tests {
             variables: HashMap::new(),
             imports: vec![],
             module_calls: vec![],
-            inputs: vec![InputParameter {
+            arguments: vec![ArgumentParameter {
                 name: "cidr".to_string(),
                 type_expr: TypeExpr::String,
                 default: None,
             }],
-            outputs: vec![],
+            attribute_params: vec![],
             backend: None,
         }
     }
@@ -743,7 +746,7 @@ mod tests {
     }
 
     #[test]
-    fn test_missing_required_input() {
+    fn test_missing_required_argument() {
         let resolver = {
             let mut r = ModuleResolver::new(".");
             r.imported_modules
@@ -758,6 +761,6 @@ mod tests {
         };
 
         let result = resolver.expand_module_call(&call, "my_instance");
-        assert!(matches!(result, Err(ModuleError::MissingInput { .. })));
+        assert!(matches!(result, Err(ModuleError::MissingArgument { .. })));
     }
 }

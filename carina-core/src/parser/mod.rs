@@ -76,7 +76,7 @@ impl std::fmt::Display for ResourceTypePath {
     }
 }
 
-/// Type expression for input/output parameters
+/// Type expression for arguments/attributes parameters
 #[derive(Debug, Clone, PartialEq)]
 pub enum TypeExpr {
     String,
@@ -106,17 +106,17 @@ impl std::fmt::Display for TypeExpr {
     }
 }
 
-/// Input parameter definition
+/// Argument parameter definition (in `arguments { ... }` block)
 #[derive(Debug, Clone)]
-pub struct InputParameter {
+pub struct ArgumentParameter {
     pub name: String,
     pub type_expr: TypeExpr,
     pub default: Option<Value>,
 }
 
-/// Output parameter definition
+/// Attribute parameter definition (in `attributes { ... }` block)
 #[derive(Debug, Clone)]
-pub struct OutputParameter {
+pub struct AttributeParameter {
     pub name: String,
     pub type_expr: TypeExpr,
     pub value: Option<Value>,
@@ -167,10 +167,10 @@ pub struct ParsedFile {
     pub imports: Vec<ImportStatement>,
     /// Module calls (instantiations)
     pub module_calls: Vec<ModuleCall>,
-    /// Top-level input parameters (directory-based module style)
-    pub inputs: Vec<InputParameter>,
-    /// Top-level output parameters (directory-based module style)
-    pub outputs: Vec<OutputParameter>,
+    /// Top-level argument parameters (directory-based module style)
+    pub arguments: Vec<ArgumentParameter>,
+    /// Top-level attribute parameters (directory-based module style)
+    pub attribute_params: Vec<AttributeParameter>,
     /// Backend configuration for state storage
     pub backend: Option<BackendConfig>,
 }
@@ -197,10 +197,10 @@ struct ParseContext {
     resource_bindings: HashMap<String, Resource>,
     /// Imported modules (alias -> path)
     imported_modules: HashMap<String, String>,
-    /// Whether we're inside a module (for input.* references)
+    /// Whether we're inside a module (for arguments.* references)
     in_module: bool,
-    /// Input parameter names when inside a module
-    input_params: HashMap<String, TypeExpr>,
+    /// Argument parameter names when inside a module
+    argument_params: HashMap<String, TypeExpr>,
 }
 
 impl ParseContext {
@@ -210,7 +210,7 @@ impl ParseContext {
             resource_bindings: HashMap::new(),
             imported_modules: HashMap::new(),
             in_module: false,
-            input_params: HashMap::new(),
+            argument_params: HashMap::new(),
         }
     }
 
@@ -266,8 +266,8 @@ pub fn parse(input: &str) -> Result<ParsedFile, ParseError> {
     let mut resources = Vec::new();
     let mut imports = Vec::new();
     let mut module_calls = Vec::new();
-    let mut inputs = Vec::new();
-    let mut outputs = Vec::new();
+    let mut arguments = Vec::new();
+    let mut attribute_params = Vec::new();
     let mut backend = None;
 
     for pair in pairs {
@@ -289,18 +289,18 @@ pub fn parse(input: &str) -> Result<ParsedFile, ParseError> {
                                 let provider = parse_provider_block(stmt, &ctx)?;
                                 providers.push(provider);
                             }
-                            Rule::input_block => {
-                                let parsed_inputs = parse_input_block(stmt)?;
-                                for input in &parsed_inputs {
-                                    ctx.input_params
-                                        .insert(input.name.clone(), input.type_expr.clone());
+                            Rule::arguments_block => {
+                                let parsed_arguments = parse_arguments_block(stmt)?;
+                                for arg in &parsed_arguments {
+                                    ctx.argument_params
+                                        .insert(arg.name.clone(), arg.type_expr.clone());
                                 }
                                 ctx.in_module = true;
-                                inputs.extend(parsed_inputs);
+                                arguments.extend(parsed_arguments);
                             }
-                            Rule::output_block => {
-                                let parsed_outputs = parse_output_block(stmt, &ctx)?;
-                                outputs.extend(parsed_outputs);
+                            Rule::attributes_block => {
+                                let parsed_attribute_params = parse_attributes_block(stmt, &ctx)?;
+                                attribute_params.extend(parsed_attribute_params);
                             }
                             Rule::let_binding => {
                                 let (line, _) = stmt.as_span().start_pos().line_col();
@@ -344,7 +344,7 @@ pub fn parse(input: &str) -> Result<ParsedFile, ParseError> {
     resolve_forward_references(
         &ctx.resource_bindings,
         &mut resources,
-        &mut outputs,
+        &mut attribute_params,
         &mut module_calls,
     );
 
@@ -354,34 +354,36 @@ pub fn parse(input: &str) -> Result<ParsedFile, ParseError> {
         variables: ctx.variables,
         imports,
         module_calls,
-        inputs,
-        outputs,
+        arguments,
+        attribute_params,
         backend,
     })
 }
 
-/// Parse input block
-fn parse_input_block(pair: pest::iterators::Pair<Rule>) -> Result<Vec<InputParameter>, ParseError> {
-    let mut inputs = Vec::new();
+/// Parse arguments block
+fn parse_arguments_block(
+    pair: pest::iterators::Pair<Rule>,
+) -> Result<Vec<ArgumentParameter>, ParseError> {
+    let mut arguments = Vec::new();
     let ctx = ParseContext::new();
 
     for param in pair.into_inner() {
-        if param.as_rule() == Rule::input_param {
+        if param.as_rule() == Rule::arguments_param {
             let mut param_inner = param.into_inner();
-            let name = next_pair(&mut param_inner, "parameter name", "input block")?
+            let name = next_pair(&mut param_inner, "parameter name", "arguments block")?
                 .as_str()
                 .to_string();
             let type_expr = parse_type_expr(next_pair(
                 &mut param_inner,
                 "type expression",
-                "input parameter",
+                "arguments parameter",
             )?)?;
             let default = if let Some(expr) = param_inner.next() {
                 Some(parse_expression(expr, &ctx)?)
             } else {
                 None
             };
-            inputs.push(InputParameter {
+            arguments.push(ArgumentParameter {
                 name,
                 type_expr,
                 default,
@@ -389,33 +391,33 @@ fn parse_input_block(pair: pest::iterators::Pair<Rule>) -> Result<Vec<InputParam
         }
     }
 
-    Ok(inputs)
+    Ok(arguments)
 }
 
-/// Parse output block
-fn parse_output_block(
+/// Parse attributes block
+fn parse_attributes_block(
     pair: pest::iterators::Pair<Rule>,
     ctx: &ParseContext,
-) -> Result<Vec<OutputParameter>, ParseError> {
-    let mut outputs = Vec::new();
+) -> Result<Vec<AttributeParameter>, ParseError> {
+    let mut attribute_params = Vec::new();
 
     for param in pair.into_inner() {
-        if param.as_rule() == Rule::output_param {
+        if param.as_rule() == Rule::attributes_param {
             let mut param_inner = param.into_inner();
-            let name = next_pair(&mut param_inner, "parameter name", "output block")?
+            let name = next_pair(&mut param_inner, "parameter name", "attributes block")?
                 .as_str()
                 .to_string();
             let type_expr = parse_type_expr(next_pair(
                 &mut param_inner,
                 "type expression",
-                "output parameter",
+                "attributes parameter",
             )?)?;
             let value = if let Some(expr) = param_inner.next() {
                 Some(parse_expression(expr, ctx)?)
             } else {
                 None
             };
-            outputs.push(OutputParameter {
+            attribute_params.push(AttributeParameter {
                 name,
                 type_expr,
                 value,
@@ -423,7 +425,7 @@ fn parse_output_block(
         }
     }
 
-    Ok(outputs)
+    Ok(attribute_params)
 }
 
 /// Parse type expression
@@ -967,17 +969,17 @@ fn parse_primary_value(
         Rule::namespaced_id => {
             // Namespaced identifier (e.g., aws.Region.ap_northeast_1)
             // or resource reference (e.g., bucket.name)
-            // or input reference in module context (e.g., input.vpc_id)
+            // or arguments reference in module context (e.g., arguments.vpc_id)
             let full_str = inner.as_str();
             let parts: Vec<&str> = full_str.split('.').collect();
 
             if parts.len() == 2 {
-                // Two-part identifier: could be input reference, resource reference or variable access
-                if parts[0] == "input" && ctx.in_module {
-                    // Input reference in module context (input.vpc_id)
-                    // Treat as a special ResourceRef with "input" as the binding name
+                // Two-part identifier: could be arguments reference, resource reference or variable access
+                if parts[0] == "arguments" && ctx.in_module {
+                    // Arguments reference in module context (arguments.vpc_id)
+                    // Treat as a special ResourceRef with "arguments" as the binding name
                     Ok(Value::ResourceRef {
-                        binding_name: "input".to_string(),
+                        binding_name: "arguments".to_string(),
                         attribute_name: parts[1].to_string(),
                     })
                 } else if ctx.get_variable(parts[0]).is_some() && !ctx.is_resource_binding(parts[0])
@@ -1043,13 +1045,13 @@ fn parse_primary_value(
             let first_ident = next_pair(&mut parts, "identifier", "variable reference")?.as_str();
 
             if let Some(second_part) = parts.next() {
-                // Member access: resource.attribute or input.param
+                // Member access: resource.attribute or arguments.param
                 let attr_name = second_part.as_str();
 
-                // Handle input reference in module context
-                if first_ident == "input" && ctx.in_module {
+                // Handle arguments reference in module context
+                if first_ident == "arguments" && ctx.in_module {
                     return Ok(Value::ResourceRef {
-                        binding_name: "input".to_string(),
+                        binding_name: "arguments".to_string(),
                         attribute_name: attr_name.to_string(),
                     });
                 }
@@ -1093,12 +1095,12 @@ fn parse_string(pair: pest::iterators::Pair<Rule>) -> String {
 ///
 /// During single-pass parsing, `identifier.member` forms where `identifier` is
 /// not yet a known binding are stored as `UnresolvedIdent(identifier, Some(member))`.
-/// This function walks all resource attributes, module call arguments, and output
-/// values, converting matching `UnresolvedIdent` to `ResourceRef`.
+/// This function walks all resource attributes, module call arguments, and attribute
+/// parameter values, converting matching `UnresolvedIdent` to `ResourceRef`.
 fn resolve_forward_references(
     resource_bindings: &HashMap<String, Resource>,
     resources: &mut [Resource],
-    outputs: &mut [OutputParameter],
+    attribute_params: &mut [AttributeParameter],
     module_calls: &mut [ModuleCall],
 ) {
     for resource in resources.iter_mut() {
@@ -1110,9 +1112,9 @@ fn resolve_forward_references(
             }
         }
     }
-    for output in outputs.iter_mut() {
-        if let Some(value) = output.value.take() {
-            output.value = Some(resolve_forward_ref_in_value(value, resource_bindings));
+    for attr_param in attribute_params.iter_mut() {
+        if let Some(value) = attr_param.value.take() {
+            attr_param.value = Some(resolve_forward_ref_in_value(value, resource_bindings));
         }
     }
     for call in module_calls.iter_mut() {
@@ -1673,45 +1675,45 @@ mod tests {
     #[test]
     fn parse_directory_module() {
         let input = r#"
-            input {
+            arguments {
                 vpc_id: string
                 enable_https: bool = true
             }
 
-            output {
+            attributes {
                 sg_id: string = web_sg.id
             }
 
             let web_sg = aws.security_group {
                 name   = "web-sg"
-                vpc_id = input.vpc_id
+                vpc_id = arguments.vpc_id
             }
         "#;
 
         let result = parse(input).unwrap();
 
-        // Check inputs
-        assert_eq!(result.inputs.len(), 2);
-        assert_eq!(result.inputs[0].name, "vpc_id");
-        assert_eq!(result.inputs[0].type_expr, TypeExpr::String);
-        assert!(result.inputs[0].default.is_none());
+        // Check arguments
+        assert_eq!(result.arguments.len(), 2);
+        assert_eq!(result.arguments[0].name, "vpc_id");
+        assert_eq!(result.arguments[0].type_expr, TypeExpr::String);
+        assert!(result.arguments[0].default.is_none());
 
-        assert_eq!(result.inputs[1].name, "enable_https");
-        assert_eq!(result.inputs[1].type_expr, TypeExpr::Bool);
-        assert_eq!(result.inputs[1].default, Some(Value::Bool(true)));
+        assert_eq!(result.arguments[1].name, "enable_https");
+        assert_eq!(result.arguments[1].type_expr, TypeExpr::Bool);
+        assert_eq!(result.arguments[1].default, Some(Value::Bool(true)));
 
-        // Check outputs
-        assert_eq!(result.outputs.len(), 1);
-        assert_eq!(result.outputs[0].name, "sg_id");
-        assert_eq!(result.outputs[0].type_expr, TypeExpr::String);
+        // Check attribute params
+        assert_eq!(result.attribute_params.len(), 1);
+        assert_eq!(result.attribute_params[0].name, "sg_id");
+        assert_eq!(result.attribute_params[0].type_expr, TypeExpr::String);
 
-        // Check resource has input reference
+        // Check resource has arguments reference
         assert_eq!(result.resources.len(), 1);
         let sg = &result.resources[0];
         assert_eq!(
             sg.attributes.get("vpc_id"),
             Some(&Value::ResourceRef {
-                binding_name: "input".to_string(),
+                binding_name: "arguments".to_string(),
                 attribute_name: "vpc_id".to_string(),
             })
         );
@@ -1732,13 +1734,13 @@ mod tests {
     #[test]
     fn parse_generic_type_expressions() {
         let input = r#"
-            input {
+            arguments {
                 ports: list(int)
                 tags: map(string)
                 cidrs: list(string)
             }
 
-            output {
+            attributes {
                 result: list(string)
             }
         "#;
@@ -1746,19 +1748,19 @@ mod tests {
         let result = parse(input).unwrap();
 
         assert_eq!(
-            result.inputs[0].type_expr,
+            result.arguments[0].type_expr,
             TypeExpr::List(Box::new(TypeExpr::Int))
         );
         assert_eq!(
-            result.inputs[1].type_expr,
+            result.arguments[1].type_expr,
             TypeExpr::Map(Box::new(TypeExpr::String))
         );
         assert_eq!(
-            result.inputs[2].type_expr,
+            result.arguments[2].type_expr,
             TypeExpr::List(Box::new(TypeExpr::String))
         );
         assert_eq!(
-            result.outputs[0].type_expr,
+            result.attribute_params[0].type_expr,
             TypeExpr::List(Box::new(TypeExpr::String))
         );
     }
@@ -1766,35 +1768,35 @@ mod tests {
     #[test]
     fn parse_ref_type_expression() {
         let input = r#"
-            input {
+            arguments {
                 vpc: ref(aws.vpc)
                 enable_https: bool = true
             }
 
-            output {
+            attributes {
                 security_group_id: ref(aws.security_group) = web_sg.id
             }
 
             let web_sg = aws.security_group {
                 name   = "web-sg"
-                vpc_id = input.vpc
+                vpc_id = arguments.vpc
             }
         "#;
 
         let result = parse(input).unwrap();
 
-        // Check ref type input
-        assert_eq!(result.inputs[0].name, "vpc");
+        // Check ref type argument
+        assert_eq!(result.arguments[0].name, "vpc");
         assert_eq!(
-            result.inputs[0].type_expr,
+            result.arguments[0].type_expr,
             TypeExpr::Ref(ResourceTypePath::new("aws", "vpc"))
         );
-        assert!(result.inputs[0].default.is_none());
+        assert!(result.arguments[0].default.is_none());
 
-        // Check ref type output
-        assert_eq!(result.outputs[0].name, "security_group_id");
+        // Check ref type attribute param
+        assert_eq!(result.attribute_params[0].name, "security_group_id");
         assert_eq!(
-            result.outputs[0].type_expr,
+            result.attribute_params[0].type_expr,
             TypeExpr::Ref(ResourceTypePath::new("aws", "security_group"))
         );
     }
@@ -1802,12 +1804,12 @@ mod tests {
     #[test]
     fn parse_ref_type_with_nested_resource_type() {
         let input = r#"
-            input {
+            arguments {
                 sg: ref(aws.security_group)
                 rule: ref(aws.security_group.ingress_rule)
             }
 
-            output {
+            attributes {
                 out: string
             }
         "#;
@@ -1816,13 +1818,13 @@ mod tests {
 
         // Single-level resource type
         assert_eq!(
-            result.inputs[0].type_expr,
+            result.arguments[0].type_expr,
             TypeExpr::Ref(ResourceTypePath::new("aws", "security_group"))
         );
 
         // Nested resource type (security_group.ingress_rule)
         assert_eq!(
-            result.inputs[1].type_expr,
+            result.arguments[1].type_expr,
             TypeExpr::Ref(ResourceTypePath::new("aws", "security_group.ingress_rule"))
         );
     }

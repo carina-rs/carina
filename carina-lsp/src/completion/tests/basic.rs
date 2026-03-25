@@ -115,9 +115,9 @@ fn module_parameter_completion_with_directory_module() {
     let module_dir = base_path.join("modules").join("web_tier");
     fs::create_dir_all(&module_dir).expect("Failed to create module dir");
 
-    // Create main.crn with input parameters
+    // Create main.crn with argument parameters
     let module_content = r#"
-input {
+arguments {
 vpc: ref(aws.ec2.vpc)
 cidr_blocks: list(cidr)
 enable_https: bool = true
@@ -197,7 +197,7 @@ fn module_parameter_completion_with_single_file_module() {
 
     // Create single file module
     let module_content = r#"
-input {
+arguments {
 name: string
 count: int = 1
 }

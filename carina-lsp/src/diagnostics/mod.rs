@@ -592,8 +592,8 @@ impl DiagnosticEngine {
                 }
             }
 
-            // Check output blocks
-            diagnostics.extend(self.check_output_blocks(doc, parsed));
+            // Check attributes blocks
+            diagnostics.extend(self.check_attributes_blocks(doc, parsed));
 
             // Check for unused let bindings
             diagnostics.extend(self.check_unused_bindings(doc, parsed));

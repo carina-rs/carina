@@ -167,20 +167,20 @@ pub fn validate_provider_config(
     Ok(())
 }
 
-/// Validate module call arguments against module input types.
+/// Validate module call arguments against module argument types.
 ///
-/// `imported_modules` maps module alias to its input parameter definitions.
+/// `imported_modules` maps module alias to its argument parameter definitions.
 pub fn validate_module_calls(
     module_calls: &[ModuleCall],
-    imported_modules: &HashMap<String, Vec<crate::parser::InputParameter>>,
+    imported_modules: &HashMap<String, Vec<crate::parser::ArgumentParameter>>,
 ) -> Result<(), String> {
     let mut errors = Vec::new();
 
     for call in module_calls {
-        if let Some(module_inputs) = imported_modules.get(&call.module_name) {
+        if let Some(module_args) = imported_modules.get(&call.module_name) {
             for (arg_name, arg_value) in &call.arguments {
-                if let Some(input) = module_inputs.iter().find(|i| &i.name == arg_name)
-                    && let Some(error) = validate_module_arg_type(&input.type_expr, arg_value)
+                if let Some(arg_param) = module_args.iter().find(|a| &a.name == arg_name)
+                    && let Some(error) = validate_module_arg_type(&arg_param.type_expr, arg_value)
                 {
                     errors.push(format!(
                         "module {} argument '{}': {}",
@@ -201,7 +201,7 @@ pub fn validate_module_calls(
 /// Check for unused `let` bindings and return the unused binding names.
 ///
 /// A binding is unused if its name never appears as a `ResourceRef.binding_name`
-/// in any resource attribute, module call argument, or output parameter value.
+/// in any resource attribute, module call argument, or attribute parameter value.
 pub fn check_unused_bindings(parsed: &ParsedFile) -> Vec<String> {
     // Collect all defined binding names
     let mut defined_bindings: Vec<String> = Vec::new();
@@ -230,8 +230,8 @@ pub fn check_unused_bindings(parsed: &ParsedFile) -> Vec<String> {
             collect_resource_refs(value, &mut referenced);
         }
     }
-    for output in &parsed.outputs {
-        if let Some(value) = &output.value {
+    for attr_param in &parsed.attribute_params {
+        if let Some(value) = &attr_param.value {
             collect_resource_refs(value, &mut referenced);
         }
     }
@@ -303,8 +303,8 @@ mod tests {
             variables: HashMap::new(),
             imports: Vec::new(),
             module_calls: Vec::new(),
-            inputs: Vec::new(),
-            outputs: Vec::new(),
+            arguments: Vec::new(),
+            attribute_params: Vec::new(),
             backend: None,
         }
     }
@@ -439,21 +439,23 @@ mod tests {
     }
 
     #[test]
-    fn binding_referenced_in_output_not_warned() {
+    fn binding_referenced_in_attributes_not_warned() {
         let mut parsed = empty_parsed();
 
         let vpc = Resource::with_provider("awscc", "ec2.vpc", "main-vpc")
             .with_attribute("_binding", Value::String("vpc".to_string()));
         parsed.resources.push(vpc);
 
-        parsed.outputs.push(crate::parser::OutputParameter {
-            name: "vpc_id".to_string(),
-            type_expr: TypeExpr::String,
-            value: Some(Value::ResourceRef {
-                binding_name: "vpc".to_string(),
-                attribute_name: "vpc_id".to_string(),
-            }),
-        });
+        parsed
+            .attribute_params
+            .push(crate::parser::AttributeParameter {
+                name: "vpc_id".to_string(),
+                type_expr: TypeExpr::String,
+                value: Some(Value::ResourceRef {
+                    binding_name: "vpc".to_string(),
+                    attribute_name: "vpc_id".to_string(),
+                }),
+            });
 
         assert!(check_unused_bindings(&parsed).is_empty());
     }

@@ -48,8 +48,8 @@ pub fn load_configuration(path: &PathBuf) -> Result<LoadedConfig, String> {
             variables: HashMap::new(),
             imports: vec![],
             module_calls: vec![],
-            inputs: vec![],
-            outputs: vec![],
+            arguments: vec![],
+            attribute_params: vec![],
             backend: None,
         };
         let mut merged = empty_parsed();
@@ -76,8 +76,10 @@ pub fn load_configuration(path: &PathBuf) -> Result<LoadedConfig, String> {
                     unresolved_merged
                         .module_calls
                         .extend(unresolved.module_calls);
-                    unresolved_merged.inputs.extend(unresolved.inputs);
-                    unresolved_merged.outputs.extend(unresolved.outputs);
+                    unresolved_merged.arguments.extend(unresolved.arguments);
+                    unresolved_merged
+                        .attribute_params
+                        .extend(unresolved.attribute_params);
 
                     // Merge resolved
                     merged.providers.extend(parsed.providers);
@@ -85,8 +87,8 @@ pub fn load_configuration(path: &PathBuf) -> Result<LoadedConfig, String> {
                     merged.variables.extend(parsed.variables);
                     merged.imports.extend(parsed.imports);
                     merged.module_calls.extend(parsed.module_calls);
-                    merged.inputs.extend(parsed.inputs);
-                    merged.outputs.extend(parsed.outputs);
+                    merged.arguments.extend(parsed.arguments);
+                    merged.attribute_params.extend(parsed.attribute_params);
                     // Merge backend (only one allowed)
                     if let Some(backend) = parsed.backend {
                         if merged.backend.is_some() {

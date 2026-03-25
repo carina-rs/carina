@@ -128,16 +128,16 @@ impl Formatter {
             NodeKind::ImportStmt => self.format_import_stmt(node),
             NodeKind::BackendBlock => self.format_backend_block(node),
             NodeKind::ProviderBlock => self.format_provider_block(node),
-            NodeKind::InputBlock => self.format_input_block(node),
-            NodeKind::OutputBlock => self.format_output_block(node),
+            NodeKind::ArgumentsBlock => self.format_arguments_block(node),
+            NodeKind::AttributesBlock => self.format_attributes_block(node),
             NodeKind::LetBinding => self.format_let_binding(node),
             NodeKind::ModuleCall => self.format_module_call(node),
             NodeKind::AnonymousResource => self.format_anonymous_resource(node),
             NodeKind::ResourceExpr => self.format_resource_expr(node),
             NodeKind::Attribute => self.format_attribute(node, 0),
             NodeKind::NestedBlock => self.format_nested_block(node),
-            NodeKind::InputParam => self.format_input_param(node, 0),
-            NodeKind::OutputParam => self.format_output_param(node, 0),
+            NodeKind::ArgumentsParam => self.format_arguments_param(node, 0),
+            NodeKind::AttributesParam => self.format_attributes_param(node, 0),
             NodeKind::PipeExpr => self.format_pipe_expr(node),
             NodeKind::FunctionCall => self.format_function_call(node),
             NodeKind::VariableRef => self.format_variable_ref(node),
@@ -260,13 +260,13 @@ impl Formatter {
         self.write_newline();
     }
 
-    fn format_input_block(&mut self, node: &CstNode) {
+    fn format_arguments_block(&mut self, node: &CstNode) {
         self.write_indent();
-        self.write("input {");
+        self.write("arguments {");
         self.write_newline();
         self.current_indent += 1;
 
-        self.format_input_params(node);
+        self.format_arguments_params(node);
 
         self.current_indent -= 1;
         self.write_indent();
@@ -274,13 +274,13 @@ impl Formatter {
         self.write_newline();
     }
 
-    fn format_output_block(&mut self, node: &CstNode) {
+    fn format_attributes_block(&mut self, node: &CstNode) {
         self.write_indent();
-        self.write("output {");
+        self.write("attributes {");
         self.write_newline();
         self.current_indent += 1;
 
-        self.format_output_params(node);
+        self.format_attributes_params(node);
 
         self.current_indent -= 1;
         self.write_indent();
@@ -288,14 +288,14 @@ impl Formatter {
         self.write_newline();
     }
 
-    fn format_input_params(&mut self, node: &CstNode) {
-        // Collect input params
+    fn format_arguments_params(&mut self, node: &CstNode) {
+        // Collect arguments params
         let params: Vec<&CstNode> = node
             .children
             .iter()
             .filter_map(|child| {
                 if let CstChild::Node(n) = child
-                    && n.kind == NodeKind::InputParam
+                    && n.kind == NodeKind::ArgumentsParam
                 {
                     return Some(n);
                 }
@@ -316,18 +316,18 @@ impl Formatter {
         };
 
         for param in params {
-            self.format_input_param(param, max_key_len);
+            self.format_arguments_param(param, max_key_len);
         }
     }
 
-    fn format_output_params(&mut self, node: &CstNode) {
-        // Collect output params
+    fn format_attributes_params(&mut self, node: &CstNode) {
+        // Collect attributes params
         let params: Vec<&CstNode> = node
             .children
             .iter()
             .filter_map(|child| {
                 if let CstChild::Node(n) = child
-                    && n.kind == NodeKind::OutputParam
+                    && n.kind == NodeKind::AttributesParam
                 {
                     return Some(n);
                 }
@@ -348,7 +348,7 @@ impl Formatter {
         };
 
         for param in params {
-            self.format_output_param(param, max_key_len);
+            self.format_attributes_param(param, max_key_len);
         }
     }
 
@@ -363,7 +363,7 @@ impl Formatter {
         None
     }
 
-    fn format_input_param(&mut self, node: &CstNode, align_to: usize) {
+    fn format_arguments_param(&mut self, node: &CstNode, align_to: usize) {
         self.write_indent();
 
         let mut key_len: usize = 0;
@@ -374,7 +374,7 @@ impl Formatter {
         for child in &node.children {
             match child {
                 CstChild::Token(token) => {
-                    if !wrote_name && self.is_identifier(&token.text) && token.text != "input" {
+                    if !wrote_name && self.is_identifier(&token.text) && token.text != "arguments" {
                         key_len = token.text.len();
                         self.write(&token.text);
                         wrote_name = true;
@@ -411,7 +411,7 @@ impl Formatter {
         self.write_newline();
     }
 
-    fn format_output_param(&mut self, node: &CstNode, align_to: usize) {
+    fn format_attributes_param(&mut self, node: &CstNode, align_to: usize) {
         self.write_indent();
 
         let mut key_len: usize = 0;
@@ -422,7 +422,8 @@ impl Formatter {
         for child in &node.children {
             match child {
                 CstChild::Token(token) => {
-                    if !wrote_name && self.is_identifier(&token.text) && token.text != "output" {
+                    if !wrote_name && self.is_identifier(&token.text) && token.text != "attributes"
+                    {
                         key_len = token.text.len();
                         self.write(&token.text);
                         wrote_name = true;

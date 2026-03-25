@@ -115,10 +115,10 @@ impl CompletionProvider {
             }
         }
 
-        // Add input parameter references if this file has inputs defined
-        let input_params = self.extract_input_parameters(text);
-        if !input_params.is_empty() {
-            // Add "input" keyword with trigger for further completion
+        // Add argument parameter references if this file has arguments defined
+        let argument_params = self.extract_argument_parameters(text);
+        if !argument_params.is_empty() {
+            // Add "arguments" keyword with trigger for further completion
             let trigger_suggest = Command {
                 title: "Trigger Suggest".to_string(),
                 command: "editor.action.triggerSuggest".to_string(),
@@ -126,21 +126,21 @@ impl CompletionProvider {
             };
 
             completions.push(CompletionItem {
-                label: "input".to_string(),
+                label: "arguments".to_string(),
                 kind: Some(CompletionItemKind::KEYWORD),
-                detail: Some("Reference to module input parameters".to_string()),
-                insert_text: Some("input.".to_string()),
+                detail: Some("Reference to module argument parameters".to_string()),
+                insert_text: Some("arguments.".to_string()),
                 command: Some(trigger_suggest),
                 ..Default::default()
             });
 
-            // Also add direct input.xxx completions
-            for (name, type_hint) in &input_params {
+            // Also add direct arguments.xxx completions
+            for (name, type_hint) in &argument_params {
                 completions.push(CompletionItem {
-                    label: format!("input.{}", name),
+                    label: format!("arguments.{}", name),
                     kind: Some(CompletionItemKind::FIELD),
-                    detail: Some(type_hint.clone()),
-                    insert_text: Some(format!("input.{}", name)),
+                    detail: Some(type_hint.to_string()),
+                    insert_text: Some(format!("arguments.{}", name)),
                     ..Default::default()
                 });
             }

@@ -416,7 +416,7 @@ pub fn validate_module_calls(parsed: &ParsedFile, base_dir: &Path) -> Result<(),
     for import in &parsed.imports {
         let module_path = base_dir.join(&import.path);
         if let Some(module_parsed) = module_resolver::load_module(&module_path) {
-            imported_modules.insert(import.alias.clone(), module_parsed.inputs);
+            imported_modules.insert(import.alias.clone(), module_parsed.arguments);
         }
     }
 

@@ -469,14 +469,14 @@ mode = 42
 }
 
 #[test]
-fn output_block_undefined_binding_reference() {
+fn attributes_block_undefined_binding_reference() {
     let engine = test_engine();
     let doc = create_document(
         r#"provider awscc {
 region = awscc.Region.ap_northeast_1
 }
 
-output {
+attributes {
     sg_id: string = nonexistent.id
 }"#,
     );
@@ -488,13 +488,13 @@ output {
         .find(|d| d.message.contains("Undefined") && d.message.contains("nonexistent"));
     assert!(
         undefined_diag.is_some(),
-        "Should warn about undefined binding in output block. Got diagnostics: {:?}",
+        "Should warn about undefined binding in attributes block. Got diagnostics: {:?}",
         diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
     );
 }
 
 #[test]
-fn output_block_valid_binding_reference() {
+fn attributes_block_valid_binding_reference() {
     let engine = test_engine();
     let doc = create_document(
         r#"provider awscc {
@@ -505,7 +505,7 @@ let sg = awscc.ec2.security_group {
 group_description = "Test security group"
 }
 
-output {
+attributes {
     sg_id: string = sg.group_id
 }"#,
     );
@@ -517,20 +517,20 @@ output {
         .find(|d| d.message.contains("Undefined") && d.message.contains("sg"));
     assert!(
         undefined_diag.is_none(),
-        "Should NOT warn about defined binding in output block. Got diagnostics: {:?}",
+        "Should NOT warn about defined binding in attributes block. Got diagnostics: {:?}",
         diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
     );
 }
 
 #[test]
-fn output_block_type_mismatch_bool_to_string() {
+fn attributes_block_type_mismatch_bool_to_string() {
     let engine = test_engine();
     let doc = create_document(
         r#"provider awscc {
 region = awscc.Region.ap_northeast_1
 }
 
-output {
+attributes {
     flag: string = true
 }"#,
     );
@@ -542,13 +542,13 @@ output {
         .find(|d| d.message.contains("Type mismatch") && d.message.contains("string"));
     assert!(
         type_diag.is_some(),
-        "Should warn about type mismatch in output block (bool assigned to string). Got diagnostics: {:?}",
+        "Should warn about type mismatch in attributes block (bool assigned to string). Got diagnostics: {:?}",
         diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
     );
 }
 
 #[test]
-fn output_block_valid_types_no_warning() {
+fn attributes_block_valid_types_no_warning() {
     let engine = test_engine();
     let doc = create_document(
         r#"provider awscc {
@@ -559,7 +559,7 @@ let sg = awscc.ec2.security_group {
 group_description = "Test security group"
 }
 
-output {
+attributes {
     sg_id: string = sg.group_id
     name: string = "hello"
     enabled: bool = true
@@ -571,10 +571,10 @@ output {
 
     let type_diag = diagnostics
         .iter()
-        .find(|d| d.message.contains("Type mismatch") && d.message.contains("output"));
+        .find(|d| d.message.contains("Type mismatch") && d.message.contains("attributes"));
     assert!(
         type_diag.is_none(),
-        "Should NOT warn about valid types in output block. Got diagnostics: {:?}",
+        "Should NOT warn about valid types in attributes block. Got diagnostics: {:?}",
         diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
     );
 }
@@ -630,18 +630,18 @@ fn find_let_binding_position_with_multibyte_leading_whitespace() {
 }
 
 #[test]
-fn output_block_detection_with_brace_on_same_line() {
+fn attributes_block_detection_with_brace_on_same_line() {
     // Regression test: ensure output block detection works correctly
-    // after removing the redundant `|| trimmed == "output {"` condition.
+    // after removing the redundant `|| trimmed == "attributes {"` condition.
     // The simplified condition `starts_with("output ") && contains('{')` must
-    // still detect `output {` (the only valid output block syntax).
+    // still detect `attributes {` (the only valid output block syntax).
     let engine = test_engine();
     let doc = create_document(
         r#"provider awscc {
 region = awscc.Region.ap_northeast_1
 }
 
-output {
+attributes {
     flag: string = true
 }"#,
     );

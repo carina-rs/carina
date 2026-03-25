@@ -159,8 +159,8 @@ impl HoverProvider {
                         if !trimmed.starts_with("let ")
                             && !starts_with_provider
                             && !trimmed.starts_with("provider ")
-                            && !trimmed.starts_with("input ")
-                            && !trimmed.starts_with("output ")
+                            && !trimmed.starts_with("arguments ")
+                            && !trimmed.starts_with("attributes ")
                             && trimmed.ends_with('{')
                         {
                             return true;
@@ -323,11 +323,11 @@ impl HoverProvider {
             "let" => Some(
                 "## let\n\nDefines a named resource or variable binding.\n\n```carina\nlet my_bucket = aws.s3.bucket {\n    name = \"my-bucket\"\n    region = aws.Region.ap_northeast_1\n}\n```",
             ),
-            "output" => Some(
-                "## output\n\nDefines module output values that can be referenced by the caller.\n\n```carina\noutput {\n    bucket_name: String = my_bucket.name\n}\n```",
+            "attributes" => Some(
+                "## attributes\n\nDefines module attribute values that can be referenced by the caller.\n\n```carina\nattributes {\n    bucket_name: String = my_bucket.name\n}\n```",
             ),
-            "input" => Some(
-                "## input\n\nDefines module input parameters that must be provided by the caller.\n\n```carina\ninput {\n    env: String\n    region: String\n}\n```",
+            "arguments" => Some(
+                "## arguments\n\nDefines module argument parameters that must be provided by the caller.\n\n```carina\narguments {\n    env: String\n    region: String\n}\n```",
             ),
             "import" => Some(
                 "## import\n\nImports a module from a file or directory.\n\n```carina\nimport \"./modules/network/main.crn\" as network\n```",
@@ -517,17 +517,17 @@ mod tests {
     }
 
     #[test]
-    fn test_keyword_hover_output() {
-        assert!(HoverProvider::keyword_description("output").is_some());
-        let desc = HoverProvider::keyword_description("output").unwrap();
-        assert!(desc.contains("output"));
+    fn test_keyword_hover_attributes() {
+        assert!(HoverProvider::keyword_description("attributes").is_some());
+        let desc = HoverProvider::keyword_description("attributes").unwrap();
+        assert!(desc.contains("attributes"));
     }
 
     #[test]
-    fn test_keyword_hover_input() {
-        assert!(HoverProvider::keyword_description("input").is_some());
-        let desc = HoverProvider::keyword_description("input").unwrap();
-        assert!(desc.contains("input"));
+    fn test_keyword_hover_arguments() {
+        assert!(HoverProvider::keyword_description("arguments").is_some());
+        let desc = HoverProvider::keyword_description("arguments").unwrap();
+        assert!(desc.contains("arguments"));
     }
 
     #[test]
