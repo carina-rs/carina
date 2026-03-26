@@ -11,12 +11,7 @@ ws = @{ (" " | "\t")+ }
 newline = @{ NEWLINE }
 comment = @{ "#" ~ (!NEWLINE ~ ANY)* }
 
-statement = { import_stmt | backend_block | provider_block | arguments_block | attributes_block | let_binding | module_call | anonymous_resource }
-
-// Import statement: import "./path/to/module.crn" as name
-import_stmt = {
-    kw_import ~ trivia+ ~ string ~ trivia+ ~ kw_as ~ trivia+ ~ identifier
-}
+statement = { backend_block | provider_block | arguments_block | attributes_block | let_binding | module_call | anonymous_resource }
 
 // Backend block: backend s3 { ... }
 backend_block = {
@@ -108,9 +103,13 @@ function_call = {
     identifier ~ open_paren ~ (trivia* ~ expression ~ (trivia* ~ comma ~ trivia* ~ expression)*)? ~ trivia* ~ close_paren
 }
 
+// Import expression: import "path" (used in let binding RHS)
+import_expr = { kw_import ~ trivia+ ~ string }
+
 // Primary value
 primary = {
     resource_expr
+  | import_expr
   | list
   | map
   | namespaced_id
@@ -172,7 +171,6 @@ pipe_op = { "|>" }
 kw_provider = { "provider" }
 kw_backend = { "backend" }
 kw_import = { "import" }
-kw_as = { "as" }
 kw_let = { "let" }
 kw_arguments = { "arguments" }
 kw_attributes = { "attributes" }

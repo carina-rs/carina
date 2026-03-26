@@ -6,7 +6,7 @@ provider awscc {
   region = awscc.Region.ap_northeast_1
 }
 
-import "./modules/network" as network
+let network = import "./modules/network"
 
 network {
   cidr_block  = "10.0.0.0/16"

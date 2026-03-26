@@ -55,7 +55,7 @@ impl Token {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NodeKind {
     File,
-    ImportStmt,
+    ImportExpr,
     BackendBlock,
     ProviderBlock,
     ArgumentsBlock,
@@ -94,7 +94,6 @@ pub enum NodeKind {
     Comma,
     // Keywords
     KwImport,
-    KwAs,
     KwBackend,
     KwProvider,
     KwLet,
