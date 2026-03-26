@@ -275,10 +275,9 @@ Module: web_tier
        ├── http: aws.security_group.ingress_rule
        └── https: aws.security_group.ingress_rule
 
-=== EXPOSES ===
+=== ATTRIBUTES ===
 
   security_group: aws.security_group
-    <- from: web_sg
 ```
 
 ## Architecture

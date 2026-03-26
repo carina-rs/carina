@@ -977,12 +977,6 @@ impl ModuleSignature {
                     "  {}{}{}: {}\n",
                     c.white, attr_param.name, c.reset, type_str
                 ));
-                if let Some(source) = &attr_param.source_binding {
-                    output.push_str(&format!(
-                        "    {}<- from:{} {}{}{}\n",
-                        c.dim, c.reset, c.cyan, source, c.reset
-                    ));
-                }
             }
         }
 

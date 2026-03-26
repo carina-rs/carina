@@ -19,6 +19,4 @@ Module: module_info
 === ATTRIBUTES ===
 
   security_group_id: awscc.ec2.security_group
-    <- from: web_sg
   instance_id: awscc.ec2.instance
-    <- from: web_instance
