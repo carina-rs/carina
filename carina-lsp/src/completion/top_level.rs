@@ -89,9 +89,9 @@ impl CompletionProvider {
                 ..Default::default()
             },
             CompletionItem {
-                label: "import".to_string(),
+                label: "let import".to_string(),
                 kind: Some(CompletionItemKind::KEYWORD),
-                insert_text: Some("import \"${1:./modules/name/main.crn}\" as ${2:module_name}".to_string()),
+                insert_text: Some("let ${1:module_name} = import \"${2:./modules/name}\"".to_string()),
                 insert_text_format: Some(InsertTextFormat::SNIPPET),
                 detail: Some("Import a module".to_string()),
                 ..Default::default()
@@ -285,22 +285,26 @@ impl CompletionProvider {
         }
     }
 
-    /// Find the import path for a given module name from the import statements
+    /// Find the import path for a given module name from let import bindings
     pub(super) fn find_module_import_path(&self, module_name: &str, text: &str) -> Option<String> {
         for line in text.lines() {
             let trimmed = line.trim();
-            // Parse: import "path" as name
-            if let Some(rest) = trimmed.strip_prefix("import ")
-                && let Some(quote_start) = rest.find('"')
-                && let Some(quote_end) = rest[quote_start + 1..].find('"')
-            {
-                let path = &rest[quote_start + 1..quote_start + 1 + quote_end];
-                // Look for "as module_name"
-                let after_path = &rest[quote_start + 1 + quote_end + 1..];
-                if let Some(as_pos) = after_path.find(" as ") {
-                    let alias = after_path[as_pos + 4..].trim();
-                    if alias == module_name {
-                        return Some(path.to_string());
+            // Parse: let name = import "path"
+            if let Some(rest) = trimmed.strip_prefix("let ") {
+                let rest = rest.trim_start();
+                if let Some(eq_pos) = rest.find('=') {
+                    let alias = rest[..eq_pos].trim();
+                    let after_eq = rest[eq_pos + 1..].trim();
+                    if let Some(import_rest) = after_eq.strip_prefix("import ") {
+                        let import_rest = import_rest.trim();
+                        if let Some(path_start) = import_rest.find('"')
+                            && let Some(path_end) = import_rest[path_start + 1..].find('"')
+                        {
+                            let path = &import_rest[path_start + 1..path_start + 1 + path_end];
+                            if alias == module_name {
+                                return Some(path.to_string());
+                            }
+                        }
                     }
                 }
             }

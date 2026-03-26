@@ -1,2 +1,2 @@
-import "./modules/web_tier" as web_tier
-import "./modules/network" as network
+let web_tier = import "./modules/web_tier"
+let network = import "./modules/network"

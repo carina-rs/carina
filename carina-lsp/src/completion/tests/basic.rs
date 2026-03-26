@@ -130,7 +130,7 @@ name = "web-sg"
     fs::write(module_dir.join("main.crn"), module_content).expect("Failed to write module file");
 
     // Create main file that imports the module
-    let main_content = r#"import "./modules/web_tier" as web_tier
+    let main_content = r#"let web_tier = import "./modules/web_tier"
 
 web_tier {
 
@@ -205,7 +205,7 @@ count: int = 1
     fs::write(module_dir.join("simple.crn"), module_content).expect("Failed to write module file");
 
     // Create main file that imports the module
-    let main_content = r#"import "./modules/simple.crn" as simple
+    let main_content = r#"let simple = import "./modules/simple.crn"
 
 simple {
 n

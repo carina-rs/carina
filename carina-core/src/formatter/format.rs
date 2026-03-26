@@ -125,7 +125,7 @@ impl Formatter {
 
     fn format_node(&mut self, node: &CstNode) {
         match node.kind {
-            NodeKind::ImportStmt => self.format_import_stmt(node),
+            NodeKind::ImportExpr => self.format_import_expr(node),
             NodeKind::BackendBlock => self.format_backend_block(node),
             NodeKind::ProviderBlock => self.format_provider_block(node),
             NodeKind::ArgumentsBlock => self.format_arguments_block(node),
@@ -149,36 +149,20 @@ impl Formatter {
         }
     }
 
-    fn format_import_stmt(&mut self, node: &CstNode) {
-        self.write_indent();
+    fn format_import_expr(&mut self, node: &CstNode) {
         self.write("import ");
-
-        let mut found_path = false;
-        let mut found_as = false;
 
         for child in &node.children {
             if let CstChild::Token(token) = child {
                 if token.text == "import" {
                     continue;
                 }
-                if token.text.starts_with('"') && !found_path {
-                    self.write(&token.text);
-                    found_path = true;
-                    continue;
-                }
-                if token.text == "as" {
-                    self.write(" as ");
-                    found_as = true;
-                    continue;
-                }
-                if found_as && self.is_identifier(&token.text) {
+                if token.text.starts_with('"') {
                     self.write(&token.text);
                     break;
                 }
             }
         }
-
-        self.write_newline();
     }
 
     fn format_backend_block(&mut self, node: &CstNode) {

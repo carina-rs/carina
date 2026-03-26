@@ -330,7 +330,7 @@ impl HoverProvider {
                 "## arguments\n\nDefines module argument parameters that must be provided by the caller.\n\n```carina\narguments {\n    env: String\n    region: String\n}\n```",
             ),
             "import" => Some(
-                "## import\n\nImports a module from a file or directory.\n\n```carina\nimport \"./modules/network/main.crn\" as network\n```",
+                "## import\n\nImports a module from a file or directory.\n\n```carina\nlet network = import \"./modules/network\"\n```",
             ),
             "backend" => Some(
                 "## backend\n\nConfigures the state backend for storing resource state.\n\n```carina\nbackend s3 {\n    bucket = \"my-carina-state\"\n    key    = \"prod/carina.crnstate\"\n    region = aws.Region.ap_northeast_1\n}\n```",

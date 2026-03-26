@@ -270,12 +270,6 @@ pub fn parse(input: &str) -> Result<ParsedFile, ParseError> {
                 if inner.as_rule() == Rule::statement {
                     for stmt in inner.into_inner() {
                         match stmt.as_rule() {
-                            Rule::import_stmt => {
-                                let import = parse_import_stmt(stmt)?;
-                                ctx.imported_modules
-                                    .insert(import.alias.clone(), import.path.clone());
-                                imports.push(import);
-                            }
                             Rule::backend_block => {
                                 backend = Some(parse_backend_block(stmt, &ctx)?);
                             }
@@ -306,7 +300,7 @@ pub fn parse(input: &str) -> Result<ParsedFile, ParseError> {
                             }
                             Rule::let_binding => {
                                 let (line, _) = stmt.as_span().start_pos().line_col();
-                                let (name, value, maybe_resource, maybe_module_call) =
+                                let (name, value, maybe_resource, maybe_module_call, maybe_import) =
                                     parse_let_binding_extended(stmt, &ctx)?;
                                 if ctx.variables.contains_key(&name)
                                     || ctx.resource_bindings.contains_key(&name)
@@ -319,8 +313,13 @@ pub fn parse(input: &str) -> Result<ParsedFile, ParseError> {
                                     resources.push(resource);
                                 }
                                 if let Some(mut call) = maybe_module_call {
-                                    call.binding_name = Some(name);
+                                    call.binding_name = Some(name.clone());
                                     module_calls.push(call);
+                                }
+                                if let Some(import) = maybe_import {
+                                    ctx.imported_modules
+                                        .insert(import.alias.clone(), import.path.clone());
+                                    imports.push(import);
                                 }
                             }
                             Rule::module_call => {
@@ -483,15 +482,18 @@ fn parse_type_expr(pair: pest::iterators::Pair<Rule>) -> Result<TypeExpr, ParseE
     }
 }
 
-/// Parse import statement
-fn parse_import_stmt(pair: pest::iterators::Pair<Rule>) -> Result<ImportStatement, ParseError> {
+/// Parse import expression (RHS of `let name = import "path"`)
+fn parse_import_expr(
+    pair: pest::iterators::Pair<Rule>,
+    binding_name: &str,
+) -> Result<ImportStatement, ParseError> {
     let mut inner = pair.into_inner();
-    let path = parse_string(next_pair(&mut inner, "import path", "import statement")?);
-    let alias = next_pair(&mut inner, "alias", "import statement")?
-        .as_str()
-        .to_string();
+    let path = parse_string(next_pair(&mut inner, "import path", "import expression")?);
 
-    Ok(ImportStatement { path, alias })
+    Ok(ImportStatement {
+        path,
+        alias: binding_name.to_string(),
+    })
 }
 
 /// Parse module call
@@ -526,30 +528,48 @@ fn parse_module_call(
     })
 }
 
-/// Extended parse_let_binding that also handles module calls
+/// Result of parsing the RHS of a let binding: (value, resource, module_call, import)
+type LetBindingRhs = (
+    Value,
+    Option<Resource>,
+    Option<ModuleCall>,
+    Option<ImportStatement>,
+);
+
+/// Extended parse_let_binding that also handles module calls and imports
+#[allow(clippy::type_complexity)]
 fn parse_let_binding_extended(
     pair: pest::iterators::Pair<Rule>,
     ctx: &ParseContext,
-) -> Result<(String, Value, Option<Resource>, Option<ModuleCall>), ParseError> {
+) -> Result<
+    (
+        String,
+        Value,
+        Option<Resource>,
+        Option<ModuleCall>,
+        Option<ImportStatement>,
+    ),
+    ParseError,
+> {
     let mut inner = pair.into_inner();
     let name = next_pair(&mut inner, "binding name", "let binding")?
         .as_str()
         .to_string();
     let expr_pair = next_pair(&mut inner, "expression", "let binding")?;
 
-    // Check if it's a module call or resource expression
-    let (value, maybe_resource, maybe_module_call) =
+    // Check if it's a module call, resource expression, or import expression
+    let (value, maybe_resource, maybe_module_call, maybe_import) =
         parse_expression_with_resource_or_module(expr_pair, ctx, &name)?;
 
-    Ok((name, value, maybe_resource, maybe_module_call))
+    Ok((name, value, maybe_resource, maybe_module_call, maybe_import))
 }
 
-/// Parse expression with potential resource or module call
+/// Parse expression with potential resource, module call, or import
 fn parse_expression_with_resource_or_module(
     pair: pest::iterators::Pair<Rule>,
     ctx: &ParseContext,
     binding_name: &str,
-) -> Result<(Value, Option<Resource>, Option<ModuleCall>), ParseError> {
+) -> Result<LetBindingRhs, ParseError> {
     let inner = first_inner(pair, "expression", "expression with resource or module")?;
     parse_pipe_expr_with_resource_or_module(inner, ctx, binding_name)
 }
@@ -558,10 +578,10 @@ fn parse_pipe_expr_with_resource_or_module(
     pair: pest::iterators::Pair<Rule>,
     ctx: &ParseContext,
     binding_name: &str,
-) -> Result<(Value, Option<Resource>, Option<ModuleCall>), ParseError> {
+) -> Result<LetBindingRhs, ParseError> {
     let mut inner = pair.into_inner();
     let primary = next_pair(&mut inner, "primary expression", "pipe expression")?;
-    let (value, maybe_resource, maybe_module_call) =
+    let (value, maybe_resource, maybe_module_call, maybe_import) =
         parse_primary_with_resource_or_module(primary, ctx, binding_name)?;
 
     // Pipe operator is parsed but not yet implemented — reject with a clear error
@@ -572,32 +592,37 @@ fn parse_pipe_expr_with_resource_or_module(
         });
     }
 
-    Ok((value, maybe_resource, maybe_module_call))
+    Ok((value, maybe_resource, maybe_module_call, maybe_import))
 }
 
 fn parse_primary_with_resource_or_module(
     pair: pest::iterators::Pair<Rule>,
     ctx: &ParseContext,
     binding_name: &str,
-) -> Result<(Value, Option<Resource>, Option<ModuleCall>), ParseError> {
+) -> Result<LetBindingRhs, ParseError> {
     let inner = first_inner(pair, "value", "primary expression")?;
 
     match inner.as_rule() {
         Rule::read_resource_expr => {
             let resource = parse_read_resource_expr(inner, ctx, binding_name)?;
             let ref_value = Value::String(format!("${{{}}}", binding_name));
-            Ok((ref_value, Some(resource), None))
+            Ok((ref_value, Some(resource), None, None))
         }
         Rule::resource_expr => {
             let resource = parse_resource_expr(inner, ctx, binding_name)?;
             let ref_value = Value::String(format!("${{{}}}", binding_name));
-            Ok((ref_value, Some(resource), None))
+            Ok((ref_value, Some(resource), None, None))
+        }
+        Rule::import_expr => {
+            let import = parse_import_expr(inner, binding_name)?;
+            let value = Value::String(format!("${{import:{}}}", import.path));
+            Ok((value, None, None, Some(import)))
         }
         _ => {
             // Check if it could be a module call (identifier followed by braces)
             // This is handled by checking if it's a simple identifier that matches a module
             let value = parse_primary_value(inner, ctx)?;
-            Ok((value, None, None))
+            Ok((value, None, None, None))
         }
     }
 }
@@ -1720,9 +1745,9 @@ mod tests {
     }
 
     #[test]
-    fn parse_import_statement() {
+    fn parse_import_expression() {
         let input = r#"
-            import "./modules/web_tier.crn" as web_tier
+            let web_tier = import "./modules/web_tier.crn"
         "#;
 
         let result = parse(input).unwrap();
