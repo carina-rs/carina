@@ -261,7 +261,6 @@ impl CompletionProvider {
         ];
 
         completions.extend(self.region_completions());
-        completions.extend(self.builtin_function_completions());
         completions
     }
 
