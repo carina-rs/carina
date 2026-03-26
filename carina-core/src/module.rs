@@ -1102,18 +1102,38 @@ impl ModuleSignature {
     }
 
     fn find_root_nodes(&self) -> Vec<String> {
-        let mut all_targets: HashSet<String> = HashSet::new();
-        let mut all_sources: HashSet<String> = HashSet::new();
+        // Collect all resource binding names
+        let resource_names: HashSet<String> = self
+            .creates
+            .iter()
+            .map(|c| c.binding_name.clone())
+            .collect();
 
-        for (source, deps) in &self.dependency_graph.edges {
-            all_sources.insert(source.clone());
-            for dep in deps {
-                all_targets.insert(dep.target.clone());
-            }
+        // Find resources whose only dependencies are on arguments (not other resources)
+        // These become root nodes
+        let mut roots: Vec<String> = resource_names
+            .iter()
+            .filter(|name| {
+                let deps = self.dependency_graph.dependencies_of(name);
+                // A resource is a root if it has no resource dependencies
+                // (it either has no deps, or all deps are on arguments)
+                deps.iter().all(|dep| !resource_names.contains(&dep.target))
+            })
+            .cloned()
+            .collect();
+
+        // If no roots found (no dependencies at all), return empty
+        // (the caller will fall back to listing resources without a tree)
+        if roots.iter().all(|r| {
+            self.dependency_graph.dependencies_of(r).is_empty()
+                && !self
+                    .dependency_graph
+                    .edges
+                    .values()
+                    .any(|deps| deps.iter().any(|d| d.target == *r))
+        }) {
+            return Vec::new();
         }
-
-        // Roots are targets that are not sources (leaf nodes in reverse direction)
-        let mut roots: Vec<String> = all_targets.difference(&all_sources).cloned().collect();
 
         roots.sort();
         roots
