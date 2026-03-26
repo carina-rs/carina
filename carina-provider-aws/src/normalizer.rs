@@ -4,6 +4,7 @@ use std::collections::HashMap;
 
 use carina_core::provider::ProviderNormalizer;
 use carina_core::resource::{Resource, Value};
+use carina_core::schema::ResourceSchema;
 
 /// Schema extension for the AWS provider.
 ///
@@ -13,6 +14,63 @@ pub struct AwsNormalizer;
 impl ProviderNormalizer for AwsNormalizer {
     fn normalize_desired(&self, resources: &mut [Resource]) {
         resolve_enum_identifiers(resources);
+    }
+
+    fn merge_default_tags(
+        &self,
+        resources: &mut [Resource],
+        default_tags: &HashMap<String, Value>,
+        schemas: &HashMap<String, ResourceSchema>,
+    ) {
+        if default_tags.is_empty() {
+            return;
+        }
+
+        for resource in resources.iter_mut() {
+            if resource.id.provider != "aws" {
+                continue;
+            }
+
+            // Check if the resource schema has a `tags` attribute
+            let schema_key = format!("aws.{}", resource.id.resource_type);
+            let has_tags = schemas
+                .get(&schema_key)
+                .is_some_and(|s| s.attributes.contains_key("tags"));
+
+            if !has_tags {
+                continue;
+            }
+
+            // Merge default_tags into the resource's tags
+            let mut default_tag_keys: Vec<String> = Vec::new();
+            match resource.attributes.get_mut("tags") {
+                Some(Value::Map(existing_tags)) => {
+                    for (key, value) in default_tags {
+                        if !existing_tags.contains_key(key) {
+                            existing_tags.insert(key.clone(), value.clone());
+                            default_tag_keys.push(key.clone());
+                        }
+                    }
+                }
+                None => {
+                    default_tag_keys = default_tags.keys().cloned().collect();
+                    resource
+                        .attributes
+                        .insert("tags".to_string(), Value::Map(default_tags.clone()));
+                }
+                _ => {
+                    continue;
+                }
+            }
+
+            if !default_tag_keys.is_empty() {
+                default_tag_keys.sort();
+                resource.attributes.insert(
+                    "_default_tag_keys".to_string(),
+                    Value::List(default_tag_keys.into_iter().map(Value::String).collect()),
+                );
+            }
+        }
     }
 }
 

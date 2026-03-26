@@ -109,7 +109,28 @@ fn build_plan_and_states_from_fixture(
     normalize_state_with_ctx(&wiring, &mut current_states);
 
     // Merge default_tags from provider configs into resources that support tags
-    crate::wiring::merge_default_tags(&wiring, &mut resources, &parsed.providers);
+    {
+        use carina_core::provider::{ProviderNormalizer, ProviderRouter};
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("failed to build tokio runtime for merge_default_tags");
+        let mut router = ProviderRouter::new();
+        for factory in wiring.factories() {
+            let attrs = HashMap::new();
+            if let Some(normalizer) = rt.block_on(factory.create_normalizer(&attrs)) {
+                router.add_normalizer(normalizer);
+            }
+        }
+        for provider_config in &parsed.providers {
+            if !provider_config.default_tags.is_empty() {
+                router.merge_default_tags(
+                    &mut resources,
+                    &provider_config.default_tags,
+                    wiring.schemas(),
+                );
+            }
+        }
+    }
 
     // Resolve enum aliases (e.g., "all" -> "-1") in both desired and current states
     resolve_enum_aliases_with_ctx(&wiring, &mut resources);
