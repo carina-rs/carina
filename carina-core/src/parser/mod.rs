@@ -1213,6 +1213,14 @@ pub fn resolve_resource_refs(parsed: &mut ParsedFile) -> Result<(), ParseError> 
         binding_map.entry(arg.name.clone()).or_default();
     }
 
+    // Register module call bindings so ResourceRefs to them are not rejected.
+    // The actual attribute values will be resolved after module expansion.
+    for call in &parsed.module_calls {
+        if let Some(ref name) = call.binding_name {
+            binding_map.entry(name.clone()).or_default();
+        }
+    }
+
     // Resolve references in each resource
     for resource in &mut parsed.resources {
         let mut resolved_attrs: HashMap<String, Value> = HashMap::new();
