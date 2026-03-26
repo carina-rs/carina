@@ -563,6 +563,14 @@ mod tests {
             },
             Value::UnresolvedIdent("dedicated".to_string(), None),
             Value::UnresolvedIdent("InstanceTenancy".to_string(), Some("dedicated".to_string())),
+            Value::Interpolation(vec![
+                InterpolationPart::Literal("prefix-".to_string()),
+                InterpolationPart::Expr(Value::ResourceRef {
+                    binding_name: "vpc".to_string(),
+                    attribute_name: "id".to_string(),
+                }),
+                InterpolationPart::Literal("-suffix".to_string()),
+            ]),
         ];
 
         for value in values {
