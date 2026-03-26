@@ -752,10 +752,10 @@ awscc.ec2.vpc_gateway_attachment {
     internet_gateway_id = igw.
 }"#,
     );
-    // Cursor after "igw." on line 4
+    // Cursor after "igw." on line 4 (4 spaces + "internet_gateway_id = igw." = 30 chars)
     let position = Position {
         line: 4,
-        character: 31,
+        character: 30,
     };
 
     let completions = provider.complete(&doc, position, None);
