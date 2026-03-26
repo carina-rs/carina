@@ -82,6 +82,7 @@ fn build_all_create_plan() -> Plan {
                 Value::ResourceRef {
                     binding_name: "vpc".to_string(),
                     attribute_name: "vpc_id".to_string(),
+                    field_path: vec![],
                 },
             ),
     ));
@@ -94,6 +95,7 @@ fn build_all_create_plan() -> Plan {
                 Value::ResourceRef {
                     binding_name: "vpc".to_string(),
                     attribute_name: "vpc_id".to_string(),
+                    field_path: vec![],
                 },
             ),
     ));
@@ -135,6 +137,7 @@ fn build_mixed_operations_plan() -> Plan {
                 Value::ResourceRef {
                     binding_name: "vpc".to_string(),
                     attribute_name: "vpc_id".to_string(),
+                    field_path: vec![],
                 },
             ),
     ));

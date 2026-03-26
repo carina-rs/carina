@@ -2541,6 +2541,7 @@ mod tests {
                 Value::ResourceRef {
                     binding_name: dep.to_string(),
                     attribute_name: "id".to_string(),
+                    field_path: vec![],
                 },
             );
         }
@@ -3151,6 +3152,7 @@ mod tests {
             Value::ResourceRef {
                 binding_name: "tgw".to_string(),
                 attribute_name: "id".to_string(),
+                field_path: vec![],
             },
         );
         route.attributes.insert(

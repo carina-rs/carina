@@ -1764,6 +1764,7 @@ mod tests {
                 Value::ResourceRef {
                     binding_name: dep.to_string(),
                     attribute_name: "id".to_string(),
+                    field_path: vec![],
                 },
             );
         }
@@ -2176,6 +2177,7 @@ mod tests {
             Value::ResourceRef {
                 binding_name: "public_rt".to_string(),
                 attribute_name: "id".to_string(),
+                field_path: vec![],
             },
         );
         r.attributes.insert(
@@ -2183,6 +2185,7 @@ mod tests {
             Value::ResourceRef {
                 binding_name: "public_subnet_1a".to_string(),
                 attribute_name: "id".to_string(),
+                field_path: vec![],
             },
         );
 
@@ -2200,6 +2203,7 @@ mod tests {
             Value::ResourceRef {
                 binding_name: "database_rt".to_string(),
                 attribute_name: "id".to_string(),
+                field_path: vec![],
             },
         );
         r.attributes.insert(
@@ -2207,6 +2211,7 @@ mod tests {
             Value::ResourceRef {
                 binding_name: "database_subnet_1a".to_string(),
                 attribute_name: "id".to_string(),
+                field_path: vec![],
             },
         );
 
@@ -2249,6 +2254,7 @@ mod tests {
             Value::ResourceRef {
                 binding_name: "igw".to_string(),
                 attribute_name: "id".to_string(),
+                field_path: vec![],
             },
         );
 
@@ -2289,6 +2295,7 @@ mod tests {
             Value::ResourceRef {
                 binding_name: "endpoint_sg".to_string(),
                 attribute_name: "id".to_string(),
+                field_path: vec![],
             },
         );
         r.attributes.insert(
@@ -2314,6 +2321,7 @@ mod tests {
             Value::List(vec![Value::ResourceRef {
                 binding_name: "endpoint_sg".to_string(),
                 attribute_name: "group_id".to_string(),
+                field_path: vec![],
             }]),
         );
         r.attributes.insert(
@@ -2321,6 +2329,7 @@ mod tests {
             Value::ResourceRef {
                 binding_name: "vpc".to_string(),
                 attribute_name: "id".to_string(),
+                field_path: vec![],
             },
         );
 
@@ -2366,6 +2375,7 @@ mod tests {
             Value::ResourceRef {
                 binding_name: "database_subnet_1a".to_string(),
                 attribute_name: "id".to_string(),
+                field_path: vec![],
             },
         );
         let result = format_compact_name(&r, "hash123", None);
@@ -2409,6 +2419,7 @@ mod tests {
             Value::ResourceRef {
                 binding_name: "public_rt".to_string(),
                 attribute_name: "id".to_string(),
+                field_path: vec![],
             },
         );
 
@@ -2429,6 +2440,7 @@ mod tests {
             Value::List(vec![Value::ResourceRef {
                 binding_name: "endpoint_sg".to_string(),
                 attribute_name: "group_id".to_string(),
+                field_path: vec![],
             }]),
         );
 
@@ -2449,6 +2461,7 @@ mod tests {
             Value::List(vec![Value::ResourceRef {
                 binding_name: "endpoint_sg".to_string(),
                 attribute_name: "group_id".to_string(),
+                field_path: vec![],
             }]),
         );
 
@@ -2535,6 +2548,7 @@ mod tests {
                 Value::ResourceRef {
                     binding_name: "vpc".to_string(),
                     attribute_name: "vpc_id".to_string(),
+                    field_path: vec![],
                 },
             )
             .with_attribute("cidr_block", Value::String("10.0.1.0/24".to_string()));
@@ -2589,6 +2603,7 @@ mod tests {
                     Value::ResourceRef {
                         binding_name: "vpc".to_string(),
                         attribute_name: "vpc_id".to_string(),
+                        field_path: vec![],
                     },
                 )
                 .with_attribute("cidr_block", Value::String("10.0.1.0/24".to_string())),
@@ -2764,6 +2779,7 @@ mod tests {
                     Value::ResourceRef {
                         binding_name: "vpc".to_string(),
                         attribute_name: "vpc_id".to_string(),
+                        field_path: vec![],
                     },
                 )
                 .with_attribute(
@@ -2820,6 +2836,7 @@ mod tests {
                 Value::List(vec![Value::ResourceRef {
                     binding_name: "sg".to_string(),
                     attribute_name: "group_id".to_string(),
+                    field_path: vec![],
                 }]),
             ),
         };

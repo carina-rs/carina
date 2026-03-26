@@ -1177,6 +1177,7 @@ mod tests {
                     Value::ResourceRef {
                         binding_name: "vpc".to_string(),
                         attribute_name: "vpc_id".to_string(),
+                        field_path: vec![],
                     },
                 ),
         ));
@@ -1348,6 +1349,7 @@ mod tests {
                     Value::ResourceRef {
                         binding_name: "vpc".to_string(),
                         attribute_name: "vpc_id".to_string(),
+                        field_path: vec![],
                     },
                 ),
         ));
@@ -1596,6 +1598,7 @@ mod tests {
             format_value(&Value::ResourceRef {
                 binding_name: "vpc".to_string(),
                 attribute_name: "vpc_id".to_string(),
+                field_path: vec![],
             }),
             "vpc.vpc_id"
         );
@@ -1615,6 +1618,7 @@ mod tests {
                     Value::ResourceRef {
                         binding_name: "vpc".to_string(),
                         attribute_name: "vpc_id".to_string(),
+                        field_path: vec![],
                     },
                 ),
         ));

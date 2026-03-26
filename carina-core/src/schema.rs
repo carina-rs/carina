@@ -481,8 +481,19 @@ impl Value {
             Value::ResourceRef {
                 binding_name,
                 attribute_name,
-                ..
-            } => format!("ResourceRef({}.{})", binding_name, attribute_name),
+                field_path,
+            } => {
+                if field_path.is_empty() {
+                    format!("ResourceRef({}.{})", binding_name, attribute_name)
+                } else {
+                    format!(
+                        "ResourceRef({}.{}.{})",
+                        binding_name,
+                        attribute_name,
+                        field_path.join(".")
+                    )
+                }
+            }
             Value::UnresolvedIdent(name, member) => match member {
                 Some(m) => format!("UnresolvedIdent({}.{})", name, m),
                 None => format!("UnresolvedIdent({})", name),
@@ -1934,6 +1945,7 @@ mod tests {
             ipv4.validate(&Value::ResourceRef {
                 binding_name: "vpc".to_string(),
                 attribute_name: "cidr_block".to_string(),
+                field_path: vec![],
             })
             .is_ok()
         );
@@ -1943,6 +1955,7 @@ mod tests {
             ipv6.validate(&Value::ResourceRef {
                 binding_name: "subnet".to_string(),
                 attribute_name: "ipv6_cidr".to_string(),
+                field_path: vec![],
             })
             .is_ok()
         );
@@ -2222,6 +2235,7 @@ mod tests {
                 .validate(&Value::ResourceRef {
                     binding_name: "gw".to_string(),
                     attribute_name: "id".to_string(),
+                    field_path: vec![],
                 })
                 .is_ok()
         );

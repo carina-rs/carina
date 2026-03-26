@@ -357,9 +357,11 @@ fn rewrite_intra_module_refs(
         Value::ResourceRef {
             binding_name,
             attribute_name,
+            field_path,
         } if intra_module_bindings.contains(binding_name) => Value::ResourceRef {
             binding_name: format!("{}.{}", instance_prefix, binding_name),
             attribute_name: attribute_name.clone(),
+            field_path: field_path.clone(),
         },
         Value::List(items) => Value::List(
             items
@@ -564,6 +566,7 @@ mod tests {
                         Value::ResourceRef {
                             binding_name: "vpc_id".to_string(),
                             attribute_name: String::new(),
+                            field_path: vec![],
                         },
                     );
                     attrs.insert(
@@ -605,6 +608,7 @@ mod tests {
         let value = Value::ResourceRef {
             binding_name: "vpc_id".to_string(),
             attribute_name: String::new(),
+            field_path: vec![],
         };
         let result = substitute_arguments(&value, &inputs);
 
@@ -620,6 +624,7 @@ mod tests {
             Value::ResourceRef {
                 binding_name: "port".to_string(),
                 attribute_name: String::new(),
+                field_path: vec![],
             },
             Value::Int(443),
         ]);
@@ -684,6 +689,7 @@ mod tests {
                             Value::ResourceRef {
                                 binding_name: "cidr".to_string(),
                                 attribute_name: String::new(),
+                                field_path: vec![],
                             },
                         );
                         attrs
@@ -702,6 +708,7 @@ mod tests {
                             Value::ResourceRef {
                                 binding_name: "vpc".to_string(),
                                 attribute_name: "id".to_string(),
+                                field_path: vec![],
                             },
                         );
                         attrs
@@ -783,6 +790,7 @@ mod tests {
             Some(&Value::ResourceRef {
                 binding_name: "prod.vpc".to_string(),
                 attribute_name: "id".to_string(),
+                field_path: vec![],
             }),
             "Instance A subnet should reference prod.vpc, not bare vpc"
         );
@@ -791,6 +799,7 @@ mod tests {
             Some(&Value::ResourceRef {
                 binding_name: "staging.vpc".to_string(),
                 attribute_name: "id".to_string(),
+                field_path: vec![],
             }),
             "Instance B subnet should reference staging.vpc, not bare vpc"
         );
@@ -832,6 +841,7 @@ mod tests {
                 value: Some(Value::ResourceRef {
                     binding_name: "sg".to_string(),
                     attribute_name: "id".to_string(),
+                    field_path: vec![],
                 }),
             }],
             backend: None,
@@ -878,6 +888,7 @@ mod tests {
             Some(&Value::ResourceRef {
                 binding_name: "web.sg".to_string(),
                 attribute_name: "id".to_string(),
+                field_path: vec![],
             })
         );
     }
@@ -998,6 +1009,7 @@ mod tests {
             Some(&Value::ResourceRef {
                 binding_name: "prod.vpc".to_string(),
                 attribute_name: "id".to_string(),
+                field_path: vec![],
             }),
         );
     }
@@ -1034,6 +1046,7 @@ mod tests {
             Some(&Value::ResourceRef {
                 binding_name: "web.sg".to_string(),
                 attribute_name: "id".to_string(),
+                field_path: vec![],
             })
         );
     }

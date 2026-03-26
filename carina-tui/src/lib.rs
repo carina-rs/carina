@@ -264,6 +264,7 @@ mod tests {
                     carina_core::resource::Value::ResourceRef {
                         binding_name: "vpc".to_string(),
                         attribute_name: "vpc_id".to_string(),
+                        field_path: vec![],
                     },
                 ),
         ));

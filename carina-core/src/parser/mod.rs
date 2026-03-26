@@ -288,6 +288,7 @@ pub fn parse(input: &str) -> Result<ParsedFile, ParseError> {
                                     let placeholder_ref = Value::ResourceRef {
                                         binding_name: arg.name.clone(),
                                         attribute_name: String::new(),
+                                        field_path: vec![],
                                     };
                                     ctx.set_variable(arg.name.clone(), placeholder_ref);
                                     let placeholder = Resource::new("_argument", &arg.name);
@@ -1263,6 +1264,7 @@ fn parse_primary_value(
                     Ok(Value::ResourceRef {
                         binding_name: parts[0].to_string(),
                         attribute_name: parts[1].to_string(),
+                        field_path: vec![],
                     })
                 } else {
                     // Unknown 2-part identifier: could be TypeName.value enum shorthand
@@ -1272,6 +1274,14 @@ fn parse_primary_value(
                         Some(parts[1].to_string()),
                     ))
                 }
+            } else if ctx.is_resource_binding(parts[0]) {
+                // 3+ part identifier where first part is a resource binding:
+                // chained field access (e.g., web.network.vpc_id)
+                Ok(Value::ResourceRef {
+                    binding_name: parts[0].to_string(),
+                    attribute_name: parts[1].to_string(),
+                    field_path: parts[2..].iter().map(|s| s.to_string()).collect(),
+                })
             } else {
                 // 3+ part identifier is a namespaced type (aws.Region.ap_northeast_1)
                 Ok(Value::String(full_str.to_string()))
@@ -1315,7 +1325,7 @@ fn parse_primary_value(
             })
         }
         Rule::variable_ref => {
-            // variable_ref can be "identifier" or "identifier.identifier" (member access)
+            // variable_ref can be "identifier", "identifier.identifier", or chained "a.b.c.d"
             let mut parts = inner.into_inner();
             let first_ident = next_pair(&mut parts, "identifier", "variable reference")?.as_str();
 
@@ -1323,10 +1333,14 @@ fn parse_primary_value(
                 // Member access: resource.attribute (argument params are also resource bindings)
                 let attr_name = second_part.as_str();
 
+                // Collect any additional chained field segments
+                let field_path: Vec<String> = parts.map(|p| p.as_str().to_string()).collect();
+
                 // Return a ResourceRef that will be resolved/validated later
                 Ok(Value::ResourceRef {
                     binding_name: first_ident.to_string(),
                     attribute_name: attr_name.to_string(),
+                    field_path,
                 })
             } else {
                 // Simple variable reference
@@ -1479,6 +1493,7 @@ fn resolve_forward_ref_in_value(
             Value::ResourceRef {
                 binding_name: name.clone(),
                 attribute_name: member.clone(),
+                field_path: vec![],
             }
         }
         Value::List(items) => Value::List(
@@ -1877,6 +1892,7 @@ mod tests {
             Some(&Value::ResourceRef {
                 binding_name: "bucket".to_string(),
                 attribute_name: "name".to_string(),
+                field_path: vec![],
             })
         );
     }
@@ -2119,6 +2135,7 @@ mod tests {
             Some(&Value::ResourceRef {
                 binding_name: "vpc_id".to_string(),
                 attribute_name: String::new(),
+                field_path: vec![],
             })
         );
     }
@@ -3097,6 +3114,7 @@ aws.s3.bucket {
             Some(&Value::ResourceRef {
                 binding_name: "vpc".to_string(),
                 attribute_name: "vpc_id".to_string(),
+                field_path: vec![],
             }),
             "Forward reference should be parsed as ResourceRef, got: {:?}",
             subnet.attributes.get("vpc_id")
@@ -3175,6 +3193,7 @@ aws.s3.bucket {
                     Some(&Value::ResourceRef {
                         binding_name: "vpc".to_string(),
                         attribute_name: "vpc_id".to_string(),
+                        field_path: vec![],
                     }),
                     "Nested forward reference should be resolved"
                 );
@@ -3546,6 +3565,7 @@ aws.s3.bucket {
             Some(&Value::ResourceRef {
                 binding_name: "web".to_string(),
                 attribute_name: "security_group".to_string(),
+                field_path: vec![],
             })
         );
     }
@@ -3613,6 +3633,7 @@ aws.s3.bucket {
                 InterpolationPart::Expr(Value::ResourceRef {
                     binding_name: "vpc".to_string(),
                     attribute_name: "vpc_id".to_string(),
+                    field_path: vec![],
                 }),
             ]))
         );
@@ -3992,6 +4013,71 @@ aws.s3.bucket {
             assert_eq!(args[2], Value::Int(0));
         } else {
             panic!("Expected FunctionCall for cidr_block");
+        }
+    }
+
+    #[test]
+    fn test_chained_field_access_two_levels() {
+        // a.b.c should parse as ResourceRef with binding_name="a", attribute_name="b", field_path=["c"]
+        let input = r#"
+            let vpc = awscc.ec2.vpc {
+                name = "test-vpc"
+            }
+
+            awscc.ec2.subnet {
+                name = "test-subnet"
+                vpc_id = vpc.network.vpc_id
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+        let subnet = &result.resources[1];
+        let vpc_id = subnet.attributes.get("vpc_id").expect("vpc_id attribute");
+        match vpc_id {
+            Value::ResourceRef {
+                binding_name,
+                attribute_name,
+                field_path,
+            } => {
+                assert_eq!(binding_name, "vpc");
+                assert_eq!(attribute_name, "network");
+                assert_eq!(field_path, &vec!["vpc_id".to_string()]);
+            }
+            other => panic!("Expected ResourceRef with field_path, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_chained_field_access_three_levels() {
+        // a.b.c.d should parse as ResourceRef with binding_name="a", attribute_name="b", field_path=["c", "d"]
+        let input = r#"
+            let web = awscc.ec2.vpc {
+                name = "test"
+            }
+
+            awscc.ec2.subnet {
+                name = "test-subnet"
+                vpc_id = web.output.network.vpc_id
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+        let subnet = &result.resources[1];
+        let vpc_id = subnet.attributes.get("vpc_id").expect("vpc_id attribute");
+        match vpc_id {
+            Value::ResourceRef {
+                binding_name,
+                attribute_name,
+                field_path,
+            } => {
+                assert_eq!(binding_name, "web");
+                assert_eq!(attribute_name, "output");
+                assert_eq!(
+                    field_path,
+                    &vec!["network".to_string(), "vpc_id".to_string()]
+                );
+            }
+            other => panic!("Expected ResourceRef with field_path, got {:?}", other),
         }
     }
 }

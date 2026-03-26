@@ -76,13 +76,33 @@ pub fn resolve_ref_value(
         Value::ResourceRef {
             binding_name,
             attribute_name,
-            ..
+            field_path,
         } => {
             if let Some(attrs) = binding_map.get(binding_name)
                 && let Some(attr_value) = attrs.get(attribute_name)
             {
-                // Recursively resolve
-                return resolve_ref_value(attr_value, binding_map);
+                // Resolve the initial attribute value
+                let mut resolved = resolve_ref_value(attr_value, binding_map);
+
+                // Traverse chained field path through nested maps
+                for field in field_path {
+                    match resolved {
+                        Value::Map(ref map) => {
+                            if let Some(nested) = map.get(field) {
+                                resolved = resolve_ref_value(nested, binding_map);
+                            } else {
+                                // Field not found in nested map, keep original ref
+                                return value.clone();
+                            }
+                        }
+                        _ => {
+                            // Cannot traverse non-map value, keep original ref
+                            return value.clone();
+                        }
+                    }
+                }
+
+                return resolved;
             }
             // Keep as-is if not found
             value.clone()
@@ -215,6 +235,7 @@ mod tests {
         let ref_value = Value::ResourceRef {
             binding_name: "my_vpc".to_string(),
             attribute_name: "id".to_string(),
+            field_path: vec![],
         };
 
         let resolved = resolve_ref_value(&ref_value, &binding_map);
@@ -233,6 +254,7 @@ mod tests {
             Value::ResourceRef {
                 binding_name: "my_sg".to_string(),
                 attribute_name: "id".to_string(),
+                field_path: vec![],
             },
         ]);
 
@@ -259,6 +281,7 @@ mod tests {
                 Value::ResourceRef {
                     binding_name: "my_subnet".to_string(),
                     attribute_name: "id".to_string(),
+                    field_path: vec![],
                 },
             )]
             .into_iter()
@@ -283,6 +306,7 @@ mod tests {
         let ref_value = Value::ResourceRef {
             binding_name: "nonexistent".to_string(),
             attribute_name: "id".to_string(),
+            field_path: vec![],
         };
 
         let resolved = resolve_ref_value(&ref_value, &binding_map);
@@ -301,6 +325,7 @@ mod tests {
             InterpolationPart::Expr(Value::ResourceRef {
                 binding_name: "my_vpc".to_string(),
                 attribute_name: "vpc_id".to_string(),
+                field_path: vec![],
             }),
         ]);
 
@@ -317,6 +342,7 @@ mod tests {
             InterpolationPart::Expr(Value::ResourceRef {
                 binding_name: "my_vpc".to_string(),
                 attribute_name: "vpc_id".to_string(),
+                field_path: vec![],
             }),
         ]);
 
@@ -360,6 +386,7 @@ mod tests {
                     Value::ResourceRef {
                         binding_name: "my_vpc".to_string(),
                         attribute_name: "vpc_id".to_string(),
+                        field_path: vec![],
                     },
                 )],
             ),
@@ -425,6 +452,7 @@ mod tests {
                     Value::ResourceRef {
                         binding_name: "vpc".to_string(),
                         attribute_name: "id".to_string(),
+                        field_path: vec![],
                     },
                 ]),
             ],
@@ -446,11 +474,78 @@ mod tests {
                 Value::List(vec![Value::ResourceRef {
                     binding_name: "unknown".to_string(),
                     attribute_name: "id".to_string(),
+                    field_path: vec![],
                 }]),
             ],
         };
 
         let resolved = resolve_ref_value(&func, &binding_map);
         assert!(matches!(resolved, Value::FunctionCall { .. }));
+    }
+
+    #[test]
+    fn test_resolve_chained_field_access() {
+        let mut binding_map: HashMap<String, HashMap<String, Value>> = HashMap::new();
+
+        // web binding has a nested map: network = { vpc_id = "vpc-123" }
+        let mut network_map = HashMap::new();
+        network_map.insert("vpc_id".to_string(), Value::String("vpc-123".to_string()));
+        let mut attrs = HashMap::new();
+        attrs.insert("network".to_string(), Value::Map(network_map));
+        binding_map.insert("web".to_string(), attrs);
+
+        // web.network.vpc_id should resolve to "vpc-123"
+        let ref_value = Value::ResourceRef {
+            binding_name: "web".to_string(),
+            attribute_name: "network".to_string(),
+            field_path: vec!["vpc_id".to_string()],
+        };
+
+        let resolved = resolve_ref_value(&ref_value, &binding_map);
+        assert_eq!(resolved, Value::String("vpc-123".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_deeply_chained_field_access() {
+        let mut binding_map: HashMap<String, HashMap<String, Value>> = HashMap::new();
+
+        // web.output.network.vpc_id
+        let mut inner_map = HashMap::new();
+        inner_map.insert("vpc_id".to_string(), Value::String("vpc-456".to_string()));
+        let mut output_map = HashMap::new();
+        output_map.insert("network".to_string(), Value::Map(inner_map));
+        let mut attrs = HashMap::new();
+        attrs.insert("output".to_string(), Value::Map(output_map));
+        binding_map.insert("web".to_string(), attrs);
+
+        let ref_value = Value::ResourceRef {
+            binding_name: "web".to_string(),
+            attribute_name: "output".to_string(),
+            field_path: vec!["network".to_string(), "vpc_id".to_string()],
+        };
+
+        let resolved = resolve_ref_value(&ref_value, &binding_map);
+        assert_eq!(resolved, Value::String("vpc-456".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_chained_field_missing_key_keeps_ref() {
+        let mut binding_map: HashMap<String, HashMap<String, Value>> = HashMap::new();
+
+        let mut network_map = HashMap::new();
+        network_map.insert("vpc_id".to_string(), Value::String("vpc-123".to_string()));
+        let mut attrs = HashMap::new();
+        attrs.insert("network".to_string(), Value::Map(network_map));
+        binding_map.insert("web".to_string(), attrs);
+
+        // web.network.nonexistent should keep original ref
+        let ref_value = Value::ResourceRef {
+            binding_name: "web".to_string(),
+            attribute_name: "network".to_string(),
+            field_path: vec!["nonexistent".to_string()],
+        };
+
+        let resolved = resolve_ref_value(&ref_value, &binding_map);
+        assert_eq!(resolved, ref_value);
     }
 }

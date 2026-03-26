@@ -488,6 +488,7 @@ pub fn cascade_dependent_updates(
                     Value::ResourceRef {
                         binding_name,
                         attribute_name,
+                        ..
                     } if binding_name == dep => {
                         Some((k.clone(), format!("{}.{}", binding_name, attribute_name)))
                     }
@@ -585,6 +586,7 @@ pub fn cascade_dependent_updates(
                             Value::ResourceRef {
                                 binding_name,
                                 attribute_name,
+                                ..
                             } if binding_name == replaced_binding
                                 && create_only_refs.contains(k) =>
                             {

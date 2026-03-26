@@ -356,6 +356,7 @@ mod tests {
             Value::ResourceRef {
                 binding_name: "vpc".to_string(),
                 attribute_name: "vpc_id".to_string(),
+                field_path: vec![],
             },
         );
         parsed.resources.push(subnet);
@@ -403,6 +404,7 @@ mod tests {
             Value::ResourceRef {
                 binding_name: "vpc".to_string(),
                 attribute_name: "vpc_id".to_string(),
+                field_path: vec![],
             },
         );
         let sg = Resource::with_provider("awscc", "ec2.security_group", "web-sg")
@@ -426,6 +428,7 @@ mod tests {
             Value::ResourceRef {
                 binding_name: "vpc".to_string(),
                 attribute_name: "vpc_id".to_string(),
+                field_path: vec![],
             },
         );
         parsed.module_calls.push(ModuleCall {
@@ -455,6 +458,7 @@ mod tests {
             Value::ResourceRef {
                 binding_name: "vpc".to_string(),
                 attribute_name: "vpc_id".to_string(),
+                field_path: vec![],
             },
         );
         parsed.resources.push(subnet);
@@ -479,6 +483,7 @@ mod tests {
                 value: Some(Value::ResourceRef {
                     binding_name: "vpc".to_string(),
                     attribute_name: "vpc_id".to_string(),
+                    field_path: vec![],
                 }),
             });
 
@@ -527,6 +532,7 @@ let route = awscc.ec2.route {
             Value::ResourceRef {
                 binding_name,
                 attribute_name,
+                ..
             } => {
                 assert_eq!(binding_name, "igw_attachment");
                 assert_eq!(attribute_name, "internet_gateway_id");
@@ -594,6 +600,7 @@ let route = awscc.ec2.route {
             Value::ResourceRef {
                 binding_name: "vpc".to_string(),
                 attribute_name: "vpc_id".to_string(),
+                field_path: vec![],
             },
         );
 
@@ -628,6 +635,7 @@ let route = awscc.ec2.route {
             Value::ResourceRef {
                 binding_name: "vpc".to_string(),
                 attribute_name: "nonexistent_attr".to_string(),
+                field_path: vec![],
             },
         );
 
