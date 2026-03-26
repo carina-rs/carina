@@ -1433,7 +1433,7 @@ async fn run_apply_from_plan_locked(
         .map(|r| (r.id.clone(), r.clone()))
         .collect();
 
-    let result = execute_effects(
+    let mut result = execute_effects(
         plan,
         &provider,
         &mut binding_map,
@@ -1441,6 +1441,12 @@ async fn run_apply_from_plan_locked(
         &unresolved_resources,
     )
     .await;
+
+    // Execute import effects: read imported resources from the provider
+    execute_import_effects(plan, &provider, &mut result).await;
+
+    // Execute remove and move effects (state-only, logged for user feedback)
+    execute_state_only_effects(plan, &mut result);
 
     finalize_apply(
         &result,
