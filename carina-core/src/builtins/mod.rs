@@ -4,6 +4,7 @@
 //! Functions take `&[Value]` arguments and return `Result<Value, String>`.
 
 mod cidr_subnet;
+mod concat;
 mod join;
 mod length;
 mod split;
@@ -18,6 +19,7 @@ use crate::resource::Value;
 pub fn evaluate_builtin(name: &str, args: &[Value]) -> Result<Value, String> {
     match name {
         "cidr_subnet" => cidr_subnet::builtin_cidr_subnet(args),
+        "concat" => concat::builtin_concat(args),
         "join" => join::builtin_join(args),
         "length" => length::builtin_length(args),
         "split" => split::builtin_split(args),
