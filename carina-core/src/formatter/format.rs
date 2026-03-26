@@ -135,6 +135,8 @@ impl Formatter {
             NodeKind::ModuleCall => self.format_module_call(node),
             NodeKind::AnonymousResource => self.format_anonymous_resource(node),
             NodeKind::ResourceExpr => self.format_resource_expr(node),
+            NodeKind::ReadResourceExpr => self.format_read_resource_expr(node),
+            NodeKind::ForExpr => self.format_for_expr(node),
             NodeKind::Attribute => self.format_attribute(node, 0),
             NodeKind::NestedBlock => self.format_nested_block(node),
             NodeKind::ArgumentsParam => self.format_arguments_param(node, 0),
@@ -558,6 +560,121 @@ impl Formatter {
             self.write("}");
         } else {
             self.write(" {}");
+        }
+    }
+
+    fn format_read_resource_expr(&mut self, node: &CstNode) {
+        self.write("read ");
+        // Write resource type (namespaced_id)
+        for child in &node.children {
+            if let CstChild::Token(token) = child
+                && token.text.contains('.')
+            {
+                self.write(&token.text);
+                break;
+            }
+        }
+
+        if self.block_has_content(node) {
+            self.write(" {");
+            self.write_newline();
+            self.current_indent += 1;
+
+            self.format_block_attributes(node);
+
+            self.current_indent -= 1;
+            self.write_indent();
+            self.write("}");
+        } else {
+            self.write(" {}");
+        }
+    }
+
+    fn format_for_expr(&mut self, node: &CstNode) {
+        // For expressions are preserved as-is with proper indentation
+        // Format: for <binding> in <iterable> { <body> }
+        self.write("for ");
+
+        let mut saw_open_brace = false;
+
+        for child in &node.children {
+            match child {
+                CstChild::Token(token) => {
+                    if token.text == "for" {
+                        continue; // Already written
+                    }
+                    if token.text == "in" {
+                        self.write(" in ");
+                        continue;
+                    }
+                    if token.text == "{" {
+                        self.write(" {");
+                        self.write_newline();
+                        self.current_indent += 1;
+                        saw_open_brace = true;
+                        continue;
+                    }
+                    if token.text == "}" {
+                        self.current_indent -= 1;
+                        self.write_indent();
+                        self.write("}");
+                        continue;
+                    }
+                    self.write(&token.text);
+                }
+                CstChild::Node(n) => {
+                    if n.kind == NodeKind::ForBinding {
+                        self.format_for_binding(n);
+                    } else if !saw_open_brace {
+                        // Iterable
+                        self.format_node(n);
+                    } else {
+                        // Body content
+                        if n.kind == NodeKind::ResourceExpr
+                            || n.kind == NodeKind::ReadResourceExpr
+                            || n.kind == NodeKind::LocalBinding
+                        {
+                            self.write_indent();
+                            self.format_node(n);
+                            self.write_newline();
+                        } else {
+                            self.format_node(n);
+                        }
+                    }
+                }
+                CstChild::Trivia(_) => {
+                    // Skip trivia - we control whitespace
+                }
+            }
+        }
+    }
+
+    fn format_for_binding(&mut self, node: &CstNode) {
+        // Collect all identifiers and check for parens
+        let mut has_open_paren = false;
+        let mut tokens: Vec<&str> = Vec::new();
+
+        for child in &node.children {
+            if let CstChild::Token(token) = child {
+                if token.text == "(" {
+                    has_open_paren = true;
+                } else if token.text == ")" || token.text == "," {
+                    // skip
+                } else {
+                    tokens.push(&token.text);
+                }
+            }
+        }
+
+        if has_open_paren {
+            // Indexed binding: (i, x)
+            self.write(&format!("({}, {})", tokens[0], tokens[1]));
+        } else if tokens.len() == 2 {
+            // Map binding: k, v
+            self.write(&format!("{}, {}", tokens[0], tokens[1]));
+        } else {
+            // Simple binding: x
+            self.write(tokens[0]);
         }
     }
 
@@ -1033,15 +1150,50 @@ impl Formatter {
     }
 
     fn format_variable_ref(&mut self, node: &CstNode) {
-        let mut parts: Vec<&str> = Vec::new();
+        for child in &node.children {
+            match child {
+                CstChild::Token(token) if self.is_identifier(&token.text) => {
+                    self.write(&token.text);
+                }
+                CstChild::Node(n) if n.kind == NodeKind::FieldAccess => {
+                    self.format_field_access(n);
+                }
+                CstChild::Node(n) if n.kind == NodeKind::IndexAccess => {
+                    self.format_index_access(n);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn format_field_access(&mut self, node: &CstNode) {
+        self.write(".");
         for child in &node.children {
             if let CstChild::Token(token) = child
                 && self.is_identifier(&token.text)
             {
-                parts.push(&token.text);
+                self.write(&token.text);
             }
         }
-        self.write(&parts.join("."));
+    }
+
+    fn format_index_access(&mut self, node: &CstNode) {
+        self.write("[");
+        for child in &node.children {
+            match child {
+                CstChild::Token(token) => {
+                    if token.text == "[" || token.text == "]" {
+                        continue;
+                    }
+                    self.write(&token.text);
+                }
+                CstChild::Node(n) => {
+                    self.format_node(n);
+                }
+                _ => {}
+            }
+        }
+        self.write("]");
     }
 
     fn format_list(&mut self, node: &CstNode) {
@@ -1751,6 +1903,71 @@ mod tests {
         assert!(
             result.contains("security_group = sg.id"),
             "Expected untyped form in:\n{}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_format_index_access() {
+        let input = "let x = items[0].name\n";
+        let config = FormatConfig::default();
+        let result = format(input, &config).unwrap();
+        assert!(
+            result.contains("items[0].name"),
+            "Expected index access in:\n{}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_format_string_index_access() {
+        let input = "let x = config[\"key\"].value\n";
+        let config = FormatConfig::default();
+        let result = format(input, &config).unwrap();
+        assert!(
+            result.contains("config[\"key\"].value"),
+            "Expected string index access in:\n{}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_format_for_expression() {
+        let input = "let subnets = for subnet in subnets {\n  awscc.ec2.subnet {\n    cidr_block = subnet.cidr\n  }\n}\n";
+        let config = FormatConfig::default();
+        let result = format(input, &config).unwrap();
+        assert!(
+            result.contains("for subnet in subnets"),
+            "Expected for expression in:\n{}",
+            result
+        );
+        assert!(
+            result.contains("awscc.ec2.subnet"),
+            "Expected resource in for body:\n{}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_format_read_resource_expr() {
+        let input = "let vpc = read awscc.ec2.vpc {\n  vpc_id = \"vpc-123\"\n}\n";
+        let config = FormatConfig::default();
+        let result = format(input, &config).unwrap();
+        assert!(
+            result.contains("read awscc.ec2.vpc"),
+            "Expected read resource expr in:\n{}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_format_function_call_in_primary() {
+        let input = "let x = concat(a, b)\n";
+        let config = FormatConfig::default();
+        let result = format(input, &config).unwrap();
+        assert!(
+            result.contains("concat(a, b)"),
+            "Expected function call in:\n{}",
             result
         );
     }

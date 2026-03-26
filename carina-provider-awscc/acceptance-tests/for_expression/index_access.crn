@@ -5,8 +5,8 @@ provider awscc {
 let vpcs = for env in ["dev", "stg"] {
   awscc.ec2.vpc {
     cidr_block = "10.0.0.0/16"
-    tags = {
-      Name = "index-access-test-${env}"
+    tags       = {
+      Name        = "index-access-test-${env}"
       Environment = env
     }
   }
@@ -17,7 +17,7 @@ awscc.ec2.subnet {
   vpc_id            = vpcs[0].vpc_id
   cidr_block        = "10.0.1.0/24"
   availability_zone = "ap-northeast-1a"
-  tags = {
+  tags              = {
     Name = "index-access-test-subnet"
   }
 }
