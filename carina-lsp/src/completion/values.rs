@@ -68,8 +68,15 @@ impl CompletionProvider {
         attr_name: &str,
         text: &str,
         current_binding: Option<&str>,
+        position: Position,
     ) -> Vec<CompletionItem> {
         let mut completions = Vec::new();
+
+        // Compute the text_edit range for resource reference completions.
+        // When the user has typed "igw." after "=", we need the range to cover
+        // from the start of "igw" to the cursor, so accepting a completion like
+        // "igw.internet_gateway_id" replaces "igw." instead of being appended.
+        let ref_edit_range = self.compute_value_prefix_range(text, position);
 
         // Type-based resource reference completions:
         // Look up the attribute's type from the schema. If it's a Custom type,
@@ -96,17 +103,20 @@ impl CompletionProvider {
                                 Self::extract_custom_type_name(&binding_attr.attr_type)
                                 && binding_type_name == target_name
                             {
+                                let full_ref = format!("{}.{}", binding_name, binding_attr.name);
                                 completions.push(CompletionItem {
-                                    label: format!("{}.{}", binding_name, binding_attr.name),
+                                    label: full_ref.clone(),
                                     kind: Some(CompletionItemKind::REFERENCE),
                                     detail: Some(format!(
                                         "Reference to {}'s {} ({})",
                                         binding_name, binding_attr.name, target_name
                                     )),
-                                    insert_text: Some(format!(
-                                        "{}.{}",
-                                        binding_name, binding_attr.name
-                                    )),
+                                    text_edit: Some(
+                                        tower_lsp::lsp_types::CompletionTextEdit::Edit(TextEdit {
+                                            range: ref_edit_range,
+                                            new_text: full_ref,
+                                        }),
+                                    ),
                                     ..Default::default()
                                 });
                             }
@@ -154,6 +164,37 @@ impl CompletionProvider {
         // Fall back to generic value completions
         completions.extend(self.generic_value_completions());
         completions
+    }
+
+    /// Compute a text edit range covering the value prefix the user has already typed
+    /// after the `=` sign. This allows resource reference completions like `igw.internet_gateway_id`
+    /// to replace the already-typed prefix (e.g., `igw.`) instead of being appended after it.
+    fn compute_value_prefix_range(&self, text: &str, position: Position) -> Range {
+        let lines: Vec<&str> = text.lines().collect();
+        let line_idx = position.line as usize;
+        let col = position.character as usize;
+
+        let start_col = if line_idx < lines.len() {
+            let prefix: String = lines[line_idx].chars().take(col).collect();
+            // Find the position after "= " (the value start)
+            if let Some(eq_pos) = prefix.rfind('=') {
+                let after_eq = &prefix[eq_pos + 1..];
+                let whitespace_len = after_eq.len() - after_eq.trim_start().len();
+                (eq_pos + 1 + whitespace_len) as u32
+            } else {
+                position.character
+            }
+        } else {
+            position.character
+        };
+
+        Range {
+            start: Position {
+                line: position.line,
+                character: start_col,
+            },
+            end: position,
+        }
     }
 
     /// Extract the Custom type name from an AttributeType, if it is a Custom type.
