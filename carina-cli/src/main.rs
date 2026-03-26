@@ -242,6 +242,8 @@ async fn main() {
 #[cfg(test)]
 mod module_info_snapshot_tests;
 #[cfg(test)]
+mod module_list_tests;
+#[cfg(test)]
 mod plan_snapshot_tests;
 #[cfg(test)]
 mod tests;

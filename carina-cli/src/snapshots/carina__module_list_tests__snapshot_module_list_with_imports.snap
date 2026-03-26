@@ -1,0 +1,7 @@
+---
+source: carina-cli/src/module_list_tests.rs
+expression: output
+---
+Modules:
+  web_tier    ./modules/web_tier
+  network     ./modules/network
