@@ -10,8 +10,8 @@ let cidrs = {
 let vpcs = for name, cidr in cidrs {
   awscc.ec2.vpc {
     cidr_block = cidr
-    tags = {
-      Name = "for-map-test-${name}"
+    tags       = {
+      Name        = "for-map-test-${name}"
       Environment = name
     }
   }
