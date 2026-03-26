@@ -25,8 +25,8 @@ pub fn evaluate_builtin(name: &str, args: &[Value]) -> Result<Value, String> {
         "split" => split::builtin_split(args),
         "trim" => trim::builtin_trim(args),
         "upper" => upper_lower::builtin_upper(args),
-        "values" => keys_values::builtin_values(args),
         "lower" => upper_lower::builtin_lower(args),
+        "values" => keys_values::builtin_values(args),
         _ => Err(format!("Unknown built-in function: {name}")),
     }
 }
