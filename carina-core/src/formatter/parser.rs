@@ -187,4 +187,119 @@ mod tests {
             result.unwrap_err()
         );
     }
+
+    #[test]
+    fn issue_1175_index_access_syntax() {
+        // Index access like a[0].b or a["key"].b should parse
+        let input = r#"let x = items[0].name
+"#;
+        let result = parse(input);
+        assert!(
+            result.is_ok(),
+            "Index access syntax should parse, got: {}",
+            result.unwrap_err()
+        );
+    }
+
+    #[test]
+    fn issue_1175_string_index_access() {
+        let input = r#"let x = config["key"].value
+"#;
+        let result = parse(input);
+        assert!(
+            result.is_ok(),
+            "String index access should parse, got: {}",
+            result.unwrap_err()
+        );
+    }
+
+    #[test]
+    fn issue_1175_for_expression() {
+        // for expressions should parse
+        let input = r#"let subnets = for subnet in subnets {
+  awscc.ec2.subnet {
+    vpc_id = vpc.vpc_id
+    cidr_block = subnet.cidr
+  }
+}
+"#;
+        let result = parse(input);
+        assert!(
+            result.is_ok(),
+            "For expression should parse, got: {}",
+            result.unwrap_err()
+        );
+    }
+
+    #[test]
+    fn issue_1175_for_indexed_binding() {
+        let input = r#"let items = for (i, x) in list {
+  awscc.ec2.subnet {
+    name = x
+  }
+}
+"#;
+        let result = parse(input);
+        assert!(
+            result.is_ok(),
+            "For expression with indexed binding should parse, got: {}",
+            result.unwrap_err()
+        );
+    }
+
+    #[test]
+    fn issue_1175_for_map_binding() {
+        let input = r#"let items = for k, v in tags {
+  awscc.ec2.subnet {
+    name = k
+  }
+}
+"#;
+        let result = parse(input);
+        assert!(
+            result.is_ok(),
+            "For expression with map binding should parse, got: {}",
+            result.unwrap_err()
+        );
+    }
+
+    #[test]
+    fn issue_1175_read_resource_expr() {
+        let input = r#"let vpc = read awscc.ec2.vpc {
+  vpc_id = "vpc-123"
+}
+"#;
+        let result = parse(input);
+        assert!(
+            result.is_ok(),
+            "Read resource expression should parse, got: {}",
+            result.unwrap_err()
+        );
+    }
+
+    #[test]
+    fn issue_1175_function_call_in_primary() {
+        // function_call should be usable in primary position (not just in pipe)
+        let input = r#"let x = concat(a, b)
+"#;
+        let result = parse(input);
+        assert!(
+            result.is_ok(),
+            "Function call in primary position should parse, got: {}",
+            result.unwrap_err()
+        );
+    }
+
+    #[test]
+    fn issue_1175_chained_field_access() {
+        // Multiple chained field accesses: a.b.c
+        let input = r#"let x = vpc.details.id
+"#;
+        let result = parse(input);
+        assert!(
+            result.is_ok(),
+            "Chained field access should parse, got: {}",
+            result.unwrap_err()
+        );
+    }
 }

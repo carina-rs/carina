@@ -100,6 +100,37 @@ impl<'a> CstBuilder<'a> {
             Rule::resource_expr => Some(CstChild::Node(
                 self.build_node(NodeKind::ResourceExpr, pair),
             )),
+            Rule::read_resource_expr => Some(CstChild::Node(
+                self.build_node(NodeKind::ReadResourceExpr, pair),
+            )),
+            Rule::for_expr => Some(CstChild::Node(self.build_node(NodeKind::ForExpr, pair))),
+            Rule::for_binding => {
+                let inner = pair.into_inner().next()?;
+                self.build_child(inner)
+            }
+            Rule::for_simple_binding => {
+                Some(CstChild::Node(self.build_node(NodeKind::ForBinding, pair)))
+            }
+            Rule::for_indexed_binding => {
+                Some(CstChild::Node(self.build_node(NodeKind::ForBinding, pair)))
+            }
+            Rule::for_map_binding => {
+                Some(CstChild::Node(self.build_node(NodeKind::ForBinding, pair)))
+            }
+            Rule::for_iterable => {
+                let inner = pair.into_inner().next()?;
+                self.build_child(inner)
+            }
+            Rule::for_body_content => None, // Silent rule
+            Rule::for_local_binding => Some(CstChild::Node(
+                self.build_node(NodeKind::LocalBinding, pair),
+            )),
+            Rule::field_access => {
+                Some(CstChild::Node(self.build_node(NodeKind::FieldAccess, pair)))
+            }
+            Rule::index_access => {
+                Some(CstChild::Node(self.build_node(NodeKind::IndexAccess, pair)))
+            }
             Rule::attribute => Some(CstChild::Node(self.build_node(NodeKind::Attribute, pair))),
             Rule::nested_block => {
                 Some(CstChild::Node(self.build_node(NodeKind::NestedBlock, pair)))
@@ -160,6 +191,9 @@ impl<'a> CstBuilder<'a> {
             }
             Rule::kw_list => Some(CstChild::Token(Token::new("list".to_string(), span))),
             Rule::kw_map => Some(CstChild::Token(Token::new("map".to_string(), span))),
+            Rule::kw_for => Some(CstChild::Token(Token::new("for".to_string(), span))),
+            Rule::kw_in => Some(CstChild::Token(Token::new("in".to_string(), span))),
+            Rule::kw_read => Some(CstChild::Token(Token::new("read".to_string(), span))),
 
             // Skip file_content (it's a silent rule wrapper)
             Rule::file_content => None,
