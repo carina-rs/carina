@@ -4,6 +4,7 @@
 //! Functions take `&[Value]` arguments and return `Result<Value, String>`.
 
 mod cidr_subnet;
+mod flatten;
 mod join;
 mod keys_values;
 mod length;
@@ -21,6 +22,7 @@ use crate::resource::Value;
 pub fn evaluate_builtin(name: &str, args: &[Value]) -> Result<Value, String> {
     match name {
         "cidr_subnet" => cidr_subnet::builtin_cidr_subnet(args),
+        "flatten" => flatten::builtin_flatten(args),
         "join" => join::builtin_join(args),
         "keys" => keys_values::builtin_keys(args),
         "length" => length::builtin_length(args),
