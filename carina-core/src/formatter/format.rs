@@ -839,23 +839,34 @@ impl Formatter {
         None
     }
 
-    /// Check if an attribute has a multi-line map value (block form `{ ... }`)
+    /// Check if an attribute has a non-empty map value (block form `{ ... }`)
     fn attribute_has_map_value(&self, node: &CstNode) -> bool {
         if node.kind != NodeKind::Attribute {
             return false;
         }
         if let Some(value_node) = self.get_value_after_equals(node) {
             // The value may be directly a Map, or wrapped in a PipeExpr
-            if value_node.kind == NodeKind::Map {
-                return true;
-            }
-            if value_node.kind == NodeKind::PipeExpr {
+            let map_node = if value_node.kind == NodeKind::Map {
+                Some(value_node)
+            } else if value_node.kind == NodeKind::PipeExpr {
                 // Check if the first child node is a Map
-                for child in &value_node.children {
-                    if let CstChild::Node(n) = child {
-                        return n.kind == NodeKind::Map;
+                value_node.children.iter().find_map(|child| {
+                    if let CstChild::Node(n) = child
+                        && n.kind == NodeKind::Map
+                    {
+                        Some(n)
+                    } else {
+                        None
                     }
-                }
+                })
+            } else {
+                None
+            };
+            // Only return true for non-empty maps (maps with at least one entry or nested block)
+            if let Some(map) = map_node {
+                return map.children.iter().any(|child| {
+                    matches!(child, CstChild::Node(n) if n.kind == NodeKind::MapEntry || n.kind == NodeKind::NestedBlock)
+                });
             }
         }
         false
@@ -2150,6 +2161,30 @@ mod tests {
             result, expected,
             "No trailing blank line when map is last attribute"
         );
+    }
+
+    #[test]
+    fn issue_1177_empty_map_no_blank_lines() {
+        // Empty maps should NOT trigger blank line insertion
+        let input = r#"awscc.ec2.vpc {
+  cidr_block = "10.0.0.0/16"
+  tags       = {}
+  enable_dns = true
+}
+"#;
+        let config = FormatConfig {
+            align_attributes: true,
+            ..Default::default()
+        };
+        let result = format(input, &config).unwrap();
+
+        let expected = r#"awscc.ec2.vpc {
+  cidr_block = "10.0.0.0/16"
+  tags       = {}
+  enable_dns = true
+}
+"#;
+        assert_eq!(result, expected, "Empty maps should not get blank lines");
     }
 
     #[test]
