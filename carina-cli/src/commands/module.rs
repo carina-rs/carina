@@ -29,19 +29,22 @@ pub fn run_module_command(command: ModuleCommands) -> Result<(), AppError> {
 
 fn run_module_list(path: &Path) -> Result<(), AppError> {
     let config = config_loader::load_configuration(&path.to_path_buf())?;
-    let imports = &config.parsed.imports;
-
-    if imports.is_empty() {
-        println!("No modules imported.");
-        return Ok(());
-    }
-
-    println!("Modules:");
-    for import in imports {
-        println!("  {:<12}{}", import.alias, import.path);
-    }
-
+    let output = format_module_list(&config.parsed.imports);
+    print!("{output}");
     Ok(())
+}
+
+/// Format the module list output as a string.
+pub fn format_module_list(imports: &[carina_core::parser::ImportStatement]) -> String {
+    if imports.is_empty() {
+        return "No modules imported.\n".to_string();
+    }
+
+    let mut out = String::from("Modules:\n");
+    for import in imports {
+        out.push_str(&format!("  {:<12}{}\n", import.alias, import.path));
+    }
+    out
 }
 
 fn run_module_info(path: &Path) -> Result<(), AppError> {
