@@ -347,11 +347,11 @@ fn update_binding_map(
 // Effect execution: sequential path
 // ---------------------------------------------------------------------------
 
-/// Count the number of actionable effects (excluding Read).
+/// Count the number of actionable effects (excluding Read and state operations).
 fn count_actionable_effects(effects: &[Effect]) -> usize {
     effects
         .iter()
-        .filter(|e| !matches!(e, Effect::Read { .. }))
+        .filter(|e| !matches!(e, Effect::Read { .. }) && !e.is_state_operation())
         .count()
 }
 
@@ -550,14 +550,16 @@ async fn execute_effects_sequential(
     let mut completed_indices: HashSet<usize> = HashSet::new();
     // Track which effect indices have been dispatched (spawned or skipped)
     let mut dispatched: HashSet<usize> = HashSet::new();
-    // All actionable effect indices (excluding Read)
+    // All actionable effect indices (excluding Read and state operations)
     let actionable_indices: Vec<usize> = (0..effects.len())
-        .filter(|&idx| !matches!(&effects[idx], Effect::Read { .. }))
+        .filter(|&idx| {
+            !matches!(&effects[idx], Effect::Read { .. }) && !effects[idx].is_state_operation()
+        })
         .collect();
 
-    // Mark Read effects as completed (they are no-ops but may be dependencies)
+    // Mark Read and state operation effects as completed (they are no-ops in the executor)
     for (idx, effect) in effects.iter().enumerate() {
-        if matches!(effect, Effect::Read { .. }) {
+        if matches!(effect, Effect::Read { .. }) || effect.is_state_operation() {
             completed_indices.insert(idx);
             dispatched.insert(idx);
         }
