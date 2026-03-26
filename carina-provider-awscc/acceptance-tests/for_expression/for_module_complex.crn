@@ -1,0 +1,18 @@
+provider awscc {
+  region = awscc.Region.ap_northeast_1
+}
+
+let network = import "./modules/network"
+
+let cidrs = {
+  dev = "10.0.0.0/16"
+  stg = "10.1.0.0/16"
+}
+
+let networks = for name, cidr in cidrs {
+  network {
+    cidr_block  = cidr
+    subnet_cidr = cidr_subnet(cidr, 8, 1)
+    az          = "ap-northeast-1a"
+  }
+}
