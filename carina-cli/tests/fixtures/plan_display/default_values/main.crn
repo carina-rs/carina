@@ -5,6 +5,6 @@ provider awscc {
 }
 
 awscc.logs.log_group {
-  log_group_name = "my-app-logs"
+  log_group_name    = "my-app-logs"
   retention_in_days = 30
 }

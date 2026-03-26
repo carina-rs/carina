@@ -3,15 +3,16 @@ provider awscc {
 }
 
 let config = {
-  app = "web"
-  env = "test"
+  app  = "web"
+  env  = "test"
   team = "infra"
 }
 
 awscc.ec2.vpc {
   cidr_block = "10.0.0.0/16"
+
   tags = {
-    Name = join("-", keys(config))
+    Name   = join("-", keys(config))
     Values = join("-", values(config))
   }
 }

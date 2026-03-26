@@ -2,6 +2,7 @@
 
 provider awscc {
   region = awscc.Region.ap_northeast_1
+
   default_tags = {
     Environment = "production"
     ManagedBy   = "carina"
@@ -11,6 +12,7 @@ provider awscc {
 # Resource with explicit tags - should merge with default_tags (resource wins on conflict)
 let vpc = awscc.ec2.vpc {
   cidr_block = "10.0.0.0/16"
+
   tags = {
     Name        = "main-vpc"
     Environment = "staging"

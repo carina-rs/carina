@@ -6,6 +6,7 @@ let parts = [["flat", "test"], ["vpc"]]
 
 awscc.ec2.vpc {
   cidr_block = "10.0.0.0/16"
+
   tags = {
     Name = join("-", flatten(parts))
   }

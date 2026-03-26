@@ -6,6 +6,7 @@ awscc.ec2.vpc {
   let env = "production"
   let name = "local-let-${env}"
   cidr_block = "10.0.0.0/16"
+
   tags = {
     Name = name
     Env  = upper(env)
