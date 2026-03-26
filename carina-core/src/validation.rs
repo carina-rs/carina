@@ -19,6 +19,11 @@ pub fn validate_resources(
     let mut all_errors = Vec::new();
 
     for resource in resources {
+        // Skip virtual resources (module attribute containers)
+        if resource.is_virtual() {
+            continue;
+        }
+
         let schema_key = schema_key_fn(resource);
 
         match schemas.get(&schema_key) {
