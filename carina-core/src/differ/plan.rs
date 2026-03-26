@@ -164,6 +164,11 @@ pub fn create_plan(
         desired.iter().map(|r| &r.id).collect();
 
     for resource in desired {
+        // Skip virtual resources (module attribute containers)
+        if resource.is_virtual() {
+            continue;
+        }
+
         // Data sources (read-only resources) only generate Read effects
         if resource.read_only {
             plan.add(Effect::Read {

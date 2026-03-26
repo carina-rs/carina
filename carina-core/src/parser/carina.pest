@@ -90,6 +90,7 @@ primary = {
     read_resource_expr   // Must come before resource_expr for "read aws..." parsing
   | resource_expr
   | import_expr          // Must come before variable_ref since "import" is an identifier
+  | module_call          // Must come before variable_ref so "name { ... }" is parsed as module call
   | list
   | map
   | namespaced_id

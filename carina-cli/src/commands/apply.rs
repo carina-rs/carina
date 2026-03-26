@@ -537,6 +537,11 @@ pub async fn detect_drift(
     let mut drift_messages: Vec<String> = Vec::new();
 
     for resource in sorted_resources {
+        // Skip virtual resources (module attribute containers)
+        if resource.is_virtual() {
+            continue;
+        }
+
         let planned_state = planned_states.get(&resource.id);
         let identifier = planned_state.and_then(|s| s.identifier.as_deref());
 
@@ -880,27 +885,30 @@ async fn run_apply_locked(
 
     // Read states for all resources using identifier from state
     // In identifier-based approach, if there's no identifier in state, the resource doesn't exist
+    // Skip virtual resources (module attribute containers) — they have no infrastructure.
     RefreshProgress::start_header();
     let multi = refresh_multi_progress();
     let current_states: HashMap<ResourceId, State> = {
         let provider_ref = &provider;
-        let results: Vec<Result<(ResourceId, State), AppError>> = stream::iter(&sorted_resources)
-            .map(|resource| {
-                let progress = RefreshProgress::begin_multi(&multi, &resource.id);
-                let identifier = state_file
-                    .as_ref()
-                    .and_then(|sf| sf.get_identifier_for_resource(resource));
-                async move {
-                    let state = read_with_retry(provider_ref, &resource.id, identifier.as_deref())
-                        .await
-                        .map_err(AppError::Provider)?;
-                    progress.finish();
-                    Ok((resource.id.clone(), state))
-                }
-            })
-            .buffer_unordered(5)
-            .collect()
-            .await;
+        let results: Vec<Result<(ResourceId, State), AppError>> =
+            stream::iter(sorted_resources.iter().filter(|r| !r.is_virtual()))
+                .map(|resource| {
+                    let progress = RefreshProgress::begin_multi(&multi, &resource.id);
+                    let identifier = state_file
+                        .as_ref()
+                        .and_then(|sf| sf.get_identifier_for_resource(resource));
+                    async move {
+                        let state =
+                            read_with_retry(provider_ref, &resource.id, identifier.as_deref())
+                                .await
+                                .map_err(AppError::Provider)?;
+                        progress.finish();
+                        Ok((resource.id.clone(), state))
+                    }
+                })
+                .buffer_unordered(5)
+                .collect()
+                .await;
         let mut states = HashMap::new();
         for result in results {
             let (id, state) = result?;

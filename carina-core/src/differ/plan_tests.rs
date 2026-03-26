@@ -671,3 +671,41 @@ fn diff_skips_internal_attributes_in_removal_detection() {
         result
     );
 }
+
+#[test]
+fn virtual_resources_are_skipped_in_plan() {
+    // Virtual resources (module attribute containers) should not generate any effects
+    let mut virtual_resource = Resource::new("_virtual", "web");
+    virtual_resource
+        .attributes
+        .insert("_virtual".to_string(), Value::String("true".to_string()));
+    virtual_resource
+        .attributes
+        .insert("_binding".to_string(), Value::String("web".to_string()));
+    virtual_resource.attributes.insert(
+        "security_group".to_string(),
+        Value::String("sg-123".to_string()),
+    );
+
+    let real_resource = Resource::new("ec2.security_group", "sg")
+        .with_attribute("group_name", Value::String("my-sg".to_string()));
+
+    let resources = vec![virtual_resource, real_resource];
+
+    let plan = create_plan(
+        &resources,
+        &HashMap::new(),
+        &HashMap::new(),
+        &HashMap::new(),
+        &HashMap::new(),
+        &HashMap::new(),
+        &HashMap::new(),
+    );
+
+    // Only the real resource should generate an effect (Create)
+    assert_eq!(plan.effects().len(), 1);
+    assert_eq!(
+        plan.effects()[0].resource_id(),
+        &ResourceId::new("ec2.security_group", "sg")
+    );
+}

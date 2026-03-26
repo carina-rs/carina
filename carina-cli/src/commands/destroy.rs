@@ -155,9 +155,11 @@ async fn run_destroy_locked(
         let multi = refresh_multi_progress();
 
         // Read states for managed resources concurrently using identifier from state.
-        // Skip data sources (read-only) -- they won't be destroyed.
-        let managed_resources: Vec<&Resource> =
-            all_resources.iter().filter(|r| !r.read_only).collect();
+        // Skip data sources (read-only) and virtual resources -- they won't be destroyed.
+        let managed_resources: Vec<&Resource> = all_resources
+            .iter()
+            .filter(|r| !r.read_only && !r.is_virtual())
+            .collect();
         let provider_ref = &provider;
         let results: Vec<Result<(ResourceId, State), AppError>> = stream::iter(&managed_resources)
             .map(|resource| {
@@ -216,7 +218,7 @@ async fn run_destroy_locked(
     } else if let Some(sf) = state_file.as_ref() {
         // --refresh=false: build states from state file without AWS calls
         for resource in &all_resources {
-            if resource.read_only {
+            if resource.read_only || resource.is_virtual() {
                 continue;
             }
             let state = sf.build_state_for_resource(resource);
@@ -244,8 +246,8 @@ async fn run_destroy_locked(
     let resources_to_destroy: Vec<&Resource> = destroy_order
         .iter()
         .filter(|r| {
-            // Skip data sources (read-only resources) -- nothing to destroy
-            if r.read_only {
+            // Skip data sources (read-only) and virtual resources -- nothing to destroy
+            if r.read_only || r.is_virtual() {
                 return false;
             }
 
