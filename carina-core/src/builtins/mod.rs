@@ -1,0 +1,34 @@
+//! Built-in functions for the Carina DSL
+//!
+//! Provides a registry of built-in functions that can be called from DSL expressions.
+//! Functions take `&[Value]` arguments and return `Result<Value, String>`.
+
+mod join;
+
+use crate::resource::Value;
+
+/// Evaluate a built-in function by name with the given arguments.
+///
+/// Returns `Err` if the function is unknown or if the arguments are invalid.
+pub fn evaluate_builtin(name: &str, args: &[Value]) -> Result<Value, String> {
+    match name {
+        "join" => join::builtin_join(args),
+        _ => Err(format!("Unknown built-in function: {name}")),
+    }
+}
+
+/// Return a human-readable type name for a Value
+fn value_type_name(value: &Value) -> &'static str {
+    match value {
+        Value::String(_) => "String",
+        Value::Int(_) => "Int",
+        Value::Float(_) => "Float",
+        Value::Bool(_) => "Bool",
+        Value::List(_) => "List",
+        Value::Map(_) => "Map",
+        Value::ResourceRef { .. } => "ResourceRef",
+        Value::UnresolvedIdent(_, _) => "UnresolvedIdent",
+        Value::Interpolation(_) => "Interpolation",
+        Value::FunctionCall { .. } => "FunctionCall",
+    }
+}

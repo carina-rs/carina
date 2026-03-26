@@ -1,19 +1,8 @@
-//! Built-in functions for the Carina DSL
-//!
-//! Provides a registry of built-in functions that can be called from DSL expressions.
-//! Functions take `&[Value]` arguments and return `Result<Value, String>`.
+//! `join(separator, list)` built-in function
 
 use crate::resource::Value;
 
-/// Evaluate a built-in function by name with the given arguments.
-///
-/// Returns `Err` if the function is unknown or if the arguments are invalid.
-pub fn evaluate_builtin(name: &str, args: &[Value]) -> Result<Value, String> {
-    match name {
-        "join" => builtin_join(args),
-        _ => Err(format!("Unknown built-in function: {name}")),
-    }
-}
+use super::value_type_name;
 
 /// `join(separator, list)` - Join list elements into a string with a separator.
 ///
@@ -26,7 +15,7 @@ pub fn evaluate_builtin(name: &str, args: &[Value]) -> Result<Value, String> {
 /// join("-", ["a", "b", "c"])  // => "a-b-c"
 /// ["a", "b"] |> join("-")     // => "a-b" (pipe form)
 /// ```
-fn builtin_join(args: &[Value]) -> Result<Value, String> {
+pub(crate) fn builtin_join(args: &[Value]) -> Result<Value, String> {
     if args.len() != 2 {
         return Err(format!(
             "join() expects 2 arguments (separator, list), got {}",
@@ -69,25 +58,10 @@ fn builtin_join(args: &[Value]) -> Result<Value, String> {
     Ok(Value::String(joined))
 }
 
-/// Return a human-readable type name for a Value
-fn value_type_name(value: &Value) -> &'static str {
-    match value {
-        Value::String(_) => "String",
-        Value::Int(_) => "Int",
-        Value::Float(_) => "Float",
-        Value::Bool(_) => "Bool",
-        Value::List(_) => "List",
-        Value::Map(_) => "Map",
-        Value::ResourceRef { .. } => "ResourceRef",
-        Value::UnresolvedIdent(_, _) => "UnresolvedIdent",
-        Value::Interpolation(_) => "Interpolation",
-        Value::FunctionCall { .. } => "FunctionCall",
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::builtins::evaluate_builtin;
+    use crate::resource::Value;
 
     #[test]
     fn join_basic() {
