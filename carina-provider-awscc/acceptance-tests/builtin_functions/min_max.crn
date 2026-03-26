@@ -4,8 +4,9 @@ provider awscc {
 
 awscc.ec2.vpc {
   cidr_block = "10.0.0.0/16"
+
   tags = {
-    Name = "min-max-test-vpc"
+    Name    = "min-max-test-vpc"
     MinPort = "port-${min(8080,9090)}"
     MaxPort = "port-${max(8080,9090)}"
   }

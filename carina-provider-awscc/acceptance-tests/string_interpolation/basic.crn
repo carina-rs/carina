@@ -6,18 +6,20 @@ let env = "test"
 
 let vpc = awscc.ec2.vpc {
   cidr_block = "10.0.0.0/16"
+
   tags = {
-    Name = "interp-${env}-vpc"
+    Name        = "interp-${env}-vpc"
     Environment = env
   }
 }
 
 let subnet = awscc.ec2.subnet {
-  vpc_id = vpc.vpc_id
-  cidr_block = "10.0.1.0/24"
+  vpc_id            = vpc.vpc_id
+  cidr_block        = "10.0.1.0/24"
   availability_zone = "ap-northeast-1a"
+
   tags = {
-    Name = "interp-${env}-subnet"
+    Name  = "interp-${env}-subnet"
     VpcId = "vpc-${vpc.vpc_id}"
   }
 }

@@ -3,10 +3,12 @@ provider awscc {
 }
 
 let parts1 = ["web", "test"]
+
 let parts2 = ["vpc"]
 
 awscc.ec2.vpc {
   cidr_block = "10.0.0.0/16"
+
   tags = {
     Name = join("-", concat(parts1, parts2))
   }

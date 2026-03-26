@@ -22,9 +22,7 @@ provider aws {
   region = aws.Region.ap_northeast_1
 }
 
-let identity = read
-
-aws.sts.caller_identity {}
+let identity = read aws.sts.caller_identity {}
 
 let ipam = awscc.ec2.ipam {
   tier = advanced

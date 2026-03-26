@@ -6,8 +6,9 @@ let items = ["a", "b", "c"]
 
 awscc.ec2.vpc {
   cidr_block = "10.0.0.0/16"
+
   tags = {
-    Name = "length-test-vpc"
+    Name      = "length-test-vpc"
     ItemCount = "count-${length(items)}"
   }
 }
