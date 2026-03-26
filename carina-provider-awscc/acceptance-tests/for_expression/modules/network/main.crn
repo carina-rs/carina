@@ -1,0 +1,32 @@
+# Network module
+#
+# Creates a VPC and subnet. Demonstrates intra-module resource references.
+
+arguments {
+  cidr_block : string
+  subnet_cidr: string
+  az         : string
+}
+
+let vpc = awscc.ec2.vpc {
+  cidr_block = cidr_block
+
+  tags = {
+    Name = "module-test"
+  }
+}
+
+let subnet = awscc.ec2.subnet {
+  vpc_id            = vpc.vpc_id
+  cidr_block        = subnet_cidr
+  availability_zone = az
+
+  tags = {
+    Name = "module-test-subnet"
+  }
+}
+
+attributes {
+  vpc_id   : awscc.ec2.vpc = vpc.vpc_id
+  subnet_id: awscc.ec2.subnet = subnet.subnet_id
+}

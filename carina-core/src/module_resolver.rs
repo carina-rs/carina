@@ -340,6 +340,26 @@ fn substitute_arguments(value: &Value, arguments: &HashMap<String, Value>) -> Va
                 .map(|(k, v)| (k.clone(), substitute_arguments(v, arguments)))
                 .collect(),
         ),
+        Value::Interpolation(parts) => {
+            use crate::resource::InterpolationPart;
+            let substituted_parts: Vec<InterpolationPart> = parts
+                .iter()
+                .map(|p| match p {
+                    InterpolationPart::Expr(v) => {
+                        InterpolationPart::Expr(substitute_arguments(v, arguments))
+                    }
+                    other => other.clone(),
+                })
+                .collect();
+            Value::Interpolation(substituted_parts)
+        }
+        Value::FunctionCall { name, args } => Value::FunctionCall {
+            name: name.clone(),
+            args: args
+                .iter()
+                .map(|v| substitute_arguments(v, arguments))
+                .collect(),
+        },
         _ => value.clone(),
     }
 }
@@ -379,6 +399,26 @@ fn rewrite_intra_module_refs(
                 })
                 .collect(),
         ),
+        Value::Interpolation(parts) => {
+            use crate::resource::InterpolationPart;
+            let rewritten_parts: Vec<InterpolationPart> = parts
+                .iter()
+                .map(|p| match p {
+                    InterpolationPart::Expr(v) => InterpolationPart::Expr(
+                        rewrite_intra_module_refs(v, instance_prefix, intra_module_bindings),
+                    ),
+                    other => other.clone(),
+                })
+                .collect();
+            Value::Interpolation(rewritten_parts)
+        }
+        Value::FunctionCall { name, args } => Value::FunctionCall {
+            name: name.clone(),
+            args: args
+                .iter()
+                .map(|v| rewrite_intra_module_refs(v, instance_prefix, intra_module_bindings))
+                .collect(),
+        },
         _ => value.clone(),
     }
 }
@@ -1047,6 +1087,233 @@ mod tests {
                 binding_name: "web.sg".to_string(),
                 attribute_name: "id".to_string(),
                 field_path: vec![],
+            })
+        );
+    }
+
+    #[test]
+    fn test_substitute_arguments_interpolation() {
+        use crate::resource::InterpolationPart;
+
+        let mut inputs = HashMap::new();
+        inputs.insert("env_name".to_string(), Value::String("dev".to_string()));
+
+        // Interpolation like "prefix-${env_name}-suffix" where env_name is a module argument
+        let value = Value::Interpolation(vec![
+            InterpolationPart::Literal("prefix-".to_string()),
+            InterpolationPart::Expr(Value::ResourceRef {
+                binding_name: "env_name".to_string(),
+                attribute_name: String::new(),
+                field_path: vec![],
+            }),
+            InterpolationPart::Literal("-suffix".to_string()),
+        ]);
+        let result = substitute_arguments(&value, &inputs);
+
+        // After substitution, the ResourceRef should be replaced with the argument value
+        assert_eq!(
+            result,
+            Value::Interpolation(vec![
+                InterpolationPart::Literal("prefix-".to_string()),
+                InterpolationPart::Expr(Value::String("dev".to_string())),
+                InterpolationPart::Literal("-suffix".to_string()),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_substitute_arguments_function_call() {
+        let mut inputs = HashMap::new();
+        inputs.insert("cidr".to_string(), Value::String("10.0.0.0/16".to_string()));
+
+        // FunctionCall like cidr_subnet(cidr, 8, 0) where cidr is a module argument
+        let value = Value::FunctionCall {
+            name: "cidr_subnet".to_string(),
+            args: vec![
+                Value::ResourceRef {
+                    binding_name: "cidr".to_string(),
+                    attribute_name: String::new(),
+                    field_path: vec![],
+                },
+                Value::Int(8),
+                Value::Int(0),
+            ],
+        };
+        let result = substitute_arguments(&value, &inputs);
+
+        assert_eq!(
+            result,
+            Value::FunctionCall {
+                name: "cidr_subnet".to_string(),
+                args: vec![
+                    Value::String("10.0.0.0/16".to_string()),
+                    Value::Int(8),
+                    Value::Int(0),
+                ],
+            }
+        );
+    }
+
+    /// Module with interpolation in resource attributes to test argument substitution
+    fn create_module_with_interpolation() -> ParsedFile {
+        use crate::resource::InterpolationPart;
+
+        ParsedFile {
+            providers: vec![],
+            resources: vec![Resource {
+                id: ResourceId::new("ec2.vpc", "vpc"),
+                attributes: {
+                    let mut attrs = HashMap::new();
+                    attrs.insert("_binding".to_string(), Value::String("vpc".to_string()));
+                    attrs.insert(
+                        "cidr_block".to_string(),
+                        Value::ResourceRef {
+                            binding_name: "cidr_block".to_string(),
+                            attribute_name: String::new(),
+                            field_path: vec![],
+                        },
+                    );
+                    attrs.insert(
+                        "name".to_string(),
+                        Value::Interpolation(vec![
+                            InterpolationPart::Literal("test-".to_string()),
+                            InterpolationPart::Expr(Value::ResourceRef {
+                                binding_name: "env_name".to_string(),
+                                attribute_name: String::new(),
+                                field_path: vec![],
+                            }),
+                        ]),
+                    );
+                    attrs.insert(
+                        "env".to_string(),
+                        Value::ResourceRef {
+                            binding_name: "env_name".to_string(),
+                            attribute_name: String::new(),
+                            field_path: vec![],
+                        },
+                    );
+                    attrs
+                },
+                read_only: false,
+                lifecycle: LifecycleConfig::default(),
+                prefixes: HashMap::new(),
+            }],
+            variables: HashMap::new(),
+            imports: vec![],
+            module_calls: vec![],
+            arguments: vec![
+                ArgumentParameter {
+                    name: "cidr_block".to_string(),
+                    type_expr: TypeExpr::String,
+                    default: None,
+                },
+                ArgumentParameter {
+                    name: "env_name".to_string(),
+                    type_expr: TypeExpr::String,
+                    default: None,
+                },
+            ],
+            attribute_params: vec![],
+            backend: None,
+        }
+    }
+
+    #[test]
+    fn test_expand_module_call_with_interpolation() {
+        use crate::resource::InterpolationPart;
+
+        let resolver = {
+            let mut r = ModuleResolver::new(".");
+            r.imported_modules
+                .insert("vpc_mod".to_string(), create_module_with_interpolation());
+            r
+        };
+
+        let call = ModuleCall {
+            module_name: "vpc_mod".to_string(),
+            binding_name: Some("dev_vpc".to_string()),
+            arguments: {
+                let mut args = HashMap::new();
+                args.insert(
+                    "cidr_block".to_string(),
+                    Value::String("10.0.0.0/16".to_string()),
+                );
+                args.insert("env_name".to_string(), Value::String("dev".to_string()));
+                args
+            },
+        };
+
+        let expanded = resolver.expand_module_call(&call, "dev_vpc").unwrap();
+        assert_eq!(expanded.len(), 1);
+
+        let vpc = &expanded[0];
+
+        // Simple argument substitution should work
+        assert_eq!(
+            vpc.attributes.get("cidr_block"),
+            Some(&Value::String("10.0.0.0/16".to_string()))
+        );
+        assert_eq!(
+            vpc.attributes.get("env"),
+            Some(&Value::String("dev".to_string()))
+        );
+
+        // Interpolation with argument should have the argument value substituted
+        assert_eq!(
+            vpc.attributes.get("name"),
+            Some(&Value::Interpolation(vec![
+                InterpolationPart::Literal("test-".to_string()),
+                InterpolationPart::Expr(Value::String("dev".to_string())),
+            ]))
+        );
+    }
+
+    #[test]
+    fn test_expand_module_call_with_function_call_argument() {
+        let resolver = {
+            let mut r = ModuleResolver::new(".");
+            r.imported_modules
+                .insert("vpc_mod".to_string(), create_module_with_interpolation());
+            r
+        };
+
+        // Pass a FunctionCall as an argument value
+        let call = ModuleCall {
+            module_name: "vpc_mod".to_string(),
+            binding_name: Some("dev_vpc".to_string()),
+            arguments: {
+                let mut args = HashMap::new();
+                args.insert(
+                    "cidr_block".to_string(),
+                    Value::FunctionCall {
+                        name: "cidr_subnet".to_string(),
+                        args: vec![
+                            Value::String("10.0.0.0/16".to_string()),
+                            Value::Int(8),
+                            Value::Int(0),
+                        ],
+                    },
+                );
+                args.insert("env_name".to_string(), Value::String("dev".to_string()));
+                args
+            },
+        };
+
+        let expanded = resolver.expand_module_call(&call, "dev_vpc").unwrap();
+        assert_eq!(expanded.len(), 1);
+
+        let vpc = &expanded[0];
+
+        // FunctionCall argument should be substituted as-is (resolved at apply time)
+        assert_eq!(
+            vpc.attributes.get("cidr_block"),
+            Some(&Value::FunctionCall {
+                name: "cidr_subnet".to_string(),
+                args: vec![
+                    Value::String("10.0.0.0/16".to_string()),
+                    Value::Int(8),
+                    Value::Int(0),
+                ],
             })
         );
     }

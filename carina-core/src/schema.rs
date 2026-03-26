@@ -193,6 +193,11 @@ impl AttributeType {
 
     /// Check if a value conforms to this type
     pub fn validate(&self, value: &Value) -> Result<(), TypeError> {
+        // FunctionCall values are resolved at runtime, skip validation
+        if matches!(value, Value::FunctionCall { .. }) {
+            return Ok(());
+        }
+
         match (self, value) {
             // ResourceRef and Interpolation values resolve to strings at runtime, so they're valid for String types
             (
