@@ -3,6 +3,7 @@
 //! Provides a registry of built-in functions that can be called from DSL expressions.
 //! Functions take `&[Value]` arguments and return `Result<Value, String>`.
 
+mod cidr_subnet;
 mod join;
 mod length;
 mod trim;
@@ -15,6 +16,7 @@ use crate::resource::Value;
 /// Returns `Err` if the function is unknown or if the arguments are invalid.
 pub fn evaluate_builtin(name: &str, args: &[Value]) -> Result<Value, String> {
     match name {
+        "cidr_subnet" => cidr_subnet::builtin_cidr_subnet(args),
         "join" => join::builtin_join(args),
         "length" => length::builtin_length(args),
         "trim" => trim::builtin_trim(args),
