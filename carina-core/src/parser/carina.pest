@@ -94,6 +94,7 @@ primary = {
     read_resource_expr   // Must come before resource_expr for "read aws..." parsing
   | resource_expr
   | import_expr          // Must come before variable_ref since "import" is an identifier
+  | for_expr             // Must come before module_call so "for" is not parsed as module name
   | module_call          // Must come before variable_ref so "name { ... }" is parsed as module call
   | function_call        // Must come before variable_ref so "func(...)" is parsed as function call
   | list
@@ -106,6 +107,25 @@ primary = {
   | variable_ref
   | "(" ~ expression ~ ")"
 }
+
+// For expression: for var in iterable { body }
+// Supports: for x in list, for (i, x) in list, for k, v in map
+for_expr = {
+    "for" ~ for_binding ~ "in" ~ for_iterable ~ "{" ~ for_body ~ "}"
+}
+
+// For binding: simple (x), indexed ((i, x)), or map (k, v)
+for_binding = { for_indexed_binding | for_map_binding | for_simple_binding }
+for_simple_binding = { identifier }
+for_indexed_binding = { "(" ~ identifier ~ "," ~ identifier ~ ")" }
+for_map_binding = { identifier ~ "," ~ identifier }
+
+// For iterable: restricted to simple expressions to avoid ambiguity with body block
+for_iterable = { function_call | list | variable_ref | "(" ~ expression ~ ")" }
+
+// For body: local let bindings followed by a resource expression
+for_body = { for_local_binding* ~ (read_resource_expr | resource_expr) }
+for_local_binding = { "let" ~ identifier ~ "=" ~ expression }
 
 // List: [item1, item2, ...]
 list = { "[" ~ (expression ~ ("," ~ expression)*)? ~ ","? ~ "]" }

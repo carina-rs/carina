@@ -301,17 +301,27 @@ pub fn parse(input: &str) -> Result<ParsedFile, ParseError> {
                             }
                             Rule::let_binding => {
                                 let (line, _) = stmt.as_span().start_pos().line_col();
-                                let (name, value, maybe_resource, maybe_module_call, maybe_import) =
-                                    parse_let_binding_extended(stmt, &ctx)?;
+                                let (
+                                    name,
+                                    value,
+                                    expanded_resources,
+                                    maybe_module_call,
+                                    maybe_import,
+                                ) = parse_let_binding_extended(stmt, &ctx)?;
                                 if ctx.variables.contains_key(&name)
                                     || ctx.resource_bindings.contains_key(&name)
                                 {
                                     return Err(ParseError::DuplicateBinding { name, line });
                                 }
                                 ctx.set_variable(name.clone(), value);
-                                if let Some(resource) = maybe_resource {
-                                    ctx.set_resource_binding(name.clone(), resource.clone());
-                                    resources.push(resource);
+                                if !expanded_resources.is_empty() {
+                                    // Register the binding name as a resource binding
+                                    // (use the first resource as placeholder)
+                                    ctx.set_resource_binding(
+                                        name.clone(),
+                                        expanded_resources[0].clone(),
+                                    );
+                                    resources.extend(expanded_resources);
                                 }
                                 if let Some(mut call) = maybe_module_call {
                                     call.binding_name = Some(name.clone());
@@ -533,15 +543,15 @@ fn parse_module_call(
     })
 }
 
-/// Result of parsing the RHS of a let binding: (value, resource, module_call, import)
+/// Result of parsing the RHS of a let binding: (value, resources, module_call, import)
 type LetBindingRhs = (
     Value,
-    Option<Resource>,
+    Vec<Resource>,
     Option<ModuleCall>,
     Option<ImportStatement>,
 );
 
-/// Extended parse_let_binding that also handles module calls and imports
+/// Extended parse_let_binding that also handles module calls, imports, and for expressions
 #[allow(clippy::type_complexity)]
 fn parse_let_binding_extended(
     pair: pest::iterators::Pair<Rule>,
@@ -550,7 +560,7 @@ fn parse_let_binding_extended(
     (
         String,
         Value,
-        Option<Resource>,
+        Vec<Resource>,
         Option<ModuleCall>,
         Option<ImportStatement>,
     ),
@@ -562,11 +572,17 @@ fn parse_let_binding_extended(
         .to_string();
     let expr_pair = next_pair(&mut inner, "expression", "let binding")?;
 
-    // Check if it's a module call, resource expression, or import expression
-    let (value, maybe_resource, maybe_module_call, maybe_import) =
+    // Check if it's a module call, resource expression, import, or for expression
+    let (value, expanded_resources, maybe_module_call, maybe_import) =
         parse_expression_with_resource_or_module(expr_pair, ctx, &name)?;
 
-    Ok((name, value, maybe_resource, maybe_module_call, maybe_import))
+    Ok((
+        name,
+        value,
+        expanded_resources,
+        maybe_module_call,
+        maybe_import,
+    ))
 }
 
 /// Parse expression with potential resource, module call, or import
@@ -586,7 +602,7 @@ fn parse_pipe_expr_with_resource_or_module(
 ) -> Result<LetBindingRhs, ParseError> {
     let mut inner = pair.into_inner();
     let primary = next_pair(&mut inner, "primary expression", "pipe expression")?;
-    let (mut value, maybe_resource, maybe_module_call, maybe_import) =
+    let (mut value, expanded_resources, maybe_module_call, maybe_import) =
         parse_primary_with_resource_or_module(primary, ctx, binding_name)?;
 
     // Desugar pipe: `x |> f(args)` becomes `f(x, args)`
@@ -608,7 +624,7 @@ fn parse_pipe_expr_with_resource_or_module(
         };
     }
 
-    Ok((value, maybe_resource, maybe_module_call, maybe_import))
+    Ok((value, expanded_resources, maybe_module_call, maybe_import))
 }
 
 fn parse_primary_with_resource_or_module(
@@ -622,28 +638,200 @@ fn parse_primary_with_resource_or_module(
         Rule::read_resource_expr => {
             let resource = parse_read_resource_expr(inner, ctx, binding_name)?;
             let ref_value = Value::String(format!("${{{}}}", binding_name));
-            Ok((ref_value, Some(resource), None, None))
+            Ok((ref_value, vec![resource], None, None))
         }
         Rule::resource_expr => {
             let resource = parse_resource_expr(inner, ctx, binding_name)?;
             let ref_value = Value::String(format!("${{{}}}", binding_name));
-            Ok((ref_value, Some(resource), None, None))
+            Ok((ref_value, vec![resource], None, None))
         }
         Rule::import_expr => {
             let import = parse_import_expr(inner, binding_name)?;
             let value = Value::String(format!("${{import:{}}}", import.path));
-            Ok((value, None, None, Some(import)))
+            Ok((value, vec![], None, Some(import)))
+        }
+        Rule::for_expr => {
+            let resources = parse_for_expr(inner, ctx, binding_name)?;
+            let ref_value = Value::String(format!("${{for:{}}}", binding_name));
+            Ok((ref_value, resources, None, None))
         }
         Rule::module_call => {
             let call = parse_module_call(inner, ctx)?;
             let value = Value::String(format!("${{module:{}}}", call.module_name));
-            Ok((value, None, Some(call), None))
+            Ok((value, vec![], Some(call), None))
         }
         _ => {
             let value = parse_primary_value(inner, ctx)?;
-            Ok((value, None, None, None))
+            Ok((value, vec![], None, None))
         }
     }
+}
+
+/// Binding pattern for a for expression
+enum ForBinding {
+    /// Simple: `for x in ...`
+    Simple(String),
+    /// Indexed: `for (i, x) in ...`
+    Indexed(String, String),
+    /// Map: `for k, v in ...`
+    Map(String, String),
+}
+
+/// Parse a for expression and expand it into individual resources.
+///
+/// `for x in list { resource_expr }` expands to resources with addresses like
+/// `binding[0]`, `binding[1]`, etc.
+///
+/// `for k, v in map { resource_expr }` expands to resources with addresses like
+/// `binding["key1"]`, `binding["key2"]`, etc.
+fn parse_for_expr(
+    pair: pest::iterators::Pair<Rule>,
+    ctx: &ParseContext,
+    binding_name: &str,
+) -> Result<Vec<Resource>, ParseError> {
+    let mut inner = pair.into_inner();
+
+    // Parse the binding pattern
+    let binding_pair = next_pair(&mut inner, "for binding", "for expression")?;
+    let binding = parse_for_binding(binding_pair)?;
+
+    // Parse the iterable expression
+    let iterable_pair = next_pair(&mut inner, "iterable", "for expression")?;
+    let iterable = parse_for_iterable(iterable_pair, ctx)?;
+
+    // Parse the body (we'll re-parse it for each iteration)
+    let body_pair = next_pair(&mut inner, "body", "for expression")?;
+
+    // Expand based on iterable type
+    match (&binding, &iterable) {
+        (ForBinding::Simple(var), Value::List(items)) => {
+            let mut resources = Vec::new();
+            for (i, item) in items.iter().enumerate() {
+                let address = format!("{}[{}]", binding_name, i);
+                let mut iter_ctx = ctx.clone();
+                iter_ctx.set_variable(var.clone(), item.clone());
+                let resource = parse_for_body(body_pair.clone(), &iter_ctx, &address)?;
+                resources.push(resource);
+            }
+            Ok(resources)
+        }
+        (ForBinding::Indexed(idx_var, val_var), Value::List(items)) => {
+            let mut resources = Vec::new();
+            for (i, item) in items.iter().enumerate() {
+                let address = format!("{}[{}]", binding_name, i);
+                let mut iter_ctx = ctx.clone();
+                iter_ctx.set_variable(idx_var.clone(), Value::Int(i as i64));
+                iter_ctx.set_variable(val_var.clone(), item.clone());
+                let resource = parse_for_body(body_pair.clone(), &iter_ctx, &address)?;
+                resources.push(resource);
+            }
+            Ok(resources)
+        }
+        (ForBinding::Map(key_var, val_var), Value::Map(map)) => {
+            let mut resources = Vec::new();
+            // Sort keys for deterministic output
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            for key in keys {
+                let val = &map[key];
+                let address = format!("{}[\"{}\"]", binding_name, key);
+                let mut iter_ctx = ctx.clone();
+                iter_ctx.set_variable(key_var.clone(), Value::String(key.clone()));
+                iter_ctx.set_variable(val_var.clone(), val.clone());
+                let resource = parse_for_body(body_pair.clone(), &iter_ctx, &address)?;
+                resources.push(resource);
+            }
+            Ok(resources)
+        }
+        _ => Err(ParseError::InvalidExpression {
+            line: 0,
+            message: "for expression: binding pattern does not match iterable type".to_string(),
+        }),
+    }
+}
+
+/// Parse a for binding pattern
+fn parse_for_binding(pair: pest::iterators::Pair<Rule>) -> Result<ForBinding, ParseError> {
+    let inner = first_inner(pair, "binding pattern", "for binding")?;
+    match inner.as_rule() {
+        Rule::for_simple_binding => {
+            let name = first_inner(inner, "identifier", "simple binding")?
+                .as_str()
+                .to_string();
+            Ok(ForBinding::Simple(name))
+        }
+        Rule::for_indexed_binding => {
+            let mut parts = inner.into_inner();
+            let idx = next_pair(&mut parts, "index variable", "indexed binding")?
+                .as_str()
+                .to_string();
+            let val = next_pair(&mut parts, "value variable", "indexed binding")?
+                .as_str()
+                .to_string();
+            Ok(ForBinding::Indexed(idx, val))
+        }
+        Rule::for_map_binding => {
+            let mut parts = inner.into_inner();
+            let key = next_pair(&mut parts, "key variable", "map binding")?
+                .as_str()
+                .to_string();
+            let val = next_pair(&mut parts, "value variable", "map binding")?
+                .as_str()
+                .to_string();
+            Ok(ForBinding::Map(key, val))
+        }
+        _ => Err(ParseError::InternalError {
+            expected: "for binding pattern".to_string(),
+            context: "for expression".to_string(),
+        }),
+    }
+}
+
+/// Parse the iterable part of a for expression
+fn parse_for_iterable(
+    pair: pest::iterators::Pair<Rule>,
+    ctx: &ParseContext,
+) -> Result<Value, ParseError> {
+    // for_iterable contains function_call | list | variable_ref | "(" expression ")"
+    let inner = first_inner(pair, "iterable expression", "for iterable")?;
+    parse_primary_value(inner, ctx)
+}
+
+/// Parse the body of a for expression and produce a single resource
+fn parse_for_body(
+    pair: pest::iterators::Pair<Rule>,
+    ctx: &ParseContext,
+    address: &str,
+) -> Result<Resource, ParseError> {
+    let mut local_ctx = ctx.clone();
+
+    for inner in pair.into_inner() {
+        match inner.as_rule() {
+            Rule::for_local_binding => {
+                let mut binding_inner = inner.into_inner();
+                let name = next_pair(&mut binding_inner, "binding name", "for local binding")?
+                    .as_str()
+                    .to_string();
+                let value = parse_expression(
+                    next_pair(&mut binding_inner, "binding value", "for local binding")?,
+                    &local_ctx,
+                )?;
+                local_ctx.set_variable(name, value);
+            }
+            Rule::resource_expr => {
+                return parse_resource_expr(inner, &local_ctx, address);
+            }
+            Rule::read_resource_expr => {
+                return parse_read_resource_expr(inner, &local_ctx, address);
+            }
+            _ => {}
+        }
+    }
+
+    Err(ParseError::InternalError {
+        expected: "resource expression".to_string(),
+        context: "for body".to_string(),
+    })
 }
 
 fn parse_provider_block(
@@ -3686,6 +3874,124 @@ aws.s3.bucket {
             }
         } else {
             panic!("Expected tags attribute as List");
+        }
+    }
+
+    #[test]
+    fn parse_for_expression_over_list() {
+        let input = r#"
+            let subnets = for az in ["ap-northeast-1a", "ap-northeast-1c"] {
+                awscc.ec2.subnet {
+                    availability_zone = az
+                }
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+        // for expression expands to individual resources at parse time
+        assert_eq!(result.resources.len(), 2);
+
+        // Resources should be addressed as subnets[0] and subnets[1]
+        assert_eq!(result.resources[0].id.name, "subnets[0]");
+        assert_eq!(result.resources[1].id.name, "subnets[1]");
+
+        // Each resource should have the loop variable substituted
+        assert_eq!(
+            result.resources[0].attributes.get("availability_zone"),
+            Some(&Value::String("ap-northeast-1a".to_string()))
+        );
+        assert_eq!(
+            result.resources[1].attributes.get("availability_zone"),
+            Some(&Value::String("ap-northeast-1c".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_for_expression_with_index() {
+        let input = r#"
+            let subnets = for (i, az) in ["ap-northeast-1a", "ap-northeast-1c"] {
+                awscc.ec2.subnet {
+                    availability_zone = az
+                    cidr_block = cidr_subnet("10.0.0.0/16", 8, i)
+                }
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+        assert_eq!(result.resources.len(), 2);
+
+        assert_eq!(result.resources[0].id.name, "subnets[0]");
+        assert_eq!(result.resources[1].id.name, "subnets[1]");
+
+        // Check index variable is substituted
+        if let Some(Value::FunctionCall { args, .. }) =
+            result.resources[0].attributes.get("cidr_block")
+        {
+            assert_eq!(args[2], Value::Int(0));
+        } else {
+            panic!("Expected FunctionCall for cidr_block");
+        }
+
+        if let Some(Value::FunctionCall { args, .. }) =
+            result.resources[1].attributes.get("cidr_block")
+        {
+            assert_eq!(args[2], Value::Int(1));
+        } else {
+            panic!("Expected FunctionCall for cidr_block");
+        }
+    }
+
+    #[test]
+    fn parse_for_expression_over_map() {
+        let input = r#"
+            let cidrs = {
+                prod    = "10.0.0.0/16"
+                staging = "10.1.0.0/16"
+            }
+
+            let networks = for name, cidr in cidrs {
+                awscc.ec2.vpc {
+                    cidr_block = cidr
+                }
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+        assert_eq!(result.resources.len(), 2);
+
+        // Map iteration produces map-keyed addresses
+        let names: Vec<&str> = result
+            .resources
+            .iter()
+            .map(|r| r.id.name.as_str())
+            .collect();
+        assert!(names.contains(&r#"networks["prod"]"#));
+        assert!(names.contains(&r#"networks["staging"]"#));
+    }
+
+    #[test]
+    fn parse_for_expression_with_local_binding() {
+        let input = r#"
+            let subnets = for (i, az) in ["ap-northeast-1a", "ap-northeast-1c"] {
+                let cidr = cidr_subnet("10.0.0.0/16", 8, i)
+                awscc.ec2.subnet {
+                    cidr_block = cidr
+                    availability_zone = az
+                }
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+        assert_eq!(result.resources.len(), 2);
+
+        // Local binding should be resolved within each iteration
+        if let Some(Value::FunctionCall { name, args }) =
+            result.resources[0].attributes.get("cidr_block")
+        {
+            assert_eq!(name, "cidr_subnet");
+            assert_eq!(args[2], Value::Int(0));
+        } else {
+            panic!("Expected FunctionCall for cidr_block");
         }
     }
 }
