@@ -1325,32 +1325,96 @@ fn parse_primary_value(
             })
         }
         Rule::variable_ref => {
-            // variable_ref can be "identifier", "identifier.identifier", or chained "a.b.c.d"
+            // variable_ref = { identifier ~ (field_access | index_access)* }
+            // field_access = { "." ~ identifier }
+            // index_access = { "[" ~ expression ~ "]" }
             let mut parts = inner.into_inner();
             let first_ident = next_pair(&mut parts, "identifier", "variable reference")?.as_str();
 
-            if let Some(second_part) = parts.next() {
-                // Member access: resource.attribute (argument params are also resource bindings)
-                let attr_name = second_part.as_str();
+            // Collect all access steps (field or index)
+            let access_steps: Vec<pest::iterators::Pair<Rule>> = parts.collect();
 
-                // Collect any additional chained field segments
-                let field_path: Vec<String> = parts.map(|p| p.as_str().to_string()).collect();
-
-                // Return a ResourceRef that will be resolved/validated later
-                Ok(Value::ResourceRef {
-                    binding_name: first_ident.to_string(),
-                    attribute_name: attr_name.to_string(),
-                    field_path,
-                })
-            } else {
-                // Simple variable reference
+            if access_steps.is_empty() {
+                // Simple variable reference (no access chain)
                 match ctx.get_variable(first_ident) {
                     Some(val) => Ok(val.clone()),
-                    None => {
-                        // Unknown identifier: could be a shorthand enum value
-                        // Will be resolved during schema validation
-                        Ok(Value::UnresolvedIdent(first_ident.to_string(), None))
+                    None => Ok(Value::UnresolvedIdent(first_ident.to_string(), None)),
+                }
+            } else {
+                // Build binding_name, attribute_name, and field_path from access steps.
+                // Index access (e.g., [0] or ["key"]) composes the binding name.
+                // Field access after the binding gives attribute_name and field_path.
+                let mut binding_name = first_ident.to_string();
+                let mut field_names: Vec<String> = Vec::new();
+                let mut in_field_phase = false;
+
+                for step in access_steps {
+                    match step.as_rule() {
+                        Rule::index_access => {
+                            if in_field_phase {
+                                // Index access after field access is not yet supported
+                                // (e.g., a.b[0] — would need runtime list indexing)
+                                return Err(ParseError::InvalidExpression {
+                                    line: 0,
+                                    message: "index access after field access is not supported"
+                                        .to_string(),
+                                });
+                            }
+                            // Parse the index expression
+                            let index_expr_pair =
+                                first_inner(step, "index expression", "index access")?;
+                            let index_value = parse_expression(index_expr_pair, ctx)?;
+                            // Compose the binding name: name[0] or name["key"]
+                            match &index_value {
+                                Value::Int(n) => {
+                                    binding_name = format!("{}[{}]", binding_name, n);
+                                }
+                                Value::String(s) => {
+                                    binding_name = format!("{}[\"{}\"]", binding_name, s);
+                                }
+                                other => {
+                                    return Err(ParseError::InvalidExpression {
+                                        line: 0,
+                                        message: format!(
+                                            "index access key must be an integer or string, got {:?}",
+                                            other
+                                        ),
+                                    });
+                                }
+                            }
+                        }
+                        Rule::field_access => {
+                            in_field_phase = true;
+                            let field_ident =
+                                first_inner(step, "field identifier", "field access")?;
+                            field_names.push(field_ident.as_str().to_string());
+                        }
+                        _ => {}
                     }
+                }
+
+                if field_names.is_empty() {
+                    // Index access only, no field access (e.g., subnets[0])
+                    // Check if the composed binding name is a known variable
+                    match ctx.get_variable(&binding_name) {
+                        Some(val) => Ok(val.clone()),
+                        None => {
+                            // Return as ResourceRef with empty attribute_name
+                            // (will be resolved later)
+                            Ok(Value::ResourceRef {
+                                binding_name,
+                                attribute_name: String::new(),
+                                field_path: vec![],
+                            })
+                        }
+                    }
+                } else {
+                    let attribute_name = field_names.remove(0);
+                    Ok(Value::ResourceRef {
+                        binding_name,
+                        attribute_name,
+                        field_path: field_names,
+                    })
                 }
             }
         }
@@ -4076,6 +4140,115 @@ aws.s3.bucket {
                     field_path,
                     &vec!["network".to_string(), "vpc_id".to_string()]
                 );
+            }
+            other => panic!("Expected ResourceRef with field_path, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_index_access_with_integer() {
+        // subnets[0].subnet_id should parse as ResourceRef with binding_name="subnets[0]"
+        let input = r#"
+            let subnets = for az in ["ap-northeast-1a", "ap-northeast-1c"] {
+                awscc.ec2.subnet {
+                    availability_zone = az
+                }
+            }
+
+            awscc.ec2.route_table {
+                name = "test"
+                subnet_id = subnets[0].subnet_id
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+        let rt = result.resources.last().expect("route_table resource");
+        let subnet_id = rt.attributes.get("subnet_id").expect("subnet_id attribute");
+        match subnet_id {
+            Value::ResourceRef {
+                binding_name,
+                attribute_name,
+                field_path,
+            } => {
+                assert_eq!(binding_name, "subnets[0]");
+                assert_eq!(attribute_name, "subnet_id");
+                assert!(field_path.is_empty());
+            }
+            other => panic!("Expected ResourceRef, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_index_access_with_string_key() {
+        // networks["prod"].vpc_id should parse as ResourceRef with binding_name=r#networks["prod"]#
+        let input = r#"
+            let cidrs = {
+                prod    = "10.0.0.0/16"
+                staging = "10.1.0.0/16"
+            }
+
+            let networks = for name, cidr in cidrs {
+                awscc.ec2.vpc {
+                    cidr_block = cidr
+                }
+            }
+
+            awscc.ec2.subnet {
+                name = "test"
+                vpc_id = networks["prod"].vpc_id
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+        let subnet = result.resources.last().expect("subnet resource");
+        let vpc_id = subnet.attributes.get("vpc_id").expect("vpc_id attribute");
+        match vpc_id {
+            Value::ResourceRef {
+                binding_name,
+                attribute_name,
+                field_path,
+            } => {
+                assert_eq!(binding_name, r#"networks["prod"]"#);
+                assert_eq!(attribute_name, "vpc_id");
+                assert!(field_path.is_empty());
+            }
+            other => panic!("Expected ResourceRef, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_index_access_with_chained_fields() {
+        // webs["prod"].security_group.id should parse with field_path
+        let input = r#"
+            let cidrs = {
+                prod    = "10.0.0.0/16"
+                staging = "10.1.0.0/16"
+            }
+
+            let webs = for name, cidr in cidrs {
+                awscc.ec2.vpc {
+                    cidr_block = cidr
+                }
+            }
+
+            awscc.ec2.subnet {
+                name = "test"
+                sg_id = webs["prod"].security_group.id
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+        let subnet = result.resources.last().expect("subnet resource");
+        let sg_id = subnet.attributes.get("sg_id").expect("sg_id attribute");
+        match sg_id {
+            Value::ResourceRef {
+                binding_name,
+                attribute_name,
+                field_path,
+            } => {
+                assert_eq!(binding_name, r#"webs["prod"]"#);
+                assert_eq!(attribute_name, "security_group");
+                assert_eq!(field_path, &vec!["id".to_string()]);
             }
             other => panic!("Expected ResourceRef with field_path, got {:?}", other),
         }

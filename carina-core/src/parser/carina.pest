@@ -142,8 +142,11 @@ resource_expr = { namespaced_id ~ "{" ~ block_content* ~ "}" }
 // Read resource expression (data source): read aws.s3_bucket { ... }
 read_resource_expr = { "read" ~ namespaced_id ~ "{" ~ block_content* ~ "}" }
 
-// Variable reference (with optional chained member access: bucket.name or a.b.c)
-variable_ref = { identifier ~ ("." ~ identifier)* }
+// Variable reference (with optional chained member access and index access)
+// Supports: bucket.name, a.b.c, a[0].b, a["key"].b.c
+variable_ref = { identifier ~ (field_access | index_access)* }
+field_access = { "." ~ identifier }
+index_access = { "[" ~ expression ~ "]" }
 
 // Literals
 boolean = { "true" | "false" }
