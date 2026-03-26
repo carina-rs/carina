@@ -191,6 +191,7 @@ impl ParsedFile {
 }
 
 /// Parse context (variable scope)
+#[derive(Clone)]
 struct ParseContext {
     variables: HashMap<String, Value>,
     /// Resource bindings (binding_name -> Resource)
@@ -753,8 +754,10 @@ fn parse_anonymous_resource(
     })
 }
 
-/// Parse block contents (attributes and nested blocks)
-/// Nested blocks with the same name are collected into a list
+/// Parse block contents (attributes, nested blocks, and local let bindings)
+/// Nested blocks with the same name are collected into a list.
+/// Local let bindings are resolved within the block scope and NOT included in
+/// the returned attributes.
 fn parse_block_contents(
     pairs: pest::iterators::Pairs<Rule>,
     ctx: &ParseContext,
@@ -762,11 +765,27 @@ fn parse_block_contents(
     let mut attributes: HashMap<String, Value> = HashMap::new();
     let mut nested_blocks: HashMap<String, Vec<Value>> = HashMap::new();
 
+    // Local scope extends the parent context with block-scoped let bindings
+    let mut local_ctx = ctx.clone();
+
     for content_pair in pairs {
         match content_pair.as_rule() {
             Rule::block_content => {
                 let inner = first_inner(content_pair, "block content item", "block content")?;
                 match inner.as_rule() {
+                    Rule::local_binding => {
+                        let mut binding_inner = inner.into_inner();
+                        let name =
+                            next_pair(&mut binding_inner, "binding name", "local let binding")?
+                                .as_str()
+                                .to_string();
+                        let value = parse_expression(
+                            next_pair(&mut binding_inner, "binding value", "local let binding")?,
+                            &local_ctx,
+                        )?;
+                        // Add to local scope only, not to attributes
+                        local_ctx.set_variable(name, value);
+                    }
                     Rule::attribute => {
                         let mut attr_inner = inner.into_inner();
                         let key = next_pair(&mut attr_inner, "attribute name", "block content")?
@@ -774,7 +793,7 @@ fn parse_block_contents(
                             .to_string();
                         let value = parse_expression(
                             next_pair(&mut attr_inner, "attribute value", "block content")?,
-                            ctx,
+                            &local_ctx,
                         )?;
                         attributes.insert(key, value);
                     }
@@ -785,7 +804,7 @@ fn parse_block_contents(
                             .to_string();
 
                         // Recursively parse nested block contents (supports arbitrary depth)
-                        let block_attrs = parse_block_contents(block_inner, ctx)?;
+                        let block_attrs = parse_block_contents(block_inner, &local_ctx)?;
 
                         // Add to the list of blocks with this name
                         nested_blocks
@@ -803,7 +822,7 @@ fn parse_block_contents(
                     .to_string();
                 let value = parse_expression(
                     next_pair(&mut attr_inner, "attribute value", "block content")?,
-                    ctx,
+                    &local_ctx,
                 )?;
                 attributes.insert(key, value);
             }
@@ -3518,5 +3537,155 @@ aws.s3.bucket {
                 Value::String("prod".to_string())
             ),]))
         );
+    }
+
+    #[test]
+    fn parse_local_let_binding_in_resource_block() {
+        let input = r#"
+            let subnet = awscc.ec2.subnet {
+                let name = "my-subnet"
+                cidr_block = "10.0.1.0/24"
+                tag_name = name
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+        let subnet = &result.resources[0];
+
+        // Local let binding should NOT appear in attributes
+        assert!(!subnet.attributes.contains_key("name"));
+
+        // The local binding value should be resolved in subsequent attributes
+        assert_eq!(
+            subnet.attributes.get("tag_name"),
+            Some(&Value::String("my-subnet".to_string()))
+        );
+        assert_eq!(
+            subnet.attributes.get("cidr_block"),
+            Some(&Value::String("10.0.1.0/24".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_local_let_binding_with_interpolation() {
+        let input = r#"
+            let env = "prod"
+            let subnet = awscc.ec2.subnet {
+                let name = "app-${env}"
+                cidr_block = "10.0.1.0/24"
+                tag_name = name
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+        let subnet = &result.resources[0];
+
+        // Local binding should resolve outer scope variable in interpolation
+        assert_eq!(
+            subnet.attributes.get("tag_name"),
+            Some(&Value::Interpolation(vec![
+                InterpolationPart::Literal("app-".to_string()),
+                InterpolationPart::Expr(Value::String("prod".to_string())),
+            ]))
+        );
+    }
+
+    #[test]
+    fn parse_local_let_binding_chain() {
+        let input = r#"
+            let subnet = awscc.ec2.subnet {
+                let prefix = "app"
+                let name = "${prefix}-subnet"
+                cidr_block = "10.0.1.0/24"
+                tag_name = name
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+        let subnet = &result.resources[0];
+
+        // Chained local bindings should resolve correctly
+        assert_eq!(
+            subnet.attributes.get("tag_name"),
+            Some(&Value::Interpolation(vec![
+                InterpolationPart::Expr(Value::String("app".to_string())),
+                InterpolationPart::Literal("-subnet".to_string()),
+            ]))
+        );
+
+        // Local bindings should NOT appear in attributes
+        assert!(!subnet.attributes.contains_key("prefix"));
+        assert!(!subnet.attributes.contains_key("name"));
+    }
+
+    #[test]
+    fn parse_local_let_binding_with_function_call() {
+        let input = r#"
+            let subnet = awscc.ec2.subnet {
+                let name = "my-subnet"
+                cidr_block = "10.0.1.0/24"
+                tag_name = upper(name)
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+        let subnet = &result.resources[0];
+
+        // Local binding used inside function call
+        assert_eq!(
+            subnet.attributes.get("tag_name"),
+            Some(&Value::FunctionCall {
+                name: "upper".to_string(),
+                args: vec![Value::String("my-subnet".to_string())],
+            })
+        );
+    }
+
+    #[test]
+    fn parse_local_let_binding_in_anonymous_resource() {
+        let input = r#"
+            awscc.ec2.subnet {
+                let name = "my-subnet"
+                cidr_block = "10.0.1.0/24"
+                tag_name = name
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+        let subnet = &result.resources[0];
+
+        // Local let binding should work in anonymous resources too
+        assert!(!subnet.attributes.contains_key("name"));
+        assert_eq!(
+            subnet.attributes.get("tag_name"),
+            Some(&Value::String("my-subnet".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_local_let_binding_in_nested_block() {
+        let input = r#"
+            let subnet = awscc.ec2.subnet {
+                let env = "prod"
+                cidr_block = "10.0.1.0/24"
+                tags {
+                    Name = env
+                }
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+        let subnet = &result.resources[0];
+
+        // Local binding should be visible in nested blocks
+        if let Some(Value::List(tags_list)) = subnet.attributes.get("tags") {
+            if let Some(Value::Map(tags)) = tags_list.first() {
+                assert_eq!(tags.get("Name"), Some(&Value::String("prod".to_string())));
+            } else {
+                panic!("Expected Map in tags list");
+            }
+        } else {
+            panic!("Expected tags attribute as List");
+        }
     }
 }

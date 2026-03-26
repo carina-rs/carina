@@ -131,6 +131,7 @@ impl Formatter {
             NodeKind::ArgumentsBlock => self.format_arguments_block(node),
             NodeKind::AttributesBlock => self.format_attributes_block(node),
             NodeKind::LetBinding => self.format_let_binding(node),
+            NodeKind::LocalBinding => self.format_let_binding(node),
             NodeKind::ModuleCall => self.format_module_call(node),
             NodeKind::AnonymousResource => self.format_anonymous_resource(node),
             NodeKind::ResourceExpr => self.format_resource_expr(node),
@@ -591,7 +592,7 @@ impl Formatter {
 
     fn block_has_content(&self, node: &CstNode) -> bool {
         node.children.iter().any(|child| {
-            matches!(child, CstChild::Node(n) if n.kind == NodeKind::Attribute || n.kind == NodeKind::NestedBlock)
+            matches!(child, CstChild::Node(n) if n.kind == NodeKind::Attribute || n.kind == NodeKind::NestedBlock || n.kind == NodeKind::LocalBinding)
                 || matches!(child, CstChild::Trivia(Trivia::LineComment(_)))
         })
     }
@@ -609,7 +610,9 @@ impl Formatter {
         for child in &node.children {
             match child {
                 CstChild::Node(n)
-                    if n.kind == NodeKind::Attribute || n.kind == NodeKind::NestedBlock =>
+                    if n.kind == NodeKind::Attribute
+                        || n.kind == NodeKind::NestedBlock
+                        || n.kind == NodeKind::LocalBinding =>
                 {
                     // Write any pending standalone comments
                     for comment in pending_comments.drain(..) {
@@ -680,9 +683,11 @@ impl Formatter {
                 0
             };
 
-            // Format each attribute/nested block in this group
+            // Format each attribute/nested block/local binding in this group
             for attr in group {
-                if attr.kind == NodeKind::NestedBlock {
+                if attr.kind == NodeKind::LocalBinding {
+                    self.format_let_binding(attr);
+                } else if attr.kind == NodeKind::NestedBlock {
                     self.format_nested_block(attr);
                 } else if let Some(block_name) = self.should_convert_to_blocks(attr) {
                     self.emit_list_as_blocks(attr, &block_name);

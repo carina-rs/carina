@@ -76,8 +76,13 @@ let_binding = {
     kw_let ~ trivia+ ~ identifier ~ trivia* ~ equals ~ trivia* ~ expression
 }
 
-// Block content: attributes, trivia, nested blocks, or nested elements
-block_content = _{ trivia | nested_block | attribute }
+// Block content: local let bindings, attributes, trivia, nested blocks, or nested elements
+block_content = _{ trivia | local_binding | nested_block | attribute }
+
+// Local let binding inside a block: let name = expression
+local_binding = {
+    kw_let ~ trivia+ ~ identifier ~ trivia* ~ equals ~ trivia* ~ expression
+}
 
 // Nested block: identifier { ... } (e.g., lifecycle { ... }, security_group_ingress { ... })
 nested_block = {

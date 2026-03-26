@@ -90,6 +90,9 @@ impl<'a> CstBuilder<'a> {
             Rule::type_map => Some(CstChild::Node(self.build_node(NodeKind::TypeExpr, pair))),
             Rule::type_ref => Some(CstChild::Node(self.build_node(NodeKind::TypeExpr, pair))),
             Rule::let_binding => Some(CstChild::Node(self.build_node(NodeKind::LetBinding, pair))),
+            Rule::local_binding => Some(CstChild::Node(
+                self.build_node(NodeKind::LocalBinding, pair),
+            )),
             Rule::module_call => Some(CstChild::Node(self.build_node(NodeKind::ModuleCall, pair))),
             Rule::anonymous_resource => Some(CstChild::Node(
                 self.build_node(NodeKind::AnonymousResource, pair),
