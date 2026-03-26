@@ -52,6 +52,14 @@ fn collect_dependencies(value: &Value, deps: &mut HashSet<String>) {
                 collect_dependencies(v, deps);
             }
         }
+        Value::Interpolation(parts) => {
+            use crate::resource::InterpolationPart;
+            for part in parts {
+                if let InterpolationPart::Expr(v) = part {
+                    collect_dependencies(v, deps);
+                }
+            }
+        }
         _ => {}
     }
 }

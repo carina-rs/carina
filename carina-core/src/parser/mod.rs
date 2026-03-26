@@ -1070,10 +1070,7 @@ fn parse_primary_value(
                 })?;
             Ok(Value::Int(n))
         }
-        Rule::string => {
-            let s = parse_string(inner);
-            Ok(Value::String(s))
-        }
+        Rule::string => parse_string_value(inner, ctx),
         Rule::variable_ref => {
             // variable_ref can be "identifier" or "identifier.identifier" (member access)
             let mut parts = inner.into_inner();
@@ -1105,17 +1102,89 @@ fn parse_primary_value(
     }
 }
 
+fn parse_string_value(
+    pair: pest::iterators::Pair<Rule>,
+    ctx: &ParseContext,
+) -> Result<Value, ParseError> {
+    use crate::resource::InterpolationPart;
+
+    let mut parts: Vec<InterpolationPart> = Vec::new();
+    let mut has_interpolation = false;
+
+    for part in pair.into_inner() {
+        if part.as_rule() == Rule::string_part {
+            let inner = first_inner(part, "string content", "string_part")?;
+            match inner.as_rule() {
+                Rule::string_literal => {
+                    let s = unescape_string(inner.as_str());
+                    parts.push(InterpolationPart::Literal(s));
+                }
+                Rule::interpolation => {
+                    has_interpolation = true;
+                    let expr_pair =
+                        first_inner(inner, "interpolation expression", "interpolation")?;
+                    let value = parse_expression(expr_pair, ctx)?;
+                    parts.push(InterpolationPart::Expr(value));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    if has_interpolation {
+        Ok(Value::Interpolation(parts))
+    } else {
+        // No interpolation — collapse to a plain String
+        let s = parts
+            .into_iter()
+            .map(|p| match p {
+                InterpolationPart::Literal(s) => s,
+                _ => unreachable!(),
+            })
+            .collect::<String>();
+        Ok(Value::String(s))
+    }
+}
+
+/// Parse a string rule for use in non-expression contexts (e.g., import paths).
+/// This only handles plain strings without interpolation.
 fn parse_string(pair: pest::iterators::Pair<Rule>) -> String {
-    let s = pair.as_str();
-    // Remove quotes
-    let inner = &s[1..s.len() - 1];
-    // Handle escape sequences
-    inner
-        .replace("\\n", "\n")
-        .replace("\\r", "\r")
-        .replace("\\t", "\t")
-        .replace("\\\"", "\"")
-        .replace("\\\\", "\\")
+    let mut result = String::new();
+    for part in pair.into_inner() {
+        if part.as_rule() == Rule::string_part
+            && let Some(inner) = part.into_inner().next()
+            && inner.as_rule() == Rule::string_literal
+        {
+            result.push_str(&unescape_string(inner.as_str()));
+        }
+    }
+    result
+}
+
+/// Handle escape sequences in string literals
+fn unescape_string(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('n') => result.push('\n'),
+                Some('r') => result.push('\r'),
+                Some('t') => result.push('\t'),
+                Some('"') => result.push('"'),
+                Some('\\') => result.push('\\'),
+                Some('$') => result.push('$'),
+                Some(other) => {
+                    result.push('\\');
+                    result.push(other);
+                }
+                None => result.push('\\'),
+            }
+        } else {
+            result.push(c);
+        }
+    }
+    result
 }
 
 /// Resolve forward references after the full binding set is known.
@@ -1180,6 +1249,20 @@ fn resolve_forward_ref_in_value(
                 .map(|(k, v)| (k, resolve_forward_ref_in_value(v, resource_bindings)))
                 .collect(),
         ),
+        Value::Interpolation(parts) => {
+            use crate::resource::InterpolationPart;
+            Value::Interpolation(
+                parts
+                    .into_iter()
+                    .map(|p| match p {
+                        InterpolationPart::Expr(v) => InterpolationPart::Expr(
+                            resolve_forward_ref_in_value(v, resource_bindings),
+                        ),
+                        other => other,
+                    })
+                    .collect(),
+            )
+        }
         other => other,
     }
 }
@@ -1277,6 +1360,19 @@ fn resolve_value(
         }
         // UnresolvedIdent is kept as-is for later resolution during schema validation
         Value::UnresolvedIdent(_, _) => Ok(value.clone()),
+        Value::Interpolation(parts) => {
+            use crate::resource::InterpolationPart;
+            let resolved: Result<Vec<InterpolationPart>, ParseError> = parts
+                .iter()
+                .map(|p| match p {
+                    InterpolationPart::Expr(v) => {
+                        Ok(InterpolationPart::Expr(resolve_value(v, binding_map)?))
+                    }
+                    other => Ok(other.clone()),
+                })
+                .collect();
+            Ok(Value::Interpolation(resolved?))
+        }
         _ => Ok(value.clone()),
     }
 }
@@ -1291,6 +1387,7 @@ pub fn parse_and_resolve(input: &str) -> Result<ParsedFile, ParseError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::resource::InterpolationPart;
 
     #[test]
     fn parse_provider_block() {
@@ -3061,6 +3158,183 @@ aws.s3.bucket {
                 binding_name: "web".to_string(),
                 attribute_name: "security_group".to_string(),
             })
+        );
+    }
+
+    #[test]
+    fn parse_string_interpolation_simple() {
+        let input = r#"
+            let env = "prod"
+            let vpc = aws.ec2.vpc {
+                name = "vpc-${env}"
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+        let vpc = &result.resources[0];
+        assert_eq!(
+            vpc.attributes.get("name"),
+            Some(&Value::Interpolation(vec![
+                InterpolationPart::Literal("vpc-".to_string()),
+                InterpolationPart::Expr(Value::String("prod".to_string())),
+            ]))
+        );
+    }
+
+    #[test]
+    fn parse_string_interpolation_multiple_exprs() {
+        let input = r#"
+            let env = "prod"
+            let region = "us-east-1"
+            let vpc = aws.ec2.vpc {
+                name = "vpc-${env}-${region}"
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+        let vpc = &result.resources[0];
+        assert_eq!(
+            vpc.attributes.get("name"),
+            Some(&Value::Interpolation(vec![
+                InterpolationPart::Literal("vpc-".to_string()),
+                InterpolationPart::Expr(Value::String("prod".to_string())),
+                InterpolationPart::Literal("-".to_string()),
+                InterpolationPart::Expr(Value::String("us-east-1".to_string())),
+            ]))
+        );
+    }
+
+    #[test]
+    fn parse_string_interpolation_with_resource_ref() {
+        let input = r#"
+            let vpc = aws.ec2.vpc {
+                cidr_block = "10.0.0.0/16"
+            }
+            let subnet = aws.ec2.subnet {
+                name = "subnet-${vpc.vpc_id}"
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+        let subnet = &result.resources[1];
+        assert_eq!(
+            subnet.attributes.get("name"),
+            Some(&Value::Interpolation(vec![
+                InterpolationPart::Literal("subnet-".to_string()),
+                InterpolationPart::Expr(Value::ResourceRef {
+                    binding_name: "vpc".to_string(),
+                    attribute_name: "vpc_id".to_string(),
+                }),
+            ]))
+        );
+    }
+
+    #[test]
+    fn parse_string_no_interpolation() {
+        // Strings without ${} should remain as plain Value::String
+        let input = r#"
+            let vpc = aws.ec2.vpc {
+                name = "my-vpc"
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+        let vpc = &result.resources[0];
+        assert_eq!(
+            vpc.attributes.get("name"),
+            Some(&Value::String("my-vpc".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_string_dollar_without_brace() {
+        // A $ not followed by { should be literal
+        let input = r#"
+            let vpc = aws.ec2.vpc {
+                name = "price$100"
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+        let vpc = &result.resources[0];
+        assert_eq!(
+            vpc.attributes.get("name"),
+            Some(&Value::String("price$100".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_string_escaped_interpolation() {
+        // \${ should be literal ${
+        let input = r#"
+            let vpc = aws.ec2.vpc {
+                name = "literal\${expr}"
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+        let vpc = &result.resources[0];
+        assert_eq!(
+            vpc.attributes.get("name"),
+            Some(&Value::String("literal${expr}".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_string_interpolation_with_bool() {
+        let input = r#"
+            let vpc = aws.ec2.vpc {
+                name = "enabled-${true}"
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+        let vpc = &result.resources[0];
+        assert_eq!(
+            vpc.attributes.get("name"),
+            Some(&Value::Interpolation(vec![
+                InterpolationPart::Literal("enabled-".to_string()),
+                InterpolationPart::Expr(Value::Bool(true)),
+            ]))
+        );
+    }
+
+    #[test]
+    fn parse_string_interpolation_with_number() {
+        let input = r#"
+            let vpc = aws.ec2.vpc {
+                name = "port-${8080}"
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+        let vpc = &result.resources[0];
+        assert_eq!(
+            vpc.attributes.get("name"),
+            Some(&Value::Interpolation(vec![
+                InterpolationPart::Literal("port-".to_string()),
+                InterpolationPart::Expr(Value::Int(8080)),
+            ]))
+        );
+    }
+
+    #[test]
+    fn parse_string_interpolation_only_expr() {
+        // String with only interpolation, no literal parts
+        let input = r#"
+            let name = "prod"
+            let vpc = aws.ec2.vpc {
+                tag = "${name}"
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+        let vpc = &result.resources[0];
+        assert_eq!(
+            vpc.attributes.get("tag"),
+            Some(&Value::Interpolation(vec![InterpolationPart::Expr(
+                Value::String("prod".to_string())
+            ),]))
         );
     }
 }

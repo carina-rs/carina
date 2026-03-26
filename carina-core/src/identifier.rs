@@ -178,6 +178,19 @@ fn deterministic_value_string(value: &Value) -> String {
         Value::UnresolvedIdent(name, member) => {
             format!("UnresolvedIdent({}, {:?})", name, member)
         }
+        Value::Interpolation(parts) => {
+            use crate::resource::InterpolationPart;
+            let strs: Vec<String> = parts
+                .iter()
+                .map(|p| match p {
+                    InterpolationPart::Literal(s) => format!("Literal({:?})", s),
+                    InterpolationPart::Expr(v) => {
+                        format!("Expr({})", deterministic_value_string(v))
+                    }
+                })
+                .collect();
+            format!("Interpolation([{}])", strs.join(", "))
+        }
     }
 }
 

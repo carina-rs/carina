@@ -479,6 +479,7 @@ impl Value {
                 Some(m) => format!("UnresolvedIdent({}.{})", name, m),
                 None => format!("UnresolvedIdent({})", name),
             },
+            Value::Interpolation(_) => "Interpolation".to_string(),
         }
     }
 }

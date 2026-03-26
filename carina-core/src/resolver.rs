@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 
 use crate::deps::get_resource_dependencies;
-use crate::resource::{Resource, ResourceId, State, Value};
+use crate::resource::{InterpolationPart, Resource, ResourceId, State, Value};
 
 /// Resolve all ResourceRef values in resources using current state.
 ///
@@ -98,7 +98,63 @@ pub fn resolve_ref_value(
                 .map(|(k, v)| (k.clone(), resolve_ref_value(v, binding_map)))
                 .collect(),
         ),
+        Value::Interpolation(parts) => {
+            let resolved_parts: Vec<InterpolationPart> = parts
+                .iter()
+                .map(|p| match p {
+                    InterpolationPart::Expr(v) => {
+                        InterpolationPart::Expr(resolve_ref_value(v, binding_map))
+                    }
+                    other => other.clone(),
+                })
+                .collect();
+
+            // Check if all parts are now resolved (no remaining ResourceRef)
+            let all_resolved = resolved_parts.iter().all(|p| match p {
+                InterpolationPart::Expr(v) => !contains_resource_ref(v),
+                InterpolationPart::Literal(_) => true,
+            });
+
+            if all_resolved {
+                // Concatenate all parts into a single String
+                let s = resolved_parts
+                    .iter()
+                    .map(|p| match p {
+                        InterpolationPart::Literal(s) => s.clone(),
+                        InterpolationPart::Expr(v) => value_to_string(v),
+                    })
+                    .collect::<String>();
+                Value::String(s)
+            } else {
+                Value::Interpolation(resolved_parts)
+            }
+        }
         _ => value.clone(),
+    }
+}
+
+/// Check if a Value contains any ResourceRef (possibly nested)
+fn contains_resource_ref(value: &Value) -> bool {
+    match value {
+        Value::ResourceRef { .. } => true,
+        Value::List(items) => items.iter().any(contains_resource_ref),
+        Value::Map(map) => map.values().any(contains_resource_ref),
+        Value::Interpolation(parts) => parts.iter().any(|p| match p {
+            InterpolationPart::Expr(v) => contains_resource_ref(v),
+            _ => false,
+        }),
+        _ => false,
+    }
+}
+
+/// Convert a Value to its string representation for interpolation
+fn value_to_string(value: &Value) -> String {
+    match value {
+        Value::String(s) => s.clone(),
+        Value::Int(n) => n.to_string(),
+        Value::Float(f) => f.to_string(),
+        Value::Bool(b) => b.to_string(),
+        _ => crate::value::format_value(value),
     }
 }
 
@@ -200,6 +256,60 @@ mod tests {
 
         let resolved = resolve_ref_value(&ref_value, &binding_map);
         assert_eq!(resolved, ref_value);
+    }
+
+    #[test]
+    fn test_resolve_interpolation_all_resolved() {
+        let mut binding_map: HashMap<String, HashMap<String, Value>> = HashMap::new();
+        let mut attrs = HashMap::new();
+        attrs.insert("vpc_id".to_string(), Value::String("vpc-123".to_string()));
+        binding_map.insert("my_vpc".to_string(), attrs);
+
+        let interp = Value::Interpolation(vec![
+            InterpolationPart::Literal("subnet-".to_string()),
+            InterpolationPart::Expr(Value::ResourceRef {
+                binding_name: "my_vpc".to_string(),
+                attribute_name: "vpc_id".to_string(),
+            }),
+        ]);
+
+        let resolved = resolve_ref_value(&interp, &binding_map);
+        assert_eq!(resolved, Value::String("subnet-vpc-123".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_interpolation_partially_unresolved() {
+        let binding_map: HashMap<String, HashMap<String, Value>> = HashMap::new();
+
+        let interp = Value::Interpolation(vec![
+            InterpolationPart::Literal("subnet-".to_string()),
+            InterpolationPart::Expr(Value::ResourceRef {
+                binding_name: "my_vpc".to_string(),
+                attribute_name: "vpc_id".to_string(),
+            }),
+        ]);
+
+        let resolved = resolve_ref_value(&interp, &binding_map);
+        // Should remain as Interpolation since the ref couldn't be resolved
+        assert!(matches!(resolved, Value::Interpolation(_)));
+    }
+
+    #[test]
+    fn test_resolve_interpolation_with_non_string_types() {
+        let binding_map: HashMap<String, HashMap<String, Value>> = HashMap::new();
+
+        let interp = Value::Interpolation(vec![
+            InterpolationPart::Literal("port-".to_string()),
+            InterpolationPart::Expr(Value::Int(8080)),
+            InterpolationPart::Literal("-enabled-".to_string()),
+            InterpolationPart::Expr(Value::Bool(true)),
+        ]);
+
+        let resolved = resolve_ref_value(&interp, &binding_map);
+        assert_eq!(
+            resolved,
+            Value::String("port-8080-enabled-true".to_string())
+        );
     }
 
     #[test]
