@@ -2151,4 +2151,25 @@ mod tests {
             "No trailing blank line when map is last attribute"
         );
     }
+
+    #[test]
+    fn issue_1177_idempotent() {
+        // Formatting should be idempotent
+        let input = r#"awscc.ec2.vpc {
+  cidr_block = "10.0.0.0/16"
+  tags = {
+    Name        = "test"
+    Environment = "dev"
+  }
+  enable_dns = true
+}
+"#;
+        let config = FormatConfig {
+            align_attributes: true,
+            ..Default::default()
+        };
+        let first = format(input, &config).unwrap();
+        let second = format(&first, &config).unwrap();
+        assert_eq!(first, second, "Formatting should be idempotent");
+    }
 }
