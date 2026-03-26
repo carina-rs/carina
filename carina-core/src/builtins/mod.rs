@@ -171,6 +171,38 @@ mod tests {
     }
 
     #[test]
+    fn test_all_builtin_modules_are_registered() {
+        let builtins_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/builtins");
+
+        // Count .rs files in builtins/ directory (excluding mod.rs)
+        let file_count = std::fs::read_dir(&builtins_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                let name = e.file_name().to_string_lossy().to_string();
+                name.ends_with(".rs") && name != "mod.rs"
+            })
+            .count();
+
+        // Count `mod` declarations in mod.rs
+        let mod_rs = std::fs::read_to_string(builtins_dir.join("mod.rs")).unwrap();
+        let mod_count = mod_rs
+            .lines()
+            .filter(|line| {
+                let trimmed = line.trim();
+                trimmed.starts_with("mod ") && trimmed.ends_with(';')
+            })
+            .count();
+
+        assert_eq!(
+            file_count, mod_count,
+            "Number of .rs files in builtins/ ({file_count}) does not match \
+             the number of `mod` declarations in mod.rs ({mod_count}). \
+             Did you forget to add a `mod` declaration for a new builtin file?"
+        );
+    }
+
+    #[test]
     fn test_unknown_function_is_rejected() {
         let result = evaluate_builtin("nonexistent_function", &[]);
         assert!(result.is_err());
