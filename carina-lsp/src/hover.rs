@@ -4,6 +4,7 @@ use std::sync::Arc;
 use tower_lsp::lsp_types::{Hover, HoverContents, MarkupContent, MarkupKind, Position};
 
 use crate::document::Document;
+use carina_core::builtins;
 use carina_core::schema::{CompletionValue, ResourceSchema};
 
 /// Convert Markdown links `[text](url)` to plain text `text (url)` for hover display.
@@ -108,6 +109,11 @@ impl HoverProvider {
             }
         }
 
+        // Check for built-in function hover
+        if let Some(hover) = self.builtin_function_hover(&word) {
+            return Some(hover);
+        }
+
         // Check for keyword hover
         if let Some(hover) = self.keyword_hover(&word) {
             return Some(hover);
@@ -119,6 +125,25 @@ impl HoverProvider {
         }
 
         None
+    }
+
+    fn builtin_function_hover(&self, word: &str) -> Option<Hover> {
+        let func = builtins::builtin_functions()
+            .iter()
+            .find(|f| f.name == word)?;
+
+        let content = format!(
+            "## {}\n\n```\n{}\n```\n\n{}",
+            func.name, func.signature, func.description
+        );
+
+        Some(Hover {
+            contents: HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value: content,
+            }),
+            range: None,
+        })
     }
 
     /// Check if the position is inside a module call block
@@ -619,5 +644,93 @@ awscc.ec2.vpc_gateway_attachment {
              but got:\n{}",
             content
         );
+    }
+
+    #[test]
+    fn test_builtin_function_hover_join() {
+        let provider = HoverProvider::new(Arc::new(HashMap::new()), vec![]);
+        let doc = Document::new("join".to_string());
+        let hover = provider
+            .hover(&doc, Position::new(0, 1))
+            .expect("Should find hover for 'join'");
+
+        let content = match &hover.contents {
+            HoverContents::Markup(m) => &m.value,
+            _ => panic!("Expected markup content"),
+        };
+
+        assert!(
+            content.contains("## join"),
+            "Should have function name header"
+        );
+        assert!(
+            content.contains("join(separator: string, list: list) -> string"),
+            "Should show signature. Got:\n{}",
+            content
+        );
+        assert!(
+            content.contains("Joins list elements"),
+            "Should show description. Got:\n{}",
+            content
+        );
+    }
+
+    #[test]
+    fn test_builtin_function_hover_cidr_subnet() {
+        let provider = HoverProvider::new(Arc::new(HashMap::new()), vec![]);
+        let doc = Document::new("cidr_subnet".to_string());
+        let hover = provider
+            .hover(&doc, Position::new(0, 3))
+            .expect("Should find hover for 'cidr_subnet'");
+
+        let content = match &hover.contents {
+            HoverContents::Markup(m) => &m.value,
+            _ => panic!("Expected markup content"),
+        };
+
+        assert!(
+            content.contains("cidr_subnet(prefix: string, newbits: int, netnum: int) -> string"),
+            "Should show cidr_subnet signature. Got:\n{}",
+            content
+        );
+    }
+
+    #[test]
+    fn test_builtin_function_hover_unknown_returns_none() {
+        let provider = HoverProvider::new(Arc::new(HashMap::new()), vec![]);
+        let doc = Document::new("not_a_function".to_string());
+        let hover = provider.hover(&doc, Position::new(0, 3));
+        assert!(hover.is_none(), "Unknown function should not show hover");
+    }
+
+    #[test]
+    fn test_all_builtin_functions_have_hover() {
+        let provider = HoverProvider::new(Arc::new(HashMap::new()), vec![]);
+        let names = [
+            "cidr_subnet",
+            "concat",
+            "flatten",
+            "join",
+            "keys",
+            "length",
+            "lookup",
+            "lower",
+            "max",
+            "min",
+            "replace",
+            "split",
+            "trim",
+            "upper",
+            "values",
+        ];
+        for name in &names {
+            let doc = Document::new(name.to_string());
+            let hover = provider.hover(&doc, Position::new(0, 1));
+            assert!(
+                hover.is_some(),
+                "Built-in function '{}' should have hover info",
+                name
+            );
+        }
     }
 }
