@@ -94,6 +94,42 @@ if [ -z "$FILTER" ] || echo "join" | grep -q "$FILTER"; then
     ACTIVE_WORK_DIR=""
 fi
 
+# ─── Test: upper() and lower() ───
+if [ -z "$FILTER" ] || echo "upper_lower" | grep -q "$FILTER"; then
+    echo ""
+    echo "Test: upper() and lower() functions"
+    echo ""
+
+    WORK_DIR=$(mktemp -d)
+    ACTIVE_WORK_DIR="$WORK_DIR"
+    cp "$SCRIPT_DIR/upper_lower.crn" "$WORK_DIR/main.crn"
+
+    cd "$WORK_DIR"
+
+    run_step "step1: apply" "$CARINA_BIN" apply --auto-approve .
+    run_step "step2: plan-verify" "$CARINA_BIN" plan .
+
+    # Verify the upper() result in state
+    assert_state_value \
+        "assert: tag Name = 'PRODUCTION'" \
+        '.resources[0].attributes.tags.Name' \
+        'PRODUCTION' \
+        "$WORK_DIR"
+
+    # Verify the lower() result in state
+    assert_state_value \
+        "assert: tag App = 'webapp'" \
+        '.resources[0].attributes.tags.App' \
+        'webapp' \
+        "$WORK_DIR"
+
+    # Cleanup
+    echo "  Cleanup: destroying resources..."
+    "$CARINA_BIN" destroy --auto-approve . > /dev/null 2>&1 || true
+    rm -rf "$WORK_DIR"
+    ACTIVE_WORK_DIR=""
+fi
+
 echo ""
 echo "════════════════════════════════════════"
 echo "Total: $TOTAL_PASSED passed, $TOTAL_FAILED failed"
