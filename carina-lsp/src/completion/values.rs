@@ -9,6 +9,12 @@ use carina_core::schema::AttributeType;
 
 use super::CompletionProvider;
 
+/// Context when the user has typed `binding_name.` after `=`.
+struct BindingDotContext {
+    binding_name: String,
+    resource_type: String,
+}
+
 impl CompletionProvider {
     pub(super) fn attribute_completions_for_type(
         &self,
@@ -77,6 +83,17 @@ impl CompletionProvider {
         // from the start of "igw" to the cursor, so accepting a completion like
         // "igw.internet_gateway_id" replaces "igw." instead of being appended.
         let ref_edit_range = self.compute_value_prefix_range(text, position);
+
+        // Check if the user has typed "binding." after "=" — if so, show only
+        // that binding's resource attributes, not built-in functions or generic completions.
+        if let Some(dot_binding) = self.detect_binding_dot_context(text, position, current_binding)
+        {
+            return self.binding_attribute_completions(
+                &dot_binding.binding_name,
+                &dot_binding.resource_type,
+                ref_edit_range,
+            );
+        }
 
         // Type-based resource reference completions:
         // Look up the attribute's type from the schema. If it's a Custom type,
@@ -163,6 +180,84 @@ impl CompletionProvider {
 
         // Fall back to generic value completions
         completions.extend(self.generic_value_completions());
+        completions
+    }
+
+    /// Detect if the user has typed `binding_name.` after `=` on the current line.
+    /// Returns the binding name and its resource type if detected.
+    fn detect_binding_dot_context(
+        &self,
+        text: &str,
+        position: Position,
+        current_binding: Option<&str>,
+    ) -> Option<BindingDotContext> {
+        let lines: Vec<&str> = text.lines().collect();
+        let line_idx = position.line as usize;
+        if line_idx >= lines.len() {
+            return None;
+        }
+
+        let col = position.character as usize;
+        let prefix: String = lines[line_idx].chars().take(col).collect();
+
+        // Extract the value part after "="
+        let after_eq = prefix.rsplit('=').next()?.trim();
+
+        // Check if it looks like "identifier." (ends with dot or has dot followed by partial text)
+        let dot_pos = after_eq.find('.')?;
+        let candidate_binding = &after_eq[..dot_pos];
+
+        // Validate binding name: alphanumeric + underscore
+        if candidate_binding.is_empty()
+            || !candidate_binding
+                .chars()
+                .all(|c| c.is_alphanumeric() || c == '_')
+        {
+            return None;
+        }
+
+        // Look up this binding in the file's bindings
+        let bindings = self.extract_resource_bindings(text);
+        for (binding_name, binding_resource_type) in &bindings {
+            if binding_name == candidate_binding && !binding_resource_type.is_empty() {
+                // Skip self-references
+                if current_binding.is_some_and(|cb| cb == binding_name) {
+                    return None;
+                }
+                return Some(BindingDotContext {
+                    binding_name: binding_name.clone(),
+                    resource_type: binding_resource_type.clone(),
+                });
+            }
+        }
+
+        None
+    }
+
+    /// Provide completions for a binding's resource attributes.
+    /// Shows all attributes of the binding's resource type as `binding.attribute` completions.
+    fn binding_attribute_completions(
+        &self,
+        binding_name: &str,
+        binding_resource_type: &str,
+        edit_range: Range,
+    ) -> Vec<CompletionItem> {
+        let mut completions = Vec::new();
+        if let Some(schema) = self.schemas.get(binding_resource_type) {
+            for attr in schema.attributes.values() {
+                let full_ref = format!("{}.{}", binding_name, attr.name);
+                completions.push(CompletionItem {
+                    label: full_ref.clone(),
+                    kind: Some(CompletionItemKind::REFERENCE),
+                    detail: attr.description.clone(),
+                    text_edit: Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(TextEdit {
+                        range: edit_range,
+                        new_text: full_ref,
+                    })),
+                    ..Default::default()
+                });
+            }
+        }
         completions
     }
 

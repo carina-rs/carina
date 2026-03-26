@@ -737,3 +737,51 @@ let igw_attachment = awscc.ec2.vpc_gateway_attachment {
         panic!("text_edit should be a TextEdit, not an InsertReplaceEdit");
     }
 }
+
+#[test]
+fn after_binding_dot_shows_resource_attributes_not_builtins() {
+    // When the user types `igw.` after `=`, completion should show
+    // the binding's resource attributes (e.g., internet_gateway_id),
+    // NOT built-in functions (cidr_subnet, concat, flatten, etc.).
+    let provider = test_provider();
+    let doc = create_document(
+        r#"let igw = awscc.ec2.internet_gateway {
+}
+
+awscc.ec2.vpc_gateway_attachment {
+    internet_gateway_id = igw.
+}"#,
+    );
+    // Cursor after "igw." on line 4 (4 spaces + "internet_gateway_id = igw." = 30 chars)
+    let position = Position {
+        line: 4,
+        character: 30,
+    };
+
+    let completions = provider.complete(&doc, position, None);
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+
+    // Should include the binding's resource attributes
+    assert!(
+        labels.contains(&"igw.internet_gateway_id"),
+        "Should suggest igw.internet_gateway_id. Got: {:?}",
+        labels
+    );
+
+    // Should NOT include built-in functions
+    assert!(
+        !labels.contains(&"cidr_subnet"),
+        "Should NOT suggest built-in function 'cidr_subnet' after 'igw.'. Got: {:?}",
+        labels
+    );
+    assert!(
+        !labels.contains(&"concat"),
+        "Should NOT suggest built-in function 'concat' after 'igw.'. Got: {:?}",
+        labels
+    );
+    assert!(
+        !labels.contains(&"join"),
+        "Should NOT suggest built-in function 'join' after 'igw.'. Got: {:?}",
+        labels
+    );
+}
