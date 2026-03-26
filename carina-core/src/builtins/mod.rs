@@ -4,6 +4,7 @@
 //! Functions take `&[Value]` arguments and return `Result<Value, String>`.
 
 mod join;
+mod length;
 mod trim;
 mod upper_lower;
 
@@ -15,6 +16,7 @@ use crate::resource::Value;
 pub fn evaluate_builtin(name: &str, args: &[Value]) -> Result<Value, String> {
     match name {
         "join" => join::builtin_join(args),
+        "length" => length::builtin_length(args),
         "trim" => trim::builtin_trim(args),
         "upper" => upper_lower::builtin_upper(args),
         "lower" => upper_lower::builtin_lower(args),
