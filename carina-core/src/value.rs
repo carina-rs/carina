@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use crate::resource::Value;
+use crate::resource::{InterpolationPart, Value};
 use crate::utils::{convert_enum_value, is_dsl_enum_format};
 
 /// Convert `Value` to `serde_json::Value`.
@@ -42,6 +42,16 @@ pub fn value_to_json(value: &Value) -> Result<serde_json::Value, String> {
             Some(m) => Ok(serde_json::Value::String(format!("{}.{}", name, m))),
             None => Ok(serde_json::Value::String(name.clone())),
         },
+        Value::Interpolation(parts) => {
+            let s = parts
+                .iter()
+                .map(|p| match p {
+                    InterpolationPart::Literal(s) => s.clone(),
+                    InterpolationPart::Expr(v) => format_value(v),
+                })
+                .collect::<String>();
+            Ok(serde_json::Value::String(s))
+        }
     }
 }
 
@@ -127,6 +137,16 @@ pub fn format_value_with_key(value: &Value, _key: Option<&str>) -> String {
             }
             None => format!("\"{}\"", name),
         },
+        Value::Interpolation(parts) => {
+            let inner: String = parts
+                .iter()
+                .map(|p| match p {
+                    InterpolationPart::Literal(s) => s.clone(),
+                    InterpolationPart::Expr(v) => format!("${{{}}}", format_value(v)),
+                })
+                .collect();
+            format!("\"{}\"", inner)
+        }
     }
 }
 

@@ -167,6 +167,17 @@ fn format_value(value: &Value) -> String {
             Some(m) => format!("{}.{}", name, m),
             None => name.clone(),
         },
+        Value::Interpolation(parts) => {
+            use crate::resource::InterpolationPart;
+            let inner: String = parts
+                .iter()
+                .map(|p| match p {
+                    InterpolationPart::Literal(s) => s.clone(),
+                    InterpolationPart::Expr(v) => format!("${{{}}}", format_value(v)),
+                })
+                .collect();
+            format!("\"{}\"", inner)
+        }
     }
 }
 
@@ -448,6 +459,14 @@ impl RootConfigSignature {
             Value::Map(map) => {
                 for (k, v) in map {
                     Self::collect_typed_dependencies(from, k, v, graph, binding_types);
+                }
+            }
+            Value::Interpolation(parts) => {
+                use crate::resource::InterpolationPart;
+                for part in parts {
+                    if let InterpolationPart::Expr(v) = part {
+                        Self::collect_typed_dependencies(from, attr_key, v, graph, binding_types);
+                    }
                 }
             }
             _ => {}
@@ -884,6 +903,21 @@ impl ModuleSignature {
                         binding_types,
                         argument_types,
                     );
+                }
+            }
+            Value::Interpolation(parts) => {
+                use crate::resource::InterpolationPart;
+                for part in parts {
+                    if let InterpolationPart::Expr(v) = part {
+                        Self::collect_typed_dependencies(
+                            from,
+                            attr_key,
+                            v,
+                            graph,
+                            binding_types,
+                            argument_types,
+                        );
+                    }
                 }
             }
             _ => {}

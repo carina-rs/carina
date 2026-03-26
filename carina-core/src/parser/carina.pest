@@ -124,11 +124,14 @@ variable_ref = { identifier ~ ("." ~ identifier)? }
 boolean = { "true" | "false" }
 float = @{ "-"? ~ ASCII_DIGIT+ ~ "." ~ ASCII_DIGIT+ }
 number = @{ "-"? ~ ASCII_DIGIT+ }
-string = ${ "\"" ~ inner_string ~ "\"" }
-inner_string = @{ char* }
-char = {
-    !("\"" | "\\") ~ ANY
-  | "\\" ~ ("\"" | "\\" | "n" | "r" | "t")
+string = ${ "\"" ~ string_part* ~ "\"" }
+string_part = ${ interpolation | string_literal }
+interpolation = ${ "${" ~ expression ~ "}" }
+string_literal = @{ string_char+ }
+string_char = {
+    !("\"" | "\\" | "${") ~ ANY
+  | "\\" ~ ("\"" | "\\" | "n" | "r" | "t" | "$")
+  | "$" ~ !("{")
 }
 
 // Whitespace (auto-skip)

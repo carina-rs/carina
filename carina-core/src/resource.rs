@@ -80,6 +80,18 @@ pub enum Value {
     /// - `dedicated` -> ("dedicated", None)
     /// - `InstanceTenancy.dedicated` -> ("InstanceTenancy", Some("dedicated"))
     UnresolvedIdent(String, Option<String>),
+    /// String interpolation: `"prefix-${expr}-suffix"`
+    /// Parts are evaluated and concatenated into a final String.
+    Interpolation(Vec<InterpolationPart>),
+}
+
+/// A part of a string interpolation expression
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum InterpolationPart {
+    /// Literal text segment
+    Literal(String),
+    /// An expression to be evaluated and converted to string
+    Expr(Value),
 }
 
 impl Value {
@@ -146,6 +158,21 @@ impl Value {
             Value::UnresolvedIdent(name, member) => {
                 name.hash(hasher);
                 member.hash(hasher);
+            }
+            Value::Interpolation(parts) => {
+                parts.len().hash(hasher);
+                for part in parts {
+                    match part {
+                        InterpolationPart::Literal(s) => {
+                            0u8.hash(hasher);
+                            s.hash(hasher);
+                        }
+                        InterpolationPart::Expr(v) => {
+                            1u8.hash(hasher);
+                            v.hash_into(hasher);
+                        }
+                    }
+                }
             }
         }
     }
@@ -536,6 +563,14 @@ mod tests {
             },
             Value::UnresolvedIdent("dedicated".to_string(), None),
             Value::UnresolvedIdent("InstanceTenancy".to_string(), Some("dedicated".to_string())),
+            Value::Interpolation(vec![
+                InterpolationPart::Literal("prefix-".to_string()),
+                InterpolationPart::Expr(Value::ResourceRef {
+                    binding_name: "vpc".to_string(),
+                    attribute_name: "id".to_string(),
+                }),
+                InterpolationPart::Literal("-suffix".to_string()),
+            ]),
         ];
 
         for value in values {
