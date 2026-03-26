@@ -679,3 +679,61 @@ fn builtin_function_completions_cover_all_functions() {
         );
     }
 }
+
+#[test]
+fn resource_ref_completion_after_dot_uses_text_edit_to_avoid_duplication() {
+    // When the user has typed `internet_gateway_id = igw.` and triggers completion,
+    // the completion item should use a text_edit that replaces from the start of "igw"
+    // to the cursor position, so accepting the completion produces
+    // `internet_gateway_id = igw.internet_gateway_id` (not `igw.igw.internet_gateway_id`).
+    let provider = test_provider();
+    let doc = create_document(
+        r#"let igw = awscc.ec2.internet_gateway {
+}
+
+let igw_attachment = awscc.ec2.vpc_gateway_attachment {
+    internet_gateway_id = igw.
+}"#,
+    );
+    // Cursor after "igw." on line 4 (character 30)
+    let position = Position {
+        line: 4,
+        character: 30,
+    };
+
+    let completions = provider.complete(&doc, position, None);
+
+    // Find the igw.internet_gateway_id completion
+    let igw_completion = completions
+        .iter()
+        .find(|c| c.label == "igw.internet_gateway_id")
+        .expect("Should suggest igw.internet_gateway_id");
+
+    // The completion must use text_edit (not just insert_text) to avoid duplication.
+    // The text_edit range should cover from the start of "igw" to the cursor position,
+    // so that "igw." gets replaced with "igw.internet_gateway_id".
+    assert!(
+        igw_completion.text_edit.is_some(),
+        "Resource reference completion should use text_edit to avoid prefix duplication. \
+         Got insert_text: {:?}",
+        igw_completion.insert_text
+    );
+
+    if let Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(edit)) = &igw_completion.text_edit {
+        assert_eq!(
+            edit.new_text, "igw.internet_gateway_id",
+            "text_edit new_text should be the full reference"
+        );
+        // The range should start at column 26 (where "igw" starts, after "    internet_gateway_id = ")
+        assert_eq!(
+            edit.range.start.character, 26,
+            "text_edit range should start at the binding name prefix"
+        );
+        assert_eq!(
+            edit.range.end.character, 30,
+            "text_edit range should end at the cursor position"
+        );
+    } else {
+        panic!("text_edit should be a TextEdit, not an InsertReplaceEdit");
+    }
+}

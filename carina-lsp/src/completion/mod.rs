@@ -67,6 +67,7 @@ impl CompletionProvider {
                 &attr_name,
                 &text,
                 current_binding.as_deref(),
+                position,
             ),
             CompletionContext::InsideStructBlock {
                 resource_type,
