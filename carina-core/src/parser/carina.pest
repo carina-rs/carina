@@ -60,8 +60,12 @@ provider_block = {
 // Variable/resource definition: let name = value
 let_binding = { "let" ~ identifier ~ "=" ~ expression }
 
-// Block content: either an attribute (key = value) or a nested block (key { ... })
-block_content = { attribute | nested_block }
+// Block content: a local let binding, an attribute (key = value), or a nested block (key { ... })
+block_content = { local_binding | attribute | nested_block }
+
+// Local let binding inside a block: let name = expression
+// These are block-scoped variables, NOT sent to the provider
+local_binding = { "let" ~ identifier ~ "=" ~ expression }
 
 // Attribute: key = value
 attribute = { identifier ~ "=" ~ expression }

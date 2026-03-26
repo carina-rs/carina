@@ -64,6 +64,7 @@ pub enum NodeKind {
     AttributesParam,
     TypeExpr,
     LetBinding,
+    LocalBinding,
     ModuleCall,
     AnonymousResource,
     ResourceExpr,
