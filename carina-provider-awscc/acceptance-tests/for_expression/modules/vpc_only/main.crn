@@ -1,0 +1,13 @@
+arguments {
+  cidr_block: string
+  env_name  : string
+}
+
+let vpc = awscc.ec2.vpc {
+  cidr_block = cidr_block
+
+  tags = {
+    Name        = "for-module-test-${env_name}"
+    Environment = env_name
+  }
+}
