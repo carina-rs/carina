@@ -4,6 +4,7 @@
 //! Functions take `&[Value]` arguments and return `Result<Value, String>`.
 
 mod join;
+mod trim;
 
 use crate::resource::Value;
 
@@ -13,6 +14,7 @@ use crate::resource::Value;
 pub fn evaluate_builtin(name: &str, args: &[Value]) -> Result<Value, String> {
     match name {
         "join" => join::builtin_join(args),
+        "trim" => trim::builtin_trim(args),
         _ => Err(format!("Unknown built-in function: {name}")),
     }
 }
