@@ -601,8 +601,10 @@ pub fn add_state_block_effects(
     state_file: &Option<StateFile>,
 ) {
     // Collect resource IDs that are covered by removed/moved blocks
-    // to suppress orphan Delete effects
+    // to suppress orphan Delete effects and moved-to Create effects
     let mut suppress_delete: std::collections::HashSet<ResourceId> =
+        std::collections::HashSet::new();
+    let mut suppress_create: std::collections::HashSet<ResourceId> =
         std::collections::HashSet::new();
 
     let mut new_effects: Vec<Effect> = Vec::new();
@@ -616,6 +618,7 @@ pub fn add_state_block_effects(
                         .is_some()
                 });
                 if !already_in_state {
+                    suppress_create.insert(to.clone());
                     new_effects.push(Effect::Import {
                         id: to.clone(),
                         identifier: id.clone(),
@@ -641,6 +644,7 @@ pub fn add_state_block_effects(
                 });
                 if old_in_state {
                     suppress_delete.insert(from.clone());
+                    suppress_create.insert(to.clone());
                     new_effects.push(Effect::Move {
                         from: from.clone(),
                         to: to.clone(),
@@ -650,14 +654,13 @@ pub fn add_state_block_effects(
         }
     }
 
-    // Remove Delete effects for resources covered by removed/moved blocks
-    if !suppress_delete.is_empty() {
-        plan.retain(|effect| {
-            if let Effect::Delete { id, .. } = effect {
-                !suppress_delete.contains(id)
-            } else {
-                true
-            }
+    // Remove Delete effects for resources covered by removed/moved blocks,
+    // and Create effects for moved-to resources (they inherit state from the old name)
+    if !suppress_delete.is_empty() || !suppress_create.is_empty() {
+        plan.retain(|effect| match effect {
+            Effect::Delete { id, .. } => !suppress_delete.contains(id),
+            Effect::Create(resource) => !suppress_create.contains(&resource.id),
+            _ => true,
         });
     }
 
