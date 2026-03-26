@@ -481,8 +481,19 @@ impl Value {
             Value::ResourceRef {
                 binding_name,
                 attribute_name,
-                ..
-            } => format!("ResourceRef({}.{})", binding_name, attribute_name),
+                field_path,
+            } => {
+                if field_path.is_empty() {
+                    format!("ResourceRef({}.{})", binding_name, attribute_name)
+                } else {
+                    format!(
+                        "ResourceRef({}.{}.{})",
+                        binding_name,
+                        attribute_name,
+                        field_path.join(".")
+                    )
+                }
+            }
             Value::UnresolvedIdent(name, member) => match member {
                 Some(m) => format!("UnresolvedIdent({}.{})", name, m),
                 None => format!("UnresolvedIdent({})", name),
