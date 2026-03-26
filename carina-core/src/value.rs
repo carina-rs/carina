@@ -52,6 +52,14 @@ pub fn value_to_json(value: &Value) -> Result<serde_json::Value, String> {
                 .collect::<String>();
             Ok(serde_json::Value::String(s))
         }
+        Value::FunctionCall { name, args } => {
+            let arg_strs: Vec<_> = args.iter().map(format_value).collect();
+            Ok(serde_json::Value::String(format!(
+                "{}({})",
+                name,
+                arg_strs.join(", ")
+            )))
+        }
     }
 }
 
@@ -146,6 +154,10 @@ pub fn format_value_with_key(value: &Value, _key: Option<&str>) -> String {
                 })
                 .collect();
             format!("\"{}\"", inner)
+        }
+        Value::FunctionCall { name, args } => {
+            let arg_strs: Vec<_> = args.iter().map(format_value).collect();
+            format!("{}({})", name, arg_strs.join(", "))
         }
     }
 }

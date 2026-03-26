@@ -2,6 +2,7 @@
 //!
 //! Core library for an infrastructure management tool that treats side effects as values
 
+pub mod builtins;
 pub mod config_loader;
 pub mod deps;
 pub mod detail_rows;

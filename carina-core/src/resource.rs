@@ -83,6 +83,14 @@ pub enum Value {
     /// String interpolation: `"prefix-${expr}-suffix"`
     /// Parts are evaluated and concatenated into a final String.
     Interpolation(Vec<InterpolationPart>),
+    /// Built-in function call: `join("-", ["a", "b"])` or via pipe `["a", "b"] |> join("-")`
+    /// Evaluated during reference resolution.
+    FunctionCall {
+        /// Function name (e.g., "join")
+        name: String,
+        /// Arguments to the function
+        args: Vec<Value>,
+    },
 }
 
 /// A part of a string interpolation expression
@@ -172,6 +180,13 @@ impl Value {
                             v.hash_into(hasher);
                         }
                     }
+                }
+            }
+            Value::FunctionCall { name, args } => {
+                name.hash(hasher);
+                args.len().hash(hasher);
+                for arg in args {
+                    arg.hash_into(hasher);
                 }
             }
         }
@@ -571,6 +586,16 @@ mod tests {
                 }),
                 InterpolationPart::Literal("-suffix".to_string()),
             ]),
+            Value::FunctionCall {
+                name: "join".to_string(),
+                args: vec![
+                    Value::String("-".to_string()),
+                    Value::List(vec![
+                        Value::String("a".to_string()),
+                        Value::String("b".to_string()),
+                    ]),
+                ],
+            },
         ];
 
         for value in values {

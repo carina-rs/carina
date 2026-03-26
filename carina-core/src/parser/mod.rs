@@ -585,15 +585,26 @@ fn parse_pipe_expr_with_resource_or_module(
 ) -> Result<LetBindingRhs, ParseError> {
     let mut inner = pair.into_inner();
     let primary = next_pair(&mut inner, "primary expression", "pipe expression")?;
-    let (value, maybe_resource, maybe_module_call, maybe_import) =
+    let (mut value, maybe_resource, maybe_module_call, maybe_import) =
         parse_primary_with_resource_or_module(primary, ctx, binding_name)?;
 
-    // Pipe operator is parsed but not yet implemented — reject with a clear error
-    if let Some(func_call) = inner.next() {
-        return Err(ParseError::InvalidExpression {
-            line: func_call.line_col().0,
-            message: "Pipe operator is not yet supported".to_string(),
-        });
+    // Desugar pipe: `x |> f(args)` becomes `f(x, args)`
+    for func_call_pair in inner {
+        let mut fc_inner = func_call_pair.into_inner();
+        let func_name = next_pair(&mut fc_inner, "function name", "pipe function call")?
+            .as_str()
+            .to_string();
+        let extra_args: Result<Vec<Value>, ParseError> =
+            fc_inner.map(|arg| parse_expression(arg, ctx)).collect();
+        let extra_args = extra_args?;
+
+        let mut args = extra_args;
+        args.push(value);
+
+        value = Value::FunctionCall {
+            name: func_name,
+            args,
+        };
     }
 
     Ok((value, maybe_resource, maybe_module_call, maybe_import))
@@ -934,14 +945,27 @@ fn parse_pipe_expr(
 ) -> Result<Value, ParseError> {
     let mut inner = pair.into_inner();
     let primary = next_pair(&mut inner, "primary expression", "pipe expression")?;
-    let value = parse_primary_value(primary, ctx)?;
+    let mut value = parse_primary_value(primary, ctx)?;
 
-    // Pipe operator is parsed but not yet implemented — reject with a clear error
-    if let Some(func_call) = inner.next() {
-        return Err(ParseError::InvalidExpression {
-            line: func_call.line_col().0,
-            message: "Pipe operator is not yet supported".to_string(),
-        });
+    // Desugar pipe: `x |> f(args)` becomes `f(x, args)`
+    for func_call_pair in inner {
+        let mut fc_inner = func_call_pair.into_inner();
+        let func_name = next_pair(&mut fc_inner, "function name", "pipe function call")?
+            .as_str()
+            .to_string();
+        let extra_args: Result<Vec<Value>, ParseError> =
+            fc_inner.map(|arg| parse_expression(arg, ctx)).collect();
+        let extra_args = extra_args?;
+
+        // Build args: pipe value is prepended as the last argument
+        // For join: `list |> join(sep)` => `join(sep, list)`
+        let mut args = extra_args;
+        args.push(value);
+
+        value = Value::FunctionCall {
+            name: func_name,
+            args,
+        };
     }
 
     Ok(value)
@@ -1071,6 +1095,18 @@ fn parse_primary_value(
             Ok(Value::Int(n))
         }
         Rule::string => parse_string_value(inner, ctx),
+        Rule::function_call => {
+            let mut fc_inner = inner.into_inner();
+            let func_name = next_pair(&mut fc_inner, "function name", "function call")?
+                .as_str()
+                .to_string();
+            let args: Result<Vec<Value>, ParseError> =
+                fc_inner.map(|arg| parse_expression(arg, ctx)).collect();
+            Ok(Value::FunctionCall {
+                name: func_name,
+                args: args?,
+            })
+        }
         Rule::variable_ref => {
             // variable_ref can be "identifier" or "identifier.identifier" (member access)
             let mut parts = inner.into_inner();
@@ -1263,6 +1299,13 @@ fn resolve_forward_ref_in_value(
                     .collect(),
             )
         }
+        Value::FunctionCall { name, args } => Value::FunctionCall {
+            name,
+            args: args
+                .into_iter()
+                .map(|v| resolve_forward_ref_in_value(v, resource_bindings))
+                .collect(),
+        },
         other => other,
     }
 }
@@ -1372,6 +1415,20 @@ fn resolve_value(
                 })
                 .collect();
             Ok(Value::Interpolation(resolved?))
+        }
+        Value::FunctionCall { name, args } => {
+            let resolved_args: Result<Vec<Value>, ParseError> =
+                args.iter().map(|a| resolve_value(a, binding_map)).collect();
+            let resolved_args = resolved_args?;
+
+            // Try to evaluate the function if all args are resolved
+            match crate::builtins::evaluate_builtin(name, &resolved_args) {
+                Ok(result) => Ok(result),
+                Err(_) => Ok(Value::FunctionCall {
+                    name: name.clone(),
+                    args: resolved_args,
+                }),
+            }
         }
         _ => Ok(value.clone()),
     }
@@ -1503,18 +1560,21 @@ mod tests {
     }
 
     #[test]
-    fn env_function_is_not_recognized() {
+    fn function_call_is_parsed() {
         let input = r#"
             let my_bucket = aws.s3_bucket {
                 name = env("SOME_VAR")
             }
         "#;
 
-        let result = parse(input);
-        assert!(
-            result.is_err(),
-            "env() should not be recognized by the parser, but got: {:?}",
-            result
+        let result = parse(input).unwrap();
+        assert_eq!(result.resources.len(), 1);
+        assert_eq!(
+            result.resources[0].attributes.get("name"),
+            Some(&Value::FunctionCall {
+                name: "env".to_string(),
+                args: vec![Value::String("SOME_VAR".to_string())],
+            })
         );
     }
 
@@ -2648,38 +2708,160 @@ aws.s3.bucket {
     }
 
     #[test]
-    fn pipe_operator_produces_error() {
+    fn pipe_operator_desugars_to_function_call() {
         let input = r#"
             let x = "hello" |> upper()
         "#;
-        let result = parse(input);
-        assert!(
-            result.is_err(),
-            "pipe operator should produce an error, but parsing succeeded"
-        );
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("Pipe operator is not yet supported"),
-            "expected 'Pipe operator is not yet supported' error, got: {err}"
+        let result = parse(input).unwrap();
+        // "hello" |> upper() desugars to upper("hello")
+        assert_eq!(
+            result.variables.get("x"),
+            Some(&Value::FunctionCall {
+                name: "upper".to_string(),
+                args: vec![Value::String("hello".to_string())],
+            })
         );
     }
 
     #[test]
-    fn pipe_operator_in_attribute_produces_error() {
+    fn pipe_operator_in_attribute_desugars() {
         let input = r#"
             let bucket = aws.s3_bucket {
                 name = "test" |> lower()
             }
         "#;
-        let result = parse(input);
-        assert!(
-            result.is_err(),
-            "pipe operator in attribute should produce an error, but parsing succeeded"
+        let result = parse(input).unwrap();
+        assert_eq!(result.resources.len(), 1);
+        assert_eq!(
+            result.resources[0].attributes.get("name"),
+            Some(&Value::FunctionCall {
+                name: "lower".to_string(),
+                args: vec![Value::String("test".to_string())],
+            })
         );
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("Pipe operator is not yet supported"),
-            "expected 'Pipe operator is not yet supported' error, got: {err}"
+    }
+
+    #[test]
+    fn join_function_call_parsed() {
+        let input = r#"
+            let bucket = aws.s3_bucket {
+                name = join("-", ["a", "b", "c"])
+            }
+        "#;
+        let result = parse(input).unwrap();
+        assert_eq!(result.resources.len(), 1);
+        // At parse time, function calls remain as FunctionCall values
+        assert_eq!(
+            result.resources[0].attributes.get("name"),
+            Some(&Value::FunctionCall {
+                name: "join".to_string(),
+                args: vec![
+                    Value::String("-".to_string()),
+                    Value::List(vec![
+                        Value::String("a".to_string()),
+                        Value::String("b".to_string()),
+                        Value::String("c".to_string()),
+                    ]),
+                ],
+            })
+        );
+    }
+
+    #[test]
+    fn pipe_with_join_parsed() {
+        let input = r#"
+            let bucket = aws.s3_bucket {
+                name = ["a", "b", "c"] |> join("-")
+            }
+        "#;
+        let result = parse(input).unwrap();
+        assert_eq!(result.resources.len(), 1);
+        // ["a", "b", "c"] |> join("-") desugars to join("-", ["a", "b", "c"])
+        assert_eq!(
+            result.resources[0].attributes.get("name"),
+            Some(&Value::FunctionCall {
+                name: "join".to_string(),
+                args: vec![
+                    Value::String("-".to_string()),
+                    Value::List(vec![
+                        Value::String("a".to_string()),
+                        Value::String("b".to_string()),
+                        Value::String("c".to_string()),
+                    ]),
+                ],
+            })
+        );
+    }
+
+    #[test]
+    fn join_with_multiple_pipes() {
+        // Chain: value |> f1(args) |> f2(args)
+        let input = r#"
+            let x = ["a", "b"] |> join("-") |> upper()
+        "#;
+        let result = parse(input).unwrap();
+        // Pipe chaining: ["a", "b"] |> join("-") |> upper()
+        // => upper(join("-", ["a", "b"]))
+        assert_eq!(
+            result.variables.get("x"),
+            Some(&Value::FunctionCall {
+                name: "upper".to_string(),
+                args: vec![Value::FunctionCall {
+                    name: "join".to_string(),
+                    args: vec![
+                        Value::String("-".to_string()),
+                        Value::List(vec![
+                            Value::String("a".to_string()),
+                            Value::String("b".to_string()),
+                        ]),
+                    ],
+                }],
+            })
+        );
+    }
+
+    #[test]
+    fn function_call_with_no_args() {
+        let input = r#"
+            let x = foo()
+        "#;
+        let result = parse(input).unwrap();
+        assert_eq!(
+            result.variables.get("x"),
+            Some(&Value::FunctionCall {
+                name: "foo".to_string(),
+                args: vec![],
+            })
+        );
+    }
+
+    #[test]
+    fn join_resolved_during_resource_ref_resolution() {
+        let input = r#"
+            let bucket = aws.s3_bucket {
+                name = join("-", ["my", "bucket", "name"])
+            }
+        "#;
+        let mut result = parse(input).unwrap();
+        resolve_resource_refs(&mut result).unwrap();
+        assert_eq!(
+            result.resources[0].attributes.get("name"),
+            Some(&Value::String("my-bucket-name".to_string()))
+        );
+    }
+
+    #[test]
+    fn pipe_join_resolved_during_resource_ref_resolution() {
+        let input = r#"
+            let bucket = aws.s3_bucket {
+                name = ["my", "bucket"] |> join("-")
+            }
+        "#;
+        let mut result = parse(input).unwrap();
+        resolve_resource_refs(&mut result).unwrap();
+        assert_eq!(
+            result.resources[0].attributes.get("name"),
+            Some(&Value::String("my-bucket".to_string()))
         );
     }
 

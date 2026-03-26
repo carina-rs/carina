@@ -91,6 +91,7 @@ primary = {
   | resource_expr
   | import_expr          // Must come before variable_ref since "import" is an identifier
   | module_call          // Must come before variable_ref so "name { ... }" is parsed as module call
+  | function_call        // Must come before variable_ref so "func(...)" is parsed as function call
   | list
   | map
   | namespaced_id
