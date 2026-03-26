@@ -1,0 +1,18 @@
+provider awscc {
+  region = awscc.Region.ap_northeast_1
+}
+
+let cidrs = {
+  dev = "10.0.0.0/16"
+  stg = "10.1.0.0/16"
+}
+
+let vpcs = for name, cidr in cidrs {
+  awscc.ec2.vpc {
+    cidr_block = cidr
+    tags = {
+      Name = "for-map-test-${name}"
+      Environment = name
+    }
+  }
+}

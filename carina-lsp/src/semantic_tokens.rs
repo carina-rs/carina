@@ -259,6 +259,17 @@ impl SemanticTokensProvider {
                     let import_start = let_start + 4 + import_pos + 2; // position of "import"
                     tokens.push((import_start as u32, 6, 0)); // KEYWORD: import
                 }
+                // Check for "for" keyword after "let name = for ..."
+                if let Some(for_pos) = after_let.find("= for ") {
+                    let for_start = let_start + 4 + for_pos + 2; // position of "for"
+                    tokens.push((for_start as u32, 3, 0)); // KEYWORD: for
+                    // Check for "in" keyword on the same line
+                    let after_for = &line[for_start + 3..];
+                    if let Some(in_pos) = after_for.find(" in ") {
+                        let in_start = for_start + 3 + in_pos + 1;
+                        tokens.push((in_start as u32, 2, 0)); // KEYWORD: in
+                    }
+                }
             }
         } else if trimmed.starts_with("attributes ") || trimmed == "attributes{" {
             tokens.push((indent, 10, 0)); // KEYWORD: attributes
@@ -1061,6 +1072,37 @@ mod tests {
         assert!(
             !comment_tokens.is_empty(),
             "Should highlight nested block comment as COMMENT. Got: {:?}",
+            tokens
+        );
+    }
+
+    #[test]
+    fn test_for_in_keywords_highlighted() {
+        let provider = SemanticTokensProvider::new(&[]);
+        let tokens = provider.tokenize_line(r#"let subnets = for az in ["a", "b"] {"#, 0);
+        // "let" should be KEYWORD
+        let let_token = tokens
+            .iter()
+            .find(|(start, len, typ)| *start == 0 && *len == 3 && *typ == 0);
+        assert!(
+            let_token.is_some(),
+            "Expected KEYWORD token for 'let'. Got: {:?}",
+            tokens
+        );
+        // "for" should be KEYWORD (at position 14: "let subnets = for")
+        let for_token = tokens
+            .iter()
+            .find(|(start, len, typ)| *start == 14 && *len == 3 && *typ == 0);
+        assert!(
+            for_token.is_some(),
+            "Expected KEYWORD token for 'for'. Got: {:?}",
+            tokens
+        );
+        // "in" should be KEYWORD
+        let in_token = tokens.iter().find(|(_, len, typ)| *len == 2 && *typ == 0);
+        assert!(
+            in_token.is_some(),
+            "Expected KEYWORD token for 'in'. Got: {:?}",
             tokens
         );
     }
