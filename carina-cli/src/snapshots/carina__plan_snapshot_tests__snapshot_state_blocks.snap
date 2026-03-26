@@ -1,0 +1,12 @@
+---
+source: carina-cli/src/plan_snapshot_tests.rs
+expression: output
+---
+Execution Plan:
+
+  -> awscc.ec2.security_group renamed-sg (from: awscc.ec2.security_group.old-sg)
+  x awscc.ec2.subnet legacy-subnet (remove from state)
+  <- awscc.ec2.vpc imported-vpc (import: vpc-0abc123def456)
+      id: vpc-0abc123def456
+
+Plan: 1 to import, 0 to add, 0 to change, 0 to destroy, 1 to remove from state, 1 to move.

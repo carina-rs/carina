@@ -11,7 +11,7 @@ ws = @{ (" " | "\t")+ }
 newline = @{ NEWLINE }
 comment = @{ "#" ~ (!NEWLINE ~ ANY)* }
 
-statement = { backend_block | provider_block | arguments_block | attributes_block | let_binding | module_call | anonymous_resource }
+statement = { backend_block | provider_block | arguments_block | attributes_block | import_state_block | removed_block | moved_block | let_binding | module_call | anonymous_resource }
 
 // Backend block: backend s3 { ... }
 backend_block = {
@@ -70,6 +70,34 @@ type_list = { kw_list ~ trivia* ~ open_paren ~ trivia* ~ type_expr ~ trivia* ~ c
 type_map = { kw_map ~ trivia* ~ open_paren ~ trivia* ~ type_expr ~ trivia* ~ close_paren }
 
 type_ref = { namespaced_id }
+
+// State manipulation blocks
+
+// Resource address: provider.service.type "name"
+resource_address = { namespaced_id ~ trivia* ~ string }
+
+// Import state block: import { to = awscc.ec2.vpc "name", id = "vpc-xxx" }
+import_state_block = {
+    kw_import ~ trivia* ~ open_brace ~ import_state_content* ~ close_brace
+}
+import_state_content = _{ trivia | import_to_attr | import_id_attr }
+import_to_attr = { kw_to ~ trivia* ~ equals ~ trivia* ~ resource_address }
+import_id_attr = { kw_id ~ trivia* ~ equals ~ trivia* ~ string }
+
+// Removed block: removed { from = awscc.ec2.vpc "name" }
+removed_block = {
+    kw_removed ~ trivia* ~ open_brace ~ removed_content* ~ close_brace
+}
+removed_content = _{ trivia | removed_from_attr }
+removed_from_attr = { kw_from ~ trivia* ~ equals ~ trivia* ~ resource_address }
+
+// Moved block: moved { from = awscc.ec2.vpc "old", to = awscc.ec2.vpc "new" }
+moved_block = {
+    kw_moved ~ trivia* ~ open_brace ~ moved_content* ~ close_brace
+}
+moved_content = _{ trivia | moved_from_attr | moved_to_attr }
+moved_from_attr = { kw_from ~ trivia* ~ equals ~ trivia* ~ resource_address }
+moved_to_attr = { kw_to ~ trivia* ~ equals ~ trivia* ~ resource_address }
 
 // Variable/resource definition: let name = value
 let_binding = {
@@ -215,3 +243,8 @@ kw_map = { "map" }
 kw_for = { "for" }
 kw_in = { "in" }
 kw_read = { "read" }
+kw_removed = { "removed" }
+kw_moved = { "moved" }
+kw_to = { "to" }
+kw_from = { "from" }
+kw_id = { "id" }

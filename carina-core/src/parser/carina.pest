@@ -3,7 +3,7 @@
 // Entry point
 file = { SOI ~ statement* ~ EOI }
 
-statement = { backend_block | provider_block | arguments_block | attributes_block | let_binding | module_call | anonymous_resource }
+statement = { backend_block | provider_block | arguments_block | attributes_block | import_state_block | removed_block | moved_block | let_binding | module_call | anonymous_resource }
 
 // Arguments block: arguments { vpc_id: string, ... }
 arguments_block = {
@@ -40,6 +40,33 @@ import_expr = { "import" ~ string }
 backend_block = {
     "backend" ~ identifier ~ "{" ~ attribute* ~ "}"
 }
+
+// State manipulation blocks (import, removed, moved)
+
+// Resource address: provider.service.type "name"
+resource_address = { namespaced_id ~ string }
+
+// Import state block: import { to = awscc.ec2.vpc "name", id = "vpc-xxx" }
+import_state_block = {
+    "import" ~ "{" ~ import_state_attr* ~ "}"
+}
+import_state_attr = { import_to_attr | import_id_attr }
+import_to_attr = { "to" ~ "=" ~ resource_address }
+import_id_attr = { "id" ~ "=" ~ string }
+
+// Removed block: removed { from = awscc.ec2.vpc "name" }
+removed_block = {
+    "removed" ~ "{" ~ removed_attr* ~ "}"
+}
+removed_attr = { "from" ~ "=" ~ resource_address }
+
+// Moved block: moved { from = awscc.ec2.vpc "old", to = awscc.ec2.vpc "new" }
+moved_block = {
+    "moved" ~ "{" ~ moved_attr* ~ "}"
+}
+moved_attr = { moved_from_attr | moved_to_attr }
+moved_from_attr = { "from" ~ "=" ~ resource_address }
+moved_to_attr = { "to" ~ "=" ~ resource_address }
 
 // Module call: module_name { key = value, ... }
 module_call = {

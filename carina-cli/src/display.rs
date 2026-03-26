@@ -343,6 +343,9 @@ pub fn format_plan(
     if summary.read > 0 {
         parts.push(format!("{} to read", summary.read.to_string().cyan()));
     }
+    if summary.import > 0 {
+        parts.push(format!("{} to import", summary.import.to_string().cyan()));
+    }
     parts.push(format!("{} to add", summary.create.to_string().green()));
     parts.push(format!("{} to change", summary.update.to_string().yellow()));
     if summary.replace > 0 {
@@ -352,6 +355,15 @@ pub fn format_plan(
         ));
     }
     parts.push(format!("{} to destroy", summary.delete.to_string().red()));
+    if summary.remove > 0 {
+        parts.push(format!(
+            "{} to remove from state",
+            summary.remove.to_string().red()
+        ));
+    }
+    if summary.moved > 0 {
+        parts.push(format!("{} to move", summary.moved.to_string().yellow()));
+    }
     writeln!(out, "Plan: {}.", parts.join(", ")).unwrap();
     writeln!(out).unwrap();
 
@@ -449,6 +461,9 @@ fn format_plan_tree(
             }
             Effect::Delete { .. } => "-".red().bold(),
             Effect::Read { .. } => "<=".cyan().bold(),
+            Effect::Import { .. } => "<-".cyan().bold(),
+            Effect::Remove { .. } => "x".red().bold(),
+            Effect::Move { .. } => "->".yellow().bold(),
         };
 
         // Build the tree connector (shown before child resources)
@@ -598,6 +613,45 @@ fn format_plan_tree(
                     .unwrap();
                 }
             }
+            Effect::Import { id, identifier } => {
+                writeln!(
+                    out,
+                    "{}{}{} {} {} {}",
+                    base_indent,
+                    connector,
+                    colored_symbol,
+                    id.display_type().cyan().bold(),
+                    id.name.cyan().bold(),
+                    format!("(import: {})", identifier).dimmed()
+                )
+                .unwrap();
+            }
+            Effect::Remove { id } => {
+                writeln!(
+                    out,
+                    "{}{}{} {} {} {}",
+                    base_indent,
+                    connector,
+                    colored_symbol,
+                    id.display_type().cyan().bold(),
+                    id.name.red().bold(),
+                    "(remove from state)".dimmed()
+                )
+                .unwrap();
+            }
+            Effect::Move { from, to } => {
+                writeln!(
+                    out,
+                    "{}{}{} {} {} {}",
+                    base_indent,
+                    connector,
+                    colored_symbol,
+                    to.display_type().cyan().bold(),
+                    to.name.yellow().bold(),
+                    format!("(from: {})", from).dimmed()
+                )
+                .unwrap();
+            }
         }
 
         // --- Detail rows (attributes) ---
@@ -635,7 +689,10 @@ fn format_plan_tree(
                     Effect::Update { to, .. } => Some(to),
                     Effect::Replace { to, .. } => Some(to),
                     Effect::Read { resource } => Some(resource),
-                    Effect::Delete { .. } => None,
+                    Effect::Delete { .. }
+                    | Effect::Import { .. }
+                    | Effect::Remove { .. }
+                    | Effect::Move { .. } => None,
                 };
                 resource.and_then(|r| {
                     r.attributes.get("_binding").and_then(|v| match v {
@@ -1291,6 +1348,15 @@ pub fn format_effect(effect: &Effect) -> String {
         Effect::Read { resource } => {
             format!("Read {}", resource.id)
         }
+        Effect::Import { id, identifier } => {
+            format!("Import {} (id: {})", id, identifier)
+        }
+        Effect::Remove { id } => {
+            format!("Remove {} from state", id)
+        }
+        Effect::Move { from, to } => {
+            format!("Move {} -> {}", from, to)
+        }
     }
 }
 
@@ -1333,6 +1399,22 @@ fn build_dependency_graph(plan: &Plan) -> DependencyGraph {
                 }
                 effect_types.insert(idx, id.resource_type.clone());
                 effect_deps.insert(idx, deps);
+                continue;
+            }
+            Effect::Import { id, .. } | Effect::Remove { id, .. } => {
+                let fallback = id.to_string();
+                binding_to_effect.insert(fallback.clone(), idx);
+                effect_bindings.insert(idx, fallback);
+                effect_types.insert(idx, id.resource_type.clone());
+                effect_deps.insert(idx, HashSet::new());
+                continue;
+            }
+            Effect::Move { to, .. } => {
+                let fallback = to.to_string();
+                binding_to_effect.insert(fallback.clone(), idx);
+                effect_bindings.insert(idx, fallback);
+                effect_types.insert(idx, to.resource_type.clone());
+                effect_deps.insert(idx, HashSet::new());
                 continue;
             }
         };
@@ -1847,6 +1929,22 @@ mod tests {
                     }
                     effect_types.insert(idx, id.resource_type.clone());
                     effect_deps.insert(idx, deps);
+                    continue;
+                }
+                Effect::Import { id, .. } | Effect::Remove { id, .. } => {
+                    let fallback = id.to_string();
+                    binding_to_effect.insert(fallback.clone(), idx);
+                    effect_bindings.insert(idx, fallback);
+                    effect_types.insert(idx, id.resource_type.clone());
+                    effect_deps.insert(idx, HashSet::new());
+                    continue;
+                }
+                Effect::Move { to, .. } => {
+                    let fallback = to.to_string();
+                    binding_to_effect.insert(fallback.clone(), idx);
+                    effect_bindings.insert(idx, fallback);
+                    effect_types.insert(idx, to.resource_type.clone());
+                    effect_deps.insert(idx, HashSet::new());
                     continue;
                 }
             };

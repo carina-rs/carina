@@ -1,0 +1,22 @@
+# State block fixture: import, removed, moved
+
+provider awscc {
+  region = awscc.Region.ap_northeast_1
+}
+
+# Import an existing VPC into management
+import {
+  to = awscc.ec2.vpc "imported-vpc"
+  id = "vpc-0abc123def456"
+}
+
+# Remove a legacy subnet from state (managed elsewhere now)
+removed {
+  from = awscc.ec2.subnet "legacy-subnet"
+}
+
+# Rename a security group binding
+moved {
+  from = awscc.ec2.security_group "old-sg"
+  to   = awscc.ec2.security_group "renamed-sg"
+}

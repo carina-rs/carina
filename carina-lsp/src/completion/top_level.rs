@@ -97,6 +97,30 @@ impl CompletionProvider {
                 ..Default::default()
             },
             CompletionItem {
+                label: "import".to_string(),
+                kind: Some(CompletionItemKind::KEYWORD),
+                insert_text: Some("import {\n    to = ${1:awscc.ec2.vpc} \"${2:name}\"\n    id = \"${3:resource-id}\"\n}".to_string()),
+                insert_text_format: Some(InsertTextFormat::SNIPPET),
+                detail: Some("Import existing resource into state".to_string()),
+                ..Default::default()
+            },
+            CompletionItem {
+                label: "removed".to_string(),
+                kind: Some(CompletionItemKind::KEYWORD),
+                insert_text: Some("removed {\n    from = ${1:awscc.ec2.vpc} \"${2:name}\"\n}".to_string()),
+                insert_text_format: Some(InsertTextFormat::SNIPPET),
+                detail: Some("Remove resource from state without destroying".to_string()),
+                ..Default::default()
+            },
+            CompletionItem {
+                label: "moved".to_string(),
+                kind: Some(CompletionItemKind::KEYWORD),
+                insert_text: Some("moved {\n    from = ${1:awscc.ec2.vpc} \"${2:old-name}\"\n    to   = ${3:awscc.ec2.vpc} \"${4:new-name}\"\n}".to_string()),
+                insert_text_format: Some(InsertTextFormat::SNIPPET),
+                detail: Some("Move/rename resource in state".to_string()),
+                ..Default::default()
+            },
+            CompletionItem {
                 label: "backend".to_string(),
                 kind: Some(CompletionItemKind::KEYWORD),
                 insert_text: Some("backend s3 {\n    bucket = \"${1:my-carina-state}\"\n    key    = \"${2:prod/carina.crnstate}\"\n    region = aws.Region.${3:ap_northeast_1}\n}".to_string()),

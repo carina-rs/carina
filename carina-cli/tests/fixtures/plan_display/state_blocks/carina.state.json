@@ -1,0 +1,43 @@
+{
+  "version": 4,
+  "serial": 1,
+  "lineage": "test-state-blocks",
+  "carina_version": "0.1.0",
+  "resources": [
+    {
+      "resource_type": "ec2.subnet",
+      "name": "legacy-subnet",
+      "provider": "awscc",
+      "identifier": "subnet-0abc123",
+      "attributes": {
+        "subnet_id": "subnet-0abc123",
+        "vpc_id": "vpc-old123",
+        "cidr_block": "10.0.1.0/24"
+      },
+      "protected": false,
+      "lifecycle": { "force_delete": false, "create_before_destroy": false },
+      "prefixes": {},
+      "name_overrides": {},
+      "desired_keys": [],
+      "binding": "legacy_subnet",
+      "dependency_bindings": []
+    },
+    {
+      "resource_type": "ec2.security_group",
+      "name": "old-sg",
+      "provider": "awscc",
+      "identifier": "sg-0abc123",
+      "attributes": {
+        "group_id": "sg-0abc123",
+        "group_description": "Old security group"
+      },
+      "protected": false,
+      "lifecycle": { "force_delete": false, "create_before_destroy": false },
+      "prefixes": {},
+      "name_overrides": {},
+      "desired_keys": [],
+      "binding": "old_sg",
+      "dependency_bindings": []
+    }
+  ]
+}

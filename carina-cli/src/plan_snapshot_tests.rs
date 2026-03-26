@@ -177,6 +177,9 @@ fn build_plan_and_states_from_fixture(
         wiring.schemas(),
     );
 
+    // Add state block effects (import/removed/moved)
+    crate::wiring::add_state_block_effects(&mut plan, &parsed.state_blocks, &state_file);
+
     (plan, current_states, wiring.schemas().clone())
 }
 
@@ -363,6 +366,18 @@ fn snapshot_explicit() {
 #[test]
 fn snapshot_default_tags() {
     let (plan, schemas) = build_plan_from_fixture("default_tags");
+    let output = strip_ansi(&format_plan(
+        &plan,
+        DetailLevel::Full,
+        &HashMap::new(),
+        Some(&schemas),
+    ));
+    insta::assert_snapshot!(output);
+}
+
+#[test]
+fn snapshot_state_blocks() {
+    let (plan, schemas) = build_plan_from_fixture("state_blocks");
     let output = strip_ansi(&format_plan(
         &plan,
         DetailLevel::Full,

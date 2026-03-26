@@ -224,6 +224,15 @@ pub fn build_detail_rows(
         ),
         Effect::Delete { id, .. } => build_delete_rows(id, delete_attributes),
         Effect::Read { resource } => build_create_rows(resource, schemas, detail),
+        Effect::Import { identifier, .. } => {
+            vec![DetailRow::Attribute {
+                key: "id".to_string(),
+                value: identifier.clone(),
+                ref_binding: None,
+                annotation: None,
+            }]
+        }
+        Effect::Remove { .. } | Effect::Move { .. } => Vec::new(),
     }
 }
 

@@ -51,6 +51,7 @@ pub fn load_configuration(path: &PathBuf) -> Result<LoadedConfig, String> {
             arguments: vec![],
             attribute_params: vec![],
             backend: None,
+            state_blocks: vec![],
         };
         let mut merged = empty_parsed();
         let mut unresolved_merged = empty_parsed();

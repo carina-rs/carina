@@ -331,6 +331,7 @@ mod tests {
             arguments: Vec::new(),
             attribute_params: Vec::new(),
             backend: None,
+            state_blocks: Vec::new(),
         }
     }
 

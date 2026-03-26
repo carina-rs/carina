@@ -122,6 +122,30 @@ pub struct AttributeParameter {
     pub value: Option<Value>,
 }
 
+/// State manipulation block (import, removed, moved)
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum StateBlock {
+    /// Import existing infrastructure into Carina management
+    Import {
+        /// Target resource address
+        to: ResourceId,
+        /// Cloud provider identifier (e.g., "vpc-0abc123def456")
+        id: String,
+    },
+    /// Remove a resource from state without destroying it
+    Removed {
+        /// Resource address to remove from state
+        from: ResourceId,
+    },
+    /// Rename/move a resource in state without destroy/recreate
+    Moved {
+        /// Old resource address
+        from: ResourceId,
+        /// New resource address
+        to: ResourceId,
+    },
+}
+
 /// Import statement
 #[derive(Debug, Clone)]
 pub struct ImportStatement {
@@ -173,6 +197,8 @@ pub struct ParsedFile {
     pub attribute_params: Vec<AttributeParameter>,
     /// Backend configuration for state storage
     pub backend: Option<BackendConfig>,
+    /// State manipulation blocks (import, removed, moved)
+    pub state_blocks: Vec<StateBlock>,
 }
 
 impl ParsedFile {
@@ -264,6 +290,7 @@ pub fn parse(input: &str) -> Result<ParsedFile, ParseError> {
     let mut arguments = Vec::new();
     let mut attribute_params = Vec::new();
     let mut backend = None;
+    let mut state_blocks = Vec::new();
 
     for pair in pairs {
         if pair.as_rule() == Rule::file {
@@ -299,6 +326,15 @@ pub fn parse(input: &str) -> Result<ParsedFile, ParseError> {
                             Rule::attributes_block => {
                                 let parsed_attribute_params = parse_attributes_block(stmt, &ctx)?;
                                 attribute_params.extend(parsed_attribute_params);
+                            }
+                            Rule::import_state_block => {
+                                state_blocks.push(parse_import_state_block(stmt)?);
+                            }
+                            Rule::removed_block => {
+                                state_blocks.push(parse_removed_block(stmt)?);
+                            }
+                            Rule::moved_block => {
+                                state_blocks.push(parse_moved_block(stmt)?);
                             }
                             Rule::let_binding => {
                                 let (line, _) = stmt.as_span().start_pos().line_col();
@@ -378,6 +414,7 @@ pub fn parse(input: &str) -> Result<ParsedFile, ParseError> {
         arguments,
         attribute_params,
         backend,
+        state_blocks,
     })
 }
 
@@ -895,6 +932,135 @@ fn parse_provider_block(
         attributes,
         default_tags,
     })
+}
+
+/// Split a namespaced identifier (e.g., "awscc.ec2.vpc") into (provider, resource_type)
+fn split_namespaced_id(namespaced: &str) -> (String, String) {
+    let parts: Vec<&str> = namespaced.split('.').collect();
+    if parts.len() >= 2 {
+        (parts[0].to_string(), parts[1..].join("."))
+    } else {
+        (String::new(), namespaced.to_string())
+    }
+}
+
+/// Parse a resource address: `provider.service.type "name"`
+fn parse_resource_address(pair: pest::iterators::Pair<Rule>) -> Result<ResourceId, ParseError> {
+    let mut inner = pair.into_inner();
+    let namespaced = next_pair(&mut inner, "namespaced id", "resource address")?
+        .as_str()
+        .to_string();
+    let name_pair = next_pair(&mut inner, "resource name", "resource address")?;
+    // The name is a string literal - extract value from quotes
+    let name = parse_string_literal(name_pair)?;
+
+    // Split namespaced id into provider and resource_type
+    let (provider, resource_type) = split_namespaced_id(&namespaced);
+
+    Ok(ResourceId::with_provider(provider, resource_type, name))
+}
+
+/// Parse a string token into its literal value (without quotes).
+/// Only handles plain strings (no interpolation).
+fn parse_string_literal(pair: pest::iterators::Pair<Rule>) -> Result<String, ParseError> {
+    let mut result = String::new();
+    for part in pair.into_inner() {
+        if part.as_rule() == Rule::string_part {
+            for inner in part.into_inner() {
+                if inner.as_rule() == Rule::string_literal {
+                    result.push_str(inner.as_str());
+                }
+            }
+        }
+    }
+    Ok(result)
+}
+
+/// Parse an import state block
+fn parse_import_state_block(pair: pest::iterators::Pair<Rule>) -> Result<StateBlock, ParseError> {
+    let mut to: Option<ResourceId> = None;
+    let mut id: Option<String> = None;
+
+    for attr in pair.into_inner() {
+        if attr.as_rule() == Rule::import_state_attr {
+            let inner = first_inner(attr, "import attribute", "import block")?;
+            match inner.as_rule() {
+                Rule::import_to_attr => {
+                    let addr = first_inner(inner, "resource address", "import to")?;
+                    to = Some(parse_resource_address(addr)?);
+                }
+                Rule::import_id_attr => {
+                    let str_pair = first_inner(inner, "string", "import id")?;
+                    id = Some(parse_string_literal(str_pair)?);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let to = to.ok_or_else(|| ParseError::InvalidExpression {
+        line: 0,
+        message: "import block requires 'to' attribute".to_string(),
+    })?;
+    let id = id.ok_or_else(|| ParseError::InvalidExpression {
+        line: 0,
+        message: "import block requires 'id' attribute".to_string(),
+    })?;
+
+    Ok(StateBlock::Import { to, id })
+}
+
+/// Parse a removed block
+fn parse_removed_block(pair: pest::iterators::Pair<Rule>) -> Result<StateBlock, ParseError> {
+    let mut from: Option<ResourceId> = None;
+
+    for attr in pair.into_inner() {
+        if attr.as_rule() == Rule::removed_attr {
+            let addr = first_inner(attr, "resource address", "removed from")?;
+            from = Some(parse_resource_address(addr)?);
+        }
+    }
+
+    let from = from.ok_or_else(|| ParseError::InvalidExpression {
+        line: 0,
+        message: "removed block requires 'from' attribute".to_string(),
+    })?;
+
+    Ok(StateBlock::Removed { from })
+}
+
+/// Parse a moved block
+fn parse_moved_block(pair: pest::iterators::Pair<Rule>) -> Result<StateBlock, ParseError> {
+    let mut from: Option<ResourceId> = None;
+    let mut to: Option<ResourceId> = None;
+
+    for attr in pair.into_inner() {
+        if attr.as_rule() == Rule::moved_attr {
+            let inner = first_inner(attr, "moved attribute", "moved block")?;
+            match inner.as_rule() {
+                Rule::moved_from_attr => {
+                    let addr = first_inner(inner, "resource address", "moved from")?;
+                    from = Some(parse_resource_address(addr)?);
+                }
+                Rule::moved_to_attr => {
+                    let addr = first_inner(inner, "resource address", "moved to")?;
+                    to = Some(parse_resource_address(addr)?);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let from = from.ok_or_else(|| ParseError::InvalidExpression {
+        line: 0,
+        message: "moved block requires 'from' attribute".to_string(),
+    })?;
+    let to = to.ok_or_else(|| ParseError::InvalidExpression {
+        line: 0,
+        message: "moved block requires 'to' attribute".to_string(),
+    })?;
+
+    Ok(StateBlock::Moved { from, to })
 }
 
 fn parse_backend_block(
@@ -4367,6 +4533,72 @@ aws.s3.bucket {
                 assert_eq!(field_path, &vec!["id".to_string()]);
             }
             other => panic!("Expected ResourceRef with field_path, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_import_block() {
+        let input = r#"
+            import {
+                to = awscc.ec2.vpc "main-vpc"
+                id = "vpc-0abc123def456"
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+        assert_eq!(result.state_blocks.len(), 1);
+        match &result.state_blocks[0] {
+            StateBlock::Import { to, id } => {
+                assert_eq!(to.provider, "awscc");
+                assert_eq!(to.resource_type, "ec2.vpc");
+                assert_eq!(to.name, "main-vpc");
+                assert_eq!(id, "vpc-0abc123def456");
+            }
+            other => panic!("Expected Import, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_removed_block() {
+        let input = r#"
+            removed {
+                from = awscc.ec2.vpc "legacy-vpc"
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+        assert_eq!(result.state_blocks.len(), 1);
+        match &result.state_blocks[0] {
+            StateBlock::Removed { from } => {
+                assert_eq!(from.provider, "awscc");
+                assert_eq!(from.resource_type, "ec2.vpc");
+                assert_eq!(from.name, "legacy-vpc");
+            }
+            other => panic!("Expected Removed, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_moved_block() {
+        let input = r#"
+            moved {
+                from = awscc.ec2.subnet "old-name"
+                to   = awscc.ec2.subnet "new-name"
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+        assert_eq!(result.state_blocks.len(), 1);
+        match &result.state_blocks[0] {
+            StateBlock::Moved { from, to } => {
+                assert_eq!(from.provider, "awscc");
+                assert_eq!(from.resource_type, "ec2.subnet");
+                assert_eq!(from.name, "old-name");
+                assert_eq!(to.provider, "awscc");
+                assert_eq!(to.resource_type, "ec2.subnet");
+                assert_eq!(to.name, "new-name");
+            }
+            other => panic!("Expected Moved, got {:?}", other),
         }
     }
 }

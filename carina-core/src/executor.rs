@@ -789,6 +789,10 @@ async fn execute_effects_sequential(
                         .await
                     }
                     Effect::Read { .. } => SingleEffectResult::ReadNoOp,
+                    // State operations are handled separately during apply
+                    Effect::Import { .. } | Effect::Remove { .. } | Effect::Move { .. } => {
+                        SingleEffectResult::ReadNoOp
+                    }
                 };
                 (idx, result)
             });

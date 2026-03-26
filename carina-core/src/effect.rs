@@ -92,6 +92,28 @@ pub enum Effect {
         #[serde(default)]
         dependencies: HashSet<String>,
     },
+
+    /// Import an existing resource into state (via provider read)
+    Import {
+        /// Target resource address
+        id: ResourceId,
+        /// Cloud provider identifier (e.g., "vpc-0abc123def456")
+        identifier: String,
+    },
+
+    /// Remove a resource from state without destroying it
+    Remove {
+        /// Resource address to remove from state
+        id: ResourceId,
+    },
+
+    /// Move/rename a resource in state without destroy/recreate
+    Move {
+        /// Old resource address
+        from: ResourceId,
+        /// New resource address
+        to: ResourceId,
+    },
 }
 
 impl Effect {
@@ -103,12 +125,23 @@ impl Effect {
             Effect::Update { .. } => "update",
             Effect::Replace { .. } => "replace",
             Effect::Delete { .. } => "delete",
+            Effect::Import { .. } => "import",
+            Effect::Remove { .. } => "remove",
+            Effect::Move { .. } => "move",
         }
     }
 
     /// Returns whether this Effect causes a mutation
     pub fn is_mutating(&self) -> bool {
         !matches!(self, Effect::Read { .. })
+    }
+
+    /// Returns whether this is a state-only operation (import/remove/move)
+    pub fn is_state_operation(&self) -> bool {
+        matches!(
+            self,
+            Effect::Import { .. } | Effect::Remove { .. } | Effect::Move { .. }
+        )
     }
 
     /// Returns the resource ID for this effect
@@ -119,18 +152,24 @@ impl Effect {
             Effect::Update { id, .. } => id,
             Effect::Replace { id, .. } => id,
             Effect::Delete { id, .. } => id,
+            Effect::Import { id, .. } => id,
+            Effect::Remove { id, .. } => id,
+            Effect::Move { to, .. } => to,
         }
     }
 
     /// Returns a reference to the resource for this effect, if it has one.
-    /// Delete effects have no resource.
+    /// Delete, Import, Remove, and Move effects have no resource.
     pub fn resource(&self) -> Option<&Resource> {
         match self {
             Effect::Create(resource) => Some(resource),
             Effect::Update { to, .. } => Some(to),
             Effect::Replace { to, .. } => Some(to),
             Effect::Read { resource } => Some(resource),
-            Effect::Delete { .. } => None,
+            Effect::Delete { .. }
+            | Effect::Import { .. }
+            | Effect::Remove { .. }
+            | Effect::Move { .. } => None,
         }
     }
 
