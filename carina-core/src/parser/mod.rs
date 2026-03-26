@@ -4138,6 +4138,62 @@ aws.s3.bucket {
             assert_eq!(call.module_name, "web");
             assert!(call.arguments.contains_key("vpc_cidr"));
         }
+
+        // Verify the argument values are the substituted loop values
+        let prod_call = result
+            .module_calls
+            .iter()
+            .find(|c| c.binding_name.as_deref() == Some(r#"webs["prod"]"#))
+            .unwrap();
+        assert_eq!(
+            prod_call.arguments.get("vpc_cidr"),
+            Some(&Value::String("10.0.0.0/16".to_string()))
+        );
+
+        let staging_call = result
+            .module_calls
+            .iter()
+            .find(|c| c.binding_name.as_deref() == Some(r#"webs["staging"]"#))
+            .unwrap();
+        assert_eq!(
+            staging_call.arguments.get("vpc_cidr"),
+            Some(&Value::String("10.1.0.0/16".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_for_expression_with_module_call_over_list() {
+        let input = r#"
+            let web = import "modules/web"
+
+            let webs = for cidr in ["10.0.0.0/16", "10.1.0.0/16"] {
+                web { vpc_cidr = cidr }
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+
+        // for expression with module call over list
+        assert_eq!(result.module_calls.len(), 2);
+        assert_eq!(result.resources.len(), 0);
+
+        assert_eq!(
+            result.module_calls[0].binding_name.as_deref(),
+            Some("webs[0]")
+        );
+        assert_eq!(
+            result.module_calls[1].binding_name.as_deref(),
+            Some("webs[1]")
+        );
+
+        assert_eq!(
+            result.module_calls[0].arguments.get("vpc_cidr"),
+            Some(&Value::String("10.0.0.0/16".to_string()))
+        );
+        assert_eq!(
+            result.module_calls[1].arguments.get("vpc_cidr"),
+            Some(&Value::String("10.1.0.0/16".to_string()))
+        );
     }
 
     #[test]
