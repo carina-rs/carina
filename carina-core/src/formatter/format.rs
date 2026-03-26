@@ -776,6 +776,10 @@ impl Formatter {
             groups.push(current_group);
         }
 
+        // Post-process groups: split around attributes with map values so they
+        // get their own group (with blank lines before/after).
+        let groups = self.split_groups_around_map_attributes(groups);
+
         // Format each group with its own alignment
         let mut global_attr_index = 0;
         for (group_index, group) in groups.iter().enumerate() {
@@ -833,6 +837,56 @@ impl Formatter {
             }
         }
         None
+    }
+
+    /// Check if an attribute has a multi-line map value (block form `{ ... }`)
+    fn attribute_has_map_value(&self, node: &CstNode) -> bool {
+        if node.kind != NodeKind::Attribute {
+            return false;
+        }
+        if let Some(value_node) = self.get_value_after_equals(node) {
+            // The value may be directly a Map, or wrapped in a PipeExpr
+            if value_node.kind == NodeKind::Map {
+                return true;
+            }
+            if value_node.kind == NodeKind::PipeExpr {
+                // Check if the first child node is a Map
+                for child in &value_node.children {
+                    if let CstChild::Node(n) = child {
+                        return n.kind == NodeKind::Map;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// Split groups so that attributes with map values are isolated into their own groups.
+    /// This ensures blank lines are inserted before and after map block attributes.
+    fn split_groups_around_map_attributes<'a>(
+        &self,
+        groups: Vec<Vec<&'a CstNode>>,
+    ) -> Vec<Vec<&'a CstNode>> {
+        let mut result: Vec<Vec<&'a CstNode>> = Vec::new();
+        for group in groups {
+            let mut current: Vec<&'a CstNode> = Vec::new();
+            for attr in group {
+                if self.attribute_has_map_value(attr) {
+                    // Push any accumulated non-map attributes as their own group
+                    if !current.is_empty() {
+                        result.push(std::mem::take(&mut current));
+                    }
+                    // Map attribute gets its own group
+                    result.push(vec![attr]);
+                } else {
+                    current.push(attr);
+                }
+            }
+            if !current.is_empty() {
+                result.push(current);
+            }
+        }
+        result
     }
 
     /// Get the first child node after `=` in any node (Attribute, MapEntry, etc.)
@@ -1969,6 +2023,132 @@ mod tests {
             result.contains("concat(a, b)"),
             "Expected function call in:\n{}",
             result
+        );
+    }
+
+    #[test]
+    fn issue_1177_blank_lines_around_map_attributes() {
+        // Map block attributes should have blank lines before and after,
+        // and alignment should reset at blank line boundaries.
+        let input = r#"awscc.ec2.vpc {
+  cidr_block = "10.0.0.0/16"
+  tags = {
+    Name        = "test"
+    Environment = "dev"
+  }
+}
+"#;
+        let config = FormatConfig {
+            align_attributes: true,
+            ..Default::default()
+        };
+        let result = format(input, &config).unwrap();
+
+        let expected = r#"awscc.ec2.vpc {
+  cidr_block = "10.0.0.0/16"
+
+  tags = {
+    Name        = "test"
+    Environment = "dev"
+  }
+}
+"#;
+        assert_eq!(result, expected, "Expected blank line before map attribute");
+    }
+
+    #[test]
+    fn issue_1177_blank_lines_around_map_alignment_reset() {
+        // Alignment should reset across blank line boundaries,
+        // so `tags` should NOT be padded to match `cidr_block`.
+        let input = r#"awscc.ec2.vpc {
+  cidr_block = "10.0.0.0/16"
+  tags       = {
+    Name = "test"
+  }
+  enable_dns = true
+}
+"#;
+        let config = FormatConfig {
+            align_attributes: true,
+            ..Default::default()
+        };
+        let result = format(input, &config).unwrap();
+
+        // tags should be in its own group (no padding)
+        // enable_dns should be in its own group (no padding)
+        let expected = r#"awscc.ec2.vpc {
+  cidr_block = "10.0.0.0/16"
+
+  tags = {
+    Name = "test"
+  }
+
+  enable_dns = true
+}
+"#;
+        assert_eq!(
+            result, expected,
+            "Alignment should reset at blank line boundaries"
+        );
+    }
+
+    #[test]
+    fn issue_1177_map_first_attribute_no_leading_blank_line() {
+        // If map attribute is the first attribute, no leading blank line
+        let input = r#"awscc.ec2.vpc {
+  tags = {
+    Name = "test"
+  }
+  cidr_block = "10.0.0.0/16"
+}
+"#;
+        let config = FormatConfig {
+            align_attributes: true,
+            ..Default::default()
+        };
+        let result = format(input, &config).unwrap();
+
+        let expected = r#"awscc.ec2.vpc {
+  tags = {
+    Name = "test"
+  }
+
+  cidr_block = "10.0.0.0/16"
+}
+"#;
+        assert_eq!(
+            result, expected,
+            "No leading blank line when map is first attribute"
+        );
+    }
+
+    #[test]
+    fn issue_1177_map_last_attribute_no_trailing_blank_line() {
+        // If map attribute is the last attribute, no trailing blank line
+        let input = r#"awscc.ec2.vpc {
+  cidr_block = "10.0.0.0/16"
+  tags = {
+    Name = "test"
+  }
+}
+"#;
+        let config = FormatConfig {
+            align_attributes: true,
+            ..Default::default()
+        };
+        let result = format(input, &config).unwrap();
+
+        let expected = r#"awscc.ec2.vpc {
+  cidr_block = "10.0.0.0/16"
+
+  tags = {
+    Name = "test"
+  }
+}
+"#;
+        assert_eq!(
+            result, expected,
+            "No trailing blank line when map is last attribute"
         );
     }
 }
