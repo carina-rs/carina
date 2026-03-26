@@ -8,6 +8,7 @@ use std::future::Future;
 use std::pin::Pin;
 
 use crate::resource::{LifecycleConfig, Resource, ResourceId, State, Value};
+use crate::schema::ResourceSchema;
 
 /// Error type for Provider operations
 #[derive(Debug)]
@@ -160,6 +161,24 @@ pub trait ProviderNormalizer: Send + Sync {
         _saved_attrs: &SavedAttrs,
     ) {
     }
+
+    /// Merge default tags from provider configuration into resources that support tags.
+    ///
+    /// For each resource whose schema includes a `tags` attribute:
+    /// - If the resource has no `tags`, set it to `default_tags`
+    /// - If the resource has `tags`, merge default_tags (resource-level tags win on conflict)
+    ///
+    /// Records which tag keys came from defaults in the `_default_tag_keys` internal
+    /// metadata attribute.
+    ///
+    /// Default implementation is a no-op for providers without tag support.
+    fn merge_default_tags(
+        &self,
+        _resources: &mut [Resource],
+        _default_tags: &HashMap<String, Value>,
+        _schemas: &HashMap<String, ResourceSchema>,
+    ) {
+    }
 }
 
 /// A provider that routes operations to the correct sub-provider
@@ -272,6 +291,17 @@ impl ProviderNormalizer for ProviderRouter {
     ) {
         for ext in &self.normalizers {
             ext.hydrate_read_state(current_states, saved_attrs);
+        }
+    }
+
+    fn merge_default_tags(
+        &self,
+        resources: &mut [Resource],
+        default_tags: &HashMap<String, Value>,
+        schemas: &HashMap<String, ResourceSchema>,
+    ) {
+        for ext in &self.normalizers {
+            ext.merge_default_tags(resources, default_tags, schemas);
         }
     }
 }

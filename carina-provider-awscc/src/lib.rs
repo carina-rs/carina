@@ -21,6 +21,7 @@ use carina_core::provider::{
     BoxFuture, Provider, ProviderFactory, ProviderNormalizer, ProviderResult, SavedAttrs,
 };
 use carina_core::resource::{LifecycleConfig, Resource, ResourceId, State, Value};
+use carina_core::schema::ResourceSchema;
 
 /// Schema extension for the AWSCC provider.
 ///
@@ -43,6 +44,67 @@ impl ProviderNormalizer for AwsccNormalizer {
         saved_attrs: &SavedAttrs,
     ) {
         crate::provider::restore_unreturned_attrs_impl(current_states, saved_attrs);
+    }
+
+    fn merge_default_tags(
+        &self,
+        resources: &mut [Resource],
+        default_tags: &HashMap<String, Value>,
+        schemas: &HashMap<String, ResourceSchema>,
+    ) {
+        if default_tags.is_empty() {
+            return;
+        }
+
+        for resource in resources.iter_mut() {
+            if resource.id.provider != "awscc" {
+                continue;
+            }
+
+            // Check if the resource schema has a `tags` attribute
+            let schema_key = format!("awscc.{}", resource.id.resource_type);
+            let has_tags = schemas
+                .get(&schema_key)
+                .is_some_and(|s| s.attributes.contains_key("tags"));
+
+            if !has_tags {
+                continue;
+            }
+
+            // Merge default_tags into the resource's tags
+            let mut default_tag_keys: Vec<String> = Vec::new();
+            match resource.attributes.get_mut("tags") {
+                Some(Value::Map(existing_tags)) => {
+                    // Resource-level tags take precedence: only insert defaults for missing keys
+                    for (key, value) in default_tags {
+                        if !existing_tags.contains_key(key) {
+                            existing_tags.insert(key.clone(), value.clone());
+                            default_tag_keys.push(key.clone());
+                        }
+                    }
+                }
+                None => {
+                    // No tags on the resource: use default_tags as-is
+                    default_tag_keys = default_tags.keys().cloned().collect();
+                    resource
+                        .attributes
+                        .insert("tags".to_string(), Value::Map(default_tags.clone()));
+                }
+                _ => {
+                    // tags is some other value type (unexpected), skip
+                    continue;
+                }
+            }
+
+            // Store which tag keys came from default_tags as internal metadata
+            if !default_tag_keys.is_empty() {
+                default_tag_keys.sort();
+                resource.attributes.insert(
+                    "_default_tag_keys".to_string(),
+                    Value::List(default_tag_keys.into_iter().map(Value::String).collect()),
+                );
+            }
+        }
     }
 }
 
@@ -169,5 +231,174 @@ impl Provider for AwsccProvider {
         let identifier = identifier.to_string();
         let lifecycle = lifecycle.clone();
         Box::pin(async move { self.delete_resource(&id, &identifier, &lifecycle).await })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn build_schemas() -> HashMap<String, ResourceSchema> {
+        let factory = AwsccProviderFactory;
+        let mut schemas = HashMap::new();
+        for schema in factory.schemas() {
+            schemas.insert(schema.resource_type.clone(), schema);
+        }
+        schemas
+    }
+
+    #[test]
+    fn test_merge_default_tags_resource_tags_win() {
+        let schemas = build_schemas();
+        let normalizer = AwsccNormalizer;
+
+        let mut resource = Resource::with_provider("awscc", "ec2.vpc", "test-vpc");
+        resource.attributes.insert(
+            "cidr_block".to_string(),
+            Value::String("10.0.0.0/16".to_string()),
+        );
+        let mut resource_tags = HashMap::new();
+        resource_tags.insert("Name".to_string(), Value::String("my-vpc".to_string()));
+        resource_tags.insert(
+            "Environment".to_string(),
+            Value::String("staging".to_string()),
+        );
+        resource
+            .attributes
+            .insert("tags".to_string(), Value::Map(resource_tags));
+
+        let mut default_tags = HashMap::new();
+        default_tags.insert(
+            "Environment".to_string(),
+            Value::String("production".to_string()),
+        );
+        default_tags.insert("Team".to_string(), Value::String("platform".to_string()));
+
+        let mut resources = vec![resource];
+        normalizer.merge_default_tags(&mut resources, &default_tags, &schemas);
+
+        if let Some(Value::Map(tags)) = resources[0].attributes.get("tags") {
+            assert_eq!(
+                tags.get("Environment"),
+                Some(&Value::String("staging".to_string()))
+            );
+            assert_eq!(tags.get("Name"), Some(&Value::String("my-vpc".to_string())));
+            assert_eq!(
+                tags.get("Team"),
+                Some(&Value::String("platform".to_string()))
+            );
+        } else {
+            panic!("Expected tags to be a Map");
+        }
+
+        if let Some(Value::List(keys)) = resources[0].attributes.get("_default_tag_keys") {
+            let key_strs: Vec<&str> = keys
+                .iter()
+                .filter_map(|v| match v {
+                    Value::String(s) => Some(s.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(key_strs, vec!["Team"]);
+        } else {
+            panic!("Expected _default_tag_keys to be set");
+        }
+    }
+
+    #[test]
+    fn test_merge_default_tags_no_explicit_tags() {
+        let schemas = build_schemas();
+        let normalizer = AwsccNormalizer;
+
+        let mut resource = Resource::with_provider("awscc", "ec2.vpc", "test-vpc");
+        resource.attributes.insert(
+            "cidr_block".to_string(),
+            Value::String("10.0.0.0/16".to_string()),
+        );
+
+        let mut default_tags = HashMap::new();
+        default_tags.insert(
+            "Environment".to_string(),
+            Value::String("production".to_string()),
+        );
+
+        let mut resources = vec![resource];
+        normalizer.merge_default_tags(&mut resources, &default_tags, &schemas);
+
+        if let Some(Value::Map(tags)) = resources[0].attributes.get("tags") {
+            assert_eq!(
+                tags.get("Environment"),
+                Some(&Value::String("production".to_string()))
+            );
+        } else {
+            panic!("Expected tags to be set from default_tags");
+        }
+
+        if let Some(Value::List(keys)) = resources[0].attributes.get("_default_tag_keys") {
+            let key_strs: Vec<&str> = keys
+                .iter()
+                .filter_map(|v| match v {
+                    Value::String(s) => Some(s.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(key_strs, vec!["Environment"]);
+        } else {
+            panic!("Expected _default_tag_keys to be set");
+        }
+    }
+
+    #[test]
+    fn test_merge_default_tags_skips_no_tag_schema() {
+        let schemas = build_schemas();
+        let normalizer = AwsccNormalizer;
+
+        let mut resource = Resource::with_provider("awscc", "ec2.route", "test-route");
+        resource.attributes.insert(
+            "route_table_id".to_string(),
+            Value::String("rtb-123".to_string()),
+        );
+
+        let mut default_tags = HashMap::new();
+        default_tags.insert(
+            "Environment".to_string(),
+            Value::String("production".to_string()),
+        );
+
+        let mut resources = vec![resource];
+        normalizer.merge_default_tags(&mut resources, &default_tags, &schemas);
+
+        assert!(!resources[0].attributes.contains_key("tags"));
+        assert!(!resources[0].attributes.contains_key("_default_tag_keys"));
+    }
+
+    #[test]
+    fn test_merge_default_tags_no_default_tags() {
+        let schemas = build_schemas();
+        let normalizer = AwsccNormalizer;
+
+        let mut resource = Resource::with_provider("awscc", "ec2.vpc", "test-vpc");
+        resource.attributes.insert(
+            "cidr_block".to_string(),
+            Value::String("10.0.0.0/16".to_string()),
+        );
+        let mut resource_tags = HashMap::new();
+        resource_tags.insert("Name".to_string(), Value::String("my-vpc".to_string()));
+        resource
+            .attributes
+            .insert("tags".to_string(), Value::Map(resource_tags));
+
+        let default_tags = HashMap::new();
+
+        let mut resources = vec![resource];
+        normalizer.merge_default_tags(&mut resources, &default_tags, &schemas);
+
+        if let Some(Value::Map(tags)) = resources[0].attributes.get("tags") {
+            assert_eq!(tags.len(), 1);
+            assert_eq!(tags.get("Name"), Some(&Value::String("my-vpc".to_string())));
+        } else {
+            panic!("Expected tags to be unchanged");
+        }
+        assert!(!resources[0].attributes.contains_key("_default_tag_keys"));
     }
 }
