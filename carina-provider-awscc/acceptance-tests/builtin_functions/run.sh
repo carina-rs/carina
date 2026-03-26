@@ -94,6 +94,35 @@ if [ -z "$FILTER" ] || echo "join" | grep -q "$FILTER"; then
     ACTIVE_WORK_DIR=""
 fi
 
+# ─── Test: trim() ───
+if [ -z "$FILTER" ] || echo "trim" | grep -q "$FILTER"; then
+    echo ""
+    echo "Test: trim() function"
+    echo ""
+
+    WORK_DIR=$(mktemp -d)
+    ACTIVE_WORK_DIR="$WORK_DIR"
+    cp "$SCRIPT_DIR/trim.crn" "$WORK_DIR/main.crn"
+
+    cd "$WORK_DIR"
+
+    run_step "step1: apply" "$CARINA_BIN" apply --auto-approve .
+    run_step "step2: plan-verify" "$CARINA_BIN" plan .
+
+    # Verify the trim() result in state
+    assert_state_value \
+        "assert: tag Name = 'trim-test-vpc'" \
+        '.resources[0].attributes.tags.Name' \
+        'trim-test-vpc' \
+        "$WORK_DIR"
+
+    # Cleanup
+    echo "  Cleanup: destroying resources..."
+    "$CARINA_BIN" destroy --auto-approve . > /dev/null 2>&1 || true
+    rm -rf "$WORK_DIR"
+    ACTIVE_WORK_DIR=""
+fi
+
 echo ""
 echo "════════════════════════════════════════"
 echo "Total: $TOTAL_PASSED passed, $TOTAL_FAILED failed"
