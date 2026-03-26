@@ -194,8 +194,11 @@ impl AttributeType {
     /// Check if a value conforms to this type
     pub fn validate(&self, value: &Value) -> Result<(), TypeError> {
         match (self, value) {
-            // ResourceRef values resolve to strings at runtime, so they're valid for String types
-            (AttributeType::String, Value::String(_) | Value::ResourceRef { .. }) => Ok(()),
+            // ResourceRef and Interpolation values resolve to strings at runtime, so they're valid for String types
+            (
+                AttributeType::String,
+                Value::String(_) | Value::ResourceRef { .. } | Value::Interpolation(_),
+            ) => Ok(()),
             (AttributeType::Int, Value::Int(_)) => Ok(()),
             (AttributeType::Float, Value::Float(f)) if f.is_finite() => Ok(()),
             (AttributeType::Float, Value::Float(f)) => Err(TypeError::ValidationFailed {
@@ -213,6 +216,10 @@ impl AttributeType {
                 },
                 v,
             ) => {
+                // Interpolation values resolve to strings at runtime, so accept them
+                if matches!(v, Value::Interpolation(_)) {
+                    return Ok(());
+                }
                 let resolved_value = Self::resolve_enum_input(name, namespace.as_deref(), v)?;
                 if matches!(resolved_value, Value::ResourceRef { .. }) {
                     return Ok(());
@@ -278,8 +285,9 @@ impl AttributeType {
                 },
                 v,
             ) => {
-                // ResourceRef values resolve to strings at runtime, so they're valid for Custom types
-                if matches!(v, Value::ResourceRef { .. }) {
+                // ResourceRef and Interpolation values resolve to strings at runtime,
+                // so they're valid for Custom types
+                if matches!(v, Value::ResourceRef { .. } | Value::Interpolation(_)) {
                     return Ok(());
                 }
                 let resolved_value = Self::resolve_enum_input(name, namespace.as_deref(), v)?;
