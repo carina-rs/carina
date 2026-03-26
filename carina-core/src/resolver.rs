@@ -129,6 +129,36 @@ pub fn resolve_ref_value(
                 Value::Interpolation(resolved_parts)
             }
         }
+        Value::FunctionCall { name, args } => {
+            // First, resolve all arguments
+            let resolved_args: Vec<Value> = args
+                .iter()
+                .map(|a| resolve_ref_value(a, binding_map))
+                .collect();
+
+            // Check if all args are fully resolved (no remaining refs)
+            let all_resolved = resolved_args.iter().all(|a| !contains_resource_ref(a));
+
+            if all_resolved {
+                // Evaluate the built-in function
+                match crate::builtins::evaluate_builtin(name, &resolved_args) {
+                    Ok(result) => result,
+                    Err(_) => {
+                        // If evaluation fails, keep as FunctionCall
+                        Value::FunctionCall {
+                            name: name.clone(),
+                            args: resolved_args,
+                        }
+                    }
+                }
+            } else {
+                // Keep as FunctionCall with partially resolved args
+                Value::FunctionCall {
+                    name: name.clone(),
+                    args: resolved_args,
+                }
+            }
+        }
         _ => value.clone(),
     }
 }
@@ -143,6 +173,7 @@ fn contains_resource_ref(value: &Value) -> bool {
             InterpolationPart::Expr(v) => contains_resource_ref(v),
             _ => false,
         }),
+        Value::FunctionCall { args, .. } => args.iter().any(contains_resource_ref),
         _ => false,
     }
 }
@@ -354,5 +385,72 @@ mod tests {
             resources[1].attributes.get("vpc_id"),
             Some(&Value::String("vpc-abc".to_string()))
         );
+    }
+
+    #[test]
+    fn test_resolve_function_call_join() {
+        let binding_map: HashMap<String, HashMap<String, Value>> = HashMap::new();
+
+        let func = Value::FunctionCall {
+            name: "join".to_string(),
+            args: vec![
+                Value::String("-".to_string()),
+                Value::List(vec![
+                    Value::String("a".to_string()),
+                    Value::String("b".to_string()),
+                    Value::String("c".to_string()),
+                ]),
+            ],
+        };
+
+        let resolved = resolve_ref_value(&func, &binding_map);
+        assert_eq!(resolved, Value::String("a-b-c".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_function_call_with_resource_ref() {
+        let mut binding_map: HashMap<String, HashMap<String, Value>> = HashMap::new();
+        binding_map.insert(
+            "vpc".to_string(),
+            HashMap::from([("id".to_string(), Value::String("vpc-123".to_string()))]),
+        );
+
+        // join("-", ["prefix", vpc.id]) should resolve vpc.id first, then evaluate
+        let func = Value::FunctionCall {
+            name: "join".to_string(),
+            args: vec![
+                Value::String("-".to_string()),
+                Value::List(vec![
+                    Value::String("prefix".to_string()),
+                    Value::ResourceRef {
+                        binding_name: "vpc".to_string(),
+                        attribute_name: "id".to_string(),
+                    },
+                ]),
+            ],
+        };
+
+        let resolved = resolve_ref_value(&func, &binding_map);
+        assert_eq!(resolved, Value::String("prefix-vpc-123".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_function_call_unresolved_ref_kept() {
+        let binding_map: HashMap<String, HashMap<String, Value>> = HashMap::new();
+
+        // If a ResourceRef in the args can't be resolved, the FunctionCall is kept
+        let func = Value::FunctionCall {
+            name: "join".to_string(),
+            args: vec![
+                Value::String("-".to_string()),
+                Value::List(vec![Value::ResourceRef {
+                    binding_name: "unknown".to_string(),
+                    attribute_name: "id".to_string(),
+                }]),
+            ],
+        };
+
+        let resolved = resolve_ref_value(&func, &binding_map);
+        assert!(matches!(resolved, Value::FunctionCall { .. }));
     }
 }

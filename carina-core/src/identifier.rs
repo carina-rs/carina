@@ -191,6 +191,10 @@ fn deterministic_value_string(value: &Value) -> String {
                 .collect();
             format!("Interpolation([{}])", strs.join(", "))
         }
+        Value::FunctionCall { name, args } => {
+            let arg_strs: Vec<String> = args.iter().map(deterministic_value_string).collect();
+            format!("FunctionCall({}({}))", name, arg_strs.join(", "))
+        }
     }
 }
 

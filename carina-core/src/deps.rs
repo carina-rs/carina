@@ -60,6 +60,11 @@ fn collect_dependencies(value: &Value, deps: &mut HashSet<String>) {
                 }
             }
         }
+        Value::FunctionCall { args, .. } => {
+            for arg in args {
+                collect_dependencies(arg, deps);
+            }
+        }
         _ => {}
     }
 }

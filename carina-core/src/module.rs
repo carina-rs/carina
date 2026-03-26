@@ -178,6 +178,10 @@ fn format_value(value: &Value) -> String {
                 .collect();
             format!("\"{}\"", inner)
         }
+        Value::FunctionCall { name, args } => {
+            let arg_strs: Vec<_> = args.iter().map(format_value).collect();
+            format!("{}({})", name, arg_strs.join(", "))
+        }
     }
 }
 
@@ -467,6 +471,11 @@ impl RootConfigSignature {
                     if let InterpolationPart::Expr(v) = part {
                         Self::collect_typed_dependencies(from, attr_key, v, graph, binding_types);
                     }
+                }
+            }
+            Value::FunctionCall { args, .. } => {
+                for arg in args {
+                    Self::collect_typed_dependencies(from, attr_key, arg, graph, binding_types);
                 }
             }
             _ => {}
@@ -918,6 +927,18 @@ impl ModuleSignature {
                             argument_types,
                         );
                     }
+                }
+            }
+            Value::FunctionCall { args, .. } => {
+                for arg in args {
+                    Self::collect_typed_dependencies(
+                        from,
+                        attr_key,
+                        arg,
+                        graph,
+                        binding_types,
+                        argument_types,
+                    );
                 }
             }
             _ => {}

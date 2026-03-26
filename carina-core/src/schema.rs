@@ -488,6 +488,7 @@ impl Value {
                 None => format!("UnresolvedIdent({})", name),
             },
             Value::Interpolation(_) => "Interpolation".to_string(),
+            Value::FunctionCall { name, .. } => format!("FunctionCall({})", name),
         }
     }
 }
