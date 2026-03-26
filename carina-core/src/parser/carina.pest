@@ -20,9 +20,10 @@ attributes_block = {
     "attributes" ~ "{" ~ attributes_param* ~ "}"
 }
 
-// Attributes parameter: name: type or name: type = expression
+// Attributes parameter: name: type = expr, or name = expr (type optional)
 attributes_param = {
-    identifier ~ ":" ~ type_expr ~ ("=" ~ expression)?
+    identifier ~ ":" ~ type_expr ~ "=" ~ expression
+  | identifier ~ "=" ~ expression
 }
 
 // Type expression: string, bool, int, float, list(type), map(type), aws.vpc (resource ref)

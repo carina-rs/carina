@@ -1733,4 +1733,36 @@ mod tests {
             result
         );
     }
+
+    #[test]
+    fn test_format_attributes_without_type() {
+        let input = "attributes {\nsecurity_group = sg.id\n}";
+        let config = FormatConfig::default();
+        let result = format(input, &config).unwrap();
+
+        assert!(
+            result.contains("security_group = sg.id"),
+            "Expected 'security_group = sg.id' in:\n{}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_format_attributes_mixed_typed_and_untyped() {
+        let input = "attributes {\nvpc_id: awscc.ec2.VpcId = vpc.vpc_id\nsecurity_group = sg.id\n}";
+        let config = FormatConfig::default();
+        let result = format(input, &config).unwrap();
+
+        // Typed form (may have alignment padding)
+        assert!(
+            result.contains("vpc_id") && result.contains("awscc.ec2.VpcId = vpc.vpc_id"),
+            "Expected typed form in:\n{}",
+            result
+        );
+        assert!(
+            result.contains("security_group = sg.id"),
+            "Expected untyped form in:\n{}",
+            result
+        );
+    }
 }

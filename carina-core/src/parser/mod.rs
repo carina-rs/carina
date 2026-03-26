@@ -118,7 +118,7 @@ pub struct ArgumentParameter {
 #[derive(Debug, Clone)]
 pub struct AttributeParameter {
     pub name: String,
-    pub type_expr: TypeExpr,
+    pub type_expr: Option<TypeExpr>,
     pub value: Option<Value>,
 }
 
@@ -409,16 +409,25 @@ fn parse_attributes_block(
             let name = next_pair(&mut param_inner, "parameter name", "attributes block")?
                 .as_str()
                 .to_string();
-            let type_expr = parse_type_expr(next_pair(
+
+            // Check whether the next inner pair is a type_expr or an expression
+            let next = next_pair(
                 &mut param_inner,
-                "type expression",
+                "type or expression",
                 "attributes parameter",
-            )?)?;
-            let value = if let Some(expr) = param_inner.next() {
-                Some(parse_expression(expr, ctx)?)
+            )?;
+            let (type_expr, value) = if next.as_rule() == Rule::type_expr {
+                // Has explicit type annotation: name: type = expr
+                let type_expr = Some(parse_type_expr(next)?);
+                let expr = next_pair(&mut param_inner, "value expression", "attributes parameter")?;
+                let value = Some(parse_expression(expr, ctx)?);
+                (type_expr, value)
             } else {
-                None
+                // No type annotation: name = expr
+                let value = Some(parse_expression(next, ctx)?);
+                (None, value)
             };
+
             attribute_params.push(AttributeParameter {
                 name,
                 type_expr,
@@ -1696,7 +1705,7 @@ mod tests {
         // Check attribute params
         assert_eq!(result.attribute_params.len(), 1);
         assert_eq!(result.attribute_params[0].name, "sg_id");
-        assert_eq!(result.attribute_params[0].type_expr, TypeExpr::String);
+        assert_eq!(result.attribute_params[0].type_expr, Some(TypeExpr::String));
 
         // Check resource has argument reference (lexically scoped)
         assert_eq!(result.resources.len(), 1);
@@ -1732,7 +1741,11 @@ mod tests {
             }
 
             attributes {
-                result: list(string)
+                result: list(string) = items.ids
+            }
+
+            let items = aws.item {
+                name = "test"
             }
         "#;
 
@@ -1752,8 +1765,9 @@ mod tests {
         );
         assert_eq!(
             result.attribute_params[0].type_expr,
-            TypeExpr::List(Box::new(TypeExpr::String))
+            Some(TypeExpr::List(Box::new(TypeExpr::String)))
         );
+        assert!(result.attribute_params[0].value.is_some());
     }
 
     #[test]
@@ -1788,7 +1802,10 @@ mod tests {
         assert_eq!(result.attribute_params[0].name, "security_group_id");
         assert_eq!(
             result.attribute_params[0].type_expr,
-            TypeExpr::Ref(ResourceTypePath::new("aws", "security_group"))
+            Some(TypeExpr::Ref(ResourceTypePath::new(
+                "aws",
+                "security_group"
+            )))
         );
     }
 
@@ -1801,7 +1818,7 @@ mod tests {
             }
 
             attributes {
-                out: string
+                out: string = sg.name
             }
         "#;
 
@@ -1818,6 +1835,71 @@ mod tests {
             result.arguments[1].type_expr,
             TypeExpr::Ref(ResourceTypePath::new("aws", "security_group.ingress_rule"))
         );
+    }
+
+    #[test]
+    fn parse_attributes_without_type_annotation() {
+        let input = r#"
+            attributes {
+                security_group = sg.id
+            }
+
+            let sg = aws.security_group {
+                name = "web-sg"
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+
+        assert_eq!(result.attribute_params.len(), 1);
+        assert_eq!(result.attribute_params[0].name, "security_group");
+        assert_eq!(result.attribute_params[0].type_expr, None);
+        assert!(result.attribute_params[0].value.is_some());
+    }
+
+    #[test]
+    fn parse_attributes_mixed_typed_and_untyped() {
+        let input = r#"
+            attributes {
+                vpc_id: awscc.ec2.VpcId = vpc.vpc_id
+                security_group = sg.id
+                subnet_ids: list(string) = subnets.ids
+            }
+
+            let vpc = awscc.ec2.vpc {
+                cidr_block = "10.0.0.0/16"
+            }
+
+            let sg = aws.security_group {
+                name = "web-sg"
+            }
+
+            let subnets = aws.subnet {
+                vpc_id = vpc.vpc_id
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+
+        assert_eq!(result.attribute_params.len(), 3);
+
+        // Explicit type
+        assert_eq!(result.attribute_params[0].name, "vpc_id");
+        assert!(result.attribute_params[0].type_expr.is_some());
+        assert!(result.attribute_params[0].value.is_some());
+
+        // No type annotation
+        assert_eq!(result.attribute_params[1].name, "security_group");
+        assert_eq!(result.attribute_params[1].type_expr, None);
+        assert!(result.attribute_params[1].value.is_some());
+
+        // Explicit type
+        assert_eq!(result.attribute_params[2].name, "subnet_ids");
+        assert_eq!(
+            result.attribute_params[2].type_expr,
+            Some(TypeExpr::List(Box::new(TypeExpr::String)))
+        );
+        assert!(result.attribute_params[2].value.is_some());
     }
 
     #[test]

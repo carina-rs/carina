@@ -470,7 +470,7 @@ mod tests {
             .attribute_params
             .push(crate::parser::AttributeParameter {
                 name: "vpc_id".to_string(),
-                type_expr: TypeExpr::String,
+                type_expr: Some(TypeExpr::String),
                 value: Some(Value::ResourceRef {
                     binding_name: "vpc".to_string(),
                     attribute_name: "vpc_id".to_string(),
@@ -672,8 +672,8 @@ let route = awscc.ec2.route {
             .attribute_params
             .push(crate::parser::AttributeParameter {
                 name: "vpc_id".to_string(),
-                type_expr: TypeExpr::String,
-                value: None,
+                type_expr: Some(TypeExpr::String),
+                value: Some(Value::String("dummy".to_string())),
             });
 
         let result = validate_no_provider_in_module(&parsed);
