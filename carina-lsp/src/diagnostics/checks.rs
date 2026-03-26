@@ -6,6 +6,7 @@ use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
 
 use crate::document::Document;
 use crate::position;
+use carina_core::builtins;
 use carina_core::parser::{ArgumentParameter, ParsedFile, TypeExpr};
 use carina_core::resource::Value;
 use carina_core::schema::validate_ipv4_cidr;
@@ -719,5 +720,93 @@ impl DiagnosticEngine {
         }
 
         diagnostics
+    }
+
+    /// Check for unknown built-in function calls in parsed resource attributes.
+    pub(super) fn check_unknown_functions(
+        &self,
+        doc: &Document,
+        parsed: &ParsedFile,
+    ) -> Vec<Diagnostic> {
+        let mut diagnostics = Vec::new();
+
+        for resource in &parsed.resources {
+            for value in resource.attributes.values() {
+                self.collect_unknown_function_diagnostics(doc, value, &mut diagnostics);
+            }
+        }
+
+        diagnostics
+    }
+
+    /// Recursively walk a Value tree to find FunctionCall nodes with unknown names.
+    fn collect_unknown_function_diagnostics(
+        &self,
+        doc: &Document,
+        value: &Value,
+        diagnostics: &mut Vec<Diagnostic>,
+    ) {
+        match value {
+            Value::FunctionCall { name, args } => {
+                if !builtins::is_known_builtin(name)
+                    && let Some((line, col)) = self.find_function_call_position(doc, name)
+                {
+                    diagnostics.push(Diagnostic {
+                        range: Range {
+                            start: Position {
+                                line,
+                                character: col,
+                            },
+                            end: Position {
+                                line,
+                                character: col + name.len() as u32,
+                            },
+                        },
+                        severity: Some(DiagnosticSeverity::ERROR),
+                        source: Some("carina".to_string()),
+                        message: format!("Unknown function '{}'", name),
+                        ..Default::default()
+                    });
+                }
+                // Also check nested function calls in arguments
+                for arg in args {
+                    self.collect_unknown_function_diagnostics(doc, arg, diagnostics);
+                }
+            }
+            Value::List(items) => {
+                for item in items {
+                    self.collect_unknown_function_diagnostics(doc, item, diagnostics);
+                }
+            }
+            Value::Map(map) => {
+                for v in map.values() {
+                    self.collect_unknown_function_diagnostics(doc, v, diagnostics);
+                }
+            }
+            Value::Interpolation(parts) => {
+                for part in parts {
+                    if let carina_core::resource::InterpolationPart::Expr(expr) = part {
+                        self.collect_unknown_function_diagnostics(doc, expr, diagnostics);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Find the position of a function call name in the document text.
+    fn find_function_call_position(&self, doc: &Document, func_name: &str) -> Option<(u32, u32)> {
+        let text = doc.text();
+        let pattern = format!("{}(", func_name);
+
+        for (line_idx, line) in text.lines().enumerate() {
+            if let Some(byte_pos) = line.find(&pattern) {
+                return Some((
+                    line_idx as u32,
+                    position::byte_offset_to_char_offset(line, byte_pos),
+                ));
+            }
+        }
+        None
     }
 }

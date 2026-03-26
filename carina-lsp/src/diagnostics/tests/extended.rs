@@ -779,3 +779,54 @@ awscc.ec2.vpc {
         diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
     );
 }
+
+#[test]
+fn unknown_function_call_produces_diagnostic() {
+    let engine = test_engine();
+    let doc = create_document(
+        r#"provider awscc {
+    region = awscc.Region.ap_northeast_1
+}
+
+awscc.ec2.vpc {
+    cidr_block = not_a_function("hello")
+}"#,
+    );
+
+    let diagnostics = engine.analyze(&doc, None);
+    let func_diag = diagnostics
+        .iter()
+        .find(|d| d.message.contains("Unknown function 'not_a_function'"));
+    assert!(
+        func_diag.is_some(),
+        "Should report unknown function 'not_a_function'. Got: {:?}",
+        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+
+    let diag = func_diag.unwrap();
+    assert_eq!(diag.severity, Some(DiagnosticSeverity::ERROR));
+}
+
+#[test]
+fn known_function_call_no_diagnostic() {
+    let engine = test_engine();
+    let doc = create_document(
+        r#"provider awscc {
+    region = awscc.Region.ap_northeast_1
+}
+
+awscc.ec2.vpc {
+    cidr_block = join("-", ["a", "b"])
+}"#,
+    );
+
+    let diagnostics = engine.analyze(&doc, None);
+    let func_diag = diagnostics
+        .iter()
+        .find(|d| d.message.contains("Unknown function"));
+    assert!(
+        func_diag.is_none(),
+        "Known function 'join' should not produce unknown function diagnostic. Got: {:?}",
+        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}

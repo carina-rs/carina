@@ -4,6 +4,7 @@ use tower_lsp::lsp_types::{
     Command, CompletionItem, CompletionItemKind, InsertTextFormat, Position, Range, TextEdit,
 };
 
+use carina_core::builtins;
 use carina_core::schema::AttributeType;
 
 use super::CompletionProvider;
@@ -126,6 +127,9 @@ impl CompletionProvider {
                 ..Default::default()
             });
         }
+
+        // Always include built-in function completions in value position
+        completions.extend(self.builtin_function_completions());
 
         // Look up the attribute type from schema
         if let Some(schema) = self.schemas.get(resource_type)
@@ -258,6 +262,21 @@ impl CompletionProvider {
 
         completions.extend(self.region_completions());
         completions
+    }
+
+    /// Provide completions for built-in function names.
+    pub(super) fn builtin_function_completions(&self) -> Vec<CompletionItem> {
+        builtins::builtin_functions()
+            .iter()
+            .map(|func| CompletionItem {
+                label: func.name.to_string(),
+                kind: Some(CompletionItemKind::FUNCTION),
+                detail: Some(func.signature.to_string()),
+                insert_text: Some(format!("{}($0)", func.name)),
+                insert_text_format: Some(InsertTextFormat::SNIPPET),
+                ..Default::default()
+            })
+            .collect()
     }
 
     pub(super) fn region_completions(&self) -> Vec<CompletionItem> {

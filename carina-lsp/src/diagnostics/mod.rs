@@ -595,6 +595,9 @@ impl DiagnosticEngine {
                 }
             }
 
+            // Check for unknown built-in function calls
+            diagnostics.extend(self.check_unknown_functions(doc, parsed));
+
             // Check attributes blocks
             diagnostics.extend(self.check_attributes_blocks(doc, parsed));
 

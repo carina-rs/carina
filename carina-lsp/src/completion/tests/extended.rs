@@ -1,4 +1,5 @@
 use super::*;
+use tower_lsp::lsp_types::InsertTextFormat;
 
 #[test]
 fn availability_zone_completions_use_dynamic_prefix() {
@@ -591,4 +592,90 @@ let igw_attachment = awscc.ec2.vpc_gateway_attachment {
         "Should suggest igw.internet_gateway_id from another binding. Got: {:?}",
         labels
     );
+}
+
+#[test]
+fn builtin_function_completions_in_value_position() {
+    let provider = test_provider();
+    let doc = create_document(
+        r#"awscc.ec2.vpc {
+    cidr_block =
+}"#,
+    );
+    let position = Position {
+        line: 1,
+        character: 18,
+    };
+
+    let completions = provider.complete(&doc, position, None);
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+
+    // Should include built-in function names
+    assert!(
+        labels.contains(&"join"),
+        "Should suggest 'join' function. Got: {:?}",
+        labels
+    );
+    assert!(
+        labels.contains(&"upper"),
+        "Should suggest 'upper' function. Got: {:?}",
+        labels
+    );
+    assert!(
+        labels.contains(&"cidr_subnet"),
+        "Should suggest 'cidr_subnet' function. Got: {:?}",
+        labels
+    );
+}
+
+#[test]
+fn builtin_function_completions_have_function_kind_and_signature() {
+    let provider = test_provider();
+    let completions = provider.builtin_function_completions();
+
+    let join = completions
+        .iter()
+        .find(|c| c.label == "join")
+        .expect("Should have join completion");
+
+    assert_eq!(join.kind, Some(CompletionItemKind::FUNCTION));
+    assert_eq!(
+        join.detail.as_deref(),
+        Some("join(separator: string, list: list) -> string")
+    );
+    assert_eq!(join.insert_text.as_deref(), Some("join($0)"));
+    assert_eq!(join.insert_text_format, Some(InsertTextFormat::SNIPPET));
+}
+
+#[test]
+fn builtin_function_completions_cover_all_functions() {
+    let provider = test_provider();
+    let completions = provider.builtin_function_completions();
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+
+    let expected = [
+        "cidr_subnet",
+        "concat",
+        "flatten",
+        "join",
+        "keys",
+        "length",
+        "lookup",
+        "lower",
+        "max",
+        "min",
+        "replace",
+        "split",
+        "trim",
+        "upper",
+        "values",
+    ];
+    for name in &expected {
+        assert!(
+            labels.contains(name),
+            "Should include '{}' function completion. Got: {:?}",
+            name,
+            labels
+        );
+    }
 }
