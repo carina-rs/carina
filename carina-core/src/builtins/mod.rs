@@ -5,6 +5,7 @@
 
 mod cidr_subnet;
 mod join;
+mod keys_values;
 mod length;
 mod split;
 mod trim;
@@ -19,10 +20,12 @@ pub fn evaluate_builtin(name: &str, args: &[Value]) -> Result<Value, String> {
     match name {
         "cidr_subnet" => cidr_subnet::builtin_cidr_subnet(args),
         "join" => join::builtin_join(args),
+        "keys" => keys_values::builtin_keys(args),
         "length" => length::builtin_length(args),
         "split" => split::builtin_split(args),
         "trim" => trim::builtin_trim(args),
         "upper" => upper_lower::builtin_upper(args),
+        "values" => keys_values::builtin_values(args),
         "lower" => upper_lower::builtin_lower(args),
         _ => Err(format!("Unknown built-in function: {name}")),
     }
