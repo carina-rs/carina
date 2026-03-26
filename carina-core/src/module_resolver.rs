@@ -11,7 +11,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::parser::{ImportStatement, ModuleCall, ParseError, ParsedFile};
-use crate::resource::{Resource, ResourceId, Value};
+use crate::resource::{LifecycleConfig, Resource, ResourceId, Value};
 
 /// Module resolution error
 #[derive(Debug, thiserror::Error)]
@@ -179,7 +179,11 @@ impl ModuleResolver {
         self.imported_modules.get(alias)
     }
 
-    /// Expand a module call into resources
+    /// Expand a module call into resources.
+    ///
+    /// If the module defines `attributes` and the call has a `binding_name`,
+    /// a virtual resource is created to expose the module's attribute values.
+    /// The virtual resource has `_virtual = "true"` and is skipped by the differ.
     pub fn expand_module_call(
         &self,
         call: &ModuleCall,
@@ -269,6 +273,43 @@ impl ModuleResolver {
             new_resource.attributes = substituted_attrs;
 
             expanded_resources.push(new_resource);
+        }
+
+        // Create a virtual resource if the module has attributes and the call has a binding
+        if !module.attribute_params.is_empty()
+            && let Some(binding_name) = &call.binding_name
+        {
+            let mut virtual_attrs: HashMap<String, Value> = HashMap::new();
+            virtual_attrs.insert("_binding".to_string(), Value::String(binding_name.clone()));
+            virtual_attrs.insert("_virtual".to_string(), Value::String("true".to_string()));
+            virtual_attrs.insert(
+                "_module".to_string(),
+                Value::String(call.module_name.clone()),
+            );
+            virtual_attrs.insert(
+                "_module_instance".to_string(),
+                Value::String(instance_prefix.to_string()),
+            );
+
+            // Copy attribute values from the module definition
+            for attr_param in &module.attribute_params {
+                if let Some(value) = &attr_param.value {
+                    // Rewrite intra-module refs and substitute arguments
+                    let rewritten =
+                        rewrite_intra_module_refs(value, instance_prefix, &intra_module_bindings);
+                    let substituted = substitute_arguments(&rewritten, &argument_values);
+                    virtual_attrs.insert(attr_param.name.clone(), substituted);
+                }
+            }
+
+            let virtual_resource = Resource {
+                id: ResourceId::new("_virtual", binding_name),
+                attributes: virtual_attrs,
+                read_only: false,
+                lifecycle: LifecycleConfig::default(),
+                prefixes: HashMap::new(),
+            };
+            expanded_resources.push(virtual_resource);
         }
 
         Ok(expanded_resources)
@@ -757,6 +798,117 @@ mod tests {
         // Resource names should also be distinct
         assert_eq!(expanded_a[0].id.name, "prod_main_vpc");
         assert_eq!(expanded_b[0].id.name, "staging_main_vpc");
+    }
+
+    /// Module with an attributes block that exposes a security_group binding.
+    fn create_module_with_attributes() -> ParsedFile {
+        use crate::parser::AttributeParameter;
+
+        ParsedFile {
+            providers: vec![],
+            resources: vec![Resource {
+                id: ResourceId::new("security_group", "sg"),
+                attributes: {
+                    let mut attrs = HashMap::new();
+                    attrs.insert("name".to_string(), Value::String("sg".to_string()));
+                    attrs.insert("_binding".to_string(), Value::String("sg".to_string()));
+                    attrs.insert(
+                        "_type".to_string(),
+                        Value::String("aws.security_group".to_string()),
+                    );
+                    attrs
+                },
+                read_only: false,
+                lifecycle: LifecycleConfig::default(),
+                prefixes: HashMap::new(),
+            }],
+            variables: HashMap::new(),
+            imports: vec![],
+            module_calls: vec![],
+            arguments: vec![],
+            attribute_params: vec![AttributeParameter {
+                name: "security_group".to_string(),
+                type_expr: None,
+                value: Some(Value::ResourceRef {
+                    binding_name: "sg".to_string(),
+                    attribute_name: "id".to_string(),
+                }),
+            }],
+            backend: None,
+        }
+    }
+
+    #[test]
+    fn test_expand_module_call_creates_virtual_resource() {
+        let resolver = {
+            let mut r = ModuleResolver::new(".");
+            r.imported_modules
+                .insert("web_tier".to_string(), create_module_with_attributes());
+            r
+        };
+
+        let call = ModuleCall {
+            module_name: "web_tier".to_string(),
+            binding_name: Some("web".to_string()),
+            arguments: HashMap::new(),
+        };
+
+        let expanded = resolver.expand_module_call(&call, "web").unwrap();
+        // 1 real resource + 1 virtual resource
+        assert_eq!(expanded.len(), 2);
+
+        // Find the virtual resource
+        let virtual_res = expanded
+            .iter()
+            .find(|r| {
+                r.attributes
+                    .get("_virtual")
+                    .is_some_and(|v| matches!(v, Value::String(s) if s == "true"))
+            })
+            .expect("Virtual resource should exist");
+
+        assert_eq!(
+            virtual_res.attributes.get("_binding"),
+            Some(&Value::String("web".to_string()))
+        );
+        // The security_group attribute should be a rewritten ResourceRef
+        // pointing to the prefixed binding (web_sg)
+        assert_eq!(
+            virtual_res.attributes.get("security_group"),
+            Some(&Value::ResourceRef {
+                binding_name: "web_sg".to_string(),
+                attribute_name: "id".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn test_expand_module_call_without_binding_no_virtual() {
+        let resolver = {
+            let mut r = ModuleResolver::new(".");
+            r.imported_modules
+                .insert("web_tier".to_string(), create_module_with_attributes());
+            r
+        };
+
+        // Module call without binding_name
+        let call = ModuleCall {
+            module_name: "web_tier".to_string(),
+            binding_name: None,
+            arguments: HashMap::new(),
+        };
+
+        let expanded = resolver.expand_module_call(&call, "web_tier").unwrap();
+        // Only real resources, no virtual
+        let virtual_count = expanded
+            .iter()
+            .filter(|r| {
+                r.attributes
+                    .get("_virtual")
+                    .is_some_and(|v| matches!(v, Value::String(s) if s == "true"))
+            })
+            .count();
+        assert_eq!(virtual_count, 0);
     }
 
     #[test]

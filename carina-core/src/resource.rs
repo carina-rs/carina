@@ -456,6 +456,17 @@ impl Resource {
     pub fn is_data_source(&self) -> bool {
         self.read_only
     }
+
+    /// Returns true if this resource is a virtual resource (module attribute container).
+    ///
+    /// Virtual resources are created by the module resolver to expose module
+    /// `attributes` values as a structured record. They should not be sent to
+    /// providers for reading, creating, or updating.
+    pub fn is_virtual(&self) -> bool {
+        self.attributes
+            .get("_virtual")
+            .is_some_and(|v| matches!(v, Value::String(s) if s == "true"))
+    }
 }
 
 /// Current state fetched from actual infrastructure

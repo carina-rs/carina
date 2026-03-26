@@ -315,6 +315,10 @@ pub fn parse(input: &str) -> Result<ParsedFile, ParseError> {
                                 if let Some(mut call) = maybe_module_call {
                                     call.binding_name = Some(name.clone());
                                     module_calls.push(call);
+                                    // Register as a resource binding so that
+                                    // `name.attr` resolves as ResourceRef
+                                    let placeholder = Resource::new("_module_binding", &name);
+                                    ctx.set_resource_binding(name.clone(), placeholder);
                                 }
                                 if let Some(import) = maybe_import {
                                     ctx.imported_modules
@@ -618,9 +622,12 @@ fn parse_primary_with_resource_or_module(
             let value = Value::String(format!("${{import:{}}}", import.path));
             Ok((value, None, None, Some(import)))
         }
+        Rule::module_call => {
+            let call = parse_module_call(inner, ctx)?;
+            let value = Value::String(format!("${{module:{}}}", call.module_name));
+            Ok((value, None, Some(call), None))
+        }
         _ => {
-            // Check if it could be a module call (identifier followed by braces)
-            // This is handled by checking if it's a simple identifier that matches a module
             let value = parse_primary_value(inner, ctx)?;
             Ok((value, None, None, None))
         }
@@ -2997,5 +3004,55 @@ aws.s3.bucket {
         let parsed = result.unwrap();
         assert_eq!(parsed.resources.len(), 2);
         assert_eq!(parsed.arguments.len(), 3);
+    }
+
+    #[test]
+    fn parse_let_binding_module_call() {
+        let input = r#"
+            let web_tier = import "./modules/web_tier"
+
+            let web = web_tier {
+                vpc = "vpc-123"
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+        assert_eq!(result.module_calls.len(), 1);
+
+        let call = &result.module_calls[0];
+        assert_eq!(call.module_name, "web_tier");
+        assert_eq!(call.binding_name, Some("web".to_string()));
+        assert_eq!(
+            call.arguments.get("vpc"),
+            Some(&Value::String("vpc-123".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_module_call_binding_enables_resource_ref() {
+        // After `let web = web_tier { ... }`, `web.security_group` should
+        // resolve as ResourceRef.
+        let input = r#"
+            let web_tier = import "./modules/web_tier"
+
+            let web = web_tier {
+                vpc = "vpc-123"
+            }
+
+            let sg = awscc.ec2.security_group {
+                group_description = "test"
+                group_name = web.security_group
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+        let sg = &result.resources[0];
+        assert_eq!(
+            sg.attributes.get("group_name"),
+            Some(&Value::ResourceRef {
+                binding_name: "web".to_string(),
+                attribute_name: "security_group".to_string(),
+            })
+        );
     }
 }
