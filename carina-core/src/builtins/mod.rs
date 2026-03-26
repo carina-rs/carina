@@ -6,6 +6,7 @@
 mod cidr_subnet;
 mod join;
 mod length;
+mod replace;
 mod split;
 mod trim;
 mod upper_lower;
@@ -24,6 +25,7 @@ pub fn evaluate_builtin(name: &str, args: &[Value]) -> Result<Value, String> {
         "trim" => trim::builtin_trim(args),
         "upper" => upper_lower::builtin_upper(args),
         "lower" => upper_lower::builtin_lower(args),
+        "replace" => replace::builtin_replace(args),
         _ => Err(format!("Unknown built-in function: {name}")),
     }
 }
