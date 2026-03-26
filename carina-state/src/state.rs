@@ -25,7 +25,8 @@ impl StateFile {
     /// Current state file format version
     /// v2: Added identifier field to ResourceState
     /// v3: Added binding and dependency_bindings fields to ResourceState
-    pub const CURRENT_VERSION: u32 = 3;
+    /// v4: Instance path addressing (dot notation instead of underscore prefix)
+    pub const CURRENT_VERSION: u32 = 4;
 
     /// Create a new empty state file
     pub fn new() -> Self {
@@ -872,6 +873,12 @@ mod tests {
 
         let id = ResourceId::with_provider("awscc", "ec2.subnet", "orphan-subnet");
         assert_eq!(deps.get(&id).unwrap(), &vec!["my_vpc".to_string()]);
+    }
+
+    #[test]
+    fn test_state_file_version_is_v4() {
+        let state = StateFile::new();
+        assert_eq!(state.version, 4);
     }
 
     #[test]

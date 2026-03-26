@@ -233,17 +233,17 @@ impl ModuleResolver {
         for resource in &module.resources {
             let mut new_resource = resource.clone();
 
-            // Prefix the resource name with instance prefix
-            let new_name = format!("{}_{}", instance_prefix, new_resource.id.name);
+            // Prefix the resource name with instance path (dot-separated)
+            let new_name = format!("{}.{}", instance_prefix, new_resource.id.name);
             new_resource.id = ResourceId::with_provider(
                 &new_resource.id.provider,
                 &new_resource.id.resource_type,
                 new_name.clone(),
             );
 
-            // Rewrite _binding with instance prefix
+            // Rewrite _binding with instance path (dot-separated)
             if let Some(Value::String(binding)) = new_resource.attributes.get("_binding") {
-                let prefixed = format!("{}_{}", instance_prefix, binding);
+                let prefixed = format!("{}.{}", instance_prefix, binding);
                 new_resource
                     .attributes
                     .insert("_binding".to_string(), Value::String(prefixed));
@@ -344,10 +344,10 @@ fn substitute_arguments(value: &Value, arguments: &HashMap<String, Value>) -> Va
     }
 }
 
-/// Rewrite intra-module ResourceRef binding names with instance prefix.
+/// Rewrite intra-module ResourceRef binding names with instance path.
 ///
 /// When a ResourceRef's binding_name matches one of the module's own bindings,
-/// prefix it so that each module instance has isolated references.
+/// prefix it with dot notation so that each module instance has isolated references.
 fn rewrite_intra_module_refs(
     value: &Value,
     instance_prefix: &str,
@@ -358,7 +358,7 @@ fn rewrite_intra_module_refs(
             binding_name,
             attribute_name,
         } if intra_module_bindings.contains(binding_name) => Value::ResourceRef {
-            binding_name: format!("{}_{}", instance_prefix, binding_name),
+            binding_name: format!("{}.{}", instance_prefix, binding_name),
             attribute_name: attribute_name.clone(),
         },
         Value::List(items) => Value::List(
@@ -658,7 +658,7 @@ mod tests {
         assert_eq!(expanded.len(), 1);
 
         let sg = &expanded[0];
-        assert_eq!(sg.id.name, "my_instance_sg");
+        assert_eq!(sg.id.name, "my_instance.sg");
         assert_eq!(
             sg.attributes.get("vpc_id"),
             Some(&Value::String("vpc-456".to_string()))
@@ -755,49 +755,49 @@ mod tests {
         let expanded_a = resolver.expand_module_call(&call_a, "prod").unwrap();
         let expanded_b = resolver.expand_module_call(&call_b, "staging").unwrap();
 
-        // _binding must be prefixed so they don't collide
+        // _binding must be prefixed so they don't collide (using dot notation)
         assert_eq!(
             expanded_a[0].attributes.get("_binding"),
-            Some(&Value::String("prod_vpc".to_string())),
-            "Instance A vpc _binding should be prefixed"
+            Some(&Value::String("prod.vpc".to_string())),
+            "Instance A vpc _binding should use dot path"
         );
         assert_eq!(
             expanded_a[1].attributes.get("_binding"),
-            Some(&Value::String("prod_subnet".to_string())),
-            "Instance A subnet _binding should be prefixed"
+            Some(&Value::String("prod.subnet".to_string())),
+            "Instance A subnet _binding should use dot path"
         );
         assert_eq!(
             expanded_b[0].attributes.get("_binding"),
-            Some(&Value::String("staging_vpc".to_string())),
-            "Instance B vpc _binding should be prefixed"
+            Some(&Value::String("staging.vpc".to_string())),
+            "Instance B vpc _binding should use dot path"
         );
         assert_eq!(
             expanded_b[1].attributes.get("_binding"),
-            Some(&Value::String("staging_subnet".to_string())),
-            "Instance B subnet _binding should be prefixed"
+            Some(&Value::String("staging.subnet".to_string())),
+            "Instance B subnet _binding should use dot path"
         );
 
-        // Intra-module ResourceRef must point to the prefixed binding
+        // Intra-module ResourceRef must point to the dot-path binding
         assert_eq!(
             expanded_a[1].attributes.get("vpc_id"),
             Some(&Value::ResourceRef {
-                binding_name: "prod_vpc".to_string(),
+                binding_name: "prod.vpc".to_string(),
                 attribute_name: "id".to_string(),
             }),
-            "Instance A subnet should reference prod_vpc, not bare vpc"
+            "Instance A subnet should reference prod.vpc, not bare vpc"
         );
         assert_eq!(
             expanded_b[1].attributes.get("vpc_id"),
             Some(&Value::ResourceRef {
-                binding_name: "staging_vpc".to_string(),
+                binding_name: "staging.vpc".to_string(),
                 attribute_name: "id".to_string(),
             }),
-            "Instance B subnet should reference staging_vpc, not bare vpc"
+            "Instance B subnet should reference staging.vpc, not bare vpc"
         );
 
-        // Resource names should also be distinct
-        assert_eq!(expanded_a[0].id.name, "prod_main_vpc");
-        assert_eq!(expanded_b[0].id.name, "staging_main_vpc");
+        // Resource names should also be distinct (dot notation)
+        assert_eq!(expanded_a[0].id.name, "prod.main_vpc");
+        assert_eq!(expanded_b[0].id.name, "staging.main_vpc");
     }
 
     /// Module with an attributes block that exposes a security_group binding.
@@ -872,11 +872,11 @@ mod tests {
             Some(&Value::String("web".to_string()))
         );
         // The security_group attribute should be a rewritten ResourceRef
-        // pointing to the prefixed binding (web_sg)
+        // pointing to the dot-path binding (web.sg)
         assert_eq!(
             virtual_res.attributes.get("security_group"),
             Some(&Value::ResourceRef {
-                binding_name: "web_sg".to_string(),
+                binding_name: "web.sg".to_string(),
                 attribute_name: "id".to_string(),
             })
         );
@@ -928,5 +928,113 @@ mod tests {
 
         let result = resolver.expand_module_call(&call, "my_instance");
         assert!(matches!(result, Err(ModuleError::MissingArgument { .. })));
+    }
+
+    #[test]
+    fn test_expand_module_call_uses_dot_path_addressing() {
+        let resolver = {
+            let mut r = ModuleResolver::new(".");
+            r.imported_modules
+                .insert("test_module".to_string(), create_test_module());
+            r
+        };
+
+        let call = ModuleCall {
+            module_name: "test_module".to_string(),
+            binding_name: Some("my_instance".to_string()),
+            arguments: {
+                let mut args = HashMap::new();
+                args.insert("vpc_id".to_string(), Value::String("vpc-456".to_string()));
+                args
+            },
+        };
+
+        let expanded = resolver.expand_module_call(&call, "my_instance").unwrap();
+        assert_eq!(expanded.len(), 1);
+
+        let sg = &expanded[0];
+        // Resource name should use dot notation, not underscore
+        assert_eq!(sg.id.name, "my_instance.sg");
+    }
+
+    #[test]
+    fn test_module_dot_path_bindings_and_refs() {
+        let resolver = {
+            let mut r = ModuleResolver::new(".");
+            r.imported_modules
+                .insert("net".to_string(), create_module_with_intra_refs());
+            r
+        };
+
+        let call = ModuleCall {
+            module_name: "net".to_string(),
+            binding_name: Some("prod".to_string()),
+            arguments: {
+                let mut args = HashMap::new();
+                args.insert("cidr".to_string(), Value::String("10.0.0.0/16".to_string()));
+                args
+            },
+        };
+
+        let expanded = resolver.expand_module_call(&call, "prod").unwrap();
+
+        // Resource names should use dot notation
+        assert_eq!(expanded[0].id.name, "prod.main_vpc");
+        assert_eq!(expanded[1].id.name, "prod.sub");
+
+        // _binding should use dot notation
+        assert_eq!(
+            expanded[0].attributes.get("_binding"),
+            Some(&Value::String("prod.vpc".to_string())),
+        );
+        assert_eq!(
+            expanded[1].attributes.get("_binding"),
+            Some(&Value::String("prod.subnet".to_string())),
+        );
+
+        // Intra-module ResourceRef should use dot notation
+        assert_eq!(
+            expanded[1].attributes.get("vpc_id"),
+            Some(&Value::ResourceRef {
+                binding_name: "prod.vpc".to_string(),
+                attribute_name: "id".to_string(),
+            }),
+        );
+    }
+
+    #[test]
+    fn test_module_virtual_resource_dot_path_refs() {
+        let resolver = {
+            let mut r = ModuleResolver::new(".");
+            r.imported_modules
+                .insert("web_tier".to_string(), create_module_with_attributes());
+            r
+        };
+
+        let call = ModuleCall {
+            module_name: "web_tier".to_string(),
+            binding_name: Some("web".to_string()),
+            arguments: HashMap::new(),
+        };
+
+        let expanded = resolver.expand_module_call(&call, "web").unwrap();
+
+        let virtual_res = expanded
+            .iter()
+            .find(|r| {
+                r.attributes
+                    .get("_virtual")
+                    .is_some_and(|v| matches!(v, Value::String(s) if s == "true"))
+            })
+            .expect("Virtual resource should exist");
+
+        // The security_group attribute should reference dot-notation binding
+        assert_eq!(
+            virtual_res.attributes.get("security_group"),
+            Some(&Value::ResourceRef {
+                binding_name: "web.sg".to_string(),
+                attribute_name: "id".to_string(),
+            })
+        );
     }
 }
