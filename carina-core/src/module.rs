@@ -199,8 +199,8 @@ pub struct ResourceCreation {
 pub struct TypedAttributeParam {
     /// Attribute parameter name
     pub name: String,
-    /// Type expression (including ref types)
-    pub type_expr: TypeExpr,
+    /// Type expression (including ref types), None if inferred
+    pub type_expr: Option<TypeExpr>,
     /// Source binding name (if the output comes from a resource)
     pub source_binding: Option<String>,
 }
@@ -972,11 +972,15 @@ impl ModuleSignature {
             output.push_str(&format!("  {}(none){}\n", c.dim, c.reset));
         } else {
             for attr_param in &self.exposes {
-                let type_str = self.format_type_expr(&attr_param.type_expr, &c);
-                output.push_str(&format!(
-                    "  {}{}{}: {}\n",
-                    c.white, attr_param.name, c.reset, type_str
-                ));
+                if let Some(type_expr) = &attr_param.type_expr {
+                    let type_str = self.format_type_expr(type_expr, &c);
+                    output.push_str(&format!(
+                        "  {}{}{}: {}\n",
+                        c.white, attr_param.name, c.reset, type_str
+                    ));
+                } else {
+                    output.push_str(&format!("  {}{}{}\n", c.white, attr_param.name, c.reset));
+                }
             }
         }
 
@@ -1323,7 +1327,11 @@ mod tests {
                 vpc: aws.vpc
             }
             attributes {
-                sg: aws.security_group
+                sg: aws.security_group = web_sg.id
+            }
+
+            let web_sg = aws.security_group {
+                name = "web-sg"
             }
         "#;
 

@@ -57,9 +57,10 @@ attributes_block = {
 
 attributes_block_content = _{ trivia | attributes_param }
 
-// Attributes parameter: name: type = value
+// Attributes parameter: name: type = value, or name = value (type optional)
 attributes_param = {
     identifier ~ trivia* ~ colon ~ trivia* ~ type_expr ~ trivia* ~ equals ~ trivia* ~ expression
+  | identifier ~ trivia* ~ equals ~ trivia* ~ expression
 }
 
 // Type expression: string, bool, int, cidr, list(type), map(type), aws.resource (resource ref)

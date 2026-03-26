@@ -473,9 +473,10 @@ impl DiagnosticEngine {
                     });
                 }
 
-                // Type validation
-                if let Some(type_error) =
-                    self.validate_attributes_type(&attr_param.type_expr, value, &attr_param.name)
+                // Type validation (only when explicit type annotation is present)
+                if let Some(ref type_expr) = attr_param.type_expr
+                    && let Some(type_error) =
+                        self.validate_attributes_type(type_expr, value, &attr_param.name)
                     && let Some((line, col)) =
                         self.find_attributes_param_position(doc, &attr_param.name)
                 {
