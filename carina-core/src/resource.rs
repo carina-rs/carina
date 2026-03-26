@@ -72,6 +72,9 @@ pub enum Value {
         binding_name: String,
         /// Attribute name being referenced (e.g., "id", "name")
         attribute_name: String,
+        /// Additional chained field path for nested access (e.g., ["vpc_id"] for a.b.vpc_id)
+        #[serde(default)]
+        field_path: Vec<String>,
     },
     /// Unresolved identifier that will be resolved during schema validation
     /// This allows shorthand enum values like `dedicated` to be resolved to
@@ -159,9 +162,11 @@ impl Value {
             Value::ResourceRef {
                 binding_name,
                 attribute_name,
+                field_path,
             } => {
                 binding_name.hash(hasher);
                 attribute_name.hash(hasher);
+                field_path.hash(hasher);
             }
             Value::UnresolvedIdent(name, member) => {
                 name.hash(hasher);
@@ -567,14 +572,17 @@ mod tests {
             Value::ResourceRef {
                 binding_name: "vpc".to_string(),
                 attribute_name: "id".to_string(),
+                field_path: vec![],
             },
             Value::ResourceRef {
                 binding_name: "web_sg".to_string(),
                 attribute_name: "id".to_string(),
+                field_path: vec![],
             },
             Value::ResourceRef {
                 binding_name: "bucket".to_string(),
                 attribute_name: "arn".to_string(),
+                field_path: vec![],
             },
             Value::UnresolvedIdent("dedicated".to_string(), None),
             Value::UnresolvedIdent("InstanceTenancy".to_string(), Some("dedicated".to_string())),
@@ -583,6 +591,7 @@ mod tests {
                 InterpolationPart::Expr(Value::ResourceRef {
                     binding_name: "vpc".to_string(),
                     attribute_name: "id".to_string(),
+                    field_path: vec![],
                 }),
                 InterpolationPart::Literal("-suffix".to_string()),
             ]),

@@ -328,6 +328,7 @@ mod tests {
                 Value::ResourceRef {
                     binding_name: dep.to_string(),
                     attribute_name: "id".to_string(),
+                    field_path: vec![],
                 },
             );
         }
@@ -362,6 +363,7 @@ mod tests {
             Value::ResourceRef {
                 binding_name: "tgw".to_string(),
                 attribute_name: "id".to_string(),
+                field_path: vec![],
             },
         );
         // route_table_id resolved to a ResourceRef pointing at "rt"
@@ -370,6 +372,7 @@ mod tests {
             Value::ResourceRef {
                 binding_name: "rt".to_string(),
                 attribute_name: "route_table_id".to_string(),
+                field_path: vec![],
             },
         );
         // _dependency_bindings was saved before resolution with the CORRECT deps

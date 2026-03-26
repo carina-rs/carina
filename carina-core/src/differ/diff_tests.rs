@@ -852,6 +852,7 @@ fn orphan_delete_preserves_binding_and_dependencies() {
         Value::ResourceRef {
             binding_name: "my_vpc".to_string(),
             attribute_name: "vpc_id".to_string(),
+            field_path: vec![],
         },
     );
     current_states.insert(

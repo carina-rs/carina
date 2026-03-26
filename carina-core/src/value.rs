@@ -33,11 +33,15 @@ pub fn value_to_json(value: &Value) -> Result<serde_json::Value, String> {
         Value::ResourceRef {
             binding_name,
             attribute_name,
-            ..
-        } => Ok(serde_json::Value::String(format!(
-            "${{{}.{}}}",
-            binding_name, attribute_name
-        ))),
+            field_path,
+        } => {
+            let mut path = format!("{}.{}", binding_name, attribute_name);
+            for field in field_path {
+                path.push('.');
+                path.push_str(field);
+            }
+            Ok(serde_json::Value::String(format!("${{{}}}", path)))
+        }
         Value::UnresolvedIdent(name, member) => match member {
             Some(m) => Ok(serde_json::Value::String(format!("{}.{}", name, m))),
             None => Ok(serde_json::Value::String(name.clone())),
@@ -135,8 +139,15 @@ pub fn format_value_with_key(value: &Value, _key: Option<&str>) -> String {
         Value::ResourceRef {
             binding_name,
             attribute_name,
-            ..
-        } => format!("{}.{}", binding_name, attribute_name),
+            field_path,
+        } => {
+            let mut path = format!("{}.{}", binding_name, attribute_name);
+            for field in field_path {
+                path.push('.');
+                path.push_str(field);
+            }
+            path
+        }
         Value::UnresolvedIdent(name, member) => match member {
             Some(m) => {
                 let full = format!("{}.{}", name, m);
@@ -280,6 +291,7 @@ mod tests {
         let v = Value::ResourceRef {
             binding_name: "vpc".to_string(),
             attribute_name: "id".to_string(),
+            field_path: vec![],
         };
         assert_eq!(value_to_json(&v).unwrap(), serde_json::json!("${vpc.id}"));
     }
@@ -427,8 +439,32 @@ mod tests {
         let v = Value::ResourceRef {
             binding_name: "vpc".to_string(),
             attribute_name: "id".to_string(),
+            field_path: vec![],
         };
         assert_eq!(format_value(&v), "vpc.id");
+    }
+
+    #[test]
+    fn test_format_value_resource_ref_with_field_path() {
+        let v = Value::ResourceRef {
+            binding_name: "web".to_string(),
+            attribute_name: "network".to_string(),
+            field_path: vec!["vpc_id".to_string()],
+        };
+        assert_eq!(format_value(&v), "web.network.vpc_id");
+    }
+
+    #[test]
+    fn test_value_to_json_resource_ref_with_field_path() {
+        let v = Value::ResourceRef {
+            binding_name: "web".to_string(),
+            attribute_name: "output".to_string(),
+            field_path: vec!["network".to_string(), "vpc_id".to_string()],
+        };
+        assert_eq!(
+            value_to_json(&v).unwrap(),
+            serde_json::json!("${web.output.network.vpc_id}")
+        );
     }
 
     #[test]

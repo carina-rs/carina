@@ -174,7 +174,19 @@ fn deterministic_value_string(value: &Value) -> String {
         Value::ResourceRef {
             binding_name,
             attribute_name,
-        } => format!("ResourceRef({}.{})", binding_name, attribute_name),
+            field_path,
+        } => {
+            if field_path.is_empty() {
+                format!("ResourceRef({}.{})", binding_name, attribute_name)
+            } else {
+                format!(
+                    "ResourceRef({}.{}.{})",
+                    binding_name,
+                    attribute_name,
+                    field_path.join(".")
+                )
+            }
+        }
         Value::UnresolvedIdent(name, member) => {
             format!("UnresolvedIdent({}, {:?})", name, member)
         }

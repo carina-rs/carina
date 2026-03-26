@@ -21,6 +21,7 @@ fn cascade_dependent_updates_adds_update_for_dependent() {
             Value::ResourceRef {
                 binding_name: "vpc".to_string(),
                 attribute_name: "vpc_id".to_string(),
+                field_path: vec![],
             },
         )
         .with_attribute("cidr_block", Value::String("10.1.1.0/24".to_string()));
@@ -116,6 +117,7 @@ fn cascade_skips_resources_already_in_plan() {
             Value::ResourceRef {
                 binding_name: "vpc".to_string(),
                 attribute_name: "vpc_id".to_string(),
+                field_path: vec![],
             },
         )
         .with_attribute("cidr_block", Value::String("10.1.2.0/24".to_string()));
@@ -199,6 +201,7 @@ fn cascade_no_op_without_create_before_destroy() {
             Value::ResourceRef {
                 binding_name: "vpc".to_string(),
                 attribute_name: "vpc_id".to_string(),
+                field_path: vec![],
             },
         );
 
@@ -258,6 +261,7 @@ fn cascade_transitive_dependencies() {
             Value::ResourceRef {
                 binding_name: "vpc".to_string(),
                 attribute_name: "vpc_id".to_string(),
+                field_path: vec![],
             },
         );
 
@@ -268,6 +272,7 @@ fn cascade_transitive_dependencies() {
             Value::ResourceRef {
                 binding_name: "subnet".to_string(),
                 attribute_name: "subnet_id".to_string(),
+                field_path: vec![],
             },
         );
 
@@ -353,6 +358,7 @@ fn cascade_anonymous_resource_dependent() {
         Value::ResourceRef {
             binding_name: "vpc".to_string(),
             attribute_name: "vpc_id".to_string(),
+            field_path: vec![],
         },
     );
 
@@ -435,6 +441,7 @@ fn cascade_generates_replace_when_dependent_attribute_is_create_only() {
             Value::ResourceRef {
                 binding_name: "vpc".to_string(),
                 attribute_name: "vpc_id".to_string(),
+                field_path: vec![],
             },
         )
         .with_attribute("cidr_block", Value::String("10.1.1.0/24".to_string()));
@@ -584,6 +591,7 @@ fn cascade_merges_with_existing_replace_direct_change_plus_cascade() {
             Value::ResourceRef {
                 binding_name: "vpc".to_string(),
                 attribute_name: "vpc_id".to_string(),
+                field_path: vec![],
             },
         )
         .with_attribute("availability_zone", Value::String("us-east-1b".to_string()))
@@ -733,6 +741,7 @@ fn auto_detect_create_before_destroy_when_resource_has_dependents() {
             Value::ResourceRef {
                 binding_name: "vpc".to_string(),
                 attribute_name: "vpc_id".to_string(),
+                field_path: vec![],
             },
         )
         .with_attribute("cidr_block", Value::String("10.1.1.0/24".to_string()));
@@ -843,6 +852,7 @@ fn cascade_upgrades_update_to_replace_when_ref_is_create_only() {
             Value::ResourceRef {
                 binding_name: "vpc".to_string(),
                 attribute_name: "vpc_id".to_string(),
+                field_path: vec![],
             },
         )
         .with_attribute("tags", Value::String("new-tag".to_string()))

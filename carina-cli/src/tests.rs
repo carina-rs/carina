@@ -985,6 +985,7 @@ fn test_plan_verify_idempotency_anonymous_flow_log_with_resource_refs() {
         Value::ResourceRef {
             binding_name: "vpc".to_string(),
             attribute_name: "vpc_id".to_string(),
+            field_path: vec![],
         },
     );
     resource_run1.attributes.insert(
@@ -1004,6 +1005,7 @@ fn test_plan_verify_idempotency_anonymous_flow_log_with_resource_refs() {
         Value::ResourceRef {
             binding_name: "bucket".to_string(),
             attribute_name: "arn".to_string(),
+            field_path: vec![],
         },
     );
     resource_run1.attributes.insert(
@@ -1042,6 +1044,7 @@ fn test_plan_verify_idempotency_anonymous_flow_log_with_resource_refs() {
         Value::ResourceRef {
             binding_name: "vpc".to_string(),
             attribute_name: "vpc_id".to_string(),
+            field_path: vec![],
         },
     );
     resource_run2.attributes.insert(
@@ -1061,6 +1064,7 @@ fn test_plan_verify_idempotency_anonymous_flow_log_with_resource_refs() {
         Value::ResourceRef {
             binding_name: "bucket".to_string(),
             attribute_name: "arn".to_string(),
+            field_path: vec![],
         },
     );
     resource_run2.attributes.insert(
@@ -1712,6 +1716,7 @@ async fn update_effect_resolves_refs_against_post_replacement_binding_map() {
             Value::ResourceRef {
                 binding_name: "vpc".to_string(),
                 attribute_name: "vpc_id".to_string(),
+                field_path: vec![],
             },
         )
         .with_attribute("cidr_block", Value::String("10.1.2.0/24".to_string()));

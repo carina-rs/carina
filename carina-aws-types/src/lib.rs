@@ -1251,6 +1251,7 @@ mod tests {
             t.validate(&Value::ResourceRef {
                 binding_name: "role".to_string(),
                 attribute_name: "arn".to_string(),
+                field_path: vec![],
             })
             .is_ok()
         );
@@ -1290,6 +1291,7 @@ mod tests {
             t.validate(&Value::ResourceRef {
                 binding_name: "my_vpc".to_string(),
                 attribute_name: "vpc_id".to_string(),
+                field_path: vec![],
             })
             .is_ok()
         );
@@ -1424,6 +1426,7 @@ mod tests {
             t.validate(&Value::ResourceRef {
                 binding_name: "subnet".to_string(),
                 attribute_name: "availability_zone_id".to_string(),
+                field_path: vec![],
             })
             .is_ok()
         );

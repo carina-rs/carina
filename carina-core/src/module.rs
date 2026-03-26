@@ -443,6 +443,7 @@ impl RootConfigSignature {
             Value::ResourceRef {
                 binding_name,
                 attribute_name,
+                ..
             } => {
                 let target_type = binding_types.get(binding_name).cloned();
                 graph.add_edge(
@@ -868,6 +869,7 @@ impl ModuleSignature {
             Value::ResourceRef {
                 binding_name,
                 attribute_name,
+                ..
             } => {
                 let target_type = if let Some(arg_type) = argument_types.get(binding_name) {
                     // Argument parameter reference (lexically scoped)
