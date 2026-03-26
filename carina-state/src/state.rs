@@ -56,36 +56,16 @@ impl StateFile {
         self.carina_version = env!("CARGO_PKG_VERSION").to_string();
     }
 
-    /// Find a resource by provider, type, and name.
-    ///
-    /// If no exact match is found and the name contains dots (instance path format),
-    /// falls back to searching with underscore notation for v3 state migration
-    /// (e.g., `web.sg` → `web_sg`).
+    /// Find a resource by provider, type, and name
     pub fn find_resource(
         &self,
         provider: &str,
         resource_type: &str,
         name: &str,
     ) -> Option<&ResourceState> {
-        // Try exact match first
-        if let Some(r) = self
-            .resources
+        self.resources
             .iter()
             .find(|r| r.provider == provider && r.resource_type == resource_type && r.name == name)
-        {
-            return Some(r);
-        }
-
-        // Legacy alias fallback: try underscore notation for v3→v4 migration
-        // Only applies to dot-notation names (instance paths like "web.sg")
-        if name.contains('.') {
-            let legacy_name = name.replace('.', "_");
-            self.resources.iter().find(|r| {
-                r.provider == provider && r.resource_type == resource_type && r.name == legacy_name
-            })
-        } else {
-            None
-        }
     }
 
     /// Find all resources matching a provider and resource type
@@ -96,34 +76,16 @@ impl StateFile {
             .collect()
     }
 
-    /// Find a resource mutably by provider, type, and name.
-    ///
-    /// If no exact match is found, falls back to underscore notation
-    /// for v3→v4 migration (same as `find_resource`).
+    /// Find a resource mutably by provider, type, and name
     pub fn find_resource_mut(
         &mut self,
         provider: &str,
         resource_type: &str,
         name: &str,
     ) -> Option<&mut ResourceState> {
-        // Try exact match first
-        if let Some(idx) = self.resources.iter().position(|r| {
-            r.provider == provider && r.resource_type == resource_type && r.name == name
-        }) {
-            return Some(&mut self.resources[idx]);
-        }
-
-        // Legacy alias fallback
-        if name.contains('.') {
-            let legacy_name = name.replace('.', "_");
-            if let Some(idx) = self.resources.iter().position(|r| {
-                r.provider == provider && r.resource_type == resource_type && r.name == legacy_name
-            }) {
-                return Some(&mut self.resources[idx]);
-            }
-        }
-
-        None
+        self.resources
+            .iter_mut()
+            .find(|r| r.provider == provider && r.resource_type == resource_type && r.name == name)
     }
 
     /// Add or update a resource in the state
@@ -218,25 +180,10 @@ impl StateFile {
         &self,
         desired_ids: &std::collections::HashSet<ResourceId>,
     ) -> HashMap<ResourceId, State> {
-        // Build a set of legacy (underscore) names from desired IDs for v3→v4 migration.
-        // For each desired ID with dot notation (e.g., "web.vpc"), also register
-        // the underscore equivalent ("web_vpc") so old state entries aren't treated as orphans.
-        let legacy_names: std::collections::HashSet<ResourceId> = desired_ids
-            .iter()
-            .filter(|id| id.name.contains('.'))
-            .map(|id| {
-                ResourceId::with_provider(
-                    &id.provider,
-                    &id.resource_type,
-                    id.name.replace('.', "_"),
-                )
-            })
-            .collect();
-
         let mut result = HashMap::new();
         for rs in &self.resources {
             let id = ResourceId::with_provider(&rs.provider, &rs.resource_type, &rs.name);
-            if desired_ids.contains(&id) || legacy_names.contains(&id) {
+            if desired_ids.contains(&id) {
                 continue;
             }
             // Only include resources that actually have an identifier (i.e. exist in infra)
@@ -268,23 +215,10 @@ impl StateFile {
         &self,
         desired_ids: &std::collections::HashSet<ResourceId>,
     ) -> HashMap<ResourceId, Vec<String>> {
-        // Build legacy name set for v3→v4 migration (same as build_orphan_states)
-        let legacy_names: std::collections::HashSet<ResourceId> = desired_ids
-            .iter()
-            .filter(|id| id.name.contains('.'))
-            .map(|id| {
-                ResourceId::with_provider(
-                    &id.provider,
-                    &id.resource_type,
-                    id.name.replace('.', "_"),
-                )
-            })
-            .collect();
-
         let mut result = HashMap::new();
         for rs in &self.resources {
             let id = ResourceId::with_provider(&rs.provider, &rs.resource_type, &rs.name);
-            if desired_ids.contains(&id) || legacy_names.contains(&id) {
+            if desired_ids.contains(&id) {
                 continue;
             }
             if rs.identifier.is_some() && !rs.dependency_bindings.is_empty() {
@@ -307,9 +241,7 @@ impl StateFile {
         result
     }
 
-    /// Remove a resource from the state.
-    ///
-    /// Supports legacy alias fallback for v3→v4 migration.
+    /// Remove a resource from the state
     pub fn remove_resource(
         &mut self,
         provider: &str,
@@ -319,20 +251,10 @@ impl StateFile {
         if let Some(pos) = self.resources.iter().position(|r| {
             r.provider == provider && r.resource_type == resource_type && r.name == name
         }) {
-            return Some(self.resources.remove(pos));
+            Some(self.resources.remove(pos))
+        } else {
+            None
         }
-
-        // Legacy alias fallback
-        if name.contains('.') {
-            let legacy_name = name.replace('.', "_");
-            if let Some(pos) = self.resources.iter().position(|r| {
-                r.provider == provider && r.resource_type == resource_type && r.name == legacy_name
-            }) {
-                return Some(self.resources.remove(pos));
-            }
-        }
-
-        None
     }
 }
 
@@ -957,37 +879,6 @@ mod tests {
     fn test_state_file_version_is_v4() {
         let state = StateFile::new();
         assert_eq!(state.version, 4);
-    }
-
-    #[test]
-    fn test_find_resource_with_legacy_underscore_alias() {
-        let mut state = StateFile::new();
-        // State has resource with old underscore naming
-        state.upsert_resource(
-            ResourceState::new("ec2.vpc", "web_vpc", "awscc").with_identifier("vpc-123"),
-        );
-
-        // Looking up with new dot notation should find it via legacy alias
-        let found = state.find_resource("awscc", "ec2.vpc", "web.vpc");
-        assert!(found.is_some());
-        assert_eq!(found.unwrap().identifier, Some("vpc-123".to_string()));
-    }
-
-    #[test]
-    fn test_dot_notation_preferred_over_legacy_alias() {
-        let mut state = StateFile::new();
-        // State has both old and new naming
-        state.upsert_resource(
-            ResourceState::new("ec2.vpc", "web_vpc", "awscc").with_identifier("old-vpc"),
-        );
-        state.upsert_resource(
-            ResourceState::new("ec2.vpc", "web.vpc", "awscc").with_identifier("new-vpc"),
-        );
-
-        // Dot notation should find the exact match, not the legacy alias
-        let found = state.find_resource("awscc", "ec2.vpc", "web.vpc");
-        assert!(found.is_some());
-        assert_eq!(found.unwrap().identifier, Some("new-vpc".to_string()));
     }
 
     #[test]
