@@ -106,6 +106,16 @@ pub enum NodeKind {
     KwEnv,
     KwInput,
     KwOutput,
+    // State block types
+    ImportStateBlock,
+    RemovedBlock,
+    MovedBlock,
+    ResourceAddress,
+    ImportToAttr,
+    ImportIdAttr,
+    RemovedFromAttr,
+    MovedFromAttr,
+    MovedToAttr,
 }
 
 /// CST node - preserves all source information

@@ -392,6 +392,59 @@ pub async fn refresh_pending_states(
     failed_refreshes
 }
 
+/// Execute import effects by reading the resource from the provider.
+///
+/// For each Import effect, calls provider.read() with the given identifier
+/// to fetch the current state and stores the result in applied_states
+/// so that finalize_apply can persist it.
+async fn execute_import_effects(plan: &Plan, provider: &dyn Provider, result: &mut ApplyResult) {
+    for effect in plan.effects() {
+        if let Effect::Import { id, identifier } = effect {
+            println!("  {} Importing {} (id: {})...", "<-".cyan(), id, identifier);
+            match provider.read(id, Some(identifier)).await {
+                Ok(state) => {
+                    if state.exists {
+                        println!("  {} Imported {}", "✓".green(), id);
+                        result.applied_states.insert(id.clone(), state);
+                        result.success_count += 1;
+                    } else {
+                        println!(
+                            "  {} Import failed: resource {} with id {} not found",
+                            "✗".red(),
+                            id,
+                            identifier
+                        );
+                        result.failure_count += 1;
+                    }
+                }
+                Err(e) => {
+                    println!("  {} Import failed for {}: {}", "✗".red(), id, e);
+                    result.failure_count += 1;
+                }
+            }
+        }
+    }
+}
+
+/// Execute state-only effects (remove, move) with user feedback.
+///
+/// These effects only modify state and don't call the provider.
+fn execute_state_only_effects(plan: &Plan, result: &mut ApplyResult) {
+    for effect in plan.effects() {
+        match effect {
+            Effect::Remove { id } => {
+                println!("  {} Removing {} from state", "x".red(), id);
+                result.success_count += 1;
+            }
+            Effect::Move { from, to } => {
+                println!("  {} Moving {} -> {}", "->".yellow(), from, to);
+                result.success_count += 1;
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Save state after apply. Does NOT release the lock -- caller is responsible.
 ///
 /// When `lock` is `None` (i.e. `--lock=false`), state is written without lock
@@ -514,10 +567,39 @@ pub fn build_state_after_apply(save: ApplyStateSave<'_>) -> Result<StateFile, Ap
     }
 
     for effect in plan.effects() {
-        if let Effect::Delete { id, .. } = effect
-            && successfully_deleted.contains(id)
-        {
-            state.remove_resource(&id.provider, &id.resource_type, &id.name);
+        match effect {
+            Effect::Delete { id, .. } if successfully_deleted.contains(id) => {
+                state.remove_resource(&id.provider, &id.resource_type, &id.name);
+            }
+            Effect::Import { id, identifier } => {
+                // Import: store the resource in state with its identifier
+                // The actual read is done during the apply phase (handled by execute_import_effects)
+                if let Some(imported_state) = applied_states.get(id) {
+                    let resource_state =
+                        ResourceState::new(&id.resource_type, &id.name, &id.provider)
+                            .with_identifier(identifier.clone())
+                            .with_attributes_from_state(imported_state);
+                    state.upsert_resource(resource_state);
+                }
+            }
+            Effect::Remove { id } => {
+                state.remove_resource(&id.provider, &id.resource_type, &id.name);
+            }
+            Effect::Move { from, to } => {
+                // Move: update the resource's identity in state
+                if let Some(existing) = state
+                    .find_resource(&from.provider, &from.resource_type, &from.name)
+                    .cloned()
+                {
+                    state.remove_resource(&from.provider, &from.resource_type, &from.name);
+                    let mut moved_resource = existing;
+                    moved_resource.provider = to.provider.clone();
+                    moved_resource.resource_type = to.resource_type.clone();
+                    moved_resource.name = to.name.clone();
+                    state.upsert_resource(moved_resource);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -989,6 +1071,9 @@ async fn run_apply_locked(
     // Uses unresolved resources (sorted_resources) so dependents retain ResourceRef values.
     cascade_dependent_updates(&mut plan, &sorted_resources, &current_states, schemas);
 
+    // Add state block effects (import/removed/moved) to the plan
+    crate::wiring::add_state_block_effects(&mut plan, &parsed.state_blocks, &state_file);
+
     if plan.is_empty() {
         println!("{}", "No changes needed.".green());
         return Ok(());
@@ -1051,7 +1136,7 @@ async fn run_apply_locked(
         .map(|r| (r.id.clone(), r.clone()))
         .collect();
 
-    let result = execute_effects(
+    let mut result = execute_effects(
         &plan,
         &provider,
         &mut binding_map,
@@ -1059,6 +1144,12 @@ async fn run_apply_locked(
         &unresolved_resources,
     )
     .await;
+
+    // Execute import effects: read imported resources from the provider
+    execute_import_effects(&plan, &provider, &mut result).await;
+
+    // Execute remove and move effects (state-only, logged for user feedback)
+    execute_state_only_effects(&plan, &mut result);
 
     finalize_apply(
         &result,
@@ -1342,7 +1433,7 @@ async fn run_apply_from_plan_locked(
         .map(|r| (r.id.clone(), r.clone()))
         .collect();
 
-    let result = execute_effects(
+    let mut result = execute_effects(
         plan,
         &provider,
         &mut binding_map,
@@ -1350,6 +1441,12 @@ async fn run_apply_from_plan_locked(
         &unresolved_resources,
     )
     .await;
+
+    // Execute import effects: read imported resources from the provider
+    execute_import_effects(plan, &provider, &mut result).await;
+
+    // Execute remove and move effects (state-only, logged for user feedback)
+    execute_state_only_effects(plan, &mut result);
 
     finalize_apply(
         &result,

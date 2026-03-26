@@ -133,6 +133,15 @@ impl Formatter {
             NodeKind::LetBinding => self.format_let_binding(node),
             NodeKind::LocalBinding => self.format_let_binding(node),
             NodeKind::ModuleCall => self.format_module_call(node),
+            NodeKind::ImportStateBlock => self.format_state_block(node, "import"),
+            NodeKind::RemovedBlock => self.format_state_block(node, "removed"),
+            NodeKind::MovedBlock => self.format_state_block(node, "moved"),
+            NodeKind::ImportToAttr
+            | NodeKind::ImportIdAttr
+            | NodeKind::RemovedFromAttr
+            | NodeKind::MovedFromAttr
+            | NodeKind::MovedToAttr => self.format_state_block_attr(node),
+            NodeKind::ResourceAddress => self.format_resource_address(node),
             NodeKind::AnonymousResource => self.format_anonymous_resource(node),
             NodeKind::ResourceExpr => self.format_resource_expr(node),
             NodeKind::ReadResourceExpr => self.format_read_resource_expr(node),
@@ -193,6 +202,73 @@ impl Formatter {
         self.write_indent();
         self.write("}");
         self.write_newline();
+    }
+
+    /// Format a state block (import, removed, moved)
+    fn format_state_block(&mut self, node: &CstNode, keyword: &str) {
+        self.write_indent();
+        self.write(keyword);
+        self.write(" {");
+        self.write_newline();
+        self.current_indent += 1;
+
+        // Format inner attributes (to, from, id)
+        for child in &node.children {
+            if let CstChild::Node(child_node) = child {
+                self.format_node(child_node);
+            }
+        }
+
+        self.current_indent -= 1;
+        self.write_indent();
+        self.write("}");
+        self.write_newline();
+    }
+
+    /// Format a state block attribute (to = ..., from = ..., id = ...)
+    fn format_state_block_attr(&mut self, node: &CstNode) {
+        self.write_indent();
+
+        // Collect tokens: keyword, "=", and value
+        let mut wrote_keyword = false;
+        for child in &node.children {
+            match child {
+                CstChild::Token(token) => {
+                    if !wrote_keyword
+                        && (token.text == "to" || token.text == "from" || token.text == "id")
+                    {
+                        self.write(&token.text);
+                        wrote_keyword = true;
+                    } else if token.text == "=" {
+                        self.write(" = ");
+                    } else {
+                        self.write(&token.text);
+                    }
+                }
+                CstChild::Node(child_node) => {
+                    self.format_node(child_node);
+                }
+                CstChild::Trivia(_) => {}
+            }
+        }
+
+        self.write_newline();
+    }
+
+    /// Format a resource address: `provider.service.type "name"`
+    fn format_resource_address(&mut self, node: &CstNode) {
+        let mut first = true;
+        for child in &node.children {
+            if let CstChild::Token(token) = child {
+                if first {
+                    self.write(&token.text);
+                    first = false;
+                } else {
+                    self.write(" ");
+                    self.write(&token.text);
+                }
+            }
+        }
     }
 
     fn format_module_call(&mut self, node: &CstNode) {

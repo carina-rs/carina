@@ -51,6 +51,7 @@ pub fn load_configuration(path: &PathBuf) -> Result<LoadedConfig, String> {
             arguments: vec![],
             attribute_params: vec![],
             backend: None,
+            state_blocks: vec![],
         };
         let mut merged = empty_parsed();
         let mut unresolved_merged = empty_parsed();
@@ -80,6 +81,9 @@ pub fn load_configuration(path: &PathBuf) -> Result<LoadedConfig, String> {
                     unresolved_merged
                         .attribute_params
                         .extend(unresolved.attribute_params);
+                    unresolved_merged
+                        .state_blocks
+                        .extend(unresolved.state_blocks);
 
                     // Merge resolved
                     merged.providers.extend(parsed.providers);
@@ -89,6 +93,7 @@ pub fn load_configuration(path: &PathBuf) -> Result<LoadedConfig, String> {
                     merged.module_calls.extend(parsed.module_calls);
                     merged.arguments.extend(parsed.arguments);
                     merged.attribute_params.extend(parsed.attribute_params);
+                    merged.state_blocks.extend(parsed.state_blocks);
                     // Merge backend (only one allowed)
                     if let Some(backend) = parsed.backend {
                         if merged.backend.is_some() {

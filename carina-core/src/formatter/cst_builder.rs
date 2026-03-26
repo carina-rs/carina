@@ -79,6 +79,35 @@ impl<'a> CstBuilder<'a> {
             Rule::arguments_param => Some(CstChild::Node(
                 self.build_node(NodeKind::ArgumentsParam, pair),
             )),
+            // State blocks
+            Rule::import_state_block => Some(CstChild::Node(
+                self.build_node(NodeKind::ImportStateBlock, pair),
+            )),
+            Rule::import_state_content => None, // Silent rule
+            Rule::import_to_attr => Some(CstChild::Node(
+                self.build_node(NodeKind::ImportToAttr, pair),
+            )),
+            Rule::import_id_attr => Some(CstChild::Node(
+                self.build_node(NodeKind::ImportIdAttr, pair),
+            )),
+            Rule::removed_block => Some(CstChild::Node(
+                self.build_node(NodeKind::RemovedBlock, pair),
+            )),
+            Rule::removed_content => None, // Silent rule
+            Rule::removed_from_attr => Some(CstChild::Node(
+                self.build_node(NodeKind::RemovedFromAttr, pair),
+            )),
+            Rule::moved_block => Some(CstChild::Node(self.build_node(NodeKind::MovedBlock, pair))),
+            Rule::moved_content => None, // Silent rule
+            Rule::moved_from_attr => Some(CstChild::Node(
+                self.build_node(NodeKind::MovedFromAttr, pair),
+            )),
+            Rule::moved_to_attr => {
+                Some(CstChild::Node(self.build_node(NodeKind::MovedToAttr, pair)))
+            }
+            Rule::resource_address => Some(CstChild::Node(
+                self.build_node(NodeKind::ResourceAddress, pair),
+            )),
             Rule::attributes_param => Some(CstChild::Node(
                 self.build_node(NodeKind::AttributesParam, pair),
             )),
@@ -194,6 +223,11 @@ impl<'a> CstBuilder<'a> {
             Rule::kw_for => Some(CstChild::Token(Token::new("for".to_string(), span))),
             Rule::kw_in => Some(CstChild::Token(Token::new("in".to_string(), span))),
             Rule::kw_read => Some(CstChild::Token(Token::new("read".to_string(), span))),
+            Rule::kw_removed => Some(CstChild::Token(Token::new("removed".to_string(), span))),
+            Rule::kw_moved => Some(CstChild::Token(Token::new("moved".to_string(), span))),
+            Rule::kw_to => Some(CstChild::Token(Token::new("to".to_string(), span))),
+            Rule::kw_from => Some(CstChild::Token(Token::new("from".to_string(), span))),
+            Rule::kw_id => Some(CstChild::Token(Token::new("id".to_string(), span))),
 
             // Skip file_content (it's a silent rule wrapper)
             Rule::file_content => None,

@@ -275,6 +275,12 @@ impl SemanticTokensProvider {
             tokens.push((indent, 10, 0)); // KEYWORD: attributes
         } else if trimmed.starts_with("arguments ") || trimmed == "arguments{" {
             tokens.push((indent, 9, 0)); // KEYWORD: arguments
+        } else if trimmed.starts_with("import ") || trimmed == "import{" {
+            tokens.push((indent, 6, 0)); // KEYWORD: import
+        } else if trimmed.starts_with("removed ") || trimmed == "removed{" {
+            tokens.push((indent, 7, 0)); // KEYWORD: removed
+        } else if trimmed.starts_with("moved ") || trimmed == "moved{" {
+            tokens.push((indent, 5, 0)); // KEYWORD: moved
         }
 
         // Nested block names: "identifier {" without "=" (e.g., "security_group_ingress {")
@@ -286,6 +292,12 @@ impl SemanticTokensProvider {
             && !trimmed.starts_with("attributes{")
             && !trimmed.starts_with("arguments ")
             && !trimmed.starts_with("arguments{")
+            && !trimmed.starts_with("import ")
+            && !trimmed.starts_with("import{")
+            && !trimmed.starts_with("removed ")
+            && !trimmed.starts_with("removed{")
+            && !trimmed.starts_with("moved ")
+            && !trimmed.starts_with("moved{")
             && !trimmed.contains('=')
             && !trimmed.contains('.')
             && trimmed.ends_with('{')

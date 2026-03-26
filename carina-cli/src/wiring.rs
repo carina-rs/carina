@@ -7,9 +7,10 @@ use futures::stream::{self, StreamExt};
 
 use carina_core::deps::sort_resources_by_dependencies;
 use carina_core::differ::{cascade_dependent_updates, create_plan};
+use carina_core::effect::Effect;
 use carina_core::identifier::{self, AnonymousIdStateInfo, PrefixStateInfo};
 use carina_core::module_resolver;
-use carina_core::parser::{ParsedFile, ProviderConfig};
+use carina_core::parser::{ParsedFile, ProviderConfig, StateBlock};
 use carina_core::plan::Plan;
 use carina_core::provider::{
     self as provider_mod, Provider, ProviderError, ProviderFactory, ProviderNormalizer,
@@ -574,11 +575,99 @@ pub async fn create_plan_from_parsed(
     // retain ResourceRef values for re-resolution at apply time.
     cascade_dependent_updates(&mut plan, &sorted_resources, &current_states, ctx.schemas());
 
+    // Add state block effects (import/removed/moved) to the plan
+    add_state_block_effects(&mut plan, &parsed.state_blocks, state_file);
+
     Ok(PlanContext {
         plan,
         sorted_resources,
         current_states,
     })
+}
+
+/// Add state block effects (import/removed/moved) to the plan.
+///
+/// State blocks become no-ops on subsequent runs when:
+/// - Import: the resource already exists in state
+/// - Removed: the resource does not exist in state
+/// - Moved: the old resource does not exist in state (already moved)
+///
+/// This function also removes Delete effects for resources covered by
+/// `removed` or `moved` blocks, since those operations manage state
+/// without destroying infrastructure.
+pub fn add_state_block_effects(
+    plan: &mut Plan,
+    state_blocks: &[StateBlock],
+    state_file: &Option<StateFile>,
+) {
+    // Collect resource IDs that are covered by removed/moved blocks
+    // to suppress orphan Delete effects and moved-to Create effects
+    let mut suppress_delete: std::collections::HashSet<ResourceId> =
+        std::collections::HashSet::new();
+    let mut suppress_create: std::collections::HashSet<ResourceId> =
+        std::collections::HashSet::new();
+
+    let mut new_effects: Vec<Effect> = Vec::new();
+
+    for block in state_blocks {
+        match block {
+            StateBlock::Import { to, id } => {
+                // Skip if resource already exists in state
+                let already_in_state = state_file.as_ref().is_some_and(|sf| {
+                    sf.find_resource(&to.provider, &to.resource_type, &to.name)
+                        .is_some()
+                });
+                if !already_in_state {
+                    suppress_create.insert(to.clone());
+                    new_effects.push(Effect::Import {
+                        id: to.clone(),
+                        identifier: id.clone(),
+                    });
+                }
+            }
+            StateBlock::Removed { from } => {
+                // Skip if resource is not in state
+                let in_state = state_file.as_ref().is_some_and(|sf| {
+                    sf.find_resource(&from.provider, &from.resource_type, &from.name)
+                        .is_some()
+                });
+                if in_state {
+                    suppress_delete.insert(from.clone());
+                    new_effects.push(Effect::Remove { id: from.clone() });
+                }
+            }
+            StateBlock::Moved { from, to } => {
+                // Skip if old resource is not in state (already moved)
+                let old_in_state = state_file.as_ref().is_some_and(|sf| {
+                    sf.find_resource(&from.provider, &from.resource_type, &from.name)
+                        .is_some()
+                });
+                if old_in_state {
+                    suppress_delete.insert(from.clone());
+                    suppress_create.insert(to.clone());
+                    new_effects.push(Effect::Move {
+                        from: from.clone(),
+                        to: to.clone(),
+                    });
+                }
+            }
+        }
+    }
+
+    // Remove Delete effects for resources covered by removed/moved blocks,
+    // and Create effects for moved-to resources (they inherit state from the old name)
+    if !suppress_delete.is_empty() || !suppress_create.is_empty() {
+        plan.retain(|effect| match effect {
+            Effect::Delete { id, .. } => !suppress_delete.contains(id),
+            Effect::Create(resource) => !suppress_create.contains(&resource.id),
+            _ => true,
+        });
+    }
+
+    // Add the new state block effects
+    for effect in new_effects {
+        plan.add(effect);
+    }
 }
 
 /// Check whether a `ProviderError` is an AWS throttling error that should be retried.

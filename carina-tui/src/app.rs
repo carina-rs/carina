@@ -572,6 +572,22 @@ fn build_tree_structure(plan: &Plan, nodes: &mut [TreeNode]) {
                 effect_deps.insert(idx, deps);
                 continue;
             }
+            Effect::Import { id, .. } | Effect::Remove { id, .. } => {
+                let fallback = id.to_string();
+                binding_to_effect.insert(fallback.clone(), idx);
+                effect_bindings.insert(idx, fallback);
+                effect_types.insert(idx, id.resource_type.clone());
+                effect_deps.insert(idx, HashSet::new());
+                continue;
+            }
+            Effect::Move { to, .. } => {
+                let fallback = to.to_string();
+                binding_to_effect.insert(fallback.clone(), idx);
+                effect_bindings.insert(idx, fallback);
+                effect_types.insert(idx, to.resource_type.clone());
+                effect_deps.insert(idx, HashSet::new());
+                continue;
+            }
         };
 
         if let Some(r) = resource {
@@ -771,7 +787,10 @@ fn shorten_effect_labels(plan: &Plan, nodes: &mut [TreeNode]) {
             Effect::Update { to, .. } => Some(to),
             Effect::Replace { to, .. } => Some(to),
             Effect::Read { resource } => Some(resource),
-            Effect::Delete { .. } => None,
+            Effect::Delete { .. }
+            | Effect::Import { .. }
+            | Effect::Remove { .. }
+            | Effect::Move { .. } => None,
         };
 
         if let Some(r) = resource {
@@ -799,7 +818,10 @@ fn shorten_effect_labels(plan: &Plan, nodes: &mut [TreeNode]) {
                         Effect::Update { to, .. } => Some(to),
                         Effect::Replace { to, .. } => Some(to),
                         Effect::Read { resource } => Some(resource),
-                        Effect::Delete { .. } => None,
+                        Effect::Delete { .. }
+                        | Effect::Import { .. }
+                        | Effect::Remove { .. }
+                        | Effect::Move { .. } => None,
                     };
                     p_resource.and_then(|pr| {
                         pr.attributes.get("_binding").and_then(|v| match v {
@@ -985,6 +1007,39 @@ fn effect_to_node(effect: &Effect, schemas: Option<&HashMap<String, ResourceSche
                 parent: None,
             }
         }
+        Effect::Import { id, .. } => TreeNode {
+            effect_label: format!("{}", id),
+            resource_type: id.display_type(),
+            name_part: id.name.clone(),
+            symbol: "<-".to_string(),
+            kind: EffectKind::Read,
+            detail_rows,
+            children: Vec::new(),
+            depth: 0,
+            parent: None,
+        },
+        Effect::Remove { id } => TreeNode {
+            effect_label: format!("{}", id),
+            resource_type: id.display_type(),
+            name_part: id.name.clone(),
+            symbol: "x".to_string(),
+            kind: EffectKind::Delete,
+            detail_rows,
+            children: Vec::new(),
+            depth: 0,
+            parent: None,
+        },
+        Effect::Move { from, to } => TreeNode {
+            effect_label: format!("{} -> {}", from, to),
+            resource_type: to.display_type(),
+            name_part: to.name.clone(),
+            symbol: "->".to_string(),
+            kind: EffectKind::Update,
+            detail_rows,
+            children: Vec::new(),
+            depth: 0,
+            parent: None,
+        },
     }
 }
 

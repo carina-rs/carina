@@ -340,6 +340,19 @@ impl ResourceState {
         self
     }
 
+    /// Populate attributes from a provider-returned State
+    pub fn with_attributes_from_state(mut self, state: &State) -> Self {
+        for (key, value) in &state.attributes {
+            if let Ok(json_value) = value_to_json(value) {
+                self.attributes.insert(key.clone(), json_value);
+            }
+        }
+        if let Some(identifier) = &state.identifier {
+            self.identifier = Some(identifier.clone());
+        }
+        self
+    }
+
     /// Mark this resource as protected
     pub fn with_protected(mut self, protected: bool) -> Self {
         self.protected = protected;

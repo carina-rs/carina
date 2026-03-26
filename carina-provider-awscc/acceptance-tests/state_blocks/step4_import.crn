@@ -1,0 +1,16 @@
+provider awscc {
+  region = awscc.Region.ap_northeast_1
+}
+
+import {
+  to = awscc.ec2.vpc "imported_vpc"
+  id = "PLACEHOLDER"
+}
+
+let imported_vpc = awscc.ec2.vpc {
+  cidr_block = "10.0.0.0/16"
+
+  tags = {
+    Name = "state-blocks-test"
+  }
+}

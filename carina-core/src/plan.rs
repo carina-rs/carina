@@ -34,6 +34,14 @@ impl Plan {
         self.effects.is_empty()
     }
 
+    /// Remove effects that don't satisfy the predicate
+    pub fn retain<F>(&mut self, f: F)
+    where
+        F: FnMut(&Effect) -> bool,
+    {
+        self.effects.retain(f);
+    }
+
     /// Set cascading updates on Replace effects that match the given replaced bindings.
     pub fn set_cascading_updates(
         &mut self,
@@ -155,6 +163,9 @@ impl Plan {
                     summary.update += cascading_updates.len();
                 }
                 Effect::Delete { .. } => summary.delete += 1,
+                Effect::Import { .. } => summary.import += 1,
+                Effect::Remove { .. } => summary.remove += 1,
+                Effect::Move { .. } => summary.moved += 1,
             }
         }
         summary
@@ -168,6 +179,9 @@ pub struct PlanSummary {
     pub update: usize,
     pub replace: usize,
     pub delete: usize,
+    pub import: usize,
+    pub remove: usize,
+    pub moved: usize,
 }
 
 impl std::fmt::Display for PlanSummary {
@@ -176,12 +190,21 @@ impl std::fmt::Display for PlanSummary {
         if self.read > 0 {
             parts.push(format!("{} to read", self.read));
         }
+        if self.import > 0 {
+            parts.push(format!("{} to import", self.import));
+        }
         parts.push(format!("{} to create", self.create));
         parts.push(format!("{} to update", self.update));
         if self.replace > 0 {
             parts.push(format!("{} to replace", self.replace));
         }
         parts.push(format!("{} to delete", self.delete));
+        if self.remove > 0 {
+            parts.push(format!("{} to remove from state", self.remove));
+        }
+        if self.moved > 0 {
+            parts.push(format!("{} to move", self.moved));
+        }
         write!(f, "Plan: {}", parts.join(", "))
     }
 }
@@ -252,7 +275,10 @@ impl ModularPlan {
                 Effect::Update { to, .. } => Self::extract_source(&to.attributes),
                 Effect::Replace { to, .. } => Self::extract_source(&to.attributes),
                 Effect::Read { resource } => Self::extract_source(&resource.attributes),
-                Effect::Delete { .. } => ModuleSource::Root,
+                Effect::Delete { .. }
+                | Effect::Import { .. }
+                | Effect::Remove { .. }
+                | Effect::Move { .. } => ModuleSource::Root,
             };
             modular.effect_sources.insert(idx, source);
         }
@@ -378,6 +404,9 @@ fn format_effect_brief(effect: &Effect) -> String {
         }
         Effect::Delete { id, .. } => format!("- {}", id),
         Effect::Read { resource } => format!("<= {} (data source)", resource.id),
+        Effect::Import { id, identifier } => format!("<- {} (import: {})", id, identifier),
+        Effect::Remove { id } => format!("x {}", id),
+        Effect::Move { from, to } => format!("-> {} (from: {})", to, from),
     }
 }
 
