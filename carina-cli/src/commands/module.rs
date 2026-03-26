@@ -1,5 +1,6 @@
 use std::path::Path;
 
+use carina_core::config_loader;
 use carina_core::module_resolver;
 
 use crate::error::AppError;
@@ -11,12 +12,36 @@ pub enum ModuleCommands {
         /// Path to module .crn file
         file: std::path::PathBuf,
     },
+    /// List imported modules
+    List {
+        /// Path to .crn file or directory
+        #[arg(default_value = ".")]
+        path: std::path::PathBuf,
+    },
 }
 
 pub fn run_module_command(command: ModuleCommands) -> Result<(), AppError> {
     match command {
         ModuleCommands::Info { file } => run_module_info(&file),
+        ModuleCommands::List { path } => run_module_list(&path),
     }
+}
+
+fn run_module_list(path: &Path) -> Result<(), AppError> {
+    let config = config_loader::load_configuration(&path.to_path_buf())?;
+    let imports = &config.parsed.imports;
+
+    if imports.is_empty() {
+        println!("No modules imported.");
+        return Ok(());
+    }
+
+    println!("Modules:");
+    for import in imports {
+        println!("  {:<12}{}", import.alias, import.path);
+    }
+
+    Ok(())
 }
 
 fn run_module_info(path: &Path) -> Result<(), AppError> {
