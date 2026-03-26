@@ -241,6 +241,10 @@ while IFS= read -r -d '' file; do
     if [ -f "$DIR_OF_FILE/run.sh" ]; then
         continue
     fi
+    # Skip .crn files inside modules/ directories (they are imported by other tests, not standalone)
+    if echo "$REL_PATH" | grep -q '/modules/'; then
+        continue
+    fi
     # Skip slow tests unless --include-slow is set or a filter is provided
     if is_slow_test "$file" && [ $INCLUDE_SLOW -eq 0 ] && [ ${#FILTERS[@]} -eq 0 ]; then
         SKIPPED_SLOW+=("$REL_PATH")
