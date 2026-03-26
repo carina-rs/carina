@@ -601,7 +601,7 @@ fn parse_pipe_expr_with_resource_or_module(
 ) -> Result<LetBindingRhs, ParseError> {
     let mut inner = pair.into_inner();
     let primary = next_pair(&mut inner, "primary expression", "pipe expression")?;
-    let (mut value, expanded_resources, maybe_module_call, maybe_import) =
+    let (mut value, expanded_resources, module_calls, maybe_import) =
         parse_primary_with_resource_or_module(primary, ctx, binding_name)?;
 
     // Desugar pipe: `x |> f(args)` becomes `f(x, args)`
@@ -623,7 +623,7 @@ fn parse_pipe_expr_with_resource_or_module(
         };
     }
 
-    Ok((value, expanded_resources, maybe_module_call, maybe_import))
+    Ok((value, expanded_resources, module_calls, maybe_import))
 }
 
 fn parse_primary_with_resource_or_module(
