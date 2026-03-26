@@ -159,7 +159,7 @@ for_map_binding = { identifier ~ trivia* ~ comma ~ trivia+ ~ identifier }
 for_iterable = { function_call | list | variable_ref | open_paren ~ trivia* ~ expression ~ trivia* ~ close_paren }
 
 // For body content
-for_body_content = _{ trivia | for_local_binding | read_resource_expr | resource_expr }
+for_body_content = _{ trivia | for_local_binding | read_resource_expr | resource_expr | module_call }
 
 // For local binding: let name = expression
 for_local_binding = { kw_let ~ trivia+ ~ identifier ~ trivia* ~ equals ~ trivia* ~ expression }

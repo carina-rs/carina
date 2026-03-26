@@ -124,7 +124,7 @@ for_map_binding = { identifier ~ "," ~ identifier }
 for_iterable = { function_call | list | variable_ref | "(" ~ expression ~ ")" }
 
 // For body: local let bindings followed by a resource expression
-for_body = { for_local_binding* ~ (read_resource_expr | resource_expr) }
+for_body = { for_local_binding* ~ (read_resource_expr | resource_expr | module_call) }
 for_local_binding = { "let" ~ identifier ~ "=" ~ expression }
 
 // List: [item1, item2, ...]

@@ -306,7 +306,7 @@ pub fn parse(input: &str) -> Result<ParsedFile, ParseError> {
                                     name,
                                     value,
                                     expanded_resources,
-                                    maybe_module_call,
+                                    expanded_module_calls,
                                     maybe_import,
                                 ) = parse_let_binding_extended(stmt, &ctx)?;
                                 if ctx.variables.contains_key(&name)
@@ -324,9 +324,13 @@ pub fn parse(input: &str) -> Result<ParsedFile, ParseError> {
                                     );
                                     resources.extend(expanded_resources);
                                 }
-                                if let Some(mut call) = maybe_module_call {
-                                    call.binding_name = Some(name.clone());
-                                    module_calls.push(call);
+                                if !expanded_module_calls.is_empty() {
+                                    for mut call in expanded_module_calls {
+                                        if call.binding_name.is_none() {
+                                            call.binding_name = Some(name.clone());
+                                        }
+                                        module_calls.push(call);
+                                    }
                                     // Register as a resource binding so that
                                     // `name.attr` resolves as ResourceRef
                                     let placeholder = Resource::new("_module_binding", &name);
@@ -544,11 +548,11 @@ fn parse_module_call(
     })
 }
 
-/// Result of parsing the RHS of a let binding: (value, resources, module_call, import)
+/// Result of parsing the RHS of a let binding: (value, resources, module_calls, import)
 type LetBindingRhs = (
     Value,
     Vec<Resource>,
-    Option<ModuleCall>,
+    Vec<ModuleCall>,
     Option<ImportStatement>,
 );
 
@@ -562,7 +566,7 @@ fn parse_let_binding_extended(
         String,
         Value,
         Vec<Resource>,
-        Option<ModuleCall>,
+        Vec<ModuleCall>,
         Option<ImportStatement>,
     ),
     ParseError,
@@ -574,16 +578,10 @@ fn parse_let_binding_extended(
     let expr_pair = next_pair(&mut inner, "expression", "let binding")?;
 
     // Check if it's a module call, resource expression, import, or for expression
-    let (value, expanded_resources, maybe_module_call, maybe_import) =
+    let (value, expanded_resources, module_calls, maybe_import) =
         parse_expression_with_resource_or_module(expr_pair, ctx, &name)?;
 
-    Ok((
-        name,
-        value,
-        expanded_resources,
-        maybe_module_call,
-        maybe_import,
-    ))
+    Ok((name, value, expanded_resources, module_calls, maybe_import))
 }
 
 /// Parse expression with potential resource, module call, or import
@@ -639,31 +637,31 @@ fn parse_primary_with_resource_or_module(
         Rule::read_resource_expr => {
             let resource = parse_read_resource_expr(inner, ctx, binding_name)?;
             let ref_value = Value::String(format!("${{{}}}", binding_name));
-            Ok((ref_value, vec![resource], None, None))
+            Ok((ref_value, vec![resource], vec![], None))
         }
         Rule::resource_expr => {
             let resource = parse_resource_expr(inner, ctx, binding_name)?;
             let ref_value = Value::String(format!("${{{}}}", binding_name));
-            Ok((ref_value, vec![resource], None, None))
+            Ok((ref_value, vec![resource], vec![], None))
         }
         Rule::import_expr => {
             let import = parse_import_expr(inner, binding_name)?;
             let value = Value::String(format!("${{import:{}}}", import.path));
-            Ok((value, vec![], None, Some(import)))
+            Ok((value, vec![], vec![], Some(import)))
         }
         Rule::for_expr => {
-            let resources = parse_for_expr(inner, ctx, binding_name)?;
+            let (resources, module_calls) = parse_for_expr(inner, ctx, binding_name)?;
             let ref_value = Value::String(format!("${{for:{}}}", binding_name));
-            Ok((ref_value, resources, None, None))
+            Ok((ref_value, resources, module_calls, None))
         }
         Rule::module_call => {
             let call = parse_module_call(inner, ctx)?;
             let value = Value::String(format!("${{module:{}}}", call.module_name));
-            Ok((value, vec![], Some(call), None))
+            Ok((value, vec![], vec![call], None))
         }
         _ => {
             let value = parse_primary_value(inner, ctx)?;
-            Ok((value, vec![], None, None))
+            Ok((value, vec![], vec![], None))
         }
     }
 }
@@ -678,18 +676,27 @@ enum ForBinding {
     Map(String, String),
 }
 
-/// Parse a for expression and expand it into individual resources.
+/// Result of parsing a for expression body: either a resource or a module call
+enum ForBodyResult {
+    Resource(Resource),
+    ModuleCall(ModuleCall),
+}
+
+/// Parse a for expression and expand it into individual resources and/or module calls.
 ///
 /// `for x in list { resource_expr }` expands to resources with addresses like
 /// `binding[0]`, `binding[1]`, etc.
 ///
 /// `for k, v in map { resource_expr }` expands to resources with addresses like
 /// `binding["key1"]`, `binding["key2"]`, etc.
+///
+/// When the body is a module call, each iteration produces a module call with
+/// a binding name like `binding[0]` or `binding["key"]`.
 fn parse_for_expr(
     pair: pest::iterators::Pair<Rule>,
     ctx: &ParseContext,
     binding_name: &str,
-) -> Result<Vec<Resource>, ParseError> {
+) -> Result<(Vec<Resource>, Vec<ModuleCall>), ParseError> {
     let mut inner = pair.into_inner();
 
     // Parse the binding pattern
@@ -703,33 +710,40 @@ fn parse_for_expr(
     // Parse the body (we'll re-parse it for each iteration)
     let body_pair = next_pair(&mut inner, "body", "for expression")?;
 
+    let mut resources = Vec::new();
+    let mut module_calls = Vec::new();
+
+    let collect = |result: ForBodyResult,
+                   resources: &mut Vec<Resource>,
+                   module_calls: &mut Vec<ModuleCall>| {
+        match result {
+            ForBodyResult::Resource(r) => resources.push(r),
+            ForBodyResult::ModuleCall(c) => module_calls.push(c),
+        }
+    };
+
     // Expand based on iterable type
     match (&binding, &iterable) {
         (ForBinding::Simple(var), Value::List(items)) => {
-            let mut resources = Vec::new();
             for (i, item) in items.iter().enumerate() {
                 let address = format!("{}[{}]", binding_name, i);
                 let mut iter_ctx = ctx.clone();
                 iter_ctx.set_variable(var.clone(), item.clone());
-                let resource = parse_for_body(body_pair.clone(), &iter_ctx, &address)?;
-                resources.push(resource);
+                let result = parse_for_body(body_pair.clone(), &iter_ctx, &address)?;
+                collect(result, &mut resources, &mut module_calls);
             }
-            Ok(resources)
         }
         (ForBinding::Indexed(idx_var, val_var), Value::List(items)) => {
-            let mut resources = Vec::new();
             for (i, item) in items.iter().enumerate() {
                 let address = format!("{}[{}]", binding_name, i);
                 let mut iter_ctx = ctx.clone();
                 iter_ctx.set_variable(idx_var.clone(), Value::Int(i as i64));
                 iter_ctx.set_variable(val_var.clone(), item.clone());
-                let resource = parse_for_body(body_pair.clone(), &iter_ctx, &address)?;
-                resources.push(resource);
+                let result = parse_for_body(body_pair.clone(), &iter_ctx, &address)?;
+                collect(result, &mut resources, &mut module_calls);
             }
-            Ok(resources)
         }
         (ForBinding::Map(key_var, val_var), Value::Map(map)) => {
-            let mut resources = Vec::new();
             // Sort keys for deterministic output
             let mut keys: Vec<&String> = map.keys().collect();
             keys.sort();
@@ -739,16 +753,19 @@ fn parse_for_expr(
                 let mut iter_ctx = ctx.clone();
                 iter_ctx.set_variable(key_var.clone(), Value::String(key.clone()));
                 iter_ctx.set_variable(val_var.clone(), val.clone());
-                let resource = parse_for_body(body_pair.clone(), &iter_ctx, &address)?;
-                resources.push(resource);
+                let result = parse_for_body(body_pair.clone(), &iter_ctx, &address)?;
+                collect(result, &mut resources, &mut module_calls);
             }
-            Ok(resources)
         }
-        _ => Err(ParseError::InvalidExpression {
-            line: 0,
-            message: "for expression: binding pattern does not match iterable type".to_string(),
-        }),
+        _ => {
+            return Err(ParseError::InvalidExpression {
+                line: 0,
+                message: "for expression: binding pattern does not match iterable type".to_string(),
+            });
+        }
     }
+
+    Ok((resources, module_calls))
 }
 
 /// Parse a for binding pattern
@@ -798,12 +815,12 @@ fn parse_for_iterable(
     parse_primary_value(inner, ctx)
 }
 
-/// Parse the body of a for expression and produce a single resource
+/// Parse the body of a for expression and produce a single resource or module call
 fn parse_for_body(
     pair: pest::iterators::Pair<Rule>,
     ctx: &ParseContext,
     address: &str,
-) -> Result<Resource, ParseError> {
+) -> Result<ForBodyResult, ParseError> {
     let mut local_ctx = ctx.clone();
 
     for inner in pair.into_inner() {
@@ -820,17 +837,24 @@ fn parse_for_body(
                 local_ctx.set_variable(name, value);
             }
             Rule::resource_expr => {
-                return parse_resource_expr(inner, &local_ctx, address);
+                let resource = parse_resource_expr(inner, &local_ctx, address)?;
+                return Ok(ForBodyResult::Resource(resource));
             }
             Rule::read_resource_expr => {
-                return parse_read_resource_expr(inner, &local_ctx, address);
+                let resource = parse_read_resource_expr(inner, &local_ctx, address)?;
+                return Ok(ForBodyResult::Resource(resource));
+            }
+            Rule::module_call => {
+                let mut call = parse_module_call(inner, &local_ctx)?;
+                call.binding_name = Some(address.to_string());
+                return Ok(ForBodyResult::ModuleCall(call));
             }
             _ => {}
         }
     }
 
     Err(ParseError::InternalError {
-        expected: "resource expression".to_string(),
+        expected: "resource expression or module call".to_string(),
         context: "for body".to_string(),
     })
 }
@@ -4077,6 +4101,42 @@ aws.s3.bucket {
             assert_eq!(args[2], Value::Int(0));
         } else {
             panic!("Expected FunctionCall for cidr_block");
+        }
+    }
+
+    #[test]
+    fn parse_for_expression_with_module_call() {
+        let input = r#"
+            let web = import "modules/web"
+
+            let envs = {
+                prod    = "10.0.0.0/16"
+                staging = "10.1.0.0/16"
+            }
+
+            let webs = for name, cidr in envs {
+                web { vpc_cidr = cidr }
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+
+        // for expression with module call should produce module calls, not resources
+        assert_eq!(result.module_calls.len(), 2);
+
+        // Module calls should have binding names like webs["prod"] and webs["staging"]
+        let binding_names: Vec<&str> = result
+            .module_calls
+            .iter()
+            .map(|c| c.binding_name.as_deref().unwrap())
+            .collect();
+        assert!(binding_names.contains(&r#"webs["prod"]"#));
+        assert!(binding_names.contains(&r#"webs["staging"]"#));
+
+        // Each module call should have the loop variable substituted in arguments
+        for call in &result.module_calls {
+            assert_eq!(call.module_name, "web");
+            assert!(call.arguments.contains_key("vpc_cidr"));
         }
     }
 
