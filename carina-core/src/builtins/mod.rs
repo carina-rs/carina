@@ -10,6 +10,7 @@ mod join;
 mod keys_values;
 mod length;
 mod lookup;
+mod min_max;
 mod replace;
 mod split;
 mod trim;
@@ -30,6 +31,8 @@ pub fn evaluate_builtin(name: &str, args: &[Value]) -> Result<Value, String> {
         "length" => length::builtin_length(args),
         "lookup" => lookup::builtin_lookup(args),
         "lower" => upper_lower::builtin_lower(args),
+        "max" => min_max::builtin_max(args),
+        "min" => min_max::builtin_min(args),
         "replace" => replace::builtin_replace(args),
         "split" => split::builtin_split(args),
         "trim" => trim::builtin_trim(args),
