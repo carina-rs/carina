@@ -1157,7 +1157,7 @@ mod tests {
             arguments: {
                 let mut args = HashMap::new();
                 args.insert("vpc_id".to_string(), Value::String("vpc-456".to_string()));
-                // Typo: vpcc_id instead of vpc_id (but vpc_id is already provided above)
+                // Unknown argument: not declared in the module
                 args.insert(
                     "unknown_arg".to_string(),
                     Value::String("should-fail".to_string()),
