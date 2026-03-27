@@ -79,8 +79,7 @@ pub fn find_duplicate_attrs(source: &str) -> Vec<DuplicateAttr> {
         let trimmed = line.trim();
         let line_number = line_idx + 1; // 1-indexed
 
-        // Count opening and closing braces on this line to handle
-        // patterns like `= [{`, `}]`, or single-line blocks
+        // Count braces to handle patterns like `= [{`, `}]`, or single-line blocks
         let opens = trimmed.chars().filter(|&c| c == '{').count();
         let closes = trimmed.chars().filter(|&c| c == '}').count();
 
