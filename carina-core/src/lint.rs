@@ -73,20 +73,27 @@ pub struct DuplicateAttr {
 /// blocks, and nested blocks.
 pub fn find_duplicate_attrs(source: &str) -> Vec<DuplicateAttr> {
     let mut results = Vec::new();
-    // Stack of (depth, HashMap<attr_name, first_line>)
     let mut block_stack: Vec<HashMap<String, usize>> = Vec::new();
 
     for (line_idx, line) in source.lines().enumerate() {
         let trimmed = line.trim();
         let line_number = line_idx + 1; // 1-indexed
 
-        // Track block entry
-        if trimmed.ends_with('{') {
+        // Count opening and closing braces on this line to handle
+        // patterns like `= [{`, `}]`, or single-line blocks
+        let opens = trimmed.chars().filter(|&c| c == '{').count();
+        let closes = trimmed.chars().filter(|&c| c == '}').count();
+
+        // Push new blocks for each opening brace
+        for _ in 0..opens {
             block_stack.push(HashMap::new());
         }
 
         // Check for attribute assignment: `key = value` or `key =`
-        if let Some(eq_pos) = trimmed.find('=') {
+        // Only check if the line doesn't start with `}` (closing brace line)
+        if !trimmed.starts_with('}')
+            && let Some(eq_pos) = trimmed.find('=')
+        {
             // The key is everything before '=' trimmed
             let key_part = trimmed[..eq_pos].trim();
 
@@ -112,12 +119,9 @@ pub fn find_duplicate_attrs(source: &str) -> Vec<DuplicateAttr> {
             }
         }
 
-        // Track block exit
-        if trimmed == "}" || trimmed.ends_with('}') {
-            // Handle closing brace - could be inline like `}]`
-            if !trimmed.ends_with('{') {
-                block_stack.pop();
-            }
+        // Pop blocks for each closing brace
+        for _ in 0..closes {
+            block_stack.pop();
         }
     }
 
@@ -253,6 +257,53 @@ awscc.ec2.security_group {
         let results = find_duplicate_attrs(source);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].name, "from_port");
+    }
+
+    #[test]
+    fn test_find_duplicate_attrs_list_literal_block() {
+        // List literal syntax: attr = [{ ... }]
+        // Duplicate within the list literal block should be detected
+        let source = r#"
+awscc.ec2.security_group {
+    group_description = "test"
+    security_group_ingress = [{
+        ip_protocol = "tcp"
+        ip_protocol = "udp"
+    }]
+}
+"#;
+        let results = find_duplicate_attrs(source);
+        assert_eq!(
+            results.len(),
+            1,
+            "Should detect duplicate in list literal block. Got: {:?}",
+            results
+        );
+        assert_eq!(results[0].name, "ip_protocol");
+    }
+
+    #[test]
+    fn test_find_duplicate_attrs_list_literal_no_cross_block() {
+        // group_description in the outer block should not conflict with
+        // attrs inside the list literal block after }] closes the inner block
+        let source = r#"
+awscc.ec2.security_group {
+    group_description = "test"
+    security_group_ingress = [{
+        ip_protocol = "tcp"
+    }]
+    group_description = "duplicate"
+}
+"#;
+        let results = find_duplicate_attrs(source);
+        // Should detect the duplicate group_description in the outer block
+        assert_eq!(
+            results.len(),
+            1,
+            "Should detect duplicate in outer block despite list literal. Got: {:?}",
+            results
+        );
+        assert_eq!(results[0].name, "group_description");
     }
 
     #[test]
