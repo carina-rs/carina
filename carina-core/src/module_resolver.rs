@@ -38,6 +38,9 @@ pub enum ModuleError {
     #[error("Parse error: {0}")]
     Parse(#[from] ParseError),
 
+    #[error("Unknown argument '{argument}' for module '{module}'")]
+    UnknownArgument { module: String, argument: String },
+
     #[error("Unknown module: {0}")]
     UnknownModule(String),
 
@@ -201,6 +204,18 @@ impl ModuleResolver {
                 return Err(ModuleError::MissingArgument {
                     module: call.module_name.clone(),
                     argument: arg.name.clone(),
+                });
+            }
+        }
+
+        // Validate no unknown arguments
+        let declared_arg_names: HashSet<&str> =
+            module.arguments.iter().map(|a| a.name.as_str()).collect();
+        for arg_name in call.arguments.keys() {
+            if !declared_arg_names.contains(arg_name.as_str()) {
+                return Err(ModuleError::UnknownArgument {
+                    module: call.module_name.clone(),
+                    argument: arg_name.clone(),
                 });
             }
         }
@@ -1124,6 +1139,38 @@ mod tests {
                 InterpolationPart::Expr(Value::String("dev".to_string())),
                 InterpolationPart::Literal("-suffix".to_string()),
             ])
+        );
+    }
+
+    #[test]
+    fn test_unknown_argument_rejected() {
+        let resolver = {
+            let mut r = ModuleResolver::new(".");
+            r.imported_modules
+                .insert("test_module".to_string(), create_test_module());
+            r
+        };
+
+        let call = ModuleCall {
+            module_name: "test_module".to_string(),
+            binding_name: Some("my_instance".to_string()),
+            arguments: {
+                let mut args = HashMap::new();
+                args.insert("vpc_id".to_string(), Value::String("vpc-456".to_string()));
+                // Unknown argument: not declared in the module
+                args.insert(
+                    "unknown_arg".to_string(),
+                    Value::String("should-fail".to_string()),
+                );
+                args
+            },
+        };
+
+        let result = resolver.expand_module_call(&call, "my_instance");
+        assert!(
+            matches!(result, Err(ModuleError::UnknownArgument { .. })),
+            "Expected UnknownArgument error, got {:?}",
+            result
         );
     }
 
