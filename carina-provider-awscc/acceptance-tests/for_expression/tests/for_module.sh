@@ -1,6 +1,6 @@
 #!/bin/bash
 # Test: for expression with module calls (for + module iteration over map)
-source "$(dirname "$0")/_helpers.sh"
+source "$(dirname "$0")/../../shared/_helpers.sh"
 
 echo "Test: for expression with module calls"
 echo ""

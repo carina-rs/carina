@@ -1,6 +1,6 @@
 #!/bin/bash
 # Test: index access on for expression results (vpcs[0].vpc_id used as subnet dependency)
-source "$(dirname "$0")/_helpers.sh"
+source "$(dirname "$0")/../../shared/_helpers.sh"
 
 echo "Test: index access on for expression results"
 echo ""

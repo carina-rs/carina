@@ -6,7 +6,7 @@
 #   3. Remove from state (removed { from=main_vpc }) — VPC still exists in AWS
 #   4. Import it back (import { to=imported_vpc, id=<vpc-id> })
 #   5. Destroy via normal apply
-source "$(dirname "$0")/_helpers.sh"
+source "$(dirname "$0")/../../shared/_helpers.sh"
 
 echo "Test: import, removed, and moved state blocks"
 echo ""

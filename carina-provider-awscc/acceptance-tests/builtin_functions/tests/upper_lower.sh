@@ -1,6 +1,6 @@
 #!/bin/bash
 # Test: upper() and lower() functions
-source "$(dirname "$0")/_helpers.sh"
+source "$(dirname "$0")/../../shared/_helpers.sh"
 
 echo "Test: upper() and lower() functions"
 echo ""

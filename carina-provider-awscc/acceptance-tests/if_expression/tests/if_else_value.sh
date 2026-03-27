@@ -1,6 +1,6 @@
 #!/bin/bash
 # Test: if/else value expression in attribute position
-source "$(dirname "$0")/_helpers.sh"
+source "$(dirname "$0")/../../shared/_helpers.sh"
 
 echo "Test: if/else value expression in attribute"
 echo ""

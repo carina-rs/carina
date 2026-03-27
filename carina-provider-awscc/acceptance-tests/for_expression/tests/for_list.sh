@@ -1,6 +1,6 @@
 #!/bin/bash
 # Test: for expression over a list with index
-source "$(dirname "$0")/_helpers.sh"
+source "$(dirname "$0")/../../shared/_helpers.sh"
 
 echo "Test: for expression over list"
 echo ""

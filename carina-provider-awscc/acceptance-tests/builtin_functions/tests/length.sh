@@ -1,6 +1,6 @@
 #!/bin/bash
 # Test: length() function
-source "$(dirname "$0")/_helpers.sh"
+source "$(dirname "$0")/../../shared/_helpers.sh"
 
 echo "Test: length() function"
 echo ""

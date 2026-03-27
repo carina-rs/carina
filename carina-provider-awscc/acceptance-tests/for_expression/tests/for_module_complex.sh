@@ -1,7 +1,7 @@
 #!/bin/bash
 # Test: for expression with module calls - complex case
 # Uses network module (VPC+Subnet with intra-module refs) and cidr_subnet as argument
-source "$(dirname "$0")/_helpers.sh"
+source "$(dirname "$0")/../../shared/_helpers.sh"
 
 echo "Test: for expression with module calls (complex)"
 echo ""
