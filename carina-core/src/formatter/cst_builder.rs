@@ -133,6 +133,12 @@ impl<'a> CstBuilder<'a> {
                 self.build_node(NodeKind::ReadResourceExpr, pair),
             )),
             Rule::for_expr => Some(CstChild::Node(self.build_node(NodeKind::ForExpr, pair))),
+            Rule::if_expr => Some(CstChild::Node(self.build_node(NodeKind::IfExpr, pair))),
+            Rule::else_clause => Some(CstChild::Node(self.build_node(NodeKind::ElseClause, pair))),
+            Rule::if_body_content => None, // Silent rule
+            Rule::if_local_binding => Some(CstChild::Node(
+                self.build_node(NodeKind::LocalBinding, pair),
+            )),
             Rule::for_binding => {
                 let inner = pair.into_inner().next()?;
                 self.build_child(inner)
@@ -222,6 +228,8 @@ impl<'a> CstBuilder<'a> {
             Rule::kw_map => Some(CstChild::Token(Token::new("map".to_string(), span))),
             Rule::kw_for => Some(CstChild::Token(Token::new("for".to_string(), span))),
             Rule::kw_in => Some(CstChild::Token(Token::new("in".to_string(), span))),
+            Rule::kw_if => Some(CstChild::Token(Token::new("if".to_string(), span))),
+            Rule::kw_else => Some(CstChild::Token(Token::new("else".to_string(), span))),
             Rule::kw_read => Some(CstChild::Token(Token::new("read".to_string(), span))),
             Rule::kw_removed => Some(CstChild::Token(Token::new("removed".to_string(), span))),
             Rule::kw_moved => Some(CstChild::Token(Token::new("moved".to_string(), span))),

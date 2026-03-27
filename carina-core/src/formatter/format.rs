@@ -146,6 +146,8 @@ impl Formatter {
             NodeKind::ResourceExpr => self.format_resource_expr(node),
             NodeKind::ReadResourceExpr => self.format_read_resource_expr(node),
             NodeKind::ForExpr => self.format_for_expr(node),
+            NodeKind::IfExpr => self.format_if_expr(node),
+            NodeKind::ElseClause => self.format_else_clause(node),
             NodeKind::Attribute => self.format_attribute(node, 0),
             NodeKind::NestedBlock => self.format_nested_block(node),
             NodeKind::ArgumentsParam => self.format_arguments_param(node, 0),
@@ -721,6 +723,83 @@ impl Formatter {
                 CstChild::Trivia(_) => {
                     // Skip trivia - we control whitespace
                 }
+            }
+        }
+    }
+
+    fn format_if_expr(&mut self, node: &CstNode) {
+        // Format: if <condition> { <body> } else { <body> }
+        self.write("if ");
+
+        let mut saw_open_brace = false;
+
+        for child in &node.children {
+            match child {
+                CstChild::Token(token) => {
+                    if token.text == "if" {
+                        continue; // Already written
+                    }
+                    if token.text == "{" {
+                        self.write(" {");
+                        self.write_newline();
+                        self.current_indent += 1;
+                        saw_open_brace = true;
+                        continue;
+                    }
+                    if token.text == "}" {
+                        self.current_indent -= 1;
+                        self.write_indent();
+                        self.write("}");
+                        continue;
+                    }
+                    self.write(&token.text);
+                }
+                CstChild::Node(n) => {
+                    if n.kind == NodeKind::ElseClause {
+                        self.write(" ");
+                        self.format_else_clause(n);
+                    } else if !saw_open_brace {
+                        // Condition expression
+                        self.format_node(n);
+                    } else {
+                        // Body content
+                        self.write_indent();
+                        self.format_node(n);
+                        self.write_newline();
+                    }
+                }
+                CstChild::Trivia(_) => {
+                    // Skip trivia
+                }
+            }
+        }
+    }
+
+    fn format_else_clause(&mut self, node: &CstNode) {
+        self.write("else {");
+        self.write_newline();
+        self.current_indent += 1;
+
+        for child in &node.children {
+            match child {
+                CstChild::Token(token) => {
+                    if token.text == "else" || token.text == "{" {
+                        continue; // Already handled
+                    }
+                    if token.text == "}" {
+                        self.current_indent -= 1;
+                        self.write_indent();
+                        self.write("}");
+                        continue;
+                    }
+                    self.write(&token.text);
+                }
+                CstChild::Node(n) => {
+                    self.write_indent();
+                    self.format_node(n);
+                    self.write_newline();
+                }
+                CstChild::Trivia(_) => {}
             }
         }
     }

@@ -691,6 +691,7 @@ fn parse_primary_with_resource_or_module(
             let ref_value = Value::String(format!("${{for:{}}}", binding_name));
             Ok((ref_value, resources, module_calls, None))
         }
+        Rule::if_expr => parse_if_expr(inner, ctx, binding_name),
         Rule::module_call => {
             let call = parse_module_call(inner, ctx)?;
             let value = Value::String(format!("${{module:{}}}", call.module_name));
@@ -938,6 +939,141 @@ fn parse_for_body(
     Err(ParseError::InternalError {
         expected: "resource expression or module call".to_string(),
         context: "for body".to_string(),
+    })
+}
+
+/// Result of parsing an if expression body: a resource, a module call, or a value
+enum IfBodyResult {
+    Resource(Resource),
+    ModuleCall(ModuleCall),
+    Value(Value),
+}
+
+/// Parse an if expression and conditionally include resources/module calls/values.
+///
+/// `if condition { body }` includes the body when condition is true.
+/// `if condition { body } else { body }` selects one branch.
+///
+/// The condition must evaluate to a static Bool value at parse time.
+fn parse_if_expr(
+    pair: pest::iterators::Pair<Rule>,
+    ctx: &ParseContext,
+    binding_name: &str,
+) -> Result<LetBindingRhs, ParseError> {
+    let mut inner = pair.into_inner();
+
+    // Parse the condition expression
+    let condition_pair = next_pair(&mut inner, "condition", "if expression")?;
+    let condition_value = parse_expression(condition_pair, ctx)?;
+
+    // Ensure the condition is statically evaluable
+    if !is_static_value(&condition_value) {
+        return Err(ParseError::InvalidExpression {
+            line: 0,
+            message: "if condition depends on a runtime value; \
+                      condition must be statically known at parse time"
+                .to_string(),
+        });
+    }
+
+    let condition_value = evaluate_static_value(condition_value)?;
+
+    // Condition must be a Bool
+    let condition = match &condition_value {
+        Value::Bool(b) => *b,
+        other => {
+            return Err(ParseError::InvalidExpression {
+                line: 0,
+                message: format!("if condition must be a Bool value, got: {:?}", other),
+            });
+        }
+    };
+
+    // Parse the if body
+    let if_body_pair = next_pair(&mut inner, "if body", "if expression")?;
+
+    // Check for else clause
+    let else_body_pair = inner.next();
+
+    if condition {
+        // Use the if branch
+        parse_if_body_to_rhs(if_body_pair, ctx, binding_name)
+    } else if let Some(else_pair) = else_body_pair {
+        // Use the else branch
+        let else_body = first_inner(else_pair, "else body", "else clause")?;
+        parse_if_body_to_rhs(else_body, ctx, binding_name)
+    } else {
+        // No else clause and condition is false: produce nothing
+        let ref_value = Value::String(format!("${{if:{}}}", binding_name));
+        Ok((ref_value, vec![], vec![], None))
+    }
+}
+
+/// Parse an if/else body and convert the result to a LetBindingRhs
+fn parse_if_body_to_rhs(
+    pair: pest::iterators::Pair<Rule>,
+    ctx: &ParseContext,
+    binding_name: &str,
+) -> Result<LetBindingRhs, ParseError> {
+    let result = parse_if_body(pair, ctx, binding_name)?;
+    match result {
+        IfBodyResult::Resource(r) => {
+            let ref_value = Value::String(format!("${{{}}}", binding_name));
+            Ok((ref_value, vec![r], vec![], None))
+        }
+        IfBodyResult::ModuleCall(c) => {
+            let value = Value::String(format!("${{module:{}}}", c.module_name));
+            Ok((value, vec![], vec![c], None))
+        }
+        IfBodyResult::Value(v) => Ok((v, vec![], vec![], None)),
+    }
+}
+
+/// Parse the body of an if expression and produce a resource, module call, or value
+fn parse_if_body(
+    pair: pest::iterators::Pair<Rule>,
+    ctx: &ParseContext,
+    binding_name: &str,
+) -> Result<IfBodyResult, ParseError> {
+    let mut local_ctx = ctx.clone();
+
+    for inner in pair.into_inner() {
+        match inner.as_rule() {
+            Rule::if_local_binding => {
+                let mut binding_inner = inner.into_inner();
+                let name = next_pair(&mut binding_inner, "binding name", "if local binding")?
+                    .as_str()
+                    .to_string();
+                let value = parse_expression(
+                    next_pair(&mut binding_inner, "binding value", "if local binding")?,
+                    &local_ctx,
+                )?;
+                local_ctx.set_variable(name, value);
+            }
+            Rule::resource_expr => {
+                let resource = parse_resource_expr(inner, &local_ctx, binding_name)?;
+                return Ok(IfBodyResult::Resource(resource));
+            }
+            Rule::read_resource_expr => {
+                let resource = parse_read_resource_expr(inner, &local_ctx, binding_name)?;
+                return Ok(IfBodyResult::Resource(resource));
+            }
+            Rule::module_call => {
+                let mut call = parse_module_call(inner, &local_ctx)?;
+                call.binding_name = Some(binding_name.to_string());
+                return Ok(IfBodyResult::ModuleCall(call));
+            }
+            Rule::expression => {
+                let value = parse_expression(inner, &local_ctx)?;
+                return Ok(IfBodyResult::Value(value));
+            }
+            _ => {}
+        }
+    }
+
+    Err(ParseError::InternalError {
+        expected: "resource expression, module call, or value expression".to_string(),
+        context: "if body".to_string(),
     })
 }
 
@@ -4749,6 +4885,247 @@ aws.s3.bucket {
             err.contains("runtime"),
             "Expected error about runtime dependency, got: {}",
             err
+        );
+    }
+
+    // ── if/else expression tests ──
+
+    #[test]
+    fn parse_if_true_condition_includes_resource() {
+        let input = r#"
+            let alarm = if true {
+                awscc.cloudwatch.alarm {
+                    alarm_name = "cpu-high"
+                }
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+        assert_eq!(result.resources.len(), 1);
+        assert_eq!(result.resources[0].id.name, "alarm");
+        assert_eq!(
+            result.resources[0].attributes.get("alarm_name"),
+            Some(&Value::String("cpu-high".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_if_false_condition_no_resource() {
+        let input = r#"
+            let alarm = if false {
+                awscc.cloudwatch.alarm {
+                    alarm_name = "cpu-high"
+                }
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+        assert_eq!(result.resources.len(), 0);
+    }
+
+    #[test]
+    fn parse_if_else_true_uses_if_branch() {
+        let input = r#"
+            let vpc = if true {
+                awscc.ec2.vpc {
+                    cidr_block = "10.0.0.0/16"
+                }
+            } else {
+                awscc.ec2.vpc {
+                    cidr_block = "172.16.0.0/16"
+                }
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+        assert_eq!(result.resources.len(), 1);
+        assert_eq!(
+            result.resources[0].attributes.get("cidr_block"),
+            Some(&Value::String("10.0.0.0/16".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_if_else_false_uses_else_branch() {
+        let input = r#"
+            let vpc = if false {
+                awscc.ec2.vpc {
+                    cidr_block = "10.0.0.0/16"
+                }
+            } else {
+                awscc.ec2.vpc {
+                    cidr_block = "172.16.0.0/16"
+                }
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+        assert_eq!(result.resources.len(), 1);
+        assert_eq!(
+            result.resources[0].attributes.get("cidr_block"),
+            Some(&Value::String("172.16.0.0/16".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_if_else_value_expression() {
+        let input = r#"
+            let instance_type = if true {
+                "m5.xlarge"
+            } else {
+                "t3.micro"
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+        assert_eq!(result.resources.len(), 0);
+        // The binding should be set to the value from the true branch
+        // We verify by using the variable in a resource
+        let input2 = r#"
+            let instance_type = if true {
+                "m5.xlarge"
+            } else {
+                "t3.micro"
+            }
+
+            awscc.ec2.instance {
+                instance_type = instance_type
+            }
+        "#;
+
+        let result2 = parse(input2).unwrap();
+        assert_eq!(
+            result2.resources[0].attributes.get("instance_type"),
+            Some(&Value::String("m5.xlarge".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_if_else_value_expression_false_branch() {
+        let input = r#"
+            let instance_type = if false {
+                "m5.xlarge"
+            } else {
+                "t3.micro"
+            }
+
+            awscc.ec2.instance {
+                instance_type = instance_type
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+        assert_eq!(
+            result.resources[0].attributes.get("instance_type"),
+            Some(&Value::String("t3.micro".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_if_with_variable_condition() {
+        let input = r#"
+            let enable_monitoring = true
+
+            let alarm = if enable_monitoring {
+                awscc.cloudwatch.alarm {
+                    alarm_name = "cpu-high"
+                }
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+        assert_eq!(result.resources.len(), 1);
+    }
+
+    #[test]
+    fn parse_if_non_bool_condition_errors() {
+        let input = r#"
+            let alarm = if "not_a_bool" {
+                awscc.cloudwatch.alarm {
+                    alarm_name = "cpu-high"
+                }
+            }
+        "#;
+
+        let result = parse(input);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("Bool"),
+            "Expected error about Bool condition, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn parse_if_resource_ref_condition_errors() {
+        let input = r#"
+            let vpc = awscc.ec2.vpc {
+                cidr_block = "10.0.0.0/16"
+            }
+
+            let alarm = if vpc.enabled {
+                awscc.cloudwatch.alarm {
+                    alarm_name = "cpu-high"
+                }
+            }
+        "#;
+
+        let result = parse(input);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("runtime") || err.contains("statically"),
+            "Expected error about runtime dependency, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn parse_if_with_module_call() {
+        let input = r#"
+            let web = import "modules/web"
+
+            let monitoring = if true {
+                web { vpc_id = "vpc-123" }
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+        assert_eq!(result.module_calls.len(), 1);
+        assert_eq!(result.module_calls[0].module_name, "web");
+    }
+
+    #[test]
+    fn parse_if_false_with_module_call() {
+        let input = r#"
+            let web = import "modules/web"
+
+            let monitoring = if false {
+                web { vpc_id = "vpc-123" }
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+        assert_eq!(result.module_calls.len(), 0);
+    }
+
+    #[test]
+    fn parse_if_with_local_binding() {
+        let input = r#"
+            let alarm = if true {
+                let name = "cpu-high"
+                awscc.cloudwatch.alarm {
+                    alarm_name = name
+                }
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+        assert_eq!(result.resources.len(), 1);
+        assert_eq!(
+            result.resources[0].attributes.get("alarm_name"),
+            Some(&Value::String("cpu-high".to_string()))
         );
     }
 }
