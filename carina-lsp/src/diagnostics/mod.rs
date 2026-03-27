@@ -605,7 +605,47 @@ impl DiagnosticEngine {
             diagnostics.extend(self.check_unused_bindings(doc, parsed));
         }
 
+        // Check for duplicate attribute keys (text-based, works without parsed file)
+        diagnostics.extend(self.check_duplicate_attrs(doc));
+
         diagnostics
+    }
+
+    /// Check for duplicate attribute keys within the same block.
+    fn check_duplicate_attrs(&self, doc: &Document) -> Vec<Diagnostic> {
+        let text = doc.text();
+        let duplicates = carina_core::lint::find_duplicate_attrs(&text);
+
+        duplicates
+            .into_iter()
+            .filter_map(|dup| {
+                // Convert 1-indexed line to 0-indexed
+                let line = (dup.line - 1) as u32;
+                // Find the column of the attribute name
+                let line_text = text.lines().nth(dup.line - 1)?;
+                let col = position::leading_whitespace_chars(line_text);
+
+                Some(Diagnostic {
+                    range: Range {
+                        start: Position {
+                            line,
+                            character: col,
+                        },
+                        end: Position {
+                            line,
+                            character: col + dup.name.len() as u32,
+                        },
+                    },
+                    severity: Some(DiagnosticSeverity::WARNING),
+                    source: Some("carina".to_string()),
+                    message: format!(
+                        "Duplicate attribute '{}' (first defined on line {}). The last value will be used.",
+                        dup.name, dup.first_line
+                    ),
+                    ..Default::default()
+                })
+            })
+            .collect()
     }
 
     fn find_resource_position(&self, doc: &Document, resource_type: &str) -> Option<(u32, u32)> {

@@ -499,3 +499,62 @@ name = "test-bucket"
         messages_normal, messages_reversed
     );
 }
+
+#[test]
+fn duplicate_attribute_warning() {
+    let engine = test_engine();
+    let doc = create_document(
+        r#"provider awscc {
+region = awscc.Region.ap_northeast_1
+}
+
+let igw_attachment = awscc.ec2.vpc_gateway_attachment {
+    vpc_id              = vpc.vpc_id
+    internet_gateway_id = igw.internet_gateway_id
+    internet_gateway_id = igw.internet_gateway_id
+}"#,
+    );
+
+    let diagnostics = engine.analyze(&doc, None);
+    let dup_diag = diagnostics.iter().find(|d| {
+        d.message
+            .contains("Duplicate attribute 'internet_gateway_id'")
+    });
+    assert!(
+        dup_diag.is_some(),
+        "Should warn about duplicate attribute. Got diagnostics: {:?}",
+        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+
+    let diag = dup_diag.unwrap();
+    // Duplicate is on line 7 (0-indexed)
+    assert_eq!(diag.range.start.line, 7);
+    assert_eq!(
+        diag.severity,
+        Some(tower_lsp::lsp_types::DiagnosticSeverity::WARNING)
+    );
+}
+
+#[test]
+fn no_duplicate_warning_for_unique_attrs() {
+    let engine = test_engine();
+    let doc = create_document(
+        r#"provider awscc {
+region = awscc.Region.ap_northeast_1
+}
+
+let vpc = awscc.ec2.vpc {
+    cidr_block = "10.0.0.0/16"
+}"#,
+    );
+
+    let diagnostics = engine.analyze(&doc, None);
+    let dup_diag = diagnostics
+        .iter()
+        .find(|d| d.message.contains("Duplicate attribute"));
+    assert!(
+        dup_diag.is_none(),
+        "Should not warn about duplicates when there are none. Got: {:?}",
+        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}
