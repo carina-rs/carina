@@ -1077,6 +1077,106 @@ fn parse_if_body(
     })
 }
 
+/// Parse an if/else expression in value position (attribute values, not let bindings).
+///
+/// Unlike `parse_if_expr()` which returns `LetBindingRhs` (resources, module calls, or values),
+/// this function only returns `Value`. The condition must be a static Bool.
+/// An else clause is required when the condition is false (a value must always be determined).
+fn parse_if_value_expr(
+    pair: pest::iterators::Pair<Rule>,
+    ctx: &ParseContext,
+) -> Result<Value, ParseError> {
+    let mut inner = pair.into_inner();
+
+    // Parse the condition expression
+    let condition_pair = next_pair(&mut inner, "condition", "if value expression")?;
+    let condition_value = parse_expression(condition_pair, ctx)?;
+
+    // Ensure the condition is statically evaluable
+    if !is_static_value(&condition_value) {
+        return Err(ParseError::InvalidExpression {
+            line: 0,
+            message: "if condition depends on a runtime value; \
+                      condition must be statically known at parse time"
+                .to_string(),
+        });
+    }
+
+    let condition_value = evaluate_static_value(condition_value)?;
+
+    // Condition must be a Bool
+    let condition = match &condition_value {
+        Value::Bool(b) => *b,
+        other => {
+            return Err(ParseError::InvalidExpression {
+                line: 0,
+                message: format!("if condition must be a Bool value, got: {:?}", other),
+            });
+        }
+    };
+
+    // Parse the if body
+    let if_body_pair = next_pair(&mut inner, "if body", "if value expression")?;
+
+    // Check for else clause
+    let else_body_pair = inner.next();
+
+    if condition {
+        parse_if_body_value(if_body_pair, ctx)
+    } else if let Some(else_pair) = else_body_pair {
+        let else_body = first_inner(else_pair, "else body", "else clause")?;
+        parse_if_body_value(else_body, ctx)
+    } else {
+        Err(ParseError::InvalidExpression {
+            line: 0,
+            message: "if expression in value position requires an else clause \
+                      when condition is false"
+                .to_string(),
+        })
+    }
+}
+
+/// Parse the body of an if expression in value position and return only the value.
+fn parse_if_body_value(
+    pair: pest::iterators::Pair<Rule>,
+    ctx: &ParseContext,
+) -> Result<Value, ParseError> {
+    let mut local_ctx = ctx.clone();
+
+    for inner in pair.into_inner() {
+        match inner.as_rule() {
+            Rule::if_local_binding => {
+                let mut binding_inner = inner.into_inner();
+                let name = next_pair(&mut binding_inner, "binding name", "if local binding")?
+                    .as_str()
+                    .to_string();
+                let value = parse_expression(
+                    next_pair(&mut binding_inner, "binding value", "if local binding")?,
+                    &local_ctx,
+                )?;
+                local_ctx.set_variable(name, value);
+            }
+            Rule::expression => {
+                return parse_expression(inner, &local_ctx);
+            }
+            Rule::resource_expr | Rule::read_resource_expr | Rule::module_call => {
+                return Err(ParseError::InvalidExpression {
+                    line: 0,
+                    message: "resource expressions and module calls cannot be used \
+                              in if value expressions; use a let binding instead"
+                        .to_string(),
+                });
+            }
+            _ => {}
+        }
+    }
+
+    Err(ParseError::InternalError {
+        expected: "value expression".to_string(),
+        context: "if value expression body".to_string(),
+    })
+}
+
 fn parse_provider_block(
     pair: pest::iterators::Pair<Rule>,
     ctx: &ParseContext,
@@ -1789,6 +1889,7 @@ fn parse_primary_value(
                 }
             }
         }
+        Rule::if_expr => parse_if_value_expr(inner, ctx),
         Rule::expression => parse_expression(inner, ctx),
         _ => Ok(Value::String(inner.as_str().to_string())),
     }
@@ -5126,6 +5227,78 @@ aws.s3.bucket {
         assert_eq!(
             result.resources[0].attributes.get("alarm_name"),
             Some(&Value::String("cpu-high".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_if_else_value_expr_in_attribute_true() {
+        let input = r#"
+            let is_production = true
+
+            awscc.ec2.vpc {
+                cidr_block = if is_production { "10.0.0.0/16" } else { "172.16.0.0/16" }
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+        assert_eq!(result.resources.len(), 1);
+        assert_eq!(
+            result.resources[0].attributes.get("cidr_block"),
+            Some(&Value::String("10.0.0.0/16".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_if_else_value_expr_in_attribute_false() {
+        let input = r#"
+            let is_production = false
+
+            awscc.ec2.vpc {
+                cidr_block = if is_production { "10.0.0.0/16" } else { "172.16.0.0/16" }
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+        assert_eq!(result.resources.len(), 1);
+        assert_eq!(
+            result.resources[0].attributes.get("cidr_block"),
+            Some(&Value::String("172.16.0.0/16".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_if_value_expr_no_else_true() {
+        // When condition is true and no else, the value is used
+        let input = r#"
+            awscc.ec2.vpc {
+                cidr_block = if true { "10.0.0.0/16" }
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+        assert_eq!(result.resources.len(), 1);
+        assert_eq!(
+            result.resources[0].attributes.get("cidr_block"),
+            Some(&Value::String("10.0.0.0/16".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_if_value_expr_no_else_false_errors() {
+        // When condition is false and no else, it's an error in value position
+        let input = r#"
+            awscc.ec2.vpc {
+                cidr_block = if false { "10.0.0.0/16" }
+            }
+        "#;
+
+        let result = parse(input);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("else"),
+            "Expected error about missing else clause, got: {}",
+            err
         );
     }
 }
