@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use crate::parser::{ModuleCall, ParsedFile, TypeExpr};
 use crate::provider::ProviderFactory;
 use crate::resource::{Resource, Value};
-use crate::schema::{AttributeType, ResourceSchema, validate_ipv4_cidr};
+use crate::schema::{AttributeType, ResourceSchema, suggest_similar_name, validate_ipv4_cidr};
 
 /// Validate resources against their schemas.
 ///
@@ -118,9 +118,14 @@ pub fn validate_resource_ref_types(
                 continue;
             };
             let Some(ref_attr_schema) = ref_schema.attributes.get(ref_attr.as_str()) else {
+                let known_attrs: Vec<&str> =
+                    ref_schema.attributes.keys().map(|s| s.as_str()).collect();
+                let suggestion = suggest_similar_name(ref_attr, &known_attrs)
+                    .map(|s| format!(" Did you mean '{}'?", s))
+                    .unwrap_or_default();
                 all_errors.push(format!(
-                    "{}: unknown attribute '{}' on '{}' in reference {}.{}",
-                    resource.id, ref_attr, ref_binding, ref_binding, ref_attr,
+                    "{}: unknown attribute '{}' on '{}' in reference {}.{}{}",
+                    resource.id, ref_attr, ref_binding, ref_binding, ref_attr, suggestion,
                 ));
                 continue;
             };
@@ -649,6 +654,93 @@ let route = awscc.ec2.route {
         assert_eq!(
             result.unwrap_err(),
             "awscc.ec2.subnet.web-subnet: unknown attribute 'nonexistent_attr' on 'vpc' in reference vpc.nonexistent_attr"
+        );
+    }
+
+    #[test]
+    fn unknown_attribute_reference_suggests_similar_name() {
+        let mut schemas = HashMap::new();
+        schemas.insert(
+            "ec2.internet_gateway".to_string(),
+            make_schema(
+                "ec2.internet_gateway",
+                vec![("internet_gateway_id", AttributeType::String)],
+            ),
+        );
+        schemas.insert(
+            "ec2.route".to_string(),
+            make_schema(
+                "ec2.route",
+                vec![
+                    ("route_table_id", AttributeType::String),
+                    ("gateway_id", AttributeType::String),
+                ],
+            ),
+        );
+
+        let igw = Resource::with_provider("awscc", "ec2.internet_gateway", "igw")
+            .with_attribute("_binding", Value::String("igw".to_string()));
+
+        // Typo: internet_gateway_idd instead of internet_gateway_id
+        let route = Resource::with_provider("awscc", "ec2.route", "main-route").with_attribute(
+            "gateway_id",
+            Value::ResourceRef {
+                binding_name: "igw".to_string(),
+                attribute_name: "internet_gateway_idd".to_string(),
+                field_path: vec![],
+            },
+        );
+
+        let result = validate_resource_ref_types(
+            &[igw, route],
+            &schemas,
+            &test_schema_key_fn,
+            &HashSet::new(),
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("Did you mean 'internet_gateway_id'?"),
+            "Expected 'did you mean' suggestion, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn unknown_attribute_reference_no_suggestion_when_too_different() {
+        let mut schemas = HashMap::new();
+        schemas.insert(
+            "ec2.vpc".to_string(),
+            make_schema("ec2.vpc", vec![("cidr_block", AttributeType::String)]),
+        );
+        schemas.insert(
+            "ec2.subnet".to_string(),
+            make_schema("ec2.subnet", vec![("vpc_id", AttributeType::String)]),
+        );
+
+        let vpc = Resource::with_provider("awscc", "ec2.vpc", "main-vpc")
+            .with_attribute("_binding", Value::String("vpc".to_string()));
+
+        // Completely unrelated attribute name - no suggestion expected
+        let subnet = Resource::with_provider("awscc", "ec2.subnet", "web-subnet").with_attribute(
+            "vpc_id",
+            Value::ResourceRef {
+                binding_name: "vpc".to_string(),
+                attribute_name: "completely_wrong_name".to_string(),
+                field_path: vec![],
+            },
+        );
+
+        let result = validate_resource_ref_types(
+            &[vpc, subnet],
+            &schemas,
+            &test_schema_key_fn,
+            &HashSet::new(),
+        );
+        let err = result.unwrap_err();
+        assert!(
+            !err.contains("Did you mean"),
+            "Should not suggest when name is too different, got: {}",
+            err
         );
     }
 

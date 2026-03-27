@@ -603,6 +603,13 @@ impl DiagnosticEngine {
 
             // Check for unused let bindings
             diagnostics.extend(self.check_unused_bindings(doc, parsed));
+
+            // Check for unknown attributes on resource references (typo detection)
+            diagnostics.extend(self.check_resource_ref_attributes(
+                doc,
+                parsed,
+                &binding_schema_map,
+            ));
         }
 
         // Check for duplicate attribute keys (text-based, works without parsed file)

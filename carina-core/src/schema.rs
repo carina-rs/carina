@@ -1344,7 +1344,7 @@ fn levenshtein_distance(a: &str, b: &str) -> usize {
 }
 
 /// Suggest the most similar field name, if one is close enough
-fn suggest_similar_name(unknown: &str, known: &[&str]) -> Option<String> {
+pub fn suggest_similar_name(unknown: &str, known: &[&str]) -> Option<String> {
     let max_distance = match unknown.len() {
         0..=2 => 1,
         3..=5 => 2,

@@ -830,3 +830,68 @@ awscc.ec2.vpc {
         diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
     );
 }
+
+#[test]
+fn resource_ref_typo_suggests_similar_attribute() {
+    let engine = test_engine();
+    let doc = create_document(
+        r#"provider awscc {
+  region = awscc.Region.ap_northeast_1
+}
+
+let igw = awscc.ec2.internet_gateway {
+}
+
+let rt = awscc.ec2.route_table {
+  vpc_id = "vpc-123"
+}
+
+awscc.ec2.route {
+  route_table_id         = rt.route_table_id
+  destination_cidr_block = "0.0.0.0/0"
+  gateway_id             = igw.internet_gateway_idd
+}"#,
+    );
+
+    let diagnostics = engine.analyze(&doc, None);
+
+    let typo_diag = diagnostics.iter().find(|d| {
+        d.message
+            .contains("Unknown attribute 'internet_gateway_idd'")
+            && d.message.contains("Did you mean 'internet_gateway_id'?")
+    });
+    assert!(
+        typo_diag.is_some(),
+        "Should warn about typo in resource ref attribute with suggestion. Got: {:?}",
+        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn resource_ref_valid_attribute_no_warning() {
+    let engine = test_engine();
+    let doc = create_document(
+        r#"provider awscc {
+  region = awscc.Region.ap_northeast_1
+}
+
+let igw = awscc.ec2.internet_gateway {
+}
+
+awscc.ec2.vpc_gateway_attachment {
+  internet_gateway_id = igw.internet_gateway_id
+  vpc_id              = "vpc-123"
+}"#,
+    );
+
+    let diagnostics = engine.analyze(&doc, None);
+
+    let ref_diag = diagnostics
+        .iter()
+        .find(|d| d.message.contains("Unknown attribute") && d.message.contains("igw"));
+    assert!(
+        ref_diag.is_none(),
+        "Valid attribute reference should not produce warning. Got: {:?}",
+        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}
