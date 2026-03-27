@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use colored::Colorize;
 
 use carina_core::config_loader::{find_crn_files_in_dir, get_base_dir, load_configuration};
-use carina_core::lint::{find_list_literal_attrs, list_struct_attr_names};
+use carina_core::lint::{find_duplicate_attrs, find_list_literal_attrs, list_struct_attr_names};
 use carina_core::module_resolver;
 use carina_core::provider::{self as provider_mod};
 
@@ -73,6 +73,7 @@ pub fn run_lint(path: &PathBuf) -> Result<(), AppError> {
     let mut warnings: Vec<LintWarning> = Vec::new();
 
     for (file_path, source) in &source_texts {
+        // Check for list literal syntax on List<Struct> attributes
         let hits = find_list_literal_attrs(source, &all_list_struct_attrs);
         for (attr_name, line) in hits {
             let suggested_name = block_name_suggestions
@@ -85,6 +86,19 @@ pub fn run_lint(path: &PathBuf) -> Result<(), AppError> {
                 message: format!(
                     "Prefer block syntax for '{}'. Use `{} {{ ... }}` instead of `{} = [{{ ... }}]`.",
                     attr_name, suggested_name, attr_name
+                ),
+            });
+        }
+
+        // Check for duplicate attribute keys within the same block
+        let duplicates = find_duplicate_attrs(source);
+        for dup in duplicates {
+            warnings.push(LintWarning {
+                file: file_path.clone(),
+                line: dup.line,
+                message: format!(
+                    "Duplicate attribute '{}' (first defined on line {}). The last value will be used.",
+                    dup.name, dup.first_line
                 ),
             });
         }
