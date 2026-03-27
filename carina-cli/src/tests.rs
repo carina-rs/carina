@@ -2307,3 +2307,77 @@ fn refresh_false_without_state_file_treats_resources_as_new() {
         "Without state file, all resources should be created"
     );
 }
+
+#[test]
+fn import_effect_preserves_resource_metadata_in_state() {
+    // Regression test: the Effect::Import arm in build_state_after_apply used to
+    // overwrite the ResourceState with a bare ResourceState::new(), stripping
+    // lifecycle, prefixes, desired_keys, binding, and dependency_bindings.
+
+    let mut resource = Resource::with_provider("awscc", "ec2.vpc", "my-vpc")
+        .with_attribute("cidr_block", Value::String("10.0.0.0/16".to_string()))
+        .with_attribute("_binding", Value::String("my_vpc_binding".to_string()));
+    resource.lifecycle.force_delete = true;
+    resource
+        .prefixes
+        .insert("vpc_name".to_string(), "prod-".to_string());
+
+    let id = resource.id.clone();
+    let identifier = "vpc-0abc123";
+
+    // Simulate the imported state returned by the provider read
+    let imported_state = State::existing(
+        id.clone(),
+        HashMap::from([(
+            "cidr_block".to_string(),
+            Value::String("10.0.0.0/16".to_string()),
+        )]),
+    )
+    .with_identifier(identifier);
+
+    let mut applied_states = HashMap::new();
+    applied_states.insert(id.clone(), imported_state);
+
+    // Build a plan with an Import effect
+    let mut plan = Plan::new();
+    plan.add(Effect::Import {
+        id: id.clone(),
+        identifier: identifier.to_string(),
+    });
+
+    let saved = build_state_after_apply(ApplyStateSave {
+        state_file: None,
+        sorted_resources: &[resource],
+        current_states: &HashMap::new(),
+        applied_states: &applied_states,
+        permanent_name_overrides: &HashMap::new(),
+        plan: &plan,
+        successfully_deleted: &HashSet::new(),
+        failed_refreshes: &HashSet::new(),
+    })
+    .unwrap();
+
+    let saved_resource = saved.find_resource("awscc", "ec2.vpc", "my-vpc").unwrap();
+
+    // Metadata must survive the import
+    assert!(
+        saved_resource.lifecycle.force_delete,
+        "lifecycle.force_delete should be preserved after import"
+    );
+    assert_eq!(
+        saved_resource.prefixes.get("vpc_name"),
+        Some(&"prod-".to_string()),
+        "prefixes should be preserved after import"
+    );
+    assert!(
+        saved_resource
+            .desired_keys
+            .contains(&"cidr_block".to_string()),
+        "desired_keys should be preserved after import"
+    );
+    assert_eq!(
+        saved_resource.binding,
+        Some("my_vpc_binding".to_string()),
+        "binding should be preserved after import"
+    );
+}
