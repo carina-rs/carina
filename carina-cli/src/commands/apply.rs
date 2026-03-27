@@ -571,16 +571,10 @@ pub fn build_state_after_apply(save: ApplyStateSave<'_>) -> Result<StateFile, Ap
             Effect::Delete { id, .. } if successfully_deleted.contains(id) => {
                 state.remove_resource(&id.provider, &id.resource_type, &id.name);
             }
-            Effect::Import { id, identifier } => {
-                // Import: store the resource in state with its identifier
-                // The actual read is done during the apply phase (handled by execute_import_effects)
-                if let Some(imported_state) = applied_states.get(id) {
-                    let resource_state =
-                        ResourceState::new(&id.resource_type, &id.name, &id.provider)
-                            .with_identifier(identifier.clone())
-                            .with_attributes_from_state(imported_state);
-                    state.upsert_resource(resource_state);
-                }
+            Effect::Import { .. } => {
+                // Already handled in the sorted_resources loop above via applied_states.
+                // Re-upserting here would overwrite metadata (lifecycle, prefixes,
+                // desired_keys, binding, dependency_bindings) with bare defaults.
             }
             Effect::Remove { id } => {
                 state.remove_resource(&id.provider, &id.resource_type, &id.name);
