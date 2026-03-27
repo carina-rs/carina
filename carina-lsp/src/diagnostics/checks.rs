@@ -928,6 +928,11 @@ impl DiagnosticEngine {
                     }
                 }
             }
+            Value::FunctionCall { args, .. } => {
+                for arg in args {
+                    self.collect_ref_attr_diagnostics(doc, arg, binding_schema_map, diagnostics);
+                }
+            }
             _ => {}
         }
     }
