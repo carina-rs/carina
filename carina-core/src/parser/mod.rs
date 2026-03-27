@@ -843,13 +843,58 @@ fn parse_for_binding(pair: pest::iterators::Pair<Rule>) -> Result<ForBinding, Pa
 }
 
 /// Parse the iterable part of a for expression
+///
+/// When the iterable is a function call with all statically-known arguments,
+/// the function is eagerly evaluated at parse time. If any argument depends on
+/// a runtime value (e.g. ResourceRef), a clear error is returned.
 fn parse_for_iterable(
     pair: pest::iterators::Pair<Rule>,
     ctx: &ParseContext,
 ) -> Result<Value, ParseError> {
     // for_iterable contains function_call | list | variable_ref | "(" expression ")"
     let inner = first_inner(pair, "iterable expression", "for iterable")?;
-    parse_primary_value(inner, ctx)
+    let value = parse_primary_value(inner, ctx)?;
+    evaluate_static_value(value)
+}
+
+/// Check whether a Value is fully static (no runtime dependencies).
+fn is_static_value(value: &Value) -> bool {
+    match value {
+        Value::String(_) | Value::Int(_) | Value::Float(_) | Value::Bool(_) => true,
+        Value::List(items) => items.iter().all(is_static_value),
+        Value::Map(map) => map.values().all(is_static_value),
+        Value::FunctionCall { args, .. } => args.iter().all(is_static_value),
+        Value::ResourceRef { .. } | Value::Interpolation(_) | Value::UnresolvedIdent(_, _) => false,
+    }
+}
+
+/// If `value` is a FunctionCall with all static arguments, eagerly evaluate it.
+/// Nested FunctionCalls in arguments are evaluated recursively first.
+fn evaluate_static_value(value: Value) -> Result<Value, ParseError> {
+    match value {
+        Value::FunctionCall { ref name, ref args } => {
+            if !is_static_value(&value) {
+                return Err(ParseError::InvalidExpression {
+                    line: 0,
+                    message: format!(
+                        "for iterable function call '{name}' depends on a runtime value; \
+                         all arguments must be statically known at parse time"
+                    ),
+                });
+            }
+            // Recursively evaluate any nested FunctionCall arguments
+            let evaluated_args: Result<Vec<Value>, ParseError> =
+                args.iter().cloned().map(evaluate_static_value).collect();
+            let evaluated_args = evaluated_args?;
+            crate::builtins::evaluate_builtin(name, &evaluated_args).map_err(|e| {
+                ParseError::InvalidExpression {
+                    line: 0,
+                    message: format!("for iterable function call '{name}' failed: {e}"),
+                }
+            })
+        }
+        other => Ok(other),
+    }
 }
 
 /// Parse the body of a for expression and produce a single resource or module call
@@ -4600,5 +4645,110 @@ aws.s3.bucket {
             }
             other => panic!("Expected Moved, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn parse_for_expression_with_keys_function_call() {
+        let input = r#"
+            let tags = {
+                Name = "web"
+                Env  = "prod"
+            }
+
+            let resources = for key in keys(tags) {
+                awscc.ec2.subnet {
+                    name = key
+                }
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+        // keys({Name = "web", Env = "prod"}) should evaluate to ["Env", "Name"] (sorted)
+        assert_eq!(result.resources.len(), 2);
+        assert_eq!(result.resources[0].id.name, "resources[0]");
+        assert_eq!(result.resources[1].id.name, "resources[1]");
+        assert_eq!(
+            result.resources[0].attributes.get("name"),
+            Some(&Value::String("Env".to_string()))
+        );
+        assert_eq!(
+            result.resources[1].attributes.get("name"),
+            Some(&Value::String("Name".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_for_expression_with_values_function_call() {
+        let input = r#"
+            let cidrs = {
+                prod    = "10.0.0.0/16"
+                staging = "10.1.0.0/16"
+            }
+
+            let networks = for cidr in values(cidrs) {
+                awscc.ec2.vpc {
+                    cidr_block = cidr
+                }
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+        // values() returns values sorted by key: prod, staging
+        assert_eq!(result.resources.len(), 2);
+        assert_eq!(
+            result.resources[0].attributes.get("cidr_block"),
+            Some(&Value::String("10.0.0.0/16".to_string()))
+        );
+        assert_eq!(
+            result.resources[1].attributes.get("cidr_block"),
+            Some(&Value::String("10.1.0.0/16".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_for_expression_with_concat_function_call() {
+        let input = r#"
+            let networks = for cidr in concat(["10.0.0.0/16"], ["10.1.0.0/16"]) {
+                awscc.ec2.vpc {
+                    cidr_block = cidr
+                }
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+        assert_eq!(result.resources.len(), 2);
+        assert_eq!(
+            result.resources[0].attributes.get("cidr_block"),
+            Some(&Value::String("10.0.0.0/16".to_string()))
+        );
+        assert_eq!(
+            result.resources[1].attributes.get("cidr_block"),
+            Some(&Value::String("10.1.0.0/16".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_for_expression_with_runtime_function_call_errors() {
+        // Function call with runtime-dependent args (ResourceRef) should error
+        let input = r#"
+            let vpc = awscc.ec2.vpc {
+                name = "test"
+            }
+
+            let subnets = for key in keys(vpc.tags) {
+                awscc.ec2.subnet {
+                    name = key
+                }
+            }
+        "#;
+
+        let result = parse(input);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("runtime"),
+            "Expected error about runtime dependency, got: {}",
+            err
+        );
     }
 }
