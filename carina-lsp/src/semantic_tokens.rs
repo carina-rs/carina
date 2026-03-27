@@ -290,10 +290,11 @@ impl SemanticTokensProvider {
 
         // "else" keyword can appear after "}" on a line like "} else {"
         if let Some(else_pos) = line.find("else") {
-            // Verify it's actually the keyword by checking surrounding characters
-            let before_ok = else_pos == 0 || !line.as_bytes()[else_pos - 1].is_ascii_alphanumeric();
-            let after_ok = else_pos + 4 >= line.len()
-                || !line.as_bytes()[else_pos + 4].is_ascii_alphanumeric();
+            // Verify it's the keyword by checking surrounding characters are not identifier chars
+            let is_ident_char = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+            let before_ok = else_pos == 0 || !is_ident_char(line.as_bytes()[else_pos - 1]);
+            let after_ok =
+                else_pos + 4 >= line.len() || !is_ident_char(line.as_bytes()[else_pos + 4]);
             if before_ok && after_ok {
                 tokens.push((else_pos as u32, 4, 0)); // KEYWORD: else
             }
