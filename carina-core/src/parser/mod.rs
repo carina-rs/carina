@@ -336,6 +336,18 @@ pub fn parse(input: &str) -> Result<ParsedFile, ParseError> {
                             Rule::moved_block => {
                                 state_blocks.push(parse_moved_block(stmt)?);
                             }
+                            Rule::for_expr => {
+                                let (expanded_resources, expanded_module_calls) =
+                                    parse_for_expr(stmt, &ctx, "_for")?;
+                                resources.extend(expanded_resources);
+                                module_calls.extend(expanded_module_calls);
+                            }
+                            Rule::if_expr => {
+                                let (_value, expanded_resources, expanded_module_calls, _import) =
+                                    parse_if_expr(stmt, &ctx, "_if")?;
+                                resources.extend(expanded_resources);
+                                module_calls.extend(expanded_module_calls);
+                            }
                             Rule::let_binding => {
                                 let (line, _) = stmt.as_span().start_pos().line_col();
                                 let (
@@ -5300,5 +5312,63 @@ aws.s3.bucket {
             "Expected error about missing else clause, got: {}",
             err
         );
+    }
+
+    #[test]
+    fn parse_top_level_for_expression() {
+        let input = r#"
+            for az in ["ap-northeast-1a", "ap-northeast-1c"] {
+                awscc.ec2.subnet {
+                    availability_zone = az
+                }
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+        assert_eq!(result.resources.len(), 2);
+
+        // Each resource should have the loop variable substituted
+        assert_eq!(
+            result.resources[0].attributes.get("availability_zone"),
+            Some(&Value::String("ap-northeast-1a".to_string()))
+        );
+        assert_eq!(
+            result.resources[1].attributes.get("availability_zone"),
+            Some(&Value::String("ap-northeast-1c".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_top_level_if_expression() {
+        let input = r#"
+            let enabled = true
+            if enabled {
+                awscc.cloudwatch.alarm {
+                    alarm_name = "cpu-high"
+                }
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+        assert_eq!(result.resources.len(), 1);
+        assert_eq!(
+            result.resources[0].attributes.get("alarm_name"),
+            Some(&Value::String("cpu-high".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_top_level_if_false_no_resources() {
+        let input = r#"
+            let enabled = false
+            if enabled {
+                awscc.cloudwatch.alarm {
+                    alarm_name = "cpu-high"
+                }
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+        assert_eq!(result.resources.len(), 0);
     }
 }
