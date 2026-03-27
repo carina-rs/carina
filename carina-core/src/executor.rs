@@ -400,6 +400,24 @@ fn build_dependency_levels(
         deps_of.insert(idx, dep_indices);
     }
 
+    // For Delete effects, add reverse dependencies: if subnet depends on vpc,
+    // the vpc delete must wait for subnet delete (children deleted before parents).
+    // Collect all reverse edges first, then apply them.
+    let mut reverse_deps: Vec<(usize, usize)> = Vec::new();
+    for (idx, effect) in effects.iter().enumerate() {
+        if let Effect::Delete { dependencies, .. } = effect {
+            for dep_binding in dependencies {
+                if let Some(&dep_idx) = binding_to_idx.get(dep_binding) {
+                    // dep_idx (the parent) must wait for idx (the child) to be deleted
+                    reverse_deps.push((dep_idx, idx));
+                }
+            }
+        }
+    }
+    for (parent_idx, child_idx) in reverse_deps {
+        deps_of.entry(parent_idx).or_default().insert(child_idx);
+    }
+
     // Assign levels: each effect's level is max(deps' levels) + 1, or 0 if no deps
     let mut levels: HashMap<usize, usize> = HashMap::new();
     let mut assigned = HashSet::new();
@@ -509,6 +527,23 @@ fn build_dependency_map(
         }
         deps_of.insert(idx, dep_indices);
     }
+
+    // For Delete effects, add reverse dependencies: if subnet depends on vpc,
+    // the vpc delete must wait for subnet delete (children deleted before parents).
+    let mut reverse_deps: Vec<(usize, usize)> = Vec::new();
+    for (idx, effect) in effects.iter().enumerate() {
+        if let Effect::Delete { dependencies, .. } = effect {
+            for dep_binding in dependencies {
+                if let Some(&dep_idx) = binding_to_idx.get(dep_binding) {
+                    reverse_deps.push((dep_idx, idx));
+                }
+            }
+        }
+    }
+    for (parent_idx, child_idx) in reverse_deps {
+        deps_of.entry(parent_idx).or_default().insert(child_idx);
+    }
+
     deps_of
 }
 
@@ -3390,6 +3425,87 @@ mod tests {
             c_waiting.contains("[a]"),
             "Waiting event should list 'a' as pending dependency, got: {}",
             c_waiting
+        );
+    }
+
+    /// Regression test for #1195: Delete effects must respect reverse dependency ordering.
+    ///
+    /// When deleting resources, children must be deleted before parents.
+    /// If subnet depends on vpc, the vpc delete must wait for subnet delete.
+    /// Before the fix, `build_dependency_map` returned empty deps for deletes,
+    /// allowing parent and child deletes to run concurrently.
+    #[test]
+    fn test_build_dependency_levels_respects_delete_dependencies() {
+        // Scenario: vpc (no deps), subnet (depends on vpc)
+        // For creation: subnet depends on vpc → vpc first, then subnet
+        // For deletion: vpc delete must wait for subnet delete → subnet first, then vpc
+        let mut plan = Plan::new();
+        plan.add(Effect::Delete {
+            id: ResourceId::new("ec2.vpc", "my-vpc"),
+            identifier: "vpc-123".to_string(),
+            lifecycle: LifecycleConfig::default(),
+            binding: Some("vpc".to_string()),
+            dependencies: HashSet::new(), // vpc has no deps
+        });
+        plan.add(Effect::Delete {
+            id: ResourceId::new("ec2.subnet", "my-subnet"),
+            identifier: "subnet-456".to_string(),
+            lifecycle: LifecycleConfig::default(),
+            binding: Some("subnet".to_string()),
+            dependencies: HashSet::from(["vpc".to_string()]), // subnet depends on vpc
+        });
+
+        let levels = build_dependency_levels(plan.effects(), &HashMap::new());
+
+        // Find levels for each effect
+        let vpc_level = levels.iter().position(|group| group.contains(&0)).unwrap();
+        let subnet_level = levels.iter().position(|group| group.contains(&1)).unwrap();
+
+        // vpc delete (idx 0) must be at a HIGHER level than subnet delete (idx 1)
+        // because vpc must wait for subnet to be deleted first (reverse ordering)
+        assert!(
+            vpc_level > subnet_level,
+            "vpc delete (level {}) must be at a higher level than subnet delete (level {}). \
+             Delete ordering must be reversed: children deleted before parents. levels: {:?}",
+            vpc_level,
+            subnet_level,
+            levels
+        );
+    }
+
+    /// Regression test for #1195: build_dependency_map also respects delete dependencies.
+    #[test]
+    fn test_build_dependency_map_respects_delete_dependencies() {
+        let mut plan = Plan::new();
+        plan.add(Effect::Delete {
+            id: ResourceId::new("ec2.vpc", "my-vpc"),
+            identifier: "vpc-123".to_string(),
+            lifecycle: LifecycleConfig::default(),
+            binding: Some("vpc".to_string()),
+            dependencies: HashSet::new(),
+        });
+        plan.add(Effect::Delete {
+            id: ResourceId::new("ec2.subnet", "my-subnet"),
+            identifier: "subnet-456".to_string(),
+            lifecycle: LifecycleConfig::default(),
+            binding: Some("subnet".to_string()),
+            dependencies: HashSet::from(["vpc".to_string()]),
+        });
+
+        let deps = build_dependency_map(plan.effects(), &HashMap::new());
+
+        // vpc delete (idx 0) must depend on subnet delete (idx 1)
+        // because subnet must be deleted before vpc (reverse dependency)
+        assert!(
+            deps[&0].contains(&1),
+            "vpc delete should depend on subnet delete (reverse ordering). deps: {:?}",
+            deps
+        );
+        // subnet delete (idx 1) should NOT depend on vpc delete (idx 0)
+        assert!(
+            !deps[&1].contains(&0),
+            "subnet delete should not depend on vpc delete. deps: {:?}",
+            deps
         );
     }
 }
