@@ -9,7 +9,7 @@ use crate::position;
 use carina_core::builtins;
 use carina_core::parser::{ArgumentParameter, ParsedFile, TypeExpr};
 use carina_core::resource::Value;
-use carina_core::schema::validate_ipv4_cidr;
+use carina_core::schema::{ResourceSchema, suggest_similar_name, validate_ipv4_cidr};
 
 use super::DiagnosticEngine;
 
@@ -801,6 +801,147 @@ impl DiagnosticEngine {
 
         for (line_idx, line) in text.lines().enumerate() {
             if let Some(byte_pos) = line.find(&pattern) {
+                return Some((
+                    line_idx as u32,
+                    position::byte_offset_to_char_offset(line, byte_pos),
+                ));
+            }
+        }
+        None
+    }
+
+    /// Check for unknown attributes on resource references (typo detection).
+    ///
+    /// When a ResourceRef like `igw.internet_gateway_idd` references an attribute
+    /// that doesn't exist in the referenced resource's schema, emit a warning
+    /// with a "did you mean" suggestion if a similar attribute exists.
+    pub(super) fn check_resource_ref_attributes(
+        &self,
+        doc: &Document,
+        parsed: &ParsedFile,
+        binding_schema_map: &HashMap<String, ResourceSchema>,
+    ) -> Vec<Diagnostic> {
+        let mut diagnostics = Vec::new();
+
+        for resource in &parsed.resources {
+            for (attr_name, attr_value) in &resource.attributes {
+                if attr_name.starts_with('_') {
+                    continue;
+                }
+                self.collect_ref_attr_diagnostics(
+                    doc,
+                    attr_value,
+                    binding_schema_map,
+                    &mut diagnostics,
+                );
+            }
+        }
+
+        // Also check module call arguments
+        for call in &parsed.module_calls {
+            for value in call.arguments.values() {
+                self.collect_ref_attr_diagnostics(doc, value, binding_schema_map, &mut diagnostics);
+            }
+        }
+
+        // Also check attribute parameter values
+        for attr_param in &parsed.attribute_params {
+            if let Some(value) = &attr_param.value {
+                self.collect_ref_attr_diagnostics(doc, value, binding_schema_map, &mut diagnostics);
+            }
+        }
+
+        diagnostics
+    }
+
+    /// Recursively check ResourceRef values for unknown attributes.
+    fn collect_ref_attr_diagnostics(
+        &self,
+        doc: &Document,
+        value: &Value,
+        binding_schema_map: &HashMap<String, ResourceSchema>,
+        diagnostics: &mut Vec<Diagnostic>,
+    ) {
+        match value {
+            Value::ResourceRef {
+                binding_name,
+                attribute_name,
+                ..
+            } => {
+                let Some(ref_schema) = binding_schema_map.get(binding_name.as_str()) else {
+                    return;
+                };
+                if ref_schema.attributes.contains_key(attribute_name.as_str()) {
+                    return;
+                }
+                // Attribute not found - build "did you mean" suggestion
+                let known_attrs: Vec<&str> =
+                    ref_schema.attributes.keys().map(|s| s.as_str()).collect();
+                let suggestion = suggest_similar_name(attribute_name, &known_attrs)
+                    .map(|s| format!(" Did you mean '{}'?", s))
+                    .unwrap_or_default();
+
+                let ref_text = format!("{}.{}", binding_name, attribute_name);
+                if let Some((line, col)) = self.find_ref_value_position(doc, &ref_text) {
+                    // Highlight just the attribute part (after the dot)
+                    let attr_col = col + binding_name.len() as u32 + 1; // +1 for the dot
+                    diagnostics.push(Diagnostic {
+                        range: Range {
+                            start: Position {
+                                line,
+                                character: attr_col,
+                            },
+                            end: Position {
+                                line,
+                                character: attr_col + attribute_name.len() as u32,
+                            },
+                        },
+                        severity: Some(DiagnosticSeverity::WARNING),
+                        source: Some("carina".to_string()),
+                        message: format!(
+                            "Unknown attribute '{}' on '{}' (type '{}'){}",
+                            attribute_name, binding_name, ref_schema.resource_type, suggestion,
+                        ),
+                        ..Default::default()
+                    });
+                }
+            }
+            Value::List(items) => {
+                for item in items {
+                    self.collect_ref_attr_diagnostics(doc, item, binding_schema_map, diagnostics);
+                }
+            }
+            Value::Map(map) => {
+                for v in map.values() {
+                    self.collect_ref_attr_diagnostics(doc, v, binding_schema_map, diagnostics);
+                }
+            }
+            Value::Interpolation(parts) => {
+                for part in parts {
+                    if let carina_core::resource::InterpolationPart::Expr(expr) = part {
+                        self.collect_ref_attr_diagnostics(
+                            doc,
+                            expr,
+                            binding_schema_map,
+                            diagnostics,
+                        );
+                    }
+                }
+            }
+            Value::FunctionCall { args, .. } => {
+                for arg in args {
+                    self.collect_ref_attr_diagnostics(doc, arg, binding_schema_map, diagnostics);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Find the position of a resource reference value (e.g., "igw.internet_gateway_id") in the document.
+    fn find_ref_value_position(&self, doc: &Document, ref_text: &str) -> Option<(u32, u32)> {
+        let text = doc.text();
+        for (line_idx, line) in text.lines().enumerate() {
+            if let Some(byte_pos) = line.find(ref_text) {
                 return Some((
                     line_idx as u32,
                     position::byte_offset_to_char_offset(line, byte_pos),
