@@ -1,6 +1,6 @@
 #!/bin/bash
 # Test: local let bindings inside resource blocks
-source "$(dirname "$0")/_helpers.sh"
+source "$(dirname "$0")/../../shared/_helpers.sh"
 
 echo "Test: local let bindings inside resource blocks"
 echo ""

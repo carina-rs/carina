@@ -1,6 +1,6 @@
 #!/bin/bash
 # Test: if expression with true condition creates resource
-source "$(dirname "$0")/_helpers.sh"
+source "$(dirname "$0")/../../shared/_helpers.sh"
 
 echo "Test: if expression (true condition)"
 echo ""

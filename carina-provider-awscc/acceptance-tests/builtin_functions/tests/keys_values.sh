@@ -1,6 +1,6 @@
 #!/bin/bash
 # Test: keys() and values() functions
-source "$(dirname "$0")/_helpers.sh"
+source "$(dirname "$0")/../../shared/_helpers.sh"
 
 echo "Test: keys() and values() functions"
 echo ""

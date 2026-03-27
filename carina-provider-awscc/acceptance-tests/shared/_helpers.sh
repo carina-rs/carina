@@ -1,11 +1,18 @@
 #!/bin/bash
-# Common helpers for module acceptance tests
+# Common helpers for acceptance tests
+#
+# Usage: source this file from test scripts:
+#   source "$(dirname "$0")/../../shared/_helpers.sh"
 
 set -e
 
 HELPERS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SCRIPT_DIR="$(cd "$HELPERS_DIR/.." && pwd)"
-PROJECT_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+# Derive SCRIPT_DIR from the caller's location (two levels up from shared/)
+# Each test script is at <suite>/tests/<script>.sh, so SCRIPT_DIR is <suite>/
+if [ -z "$SCRIPT_DIR" ]; then
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[1]}")/.." && pwd)"
+fi
+PROJECT_ROOT="$(cd "$HELPERS_DIR/../../.." && pwd)"
 
 CARINA_BIN="$PROJECT_ROOT/target/debug/carina"
 if [ ! -f "$CARINA_BIN" ]; then
