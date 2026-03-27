@@ -916,6 +916,18 @@ impl DiagnosticEngine {
                     self.collect_ref_attr_diagnostics(doc, v, binding_schema_map, diagnostics);
                 }
             }
+            Value::Interpolation(parts) => {
+                for part in parts {
+                    if let carina_core::resource::InterpolationPart::Expr(expr) = part {
+                        self.collect_ref_attr_diagnostics(
+                            doc,
+                            expr,
+                            binding_schema_map,
+                            diagnostics,
+                        );
+                    }
+                }
+            }
             _ => {}
         }
     }
