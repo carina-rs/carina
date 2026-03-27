@@ -2380,4 +2380,9 @@ fn import_effect_preserves_resource_metadata_in_state() {
         Some("my_vpc_binding".to_string()),
         "binding should be preserved after import"
     );
+    assert_eq!(
+        saved_resource.identifier,
+        Some("vpc-0abc123".to_string()),
+        "identifier should be preserved after import"
+    );
 }
