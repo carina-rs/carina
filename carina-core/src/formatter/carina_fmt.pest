@@ -145,6 +145,7 @@ primary = {
   | resource_expr
   | import_expr
   | for_expr
+  | if_expr
   | function_call
   | list
   | map
@@ -191,6 +192,18 @@ for_body_content = _{ trivia | for_local_binding | read_resource_expr | resource
 
 // For local binding: let name = expression
 for_local_binding = { kw_let ~ trivia+ ~ identifier ~ trivia* ~ equals ~ trivia* ~ expression }
+
+// If expression: if condition { body } else { body }
+if_expr = {
+    kw_if ~ trivia+ ~ expression ~ trivia* ~ open_brace ~ if_body_content* ~ close_brace ~ (trivia* ~ else_clause)?
+}
+else_clause = { kw_else ~ trivia* ~ open_brace ~ if_body_content* ~ close_brace }
+
+// If body content
+if_body_content = _{ trivia | if_local_binding | read_resource_expr | resource_expr | module_call | expression }
+
+// If local binding: let name = expression
+if_local_binding = { kw_let ~ trivia+ ~ identifier ~ trivia* ~ equals ~ trivia* ~ expression }
 
 // Resource expression: aws.s3_bucket { ... }
 resource_expr = {
@@ -242,6 +255,8 @@ kw_list = { "list" }
 kw_map = { "map" }
 kw_for = { "for" }
 kw_in = { "in" }
+kw_if = { "if" }
+kw_else = { "else" }
 kw_read = { "read" }
 kw_removed = { "removed" }
 kw_moved = { "moved" }

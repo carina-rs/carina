@@ -71,6 +71,8 @@ pub enum NodeKind {
     ReadResourceExpr,
     ForExpr,
     ForBinding,
+    IfExpr,
+    ElseClause,
     FieldAccess,
     IndexAccess,
     Attribute,

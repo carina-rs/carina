@@ -122,6 +122,7 @@ primary = {
   | resource_expr
   | import_expr          // Must come before variable_ref since "import" is an identifier
   | for_expr             // Must come before module_call so "for" is not parsed as module name
+  | if_expr              // Must come before module_call so "if" is not parsed as module name
   | module_call          // Must come before variable_ref so "name { ... }" is parsed as module call
   | function_call        // Must come before variable_ref so "func(...)" is parsed as function call
   | list
@@ -153,6 +154,12 @@ for_iterable = { function_call | list | variable_ref | "(" ~ expression ~ ")" }
 // For body: local let bindings followed by a resource expression or module call
 for_body = { for_local_binding* ~ (read_resource_expr | resource_expr | module_call) }
 for_local_binding = { "let" ~ identifier ~ "=" ~ expression }
+
+// If expression: if condition { body } else { body }
+if_expr = { "if" ~ expression ~ "{" ~ if_body ~ "}" ~ else_clause? }
+else_clause = { "else" ~ "{" ~ if_body ~ "}" }
+if_body = { if_local_binding* ~ (read_resource_expr | resource_expr | module_call | expression) }
+if_local_binding = { "let" ~ identifier ~ "=" ~ expression }
 
 // List: [item1, item2, ...]
 list = { "[" ~ (expression ~ ("," ~ expression)*)? ~ ","? ~ "]" }
