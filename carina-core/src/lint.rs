@@ -151,6 +151,29 @@ fn is_snake_case(name: &str) -> bool {
         .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
 }
 
+/// Extract a binding name from the text after a keyword (`let`, `for`, `import`).
+///
+/// If `stop_at_eq` is true, the name is delimited by whitespace or `=` (for `let`/`import`).
+/// If false, the name is delimited by whitespace only (for `for`).
+/// Returns `None` if the name is empty or starts with `_`.
+fn extract_binding_name(after_keyword: &str, stop_at_eq: bool) -> Option<String> {
+    let trimmed = after_keyword.trim_start();
+    let name: String = if stop_at_eq {
+        trimmed
+            .chars()
+            .take_while(|c| !c.is_whitespace() && *c != '=')
+            .collect()
+    } else {
+        trimmed.chars().take_while(|c| !c.is_whitespace()).collect()
+    };
+
+    if name.is_empty() || name.starts_with('_') {
+        return None;
+    }
+
+    Some(name)
+}
+
 /// Find `let` bindings with non-snake_case names in source text.
 ///
 /// Scans lines for `let <name> =` patterns and checks if `<name>` follows
@@ -166,75 +189,24 @@ pub fn find_non_snake_case_bindings(source: &str) -> Vec<NamingWarning> {
             continue;
         }
 
-        // Look for `let <name> =` pattern
-        if let Some(rest) = trimmed.strip_prefix("let ") {
-            let rest = rest.trim_start();
-            // Extract the binding name (up to whitespace or '=')
-            let name: String = rest
-                .chars()
-                .take_while(|c| !c.is_whitespace() && *c != '=')
-                .collect();
+        // Extract binding name from `let`, `for`, or `import` patterns
+        let name = if let Some(rest) = trimmed.strip_prefix("let ") {
+            extract_binding_name(rest, true)
+        } else if let Some(rest) = trimmed.strip_prefix("for ") {
+            extract_binding_name(rest, false)
+        } else if let Some(rest) = trimmed.strip_prefix("import ") {
+            extract_binding_name(rest, true)
+        } else {
+            None
+        };
 
-            if name.is_empty() {
-                continue;
-            }
-
-            // Skip internal bindings starting with `_`
-            if name.starts_with('_') {
-                continue;
-            }
-
-            if !is_snake_case(&name) {
-                warnings.push(NamingWarning {
-                    name,
-                    line: line_idx + 1,
-                });
-            }
-        }
-
-        // Look for `for <name> in` pattern
-        if let Some(rest) = trimmed.strip_prefix("for ") {
-            let rest = rest.trim_start();
-            let name: String = rest.chars().take_while(|c| !c.is_whitespace()).collect();
-
-            if name.is_empty() {
-                continue;
-            }
-
-            if name.starts_with('_') {
-                continue;
-            }
-
-            if !is_snake_case(&name) {
-                warnings.push(NamingWarning {
-                    name,
-                    line: line_idx + 1,
-                });
-            }
-        }
-
-        // Look for `import <name> =` pattern (module imports)
-        if let Some(rest) = trimmed.strip_prefix("import ") {
-            let rest = rest.trim_start();
-            let name: String = rest
-                .chars()
-                .take_while(|c| !c.is_whitespace() && *c != '=')
-                .collect();
-
-            if name.is_empty() {
-                continue;
-            }
-
-            if name.starts_with('_') {
-                continue;
-            }
-
-            if !is_snake_case(&name) {
-                warnings.push(NamingWarning {
-                    name,
-                    line: line_idx + 1,
-                });
-            }
+        if let Some(name) = name
+            && !is_snake_case(&name)
+        {
+            warnings.push(NamingWarning {
+                name,
+                line: line_idx + 1,
+            });
         }
     }
 
