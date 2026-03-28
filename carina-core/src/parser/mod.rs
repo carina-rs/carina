@@ -2088,9 +2088,10 @@ fn resolve_forward_ref_in_value(
 ) -> Value {
     match value {
         Value::String(ref s) => {
-            // A dotted string like "vpc.vpc_id" may be a forward reference that
-            // was stored as a string during single-pass parsing. Resolve it to
-            // ResourceRef if the first segment is a known resource binding.
+            // A dotted string like "vpc.vpc_id" or "vpc.attr.nested" may be a
+            // forward reference that was stored as a string during single-pass
+            // parsing. Resolve it to ResourceRef if the first segment is a known
+            // resource binding. Parts after the second become field_path.
             let parts: Vec<&str> = s.splitn(3, '.').collect();
             if parts.len() >= 2 && resource_bindings.contains_key(parts[0]) {
                 let field_path = parts
