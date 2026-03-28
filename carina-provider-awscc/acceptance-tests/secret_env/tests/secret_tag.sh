@@ -32,11 +32,11 @@ fi
 # Verify the state contains a hash for the secret tag
 printf "  %-50s" "assert: state contains secret hash"
 SECRET_VAL=$(jq -r '.resources[0].attributes.tags.SecretTag' "$WORK_DIR/carina.state.json" 2>/dev/null)
-if echo "$SECRET_VAL" | grep -q "^_secret:sha256:"; then
+if echo "$SECRET_VAL" | grep -q "^_secret:argon2:"; then
     echo "OK"
     TEST_PASSED=$((TEST_PASSED + 1))
 else
-    echo "FAIL (expected _secret:sha256:..., got '$SECRET_VAL')"
+    echo "FAIL (expected _secret:argon2:..., got '$SECRET_VAL')"
     TEST_FAILED=$((TEST_FAILED + 1))
 fi
 

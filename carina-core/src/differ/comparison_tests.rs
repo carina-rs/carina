@@ -6,22 +6,26 @@ fn type_aware_int_float_coercion() {
         &Value::Int(42),
         &Value::Float(42.0),
         Some(&AttributeType::Float),
+        None,
     ));
     assert!(type_aware_equal(
         &Value::Float(42.0),
         &Value::Int(42),
         Some(&AttributeType::Float),
+        None,
     ));
     // Non-exact conversion should not be equal
     assert!(!type_aware_equal(
         &Value::Int(42),
         &Value::Float(42.5),
         Some(&AttributeType::Float),
+        None,
     ));
     // Without type info, Int and Float are not equal
     assert!(!type_aware_equal(
         &Value::Int(42),
         &Value::Float(42.0),
+        None,
         None,
     ));
 }
@@ -33,6 +37,7 @@ fn type_aware_int_float_coercion_for_int_type() {
         &Value::Int(10),
         &Value::Float(10.0),
         Some(&AttributeType::Int),
+        None,
     ));
 }
 
@@ -44,6 +49,7 @@ fn type_aware_list_with_inner_type() {
         &Value::List(vec![Value::Int(1), Value::Int(2)]),
         &Value::List(vec![Value::Float(2.0), Value::Float(1.0)]),
         Some(&list_type),
+        None,
     ));
 }
 
@@ -66,7 +72,7 @@ fn type_aware_struct_per_field() {
         ("count".to_string(), Value::Float(5.0)),
         ("name".to_string(), Value::String("test".to_string())),
     ]));
-    assert!(type_aware_equal(&a, &b, Some(&struct_type)));
+    assert!(type_aware_equal(&a, &b, Some(&struct_type), None));
 }
 
 #[test]
@@ -76,6 +82,7 @@ fn type_aware_union_numeric() {
         &Value::Int(7),
         &Value::Float(7.0),
         Some(&union_type),
+        None,
     ));
 }
 
@@ -92,6 +99,7 @@ fn type_aware_custom_delegates_to_base() {
         &Value::Int(8080),
         &Value::Float(8080.0),
         Some(&custom_type),
+        None,
     ));
 }
 
@@ -157,7 +165,7 @@ fn type_aware_struct_ignores_default_bool_false() {
     ]));
 
     assert!(
-        type_aware_equal(&desired, &current, Some(&struct_type)),
+        type_aware_equal(&desired, &current, Some(&struct_type), None),
         "Struct with extra default Bool(false) should be considered equal"
     );
 }
@@ -190,7 +198,7 @@ fn type_aware_struct_does_not_ignore_non_default_bool() {
     ]));
 
     assert!(
-        !type_aware_equal(&desired, &current, Some(&struct_type)),
+        !type_aware_equal(&desired, &current, Some(&struct_type), None),
         "Struct with non-default Bool(true) should NOT be considered equal"
     );
 }
@@ -217,6 +225,7 @@ fn type_aware_string_enum_namespaced_vs_raw() {
             ),
             &Value::String("AES256".to_string()),
             Some(&enum_type),
+            None,
         ),
         "Namespaced enum and raw value should be considered equal"
     );
@@ -231,6 +240,7 @@ fn type_aware_string_enum_namespaced_vs_raw() {
                 "awscc.s3.bucket.ServerSideEncryptionByDefaultSseAlgorithm.AES256".to_string()
             ),
             Some(&enum_type),
+            None,
         ),
         "Both namespaced should be equal"
     );
@@ -243,6 +253,7 @@ fn type_aware_string_enum_namespaced_vs_raw() {
             ),
             &Value::String("aws:kms".to_string()),
             Some(&enum_type),
+            None,
         ),
         "Different enum values should not be equal"
     );
@@ -281,7 +292,7 @@ fn type_aware_struct_ignores_default_string_enum_empty() {
     ]));
 
     assert!(
-        type_aware_equal(&desired, &current, Some(&struct_type)),
+        type_aware_equal(&desired, &current, Some(&struct_type), None),
         "Struct with extra default StringEnum empty string should be considered equal"
     );
 }
@@ -320,7 +331,7 @@ fn type_aware_struct_ignores_default_custom_type() {
     ]));
 
     assert!(
-        type_aware_equal(&desired, &current, Some(&struct_type)),
+        type_aware_equal(&desired, &current, Some(&struct_type), None),
         "Struct with extra default Custom(Int) zero should be considered equal"
     );
 }
@@ -356,7 +367,7 @@ fn type_aware_struct_ignores_default_nested_struct_empty() {
     ]));
 
     assert!(
-        type_aware_equal(&desired, &current, Some(&struct_type)),
+        type_aware_equal(&desired, &current, Some(&struct_type), None),
         "Struct with extra default nested Struct empty map should be considered equal"
     );
 }
@@ -380,7 +391,7 @@ fn type_aware_ordered_list_detects_reorder() {
     ]);
 
     assert!(
-        !type_aware_equal(&a, &b, Some(&ordered_list_type)),
+        !type_aware_equal(&a, &b, Some(&ordered_list_type), None),
         "Ordered list should detect reorder as NOT equal"
     );
 
@@ -390,7 +401,7 @@ fn type_aware_ordered_list_detects_reorder() {
         Value::String("b".to_string()),
     ]);
     assert!(
-        type_aware_equal(&a, &c, Some(&ordered_list_type)),
+        type_aware_equal(&a, &c, Some(&ordered_list_type), None),
         "Ordered list with same order should be equal"
     );
 }
@@ -413,7 +424,7 @@ fn type_aware_unordered_list_ignores_reorder() {
     ]);
 
     assert!(
-        type_aware_equal(&a, &b, Some(&unordered_list_type)),
+        type_aware_equal(&a, &b, Some(&unordered_list_type), None),
         "Unordered list should treat reorder as equal"
     );
 }
@@ -441,7 +452,7 @@ fn write_only_attr_in_desired_not_in_current_no_diff() {
         Value::String("10.0.0.0/16".to_string()),
     )]);
 
-    let changed = find_changed_attributes(&desired, &current, None, None, Some(&schema));
+    let changed = find_changed_attributes(&desired, &current, None, None, Some(&schema), None);
     assert!(
         changed.is_empty(),
         "Write-only attribute absent from current should not trigger a diff, got: {:?}",
@@ -472,7 +483,7 @@ fn write_only_attr_in_both_same_value_no_diff() {
         ("ipv4_netmask_length".to_string(), Value::Int(16)),
     ]);
 
-    let changed = find_changed_attributes(&desired, &current, None, None, Some(&schema));
+    let changed = find_changed_attributes(&desired, &current, None, None, Some(&schema), None);
     assert!(
         changed.is_empty(),
         "Write-only attribute with same value should not trigger a diff, got: {:?}",
@@ -503,7 +514,7 @@ fn write_only_attr_in_both_different_value_detects_diff() {
         ("ipv4_netmask_length".to_string(), Value::Int(16)),
     ]);
 
-    let changed = find_changed_attributes(&desired, &current, None, None, Some(&schema));
+    let changed = find_changed_attributes(&desired, &current, None, None, Some(&schema), None);
     assert!(
         changed.contains(&"ipv4_netmask_length".to_string()),
         "Write-only attribute with different value should trigger a diff"
@@ -530,7 +541,7 @@ fn non_write_only_attr_in_desired_not_in_current_detects_diff() {
         Value::String("10.0.0.0/16".to_string()),
     )]);
 
-    let changed = find_changed_attributes(&desired, &current, None, None, Some(&schema));
+    let changed = find_changed_attributes(&desired, &current, None, None, Some(&schema), None);
     assert!(
         changed.contains(&"enable_dns".to_string()),
         "Non-write-only attribute absent from current should trigger a diff"
@@ -551,11 +562,13 @@ fn secret_unchanged_same_hash() {
         &secret_value,
         &Value::String(hash_str.clone()),
         None,
+        None,
     ));
     // Reversed order should also work
     assert!(type_aware_equal(
         &Value::String(hash_str),
         &secret_value,
+        None,
         None,
     ));
 }
@@ -575,6 +588,7 @@ fn secret_changed_different_hash() {
         &new_secret,
         &Value::String(old_hash_str),
         None,
+        None,
     ));
 }
 
@@ -589,7 +603,7 @@ fn secret_in_find_changed_attributes_no_change() {
     let desired = HashMap::from([("password".to_string(), secret_value)]);
     let current = HashMap::from([("password".to_string(), Value::String(hash_str))]);
 
-    let changed = find_changed_attributes(&desired, &current, None, None, None);
+    let changed = find_changed_attributes(&desired, &current, None, None, None, None);
     assert!(
         changed.is_empty(),
         "Secret with matching hash should not show as changed, got: {:?}",
@@ -609,7 +623,7 @@ fn secret_in_find_changed_attributes_changed() {
     let desired = HashMap::from([("password".to_string(), new_secret)]);
     let current = HashMap::from([("password".to_string(), Value::String(old_hash_str))]);
 
-    let changed = find_changed_attributes(&desired, &current, None, None, None);
+    let changed = find_changed_attributes(&desired, &current, None, None, None, None);
     assert!(
         changed.contains(&"password".to_string()),
         "Secret with different hash should show as changed"
@@ -638,10 +652,112 @@ fn secret_in_map_no_change_when_hash_matches() {
     let desired = HashMap::from([("tags".to_string(), desired_tags)]);
     let current = HashMap::from([("tags".to_string(), state_tags)]);
 
-    let changed = find_changed_attributes(&desired, &current, None, None, None);
+    let changed = find_changed_attributes(&desired, &current, None, None, None, None);
     assert!(
         changed.is_empty(),
         "Secret in map with matching hash should not show as changed, got: {:?}",
         changed
+    );
+}
+
+#[test]
+fn secret_with_context_no_change_when_hash_matches() {
+    use crate::resource::ResourceId;
+    use crate::value::{SecretHashContext, value_to_json_with_context};
+
+    let resource_id = ResourceId::with_provider("awscc", "rds.db_instance", "my-db");
+    let ctx = SecretHashContext::new(
+        resource_id.display_type(),
+        &resource_id.name,
+        "master_password",
+    );
+
+    let secret_value = Value::Secret(Box::new(Value::String("my-password".to_string())));
+    // Hash with context (as from_provider_state would do)
+    let hash_json = value_to_json_with_context(&secret_value, Some(&ctx)).unwrap();
+    let hash_str = hash_json.as_str().unwrap().to_string();
+
+    let desired = HashMap::from([("master_password".to_string(), secret_value)]);
+    let current = HashMap::from([("master_password".to_string(), Value::String(hash_str))]);
+
+    // find_changed_attributes builds context from resource_id
+    let changed = find_changed_attributes(&desired, &current, None, None, None, Some(&resource_id));
+    assert!(
+        changed.is_empty(),
+        "Secret with matching context-hashed value should not show as changed, got: {:?}",
+        changed
+    );
+}
+
+#[test]
+fn secret_with_context_detects_change() {
+    use crate::resource::ResourceId;
+    use crate::value::{SecretHashContext, value_to_json_with_context};
+
+    let resource_id = ResourceId::with_provider("awscc", "rds.db_instance", "my-db");
+    let ctx = SecretHashContext::new(
+        resource_id.display_type(),
+        &resource_id.name,
+        "master_password",
+    );
+
+    let old_secret = Value::Secret(Box::new(Value::String("old-password".to_string())));
+    let new_secret = Value::Secret(Box::new(Value::String("new-password".to_string())));
+    // Hash the OLD secret with context
+    let hash_json = value_to_json_with_context(&old_secret, Some(&ctx)).unwrap();
+    let hash_str = hash_json.as_str().unwrap().to_string();
+
+    let desired = HashMap::from([("master_password".to_string(), new_secret)]);
+    let current = HashMap::from([("master_password".to_string(), Value::String(hash_str))]);
+
+    let changed = find_changed_attributes(&desired, &current, None, None, None, Some(&resource_id));
+    assert!(
+        changed.contains(&"master_password".to_string()),
+        "Secret with different value should show as changed with context"
+    );
+}
+
+#[test]
+fn secret_same_password_different_resources_produces_different_hashes() {
+    use crate::resource::ResourceId;
+    use crate::value::{SecretHashContext, value_to_json_with_context};
+
+    let secret = Value::Secret(Box::new(Value::String("shared-password".to_string())));
+
+    let ctx1 = SecretHashContext::new("awscc.rds.db_instance", "db-1", "master_password");
+    let ctx2 = SecretHashContext::new("awscc.rds.db_instance", "db-2", "master_password");
+
+    let hash1 = value_to_json_with_context(&secret, Some(&ctx1)).unwrap();
+    let hash2 = value_to_json_with_context(&secret, Some(&ctx2)).unwrap();
+
+    assert_ne!(
+        hash1, hash2,
+        "Same password on different resources should produce different state hashes"
+    );
+
+    // Each hash should match its own context
+    let id1 = ResourceId::with_provider("awscc", "rds.db_instance", "db-1");
+    let desired1 = HashMap::from([("master_password".to_string(), secret.clone())]);
+    let current1 = HashMap::from([(
+        "master_password".to_string(),
+        Value::String(hash1.as_str().unwrap().to_string()),
+    )]);
+    let changed1 = find_changed_attributes(&desired1, &current1, None, None, None, Some(&id1));
+    assert!(
+        changed1.is_empty(),
+        "Hash should match its own resource context"
+    );
+
+    // But not the other resource's context
+    let id2 = ResourceId::with_provider("awscc", "rds.db_instance", "db-2");
+    let desired2 = HashMap::from([("master_password".to_string(), secret)]);
+    let current2 = HashMap::from([(
+        "master_password".to_string(),
+        Value::String(hash1.as_str().unwrap().to_string()),
+    )]);
+    let changed2 = find_changed_attributes(&desired2, &current2, None, None, None, Some(&id2));
+    assert!(
+        changed2.contains(&"master_password".to_string()),
+        "Hash from db-1 should not match db-2's context"
     );
 }

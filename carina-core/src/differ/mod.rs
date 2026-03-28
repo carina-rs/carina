@@ -76,6 +76,7 @@ pub fn diff(
         saved,
         prev_desired_keys,
         schema,
+        Some(&desired.id),
     );
 
     if changed.is_empty() {
