@@ -1091,19 +1091,13 @@ async fn execute_cbd_replace_parallel(
         Ok(r) => r,
         Err(e) => {
             observer.on_event(&ExecutionEvent::EffectFailed {
-                effect: &Effect::Create(to.clone()),
+                effect,
                 error: &e,
                 duration: started.elapsed(),
                 progress,
             });
             return SingleEffectResult::Failure {
-                binding: to.attributes.get("_binding").and_then(|v| {
-                    if let Value::String(s) = v {
-                        Some(s.clone())
-                    } else {
-                        None
-                    }
-                }),
+                binding: effect.binding_name(),
                 refresh: None,
             };
         }
