@@ -2,7 +2,7 @@ provider awscc {
   region = awscc.Region.ap_northeast_1
 }
 
-fn tag_name(env, service) {
+fn tag_name(env: string, service: string): string {
   join("-", [env, service, "vpc"])
 }
 

@@ -116,7 +116,7 @@ moved_to_attr = { kw_to ~ trivia* ~ equals ~ trivia* ~ resource_address }
 
 // User-defined function: fn name(params) { body }
 fn_def = {
-    kw_fn ~ trivia+ ~ identifier ~ trivia* ~ open_paren ~ fn_params_content* ~ close_paren ~ trivia* ~ open_brace ~ fn_body_content* ~ close_brace
+    kw_fn ~ trivia+ ~ identifier ~ trivia* ~ open_paren ~ fn_params_content* ~ close_paren ~ (trivia* ~ colon ~ trivia* ~ type_expr)? ~ trivia* ~ open_brace ~ fn_body_content* ~ close_brace
 }
 fn_params_content = _{ trivia | comma | fn_param }
 fn_param = { identifier ~ (trivia* ~ colon ~ trivia* ~ type_expr)? ~ (trivia* ~ equals ~ trivia* ~ expression)? }

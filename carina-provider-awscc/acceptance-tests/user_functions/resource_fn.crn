@@ -2,7 +2,7 @@ provider awscc {
   region = awscc.Region.ap_northeast_1
 }
 
-fn tagged_vpc(cidr, env) {
+fn tagged_vpc(cidr: string, env: string): awscc.ec2.vpc {
   awscc.ec2.vpc {
     cidr_block = cidr
 
