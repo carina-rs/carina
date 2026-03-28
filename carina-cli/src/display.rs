@@ -664,6 +664,12 @@ fn format_plan_tree(
                 .unwrap();
             }
             Effect::Move { from, to } => {
+                // Skip Move line display when an Update/Replace with "(moved from: ...)"
+                // annotation already exists for this target. The Move effect stays in the
+                // plan for summary counting ("N to move").
+                if moved_origins.contains_key(to) {
+                    return false;
+                }
                 writeln!(
                     out,
                     "{}{}{} {} {} {}",

@@ -16,4 +16,4 @@ Execution Plan:
               network_acl_association_id: (known after apply)
               subnet_id: (known after apply)
 
-Plan: 1 to add, 1 to change, 0 to destroy.
+Plan: 1 to add, 1 to change, 0 to destroy, 1 to move.
