@@ -6,6 +6,8 @@ use carina_core::value::{json_to_dsl_value, value_to_json};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+use crate::backend::BackendError;
+
 /// The main state file structure that persists to the backend
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StateFile {
@@ -262,6 +264,65 @@ impl Default for StateFile {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Minimal struct for extracting just the version field from a state file.
+#[derive(Deserialize)]
+struct VersionCheck {
+    version: u32,
+}
+
+/// Deserialize a state file from a JSON string, checking the version and
+/// migrating from older formats if necessary.
+///
+/// - Current version: deserialized directly.
+/// - Future version (newer than supported): returns a clear error asking the
+///   user to upgrade Carina.
+/// - Older version: attempts deserialization with serde defaults and bumps
+///   the version to current. When a future version introduces breaking changes,
+///   explicit migration functions should be added here.
+/// - Invalid JSON: returns a parse error.
+pub fn check_and_migrate(content: &str) -> Result<StateFile, BackendError> {
+    let check: VersionCheck = serde_json::from_str(content)
+        .map_err(|e| BackendError::InvalidState(format!("Failed to parse state version: {}", e)))?;
+
+    match check.version {
+        v if v == StateFile::CURRENT_VERSION => serde_json::from_str(content)
+            .map_err(|e| BackendError::InvalidState(format!("Failed to parse state file: {}", e))),
+        v if v > StateFile::CURRENT_VERSION => Err(BackendError::InvalidState(format!(
+            "State file version {} is newer than supported version {}. Please upgrade Carina.",
+            v,
+            StateFile::CURRENT_VERSION
+        ))),
+        v => {
+            // Older version — for now, try to deserialize with serde defaults.
+            // In the future, add explicit migration functions here.
+            eprintln!(
+                "Warning: Migrating state file from v{} to v{}",
+                v,
+                StateFile::CURRENT_VERSION
+            );
+            let mut state: StateFile = serde_json::from_str(content).map_err(|e| {
+                BackendError::InvalidState(format!(
+                    "Failed to migrate state file from v{}: {}",
+                    v, e
+                ))
+            })?;
+            state.version = StateFile::CURRENT_VERSION;
+            Ok(state)
+        }
+    }
+}
+
+/// Deserialize a state file from a byte slice, checking the version and
+/// migrating from older formats if necessary.
+///
+/// This is the byte-slice equivalent of [`check_and_migrate`] for backends
+/// that read raw bytes (e.g., S3).
+pub fn check_and_migrate_bytes(bytes: &[u8]) -> Result<StateFile, BackendError> {
+    let content = std::str::from_utf8(bytes)
+        .map_err(|e| BackendError::InvalidState(format!("State file is not valid UTF-8: {}", e)))?;
+    check_and_migrate(content)
 }
 
 /// State of a single managed resource
@@ -911,5 +972,98 @@ mod tests {
 
         let deps = state.build_orphan_dependencies(&desired_ids);
         assert!(deps.is_empty());
+    }
+
+    #[test]
+    fn test_check_and_migrate_current_version() {
+        use super::check_and_migrate;
+
+        let state = StateFile::new();
+        let json = serde_json::to_string_pretty(&state).unwrap();
+        let result = check_and_migrate(&json).unwrap();
+        assert_eq!(result.version, StateFile::CURRENT_VERSION);
+        assert_eq!(result.lineage, state.lineage);
+    }
+
+    #[test]
+    fn test_check_and_migrate_future_version_returns_error() {
+        use super::check_and_migrate;
+
+        let json = r#"{
+            "version": 999,
+            "serial": 0,
+            "lineage": "test-lineage",
+            "carina_version": "0.1.0",
+            "resources": []
+        }"#;
+
+        let result = check_and_migrate(json);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("999"),
+            "error should mention the unsupported version"
+        );
+        assert!(
+            err.contains("Please upgrade Carina"),
+            "error should suggest upgrading"
+        );
+    }
+
+    #[test]
+    fn test_check_and_migrate_older_version_migrates() {
+        use super::check_and_migrate;
+
+        // v3 state file — should be migrated to current version
+        let json = r#"{
+            "version": 3,
+            "serial": 5,
+            "lineage": "old-lineage",
+            "carina_version": "0.0.1",
+            "resources": []
+        }"#;
+
+        let result = check_and_migrate(json).unwrap();
+        assert_eq!(
+            result.version,
+            StateFile::CURRENT_VERSION,
+            "version should be bumped to current"
+        );
+        assert_eq!(result.serial, 5, "serial should be preserved");
+        assert_eq!(result.lineage, "old-lineage", "lineage should be preserved");
+    }
+
+    #[test]
+    fn test_check_and_migrate_invalid_json_returns_error() {
+        use super::check_and_migrate;
+
+        let result = check_and_migrate("not valid json at all");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("Failed to parse state version"),
+            "error should mention version parsing failure"
+        );
+    }
+
+    #[test]
+    fn test_check_and_migrate_bytes_works() {
+        use super::check_and_migrate_bytes;
+
+        let state = StateFile::new();
+        let json = serde_json::to_string_pretty(&state).unwrap();
+        let result = check_and_migrate_bytes(json.as_bytes()).unwrap();
+        assert_eq!(result.version, StateFile::CURRENT_VERSION);
+    }
+
+    #[test]
+    fn test_check_and_migrate_bytes_invalid_utf8() {
+        use super::check_and_migrate_bytes;
+
+        let bytes: &[u8] = &[0xff, 0xfe, 0xfd];
+        let result = check_and_migrate_bytes(bytes);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("UTF-8"), "error should mention UTF-8 issue");
     }
 }

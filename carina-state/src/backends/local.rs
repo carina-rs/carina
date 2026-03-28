@@ -12,7 +12,7 @@ use tokio::time::sleep as async_sleep;
 
 use crate::backend::{BackendConfig, BackendError, BackendResult, StateBackend};
 use crate::lock::LockInfo;
-use crate::state::StateFile;
+use crate::state::{self, StateFile};
 
 /// Local file backend for development and simple use cases
 pub struct LocalBackend {
@@ -236,9 +236,7 @@ impl StateBackend for LocalBackend {
             }
         };
 
-        let state: StateFile = serde_json::from_str(&content).map_err(|e| {
-            BackendError::InvalidState(format!("Failed to parse state file: {}", e))
-        })?;
+        let state = state::check_and_migrate(&content)?;
 
         Ok(Some(state))
     }
