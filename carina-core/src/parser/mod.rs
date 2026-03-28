@@ -168,6 +168,20 @@ pub struct FnParam {
     pub default: Option<Value>,
 }
 
+/// The body of a user-defined function: either a value expression or a resource expression
+#[derive(Debug, Clone)]
+pub enum UserFunctionBody {
+    /// The function returns a value (existing behavior)
+    Value(Value),
+    /// The function returns a resource expression (resource-generating function)
+    Resource {
+        /// The raw pest pair source for re-parsing with substituted parameters
+        resource_source: String,
+        /// The namespaced resource type (e.g., "aws.s3_bucket")
+        resource_type: String,
+    },
+}
+
 /// User-defined pure function
 #[derive(Debug, Clone)]
 pub struct UserFunction {
@@ -175,8 +189,8 @@ pub struct UserFunction {
     pub params: Vec<FnParam>,
     /// Local let bindings inside the function body (name, expression)
     pub local_lets: Vec<(String, Value)>,
-    /// The body expression (the final expression in the fn block)
-    pub body: Value,
+    /// The body of the function
+    pub body: UserFunctionBody,
 }
 
 /// Module call (instantiation)
@@ -453,6 +467,31 @@ pub fn parse(input: &str) -> Result<ParsedFile, ParseError> {
                             Rule::module_call => {
                                 let call = parse_module_call(stmt, &ctx)?;
                                 module_calls.push(call);
+                            }
+                            Rule::function_call => {
+                                // Top-level function call: if it's a resource-generating fn,
+                                // expand it as an anonymous resource
+                                let mut fc_inner = stmt.into_inner();
+                                let func_name = next_pair(
+                                    &mut fc_inner,
+                                    "function name",
+                                    "top-level function call",
+                                )?
+                                .as_str()
+                                .to_string();
+                                if let Some(user_fn) = ctx.user_functions.get(&func_name)
+                                    && matches!(user_fn.body, UserFunctionBody::Resource { .. })
+                                {
+                                    let args: Result<Vec<Value>, ParseError> =
+                                        fc_inner.map(|arg| parse_expression(arg, &ctx)).collect();
+                                    let args = args?;
+                                    let user_fn = user_fn.clone();
+                                    // Use empty binding name for anonymous resource
+                                    let resource = evaluate_user_function_as_resource(
+                                        &user_fn, &args, &ctx, "",
+                                    )?;
+                                    resources.push(resource);
+                                }
                             }
                             Rule::anonymous_resource => {
                                 let resource = parse_anonymous_resource(stmt, &ctx)?;
@@ -811,6 +850,31 @@ fn parse_primary_with_resource_or_module(
             let call = parse_module_call(inner, ctx)?;
             let value = Value::String(format!("${{module:{}}}", call.module_name));
             Ok((value, vec![], vec![call], None))
+        }
+        Rule::function_call => {
+            // Check if this is a resource-generating user function call
+            let mut fc_inner = inner.clone().into_inner();
+            let func_name = fc_inner
+                .next()
+                .map(|p| p.as_str().to_string())
+                .unwrap_or_default();
+            if let Some(user_fn) = ctx.user_functions.get(&func_name)
+                && matches!(user_fn.body, UserFunctionBody::Resource { .. })
+            {
+                // Parse args and evaluate as resource
+                let mut fc_inner = inner.into_inner();
+                let _name = fc_inner.next(); // skip function name
+                let args: Result<Vec<Value>, ParseError> =
+                    fc_inner.map(|arg| parse_expression(arg, ctx)).collect();
+                let args = args?;
+                let user_fn = user_fn.clone();
+                let resource =
+                    evaluate_user_function_as_resource(&user_fn, &args, ctx, binding_name)?;
+                let ref_value = Value::String(format!("${{{}}}", binding_name));
+                return Ok((ref_value, vec![resource], vec![], None));
+            }
+            let value = parse_primary_value(inner, ctx)?;
+            Ok((value, vec![], vec![], None))
         }
         _ => {
             let value = parse_primary_value(inner, ctx)?;
@@ -1505,9 +1569,9 @@ fn parse_fn_def(
         next
     };
 
-    // Parse body: fn_local_let* ~ expression
+    // Parse body: fn_local_let* ~ (resource_expr | read_resource_expr | expression)
     let mut local_lets = Vec::new();
-    let mut body_expr = None;
+    let mut body: Option<UserFunctionBody> = None;
 
     // Create a context where parameters are registered as variables
     // so that param references in the body are resolved as variable refs
@@ -1536,14 +1600,30 @@ fn parse_fn_def(
                 );
                 local_lets.push((let_name, let_expr));
             }
+            Rule::resource_expr | Rule::read_resource_expr => {
+                // Resource-generating function: store the source text for re-parsing
+                let resource_source = body_inner.as_str().to_string();
+                // Extract the namespaced type from the first inner pair
+                let resource_type = body_inner
+                    .into_inner()
+                    .next()
+                    .map(|p| p.as_str().to_string())
+                    .unwrap_or_default();
+                body = Some(UserFunctionBody::Resource {
+                    resource_source,
+                    resource_type,
+                });
+            }
             _ => {
                 // This should be the expression (the body)
-                body_expr = Some(parse_expression(body_inner, &body_ctx)?);
+                body = Some(UserFunctionBody::Value(parse_expression(
+                    body_inner, &body_ctx,
+                )?));
             }
         }
     }
 
-    let body = body_expr.ok_or_else(|| ParseError::InternalError {
+    let body = body.ok_or_else(|| ParseError::InternalError {
         expected: "body expression".to_string(),
         context: "fn_def".to_string(),
     })?;
@@ -1608,8 +1688,97 @@ fn evaluate_user_function(
     }
 
     // Substitute params into body and evaluate
-    let substituted_body = substitute_fn_params(&func.body, &substitutions);
-    try_evaluate_fn_value(substituted_body, &child_ctx)
+    match &func.body {
+        UserFunctionBody::Value(body) => {
+            let substituted_body = substitute_fn_params(body, &substitutions);
+            try_evaluate_fn_value(substituted_body, &child_ctx)
+        }
+        UserFunctionBody::Resource { .. } => Err(ParseError::UserFunctionError(format!(
+            "function '{fn_name}' returns a resource, not a value; use it in a let binding"
+        ))),
+    }
+}
+
+/// Evaluate a resource-generating user-defined function call.
+/// Re-parses the resource expression source with substituted parameter values.
+fn evaluate_user_function_as_resource(
+    func: &UserFunction,
+    args: &[Value],
+    ctx: &ParseContext,
+    binding_name: &str,
+) -> Result<Resource, ParseError> {
+    let fn_name = &func.name;
+
+    // Check recursion
+    if ctx.evaluating_functions.contains(fn_name) {
+        return Err(ParseError::RecursiveFunction(fn_name.clone()));
+    }
+
+    // Validate argument count
+    let required_count = func.params.iter().filter(|p| p.default.is_none()).count();
+    let max_count = func.params.len();
+    if args.len() < required_count {
+        return Err(ParseError::UserFunctionError(format!(
+            "function '{fn_name}' expects at least {required_count} argument(s), got {}",
+            args.len()
+        )));
+    }
+    if args.len() > max_count {
+        return Err(ParseError::UserFunctionError(format!(
+            "function '{fn_name}' expects at most {max_count} argument(s), got {}",
+            args.len()
+        )));
+    }
+
+    // Build substitution map: param_name -> value
+    let mut substitutions: HashMap<String, Value> = HashMap::new();
+    for (i, param) in func.params.iter().enumerate() {
+        let value = if i < args.len() {
+            args[i].clone()
+        } else {
+            param.default.clone().unwrap()
+        };
+        substitutions.insert(param.name.clone(), value);
+    }
+
+    // Create a child context with recursion tracking
+    let mut child_ctx = ctx.clone();
+    child_ctx.evaluating_functions.push(fn_name.clone());
+
+    // Evaluate local lets, substituting and resolving each one
+    for (let_name, let_expr) in &func.local_lets {
+        let substituted = substitute_fn_params(let_expr, &substitutions);
+        let evaluated = try_evaluate_fn_value(substituted, &child_ctx)?;
+        // Also register as a variable in the child context so resource body can reference it
+        child_ctx.set_variable(let_name.clone(), evaluated.clone());
+        substitutions.insert(let_name.clone(), evaluated);
+    }
+
+    // Register substituted parameter values in the child context
+    for (param_name, value) in &substitutions {
+        child_ctx.set_variable(param_name.clone(), value.clone());
+    }
+
+    match &func.body {
+        UserFunctionBody::Resource {
+            resource_source, ..
+        } => {
+            // Re-parse the resource expression source with the child context
+            // that has parameter values as variables
+            let mut parsed = CarinaParser::parse(Rule::resource_expr, resource_source)
+                .map_err(ParseError::Syntax)?;
+
+            let resource_pair = parsed.next().ok_or_else(|| ParseError::InternalError {
+                expected: "resource expression".to_string(),
+                context: "fn resource evaluation".to_string(),
+            })?;
+
+            parse_resource_expr(resource_pair, &child_ctx, binding_name)
+        }
+        UserFunctionBody::Value(_) => Err(ParseError::UserFunctionError(format!(
+            "function '{fn_name}' returns a value, not a resource"
+        ))),
+    }
 }
 
 /// Recursively substitute function parameter placeholders with actual values
@@ -6432,5 +6601,141 @@ aws.s3.bucket {
             }
             _ => panic!("Expected Interpolation, got: {:?}", name),
         }
+    }
+
+    #[test]
+    fn user_fn_returns_resource() {
+        let input = r#"
+            fn make_bucket(name) {
+                aws.s3_bucket {
+                    name = name
+                }
+            }
+
+            let my_bucket = make_bucket("test-bucket")
+        "#;
+
+        let result = parse(input).unwrap();
+        assert_eq!(result.resources.len(), 1);
+        let resource = &result.resources[0];
+        assert_eq!(resource.id.resource_type, "s3_bucket");
+        assert_eq!(resource.id.name, "my_bucket");
+        assert_eq!(
+            resource.attributes.get("name"),
+            Some(&Value::String("test-bucket".to_string())),
+        );
+        assert_eq!(
+            resource.attributes.get("_binding"),
+            Some(&Value::String("my_bucket".to_string())),
+        );
+    }
+
+    #[test]
+    fn user_fn_returns_resource_with_local_let() {
+        let input = r#"
+            fn tagged_bucket(env) {
+                let full_name = join("-", [env, "bucket"])
+                aws.s3_bucket {
+                    name = full_name
+                }
+            }
+
+            let prod_bucket = tagged_bucket("prod")
+        "#;
+
+        let result = parse(input).unwrap();
+        assert_eq!(result.resources.len(), 1);
+        let resource = &result.resources[0];
+        assert_eq!(resource.id.name, "prod_bucket");
+        assert_eq!(
+            resource.attributes.get("name"),
+            Some(&Value::String("prod-bucket".to_string())),
+        );
+    }
+
+    #[test]
+    fn user_fn_returns_resource_with_param_substitution() {
+        let input = r#"
+            fn subnet(vpc_id, cidr, az) {
+                awscc.ec2.subnet {
+                    vpc_id            = vpc_id
+                    cidr_block        = cidr
+                    availability_zone = az
+                }
+            }
+
+            let subnet_a = subnet("vpc-123", "10.0.1.0/24", "ap-northeast-1a")
+            let subnet_b = subnet("vpc-123", "10.0.2.0/24", "ap-northeast-1c")
+        "#;
+
+        let result = parse(input).unwrap();
+        assert_eq!(result.resources.len(), 2);
+
+        let subnet_a = &result.resources[0];
+        assert_eq!(subnet_a.id.resource_type, "ec2.subnet");
+        assert_eq!(subnet_a.id.name, "subnet_a");
+        assert_eq!(
+            subnet_a.attributes.get("vpc_id"),
+            Some(&Value::String("vpc-123".to_string())),
+        );
+        assert_eq!(
+            subnet_a.attributes.get("availability_zone"),
+            Some(&Value::String("ap-northeast-1a".to_string())),
+        );
+
+        let subnet_b = &result.resources[1];
+        assert_eq!(subnet_b.id.name, "subnet_b");
+        assert_eq!(
+            subnet_b.attributes.get("availability_zone"),
+            Some(&Value::String("ap-northeast-1c".to_string())),
+        );
+    }
+
+    #[test]
+    fn user_fn_resource_nested_fn_call() {
+        let input = r#"
+            fn make_name(prefix) {
+                join("-", [prefix, "bucket"])
+            }
+
+            fn make_bucket(prefix) {
+                aws.s3_bucket {
+                    name = make_name(prefix)
+                }
+            }
+
+            let my_bucket = make_bucket("test")
+        "#;
+
+        let result = parse(input).unwrap();
+        assert_eq!(result.resources.len(), 1);
+        let resource = &result.resources[0];
+        assert_eq!(resource.id.name, "my_bucket");
+        assert_eq!(
+            resource.attributes.get("name"),
+            Some(&Value::String("test-bucket".to_string())),
+        );
+    }
+
+    #[test]
+    fn user_fn_resource_top_level_call() {
+        let input = r#"
+            fn make_bucket(name) {
+                aws.s3_bucket {
+                    name = name
+                }
+            }
+
+            make_bucket("anon-bucket")
+        "#;
+
+        let result = parse(input).unwrap();
+        assert_eq!(result.resources.len(), 1);
+        let resource = &result.resources[0];
+        assert_eq!(resource.id.resource_type, "s3_bucket");
+        assert_eq!(
+            resource.attributes.get("name"),
+            Some(&Value::String("anon-bucket".to_string())),
+        );
     }
 }
