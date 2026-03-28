@@ -107,7 +107,7 @@ if_body = { local_let_binding* ~ (read_resource_expr | resource_expr | module_ca
 
 ### 7. Nested modules: future work
 
-**Decision**: Not addressed in this review. Tracked in #1053.
+**Decision**: Not addressed in this review. Tracked in #1224.
 
 ### 8. Pipe operator and function argument convention
 
