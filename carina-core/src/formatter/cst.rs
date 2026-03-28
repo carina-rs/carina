@@ -61,6 +61,8 @@ pub enum NodeKind {
     ArgumentsBlock,
     AttributesBlock,
     ArgumentsParam,
+    ArgumentsParamBlock,
+    ArgumentsParamAttr,
     AttributesParam,
     TypeExpr,
     LetBinding,

@@ -1,7 +1,14 @@
 arguments {
-  vpc_id           : awscc.ec2.vpc
-  environment      : string
-  instance_type    : string = "t3.micro"
+  vpc_id: awscc.ec2.vpc {
+    description = "The VPC to deploy resources into"
+  }
+  environment: string {
+    description = "Deployment environment name"
+  }
+  instance_type: string {
+    description = "EC2 instance type"
+    default     = "t3.micro"
+  }
   enable_monitoring: bool = true
 }
 

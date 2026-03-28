@@ -79,6 +79,13 @@ impl<'a> CstBuilder<'a> {
             Rule::arguments_param => Some(CstChild::Node(
                 self.build_node(NodeKind::ArgumentsParam, pair),
             )),
+            Rule::arguments_param_block => Some(CstChild::Node(
+                self.build_node(NodeKind::ArgumentsParamBlock, pair),
+            )),
+            Rule::arguments_param_block_content => None, // Silent rule
+            Rule::arguments_param_attr => Some(CstChild::Node(
+                self.build_node(NodeKind::ArgumentsParamAttr, pair),
+            )),
             // State blocks
             Rule::import_state_block => Some(CstChild::Node(
                 self.build_node(NodeKind::ImportStateBlock, pair),
@@ -236,6 +243,10 @@ impl<'a> CstBuilder<'a> {
             Rule::kw_to => Some(CstChild::Token(Token::new("to".to_string(), span))),
             Rule::kw_from => Some(CstChild::Token(Token::new("from".to_string(), span))),
             Rule::kw_id => Some(CstChild::Token(Token::new("id".to_string(), span))),
+            Rule::kw_description => {
+                Some(CstChild::Token(Token::new("description".to_string(), span)))
+            }
+            Rule::kw_default => Some(CstChild::Token(Token::new("default".to_string(), span))),
 
             // Skip file_content (it's a silent rule wrapper)
             Rule::file_content => None,

@@ -10,9 +10,19 @@ arguments_block = {
     "arguments" ~ "{" ~ arguments_param* ~ "}"
 }
 
-// Arguments parameter: name: type or name: type = default
+// Arguments parameter: name: type or name: type = default, or block form with description/default
 arguments_param = {
-    identifier ~ ":" ~ type_expr ~ ("=" ~ expression)?
+    identifier ~ ":" ~ type_expr ~ arguments_param_block
+  | identifier ~ ":" ~ type_expr ~ ("=" ~ expression)?
+}
+
+arguments_param_block = {
+    "{" ~ arguments_param_attr* ~ "}"
+}
+
+arguments_param_attr = {
+    "description" ~ "=" ~ string
+  | "default" ~ "=" ~ expression
 }
 
 // Attributes block: attributes { subnet_ids: list(string), ... }

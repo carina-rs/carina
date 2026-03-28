@@ -151,6 +151,8 @@ impl Formatter {
             NodeKind::Attribute => self.format_attribute(node, 0),
             NodeKind::NestedBlock => self.format_nested_block(node),
             NodeKind::ArgumentsParam => self.format_arguments_param(node, 0),
+            NodeKind::ArgumentsParamBlock => self.format_arguments_param_block(node),
+            NodeKind::ArgumentsParamAttr => self.format_arguments_param_attr(node, 0),
             NodeKind::AttributesParam => self.format_attributes_param(node, 0),
             NodeKind::PipeExpr => self.format_pipe_expr(node),
             NodeKind::FunctionCall => self.format_function_call(node),
@@ -368,10 +370,16 @@ impl Formatter {
             })
             .collect();
 
-        // Calculate max key length for alignment
+        // Calculate max key length for alignment (only simple-form params)
         let max_key_len = if self.config.align_attributes {
             params
                 .iter()
+                .filter(|p| {
+                    // Only consider simple-form params for alignment
+                    !p.children.iter().any(|child| {
+                        matches!(child, CstChild::Node(n) if n.kind == NodeKind::ArgumentsParamBlock)
+                    })
+                })
                 .filter_map(|p| self.get_param_name(p))
                 .map(|k| k.len())
                 .max()
@@ -429,6 +437,19 @@ impl Formatter {
     }
 
     fn format_arguments_param(&mut self, node: &CstNode, align_to: usize) {
+        // Check if this is a block form (has ArgumentsParamBlock child)
+        let has_block = node.children.iter().any(
+            |child| matches!(child, CstChild::Node(n) if n.kind == NodeKind::ArgumentsParamBlock),
+        );
+
+        if has_block {
+            self.format_arguments_param_block_form(node);
+        } else {
+            self.format_arguments_param_simple(node, align_to);
+        }
+    }
+
+    fn format_arguments_param_simple(&mut self, node: &CstNode, align_to: usize) {
         self.write_indent();
 
         let mut key_len: usize = 0;
@@ -466,6 +487,129 @@ impl Formatter {
                     if wrote_colon && !wrote_equals {
                         self.format_type_expr(n);
                     } else if wrote_equals {
+                        self.format_node(n);
+                    }
+                }
+                CstChild::Trivia(_) => {}
+            }
+        }
+
+        self.write_newline();
+    }
+
+    fn format_arguments_param_block_form(&mut self, node: &CstNode) {
+        self.write_indent();
+
+        let mut wrote_name = false;
+        let mut wrote_colon = false;
+
+        for child in &node.children {
+            match child {
+                CstChild::Token(token) => {
+                    if !wrote_name && self.is_identifier(&token.text) && token.text != "arguments" {
+                        self.write(&token.text);
+                        wrote_name = true;
+                    } else if token.text == ":" && !wrote_colon {
+                        self.write(": ");
+                        wrote_colon = true;
+                    } else if wrote_colon {
+                        // Type primitive
+                        self.write(&token.text);
+                    }
+                }
+                CstChild::Node(n) => {
+                    if n.kind == NodeKind::ArgumentsParamBlock {
+                        self.format_arguments_param_block(n);
+                    } else if wrote_colon {
+                        self.format_type_expr(n);
+                    }
+                }
+                CstChild::Trivia(_) => {}
+            }
+        }
+
+        self.write_newline();
+    }
+
+    fn format_arguments_param_block(&mut self, node: &CstNode) {
+        self.write(" {");
+        self.write_newline();
+        self.current_indent += 1;
+
+        // Collect attrs and find max key length for alignment
+        let attrs: Vec<&CstNode> = node
+            .children
+            .iter()
+            .filter_map(|child| {
+                if let CstChild::Node(n) = child
+                    && n.kind == NodeKind::ArgumentsParamAttr
+                {
+                    Some(n)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        let max_key_len = if self.config.align_attributes {
+            attrs
+                .iter()
+                .filter_map(|attr| self.get_arguments_param_attr_key(attr))
+                .map(|k| k.len())
+                .max()
+                .unwrap_or(0)
+        } else {
+            0
+        };
+
+        for attr in &attrs {
+            self.format_arguments_param_attr(attr, max_key_len);
+        }
+
+        self.current_indent -= 1;
+        self.write_indent();
+        self.write("}");
+    }
+
+    fn get_arguments_param_attr_key(&self, node: &CstNode) -> Option<String> {
+        for child in &node.children {
+            if let CstChild::Token(token) = child
+                && self.is_identifier(&token.text)
+            {
+                return Some(token.text.clone());
+            }
+        }
+        None
+    }
+
+    fn format_arguments_param_attr(&mut self, node: &CstNode, align_to: usize) {
+        self.write_indent();
+
+        let mut key_len: usize = 0;
+        let mut wrote_key = false;
+        let mut wrote_equals = false;
+
+        for child in &node.children {
+            match child {
+                CstChild::Token(token) => {
+                    if !wrote_key && self.is_identifier(&token.text) {
+                        key_len = token.text.len();
+                        self.write(&token.text);
+                        wrote_key = true;
+                    } else if token.text == "=" && !wrote_equals {
+                        if align_to > 0 && key_len < align_to {
+                            let padding = align_to - key_len;
+                            self.write(&" ".repeat(padding));
+                        }
+                        self.write(" = ");
+                        wrote_equals = true;
+                    } else if wrote_equals {
+                        // Value token (string, number, etc.)
+                        self.write(&token.text);
+                    }
+                }
+                CstChild::Node(n) => {
+                    if wrote_equals {
                         self.format_node(n);
                     }
                 }
@@ -2358,6 +2502,59 @@ mod tests {
             align_attributes: true,
             ..Default::default()
         };
+        let first = format(input, &config).unwrap();
+        let second = format(&first, &config).unwrap();
+        assert_eq!(first, second, "Formatting should be idempotent");
+    }
+
+    #[test]
+    fn format_arguments_param_block_form() {
+        let input = r#"arguments {
+  vpc: awscc.ec2.vpc {
+    description = "The VPC to deploy into"
+  }
+  port: int {
+    description = "Web server port"
+    default     = 8080
+  }
+}
+"#;
+        let config = FormatConfig::default();
+        let result = format(input, &config).unwrap();
+        assert_eq!(result, input);
+    }
+
+    #[test]
+    fn format_arguments_mixed_simple_and_block_form() {
+        let input = r#"arguments {
+  enable_https: bool = true
+  vpc: awscc.ec2.vpc {
+    description = "The VPC to deploy into"
+  }
+  port: int {
+    description = "Web server port"
+    default     = 8080
+  }
+}
+"#;
+        let config = FormatConfig::default();
+        let result = format(input, &config).unwrap();
+        assert_eq!(result, input);
+    }
+
+    #[test]
+    fn format_arguments_block_form_idempotent() {
+        let input = r#"arguments {
+  vpc: awscc.ec2.vpc {
+    description = "The VPC"
+  }
+  port: int {
+    description = "Port"
+    default     = 8080
+  }
+}
+"#;
+        let config = FormatConfig::default();
         let first = format(input, &config).unwrap();
         let second = format(&first, &config).unwrap();
         assert_eq!(first, second, "Formatting should be idempotent");

@@ -112,6 +112,8 @@ pub struct ArgumentParameter {
     pub name: String,
     pub type_expr: TypeExpr,
     pub default: Option<Value>,
+    /// Optional description (from block form)
+    pub description: Option<String>,
 }
 
 /// Attribute parameter definition (in `attributes { ... }` block)
@@ -454,16 +456,58 @@ fn parse_arguments_block(
                 "type expression",
                 "arguments parameter",
             )?)?;
-            let default = if let Some(expr) = param_inner.next() {
-                Some(parse_expression(expr, &ctx)?)
+
+            // Check if the next element is a block form or simple default
+            if let Some(next) = param_inner.next() {
+                if next.as_rule() == Rule::arguments_param_block {
+                    // Block form: parse description and default from attrs
+                    let mut description = None;
+                    let mut default = None;
+                    for attr in next.into_inner() {
+                        if attr.as_rule() == Rule::arguments_param_attr {
+                            let mut attr_inner = attr.into_inner();
+                            if let Some(first) = attr_inner.next() {
+                                match first.as_rule() {
+                                    Rule::string => {
+                                        // description = "..."
+                                        let value = parse_string_value(first, &ctx)?;
+                                        if let Value::String(s) = value {
+                                            description = Some(s);
+                                        }
+                                    }
+                                    _ => {
+                                        // default = expression
+                                        default = Some(parse_expression(first, &ctx)?);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    arguments.push(ArgumentParameter {
+                        name,
+                        type_expr,
+                        default,
+                        description,
+                    });
+                } else {
+                    // Simple form: the next element is the default expression
+                    let default = Some(parse_expression(next, &ctx)?);
+                    arguments.push(ArgumentParameter {
+                        name,
+                        type_expr,
+                        default,
+                        description: None,
+                    });
+                }
             } else {
-                None
-            };
-            arguments.push(ArgumentParameter {
-                name,
-                type_expr,
-                default,
-            });
+                // No default, no block
+                arguments.push(ArgumentParameter {
+                    name,
+                    type_expr,
+                    default: None,
+                    description: None,
+                });
+            }
         }
     }
 
@@ -5428,5 +5472,114 @@ aws.s3.bucket {
 
         let result = parse(input).unwrap();
         assert_eq!(result.resources.len(), 0);
+    }
+
+    #[test]
+    fn parse_arguments_block_form_description_only() {
+        let input = r#"
+            arguments {
+                vpc: awscc.ec2.vpc {
+                    description = "The VPC to deploy into"
+                }
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+        assert_eq!(result.arguments.len(), 1);
+        assert_eq!(result.arguments[0].name, "vpc");
+        assert_eq!(
+            result.arguments[0].type_expr,
+            TypeExpr::Ref(ResourceTypePath::new("awscc", "ec2.vpc"))
+        );
+        assert!(result.arguments[0].default.is_none());
+        assert_eq!(
+            result.arguments[0].description.as_deref(),
+            Some("The VPC to deploy into")
+        );
+    }
+
+    #[test]
+    fn parse_arguments_block_form_description_and_default() {
+        let input = r#"
+            arguments {
+                port: int {
+                    description = "Web server port"
+                    default     = 8080
+                }
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+        assert_eq!(result.arguments.len(), 1);
+        assert_eq!(result.arguments[0].name, "port");
+        assert_eq!(result.arguments[0].type_expr, TypeExpr::Int);
+        assert_eq!(result.arguments[0].default, Some(Value::Int(8080)));
+        assert_eq!(
+            result.arguments[0].description.as_deref(),
+            Some("Web server port")
+        );
+    }
+
+    #[test]
+    fn parse_arguments_mixed_simple_and_block_form() {
+        let input = r#"
+            arguments {
+                enable_https: bool = true
+
+                vpc: awscc.ec2.vpc {
+                    description = "The VPC to deploy into"
+                }
+
+                port: int {
+                    description = "Web server port"
+                    default     = 8080
+                }
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+        assert_eq!(result.arguments.len(), 3);
+
+        // Simple form (unchanged)
+        assert_eq!(result.arguments[0].name, "enable_https");
+        assert_eq!(result.arguments[0].type_expr, TypeExpr::Bool);
+        assert_eq!(result.arguments[0].default, Some(Value::Bool(true)));
+        assert!(result.arguments[0].description.is_none());
+
+        // Block form with description only
+        assert_eq!(result.arguments[1].name, "vpc");
+        assert_eq!(
+            result.arguments[1].type_expr,
+            TypeExpr::Ref(ResourceTypePath::new("awscc", "ec2.vpc"))
+        );
+        assert!(result.arguments[1].default.is_none());
+        assert_eq!(
+            result.arguments[1].description.as_deref(),
+            Some("The VPC to deploy into")
+        );
+
+        // Block form with description and default
+        assert_eq!(result.arguments[2].name, "port");
+        assert_eq!(result.arguments[2].type_expr, TypeExpr::Int);
+        assert_eq!(result.arguments[2].default, Some(Value::Int(8080)));
+        assert_eq!(
+            result.arguments[2].description.as_deref(),
+            Some("Web server port")
+        );
+    }
+
+    #[test]
+    fn parse_arguments_simple_form_has_no_description() {
+        let input = r#"
+            arguments {
+                vpc_id: string
+                port: int = 8080
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+        assert_eq!(result.arguments.len(), 2);
+        assert!(result.arguments[0].description.is_none());
+        assert!(result.arguments[1].description.is_none());
     }
 }
