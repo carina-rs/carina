@@ -33,17 +33,23 @@ fn strip_ansi(s: &str) -> String {
 /// Build a plan from a .crn fixture and optional state file, mimicking `--refresh=false`.
 fn build_plan_from_fixture(
     fixture_dir: &str,
-) -> (carina_core::plan::Plan, HashMap<String, ResourceSchema>) {
-    let (plan, _, schemas) = build_plan_and_states_from_fixture(fixture_dir);
-    (plan, schemas)
+) -> (
+    carina_core::plan::Plan,
+    HashMap<String, ResourceSchema>,
+    HashMap<ResourceId, ResourceId>,
+) {
+    let (plan, _, schemas, moved_origins) = build_plan_and_states_from_fixture(fixture_dir);
+    (plan, schemas, moved_origins)
 }
 
+#[allow(clippy::type_complexity)]
 fn build_plan_and_states_from_fixture(
     fixture_dir: &str,
 ) -> (
     carina_core::plan::Plan,
     HashMap<ResourceId, State>,
     HashMap<String, ResourceSchema>,
+    HashMap<ResourceId, ResourceId>,
 ) {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let crn_path = PathBuf::from(format!(
@@ -193,41 +199,54 @@ fn build_plan_and_states_from_fixture(
         &moved_pairs,
     );
 
-    (plan, current_states, wiring.schemas().clone())
+    let moved_origins: HashMap<ResourceId, ResourceId> = moved_pairs
+        .iter()
+        .map(|(from, to)| (to.clone(), from.clone()))
+        .collect();
+
+    (
+        plan,
+        current_states,
+        wiring.schemas().clone(),
+        moved_origins,
+    )
 }
 
 #[test]
 fn snapshot_all_create() {
-    let (plan, schemas) = build_plan_from_fixture("all_create");
+    let (plan, schemas, _moved) = build_plan_from_fixture("all_create");
     let output = strip_ansi(&format_plan(
         &plan,
         DetailLevel::Full,
         &HashMap::new(),
         Some(&schemas),
+        &HashMap::new(),
     ));
     insta::assert_snapshot!(output);
 }
 
 #[test]
 fn snapshot_no_changes() {
-    let (plan, _schemas) = build_plan_from_fixture("no_changes");
+    let (plan, _schemas, _moved) = build_plan_from_fixture("no_changes");
     let output = strip_ansi(&format_plan(
         &plan,
         DetailLevel::Full,
         &HashMap::new(),
         None,
+        &HashMap::new(),
     ));
     insta::assert_snapshot!(output);
 }
 
 #[test]
 fn snapshot_mixed_operations() {
-    let (plan, schemas) = build_plan_from_fixture("mixed_operations");
+    let (plan, schemas, _moved) = build_plan_from_fixture("mixed_operations");
     let output = strip_ansi(&format_plan(
         &plan,
         DetailLevel::Full,
         &HashMap::new(),
         Some(&schemas),
+        &HashMap::new(),
     ));
     insta::assert_snapshot!(output);
 }
@@ -235,7 +254,8 @@ fn snapshot_mixed_operations() {
 #[test]
 fn snapshot_delete_orphan() {
     use carina_core::resource::Value;
-    let (plan, current_states, schemas) = build_plan_and_states_from_fixture("delete_orphan");
+    let (plan, current_states, schemas, _moved) =
+        build_plan_and_states_from_fixture("delete_orphan");
     let delete_attributes: HashMap<ResourceId, HashMap<String, Value>> = plan
         .effects()
         .iter()
@@ -254,54 +274,59 @@ fn snapshot_delete_orphan() {
         DetailLevel::Full,
         &delete_attributes,
         Some(&schemas),
+        &HashMap::new(),
     ));
     insta::assert_snapshot!(output);
 }
 
 #[test]
 fn snapshot_compact() {
-    let (plan, _schemas) = build_plan_from_fixture("compact");
+    let (plan, _schemas, _moved) = build_plan_from_fixture("compact");
     let output = strip_ansi(&format_plan(
         &plan,
         DetailLevel::None,
         &HashMap::new(),
         None,
+        &HashMap::new(),
     ));
     insta::assert_snapshot!(output);
 }
 
 #[test]
 fn snapshot_map_key_diff() {
-    let (plan, schemas) = build_plan_from_fixture("map_key_diff");
+    let (plan, schemas, _moved) = build_plan_from_fixture("map_key_diff");
     let output = strip_ansi(&format_plan(
         &plan,
         DetailLevel::Full,
         &HashMap::new(),
         Some(&schemas),
+        &HashMap::new(),
     ));
     insta::assert_snapshot!(output);
 }
 
 #[test]
 fn snapshot_enum_display() {
-    let (plan, schemas) = build_plan_from_fixture("enum_display");
+    let (plan, schemas, _moved) = build_plan_from_fixture("enum_display");
     let output = strip_ansi(&format_plan(
         &plan,
         DetailLevel::Full,
         &HashMap::new(),
         Some(&schemas),
+        &HashMap::new(),
     ));
     insta::assert_snapshot!(output);
 }
 
 #[test]
 fn snapshot_no_changes_enum() {
-    let (plan, _schemas) = build_plan_from_fixture("no_changes_enum");
+    let (plan, _schemas, _moved) = build_plan_from_fixture("no_changes_enum");
     let output = strip_ansi(&format_plan(
         &plan,
         DetailLevel::Full,
         &HashMap::new(),
         None,
+        &HashMap::new(),
     ));
     insta::assert_snapshot!(output);
 }
@@ -309,7 +334,8 @@ fn snapshot_no_changes_enum() {
 #[test]
 fn snapshot_destroy_full() {
     use carina_core::resource::Value;
-    let (plan, current_states, _schemas) = build_plan_and_states_from_fixture("destroy_full");
+    let (plan, current_states, _schemas, _moved) =
+        build_plan_and_states_from_fixture("destroy_full");
     let delete_attributes: HashMap<ResourceId, HashMap<String, Value>> = current_states
         .into_iter()
         .filter(|(_, state)| state.exists)
@@ -326,7 +352,8 @@ fn snapshot_destroy_full() {
 #[test]
 fn snapshot_destroy_orphans() {
     use carina_core::resource::Value;
-    let (plan, current_states, _schemas) = build_plan_and_states_from_fixture("destroy_orphans");
+    let (plan, current_states, _schemas, _moved) =
+        build_plan_and_states_from_fixture("destroy_orphans");
     let delete_attributes: HashMap<ResourceId, HashMap<String, Value>> = current_states
         .into_iter()
         .filter(|(_, state)| state.exists)
@@ -342,60 +369,65 @@ fn snapshot_destroy_orphans() {
 
 #[test]
 fn snapshot_default_values() {
-    let (plan, schemas) = build_plan_from_fixture("default_values");
+    let (plan, schemas, _moved) = build_plan_from_fixture("default_values");
     let output = strip_ansi(&format_plan(
         &plan,
         DetailLevel::Full,
         &HashMap::new(),
         Some(&schemas),
+        &HashMap::new(),
     ));
     insta::assert_snapshot!(output);
 }
 
 #[test]
 fn snapshot_read_only_attrs() {
-    let (plan, schemas) = build_plan_from_fixture("read_only_attrs");
+    let (plan, schemas, _moved) = build_plan_from_fixture("read_only_attrs");
     let output = strip_ansi(&format_plan(
         &plan,
         DetailLevel::Full,
         &HashMap::new(),
         Some(&schemas),
+        &HashMap::new(),
     ));
     insta::assert_snapshot!(output);
 }
 
 #[test]
 fn snapshot_explicit() {
-    let (plan, schemas) = build_plan_from_fixture("explicit");
+    let (plan, schemas, _moved) = build_plan_from_fixture("explicit");
     let output = strip_ansi(&format_plan(
         &plan,
         DetailLevel::Explicit,
         &HashMap::new(),
         Some(&schemas),
+        &HashMap::new(),
     ));
     insta::assert_snapshot!(output);
 }
 
 #[test]
 fn snapshot_default_tags() {
-    let (plan, schemas) = build_plan_from_fixture("default_tags");
+    let (plan, schemas, _moved) = build_plan_from_fixture("default_tags");
     let output = strip_ansi(&format_plan(
         &plan,
         DetailLevel::Full,
         &HashMap::new(),
         Some(&schemas),
+        &HashMap::new(),
     ));
     insta::assert_snapshot!(output);
 }
 
 #[test]
 fn snapshot_state_blocks() {
-    let (plan, schemas) = build_plan_from_fixture("state_blocks");
+    let (plan, schemas, _moved) = build_plan_from_fixture("state_blocks");
     let output = strip_ansi(&format_plan(
         &plan,
         DetailLevel::Full,
         &HashMap::new(),
         Some(&schemas),
+        &HashMap::new(),
     ));
     insta::assert_snapshot!(output);
 }
@@ -403,7 +435,8 @@ fn snapshot_state_blocks() {
 #[test]
 fn snapshot_secret_values() {
     use carina_core::resource::Value;
-    let (plan, current_states, schemas) = build_plan_and_states_from_fixture("secret_values");
+    let (plan, current_states, schemas, _moved) =
+        build_plan_and_states_from_fixture("secret_values");
     let delete_attributes: HashMap<ResourceId, HashMap<String, Value>> = plan
         .effects()
         .iter()
@@ -422,18 +455,20 @@ fn snapshot_secret_values() {
         DetailLevel::Full,
         &delete_attributes,
         Some(&schemas),
+        &HashMap::new(),
     ));
     insta::assert_snapshot!(output);
 }
 
 #[test]
 fn snapshot_moved_with_changes() {
-    let (plan, schemas) = build_plan_from_fixture("moved_with_changes");
+    let (plan, schemas, moved_origins) = build_plan_from_fixture("moved_with_changes");
     let output = strip_ansi(&format_plan(
         &plan,
         DetailLevel::Full,
         &HashMap::new(),
         Some(&schemas),
+        &moved_origins,
     ));
     insta::assert_snapshot!(output);
 }

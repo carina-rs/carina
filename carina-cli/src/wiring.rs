@@ -34,6 +34,9 @@ pub struct PlanContext {
     pub plan: Plan,
     pub sorted_resources: Vec<Resource>,
     pub current_states: HashMap<ResourceId, State>,
+    /// Maps moved-to resource IDs to their original (moved-from) IDs.
+    /// Used by display to show "(moved from: ...)" annotations on Update/Replace effects.
+    pub moved_origins: HashMap<ResourceId, ResourceId>,
 }
 
 /// Cached provider factories and schemas, constructed once per CLI invocation.
@@ -583,10 +586,16 @@ pub async fn create_plan_from_parsed(
     // Add state block effects (import/removed/moved) to the plan
     add_state_block_effects(&mut plan, &parsed.state_blocks, state_file, &moved_pairs);
 
+    let moved_origins: HashMap<ResourceId, ResourceId> = moved_pairs
+        .iter()
+        .map(|(from, to)| (to.clone(), from.clone()))
+        .collect();
+
     Ok(PlanContext {
         plan,
         sorted_resources,
         current_states,
+        moved_origins,
     })
 }
 
@@ -689,6 +698,9 @@ pub fn add_state_block_effects(
     }
 
     // Add Move effects from pre-computed moved pairs.
+    // Move effects are always added to the plan (for summary counting),
+    // but display skips the Move line when an Update/Replace with
+    // "(moved from: ...)" annotation already conveys the information.
     // Also suppress orphan Delete for `to` when there is no desired resource
     // for the target (the moved state entry would otherwise appear as an orphan).
     for (from, to) in moved_pairs {

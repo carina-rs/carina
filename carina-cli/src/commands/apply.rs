@@ -1150,11 +1150,17 @@ async fn run_apply_locked(
         })
         .collect();
 
+    let moved_origins: HashMap<ResourceId, ResourceId> = moved_pairs
+        .iter()
+        .map(|(from, to)| (to.clone(), from.clone()))
+        .collect();
+
     print_plan(
         &plan,
         DetailLevel::Full,
         &delete_attributes,
         Some(ctx.schemas()),
+        &moved_origins,
     );
 
     // Confirmation prompt
@@ -1435,7 +1441,13 @@ async fn run_apply_from_plan_locked(
         })
         .collect();
 
-    print_plan(plan, DetailLevel::Full, &delete_attributes, None);
+    print_plan(
+        plan,
+        DetailLevel::Full,
+        &delete_attributes,
+        None,
+        &HashMap::new(),
+    );
 
     // Confirmation prompt
     if !auto_approve {
