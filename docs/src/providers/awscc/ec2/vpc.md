@@ -57,6 +57,7 @@ The allowed tenancy of instances launched into the VPC. + ``default``: An instan
 - **Type:** IpamPoolId
 - **Required:** No
 - **Create-only:** Yes
+- **Write-only:** Yes
 
 The ID of an IPv4 IPAM pool you want to use for allocating this VPC's CIDR. For more information, see [What is IPAM?](https://docs.aws.amazon.com//vpc/latest/ipam/what-is-it-ipam.html) in the *Amazon VPC IPAM User Guide*. You must specify either``CidrBlock`` or ``Ipv4IpamPoolId``.
 
@@ -65,6 +66,7 @@ The ID of an IPv4 IPAM pool you want to use for allocating this VPC's CIDR. For 
 - **Type:** Int(0..=32)
 - **Required:** No
 - **Create-only:** Yes
+- **Write-only:** Yes
 
 The netmask length of the IPv4 CIDR you want to allocate to this VPC from an Amazon VPC IP Address Manager (IPAM) pool. For more information about IPAM, see [What is IPAM?](https://docs.aws.amazon.com//vpc/latest/ipam/what-is-it-ipam.html) in the *Amazon VPC IPAM User Guide*.
 

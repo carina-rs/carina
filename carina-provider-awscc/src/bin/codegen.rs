@@ -719,6 +719,13 @@ fn generate_markdown(schema: &CfnSchema, type_name: &str) -> Result<String> {
         .map(|p| p.trim_start_matches("/properties/").to_string())
         .collect();
 
+    // Build write-only properties set
+    let write_only: HashSet<String> = schema
+        .write_only_properties
+        .iter()
+        .map(|p| p.trim_start_matches("/properties/").to_string())
+        .collect();
+
     let required: HashSet<String> = schema.required.iter().cloned().collect();
 
     // Collect enum info and struct definitions
@@ -780,6 +787,9 @@ fn generate_markdown(schema: &CfnSchema, type_name: &str) -> Result<String> {
         }
         if create_only.contains(prop_name) {
             md.push_str("- **Create-only:** Yes\n");
+        }
+        if write_only.contains(prop_name) {
+            md.push_str("- **Write-only:** Yes\n");
         }
         if let Some(default_val) = &prop.default_value
             && let Some(display) = json_default_to_markdown(default_val)
@@ -1176,6 +1186,13 @@ fn generate_schema_code(schema: &CfnSchema, type_name: &str) -> Result<String> {
     // Build create-only properties set
     let create_only: HashSet<String> = schema
         .create_only_properties
+        .iter()
+        .map(|p| p.trim_start_matches("/properties/").to_string())
+        .collect();
+
+    // Build write-only properties set
+    let write_only: HashSet<String> = schema
+        .write_only_properties
         .iter()
         .map(|p| p.trim_start_matches("/properties/").to_string())
         .collect();
@@ -1880,6 +1897,10 @@ pub fn {}() -> AwsccSchemaConfig {{
             || create_only
                 .iter()
                 .any(|p| p.starts_with(&format!("{}/", prop_name)));
+        let is_write_only = write_only.contains(prop_name)
+            || write_only
+                .iter()
+                .any(|p| p.starts_with(&format!("{}/", prop_name)));
 
         let attr_type = if let Some(enum_info) = enums.get(prop_name) {
             // Use shared schema enum type for constrained strings.
@@ -1963,6 +1984,10 @@ pub fn {}() -> AwsccSchemaConfig {{
 
         if is_read_only {
             attr_code.push_str("\n                .read_only()");
+        }
+
+        if is_write_only {
+            attr_code.push_str("\n                .write_only()");
         }
 
         if let Some(desc) = &prop.description {
@@ -9338,6 +9363,116 @@ mod tests {
         assert!(
             code.contains("\"internet_gateway_id\"") && code.contains("\"vpn_gateway_id\""),
             "Generated code should reference snake_case field names: {code}"
+        );
+    }
+
+    #[test]
+    fn test_generate_schema_code_emits_write_only() {
+        let mut properties = BTreeMap::new();
+        properties.insert(
+            "Password".to_string(),
+            CfnProperty {
+                prop_type: Some(TypeValue::Single("string".to_string())),
+                description: Some("The password.".to_string()),
+                ..Default::default()
+            },
+        );
+        properties.insert(
+            "Name".to_string(),
+            CfnProperty {
+                prop_type: Some(TypeValue::Single("string".to_string())),
+                description: Some("The name.".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let schema = CfnSchema {
+            type_name: "AWS::Test::Resource".to_string(),
+            description: None,
+            properties,
+            required: vec![],
+            read_only_properties: vec![],
+            create_only_properties: vec![],
+            write_only_properties: vec!["/properties/Password".to_string()],
+            primary_identifier: None,
+            definitions: None,
+            tagging: None,
+            one_of: vec![],
+            any_of: vec![],
+        };
+
+        let code = generate_schema_code(&schema, "AWS::Test::Resource").unwrap();
+
+        // Password should have .write_only()
+        assert!(
+            code.contains(".write_only()"),
+            "Should emit .write_only() for Password: {code}"
+        );
+        // Name should NOT have .write_only()
+        let name_section = code
+            .split("AttributeSchema::new(\"name\"")
+            .nth(1)
+            .unwrap_or("");
+        let name_attr_end = name_section
+            .split(".attribute(")
+            .next()
+            .unwrap_or(name_section);
+        assert!(
+            !name_attr_end.contains(".write_only()"),
+            "Name should not have .write_only(): {code}"
+        );
+    }
+
+    #[test]
+    fn test_generate_markdown_shows_write_only() {
+        let mut properties = BTreeMap::new();
+        properties.insert(
+            "Password".to_string(),
+            CfnProperty {
+                prop_type: Some(TypeValue::Single("string".to_string())),
+                description: Some("The password.".to_string()),
+                ..Default::default()
+            },
+        );
+        properties.insert(
+            "Name".to_string(),
+            CfnProperty {
+                prop_type: Some(TypeValue::Single("string".to_string())),
+                description: Some("The name.".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let schema = CfnSchema {
+            type_name: "AWS::Test::Resource".to_string(),
+            description: None,
+            properties,
+            required: vec![],
+            read_only_properties: vec![],
+            create_only_properties: vec![],
+            write_only_properties: vec!["/properties/Password".to_string()],
+            primary_identifier: None,
+            definitions: None,
+            tagging: None,
+            one_of: vec![],
+            any_of: vec![],
+        };
+
+        let md = generate_markdown(&schema, "AWS::Test::Resource").unwrap();
+
+        assert!(
+            md.contains("**Write-only:** Yes"),
+            "Should show write-only annotation for Password: {md}"
+        );
+        // Name should NOT have write-only
+        let name_section = md.split("### `name`").nth(1).unwrap_or("");
+        assert!(
+            !name_section
+                .split("###")
+                .next()
+                .unwrap_or("")
+                .contains("Write-only"),
+            "Name should not have write-only annotation: {md}"
         );
     }
 }

@@ -602,6 +602,8 @@ pub struct AttributeSchema {
     pub removable: Option<bool>,
     /// Alternative block name for repeated block syntax (e.g., "operating_region" for "operating_regions")
     pub block_name: Option<String>,
+    /// Whether this attribute is write-only (value sent to provider but not persisted in state)
+    pub write_only: bool,
 }
 
 impl AttributeSchema {
@@ -618,6 +620,7 @@ impl AttributeSchema {
             read_only: false,
             removable: None,
             block_name: None,
+            write_only: false,
         }
     }
 
@@ -633,6 +636,11 @@ impl AttributeSchema {
 
     pub fn read_only(mut self) -> Self {
         self.read_only = true;
+        self
+    }
+
+    pub fn write_only(mut self) -> Self {
+        self.write_only = true;
         self
     }
 
@@ -1386,6 +1394,18 @@ fn validate_ipv6_group(group: &str, addr: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn attribute_schema_write_only_default_false() {
+        let attr = AttributeSchema::new("password", AttributeType::String);
+        assert!(!attr.write_only);
+    }
+
+    #[test]
+    fn attribute_schema_write_only_builder() {
+        let attr = AttributeSchema::new("password", AttributeType::String).write_only();
+        assert!(attr.write_only);
+    }
 
     #[test]
     fn resource_schema_data_source_default_false() {

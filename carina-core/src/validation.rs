@@ -574,6 +574,7 @@ let route = awscc.ec2.route {
                     read_only: false,
                     removable: None,
                     block_name: None,
+                    write_only: false,
                 },
             );
         }

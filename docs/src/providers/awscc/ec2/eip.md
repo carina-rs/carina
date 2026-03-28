@@ -25,6 +25,7 @@ awscc.ec2.eip {
 - **Type:** Ipv4Address
 - **Required:** No
 - **Create-only:** Yes
+- **Write-only:** Yes
 
 
 
@@ -47,6 +48,7 @@ The ID of the instance. Updates to the ``InstanceId`` property may require *some
 - **Type:** IpamPoolId
 - **Required:** No
 - **Create-only:** Yes
+- **Write-only:** Yes
 
 
 
@@ -77,6 +79,7 @@ Any tags assigned to the Elastic IP address. Updates to the ``Tags`` property ma
 - **Type:** Ipv4Address
 - **Required:** No
 - **Create-only:** Yes
+- **Write-only:** Yes
 
 The Elastic IP address you are accepting for transfer. You can only accept one transferred address. For more information on Elastic IP address transfers, see [Transfer Elastic IP addresses](https://docs.aws.amazon.com/vpc/latest/userguide/vpc-eips.html#transfer-EIPs-intro) in the *Amazon Virtual Private Cloud User Guide*.
 

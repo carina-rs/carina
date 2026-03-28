@@ -74,6 +74,7 @@ Indicates whether the NAT gateway supports public or private connectivity. The d
 
 - **Type:** Int
 - **Required:** No
+- **Write-only:** Yes
 
 The maximum amount of time to wait (in seconds) before forcibly releasing the IP addresses if connections are still in progress. Default value is 350 seconds.
 

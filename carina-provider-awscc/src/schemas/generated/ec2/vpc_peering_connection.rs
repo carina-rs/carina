@@ -19,6 +19,7 @@ pub fn ec2_vpc_peering_connection_config() -> AwsccSchemaConfig {
         .attribute(
             AttributeSchema::new("assume_role_region", super::awscc_region())
                 .create_only()
+                .write_only()
                 .with_description("The Region code to use when calling Security Token Service (STS) to assume the PeerRoleArn, if provided.")
                 .with_provider_name("AssumeRoleRegion"),
         )
@@ -42,6 +43,7 @@ pub fn ec2_vpc_peering_connection_config() -> AwsccSchemaConfig {
         .attribute(
             AttributeSchema::new("peer_role_arn", super::iam_role_arn())
                 .create_only()
+                .write_only()
                 .with_description("The Amazon Resource Name (ARN) of the VPC peer role for the peering connection in another AWS account.")
                 .with_provider_name("PeerRoleArn"),
         )

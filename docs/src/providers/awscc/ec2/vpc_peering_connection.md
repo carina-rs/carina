@@ -32,6 +32,7 @@ awscc.ec2.vpc_peering_connection {
 - **Type:** Region
 - **Required:** No
 - **Create-only:** Yes
+- **Write-only:** Yes
 
 The Region code to use when calling Security Token Service (STS) to assume the PeerRoleArn, if provided.
 
@@ -56,6 +57,7 @@ The Region code for the accepter VPC, if the accepter VPC is located in a Region
 - **Type:** IamRoleArn
 - **Required:** No
 - **Create-only:** Yes
+- **Write-only:** Yes
 
 The Amazon Resource Name (ARN) of the VPC peer role for the peering connection in another AWS account.
 
