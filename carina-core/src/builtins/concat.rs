@@ -1,29 +1,34 @@
-//! `concat(list, list)` built-in function
+//! `concat(items, base_list)` built-in function
 
 use crate::resource::Value;
 
 use super::value_type_name;
 
-/// `concat(list, list)` - Concatenate two lists into one.
+/// `concat(items, base_list)` - Concatenate two lists into one.
 ///
-/// - First argument: a List
-/// - Second argument: a List
-/// - Returns: a new List containing all elements from both lists
+/// Follows F#/Haskell convention: data argument (base_list) is last,
+/// so pipe form works naturally: `base_list |> concat(items)`.
+///
+/// The result is `base_list ++ items` (base first, then items appended).
+///
+/// - First argument: items to append (List)
+/// - Second argument: base list (List) — the data argument
+/// - Returns: a new List with base_list elements followed by items
 ///
 /// Examples:
 /// ```text
-/// concat([1, 2], [3, 4])       // => [1, 2, 3, 4]
-/// concat(["a"], ["b", "c"])    // => ["a", "b", "c"]
+/// concat([3, 4], [1, 2])         // => [1, 2, 3, 4]
+/// [1, 2] |> concat([3, 4])       // => [1, 2, 3, 4] (pipe form)
 /// ```
 pub(crate) fn builtin_concat(args: &[Value]) -> Result<Value, String> {
     if args.len() != 2 {
         return Err(format!(
-            "concat() expects 2 arguments (list, list), got {}",
+            "concat() expects 2 arguments (items, base_list), got {}",
             args.len()
         ));
     }
 
-    let first = match &args[0] {
+    let items = match &args[0] {
         Value::List(items) => items,
         other => {
             return Err(format!(
@@ -33,7 +38,7 @@ pub(crate) fn builtin_concat(args: &[Value]) -> Result<Value, String> {
         }
     };
 
-    let second = match &args[1] {
+    let base = match &args[1] {
         Value::List(items) => items,
         other => {
             return Err(format!(
@@ -43,8 +48,9 @@ pub(crate) fn builtin_concat(args: &[Value]) -> Result<Value, String> {
         }
     };
 
-    let mut result = first.clone();
-    result.extend(second.iter().cloned());
+    // base_list first, then items appended
+    let mut result = base.clone();
+    result.extend(items.iter().cloned());
     Ok(Value::List(result))
 }
 
@@ -55,9 +61,10 @@ mod tests {
 
     #[test]
     fn concat_basic() {
+        // concat(items, base_list) => base_list ++ items
         let args = vec![
-            Value::List(vec![Value::Int(1), Value::Int(2)]),
             Value::List(vec![Value::Int(3), Value::Int(4)]),
+            Value::List(vec![Value::Int(1), Value::Int(2)]),
         ];
         let result = evaluate_builtin("concat", &args).unwrap();
         assert_eq!(
@@ -73,11 +80,12 @@ mod tests {
 
     #[test]
     fn concat_strings() {
+        // concat(items=["c"], base=["a", "b"]) => ["a", "b", "c"]
         let args = vec![
-            Value::List(vec![Value::String("a".to_string())]),
+            Value::List(vec![Value::String("c".to_string())]),
             Value::List(vec![
+                Value::String("a".to_string()),
                 Value::String("b".to_string()),
-                Value::String("c".to_string()),
             ]),
         ];
         let result = evaluate_builtin("concat", &args).unwrap();
@@ -93,9 +101,10 @@ mod tests {
 
     #[test]
     fn concat_mixed_types() {
+        // concat(items=[true], base=[1, "two"]) => [1, "two", true]
         let args = vec![
-            Value::List(vec![Value::Int(1), Value::String("two".to_string())]),
             Value::List(vec![Value::Bool(true)]),
+            Value::List(vec![Value::Int(1), Value::String("two".to_string())]),
         ];
         let result = evaluate_builtin("concat", &args).unwrap();
         assert_eq!(
@@ -110,6 +119,7 @@ mod tests {
 
     #[test]
     fn concat_empty_first() {
+        // concat(items=[], base=[1, 2]) => [1, 2]
         let args = vec![
             Value::List(vec![]),
             Value::List(vec![Value::Int(1), Value::Int(2)]),
@@ -120,6 +130,7 @@ mod tests {
 
     #[test]
     fn concat_empty_second() {
+        // concat(items=[1, 2], base=[]) => [1, 2]
         let args = vec![
             Value::List(vec![Value::Int(1), Value::Int(2)]),
             Value::List(vec![]),

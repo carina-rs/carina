@@ -4992,13 +4992,15 @@ aws.s3.bucket {
 
         let result = parse(input).unwrap();
         assert_eq!(result.resources.len(), 2);
+        // concat(items, base_list) => base_list ++ items
+        // So concat(["10.0.0.0/16"], ["10.1.0.0/16"]) => ["10.1.0.0/16", "10.0.0.0/16"]
         assert_eq!(
             result.resources[0].attributes.get("cidr_block"),
-            Some(&Value::String("10.0.0.0/16".to_string()))
+            Some(&Value::String("10.1.0.0/16".to_string()))
         );
         assert_eq!(
             result.resources[1].attributes.get("cidr_block"),
-            Some(&Value::String("10.1.0.0/16".to_string()))
+            Some(&Value::String("10.0.0.0/16".to_string()))
         );
     }
 
