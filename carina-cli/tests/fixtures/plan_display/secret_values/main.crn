@@ -1,0 +1,13 @@
+# Secret values: VPC with secret tag (update scenario - state has different hash)
+
+provider awscc {
+  region = awscc.Region.ap_northeast_1
+}
+
+awscc.ec2.vpc {
+  cidr_block = "10.0.0.0/16"
+  tags = {
+    Name     = "secret-test"
+    Password = secret("my-secret-password")
+  }
+}

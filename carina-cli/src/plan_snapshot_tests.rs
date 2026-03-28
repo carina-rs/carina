@@ -387,6 +387,32 @@ fn snapshot_state_blocks() {
     insta::assert_snapshot!(output);
 }
 
+#[test]
+fn snapshot_secret_values() {
+    use carina_core::resource::Value;
+    let (plan, current_states, schemas) = build_plan_and_states_from_fixture("secret_values");
+    let delete_attributes: HashMap<ResourceId, HashMap<String, Value>> = plan
+        .effects()
+        .iter()
+        .filter_map(|e| {
+            if let carina_core::effect::Effect::Delete { id, .. } = e {
+                current_states
+                    .get(id)
+                    .map(|s| (id.clone(), s.attributes.clone()))
+            } else {
+                None
+            }
+        })
+        .collect();
+    let output = strip_ansi(&format_plan(
+        &plan,
+        DetailLevel::Full,
+        &delete_attributes,
+        Some(&schemas),
+    ));
+    insta::assert_snapshot!(output);
+}
+
 /// Ensure no fixture .crn file has unused `let` bindings.
 ///
 /// `let` should only be used when a binding is referenced by another resource.

@@ -1,0 +1,51 @@
+{
+  "version": 3,
+  "serial": 1,
+  "lineage": "test-lineage-secret",
+  "carina_version": "0.1.0",
+  "resources": [
+    {
+      "resource_type": "ec2.vpc",
+      "name": "ec2_vpc_fb75c929",
+      "provider": "awscc",
+      "identifier": "vpc-0123456789abcdef0",
+      "attributes": {
+        "cidr_block": "10.0.0.0/16",
+        "vpc_id": "vpc-0123456789abcdef0",
+        "tags": {
+          "Name": "secret-test",
+          "Password": "_secret:argon2:0000000000000000000000000000000000000000000000000000000000000000"
+        }
+      },
+      "protected": false,
+      "lifecycle": {},
+      "prefixes": {},
+      "name_overrides": {},
+      "desired_keys": ["cidr_block", "tags"],
+      "binding": null,
+      "dependency_bindings": []
+    },
+    {
+      "resource_type": "ec2.subnet",
+      "name": "orphan_subnet",
+      "provider": "awscc",
+      "identifier": "subnet-0123456789abcdef0",
+      "attributes": {
+        "vpc_id": "vpc-0123456789abcdef0",
+        "cidr_block": "10.0.1.0/24",
+        "subnet_id": "subnet-0123456789abcdef0",
+        "tags": {
+          "Name": "orphan-subnet",
+          "ApiKey": "_secret:argon2:1111111111111111111111111111111111111111111111111111111111111111"
+        }
+      },
+      "protected": false,
+      "lifecycle": {},
+      "prefixes": {},
+      "name_overrides": {},
+      "desired_keys": ["vpc_id", "cidr_block", "tags"],
+      "binding": null,
+      "dependency_bindings": []
+    }
+  ]
+}
