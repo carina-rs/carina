@@ -602,7 +602,10 @@ pub struct AttributeSchema {
     pub removable: Option<bool>,
     /// Alternative block name for repeated block syntax (e.g., "operating_region" for "operating_regions")
     pub block_name: Option<String>,
-    /// Whether this attribute is write-only (value sent to provider but not persisted in state)
+    /// Whether this attribute is write-only (not returned by the provider's read API).
+    /// Write-only attributes are sent to the provider during create/update but may not
+    /// appear in read responses. This is NOT related to sensitive/secret values — it
+    /// indicates a CloudFormation `writeOnlyProperties` attribute.
     pub write_only: bool,
 }
 
@@ -1397,13 +1400,13 @@ mod tests {
 
     #[test]
     fn attribute_schema_write_only_default_false() {
-        let attr = AttributeSchema::new("password", AttributeType::String);
+        let attr = AttributeSchema::new("ipv4_netmask_length", AttributeType::Int);
         assert!(!attr.write_only);
     }
 
     #[test]
     fn attribute_schema_write_only_builder() {
-        let attr = AttributeSchema::new("password", AttributeType::String).write_only();
+        let attr = AttributeSchema::new("ipv4_netmask_length", AttributeType::Int).write_only();
         assert!(attr.write_only);
     }
 
