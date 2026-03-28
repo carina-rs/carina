@@ -1,0 +1,16 @@
+provider awscc {
+  region = awscc.Region.ap_northeast_1
+}
+
+# VPC has write-only attributes (ipv4_ipam_pool_id, ipv4_netmask_length)
+# that are NOT used here. Plan should be idempotent — no false diffs
+# from write-only attributes missing in state.
+let vpc = awscc.ec2.vpc {
+  cidr_block           = "10.0.0.0/16"
+  enable_dns_support   = true
+  enable_dns_hostnames = true
+
+  tags = {
+    Name = "write-only-attrs-test"
+  }
+}
