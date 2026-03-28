@@ -296,9 +296,12 @@ fn collect_resource_refs(value: &Value, refs: &mut HashSet<String>) {
 /// Validate a module argument value against its expected type.
 pub fn validate_module_arg_type(type_expr: &TypeExpr, value: &Value) -> Option<String> {
     match (type_expr, value) {
-        (TypeExpr::Cidr, Value::String(s)) => validate_ipv4_cidr(s).err(),
+        (TypeExpr::Simple(name), Value::String(s)) if name == "cidr" => validate_ipv4_cidr(s).err(),
         (TypeExpr::List(inner), Value::List(items)) => {
-            if let TypeExpr::Cidr = inner.as_ref() {
+            if let TypeExpr::Simple(name) = inner.as_ref() {
+                if name != "cidr" {
+                    return None;
+                }
                 for (i, item) in items.iter().enumerate() {
                     if let Value::String(s) = item {
                         if let Err(e) = validate_ipv4_cidr(s) {

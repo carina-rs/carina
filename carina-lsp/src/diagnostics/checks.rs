@@ -253,10 +253,15 @@ impl DiagnosticEngine {
     ) -> Option<String> {
         match (type_expr, value) {
             // CIDR type validation
-            (TypeExpr::Cidr, Value::String(s)) => validate_ipv4_cidr(s).err(),
+            (TypeExpr::Simple(name), Value::String(s)) if name == "cidr" => {
+                validate_ipv4_cidr(s).err()
+            }
             // List of CIDR type validation
             (TypeExpr::List(inner), Value::List(items)) => {
-                if let TypeExpr::Cidr = inner.as_ref() {
+                if let TypeExpr::Simple(name) = inner.as_ref() {
+                    if name != "cidr" {
+                        return None;
+                    }
                     for (i, item) in items.iter().enumerate() {
                         if let Value::String(s) = item {
                             if let Err(e) = validate_ipv4_cidr(s) {

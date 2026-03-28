@@ -43,9 +43,9 @@ attributes_param = {
   | identifier ~ "=" ~ expression
 }
 
-// Type expression: string, bool, int, float, list(type), map(type), aws.vpc (resource ref)
+// Type expression: string, bool, int, float, cidr, arn, etc., list(type), map(type), aws.vpc (resource ref)
 type_expr = { type_ref | type_generic | type_simple }
-type_simple = @{ "string" | "bool" | "int" | "float" | "cidr" }
+type_simple = @{ identifier }
 type_generic = { ("list" | "map") ~ "(" ~ type_expr ~ ")" }
 type_ref = { resource_type_path }
 resource_type_path = @{ identifier ~ ("." ~ identifier)+ }

@@ -2776,4 +2776,32 @@ mod tests {
         let result = format(input, &config).unwrap();
         assert_eq!(result, expected);
     }
+
+    #[test]
+    fn format_custom_schema_type_annotations() {
+        let config = FormatConfig::default();
+
+        // Custom type in arguments block
+        let input = "arguments {\nvpc_cidr: cidr\nserver_ip: ipv4_address\n}\n";
+        let result = format(input, &config).unwrap();
+        assert!(
+            result.contains("vpc_cidr") && result.contains("cidr"),
+            "Expected 'vpc_cidr' and 'cidr' in:\n{}",
+            result
+        );
+        assert!(
+            result.contains("server_ip") && result.contains("ipv4_address"),
+            "Expected 'server_ip' and 'ipv4_address' in:\n{}",
+            result
+        );
+
+        // Custom type in fn param
+        let input = "fn f(addr: arn) {\n  addr\n}\n";
+        let result = format(input, &config).unwrap();
+        assert!(
+            result.contains("addr: arn"),
+            "Expected 'addr: arn' in:\n{}",
+            result
+        );
+    }
 }
