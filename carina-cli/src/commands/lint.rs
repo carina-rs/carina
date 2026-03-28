@@ -5,7 +5,10 @@ use std::path::PathBuf;
 use colored::Colorize;
 
 use carina_core::config_loader::{find_crn_files_in_dir, get_base_dir, load_configuration};
-use carina_core::lint::{find_duplicate_attrs, find_list_literal_attrs, list_struct_attr_names};
+use carina_core::lint::{
+    find_duplicate_attrs, find_list_literal_attrs, find_pipe_preferred_direct_calls,
+    list_struct_attr_names,
+};
 use carina_core::module_resolver;
 use carina_core::provider::{self as provider_mod};
 
@@ -99,6 +102,19 @@ pub fn run_lint(path: &PathBuf) -> Result<(), AppError> {
                 message: format!(
                     "Duplicate attribute '{}' (first defined on line {}). The last value will be used.",
                     dup.name, dup.first_line
+                ),
+            });
+        }
+
+        // Check for direct calls to pipe-preferred functions
+        let pipe_warnings = find_pipe_preferred_direct_calls(source);
+        for pw in pipe_warnings {
+            warnings.push(LintWarning {
+                file: file_path.clone(),
+                line: pw.line,
+                message: format!(
+                    "Consider using pipe form for '{}': data |> {}(...)",
+                    pw.name, pw.name
                 ),
             });
         }

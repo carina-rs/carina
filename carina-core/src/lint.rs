@@ -52,6 +52,83 @@ pub fn list_struct_attr_names(schema: &ResourceSchema) -> HashSet<String> {
         .collect()
 }
 
+/// Functions that follow data-last convention for pipe compatibility.
+/// Direct calls with 2+ args work but have unintuitive argument order;
+/// pipe form is preferred.
+const PIPE_PREFERRED_FUNCTIONS: &[&str] = &["join", "split", "map", "concat", "replace"];
+
+/// A warning for direct calls to pipe-preferred functions.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PipePreferredWarning {
+    /// The function name
+    pub name: String,
+    /// 1-indexed line number
+    pub line: usize,
+}
+
+/// Find direct calls to pipe-preferred transformation functions.
+///
+/// Detects patterns like `join("-", parts)` where the pipe form
+/// `parts |> join("-")` is recommended. Only warns when the function
+/// call is NOT preceded by `|>` on the same line.
+pub fn find_pipe_preferred_direct_calls(source: &str) -> Vec<PipePreferredWarning> {
+    let mut warnings = Vec::new();
+
+    for (line_idx, line) in source.lines().enumerate() {
+        let trimmed = line.trim();
+        for &func_name in PIPE_PREFERRED_FUNCTIONS {
+            let pattern = format!("{}(", func_name);
+            // Search for all occurrences of the pattern on this line
+            let mut search_from = 0;
+            while let Some(rel_pos) = trimmed[search_from..].find(&pattern) {
+                let pos = search_from + rel_pos;
+                search_from = pos + pattern.len();
+
+                // Check that this is not part of a longer identifier
+                // (e.g., "my_join(" should not match "join(")
+                if pos > 0 {
+                    let prev_char = trimmed.as_bytes()[pos - 1];
+                    if prev_char.is_ascii_alphanumeric() || prev_char == b'_' {
+                        continue;
+                    }
+                }
+
+                // Check if this is a pipe call (|> before the function on this line)
+                let before = &trimmed[..pos];
+                if before.contains("|>") {
+                    continue;
+                }
+
+                // Rough check: skip if inside a string literal
+                if is_inside_string(trimmed, pos) {
+                    continue;
+                }
+
+                warnings.push(PipePreferredWarning {
+                    name: func_name.to_string(),
+                    line: line_idx + 1,
+                });
+            }
+        }
+    }
+
+    warnings
+}
+
+/// Rough heuristic to check if a byte position is inside a string literal.
+fn is_inside_string(line: &str, pos: usize) -> bool {
+    let mut in_string = false;
+    for (i, ch) in line.char_indices() {
+        if i >= pos {
+            break;
+        }
+        if ch == '"' {
+            in_string = !in_string;
+        }
+    }
+    in_string
+}
+
 /// A duplicate attribute warning with attribute name, 1-indexed line number, and first occurrence line.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DuplicateAttr {
@@ -346,6 +423,77 @@ provider awscc {
         assert!(
             !names.contains("group_description"),
             "String should not be included"
+        );
+    }
+
+    #[test]
+    fn test_pipe_preferred_direct_call_warns() {
+        let source = r#"let name = join("-", parts)"#;
+        let results = find_pipe_preferred_direct_calls(source);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name, "join");
+        assert_eq!(results[0].line, 1);
+    }
+
+    #[test]
+    fn test_pipe_preferred_pipe_form_no_warning() {
+        let source = r#"let name = parts |> join("-")"#;
+        let results = find_pipe_preferred_direct_calls(source);
+        assert!(results.is_empty(), "Pipe form should not warn");
+    }
+
+    #[test]
+    fn test_pipe_preferred_single_arg_no_warning() {
+        // flatten is not in PIPE_PREFERRED_FUNCTIONS
+        let source = r#"let flat = flatten(list)"#;
+        let results = find_pipe_preferred_direct_calls(source);
+        assert!(results.is_empty(), "Single-arg functions should not warn");
+    }
+
+    #[test]
+    fn test_pipe_preferred_computation_no_warning() {
+        // cidr_subnet is not in PIPE_PREFERRED_FUNCTIONS
+        let source = r#"let subnet = cidr_subnet("10.0.0.0/16", 8, 1)"#;
+        let results = find_pipe_preferred_direct_calls(source);
+        assert!(results.is_empty(), "Computation functions should not warn");
+    }
+
+    #[test]
+    fn test_pipe_preferred_all_functions() {
+        let source = r#"
+let a = join("-", parts)
+let b = split(",", str)
+let c = map(".id", list)
+let d = concat(extra, base)
+let e = replace("old", "new", str)
+"#;
+        let results = find_pipe_preferred_direct_calls(source);
+        assert_eq!(results.len(), 5);
+        assert_eq!(results[0].name, "join");
+        assert_eq!(results[1].name, "split");
+        assert_eq!(results[2].name, "map");
+        assert_eq!(results[3].name, "concat");
+        assert_eq!(results[4].name, "replace");
+    }
+
+    #[test]
+    fn test_pipe_preferred_inside_string_no_warning() {
+        let source = r#"let x = "join(a, b)""#;
+        let results = find_pipe_preferred_direct_calls(source);
+        assert!(
+            results.is_empty(),
+            "Function name inside string literal should not warn"
+        );
+    }
+
+    #[test]
+    fn test_pipe_preferred_no_false_positive_on_similar_name() {
+        // "my_join(" should not match "join("
+        let source = r#"let x = my_join("-", parts)"#;
+        let results = find_pipe_preferred_direct_calls(source);
+        assert!(
+            results.is_empty(),
+            "Should not match when function name is part of a longer identifier"
         );
     }
 }

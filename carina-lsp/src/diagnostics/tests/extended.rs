@@ -895,3 +895,57 @@ awscc.ec2.vpc_gateway_attachment {
         diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
     );
 }
+
+#[test]
+fn pipe_preferred_direct_call_produces_info_diagnostic() {
+    let engine = test_engine();
+    let doc = create_document(
+        r#"provider awscc {
+region = awscc.Region.ap_northeast_1
+}
+
+let name = join("-", parts)
+"#,
+    );
+
+    let diagnostics = engine.analyze(&doc, None);
+
+    let pipe_diag = diagnostics
+        .iter()
+        .find(|d| d.message.contains("Consider using pipe form for 'join'"));
+    assert!(
+        pipe_diag.is_some(),
+        "Direct call to pipe-preferred function should produce diagnostic. Got: {:?}",
+        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+    let diag = pipe_diag.unwrap();
+    assert_eq!(
+        diag.severity,
+        Some(tower_lsp::lsp_types::DiagnosticSeverity::INFORMATION),
+        "Pipe-preferred diagnostic should be info-level, not warning"
+    );
+}
+
+#[test]
+fn pipe_preferred_pipe_form_no_diagnostic() {
+    let engine = test_engine();
+    let doc = create_document(
+        r#"provider awscc {
+region = awscc.Region.ap_northeast_1
+}
+
+let name = parts |> join("-")
+"#,
+    );
+
+    let diagnostics = engine.analyze(&doc, None);
+
+    let pipe_diag = diagnostics
+        .iter()
+        .find(|d| d.message.contains("Consider using pipe form for 'join'"));
+    assert!(
+        pipe_diag.is_none(),
+        "Pipe form should not produce pipe-preferred diagnostic. Got: {:?}",
+        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}
