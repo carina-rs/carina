@@ -2028,10 +2028,16 @@ fn parse_pipe_expr(
         let mut args = extra_args;
         args.push(value);
 
-        value = Value::FunctionCall {
-            name: func_name,
-            args,
-        };
+        // Try to eagerly evaluate user-defined function calls
+        if ctx.user_functions.contains_key(&func_name) && args.iter().all(is_static_value) {
+            let user_fn = ctx.user_functions.get(&func_name).unwrap().clone();
+            value = evaluate_user_function(&user_fn, &args, ctx)?;
+        } else {
+            value = Value::FunctionCall {
+                name: func_name,
+                args,
+            };
+        }
     }
 
     Ok(value)
@@ -6378,5 +6384,53 @@ aws.s3.bucket {
             err.contains("required parameter") && err.contains("cannot follow optional"),
             "Expected param ordering error, got: {err}"
         );
+    }
+
+    #[test]
+    fn user_fn_with_pipe_operator() {
+        let input = r#"
+            fn wrap(prefix, val) {
+                join("-", [prefix, val])
+            }
+
+            let vpc = aws.s3_bucket {
+                name = "world" |> wrap("hello")
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+        assert_eq!(
+            result.resources[0].attributes.get("name"),
+            Some(&Value::String("hello-world".to_string())),
+        );
+    }
+
+    #[test]
+    fn user_fn_with_string_interpolation() {
+        let input = r#"
+            fn greet(name) {
+                join(" ", ["hello", name])
+            }
+
+            let vpc = aws.s3_bucket {
+                name = "${greet("world")}-suffix"
+            }
+        "#;
+
+        // At parse time, fn is evaluated but interpolation is not fully resolved
+        let result = parse(input).unwrap();
+        let name = result.resources[0].attributes.get("name").unwrap();
+        match name {
+            Value::Interpolation(parts) => {
+                // The greet() call is evaluated to "hello world"
+                assert_eq!(parts.len(), 2);
+                assert_eq!(
+                    parts[0],
+                    InterpolationPart::Expr(Value::String("hello world".to_string()))
+                );
+                assert_eq!(parts[1], InterpolationPart::Literal("-suffix".to_string()));
+            }
+            _ => panic!("Expected Interpolation, got: {:?}", name),
+        }
     }
 }
