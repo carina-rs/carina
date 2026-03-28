@@ -10,6 +10,9 @@ use carina_core::effect::Effect;
 use carina_core::parser::{BackendConfig, ProviderConfig};
 use carina_core::plan::Plan;
 use carina_core::resource::{Resource, ResourceId, State, Value};
+use carina_core::value::{
+    redact_secrets_in_plan, redact_secrets_in_resource, redact_secrets_in_state,
+};
 use carina_state::{
     BackendConfig as StateBackendConfig, StateBackend, StateFile, create_backend,
     create_local_backend,
@@ -210,6 +213,7 @@ pub async fn run_plan(
 
     // Save plan to file if --out was specified
     if let Some(out_path) = out {
+        // Redact secrets before serializing to prevent plaintext secret leakage
         let plan_file = PlanFile {
             version: 1,
             carina_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -219,12 +223,19 @@ pub async fn run_plan(
             state_serial: state_file.as_ref().map(|s| s.serial),
             provider_configs: parsed.providers.clone(),
             backend_config: parsed.backend.clone(),
-            plan: ctx.plan,
-            sorted_resources: ctx.sorted_resources,
+            plan: redact_secrets_in_plan(&ctx.plan),
+            sorted_resources: ctx
+                .sorted_resources
+                .iter()
+                .map(redact_secrets_in_resource)
+                .collect(),
             current_states: ctx
                 .current_states
-                .into_iter()
-                .map(|(id, state)| CurrentStateEntry { id, state })
+                .iter()
+                .map(|(id, state)| CurrentStateEntry {
+                    id: id.clone(),
+                    state: redact_secrets_in_state(state),
+                })
                 .collect(),
         };
 
