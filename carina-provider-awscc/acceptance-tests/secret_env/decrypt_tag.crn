@@ -1,0 +1,16 @@
+provider awscc {
+  region = awscc.Region.ap_northeast_1
+}
+
+# KMS-encrypted value (encrypted with alias/carina-test key in carina-test-000 account)
+# Plaintext: "decrypt-test-value"
+let encrypted = "AQICAHiUU4BhXxV/24kFblvFgRinfx00Rva9nBXHESKU/n2W1QHeJgFItWvJdpm6QXmCH3s7AAAAajBoBgkqhkiG9w0BBwagWzBZAgEAMFQGCSqGSIb3DQEHATAeBglghkgBZQMEAS4wEQQMdsKc/QPUdhV6Uy4dAgEQgCeZSRW3iwDwiszbvKUyTpsZRQZdGQzY9M94i6ZO70MQdiy8wEi+DEs="
+
+awscc.ec2.vpc {
+  cidr_block = "10.0.0.0/16"
+
+  tags = {
+    Name         = "decrypt-test"
+    DecryptedTag = secret(decrypt(encrypted))
+  }
+}
