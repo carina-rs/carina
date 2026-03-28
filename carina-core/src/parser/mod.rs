@@ -194,6 +194,8 @@ impl UserFunctionBody {
 pub struct UserFunction {
     pub name: String,
     pub params: Vec<FnParam>,
+    /// Optional return type annotation
+    pub return_type: Option<TypeExpr>,
     /// Local let bindings inside the function body (name, expression)
     pub local_lets: Vec<(String, Value)>,
     /// The body of the function
@@ -1544,7 +1546,7 @@ fn parse_fn_def(
     // Parse parameters (optional)
     let mut params = Vec::new();
     let next = next_pair(&mut inner, "fn_params or fn_body", "fn_def")?;
-    let body_pair = if next.as_rule() == Rule::fn_params {
+    let next_token = if next.as_rule() == Rule::fn_params {
         // Parse parameter list
         for param_pair in next.into_inner() {
             if param_pair.as_rule() == Rule::fn_param {
@@ -1580,9 +1582,18 @@ fn parse_fn_def(
                 });
             }
         }
-        next_pair(&mut inner, "fn_body", "fn_def")?
+        next_pair(&mut inner, "type_expr or fn_body", "fn_def")?
     } else {
         next
+    };
+
+    // Parse optional return type annotation (: type_expr)
+    let (return_type, body_pair) = if next_token.as_rule() == Rule::type_expr {
+        let rt = parse_type_expr(next_token)?;
+        let bp = next_pair(&mut inner, "fn_body", "fn_def")?;
+        (Some(rt), bp)
+    } else {
+        (None, next_token)
     };
 
     // Parse body: fn_local_let* ~ (resource_expr | read_resource_expr | expression)
@@ -1641,6 +1652,7 @@ fn parse_fn_def(
     Ok(UserFunction {
         name,
         params,
+        return_type,
         local_lets,
         body,
     })
@@ -1741,6 +1753,38 @@ fn check_fn_arg_type(
     Ok(())
 }
 
+/// Check that a function's return value matches the declared return type.
+fn check_fn_return_type(
+    fn_name: &str,
+    type_expr: &TypeExpr,
+    value: &Value,
+) -> Result<(), ParseError> {
+    let type_matches = match type_expr {
+        TypeExpr::String => matches!(
+            value,
+            Value::String(_) | Value::Interpolation(_) | Value::ResourceRef { .. }
+        ),
+        TypeExpr::Int => matches!(value, Value::Int(_)),
+        TypeExpr::Float => matches!(value, Value::Float(_)),
+        TypeExpr::Bool => matches!(value, Value::Bool(_)),
+        TypeExpr::List(_) => matches!(value, Value::List(_)),
+        TypeExpr::Map(_) => matches!(value, Value::Map(_)),
+        TypeExpr::Cidr => matches!(
+            value,
+            Value::String(_) | Value::Interpolation(_) | Value::ResourceRef { .. }
+        ),
+        // Resource type refs: not applicable for value functions
+        TypeExpr::Ref(_) => true,
+    };
+    if !type_matches {
+        let actual_type = value_type_name(value);
+        return Err(ParseError::UserFunctionError(format!(
+            "function '{fn_name}': return type '{type_expr}' does not match actual return value of type {actual_type}"
+        )));
+    }
+    Ok(())
+}
+
 /// Return a human-readable type name for a Value
 fn value_type_name(value: &Value) -> &'static str {
     match value {
@@ -1768,7 +1812,12 @@ fn evaluate_user_function(
     match &func.body {
         UserFunctionBody::Value(body) => {
             let substituted_body = substitute_fn_params(body, &substitutions);
-            try_evaluate_fn_value(substituted_body, &child_ctx)
+            let result = try_evaluate_fn_value(substituted_body, &child_ctx)?;
+            // Check return type if annotated
+            if let Some(ref return_type) = func.return_type {
+                check_fn_return_type(&func.name, return_type, &result)?;
+            }
+            Ok(result)
         }
         UserFunctionBody::Resource(_) | UserFunctionBody::ReadResource(_) => {
             Err(ParseError::UserFunctionError(format!(
@@ -1837,6 +1886,20 @@ fn evaluate_user_function_as_resource(
     if !param_to_binding.is_empty() {
         for value in resource.attributes.values_mut() {
             remap_resource_refs(value, &param_to_binding);
+        }
+    }
+
+    // Check return type if annotated
+    if let Some(TypeExpr::Ref(ref expected_path)) = func.return_type {
+        let actual_path = ResourceTypePath {
+            provider: resource.id.provider.clone(),
+            resource_type: resource.id.resource_type.clone(),
+        };
+        if *expected_path != actual_path {
+            return Err(ParseError::UserFunctionError(format!(
+                "function '{}': return type '{}' does not match actual resource type '{}'",
+                func.name, expected_path, actual_path
+            )));
         }
     }
 
@@ -7072,5 +7135,95 @@ aws.s3.bucket {
         let result = parse(input).unwrap();
         let func = result.user_functions.get("greet").unwrap();
         assert_eq!(func.params[0].param_type, None);
+    }
+
+    #[test]
+    fn user_fn_return_type_string() {
+        let input = r#"
+            fn greet(name: string): string {
+                name
+            }
+
+            let vpc = aws.s3_bucket {
+                name = greet("hello")
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+        let func = result.user_functions.get("greet").unwrap();
+        assert_eq!(func.return_type, Some(TypeExpr::String));
+    }
+
+    #[test]
+    fn user_fn_return_type_none_when_omitted() {
+        let input = r#"
+            fn greet(name) {
+                name
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+        let func = result.user_functions.get("greet").unwrap();
+        assert_eq!(func.return_type, None);
+    }
+
+    #[test]
+    fn user_fn_return_type_mismatch_value() {
+        let input = r#"
+            fn bad(): string {
+                42
+            }
+
+            let vpc = aws.s3_bucket {
+                name = bad()
+            }
+        "#;
+
+        let err = parse(input).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("return type"),
+            "Expected return type error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn user_fn_return_type_resource_ref() {
+        let input = r#"
+            fn make_bucket(): aws.s3_bucket {
+                aws.s3_bucket {
+                    name = "test"
+                }
+            }
+
+            let b = make_bucket()
+        "#;
+
+        let result = parse(input).unwrap();
+        let func = result.user_functions.get("make_bucket").unwrap();
+        assert_eq!(
+            func.return_type,
+            Some(TypeExpr::Ref(ResourceTypePath::new("aws", "s3_bucket")))
+        );
+    }
+
+    #[test]
+    fn user_fn_return_type_resource_mismatch() {
+        let input = r#"
+            fn make_bucket(): aws.ec2_instance {
+                aws.s3_bucket {
+                    name = "test"
+                }
+            }
+
+            let b = make_bucket()
+        "#;
+
+        let err = parse(input).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("return type"),
+            "Expected return type error, got: {msg}"
+        );
     }
 }

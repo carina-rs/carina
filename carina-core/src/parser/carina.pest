@@ -6,7 +6,7 @@ file = { SOI ~ statement* ~ EOI }
 statement = { backend_block | provider_block | arguments_block | attributes_block | import_state_block | removed_block | moved_block | if_expr | for_expr | fn_def | let_binding | module_call | function_call | anonymous_resource }
 
 // User-defined function: fn name(params) { body }
-fn_def = { "fn" ~ identifier ~ "(" ~ fn_params? ~ ")" ~ "{" ~ fn_body ~ "}" }
+fn_def = { "fn" ~ identifier ~ "(" ~ fn_params? ~ ")" ~ (":" ~ type_expr)? ~ "{" ~ fn_body ~ "}" }
 fn_params = { fn_param ~ ("," ~ fn_param)* }
 fn_param = { identifier ~ (":" ~ type_expr)? ~ ("=" ~ expression)? }
 fn_body = { fn_local_let* ~ (resource_expr | read_resource_expr | expression) }

@@ -837,6 +837,10 @@ impl Formatter {
                         saw_close_paren = true;
                         continue;
                     }
+                    if token.text == ":" && saw_close_paren && !saw_open_brace {
+                        // Return type colon - handled when we see the TypeExpr node
+                        continue;
+                    }
                     if token.text == "," && !saw_close_paren {
                         // Comma between params - handled by param_count logic
                         continue;
@@ -863,6 +867,10 @@ impl Formatter {
                         }
                         self.format_fn_param(n);
                         param_count += 1;
+                    } else if n.kind == NodeKind::TypeExpr && saw_close_paren && !saw_open_brace {
+                        // Return type annotation: ): type {
+                        self.write(": ");
+                        self.format_node(n);
                     } else if saw_open_brace {
                         // Body content (local let or expression)
                         if n.kind == NodeKind::LocalBinding {
@@ -2738,6 +2746,33 @@ mod tests {
         let config = FormatConfig::default();
         let input = "fn tag(env,suffix:string) {\n  suffix\n}\n";
         let expected = "fn tag(env, suffix: string) {\n  suffix\n}\n";
+        let result = format(input, &config).unwrap();
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn format_fn_def_with_return_type() {
+        let config = FormatConfig::default();
+        let input = "fn greet(name:string):string {\n  name\n}\n";
+        let expected = "fn greet(name: string): string {\n  name\n}\n";
+        let result = format(input, &config).unwrap();
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn format_fn_def_with_resource_return_type() {
+        let config = FormatConfig::default();
+        let input = "fn make():awscc.ec2.vpc {\n  awscc.ec2.vpc {\n    cidr_block = \"10.0.0.0/16\"\n  }\n}\n";
+        let expected = "fn make(): awscc.ec2.vpc {\n  awscc.ec2.vpc {\n    cidr_block = \"10.0.0.0/16\"\n  }\n}\n";
+        let result = format(input, &config).unwrap();
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn format_fn_def_without_return_type_unchanged() {
+        let config = FormatConfig::default();
+        let input = "fn greet(name) {\n  name\n}\n";
+        let expected = "fn greet(name) {\n  name\n}\n";
         let result = format(input, &config).unwrap();
         assert_eq!(result, expected);
     }
