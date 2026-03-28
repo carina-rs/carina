@@ -1,0 +1,11 @@
+arguments {
+  cidr_block: string
+}
+
+attributes {
+  vpc_id = vpc.vpc_id
+}
+
+let vpc = awscc.ec2.vpc {
+  cidr_block = cidr_block
+}
