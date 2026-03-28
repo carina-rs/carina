@@ -3,6 +3,9 @@
 //! Convert DSL to AST using pest
 
 use crate::resource::{LifecycleConfig, Resource, ResourceId, Value};
+use crate::schema::{
+    validate_ipv4_address, validate_ipv4_cidr, validate_ipv6_address, validate_ipv6_cidr,
+};
 use pest::Parser;
 use pest_derive::Parser;
 use std::collections::HashMap;
@@ -1697,7 +1700,7 @@ fn prepare_user_function_call(
         };
         // Type-check if the parameter has a type annotation
         if let Some(ref type_expr) = param.param_type {
-            check_fn_arg_type(fn_name, &param.name, type_expr, &value)?;
+            check_fn_arg_type(fn_name, &param.name, type_expr, &value, ctx)?;
         }
         substitutions.insert(param.name.clone(), value);
     }
@@ -1717,13 +1720,35 @@ fn prepare_user_function_call(
     Ok((child_ctx, substitutions))
 }
 
+/// Validate a value against a custom type (cidr, ipv4_address, etc.).
+/// Returns Ok(()) if the value passes validation or cannot be validated statically
+/// (e.g., ResourceRef, FunctionCall, Interpolation are deferred).
+fn validate_custom_type(type_name: &str, value: &Value) -> Result<(), String> {
+    match (type_name, value) {
+        ("cidr", Value::String(s)) => validate_ipv4_cidr(s),
+        ("ipv4_address", Value::String(s)) => validate_ipv4_address(s),
+        ("ipv6_cidr", Value::String(s)) => validate_ipv6_cidr(s),
+        ("ipv6_address", Value::String(s)) => validate_ipv6_address(s),
+        // arn, availability_zone — just accept strings for now (format varies too much)
+        (_, Value::String(_)) => Ok(()),
+        (_, Value::ResourceRef { .. }) => Ok(()), // will be resolved later
+        (_, Value::FunctionCall { .. }) => Ok(()), // will be resolved later
+        (_, Value::Interpolation(_)) => Ok(()),   // will be resolved later
+        (_, value) => Err(format!(
+            "expected {}, got {}",
+            type_name,
+            value_type_name(value)
+        )),
+    }
+}
+
 /// Check that a function argument matches the declared parameter type.
-/// Resource type annotations (TypeExpr::Ref) are parsed but not validated at call site.
 fn check_fn_arg_type(
     fn_name: &str,
     param_name: &str,
     type_expr: &TypeExpr,
     value: &Value,
+    ctx: &ParseContext,
 ) -> Result<(), ParseError> {
     let type_matches = match type_expr {
         TypeExpr::String => matches!(
@@ -1736,12 +1761,45 @@ fn check_fn_arg_type(
         TypeExpr::List(_) => matches!(value, Value::List(_)),
         TypeExpr::Map(_) => matches!(value, Value::Map(_)),
         // Simple types (cidr, ipv4_address, arn, etc.) are string subtypes at runtime
-        TypeExpr::Simple(_) => matches!(
-            value,
-            Value::String(_) | Value::Interpolation(_) | Value::ResourceRef { .. }
-        ),
-        // Resource type refs: parsed but not validated (see issue guide)
-        TypeExpr::Ref(_) => true,
+        TypeExpr::Simple(name) => {
+            if !matches!(
+                value,
+                Value::String(_) | Value::Interpolation(_) | Value::ResourceRef { .. }
+            ) {
+                false
+            } else {
+                // Validate the actual value against the custom type
+                if let Err(e) = validate_custom_type(name, value) {
+                    return Err(ParseError::UserFunctionError(format!(
+                        "function '{fn_name}': parameter '{param_name}' type '{name}' validation failed: {e}"
+                    )));
+                }
+                true
+            }
+        }
+        // Resource type refs: check that the argument is a binding of the correct resource type
+        TypeExpr::Ref(expected_path) => {
+            // The argument is passed as a ResourceRef-like string "${binding_name}"
+            // or as a direct ResourceRef. Check if it corresponds to a resource binding
+            // of the expected type.
+            if let Value::String(s) = value
+                && let Some(ref_name) = s.strip_prefix("${").and_then(|s| s.strip_suffix('}'))
+                && let Some(resource) = ctx.resource_bindings.get(ref_name)
+            {
+                let actual_provider = &resource.id.provider;
+                let actual_type = &resource.id.resource_type;
+                if actual_provider != &expected_path.provider
+                    || actual_type != &expected_path.resource_type
+                {
+                    return Err(ParseError::UserFunctionError(format!(
+                        "function '{fn_name}': parameter '{param_name}' expects resource type '{expected_path}', \
+                                 got {actual_provider}.{actual_type}"
+                    )));
+                }
+            }
+            // If not found in bindings, skip validation (forward ref or dynamic)
+            true
+        }
     };
     if !type_matches {
         let actual_type = value_type_name(value);
@@ -1768,11 +1826,22 @@ fn check_fn_return_type(
         TypeExpr::Bool => matches!(value, Value::Bool(_)),
         TypeExpr::List(_) => matches!(value, Value::List(_)),
         TypeExpr::Map(_) => matches!(value, Value::Map(_)),
-        // Simple types (cidr, ipv4_address, arn, etc.) are string subtypes at runtime
-        TypeExpr::Simple(_) => matches!(
-            value,
-            Value::String(_) | Value::Interpolation(_) | Value::ResourceRef { .. }
-        ),
+        // Simple types (cidr, ipv4_address, arn, etc.) — validate the value
+        TypeExpr::Simple(name) => {
+            if !matches!(
+                value,
+                Value::String(_) | Value::Interpolation(_) | Value::ResourceRef { .. }
+            ) {
+                false
+            } else {
+                if let Err(e) = validate_custom_type(name, value) {
+                    return Err(ParseError::UserFunctionError(format!(
+                        "function '{fn_name}': return type '{name}' validation failed: {e}"
+                    )));
+                }
+                true
+            }
+        }
         // Resource type refs: not applicable for value functions
         TypeExpr::Ref(_) => true,
     };
@@ -7348,5 +7417,288 @@ aws.s3.bucket {
             "ipv4_address"
         );
         assert_eq!(TypeExpr::Simple("arn".to_string()).to_string(), "arn");
+    }
+
+    // --- Issue #1285: Validate fn call arguments for custom types ---
+
+    #[test]
+    fn user_fn_custom_type_cidr_arg_valid() {
+        let input = r#"
+            fn f(x: cidr) { x }
+
+            let b = aws.s3_bucket {
+                name = f("10.0.0.0/16")
+            }
+        "#;
+        let result = parse(input);
+        assert!(result.is_ok(), "Expected OK, got: {:?}", result.err());
+    }
+
+    #[test]
+    fn user_fn_custom_type_cidr_arg_invalid() {
+        let input = r#"
+            fn f(x: cidr) { x }
+
+            let b = aws.s3_bucket {
+                name = f("invalid")
+            }
+        "#;
+        let err = parse(input).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("invalid") || msg.contains("cidr"),
+            "Expected cidr validation error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn user_fn_custom_type_ipv4_address_arg_valid() {
+        let input = r#"
+            fn f(x: ipv4_address) { x }
+
+            let b = aws.s3_bucket {
+                name = f("10.0.0.1")
+            }
+        "#;
+        let result = parse(input);
+        assert!(result.is_ok(), "Expected OK, got: {:?}", result.err());
+    }
+
+    #[test]
+    fn user_fn_custom_type_ipv4_address_arg_invalid() {
+        let input = r#"
+            fn f(x: ipv4_address) { x }
+
+            let b = aws.s3_bucket {
+                name = f("invalid")
+            }
+        "#;
+        let err = parse(input).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("invalid") || msg.contains("ipv4_address"),
+            "Expected ipv4_address validation error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn user_fn_custom_type_ipv6_cidr_arg_valid() {
+        let input = r#"
+            fn f(x: ipv6_cidr) { x }
+
+            let b = aws.s3_bucket {
+                name = f("2001:db8::/32")
+            }
+        "#;
+        let result = parse(input);
+        assert!(result.is_ok(), "Expected OK, got: {:?}", result.err());
+    }
+
+    #[test]
+    fn user_fn_custom_type_ipv6_cidr_arg_invalid() {
+        let input = r#"
+            fn f(x: ipv6_cidr) { x }
+
+            let b = aws.s3_bucket {
+                name = f("invalid")
+            }
+        "#;
+        let err = parse(input).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("invalid") || msg.contains("ipv6"),
+            "Expected ipv6_cidr validation error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn user_fn_custom_type_ipv6_address_arg_valid() {
+        let input = r#"
+            fn f(x: ipv6_address) { x }
+
+            let b = aws.s3_bucket {
+                name = f("2001:db8::1")
+            }
+        "#;
+        let result = parse(input);
+        assert!(result.is_ok(), "Expected OK, got: {:?}", result.err());
+    }
+
+    #[test]
+    fn user_fn_custom_type_ipv6_address_arg_invalid() {
+        let input = r#"
+            fn f(x: ipv6_address) { x }
+
+            let b = aws.s3_bucket {
+                name = f("invalid")
+            }
+        "#;
+        let err = parse(input).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("invalid") || msg.contains("ipv6"),
+            "Expected ipv6_address validation error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn user_fn_custom_type_arn_arg_accepts_string() {
+        // arn format varies too much, just accept any string
+        let input = r#"
+            fn f(x: arn) { x }
+
+            let b = aws.s3_bucket {
+                name = f("arn:aws:s3:::my-bucket")
+            }
+        "#;
+        let result = parse(input);
+        assert!(result.is_ok(), "Expected OK, got: {:?}", result.err());
+    }
+
+    #[test]
+    fn user_fn_custom_type_arg_resource_ref_skipped() {
+        // ResourceRef values should be accepted (resolved later)
+        let input = r#"
+            fn f(x: cidr) { x }
+
+            let vpc = awscc.ec2.vpc {
+                cidr_block = "10.0.0.0/16"
+            }
+
+            let b = aws.s3_bucket {
+                name = f(vpc.cidr_block)
+            }
+        "#;
+        let result = parse(input);
+        assert!(result.is_ok(), "Expected OK, got: {:?}", result.err());
+    }
+
+    // --- Issue #1284: Validate fn return type for custom types ---
+
+    #[test]
+    fn user_fn_custom_type_return_cidr_valid() {
+        let input = r#"
+            fn f(): cidr { "10.0.0.0/16" }
+
+            let b = aws.s3_bucket {
+                name = f()
+            }
+        "#;
+        let result = parse(input);
+        assert!(result.is_ok(), "Expected OK, got: {:?}", result.err());
+    }
+
+    #[test]
+    fn user_fn_custom_type_return_cidr_invalid() {
+        let input = r#"
+            fn f(): cidr { "invalid" }
+
+            let b = aws.s3_bucket {
+                name = f()
+            }
+        "#;
+        let err = parse(input).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("invalid") || msg.contains("cidr"),
+            "Expected cidr validation error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn user_fn_custom_type_return_ipv4_address_invalid() {
+        let input = r#"
+            fn f(): ipv4_address { "invalid" }
+
+            let b = aws.s3_bucket {
+                name = f()
+            }
+        "#;
+        let err = parse(input).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("invalid") || msg.contains("ipv4_address"),
+            "Expected ipv4_address validation error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn user_fn_custom_type_return_ipv6_cidr_invalid() {
+        let input = r#"
+            fn f(): ipv6_cidr { "invalid" }
+
+            let b = aws.s3_bucket {
+                name = f()
+            }
+        "#;
+        let err = parse(input).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("invalid") || msg.contains("ipv6"),
+            "Expected ipv6_cidr validation error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn user_fn_custom_type_return_ipv6_address_invalid() {
+        let input = r#"
+            fn f(): ipv6_address { "invalid" }
+
+            let b = aws.s3_bucket {
+                name = f()
+            }
+        "#;
+        let err = parse(input).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("invalid") || msg.contains("ipv6"),
+            "Expected ipv6_address validation error, got: {msg}"
+        );
+    }
+
+    // --- Issue #1285: Validate fn call arguments for resource types ---
+
+    #[test]
+    fn user_fn_resource_type_arg_matching() {
+        let input = r#"
+            fn make_subnet(vpc: awscc.ec2.vpc, cidr: string) {
+                awscc.ec2.subnet {
+                    vpc_id     = vpc.vpc_id
+                    cidr_block = cidr
+                }
+            }
+
+            let vpc = awscc.ec2.vpc {
+                cidr_block = "10.0.0.0/16"
+            }
+
+            let subnet = make_subnet(vpc, "10.0.1.0/24")
+        "#;
+        let result = parse(input);
+        assert!(result.is_ok(), "Expected OK, got: {:?}", result.err());
+    }
+
+    #[test]
+    fn user_fn_resource_type_arg_mismatched() {
+        let input = r#"
+            fn make_subnet(vpc: awscc.ec2.vpc, cidr: string) {
+                awscc.ec2.subnet {
+                    vpc_id     = vpc.vpc_id
+                    cidr_block = cidr
+                }
+            }
+
+            let sg = awscc.ec2.security_group {
+                group_description = "test"
+            }
+
+            let subnet = make_subnet(sg, "10.0.1.0/24")
+        "#;
+        let err = parse(input).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("ec2.vpc") || msg.contains("type mismatch"),
+            "Expected resource type mismatch error, got: {msg}"
+        );
     }
 }
