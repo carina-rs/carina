@@ -1069,6 +1069,10 @@ async fn run_apply_locked(
     resolve_refs_with_state(&mut resources_for_plan, &current_states)?;
     provider.normalize_desired(&mut resources_for_plan);
 
+    // Normalize state enum values to match the DSL format produced by normalize_desired.
+    // Must match the plan path in wiring.rs to ensure plan/apply produce the same diffs.
+    provider.normalize_state(&mut current_states);
+
     // Resolve enum aliases (e.g., "all" -> "-1") in both desired resources
     // and current states so the plan shows canonical AWS values.
     crate::wiring::resolve_enum_aliases_with_ctx(ctx, &mut resources_for_plan);

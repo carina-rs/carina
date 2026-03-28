@@ -869,6 +869,81 @@ mod tests {
         }
     }
 
+    /// Verify that normalize_state prevents false diffs for enum values in state.
+    ///
+    /// When state contains raw AWS enum values (e.g., "default") and desired
+    /// resources have been normalized to DSL enum format (e.g.,
+    /// "awscc.ec2.vpc.InstanceTenancy.default"), the differ would see a false
+    /// diff unless normalize_state is also applied to current states.
+    ///
+    /// Both the plan path (wiring.rs) and the apply path (apply.rs) must call
+    /// normalize_state to maintain parity. This test ensures the normalization
+    /// produces matching values so no false diff occurs.
+    #[test]
+    fn test_normalize_state_prevents_false_enum_diff() {
+        use carina_core::differ::create_plan;
+        use carina_core::resource::LifecycleConfig;
+        use carina_core::schema::ResourceSchema;
+
+        let ctx = WiringContext::new();
+
+        // Desired resource with normalized DSL enum value (after normalize_desired)
+        let mut resource = Resource::with_provider("awscc", "ec2.vpc", "test-vpc");
+        resource.attributes.insert(
+            "instance_tenancy".to_string(),
+            Value::String("awscc.ec2.vpc.InstanceTenancy.default".to_string()),
+        );
+
+        // State with raw AWS value (as returned by provider.read())
+        let id = resource.id.clone();
+        let mut state_attrs = HashMap::new();
+        state_attrs.insert(
+            "instance_tenancy".to_string(),
+            Value::String("default".to_string()),
+        );
+        let state = State::existing(id.clone(), state_attrs);
+        let mut current_states = HashMap::new();
+        current_states.insert(id.clone(), state);
+
+        // Without normalize_state, the differ would see a false diff
+        let resources_without = vec![resource.clone()];
+        let lifecycles: HashMap<ResourceId, LifecycleConfig> = HashMap::new();
+        let schemas: HashMap<String, ResourceSchema> = HashMap::new();
+        let saved_attrs = HashMap::new();
+        let prev_desired_keys = HashMap::new();
+        let orphan_deps = HashMap::new();
+        let plan_without = create_plan(
+            &resources_without,
+            &current_states,
+            &lifecycles,
+            &schemas,
+            &saved_attrs,
+            &prev_desired_keys,
+            &orphan_deps,
+        );
+        assert!(
+            !plan_without.is_empty(),
+            "Without normalize_state, differ should see a false diff"
+        );
+
+        // After normalize_state, state values match desired values → no diff
+        normalize_state_with_ctx(&ctx, &mut current_states);
+        let resources_with = vec![resource];
+        let plan_with = create_plan(
+            &resources_with,
+            &current_states,
+            &lifecycles,
+            &schemas,
+            &saved_attrs,
+            &prev_desired_keys,
+            &orphan_deps,
+        );
+        assert!(
+            plan_with.is_empty(),
+            "After normalize_state, no false diff should occur"
+        );
+    }
+
     #[test]
     fn test_resolve_enum_aliases_non_enum_values_unchanged() {
         // Non-DSL-enum strings should not be affected
