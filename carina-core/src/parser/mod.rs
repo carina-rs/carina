@@ -291,6 +291,8 @@ pub fn parse(input: &str) -> Result<ParsedFile, ParseError> {
     let mut attribute_params = Vec::new();
     let mut backend = None;
     let mut state_blocks = Vec::new();
+    let mut anon_for_counter = 0usize;
+    let mut anon_if_counter = 0usize;
 
     for pair in pairs {
         if pair.as_rule() == Rule::file {
@@ -335,6 +337,22 @@ pub fn parse(input: &str) -> Result<ParsedFile, ParseError> {
                             }
                             Rule::moved_block => {
                                 state_blocks.push(parse_moved_block(stmt)?);
+                            }
+                            Rule::for_expr => {
+                                let binding_name = format!("_for{}", anon_for_counter);
+                                anon_for_counter += 1;
+                                let (expanded_resources, expanded_module_calls) =
+                                    parse_for_expr(stmt, &ctx, &binding_name)?;
+                                resources.extend(expanded_resources);
+                                module_calls.extend(expanded_module_calls);
+                            }
+                            Rule::if_expr => {
+                                let binding_name = format!("_if{}", anon_if_counter);
+                                anon_if_counter += 1;
+                                let (_value, expanded_resources, expanded_module_calls, _import) =
+                                    parse_if_expr(stmt, &ctx, &binding_name)?;
+                                resources.extend(expanded_resources);
+                                module_calls.extend(expanded_module_calls);
                             }
                             Rule::let_binding => {
                                 let (line, _) = stmt.as_span().start_pos().line_col();
@@ -5300,5 +5318,93 @@ aws.s3.bucket {
             "Expected error about missing else clause, got: {}",
             err
         );
+    }
+
+    #[test]
+    fn parse_top_level_for_expression() {
+        let input = r#"
+            for az in ["ap-northeast-1a", "ap-northeast-1c"] {
+                awscc.ec2.subnet {
+                    availability_zone = az
+                }
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+        assert_eq!(result.resources.len(), 2);
+
+        // Each resource should have the loop variable substituted
+        assert_eq!(
+            result.resources[0].attributes.get("availability_zone"),
+            Some(&Value::String("ap-northeast-1a".to_string()))
+        );
+        assert_eq!(
+            result.resources[1].attributes.get("availability_zone"),
+            Some(&Value::String("ap-northeast-1c".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_top_level_if_expression() {
+        let input = r#"
+            let enabled = true
+            if enabled {
+                awscc.cloudwatch.alarm {
+                    alarm_name = "cpu-high"
+                }
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+        assert_eq!(result.resources.len(), 1);
+        assert_eq!(
+            result.resources[0].attributes.get("alarm_name"),
+            Some(&Value::String("cpu-high".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_top_level_multiple_for_no_collision() {
+        let input = r#"
+            for az in ["a", "b"] {
+                awscc.ec2.subnet {
+                    availability_zone = az
+                }
+            }
+            for name in ["web", "api"] {
+                awscc.ec2.security_group {
+                    group_name = name
+                }
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+        assert_eq!(result.resources.len(), 4);
+
+        // First for gets _for0, second gets _for1 - no collisions
+        let names: Vec<&str> = result
+            .resources
+            .iter()
+            .map(|r| r.id.name.as_str())
+            .collect();
+        assert_eq!(names[0], "_for0[0]");
+        assert_eq!(names[1], "_for0[1]");
+        assert_eq!(names[2], "_for1[0]");
+        assert_eq!(names[3], "_for1[1]");
+    }
+
+    #[test]
+    fn parse_top_level_if_false_no_resources() {
+        let input = r#"
+            let enabled = false
+            if enabled {
+                awscc.cloudwatch.alarm {
+                    alarm_name = "cpu-high"
+                }
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+        assert_eq!(result.resources.len(), 0);
     }
 }
