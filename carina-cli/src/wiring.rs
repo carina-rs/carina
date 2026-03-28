@@ -944,6 +944,113 @@ mod tests {
         );
     }
 
+    /// Verify that merge_default_tags prevents false diffs when default_tags are
+    /// configured in the provider block.
+    ///
+    /// When default_tags are set and state already contains those tags (from a
+    /// previous apply), the differ must not report a diff for the tags. This
+    /// requires merge_default_tags to be called so the desired resources include
+    /// the default tags before diffing.
+    ///
+    /// Both the plan path (wiring.rs) and the apply path (apply.rs) must call
+    /// merge_default_tags to maintain parity.
+    #[test]
+    fn test_merge_default_tags_prevents_false_diff() {
+        use carina_core::differ::create_plan;
+        use carina_core::resource::LifecycleConfig;
+        use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
+        // Build a minimal schema that has a "tags" attribute.
+        // merge_default_tags checks for the presence of "tags" in the schema.
+        let schema = ResourceSchema::new("awscc.s3.bucket").attribute(AttributeSchema::new(
+            "tags",
+            AttributeType::Map(Box::new(AttributeType::String)),
+        ));
+        let mut schemas: HashMap<String, ResourceSchema> = HashMap::new();
+        schemas.insert("awscc.s3.bucket".to_string(), schema);
+
+        // Desired resource without explicit tags
+        let resource = Resource::with_provider("awscc", "s3.bucket", "test-bucket");
+
+        // State already has the default tags (from a previous apply)
+        let id = resource.id.clone();
+        let mut state_attrs = HashMap::new();
+        let mut tags = HashMap::new();
+        tags.insert(
+            "Environment".to_string(),
+            Value::String("production".to_string()),
+        );
+        state_attrs.insert("tags".to_string(), Value::Map(tags));
+        let state = State::existing(id.clone(), state_attrs);
+        let mut current_states = HashMap::new();
+        current_states.insert(id.clone(), state);
+
+        let default_tags: HashMap<String, Value> = {
+            let mut m = HashMap::new();
+            m.insert(
+                "Environment".to_string(),
+                Value::String("production".to_string()),
+            );
+            m
+        };
+
+        // Simulate prev_desired_keys from a previous apply that included "tags"
+        // (because merge_default_tags was called correctly in the plan path).
+        let mut prev_desired_keys = HashMap::new();
+        prev_desired_keys.insert(resource.id.clone(), vec!["tags".to_string()]);
+
+        // Without merge_default_tags, the desired resource has no tags,
+        // but state has tags and prev_desired_keys says "tags" was previously desired.
+        // The differ sees this as attribute removal → false Update diff.
+        let resources_without = vec![resource.clone()];
+        let lifecycles: HashMap<ResourceId, LifecycleConfig> = HashMap::new();
+        let saved_attrs = HashMap::new();
+        let orphan_deps = HashMap::new();
+        let plan_without = create_plan(
+            &resources_without,
+            &current_states,
+            &lifecycles,
+            &schemas,
+            &saved_attrs,
+            &prev_desired_keys,
+            &orphan_deps,
+        );
+        assert!(
+            !plan_without.is_empty(),
+            "Without merge_default_tags, differ should see a false diff"
+        );
+
+        // After merge_default_tags, desired resource gains the default tags → no diff
+        let ctx = WiringContext::new();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("failed to build tokio runtime");
+        let mut router = ProviderRouter::new();
+        for factory in ctx.factories() {
+            let attrs = HashMap::new();
+            if let Some(normalizer) = rt.block_on(factory.create_normalizer(&attrs)) {
+                router.add_normalizer(normalizer);
+            }
+        }
+        let mut resources_with = vec![resource];
+        router.merge_default_tags(&mut resources_with, &default_tags, &schemas);
+
+        // After merging, desired now has tags matching state → no diff
+        let plan_with = create_plan(
+            &resources_with,
+            &current_states,
+            &lifecycles,
+            &schemas,
+            &saved_attrs,
+            &prev_desired_keys,
+            &orphan_deps,
+        );
+        assert!(
+            plan_with.is_empty(),
+            "After merge_default_tags, no false diff should occur"
+        );
+    }
+
     #[test]
     fn test_resolve_enum_aliases_non_enum_values_unchanged() {
         // Non-DSL-enum strings should not be affected
