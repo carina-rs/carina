@@ -204,6 +204,9 @@ fn deterministic_value_string(value: &Value) -> String {
             let arg_strs: Vec<String> = args.iter().map(deterministic_value_string).collect();
             format!("FunctionCall({}({}))", name, arg_strs.join(", "))
         }
+        Value::Secret(inner) => {
+            format!("Secret({})", deterministic_value_string(inner))
+        }
     }
 }
 

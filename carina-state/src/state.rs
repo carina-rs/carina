@@ -472,6 +472,15 @@ impl ResourceState {
         for (k, v) in &state.attributes {
             rs.attributes.insert(k.clone(), value_to_json(v)?);
         }
+        // For secret attributes, override the provider-returned plain value
+        // with the SHA256 hash. The provider returns the actual value (since
+        // secrets are unwrapped before sending), but state should only store
+        // the hash to avoid persisting sensitive data.
+        for (k, v) in &resource.attributes {
+            if let Value::Secret(_) = v {
+                rs.attributes.insert(k.clone(), value_to_json(v)?);
+            }
+        }
         if let Some(existing) = existing {
             rs.protected = existing.protected;
             rs.name_overrides = existing.name_overrides.clone();
@@ -1248,6 +1257,50 @@ mod tests {
         assert!(
             !json.contains("write_only_attributes"),
             "write_only_attributes should be omitted when empty"
+        );
+    }
+
+    #[test]
+    fn test_from_provider_state_secret_stored_as_hash() {
+        use carina_core::resource::{Resource, State as ProviderState, Value};
+        use carina_core::value::SECRET_PREFIX;
+
+        let mut resource = Resource::with_provider("awscc", "rds.db_instance", "my-db");
+        resource.attributes.insert(
+            "master_password".to_string(),
+            Value::Secret(Box::new(Value::String("my-password".to_string()))),
+        );
+
+        let provider_state = ProviderState {
+            id: resource.id.clone(),
+            identifier: Some("my-db-id".to_string()),
+            // Provider returns the actual password (since secret was unwrapped before sending)
+            attributes: [(
+                "master_password".to_string(),
+                Value::String("my-password".to_string()),
+            )]
+            .into_iter()
+            .collect(),
+            exists: true,
+        };
+
+        let rs = ResourceState::from_provider_state(&resource, &provider_state, None).unwrap();
+
+        // State should store the hash, not the plain password
+        let stored = rs
+            .attributes
+            .get("master_password")
+            .unwrap()
+            .as_str()
+            .unwrap();
+        assert!(
+            stored.starts_with(SECRET_PREFIX),
+            "Expected secret hash, got: {}",
+            stored
+        );
+        assert!(
+            !stored.contains("my-password"),
+            "State should not contain the plain password"
         );
     }
 }

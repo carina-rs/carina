@@ -928,6 +928,7 @@ fn is_static_value(value: &Value) -> bool {
         Value::Map(map) => map.values().all(is_static_value),
         Value::FunctionCall { args, .. } => args.iter().all(is_static_value),
         Value::ResourceRef { .. } | Value::Interpolation(_) => false,
+        Value::Secret(inner) => is_static_value(inner),
     }
 }
 

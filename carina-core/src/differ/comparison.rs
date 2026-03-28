@@ -4,6 +4,7 @@ use std::collections::HashMap;
 
 use crate::resource::{Value, merge_with_saved};
 use crate::schema::{AttributeType, ResourceSchema};
+use crate::value::{SECRET_PREFIX, value_to_json};
 
 /// Type-aware semantic comparison of two Values.
 ///
@@ -18,6 +19,15 @@ use crate::schema::{AttributeType, ResourceSchema};
 ///
 /// Without type information, falls back to `Value::semantically_equal()`.
 pub(super) fn type_aware_equal(a: &Value, b: &Value, attr_type: Option<&AttributeType>) -> bool {
+    // Secret comparison: compare the hash of the desired secret with the state hash string.
+    // State stores secrets as "_secret:sha256:<hex>", desired has Value::Secret(inner).
+    if let Value::Secret(inner) = a {
+        return secret_matches_state(inner, b);
+    }
+    if let Value::Secret(inner) = b {
+        return secret_matches_state(inner, a);
+    }
+
     match attr_type {
         None => a.semantically_equal(b),
         Some(at) => match (a, b, at) {
@@ -208,6 +218,29 @@ fn is_type_default(value: &Value, attr_type: Option<&AttributeType>) -> bool {
         (_, Some(AttributeType::Custom { base, .. })) => is_type_default(value, Some(base)),
         _ => false,
     }
+}
+
+/// Check if a secret's inner value matches a state hash string.
+///
+/// Hashes the inner value the same way `value_to_json` does for `Value::Secret`,
+/// then compares the resulting hash string with the state value.
+fn secret_matches_state(inner: &Value, state_value: &Value) -> bool {
+    let Value::String(state_str) = state_value else {
+        return false;
+    };
+    let Some(state_hash) = state_str.strip_prefix(SECRET_PREFIX) else {
+        return false;
+    };
+    // Compute the hash of the inner value
+    let Ok(inner_json) = value_to_json(inner) else {
+        return false;
+    };
+    let Ok(json_str) = serde_json::to_string(&inner_json) else {
+        return false;
+    };
+    use sha2::{Digest, Sha256};
+    let computed_hash = format!("{:x}", Sha256::digest(json_str.as_bytes()));
+    computed_hash == state_hash
 }
 
 /// Find changed attributes between desired and current state.

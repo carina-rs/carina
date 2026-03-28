@@ -667,6 +667,7 @@ fn builtin_function_completions_cover_all_functions() {
         "max",
         "min",
         "replace",
+        "secret",
         "split",
         "trim",
         "upper",

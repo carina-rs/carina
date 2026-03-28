@@ -178,6 +178,7 @@ fn format_value(value: &Value) -> String {
             let arg_strs: Vec<_> = args.iter().map(format_value).collect();
             format!("{}({})", name, arg_strs.join(", "))
         }
+        Value::Secret(_) => "(secret)".to_string(),
     }
 }
 

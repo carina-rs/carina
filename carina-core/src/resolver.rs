@@ -179,6 +179,10 @@ pub fn resolve_ref_value(
                 }
             }
         }
+        Value::Secret(inner) => {
+            let resolved_inner = resolve_ref_value(inner, binding_map);
+            Value::Secret(Box::new(resolved_inner))
+        }
         _ => value.clone(),
     }
 }
@@ -194,6 +198,7 @@ fn contains_resource_ref(value: &Value) -> bool {
             _ => false,
         }),
         Value::FunctionCall { args, .. } => args.iter().any(contains_resource_ref),
+        Value::Secret(inner) => contains_resource_ref(inner),
         _ => false,
     }
 }
@@ -205,6 +210,7 @@ fn value_to_string(value: &Value) -> String {
         Value::Int(n) => n.to_string(),
         Value::Float(f) => f.to_string(),
         Value::Bool(b) => b.to_string(),
+        Value::Secret(inner) => value_to_string(inner),
         _ => crate::value::format_value(value),
     }
 }

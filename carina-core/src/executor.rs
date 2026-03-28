@@ -300,20 +300,23 @@ async fn refresh_pending_states(
 }
 
 /// Resolve a resource's attributes using the current binding map.
+/// Secret values are unwrapped so the provider receives the plain inner value.
 fn resolve_resource(
     resource: &Resource,
     binding_map: &HashMap<String, HashMap<String, Value>>,
 ) -> Resource {
     let mut resolved = resource.clone();
     for (key, value) in &resource.attributes {
+        let resolved_value = resolve_ref_value(value, binding_map);
         resolved
             .attributes
-            .insert(key.clone(), resolve_ref_value(value, binding_map));
+            .insert(key.clone(), unwrap_secret(resolved_value));
     }
     resolved
 }
 
 /// Resolve a resource, preferring unresolved source for re-resolution.
+/// Secret values are unwrapped so the provider receives the plain inner value.
 fn resolve_resource_with_source(
     target: &Resource,
     source: &Resource,
@@ -321,11 +324,27 @@ fn resolve_resource_with_source(
 ) -> Resource {
     let mut resolved = target.clone();
     for (key, value) in &source.attributes {
+        let resolved_value = resolve_ref_value(value, binding_map);
         resolved
             .attributes
-            .insert(key.clone(), resolve_ref_value(value, binding_map));
+            .insert(key.clone(), unwrap_secret(resolved_value));
     }
     resolved
+}
+
+/// Recursively unwrap `Value::Secret(inner)` to just the inner value.
+/// This ensures the provider never sees the Secret wrapper.
+fn unwrap_secret(value: Value) -> Value {
+    match value {
+        Value::Secret(inner) => unwrap_secret(*inner),
+        Value::List(items) => Value::List(items.into_iter().map(unwrap_secret).collect()),
+        Value::Map(map) => Value::Map(
+            map.into_iter()
+                .map(|(k, v)| (k, unwrap_secret(v)))
+                .collect(),
+        ),
+        other => other,
+    }
 }
 
 /// Update the binding map with a newly created/updated resource's state.
