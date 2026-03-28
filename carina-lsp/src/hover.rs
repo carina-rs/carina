@@ -863,6 +863,7 @@ awscc.ec2.vpc_gateway_attachment {
             "max",
             "min",
             "replace",
+            "secret",
             "split",
             "trim",
             "upper",
