@@ -1708,9 +1708,20 @@ fn evaluate_user_function_as_resource(
 ) -> Result<Resource, ParseError> {
     let (mut child_ctx, substitutions) = prepare_user_function_call(func, args, ctx)?;
 
-    // Register substituted values in the child context so resource body can reference them
+    // Register substituted values in the child context so resource body can reference them.
+    // For parameters that point to resource bindings (value = "${binding_name}"),
+    // also register the param name as a resource binding so that field access works.
+    // Track the mapping from param names to original binding names for ResourceRef fixup.
+    let mut param_to_binding: HashMap<String, String> = HashMap::new();
     for (param_name, value) in &substitutions {
         child_ctx.set_variable(param_name.clone(), value.clone());
+        if let Value::String(s) = value
+            && let Some(ref_name) = s.strip_prefix("${").and_then(|s| s.strip_suffix('}'))
+            && let Some(resource) = ctx.resource_bindings.get(ref_name)
+        {
+            child_ctx.set_resource_binding(param_name.clone(), resource.clone());
+            param_to_binding.insert(param_name.clone(), ref_name.to_string());
+        }
     }
 
     match &func.body {
@@ -1725,12 +1736,50 @@ fn evaluate_user_function_as_resource(
                 context: "fn resource evaluation".to_string(),
             })?;
 
-            parse_resource_expr(resource_pair, &child_ctx, binding_name)
+            let mut resource = parse_resource_expr(resource_pair, &child_ctx, binding_name)?;
+
+            // Fix up ResourceRef binding names: replace fn parameter names with
+            // the actual outer binding names they refer to
+            if !param_to_binding.is_empty() {
+                for value in resource.attributes.values_mut() {
+                    remap_resource_refs(value, &param_to_binding);
+                }
+            }
+
+            Ok(resource)
         }
         UserFunctionBody::Value(_) => Err(ParseError::UserFunctionError(format!(
             "function '{}' returns a value, not a resource",
             func.name
         ))),
+    }
+}
+
+/// Recursively remap ResourceRef binding names from fn parameter names to
+/// the actual outer binding names they refer to.
+fn remap_resource_refs(value: &mut Value, param_to_binding: &HashMap<String, String>) {
+    match value {
+        Value::ResourceRef { binding_name, .. } => {
+            if let Some(actual_name) = param_to_binding.get(binding_name) {
+                *binding_name = actual_name.clone();
+            }
+        }
+        Value::List(items) => {
+            for item in items {
+                remap_resource_refs(item, param_to_binding);
+            }
+        }
+        Value::Map(map) => {
+            for v in map.values_mut() {
+                remap_resource_refs(v, param_to_binding);
+            }
+        }
+        Value::FunctionCall { args, .. } => {
+            for arg in args {
+                remap_resource_refs(arg, param_to_binding);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -6690,5 +6739,82 @@ aws.s3.bucket {
             resource.attributes.get("name"),
             Some(&Value::String("anon-bucket".to_string())),
         );
+    }
+
+    #[test]
+    fn user_fn_resource_with_resource_ref_param() {
+        let input = r#"
+            fn make_subnet(vpc, cidr) {
+                awscc.ec2.subnet {
+                    vpc_id     = vpc.vpc_id
+                    cidr_block = cidr
+                }
+            }
+
+            let vpc = awscc.ec2.vpc {
+                cidr_block = "10.0.0.0/16"
+            }
+
+            let subnet_a = make_subnet(vpc, "10.0.1.0/24")
+        "#;
+
+        let result = parse(input).unwrap();
+        assert_eq!(result.resources.len(), 2);
+
+        let subnet = &result.resources[1];
+        assert_eq!(subnet.id.name, "subnet_a");
+        assert_eq!(subnet.id.resource_type, "ec2.subnet");
+        // vpc.vpc_id should be a ResourceRef
+        match subnet.attributes.get("vpc_id") {
+            Some(Value::ResourceRef {
+                binding_name,
+                attribute_name,
+                ..
+            }) => {
+                assert_eq!(binding_name, "vpc");
+                assert_eq!(attribute_name, "vpc_id");
+            }
+            other => panic!("Expected ResourceRef for vpc_id, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn user_fn_resource_with_renamed_resource_ref_param() {
+        // When fn param name differs from the outer binding name,
+        // the resource ref should use the param name in the fn body
+        let input = r#"
+            fn make_subnet(v, cidr) {
+                awscc.ec2.subnet {
+                    vpc_id     = v.vpc_id
+                    cidr_block = cidr
+                }
+            }
+
+            let my_vpc = awscc.ec2.vpc {
+                cidr_block = "10.0.0.0/16"
+            }
+
+            let subnet_a = make_subnet(my_vpc, "10.0.1.0/24")
+        "#;
+
+        let result = parse(input).unwrap();
+        assert_eq!(result.resources.len(), 2);
+
+        let subnet = &result.resources[1];
+        assert_eq!(subnet.id.name, "subnet_a");
+        // v.vpc_id should be resolved to my_vpc.vpc_id via forward reference resolution
+        // or kept as a resource ref pointing to my_vpc
+        match subnet.attributes.get("vpc_id") {
+            Some(Value::ResourceRef {
+                binding_name,
+                attribute_name,
+                ..
+            }) => {
+                // The reference should point to the actual resource (my_vpc)
+                assert_eq!(binding_name, "my_vpc");
+                assert_eq!(attribute_name, "vpc_id");
+            }
+            other => panic!("Expected ResourceRef for vpc_id, got: {:?}", other),
+        }
     }
 }
