@@ -89,6 +89,14 @@ impl CompletionProvider {
                 ..Default::default()
             },
             CompletionItem {
+                label: "fn".to_string(),
+                kind: Some(CompletionItemKind::KEYWORD),
+                insert_text: Some("fn ${1:name}(${2:params}) {\n    ${3:body}\n}".to_string()),
+                insert_text_format: Some(InsertTextFormat::SNIPPET),
+                detail: Some("Define a pure function".to_string()),
+                ..Default::default()
+            },
+            CompletionItem {
                 label: "let import".to_string(),
                 kind: Some(CompletionItemKind::KEYWORD),
                 insert_text: Some("let ${1:module_name} = import \"${2:./modules/name}\"".to_string()),

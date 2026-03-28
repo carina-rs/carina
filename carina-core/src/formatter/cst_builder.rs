@@ -139,6 +139,13 @@ impl<'a> CstBuilder<'a> {
             Rule::read_resource_expr => Some(CstChild::Node(
                 self.build_node(NodeKind::ReadResourceExpr, pair),
             )),
+            Rule::fn_def => Some(CstChild::Node(self.build_node(NodeKind::FnDef, pair))),
+            Rule::fn_param => Some(CstChild::Node(self.build_node(NodeKind::FnParam, pair))),
+            Rule::fn_local_let => Some(CstChild::Node(
+                self.build_node(NodeKind::LocalBinding, pair),
+            )),
+            Rule::fn_body_content => None,   // Silent rule
+            Rule::fn_params_content => None, // Silent rule
             Rule::for_expr => Some(CstChild::Node(self.build_node(NodeKind::ForExpr, pair))),
             Rule::if_expr => Some(CstChild::Node(self.build_node(NodeKind::IfExpr, pair))),
             Rule::else_clause => Some(CstChild::Node(self.build_node(NodeKind::ElseClause, pair))),
@@ -238,6 +245,7 @@ impl<'a> CstBuilder<'a> {
             Rule::kw_if => Some(CstChild::Token(Token::new("if".to_string(), span))),
             Rule::kw_else => Some(CstChild::Token(Token::new("else".to_string(), span))),
             Rule::kw_read => Some(CstChild::Token(Token::new("read".to_string(), span))),
+            Rule::kw_fn => Some(CstChild::Token(Token::new("fn".to_string(), span))),
             Rule::kw_removed => Some(CstChild::Token(Token::new("removed".to_string(), span))),
             Rule::kw_moved => Some(CstChild::Token(Token::new("moved".to_string(), span))),
             Rule::kw_to => Some(CstChild::Token(Token::new("to".to_string(), span))),

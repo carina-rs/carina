@@ -11,7 +11,7 @@ ws = @{ (" " | "\t")+ }
 newline = @{ NEWLINE }
 comment = @{ "#" ~ (!NEWLINE ~ ANY)* }
 
-statement = { backend_block | provider_block | arguments_block | attributes_block | import_state_block | removed_block | moved_block | if_expr | for_expr | let_binding | module_call | anonymous_resource }
+statement = { backend_block | provider_block | arguments_block | attributes_block | import_state_block | removed_block | moved_block | if_expr | for_expr | fn_def | let_binding | module_call | anonymous_resource }
 
 // Backend block: backend s3 { ... }
 backend_block = {
@@ -113,6 +113,15 @@ moved_block = {
 moved_content = _{ trivia | moved_from_attr | moved_to_attr }
 moved_from_attr = { kw_from ~ trivia* ~ equals ~ trivia* ~ resource_address }
 moved_to_attr = { kw_to ~ trivia* ~ equals ~ trivia* ~ resource_address }
+
+// User-defined function: fn name(params) { body }
+fn_def = {
+    kw_fn ~ trivia+ ~ identifier ~ trivia* ~ open_paren ~ fn_params_content* ~ close_paren ~ trivia* ~ open_brace ~ fn_body_content* ~ close_brace
+}
+fn_params_content = _{ trivia | comma | fn_param }
+fn_param = { identifier ~ (trivia* ~ equals ~ trivia* ~ expression)? }
+fn_body_content = _{ trivia | fn_local_let | expression }
+fn_local_let = { kw_let ~ trivia+ ~ identifier ~ trivia* ~ equals ~ trivia* ~ expression }
 
 // Variable/resource definition: let name = value
 let_binding = {
@@ -273,6 +282,7 @@ kw_in = { "in" }
 kw_if = { "if" }
 kw_else = { "else" }
 kw_read = { "read" }
+kw_fn = { "fn" }
 kw_removed = { "removed" }
 kw_moved = { "moved" }
 kw_to = { "to" }

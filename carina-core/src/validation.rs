@@ -337,6 +337,7 @@ mod tests {
             attribute_params: Vec::new(),
             backend: None,
             state_blocks: Vec::new(),
+            user_functions: HashMap::new(),
         }
     }
 

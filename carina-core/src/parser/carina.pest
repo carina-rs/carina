@@ -3,7 +3,14 @@
 // Entry point
 file = { SOI ~ statement* ~ EOI }
 
-statement = { backend_block | provider_block | arguments_block | attributes_block | import_state_block | removed_block | moved_block | if_expr | for_expr | let_binding | module_call | anonymous_resource }
+statement = { backend_block | provider_block | arguments_block | attributes_block | import_state_block | removed_block | moved_block | if_expr | for_expr | fn_def | let_binding | module_call | anonymous_resource }
+
+// User-defined function: fn name(params) { body }
+fn_def = { "fn" ~ identifier ~ "(" ~ fn_params? ~ ")" ~ "{" ~ fn_body ~ "}" }
+fn_params = { fn_param ~ ("," ~ fn_param)* }
+fn_param = { identifier ~ ("=" ~ expression)? }
+fn_body = { fn_local_let* ~ expression }
+fn_local_let = { "let" ~ identifier ~ "=" ~ expression }
 
 // Arguments block: arguments { vpc_id: string, ... }
 arguments_block = {

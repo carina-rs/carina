@@ -37,6 +37,12 @@ pub enum ParseError {
 
     #[error("Internal parser error: expected {expected} in {context}")]
     InternalError { expected: String, context: String },
+
+    #[error("Recursive function call detected: {0}")]
+    RecursiveFunction(String),
+
+    #[error("User-defined function error: {0}")]
+    UserFunctionError(String),
 }
 
 /// Resource type path for typed references (e.g., aws.vpc, aws.security_group)
@@ -155,6 +161,24 @@ pub struct ImportStatement {
     pub alias: String,
 }
 
+/// Parameter for a user-defined function
+#[derive(Debug, Clone)]
+pub struct FnParam {
+    pub name: String,
+    pub default: Option<Value>,
+}
+
+/// User-defined pure function
+#[derive(Debug, Clone)]
+pub struct UserFunction {
+    pub name: String,
+    pub params: Vec<FnParam>,
+    /// Local let bindings inside the function body (name, expression)
+    pub local_lets: Vec<(String, Value)>,
+    /// The body expression (the final expression in the fn block)
+    pub body: Value,
+}
+
 /// Module call (instantiation)
 #[derive(Debug, Clone)]
 pub struct ModuleCall {
@@ -201,6 +225,8 @@ pub struct ParsedFile {
     pub backend: Option<BackendConfig>,
     /// State manipulation blocks (import, removed, moved)
     pub state_blocks: Vec<StateBlock>,
+    /// User-defined pure functions
+    pub user_functions: HashMap<String, UserFunction>,
 }
 
 impl ParsedFile {
@@ -226,6 +252,10 @@ struct ParseContext {
     resource_bindings: HashMap<String, Resource>,
     /// Imported modules (alias -> path)
     imported_modules: HashMap<String, String>,
+    /// User-defined functions
+    user_functions: HashMap<String, UserFunction>,
+    /// Functions currently being evaluated (for recursion detection)
+    evaluating_functions: Vec<String>,
 }
 
 impl ParseContext {
@@ -234,6 +264,8 @@ impl ParseContext {
             variables: HashMap::new(),
             resource_bindings: HashMap::new(),
             imported_modules: HashMap::new(),
+            user_functions: HashMap::new(),
+            evaluating_functions: Vec::new(),
         }
     }
 
@@ -356,6 +388,26 @@ pub fn parse(input: &str) -> Result<ParsedFile, ParseError> {
                                 resources.extend(expanded_resources);
                                 module_calls.extend(expanded_module_calls);
                             }
+                            Rule::fn_def => {
+                                let user_fn = parse_fn_def(stmt, &ctx)?;
+                                let fn_name = user_fn.name.clone();
+                                // Check for shadowing builtins
+                                if crate::builtins::evaluate_builtin(&fn_name, &[]).is_ok()
+                                    || crate::builtins::builtin_functions()
+                                        .iter()
+                                        .any(|f| f.name == fn_name)
+                                {
+                                    return Err(ParseError::UserFunctionError(format!(
+                                        "function '{fn_name}' shadows a built-in function"
+                                    )));
+                                }
+                                if ctx.user_functions.contains_key(&fn_name) {
+                                    return Err(ParseError::UserFunctionError(format!(
+                                        "duplicate function definition: '{fn_name}'"
+                                    )));
+                                }
+                                ctx.user_functions.insert(fn_name, user_fn);
+                            }
                             Rule::let_binding => {
                                 let (line, _) = stmt.as_span().start_pos().line_col();
                                 let (
@@ -435,6 +487,7 @@ pub fn parse(input: &str) -> Result<ParsedFile, ParseError> {
         attribute_params,
         backend,
         state_blocks,
+        user_functions: ctx.user_functions,
     })
 }
 
@@ -1407,6 +1460,277 @@ fn parse_moved_block(pair: pest::iterators::Pair<Rule>) -> Result<StateBlock, Pa
     Ok(StateBlock::Moved { from, to })
 }
 
+/// Parse a user-defined function definition
+fn parse_fn_def(
+    pair: pest::iterators::Pair<Rule>,
+    _ctx: &ParseContext,
+) -> Result<UserFunction, ParseError> {
+    let mut inner = pair.into_inner();
+    let name = next_pair(&mut inner, "function name", "fn_def")?
+        .as_str()
+        .to_string();
+
+    // Parse parameters (optional)
+    let mut params = Vec::new();
+    let next = next_pair(&mut inner, "fn_params or fn_body", "fn_def")?;
+    let body_pair = if next.as_rule() == Rule::fn_params {
+        // Parse parameter list
+        for param_pair in next.into_inner() {
+            if param_pair.as_rule() == Rule::fn_param {
+                let mut param_inner = param_pair.into_inner();
+                let param_name = next_pair(&mut param_inner, "parameter name", "fn_param")?
+                    .as_str()
+                    .to_string();
+                let default = if let Some(default_expr) = param_inner.next() {
+                    // Create a minimal context with no bindings for default expressions
+                    let default_ctx = ParseContext::new();
+                    Some(parse_expression(default_expr, &default_ctx)?)
+                } else {
+                    None
+                };
+                // Validate: required params must come before optional params
+                if default.is_none() && params.iter().any(|p: &FnParam| p.default.is_some()) {
+                    return Err(ParseError::UserFunctionError(format!(
+                        "in function '{name}': required parameter '{param_name}' cannot follow optional parameter"
+                    )));
+                }
+                params.push(FnParam {
+                    name: param_name,
+                    default,
+                });
+            }
+        }
+        next_pair(&mut inner, "fn_body", "fn_def")?
+    } else {
+        next
+    };
+
+    // Parse body: fn_local_let* ~ expression
+    let mut local_lets = Vec::new();
+    let mut body_expr = None;
+
+    // Create a context where parameters are registered as variables
+    // so that param references in the body are resolved as variable refs
+    let mut body_ctx = ParseContext::new();
+    for p in &params {
+        body_ctx.set_variable(
+            p.name.clone(),
+            Value::String(format!("__fn_param_{}", p.name)),
+        );
+    }
+
+    for body_inner in body_pair.into_inner() {
+        match body_inner.as_rule() {
+            Rule::fn_local_let => {
+                let mut let_inner = body_inner.into_inner();
+                let let_name = next_pair(&mut let_inner, "let name", "fn_local_let")?
+                    .as_str()
+                    .to_string();
+                let let_expr = parse_expression(
+                    next_pair(&mut let_inner, "let expression", "fn_local_let")?,
+                    &body_ctx,
+                )?;
+                body_ctx.set_variable(
+                    let_name.clone(),
+                    Value::String(format!("__fn_local_{let_name}")),
+                );
+                local_lets.push((let_name, let_expr));
+            }
+            _ => {
+                // This should be the expression (the body)
+                body_expr = Some(parse_expression(body_inner, &body_ctx)?);
+            }
+        }
+    }
+
+    let body = body_expr.ok_or_else(|| ParseError::InternalError {
+        expected: "body expression".to_string(),
+        context: "fn_def".to_string(),
+    })?;
+
+    Ok(UserFunction {
+        name,
+        params,
+        local_lets,
+        body,
+    })
+}
+
+/// Evaluate a user-defined function call by substituting arguments into the body
+fn evaluate_user_function(
+    func: &UserFunction,
+    args: &[Value],
+    ctx: &ParseContext,
+) -> Result<Value, ParseError> {
+    let fn_name = &func.name;
+
+    // Check recursion
+    if ctx.evaluating_functions.contains(fn_name) {
+        return Err(ParseError::RecursiveFunction(fn_name.clone()));
+    }
+
+    // Validate argument count
+    let required_count = func.params.iter().filter(|p| p.default.is_none()).count();
+    let max_count = func.params.len();
+    if args.len() < required_count {
+        return Err(ParseError::UserFunctionError(format!(
+            "function '{fn_name}' expects at least {required_count} argument(s), got {}",
+            args.len()
+        )));
+    }
+    if args.len() > max_count {
+        return Err(ParseError::UserFunctionError(format!(
+            "function '{fn_name}' expects at most {max_count} argument(s), got {}",
+            args.len()
+        )));
+    }
+
+    // Build substitution map: param_name -> value
+    let mut substitutions: HashMap<String, Value> = HashMap::new();
+    for (i, param) in func.params.iter().enumerate() {
+        let value = if i < args.len() {
+            args[i].clone()
+        } else {
+            param.default.clone().unwrap()
+        };
+        substitutions.insert(param.name.clone(), value);
+    }
+
+    // Create a child context with recursion tracking
+    let mut child_ctx = ctx.clone();
+    child_ctx.evaluating_functions.push(fn_name.clone());
+
+    // Evaluate local lets, substituting and resolving each one
+    for (let_name, let_expr) in &func.local_lets {
+        let substituted = substitute_fn_params(let_expr, &substitutions);
+        let evaluated = try_evaluate_fn_value(substituted, &child_ctx)?;
+        substitutions.insert(let_name.clone(), evaluated);
+    }
+
+    // Substitute params into body and evaluate
+    let substituted_body = substitute_fn_params(&func.body, &substitutions);
+    try_evaluate_fn_value(substituted_body, &child_ctx)
+}
+
+/// Recursively substitute function parameter placeholders with actual values
+fn substitute_fn_params(value: &Value, substitutions: &HashMap<String, Value>) -> Value {
+    match value {
+        Value::String(s) => {
+            // Check if this is a parameter placeholder
+            if let Some(param_name) = s.strip_prefix("__fn_param_")
+                && let Some(sub) = substitutions.get(param_name)
+            {
+                return sub.clone();
+            }
+            if let Some(local_name) = s.strip_prefix("__fn_local_")
+                && let Some(sub) = substitutions.get(local_name)
+            {
+                return sub.clone();
+            }
+            Value::String(s.clone())
+        }
+        Value::List(items) => Value::List(
+            items
+                .iter()
+                .map(|v| substitute_fn_params(v, substitutions))
+                .collect(),
+        ),
+        Value::Map(map) => Value::Map(
+            map.iter()
+                .map(|(k, v)| (k.clone(), substitute_fn_params(v, substitutions)))
+                .collect(),
+        ),
+        Value::FunctionCall { name, args } => Value::FunctionCall {
+            name: name.clone(),
+            args: args
+                .iter()
+                .map(|a| substitute_fn_params(a, substitutions))
+                .collect(),
+        },
+        Value::Interpolation(parts) => Value::Interpolation(
+            parts
+                .iter()
+                .map(|p| match p {
+                    crate::resource::InterpolationPart::Expr(v) => {
+                        crate::resource::InterpolationPart::Expr(substitute_fn_params(
+                            v,
+                            substitutions,
+                        ))
+                    }
+                    other => other.clone(),
+                })
+                .collect(),
+        ),
+        Value::Secret(inner) => Value::Secret(Box::new(substitute_fn_params(inner, substitutions))),
+        other => other.clone(),
+    }
+}
+
+/// Try to evaluate a value (resolve function calls including user-defined ones)
+fn try_evaluate_fn_value(value: Value, ctx: &ParseContext) -> Result<Value, ParseError> {
+    match value {
+        Value::FunctionCall { ref name, ref args } => {
+            // First, recursively evaluate arguments
+            let evaluated_args: Result<Vec<Value>, ParseError> = args
+                .iter()
+                .map(|a| try_evaluate_fn_value(a.clone(), ctx))
+                .collect();
+            let evaluated_args = evaluated_args?;
+
+            // Try built-in first
+            match crate::builtins::evaluate_builtin(name, &evaluated_args) {
+                Ok(result) => Ok(result),
+                Err(_builtin_err) => {
+                    // Try user-defined function
+                    if let Some(user_fn) = ctx.user_functions.get(name) {
+                        evaluate_user_function(user_fn, &evaluated_args, ctx)
+                    } else {
+                        // Keep as FunctionCall (may contain unresolved refs)
+                        if evaluated_args.iter().all(is_static_value) {
+                            Err(ParseError::InvalidExpression {
+                                line: 0,
+                                message: format!("Unknown function: {name}"),
+                            })
+                        } else {
+                            Ok(Value::FunctionCall {
+                                name: name.clone(),
+                                args: evaluated_args,
+                            })
+                        }
+                    }
+                }
+            }
+        }
+        Value::List(items) => {
+            let evaluated: Result<Vec<Value>, ParseError> = items
+                .into_iter()
+                .map(|v| try_evaluate_fn_value(v, ctx))
+                .collect();
+            Ok(Value::List(evaluated?))
+        }
+        Value::Map(map) => {
+            let evaluated: Result<HashMap<String, Value>, ParseError> = map
+                .into_iter()
+                .map(|(k, v)| try_evaluate_fn_value(v, ctx).map(|ev| (k, ev)))
+                .collect();
+            Ok(Value::Map(evaluated?))
+        }
+        Value::Interpolation(parts) => {
+            let evaluated: Result<Vec<crate::resource::InterpolationPart>, ParseError> = parts
+                .into_iter()
+                .map(|p| match p {
+                    crate::resource::InterpolationPart::Expr(v) => {
+                        try_evaluate_fn_value(v, ctx).map(crate::resource::InterpolationPart::Expr)
+                    }
+                    other => Ok(other),
+                })
+                .collect();
+            Ok(Value::Interpolation(evaluated?))
+        }
+        other => Ok(other),
+    }
+}
+
 fn parse_backend_block(
     pair: pest::iterators::Pair<Rule>,
     ctx: &ParseContext,
@@ -1704,10 +2028,16 @@ fn parse_pipe_expr(
         let mut args = extra_args;
         args.push(value);
 
-        value = Value::FunctionCall {
-            name: func_name,
-            args,
-        };
+        // Try to eagerly evaluate user-defined function calls
+        if ctx.user_functions.contains_key(&func_name) && args.iter().all(is_static_value) {
+            let user_fn = ctx.user_functions.get(&func_name).unwrap().clone();
+            value = evaluate_user_function(&user_fn, &args, ctx)?;
+        } else {
+            value = Value::FunctionCall {
+                name: func_name,
+                args,
+            };
+        }
     }
 
     Ok(value)
@@ -1850,9 +2180,17 @@ fn parse_primary_value(
                 .to_string();
             let args: Result<Vec<Value>, ParseError> =
                 fc_inner.map(|arg| parse_expression(arg, ctx)).collect();
+            let args = args?;
+
+            // Try to eagerly evaluate user-defined function calls
+            if ctx.user_functions.contains_key(&func_name) && args.iter().all(is_static_value) {
+                let user_fn = ctx.user_functions.get(&func_name).unwrap().clone();
+                return evaluate_user_function(&user_fn, &args, ctx);
+            }
+
             Ok(Value::FunctionCall {
                 name: func_name,
-                args: args?,
+                args,
             })
         }
         Rule::variable_ref => {
@@ -5757,5 +6095,342 @@ aws.s3.bucket {
             resource.attributes.get("name"),
             Some(&Value::String("a-b-c".to_string())),
         );
+    }
+
+    // --- User-defined function tests ---
+
+    #[test]
+    fn user_fn_simple_call() {
+        let input = r#"
+            fn greet(name) {
+                join(" ", ["hello", name])
+            }
+
+            let vpc = aws.s3_bucket {
+                name = greet("world")
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+        assert_eq!(result.resources.len(), 1);
+        assert_eq!(
+            result.resources[0].attributes.get("name"),
+            Some(&Value::String("hello world".to_string())),
+        );
+    }
+
+    #[test]
+    fn user_fn_with_default_param() {
+        let input = r#"
+            fn tag(env, suffix = "default") {
+                join("-", [env, suffix])
+            }
+
+            let a = aws.s3_bucket {
+                name = tag("prod")
+            }
+
+            let b = aws.s3_bucket {
+                name = tag("prod", "web")
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+        assert_eq!(
+            result.resources[0].attributes.get("name"),
+            Some(&Value::String("prod-default".to_string())),
+        );
+        assert_eq!(
+            result.resources[1].attributes.get("name"),
+            Some(&Value::String("prod-web".to_string())),
+        );
+    }
+
+    #[test]
+    fn user_fn_with_local_let() {
+        let input = r#"
+            fn subnet_name(env, az) {
+                let prefix = join("-", [env, "subnet"])
+                join("-", [prefix, az])
+            }
+
+            let vpc = aws.s3_bucket {
+                name = subnet_name("prod", "a")
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+        assert_eq!(
+            result.resources[0].attributes.get("name"),
+            Some(&Value::String("prod-subnet-a".to_string())),
+        );
+    }
+
+    #[test]
+    fn user_fn_calling_builtin() {
+        let input = r#"
+            fn upper_name(name) {
+                upper(name)
+            }
+
+            let vpc = aws.s3_bucket {
+                name = upper_name("hello")
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+        assert_eq!(
+            result.resources[0].attributes.get("name"),
+            Some(&Value::String("HELLO".to_string())),
+        );
+    }
+
+    #[test]
+    fn user_fn_calling_another_fn() {
+        let input = r#"
+            fn prefix(env) {
+                join("-", [env, "app"])
+            }
+
+            fn full_name(env, service) {
+                join("-", [prefix(env), service])
+            }
+
+            let vpc = aws.s3_bucket {
+                name = full_name("prod", "web")
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+        assert_eq!(
+            result.resources[0].attributes.get("name"),
+            Some(&Value::String("prod-app-web".to_string())),
+        );
+    }
+
+    #[test]
+    fn user_fn_recursive_call_errors() {
+        let input = r#"
+            fn recurse(x) {
+                recurse(x)
+            }
+
+            let vpc = aws.s3_bucket {
+                name = recurse("hello")
+            }
+        "#;
+
+        let result = parse(input);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("Recursive function call"),
+            "Expected recursive function error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn user_fn_missing_required_arg_errors() {
+        let input = r#"
+            fn greet(name, title) {
+                join(" ", [title, name])
+            }
+
+            let vpc = aws.s3_bucket {
+                name = greet("world")
+            }
+        "#;
+
+        let result = parse(input);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("expects at least 2"),
+            "Expected missing arg error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn user_fn_too_many_args_errors() {
+        let input = r#"
+            fn greet(name) {
+                join(" ", ["hello", name])
+            }
+
+            let vpc = aws.s3_bucket {
+                name = greet("world", "extra")
+            }
+        "#;
+
+        let result = parse(input);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("expects at most 1"),
+            "Expected too many args error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn user_fn_shadows_builtin_errors() {
+        let input = r#"
+            fn join(sep, items) {
+                sep
+            }
+        "#;
+
+        let result = parse(input);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("shadows a built-in function"),
+            "Expected shadow error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn user_fn_duplicate_definition_errors() {
+        let input = r#"
+            fn greet(name) {
+                name
+            }
+
+            fn greet(x) {
+                x
+            }
+        "#;
+
+        let result = parse(input);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("duplicate function definition"),
+            "Expected duplicate error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn user_fn_stored_in_parsed_file() {
+        let input = r#"
+            fn greet(name) {
+                join(" ", ["hello", name])
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+        assert!(result.user_functions.contains_key("greet"));
+        let func = &result.user_functions["greet"];
+        assert_eq!(func.name, "greet");
+        assert_eq!(func.params.len(), 1);
+        assert_eq!(func.params[0].name, "name");
+    }
+
+    #[test]
+    fn user_fn_no_params() {
+        let input = r#"
+            fn hello() {
+                "hello"
+            }
+
+            let vpc = aws.s3_bucket {
+                name = hello()
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+        assert_eq!(
+            result.resources[0].attributes.get("name"),
+            Some(&Value::String("hello".to_string())),
+        );
+    }
+
+    #[test]
+    fn user_fn_indirect_recursion_errors() {
+        let input = r#"
+            fn foo(x) {
+                bar(x)
+            }
+
+            fn bar(x) {
+                foo(x)
+            }
+
+            let vpc = aws.s3_bucket {
+                name = foo("hello")
+            }
+        "#;
+
+        let result = parse(input);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("Recursive function call"),
+            "Expected recursive function error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn user_fn_required_param_after_optional_errors() {
+        let input = r#"
+            fn bad(a = "x", b) {
+                join("-", [a, b])
+            }
+        "#;
+
+        let result = parse(input);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("required parameter") && err.contains("cannot follow optional"),
+            "Expected param ordering error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn user_fn_with_pipe_operator() {
+        let input = r#"
+            fn wrap(prefix, val) {
+                join("-", [prefix, val])
+            }
+
+            let vpc = aws.s3_bucket {
+                name = "world" |> wrap("hello")
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+        assert_eq!(
+            result.resources[0].attributes.get("name"),
+            Some(&Value::String("hello-world".to_string())),
+        );
+    }
+
+    #[test]
+    fn user_fn_with_string_interpolation() {
+        let input = r#"
+            fn greet(name) {
+                join(" ", ["hello", name])
+            }
+
+            let vpc = aws.s3_bucket {
+                name = "${greet("world")}-suffix"
+            }
+        "#;
+
+        // At parse time, fn is evaluated but interpolation is not fully resolved
+        let result = parse(input).unwrap();
+        let name = result.resources[0].attributes.get("name").unwrap();
+        match name {
+            Value::Interpolation(parts) => {
+                // The greet() call is evaluated to "hello world"
+                assert_eq!(parts.len(), 2);
+                assert_eq!(
+                    parts[0],
+                    InterpolationPart::Expr(Value::String("hello world".to_string()))
+                );
+                assert_eq!(parts[1], InterpolationPart::Literal("-suffix".to_string()));
+            }
+            _ => panic!("Expected Interpolation, got: {:?}", name),
+        }
     }
 }
