@@ -34,6 +34,7 @@ awscc.ec2.security_group_egress {
 
 - **Type:** Ipv4Cidr
 - **Required:** No
+- **Create-only:** Yes
 
 The IPv4 address range, in CIDR format. You must specify exactly one of the following: ``CidrIp``, ``CidrIpv6``, ``DestinationPrefixListId``, or ``DestinationSecurityGroupId``. For examples of rules that you can add to security groups for specific access scenarios, see [Security group rules for different use cases](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/security-group-rules-reference.html) in the *User Guide*.
 
@@ -41,6 +42,7 @@ The IPv4 address range, in CIDR format. You must specify exactly one of the foll
 
 - **Type:** Ipv6Cidr
 - **Required:** No
+- **Create-only:** Yes
 
 The IPv6 address range, in CIDR format. You must specify exactly one of the following: ``CidrIp``, ``CidrIpv6``, ``DestinationPrefixListId``, or ``DestinationSecurityGroupId``. For examples of rules that you can add to security groups for specific access scenarios, see [Security group rules for different use cases](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/security-group-rules-reference.html) in the *User Guide*.
 
@@ -55,6 +57,7 @@ The description of an egress (outbound) security group rule. Constraints: Up to 
 
 - **Type:** PrefixListId
 - **Required:** No
+- **Create-only:** Yes
 
 The prefix list IDs for an AWS service. This is the AWS service to access through a VPC endpoint from instances associated with the security group. You must specify exactly one of the following: ``CidrIp``, ``CidrIpv6``, ``DestinationPrefixListId``, or ``DestinationSecurityGroupId``.
 
@@ -62,6 +65,7 @@ The prefix list IDs for an AWS service. This is the AWS service to access throug
 
 - **Type:** SecurityGroupId
 - **Required:** No
+- **Create-only:** Yes
 
 The ID of the security group. You must specify exactly one of the following: ``CidrIp``, ``CidrIpv6``, ``DestinationPrefixListId``, or ``DestinationSecurityGroupId``.
 
@@ -69,6 +73,7 @@ The ID of the security group. You must specify exactly one of the following: ``C
 
 - **Type:** Int(-1..=65535)
 - **Required:** No
+- **Create-only:** Yes
 
 If the protocol is TCP or UDP, this is the start of the port range. If the protocol is ICMP or ICMPv6, this is the ICMP type or -1 (all ICMP types).
 
@@ -76,6 +81,7 @@ If the protocol is TCP or UDP, this is the start of the port range. If the proto
 
 - **Type:** SecurityGroupId
 - **Required:** Yes
+- **Create-only:** Yes
 
 The ID of the security group. You must specify either the security group ID or the security group name in the request. For security groups in a nondefault VPC, you must specify the security group ID.
 
@@ -83,6 +89,7 @@ The ID of the security group. You must specify either the security group ID or t
 
 - **Type:** [Enum (IpProtocol)](#ip_protocol-ipprotocol)
 - **Required:** Yes
+- **Create-only:** Yes
 
 The IP protocol name (``tcp``, ``udp``, ``icmp``, ``icmpv6``) or number (see [Protocol Numbers](https://docs.aws.amazon.com/http://www.iana.org/assignments/protocol-numbers/protocol-numbers.xhtml)). Use ``-1`` to specify all protocols. When authorizing security group rules, specifying ``-1`` or a protocol number other than ``tcp``, ``udp``, ``icmp``, or ``icmpv6`` allows traffic on all ports, regardless of any port range you specify. For ``tcp``, ``udp``, and ``icmp``, you must specify a port range. For ``icmpv6``, the port range is optional; if you omit the port range, traffic for all types and codes is allowed.
 
@@ -90,6 +97,7 @@ The IP protocol name (``tcp``, ``udp``, ``icmp``, ``icmpv6``) or number (see [Pr
 
 - **Type:** Int(-1..=65535)
 - **Required:** No
+- **Create-only:** Yes
 
 If the protocol is TCP or UDP, this is the end of the port range. If the protocol is ICMP or ICMPv6, this is the ICMP code or -1 (all ICMP codes). If the start port is -1 (all ICMP types), then the end port must be -1 (all ICMP codes).
 
@@ -112,5 +120,7 @@ Shorthand formats: `tcp` or `IpProtocol.tcp`
 ### `id`
 
 - **Type:** String
+
+
 
 

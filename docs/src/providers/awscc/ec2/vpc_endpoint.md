@@ -80,6 +80,7 @@ Indicate whether to associate a private hosted zone with the specified VPC. The 
 
 - **Type:** Arn
 - **Required:** No
+- **Create-only:** Yes
 
 The Amazon Resource Name (ARN) of the resource configuration.
 
@@ -101,6 +102,7 @@ The IDs of the security groups to associate with the endpoint network interfaces
 
 - **Type:** String
 - **Required:** No
+- **Create-only:** Yes
 
 The name of the endpoint service.
 
@@ -108,6 +110,7 @@ The name of the endpoint service.
 
 - **Type:** Arn
 - **Required:** No
+- **Create-only:** Yes
 
 The Amazon Resource Name (ARN) of the service network.
 
@@ -115,6 +118,7 @@ The Amazon Resource Name (ARN) of the service network.
 
 - **Type:** Region
 - **Required:** No
+- **Create-only:** Yes
 
 Describes a Region.
 
@@ -127,7 +131,7 @@ The IDs of the subnets in which to create endpoint network interfaces. You must 
 
 ### `tags`
 
-- **Type:** Map
+- **Type:** Map(String)
 - **Required:** No
 
 The tags to associate with the endpoint.
@@ -136,6 +140,7 @@ The tags to associate with the endpoint.
 
 - **Type:** [Enum (VpcEndpointType)](#vpc_endpoint_type-vpcendpointtype)
 - **Required:** No
+- **Create-only:** Yes
 
 The type of endpoint. Default: Gateway
 
@@ -143,6 +148,7 @@ The type of endpoint. Default: Gateway
 
 - **Type:** VpcId
 - **Required:** Yes
+- **Create-only:** Yes
 
 The ID of the VPC.
 
@@ -221,16 +227,24 @@ Shorthand formats: `Interface` or `VpcEndpointType.Interface`
 
 - **Type:** String
 
+
+
 ### `dns_entries`
 
 - **Type:** `List<String>`
+
+
 
 ### `id`
 
 - **Type:** VpcEndpointId
 
+
+
 ### `network_interface_ids`
 
 - **Type:** `List<NetworkInterfaceId>`
+
+
 
 

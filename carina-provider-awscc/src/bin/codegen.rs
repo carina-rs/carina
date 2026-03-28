@@ -506,10 +506,10 @@ fn type_display_string(
             enum_link
         }
     } else if prop_name == "Tags" {
-        "Map".to_string()
+        "Map(String)".to_string()
     } else if let Some(ref_path) = &prop.ref_path {
         if ref_path.contains("/Tag") {
-            "Map".to_string()
+            "Map(String)".to_string()
         } else if let Some(def_name) = ref_def_name(ref_path)
             && resolve_ref(schema, ref_path)
                 .and_then(|d| d.properties.as_ref())
@@ -667,7 +667,7 @@ fn type_display_string(
                                 "`List<String>`".to_string()
                             }
                         } else {
-                            "`List<Map>`".to_string()
+                            "`List<Map(String)>`".to_string()
                         }
                     } else {
                         list_element_type_display(items, prop_name, &schema.type_name)
@@ -691,7 +691,7 @@ fn type_display_string(
                 } else if prop_name.ends_with("PolicyDocument") {
                     "IamPolicyDocument".to_string()
                 } else {
-                    "Map".to_string()
+                    "Map(String)".to_string()
                 }
             }
             _ => "String".to_string(),
@@ -708,6 +708,13 @@ fn generate_markdown(schema: &CfnSchema, type_name: &str) -> Result<String> {
     // Build read-only properties set
     let read_only: HashSet<String> = schema
         .read_only_properties
+        .iter()
+        .map(|p| p.trim_start_matches("/properties/").to_string())
+        .collect();
+
+    // Build create-only properties set
+    let create_only: HashSet<String> = schema
+        .create_only_properties
         .iter()
         .map(|p| p.trim_start_matches("/properties/").to_string())
         .collect();
@@ -770,6 +777,9 @@ fn generate_markdown(schema: &CfnSchema, type_name: &str) -> Result<String> {
             md.push_str("- **Required:** Yes\n");
         } else {
             md.push_str("- **Required:** No\n");
+        }
+        if create_only.contains(prop_name) {
+            md.push_str("- **Create-only:** Yes\n");
         }
         if let Some(default_val) = &prop.default_value
             && let Some(display) = json_default_to_markdown(default_val)
@@ -922,7 +932,14 @@ fn generate_markdown(schema: &CfnSchema, type_name: &str) -> Result<String> {
             let type_display = type_display_string(prop_name, prop, schema, &enums);
 
             md.push_str(&format!("### `{}`\n\n", attr_name));
-            md.push_str(&format!("- **Type:** {}\n\n", type_display));
+            md.push_str(&format!("- **Type:** {}\n", type_display));
+
+            if let Some(d) = &prop.description {
+                let desc = collapse_whitespace(&d.replace('\n', " "));
+                md.push_str(&format!("\n{}\n\n", desc));
+            } else {
+                md.push('\n');
+            }
         }
     }
 
@@ -4656,7 +4673,7 @@ mod tests {
 
     #[test]
     fn test_type_display_string_array_tag_ref() {
-        // Array with Tag $ref should display List<Map>
+        // Array with Tag $ref should display List<Map(String)>
         let prop = CfnProperty {
             prop_type: Some(TypeValue::Single("array".to_string())),
             description: None,
@@ -4715,7 +4732,7 @@ mod tests {
         let enums = BTreeMap::new();
         assert_eq!(
             type_display_string("ResourceTags", &prop, &schema, &enums),
-            "`List<Map>`"
+            "`List<Map(String)>`"
         );
     }
 
@@ -7446,6 +7463,155 @@ mod tests {
         assert!(
             md.contains("**Default:** `true`"),
             "Should show boolean default in markdown: {md}"
+        );
+    }
+
+    #[test]
+    fn test_type_display_string_tags_shows_map_string() {
+        let prop = CfnProperty {
+            prop_type: None,
+            ref_path: Some("#/definitions/Tag".to_string()),
+            ..Default::default()
+        };
+        let schema = CfnSchema {
+            type_name: "AWS::EC2::VPC".to_string(),
+            description: None,
+            properties: BTreeMap::new(),
+            required: vec![],
+            read_only_properties: vec![],
+            create_only_properties: vec![],
+            write_only_properties: vec![],
+            primary_identifier: None,
+            definitions: None,
+            tagging: None,
+            one_of: vec![],
+            any_of: vec![],
+        };
+        let enums = BTreeMap::new();
+        // Tags property should display Map(String)
+        assert_eq!(
+            type_display_string("Tags", &prop, &schema, &enums),
+            "Map(String)"
+        );
+    }
+
+    #[test]
+    fn test_type_display_string_generic_object_shows_map_string() {
+        let prop = CfnProperty {
+            prop_type: Some(TypeValue::Single("object".to_string())),
+            ..Default::default()
+        };
+        let schema = CfnSchema {
+            type_name: "AWS::Logs::LogGroup".to_string(),
+            description: None,
+            properties: BTreeMap::new(),
+            required: vec![],
+            read_only_properties: vec![],
+            create_only_properties: vec![],
+            write_only_properties: vec![],
+            primary_identifier: None,
+            definitions: None,
+            tagging: None,
+            one_of: vec![],
+            any_of: vec![],
+        };
+        let enums = BTreeMap::new();
+        // Generic object should display Map(String)
+        assert_eq!(
+            type_display_string("DataProtectionPolicy", &prop, &schema, &enums),
+            "Map(String)"
+        );
+    }
+
+    #[test]
+    fn test_generate_markdown_shows_create_only() {
+        let mut properties = BTreeMap::new();
+        properties.insert(
+            "CidrBlock".to_string(),
+            CfnProperty {
+                prop_type: Some(TypeValue::Single("string".to_string())),
+                description: Some("The CIDR block.".to_string()),
+                ..Default::default()
+            },
+        );
+        properties.insert(
+            "Name".to_string(),
+            CfnProperty {
+                prop_type: Some(TypeValue::Single("string".to_string())),
+                description: Some("The name.".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let schema = CfnSchema {
+            type_name: "AWS::Test::Resource".to_string(),
+            description: None,
+            properties,
+            required: vec![],
+            read_only_properties: vec![],
+            create_only_properties: vec!["/properties/CidrBlock".to_string()],
+            write_only_properties: vec![],
+            primary_identifier: None,
+            definitions: None,
+            tagging: None,
+            one_of: vec![],
+            any_of: vec![],
+        };
+
+        let md = generate_markdown(&schema, "AWS::Test::Resource").unwrap();
+
+        assert!(
+            md.contains("**Create-only:** Yes"),
+            "Should show create-only annotation for CidrBlock: {md}"
+        );
+        // Name should NOT have create-only
+        let name_section = md.split("### `name`").nth(1).unwrap_or("");
+        assert!(
+            !name_section
+                .split("###")
+                .next()
+                .unwrap_or("")
+                .contains("Create-only"),
+            "Name should not have create-only annotation: {md}"
+        );
+    }
+
+    #[test]
+    fn test_generate_markdown_read_only_description() {
+        let mut properties = BTreeMap::new();
+        properties.insert(
+            "Id".to_string(),
+            CfnProperty {
+                prop_type: Some(TypeValue::Single("string".to_string())),
+                description: Some("The resource ID.".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let schema = CfnSchema {
+            type_name: "AWS::Test::Resource".to_string(),
+            description: None,
+            properties,
+            required: vec![],
+            read_only_properties: vec!["/properties/Id".to_string()],
+            create_only_properties: vec![],
+            write_only_properties: vec![],
+            primary_identifier: None,
+            definitions: None,
+            tagging: None,
+            one_of: vec![],
+            any_of: vec![],
+        };
+
+        let md = generate_markdown(&schema, "AWS::Test::Resource").unwrap();
+
+        assert!(
+            md.contains("## Attribute Reference"),
+            "Should have Attribute Reference section: {md}"
+        );
+        assert!(
+            md.contains("The resource ID."),
+            "Should show description for read-only attribute: {md}"
         );
     }
 

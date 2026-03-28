@@ -41,6 +41,7 @@ awscc.ec2.security_group {
 
 - **Type:** String
 - **Required:** Yes
+- **Create-only:** Yes
 
 A description for the security group.
 
@@ -48,6 +49,7 @@ A description for the security group.
 
 - **Type:** String
 - **Required:** No
+- **Create-only:** Yes
 
 The name of the security group.
 
@@ -67,7 +69,7 @@ The inbound rules associated with the security group. There is a short interrupt
 
 ### `tags`
 
-- **Type:** Map
+- **Type:** Map(String)
 - **Required:** No
 
 Any tags assigned to the security group.
@@ -76,6 +78,7 @@ Any tags assigned to the security group.
 
 - **Type:** VpcId
 - **Required:** No
+- **Create-only:** Yes
 
 The ID of the VPC for the security group.
 
@@ -129,8 +132,12 @@ Shorthand formats: `tcp` or `IpProtocol.tcp`
 
 - **Type:** SecurityGroupId
 
+The group ID of the specified security group.
+
 ### `id`
 
 - **Type:** SecurityGroupId
+
+The group name or group ID depending on whether the SG is created in default or specific VPC
 
 

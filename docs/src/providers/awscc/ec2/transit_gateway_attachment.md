@@ -48,18 +48,20 @@ The options for the transit gateway vpc attachment.
 
 ### `tags`
 
-- **Type:** Map
+- **Type:** Map(String)
 - **Required:** No
 
 ### `transit_gateway_id`
 
 - **Type:** TransitGatewayId
 - **Required:** Yes
+- **Create-only:** Yes
 
 ### `vpc_id`
 
 - **Type:** VpcId
 - **Required:** Yes
+- **Create-only:** Yes
 
 ## Enum Values
 

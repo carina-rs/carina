@@ -38,6 +38,7 @@ awscc.ec2.ipam_pool {
 
 - **Type:** [Enum (AddressFamily)](#address_family-addressfamily)
 - **Required:** Yes
+- **Create-only:** Yes
 
 The address family of the address space in this pool. Either IPv4 or IPv6.
 
@@ -64,7 +65,7 @@ The minimum allowed netmask length for allocations made from this pool.
 
 ### `allocation_resource_tags`
 
-- **Type:** `List<Map>`
+- **Type:** `List<Map(String)>`
 - **Required:** No
 
 When specified, an allocation will not be allowed unless a resource has a matching set of tags.
@@ -80,6 +81,7 @@ Determines what to do if IPAM discovers resources that haven't been assigned an 
 
 - **Type:** [Enum (AwsService)](#aws_service-awsservice)
 - **Required:** No
+- **Create-only:** Yes
 
 Limits which service in Amazon Web Services that the pool can be used in.
 
@@ -92,6 +94,7 @@ Limits which service in Amazon Web Services that the pool can be used in.
 
 - **Type:** String
 - **Required:** Yes
+- **Create-only:** Yes
 
 The Id of the scope this pool is a part of.
 
@@ -99,6 +102,7 @@ The Id of the scope this pool is a part of.
 
 - **Type:** Region
 - **Required:** No
+- **Create-only:** Yes
 
 The region of this pool. If not set, this will default to "None" which will disable non-custom allocations. If the locale has been specified for the source pool, this value must match.
 
@@ -113,6 +117,7 @@ A list of cidrs representing the address space available for allocation in this 
 
 - **Type:** [Enum (PublicIpSource)](#public_ip_source-publicipsource)
 - **Required:** No
+- **Create-only:** Yes
 
 The IP address source for pools in the public scope. Only used for provisioning IP address CIDRs to pools in the public scope. Default is `byoip`.
 
@@ -120,6 +125,7 @@ The IP address source for pools in the public scope. Only used for provisioning 
 
 - **Type:** Bool
 - **Required:** No
+- **Create-only:** Yes
 
 Determines whether or not address space from this pool is publicly advertised. Must be set if and only if the pool is IPv6.
 
@@ -127,6 +133,7 @@ Determines whether or not address space from this pool is publicly advertised. M
 
 - **Type:** IpamPoolId
 - **Required:** No
+- **Create-only:** Yes
 
 The Id of this pool's source. If set, all space provisioned in this pool must be free space provisioned in the parent pool.
 
@@ -134,10 +141,11 @@ The Id of this pool's source. If set, all space provisioned in this pool must be
 
 - **Type:** [Struct(SourceResource)](#sourceresource)
 - **Required:** No
+- **Create-only:** Yes
 
 ### `tags`
 
-- **Type:** Map
+- **Type:** Map(String)
 - **Required:** No
 
 An array of key-value pairs to apply to this resource.
@@ -216,32 +224,48 @@ Shorthand formats: `create_in_progress` or `State.create_in_progress`
 
 - **Type:** Arn
 
+The Amazon Resource Name (ARN) of the IPAM Pool.
+
 ### `ipam_arn`
 
 - **Type:** Arn
+
+The Amazon Resource Name (ARN) of the IPAM this pool is a part of.
 
 ### `ipam_pool_id`
 
 - **Type:** IpamPoolId
 
+Id of the IPAM Pool.
+
 ### `ipam_scope_arn`
 
 - **Type:** Arn
+
+The Amazon Resource Name (ARN) of the scope this pool is a part of.
 
 ### `ipam_scope_type`
 
 - **Type:** [Enum (IpamScopeType)](#ipam_scope_type-ipamscopetype)
 
+Determines whether this scope contains publicly routable space or space for a private network
+
 ### `pool_depth`
 
 - **Type:** Int
+
+The depth of this pool in the source pool hierarchy.
 
 ### `state`
 
 - **Type:** [Enum (State)](#state-state)
 
+The state of this pool. This can be one of the following values: "create-in-progress", "create-complete", "modify-in-progress", "modify-complete", "delete-in-progress", or "delete-complete"
+
 ### `state_message`
 
 - **Type:** String
+
+An explanation of how the pool arrived at it current state.
 
 

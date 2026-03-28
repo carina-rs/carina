@@ -34,6 +34,7 @@ The ID of the internet gateway. You must specify either InternetGatewayId or Vpn
 
 - **Type:** VpcId
 - **Required:** Yes
+- **Create-only:** Yes
 
 The ID of the VPC.
 
@@ -49,5 +50,7 @@ The ID of the virtual private gateway. You must specify either InternetGatewayId
 ### `attachment_type`
 
 - **Type:** String
+
+Used to identify if this resource is an Internet Gateway or Vpn Gateway Attachment 
 
 

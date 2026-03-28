@@ -25,7 +25,7 @@ awscc.logs.log_group {
 
 ### `data_protection_policy`
 
-- **Type:** Map
+- **Type:** Map(String)
 - **Required:** No
 
 Creates a data protection policy and assigns it to the log group. A data protection policy can help safeguard sensitive data that's ingested by the log group by auditing and masking the sensitive log data. When a user who does not have permission to view masked data views a log event that includes masked data, the sensitive data is replaced by asterisks.
@@ -64,6 +64,7 @@ Specifies the log group class for this log group. There are two classes: + The `
 
 - **Type:** String(pattern, len: 1..=512)
 - **Required:** No
+- **Create-only:** Yes
 
 The name of the log group. If you don't specify a name, CFNlong generates a unique ID for the log group.
 
@@ -83,7 +84,7 @@ The number of days to retain the log events in the specified log group. Possible
 
 ### `tags`
 
-- **Type:** Map
+- **Type:** Map(String)
 - **Required:** No
 
 An array of key-value pairs to apply to the log group. For more information, see [Tag](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-properties-resource-tags.html).
@@ -105,5 +106,7 @@ Shorthand formats: `STANDARD` or `LogGroupClass.STANDARD`
 ### `arn`
 
 - **Type:** Arn
+
+
 
 

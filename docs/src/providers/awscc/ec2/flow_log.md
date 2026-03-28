@@ -30,6 +30,7 @@ awscc.ec2.flow_log {
 
 - **Type:** IamRoleArn
 - **Required:** No
+- **Create-only:** Yes
 
 The ARN of the IAM role that allows Amazon EC2 to publish flow logs across accounts.
 
@@ -37,6 +38,7 @@ The ARN of the IAM role that allows Amazon EC2 to publish flow logs across accou
 
 - **Type:** IamRoleArn
 - **Required:** No
+- **Create-only:** Yes
 
 The ARN for the IAM role that permits Amazon EC2 to publish flow logs to a CloudWatch Logs log group in your account. If you specify LogDestinationType as s3 or kinesis-data-firehose, do not specify DeliverLogsPermissionArn or LogGroupName.
 
@@ -44,11 +46,13 @@ The ARN for the IAM role that permits Amazon EC2 to publish flow logs to a Cloud
 
 - **Type:** [Struct(DestinationOptions)](#destinationoptions)
 - **Required:** No
+- **Create-only:** Yes
 
 ### `log_destination`
 
 - **Type:** Arn
 - **Required:** No
+- **Create-only:** Yes
 
 Specifies the destination to which the flow log data is to be published. Flow log data can be published to a CloudWatch Logs log group, an Amazon S3 bucket, or a Kinesis Firehose stream. The value specified for this parameter depends on the value specified for LogDestinationType.
 
@@ -56,6 +60,7 @@ Specifies the destination to which the flow log data is to be published. Flow lo
 
 - **Type:** [Enum (LogDestinationType)](#log_destination_type-logdestinationtype)
 - **Required:** No
+- **Create-only:** Yes
 
 Specifies the type of destination to which the flow log data is to be published. Flow log data can be published to CloudWatch Logs or Amazon S3.
 
@@ -63,6 +68,7 @@ Specifies the type of destination to which the flow log data is to be published.
 
 - **Type:** String
 - **Required:** No
+- **Create-only:** Yes
 
 The fields to include in the flow log record, in the order in which they should appear.
 
@@ -70,6 +76,7 @@ The fields to include in the flow log record, in the order in which they should 
 
 - **Type:** String
 - **Required:** No
+- **Create-only:** Yes
 
 The name of a new or existing CloudWatch Logs log group where Amazon EC2 publishes your flow logs. If you specify LogDestinationType as s3 or kinesis-data-firehose, do not specify DeliverLogsPermissionArn or LogGroupName.
 
@@ -77,6 +84,7 @@ The name of a new or existing CloudWatch Logs log group where Amazon EC2 publish
 
 - **Type:** IntEnum([60, 600])
 - **Required:** No
+- **Create-only:** Yes
 
 The maximum interval of time during which a flow of packets is captured and aggregated into a flow log record. You can specify 60 seconds (1 minute) or 600 seconds (10 minutes).
 
@@ -84,6 +92,7 @@ The maximum interval of time during which a flow of packets is captured and aggr
 
 - **Type:** String
 - **Required:** Yes
+- **Create-only:** Yes
 
 The ID of the subnet, network interface, or VPC for which you want to create a flow log.
 
@@ -91,12 +100,13 @@ The ID of the subnet, network interface, or VPC for which you want to create a f
 
 - **Type:** [Enum (ResourceType)](#resource_type-resourcetype)
 - **Required:** Yes
+- **Create-only:** Yes
 
 The type of resource for which to create the flow log. For example, if you specified a VPC ID for the ResourceId property, specify VPC for this property.
 
 ### `tags`
 
-- **Type:** Map
+- **Type:** Map(String)
 - **Required:** No
 
 The tags to apply to the flow logs.
@@ -105,6 +115,7 @@ The tags to apply to the flow logs.
 
 - **Type:** [Enum (TrafficType)](#traffic_type-traffictype)
 - **Required:** No
+- **Create-only:** Yes
 
 The type of traffic to log. You can log traffic that the resource accepts or rejects, or all traffic.
 
@@ -167,5 +178,7 @@ Shorthand formats: `ACCEPT` or `TrafficType.ACCEPT`
 ### `id`
 
 - **Type:** FlowLogId
+
+The Flow Log ID
 
 

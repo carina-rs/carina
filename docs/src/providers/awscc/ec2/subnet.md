@@ -40,6 +40,7 @@ Indicates whether a network interface created in this subnet receives an IPv6 ad
 
 - **Type:** AvailabilityZone
 - **Required:** No
+- **Create-only:** Yes
 
 The Availability Zone of the subnet. If you update this property, you must also update the ``CidrBlock`` property.
 
@@ -47,6 +48,7 @@ The Availability Zone of the subnet. If you update this property, you must also 
 
 - **Type:** AvailabilityZoneId
 - **Required:** No
+- **Create-only:** Yes
 
 The AZ ID of the subnet.
 
@@ -54,6 +56,7 @@ The AZ ID of the subnet.
 
 - **Type:** Ipv4Cidr
 - **Required:** No
+- **Create-only:** Yes
 
 The IPv4 CIDR block assigned to the subnet. If you update this property, we create a new subnet, and then delete the existing one.
 
@@ -75,6 +78,7 @@ Indicates the device position for local network interfaces in this subnet. For e
 
 - **Type:** IpamPoolId
 - **Required:** No
+- **Create-only:** Yes
 
 An IPv4 IPAM pool ID for the subnet.
 
@@ -82,6 +86,7 @@ An IPv4 IPAM pool ID for the subnet.
 
 - **Type:** Int(0..=32)
 - **Required:** No
+- **Create-only:** Yes
 
 An IPv4 netmask length for the subnet.
 
@@ -96,6 +101,7 @@ The IPv6 CIDR block. If you specify ``AssignIpv6AddressOnCreation``, you must al
 
 - **Type:** IpamPoolId
 - **Required:** No
+- **Create-only:** Yes
 
 An IPv6 IPAM pool ID for the subnet.
 
@@ -103,6 +109,7 @@ An IPv6 IPAM pool ID for the subnet.
 
 - **Type:** Bool
 - **Required:** No
+- **Create-only:** Yes
 
 Indicates whether this is an IPv6 only subnet. For more information, see [Subnet basics](https://docs.aws.amazon.com/vpc/latest/userguide/VPC_Subnets.html#subnet-basics) in the *User Guide*.
 
@@ -110,6 +117,7 @@ Indicates whether this is an IPv6 only subnet. For more information, see [Subnet
 
 - **Type:** Int(0..=128)
 - **Required:** No
+- **Create-only:** Yes
 
 An IPv6 netmask length for the subnet.
 
@@ -124,6 +132,7 @@ Indicates whether instances launched in this subnet receive a public IPv4 addres
 
 - **Type:** Arn
 - **Required:** No
+- **Create-only:** Yes
 
 The Amazon Resource Name (ARN) of the Outpost.
 
@@ -136,7 +145,7 @@ The hostname type for EC2 instances launched into this subnet and how DNS A and 
 
 ### `tags`
 
-- **Type:** Map
+- **Type:** Map(String)
 - **Required:** No
 
 Any tags assigned to the subnet.
@@ -145,6 +154,7 @@ Any tags assigned to the subnet.
 
 - **Type:** VpcId
 - **Required:** Yes
+- **Create-only:** Yes
 
 The ID of the VPC the subnet is in. If you update this property, you must also update the ``CidrBlock`` property.
 
@@ -191,16 +201,24 @@ Shorthand formats: `ip_name` or `HostnameType.ip_name`
 
 - **Type:** [Struct(BlockPublicAccessStates)](#blockpublicaccessstates)
 
+
+
 ### `ipv6_cidr_blocks`
 
 - **Type:** `List<Ipv6Cidr>`
+
+
 
 ### `network_acl_association_id`
 
 - **Type:** String
 
+
+
 ### `subnet_id`
 
 - **Type:** SubnetId
+
+
 
 

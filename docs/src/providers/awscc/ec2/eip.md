@@ -24,6 +24,7 @@ awscc.ec2.eip {
 
 - **Type:** Ipv4Address
 - **Required:** No
+- **Create-only:** Yes
 
 
 
@@ -45,6 +46,7 @@ The ID of the instance. Updates to the ``InstanceId`` property may require *some
 
 - **Type:** IpamPoolId
 - **Required:** No
+- **Create-only:** Yes
 
 
 
@@ -52,6 +54,7 @@ The ID of the instance. Updates to the ``InstanceId`` property may require *some
 
 - **Type:** String
 - **Required:** No
+- **Create-only:** Yes
 
 A unique set of Availability Zones, Local Zones, or Wavelength Zones from which AWS advertises IP addresses. Use this parameter to limit the IP address to this location. IP addresses cannot move between network border groups. Use [DescribeAvailabilityZones](https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_DescribeAvailabilityZones.html) to view the network border groups.
 
@@ -64,7 +67,7 @@ The ID of an address pool that you own. Use this parameter to let Amazon EC2 sel
 
 ### `tags`
 
-- **Type:** Map
+- **Type:** Map(String)
 - **Required:** No
 
 Any tags assigned to the Elastic IP address. Updates to the ``Tags`` property may require *some interruptions*. Updates on an EIP reassociates the address on its associated resource.
@@ -73,6 +76,7 @@ Any tags assigned to the Elastic IP address. Updates to the ``Tags`` property ma
 
 - **Type:** Ipv4Address
 - **Required:** No
+- **Create-only:** Yes
 
 The Elastic IP address you are accepting for transfer. You can only accept one transferred address. For more information on Elastic IP address transfers, see [Transfer Elastic IP addresses](https://docs.aws.amazon.com/vpc/latest/userguide/vpc-eips.html#transfer-EIPs-intro) in the *Amazon Virtual Private Cloud User Guide*.
 
@@ -93,8 +97,12 @@ Shorthand formats: `vpc` or `Domain.vpc`
 
 - **Type:** AllocationId
 
+
+
 ### `public_ip`
 
 - **Type:** Ipv4Address
+
+
 
 
