@@ -5,6 +5,7 @@
 
 mod cidr_subnet;
 mod concat;
+mod env;
 mod flatten;
 mod join;
 mod keys_values;
@@ -73,6 +74,10 @@ register_builtins! {
     concat(concat::builtin_concat) {
         signature: "concat(items: list, base_list: list) -> list",
         description: "Appends items to a list. Data-last: base_list |> concat(items).",
+    },
+    env(env::builtin_env) {
+        signature: "env(name: string) -> string",
+        description: "Reads an environment variable. Errors if the variable is not set.",
     },
     flatten(flatten::builtin_flatten) {
         signature: "flatten(list: list) -> list",

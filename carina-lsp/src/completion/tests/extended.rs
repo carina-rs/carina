@@ -656,6 +656,7 @@ fn builtin_function_completions_cover_all_functions() {
     let expected = [
         "cidr_subnet",
         "concat",
+        "env",
         "flatten",
         "join",
         "keys",

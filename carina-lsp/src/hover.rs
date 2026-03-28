@@ -852,6 +852,7 @@ awscc.ec2.vpc_gateway_attachment {
         let names = [
             "cidr_subnet",
             "concat",
+            "env",
             "flatten",
             "join",
             "keys",
