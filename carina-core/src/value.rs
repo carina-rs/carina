@@ -347,7 +347,8 @@ pub fn merge_secrets_into_provider_json(
 ///
 /// This ensures that when a `Value` tree is serialized (e.g., via serde), no
 /// secret plaintext is ever written. The hash uses Argon2id with the fallback
-/// salt. For context-aware hashing, use `redact_secrets_in_attributes`.
+/// salt (not context-aware). This is suitable for plan file serialization where
+/// the goal is redaction, not state comparison.
 pub fn redact_secrets_in_value(value: &Value) -> Value {
     match value {
         Value::Secret(inner) => {
