@@ -33,6 +33,13 @@ for dir in "${DIRS[@]}"; do
     fi
 
     while IFS= read -r -d '' file; do
+        # Skip files in directories with .validate-skip marker
+        # (e.g., tests requiring env vars or AWS credentials)
+        file_dir="$(dirname "$file")"
+        if [ -f "$file_dir/.validate-skip" ]; then
+            continue
+        fi
+
         if "$CARINA" validate "$file" > /dev/null 2>&1; then
             PASSED=$((PASSED + 1))
         else

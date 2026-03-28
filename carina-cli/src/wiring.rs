@@ -525,7 +525,7 @@ pub async fn create_plan_from_parsed(
 
     // Resolve ResourceRef values and enum identifiers using AWS state
     let mut resources = sorted_resources.clone();
-    resolve_refs_with_state(&mut resources, &current_states);
+    resolve_refs_with_state(&mut resources, &current_states)?;
     provider.normalize_desired(&mut resources);
 
     // Normalize state enum values to match the DSL format produced by normalize_desired.

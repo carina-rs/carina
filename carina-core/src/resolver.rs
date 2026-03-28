@@ -19,7 +19,7 @@ use crate::resource::{InterpolationPart, Resource, ResourceId, State, Value};
 pub fn resolve_refs_with_state(
     resources: &mut [Resource],
     current_states: &HashMap<ResourceId, State>,
-) {
+) -> Result<(), String> {
     // Save dependency bindings before resolution destroys ResourceRef values.
     // This metadata is used by plan tree building to recover parent-child
     // relationships (see build_plan_tree in display.rs and app.rs).
@@ -59,19 +59,21 @@ pub fn resolve_refs_with_state(
     for resource in resources.iter_mut() {
         let mut resolved_attrs = HashMap::new();
         for (key, value) in &resource.attributes {
-            resolved_attrs.insert(key.clone(), resolve_ref_value(value, &binding_map));
+            resolved_attrs.insert(key.clone(), resolve_ref_value(value, &binding_map)?);
         }
         resource.attributes = resolved_attrs;
     }
+    Ok(())
 }
 
 /// Recursively resolve a single Value, replacing ResourceRef with the referenced value.
 ///
 /// If the referenced binding or attribute is not found, the value is returned as-is.
+/// Returns an error if a builtin function fails with fully-resolved arguments.
 pub fn resolve_ref_value(
     value: &Value,
     binding_map: &HashMap<String, HashMap<String, Value>>,
-) -> Value {
+) -> Result<Value, String> {
     match value {
         Value::ResourceRef {
             binding_name,
@@ -82,52 +84,56 @@ pub fn resolve_ref_value(
                 && let Some(attr_value) = attrs.get(attribute_name)
             {
                 // Resolve the initial attribute value
-                let mut resolved = resolve_ref_value(attr_value, binding_map);
+                let mut resolved = resolve_ref_value(attr_value, binding_map)?;
 
                 // Traverse chained field path through nested maps
                 for field in field_path {
                     match resolved {
                         Value::Map(ref map) => {
                             if let Some(nested) = map.get(field) {
-                                resolved = resolve_ref_value(nested, binding_map);
+                                resolved = resolve_ref_value(nested, binding_map)?;
                             } else {
                                 // Field not found in nested map, keep original ref
-                                return value.clone();
+                                return Ok(value.clone());
                             }
                         }
                         _ => {
                             // Cannot traverse non-map value, keep original ref
-                            return value.clone();
+                            return Ok(value.clone());
                         }
                     }
                 }
 
-                return resolved;
+                return Ok(resolved);
             }
             // Keep as-is if not found
-            value.clone()
+            Ok(value.clone())
         }
-        Value::List(items) => Value::List(
-            items
+        Value::List(items) => {
+            let resolved: Result<Vec<Value>, String> = items
                 .iter()
                 .map(|v| resolve_ref_value(v, binding_map))
-                .collect(),
-        ),
-        Value::Map(map) => Value::Map(
-            map.iter()
-                .map(|(k, v)| (k.clone(), resolve_ref_value(v, binding_map)))
-                .collect(),
-        ),
+                .collect();
+            Ok(Value::List(resolved?))
+        }
+        Value::Map(map) => {
+            let mut resolved = HashMap::new();
+            for (k, v) in map {
+                resolved.insert(k.clone(), resolve_ref_value(v, binding_map)?);
+            }
+            Ok(Value::Map(resolved))
+        }
         Value::Interpolation(parts) => {
-            let resolved_parts: Vec<InterpolationPart> = parts
+            let resolved_parts: Result<Vec<InterpolationPart>, String> = parts
                 .iter()
                 .map(|p| match p {
                     InterpolationPart::Expr(v) => {
-                        InterpolationPart::Expr(resolve_ref_value(v, binding_map))
+                        Ok(InterpolationPart::Expr(resolve_ref_value(v, binding_map)?))
                     }
-                    other => other.clone(),
+                    other => Ok(other.clone()),
                 })
                 .collect();
+            let resolved_parts = resolved_parts?;
 
             // Check if all parts are now resolved (no remaining ResourceRef)
             let all_resolved = resolved_parts.iter().all(|p| match p {
@@ -144,46 +150,41 @@ pub fn resolve_ref_value(
                         InterpolationPart::Expr(v) => value_to_string(v),
                     })
                     .collect::<String>();
-                Value::String(s)
+                Ok(Value::String(s))
             } else {
-                Value::Interpolation(resolved_parts)
+                Ok(Value::Interpolation(resolved_parts))
             }
         }
         Value::FunctionCall { name, args } => {
             // First, resolve all arguments
-            let resolved_args: Vec<Value> = args
+            let resolved_args: Result<Vec<Value>, String> = args
                 .iter()
                 .map(|a| resolve_ref_value(a, binding_map))
                 .collect();
+            let resolved_args = resolved_args?;
 
             // Check if all args are fully resolved (no remaining refs)
             let all_resolved = resolved_args.iter().all(|a| !contains_resource_ref(a));
 
             if all_resolved {
-                // Evaluate the built-in function
+                // Evaluate the built-in function; propagate errors since args are resolved
                 match crate::builtins::evaluate_builtin(name, &resolved_args) {
-                    Ok(result) => result,
-                    Err(_) => {
-                        // If evaluation fails, keep as FunctionCall
-                        Value::FunctionCall {
-                            name: name.clone(),
-                            args: resolved_args,
-                        }
-                    }
+                    Ok(result) => Ok(result),
+                    Err(e) => Err(format!("{}(): {}", name, e)),
                 }
             } else {
                 // Keep as FunctionCall with partially resolved args
-                Value::FunctionCall {
+                Ok(Value::FunctionCall {
                     name: name.clone(),
                     args: resolved_args,
-                }
+                })
             }
         }
         Value::Secret(inner) => {
-            let resolved_inner = resolve_ref_value(inner, binding_map);
-            Value::Secret(Box::new(resolved_inner))
+            let resolved_inner = resolve_ref_value(inner, binding_map)?;
+            Ok(Value::Secret(Box::new(resolved_inner)))
         }
-        _ => value.clone(),
+        _ => Ok(value.clone()),
     }
 }
 
@@ -244,7 +245,7 @@ mod tests {
             field_path: vec![],
         };
 
-        let resolved = resolve_ref_value(&ref_value, &binding_map);
+        let resolved = resolve_ref_value(&ref_value, &binding_map).unwrap();
         assert_eq!(resolved, Value::String("vpc-123".to_string()));
     }
 
@@ -264,7 +265,7 @@ mod tests {
             },
         ]);
 
-        let resolved = resolve_ref_value(&list, &binding_map);
+        let resolved = resolve_ref_value(&list, &binding_map).unwrap();
         assert_eq!(
             resolved,
             Value::List(vec![
@@ -294,7 +295,7 @@ mod tests {
             .collect(),
         );
 
-        let resolved = resolve_ref_value(&map, &binding_map);
+        let resolved = resolve_ref_value(&map, &binding_map).unwrap();
         if let Value::Map(m) = resolved {
             assert_eq!(
                 m.get("subnet_id"),
@@ -315,7 +316,7 @@ mod tests {
             field_path: vec![],
         };
 
-        let resolved = resolve_ref_value(&ref_value, &binding_map);
+        let resolved = resolve_ref_value(&ref_value, &binding_map).unwrap();
         assert_eq!(resolved, ref_value);
     }
 
@@ -335,7 +336,7 @@ mod tests {
             }),
         ]);
 
-        let resolved = resolve_ref_value(&interp, &binding_map);
+        let resolved = resolve_ref_value(&interp, &binding_map).unwrap();
         assert_eq!(resolved, Value::String("subnet-vpc-123".to_string()));
     }
 
@@ -352,7 +353,7 @@ mod tests {
             }),
         ]);
 
-        let resolved = resolve_ref_value(&interp, &binding_map);
+        let resolved = resolve_ref_value(&interp, &binding_map).unwrap();
         // Should remain as Interpolation since the ref couldn't be resolved
         assert!(matches!(resolved, Value::Interpolation(_)));
     }
@@ -368,7 +369,7 @@ mod tests {
             InterpolationPart::Expr(Value::Bool(true)),
         ]);
 
-        let resolved = resolve_ref_value(&interp, &binding_map);
+        let resolved = resolve_ref_value(&interp, &binding_map).unwrap();
         assert_eq!(
             resolved,
             Value::String("port-8080-enabled-true".to_string())
@@ -411,7 +412,7 @@ mod tests {
             },
         );
 
-        resolve_refs_with_state(&mut resources, &current_states);
+        resolve_refs_with_state(&mut resources, &current_states).unwrap();
 
         // The subnet's vpc_id should be resolved from state
         assert_eq!(
@@ -436,7 +437,7 @@ mod tests {
             ],
         };
 
-        let resolved = resolve_ref_value(&func, &binding_map);
+        let resolved = resolve_ref_value(&func, &binding_map).unwrap();
         assert_eq!(resolved, Value::String("a-b-c".to_string()));
     }
 
@@ -464,7 +465,7 @@ mod tests {
             ],
         };
 
-        let resolved = resolve_ref_value(&func, &binding_map);
+        let resolved = resolve_ref_value(&func, &binding_map).unwrap();
         assert_eq!(resolved, Value::String("prefix-vpc-123".to_string()));
     }
 
@@ -485,7 +486,7 @@ mod tests {
             ],
         };
 
-        let resolved = resolve_ref_value(&func, &binding_map);
+        let resolved = resolve_ref_value(&func, &binding_map).unwrap();
         assert!(matches!(resolved, Value::FunctionCall { .. }));
     }
 
@@ -507,7 +508,7 @@ mod tests {
             field_path: vec!["vpc_id".to_string()],
         };
 
-        let resolved = resolve_ref_value(&ref_value, &binding_map);
+        let resolved = resolve_ref_value(&ref_value, &binding_map).unwrap();
         assert_eq!(resolved, Value::String("vpc-123".to_string()));
     }
 
@@ -530,7 +531,7 @@ mod tests {
             field_path: vec!["network".to_string(), "vpc_id".to_string()],
         };
 
-        let resolved = resolve_ref_value(&ref_value, &binding_map);
+        let resolved = resolve_ref_value(&ref_value, &binding_map).unwrap();
         assert_eq!(resolved, Value::String("vpc-456".to_string()));
     }
 
@@ -551,7 +552,86 @@ mod tests {
             field_path: vec!["nonexistent".to_string()],
         };
 
-        let resolved = resolve_ref_value(&ref_value, &binding_map);
+        let resolved = resolve_ref_value(&ref_value, &binding_map).unwrap();
         assert_eq!(resolved, ref_value);
+    }
+
+    #[test]
+    fn resolve_builtin_error_propagated_when_args_resolved() {
+        // env() with a var name that is extremely unlikely to be set should propagate error
+        let binding_map: HashMap<String, HashMap<String, Value>> = HashMap::new();
+        let value = Value::FunctionCall {
+            name: "env".to_string(),
+            args: vec![Value::String(
+                "CARINA_RESOLVER_TEST_NONEXISTENT_VAR_12345".to_string(),
+            )],
+        };
+
+        let result = resolve_ref_value(&value, &binding_map);
+        assert!(
+            result.is_err(),
+            "Expected error for env() with missing var, got: {:?}",
+            result
+        );
+        let err_msg = result.unwrap_err();
+        assert!(
+            err_msg.contains("CARINA_RESOLVER_TEST_NONEXISTENT_VAR_12345"),
+            "Error should mention the missing env var, got: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn resolve_builtin_with_unresolved_ref_stays_as_function_call() {
+        // join("-", vpc.tags) should stay as FunctionCall when vpc.tags is unresolved
+        let binding_map: HashMap<String, HashMap<String, Value>> = HashMap::new();
+        let value = Value::FunctionCall {
+            name: "join".to_string(),
+            args: vec![
+                Value::String("-".to_string()),
+                Value::ResourceRef {
+                    binding_name: "vpc".to_string(),
+                    attribute_name: "tags".to_string(),
+                    field_path: vec![],
+                },
+            ],
+        };
+
+        let result = resolve_ref_value(&value, &binding_map);
+        assert!(result.is_ok(), "Unresolved ref should not cause error");
+        match result.unwrap() {
+            Value::FunctionCall { name, .. } => assert_eq!(name, "join"),
+            other => panic!("Expected FunctionCall, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn resolve_refs_with_state_propagates_builtin_error() {
+        let mut resources = vec![make_resource(
+            "test",
+            None,
+            vec![(
+                "value",
+                Value::FunctionCall {
+                    name: "env".to_string(),
+                    args: vec![Value::String(
+                        "CARINA_RESOLVER_STATE_TEST_NONEXISTENT_VAR_12345".to_string(),
+                    )],
+                },
+            )],
+        )];
+
+        let current_states: HashMap<ResourceId, State> = HashMap::new();
+        let result = resolve_refs_with_state(&mut resources, &current_states);
+        assert!(
+            result.is_err(),
+            "Expected error from resolve_refs_with_state, got Ok"
+        );
+        let err_msg = result.unwrap_err();
+        assert!(
+            err_msg.contains("CARINA_RESOLVER_STATE_TEST_NONEXISTENT_VAR_12345"),
+            "Error should mention the missing env var, got: {}",
+            err_msg
+        );
     }
 }

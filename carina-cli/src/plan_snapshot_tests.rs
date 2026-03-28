@@ -100,7 +100,8 @@ fn build_plan_and_states_from_fixture(
 
     // Resolve ResourceRef values using state
     let mut resources = sorted_resources.clone();
-    resolve_refs_with_state(&mut resources, &current_states);
+    resolve_refs_with_state(&mut resources, &current_states)
+        .expect("Failed to resolve refs with state");
 
     // Normalize desired resources (resolve enum identifiers)
     normalize_desired_with_ctx(&wiring, &mut resources);
