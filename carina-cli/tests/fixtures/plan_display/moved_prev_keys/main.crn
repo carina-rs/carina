@@ -1,0 +1,22 @@
+# Moved block with attribute removal: prev_desired_keys transfer
+# State has "old_vpc" with desired_keys=["cidr_block", "tags"].
+# After move to "new_vpc", tags are removed from the DSL.
+# Plan should detect the removal (via prev_desired_keys under the new name).
+
+provider awscc {
+  region = awscc.Region.ap_northeast_1
+}
+
+moved {
+  from = awscc.ec2.vpc "old_vpc"
+  to   = awscc.ec2.vpc "new_vpc"
+}
+
+let new_vpc = awscc.ec2.vpc {
+  cidr_block = "10.0.0.0/16"
+}
+
+awscc.ec2.subnet {
+  vpc_id     = new_vpc.vpc_id
+  cidr_block = "10.0.1.0/24"
+}

@@ -149,12 +149,12 @@ fn build_plan_and_states_from_fixture(
         .map(|sf| sf.build_lifecycles())
         .unwrap_or_default();
 
-    let saved_attrs = state_file
+    let mut saved_attrs = state_file
         .as_ref()
         .map(|sf| sf.build_saved_attrs())
         .unwrap_or_default();
 
-    let prev_desired_keys = state_file
+    let mut prev_desired_keys = state_file
         .as_ref()
         .map(|sf| sf.build_desired_keys())
         .unwrap_or_default();
@@ -167,9 +167,11 @@ fn build_plan_and_states_from_fixture(
         HashMap::new()
     };
 
-    // Pre-process moved blocks: transfer state from old name to new name
+    // Pre-process moved blocks: transfer state, prev_desired_keys, and saved_attrs
     let moved_pairs = crate::wiring::materialize_moved_states(
         &mut current_states,
+        &mut prev_desired_keys,
+        &mut saved_attrs,
         &parsed.state_blocks,
         &state_file,
     );
@@ -463,6 +465,33 @@ fn snapshot_secret_values() {
 #[test]
 fn snapshot_moved_with_changes() {
     let (plan, schemas, moved_origins) = build_plan_from_fixture("moved_with_changes");
+    let output = strip_ansi(&format_plan(
+        &plan,
+        DetailLevel::Full,
+        &HashMap::new(),
+        Some(&schemas),
+        &moved_origins,
+    ));
+    insta::assert_snapshot!(output);
+}
+
+/// Moved block with attribute removal: prev_desired_keys must transfer to new name.
+///
+/// State has "old_vpc" with desired_keys=["cidr_block", "tags"].
+/// After move to "new_vpc", tags are removed from the DSL.
+/// Plan should detect the removal via prev_desired_keys under the new name.
+#[test]
+fn snapshot_moved_prev_keys() {
+    let (plan, schemas, moved_origins) = build_plan_from_fixture("moved_prev_keys");
+    // The plan must contain an Update effect to remove the "tags" attribute.
+    let has_update = plan
+        .effects()
+        .iter()
+        .any(|e| matches!(e, carina_core::effect::Effect::Update { .. }));
+    assert!(
+        has_update,
+        "Plan should detect tag removal via prev_desired_keys transfer, but no Update effect found"
+    );
     let output = strip_ansi(&format_plan(
         &plan,
         DetailLevel::Full,

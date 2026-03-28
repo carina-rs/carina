@@ -1039,7 +1039,7 @@ async fn run_apply_locked(
     }
 
     // Restore unreturned attributes from state file (CloudControl doesn't always return them)
-    let saved_attrs = state_file
+    let mut saved_attrs = state_file
         .as_ref()
         .map(|sf| sf.build_saved_attrs())
         .unwrap_or_default();
@@ -1091,10 +1091,20 @@ async fn run_apply_locked(
     crate::wiring::resolve_enum_aliases_with_ctx(ctx, &mut resources_for_plan);
     crate::wiring::resolve_enum_aliases_in_states(ctx, &mut current_states);
 
-    // Pre-process moved blocks: transfer state from old name to new name
-    // so the differ sees attribute changes and produces Update/Replace effects.
+    // Build prev_desired_keys before moved-state transfer so
+    // materialize_moved_states can re-key them under the new resource name.
+    let mut prev_desired_keys = state_file
+        .as_ref()
+        .map(|sf| sf.build_desired_keys())
+        .unwrap_or_default();
+
+    // Pre-process moved blocks: transfer state, prev_desired_keys, and
+    // saved_attrs from old name to new name so the differ sees attribute
+    // changes (including removals) and produces Update/Replace effects.
     let moved_pairs = crate::wiring::materialize_moved_states(
         &mut current_states,
+        &mut prev_desired_keys,
+        &mut saved_attrs,
         &parsed.state_blocks,
         &state_file,
     );
@@ -1104,10 +1114,6 @@ async fn run_apply_locked(
         .map(|sf| sf.build_lifecycles())
         .unwrap_or_default();
     let schemas = ctx.schemas();
-    let prev_desired_keys = state_file
-        .as_ref()
-        .map(|sf| sf.build_desired_keys())
-        .unwrap_or_default();
     let mut plan = create_plan(
         &resources_for_plan,
         &current_states,
