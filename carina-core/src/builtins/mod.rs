@@ -99,8 +99,8 @@ register_builtins! {
         description: "Converts a string to lowercase.",
     },
     map(map::builtin_map) {
-        signature: "map(collection: list | map, accessor: string) -> list | map",
-        description: "Extracts a field from each element. Use a dot-prefixed accessor (e.g., \".field_name\").",
+        signature: "map(accessor: string, collection: list | map) -> list | map",
+        description: "Extracts a field from each element. Use a dot-prefixed accessor (e.g., \".field_name\"). Pipe form: collection |> map(\".field\").",
     },
     max(min_max::builtin_max) {
         signature: "max(a: number, b: number) -> number",

@@ -1,4 +1,4 @@
-//! `map(collection, ".field")` built-in function
+//! `map(accessor, collection)` built-in function
 
 use std::collections::HashMap;
 
@@ -6,15 +6,18 @@ use crate::resource::Value;
 
 use super::value_type_name;
 
-/// `map(collection, ".field_name")` - Extract a field from each element of a collection.
+/// `map(accessor, collection)` - Extract a field from each element of a collection.
 ///
-/// - First argument: a List of Maps, or a Map of Maps
-/// - Second argument: a field accessor string starting with `.` (e.g., `".subnet_id"`)
+/// - First argument: a field accessor string starting with `.` (e.g., `".subnet_id"`)
+/// - Second argument: a List of Maps, or a Map of Maps
 /// - Returns: List or Map with each element replaced by the extracted field value
+///
+/// The argument order matches pipe convention: the collection (pipe target) is the
+/// last argument. `subnets |> map(".subnet_id")` desugars to `map(".subnet_id", subnets)`.
 ///
 /// Examples:
 /// ```text
-/// map([{name: "a", id: "1"}, {name: "b", id: "2"}], ".id")  // => ["1", "2"]
+/// map(".id", [{name: "a", id: "1"}, {name: "b", id: "2"}])  // => ["1", "2"]
 /// subnets |> map(".subnet_id")  // pipe syntax
 /// ```
 pub(crate) fn builtin_map(args: &[Value]) -> Result<Value, String> {
@@ -22,16 +25,16 @@ pub(crate) fn builtin_map(args: &[Value]) -> Result<Value, String> {
         return Err(format!("map() requires 2 arguments, got {}", args.len()));
     }
 
-    let accessor = match &args[1] {
+    let accessor = match &args[0] {
         Value::String(s) if s.starts_with('.') => &s[1..],
         _ => {
             return Err(
-                "map() second argument must be a field accessor string starting with '.' (e.g., \".field_name\")".to_string(),
+                "map() first argument must be a field accessor string starting with '.' (e.g., \".field_name\")".to_string(),
             );
         }
     };
 
-    match &args[0] {
+    match &args[1] {
         Value::List(items) => {
             let mapped: Result<Vec<Value>, String> = items
                 .iter()
@@ -70,7 +73,7 @@ pub(crate) fn builtin_map(args: &[Value]) -> Result<Value, String> {
             Ok(Value::Map(mapped?))
         }
         other => Err(format!(
-            "map() first argument must be a list or map, got {}",
+            "map() second argument must be a list or map, got {}",
             value_type_name(other)
         )),
     }
@@ -90,6 +93,7 @@ mod tests {
     #[test]
     fn map_list_of_maps_extracts_field() {
         let args = vec![
+            Value::String(".subnet_id".to_string()),
             Value::List(vec![
                 make_map(vec![
                     ("name", Value::String("subnet-a".to_string())),
@@ -100,7 +104,6 @@ mod tests {
                     ("subnet_id", Value::String("id-2".to_string())),
                 ]),
             ]),
-            Value::String(".subnet_id".to_string()),
         ];
         let result = evaluate_builtin("map", &args).unwrap();
         assert_eq!(
@@ -129,7 +132,7 @@ mod tests {
                 ("id", Value::String("2".to_string())),
             ]),
         );
-        let args = vec![Value::Map(outer), Value::String(".id".to_string())];
+        let args = vec![Value::String(".id".to_string()), Value::Map(outer)];
         let result = evaluate_builtin("map", &args).unwrap();
         match result {
             Value::Map(m) => {
@@ -142,7 +145,7 @@ mod tests {
 
     #[test]
     fn map_empty_list() {
-        let args = vec![Value::List(vec![]), Value::String(".field".to_string())];
+        let args = vec![Value::String(".field".to_string()), Value::List(vec![])];
         let result = evaluate_builtin("map", &args).unwrap();
         assert_eq!(result, Value::List(vec![]));
     }
@@ -176,7 +179,7 @@ mod tests {
 
     #[test]
     fn map_error_accessor_without_dot() {
-        let args = vec![Value::List(vec![]), Value::String("field".to_string())];
+        let args = vec![Value::String("field".to_string()), Value::List(vec![])];
         let result = evaluate_builtin("map", &args);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("field accessor"));
@@ -184,7 +187,7 @@ mod tests {
 
     #[test]
     fn map_error_accessor_not_string() {
-        let args = vec![Value::List(vec![]), Value::Int(42)];
+        let args = vec![Value::Int(42), Value::List(vec![])];
         let result = evaluate_builtin("map", &args);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("field accessor"));
@@ -193,8 +196,8 @@ mod tests {
     #[test]
     fn map_error_non_map_elements_in_list() {
         let args = vec![
-            Value::List(vec![Value::String("not a map".to_string())]),
             Value::String(".field".to_string()),
+            Value::List(vec![Value::String("not a map".to_string())]),
         ];
         let result = evaluate_builtin("map", &args);
         assert!(result.is_err());
@@ -204,11 +207,11 @@ mod tests {
     #[test]
     fn map_error_missing_field() {
         let args = vec![
+            Value::String(".missing".to_string()),
             Value::List(vec![make_map(vec![(
                 "name",
                 Value::String("foo".to_string()),
             )])]),
-            Value::String(".missing".to_string()),
         ];
         let result = evaluate_builtin("map", &args);
         assert!(result.is_err());
@@ -216,10 +219,10 @@ mod tests {
     }
 
     #[test]
-    fn map_error_first_arg_not_collection() {
+    fn map_error_second_arg_not_collection() {
         let args = vec![
-            Value::String("not a collection".to_string()),
             Value::String(".field".to_string()),
+            Value::String("not a collection".to_string()),
         ];
         let result = evaluate_builtin("map", &args);
         assert!(result.is_err());
