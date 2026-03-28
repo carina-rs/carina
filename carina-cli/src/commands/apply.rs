@@ -22,6 +22,7 @@ use carina_core::plan::Plan;
 use carina_core::provider::{self as provider_mod, Provider, ProviderNormalizer};
 use carina_core::resolver::resolve_refs_with_state;
 use carina_core::resource::{Resource, ResourceId, State, Value};
+use carina_core::schema::ResourceSchema;
 use carina_core::value::format_value;
 use carina_state::{
     BackendConfig as StateBackendConfig, LockInfo, ResourceState, StateBackend, StateFile,
@@ -449,6 +450,7 @@ fn execute_state_only_effects(plan: &Plan, result: &mut ApplyResult) {
 ///
 /// When `lock` is `None` (i.e. `--lock=false`), state is written without lock
 /// validation via `save_state_unlocked`.
+#[allow(clippy::too_many_arguments)]
 pub async fn finalize_apply(
     result: &ApplyResult,
     state_file: Option<StateFile>,
@@ -457,6 +459,7 @@ pub async fn finalize_apply(
     plan: &Plan,
     backend: &dyn StateBackend,
     lock: Option<&LockInfo>,
+    schemas: &HashMap<String, ResourceSchema>,
 ) -> Result<(), AppError> {
     println!();
     println!("{}", "Saving state...".cyan());
@@ -470,6 +473,7 @@ pub async fn finalize_apply(
         plan,
         successfully_deleted: &result.successfully_deleted,
         failed_refreshes: &result.failed_refreshes,
+        schemas,
     })?;
 
     if let Some(lock) = lock {
@@ -521,6 +525,7 @@ pub struct ApplyStateSave<'a> {
     pub plan: &'a Plan,
     pub successfully_deleted: &'a HashSet<ResourceId>,
     pub failed_refreshes: &'a HashSet<ResourceId>,
+    pub schemas: &'a HashMap<String, ResourceSchema>,
 }
 
 pub fn build_state_after_apply(save: ApplyStateSave<'_>) -> Result<StateFile, AppError> {
@@ -533,6 +538,7 @@ pub fn build_state_after_apply(save: ApplyStateSave<'_>) -> Result<StateFile, Ap
         plan,
         successfully_deleted,
         failed_refreshes,
+        schemas,
     } = save;
     let mut state = state_file.unwrap_or_default();
 
@@ -542,19 +548,38 @@ pub fn build_state_after_apply(save: ApplyStateSave<'_>) -> Result<StateFile, Ap
             &resource.id.resource_type,
             &resource.id.name,
         );
+        // Collect write-only attribute names from the schema for this resource type
+        let write_only_keys: Vec<String> = schemas
+            .get(&resource.id.resource_type)
+            .map(|schema| {
+                schema
+                    .attributes
+                    .iter()
+                    .filter(|(_, attr)| attr.write_only)
+                    .map(|(name, _)| name.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+
         if let Some(applied_state) = applied_states.get(&resource.id) {
             let mut resource_state =
                 ResourceState::from_provider_state(resource, applied_state, existing)?;
             if let Some(overrides) = permanent_name_overrides.get(&resource.id) {
                 resource_state.name_overrides = overrides.clone();
             }
+            if !write_only_keys.is_empty() {
+                resource_state.merge_write_only_attributes(resource, &write_only_keys);
+            }
             state.upsert_resource(resource_state);
         } else if failed_refreshes.contains(&resource.id) {
             continue;
         } else if let Some(current_state) = current_states.get(&resource.id) {
             if current_state.exists {
-                let resource_state =
+                let mut resource_state =
                     ResourceState::from_provider_state(resource, current_state, existing)?;
+                if !write_only_keys.is_empty() {
+                    resource_state.merge_write_only_attributes(resource, &write_only_keys);
+                }
                 state.upsert_resource(resource_state);
             } else {
                 state.remove_resource(
@@ -1153,6 +1178,7 @@ async fn run_apply_locked(
         &plan,
         backend,
         lock,
+        schemas,
     )
     .await?;
 
@@ -1442,6 +1468,9 @@ async fn run_apply_from_plan_locked(
     // Execute remove and move effects (state-only, logged for user feedback)
     execute_state_only_effects(plan, &mut result);
 
+    // Build schemas for write-only attribute persistence
+    let ctx = WiringContext::new();
+
     finalize_apply(
         &result,
         state_file,
@@ -1450,6 +1479,7 @@ async fn run_apply_from_plan_locked(
         plan,
         backend,
         lock,
+        ctx.schemas(),
     )
     .await?;
 
