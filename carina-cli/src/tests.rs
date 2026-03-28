@@ -2423,10 +2423,11 @@ fn build_state_after_apply_persists_write_only_attributes() {
         },
     )]);
 
-    // Build schema with write-only attribute
+    // Build schema with write-only attribute.
+    // Schema keys include the provider prefix (e.g., "awscc.ec2.vpc").
     let mut schemas = HashMap::new();
     schemas.insert(
-        "ec2.vpc".to_string(),
+        "awscc.ec2.vpc".to_string(),
         ResourceSchema::new("ec2.vpc")
             .attribute(AttributeSchema::new("cidr_block", AttributeType::String))
             .attribute(
@@ -2509,7 +2510,7 @@ fn build_state_after_apply_write_only_detects_value_change() {
 
     let mut schemas = HashMap::new();
     schemas.insert(
-        "ec2.vpc".to_string(),
+        "awscc.ec2.vpc".to_string(),
         ResourceSchema::new("ec2.vpc")
             .attribute(AttributeSchema::new("cidr_block", AttributeType::String))
             .attribute(

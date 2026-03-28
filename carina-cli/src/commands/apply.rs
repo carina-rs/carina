@@ -548,9 +548,16 @@ pub fn build_state_after_apply(save: ApplyStateSave<'_>) -> Result<StateFile, Ap
             &resource.id.resource_type,
             &resource.id.name,
         );
-        // Collect write-only attribute names from the schema for this resource type
+        // Collect write-only attribute names from the schema for this resource type.
+        // Schema keys include the provider prefix (e.g., "awscc.ec2.vpc"), so we must
+        // construct the key the same way as schema_key_for_resource().
+        let schema_key = if resource.id.provider.is_empty() {
+            resource.id.resource_type.clone()
+        } else {
+            format!("{}.{}", resource.id.provider, resource.id.resource_type)
+        };
         let write_only_keys: Vec<String> = schemas
-            .get(&resource.id.resource_type)
+            .get(&schema_key)
             .map(|schema| {
                 schema
                     .attributes
@@ -1510,6 +1517,75 @@ async fn run_apply_from_plan_locked(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use carina_core::schema::{AttributeSchema, AttributeType};
+
+    #[test]
+    fn build_state_after_apply_finds_write_only_with_provider_prefix() {
+        // The schema map is keyed by provider-prefixed names (e.g., "awscc.ec2.vpc"),
+        // but the buggy code used resource.id.resource_type (e.g., "ec2.vpc") for lookup.
+        // This test verifies that write-only attributes are found when the schema key
+        // includes the provider prefix.
+        let mut schemas = HashMap::new();
+        let schema = ResourceSchema::new("ec2.vpc")
+            .attribute(AttributeSchema::new("cidr_block", AttributeType::String))
+            .attribute(
+                AttributeSchema::new("ipv4_netmask_length", AttributeType::Int).write_only(),
+            );
+        // Schema is registered with provider-prefixed key
+        schemas.insert("awscc.ec2.vpc".to_string(), schema);
+
+        let resource = Resource::with_provider("awscc", "ec2.vpc", "my-vpc");
+        let mut resource_with_attrs = resource.clone();
+        resource_with_attrs.attributes.insert(
+            "cidr_block".to_string(),
+            Value::String("10.0.0.0/16".to_string()),
+        );
+        resource_with_attrs.attributes.insert(
+            "ipv4_netmask_length".to_string(),
+            Value::String("16".to_string()),
+        );
+
+        let sorted_resources = vec![resource_with_attrs];
+
+        // Simulate provider returning state without the write-only attribute
+        let mut applied_attrs = HashMap::new();
+        applied_attrs.insert(
+            "cidr_block".to_string(),
+            Value::String("10.0.0.0/16".to_string()),
+        );
+        let applied_state = State::existing(sorted_resources[0].id.clone(), applied_attrs);
+        let mut applied_states = HashMap::new();
+        applied_states.insert(sorted_resources[0].id.clone(), applied_state);
+
+        let current_states = HashMap::new();
+        let permanent_name_overrides = HashMap::new();
+        let plan = Plan::new();
+        let successfully_deleted = HashSet::new();
+        let failed_refreshes = HashSet::new();
+
+        let result = build_state_after_apply(ApplyStateSave {
+            state_file: None,
+            sorted_resources: &sorted_resources,
+            current_states: &current_states,
+            applied_states: &applied_states,
+            permanent_name_overrides: &permanent_name_overrides,
+            plan: &plan,
+            successfully_deleted: &successfully_deleted,
+            failed_refreshes: &failed_refreshes,
+            schemas: &schemas,
+        })
+        .unwrap();
+
+        // The write-only attribute should be merged from the desired resource into state
+        let saved = result
+            .find_resource("awscc", "ec2.vpc", "my-vpc")
+            .expect("resource should exist in state");
+        assert_eq!(
+            saved.attributes.get("ipv4_netmask_length"),
+            Some(&serde_json::Value::String("16".to_string())),
+            "write-only attribute should be persisted in state"
+        );
+    }
 
     #[test]
     fn format_duration_sub_second() {
