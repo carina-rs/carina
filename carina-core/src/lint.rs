@@ -76,6 +76,12 @@ pub fn find_pipe_preferred_direct_calls(source: &str) -> Vec<PipePreferredWarnin
 
     for (line_idx, line) in source.lines().enumerate() {
         let trimmed = line.trim();
+
+        // Skip comment lines
+        if trimmed.starts_with("//") || trimmed.starts_with('#') {
+            continue;
+        }
+
         for &func_name in PIPE_PREFERRED_FUNCTIONS {
             let pattern = format!("{}(", func_name);
             // Search for all occurrences of the pattern on this line
@@ -494,6 +500,16 @@ let e = replace("old", "new", str)
         assert!(
             results.is_empty(),
             "Should not match when function name is part of a longer identifier"
+        );
+    }
+
+    #[test]
+    fn test_pipe_preferred_comment_lines_no_warning() {
+        let source = "# join(\"-\", parts)\n// split(\",\", str)";
+        let results = find_pipe_preferred_direct_calls(source);
+        assert!(
+            results.is_empty(),
+            "Comment lines should not produce warnings"
         );
     }
 }
