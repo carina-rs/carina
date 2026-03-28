@@ -172,14 +172,22 @@ enum Commands {
 /// builtin evaluation. AWS credentials are loaded from the default chain
 /// (environment variables, profiles, instance metadata, etc.).
 fn register_kms_decryptor() {
+    static KMS_CLIENT: tokio::sync::OnceCell<aws_sdk_kms::Client> =
+        tokio::sync::OnceCell::const_new();
+
     carina_core::builtins::decrypt::register_decryptor(Box::new(|ciphertext, key| {
         let ciphertext = ciphertext.to_string();
         let key = key.map(|k| k.to_string());
 
         let rt = tokio::runtime::Handle::current();
         rt.block_on(async {
-            let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
-            let client = aws_sdk_kms::Client::new(&config);
+            let client = KMS_CLIENT
+                .get_or_init(|| async {
+                    let config =
+                        aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+                    aws_sdk_kms::Client::new(&config)
+                })
+                .await;
 
             let blob = base64::engine::general_purpose::STANDARD
                 .decode(&ciphertext)
