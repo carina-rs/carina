@@ -286,6 +286,15 @@ impl SemanticTokensProvider {
             tokens.push((indent, 7, 0)); // KEYWORD: removed
         } else if trimmed.starts_with("moved ") || trimmed == "moved{" {
             tokens.push((indent, 5, 0)); // KEYWORD: moved
+        } else if trimmed.starts_with("for ") {
+            tokens.push((indent, 3, 0)); // KEYWORD: for
+            // Check for "in" keyword on the same line
+            if let Some(in_pos) = trimmed.find(" in ") {
+                let in_start = indent as usize + in_pos + 1;
+                tokens.push((in_start as u32, 2, 0)); // KEYWORD: in
+            }
+        } else if trimmed.starts_with("if ") {
+            tokens.push((indent, 2, 0)); // KEYWORD: if
         }
 
         // "else" keyword can appear after "}" on a line like "} else {"
@@ -315,6 +324,8 @@ impl SemanticTokensProvider {
             && !trimmed.starts_with("removed{")
             && !trimmed.starts_with("moved ")
             && !trimmed.starts_with("moved{")
+            && !trimmed.starts_with("for ")
+            && !trimmed.starts_with("if ")
             && !trimmed.contains('=')
             && !trimmed.contains('.')
             && trimmed.ends_with('{')
@@ -1101,6 +1112,73 @@ mod tests {
         assert!(
             !comment_tokens.is_empty(),
             "Should highlight nested block comment as COMMENT. Got: {:?}",
+            tokens
+        );
+    }
+
+    #[test]
+    fn test_top_level_for_keyword_highlighted() {
+        let provider = SemanticTokensProvider::new(&[]);
+        let tokens = provider.tokenize_line(r#"for az in ["a", "b"] {"#, 0);
+        // "for" should be KEYWORD at position 0
+        let for_token = tokens
+            .iter()
+            .find(|(start, len, typ)| *start == 0 && *len == 3 && *typ == 0);
+        assert!(
+            for_token.is_some(),
+            "Expected KEYWORD token for top-level 'for'. Got: {:?}",
+            tokens
+        );
+        // "in" should be KEYWORD
+        let in_token = tokens.iter().find(|(_, len, typ)| *len == 2 && *typ == 0);
+        assert!(
+            in_token.is_some(),
+            "Expected KEYWORD token for 'in' in top-level for. Got: {:?}",
+            tokens
+        );
+    }
+
+    #[test]
+    fn test_top_level_if_keyword_highlighted() {
+        let provider = SemanticTokensProvider::new(&[]);
+        let tokens = provider.tokenize_line("if some_condition {", 0);
+        // "if" should be KEYWORD at position 0
+        let if_token = tokens
+            .iter()
+            .find(|(start, len, typ)| *start == 0 && *len == 2 && *typ == 0);
+        assert!(
+            if_token.is_some(),
+            "Expected KEYWORD token for top-level 'if'. Got: {:?}",
+            tokens
+        );
+    }
+
+    #[test]
+    fn test_indented_top_level_for_keyword_highlighted() {
+        let provider = SemanticTokensProvider::new(&[]);
+        let tokens = provider.tokenize_line(r#"    for az in ["a", "b"] {"#, 0);
+        // "for" should be KEYWORD at position 4
+        let for_token = tokens
+            .iter()
+            .find(|(start, len, typ)| *start == 4 && *len == 3 && *typ == 0);
+        assert!(
+            for_token.is_some(),
+            "Expected KEYWORD token for indented top-level 'for'. Got: {:?}",
+            tokens
+        );
+    }
+
+    #[test]
+    fn test_indented_top_level_if_keyword_highlighted() {
+        let provider = SemanticTokensProvider::new(&[]);
+        let tokens = provider.tokenize_line("    if some_condition {", 0);
+        // "if" should be KEYWORD at position 4
+        let if_token = tokens
+            .iter()
+            .find(|(start, len, typ)| *start == 4 && *len == 2 && *typ == 0);
+        assert!(
+            if_token.is_some(),
+            "Expected KEYWORD token for indented top-level 'if'. Got: {:?}",
             tokens
         );
     }
