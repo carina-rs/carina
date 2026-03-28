@@ -550,6 +550,11 @@ pub async fn create_plan_from_parsed(
     resolve_enum_aliases_with_ctx(&ctx, &mut resources);
     resolve_enum_aliases_in_states(&ctx, &mut current_states);
 
+    // Pre-process moved blocks: transfer state from old name to new name
+    // so the differ sees attribute changes and produces Update/Replace effects.
+    let moved_pairs =
+        materialize_moved_states(&mut current_states, &parsed.state_blocks, state_file);
+
     // Build lifecycles map from state file for orphaned resource deletion
     let lifecycles = state_file
         .as_ref()
@@ -576,13 +581,49 @@ pub async fn create_plan_from_parsed(
     cascade_dependent_updates(&mut plan, &sorted_resources, &current_states, ctx.schemas());
 
     // Add state block effects (import/removed/moved) to the plan
-    add_state_block_effects(&mut plan, &parsed.state_blocks, state_file);
+    add_state_block_effects(&mut plan, &parsed.state_blocks, state_file, &moved_pairs);
 
     Ok(PlanContext {
         plan,
         sorted_resources,
         current_states,
     })
+}
+
+/// Pre-process moved blocks by transferring state from the old name to the new name.
+///
+/// This must be called BEFORE `create_plan()` so the differ sees the moved
+/// resource's state under its new name and can produce Update/Replace effects
+/// if attributes differ between state and desired.
+///
+/// Returns a list of active Move pairs (from, to) where the `from` resource
+/// existed in state. Callers use this to add Move effects to the plan.
+pub fn materialize_moved_states(
+    current_states: &mut HashMap<ResourceId, State>,
+    state_blocks: &[StateBlock],
+    state_file: &Option<StateFile>,
+) -> Vec<(ResourceId, ResourceId)> {
+    let mut moved_pairs = Vec::new();
+
+    for block in state_blocks {
+        if let StateBlock::Moved { from, to } = block {
+            let old_in_state = state_file.as_ref().is_some_and(|sf| {
+                sf.find_resource(&from.provider, &from.resource_type, &from.name)
+                    .is_some()
+            });
+            if old_in_state {
+                // Transfer state from the old name to the new name so the
+                // differ compares desired(to) against actual(from).
+                if let Some(mut state) = current_states.remove(from) {
+                    state.id = to.clone();
+                    current_states.insert(to.clone(), state);
+                }
+                moved_pairs.push((from.clone(), to.clone()));
+            }
+        }
+    }
+
+    moved_pairs
 }
 
 /// Add state block effects (import/removed/moved) to the plan.
@@ -592,16 +633,21 @@ pub async fn create_plan_from_parsed(
 /// - Removed: the resource does not exist in state
 /// - Moved: the old resource does not exist in state (already moved)
 ///
+/// For `moved` blocks, `materialize_moved_states()` must be called before
+/// `create_plan()` to transfer state entries. The pre-computed `moved_pairs`
+/// are passed here to add Move effects without re-checking state.
+///
 /// This function also removes Delete effects for resources covered by
-/// `removed` or `moved` blocks, since those operations manage state
-/// without destroying infrastructure.
+/// `removed` blocks, since those operations manage state without
+/// destroying infrastructure.
 pub fn add_state_block_effects(
     plan: &mut Plan,
     state_blocks: &[StateBlock],
     state_file: &Option<StateFile>,
+    moved_pairs: &[(ResourceId, ResourceId)],
 ) {
-    // Collect resource IDs that are covered by removed/moved blocks
-    // to suppress orphan Delete effects and moved-to Create effects
+    // Collect resource IDs that are covered by removed blocks
+    // to suppress orphan Delete effects
     let mut suppress_delete: std::collections::HashSet<ResourceId> =
         std::collections::HashSet::new();
     let mut suppress_create: std::collections::HashSet<ResourceId> =
@@ -636,26 +682,25 @@ pub fn add_state_block_effects(
                     new_effects.push(Effect::Remove { id: from.clone() });
                 }
             }
-            StateBlock::Moved { from, to } => {
-                // Skip if old resource is not in state (already moved)
-                let old_in_state = state_file.as_ref().is_some_and(|sf| {
-                    sf.find_resource(&from.provider, &from.resource_type, &from.name)
-                        .is_some()
-                });
-                if old_in_state {
-                    suppress_delete.insert(from.clone());
-                    suppress_create.insert(to.clone());
-                    new_effects.push(Effect::Move {
-                        from: from.clone(),
-                        to: to.clone(),
-                    });
-                }
+            StateBlock::Moved { .. } => {
+                // Moved blocks are handled by materialize_moved_states() + moved_pairs below
             }
         }
     }
 
-    // Remove Delete effects for resources covered by removed/moved blocks,
-    // and Create effects for moved-to resources (they inherit state from the old name)
+    // Add Move effects from pre-computed moved pairs.
+    // Also suppress orphan Delete for `to` when there is no desired resource
+    // for the target (the moved state entry would otherwise appear as an orphan).
+    for (from, to) in moved_pairs {
+        suppress_delete.insert(to.clone());
+        new_effects.push(Effect::Move {
+            from: from.clone(),
+            to: to.clone(),
+        });
+    }
+
+    // Remove Delete effects for resources covered by removed blocks,
+    // and Create effects for import targets (they will be imported, not created)
     if !suppress_delete.is_empty() || !suppress_create.is_empty() {
         plan.retain(|effect| match effect {
             Effect::Delete { id, .. } => !suppress_delete.contains(id),
