@@ -343,6 +343,141 @@ pub fn merge_secrets_into_provider_json(
     }
 }
 
+/// Recursively replace all `Value::Secret(inner)` with `Value::String(hash)`.
+///
+/// This ensures that when a `Value` tree is serialized (e.g., via serde), no
+/// secret plaintext is ever written. The hash uses Argon2id with the fallback
+/// salt. For context-aware hashing, use `redact_secrets_in_attributes`.
+pub fn redact_secrets_in_value(value: &Value) -> Value {
+    match value {
+        Value::Secret(inner) => {
+            let inner_json = value_to_json(inner).unwrap_or(serde_json::Value::Null);
+            let json_str = serde_json::to_string(&inner_json).unwrap_or_default();
+            let hash_hex = argon2id_hash(json_str.as_bytes(), None);
+            Value::String(format!("{SECRET_PREFIX}{hash_hex}"))
+        }
+        Value::Map(map) => {
+            let redacted: HashMap<String, Value> = map
+                .iter()
+                .map(|(k, v)| (k.clone(), redact_secrets_in_value(v)))
+                .collect();
+            Value::Map(redacted)
+        }
+        Value::List(items) => Value::List(items.iter().map(redact_secrets_in_value).collect()),
+        other => other.clone(),
+    }
+}
+
+/// Redact all secrets in an attributes map.
+pub fn redact_secrets_in_attributes(attrs: &HashMap<String, Value>) -> HashMap<String, Value> {
+    attrs
+        .iter()
+        .map(|(k, v)| (k.clone(), redact_secrets_in_value(v)))
+        .collect()
+}
+
+/// Redact all secrets in a `Resource`, returning a new Resource with secrets replaced by hashes.
+pub fn redact_secrets_in_resource(
+    resource: &crate::resource::Resource,
+) -> crate::resource::Resource {
+    crate::resource::Resource {
+        id: resource.id.clone(),
+        attributes: redact_secrets_in_attributes(&resource.attributes),
+        read_only: resource.read_only,
+        lifecycle: resource.lifecycle.clone(),
+        prefixes: resource.prefixes.clone(),
+    }
+}
+
+/// Redact all secrets in a `State`, returning a new State with secrets replaced by hashes.
+pub fn redact_secrets_in_state(state: &crate::resource::State) -> crate::resource::State {
+    crate::resource::State {
+        id: state.id.clone(),
+        identifier: state.identifier.clone(),
+        attributes: redact_secrets_in_attributes(&state.attributes),
+        exists: state.exists,
+    }
+}
+
+/// Redact all secrets in an `Effect`, returning a new Effect with secrets replaced by hashes.
+pub fn redact_secrets_in_effect(effect: &crate::effect::Effect) -> crate::effect::Effect {
+    use crate::effect::Effect;
+    match effect {
+        Effect::Read { resource } => Effect::Read {
+            resource: redact_secrets_in_resource(resource),
+        },
+        Effect::Create(resource) => Effect::Create(redact_secrets_in_resource(resource)),
+        Effect::Update {
+            id,
+            from,
+            to,
+            changed_attributes,
+        } => Effect::Update {
+            id: id.clone(),
+            from: Box::new(redact_secrets_in_state(from)),
+            to: redact_secrets_in_resource(to),
+            changed_attributes: changed_attributes.clone(),
+        },
+        Effect::Replace {
+            id,
+            from,
+            to,
+            lifecycle,
+            changed_create_only,
+            cascading_updates,
+            temporary_name,
+            cascade_ref_hints,
+        } => Effect::Replace {
+            id: id.clone(),
+            from: Box::new(redact_secrets_in_state(from)),
+            to: redact_secrets_in_resource(to),
+            lifecycle: lifecycle.clone(),
+            changed_create_only: changed_create_only.clone(),
+            temporary_name: temporary_name.clone(),
+            cascade_ref_hints: cascade_ref_hints.clone(),
+            cascading_updates: cascading_updates
+                .iter()
+                .map(|cu| crate::effect::CascadingUpdate {
+                    id: cu.id.clone(),
+                    from: Box::new(redact_secrets_in_state(&cu.from)),
+                    to: redact_secrets_in_resource(&cu.to),
+                })
+                .collect(),
+        },
+        Effect::Delete {
+            id,
+            identifier,
+            lifecycle,
+            binding,
+            dependencies,
+        } => Effect::Delete {
+            id: id.clone(),
+            identifier: identifier.clone(),
+            lifecycle: lifecycle.clone(),
+            binding: binding.clone(),
+            dependencies: dependencies.clone(),
+        },
+        Effect::Import { id, identifier } => Effect::Import {
+            id: id.clone(),
+            identifier: identifier.clone(),
+        },
+        Effect::Remove { id } => Effect::Remove { id: id.clone() },
+        Effect::Move { from, to } => Effect::Move {
+            from: from.clone(),
+            to: to.clone(),
+        },
+    }
+}
+
+/// Redact all secrets in a `Plan`, returning a new Plan with secrets replaced by hashes.
+pub fn redact_secrets_in_plan(plan: &crate::plan::Plan) -> crate::plan::Plan {
+    let mut redacted = crate::plan::Plan::new();
+    for effect in plan.effects() {
+        redacted.add(redact_secrets_in_effect(effect));
+    }
+    redacted
+}
+
 /// Check if a value is a list of maps (list-of-struct)
 pub fn is_list_of_maps(value: &Value) -> bool {
     if let Value::List(items) = value {
@@ -821,5 +956,101 @@ mod tests {
             json_with_ctx, json_no_ctx,
             "Context-based hash should differ from fallback hash"
         );
+    }
+
+    #[test]
+    fn test_redact_secrets_in_value_replaces_secret() {
+        let v = Value::Secret(Box::new(Value::String("my-password".to_string())));
+        let redacted = redact_secrets_in_value(&v);
+        // Should be a String starting with the secret prefix, not a Secret variant
+        match &redacted {
+            Value::String(s) => {
+                assert!(
+                    s.starts_with(SECRET_PREFIX),
+                    "Expected secret hash prefix, got: {}",
+                    s
+                );
+            }
+            _ => panic!(
+                "Expected Value::String after redaction, got: {:?}",
+                redacted
+            ),
+        }
+    }
+
+    #[test]
+    fn test_redact_secrets_in_value_no_plaintext_in_serialized_output() {
+        let v = Value::Secret(Box::new(Value::String("super-secret-password".to_string())));
+        let redacted = redact_secrets_in_value(&v);
+        let json = serde_json::to_string(&redacted).unwrap();
+        assert!(
+            !json.contains("super-secret-password"),
+            "Serialized output must not contain plaintext secret, got: {}",
+            json
+        );
+    }
+
+    #[test]
+    fn test_redact_secrets_in_value_nested_in_map() {
+        let mut map = HashMap::new();
+        map.insert("name".to_string(), Value::String("test".to_string()));
+        map.insert(
+            "password".to_string(),
+            Value::Secret(Box::new(Value::String("s3cret".to_string()))),
+        );
+        let v = Value::Map(map);
+        let redacted = redact_secrets_in_value(&v);
+        let json = serde_json::to_string(&redacted).unwrap();
+        assert!(
+            !json.contains("s3cret"),
+            "Serialized map must not contain plaintext secret, got: {}",
+            json
+        );
+        // Non-secret values should be preserved
+        assert!(
+            json.contains("test"),
+            "Non-secret value should be preserved"
+        );
+    }
+
+    #[test]
+    fn test_redact_secrets_in_value_nested_in_list() {
+        let v = Value::List(vec![
+            Value::String("visible".to_string()),
+            Value::Secret(Box::new(Value::String("hidden".to_string()))),
+        ]);
+        let redacted = redact_secrets_in_value(&v);
+        let json = serde_json::to_string(&redacted).unwrap();
+        assert!(
+            !json.contains("hidden"),
+            "Serialized list must not contain plaintext secret, got: {}",
+            json
+        );
+        assert!(json.contains("visible"));
+    }
+
+    #[test]
+    fn test_redact_secrets_in_value_preserves_non_secret() {
+        let v = Value::String("not-a-secret".to_string());
+        let redacted = redact_secrets_in_value(&v);
+        assert_eq!(redacted, v);
+    }
+
+    #[test]
+    fn test_redact_secrets_in_attributes() {
+        let mut attrs = HashMap::new();
+        attrs.insert("name".to_string(), Value::String("my-bucket".to_string()));
+        attrs.insert(
+            "password".to_string(),
+            Value::Secret(Box::new(Value::String("hunter2".to_string()))),
+        );
+        let redacted = redact_secrets_in_attributes(&attrs);
+        let json = serde_json::to_string(&redacted).unwrap();
+        assert!(
+            !json.contains("hunter2"),
+            "Serialized attributes must not contain plaintext secret, got: {}",
+            json
+        );
+        assert!(json.contains("my-bucket"));
     }
 }

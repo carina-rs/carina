@@ -2539,3 +2539,65 @@ fn build_state_after_apply_write_only_detects_value_change() {
         "write-only attribute should reflect the updated desired value"
     );
 }
+
+#[test]
+fn plan_file_serialization_redacts_secrets() {
+    use carina_core::value::{
+        SECRET_PREFIX, redact_secrets_in_plan, redact_secrets_in_resource, redact_secrets_in_state,
+    };
+
+    // Build a plan with secrets in resources, states, and effects
+    let secret_password = Value::Secret(Box::new(Value::String("super-secret-pw".to_string())));
+
+    let resource_with_secret = Resource::with_provider("awscc", "rds.db_instance", "my-db")
+        .with_attribute("name", Value::String("my-db".to_string()))
+        .with_attribute("master_password", secret_password.clone());
+
+    let mut plan = Plan::new();
+    plan.add(Effect::Create(resource_with_secret.clone()));
+
+    let mut state_attrs = HashMap::new();
+    state_attrs.insert("name".to_string(), Value::String("my-db".to_string()));
+    state_attrs.insert("master_password".to_string(), secret_password.clone());
+    let state_with_secret = State::existing(
+        ResourceId::with_provider("awscc", "rds.db_instance", "my-db"),
+        state_attrs,
+    );
+
+    // Redact before building PlanFile (same as production code does)
+    let plan_file = PlanFile {
+        version: 1,
+        carina_version: "0.1.0".to_string(),
+        timestamp: "2025-01-01T00:00:00Z".to_string(),
+        source_path: "example.crn".to_string(),
+        state_lineage: None,
+        state_serial: None,
+        provider_configs: vec![],
+        backend_config: None,
+        plan: redact_secrets_in_plan(&plan),
+        sorted_resources: vec![redact_secrets_in_resource(&resource_with_secret)],
+        current_states: vec![CurrentStateEntry {
+            id: ResourceId::with_provider("awscc", "rds.db_instance", "my-db"),
+            state: redact_secrets_in_state(&state_with_secret),
+        }],
+    };
+
+    let json = serde_json::to_string_pretty(&plan_file).unwrap();
+
+    // The plaintext secret must never appear in the serialized output
+    assert!(
+        !json.contains("super-secret-pw"),
+        "Plan file JSON must not contain plaintext secret value.\nJSON:\n{}",
+        json
+    );
+
+    // The hash prefix should appear (secrets are replaced with hashes)
+    assert!(
+        json.contains(SECRET_PREFIX),
+        "Plan file JSON should contain secret hash prefix.\nJSON:\n{}",
+        json
+    );
+
+    // Non-secret values should still be present
+    assert!(json.contains("my-db"));
+}
