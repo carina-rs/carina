@@ -71,6 +71,7 @@ Indicates whether DNS queries made to the Amazon-provided DNS Resolver in this s
 
 - **Type:** Int
 - **Required:** No
+- **Write-only:** Yes
 
 Indicates the device position for local network interfaces in this subnet. For example, ``1`` indicates local network interfaces in this subnet are the secondary network interface (eth1).
 
@@ -79,6 +80,7 @@ Indicates the device position for local network interfaces in this subnet. For e
 - **Type:** IpamPoolId
 - **Required:** No
 - **Create-only:** Yes
+- **Write-only:** Yes
 
 An IPv4 IPAM pool ID for the subnet.
 
@@ -87,6 +89,7 @@ An IPv4 IPAM pool ID for the subnet.
 - **Type:** Int(0..=32)
 - **Required:** No
 - **Create-only:** Yes
+- **Write-only:** Yes
 
 An IPv4 netmask length for the subnet.
 
@@ -102,6 +105,7 @@ The IPv6 CIDR block. If you specify ``AssignIpv6AddressOnCreation``, you must al
 - **Type:** IpamPoolId
 - **Required:** No
 - **Create-only:** Yes
+- **Write-only:** Yes
 
 An IPv6 IPAM pool ID for the subnet.
 
@@ -118,6 +122,7 @@ Indicates whether this is an IPv6 only subnet. For more information, see [Subnet
 - **Type:** Int(0..=128)
 - **Required:** No
 - **Create-only:** Yes
+- **Write-only:** Yes
 
 An IPv6 netmask length for the subnet.
 

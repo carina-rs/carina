@@ -130,6 +130,7 @@ pub fn ec2_transit_gateway_config() -> AwsccSchemaConfig {
                         to_dsl: None,
                     },
                 )
+                .write_only()
                 .with_provider_name("EncryptionSupport"),
             )
             .attribute(

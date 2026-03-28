@@ -87,12 +87,14 @@ pub fn ec2_subnet_config() -> AwsccSchemaConfig {
         )
         .attribute(
             AttributeSchema::new("enable_lni_at_device_index", AttributeType::Int)
+                .write_only()
                 .with_description("Indicates the device position for local network interfaces in this subnet. For example, ``1`` indicates local network interfaces in this subnet are the secondary network interface (eth1).")
                 .with_provider_name("EnableLniAtDeviceIndex"),
         )
         .attribute(
             AttributeSchema::new("ipv4_ipam_pool_id", super::ipam_pool_id())
                 .create_only()
+                .write_only()
                 .with_description("An IPv4 IPAM pool ID for the subnet.")
                 .with_provider_name("Ipv4IpamPoolId"),
         )
@@ -105,6 +107,7 @@ pub fn ec2_subnet_config() -> AwsccSchemaConfig {
                 to_dsl: None,
             })
                 .create_only()
+                .write_only()
                 .with_description("An IPv4 netmask length for the subnet.")
                 .with_provider_name("Ipv4NetmaskLength"),
         )
@@ -122,6 +125,7 @@ pub fn ec2_subnet_config() -> AwsccSchemaConfig {
         .attribute(
             AttributeSchema::new("ipv6_ipam_pool_id", super::ipam_pool_id())
                 .create_only()
+                .write_only()
                 .with_description("An IPv6 IPAM pool ID for the subnet.")
                 .with_provider_name("Ipv6IpamPoolId"),
         )
@@ -140,6 +144,7 @@ pub fn ec2_subnet_config() -> AwsccSchemaConfig {
                 to_dsl: None,
             })
                 .create_only()
+                .write_only()
                 .with_description("An IPv6 netmask length for the subnet.")
                 .with_provider_name("Ipv6NetmaskLength"),
         )

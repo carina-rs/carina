@@ -58,6 +58,7 @@ awscc.ec2.transit_gateway {
 
 - **Type:** [Enum (EncryptionSupport)](#encryption_support-encryptionsupport)
 - **Required:** No
+- **Write-only:** Yes
 
 ### `multicast_support`
 

@@ -21,6 +21,7 @@ pub fn ec2_eip_config() -> AwsccSchemaConfig {
         .attribute(
             AttributeSchema::new("address", types::ipv4_address())
                 .create_only()
+                .write_only()
                 .with_description("")
                 .with_provider_name("Address"),
         )
@@ -48,6 +49,7 @@ pub fn ec2_eip_config() -> AwsccSchemaConfig {
         .attribute(
             AttributeSchema::new("ipam_pool_id", super::ipam_pool_id())
                 .create_only()
+                .write_only()
                 .with_description("")
                 .with_provider_name("IpamPoolId"),
         )
@@ -76,6 +78,7 @@ pub fn ec2_eip_config() -> AwsccSchemaConfig {
         .attribute(
             AttributeSchema::new("transfer_address", types::ipv4_address())
                 .create_only()
+                .write_only()
                 .with_description("The Elastic IP address you are accepting for transfer. You can only accept one transferred address. For more information on Elastic IP address transfers, see [Transfer Elastic IP addresses](https://docs.aws.amazon.com/vpc/latest/userguide/vpc-eips.html#transfer-EIPs-intro) in the *Amazon Virtual Private Cloud User Guide*.")
                 .with_provider_name("TransferAddress"),
         )

@@ -262,6 +262,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                 namespace: Some("awscc.s3.bucket".to_string()),
                 to_dsl: None,
             })
+                .write_only()
                 .with_description("This is a legacy property, and it is not recommended for most use cases. A majority of modern use cases in Amazon S3 no longer require the use of ACLs, and we recommend that you keep ACLs disabled. For more information, see [Controlling object ownership](https://docs.aws.amazon.com//AmazonS3/latest/userguide/about-object-ownership.html) in the *Amazon S3 User Guide*. A canned access control list (ACL) that grants predefined permissions to the bucket. For more information about canned ACLs, see [Canned ACL](https://docs.aws.amazon.com/AmazonS3/latest/dev/acl-overview.html#canned-acl) in the *Amazon S3 User Guide*. S3 buckets are created with ACLs disabled by default. Therefore, unless you explicitly set the [AWS::S3::OwnershipControls](https://docs.aws.amazon.com//AWSCloudFormation/latest/UserGuide/aws-properties-s3-bucket-ownershipcontrols.html) property to enable ACLs, your resource will fail to deploy with any value other than Private. Use cases requiring ACLs are uncommon. The majority of access control configurations can be successfully and more easily achieved with bucket policies. For more information, see [AWS::S3::BucketPolicy](https://docs.aws.amazon.com//AWSCloudFormation/latest/UserGuide/aws-properties-s3-policy.html). For examples of common policy configurations, including S3 Server Access Logs buckets and more, see [Bucket policy examples](https://docs.aws.amazon.com/AmazonS3/latest/userguide/example-bucket-policies.html) in the *Amazon S3 User Guide*.")
                 .with_provider_name("AccessControl"),
         )
@@ -624,6 +625,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
             }).with_description("Indicates which default minimum object size behavior is applied to the lifecycle configuration. This parameter applies to general purpose buckets only. It isn't supported for directory bucket lifecycle configurations. + ``all_storage_classes_128K`` - Objects smaller than 128 KB will not transition to any storage class by default. + ``varies_by_storage_class`` - Objects smaller than 128 KB will transition to Glacier Flexible Retrieval or Glacier Deep Archive storage classes. By default, all other storage classes will prevent transitions smaller than 128 KB. To customize the minimum object size for any transition you can add a filter that specifies a custom ``ObjectSizeGreaterThan`` or ``ObjectSizeLessThan`` in the body of your transition rule. Custom filters always take precedence over the default transition behavior.").with_provider_name("TransitionDefaultMinimumObjectSize")
                     ],
                 })
+                .write_only()
                 .with_description("Specifies the lifecycle configuration for objects in an Amazon S3 bucket. For more information, see [Object Lifecycle Management](https://docs.aws.amazon.com/AmazonS3/latest/dev/object-lifecycle-mgmt.html) in the *Amazon S3 User Guide*.")
                 .with_provider_name("LifecycleConfiguration")
                 .with_block_name("lifecycle_configuration"),
@@ -734,6 +736,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                 }).required().with_description("The journal table configuration for a metadata configuration.").with_provider_name("JournalTableConfiguration")
                     ],
                 })
+                .write_only()
                 .with_description("The S3 Metadata configuration for a general purpose bucket.")
                 .with_provider_name("MetadataConfiguration"),
         )
@@ -1102,6 +1105,7 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                 })).required().with_description("A container for one or more replication rules. A replication configuration must have at least one rule and can contain a maximum of 1,000 rules.").with_provider_name("Rules").with_block_name("rule")
                     ],
                 })
+                .write_only()
                 .with_description("Configuration for replicating objects in an S3 bucket. To enable replication, you must also enable versioning by using the ``VersioningConfiguration`` property. Amazon S3 can store replicated objects in a single destination bucket or multiple destination buckets. The destination bucket or buckets must already exist.")
                 .with_provider_name("ReplicationConfiguration")
                 .with_block_name("replication_configuration"),

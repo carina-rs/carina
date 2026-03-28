@@ -94,6 +94,7 @@ pub fn ec2_nat_gateway_config() -> AwsccSchemaConfig {
         )
         .attribute(
             AttributeSchema::new("max_drain_duration_seconds", AttributeType::Int)
+                .write_only()
                 .with_description("The maximum amount of time to wait (in seconds) before forcibly releasing the IP addresses if connections are still in progress. Default value is 350 seconds.")
                 .with_provider_name("MaxDrainDurationSeconds"),
         )

@@ -78,6 +78,7 @@ pub fn ec2_vpc_config() -> AwsccSchemaConfig {
         .attribute(
             AttributeSchema::new("ipv4_ipam_pool_id", super::ipam_pool_id())
                 .create_only()
+                .write_only()
                 .with_description("The ID of an IPv4 IPAM pool you want to use for allocating this VPC's CIDR. For more information, see [What is IPAM?](https://docs.aws.amazon.com//vpc/latest/ipam/what-is-it-ipam.html) in the *Amazon VPC IPAM User Guide*. You must specify either``CidrBlock`` or ``Ipv4IpamPoolId``.")
                 .with_provider_name("Ipv4IpamPoolId"),
         )
@@ -90,6 +91,7 @@ pub fn ec2_vpc_config() -> AwsccSchemaConfig {
                 to_dsl: None,
             })
                 .create_only()
+                .write_only()
                 .with_description("The netmask length of the IPv4 CIDR you want to allocate to this VPC from an Amazon VPC IP Address Manager (IPAM) pool. For more information about IPAM, see [What is IPAM?](https://docs.aws.amazon.com//vpc/latest/ipam/what-is-it-ipam.html) in the *Amazon VPC IPAM User Guide*.")
                 .with_provider_name("Ipv4NetmaskLength"),
         )
