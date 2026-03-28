@@ -53,6 +53,7 @@ The Amazon Resource Name (ARN) of the core network.
 
 - **Type:** Ipv4Cidr
 - **Required:** No
+- **Create-only:** Yes
 
 The IPv4 CIDR address block used for the destination match. Routing decisions are based on the most specific match. We modify the specified CIDR block to its canonical form; for example, if you specify ``100.68.0.18/18``, we modify it to ``100.68.0.0/18``.
 
@@ -60,6 +61,7 @@ The IPv4 CIDR address block used for the destination match. Routing decisions ar
 
 - **Type:** Ipv6Cidr
 - **Required:** No
+- **Create-only:** Yes
 
 The IPv6 CIDR block used for the destination match. Routing decisions are based on the most specific match.
 
@@ -67,6 +69,7 @@ The IPv6 CIDR block used for the destination match. Routing decisions are based 
 
 - **Type:** PrefixListId
 - **Required:** No
+- **Create-only:** Yes
 
 The ID of a prefix list used for the destination match.
 
@@ -116,6 +119,7 @@ The ID of a network interface.
 
 - **Type:** RouteTableId
 - **Required:** Yes
+- **Create-only:** Yes
 
 The ID of the route table for the route.
 
@@ -145,5 +149,7 @@ The ID of a VPC peering connection.
 ### `cidr_block`
 
 - **Type:** Ipv4Cidr
+
+
 
 

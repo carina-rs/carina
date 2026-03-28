@@ -14,11 +14,13 @@ awscc.iam.role {
   assume_role_policy_document = {
     version = "2012-10-17"
     statement {
-      effect    = "Allow"
+      effect = "Allow"
+
       principal = {
         service = "lambda.amazonaws.com"
       }
-      action    = "sts:AssumeRole"
+
+      action = "sts:AssumeRole"
     }
   }
 
@@ -62,6 +64,7 @@ The maximum session duration (in seconds) that you want to set for the specified
 
 - **Type:** String
 - **Required:** No
+- **Create-only:** Yes
 - **Default:** `"/"`
 
 The path to the role. For more information about paths, see [IAM Identifiers](https://docs.aws.amazon.com/IAM/latest/UserGuide/Using_Identifiers.html) in the *IAM User Guide*. This parameter is optional. If it is not included, it defaults to a slash (/). This parameter allows (through its [regex pattern](https://docs.aws.amazon.com/http://wikipedia.org/wiki/regex)) a string of characters consisting of either a forward slash (/) by itself or a string that must begin and end with forward slashes. In addition, it can contain any ASCII character from the ! (``\u0021``) through the DEL character (``\u007F``), including most punctuation characters, digits, and upper and lowercased letters.
@@ -84,12 +87,13 @@ Adds or updates an inline policy document that is embedded in the specified IAM 
 
 - **Type:** String
 - **Required:** No
+- **Create-only:** Yes
 
 A name for the IAM role, up to 64 characters in length. For valid values, see the ``RoleName`` parameter for the [CreateRole](https://docs.aws.amazon.com/IAM/latest/APIReference/API_CreateRole.html) action in the *User Guide*. This parameter allows (per its [regex pattern](https://docs.aws.amazon.com/http://wikipedia.org/wiki/regex)) a string of characters consisting of upper and lowercase alphanumeric characters with no spaces. You can also include any of the following characters: _+=,.@-. The role name must be unique within the account. Role names are not distinguished by case. For example, you cannot create roles named both "Role1" and "role1". If you don't specify a name, CFN generates a unique physical ID and uses that ID for the role name. If you specify a name, you must specify the ``CAPABILITY_NAMED_IAM`` value to acknowledge your template's capabilities. For more information, see [Acknowledging Resources in Templates](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/using-iam-template.html#using-iam-capabilities). Naming an IAM resource can cause an unrecoverable error if you reuse the same template in multiple Regions. To prevent this, we recommend using ``Fn::Join`` and ``AWS::Region`` to create a Region-specific name, as in the following example: ``{"Fn::Join": ["", [{"Ref": "AWS::Region"}, {"Ref": "MyResourceName"}]]}``.
 
 ### `tags`
 
-- **Type:** Map
+- **Type:** Map(String)
 - **Required:** No
 
 A list of tags that are attached to the role. For more information about tagging, see [Tagging IAM resources](https://docs.aws.amazon.com/IAM/latest/UserGuide/id_tags.html) in the *IAM User Guide*.
@@ -109,8 +113,12 @@ A list of tags that are attached to the role. For more information about tagging
 
 - **Type:** IamRoleArn
 
+
+
 ### `role_id`
 
 - **Type:** IamRoleId
+
+
 
 

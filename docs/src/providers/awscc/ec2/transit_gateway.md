@@ -22,6 +22,7 @@ awscc.ec2.transit_gateway {
 
 - **Type:** Int(1..=4294967294)
 - **Required:** No
+- **Create-only:** Yes
 
 ### `association_default_route_table_id`
 
@@ -62,6 +63,7 @@ awscc.ec2.transit_gateway {
 
 - **Type:** [Enum (MulticastSupport)](#multicast_support-multicastsupport)
 - **Required:** No
+- **Create-only:** Yes
 
 ### `propagation_default_route_table_id`
 
@@ -75,7 +77,7 @@ awscc.ec2.transit_gateway {
 
 ### `tags`
 
-- **Type:** Map
+- **Type:** Map(String)
 - **Required:** No
 
 ### `transit_gateway_cidr_blocks`

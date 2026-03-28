@@ -506,10 +506,10 @@ fn type_display_string(
             enum_link
         }
     } else if prop_name == "Tags" {
-        "Map".to_string()
+        "Map(String)".to_string()
     } else if let Some(ref_path) = &prop.ref_path {
         if ref_path.contains("/Tag") {
-            "Map".to_string()
+            "Map(String)".to_string()
         } else if let Some(def_name) = ref_def_name(ref_path)
             && resolve_ref(schema, ref_path)
                 .and_then(|d| d.properties.as_ref())
@@ -667,7 +667,7 @@ fn type_display_string(
                                 "`List<String>`".to_string()
                             }
                         } else {
-                            "`List<Map>`".to_string()
+                            "`List<Map(String)>`".to_string()
                         }
                     } else {
                         list_element_type_display(items, prop_name, &schema.type_name)
@@ -691,7 +691,7 @@ fn type_display_string(
                 } else if prop_name.ends_with("PolicyDocument") {
                     "IamPolicyDocument".to_string()
                 } else {
-                    "Map".to_string()
+                    "Map(Json)".to_string()
                 }
             }
             _ => "String".to_string(),
@@ -708,6 +708,13 @@ fn generate_markdown(schema: &CfnSchema, type_name: &str) -> Result<String> {
     // Build read-only properties set
     let read_only: HashSet<String> = schema
         .read_only_properties
+        .iter()
+        .map(|p| p.trim_start_matches("/properties/").to_string())
+        .collect();
+
+    // Build create-only properties set
+    let create_only: HashSet<String> = schema
+        .create_only_properties
         .iter()
         .map(|p| p.trim_start_matches("/properties/").to_string())
         .collect();
@@ -770,6 +777,9 @@ fn generate_markdown(schema: &CfnSchema, type_name: &str) -> Result<String> {
             md.push_str("- **Required:** Yes\n");
         } else {
             md.push_str("- **Required:** No\n");
+        }
+        if create_only.contains(prop_name) {
+            md.push_str("- **Create-only:** Yes\n");
         }
         if let Some(default_val) = &prop.default_value
             && let Some(display) = json_default_to_markdown(default_val)
@@ -922,7 +932,14 @@ fn generate_markdown(schema: &CfnSchema, type_name: &str) -> Result<String> {
             let type_display = type_display_string(prop_name, prop, schema, &enums);
 
             md.push_str(&format!("### `{}`\n\n", attr_name));
-            md.push_str(&format!("- **Type:** {}\n\n", type_display));
+            md.push_str(&format!("- **Type:** {}\n", type_display));
+
+            if let Some(d) = &prop.description {
+                let desc = collapse_whitespace(&d.replace('\n', " "));
+                md.push_str(&format!("\n{}\n\n", desc));
+            } else {
+                md.push('\n');
+            }
         }
     }
 
@@ -4656,7 +4673,7 @@ mod tests {
 
     #[test]
     fn test_type_display_string_array_tag_ref() {
-        // Array with Tag $ref should display List<Map>
+        // Array with Tag $ref should display List<Map(String)>
         let prop = CfnProperty {
             prop_type: Some(TypeValue::Single("array".to_string())),
             description: None,
@@ -4715,7 +4732,7 @@ mod tests {
         let enums = BTreeMap::new();
         assert_eq!(
             type_display_string("ResourceTags", &prop, &schema, &enums),
-            "`List<Map>`"
+            "`List<Map(String)>`"
         );
     }
 

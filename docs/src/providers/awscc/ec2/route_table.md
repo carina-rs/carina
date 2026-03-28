@@ -27,7 +27,7 @@ awscc.ec2.route_table {
 
 ### `tags`
 
-- **Type:** Map
+- **Type:** Map(String)
 - **Required:** No
 
 Any tags assigned to the route table.
@@ -36,6 +36,7 @@ Any tags assigned to the route table.
 
 - **Type:** VpcId
 - **Required:** Yes
+- **Create-only:** Yes
 
 The ID of the VPC.
 
@@ -44,5 +45,7 @@ The ID of the VPC.
 ### `route_table_id`
 
 - **Type:** RouteTableId
+
+
 
 

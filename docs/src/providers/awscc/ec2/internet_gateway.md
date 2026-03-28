@@ -18,7 +18,7 @@ awscc.ec2.internet_gateway {
 
 ### `tags`
 
-- **Type:** Map
+- **Type:** Map(String)
 - **Required:** No
 
 Any tags to assign to the internet gateway.
@@ -28,5 +28,7 @@ Any tags to assign to the internet gateway.
 ### `internet_gateway_id`
 
 - **Type:** InternetGatewayId
+
+
 
 

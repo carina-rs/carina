@@ -58,7 +58,7 @@ The regions IPAM is enabled for. Allows pools to be created in these regions, as
 
 ### `tags`
 
-- **Type:** Map
+- **Type:** Map(String)
 - **Required:** No
 
 An array of key-value pairs to apply to this resource.
@@ -110,32 +110,48 @@ Shorthand formats: `free` or `Tier.free`
 
 - **Type:** Arn
 
+The Amazon Resource Name (ARN) of the IPAM.
+
 ### `default_resource_discovery_association_id`
 
 - **Type:** String
+
+The Id of the default association to the default resource discovery, created with this IPAM.
 
 ### `default_resource_discovery_id`
 
 - **Type:** String
 
+The Id of the default resource discovery, created with this IPAM.
+
 ### `ipam_id`
 
 - **Type:** IpamId
+
+Id of the IPAM.
 
 ### `private_default_scope_id`
 
 - **Type:** String
 
+The Id of the default scope for publicly routable IP space, created with this IPAM.
+
 ### `public_default_scope_id`
 
 - **Type:** String(len: ..=255)
+
+The Id of the default scope for publicly routable IP space, created with this IPAM.
 
 ### `resource_discovery_association_count`
 
 - **Type:** Int
 
+The count of resource discoveries associated with this IPAM.
+
 ### `scope_count`
 
 - **Type:** Int
+
+The number of scopes that currently exist in this IPAM.
 
 

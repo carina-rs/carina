@@ -24,7 +24,7 @@ awscc.ec2.egress_only_internet_gateway {
 
 ### `tags`
 
-- **Type:** Map
+- **Type:** Map(String)
 - **Required:** No
 
 Any tags assigned to the egress only internet gateway.
@@ -33,6 +33,7 @@ Any tags assigned to the egress only internet gateway.
 
 - **Type:** VpcId
 - **Required:** Yes
+- **Create-only:** Yes
 
 The ID of the VPC for which to create the egress-only internet gateway.
 
@@ -41,5 +42,7 @@ The ID of the VPC for which to create the egress-only internet gateway.
 ### `id`
 
 - **Type:** EgressOnlyInternetGatewayId
+
+Service Generated ID of the EgressOnlyInternetGateway
 
 

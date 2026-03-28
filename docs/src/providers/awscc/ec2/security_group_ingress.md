@@ -32,6 +32,7 @@ awscc.ec2.security_group_ingress {
 
 - **Type:** Ipv4Cidr
 - **Required:** No
+- **Create-only:** Yes
 
 The IPv4 ranges
 
@@ -39,6 +40,7 @@ The IPv4 ranges
 
 - **Type:** Ipv6Cidr
 - **Required:** No
+- **Create-only:** Yes
 
 [VPC only] The IPv6 ranges
 
@@ -53,6 +55,7 @@ Updates the description of an ingress (inbound) security group rule. You can rep
 
 - **Type:** Int(-1..=65535)
 - **Required:** No
+- **Create-only:** Yes
 
 The start of port range for the TCP and UDP protocols, or an ICMP/ICMPv6 type number. A value of -1 indicates all ICMP/ICMPv6 types. If you specify all ICMP/ICMPv6 types, you must specify all codes. Use this for ICMP and any protocol that uses ports.
 
@@ -60,6 +63,7 @@ The start of port range for the TCP and UDP protocols, or an ICMP/ICMPv6 type nu
 
 - **Type:** SecurityGroupId
 - **Required:** No
+- **Create-only:** Yes
 
 The ID of the security group. You must specify either the security group ID or the security group name in the request. For security groups in a nondefault VPC, you must specify the security group ID. You must specify the GroupName property or the GroupId property. For security groups that are in a VPC, you must use the GroupId property.
 
@@ -67,6 +71,7 @@ The ID of the security group. You must specify either the security group ID or t
 
 - **Type:** String
 - **Required:** No
+- **Create-only:** Yes
 
 The name of the security group.
 
@@ -74,6 +79,7 @@ The name of the security group.
 
 - **Type:** [Enum (IpProtocol)](#ip_protocol-ipprotocol)
 - **Required:** Yes
+- **Create-only:** Yes
 
 The IP protocol name (tcp, udp, icmp, icmpv6) or number (see Protocol Numbers). [VPC only] Use -1 to specify all protocols. When authorizing security group rules, specifying -1 or a protocol number other than tcp, udp, icmp, or icmpv6 allows traffic on all ports, regardless of any port range you specify. For tcp, udp, and icmp, you must specify a port range. For icmpv6, the port range is optional; if you omit the port range, traffic for all types and codes is allowed.
 
@@ -81,6 +87,7 @@ The IP protocol name (tcp, udp, icmp, icmpv6) or number (see Protocol Numbers). 
 
 - **Type:** PrefixListId
 - **Required:** No
+- **Create-only:** Yes
 
 [EC2-VPC only] The ID of a prefix list. 
 
@@ -88,6 +95,7 @@ The IP protocol name (tcp, udp, icmp, icmpv6) or number (see Protocol Numbers). 
 
 - **Type:** SecurityGroupId
 - **Required:** No
+- **Create-only:** Yes
 
 The ID of the security group. You must specify either the security group ID or the security group name. For security groups in a nondefault VPC, you must specify the security group ID.
 
@@ -95,6 +103,7 @@ The ID of the security group. You must specify either the security group ID or t
 
 - **Type:** String
 - **Required:** No
+- **Create-only:** Yes
 
 [EC2-Classic, default VPC] The name of the source security group. You must specify the GroupName property or the GroupId property. For security groups that are in a VPC, you must use the GroupId property.
 
@@ -102,6 +111,7 @@ The ID of the security group. You must specify either the security group ID or t
 
 - **Type:** AwsAccountId
 - **Required:** No
+- **Create-only:** Yes
 
 [nondefault VPC] The AWS account ID that owns the source security group. You can't specify this property with an IP address range. If you specify SourceSecurityGroupName or SourceSecurityGroupId and that security group is owned by a different account than the account creating the stack, you must specify the SourceSecurityGroupOwnerId; otherwise, this property is optional.
 
@@ -109,6 +119,7 @@ The ID of the security group. You must specify either the security group ID or t
 
 - **Type:** Int(-1..=65535)
 - **Required:** No
+- **Create-only:** Yes
 
 The end of port range for the TCP and UDP protocols, or an ICMP/ICMPv6 code. A value of -1 indicates all ICMP/ICMPv6 codes for the specified ICMP type. If you specify all ICMP/ICMPv6 types, you must specify all codes. Use this for ICMP and any protocol that uses ports.
 
@@ -131,5 +142,7 @@ Shorthand formats: `tcp` or `IpProtocol.tcp`
 ### `id`
 
 - **Type:** String
+
+The Security Group Rule Id
 
 

@@ -31,6 +31,7 @@ awscc.ec2.vpc_peering_connection {
 
 - **Type:** Region
 - **Required:** No
+- **Create-only:** Yes
 
 The Region code to use when calling Security Token Service (STS) to assume the PeerRoleArn, if provided.
 
@@ -38,6 +39,7 @@ The Region code to use when calling Security Token Service (STS) to assume the P
 
 - **Type:** AwsAccountId
 - **Required:** No
+- **Create-only:** Yes
 
 The AWS account ID of the owner of the accepter VPC.
 
@@ -45,6 +47,7 @@ The AWS account ID of the owner of the accepter VPC.
 
 - **Type:** Region
 - **Required:** No
+- **Create-only:** Yes
 
 The Region code for the accepter VPC, if the accepter VPC is located in a Region other than the Region in which you make the request.
 
@@ -52,6 +55,7 @@ The Region code for the accepter VPC, if the accepter VPC is located in a Region
 
 - **Type:** IamRoleArn
 - **Required:** No
+- **Create-only:** Yes
 
 The Amazon Resource Name (ARN) of the VPC peer role for the peering connection in another AWS account.
 
@@ -59,18 +63,20 @@ The Amazon Resource Name (ARN) of the VPC peer role for the peering connection i
 
 - **Type:** VpcId
 - **Required:** Yes
+- **Create-only:** Yes
 
 The ID of the VPC with which you are creating the VPC peering connection. You must specify this parameter in the request.
 
 ### `tags`
 
-- **Type:** Map
+- **Type:** Map(String)
 - **Required:** No
 
 ### `vpc_id`
 
 - **Type:** VpcId
 - **Required:** Yes
+- **Create-only:** Yes
 
 The ID of the VPC.
 

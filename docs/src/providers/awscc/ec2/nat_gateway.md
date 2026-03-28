@@ -43,6 +43,7 @@ awscc.ec2.nat_gateway {
 
 - **Type:** AllocationId
 - **Required:** No
+- **Create-only:** Yes
 
 [Public NAT gateway only] The allocation ID of the Elastic IP address that's associated with the NAT gateway. This property is required for a public NAT gateway and cannot be specified with a private NAT gateway.
 
@@ -50,6 +51,7 @@ awscc.ec2.nat_gateway {
 
 - **Type:** [Enum (AvailabilityMode)](#availability_mode-availabilitymode)
 - **Required:** No
+- **Create-only:** Yes
 
 Indicates whether this is a zonal (single-AZ) or regional (multi-AZ) NAT gateway. A zonal NAT gateway is a NAT Gateway that provides redundancy and scalability within a single availability zone. A regional NAT gateway is a single NAT Gateway that works across multiple availability zones (AZs) in your VPC, providing redundancy, scalability and availability across all the AZs in a Region. For more information, see [Regional NAT gateways for automatic multi-AZ expansion](https://docs.aws.amazon.com/vpc/latest/userguide/nat-gateways-regional.html) in the *Amazon VPC User Guide*.
 
@@ -64,6 +66,7 @@ For regional NAT gateways only: Specifies which Availability Zones you want the 
 
 - **Type:** [Enum (ConnectivityType)](#connectivity_type-connectivitytype)
 - **Required:** No
+- **Create-only:** Yes
 
 Indicates whether the NAT gateway supports public or private connectivity. The default is public connectivity.
 
@@ -78,6 +81,7 @@ The maximum amount of time to wait (in seconds) before forcibly releasing the IP
 
 - **Type:** Ipv4Address
 - **Required:** No
+- **Create-only:** Yes
 
 The private IPv4 address to assign to the NAT gateway. If you don't provide an address, a private IPv4 address will be automatically assigned.
 
@@ -106,12 +110,13 @@ Secondary private IPv4 addresses. For more information about secondary addresses
 
 - **Type:** SubnetId
 - **Required:** No
+- **Create-only:** Yes
 
 The ID of the subnet in which the NAT gateway is located.
 
 ### `tags`
 
-- **Type:** Map
+- **Type:** Map(String)
 - **Required:** No
 
 The tags for the NAT gateway.
@@ -120,6 +125,7 @@ The tags for the NAT gateway.
 
 - **Type:** VpcId
 - **Required:** No
+- **Create-only:** Yes
 
 The ID of the VPC in which the NAT gateway is located.
 
@@ -159,20 +165,30 @@ Shorthand formats: `public` or `ConnectivityType.public`
 
 - **Type:** String
 
+
+
 ### `auto_scaling_ips`
 
 - **Type:** String
+
+
 
 ### `eni_id`
 
 - **Type:** NetworkInterfaceId
 
+
+
 ### `nat_gateway_id`
 
 - **Type:** NatGatewayId
 
+
+
 ### `route_table_id`
 
 - **Type:** RouteTableId
+
+
 
 

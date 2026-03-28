@@ -23,12 +23,13 @@ awscc.ec2.vpn_gateway {
 
 - **Type:** Int(1..=4294967294)
 - **Required:** No
+- **Create-only:** Yes
 
 The private Autonomous System Number (ASN) for the Amazon side of a BGP session.
 
 ### `tags`
 
-- **Type:** Map
+- **Type:** Map(String)
 - **Required:** No
 
 Any tags assigned to the virtual private gateway.
@@ -37,6 +38,7 @@ Any tags assigned to the virtual private gateway.
 
 - **Type:** String
 - **Required:** Yes
+- **Create-only:** Yes
 
 The type of VPN connection the virtual private gateway supports.
 
@@ -45,5 +47,7 @@ The type of VPN connection the virtual private gateway supports.
 ### `vpn_gateway_id`
 
 - **Type:** VpnGatewayId
+
+
 
 

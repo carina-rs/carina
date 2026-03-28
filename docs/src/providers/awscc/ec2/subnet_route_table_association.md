@@ -35,6 +35,7 @@ awscc.ec2.subnet_route_table_association {
 
 - **Type:** RouteTableId
 - **Required:** Yes
+- **Create-only:** Yes
 
 The ID of the route table. The physical ID changes when the route table ID is changed.
 
@@ -42,6 +43,7 @@ The ID of the route table. The physical ID changes when the route table ID is ch
 
 - **Type:** SubnetId
 - **Required:** Yes
+- **Create-only:** Yes
 
 The ID of the subnet.
 
@@ -50,5 +52,7 @@ The ID of the subnet.
 ### `id`
 
 - **Type:** SubnetRouteTableAssociationId
+
+
 
 

@@ -63,6 +63,7 @@ Specifies default encryption for a bucket using server-side encryption with Amaz
 
 - **Type:** String
 - **Required:** No
+- **Create-only:** Yes
 
 A name for the bucket. If you don't specify a name, AWS CloudFormation generates a unique ID and uses that ID for the bucket name. The bucket name must contain only lowercase letters, numbers, periods (.), and dashes (-) and must follow [Amazon S3 bucket restrictions and limitations](https://docs.aws.amazon.com/AmazonS3/latest/dev/BucketRestrictions.html). For more information, see [Rules for naming Amazon S3 buckets](https://docs.aws.amazon.com/AmazonS3/latest/userguide/bucketnamingrules.html) in the *Amazon S3 User Guide*. If you specify a name, you can't perform updates that require replacement of this resource. You can perform updates that require no or some interruption. If you need to replace the resource, specify a new name.
 
@@ -166,7 +167,7 @@ Configuration for replicating objects in an S3 bucket. To enable replication, yo
 
 ### `tags`
 
-- **Type:** Map
+- **Type:** Map(String)
 - **Required:** No
 
 An arbitrary set of tags (key-value pairs) for this S3 bucket.
@@ -566,7 +567,7 @@ Shorthand formats: `Enabled` or `VersioningConfigurationStatus.Enabled`
 | `id` | String | Yes | The ID that identifies the analytics configuration. |
 | `prefix` | String | No | The prefix that an object must have to be included in the analytics results. |
 | `storage_class_analysis` | [Struct(StorageClassAnalysis)](#storageclassanalysis) | Yes | Contains data related to access patterns to be collected and made available to analyze the tradeoffs between different storage classes. |
-| `tag_filters` | `List<Map>` | No | The tags to use when evaluating an analytics filter. The analytics only includes objects that meet the filter's criteria. If no filter is specified, all of the contents of the bucket are included in the analysis. |
+| `tag_filters` | `List<Map(String)>` | No | The tags to use when evaluating an analytics filter. The analytics only includes objects that meet the filter's criteria. If no filter is specified, all of the contents of the bucket are included in the analysis. |
 
 ### BlockedEncryptionTypes
 
@@ -653,7 +654,7 @@ Shorthand formats: `Enabled` or `VersioningConfigurationStatus.Enabled`
 | `id` | String | Yes | The ID used to identify the S3 Intelligent-Tiering configuration. |
 | `prefix` | String | No | An object key name prefix that identifies the subset of objects to which the rule applies. |
 | `status` | [Enum (IntelligentTieringConfigurationStatus)](#status-intelligenttieringconfigurationstatus) | Yes | Specifies the status of the configuration. |
-| `tag_filters` | `List<Map>` | No | A container for a key-value pair. |
+| `tag_filters` | `List<Map(String)>` | No | A container for a key-value pair. |
 | `tierings` | [List\<Tiering\>](#tiering) | Yes | Specifies a list of S3 Intelligent-Tiering storage class tiers in the configuration. At least one tier must be defined in the list. At most, you can specify two tiers in the list, one for each available AccessTier: ``ARCHIVE_ACCESS`` and ``DEEP_ARCHIVE_ACCESS``. You only need Intelligent Tiering Configuration enabled on a bucket if you want to automatically move objects stored in the Intelligent-Tiering storage class to Archive Access or Deep Archive Access tiers. |
 
 ### InventoryConfiguration
@@ -752,7 +753,7 @@ Shorthand formats: `Enabled` or `VersioningConfigurationStatus.Enabled`
 | `access_point_arn` | Arn | No | The access point that was used while performing operations on the object. The metrics configuration only includes objects that meet the filter's criteria. |
 | `id` | String | Yes | The ID used to identify the metrics configuration. This can be any value you choose that helps you identify your metrics configuration. |
 | `prefix` | String | No | The prefix that an object must have to be included in the metrics results. |
-| `tag_filters` | `List<Map>` | No | Specifies a list of tag filters to use as a metrics configuration filter. The metrics configuration includes only objects that meet the filter's criteria. |
+| `tag_filters` | `List<Map(String)>` | No | Specifies a list of tag filters to use as a metrics configuration filter. The metrics configuration includes only objects that meet the filter's criteria. |
 
 ### NoncurrentVersionExpiration
 
@@ -899,7 +900,7 @@ Shorthand formats: `Enabled` or `VersioningConfigurationStatus.Enabled`
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `prefix` | String | No | An object key name prefix that identifies the subset of objects to which the rule applies. |
-| `tag_filters` | `List<Map>` | No | An array of tags containing key and value pairs. |
+| `tag_filters` | `List<Map(String)>` | No | An array of tags containing key and value pairs. |
 
 ### ReplicationRuleFilter
 
@@ -907,7 +908,7 @@ Shorthand formats: `Enabled` or `VersioningConfigurationStatus.Enabled`
 |-------|------|----------|-------------|
 | `and` | [Struct(ReplicationRuleAndOperator)](#replicationruleandoperator) | No | A container for specifying rule filters. The filters determine the subset of objects to which the rule applies. This element is required only if you specify more than one filter. For example: + If you specify both a ``Prefix`` and a ``TagFilter``, wrap these filters in an ``And`` tag. + If you specify a filter based on multiple tags, wrap the ``TagFilter`` elements in an ``And`` tag. |
 | `prefix` | String | No | An object key name prefix that identifies the subset of objects to which the rule applies. Replacement must be made for object keys containing special characters (such as carriage returns) when using XML requests. For more information, see [XML related object key constraints](https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-keys.html#object-key-xml-related-constraints). |
-| `tag_filter` | Map | No | A container for specifying a tag key and value. The rule applies only to objects that have the tag in their tag set. |
+| `tag_filter` | Map(String) | No | A container for specifying a tag key and value. The rule applies only to objects that have the tag in their tag set. |
 
 ### ReplicationTime
 
@@ -953,7 +954,7 @@ Shorthand formats: `Enabled` or `VersioningConfigurationStatus.Enabled`
 | `object_size_less_than` | NumericString(len: ..=20) | No | Specifies the maximum object size in bytes for this rule to apply to. Objects must be smaller than this value in bytes. For more information about sized based rules, see [Lifecycle configuration using size-based rules](https://docs.aws.amazon.com/AmazonS3/latest/userguide/lifecycle-configuration-examples.html#lc-size-rules) in the *Amazon S3 User Guide*. |
 | `prefix` | String | No | Object key prefix that identifies one or more objects to which this rule applies. Replacement must be made for object keys containing special characters (such as carriage returns) when using XML requests. For more information, see [XML related object key constraints](https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-keys.html#object-key-xml-related-constraints). |
 | `status` | [Enum (RuleStatus)](#status-rulestatus) | Yes | If ``Enabled``, the rule is currently being applied. If ``Disabled``, the rule is not currently being applied. |
-| `tag_filters` | `List<Map>` | No | Tags to use to identify a subset of objects to which the lifecycle rule applies. |
+| `tag_filters` | `List<Map(String)>` | No | Tags to use to identify a subset of objects to which the lifecycle rule applies. |
 | `transition` | [Struct(Transition)](#transition) | No | (Deprecated.) Specifies when an object transitions to a specified storage class. If you specify an expiration and transition time, you must use the same time unit for both properties (either in days or by date). The expiration time must also be later than the transition time. If you specify this property, don't specify the ``Transitions`` property. |
 | `transitions` | [List\<Transition\>](#transition) | No | One or more transition rules that specify when an object transitions to a specified storage class. If you specify an expiration and transition time, you must use the same time unit for both properties (either in days or by date). The expiration time must also be later than the transition time. If you specify this property, don't specify the ``Transition`` property. |
 
@@ -1011,7 +1012,7 @@ Shorthand formats: `Enabled` or `VersioningConfigurationStatus.Enabled`
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `partitioned_prefix` | [Struct(PartitionedPrefix)](#partitionedprefix) | No |  |
-| `simple_prefix` | Map | No | This format defaults the prefix to the given log file prefix for delivering server access log file. |
+| `simple_prefix` | Map(Json) | No | This format defaults the prefix to the given log file prefix for delivering server access log file. |
 
 ### Tiering
 
@@ -1057,20 +1058,30 @@ Shorthand formats: `Enabled` or `VersioningConfigurationStatus.Enabled`
 
 - **Type:** Arn
 
+
+
 ### `domain_name`
 
 - **Type:** String
+
+
 
 ### `dual_stack_domain_name`
 
 - **Type:** String
 
+
+
 ### `regional_domain_name`
 
 - **Type:** String
 
+
+
 ### `website_url`
 
 - **Type:** String(uri)
+
+
 
 
