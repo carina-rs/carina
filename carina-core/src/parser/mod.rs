@@ -176,6 +176,16 @@ pub enum UserFunctionBody {
     /// The function returns a resource expression (resource-generating function).
     /// Stores the raw source text for re-parsing with substituted parameters.
     Resource(String),
+    /// The function returns a read resource expression (data source).
+    /// Stores the raw source text for re-parsing with substituted parameters.
+    ReadResource(String),
+}
+
+impl UserFunctionBody {
+    /// Returns true if this body produces a resource (either regular or read).
+    fn is_resource(&self) -> bool {
+        matches!(self, Self::Resource(_) | Self::ReadResource(_))
+    }
 }
 
 /// User-defined pure function
@@ -476,7 +486,7 @@ pub fn parse(input: &str) -> Result<ParsedFile, ParseError> {
                                 .as_str()
                                 .to_string();
                                 if let Some(user_fn) = ctx.user_functions.get(&func_name)
-                                    && matches!(user_fn.body, UserFunctionBody::Resource(_))
+                                    && user_fn.body.is_resource()
                                 {
                                     let args: Result<Vec<Value>, ParseError> =
                                         fc_inner.map(|arg| parse_expression(arg, &ctx)).collect();
@@ -855,7 +865,7 @@ fn parse_primary_with_resource_or_module(
                 .map(|p| p.as_str().to_string())
                 .unwrap_or_default();
             if let Some(user_fn) = ctx.user_functions.get(&func_name)
-                && matches!(user_fn.body, UserFunctionBody::Resource(_))
+                && user_fn.body.is_resource()
             {
                 // Parse args and evaluate as resource
                 let mut fc_inner = inner.into_inner();
@@ -1596,9 +1606,13 @@ fn parse_fn_def(
                 );
                 local_lets.push((let_name, let_expr));
             }
-            Rule::resource_expr | Rule::read_resource_expr => {
-                // Resource-generating function: store the source text for re-parsing
+            Rule::resource_expr => {
                 body = Some(UserFunctionBody::Resource(body_inner.as_str().to_string()));
+            }
+            Rule::read_resource_expr => {
+                body = Some(UserFunctionBody::ReadResource(
+                    body_inner.as_str().to_string(),
+                ));
             }
             _ => {
                 // This should be the expression (the body)
@@ -1691,10 +1705,12 @@ fn evaluate_user_function(
             let substituted_body = substitute_fn_params(body, &substitutions);
             try_evaluate_fn_value(substituted_body, &child_ctx)
         }
-        UserFunctionBody::Resource(_) => Err(ParseError::UserFunctionError(format!(
-            "function '{}' returns a resource, not a value; use it in a let binding",
-            func.name
-        ))),
+        UserFunctionBody::Resource(_) | UserFunctionBody::ReadResource(_) => {
+            Err(ParseError::UserFunctionError(format!(
+                "function '{}' returns a resource, not a value; use it in a let binding",
+                func.name
+            )))
+        }
     }
 }
 
@@ -1724,35 +1740,42 @@ fn evaluate_user_function_as_resource(
         }
     }
 
-    match &func.body {
-        UserFunctionBody::Resource(resource_source) => {
-            // Re-parse the resource expression source with the child context
-            // that has parameter values as variables
-            let mut parsed = CarinaParser::parse(Rule::resource_expr, resource_source)
-                .map_err(ParseError::Syntax)?;
-
-            let resource_pair = parsed.next().ok_or_else(|| ParseError::InternalError {
-                expected: "resource expression".to_string(),
-                context: "fn resource evaluation".to_string(),
-            })?;
-
-            let mut resource = parse_resource_expr(resource_pair, &child_ctx, binding_name)?;
-
-            // Fix up ResourceRef binding names: replace fn parameter names with
-            // the actual outer binding names they refer to
-            if !param_to_binding.is_empty() {
-                for value in resource.attributes.values_mut() {
-                    remap_resource_refs(value, &param_to_binding);
-                }
-            }
-
-            Ok(resource)
+    let (rule, resource_source) = match &func.body {
+        UserFunctionBody::Resource(src) => (Rule::resource_expr, src.as_str()),
+        UserFunctionBody::ReadResource(src) => (Rule::read_resource_expr, src.as_str()),
+        UserFunctionBody::Value(_) => {
+            return Err(ParseError::UserFunctionError(format!(
+                "function '{}' returns a value, not a resource",
+                func.name
+            )));
         }
-        UserFunctionBody::Value(_) => Err(ParseError::UserFunctionError(format!(
-            "function '{}' returns a value, not a resource",
-            func.name
-        ))),
+    };
+
+    // Re-parse the resource expression source with the child context
+    // that has parameter values as variables
+    let mut parsed = CarinaParser::parse(rule, resource_source).map_err(ParseError::Syntax)?;
+
+    let resource_pair = parsed.next().ok_or_else(|| ParseError::InternalError {
+        expected: "resource expression".to_string(),
+        context: "fn resource evaluation".to_string(),
+    })?;
+
+    let parse_fn = if rule == Rule::resource_expr {
+        parse_resource_expr
+    } else {
+        parse_read_resource_expr
+    };
+    let mut resource = parse_fn(resource_pair, &child_ctx, binding_name)?;
+
+    // Fix up ResourceRef binding names: replace fn parameter names with
+    // the actual outer binding names they refer to
+    if !param_to_binding.is_empty() {
+        for value in resource.attributes.values_mut() {
+            remap_resource_refs(value, &param_to_binding);
+        }
     }
+
+    Ok(resource)
 }
 
 /// Recursively remap ResourceRef binding names from fn parameter names to
