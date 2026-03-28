@@ -29,7 +29,16 @@ pub(super) fn type_aware_equal(a: &Value, b: &Value, attr_type: Option<&Attribut
     }
 
     match attr_type {
-        None => a.semantically_equal(b),
+        None => {
+            // Even without type info, use type_aware_maps_equal / type_aware_lists_equal
+            // for Maps/Lists so that nested Secret values are compared via their hashes.
+            // semantically_equal uses PartialEq which doesn't handle Secret↔hash comparison.
+            match (a, b) {
+                (Value::Map(ma), Value::Map(mb)) => type_aware_maps_equal(ma, mb, |_key| None),
+                (Value::List(la), Value::List(lb)) => type_aware_lists_equal(la, lb, None, false),
+                _ => a.semantically_equal(b),
+            }
+        }
         Some(at) => match (a, b, at) {
             // Int/Float coercion for numeric types
             (Value::Int(i), Value::Float(f), AttributeType::Float | AttributeType::Int) => {

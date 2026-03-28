@@ -182,6 +182,82 @@ pub fn format_value_with_key(value: &Value, _key: Option<&str>) -> String {
     }
 }
 
+/// Check if a Value contains any Secret values at any nesting depth.
+pub fn contains_secret(value: &Value) -> bool {
+    match value {
+        Value::Secret(_) => true,
+        Value::Map(map) => map.values().any(contains_secret),
+        Value::List(items) => items.iter().any(contains_secret),
+        _ => false,
+    }
+}
+
+/// Merge secret hashes from the desired value into the provider-returned JSON.
+///
+/// For attributes containing secrets nested inside Maps or Lists, we cannot simply
+/// replace the entire provider value with the desired value's JSON, because the
+/// provider may return extra keys (e.g., CloudControl auto-adds tags). This function
+/// recursively walks both trees:
+/// - If the desired value is `Secret(inner)`, return the hashed value
+/// - If desired is a `Map` and provider is an object, merge: for each provider key,
+///   if the desired map has a corresponding secret-containing value, use the hashed
+///   version; otherwise keep the provider value
+/// - If desired is a `List` and provider is an array, merge element-by-element
+/// - Otherwise, return the provider value as-is
+pub fn merge_secrets_into_provider_json(
+    desired: &Value,
+    provider_json: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    match desired {
+        Value::Secret(_) => value_to_json(desired),
+        Value::Map(desired_map) => {
+            if let serde_json::Value::Object(provider_obj) = provider_json {
+                let mut merged = provider_obj.clone();
+                for (k, desired_val) in desired_map {
+                    if contains_secret(desired_val) {
+                        if let Some(provider_val) = provider_obj.get(k) {
+                            merged.insert(
+                                k.clone(),
+                                merge_secrets_into_provider_json(desired_val, provider_val)?,
+                            );
+                        } else {
+                            // Key only in desired (not returned by provider); use desired hash
+                            merged.insert(k.clone(), value_to_json(desired_val)?);
+                        }
+                    }
+                }
+                Ok(serde_json::Value::Object(merged))
+            } else {
+                // Provider didn't return a map; fall back to desired
+                value_to_json(desired)
+            }
+        }
+        Value::List(desired_items) => {
+            if let serde_json::Value::Array(provider_arr) = provider_json {
+                let mut merged = Vec::with_capacity(provider_arr.len());
+                for (i, provider_elem) in provider_arr.iter().enumerate() {
+                    if let Some(desired_elem) = desired_items.get(i) {
+                        if contains_secret(desired_elem) {
+                            merged.push(merge_secrets_into_provider_json(
+                                desired_elem,
+                                provider_elem,
+                            )?);
+                        } else {
+                            merged.push(provider_elem.clone());
+                        }
+                    } else {
+                        merged.push(provider_elem.clone());
+                    }
+                }
+                Ok(serde_json::Value::Array(merged))
+            } else {
+                value_to_json(desired)
+            }
+        }
+        _ => Ok(provider_json.clone()),
+    }
+}
+
 /// Check if a value is a list of maps (list-of-struct)
 pub fn is_list_of_maps(value: &Value) -> bool {
     if let Value::List(items) = value {
@@ -556,6 +632,49 @@ mod tests {
     fn test_format_value_secret() {
         let v = Value::Secret(Box::new(Value::String("my-password".to_string())));
         assert_eq!(format_value(&v), "(secret)");
+    }
+
+    #[test]
+    fn test_format_value_secret_in_map() {
+        let mut map = HashMap::new();
+        map.insert("Name".to_string(), Value::String("test".to_string()));
+        map.insert(
+            "SecretTag".to_string(),
+            Value::Secret(Box::new(Value::String("my-password".to_string()))),
+        );
+        let v = Value::Map(map);
+        let formatted = format_value(&v);
+        // Secret values inside maps should show as (secret), not the raw value
+        assert!(
+            formatted.contains("(secret)"),
+            "Expected (secret) in map display, got: {}",
+            formatted
+        );
+        assert!(
+            !formatted.contains("my-password"),
+            "Should not contain the secret value, got: {}",
+            formatted
+        );
+    }
+
+    #[test]
+    fn test_value_to_json_secret_in_map() {
+        let mut map = HashMap::new();
+        map.insert("Name".to_string(), Value::String("test".to_string()));
+        map.insert(
+            "SecretTag".to_string(),
+            Value::Secret(Box::new(Value::String("my-password".to_string()))),
+        );
+        let v = Value::Map(map);
+        let json = value_to_json(&v).unwrap();
+        let obj = json.as_object().unwrap();
+        assert_eq!(obj.get("Name").unwrap().as_str().unwrap(), "test");
+        let secret_val = obj.get("SecretTag").unwrap().as_str().unwrap();
+        assert!(
+            secret_val.starts_with(SECRET_PREFIX),
+            "Expected secret hash in map value JSON, got: {}",
+            secret_val
+        );
     }
 
     #[test]

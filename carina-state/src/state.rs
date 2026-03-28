@@ -2,7 +2,9 @@
 
 use carina_core::deps::get_resource_dependencies;
 use carina_core::resource::{LifecycleConfig, Resource, ResourceId, State, Value};
-use carina_core::value::{json_to_dsl_value, value_to_json};
+use carina_core::value::{
+    contains_secret, json_to_dsl_value, merge_secrets_into_provider_json, value_to_json,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -476,9 +478,18 @@ impl ResourceState {
         // with the SHA256 hash. The provider returns the actual value (since
         // secrets are unwrapped before sending), but state should only store
         // the hash to avoid persisting sensitive data.
+        // For nested secrets (inside Maps/Lists), merge the hashed values into
+        // the provider-returned structure to preserve extra keys from the provider.
         for (k, v) in &resource.attributes {
-            if let Value::Secret(_) = v {
-                rs.attributes.insert(k.clone(), value_to_json(v)?);
+            if contains_secret(v) {
+                if let Some(provider_json) = rs.attributes.get(k).cloned() {
+                    rs.attributes.insert(
+                        k.clone(),
+                        merge_secrets_into_provider_json(v, &provider_json)?,
+                    );
+                } else {
+                    rs.attributes.insert(k.clone(), value_to_json(v)?);
+                }
             }
         }
         if let Some(existing) = existing {
@@ -1301,6 +1312,170 @@ mod tests {
         assert!(
             !stored.contains("my-password"),
             "State should not contain the plain password"
+        );
+    }
+
+    #[test]
+    fn test_from_provider_state_secret_in_map_stored_as_hash() {
+        use carina_core::resource::{Resource, State as ProviderState, Value};
+        use carina_core::value::SECRET_PREFIX;
+        use std::collections::HashMap as StdHashMap;
+
+        let mut resource = Resource::with_provider("awscc", "ec2.vpc", "my-vpc");
+        let mut tags_map = StdHashMap::new();
+        tags_map.insert("Name".to_string(), Value::String("test".to_string()));
+        tags_map.insert(
+            "SecretTag".to_string(),
+            Value::Secret(Box::new(Value::String("super-secret-value".to_string()))),
+        );
+        resource
+            .attributes
+            .insert("tags".to_string(), Value::Map(tags_map));
+
+        let mut state_tags = StdHashMap::new();
+        state_tags.insert("Name".to_string(), Value::String("test".to_string()));
+        state_tags.insert(
+            "SecretTag".to_string(),
+            Value::String("super-secret-value".to_string()),
+        );
+
+        let provider_state = ProviderState {
+            id: resource.id.clone(),
+            identifier: Some("vpc-123".to_string()),
+            attributes: [("tags".to_string(), Value::Map(state_tags))]
+                .into_iter()
+                .collect(),
+            exists: true,
+        };
+
+        let rs = ResourceState::from_provider_state(&resource, &provider_state, None).unwrap();
+
+        // The tags map in state should have the hash for SecretTag
+        let tags_json = rs.attributes.get("tags").unwrap();
+        let tags_obj = tags_json.as_object().unwrap();
+
+        // Name should be plain
+        assert_eq!(tags_obj.get("Name").unwrap().as_str().unwrap(), "test");
+
+        // SecretTag should be stored as a hash, not the plain value
+        let secret_stored = tags_obj.get("SecretTag").unwrap().as_str().unwrap();
+        assert!(
+            secret_stored.starts_with(SECRET_PREFIX),
+            "Expected secret hash in map value, got: {}",
+            secret_stored
+        );
+        assert!(
+            !secret_stored.contains("super-secret-value"),
+            "State should not contain the plain secret value in map"
+        );
+    }
+
+    #[test]
+    fn test_from_provider_state_secret_in_map_preserves_provider_extra_keys() {
+        use carina_core::resource::{Resource, State as ProviderState, Value};
+        use carina_core::value::SECRET_PREFIX;
+        use std::collections::HashMap as StdHashMap;
+
+        // User specifies only SecretTag in tags
+        let mut resource = Resource::with_provider("awscc", "ec2.vpc", "my-vpc");
+        let mut tags_map = StdHashMap::new();
+        tags_map.insert(
+            "SecretTag".to_string(),
+            Value::Secret(Box::new(Value::String("super-secret-value".to_string()))),
+        );
+        resource
+            .attributes
+            .insert("tags".to_string(), Value::Map(tags_map));
+
+        // Provider returns extra keys (e.g., CloudControl adds Name automatically)
+        let mut state_tags = StdHashMap::new();
+        state_tags.insert("Name".to_string(), Value::String("test".to_string()));
+        state_tags.insert(
+            "ExtraTag".to_string(),
+            Value::String("extra-value".to_string()),
+        );
+        state_tags.insert(
+            "SecretTag".to_string(),
+            Value::String("super-secret-value".to_string()),
+        );
+
+        let provider_state = ProviderState {
+            id: resource.id.clone(),
+            identifier: Some("vpc-123".to_string()),
+            attributes: [("tags".to_string(), Value::Map(state_tags))]
+                .into_iter()
+                .collect(),
+            exists: true,
+        };
+
+        let rs = ResourceState::from_provider_state(&resource, &provider_state, None).unwrap();
+
+        let tags_json = rs.attributes.get("tags").unwrap();
+        let tags_obj = tags_json.as_object().unwrap();
+
+        // Provider-only keys should be preserved from the provider state
+        assert_eq!(tags_obj.get("Name").unwrap().as_str().unwrap(), "test");
+        assert_eq!(
+            tags_obj.get("ExtraTag").unwrap().as_str().unwrap(),
+            "extra-value"
+        );
+
+        // SecretTag should be stored as a hash, not the plain value
+        let secret_stored = tags_obj.get("SecretTag").unwrap().as_str().unwrap();
+        assert!(
+            secret_stored.starts_with(SECRET_PREFIX),
+            "Expected secret hash in map value, got: {}",
+            secret_stored
+        );
+        assert!(
+            !secret_stored.contains("super-secret-value"),
+            "State should not contain the plain secret value in map"
+        );
+    }
+
+    #[test]
+    fn test_from_provider_state_secret_in_list_stored_as_hash() {
+        use carina_core::resource::{Resource, State as ProviderState, Value};
+        use carina_core::value::SECRET_PREFIX;
+
+        let mut resource = Resource::with_provider("awscc", "test.resource", "my-res");
+        resource.attributes.insert(
+            "values".to_string(),
+            Value::List(vec![
+                Value::String("public".to_string()),
+                Value::Secret(Box::new(Value::String("secret-item".to_string()))),
+            ]),
+        );
+
+        let provider_state = ProviderState {
+            id: resource.id.clone(),
+            identifier: Some("res-123".to_string()),
+            attributes: [(
+                "values".to_string(),
+                Value::List(vec![
+                    Value::String("public".to_string()),
+                    Value::String("secret-item".to_string()),
+                ]),
+            )]
+            .into_iter()
+            .collect(),
+            exists: true,
+        };
+
+        let rs = ResourceState::from_provider_state(&resource, &provider_state, None).unwrap();
+
+        let values_json = rs.attributes.get("values").unwrap();
+        let values_arr = values_json.as_array().unwrap();
+
+        // First item should be plain
+        assert_eq!(values_arr[0].as_str().unwrap(), "public");
+
+        // Second item should be stored as a hash
+        let secret_stored = values_arr[1].as_str().unwrap();
+        assert!(
+            secret_stored.starts_with(SECRET_PREFIX),
+            "Expected secret hash in list value, got: {}",
+            secret_stored
         );
     }
 }
