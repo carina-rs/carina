@@ -2559,4 +2559,30 @@ mod tests {
         let second = format(&first, &config).unwrap();
         assert_eq!(first, second, "Formatting should be idempotent");
     }
+
+    #[test]
+    fn format_arguments_mixed_with_alignment() {
+        let input = r#"arguments {
+  short: bool = true
+  longer_name: string = "hello"
+  vpc: awscc.ec2.vpc {
+    description = "The VPC"
+  }
+}
+"#;
+        let config = FormatConfig {
+            align_attributes: true,
+            ..Default::default()
+        };
+        let expected = r#"arguments {
+  short      : bool = true
+  longer_name: string = "hello"
+  vpc: awscc.ec2.vpc {
+    description = "The VPC"
+  }
+}
+"#;
+        let result = format(input, &config).unwrap();
+        assert_eq!(result, expected);
+    }
 }

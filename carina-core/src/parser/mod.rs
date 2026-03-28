@@ -5582,4 +5582,61 @@ aws.s3.bucket {
         assert!(result.arguments[0].description.is_none());
         assert!(result.arguments[1].description.is_none());
     }
+
+    #[test]
+    fn parse_arguments_block_form_default_only() {
+        let input = r#"
+            arguments {
+                port: int {
+                    default = 8080
+                }
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+        assert_eq!(result.arguments.len(), 1);
+        assert_eq!(result.arguments[0].name, "port");
+        assert_eq!(result.arguments[0].default, Some(Value::Int(8080)));
+        assert!(result.arguments[0].description.is_none());
+    }
+
+    #[test]
+    fn parse_arguments_block_form_empty_block() {
+        let input = r#"
+            arguments {
+                port: int {}
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+        assert_eq!(result.arguments.len(), 1);
+        assert_eq!(result.arguments[0].name, "port");
+        assert!(result.arguments[0].default.is_none());
+        assert!(result.arguments[0].description.is_none());
+    }
+
+    #[test]
+    fn parse_arguments_block_form_string_default_not_confused_with_description() {
+        let input = r#"
+            arguments {
+                name: string {
+                    description = "Name of the resource"
+                    default     = "my-resource"
+                }
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+        assert_eq!(result.arguments.len(), 1);
+        assert_eq!(result.arguments[0].name, "name");
+        assert_eq!(result.arguments[0].type_expr, TypeExpr::String);
+        assert_eq!(
+            result.arguments[0].description.as_deref(),
+            Some("Name of the resource")
+        );
+        assert_eq!(
+            result.arguments[0].default,
+            Some(Value::String("my-resource".to_string()))
+        );
+    }
 }
