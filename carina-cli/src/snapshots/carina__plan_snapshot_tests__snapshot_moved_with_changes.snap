@@ -5,7 +5,7 @@ expression: output
 Execution Plan:
 
   -> awscc.ec2.vpc new_vpc (from: awscc.ec2.vpc.old_vpc)
-  ~ awscc.ec2.vpc new_vpc
+  ~ awscc.ec2.vpc new_vpc (moved from: awscc.ec2.vpc.old_vpc)
       tags: (none) → {Name: "updated"}
       # (1 unchanged attribute hidden)
         │

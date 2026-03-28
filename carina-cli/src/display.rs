@@ -301,8 +301,12 @@ pub fn print_plan(
     detail: DetailLevel,
     delete_attributes: &HashMap<ResourceId, HashMap<String, Value>>,
     schemas: Option<&HashMap<String, ResourceSchema>>,
+    moved_origins: &HashMap<ResourceId, ResourceId>,
 ) {
-    print!("{}", format_plan(plan, detail, delete_attributes, schemas));
+    print!(
+        "{}",
+        format_plan(plan, detail, delete_attributes, schemas, moved_origins)
+    );
 }
 
 /// Format a plan as a string for display.
@@ -314,6 +318,7 @@ pub fn format_plan(
     detail: DetailLevel,
     delete_attributes: &HashMap<ResourceId, HashMap<String, Value>>,
     schemas: Option<&HashMap<String, ResourceSchema>>,
+    moved_origins: &HashMap<ResourceId, ResourceId>,
 ) -> String {
     let mut out = String::new();
 
@@ -335,7 +340,13 @@ pub fn format_plan(
     } else {
         Some(delete_attributes)
     };
-    out.push_str(&format_plan_tree(plan, detail, attrs, schemas));
+    out.push_str(&format_plan_tree(
+        plan,
+        detail,
+        attrs,
+        schemas,
+        moved_origins,
+    ));
 
     writeln!(out).unwrap();
     let summary = plan.summary();
@@ -396,6 +407,7 @@ pub fn format_destroy_plan(
         detail,
         Some(delete_attributes),
         None,
+        &HashMap::new(),
     ));
 
     out
@@ -410,6 +422,7 @@ fn format_plan_tree(
     detail: DetailLevel,
     delete_attributes: Option<&HashMap<ResourceId, HashMap<String, Value>>>,
     schemas: Option<&HashMap<String, ResourceSchema>>,
+    moved_origins: &HashMap<ResourceId, ResourceId>,
 ) -> String {
     let mut out = String::new();
 
@@ -442,6 +455,7 @@ fn format_plan_tree(
         parent_binding: Option<&str>,
         delete_attributes: Option<&HashMap<ResourceId, HashMap<String, Value>>>,
         schemas: Option<&HashMap<String, ResourceSchema>>,
+        moved_origins: &HashMap<ResourceId, ResourceId>,
     ) -> bool {
         if printed.contains(&idx) {
             return false;
@@ -511,27 +525,32 @@ fn format_plan_tree(
                 }
             }
             Effect::Update { id, to, .. } => {
+                let moved_note = moved_origins
+                    .get(id)
+                    .map(|from| format!(" (moved from: {}.{})", from.display_type(), from.name));
                 if detail == DetailLevel::None {
                     let name_part = format_compact_name(to, &id.name, parent_binding);
                     writeln!(
                         out,
-                        "{}{}{} {} {}",
+                        "{}{}{} {} {}{}",
                         base_indent,
                         connector,
                         colored_symbol,
                         id.display_type().cyan().bold(),
-                        name_part.yellow().bold()
+                        name_part.yellow().bold(),
+                        moved_note.as_deref().unwrap_or("").yellow()
                     )
                     .unwrap();
                 } else {
                     writeln!(
                         out,
-                        "{}{}{} {} {}",
+                        "{}{}{} {} {}{}",
                         base_indent,
                         connector,
                         colored_symbol,
                         id.display_type().cyan().bold(),
-                        id.name.yellow().bold()
+                        id.name.yellow().bold(),
+                        moved_note.as_deref().unwrap_or("").yellow()
                     )
                     .unwrap();
                 }
@@ -544,29 +563,34 @@ fn format_plan_tree(
                 } else {
                     "(must be replaced)"
                 };
+                let moved_note = moved_origins
+                    .get(id)
+                    .map(|from| format!(" (moved from: {}.{})", from.display_type(), from.name));
                 if detail == DetailLevel::None {
                     let name_part = format_compact_name(to, &id.name, parent_binding);
                     writeln!(
                         out,
-                        "{}{}{} {} {} {}",
+                        "{}{}{} {} {} {}{}",
                         base_indent,
                         connector,
                         colored_symbol,
                         id.display_type().cyan().bold(),
                         name_part.magenta().bold(),
-                        replace_note.magenta()
+                        replace_note.magenta(),
+                        moved_note.as_deref().unwrap_or("").magenta()
                     )
                     .unwrap();
                 } else {
                     writeln!(
                         out,
-                        "{}{}{} {} {} {}",
+                        "{}{}{} {} {} {}{}",
                         base_indent,
                         connector,
                         colored_symbol,
                         id.display_type().cyan().bold(),
                         id.name.magenta().bold(),
-                        replace_note.magenta()
+                        replace_note.magenta(),
+                        moved_note.as_deref().unwrap_or("").magenta()
                     )
                     .unwrap();
                 }
@@ -743,6 +767,7 @@ fn format_plan_tree(
                 current_binding.as_deref(),
                 delete_attributes,
                 schemas,
+                moved_origins,
             );
             // Add separator line between siblings when previous sibling displayed attributes
             if child_had_attrs && !child_is_last {
@@ -781,6 +806,7 @@ fn format_plan_tree(
             None,
             delete_attributes,
             schemas,
+            moved_origins,
         );
     }
 
@@ -803,6 +829,7 @@ fn format_plan_tree(
             None,
             delete_attributes,
             schemas,
+            moved_origins,
         );
     }
 
@@ -1866,7 +1893,13 @@ mod tests {
         plan.add(Effect::Create(b));
 
         // Should not panic
-        print_plan(&plan, DetailLevel::Full, &HashMap::new(), None);
+        print_plan(
+            &plan,
+            DetailLevel::Full,
+            &HashMap::new(),
+            None,
+            &HashMap::new(),
+        );
     }
 
     /// Test that print_plan handles the dependency graph correctly when
@@ -1880,7 +1913,13 @@ mod tests {
         plan.add(Effect::Create(b));
 
         // Should not panic
-        print_plan(&plan, DetailLevel::Full, &HashMap::new(), None);
+        print_plan(
+            &plan,
+            DetailLevel::Full,
+            &HashMap::new(),
+            None,
+            &HashMap::new(),
+        );
     }
 
     /// Helper: compute root indices using the same algorithm as print_plan.
@@ -2500,7 +2539,13 @@ mod tests {
         plan.add(Effect::Create(rt));
 
         // Should not panic
-        print_plan(&plan, DetailLevel::None, &HashMap::new(), None);
+        print_plan(
+            &plan,
+            DetailLevel::None,
+            &HashMap::new(),
+            None,
+            &HashMap::new(),
+        );
     }
 
     /// Test compact mode skips attributes by checking that _binding attribute
@@ -2525,7 +2570,13 @@ mod tests {
         plan.add(Effect::Create(anon));
 
         // Should not panic; anonymous resources should show hints
-        print_plan(&plan, DetailLevel::None, &HashMap::new(), None);
+        print_plan(
+            &plan,
+            DetailLevel::None,
+            &HashMap::new(),
+            None,
+            &HashMap::new(),
+        );
     }
 
     /// Test that extract_compact_hint extracts ResourceRef from inside a List value.
@@ -2673,7 +2724,13 @@ mod tests {
         plan.add(replace_effect);
 
         // Should not panic and should display attribute diffs for cascading updates
-        print_plan(&plan, DetailLevel::Full, &HashMap::new(), None);
+        print_plan(
+            &plan,
+            DetailLevel::Full,
+            &HashMap::new(),
+            None,
+            &HashMap::new(),
+        );
     }
 
     #[test]

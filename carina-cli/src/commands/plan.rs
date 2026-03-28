@@ -208,6 +208,7 @@ pub async fn run_plan(
             detail,
             &delete_attributes,
             Some(wiring.schemas()),
+            &ctx.moved_origins,
         );
     }
 
