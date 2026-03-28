@@ -101,11 +101,19 @@ impl ModuleResolver {
         self.resolving.insert(canonical.clone());
 
         // Load module: directory or single file
-        let mut parsed = if full_path.is_dir() {
-            self.load_directory_module(&full_path)?
+        let load_result = if full_path.is_dir() {
+            self.load_directory_module(&full_path)
         } else {
-            let content = fs::read_to_string(&full_path)?;
-            crate::parser::parse(&content)?
+            fs::read_to_string(&full_path)
+                .map_err(ModuleError::from)
+                .and_then(|content| crate::parser::parse(&content).map_err(ModuleError::from))
+        };
+        let mut parsed = match load_result {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                self.resolving.remove(&canonical);
+                return Err(e);
+            }
         };
 
         // Verify it's a module (has arguments or attributes)
@@ -1539,5 +1547,66 @@ mod tests {
                 ],
             })
         );
+    }
+
+    #[test]
+    fn test_load_module_io_error_cleans_resolving_set() {
+        let tmp_dir = std::env::temp_dir().join("carina_test_io_error_cleanup");
+        let _ = fs::create_dir_all(&tmp_dir);
+
+        let mut resolver = ModuleResolver::new(&tmp_dir);
+
+        // First attempt: load a non-existent file -> IO error
+        let result = resolver.load_module("nonexistent");
+        assert!(result.is_err());
+        assert!(
+            matches!(&result.unwrap_err(), ModuleError::Io(_)),
+            "expected IO error on first attempt"
+        );
+
+        // Second attempt: should get the same IO error, not a circular import error.
+        // Before the fix, the path stayed in `resolving` and this would return CircularImport.
+        let result = resolver.load_module("nonexistent");
+        assert!(result.is_err());
+        assert!(
+            matches!(&result.unwrap_err(), ModuleError::Io(_)),
+            "expected IO error on second attempt, not CircularImport"
+        );
+
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_load_module_parse_error_cleans_resolving_set() {
+        let tmp_dir = std::env::temp_dir().join("carina_test_parse_error_cleanup");
+        let _ = fs::create_dir_all(&tmp_dir);
+        let bad_file = tmp_dir.join("bad_module.crn");
+        fs::write(&bad_file, "this is not valid carina syntax {{{{").unwrap();
+
+        let mut resolver = ModuleResolver::new(&tmp_dir);
+
+        // First attempt: parse error (use .crn extension since load_module reads full_path directly)
+        let result = resolver.load_module("bad_module.crn");
+        assert!(
+            result.is_err(),
+            "expected error but got: {:?}",
+            result.unwrap()
+        );
+        let err = result.unwrap_err();
+        assert!(
+            matches!(&err, ModuleError::Parse(_)),
+            "expected Parse error on first attempt, got: {err:?}"
+        );
+
+        // Second attempt: should still get parse error, not circular import
+        let result = resolver.load_module("bad_module.crn");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(&err, ModuleError::Parse(_)),
+            "expected Parse error on second attempt, not CircularImport, got: {err:?}"
+        );
+
+        let _ = fs::remove_dir_all(&tmp_dir);
     }
 }
