@@ -119,7 +119,7 @@ fn_def = {
     kw_fn ~ trivia+ ~ identifier ~ trivia* ~ open_paren ~ fn_params_content* ~ close_paren ~ trivia* ~ open_brace ~ fn_body_content* ~ close_brace
 }
 fn_params_content = _{ trivia | comma | fn_param }
-fn_param = { identifier ~ (trivia* ~ equals ~ trivia* ~ expression)? }
+fn_param = { identifier ~ (trivia* ~ colon ~ trivia* ~ type_expr)? ~ (trivia* ~ equals ~ trivia* ~ expression)? }
 fn_body_content = _{ trivia | fn_local_let | read_resource_expr | resource_expr | expression }
 fn_local_let = { kw_let ~ trivia+ ~ identifier ~ trivia* ~ equals ~ trivia* ~ expression }
 

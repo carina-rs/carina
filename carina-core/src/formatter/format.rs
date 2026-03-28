@@ -890,6 +890,8 @@ impl Formatter {
                 CstChild::Token(token) => {
                     if token.text == "=" {
                         self.write(" = ");
+                    } else if token.text == ":" {
+                        self.write(": ");
                     } else {
                         self.write(&token.text);
                     }
@@ -2699,6 +2701,43 @@ mod tests {
         let config = FormatConfig::default();
         let input = "fn name(env,az) {\n  let prefix=join(\"-\",[env,\"subnet\"])\n  join(\"-\",[prefix,az])\n}\n";
         let expected = "fn name(env, az) {\n  let prefix = join(\"-\", [env, \"subnet\"])\n  join(\"-\", [prefix, az])\n}\n";
+        let result = format(input, &config).unwrap();
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn format_fn_def_with_typed_params() {
+        let config = FormatConfig::default();
+        let input = "fn greet(name:string) {\n  name\n}\n";
+        let expected = "fn greet(name: string) {\n  name\n}\n";
+        let result = format(input, &config).unwrap();
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn format_fn_def_with_typed_param_and_default() {
+        let config = FormatConfig::default();
+        let input =
+            "fn tag(env:string,suffix:string=\"default\") {\n  join(\"-\", [env, suffix])\n}\n";
+        let expected = "fn tag(env: string, suffix: string = \"default\") {\n  join(\"-\", [env, suffix])\n}\n";
+        let result = format(input, &config).unwrap();
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn format_fn_def_with_resource_type_param() {
+        let config = FormatConfig::default();
+        let input = "fn make(vpc:awscc.ec2.vpc,cidr:string) {\n  vpc\n}\n";
+        let expected = "fn make(vpc: awscc.ec2.vpc, cidr: string) {\n  vpc\n}\n";
+        let result = format(input, &config).unwrap();
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn format_fn_def_mixed_typed_untyped() {
+        let config = FormatConfig::default();
+        let input = "fn tag(env,suffix:string) {\n  suffix\n}\n";
+        let expected = "fn tag(env, suffix: string) {\n  suffix\n}\n";
         let result = format(input, &config).unwrap();
         assert_eq!(result, expected);
     }
