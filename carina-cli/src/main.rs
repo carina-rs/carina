@@ -9,6 +9,7 @@ use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::{CompleteEnv, Shell, generate};
 use colored::Colorize;
 
+use base64::Engine;
 use commands::apply::{run_apply, run_apply_from_plan};
 use commands::destroy::run_destroy;
 use commands::fmt::run_fmt;
@@ -165,11 +166,64 @@ enum Commands {
     },
 }
 
+/// Register the AWS KMS decryptor for the `decrypt()` built-in function.
+///
+/// Uses the tokio runtime to call KMS synchronously from within the parse-time
+/// builtin evaluation. AWS credentials are loaded from the default chain
+/// (environment variables, profiles, instance metadata, etc.).
+fn register_kms_decryptor() {
+    static KMS_CLIENT: tokio::sync::OnceCell<aws_sdk_kms::Client> =
+        tokio::sync::OnceCell::const_new();
+
+    carina_core::builtins::decrypt::register_decryptor(Box::new(|ciphertext, key| {
+        let ciphertext = ciphertext.to_string();
+        let key = key.map(|k| k.to_string());
+
+        let rt = tokio::runtime::Handle::current();
+        rt.block_on(async {
+            let client = KMS_CLIENT
+                .get_or_init(|| async {
+                    let config =
+                        aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+                    aws_sdk_kms::Client::new(&config)
+                })
+                .await;
+
+            let blob = base64::engine::general_purpose::STANDARD
+                .decode(&ciphertext)
+                .map_err(|e| format!("decrypt(): invalid base64 ciphertext: {e}"))?;
+
+            let mut req = client
+                .decrypt()
+                .ciphertext_blob(aws_sdk_kms::primitives::Blob::new(blob));
+            if let Some(k) = key {
+                req = req.key_id(k);
+            }
+
+            let resp = req
+                .send()
+                .await
+                .map_err(|e| format!("decrypt(): KMS decrypt failed: {e}"))?;
+
+            let plaintext = resp
+                .plaintext()
+                .ok_or_else(|| "decrypt(): KMS response contained no plaintext".to_string())?;
+
+            String::from_utf8(plaintext.as_ref().to_vec())
+                .map_err(|e| format!("decrypt(): decrypted value is not valid UTF-8: {e}"))
+        })
+    }));
+}
+
 #[tokio::main]
 async fn main() {
     CompleteEnv::with_factory(Cli::command).complete();
 
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
+
+    // Register the AWS KMS decryptor for the decrypt() built-in function.
+    // This must happen before any .crn parsing so that decrypt() calls can be evaluated.
+    register_kms_decryptor();
 
     let cli = Cli::parse();
 

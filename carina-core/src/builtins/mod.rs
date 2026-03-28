@@ -5,6 +5,7 @@
 
 mod cidr_subnet;
 mod concat;
+pub mod decrypt;
 mod env;
 mod flatten;
 mod join;
@@ -75,6 +76,10 @@ register_builtins! {
     concat(concat::builtin_concat) {
         signature: "concat(items: list, base_list: list) -> list",
         description: "Appends items to a list. Data-last: base_list |> concat(items).",
+    },
+    decrypt(decrypt::builtin_decrypt) {
+        signature: "decrypt(ciphertext: string, key?: string) -> string",
+        description: "Decrypts ciphertext using the configured provider's encryption service (e.g., AWS KMS). Key is optional when embedded in ciphertext.",
     },
     env(env::builtin_env) {
         signature: "env(name: string) -> string",
@@ -205,7 +210,8 @@ mod tests {
             .lines()
             .filter(|line| {
                 let trimmed = line.trim();
-                trimmed.starts_with("mod ") && trimmed.ends_with(';')
+                (trimmed.starts_with("mod ") || trimmed.starts_with("pub mod "))
+                    && trimmed.ends_with(';')
             })
             .count();
 

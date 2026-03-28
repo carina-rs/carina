@@ -3,7 +3,8 @@
 use carina_core::deps::get_resource_dependencies;
 use carina_core::resource::{LifecycleConfig, Resource, ResourceId, State, Value};
 use carina_core::value::{
-    contains_secret, json_to_dsl_value, merge_secrets_into_provider_json, value_to_json,
+    SecretHashContext, contains_secret, json_to_dsl_value, merge_secrets_into_provider_json,
+    value_to_json,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -475,20 +476,24 @@ impl ResourceState {
             rs.attributes.insert(k.clone(), value_to_json(v)?);
         }
         // For secret attributes, override the provider-returned plain value
-        // with the SHA256 hash. The provider returns the actual value (since
+        // with the Argon2id hash. The provider returns the actual value (since
         // secrets are unwrapped before sending), but state should only store
         // the hash to avoid persisting sensitive data.
         // For nested secrets (inside Maps/Lists), merge the hashed values into
         // the provider-returned structure to preserve extra keys from the provider.
         for (k, v) in &resource.attributes {
             if contains_secret(v) {
+                let ctx = SecretHashContext::new(resource.id.display_type(), &resource.id.name, k);
                 if let Some(provider_json) = rs.attributes.get(k).cloned() {
                     rs.attributes.insert(
                         k.clone(),
-                        merge_secrets_into_provider_json(v, &provider_json)?,
+                        merge_secrets_into_provider_json(v, &provider_json, Some(&ctx))?,
                     );
                 } else {
-                    rs.attributes.insert(k.clone(), value_to_json(v)?);
+                    rs.attributes.insert(
+                        k.clone(),
+                        carina_core::value::value_to_json_with_context(v, Some(&ctx))?,
+                    );
                 }
             }
         }

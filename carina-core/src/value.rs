@@ -2,19 +2,90 @@
 
 use std::collections::HashMap;
 
-use sha2::{Digest, Sha256};
+use argon2::Argon2;
 
 use crate::resource::{InterpolationPart, Value};
 use crate::utils::{convert_enum_value, is_dsl_enum_format};
 
 /// Secret value prefix used in state serialization.
-pub const SECRET_PREFIX: &str = "_secret:sha256:";
+pub const SECRET_PREFIX: &str = "_secret:argon2:";
+
+/// Fallback salt for Argon2id hashing when no context is available.
+const ARGON2_FALLBACK_SALT: &[u8] = b"carina-secret-v1";
+
+/// Context for deterministic salt generation when hashing secrets.
+///
+/// The salt is derived from the resource context to ensure that the same
+/// password on different resources produces different hashes.
+#[derive(Debug, Clone)]
+pub struct SecretHashContext {
+    pub resource_type: String,
+    pub resource_name: String,
+    pub attribute_key: String,
+}
+
+impl SecretHashContext {
+    pub fn new(
+        resource_type: impl Into<String>,
+        resource_name: impl Into<String>,
+        attribute_key: impl Into<String>,
+    ) -> Self {
+        Self {
+            resource_type: resource_type.into(),
+            resource_name: resource_name.into(),
+            attribute_key: attribute_key.into(),
+        }
+    }
+
+    /// Build a deterministic salt from the context.
+    fn salt(&self) -> String {
+        format!(
+            "carina:{}:{}:{}",
+            self.resource_type, self.resource_name, self.attribute_key
+        )
+    }
+}
+
+/// Hash bytes using Argon2id, returning a hex string.
+///
+/// When `context` is provided, a deterministic salt derived from the resource
+/// context is used. Otherwise, a fixed fallback salt is used.
+pub(crate) fn argon2id_hash(input: &[u8], context: Option<&SecretHashContext>) -> String {
+    let salt_string;
+    let salt: &[u8] = match context {
+        Some(ctx) => {
+            salt_string = ctx.salt();
+            salt_string.as_bytes()
+        }
+        None => ARGON2_FALLBACK_SALT,
+    };
+    let mut output = [0u8; 32];
+    Argon2::default()
+        .hash_password_into(input, salt, &mut output)
+        .expect("Argon2id hashing should not fail");
+    output.iter().map(|b| format!("{b:02x}")).collect()
+}
 
 /// Convert `Value` to `serde_json::Value`.
 ///
 /// Returns an error if `value` contains a non-finite float (NaN or infinity)
 /// because JSON cannot represent these values.
+///
+/// For `Value::Secret`, uses the fallback salt. Use `value_to_json_with_context`
+/// to provide resource context for deterministic context-specific salt.
 pub fn value_to_json(value: &Value) -> Result<serde_json::Value, String> {
+    value_to_json_with_context(value, None)
+}
+
+/// Convert `Value` to `serde_json::Value` with optional secret hash context.
+///
+/// When `context` is provided and the value contains `Value::Secret`, the hash
+/// uses a deterministic salt derived from the resource context. This ensures
+/// that the same password on different resources produces different hashes.
+pub fn value_to_json_with_context(
+    value: &Value,
+    context: Option<&SecretHashContext>,
+) -> Result<serde_json::Value, String> {
     match value {
         Value::String(s) => Ok(serde_json::Value::String(s.clone())),
         Value::Int(n) => Ok(serde_json::Value::Number((*n).into())),
@@ -25,13 +96,16 @@ pub fn value_to_json(value: &Value) -> Result<serde_json::Value, String> {
         }
         Value::Bool(b) => Ok(serde_json::Value::Bool(*b)),
         Value::List(items) => {
-            let arr: Result<Vec<_>, _> = items.iter().map(value_to_json).collect();
+            let arr: Result<Vec<_>, _> = items
+                .iter()
+                .map(|item| value_to_json_with_context(item, context))
+                .collect();
             Ok(serde_json::Value::Array(arr?))
         }
         Value::Map(map) => {
             let obj: Result<serde_json::Map<_, _>, _> = map
                 .iter()
-                .map(|(k, v)| value_to_json(v).map(|jv| (k.clone(), jv)))
+                .map(|(k, v)| value_to_json_with_context(v, context).map(|jv| (k.clone(), jv)))
                 .collect();
             Ok(serde_json::Value::Object(obj?))
         }
@@ -66,13 +140,12 @@ pub fn value_to_json(value: &Value) -> Result<serde_json::Value, String> {
             )))
         }
         Value::Secret(inner) => {
-            let inner_json = value_to_json(inner)?;
+            let inner_json = value_to_json_with_context(inner, context)?;
             let json_str = serde_json::to_string(&inner_json)
                 .map_err(|e| format!("failed to serialize secret inner value: {e}"))?;
-            let hash = Sha256::digest(json_str.as_bytes());
+            let hash_hex = argon2id_hash(json_str.as_bytes(), context);
             Ok(serde_json::Value::String(format!(
-                "{SECRET_PREFIX}{:x}",
-                hash
+                "{SECRET_PREFIX}{hash_hex}",
             )))
         }
     }
@@ -204,12 +277,16 @@ pub fn contains_secret(value: &Value) -> bool {
 ///   version; otherwise keep the provider value
 /// - If desired is a `List` and provider is an array, merge element-by-element
 /// - Otherwise, return the provider value as-is
+///
+/// When `context` is provided, it is passed through to `value_to_json_with_context`
+/// for deterministic context-specific salt in Argon2id hashing.
 pub fn merge_secrets_into_provider_json(
     desired: &Value,
     provider_json: &serde_json::Value,
+    context: Option<&SecretHashContext>,
 ) -> Result<serde_json::Value, String> {
     match desired {
-        Value::Secret(_) => value_to_json(desired),
+        Value::Secret(_) => value_to_json_with_context(desired, context),
         Value::Map(desired_map) => {
             if let serde_json::Value::Object(provider_obj) = provider_json {
                 let mut merged = provider_obj.clone();
@@ -218,18 +295,25 @@ pub fn merge_secrets_into_provider_json(
                         if let Some(provider_val) = provider_obj.get(k) {
                             merged.insert(
                                 k.clone(),
-                                merge_secrets_into_provider_json(desired_val, provider_val)?,
+                                merge_secrets_into_provider_json(
+                                    desired_val,
+                                    provider_val,
+                                    context,
+                                )?,
                             );
                         } else {
                             // Key only in desired (not returned by provider); use desired hash
-                            merged.insert(k.clone(), value_to_json(desired_val)?);
+                            merged.insert(
+                                k.clone(),
+                                value_to_json_with_context(desired_val, context)?,
+                            );
                         }
                     }
                 }
                 Ok(serde_json::Value::Object(merged))
             } else {
                 // Provider didn't return a map; fall back to desired
-                value_to_json(desired)
+                value_to_json_with_context(desired, context)
             }
         }
         Value::List(desired_items) => {
@@ -241,6 +325,7 @@ pub fn merge_secrets_into_provider_json(
                             merged.push(merge_secrets_into_provider_json(
                                 desired_elem,
                                 provider_elem,
+                                context,
                             )?);
                         } else {
                             merged.push(provider_elem.clone());
@@ -251,7 +336,7 @@ pub fn merge_secrets_into_provider_json(
                 }
                 Ok(serde_json::Value::Array(merged))
             } else {
-                value_to_json(desired)
+                value_to_json_with_context(desired, context)
             }
         }
         _ => Ok(provider_json.clone()),
@@ -605,7 +690,7 @@ mod tests {
             "Expected secret hash prefix, got: {}",
             s
         );
-        // SHA256 hex is 64 characters
+        // Argon2id with 32-byte output = 64 hex characters
         let hash = s.strip_prefix(SECRET_PREFIX).unwrap();
         assert_eq!(hash.len(), 64, "Expected 64-char hex hash, got: {}", hash);
     }
@@ -686,5 +771,55 @@ mod tests {
         );
         let v = Value::String(hash_str);
         assert_eq!(format_value(&v), "(secret)");
+    }
+
+    #[test]
+    fn test_value_to_json_with_context_different_resources_different_hashes() {
+        let v = Value::Secret(Box::new(Value::String("my-password".to_string())));
+        let ctx1 = SecretHashContext::new("ec2.vpc", "vpc-1", "password");
+        let ctx2 = SecretHashContext::new("rds.db_instance", "my-db", "password");
+        let json1 = value_to_json_with_context(&v, Some(&ctx1)).unwrap();
+        let json2 = value_to_json_with_context(&v, Some(&ctx2)).unwrap();
+        assert_ne!(
+            json1, json2,
+            "Same password on different resources should produce different hashes"
+        );
+    }
+
+    #[test]
+    fn test_value_to_json_with_context_different_attributes_different_hashes() {
+        let v = Value::Secret(Box::new(Value::String("my-password".to_string())));
+        let ctx1 = SecretHashContext::new("rds.db_instance", "my-db", "master_password");
+        let ctx2 = SecretHashContext::new("rds.db_instance", "my-db", "admin_password");
+        let json1 = value_to_json_with_context(&v, Some(&ctx1)).unwrap();
+        let json2 = value_to_json_with_context(&v, Some(&ctx2)).unwrap();
+        assert_ne!(
+            json1, json2,
+            "Same password on different attributes should produce different hashes"
+        );
+    }
+
+    #[test]
+    fn test_value_to_json_with_context_same_context_is_deterministic() {
+        let v = Value::Secret(Box::new(Value::String("my-password".to_string())));
+        let ctx = SecretHashContext::new("rds.db_instance", "my-db", "master_password");
+        let json1 = value_to_json_with_context(&v, Some(&ctx)).unwrap();
+        let json2 = value_to_json_with_context(&v, Some(&ctx)).unwrap();
+        assert_eq!(
+            json1, json2,
+            "Same password with same context should produce identical hashes"
+        );
+    }
+
+    #[test]
+    fn test_value_to_json_with_context_differs_from_no_context() {
+        let v = Value::Secret(Box::new(Value::String("my-password".to_string())));
+        let ctx = SecretHashContext::new("rds.db_instance", "my-db", "master_password");
+        let json_with_ctx = value_to_json_with_context(&v, Some(&ctx)).unwrap();
+        let json_no_ctx = value_to_json(&v).unwrap();
+        assert_ne!(
+            json_with_ctx, json_no_ctx,
+            "Context-based hash should differ from fallback hash"
+        );
     }
 }
