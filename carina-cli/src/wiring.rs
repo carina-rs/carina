@@ -196,7 +196,7 @@ pub fn compute_anonymous_identifiers_with_ctx(
 ///
 /// Creates normalizers from all registered provider factories and applies
 /// `normalize_desired()` to the resources. This resolves enum identifiers
-/// (e.g., `UnresolvedIdent` -> namespaced enum strings) without requiring
+/// (e.g., bare enum identifiers -> namespaced enum strings) without requiring
 /// actual provider instances or network access.
 #[cfg(test)]
 pub fn normalize_desired_with_ctx(ctx: &WiringContext, resources: &mut [Resource]) {

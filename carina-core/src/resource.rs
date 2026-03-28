@@ -76,13 +76,6 @@ pub enum Value {
         #[serde(default)]
         field_path: Vec<String>,
     },
-    /// Unresolved identifier that will be resolved during schema validation
-    /// This allows shorthand enum values like `dedicated` to be resolved to
-    /// `aws.vpc.InstanceTenancy.dedicated` based on schema context.
-    /// The tuple contains (identifier, optional_member) for forms like:
-    /// - `dedicated` -> ("dedicated", None)
-    /// - `InstanceTenancy.dedicated` -> ("InstanceTenancy", Some("dedicated"))
-    UnresolvedIdent(String, Option<String>),
     /// String interpolation: `"prefix-${expr}-suffix"`
     /// Parts are evaluated and concatenated into a final String.
     Interpolation(Vec<InterpolationPart>),
@@ -167,10 +160,6 @@ impl Value {
                 binding_name.hash(hasher);
                 attribute_name.hash(hasher);
                 field_path.hash(hasher);
-            }
-            Value::UnresolvedIdent(name, member) => {
-                name.hash(hasher);
-                member.hash(hasher);
             }
             Value::Interpolation(parts) => {
                 parts.len().hash(hasher);
@@ -584,8 +573,8 @@ mod tests {
                 attribute_name: "arn".to_string(),
                 field_path: vec![],
             },
-            Value::UnresolvedIdent("dedicated".to_string(), None),
-            Value::UnresolvedIdent("InstanceTenancy".to_string(), Some("dedicated".to_string())),
+            Value::String("dedicated".to_string()),
+            Value::String("InstanceTenancy.dedicated".to_string()),
             Value::Interpolation(vec![
                 InterpolationPart::Literal("prefix-".to_string()),
                 InterpolationPart::Expr(Value::ResourceRef {

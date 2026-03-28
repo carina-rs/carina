@@ -194,26 +194,6 @@ pub(crate) fn dsl_value_to_aws(
                 };
                 Some(json!(resolved))
             }
-            Value::UnresolvedIdent(ident, member) => {
-                let raw = if let Some(m) = member {
-                    m.clone()
-                } else {
-                    ident.clone()
-                };
-                // Use valid values when available for correct resolution
-                let converted = if let Some((_, values, _, _)) = attr_type.string_enum_parts() {
-                    let valid: Vec<&str> = values.iter().map(String::as_str).collect();
-                    canonicalize_enum_value(&raw, &valid)
-                } else {
-                    raw.replace('_', "-")
-                };
-                // Apply alias reverse mapping (e.g., "all" -> "-1")
-                let resolved = match get_enum_alias_reverse(resource_type, attr_name, &converted) {
-                    Some(canonical) => canonical.to_string(),
-                    None => converted,
-                };
-                Some(json!(resolved))
-            }
             _ => value_to_json(value),
         }
     } else if let AttributeType::List { inner, .. } = attr_type
@@ -515,7 +495,7 @@ mod tests {
             .insert("vpc_id".to_string(), Value::String("vpc-123".to_string()));
         resource.attributes.insert(
             "vpc_endpoint_type".to_string(),
-            Value::UnresolvedIdent("Gateway".to_string(), None),
+            Value::String("Gateway".to_string()),
         );
 
         let mut resources = vec![resource];

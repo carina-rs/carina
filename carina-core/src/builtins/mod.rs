@@ -142,7 +142,6 @@ fn value_type_name(value: &Value) -> &'static str {
         Value::List(_) => "List",
         Value::Map(_) => "Map",
         Value::ResourceRef { .. } => "ResourceRef",
-        Value::UnresolvedIdent(_, _) => "UnresolvedIdent",
         Value::Interpolation(_) => "Interpolation",
         Value::FunctionCall { .. } => "FunctionCall",
     }
