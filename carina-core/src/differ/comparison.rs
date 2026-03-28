@@ -232,6 +232,16 @@ pub(super) fn find_changed_attributes(
             continue;
         }
 
+        // Skip write-only attributes not present in current state.
+        // CloudControl API does not return write-only properties, so their
+        // absence from state is expected and should not trigger a diff.
+        if schema
+            .and_then(|s| s.attributes.get(key))
+            .is_some_and(|attr| attr.write_only && !current.contains_key(key))
+        {
+            continue;
+        }
+
         let attr_type = schema
             .and_then(|s| s.attributes.get(key))
             .map(|a| &a.attr_type);
