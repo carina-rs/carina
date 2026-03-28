@@ -536,3 +536,82 @@ fn non_write_only_attr_in_desired_not_in_current_detects_diff() {
         "Non-write-only attribute absent from current should trigger a diff"
     );
 }
+
+#[test]
+fn secret_unchanged_same_hash() {
+    use crate::value::value_to_json;
+
+    let secret_value = Value::Secret(Box::new(Value::String("my-password".to_string())));
+    // Compute the hash that would be stored in state
+    let hash_json = value_to_json(&secret_value).unwrap();
+    let hash_str = hash_json.as_str().unwrap().to_string();
+
+    // State has the hash string, desired has the Secret wrapper
+    assert!(type_aware_equal(
+        &secret_value,
+        &Value::String(hash_str.clone()),
+        None,
+    ));
+    // Reversed order should also work
+    assert!(type_aware_equal(
+        &Value::String(hash_str),
+        &secret_value,
+        None,
+    ));
+}
+
+#[test]
+fn secret_changed_different_hash() {
+    use crate::value::value_to_json;
+
+    let old_secret = Value::Secret(Box::new(Value::String("old-password".to_string())));
+    let new_secret = Value::Secret(Box::new(Value::String("new-password".to_string())));
+    // Compute the hash for the OLD secret (stored in state)
+    let old_hash_json = value_to_json(&old_secret).unwrap();
+    let old_hash_str = old_hash_json.as_str().unwrap().to_string();
+
+    // New desired vs old state hash should be different
+    assert!(!type_aware_equal(
+        &new_secret,
+        &Value::String(old_hash_str),
+        None,
+    ));
+}
+
+#[test]
+fn secret_in_find_changed_attributes_no_change() {
+    use crate::value::value_to_json;
+
+    let secret_value = Value::Secret(Box::new(Value::String("my-password".to_string())));
+    let hash_json = value_to_json(&secret_value).unwrap();
+    let hash_str = hash_json.as_str().unwrap().to_string();
+
+    let desired = HashMap::from([("password".to_string(), secret_value)]);
+    let current = HashMap::from([("password".to_string(), Value::String(hash_str))]);
+
+    let changed = find_changed_attributes(&desired, &current, None, None, None);
+    assert!(
+        changed.is_empty(),
+        "Secret with matching hash should not show as changed, got: {:?}",
+        changed
+    );
+}
+
+#[test]
+fn secret_in_find_changed_attributes_changed() {
+    use crate::value::value_to_json;
+
+    let old_secret = Value::Secret(Box::new(Value::String("old-password".to_string())));
+    let new_secret = Value::Secret(Box::new(Value::String("new-password".to_string())));
+    let old_hash_json = value_to_json(&old_secret).unwrap();
+    let old_hash_str = old_hash_json.as_str().unwrap().to_string();
+
+    let desired = HashMap::from([("password".to_string(), new_secret)]);
+    let current = HashMap::from([("password".to_string(), Value::String(old_hash_str))]);
+
+    let changed = find_changed_attributes(&desired, &current, None, None, None);
+    assert!(
+        changed.contains(&"password".to_string()),
+        "Secret with different hash should show as changed"
+    );
+}

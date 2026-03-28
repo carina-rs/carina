@@ -65,6 +65,9 @@ fn collect_dependencies(value: &Value, deps: &mut HashSet<String>) {
                 collect_dependencies(arg, deps);
             }
         }
+        Value::Secret(inner) => {
+            collect_dependencies(inner, deps);
+        }
         _ => {}
     }
 }

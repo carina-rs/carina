@@ -2,8 +2,13 @@
 
 use std::collections::HashMap;
 
+use sha2::{Digest, Sha256};
+
 use crate::resource::{InterpolationPart, Value};
 use crate::utils::{convert_enum_value, is_dsl_enum_format};
+
+/// Secret value prefix used in state serialization.
+pub const SECRET_PREFIX: &str = "_secret:sha256:";
 
 /// Convert `Value` to `serde_json::Value`.
 ///
@@ -58,6 +63,16 @@ pub fn value_to_json(value: &Value) -> Result<serde_json::Value, String> {
                 "{}({})",
                 name,
                 arg_strs.join(", ")
+            )))
+        }
+        Value::Secret(inner) => {
+            let inner_json = value_to_json(inner)?;
+            let json_str = serde_json::to_string(&inner_json)
+                .map_err(|e| format!("failed to serialize secret inner value: {e}"))?;
+            let hash = Sha256::digest(json_str.as_bytes());
+            Ok(serde_json::Value::String(format!(
+                "{SECRET_PREFIX}{:x}",
+                hash
             )))
         }
     }
@@ -158,6 +173,7 @@ pub fn format_value_with_key(value: &Value, _key: Option<&str>) -> String {
             let arg_strs: Vec<_> = args.iter().map(format_value).collect();
             format!("{}({})", name, arg_strs.join(", "))
         }
+        Value::Secret(_) => "(secret)".to_string(),
     }
 }
 
@@ -496,5 +512,44 @@ mod tests {
     #[test]
     fn test_map_similarity_non_maps() {
         assert_eq!(map_similarity(&Value::Int(1), &Value::Int(1)), 0);
+    }
+
+    #[test]
+    fn test_value_to_json_secret_produces_hash() {
+        let v = Value::Secret(Box::new(Value::String("my-password".to_string())));
+        let json = value_to_json(&v).unwrap();
+        let s = json.as_str().unwrap();
+        assert!(
+            s.starts_with(SECRET_PREFIX),
+            "Expected secret hash prefix, got: {}",
+            s
+        );
+        // SHA256 hex is 64 characters
+        let hash = s.strip_prefix(SECRET_PREFIX).unwrap();
+        assert_eq!(hash.len(), 64, "Expected 64-char hex hash, got: {}", hash);
+    }
+
+    #[test]
+    fn test_value_to_json_secret_is_deterministic() {
+        let v1 = Value::Secret(Box::new(Value::String("my-password".to_string())));
+        let v2 = Value::Secret(Box::new(Value::String("my-password".to_string())));
+        let json1 = value_to_json(&v1).unwrap();
+        let json2 = value_to_json(&v2).unwrap();
+        assert_eq!(json1, json2);
+    }
+
+    #[test]
+    fn test_value_to_json_secret_different_values_different_hashes() {
+        let v1 = Value::Secret(Box::new(Value::String("password-1".to_string())));
+        let v2 = Value::Secret(Box::new(Value::String("password-2".to_string())));
+        let json1 = value_to_json(&v1).unwrap();
+        let json2 = value_to_json(&v2).unwrap();
+        assert_ne!(json1, json2);
+    }
+
+    #[test]
+    fn test_format_value_secret() {
+        let v = Value::Secret(Box::new(Value::String("my-password".to_string())));
+        assert_eq!(format_value(&v), "(secret)");
     }
 }

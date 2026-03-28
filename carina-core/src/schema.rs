@@ -512,6 +512,7 @@ impl Value {
             }
             Value::Interpolation(_) => "Interpolation".to_string(),
             Value::FunctionCall { name, .. } => format!("FunctionCall({})", name),
+            Value::Secret(_) => "Secret".to_string(),
         }
     }
 }

@@ -14,6 +14,7 @@ mod lookup;
 mod map;
 mod min_max;
 mod replace;
+mod secret;
 mod split;
 mod trim;
 mod upper_lower;
@@ -119,6 +120,10 @@ register_builtins! {
         signature: "replace(search: string, replacement: string, string: string) -> string",
         description: "Replaces all occurrences of a search string. Data-last: string |> replace(search, replacement).",
     },
+    secret(secret::builtin_secret) {
+        signature: "secret(value: any) -> secret",
+        description: "Marks a value as secret. The value is sent to the provider but stored only as a SHA256 hash in state.",
+    },
     split(split::builtin_split) {
         signature: "split(separator: string, string: string) -> list",
         description: "Splits a string into a list using the separator.",
@@ -154,6 +159,7 @@ fn value_type_name(value: &Value) -> &'static str {
         Value::ResourceRef { .. } => "ResourceRef",
         Value::Interpolation(_) => "Interpolation",
         Value::FunctionCall { .. } => "FunctionCall",
+        Value::Secret(_) => "Secret",
     }
 }
 

@@ -87,6 +87,9 @@ pub enum Value {
         /// Arguments to the function
         args: Vec<Value>,
     },
+    /// A secret value. The inner value is sent to the provider but stored as a
+    /// SHA256 hash in state. Plan output displays `(secret)` instead of the value.
+    Secret(Box<Value>),
 }
 
 /// A part of a string interpolation expression
@@ -182,6 +185,9 @@ impl Value {
                 for arg in args {
                     arg.hash_into(hasher);
                 }
+            }
+            Value::Secret(inner) => {
+                inner.hash_into(hasher);
             }
         }
     }
@@ -594,6 +600,7 @@ mod tests {
                     ]),
                 ],
             },
+            Value::Secret(Box::new(Value::String("my-password".to_string()))),
         ];
 
         for value in values {
