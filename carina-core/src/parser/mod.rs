@@ -165,6 +165,7 @@ pub struct ImportStatement {
 #[derive(Debug, Clone)]
 pub struct FnParam {
     pub name: String,
+    pub param_type: Option<TypeExpr>,
     pub default: Option<Value>,
 }
 
@@ -1551,13 +1552,21 @@ fn parse_fn_def(
                 let param_name = next_pair(&mut param_inner, "parameter name", "fn_param")?
                     .as_str()
                     .to_string();
-                let default = if let Some(default_expr) = param_inner.next() {
-                    // Create a minimal context with no bindings for default expressions
-                    let default_ctx = ParseContext::new();
-                    Some(parse_expression(default_expr, &default_ctx)?)
-                } else {
-                    None
-                };
+                // Parse optional type annotation (: type_expr)
+                let mut param_type = None;
+                let mut default = None;
+                for remaining in param_inner {
+                    match remaining.as_rule() {
+                        Rule::type_expr => {
+                            param_type = Some(parse_type_expr(remaining)?);
+                        }
+                        _ => {
+                            // This is the default expression
+                            let default_ctx = ParseContext::new();
+                            default = Some(parse_expression(remaining, &default_ctx)?);
+                        }
+                    }
+                }
                 // Validate: required params must come before optional params
                 if default.is_none() && params.iter().any(|p: &FnParam| p.default.is_some()) {
                     return Err(ParseError::UserFunctionError(format!(
@@ -1566,6 +1575,7 @@ fn parse_fn_def(
                 }
                 params.push(FnParam {
                     name: param_name,
+                    param_type,
                     default,
                 });
             }
@@ -1666,7 +1676,7 @@ fn prepare_user_function_call(
         )));
     }
 
-    // Build substitution map: param_name -> value
+    // Build substitution map: param_name -> value, and type-check annotated params
     let mut substitutions: HashMap<String, Value> = HashMap::new();
     for (i, param) in func.params.iter().enumerate() {
         let value = if i < args.len() {
@@ -1674,6 +1684,10 @@ fn prepare_user_function_call(
         } else {
             param.default.clone().unwrap()
         };
+        // Type-check if the parameter has a type annotation
+        if let Some(ref type_expr) = param.param_type {
+            check_fn_arg_type(fn_name, &param.name, type_expr, &value)?;
+        }
         substitutions.insert(param.name.clone(), value);
     }
 
@@ -1690,6 +1704,57 @@ fn prepare_user_function_call(
     }
 
     Ok((child_ctx, substitutions))
+}
+
+/// Check that a function argument matches the declared parameter type.
+/// Resource type annotations (TypeExpr::Ref) are parsed but not validated at call site.
+fn check_fn_arg_type(
+    fn_name: &str,
+    param_name: &str,
+    type_expr: &TypeExpr,
+    value: &Value,
+) -> Result<(), ParseError> {
+    let type_matches = match type_expr {
+        TypeExpr::String => matches!(
+            value,
+            Value::String(_) | Value::Interpolation(_) | Value::ResourceRef { .. }
+        ),
+        TypeExpr::Int => matches!(value, Value::Int(_)),
+        TypeExpr::Float => matches!(value, Value::Float(_)),
+        TypeExpr::Bool => matches!(value, Value::Bool(_)),
+        TypeExpr::List(_) => matches!(value, Value::List(_)),
+        TypeExpr::Map(_) => matches!(value, Value::Map(_)),
+        // Cidr is a string subtype
+        TypeExpr::Cidr => matches!(
+            value,
+            Value::String(_) | Value::Interpolation(_) | Value::ResourceRef { .. }
+        ),
+        // Resource type refs: parsed but not validated (see issue guide)
+        TypeExpr::Ref(_) => true,
+    };
+    if !type_matches {
+        let actual_type = value_type_name(value);
+        return Err(ParseError::UserFunctionError(format!(
+            "function '{fn_name}': parameter '{param_name}' expects type '{type_expr}', got {actual_type}"
+        )));
+    }
+    Ok(())
+}
+
+/// Return a human-readable type name for a Value
+fn value_type_name(value: &Value) -> &'static str {
+    match value {
+        Value::String(_) => "string",
+        Value::Int(_) => "int",
+        Value::Float(_) => "float",
+        Value::Bool(_) => "bool",
+        Value::List(_) => "list",
+        Value::Map(_) => "map",
+        Value::ResourceRef { .. } => "resource reference",
+        Value::Interpolation(_) => "string",
+        Value::FunctionCall { .. } => "function call",
+        Value::Secret(_) => "secret",
+    }
 }
 
 /// Evaluate a user-defined function call by substituting arguments into the body
@@ -6839,5 +6904,173 @@ aws.s3.bucket {
             }
             other => panic!("Expected ResourceRef for vpc_id, got: {:?}", other),
         }
+    }
+
+    #[test]
+    fn user_fn_typed_param_string() {
+        let input = r#"
+            fn greet(name: string) {
+                join(" ", ["hello", name])
+            }
+
+            let vpc = aws.s3_bucket {
+                name = greet("world")
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+        assert_eq!(result.resources.len(), 1);
+        assert_eq!(
+            result.resources[0].attributes.get("name"),
+            Some(&Value::String("hello world".to_string())),
+        );
+    }
+
+    #[test]
+    fn user_fn_typed_param_type_mismatch() {
+        let input = r#"
+            fn greet(name: string) {
+                name
+            }
+
+            let vpc = aws.s3_bucket {
+                name = greet(42)
+            }
+        "#;
+
+        let err = parse(input).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("expects type 'string'"),
+            "Expected type mismatch error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn user_fn_typed_param_int() {
+        let input = r#"
+            fn double(x: int) {
+                x
+            }
+
+            let vpc = aws.s3_bucket {
+                name = double("not_int")
+            }
+        "#;
+
+        let err = parse(input).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("expects type 'int'"),
+            "Expected type mismatch error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn user_fn_typed_param_with_default() {
+        let input = r#"
+            fn tag(env: string, suffix: string = "default") {
+                join("-", [env, suffix])
+            }
+
+            let a = aws.s3_bucket {
+                name = tag("prod")
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+        assert_eq!(
+            result.resources[0].attributes.get("name"),
+            Some(&Value::String("prod-default".to_string())),
+        );
+    }
+
+    #[test]
+    fn user_fn_mixed_typed_and_untyped() {
+        let input = r#"
+            fn tag(env, suffix: string) {
+                join("-", [env, suffix])
+            }
+
+            let a = aws.s3_bucket {
+                name = tag("prod", "web")
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+        assert_eq!(
+            result.resources[0].attributes.get("name"),
+            Some(&Value::String("prod-web".to_string())),
+        );
+    }
+
+    #[test]
+    fn user_fn_resource_type_annotation_parsed() {
+        // Resource type annotations are parsed but not validated at call site
+        let input = r#"
+            fn make_subnet(vpc: awscc.ec2.vpc, cidr: string) {
+                awscc.ec2.subnet {
+                    vpc_id     = vpc.vpc_id
+                    cidr_block = cidr
+                }
+            }
+
+            let vpc = awscc.ec2.vpc {
+                cidr_block = "10.0.0.0/16"
+            }
+
+            let subnet = make_subnet(vpc, "10.0.1.0/24")
+        "#;
+
+        let result = parse(input).unwrap();
+        assert_eq!(result.resources.len(), 2);
+        assert_eq!(result.resources[1].id.name, "subnet");
+    }
+
+    #[test]
+    fn user_fn_typed_param_bool_mismatch() {
+        let input = r#"
+            fn check(flag: bool) {
+                flag
+            }
+
+            let vpc = aws.s3_bucket {
+                name = check("not_bool")
+            }
+        "#;
+
+        let err = parse(input).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("expects type 'bool'"),
+            "Expected type mismatch error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn user_fn_param_type_stored_in_parsed_file() {
+        let input = r#"
+            fn greet(name: string, count: int) {
+                name
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+        let func = result.user_functions.get("greet").unwrap();
+        assert_eq!(func.params[0].param_type, Some(TypeExpr::String));
+        assert_eq!(func.params[1].param_type, Some(TypeExpr::Int));
+    }
+
+    #[test]
+    fn user_fn_untyped_param_type_is_none() {
+        let input = r#"
+            fn greet(name) {
+                name
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+        let func = result.user_functions.get("greet").unwrap();
+        assert_eq!(func.params[0].param_type, None);
     }
 }

@@ -8,7 +8,7 @@ statement = { backend_block | provider_block | arguments_block | attributes_bloc
 // User-defined function: fn name(params) { body }
 fn_def = { "fn" ~ identifier ~ "(" ~ fn_params? ~ ")" ~ "{" ~ fn_body ~ "}" }
 fn_params = { fn_param ~ ("," ~ fn_param)* }
-fn_param = { identifier ~ ("=" ~ expression)? }
+fn_param = { identifier ~ (":" ~ type_expr)? ~ ("=" ~ expression)? }
 fn_body = { fn_local_let* ~ (resource_expr | read_resource_expr | expression) }
 fn_local_let = { "let" ~ identifier ~ "=" ~ expression }
 
