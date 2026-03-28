@@ -553,7 +553,7 @@ pub async fn create_plan_from_parsed(
     resolve_enum_aliases_with_ctx(&ctx, &mut resources);
     resolve_enum_aliases_in_states(&ctx, &mut current_states);
 
-    // Build prev_desired_keys and lifecycles before moved-state transfer
+    // Build prev_desired_keys before moved-state transfer
     // so materialize_moved_states can re-key them under the new resource name.
     let mut prev_desired_keys = state_file
         .as_ref()
@@ -607,11 +607,14 @@ pub async fn create_plan_from_parsed(
     })
 }
 
-/// Pre-process moved blocks by transferring state from the old name to the new name.
+/// Pre-process moved blocks by transferring state, `prev_desired_keys`, and
+/// `saved_attrs` from the old resource name to the new name.
 ///
 /// This must be called BEFORE `create_plan()` so the differ sees the moved
 /// resource's state under its new name and can produce Update/Replace effects
-/// if attributes differ between state and desired.
+/// if attributes differ between state and desired. Transferring
+/// `prev_desired_keys` ensures attribute removals are detected; transferring
+/// `saved_attrs` ensures hydrated attributes are found under the new name.
 ///
 /// Returns a list of active Move pairs (from, to) where the `from` resource
 /// existed in state. Callers use this to add Move effects to the plan.
@@ -644,8 +647,8 @@ pub fn materialize_moved_states(
                     prev_desired_keys.insert(to.clone(), keys);
                 }
 
-                // Transfer saved_attrs so hydrate_read_state lookups work
-                // under the new resource name.
+                // Transfer saved_attrs so create_plan can look up saved
+                // attributes under the new resource name.
                 if let Some(attrs) = saved_attrs.remove(from) {
                     saved_attrs.insert(to.clone(), attrs);
                 }
