@@ -1091,6 +1091,14 @@ async fn run_apply_locked(
     crate::wiring::resolve_enum_aliases_with_ctx(ctx, &mut resources_for_plan);
     crate::wiring::resolve_enum_aliases_in_states(ctx, &mut current_states);
 
+    // Pre-process moved blocks: transfer state from old name to new name
+    // so the differ sees attribute changes and produces Update/Replace effects.
+    let moved_pairs = crate::wiring::materialize_moved_states(
+        &mut current_states,
+        &parsed.state_blocks,
+        &state_file,
+    );
+
     let lifecycles = state_file
         .as_ref()
         .map(|sf| sf.build_lifecycles())
@@ -1115,7 +1123,12 @@ async fn run_apply_locked(
     cascade_dependent_updates(&mut plan, &sorted_resources, &current_states, schemas);
 
     // Add state block effects (import/removed/moved) to the plan
-    crate::wiring::add_state_block_effects(&mut plan, &parsed.state_blocks, &state_file);
+    crate::wiring::add_state_block_effects(
+        &mut plan,
+        &parsed.state_blocks,
+        &state_file,
+        &moved_pairs,
+    );
 
     if plan.is_empty() {
         println!("{}", "No changes needed.".green());

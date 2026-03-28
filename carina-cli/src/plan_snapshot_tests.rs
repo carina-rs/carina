@@ -161,6 +161,13 @@ fn build_plan_and_states_from_fixture(
         HashMap::new()
     };
 
+    // Pre-process moved blocks: transfer state from old name to new name
+    let moved_pairs = crate::wiring::materialize_moved_states(
+        &mut current_states,
+        &parsed.state_blocks,
+        &state_file,
+    );
+
     let mut plan = create_plan(
         &resources,
         &current_states,
@@ -179,7 +186,12 @@ fn build_plan_and_states_from_fixture(
     );
 
     // Add state block effects (import/removed/moved)
-    crate::wiring::add_state_block_effects(&mut plan, &parsed.state_blocks, &state_file);
+    crate::wiring::add_state_block_effects(
+        &mut plan,
+        &parsed.state_blocks,
+        &state_file,
+        &moved_pairs,
+    );
 
     (plan, current_states, wiring.schemas().clone())
 }
@@ -409,6 +421,18 @@ fn snapshot_secret_values() {
         &plan,
         DetailLevel::Full,
         &delete_attributes,
+        Some(&schemas),
+    ));
+    insta::assert_snapshot!(output);
+}
+
+#[test]
+fn snapshot_moved_with_changes() {
+    let (plan, schemas) = build_plan_from_fixture("moved_with_changes");
+    let output = strip_ansi(&format_plan(
+        &plan,
+        DetailLevel::Full,
+        &HashMap::new(),
         Some(&schemas),
     ));
     insta::assert_snapshot!(output);

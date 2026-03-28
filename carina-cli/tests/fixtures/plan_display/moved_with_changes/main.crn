@@ -1,0 +1,24 @@
+# Moved block with attribute changes: Move + Update
+# State has "old_vpc" with cidr_block=10.0.0.0/16, no tags.
+# After move to "new_vpc", tags are added -> expect Update effect.
+
+provider awscc {
+  region = awscc.Region.ap_northeast_1
+}
+
+moved {
+  from = awscc.ec2.vpc "old_vpc"
+  to   = awscc.ec2.vpc "new_vpc"
+}
+
+let new_vpc = awscc.ec2.vpc {
+  cidr_block = "10.0.0.0/16"
+  tags = {
+    Name = "updated"
+  }
+}
+
+awscc.ec2.subnet {
+  vpc_id     = new_vpc.vpc_id
+  cidr_block = "10.0.1.0/24"
+}
