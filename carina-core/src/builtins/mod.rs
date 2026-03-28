@@ -10,6 +10,7 @@ mod join;
 mod keys_values;
 mod length;
 mod lookup;
+mod map;
 mod min_max;
 mod replace;
 mod split;
@@ -96,6 +97,10 @@ register_builtins! {
     lower(upper_lower::builtin_lower) {
         signature: "lower(string: string) -> string",
         description: "Converts a string to lowercase.",
+    },
+    map(map::builtin_map) {
+        signature: "map(collection: list | map, accessor: string) -> list | map",
+        description: "Extracts a field from each element. Use a dot-prefixed accessor (e.g., \".field_name\").",
     },
     max(min_max::builtin_max) {
         signature: "max(a: number, b: number) -> number",
