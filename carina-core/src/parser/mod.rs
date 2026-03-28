@@ -173,13 +173,9 @@ pub struct FnParam {
 pub enum UserFunctionBody {
     /// The function returns a value (existing behavior)
     Value(Value),
-    /// The function returns a resource expression (resource-generating function)
-    Resource {
-        /// The raw pest pair source for re-parsing with substituted parameters
-        resource_source: String,
-        /// The namespaced resource type (e.g., "aws.s3_bucket")
-        resource_type: String,
-    },
+    /// The function returns a resource expression (resource-generating function).
+    /// Stores the raw source text for re-parsing with substituted parameters.
+    Resource(String),
 }
 
 /// User-defined pure function
@@ -480,7 +476,7 @@ pub fn parse(input: &str) -> Result<ParsedFile, ParseError> {
                                 .as_str()
                                 .to_string();
                                 if let Some(user_fn) = ctx.user_functions.get(&func_name)
-                                    && matches!(user_fn.body, UserFunctionBody::Resource { .. })
+                                    && matches!(user_fn.body, UserFunctionBody::Resource(_))
                                 {
                                     let args: Result<Vec<Value>, ParseError> =
                                         fc_inner.map(|arg| parse_expression(arg, &ctx)).collect();
@@ -859,7 +855,7 @@ fn parse_primary_with_resource_or_module(
                 .map(|p| p.as_str().to_string())
                 .unwrap_or_default();
             if let Some(user_fn) = ctx.user_functions.get(&func_name)
-                && matches!(user_fn.body, UserFunctionBody::Resource { .. })
+                && matches!(user_fn.body, UserFunctionBody::Resource(_))
             {
                 // Parse args and evaluate as resource
                 let mut fc_inner = inner.into_inner();
@@ -1602,17 +1598,7 @@ fn parse_fn_def(
             }
             Rule::resource_expr | Rule::read_resource_expr => {
                 // Resource-generating function: store the source text for re-parsing
-                let resource_source = body_inner.as_str().to_string();
-                // Extract the namespaced type from the first inner pair
-                let resource_type = body_inner
-                    .into_inner()
-                    .next()
-                    .map(|p| p.as_str().to_string())
-                    .unwrap_or_default();
-                body = Some(UserFunctionBody::Resource {
-                    resource_source,
-                    resource_type,
-                });
+                body = Some(UserFunctionBody::Resource(body_inner.as_str().to_string()));
             }
             _ => {
                 // This should be the expression (the body)
@@ -1636,12 +1622,13 @@ fn parse_fn_def(
     })
 }
 
-/// Evaluate a user-defined function call by substituting arguments into the body
-fn evaluate_user_function(
+/// Prepare a user-defined function call: validate args, build substitutions, and return
+/// the child context with all parameters and local lets resolved.
+fn prepare_user_function_call(
     func: &UserFunction,
     args: &[Value],
     ctx: &ParseContext,
-) -> Result<Value, ParseError> {
+) -> Result<(ParseContext, HashMap<String, Value>), ParseError> {
     let fn_name = &func.name;
 
     // Check recursion
@@ -1684,17 +1671,29 @@ fn evaluate_user_function(
     for (let_name, let_expr) in &func.local_lets {
         let substituted = substitute_fn_params(let_expr, &substitutions);
         let evaluated = try_evaluate_fn_value(substituted, &child_ctx)?;
+        child_ctx.set_variable(let_name.clone(), evaluated.clone());
         substitutions.insert(let_name.clone(), evaluated);
     }
 
-    // Substitute params into body and evaluate
+    Ok((child_ctx, substitutions))
+}
+
+/// Evaluate a user-defined function call by substituting arguments into the body
+fn evaluate_user_function(
+    func: &UserFunction,
+    args: &[Value],
+    ctx: &ParseContext,
+) -> Result<Value, ParseError> {
+    let (child_ctx, substitutions) = prepare_user_function_call(func, args, ctx)?;
+
     match &func.body {
         UserFunctionBody::Value(body) => {
             let substituted_body = substitute_fn_params(body, &substitutions);
             try_evaluate_fn_value(substituted_body, &child_ctx)
         }
-        UserFunctionBody::Resource { .. } => Err(ParseError::UserFunctionError(format!(
-            "function '{fn_name}' returns a resource, not a value; use it in a let binding"
+        UserFunctionBody::Resource(_) => Err(ParseError::UserFunctionError(format!(
+            "function '{}' returns a resource, not a value; use it in a let binding",
+            func.name
         ))),
     }
 }
@@ -1707,62 +1706,15 @@ fn evaluate_user_function_as_resource(
     ctx: &ParseContext,
     binding_name: &str,
 ) -> Result<Resource, ParseError> {
-    let fn_name = &func.name;
+    let (mut child_ctx, substitutions) = prepare_user_function_call(func, args, ctx)?;
 
-    // Check recursion
-    if ctx.evaluating_functions.contains(fn_name) {
-        return Err(ParseError::RecursiveFunction(fn_name.clone()));
-    }
-
-    // Validate argument count
-    let required_count = func.params.iter().filter(|p| p.default.is_none()).count();
-    let max_count = func.params.len();
-    if args.len() < required_count {
-        return Err(ParseError::UserFunctionError(format!(
-            "function '{fn_name}' expects at least {required_count} argument(s), got {}",
-            args.len()
-        )));
-    }
-    if args.len() > max_count {
-        return Err(ParseError::UserFunctionError(format!(
-            "function '{fn_name}' expects at most {max_count} argument(s), got {}",
-            args.len()
-        )));
-    }
-
-    // Build substitution map: param_name -> value
-    let mut substitutions: HashMap<String, Value> = HashMap::new();
-    for (i, param) in func.params.iter().enumerate() {
-        let value = if i < args.len() {
-            args[i].clone()
-        } else {
-            param.default.clone().unwrap()
-        };
-        substitutions.insert(param.name.clone(), value);
-    }
-
-    // Create a child context with recursion tracking
-    let mut child_ctx = ctx.clone();
-    child_ctx.evaluating_functions.push(fn_name.clone());
-
-    // Evaluate local lets, substituting and resolving each one
-    for (let_name, let_expr) in &func.local_lets {
-        let substituted = substitute_fn_params(let_expr, &substitutions);
-        let evaluated = try_evaluate_fn_value(substituted, &child_ctx)?;
-        // Also register as a variable in the child context so resource body can reference it
-        child_ctx.set_variable(let_name.clone(), evaluated.clone());
-        substitutions.insert(let_name.clone(), evaluated);
-    }
-
-    // Register substituted parameter values in the child context
+    // Register substituted values in the child context so resource body can reference them
     for (param_name, value) in &substitutions {
         child_ctx.set_variable(param_name.clone(), value.clone());
     }
 
     match &func.body {
-        UserFunctionBody::Resource {
-            resource_source, ..
-        } => {
+        UserFunctionBody::Resource(resource_source) => {
             // Re-parse the resource expression source with the child context
             // that has parameter values as variables
             let mut parsed = CarinaParser::parse(Rule::resource_expr, resource_source)
@@ -1776,7 +1728,8 @@ fn evaluate_user_function_as_resource(
             parse_resource_expr(resource_pair, &child_ctx, binding_name)
         }
         UserFunctionBody::Value(_) => Err(ParseError::UserFunctionError(format!(
-            "function '{fn_name}' returns a value, not a resource"
+            "function '{}' returns a value, not a resource",
+            func.name
         ))),
     }
 }
