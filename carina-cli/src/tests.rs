@@ -991,15 +991,14 @@ fn test_plan_verify_idempotency_anonymous_flow_log_with_resource_refs() {
     );
     resource_run1.attributes.insert(
         "resource_type".to_string(),
-        Value::UnresolvedIdent("VPC".to_string(), None),
+        Value::String("VPC".to_string()),
     );
-    resource_run1.attributes.insert(
-        "traffic_type".to_string(),
-        Value::UnresolvedIdent("ALL".to_string(), None),
-    );
+    resource_run1
+        .attributes
+        .insert("traffic_type".to_string(), Value::String("ALL".to_string()));
     resource_run1.attributes.insert(
         "log_destination_type".to_string(),
-        Value::UnresolvedIdent("s3".to_string(), None),
+        Value::String("s3".to_string()),
     );
     resource_run1.attributes.insert(
         "log_destination".to_string(),
@@ -1050,15 +1049,14 @@ fn test_plan_verify_idempotency_anonymous_flow_log_with_resource_refs() {
     );
     resource_run2.attributes.insert(
         "resource_type".to_string(),
-        Value::UnresolvedIdent("VPC".to_string(), None),
+        Value::String("VPC".to_string()),
     );
-    resource_run2.attributes.insert(
-        "traffic_type".to_string(),
-        Value::UnresolvedIdent("ALL".to_string(), None),
-    );
+    resource_run2
+        .attributes
+        .insert("traffic_type".to_string(), Value::String("ALL".to_string()));
     resource_run2.attributes.insert(
         "log_destination_type".to_string(),
-        Value::UnresolvedIdent("s3".to_string(), None),
+        Value::String("s3".to_string()),
     );
     resource_run2.attributes.insert(
         "log_destination".to_string(),

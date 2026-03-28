@@ -414,8 +414,8 @@ pub fn parse(input: &str) -> Result<ParsedFile, ParseError> {
 
     // Second pass: resolve forward references.
     // During parsing, unknown 2-part identifiers (e.g., vpc.vpc_id where vpc is
-    // declared later) become UnresolvedIdent. Now that we have the full binding set,
-    // convert them to ResourceRef.
+    // declared later) become String values like "vpc.vpc_id". Now that we have the
+    // full binding set, convert matching ones to ResourceRef.
     resolve_forward_references(
         &ctx.resource_bindings,
         &mut resources,
@@ -883,7 +883,7 @@ fn is_static_value(value: &Value) -> bool {
         Value::List(items) => items.iter().all(is_static_value),
         Value::Map(map) => map.values().all(is_static_value),
         Value::FunctionCall { args, .. } => args.iter().all(is_static_value),
-        Value::ResourceRef { .. } | Value::Interpolation(_) | Value::UnresolvedIdent(_, _) => false,
+        Value::ResourceRef { .. } | Value::Interpolation(_) => false,
     }
 }
 
@@ -1758,10 +1758,7 @@ fn parse_primary_value(
                 } else {
                     // Unknown 2-part identifier: could be TypeName.value enum shorthand
                     // Will be resolved during schema validation
-                    Ok(Value::UnresolvedIdent(
-                        parts[0].to_string(),
-                        Some(parts[1].to_string()),
-                    ))
+                    Ok(Value::String(format!("{}.{}", parts[0], parts[1])))
                 }
             } else if ctx.is_resource_binding(parts[0]) {
                 // 3+ part identifier where first part is a resource binding:
@@ -1827,7 +1824,7 @@ fn parse_primary_value(
                 // Simple variable reference (no access chain)
                 match ctx.get_variable(first_ident) {
                     Some(val) => Ok(val.clone()),
-                    None => Ok(Value::UnresolvedIdent(first_ident.to_string(), None)),
+                    None => Ok(Value::String(first_ident.to_string())),
                 }
             } else {
                 // Build binding_name, attribute_name, and field_path from access steps.
@@ -2001,9 +1998,9 @@ fn unescape_string(s: &str) -> String {
 /// Resolve forward references after the full binding set is known.
 ///
 /// During single-pass parsing, `identifier.member` forms where `identifier` is
-/// not yet a known binding are stored as `UnresolvedIdent(identifier, Some(member))`.
+/// not yet a known binding are stored as `String("identifier.member")`.
 /// This function walks all resource attributes, module call arguments, and attribute
-/// parameter values, converting matching `UnresolvedIdent` to `ResourceRef`.
+/// parameter values, converting matching strings to `ResourceRef`.
 fn resolve_forward_references(
     resource_bindings: &HashMap<String, Resource>,
     resources: &mut [Resource],
@@ -2036,19 +2033,30 @@ fn resolve_forward_references(
 }
 
 /// Recursively resolve forward references in a single Value.
+///
+/// Strings in `"name.member"` format where `name` is a known resource binding
+/// are resolved to `ResourceRef`. This handles forward references that were
+/// stored as strings during single-pass parsing.
 fn resolve_forward_ref_in_value(
     value: Value,
     resource_bindings: &HashMap<String, Resource>,
 ) -> Value {
     match value {
-        Value::UnresolvedIdent(ref name, Some(ref member))
-            if resource_bindings.contains_key(name) =>
-        {
-            Value::ResourceRef {
-                binding_name: name.clone(),
-                attribute_name: member.clone(),
-                field_path: vec![],
+        Value::String(ref s) => {
+            // A dotted string like "vpc.vpc_id" may be a forward reference that
+            // was stored as a string during single-pass parsing. Resolve it to
+            // ResourceRef if the first segment is a known resource binding.
+            if let Some((name, member)) = s.split_once('.')
+                && !member.contains('.')
+                && resource_bindings.contains_key(name)
+            {
+                return Value::ResourceRef {
+                    binding_name: name.to_string(),
+                    attribute_name: member.to_string(),
+                    field_path: vec![],
+                };
             }
+            value
         }
         Value::List(items) => Value::List(
             items
@@ -2177,8 +2185,6 @@ fn resolve_value(
             }
             Ok(Value::Map(resolved))
         }
-        // UnresolvedIdent is kept as-is for later resolution during schema validation
-        Value::UnresolvedIdent(_, _) => Ok(value.clone()),
         Value::Interpolation(parts) => {
             use crate::resource::InterpolationPart;
             let resolved: Result<Vec<InterpolationPart>, ParseError> = parts
@@ -2482,9 +2488,9 @@ mod tests {
     }
 
     #[test]
-    fn parse_undefined_resource_reference_becomes_unresolved() {
+    fn parse_undefined_two_part_identifier_becomes_string() {
         // When a 2-part identifier references an unknown binding,
-        // it becomes an UnresolvedIdent to be resolved during schema validation
+        // it becomes a String (e.g., "nonexistent.name") for later schema validation
         let input = r#"
             let policy = aws.s3_bucket_policy {
                 name = "my-policy"
@@ -2492,16 +2498,30 @@ mod tests {
             }
         "#;
 
-        // Parsing succeeds - unknown identifiers become UnresolvedIdent
+        // Parsing succeeds - unknown identifiers become String
         let result = parse_and_resolve(input);
         assert!(result.is_ok());
         let parsed = result.unwrap();
         assert_eq!(
             parsed.resources[0].attributes.get("bucket"),
-            Some(&Value::UnresolvedIdent(
-                "nonexistent".to_string(),
-                Some("name".to_string())
-            ))
+            Some(&Value::String("nonexistent.name".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_bare_identifier_becomes_string() {
+        // When a bare identifier is not a known variable or binding,
+        // it becomes a String for later schema validation (enum resolution)
+        let input = r#"
+            let vpc = awscc.ec2.vpc {
+                instance_tenancy = dedicated
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+        assert_eq!(
+            result.resources[0].attributes.get("instance_tenancy"),
+            Some(&Value::String("dedicated".to_string()))
         );
     }
 
@@ -3646,7 +3666,7 @@ aws.s3.bucket {
     #[test]
     fn forward_reference_parsed_as_resource_ref() {
         // Issue #866: Forward references should be resolved as ResourceRef,
-        // not silently downgraded to UnresolvedIdent.
+        // not silently left as a plain string.
         let input = r#"
             let subnet = awscc.ec2.subnet {
                 vpc_id     = vpc.vpc_id
@@ -3662,7 +3682,7 @@ aws.s3.bucket {
         assert_eq!(result.resources.len(), 2);
 
         let subnet = &result.resources[0];
-        // Forward reference vpc.vpc_id should be a ResourceRef, not UnresolvedIdent
+        // Forward reference vpc.vpc_id should be a ResourceRef, not a plain String
         assert_eq!(
             subnet.attributes.get("vpc_id"),
             Some(&Value::ResourceRef {

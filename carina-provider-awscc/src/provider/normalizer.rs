@@ -42,19 +42,19 @@ pub fn resolve_enum_identifiers_impl(resources: &mut [Resource]) {
                 && let Some((type_name, ns, to_dsl)) = attr_schema.attr_type.namespaced_enum_parts()
             {
                 let resolved = match value {
-                    Value::UnresolvedIdent(ident, None) => {
-                        // bare identifier: advanced -> awscc.ec2.ipam.Tier.advanced
-                        let dsl_val = to_dsl.map_or_else(|| ident.clone(), |f| f(ident));
-                        Value::String(format!("{}.{}.{}", ns, type_name, dsl_val))
-                    }
-                    Value::UnresolvedIdent(ident, Some(member)) if ident == type_name => {
-                        // TypeName.value: Tier.advanced -> awscc.ec2.ipam.Tier.advanced
-                        let dsl_val = to_dsl.map_or_else(|| member.clone(), |f| f(member));
-                        Value::String(format!("{}.{}.{}", ns, type_name, dsl_val))
-                    }
                     Value::String(s) if !s.contains('.') => {
-                        // plain string: "ap-northeast-1a" -> awscc.AvailabilityZone.ap_northeast_1a
+                        // bare identifier or plain string: "advanced" -> awscc.ec2.ipam.Tier.advanced
                         let dsl_val = to_dsl.map_or_else(|| s.clone(), |f| f(s));
+                        Value::String(format!("{}.{}.{}", ns, type_name, dsl_val))
+                    }
+                    Value::String(s)
+                        if s.split_once('.').is_some_and(|(ident, member)| {
+                            ident == type_name && !member.contains('.')
+                        }) =>
+                    {
+                        // TypeName.value: "Tier.advanced" -> awscc.ec2.ipam.Tier.advanced
+                        let member = s.split_once('.').unwrap().1;
+                        let dsl_val = to_dsl.map_or_else(|| member.to_string(), |f| f(member));
                         Value::String(format!("{}.{}.{}", ns, type_name, dsl_val))
                     }
                     _ => value.clone(),
@@ -91,7 +91,7 @@ pub fn resolve_enum_identifiers_impl(resources: &mut [Resource]) {
 }
 
 /// Resolve enum identifiers within struct field values.
-/// Recurses into List and Map values, resolving UnresolvedIdent values
+/// Recurses into List and Map values, resolving bare/shorthand enum values
 /// for struct fields that have StringEnum type with namespace.
 fn resolve_struct_enum_values(value: &Value, fields: &[StructField]) -> Value {
     match value {
@@ -109,16 +109,17 @@ fn resolve_struct_enum_values(value: &Value, fields: &[StructField]) -> Value {
                     && let Some((type_name, ns, to_dsl)) = field.field_type.namespaced_enum_parts()
                 {
                     let resolved = match field_value {
-                        Value::UnresolvedIdent(ident, None) => {
-                            let dsl_val = to_dsl.map_or_else(|| ident.clone(), |f| f(ident));
-                            Value::String(format!("{}.{}.{}", ns, type_name, dsl_val))
-                        }
-                        Value::UnresolvedIdent(ident, Some(member)) if ident == type_name => {
-                            let dsl_val = to_dsl.map_or_else(|| member.clone(), |f| f(member));
-                            Value::String(format!("{}.{}.{}", ns, type_name, dsl_val))
-                        }
                         Value::String(s) if !s.contains('.') => {
                             let dsl_val = to_dsl.map_or_else(|| s.clone(), |f| f(s));
+                            Value::String(format!("{}.{}.{}", ns, type_name, dsl_val))
+                        }
+                        Value::String(s)
+                            if s.split_once('.').is_some_and(|(ident, member)| {
+                                ident == type_name && !member.contains('.')
+                            }) =>
+                        {
+                            let member = s.split_once('.').unwrap().1;
+                            let dsl_val = to_dsl.map_or_else(|| member.to_string(), |f| f(member));
                             Value::String(format!("{}.{}.{}", ns, type_name, dsl_val))
                         }
                         _ => field_value.clone(),
@@ -245,7 +246,7 @@ mod tests {
         let mut resource = Resource::with_provider("awscc", "ec2.vpc", "test");
         resource.attributes.insert(
             "instance_tenancy".to_string(),
-            Value::UnresolvedIdent("dedicated".to_string(), None),
+            Value::String("dedicated".to_string()),
         );
 
         let mut resources = vec![resource];
@@ -265,7 +266,7 @@ mod tests {
         let mut resource = Resource::with_provider("awscc", "ec2.vpc", "test");
         resource.attributes.insert(
             "instance_tenancy".to_string(),
-            Value::UnresolvedIdent("InstanceTenancy".to_string(), Some("dedicated".to_string())),
+            Value::String("InstanceTenancy.dedicated".to_string()),
         );
 
         let mut resources = vec![resource];
@@ -285,14 +286,14 @@ mod tests {
         let mut resource = Resource::with_provider("aws", "s3.bucket", "test");
         resource.attributes.insert(
             "instance_tenancy".to_string(),
-            Value::UnresolvedIdent("dedicated".to_string(), None),
+            Value::String("dedicated".to_string()),
         );
 
         let mut resources = vec![resource];
         resolve_enum_identifiers_impl(&mut resources);
         assert!(matches!(
             &resources[0].attributes["instance_tenancy"],
-            Value::UnresolvedIdent(_, _)
+            Value::String(_)
         ));
     }
 
@@ -301,7 +302,7 @@ mod tests {
         let mut resource = Resource::with_provider("awscc", "ec2.flow_log", "test");
         resource.attributes.insert(
             "log_destination_type".to_string(),
-            Value::UnresolvedIdent("cloud_watch_logs".to_string(), None),
+            Value::String("cloud_watch_logs".to_string()),
         );
 
         let mut resources = vec![resource];
@@ -446,10 +447,9 @@ mod tests {
     #[test]
     fn test_resolve_enum_identifiers_ip_protocol_all_alias() {
         let mut resource = Resource::with_provider("awscc", "ec2.security_group_egress", "test");
-        resource.attributes.insert(
-            "ip_protocol".to_string(),
-            Value::UnresolvedIdent("all".to_string(), None),
-        );
+        resource
+            .attributes
+            .insert("ip_protocol".to_string(), Value::String("all".to_string()));
 
         let mut resources = vec![resource];
         resolve_enum_identifiers_impl(&mut resources);
@@ -468,10 +468,9 @@ mod tests {
     #[test]
     fn test_resolve_enum_identifiers_ip_protocol_tcp() {
         let mut resource = Resource::with_provider("awscc", "ec2.security_group_egress", "test");
-        resource.attributes.insert(
-            "ip_protocol".to_string(),
-            Value::UnresolvedIdent("tcp".to_string(), None),
-        );
+        resource
+            .attributes
+            .insert("ip_protocol".to_string(), Value::String("tcp".to_string()));
 
         let mut resources = vec![resource];
         resolve_enum_identifiers_impl(&mut resources);
@@ -513,10 +512,7 @@ mod tests {
     fn test_resolve_struct_enum_values_bare_ident() {
         let fields = test_ip_protocol_fields();
         let mut map = HashMap::new();
-        map.insert(
-            "ip_protocol".to_string(),
-            Value::UnresolvedIdent("all".to_string(), None),
-        );
+        map.insert("ip_protocol".to_string(), Value::String("all".to_string()));
         map.insert("from_port".to_string(), Value::Int(443));
         let value = Value::List(vec![Value::Map(map)]);
 
@@ -544,7 +540,7 @@ mod tests {
         let mut map = HashMap::new();
         map.insert(
             "ip_protocol".to_string(),
-            Value::UnresolvedIdent("IpProtocol".to_string(), Some("tcp".to_string())),
+            Value::String("IpProtocol.tcp".to_string()),
         );
         let value = Value::List(vec![Value::Map(map)]);
 
@@ -600,10 +596,7 @@ mod tests {
             Value::String("test".to_string()),
         );
         let mut egress_map = HashMap::new();
-        egress_map.insert(
-            "ip_protocol".to_string(),
-            Value::UnresolvedIdent("all".to_string(), None),
-        );
+        egress_map.insert("ip_protocol".to_string(), Value::String("all".to_string()));
         egress_map.insert(
             "cidr_ip".to_string(),
             Value::String("0.0.0.0/0".to_string()),

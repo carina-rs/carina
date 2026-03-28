@@ -147,15 +147,26 @@ impl AttributeType {
         }
 
         match value {
-            Value::UnresolvedIdent(ident, member) => {
-                let expanded = match (namespace, member) {
-                    (Some(ns), Some(m)) if ident == name => format!("{}.{}.{}", ns, ident, m),
-                    (Some(_), Some(m)) => format!("{}.{}", ident, m),
-                    (Some(ns), None) => format!("{}.{}.{}", ns, name, ident),
-                    (None, Some(m)) => format!("{}.{}", ident, m),
-                    (None, None) => ident.clone(),
+            Value::String(s) if !s.contains('.') => {
+                // Bare identifier like "dedicated"
+                let expanded = match namespace {
+                    Some(ns) => format!("{}.{}.{}", ns, name, s),
+                    None => s.clone(),
                 };
                 Ok(Value::String(expanded))
+            }
+            Value::String(s) if s.split('.').count() == 2 => {
+                // Two-part identifier like "InstanceTenancy.dedicated"
+                if let Some((ident, member)) = s.split_once('.') {
+                    let expanded = match namespace {
+                        Some(ns) if ident == name => format!("{}.{}.{}", ns, ident, member),
+                        Some(_) => s.clone(),
+                        None => s.clone(),
+                    };
+                    Ok(Value::String(expanded))
+                } else {
+                    Ok(value.clone())
+                }
             }
             other => Ok(other.clone()),
         }
@@ -499,10 +510,6 @@ impl Value {
                     )
                 }
             }
-            Value::UnresolvedIdent(name, member) => match member {
-                Some(m) => format!("UnresolvedIdent({}.{})", name, m),
-                None => format!("UnresolvedIdent({})", name),
-            },
             Value::Interpolation(_) => "Interpolation".to_string(),
             Value::FunctionCall { name, .. } => format!("FunctionCall({})", name),
         }
@@ -1413,10 +1420,7 @@ mod tests {
             ))
             .is_ok()
         );
-        assert!(
-            t.validate(&Value::UnresolvedIdent("IPv6".to_string(), None))
-                .is_ok()
-        );
+        assert!(t.validate(&Value::String("IPv6".to_string())).is_ok());
         assert!(t.validate(&Value::String("ipv4".to_string())).is_ok());
         assert!(t.validate(&Value::String("IPv5".to_string())).is_err());
     }

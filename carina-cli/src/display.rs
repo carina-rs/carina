@@ -2882,10 +2882,7 @@ mod tests {
                 )
                 .with_attribute(
                     "availability_zone",
-                    Value::UnresolvedIdent(
-                        "awscc.AvailabilityZone.ap_northeast_1a".to_string(),
-                        None,
-                    ),
+                    Value::String("awscc.AvailabilityZone.ap_northeast_1a".to_string()),
                 )
                 .with_attribute("cidr_block", Value::String("10.0.1.0/24".to_string())),
         };

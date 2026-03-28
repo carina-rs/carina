@@ -42,10 +42,6 @@ pub fn value_to_json(value: &Value) -> Result<serde_json::Value, String> {
             }
             Ok(serde_json::Value::String(format!("${{{}}}", path)))
         }
-        Value::UnresolvedIdent(name, member) => match member {
-            Some(m) => Ok(serde_json::Value::String(format!("{}.{}", name, m))),
-            None => Ok(serde_json::Value::String(name.clone())),
-        },
         Value::Interpolation(parts) => {
             let s = parts
                 .iter()
@@ -148,14 +144,6 @@ pub fn format_value_with_key(value: &Value, _key: Option<&str>) -> String {
             }
             path
         }
-        Value::UnresolvedIdent(name, member) => match member {
-            Some(m) => {
-                let full = format!("{}.{}", name, m);
-                let resolved = convert_enum_value(&full);
-                format!("\"{}\"", resolved)
-            }
-            None => format!("\"{}\"", name),
-        },
         Value::Interpolation(parts) => {
             let inner: String = parts
                 .iter()
@@ -398,15 +386,16 @@ mod tests {
     }
 
     #[test]
-    fn test_format_value_unresolved_ident_with_member() {
-        let v =
-            Value::UnresolvedIdent("InstanceTenancy".to_string(), Some("dedicated".to_string()));
+    fn test_format_value_two_part_enum_string() {
+        // Two-part enum strings like "InstanceTenancy.dedicated" are formatted
+        // through convert_enum_value which extracts the value part
+        let v = Value::String("InstanceTenancy.dedicated".to_string());
         assert_eq!(format_value(&v), "\"dedicated\"");
     }
 
     #[test]
-    fn test_format_value_unresolved_ident_bare() {
-        let v = Value::UnresolvedIdent("dedicated".to_string(), None);
+    fn test_format_value_bare_enum_string() {
+        let v = Value::String("dedicated".to_string());
         assert_eq!(format_value(&v), "\"dedicated\"");
     }
 

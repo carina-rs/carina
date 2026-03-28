@@ -107,19 +107,19 @@ pub(crate) fn resolve_enum_identifiers(resources: &mut [Resource]) {
                 && let Some((type_name, ns, to_dsl)) = attr_schema.attr_type.namespaced_enum_parts()
             {
                 let resolved = match value {
-                    Value::UnresolvedIdent(ident, None) => {
-                        // bare identifier: Enabled → aws.s3.bucket.VersioningStatus.Enabled
-                        let dsl_val = to_dsl.map_or_else(|| ident.clone(), |f| f(ident));
-                        Value::String(format!("{}.{}.{}", ns, type_name, dsl_val))
-                    }
-                    Value::UnresolvedIdent(ident, Some(member)) if ident == type_name => {
-                        // TypeName.value: VersioningStatus.Enabled → aws.s3.bucket.VersioningStatus.Enabled
-                        let dsl_val = to_dsl.map_or_else(|| member.clone(), |f| f(member));
-                        Value::String(format!("{}.{}.{}", ns, type_name, dsl_val))
-                    }
                     Value::String(s) if !s.contains('.') => {
-                        // plain string without dots: "Enabled" → aws.s3.bucket.VersioningStatus.Enabled
+                        // bare identifier or plain string: "Enabled" → aws.s3.bucket.VersioningStatus.Enabled
                         let dsl_val = to_dsl.map_or_else(|| s.clone(), |f| f(s));
+                        Value::String(format!("{}.{}.{}", ns, type_name, dsl_val))
+                    }
+                    Value::String(s)
+                        if s.split_once('.').is_some_and(|(ident, member)| {
+                            ident == type_name && !member.contains('.')
+                        }) =>
+                    {
+                        // TypeName.value: "VersioningStatus.Enabled" → aws.s3.bucket.VersioningStatus.Enabled
+                        let member = s.split_once('.').unwrap().1;
+                        let dsl_val = to_dsl.map_or_else(|| member.to_string(), |f| f(member));
                         Value::String(format!("{}.{}.{}", ns, type_name, dsl_val))
                     }
                     _ => value.clone(),
@@ -218,7 +218,7 @@ mod tests {
         let mut resource = Resource::with_provider("aws", "s3.bucket", "test-bucket");
         resource.attributes.insert(
             "versioning_status".to_string(),
-            Value::UnresolvedIdent("Enabled".to_string(), None),
+            Value::String("Enabled".to_string()),
         );
         let mut resources = vec![resource];
         resolve_enum_identifiers(&mut resources);
@@ -235,10 +235,7 @@ mod tests {
         let mut resource = Resource::with_provider("aws", "s3.bucket", "test-bucket");
         resource.attributes.insert(
             "object_ownership".to_string(),
-            Value::UnresolvedIdent(
-                "ObjectOwnership".to_string(),
-                Some("BucketOwnerEnforced".to_string()),
-            ),
+            Value::String("ObjectOwnership.BucketOwnerEnforced".to_string()),
         );
         let mut resources = vec![resource];
         resolve_enum_identifiers(&mut resources);
@@ -369,7 +366,7 @@ mod tests {
         let mut resource = Resource::with_provider("aws", "ec2.vpc", "test-vpc");
         resource.attributes.insert(
             "instance_tenancy".to_string(),
-            Value::UnresolvedIdent("InstanceTenancy".to_string(), Some("dedicated".to_string())),
+            Value::String("InstanceTenancy.dedicated".to_string()),
         );
         let mut resources = vec![resource];
         resolve_enum_identifiers(&mut resources);
@@ -387,7 +384,7 @@ mod tests {
             Resource::with_provider("aws", "ec2.security_group_ingress", "test-rule");
         resource.attributes.insert(
             "ip_protocol".to_string(),
-            Value::UnresolvedIdent("IpProtocol".to_string(), Some("tcp".to_string())),
+            Value::String("IpProtocol.tcp".to_string()),
         );
         let mut resources = vec![resource];
         resolve_enum_identifiers(&mut resources);

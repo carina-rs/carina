@@ -187,9 +187,6 @@ fn deterministic_value_string(value: &Value) -> String {
                 )
             }
         }
-        Value::UnresolvedIdent(name, member) => {
-            format!("UnresolvedIdent({}, {:?})", name, member)
-        }
         Value::Interpolation(parts) => {
             use crate::resource::InterpolationPart;
             let strs: Vec<String> = parts

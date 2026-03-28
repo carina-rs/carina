@@ -163,10 +163,6 @@ fn format_value(value: &Value) -> String {
                 format!("{}.{}", binding_name, attribute_name)
             }
         }
-        Value::UnresolvedIdent(name, member) => match member {
-            Some(m) => format!("{}.{}", name, m),
-            None => name.clone(),
-        },
         Value::Interpolation(parts) => {
             use crate::resource::InterpolationPart;
             let inner: String = parts
