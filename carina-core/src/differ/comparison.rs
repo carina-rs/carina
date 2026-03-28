@@ -248,10 +248,16 @@ fn is_type_default(value: &Value, attr_type: Option<&AttributeType>) -> bool {
     }
 }
 
-/// Check if a secret's inner value matches a state hash string.
+/// Check if a secret's inner value matches a state value.
 ///
-/// Hashes the inner value the same way `value_to_json` does for `Value::Secret`,
-/// then compares the resulting hash string with the state value.
+/// Two cases are handled:
+/// 1. **Hash string** (from state file, `--refresh=false`): the state value is
+///    `"_secret:argon2:<hex>"`. We hash the inner value and compare hashes.
+/// 2. **Plain-text string** (from provider read, `--refresh=true`): the state
+///    value is the raw secret. We compare the inner value directly. This is the
+///    fix for issue #1249 where secrets nested in Maps (e.g., tags) caused false
+///    diffs because the provider returns plain-text values on read.
+///
 /// When `context` is provided, uses context-specific salt for hashing.
 fn secret_matches_state(
     inner: &Value,
@@ -261,18 +267,25 @@ fn secret_matches_state(
     let Value::String(state_str) = state_value else {
         return false;
     };
-    let Some(state_hash) = state_str.strip_prefix(SECRET_PREFIX) else {
-        return false;
-    };
-    // Compute the hash of the inner value
-    let Ok(inner_json) = value_to_json_with_context(inner, context) else {
-        return false;
-    };
-    let Ok(json_str) = serde_json::to_string(&inner_json) else {
-        return false;
-    };
-    let computed_hash = argon2id_hash(json_str.as_bytes(), context);
-    computed_hash == state_hash
+
+    // Case 1: State has a hashed value (from state file / --refresh=false)
+    if let Some(state_hash) = state_str.strip_prefix(SECRET_PREFIX) {
+        let Ok(inner_json) = value_to_json_with_context(inner, context) else {
+            return false;
+        };
+        let Ok(json_str) = serde_json::to_string(&inner_json) else {
+            return false;
+        };
+        let computed_hash = argon2id_hash(json_str.as_bytes(), context);
+        return computed_hash == state_hash;
+    }
+
+    // Case 2: State has plain-text value (from provider read / --refresh=true).
+    // Compare the inner secret value directly against the raw state string.
+    match inner {
+        Value::String(inner_str) => inner_str == state_str,
+        _ => false,
+    }
 }
 
 /// Find changed attributes between desired and current state.
