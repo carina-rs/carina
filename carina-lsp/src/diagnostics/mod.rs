@@ -871,5 +871,19 @@ fn parse_error_to_diagnostic(error: &ParseError) -> Diagnostic {
             ),
             ..Default::default()
         },
+        ParseError::RecursiveFunction(name) => Diagnostic {
+            range: Range::default(),
+            severity: Some(DiagnosticSeverity::ERROR),
+            source: Some("carina".to_string()),
+            message: format!("Recursive function call detected: {}", name),
+            ..Default::default()
+        },
+        ParseError::UserFunctionError(msg) => Diagnostic {
+            range: Range::default(),
+            severity: Some(DiagnosticSeverity::ERROR),
+            source: Some("carina".to_string()),
+            message: msg.to_string(),
+            ..Default::default()
+        },
     }
 }

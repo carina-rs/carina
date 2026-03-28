@@ -161,6 +161,7 @@ impl ModuleResolver {
             attribute_params: vec![],
             backend: None,
             state_blocks: vec![],
+            user_functions: HashMap::new(),
         };
 
         // Read all .crn files in the directory
@@ -589,6 +590,7 @@ pub fn load_directory_module(dir_path: &Path) -> Option<ParsedFile> {
         attribute_params: vec![],
         backend: None,
         state_blocks: vec![],
+        user_functions: HashMap::new(),
     };
 
     for entry in entries.flatten() {
@@ -665,6 +667,7 @@ pub fn load_module_from_directory(dir: &Path) -> Result<ParsedFile, String> {
         attribute_params: vec![],
         backend: None,
         state_blocks: vec![],
+        user_functions: HashMap::new(),
     };
 
     for entry in entries {
@@ -743,6 +746,7 @@ mod tests {
             attribute_params: vec![],
             backend: None,
             state_blocks: vec![],
+            user_functions: HashMap::new(),
         }
     }
 
@@ -877,6 +881,7 @@ mod tests {
             attribute_params: vec![],
             backend: None,
             state_blocks: vec![],
+            user_functions: HashMap::new(),
         }
     }
 
@@ -995,6 +1000,7 @@ mod tests {
             }],
             backend: None,
             state_blocks: vec![],
+            user_functions: HashMap::new(),
         }
     }
 
@@ -1360,6 +1366,7 @@ mod tests {
             attribute_params: vec![],
             backend: None,
             state_blocks: vec![],
+            user_functions: HashMap::new(),
         }
     }
 

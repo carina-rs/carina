@@ -145,6 +145,8 @@ impl Formatter {
             NodeKind::AnonymousResource => self.format_anonymous_resource(node),
             NodeKind::ResourceExpr => self.format_resource_expr(node),
             NodeKind::ReadResourceExpr => self.format_read_resource_expr(node),
+            NodeKind::FnDef => self.format_fn_def(node),
+            NodeKind::FnParam => self.format_default(node),
             NodeKind::ForExpr => self.format_for_expr(node),
             NodeKind::IfExpr => self.format_if_expr(node),
             NodeKind::ElseClause => self.format_else_clause(node),
@@ -809,6 +811,94 @@ impl Formatter {
             self.write("}");
         } else {
             self.write(" {}");
+        }
+    }
+
+    fn format_fn_def(&mut self, node: &CstNode) {
+        // Format: fn name(params) { body }
+        self.write("fn ");
+
+        let mut saw_close_paren = false;
+        let mut saw_open_brace = false;
+        let mut param_count = 0;
+
+        for child in &node.children {
+            match child {
+                CstChild::Token(token) => {
+                    if token.text == "fn" {
+                        continue; // Already written
+                    }
+                    if token.text == "(" {
+                        self.write("(");
+                        continue;
+                    }
+                    if token.text == ")" {
+                        self.write(")");
+                        saw_close_paren = true;
+                        continue;
+                    }
+                    if token.text == "," && !saw_close_paren {
+                        // Comma between params - handled by param_count logic
+                        continue;
+                    }
+                    if token.text == "{" && saw_close_paren {
+                        self.write(" {");
+                        self.write_newline();
+                        self.current_indent += 1;
+                        saw_open_brace = true;
+                        continue;
+                    }
+                    if token.text == "}" {
+                        self.current_indent -= 1;
+                        self.write_indent();
+                        self.write("}");
+                        continue;
+                    }
+                    self.write(&token.text);
+                }
+                CstChild::Node(n) => {
+                    if n.kind == NodeKind::FnParam {
+                        if param_count > 0 {
+                            self.write(", ");
+                        }
+                        self.format_fn_param(n);
+                        param_count += 1;
+                    } else if saw_open_brace {
+                        // Body content (local let or expression)
+                        if n.kind == NodeKind::LocalBinding {
+                            // LocalBinding formats its own indent and newline via format_let_binding
+                            self.format_node(n);
+                        } else {
+                            self.write_indent();
+                            self.format_node(n);
+                            self.write_newline();
+                        }
+                    } else {
+                        self.format_node(n);
+                    }
+                }
+                CstChild::Trivia(_) => {
+                    // Skip trivia - we control whitespace
+                }
+            }
+        }
+    }
+
+    fn format_fn_param(&mut self, node: &CstNode) {
+        for child in &node.children {
+            match child {
+                CstChild::Token(token) => {
+                    if token.text == "=" {
+                        self.write(" = ");
+                    } else {
+                        self.write(&token.text);
+                    }
+                }
+                CstChild::Node(n) => {
+                    self.format_node(n);
+                }
+                CstChild::Trivia(_) => {}
+            }
         }
     }
 
@@ -2582,6 +2672,33 @@ mod tests {
   }
 }
 "#;
+        let result = format(input, &config).unwrap();
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn format_fn_def_simple() {
+        let config = FormatConfig::default();
+        let input = "fn greet(name) {\n  join(\" \", [\"hello\",name])\n}\n";
+        let expected = "fn greet(name) {\n  join(\" \", [\"hello\", name])\n}\n";
+        let result = format(input, &config).unwrap();
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn format_fn_def_with_default_param() {
+        let config = FormatConfig::default();
+        let input = "fn tag(env,suffix=\"default\") {\n  join(\"-\", [env, suffix])\n}\n";
+        let expected = "fn tag(env, suffix = \"default\") {\n  join(\"-\", [env, suffix])\n}\n";
+        let result = format(input, &config).unwrap();
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn format_fn_def_with_local_let() {
+        let config = FormatConfig::default();
+        let input = "fn name(env,az) {\n  let prefix=join(\"-\",[env,\"subnet\"])\n  join(\"-\",[prefix,az])\n}\n";
+        let expected = "fn name(env, az) {\n  let prefix = join(\"-\", [env, \"subnet\"])\n  join(\"-\", [prefix, az])\n}\n";
         let result = format(input, &config).unwrap();
         assert_eq!(result, expected);
     }

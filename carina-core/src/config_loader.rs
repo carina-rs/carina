@@ -52,6 +52,7 @@ pub fn load_configuration(path: &PathBuf) -> Result<LoadedConfig, String> {
             attribute_params: vec![],
             backend: None,
             state_blocks: vec![],
+            user_functions: HashMap::new(),
         };
         let mut merged = empty_parsed();
         let mut unresolved_merged = empty_parsed();

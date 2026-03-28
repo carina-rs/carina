@@ -286,6 +286,21 @@ impl SemanticTokensProvider {
             tokens.push((indent, 7, 0)); // KEYWORD: removed
         } else if trimmed.starts_with("moved ") || trimmed == "moved{" {
             tokens.push((indent, 5, 0)); // KEYWORD: moved
+        } else if trimmed.starts_with("fn ") {
+            tokens.push((indent, 2, 0)); // KEYWORD: fn
+            // Highlight the function name after "fn "
+            if let Some(fn_start) = line.find("fn ") {
+                let after_fn = &line[fn_start + 3..];
+                let leading_spaces = after_fn.len() - after_fn.trim_start().len();
+                let after_fn_trimmed = after_fn.trim_start();
+                if let Some(name_end) = after_fn_trimmed.find(['(', ' ']) {
+                    let name = &after_fn_trimmed[..name_end];
+                    if !name.is_empty() {
+                        let name_pos = fn_start + 3 + leading_spaces;
+                        tokens.push((name_pos as u32, name.len() as u32, 3)); // FUNCTION
+                    }
+                }
+            }
         } else if trimmed.starts_with("for ") {
             tokens.push((indent, 3, 0)); // KEYWORD: for
             // Check for "in" keyword on the same line
