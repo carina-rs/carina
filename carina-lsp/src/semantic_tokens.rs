@@ -3,7 +3,7 @@ use tower_lsp::lsp_types::{SemanticToken, SemanticTokenType, SemanticTokensLegen
 
 /// Token types supported by this language server
 pub const TOKEN_TYPES: &[SemanticTokenType] = &[
-    SemanticTokenType::KEYWORD,  // 0: provider, let
+    SemanticTokenType::KEYWORD,  // 0: provider, let, fn
     SemanticTokenType::TYPE,     // 1: aws.s3.bucket, aws.ec2.vpc, aws.Region.*
     SemanticTokenType::VARIABLE, // 2: variable names
     SemanticTokenType::PROPERTY, // 3: attribute names (name, region, etc.)
@@ -11,6 +11,7 @@ pub const TOKEN_TYPES: &[SemanticTokenType] = &[
     SemanticTokenType::NUMBER,   // 5: number literals
     SemanticTokenType::OPERATOR, // 6: =
     SemanticTokenType::COMMENT,  // 7: comments
+    SemanticTokenType::FUNCTION, // 8: function names
 ];
 
 /// Create the semantic tokens legend for capability registration
@@ -297,7 +298,7 @@ impl SemanticTokensProvider {
                     let name = &after_fn_trimmed[..name_end];
                     if !name.is_empty() {
                         let name_pos = fn_start + 3 + leading_spaces;
-                        tokens.push((name_pos as u32, name.len() as u32, 3)); // FUNCTION
+                        tokens.push((name_pos as u32, name.len() as u32, 8)); // FUNCTION
                     }
                 }
             }
