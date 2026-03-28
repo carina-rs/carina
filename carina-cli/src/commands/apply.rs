@@ -1059,7 +1059,7 @@ async fn run_apply_locked(
 
     // Resolve references and enum identifiers, then create initial plan for display
     let mut resources_for_plan = sorted_resources.clone();
-    resolve_refs_with_state(&mut resources_for_plan, &current_states);
+    resolve_refs_with_state(&mut resources_for_plan, &current_states)?;
     provider.normalize_desired(&mut resources_for_plan);
 
     // Resolve enum aliases (e.g., "all" -> "-1") in both desired resources

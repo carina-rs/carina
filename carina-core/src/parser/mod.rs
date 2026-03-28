@@ -2248,13 +2248,25 @@ fn resolve_value(
                 args.iter().map(|a| resolve_value(a, binding_map)).collect();
             let resolved_args = resolved_args?;
 
-            // Try to evaluate the function if all args are resolved
+            let all_args_resolved = resolved_args.iter().all(is_static_value);
+
             match crate::builtins::evaluate_builtin(name, &resolved_args) {
                 Ok(result) => Ok(result),
-                Err(_) => Ok(Value::FunctionCall {
-                    name: name.clone(),
-                    args: resolved_args,
-                }),
+                Err(e) => {
+                    if all_args_resolved {
+                        // All args are resolved but builtin failed — propagate the error
+                        Err(ParseError::InvalidExpression {
+                            line: 0,
+                            message: format!("{}(): {}", name, e),
+                        })
+                    } else {
+                        // Args contain unresolved refs — keep as FunctionCall for later resolution
+                        Ok(Value::FunctionCall {
+                            name: name.clone(),
+                            args: resolved_args,
+                        })
+                    }
+                }
             }
         }
         _ => Ok(value.clone()),
@@ -5638,6 +5650,53 @@ aws.s3.bucket {
         assert_eq!(
             result.arguments[0].default,
             Some(Value::String("my-resource".to_string()))
+        );
+    }
+
+    #[test]
+    fn env_missing_var_produces_error_at_parse_time() {
+        // Use a var name that is extremely unlikely to be set
+        let input = r#"
+            provider aws {
+                region = aws.Region.ap_northeast_1
+            }
+
+            aws.s3.bucket {
+                name = env("CARINA_TEST_NONEXISTENT_VAR_12345")
+            }
+        "#;
+
+        let result = parse_and_resolve(input);
+        assert!(
+            result.is_err(),
+            "Expected error for missing env var, got: {:?}",
+            result
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("CARINA_TEST_NONEXISTENT_VAR_12345"),
+            "Error should mention the missing env var name, got: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn join_with_resolved_args_still_works() {
+        let input = r#"
+            provider aws {
+                region = aws.Region.ap_northeast_1
+            }
+
+            aws.s3.bucket {
+                name = join("-", ["a", "b", "c"])
+            }
+        "#;
+
+        let result = parse_and_resolve(input).unwrap();
+        let resource = &result.resources[0];
+        assert_eq!(
+            resource.attributes.get("name"),
+            Some(&Value::String("a-b-c".to_string())),
         );
     }
 }

@@ -304,15 +304,15 @@ async fn refresh_pending_states(
 fn resolve_resource(
     resource: &Resource,
     binding_map: &HashMap<String, HashMap<String, Value>>,
-) -> Resource {
+) -> Result<Resource, String> {
     let mut resolved = resource.clone();
     for (key, value) in &resource.attributes {
-        let resolved_value = resolve_ref_value(value, binding_map);
+        let resolved_value = resolve_ref_value(value, binding_map)?;
         resolved
             .attributes
             .insert(key.clone(), unwrap_secret(resolved_value));
     }
-    resolved
+    Ok(resolved)
 }
 
 /// Resolve a resource, preferring unresolved source for re-resolution.
@@ -321,15 +321,15 @@ fn resolve_resource_with_source(
     target: &Resource,
     source: &Resource,
     binding_map: &HashMap<String, HashMap<String, Value>>,
-) -> Resource {
+) -> Result<Resource, String> {
     let mut resolved = target.clone();
     for (key, value) in &source.attributes {
-        let resolved_value = resolve_ref_value(value, binding_map);
+        let resolved_value = resolve_ref_value(value, binding_map)?;
         resolved
             .attributes
             .insert(key.clone(), unwrap_secret(resolved_value));
     }
-    resolved
+    Ok(resolved)
 }
 
 /// Recursively unwrap `Value::Secret(inner)` to just the inner value.
@@ -691,7 +691,27 @@ async fn execute_effects_sequential(
                         let c = completed_ref.fetch_add(1, Ordering::Relaxed) + 1;
                         let started = Instant::now();
                         observer.on_event(&ExecutionEvent::EffectStarted { effect });
-                        let resolved = resolve_resource(resource, &binding_snapshot);
+                        let resolved = match resolve_resource(resource, &binding_snapshot) {
+                            Ok(r) => r,
+                            Err(e) => {
+                                observer.on_event(&ExecutionEvent::EffectFailed {
+                                    effect,
+                                    error: &e,
+                                    duration: started.elapsed(),
+                                    progress: ProgressInfo {
+                                        completed: c,
+                                        total,
+                                    },
+                                });
+                                return (
+                                    idx,
+                                    SingleEffectResult::Failure {
+                                        binding: effect.binding_name(),
+                                        refresh: None,
+                                    },
+                                );
+                            }
+                        };
                         match provider.create(&resolved).await {
                             Ok(state) => {
                                 observer.on_event(&ExecutionEvent::EffectSucceeded {
@@ -732,8 +752,31 @@ async fn execute_effects_sequential(
                         let started = Instant::now();
                         observer.on_event(&ExecutionEvent::EffectStarted { effect });
                         let resolve_source = unresolved.get(id).unwrap_or(to);
-                        let resolved_to =
-                            resolve_resource_with_source(to, resolve_source, &binding_snapshot);
+                        let resolved_to = match resolve_resource_with_source(
+                            to,
+                            resolve_source,
+                            &binding_snapshot,
+                        ) {
+                            Ok(r) => r,
+                            Err(e) => {
+                                observer.on_event(&ExecutionEvent::EffectFailed {
+                                    effect,
+                                    error: &e,
+                                    duration: started.elapsed(),
+                                    progress: ProgressInfo {
+                                        completed: c,
+                                        total,
+                                    },
+                                });
+                                return (
+                                    idx,
+                                    SingleEffectResult::Failure {
+                                        binding: effect.binding_name(),
+                                        refresh: None,
+                                    },
+                                );
+                            }
+                        };
                         let identifier = from.identifier.as_deref().unwrap_or("");
                         match provider.update(id, identifier, from, &resolved_to).await {
                             Ok(state) => {
@@ -1044,7 +1087,27 @@ async fn execute_cbd_replace_parallel(
     progress: ProgressInfo,
     observer: &dyn ExecutionObserver,
 ) -> SingleEffectResult {
-    let resolved = resolve_resource(to, binding_map);
+    let resolved = match resolve_resource(to, binding_map) {
+        Ok(r) => r,
+        Err(e) => {
+            observer.on_event(&ExecutionEvent::EffectFailed {
+                effect: &Effect::Create(to.clone()),
+                error: &e,
+                duration: started.elapsed(),
+                progress,
+            });
+            return SingleEffectResult::Failure {
+                binding: to.attributes.get("_binding").and_then(|v| {
+                    if let Value::String(s) = v {
+                        Some(s.clone())
+                    } else {
+                        None
+                    }
+                }),
+                refresh: None,
+            };
+        }
+    };
     let mut refreshes = Vec::new();
 
     match provider.create(&resolved).await {
@@ -1056,7 +1119,19 @@ async fn execute_cbd_replace_parallel(
             // Execute cascading updates
             let mut cascade_failed = false;
             for cascade in cascading_updates {
-                let resolved_to = resolve_resource(&cascade.to, &local_binding_map);
+                let resolved_to = match resolve_resource(&cascade.to, &local_binding_map) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        observer.on_event(&ExecutionEvent::CascadeUpdateFailed {
+                            id: &cascade.id,
+                            error: &e,
+                        });
+                        let cascade_identifier = cascade.from.identifier.as_deref().unwrap_or("");
+                        refreshes.push((cascade.id.clone(), cascade_identifier.to_string()));
+                        cascade_failed = true;
+                        break;
+                    }
+                };
                 let cascade_identifier = cascade.from.identifier.as_deref().unwrap_or("");
                 match provider
                     .update(&cascade.id, cascade_identifier, &cascade.from, &resolved_to)
@@ -1245,7 +1320,27 @@ async fn execute_dbd_replace_parallel(
     match provider.delete(id, identifier, lifecycle).await {
         Ok(()) => {
             let resolve_source = unresolved.get(&to.id).unwrap_or(to);
-            let resolved = resolve_resource_with_source(to, resolve_source, binding_map);
+            let resolved = match resolve_resource_with_source(to, resolve_source, binding_map) {
+                Ok(r) => r,
+                Err(e) => {
+                    observer.on_event(&ExecutionEvent::EffectFailed {
+                        effect,
+                        error: &e,
+                        duration: started.elapsed(),
+                        progress,
+                    });
+                    refreshes.push((to.id.clone(), identifier.to_string()));
+                    return SingleEffectResult::Replace {
+                        success: false,
+                        state: None,
+                        resource_id: to.id.clone(),
+                        resolved_attrs: None,
+                        binding: effect.binding_name(),
+                        refreshes,
+                        permanent_overrides: None,
+                    };
+                }
+            };
             match provider.create(&resolved).await {
                 Ok(state) => {
                     observer.on_event(&ExecutionEvent::EffectSucceeded {
@@ -1505,7 +1600,27 @@ async fn execute_effects_phased(
                             let c = completed_ref.fetch_add(1, Ordering::Relaxed) + 1;
                             let started = Instant::now();
                             observer.on_event(&ExecutionEvent::EffectStarted { effect });
-                            let resolved = resolve_resource(resource, &binding_snapshot);
+                            let resolved = match resolve_resource(resource, &binding_snapshot) {
+                                Ok(r) => r,
+                                Err(e) => {
+                                    observer.on_event(&ExecutionEvent::EffectFailed {
+                                        effect,
+                                        error: &e,
+                                        duration: started.elapsed(),
+                                        progress: ProgressInfo {
+                                            completed: c,
+                                            total,
+                                        },
+                                    });
+                                    return (
+                                        idx,
+                                        PhaseEffectResult::Failure {
+                                            binding: effect.binding_name(),
+                                            refresh: None,
+                                        },
+                                    );
+                                }
+                            };
                             match provider.create(&resolved).await {
                                 Ok(state) => {
                                     observer.on_event(&ExecutionEvent::EffectSucceeded {
@@ -1546,8 +1661,31 @@ async fn execute_effects_phased(
                             let started = Instant::now();
                             observer.on_event(&ExecutionEvent::EffectStarted { effect });
                             let resolve_source = unresolved.get(id).unwrap_or(to);
-                            let resolved_to =
-                                resolve_resource_with_source(to, resolve_source, &binding_snapshot);
+                            let resolved_to = match resolve_resource_with_source(
+                                to,
+                                resolve_source,
+                                &binding_snapshot,
+                            ) {
+                                Ok(r) => r,
+                                Err(e) => {
+                                    observer.on_event(&ExecutionEvent::EffectFailed {
+                                        effect,
+                                        error: &e,
+                                        duration: started.elapsed(),
+                                        progress: ProgressInfo {
+                                            completed: c,
+                                            total,
+                                        },
+                                    });
+                                    return (
+                                        idx,
+                                        PhaseEffectResult::Failure {
+                                            binding: effect.binding_name(),
+                                            refresh: None,
+                                        },
+                                    );
+                                }
+                            };
                             let identifier = from.identifier.as_deref().unwrap_or("");
                             match provider.update(id, identifier, from, &resolved_to).await {
                                 Ok(state) => {
@@ -1762,8 +1900,29 @@ async fn execute_effects_phased(
                         observer.on_event(&ExecutionEvent::EffectStarted { effect });
 
                         let resolve_source = unresolved.get(&to.id).unwrap_or(to);
-                        let resolved =
-                            resolve_resource_with_source(to, resolve_source, &binding_snapshot);
+                        let resolved = match resolve_resource_with_source(
+                            to,
+                            resolve_source,
+                            &binding_snapshot,
+                        ) {
+                            Ok(r) => r,
+                            Err(e) => {
+                                observer.on_event(&ExecutionEvent::EffectFailed {
+                                    effect,
+                                    error: &e,
+                                    duration: started.elapsed(),
+                                    progress,
+                                });
+                                return (
+                                    idx,
+                                    started,
+                                    PhaseEffectResult::Failure {
+                                        binding: effect.binding_name(),
+                                        refresh: None,
+                                    },
+                                );
+                            }
+                        };
 
                         match provider.create(&resolved).await {
                             Ok(state) => {
@@ -1779,7 +1938,28 @@ async fn execute_effects_phased(
                                 let mut cascade_states = Vec::new();
                                 for cascade in cascading_updates {
                                     let resolved_to =
-                                        resolve_resource(&cascade.to, &local_binding_map);
+                                        match resolve_resource(&cascade.to, &local_binding_map) {
+                                            Ok(r) => r,
+                                            Err(e) => {
+                                                observer.on_event(
+                                                    &ExecutionEvent::CascadeUpdateFailed {
+                                                        id: &cascade.id,
+                                                        error: &e,
+                                                    },
+                                                );
+                                                let cascade_identifier = cascade
+                                                    .from
+                                                    .identifier
+                                                    .as_deref()
+                                                    .unwrap_or("");
+                                                refreshes.push((
+                                                    cascade.id.clone(),
+                                                    cascade_identifier.to_string(),
+                                                ));
+                                                cascade_failed = true;
+                                                break;
+                                            }
+                                        };
                                     let cascade_identifier =
                                         cascade.from.identifier.as_deref().unwrap_or("");
                                     match provider
@@ -2286,11 +2466,28 @@ async fn execute_effects_phased(
                             if let Effect::Replace { to, .. } = effect {
                                 let started = effect_started;
                                 let resolve_source = unresolved.get(&to.id).unwrap_or(to);
-                                let resolved = resolve_resource_with_source(
+                                let resolved = match resolve_resource_with_source(
                                     to,
                                     resolve_source,
                                     &binding_snapshot,
-                                );
+                                ) {
+                                    Ok(r) => r,
+                                    Err(e) => {
+                                        observer.on_event(&ExecutionEvent::EffectFailed {
+                                            effect,
+                                            error: &e,
+                                            duration: started.elapsed(),
+                                            progress,
+                                        });
+                                        return (
+                                            idx,
+                                            PhaseEffectResult::Failure {
+                                                binding: effect.binding_name(),
+                                                refresh: None,
+                                            },
+                                        );
+                                    }
+                                };
 
                                 match provider.create(&resolved).await {
                                     Ok(state) => {
