@@ -691,7 +691,7 @@ fn type_display_string(
                 } else if prop_name.ends_with("PolicyDocument") {
                     "IamPolicyDocument".to_string()
                 } else {
-                    "Map(Json)".to_string()
+                    "Map(String)".to_string()
                 }
             }
             _ => "String".to_string(),
@@ -7496,7 +7496,7 @@ mod tests {
     }
 
     #[test]
-    fn test_type_display_string_generic_object_shows_map_json() {
+    fn test_type_display_string_generic_object_shows_map_string() {
         let prop = CfnProperty {
             prop_type: Some(TypeValue::Single("object".to_string())),
             ..Default::default()
@@ -7516,10 +7516,10 @@ mod tests {
             any_of: vec![],
         };
         let enums = BTreeMap::new();
-        // Generic object should display Map(Json)
+        // Generic object should display Map(String)
         assert_eq!(
             type_display_string("DataProtectionPolicy", &prop, &schema, &enums),
-            "Map(Json)"
+            "Map(String)"
         );
     }
 

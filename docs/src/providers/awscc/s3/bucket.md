@@ -1012,7 +1012,7 @@ Shorthand formats: `Enabled` or `VersioningConfigurationStatus.Enabled`
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `partitioned_prefix` | [Struct(PartitionedPrefix)](#partitionedprefix) | No |  |
-| `simple_prefix` | Map(Json) | No | This format defaults the prefix to the given log file prefix for delivering server access log file. |
+| `simple_prefix` | Map(String) | No | This format defaults the prefix to the given log file prefix for delivering server access log file. |
 
 ### Tiering
 
