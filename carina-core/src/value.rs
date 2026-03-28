@@ -117,6 +117,11 @@ pub fn format_value(value: &Value) -> String {
 pub fn format_value_with_key(value: &Value, _key: Option<&str>) -> String {
     match value {
         Value::String(s) => {
+            // Secret hash strings should display as "(secret)" to avoid
+            // leaking internal hash representation in plan output
+            if s.starts_with(SECRET_PREFIX) {
+                return "(secret)".to_string();
+            }
             // DSL enum format (namespaced identifiers) - resolve to provider value
             if is_dsl_enum_format(s) {
                 let resolved = convert_enum_value(s);
@@ -550,6 +555,17 @@ mod tests {
     #[test]
     fn test_format_value_secret() {
         let v = Value::Secret(Box::new(Value::String("my-password".to_string())));
+        assert_eq!(format_value(&v), "(secret)");
+    }
+
+    #[test]
+    fn test_format_value_secret_hash_string() {
+        // State stores secret hashes as strings; they should also display as "(secret)"
+        let hash_str = format!(
+            "{}{}",
+            SECRET_PREFIX, "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+        );
+        let v = Value::String(hash_str);
         assert_eq!(format_value(&v), "(secret)");
     }
 }
