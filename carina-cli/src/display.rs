@@ -672,7 +672,7 @@ fn format_plan_tree(
                     colored_symbol,
                     to.display_type().cyan().bold(),
                     to.name.yellow().bold(),
-                    format!("(from: {})", from).dimmed()
+                    format!("(moved from: {})", from).dimmed()
                 )
                 .unwrap();
             }

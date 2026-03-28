@@ -698,14 +698,28 @@ pub fn add_state_block_effects(
     }
 
     // Add Move effects from pre-computed moved pairs.
+    // Skip the Move effect if the plan already has an Update/Replace for the target
+    // (the "(moved from: ...)" annotation on Update/Replace makes the separate Move
+    // line redundant when there are attribute changes).
     // Also suppress orphan Delete for `to` when there is no desired resource
     // for the target (the moved state entry would otherwise appear as an orphan).
+    let has_update_or_replace: std::collections::HashSet<ResourceId> = plan
+        .effects()
+        .iter()
+        .filter_map(|e| match e {
+            Effect::Update { id, .. } | Effect::Replace { id, .. } => Some(id.clone()),
+            _ => None,
+        })
+        .collect();
+
     for (from, to) in moved_pairs {
         suppress_delete.insert(to.clone());
-        new_effects.push(Effect::Move {
-            from: from.clone(),
-            to: to.clone(),
-        });
+        if !has_update_or_replace.contains(to) {
+            new_effects.push(Effect::Move {
+                from: from.clone(),
+                to: to.clone(),
+            });
+        }
     }
 
     // Remove Delete effects for resources covered by removed blocks,
