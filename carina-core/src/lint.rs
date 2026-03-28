@@ -121,6 +121,98 @@ pub fn find_pipe_preferred_direct_calls(source: &str) -> Vec<PipePreferredWarnin
     warnings
 }
 
+/// A warning for non-snake_case binding names.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NamingWarning {
+    /// The binding name that violates snake_case convention
+    pub name: String,
+    /// 1-indexed line number
+    pub line: usize,
+}
+
+/// Check whether a name follows snake_case convention.
+///
+/// Rules:
+/// - Only lowercase ASCII letters, digits, and underscores
+/// - Cannot start with a digit
+/// - Cannot start or end with underscore
+/// - Cannot have consecutive underscores
+fn is_snake_case(name: &str) -> bool {
+    if name.is_empty() || name.starts_with('_') || name.ends_with('_') {
+        return false;
+    }
+    if name.starts_with(|c: char| c.is_ascii_digit()) {
+        return false;
+    }
+    if name.contains("__") {
+        return false;
+    }
+    name.chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+}
+
+/// Extract a binding name from the text after a keyword (`let`, `for`, `import`).
+///
+/// If `stop_at_eq` is true, the name is delimited by whitespace or `=` (for `let`/`import`).
+/// If false, the name is delimited by whitespace only (for `for`).
+/// Returns `None` if the name is empty or starts with `_`.
+fn extract_binding_name(after_keyword: &str, stop_at_eq: bool) -> Option<String> {
+    let trimmed = after_keyword.trim_start();
+    let name: String = if stop_at_eq {
+        trimmed
+            .chars()
+            .take_while(|c| !c.is_whitespace() && *c != '=')
+            .collect()
+    } else {
+        trimmed.chars().take_while(|c| !c.is_whitespace()).collect()
+    };
+
+    if name.is_empty() || name.starts_with('_') {
+        return None;
+    }
+
+    Some(name)
+}
+
+/// Find `let` bindings with non-snake_case names in source text.
+///
+/// Scans lines for `let <name> =` patterns and checks if `<name>` follows
+/// snake_case convention. Bindings starting with `_` are skipped (internal/synthetic).
+pub fn find_non_snake_case_bindings(source: &str) -> Vec<NamingWarning> {
+    let mut warnings = Vec::new();
+
+    for (line_idx, line) in source.lines().enumerate() {
+        let trimmed = line.trim_start();
+
+        // Skip comment lines
+        if trimmed.starts_with("//") || trimmed.starts_with('#') {
+            continue;
+        }
+
+        // Extract binding name from `let`, `for`, or `import` patterns
+        let name = if let Some(rest) = trimmed.strip_prefix("let ") {
+            extract_binding_name(rest, true)
+        } else if let Some(rest) = trimmed.strip_prefix("for ") {
+            extract_binding_name(rest, false)
+        } else if let Some(rest) = trimmed.strip_prefix("import ") {
+            extract_binding_name(rest, true)
+        } else {
+            None
+        };
+
+        if let Some(name) = name
+            && !is_snake_case(&name)
+        {
+            warnings.push(NamingWarning {
+                name,
+                line: line_idx + 1,
+            });
+        }
+    }
+
+    warnings
+}
+
 /// Rough heuristic to check if a byte position is inside a string literal.
 fn is_inside_string(line: &str, pos: usize) -> bool {
     let mut in_string = false;
@@ -511,5 +603,120 @@ let e = replace("old", "new", str)
             results.is_empty(),
             "Comment lines should not produce warnings"
         );
+    }
+
+    // --- Naming convention tests ---
+
+    #[test]
+    fn test_is_snake_case_valid() {
+        assert!(is_snake_case("my_vpc"));
+        assert!(is_snake_case("vpc"));
+        assert!(is_snake_case("a1"));
+        assert!(is_snake_case("web_server_2"));
+    }
+
+    #[test]
+    fn test_is_snake_case_invalid() {
+        assert!(!is_snake_case("myVpc")); // camelCase
+        assert!(!is_snake_case("MyVpc")); // PascalCase
+        assert!(!is_snake_case("_internal")); // leading underscore
+        assert!(!is_snake_case("trailing_")); // trailing underscore
+        assert!(!is_snake_case("double__underscore")); // consecutive underscores
+        assert!(!is_snake_case("1start")); // starts with digit
+        assert!(!is_snake_case("")); // empty
+    }
+
+    #[test]
+    fn test_naming_camel_case_warns() {
+        let source = r#"let myVpc = awscc.ec2.vpc { cidr_block = "10.0.0.0/16" }"#;
+        let results = find_non_snake_case_bindings(source);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name, "myVpc");
+        assert_eq!(results[0].line, 1);
+    }
+
+    #[test]
+    fn test_naming_pascal_case_warns() {
+        let source = r#"let MyVpc = awscc.ec2.vpc { cidr_block = "10.0.0.0/16" }"#;
+        let results = find_non_snake_case_bindings(source);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name, "MyVpc");
+    }
+
+    #[test]
+    fn test_naming_snake_case_no_warning() {
+        let source = r#"let my_vpc = awscc.ec2.vpc { cidr_block = "10.0.0.0/16" }"#;
+        let results = find_non_snake_case_bindings(source);
+        assert!(results.is_empty(), "snake_case should not warn");
+    }
+
+    #[test]
+    fn test_naming_underscore_prefix_skipped() {
+        let source = r#"let _internal = awscc.ec2.vpc { cidr_block = "10.0.0.0/16" }"#;
+        let results = find_non_snake_case_bindings(source);
+        assert!(
+            results.is_empty(),
+            "Bindings starting with _ should be skipped"
+        );
+    }
+
+    #[test]
+    fn test_naming_for_loop_variable_warns() {
+        let source = "for badName in items {\n    let x = badName\n}";
+        let results = find_non_snake_case_bindings(source);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name, "badName");
+        assert_eq!(results[0].line, 1);
+    }
+
+    #[test]
+    fn test_naming_for_loop_snake_case_no_warning() {
+        let source = "for item in items {\n    let x = item\n}";
+        let results = find_non_snake_case_bindings(source);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_naming_import_binding_warns() {
+        let source = r#"import myModule = "./modules/web""#;
+        let results = find_non_snake_case_bindings(source);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name, "myModule");
+    }
+
+    #[test]
+    fn test_naming_import_snake_case_no_warning() {
+        let source = r#"import web_tier = "./modules/web""#;
+        let results = find_non_snake_case_bindings(source);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_naming_comment_lines_no_warning() {
+        let source = "// let myBadName = something\n# let AnotherBad = thing";
+        let results = find_non_snake_case_bindings(source);
+        assert!(
+            results.is_empty(),
+            "Comment lines should not produce warnings"
+        );
+    }
+
+    #[test]
+    fn test_naming_multiple_warnings() {
+        let source = "let myVpc = awscc.ec2.vpc {}\nlet MySubnet = awscc.ec2.subnet {}\nlet good_name = awscc.ec2.igw {}";
+        let results = find_non_snake_case_bindings(source);
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].name, "myVpc");
+        assert_eq!(results[1].name, "MySubnet");
+    }
+
+    #[test]
+    fn test_naming_let_inside_block_checked() {
+        // `let` inside a for body should still be checked
+        let source = "for item in items {\n    let badName = item.value\n}";
+        let results = find_non_snake_case_bindings(source);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name, "badName");
+        assert_eq!(results[0].line, 2);
     }
 }
