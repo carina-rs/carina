@@ -761,3 +761,85 @@ fn secret_same_password_different_resources_produces_different_hashes() {
         "Hash from db-1 should not match db-2's context"
     );
 }
+
+/// Regression test for #1249: Secret compared against plain-text state value
+/// (as returned by provider.read in refresh=true mode) should match when
+/// the inner values are equal.
+#[test]
+fn secret_matches_plain_text_state_value() {
+    let secret = Value::Secret(Box::new(Value::String("my-password".to_string())));
+    let plain = Value::String("my-password".to_string());
+    assert!(
+        type_aware_equal(&secret, &plain, None, None),
+        "Secret should match plain-text state when inner values are equal"
+    );
+    assert!(
+        type_aware_equal(&plain, &secret, None, None),
+        "Plain-text state should match secret when inner values are equal"
+    );
+}
+
+/// Secret with different inner value should NOT match plain-text state.
+#[test]
+fn secret_does_not_match_different_plain_text() {
+    let secret = Value::Secret(Box::new(Value::String("my-password".to_string())));
+    let plain = Value::String("other-password".to_string());
+    assert!(
+        !type_aware_equal(&secret, &plain, None, None),
+        "Secret should not match different plain-text state"
+    );
+}
+
+/// Regression test for #1249: secret nested inside a Map (e.g., tags) with
+/// refresh=true. After apply, plan reads from the provider which returns
+/// the plain-text tag value. The differ must recognize that
+/// Secret("super-secret-value") matches String("super-secret-value") when
+/// the state value is the raw provider response (not a hash).
+#[test]
+fn secret_in_map_with_refresh_no_false_diff() {
+    use crate::resource::ResourceId;
+    use crate::schema::{AttributeSchema, ResourceSchema};
+
+    let resource_id = ResourceId::with_provider("awscc", "ec2.vpc", "ec2_vpc_fb75c929");
+
+    // Desired: tags map with a secret value (as written in .crn)
+    let desired_tags = Value::Map(HashMap::from([
+        ("Name".to_string(), Value::String("test".to_string())),
+        (
+            "SecretTag".to_string(),
+            Value::Secret(Box::new(Value::String("super-secret-value".to_string()))),
+        ),
+    ]));
+
+    // Current state from provider read (refresh=true): plain-text values
+    let current_tags = Value::Map(HashMap::from([
+        ("Name".to_string(), Value::String("test".to_string())),
+        (
+            "SecretTag".to_string(),
+            Value::String("super-secret-value".to_string()),
+        ),
+    ]));
+
+    // Build schema with tags as Map(String)
+    let schema = ResourceSchema::new("ec2.vpc").attribute(AttributeSchema::new(
+        "tags",
+        AttributeType::Map(Box::new(AttributeType::String)),
+    ));
+
+    let desired = HashMap::from([("tags".to_string(), desired_tags)]);
+    let current = HashMap::from([("tags".to_string(), current_tags)]);
+
+    let changed = find_changed_attributes(
+        &desired,
+        &current,
+        None,
+        None,
+        Some(&schema),
+        Some(&resource_id),
+    );
+    assert!(
+        changed.is_empty(),
+        "Secret in map should not show false diff when current has plain-text from provider (issue #1249), got changed: {:?}",
+        changed,
+    );
+}
