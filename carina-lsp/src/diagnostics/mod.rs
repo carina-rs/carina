@@ -619,6 +619,9 @@ impl DiagnosticEngine {
         // Check for duplicate attribute keys (text-based, works without parsed file)
         diagnostics.extend(self.check_duplicate_attrs(doc));
 
+        // Check for direct calls to pipe-preferred functions
+        diagnostics.extend(self.check_pipe_preferred_direct_calls(doc));
+
         diagnostics
     }
 
@@ -652,6 +655,43 @@ impl DiagnosticEngine {
                     message: format!(
                         "Duplicate attribute '{}' (first defined on line {}). The last value will be used.",
                         dup.name, dup.first_line
+                    ),
+                    ..Default::default()
+                })
+            })
+            .collect()
+    }
+
+    /// Check for direct calls to pipe-preferred functions (info-level).
+    fn check_pipe_preferred_direct_calls(&self, doc: &Document) -> Vec<Diagnostic> {
+        let text = doc.text();
+        let warnings = carina_core::lint::find_pipe_preferred_direct_calls(&text);
+
+        warnings
+            .into_iter()
+            .filter_map(|pw| {
+                let line = (pw.line - 1) as u32;
+                let line_text = text.lines().nth(pw.line - 1)?;
+                let pattern = format!("{}(", pw.name);
+                let byte_pos = line_text.find(&pattern)?;
+                let col = position::byte_offset_to_char_offset(line_text, byte_pos);
+
+                Some(Diagnostic {
+                    range: Range {
+                        start: Position {
+                            line,
+                            character: col,
+                        },
+                        end: Position {
+                            line,
+                            character: col + pw.name.len() as u32,
+                        },
+                    },
+                    severity: Some(DiagnosticSeverity::INFORMATION),
+                    source: Some("carina".to_string()),
+                    message: format!(
+                        "Consider using pipe form for '{}': data |> {}(...)",
+                        pw.name, pw.name
                     ),
                     ..Default::default()
                 })
