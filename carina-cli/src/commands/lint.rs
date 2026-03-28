@@ -6,8 +6,8 @@ use colored::Colorize;
 
 use carina_core::config_loader::{find_crn_files_in_dir, get_base_dir, load_configuration};
 use carina_core::lint::{
-    find_duplicate_attrs, find_list_literal_attrs, find_pipe_preferred_direct_calls,
-    list_struct_attr_names,
+    find_duplicate_attrs, find_list_literal_attrs, find_non_snake_case_bindings,
+    find_pipe_preferred_direct_calls, list_struct_attr_names,
 };
 use carina_core::module_resolver;
 use carina_core::provider::{self as provider_mod};
@@ -115,6 +115,19 @@ pub fn run_lint(path: &PathBuf) -> Result<(), AppError> {
                 message: format!(
                     "Consider using pipe form for '{}': data |> {}(...)",
                     pw.name, pw.name
+                ),
+            });
+        }
+
+        // Check for non-snake_case binding names
+        let naming_warnings = find_non_snake_case_bindings(source);
+        for nw in naming_warnings {
+            warnings.push(LintWarning {
+                file: file_path.clone(),
+                line: nw.line,
+                message: format!(
+                    "Binding '{}' is not snake_case. Use snake_case for binding names (e.g., 'my_resource').",
+                    nw.name
                 ),
             });
         }

@@ -622,6 +622,9 @@ impl DiagnosticEngine {
         // Check for direct calls to pipe-preferred functions
         diagnostics.extend(self.check_pipe_preferred_direct_calls(doc));
 
+        // Check for non-snake_case binding names
+        diagnostics.extend(self.check_non_snake_case_bindings(doc));
+
         diagnostics
     }
 
@@ -692,6 +695,43 @@ impl DiagnosticEngine {
                     message: format!(
                         "Consider using pipe form for '{}': data |> {}(...)",
                         pw.name, pw.name
+                    ),
+                    ..Default::default()
+                })
+            })
+            .collect()
+    }
+
+    /// Check for non-snake_case binding names (info-level).
+    fn check_non_snake_case_bindings(&self, doc: &Document) -> Vec<Diagnostic> {
+        let text = doc.text();
+        let warnings = carina_core::lint::find_non_snake_case_bindings(&text);
+
+        warnings
+            .into_iter()
+            .filter_map(|nw| {
+                let line = (nw.line - 1) as u32;
+                let line_text = text.lines().nth(nw.line - 1)?;
+                // Find the binding name position in the line
+                let byte_pos = line_text.find(&nw.name)?;
+                let col = position::byte_offset_to_char_offset(line_text, byte_pos);
+
+                Some(Diagnostic {
+                    range: Range {
+                        start: Position {
+                            line,
+                            character: col,
+                        },
+                        end: Position {
+                            line,
+                            character: col + nw.name.len() as u32,
+                        },
+                    },
+                    severity: Some(DiagnosticSeverity::INFORMATION),
+                    source: Some("carina".to_string()),
+                    message: format!(
+                        "Binding '{}' is not snake_case. Use snake_case for binding names (e.g., 'my_resource').",
+                        nw.name
                     ),
                     ..Default::default()
                 })
