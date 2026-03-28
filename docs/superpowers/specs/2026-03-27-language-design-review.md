@@ -109,6 +109,33 @@ if_body = { local_let_binding* ~ (read_resource_expr | resource_expr | module_ca
 
 **Decision**: Not addressed in this review. Tracked in #1053.
 
+### 8. Pipe operator and function argument convention
+
+**Decision**: Follow F#/Haskell data-last convention. Pipe form is the recommended calling style for multi-argument transformation functions.
+
+**Pipe behavior**: `x |> f(a, b)` desugars to `f(a, b, x)` — the piped value is inserted as the last argument.
+
+**Convention**: All multi-argument transformation functions place the data argument last:
+
+```crn
+# Recommended (pipe form) — data flows left to right
+let ids = subnets |> map(".subnet_id")
+let name = parts |> join("-")
+let result = str |> replace("old", "new")
+let combined = base |> concat(extra)
+
+# Direct call works but is not recommended for 2+ arg transformations
+# (argument order is optimized for pipe, not direct reading)
+let ids = map(".subnet_id", subnets)
+```
+
+**Function categories**:
+- **Transformation functions** (2+ args): pipe form recommended. `join`, `split`, `map`, `concat`, `replace`
+- **Single-arg functions**: pipe and direct call are equivalent. `flatten`, `keys`, `values`, `trim`, `upper`, `lower`, `length`
+- **Computation functions**: direct call only (not pipe targets). `cidr_subnet`, `lookup`, `min`, `max`
+
+**Future**: Function composition (#1222) would enable point-free style (`map(".id") >> join(",")`) but requires partial application/currying, deferred to after Expr type separation.
+
 ## Implementation Priority
 
 | Priority | Item | Effort | Dependencies |
