@@ -1534,18 +1534,17 @@ mod tests {
         // Schema is registered with provider-prefixed key
         schemas.insert("awscc.ec2.vpc".to_string(), schema);
 
-        let resource = Resource::with_provider("awscc", "ec2.vpc", "my-vpc");
-        let mut resource_with_attrs = resource.clone();
-        resource_with_attrs.attributes.insert(
+        let mut resource = Resource::with_provider("awscc", "ec2.vpc", "my-vpc");
+        resource.attributes.insert(
             "cidr_block".to_string(),
             Value::String("10.0.0.0/16".to_string()),
         );
-        resource_with_attrs.attributes.insert(
+        resource.attributes.insert(
             "ipv4_netmask_length".to_string(),
             Value::String("16".to_string()),
         );
 
-        let sorted_resources = vec![resource_with_attrs];
+        let sorted_resources = vec![resource];
 
         // Simulate provider returning state without the write-only attribute
         let mut applied_attrs = HashMap::new();
