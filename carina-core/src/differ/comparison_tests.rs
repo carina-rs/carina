@@ -615,3 +615,33 @@ fn secret_in_find_changed_attributes_changed() {
         "Secret with different hash should show as changed"
     );
 }
+
+#[test]
+fn secret_in_map_no_change_when_hash_matches() {
+    use crate::value::value_to_json;
+
+    // Desired: tags map with a secret value
+    let secret_value = Value::Secret(Box::new(Value::String("super-secret".to_string())));
+    let desired_tags = Value::Map(HashMap::from([
+        ("Name".to_string(), Value::String("test".to_string())),
+        ("SecretTag".to_string(), secret_value.clone()),
+    ]));
+
+    // State: tags map with the secret hash (as stored by from_provider_state)
+    let hash_json = value_to_json(&secret_value).unwrap();
+    let hash_str = hash_json.as_str().unwrap().to_string();
+    let state_tags = Value::Map(HashMap::from([
+        ("Name".to_string(), Value::String("test".to_string())),
+        ("SecretTag".to_string(), Value::String(hash_str)),
+    ]));
+
+    let desired = HashMap::from([("tags".to_string(), desired_tags)]);
+    let current = HashMap::from([("tags".to_string(), state_tags)]);
+
+    let changed = find_changed_attributes(&desired, &current, None, None, None);
+    assert!(
+        changed.is_empty(),
+        "Secret in map with matching hash should not show as changed, got: {:?}",
+        changed
+    );
+}
