@@ -520,7 +520,7 @@ pub async fn create_plan_from_parsed(
     };
 
     // Restore unreturned attributes from state file (CloudControl doesn't always return them)
-    let saved_attrs = state_file
+    let mut saved_attrs = state_file
         .as_ref()
         .map(|sf| sf.build_saved_attrs())
         .unwrap_or_default();
@@ -553,20 +553,28 @@ pub async fn create_plan_from_parsed(
     resolve_enum_aliases_with_ctx(&ctx, &mut resources);
     resolve_enum_aliases_in_states(&ctx, &mut current_states);
 
-    // Pre-process moved blocks: transfer state from old name to new name
-    // so the differ sees attribute changes and produces Update/Replace effects.
-    let moved_pairs =
-        materialize_moved_states(&mut current_states, &parsed.state_blocks, state_file);
+    // Build prev_desired_keys and lifecycles before moved-state transfer
+    // so materialize_moved_states can re-key them under the new resource name.
+    let mut prev_desired_keys = state_file
+        .as_ref()
+        .map(|sf| sf.build_desired_keys())
+        .unwrap_or_default();
+
+    // Pre-process moved blocks: transfer state, prev_desired_keys, and
+    // saved_attrs from old name to new name so the differ sees attribute
+    // changes (including removals) and produces Update/Replace effects.
+    let moved_pairs = materialize_moved_states(
+        &mut current_states,
+        &mut prev_desired_keys,
+        &mut saved_attrs,
+        &parsed.state_blocks,
+        state_file,
+    );
 
     // Build lifecycles map from state file for orphaned resource deletion
     let lifecycles = state_file
         .as_ref()
         .map(|sf| sf.build_lifecycles())
-        .unwrap_or_default();
-
-    let prev_desired_keys = state_file
-        .as_ref()
-        .map(|sf| sf.build_desired_keys())
         .unwrap_or_default();
     let mut plan = create_plan(
         &resources,
@@ -609,6 +617,8 @@ pub async fn create_plan_from_parsed(
 /// existed in state. Callers use this to add Move effects to the plan.
 pub fn materialize_moved_states(
     current_states: &mut HashMap<ResourceId, State>,
+    prev_desired_keys: &mut HashMap<ResourceId, Vec<String>>,
+    saved_attrs: &mut HashMap<ResourceId, HashMap<String, Value>>,
     state_blocks: &[StateBlock],
     state_file: &Option<StateFile>,
 ) -> Vec<(ResourceId, ResourceId)> {
@@ -627,6 +637,19 @@ pub fn materialize_moved_states(
                     state.id = to.clone();
                     current_states.insert(to.clone(), state);
                 }
+
+                // Transfer prev_desired_keys so the differ detects attribute
+                // removals under the new resource name.
+                if let Some(keys) = prev_desired_keys.remove(from) {
+                    prev_desired_keys.insert(to.clone(), keys);
+                }
+
+                // Transfer saved_attrs so hydrate_read_state lookups work
+                // under the new resource name.
+                if let Some(attrs) = saved_attrs.remove(from) {
+                    saved_attrs.insert(to.clone(), attrs);
+                }
+
                 moved_pairs.push((from.clone(), to.clone()));
             }
         }

@@ -52,6 +52,9 @@ plan-secret-values:
 plan-moved-with-changes:
 	cd $(FIXTURES)/moved_with_changes && $(CARINA) plan --refresh=false main.crn
 
+plan-moved-prev-keys:
+	cd $(FIXTURES)/moved_prev_keys && $(CARINA) plan --refresh=false main.crn
+
 plan-map-diff-tui:
 	cd $(FIXTURES)/map_key_diff && $(CARINA) plan --refresh=false --tui main.crn
 
@@ -115,9 +118,12 @@ plan-fixtures:
 	@echo ""
 	@echo "=== moved_with_changes ==="
 	@$(MAKE) plan-moved-with-changes
+	@echo ""
+	@echo "=== moved_prev_keys ==="
+	@$(MAKE) plan-moved-prev-keys
 
 .PHONY: plan-all-create plan-no-changes plan-no-changes-enum plan-mixed plan-delete plan-compact \
         plan-map-diff plan-enum-display plan-destroy-full plan-destroy-orphans plan-read-only-attrs \
         plan-default-values plan-explicit plan-default-tags \
-        plan-state-blocks plan-secret-values plan-moved-with-changes \
+        plan-state-blocks plan-secret-values plan-moved-with-changes plan-moved-prev-keys \
         plan-map-diff-tui plan-all-create-tui plan-mixed-tui plan-delete-tui plan-fixtures
