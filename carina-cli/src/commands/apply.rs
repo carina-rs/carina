@@ -1073,6 +1073,19 @@ async fn run_apply_locked(
     // Must match the plan path in wiring.rs to ensure plan/apply produce the same diffs.
     provider.normalize_state(&mut current_states);
 
+    // Merge default_tags from provider configs into resources that support tags.
+    // Done after normalize_desired so enum values in tags are already resolved.
+    // Must match the plan path in wiring.rs to ensure plan/apply produce the same diffs.
+    for provider_config in &parsed.providers {
+        if !provider_config.default_tags.is_empty() {
+            provider.merge_default_tags(
+                &mut resources_for_plan,
+                &provider_config.default_tags,
+                ctx.schemas(),
+            );
+        }
+    }
+
     // Resolve enum aliases (e.g., "all" -> "-1") in both desired resources
     // and current states so the plan shows canonical AWS values.
     crate::wiring::resolve_enum_aliases_with_ctx(ctx, &mut resources_for_plan);
