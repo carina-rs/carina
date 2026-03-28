@@ -12,7 +12,7 @@ use aws_sdk_s3::types::{
 
 use crate::backend::{BackendConfig, BackendError, BackendResult, StateBackend};
 use crate::lock::LockInfo;
-use crate::state::StateFile;
+use crate::state::{self, StateFile};
 
 /// S3-based state backend
 pub struct S3Backend {
@@ -208,8 +208,7 @@ impl StateBackend for S3Backend {
                     .await
                     .map_err(|e| BackendError::Io(e.to_string()))?;
                 let bytes = body.into_bytes();
-                let state: StateFile = serde_json::from_slice(&bytes)
-                    .map_err(|e| BackendError::InvalidState(e.to_string()))?;
+                let state = state::check_and_migrate_bytes(&bytes)?;
                 Ok(Some(state))
             }
             Err(err) => {
