@@ -89,8 +89,8 @@ pub enum TypeExpr {
     Bool,
     Int,
     Float,
-    /// CIDR block (e.g., "10.0.0.0/16")
-    Cidr,
+    /// Schema type identified by name (e.g., "cidr", "ipv4_address", "arn")
+    Simple(std::string::String),
     List(Box<TypeExpr>),
     Map(Box<TypeExpr>),
     /// Reference to a resource type (e.g., aws.vpc)
@@ -104,7 +104,7 @@ impl std::fmt::Display for TypeExpr {
             TypeExpr::Bool => write!(f, "bool"),
             TypeExpr::Int => write!(f, "int"),
             TypeExpr::Float => write!(f, "float"),
-            TypeExpr::Cidr => write!(f, "cidr"),
+            TypeExpr::Simple(name) => write!(f, "{}", name),
             TypeExpr::List(inner) => write!(f, "list({})", inner),
             TypeExpr::Map(inner) => write!(f, "map({})", inner),
             TypeExpr::Ref(path) => write!(f, "{}", path),
@@ -667,8 +667,7 @@ fn parse_type_expr(pair: pest::iterators::Pair<Rule>) -> Result<TypeExpr, ParseE
             "bool" => Ok(TypeExpr::Bool),
             "int" => Ok(TypeExpr::Int),
             "float" => Ok(TypeExpr::Float),
-            "cidr" => Ok(TypeExpr::Cidr),
-            _ => Ok(TypeExpr::String), // Default fallback
+            other => Ok(TypeExpr::Simple(other.to_string())),
         },
         Rule::type_generic => {
             // Get the full string representation to determine if it's list or map
@@ -1736,8 +1735,8 @@ fn check_fn_arg_type(
         TypeExpr::Bool => matches!(value, Value::Bool(_)),
         TypeExpr::List(_) => matches!(value, Value::List(_)),
         TypeExpr::Map(_) => matches!(value, Value::Map(_)),
-        // Cidr is a string subtype
-        TypeExpr::Cidr => matches!(
+        // Simple types (cidr, ipv4_address, arn, etc.) are string subtypes at runtime
+        TypeExpr::Simple(_) => matches!(
             value,
             Value::String(_) | Value::Interpolation(_) | Value::ResourceRef { .. }
         ),
@@ -1769,7 +1768,8 @@ fn check_fn_return_type(
         TypeExpr::Bool => matches!(value, Value::Bool(_)),
         TypeExpr::List(_) => matches!(value, Value::List(_)),
         TypeExpr::Map(_) => matches!(value, Value::Map(_)),
-        TypeExpr::Cidr => matches!(
+        // Simple types (cidr, ipv4_address, arn, etc.) are string subtypes at runtime
+        TypeExpr::Simple(_) => matches!(
             value,
             Value::String(_) | Value::Interpolation(_) | Value::ResourceRef { .. }
         ),
@@ -7225,5 +7225,128 @@ aws.s3.bucket {
             msg.contains("return type"),
             "Expected return type error, got: {msg}"
         );
+    }
+
+    #[test]
+    fn parse_custom_schema_type_in_fn_param() {
+        // Custom schema types like cidr, ipv4_address, arn should be accepted as type annotations
+        let input = r#"
+            fn subnet(vpc: awscc.ec2.vpc, cidr_block: cidr) {
+                awscc.ec2.subnet {
+                    name     = "test"
+                    vpc_id   = vpc.vpc_id
+                    cidr_block = cidr_block
+                }
+            }
+        "#;
+        let result = parse(input).unwrap();
+        let func = result.user_functions.get("subnet").unwrap();
+        assert_eq!(func.params[1].name, "cidr_block");
+        assert_eq!(
+            func.params[1].param_type,
+            Some(TypeExpr::Simple("cidr".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_ipv4_address_type_in_fn_param() {
+        let input = r#"
+            fn f(addr: ipv4_address) {
+                addr
+            }
+        "#;
+        let result = parse(input).unwrap();
+        let func = result.user_functions.get("f").unwrap();
+        assert_eq!(
+            func.params[0].param_type,
+            Some(TypeExpr::Simple("ipv4_address".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_arn_type_in_fn_param() {
+        let input = r#"
+            fn f(role: arn) {
+                role
+            }
+        "#;
+        let result = parse(input).unwrap();
+        let func = result.user_functions.get("f").unwrap();
+        assert_eq!(
+            func.params[0].param_type,
+            Some(TypeExpr::Simple("arn".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_custom_type_in_list_generic() {
+        let input = r#"
+            fn f(cidrs: list(cidr)) {
+                cidrs
+            }
+        "#;
+        let result = parse(input).unwrap();
+        let func = result.user_functions.get("f").unwrap();
+        assert_eq!(
+            func.params[0].param_type,
+            Some(TypeExpr::List(Box::new(TypeExpr::Simple(
+                "cidr".to_string()
+            ))))
+        );
+    }
+
+    #[test]
+    fn parse_custom_type_in_module_arguments() {
+        let input = r#"
+            arguments {
+                vpc_cidr: cidr
+                server_ip: ipv4_address
+            }
+
+            awscc.ec2.vpc {
+                name       = "test"
+                cidr_block = vpc_cidr
+            }
+        "#;
+        let result = parse(input).unwrap();
+        assert_eq!(result.arguments[0].name, "vpc_cidr");
+        assert_eq!(
+            result.arguments[0].type_expr,
+            TypeExpr::Simple("cidr".to_string())
+        );
+        assert_eq!(result.arguments[1].name, "server_ip");
+        assert_eq!(
+            result.arguments[1].type_expr,
+            TypeExpr::Simple("ipv4_address".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_custom_type_in_attributes() {
+        let input = r#"
+            attributes {
+                block: cidr = vpc.cidr_block
+            }
+
+            let vpc = awscc.ec2.vpc {
+                name       = "test"
+                cidr_block = "10.0.0.0/16"
+            }
+        "#;
+        let result = parse(input).unwrap();
+        assert_eq!(
+            result.attribute_params[0].type_expr,
+            Some(TypeExpr::Simple("cidr".to_string()))
+        );
+    }
+
+    #[test]
+    fn type_expr_display_simple() {
+        assert_eq!(TypeExpr::Simple("cidr".to_string()).to_string(), "cidr");
+        assert_eq!(
+            TypeExpr::Simple("ipv4_address".to_string()).to_string(),
+            "ipv4_address"
+        );
+        assert_eq!(TypeExpr::Simple("arn".to_string()).to_string(), "arn");
     }
 }

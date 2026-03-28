@@ -308,7 +308,7 @@ impl CompletionProvider {
             parser::TypeExpr::Bool => "bool".to_string(),
             parser::TypeExpr::Int => "int".to_string(),
             parser::TypeExpr::Float => "float".to_string(),
-            parser::TypeExpr::Cidr => "cidr".to_string(),
+            parser::TypeExpr::Simple(name) => name.clone(),
             parser::TypeExpr::List(inner) => format!("list({})", self.format_type_expr(inner)),
             parser::TypeExpr::Map(inner) => format!("map({})", self.format_type_expr(inner)),
             parser::TypeExpr::Ref(resource_path) => {

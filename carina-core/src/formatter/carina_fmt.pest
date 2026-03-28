@@ -73,12 +73,12 @@ attributes_param = {
   | identifier ~ trivia* ~ equals ~ trivia* ~ expression
 }
 
-// Type expression: string, bool, int, cidr, list(type), map(type), aws.resource (resource ref)
+// Type expression: string, bool, int, cidr, arn, etc., list(type), map(type), aws.resource (resource ref)
 type_expr = {
     type_ref | type_list | type_map | type_primitive
 }
 
-type_primitive = @{ "string" | "bool" | "int" | "float" | "cidr" }
+type_primitive = @{ identifier }
 
 type_list = { kw_list ~ trivia* ~ open_paren ~ trivia* ~ type_expr ~ trivia* ~ close_paren }
 
