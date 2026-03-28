@@ -9,6 +9,7 @@ use carina_core::parser::{ParsedFile, ProviderConfig};
 use carina_core::plan::Plan;
 use carina_core::provider::{BoxFuture, ProviderError, ProviderResult};
 use carina_core::resource::{LifecycleConfig, Resource, ResourceId, State, Value};
+use carina_core::schema::ResourceSchema;
 use carina_state::{BackendError, LockInfo, ResourceState, StateBackend, StateFile};
 
 use crate::commands::apply::{
@@ -133,6 +134,7 @@ async fn refresh_pending_states_updates_saved_state_from_provider_read() {
         plan: &Plan::new(),
         successfully_deleted: &HashSet::new(),
         failed_refreshes: &failed_refreshes,
+        schemas: &HashMap::new(),
     })
     .unwrap();
 
@@ -180,6 +182,7 @@ async fn refresh_pending_states_removes_not_found_resource_from_saved_state() {
         plan: &Plan::new(),
         successfully_deleted: &HashSet::new(),
         failed_refreshes: &failed_refreshes,
+        schemas: &HashMap::new(),
     })
     .unwrap();
 
@@ -226,6 +229,7 @@ async fn refresh_pending_states_does_not_overwrite_with_stale_snapshot_when_refr
         plan: &Plan::new(),
         successfully_deleted: &HashSet::new(),
         failed_refreshes: &failed_refreshes,
+        schemas: &HashMap::new(),
     })
     .unwrap();
 
@@ -1367,6 +1371,7 @@ async fn lock_released_on_write_state_failure() {
         &Plan::new(),
         &backend,
         Some(&lock),
+        &HashMap::new(),
     )
     .await;
 
@@ -1498,6 +1503,7 @@ async fn finalize_apply_uses_write_state_locked() {
         &Plan::new(),
         &backend,
         Some(&lock),
+        &HashMap::new(),
     )
     .await;
 
@@ -2016,6 +2022,7 @@ async fn finalize_apply_without_lock_uses_write_state() {
         &Plan::new(),
         &backend,
         None, // No lock
+        &HashMap::new(),
     )
     .await;
 
@@ -2352,6 +2359,7 @@ fn import_effect_preserves_resource_metadata_in_state() {
         plan: &plan,
         successfully_deleted: &HashSet::new(),
         failed_refreshes: &HashSet::new(),
+        schemas: &HashMap::new(),
     })
     .unwrap();
 
@@ -2382,5 +2390,152 @@ fn import_effect_preserves_resource_metadata_in_state() {
         saved_resource.identifier,
         Some("vpc-0abc123".to_string()),
         "identifier should be preserved after import"
+    );
+}
+
+#[test]
+fn build_state_after_apply_persists_write_only_attributes() {
+    use carina_core::schema::{AttributeSchema, AttributeType};
+
+    // Set up a resource with a write-only attribute (ipv4_netmask_length)
+    let mut resource = Resource::with_provider("awscc", "ec2.vpc", "my-vpc");
+    resource.attributes.insert(
+        "cidr_block".to_string(),
+        Value::String("10.0.0.0/16".to_string()),
+    );
+    resource
+        .attributes
+        .insert("ipv4_netmask_length".to_string(), Value::Int(16));
+
+    let id = resource.id.clone();
+
+    // Provider returns state WITHOUT the write-only attribute (API doesn't return it)
+    let applied_states = HashMap::from([(
+        id.clone(),
+        State {
+            id: id.clone(),
+            identifier: Some("vpc-123".to_string()),
+            attributes: HashMap::from([(
+                "cidr_block".to_string(),
+                Value::String("10.0.0.0/16".to_string()),
+            )]),
+            exists: true,
+        },
+    )]);
+
+    // Build schema with write-only attribute
+    let mut schemas = HashMap::new();
+    schemas.insert(
+        "ec2.vpc".to_string(),
+        ResourceSchema::new("ec2.vpc")
+            .attribute(AttributeSchema::new("cidr_block", AttributeType::String))
+            .attribute(
+                AttributeSchema::new("ipv4_netmask_length", AttributeType::Int).write_only(),
+            ),
+    );
+
+    let saved = build_state_after_apply(ApplyStateSave {
+        state_file: None,
+        sorted_resources: &[resource],
+        current_states: &HashMap::new(),
+        applied_states: &applied_states,
+        permanent_name_overrides: &HashMap::new(),
+        plan: &Plan::new(),
+        successfully_deleted: &HashSet::new(),
+        failed_refreshes: &HashSet::new(),
+        schemas: &schemas,
+    })
+    .unwrap();
+
+    let saved_resource = saved.find_resource("awscc", "ec2.vpc", "my-vpc").unwrap();
+
+    // The write-only attribute should be persisted from the desired resource
+    assert_eq!(
+        saved_resource.attributes.get("ipv4_netmask_length"),
+        Some(&json!(16)),
+        "write-only attribute should be persisted in state"
+    );
+    assert_eq!(
+        saved_resource.write_only_attributes,
+        vec!["ipv4_netmask_length"],
+        "write-only attribute names should be recorded"
+    );
+
+    // The regular attribute should also be there
+    assert_eq!(
+        saved_resource.attributes.get("cidr_block"),
+        Some(&json!("10.0.0.0/16"))
+    );
+}
+
+#[test]
+fn build_state_after_apply_write_only_detects_value_change() {
+    use carina_core::schema::{AttributeSchema, AttributeType};
+
+    // Simulate: user changed ipv4_netmask_length from 16 to 24
+    let mut resource = Resource::with_provider("awscc", "ec2.vpc", "my-vpc");
+    resource.attributes.insert(
+        "cidr_block".to_string(),
+        Value::String("10.0.0.0/24".to_string()),
+    );
+    resource
+        .attributes
+        .insert("ipv4_netmask_length".to_string(), Value::Int(24));
+
+    let id = resource.id.clone();
+
+    // Provider returns updated state (after apply) without write-only attribute
+    let applied_states = HashMap::from([(
+        id.clone(),
+        State {
+            id: id.clone(),
+            identifier: Some("vpc-123".to_string()),
+            attributes: HashMap::from([(
+                "cidr_block".to_string(),
+                Value::String("10.0.0.0/24".to_string()),
+            )]),
+            exists: true,
+        },
+    )]);
+
+    // Previous state had old write-only value
+    let mut existing_state = StateFile::new();
+    let mut old_rs = ResourceState::new("ec2.vpc", "my-vpc", "awscc")
+        .with_identifier("vpc-123")
+        .with_attribute("cidr_block".to_string(), json!("10.0.0.0/16"))
+        .with_attribute("ipv4_netmask_length".to_string(), json!(16));
+    old_rs.write_only_attributes = vec!["ipv4_netmask_length".to_string()];
+    existing_state.upsert_resource(old_rs);
+
+    let mut schemas = HashMap::new();
+    schemas.insert(
+        "ec2.vpc".to_string(),
+        ResourceSchema::new("ec2.vpc")
+            .attribute(AttributeSchema::new("cidr_block", AttributeType::String))
+            .attribute(
+                AttributeSchema::new("ipv4_netmask_length", AttributeType::Int).write_only(),
+            ),
+    );
+
+    let saved = build_state_after_apply(ApplyStateSave {
+        state_file: Some(existing_state),
+        sorted_resources: &[resource],
+        current_states: &HashMap::new(),
+        applied_states: &applied_states,
+        permanent_name_overrides: &HashMap::new(),
+        plan: &Plan::new(),
+        successfully_deleted: &HashSet::new(),
+        failed_refreshes: &HashSet::new(),
+        schemas: &schemas,
+    })
+    .unwrap();
+
+    let saved_resource = saved.find_resource("awscc", "ec2.vpc", "my-vpc").unwrap();
+
+    // The write-only attribute should have the NEW value (24, not 16)
+    assert_eq!(
+        saved_resource.attributes.get("ipv4_netmask_length"),
+        Some(&json!(24)),
+        "write-only attribute should reflect the updated desired value"
     );
 }

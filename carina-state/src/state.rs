@@ -364,6 +364,11 @@ pub struct ResourceState {
     /// Binding names of resources this resource depends on (via ResourceRef).
     /// Stored so orphan Delete effects can have tree structure.
     pub dependency_bindings: Vec<String>,
+    /// Attribute names that are write-only (not returned by the provider API).
+    /// Their values are persisted from the user's desired state so that changes
+    /// to write-only attributes can be detected on subsequent plans.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub write_only_attributes: Vec<String>,
 }
 
 impl ResourceState {
@@ -386,6 +391,7 @@ impl ResourceState {
             desired_keys: Vec::new(),
             binding: None,
             dependency_bindings: Vec::new(),
+            write_only_attributes: Vec::new(),
         }
     }
 
@@ -418,6 +424,32 @@ impl ResourceState {
     pub fn with_protected(mut self, protected: bool) -> Self {
         self.protected = protected;
         self
+    }
+
+    /// Merge write-only attribute values from the desired resource into this state.
+    ///
+    /// Write-only attributes are not returned by the provider API after create/update,
+    /// so their user-specified values must be persisted from the desired resource.
+    /// This enables the differ to detect changes to write-only attribute values on
+    /// subsequent plans.
+    ///
+    /// `write_only_keys` is the set of attribute names that are marked write-only
+    /// in the resource schema.
+    pub fn merge_write_only_attributes(&mut self, resource: &Resource, write_only_keys: &[String]) {
+        let mut merged = Vec::new();
+        for key in write_only_keys {
+            // Only merge if the user specified this attribute and it's not already
+            // in the provider-returned state
+            if let Some(value) = resource.attributes.get(key)
+                && !self.attributes.contains_key(key)
+                && let Ok(json_value) = value_to_json(value)
+            {
+                self.attributes.insert(key.clone(), json_value);
+                merged.push(key.clone());
+            }
+        }
+        merged.sort();
+        self.write_only_attributes = merged;
     }
 
     /// Build a ResourceState from a Resource and its provider-returned State.
@@ -1065,5 +1097,157 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("UTF-8"), "error should mention UTF-8 issue");
+    }
+
+    #[test]
+    fn test_merge_write_only_attributes() {
+        use carina_core::resource::{Resource, State as ProviderState, Value};
+
+        // Simulate a VPC resource with a write-only attribute (ipv4_netmask_length)
+        let mut resource = Resource::with_provider("awscc", "ec2.vpc", "my-vpc");
+        resource.attributes.insert(
+            "cidr_block".to_string(),
+            Value::String("10.0.0.0/16".to_string()),
+        );
+        resource
+            .attributes
+            .insert("ipv4_netmask_length".to_string(), Value::Int(16));
+
+        // Provider returns state without write-only attributes (API doesn't return them)
+        let provider_state = ProviderState {
+            id: resource.id.clone(),
+            identifier: Some("vpc-123".to_string()),
+            attributes: [(
+                "cidr_block".to_string(),
+                Value::String("10.0.0.0/16".to_string()),
+            )]
+            .into_iter()
+            .collect(),
+            exists: true,
+        };
+
+        let mut rs = ResourceState::from_provider_state(&resource, &provider_state, None).unwrap();
+
+        // Merge write-only attributes
+        let write_only_keys = vec!["ipv4_netmask_length".to_string()];
+        rs.merge_write_only_attributes(&resource, &write_only_keys);
+
+        // The write-only attribute should be persisted in state
+        assert_eq!(
+            rs.attributes.get("ipv4_netmask_length"),
+            Some(&serde_json::json!(16))
+        );
+        assert_eq!(rs.write_only_attributes, vec!["ipv4_netmask_length"]);
+
+        // The regular attribute should still be there
+        assert_eq!(
+            rs.attributes.get("cidr_block"),
+            Some(&serde_json::json!("10.0.0.0/16"))
+        );
+    }
+
+    #[test]
+    fn test_merge_write_only_attributes_not_in_desired() {
+        use carina_core::resource::{Resource, State as ProviderState, Value};
+
+        // Resource without write-only attribute specified
+        let mut resource = Resource::with_provider("awscc", "ec2.vpc", "my-vpc");
+        resource.attributes.insert(
+            "cidr_block".to_string(),
+            Value::String("10.0.0.0/16".to_string()),
+        );
+
+        let provider_state = ProviderState {
+            id: resource.id.clone(),
+            identifier: Some("vpc-123".to_string()),
+            attributes: [(
+                "cidr_block".to_string(),
+                Value::String("10.0.0.0/16".to_string()),
+            )]
+            .into_iter()
+            .collect(),
+            exists: true,
+        };
+
+        let mut rs = ResourceState::from_provider_state(&resource, &provider_state, None).unwrap();
+
+        // Try to merge a write-only attribute that the user didn't specify
+        let write_only_keys = vec!["ipv4_netmask_length".to_string()];
+        rs.merge_write_only_attributes(&resource, &write_only_keys);
+
+        // Should NOT be in state since user didn't specify it
+        assert!(!rs.attributes.contains_key("ipv4_netmask_length"));
+        assert!(rs.write_only_attributes.is_empty());
+    }
+
+    #[test]
+    fn test_merge_write_only_skips_if_already_in_provider_state() {
+        use carina_core::resource::{Resource, State as ProviderState, Value};
+
+        // Resource with a write-only attribute
+        let mut resource = Resource::with_provider("awscc", "ec2.vpc", "my-vpc");
+        resource.attributes.insert(
+            "some_attr".to_string(),
+            Value::String("desired".to_string()),
+        );
+
+        // Provider happens to return this attribute (unusual for write-only but possible)
+        let provider_state = ProviderState {
+            id: resource.id.clone(),
+            identifier: Some("vpc-123".to_string()),
+            attributes: [(
+                "some_attr".to_string(),
+                Value::String("from-api".to_string()),
+            )]
+            .into_iter()
+            .collect(),
+            exists: true,
+        };
+
+        let mut rs = ResourceState::from_provider_state(&resource, &provider_state, None).unwrap();
+
+        let write_only_keys = vec!["some_attr".to_string()];
+        rs.merge_write_only_attributes(&resource, &write_only_keys);
+
+        // Should keep the API-returned value, not overwrite with desired
+        assert_eq!(
+            rs.attributes.get("some_attr"),
+            Some(&serde_json::json!("from-api"))
+        );
+        // Should NOT be recorded as write-only since the API returned it
+        assert!(rs.write_only_attributes.is_empty());
+    }
+
+    #[test]
+    fn test_write_only_attributes_serialization() {
+        let mut rs = ResourceState::new("ec2.vpc", "my-vpc", "awscc")
+            .with_identifier("vpc-123")
+            .with_attribute("cidr_block".to_string(), serde_json::json!("10.0.0.0/16"))
+            .with_attribute("ipv4_netmask_length".to_string(), serde_json::json!(16));
+        rs.write_only_attributes = vec!["ipv4_netmask_length".to_string()];
+
+        let json = serde_json::to_string_pretty(&rs).unwrap();
+        let deserialized: ResourceState = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(
+            deserialized.write_only_attributes,
+            vec!["ipv4_netmask_length"]
+        );
+        assert_eq!(
+            deserialized.attributes.get("ipv4_netmask_length"),
+            Some(&serde_json::json!(16))
+        );
+    }
+
+    #[test]
+    fn test_write_only_attributes_omitted_when_empty() {
+        let rs = ResourceState::new("s3.bucket", "my-bucket", "awscc");
+        let json = serde_json::to_string(&rs).unwrap();
+
+        // write_only_attributes should not appear in JSON when empty
+        assert!(
+            !json.contains("write_only_attributes"),
+            "write_only_attributes should be omitted when empty"
+        );
     }
 }
