@@ -179,38 +179,39 @@ fn register_kms_decryptor() {
         let ciphertext = ciphertext.to_string();
         let key = key.map(|k| k.to_string());
 
-        let rt = tokio::runtime::Handle::current();
-        rt.block_on(async {
-            let client = KMS_CLIENT
-                .get_or_init(|| async {
-                    let config =
-                        aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
-                    aws_sdk_kms::Client::new(&config)
-                })
-                .await;
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                let client = KMS_CLIENT
+                    .get_or_init(|| async {
+                        let config =
+                            aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+                        aws_sdk_kms::Client::new(&config)
+                    })
+                    .await;
 
-            let blob = base64::engine::general_purpose::STANDARD
-                .decode(&ciphertext)
-                .map_err(|e| format!("decrypt(): invalid base64 ciphertext: {e}"))?;
+                let blob = base64::engine::general_purpose::STANDARD
+                    .decode(&ciphertext)
+                    .map_err(|e| format!("decrypt(): invalid base64 ciphertext: {e}"))?;
 
-            let mut req = client
-                .decrypt()
-                .ciphertext_blob(aws_sdk_kms::primitives::Blob::new(blob));
-            if let Some(k) = key {
-                req = req.key_id(k);
-            }
+                let mut req = client
+                    .decrypt()
+                    .ciphertext_blob(aws_sdk_kms::primitives::Blob::new(blob));
+                if let Some(k) = key {
+                    req = req.key_id(k);
+                }
 
-            let resp = req
-                .send()
-                .await
-                .map_err(|e| format!("decrypt(): KMS decrypt failed: {e}"))?;
+                let resp = req
+                    .send()
+                    .await
+                    .map_err(|e| format!("decrypt(): KMS decrypt failed: {e}"))?;
 
-            let plaintext = resp
-                .plaintext()
-                .ok_or_else(|| "decrypt(): KMS response contained no plaintext".to_string())?;
+                let plaintext = resp
+                    .plaintext()
+                    .ok_or_else(|| "decrypt(): KMS response contained no plaintext".to_string())?;
 
-            String::from_utf8(plaintext.as_ref().to_vec())
-                .map_err(|e| format!("decrypt(): decrypted value is not valid UTF-8: {e}"))
+                String::from_utf8(plaintext.as_ref().to_vec())
+                    .map_err(|e| format!("decrypt(): decrypted value is not valid UTF-8: {e}"))
+            })
         })
     }));
 }
