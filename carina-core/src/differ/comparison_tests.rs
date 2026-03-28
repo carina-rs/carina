@@ -417,3 +417,122 @@ fn type_aware_unordered_list_ignores_reorder() {
         "Unordered list should treat reorder as equal"
     );
 }
+
+// --- Tests for write-only attribute skip in find_changed_attributes ---
+
+#[test]
+fn write_only_attr_in_desired_not_in_current_no_diff() {
+    use crate::schema::{AttributeSchema, ResourceSchema};
+
+    let schema = ResourceSchema::new("ec2.vpc")
+        .attribute(AttributeSchema::new("cidr_block", AttributeType::String))
+        .attribute(AttributeSchema::new("ipv4_netmask_length", AttributeType::Int).write_only());
+
+    let desired = HashMap::from([
+        (
+            "cidr_block".to_string(),
+            Value::String("10.0.0.0/16".to_string()),
+        ),
+        ("ipv4_netmask_length".to_string(), Value::Int(16)),
+    ]);
+    // CloudControl Read API does not return write-only attributes
+    let current = HashMap::from([(
+        "cidr_block".to_string(),
+        Value::String("10.0.0.0/16".to_string()),
+    )]);
+
+    let changed = find_changed_attributes(&desired, &current, None, None, Some(&schema));
+    assert!(
+        changed.is_empty(),
+        "Write-only attribute absent from current should not trigger a diff, got: {:?}",
+        changed
+    );
+}
+
+#[test]
+fn write_only_attr_in_both_same_value_no_diff() {
+    use crate::schema::{AttributeSchema, ResourceSchema};
+
+    let schema = ResourceSchema::new("ec2.vpc")
+        .attribute(AttributeSchema::new("cidr_block", AttributeType::String))
+        .attribute(AttributeSchema::new("ipv4_netmask_length", AttributeType::Int).write_only());
+
+    let desired = HashMap::from([
+        (
+            "cidr_block".to_string(),
+            Value::String("10.0.0.0/16".to_string()),
+        ),
+        ("ipv4_netmask_length".to_string(), Value::Int(16)),
+    ]);
+    let current = HashMap::from([
+        (
+            "cidr_block".to_string(),
+            Value::String("10.0.0.0/16".to_string()),
+        ),
+        ("ipv4_netmask_length".to_string(), Value::Int(16)),
+    ]);
+
+    let changed = find_changed_attributes(&desired, &current, None, None, Some(&schema));
+    assert!(
+        changed.is_empty(),
+        "Write-only attribute with same value should not trigger a diff, got: {:?}",
+        changed
+    );
+}
+
+#[test]
+fn write_only_attr_in_both_different_value_detects_diff() {
+    use crate::schema::{AttributeSchema, ResourceSchema};
+
+    let schema = ResourceSchema::new("ec2.vpc")
+        .attribute(AttributeSchema::new("cidr_block", AttributeType::String))
+        .attribute(AttributeSchema::new("ipv4_netmask_length", AttributeType::Int).write_only());
+
+    let desired = HashMap::from([
+        (
+            "cidr_block".to_string(),
+            Value::String("10.0.0.0/16".to_string()),
+        ),
+        ("ipv4_netmask_length".to_string(), Value::Int(24)),
+    ]);
+    let current = HashMap::from([
+        (
+            "cidr_block".to_string(),
+            Value::String("10.0.0.0/16".to_string()),
+        ),
+        ("ipv4_netmask_length".to_string(), Value::Int(16)),
+    ]);
+
+    let changed = find_changed_attributes(&desired, &current, None, None, Some(&schema));
+    assert!(
+        changed.contains(&"ipv4_netmask_length".to_string()),
+        "Write-only attribute with different value should trigger a diff"
+    );
+}
+
+#[test]
+fn non_write_only_attr_in_desired_not_in_current_detects_diff() {
+    use crate::schema::{AttributeSchema, ResourceSchema};
+
+    let schema = ResourceSchema::new("ec2.vpc")
+        .attribute(AttributeSchema::new("cidr_block", AttributeType::String))
+        .attribute(AttributeSchema::new("enable_dns", AttributeType::Bool));
+
+    let desired = HashMap::from([
+        (
+            "cidr_block".to_string(),
+            Value::String("10.0.0.0/16".to_string()),
+        ),
+        ("enable_dns".to_string(), Value::Bool(true)),
+    ]);
+    let current = HashMap::from([(
+        "cidr_block".to_string(),
+        Value::String("10.0.0.0/16".to_string()),
+    )]);
+
+    let changed = find_changed_attributes(&desired, &current, None, None, Some(&schema));
+    assert!(
+        changed.contains(&"enable_dns".to_string()),
+        "Non-write-only attribute absent from current should trigger a diff"
+    );
+}

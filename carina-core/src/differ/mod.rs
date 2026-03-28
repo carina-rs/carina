@@ -23,6 +23,8 @@ use crate::resource::LifecycleConfig;
 #[cfg(test)]
 use crate::schema::AttributeType;
 #[cfg(test)]
+use comparison::find_changed_attributes;
+#[cfg(test)]
 use comparison::type_aware_equal;
 
 /// Result of a diff operation
