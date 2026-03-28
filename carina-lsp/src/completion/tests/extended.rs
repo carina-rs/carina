@@ -662,6 +662,7 @@ fn builtin_function_completions_cover_all_functions() {
         "length",
         "lookup",
         "lower",
+        "map",
         "max",
         "min",
         "replace",

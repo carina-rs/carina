@@ -715,6 +715,7 @@ awscc.ec2.vpc_gateway_attachment {
             "length",
             "lookup",
             "lower",
+            "map",
             "max",
             "min",
             "replace",

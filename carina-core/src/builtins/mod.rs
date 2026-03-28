@@ -10,6 +10,7 @@ mod join;
 mod keys_values;
 mod length;
 mod lookup;
+mod map;
 mod min_max;
 mod replace;
 mod split;
@@ -70,8 +71,8 @@ register_builtins! {
         description: "Calculates a subnet CIDR block within a given IP network address prefix.",
     },
     concat(concat::builtin_concat) {
-        signature: "concat(list1: list, list2: list) -> list",
-        description: "Concatenates two lists into a single list.",
+        signature: "concat(items: list, base_list: list) -> list",
+        description: "Appends items to a list. Data-last: base_list |> concat(items).",
     },
     flatten(flatten::builtin_flatten) {
         signature: "flatten(list: list) -> list",
@@ -97,6 +98,10 @@ register_builtins! {
         signature: "lower(string: string) -> string",
         description: "Converts a string to lowercase.",
     },
+    map(map::builtin_map) {
+        signature: "map(accessor: string, collection: list | map) -> list | map",
+        description: "Extracts a field from each element. Use a dot-prefixed accessor (e.g., \".field_name\"). Pipe form: collection |> map(\".field\").",
+    },
     max(min_max::builtin_max) {
         signature: "max(a: number, b: number) -> number",
         description: "Returns the maximum of two numbers.",
@@ -106,8 +111,8 @@ register_builtins! {
         description: "Returns the minimum of two numbers.",
     },
     replace(replace::builtin_replace) {
-        signature: "replace(string: string, search: string, replacement: string) -> string",
-        description: "Replaces all occurrences of a search string with a replacement string.",
+        signature: "replace(search: string, replacement: string, string: string) -> string",
+        description: "Replaces all occurrences of a search string. Data-last: string |> replace(search, replacement).",
     },
     split(split::builtin_split) {
         signature: "split(separator: string, string: string) -> list",
