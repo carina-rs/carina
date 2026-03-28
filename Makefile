@@ -46,6 +46,9 @@ plan-explicit:
 plan-default-tags:
 	cd $(FIXTURES)/default_tags && $(CARINA) plan --refresh=false main.crn
 
+plan-secret-values:
+	cd $(FIXTURES)/secret_values && $(CARINA) plan --refresh=false main.crn
+
 plan-map-diff-tui:
 	cd $(FIXTURES)/map_key_diff && $(CARINA) plan --refresh=false --tui main.crn
 
@@ -103,9 +106,12 @@ plan-fixtures:
 	@echo ""
 	@echo "=== state_blocks ==="
 	@$(MAKE) plan-state-blocks
+	@echo ""
+	@echo "=== secret_values ==="
+	@$(MAKE) plan-secret-values
 
 .PHONY: plan-all-create plan-no-changes plan-no-changes-enum plan-mixed plan-delete plan-compact \
         plan-map-diff plan-enum-display plan-destroy-full plan-destroy-orphans plan-read-only-attrs \
         plan-default-values plan-explicit plan-default-tags \
-        plan-state-blocks \
+        plan-state-blocks plan-secret-values \
         plan-map-diff-tui plan-all-create-tui plan-mixed-tui plan-delete-tui plan-fixtures
