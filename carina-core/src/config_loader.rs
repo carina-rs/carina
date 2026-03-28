@@ -85,6 +85,9 @@ pub fn load_configuration(path: &PathBuf) -> Result<LoadedConfig, String> {
                     unresolved_merged
                         .state_blocks
                         .extend(unresolved.state_blocks);
+                    unresolved_merged
+                        .user_functions
+                        .extend(unresolved.user_functions);
 
                     // Merge resolved
                     merged.providers.extend(parsed.providers);
@@ -95,6 +98,7 @@ pub fn load_configuration(path: &PathBuf) -> Result<LoadedConfig, String> {
                     merged.arguments.extend(parsed.arguments);
                     merged.attribute_params.extend(parsed.attribute_params);
                     merged.state_blocks.extend(parsed.state_blocks);
+                    merged.user_functions.extend(parsed.user_functions);
                     // Merge backend (only one allowed)
                     if let Some(backend) = parsed.backend {
                         if merged.backend.is_some() {

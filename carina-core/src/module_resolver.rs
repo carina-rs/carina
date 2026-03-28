@@ -186,6 +186,7 @@ impl ModuleResolver {
             merged.module_calls.extend(parsed.module_calls);
             merged.arguments.extend(parsed.arguments);
             merged.attribute_params.extend(parsed.attribute_params);
+            merged.user_functions.extend(parsed.user_functions);
         }
 
         Ok(merged)
@@ -606,6 +607,7 @@ pub fn load_directory_module(dir_path: &Path) -> Option<ParsedFile> {
             merged.module_calls.extend(parsed.module_calls);
             merged.arguments.extend(parsed.arguments);
             merged.attribute_params.extend(parsed.attribute_params);
+            merged.user_functions.extend(parsed.user_functions);
         }
     }
 
@@ -688,6 +690,7 @@ pub fn load_module_from_directory(dir: &Path) -> Result<ParsedFile, String> {
             merged.module_calls.extend(parsed.module_calls);
             merged.arguments.extend(parsed.arguments);
             merged.attribute_params.extend(parsed.attribute_params);
+            merged.user_functions.extend(parsed.user_functions);
         }
     }
 
