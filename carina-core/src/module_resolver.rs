@@ -127,7 +127,10 @@ impl ModuleResolver {
         } else {
             full_path.parent().unwrap_or(&full_path).to_path_buf()
         };
-        self.resolve_nested_modules(&mut parsed, &module_base_dir)?;
+        if let Err(e) = self.resolve_nested_modules(&mut parsed, &module_base_dir) {
+            self.resolving.remove(&canonical);
+            return Err(e);
+        }
 
         // Remove from resolving set
         self.resolving.remove(&canonical);
