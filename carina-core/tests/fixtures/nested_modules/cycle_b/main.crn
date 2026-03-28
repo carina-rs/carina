@@ -1,0 +1,9 @@
+let a = import "../cycle_a"
+
+arguments {
+  value: string
+}
+
+let res = a {
+  value = value
+}

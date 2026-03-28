@@ -1,0 +1,13 @@
+let inner = import "../inner_module"
+
+arguments {
+  cidr_block: string
+}
+
+attributes {
+  vpc_id = net.vpc_id
+}
+
+let net = inner {
+  cidr_block = cidr_block
+}

@@ -77,21 +77,31 @@ impl ModuleResolver {
     pub fn load_module(&mut self, path: &str) -> Result<ParsedFile, ModuleError> {
         let full_path = self.resolve_path(path);
 
+        // Canonicalize for consistent cycle detection and caching.
+        // For directories, canonicalize directly. For files, try with .crn extension.
+        let canonical = if full_path.exists() {
+            full_path.canonicalize()?
+        } else if full_path.with_extension("crn").exists() {
+            full_path.with_extension("crn").canonicalize()?
+        } else {
+            full_path.clone()
+        };
+
         // Check for circular import
-        if self.resolving.contains(&full_path) {
+        if self.resolving.contains(&canonical) {
             return Err(ModuleError::CircularImport(path.to_string()));
         }
 
         // Check cache
-        if let Some(module) = self.module_cache.get(&full_path) {
+        if let Some(module) = self.module_cache.get(&canonical) {
             return Ok(module.clone());
         }
 
         // Mark as resolving
-        self.resolving.insert(full_path.clone());
+        self.resolving.insert(canonical.clone());
 
         // Load module: directory or single file
-        let parsed = if full_path.is_dir() {
+        let mut parsed = if full_path.is_dir() {
             self.load_directory_module(&full_path)?
         } else {
             let content = fs::read_to_string(&full_path)?;
@@ -100,20 +110,30 @@ impl ModuleResolver {
 
         // Verify it's a module (has arguments or attributes)
         if parsed.arguments.is_empty() && parsed.attribute_params.is_empty() {
+            self.resolving.remove(&canonical);
             return Err(ModuleError::NotFound(path.to_string()));
         }
 
         // Reject provider blocks inside modules
         if !parsed.providers.is_empty() {
-            self.resolving.remove(&full_path);
+            self.resolving.remove(&canonical);
             return Err(ModuleError::ProviderInModule);
         }
 
+        // Recursively resolve nested module imports within this module.
+        // The module's base directory is used for resolving its relative imports.
+        let module_base_dir = if full_path.is_dir() {
+            full_path.clone()
+        } else {
+            full_path.parent().unwrap_or(&full_path).to_path_buf()
+        };
+        self.resolve_nested_modules(&mut parsed, &module_base_dir)?;
+
         // Remove from resolving set
-        self.resolving.remove(&full_path);
+        self.resolving.remove(&canonical);
 
         // Cache the module
-        self.module_cache.insert(full_path, parsed.clone());
+        self.module_cache.insert(canonical, parsed.clone());
 
         Ok(parsed)
     }
@@ -175,6 +195,61 @@ impl ModuleResolver {
             let module = self.load_module(&import.path)?;
             self.imported_modules.insert(import.alias.clone(), module);
         }
+        Ok(())
+    }
+
+    /// Resolve nested module imports within a parsed module.
+    ///
+    /// This processes the module's own imports and module_calls, expanding any
+    /// nested modules recursively. Cycle detection is handled by the `resolving`
+    /// set in `load_module()`.
+    fn resolve_nested_modules(
+        &mut self,
+        parsed: &mut ParsedFile,
+        base_dir: &Path,
+    ) -> Result<(), ModuleError> {
+        if parsed.imports.is_empty() || parsed.module_calls.is_empty() {
+            return Ok(());
+        }
+
+        // Save and temporarily replace the base_dir and imported_modules
+        let original_base_dir = std::mem::replace(&mut self.base_dir, base_dir.to_path_buf());
+        let original_imported = std::mem::take(&mut self.imported_modules);
+
+        // Process the module's own imports
+        let imports = parsed.imports.clone();
+        let result = self.process_imports(&imports);
+
+        if let Err(e) = result {
+            // Restore state on error
+            self.base_dir = original_base_dir;
+            self.imported_modules = original_imported;
+            return Err(e);
+        }
+
+        // Expand the module's own module_calls
+        let module_calls = parsed.module_calls.clone();
+        for call in &module_calls {
+            let instance_prefix = call
+                .binding_name
+                .as_ref()
+                .cloned()
+                .unwrap_or_else(|| call.module_name.clone());
+
+            match self.expand_module_call(call, &instance_prefix) {
+                Ok(expanded) => parsed.resources.extend(expanded),
+                Err(e) => {
+                    self.base_dir = original_base_dir;
+                    self.imported_modules = original_imported;
+                    return Err(e);
+                }
+            }
+        }
+
+        // Restore original state
+        self.base_dir = original_base_dir;
+        self.imported_modules = original_imported;
+
         Ok(())
     }
 
@@ -1324,6 +1399,92 @@ mod tests {
                 InterpolationPart::Literal("test-".to_string()),
                 InterpolationPart::Expr(Value::String("dev".to_string())),
             ]))
+        );
+    }
+
+    #[test]
+    fn test_nested_module_two_level() {
+        // outer_module imports inner_module
+        // resolve_modules on root.crn should expand both levels
+        let fixtures_dir =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/nested_modules");
+        let content = fs::read_to_string(fixtures_dir.join("root.crn")).unwrap();
+        let mut parsed = crate::parser::parse(&content).unwrap();
+
+        resolve_modules(&mut parsed, &fixtures_dir).unwrap();
+
+        // Should have resources from both inner_module (vpc) and outer_module (sg)
+        let resource_types: Vec<&str> = parsed
+            .resources
+            .iter()
+            .filter_map(|r| {
+                r.attributes.get("_type").and_then(|v| match v {
+                    Value::String(s) => Some(s.as_str()),
+                    _ => None,
+                })
+            })
+            .collect();
+
+        assert!(
+            resource_types.iter().any(|t| t.contains("vpc")),
+            "Should contain VPC resource from inner module, got: {:?}",
+            resource_types
+        );
+        assert!(
+            resource_types.iter().any(|t| t.contains("security_group")),
+            "Should contain security group from outer module, got: {:?}",
+            resource_types
+        );
+    }
+
+    #[test]
+    fn test_nested_module_three_level() {
+        // root -> middle_module -> inner_module
+        let fixtures_dir =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/nested_modules");
+        let content = fs::read_to_string(fixtures_dir.join("root_three_level.crn")).unwrap();
+        let mut parsed = crate::parser::parse(&content).unwrap();
+
+        resolve_modules(&mut parsed, &fixtures_dir).unwrap();
+
+        // Should have the VPC resource from inner_module (through middle_module)
+        let resource_types: Vec<&str> = parsed
+            .resources
+            .iter()
+            .filter_map(|r| {
+                r.attributes.get("_type").and_then(|v| match v {
+                    Value::String(s) => Some(s.as_str()),
+                    _ => None,
+                })
+            })
+            .collect();
+
+        assert!(
+            resource_types.iter().any(|t| t.contains("vpc")),
+            "Should contain VPC resource from inner module (3 levels deep), got: {:?}",
+            resource_types
+        );
+    }
+
+    #[test]
+    fn test_nested_module_cycle_detection() {
+        // cycle_a imports cycle_b, cycle_b imports cycle_a
+        let fixtures_dir =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/nested_modules");
+        let content = fs::read_to_string(fixtures_dir.join("root_cycle.crn")).unwrap();
+        let mut parsed = crate::parser::parse(&content).unwrap();
+
+        let result = resolve_modules(&mut parsed, &fixtures_dir);
+        assert!(
+            result.is_err(),
+            "Should detect circular import, but got: {:?}",
+            result
+        );
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, ModuleError::CircularImport(_)),
+            "Expected CircularImport error, got: {:?}",
+            err
         );
     }
 
