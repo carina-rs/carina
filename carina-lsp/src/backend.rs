@@ -177,7 +177,15 @@ impl LanguageServer for Backend {
         let position = params.text_document_position_params.position;
 
         if let Some(doc) = self.documents.get(uri) {
-            return Ok(self.hover_provider.hover(&doc, position));
+            let base_path = uri
+                .to_file_path()
+                .ok()
+                .and_then(|p| p.parent().map(|p| p.to_path_buf()));
+            return Ok(self.hover_provider.hover_with_base_path(
+                &doc,
+                position,
+                base_path.as_deref(),
+            ));
         }
         Ok(None)
     }

@@ -40,10 +40,25 @@ arguments_block = {
 
 arguments_block_content = _{ trivia | arguments_param }
 
-// Arguments parameter: name: type or name: type = default
+// Arguments parameter: name: type or name: type = default, or block form
 arguments_param = {
-    identifier ~ trivia* ~ colon ~ trivia* ~ type_expr ~ (trivia* ~ equals ~ trivia* ~ expression)?
+    identifier ~ trivia* ~ colon ~ trivia* ~ type_expr ~ trivia* ~ arguments_param_block
+  | identifier ~ trivia* ~ colon ~ trivia* ~ type_expr ~ (trivia* ~ equals ~ trivia* ~ expression)?
 }
+
+arguments_param_block = {
+    open_brace ~ arguments_param_block_content* ~ close_brace
+}
+
+arguments_param_block_content = _{ trivia | arguments_param_attr }
+
+arguments_param_attr = {
+    kw_description ~ trivia* ~ equals ~ trivia* ~ string
+  | kw_default ~ trivia* ~ equals ~ trivia* ~ expression
+}
+
+kw_description = { "description" }
+kw_default = { "default" }
 
 // Attributes block: attributes { name: type = value }
 attributes_block = {

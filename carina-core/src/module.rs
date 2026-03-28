@@ -192,6 +192,8 @@ pub struct TypedArgument {
     pub required: bool,
     /// Default value as a display string
     pub default: Option<String>,
+    /// Optional description (from block form)
+    pub description: Option<String>,
 }
 
 /// Resource creation entry in module signature
@@ -743,6 +745,7 @@ impl ModuleSignature {
                 type_expr: input.type_expr.clone(),
                 required: input.default.is_none(),
                 default: input.default.as_ref().map(format_value),
+                description: input.description.clone(),
             })
             .collect();
 
@@ -979,6 +982,9 @@ impl ModuleSignature {
                     "  {}{}{}: {}{}  {}\n",
                     c.white, input.name, c.reset, type_str, default_str, required_str
                 ));
+                if let Some(desc) = &input.description {
+                    output.push_str(&format!("    {}{}{}\n", c.dim, desc, c.reset));
+                }
             }
         }
         output.push('\n');

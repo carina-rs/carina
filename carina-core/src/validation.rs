@@ -756,6 +756,7 @@ let route = awscc.ec2.route {
             name: "vpc_cidr".to_string(),
             type_expr: TypeExpr::String,
             default: None,
+            description: None,
         });
 
         let result = validate_no_provider_in_module(&parsed);
@@ -806,6 +807,7 @@ let route = awscc.ec2.route {
             name: "vpc_cidr".to_string(),
             type_expr: TypeExpr::String,
             default: None,
+            description: None,
         });
 
         let result = validate_no_provider_in_module(&parsed);

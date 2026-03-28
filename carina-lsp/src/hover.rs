@@ -1,11 +1,27 @@
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 
 use tower_lsp::lsp_types::{Hover, HoverContents, MarkupContent, MarkupKind, Position};
 
 use crate::document::Document;
 use carina_core::builtins;
+use carina_core::parser::ArgumentParameter;
+use carina_core::resource::Value;
 use carina_core::schema::{CompletionValue, ResourceSchema};
+
+/// Format a Value for hover display
+fn format_value_for_hover(value: &Value) -> String {
+    match value {
+        Value::String(s) => format!("\"{}\"", s),
+        Value::Int(n) => n.to_string(),
+        Value::Float(f) => f.to_string(),
+        Value::Bool(b) => b.to_string(),
+        Value::List(_) => "[...]".to_string(),
+        Value::Map(_) => "{...}".to_string(),
+        _ => format!("{:?}", value),
+    }
+}
 
 /// Convert Markdown links `[text](url)` to plain text `text (url)` for hover display.
 /// LSP hover popups render as plain text in many editors, so raw Markdown link syntax
@@ -94,10 +110,27 @@ impl HoverProvider {
     }
 
     pub fn hover(&self, doc: &Document, position: Position) -> Option<Hover> {
+        self.hover_with_base_path(doc, position, None)
+    }
+
+    pub fn hover_with_base_path(
+        &self,
+        doc: &Document,
+        position: Position,
+        base_path: Option<&Path>,
+    ) -> Option<Hover> {
         let word = doc.word_at(position)?;
 
         // Check for resource type hover
         if let Some(hover) = self.resource_type_hover(&word) {
+            return Some(hover);
+        }
+
+        // Check for module argument description hover (inside module calls)
+        if self.is_in_module_call(doc, position)
+            && let Some(base) = base_path
+            && let Some(hover) = self.module_argument_hover(doc, position, &word, base)
+        {
             return Some(hover);
         }
 
@@ -197,6 +230,116 @@ impl HoverProvider {
         }
 
         false
+    }
+
+    /// Show hover info for a module call argument, including its description if available.
+    fn module_argument_hover(
+        &self,
+        doc: &Document,
+        position: Position,
+        word: &str,
+        base_path: &Path,
+    ) -> Option<Hover> {
+        let parsed = doc.parsed()?;
+
+        // Find the enclosing module call name
+        let module_name = self.find_enclosing_module_call_name(doc, position)?;
+
+        // Find the import for this module
+        let import = parsed.imports.iter().find(|imp| imp.alias == module_name)?;
+
+        // Load the module to get argument definitions
+        let module_path = base_path.join(&import.path);
+        let module_parsed = carina_core::module_resolver::load_module(&module_path)?;
+
+        // Find the argument matching the word
+        let arg = module_parsed.arguments.iter().find(|a| a.name == word)?;
+
+        // Build hover content
+        self.build_module_argument_hover(arg, &module_name)
+    }
+
+    fn build_module_argument_hover(
+        &self,
+        arg: &ArgumentParameter,
+        module_name: &str,
+    ) -> Option<Hover> {
+        let mut content = format!("## {}.{}\n\n", module_name, arg.name);
+
+        if let Some(desc) = &arg.description {
+            content.push_str(desc);
+            content.push_str("\n\n");
+        }
+
+        content.push_str(&format!("- **Type**: {}\n", arg.type_expr));
+
+        if let Some(default) = &arg.default {
+            let default_str = format_value_for_hover(default);
+            content.push_str(&format!("- **Default**: {}\n", default_str));
+        } else {
+            content.push_str("- **Required**\n");
+        }
+
+        Some(Hover {
+            contents: HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value: content,
+            }),
+            range: None,
+        })
+    }
+
+    /// Find the name of the enclosing module call block.
+    fn find_enclosing_module_call_name(
+        &self,
+        doc: &Document,
+        position: Position,
+    ) -> Option<String> {
+        let text = doc.text();
+        let lines: Vec<&str> = text.lines().collect();
+        let current_line = position.line as usize;
+
+        let mut brace_depth = 0;
+
+        for line_idx in (0..=current_line).rev() {
+            let line = lines.get(line_idx).unwrap_or(&"");
+            let trimmed = line.trim();
+
+            for ch in trimmed.chars() {
+                if ch == '}' {
+                    brace_depth += 1;
+                } else if ch == '{' {
+                    if brace_depth > 0 {
+                        brace_depth -= 1;
+                    } else {
+                        // Found opening brace. Check if it's a module call.
+                        let provider_prefixes: Vec<&str> = self
+                            .schemas
+                            .keys()
+                            .filter_map(|k| k.split('.').next())
+                            .collect();
+                        let starts_with_provider = provider_prefixes
+                            .iter()
+                            .any(|p| trimmed.starts_with(&format!("{}.", p)));
+
+                        if !trimmed.starts_with("let ")
+                            && !starts_with_provider
+                            && !trimmed.starts_with("provider ")
+                            && !trimmed.starts_with("arguments ")
+                            && !trimmed.starts_with("attributes ")
+                            && trimmed.ends_with('{')
+                        {
+                            // Extract module name (first word before '{')
+                            let name = trimmed.split_whitespace().next()?;
+                            return Some(name.to_string());
+                        }
+                        return None;
+                    }
+                }
+            }
+        }
+
+        None
     }
 
     fn resource_type_hover(&self, word: &str) -> Option<Hover> {
@@ -733,5 +876,116 @@ awscc.ec2.vpc_gateway_attachment {
                 name
             );
         }
+    }
+
+    #[test]
+    fn test_module_argument_hover_with_description() {
+        use carina_core::parser::{ArgumentParameter, TypeExpr};
+
+        let provider = HoverProvider::new(Arc::new(HashMap::new()), vec![]);
+        let arg = ArgumentParameter {
+            name: "vpc".to_string(),
+            type_expr: TypeExpr::Ref(carina_core::parser::ResourceTypePath::new(
+                "awscc", "ec2.vpc",
+            )),
+            default: None,
+            description: Some("The VPC to deploy into".to_string()),
+        };
+
+        let hover = provider
+            .build_module_argument_hover(&arg, "web_tier")
+            .expect("Should produce hover");
+
+        let content = match &hover.contents {
+            HoverContents::Markup(m) => &m.value,
+            _ => panic!("Expected markup content"),
+        };
+
+        assert!(
+            content.contains("web_tier.vpc"),
+            "Should show module.arg name, got:\n{}",
+            content
+        );
+        assert!(
+            content.contains("The VPC to deploy into"),
+            "Should show description, got:\n{}",
+            content
+        );
+        assert!(
+            content.contains("awscc.ec2.vpc"),
+            "Should show type, got:\n{}",
+            content
+        );
+        assert!(
+            content.contains("Required"),
+            "Should show required, got:\n{}",
+            content
+        );
+    }
+
+    #[test]
+    fn test_module_argument_hover_with_default() {
+        use carina_core::parser::{ArgumentParameter, TypeExpr};
+
+        let provider = HoverProvider::new(Arc::new(HashMap::new()), vec![]);
+        let arg = ArgumentParameter {
+            name: "port".to_string(),
+            type_expr: TypeExpr::Int,
+            default: Some(Value::Int(8080)),
+            description: Some("Web server port".to_string()),
+        };
+
+        let hover = provider
+            .build_module_argument_hover(&arg, "web_tier")
+            .expect("Should produce hover");
+
+        let content = match &hover.contents {
+            HoverContents::Markup(m) => &m.value,
+            _ => panic!("Expected markup content"),
+        };
+
+        assert!(
+            content.contains("Web server port"),
+            "Should show description, got:\n{}",
+            content
+        );
+        assert!(
+            content.contains("8080"),
+            "Should show default value, got:\n{}",
+            content
+        );
+    }
+
+    #[test]
+    fn test_module_argument_hover_without_description() {
+        use carina_core::parser::{ArgumentParameter, TypeExpr};
+
+        let provider = HoverProvider::new(Arc::new(HashMap::new()), vec![]);
+        let arg = ArgumentParameter {
+            name: "env".to_string(),
+            type_expr: TypeExpr::String,
+            default: None,
+            description: None,
+        };
+
+        let hover = provider
+            .build_module_argument_hover(&arg, "web_tier")
+            .expect("Should produce hover");
+
+        let content = match &hover.contents {
+            HoverContents::Markup(m) => &m.value,
+            _ => panic!("Expected markup content"),
+        };
+
+        assert!(
+            content.contains("web_tier.env"),
+            "Should show module.arg name, got:\n{}",
+            content
+        );
+        assert!(
+            content.contains("string"),
+            "Should show type, got:\n{}",
+            content
+        );
     }
 }
