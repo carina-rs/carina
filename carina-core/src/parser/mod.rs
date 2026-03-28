@@ -2088,17 +2088,20 @@ fn resolve_forward_ref_in_value(
 ) -> Value {
     match value {
         Value::String(ref s) => {
-            // A dotted string like "vpc.vpc_id" may be a forward reference that
-            // was stored as a string during single-pass parsing. Resolve it to
-            // ResourceRef if the first segment is a known resource binding.
-            if let Some((name, member)) = s.split_once('.')
-                && !member.contains('.')
-                && resource_bindings.contains_key(name)
-            {
+            // A dotted string like "vpc.vpc_id" or "vpc.attr.nested" may be a
+            // forward reference that was stored as a string during single-pass
+            // parsing. Resolve it to ResourceRef if the first segment is a known
+            // resource binding. Parts after the second become field_path.
+            let parts: Vec<&str> = s.splitn(3, '.').collect();
+            if parts.len() >= 2 && resource_bindings.contains_key(parts[0]) {
+                let field_path = parts
+                    .get(2)
+                    .map(|rest| rest.split('.').map(|s| s.to_string()).collect())
+                    .unwrap_or_default();
                 return Value::ResourceRef {
-                    binding_name: name.to_string(),
-                    attribute_name: member.to_string(),
-                    field_path: vec![],
+                    binding_name: parts[0].to_string(),
+                    attribute_name: parts[1].to_string(),
+                    field_path,
                 };
             }
             value
@@ -3834,6 +3837,62 @@ aws.s3.bucket {
         } else {
             panic!("Expected tags to be a list");
         }
+    }
+
+    #[test]
+    fn forward_reference_chained_three_parts() {
+        // Issue #1259: Chained forward references like "later.attr.nested" should
+        // be resolved to ResourceRef with field_path, not left as a plain string.
+        let input = r#"
+            let subnet = awscc.ec2.subnet {
+                vpc_id     = vpc.encryption_specification.status
+                cidr_block = "10.0.1.0/24"
+            }
+
+            let vpc = awscc.ec2.vpc {
+                cidr_block = "10.0.0.0/16"
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+        let subnet = &result.resources[0];
+        assert_eq!(
+            subnet.attributes.get("vpc_id"),
+            Some(&Value::ResourceRef {
+                binding_name: "vpc".to_string(),
+                attribute_name: "encryption_specification".to_string(),
+                field_path: vec!["status".to_string()],
+            }),
+            "Chained forward reference should be parsed as ResourceRef with field_path"
+        );
+    }
+
+    #[test]
+    fn forward_reference_chained_four_parts() {
+        // Issue #1259: Deep chained forward references like "later.attr.deep.nested"
+        // should be resolved to ResourceRef with multiple field_path entries.
+        let input = r#"
+            let subnet = awscc.ec2.subnet {
+                vpc_id     = vpc.config.deep.nested
+                cidr_block = "10.0.1.0/24"
+            }
+
+            let vpc = awscc.ec2.vpc {
+                cidr_block = "10.0.0.0/16"
+            }
+        "#;
+
+        let result = parse(input).unwrap();
+        let subnet = &result.resources[0];
+        assert_eq!(
+            subnet.attributes.get("vpc_id"),
+            Some(&Value::ResourceRef {
+                binding_name: "vpc".to_string(),
+                attribute_name: "config".to_string(),
+                field_path: vec!["deep".to_string(), "nested".to_string()],
+            }),
+            "Deep chained forward reference should have multiple field_path entries"
+        );
     }
 
     #[test]
