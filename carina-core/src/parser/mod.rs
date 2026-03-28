@@ -1792,8 +1792,7 @@ fn check_fn_arg_type(
                     || actual_type != &expected_path.resource_type
                 {
                     return Err(ParseError::UserFunctionError(format!(
-                        "function '{fn_name}': parameter '{param_name}' expects resource type '{expected_path}', \
-                                 got {actual_provider}.{actual_type}"
+                        "function '{fn_name}': parameter '{param_name}' expects resource type '{expected_path}', got {actual_provider}.{actual_type}"
                     )));
                 }
             }
@@ -7446,7 +7445,7 @@ aws.s3.bucket {
         let err = parse(input).unwrap_err();
         let msg = format!("{err}");
         assert!(
-            msg.contains("invalid") || msg.contains("cidr"),
+            msg.contains("type 'cidr' validation failed"),
             "Expected cidr validation error, got: {msg}"
         );
     }
@@ -7476,7 +7475,7 @@ aws.s3.bucket {
         let err = parse(input).unwrap_err();
         let msg = format!("{err}");
         assert!(
-            msg.contains("invalid") || msg.contains("ipv4_address"),
+            msg.contains("type 'ipv4_address' validation failed"),
             "Expected ipv4_address validation error, got: {msg}"
         );
     }
@@ -7506,7 +7505,7 @@ aws.s3.bucket {
         let err = parse(input).unwrap_err();
         let msg = format!("{err}");
         assert!(
-            msg.contains("invalid") || msg.contains("ipv6"),
+            msg.contains("type 'ipv6_cidr' validation failed"),
             "Expected ipv6_cidr validation error, got: {msg}"
         );
     }
@@ -7536,7 +7535,7 @@ aws.s3.bucket {
         let err = parse(input).unwrap_err();
         let msg = format!("{err}");
         assert!(
-            msg.contains("invalid") || msg.contains("ipv6"),
+            msg.contains("type 'ipv6_address' validation failed"),
             "Expected ipv6_address validation error, got: {msg}"
         );
     }
@@ -7600,7 +7599,7 @@ aws.s3.bucket {
         let err = parse(input).unwrap_err();
         let msg = format!("{err}");
         assert!(
-            msg.contains("invalid") || msg.contains("cidr"),
+            msg.contains("return type 'cidr' validation failed"),
             "Expected cidr validation error, got: {msg}"
         );
     }
@@ -7617,7 +7616,7 @@ aws.s3.bucket {
         let err = parse(input).unwrap_err();
         let msg = format!("{err}");
         assert!(
-            msg.contains("invalid") || msg.contains("ipv4_address"),
+            msg.contains("return type 'ipv4_address' validation failed"),
             "Expected ipv4_address validation error, got: {msg}"
         );
     }
@@ -7634,7 +7633,7 @@ aws.s3.bucket {
         let err = parse(input).unwrap_err();
         let msg = format!("{err}");
         assert!(
-            msg.contains("invalid") || msg.contains("ipv6"),
+            msg.contains("return type 'ipv6_cidr' validation failed"),
             "Expected ipv6_cidr validation error, got: {msg}"
         );
     }
@@ -7651,7 +7650,7 @@ aws.s3.bucket {
         let err = parse(input).unwrap_err();
         let msg = format!("{err}");
         assert!(
-            msg.contains("invalid") || msg.contains("ipv6"),
+            msg.contains("return type 'ipv6_address' validation failed"),
             "Expected ipv6_address validation error, got: {msg}"
         );
     }
@@ -7697,7 +7696,8 @@ aws.s3.bucket {
         let err = parse(input).unwrap_err();
         let msg = format!("{err}");
         assert!(
-            msg.contains("ec2.vpc") || msg.contains("type mismatch"),
+            msg.contains("expects resource type 'awscc.ec2.vpc'")
+                && msg.contains("got awscc.ec2.security_group"),
             "Expected resource type mismatch error, got: {msg}"
         );
     }
