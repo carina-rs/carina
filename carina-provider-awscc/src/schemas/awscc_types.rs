@@ -6,6 +6,9 @@
 
 pub use carina_aws_types::*;
 
+use std::collections::HashMap;
+
+use carina_core::parser::ValidatorFn;
 use carina_core::resource::Value;
 use carina_core::schema::{AttributeType, ResourceSchema};
 use carina_core::utils::{extract_enum_value, validate_enum_namespace};
@@ -106,6 +109,27 @@ pub fn availability_zone() -> AttributeType {
 
 // iam_policy_document() and validate_iam_policy_document() are provided by
 // `pub use carina_aws_types::*` above
+
+/// Build a map of AWS-specific type validators for registration in ProviderContext.
+///
+/// These validators are called by the parser when it encounters custom type annotations
+/// (e.g., `fn f(x: arn) { ... }; f("arn:aws:s3:::my-bucket")`).
+pub fn awscc_validators() -> HashMap<String, ValidatorFn> {
+    let mut m: HashMap<String, ValidatorFn> = HashMap::new();
+    m.insert(
+        "arn".to_string(),
+        Box::new(validate_arn as fn(&str) -> Result<(), String>),
+    );
+    m.insert(
+        "availability_zone".to_string(),
+        Box::new(validate_availability_zone as fn(&str) -> Result<(), String>),
+    );
+    m.insert(
+        "aws_resource_id".to_string(),
+        Box::new(validate_aws_resource_id as fn(&str) -> Result<(), String>),
+    );
+    m
+}
 
 #[cfg(test)]
 mod tests {
@@ -226,5 +250,64 @@ mod tests {
             .collect(),
         );
         assert!(validate_iam_policy_document(&doc).is_ok());
+    }
+
+    // --- awscc_validators() tests ---
+
+    #[test]
+    fn awscc_validators_contains_expected_keys() {
+        let validators = awscc_validators();
+        assert!(validators.contains_key("arn"));
+        assert!(validators.contains_key("availability_zone"));
+        assert!(validators.contains_key("aws_resource_id"));
+        assert_eq!(validators.len(), 3);
+    }
+
+    #[test]
+    fn awscc_validators_arn_accepts_valid() {
+        let validators = awscc_validators();
+        let validate = validators.get("arn").unwrap();
+        assert!(validate("arn:aws:s3:::my-bucket").is_ok());
+        assert!(validate("arn:aws:iam::123456789012:role/my-role").is_ok());
+    }
+
+    #[test]
+    fn awscc_validators_arn_rejects_invalid() {
+        let validators = awscc_validators();
+        let validate = validators.get("arn").unwrap();
+        assert!(validate("not-an-arn").is_err());
+        assert!(validate("arn:aws:s3").is_err());
+    }
+
+    #[test]
+    fn awscc_validators_availability_zone_accepts_valid() {
+        let validators = awscc_validators();
+        let validate = validators.get("availability_zone").unwrap();
+        assert!(validate("us-east-1a").is_ok());
+        assert!(validate("ap-northeast-1c").is_ok());
+    }
+
+    #[test]
+    fn awscc_validators_availability_zone_rejects_invalid() {
+        let validators = awscc_validators();
+        let validate = validators.get("availability_zone").unwrap();
+        assert!(validate("us-east-1").is_err()); // region, not AZ
+        assert!(validate("invalid").is_err());
+    }
+
+    #[test]
+    fn awscc_validators_aws_resource_id_accepts_valid() {
+        let validators = awscc_validators();
+        let validate = validators.get("aws_resource_id").unwrap();
+        assert!(validate("vpc-1a2b3c4d5e6f7890a").is_ok());
+        assert!(validate("subnet-0123456789abcdef0").is_ok());
+    }
+
+    #[test]
+    fn awscc_validators_aws_resource_id_rejects_invalid() {
+        let validators = awscc_validators();
+        let validate = validators.get("aws_resource_id").unwrap();
+        assert!(validate("not-a-resource-id").is_err());
+        assert!(validate("vpc-short").is_err());
     }
 }

@@ -7873,4 +7873,71 @@ aws.s3.bucket {
             "Expected validation error, got: {msg}"
         );
     }
+
+    #[test]
+    fn parse_provider_validator_arn_accepts_valid() {
+        use std::collections::HashMap;
+        let mut validators: HashMap<String, ValidatorFn> = HashMap::new();
+        validators.insert(
+            "arn".to_string(),
+            Box::new(|s: &str| -> Result<(), String> {
+                if s.starts_with("arn:") {
+                    Ok(())
+                } else {
+                    Err(format!("not an ARN: {s}"))
+                }
+            }),
+        );
+        let config = ProviderContext {
+            decryptor: None,
+            validators,
+        };
+
+        let result = validate_custom_type(
+            "arn",
+            &Value::String("arn:aws:s3:::my-bucket".to_string()),
+            &config,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn parse_provider_validator_arn_rejects_invalid() {
+        use std::collections::HashMap;
+        let mut validators: HashMap<String, ValidatorFn> = HashMap::new();
+        validators.insert(
+            "arn".to_string(),
+            Box::new(|s: &str| -> Result<(), String> {
+                if s.starts_with("arn:") {
+                    Ok(())
+                } else {
+                    Err(format!("not an ARN: {s}"))
+                }
+            }),
+        );
+        let config = ProviderContext {
+            decryptor: None,
+            validators,
+        };
+
+        let result = validate_custom_type("arn", &Value::String("not-an-arn".to_string()), &config);
+        assert!(result.is_err());
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("not an ARN"),
+            "Expected ARN validation error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn parse_provider_validator_not_called_without_registration() {
+        // Without registering a validator, unknown types pass validation (permissive)
+        let config = ProviderContext::default();
+
+        let result = validate_custom_type("arn", &Value::String("anything".to_string()), &config);
+        assert!(
+            result.is_ok(),
+            "Unknown types without validators should pass"
+        );
+    }
 }

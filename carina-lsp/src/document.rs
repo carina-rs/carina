@@ -37,7 +37,11 @@ impl Document {
 
     fn reparse(&mut self) {
         let text = self.content.to_string();
-        match parse(&text, &ProviderContext::default()) {
+        let ctx = ProviderContext {
+            decryptor: None,
+            validators: carina_provider_awscc::schemas::awscc_types::awscc_validators(),
+        };
+        match parse(&text, &ctx) {
             Ok(parsed) => {
                 self.parsed = Some(parsed);
                 self.parse_error = None;
