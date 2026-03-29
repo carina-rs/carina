@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use carina_core::provider::{ProviderError, ProviderResult};
 use carina_core::resource::{Resource, ResourceId, State, Value};
-use carina_core::utils::{extract_enum_value, extract_enum_value_with_values};
+use carina_core::utils::extract_enum_value;
 
 use crate::AwsProvider;
 
@@ -93,9 +93,14 @@ impl AwsProvider {
         if let Some(Value::String(log_dest_type)) = resource.attributes.get("log_destination_type")
         {
             use aws_sdk_ec2::types::LogDestinationType;
-            let valid = &["cloud-watch-logs", "s3", "kinesis-data-firehose"];
-            let ldt =
-                LogDestinationType::from(extract_enum_value_with_values(log_dest_type, valid));
+            let raw = extract_enum_value(log_dest_type);
+            // Map DSL snake_case enum values back to API hyphenated format
+            let api_value = match raw {
+                "cloud_watch_logs" => "cloud-watch-logs",
+                "kinesis_data_firehose" => "kinesis-data-firehose",
+                other => other,
+            };
+            let ldt = LogDestinationType::from(api_value);
             req = req.log_destination_type(ldt);
         }
 
@@ -145,10 +150,13 @@ impl AwsProvider {
             let resp = match req.clone().send().await {
                 Ok(resp) => resp,
                 Err(e) => {
-                    let err_str = format!("{}", e);
-                    // IAM propagation or authorization error — will retry
+                    let err_str = format!("{:?}", e);
                     last_error = err_str.clone();
-                    if err_str.contains("Unable to assume") || err_str.contains("Not authorized") {
+                    // Retry on IAM propagation errors (check both Display and Debug output)
+                    if err_str.contains("Unable to assume")
+                        || err_str.contains("Not authorized")
+                        || err_str.contains("Access Denied")
+                    {
                         continue;
                     }
                     return Err(ProviderError::new("Failed to create flow logs")
@@ -163,9 +171,14 @@ impl AwsProvider {
                     .error()
                     .and_then(|e| e.message())
                     .unwrap_or("unknown error");
-                last_error = msg.to_string();
+                let code = err.error().and_then(|e| e.code()).unwrap_or("");
+                last_error = format!("{} ({})", msg, code);
                 // Retry on IAM propagation errors
-                if msg.contains("Unable to assume IAM role") || msg.contains("Not authorized") {
+                if msg.contains("Unable to assume IAM role")
+                    || msg.contains("Not authorized")
+                    || msg.contains("Access Denied")
+                    || code == "403"
+                {
                     continue;
                 }
                 return Err(
