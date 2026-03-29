@@ -2,37 +2,13 @@
 
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
-use ratatui::buffer::Buffer;
 
 use carina_core::module::FileSignature;
 use carina_core::parser::{ProviderContext, parse};
 
 use crate::module_info_app::ModuleInfoApp;
 use crate::module_info_ui::draw;
-
-/// Convert a ratatui Buffer to a string, trimming trailing whitespace per line.
-fn buffer_to_string(buffer: &Buffer) -> String {
-    let mut output = String::new();
-    for y in 0..buffer.area.height {
-        for x in 0..buffer.area.width {
-            output.push(
-                buffer
-                    .cell((x, y))
-                    .unwrap()
-                    .symbol()
-                    .chars()
-                    .next()
-                    .unwrap_or(' '),
-            );
-        }
-        output.push('\n');
-    }
-    output
-        .lines()
-        .map(|l| l.trim_end())
-        .collect::<Vec<_>>()
-        .join("\n")
-}
+use crate::test_utils::buffer_to_string;
 
 /// Render the module info TUI into a string.
 fn render_module_info(signature: &FileSignature, width: u16, height: u16) -> String {

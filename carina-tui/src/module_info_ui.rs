@@ -3,7 +3,8 @@
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
 
-use crate::module_info_app::{FocusedPanel, ModuleInfoApp, SectionKind};
+use crate::app::FocusedPanel;
+use crate::module_info_app::{ModuleInfoApp, SectionKind};
 
 /// Draw the main layout: tree (70%), detail panel (30%), help bar (1 line)
 pub fn draw(frame: &mut Frame, app: &mut ModuleInfoApp) {
@@ -31,12 +32,13 @@ fn draw_tree(frame: &mut Frame, app: &mut ModuleInfoApp, area: Rect) {
         Style::default().fg(Color::DarkGray)
     };
 
+    let selected = app.selected();
     let items: Vec<ListItem> = app
         .rows
         .iter()
         .enumerate()
         .map(|(idx, row)| {
-            let is_selected = idx == app.selected;
+            let is_selected = idx == selected;
             build_list_item(row, is_selected)
         })
         .collect();
@@ -78,21 +80,18 @@ fn build_list_item(row: &crate::module_info_app::InfoRow, is_selected: bool) -> 
         }
         SectionKind::Argument => {
             let mut s = vec![
-                Span::raw(indent.clone()),
+                Span::raw(indent),
                 Span::styled(row.label.clone(), Style::default().fg(Color::White)),
                 Span::raw(": "),
                 Span::styled(row.type_info.clone(), Style::default().fg(Color::Yellow)),
             ];
-            if row.detail.contains("required") {
+            if row.required {
                 s.push(Span::styled(
                     "  (required)",
                     Style::default().fg(Color::Red),
                 ));
             }
-            if row.detail.contains("default:")
-                && let Some(default_part) = row.detail.split("default: ").nth(1)
-            {
-                let default_val = default_part.split(" | ").next().unwrap_or(default_part);
+            if let Some(default_val) = &row.default_value {
                 s.push(Span::styled(
                     format!(" = {}", default_val),
                     Style::default().fg(Color::Green),

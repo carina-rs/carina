@@ -12,6 +12,8 @@ mod ui;
 #[cfg(test)]
 mod module_info_tui_snapshot_tests;
 #[cfg(test)]
+mod test_utils;
+#[cfg(test)]
 mod tui_snapshot_tests;
 
 use std::collections::HashMap;
@@ -176,37 +178,8 @@ pub fn handle_module_info_key(app: &mut ModuleInfoApp, code: KeyCode) -> KeyActi
 
 /// Run the module info TUI with the given file signature.
 pub fn run_module_info(signature: &FileSignature) -> io::Result<()> {
-    terminal::enable_raw_mode()?;
-    io::stdout().execute(EnterAlternateScreen)?;
-    let backend = CrosstermBackend::new(io::stdout());
-    let mut terminal = Terminal::new(backend)?;
-
     let mut app = ModuleInfoApp::new(signature);
-    let result = run_module_info_loop(&mut terminal, &mut app);
-
-    terminal::disable_raw_mode()?;
-    execute!(io::stdout(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
-
-    result
-}
-
-fn run_module_info_loop(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    app: &mut ModuleInfoApp,
-) -> io::Result<()> {
-    loop {
-        terminal.draw(|frame| module_info_ui::draw(frame, app))?;
-
-        if let Event::Key(key) = event::read()? {
-            if key.kind != KeyEventKind::Press {
-                continue;
-            }
-            if handle_module_info_key(app, key.code) == KeyAction::Quit {
-                return Ok(());
-            }
-        }
-    }
+    run_tui(module_info_ui::draw, handle_module_info_key, &mut app)
 }
 
 /// Run the TUI with the given plan and optional schemas.
@@ -214,41 +187,40 @@ fn run_module_info_loop(
 /// When schemas are provided, the detail panel shows read-only attributes
 /// with `(known after apply)` and default values with `# default`,
 /// matching CLI `--detail full` behavior.
-///
-/// Takes ownership of the terminal, displays the interactive plan viewer,
-/// and restores the terminal on exit.
 pub fn run(plan: &Plan, schemas: &HashMap<String, ResourceSchema>) -> io::Result<()> {
+    let mut app = App::new(plan, schemas);
+    run_tui(ui::draw, handle_key, &mut app)
+}
+
+fn run_tui<A>(
+    draw_fn: impl Fn(&mut ratatui::Frame, &mut A),
+    key_fn: impl Fn(&mut A, KeyCode) -> KeyAction,
+    app: &mut A,
+) -> io::Result<()> {
     terminal::enable_raw_mode()?;
     io::stdout().execute(EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
 
-    let mut app = App::new(plan, schemas);
-    let result = run_loop(&mut terminal, &mut app);
+    let result = (|| {
+        loop {
+            terminal.draw(|frame| draw_fn(frame, app))?;
+            if let Event::Key(key) = event::read()? {
+                if key.kind != KeyEventKind::Press {
+                    continue;
+                }
+                if key_fn(app, key.code) == KeyAction::Quit {
+                    return Ok(());
+                }
+            }
+        }
+    })();
 
     terminal::disable_raw_mode()?;
     execute!(io::stdout(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
 
     result
-}
-
-fn run_loop(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    app: &mut App,
-) -> io::Result<()> {
-    loop {
-        terminal.draw(|frame| ui::draw(frame, app))?;
-
-        if let Event::Key(key) = event::read()? {
-            if key.kind != KeyEventKind::Press {
-                continue;
-            }
-            if handle_key(app, key.code) == KeyAction::Quit {
-                return Ok(());
-            }
-        }
-    }
 }
 
 #[cfg(test)]
@@ -921,24 +893,24 @@ mod tests {
     #[test]
     fn module_info_navigation() {
         let mut app = make_module_info_app();
-        assert_eq!(app.selected, 0);
+        assert_eq!(app.selected(), 0);
         handle_module_info_key(&mut app, KeyCode::Down);
-        assert_eq!(app.selected, 1);
+        assert_eq!(app.selected(), 1);
         handle_module_info_key(&mut app, KeyCode::Up);
-        assert_eq!(app.selected, 0);
+        assert_eq!(app.selected(), 0);
         handle_module_info_key(&mut app, KeyCode::Char('j'));
-        assert_eq!(app.selected, 1);
+        assert_eq!(app.selected(), 1);
         handle_module_info_key(&mut app, KeyCode::Char('k'));
-        assert_eq!(app.selected, 0);
+        assert_eq!(app.selected(), 0);
     }
 
     #[test]
     fn module_info_tab_toggles_focus() {
         let mut app = make_module_info_app();
-        assert_eq!(app.focused_panel, module_info_app::FocusedPanel::Tree);
+        assert_eq!(app.focused_panel, FocusedPanel::Tree);
         handle_module_info_key(&mut app, KeyCode::Tab);
-        assert_eq!(app.focused_panel, module_info_app::FocusedPanel::Detail);
+        assert_eq!(app.focused_panel, FocusedPanel::Detail);
         handle_module_info_key(&mut app, KeyCode::Tab);
-        assert_eq!(app.focused_panel, module_info_app::FocusedPanel::Tree);
+        assert_eq!(app.focused_panel, FocusedPanel::Tree);
     }
 }
