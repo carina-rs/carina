@@ -17,6 +17,47 @@ use carina_core::provider::ProviderFactory;
 use carina_core::resource::Value;
 use carina_core::schema::ResourceSchema;
 
+/// Create a `Diagnostic` on a single line with the standard "carina" source.
+pub(crate) fn carina_diagnostic(
+    line: u32,
+    start_col: u32,
+    end_col: u32,
+    severity: DiagnosticSeverity,
+    message: String,
+) -> Diagnostic {
+    Diagnostic {
+        range: Range {
+            start: Position {
+                line,
+                character: start_col,
+            },
+            end: Position {
+                line,
+                character: end_col,
+            },
+        },
+        severity: Some(severity),
+        source: Some("carina".to_string()),
+        message,
+        ..Default::default()
+    }
+}
+
+/// Create a `Diagnostic` with an arbitrary `Range` and the standard "carina" source.
+pub(crate) fn carina_diagnostic_range(
+    range: Range,
+    severity: DiagnosticSeverity,
+    message: String,
+) -> Diagnostic {
+    Diagnostic {
+        range,
+        severity: Some(severity),
+        source: Some("carina".to_string()),
+        message,
+        ..Default::default()
+    }
+}
+
 pub struct DiagnosticEngine {
     schemas: Arc<HashMap<String, ResourceSchema>>,
     provider_names: Vec<String>,
@@ -84,28 +125,20 @@ impl DiagnosticEngine {
                     if let Some((line, col)) =
                         self.find_resource_position(doc, &resource.id.resource_type)
                     {
-                        diagnostics.push(Diagnostic {
-                            range: Range {
-                                start: Position {
-                                    line,
-                                    character: col,
-                                },
-                                end: Position {
-                                    line,
-                                    character: col
-                                        + resource.id.resource_type.len() as u32
-                                        + provider.len() as u32
-                                        + 1, // "provider." prefix
-                                },
-                            },
-                            severity: Some(DiagnosticSeverity::ERROR),
-                            source: Some("carina".to_string()),
-                            message: format!(
+                        let end_col = col
+                            + resource.id.resource_type.len() as u32
+                            + provider.len() as u32
+                            + 1; // "provider." prefix
+                        diagnostics.push(carina_diagnostic(
+                            line,
+                            col,
+                            end_col,
+                            DiagnosticSeverity::ERROR,
+                            format!(
                                 "Unknown resource type: {}.{}",
                                 provider, resource.id.resource_type
                             ),
-                            ..Default::default()
-                        });
+                        ));
                     }
                 }
 
@@ -118,28 +151,20 @@ impl DiagnosticEngine {
                         && let Some((line, col)) =
                             self.find_resource_position(doc, &resource.id.resource_type)
                     {
-                        diagnostics.push(Diagnostic {
-                            range: Range {
-                                start: Position {
-                                    line,
-                                    character: col,
-                                },
-                                end: Position {
-                                    line,
-                                    character: col
-                                        + resource.id.resource_type.len() as u32
-                                        + provider.len() as u32
-                                        + 1,
-                                },
-                            },
-                            severity: Some(DiagnosticSeverity::ERROR),
-                            source: Some("carina".to_string()),
-                            message: format!(
+                        let end_col = col
+                            + resource.id.resource_type.len() as u32
+                            + provider.len() as u32
+                            + 1;
+                        diagnostics.push(carina_diagnostic(
+                            line,
+                            col,
+                            end_col,
+                            DiagnosticSeverity::ERROR,
+                            format!(
                                 "{} is a data source and must be used with the `read` keyword:\n  let <name> = read {} {{ }}",
                                 full_resource_type, full_resource_type
                             ),
-                            ..Default::default()
-                        });
+                        ));
                     }
                 }
                 if let Some(schema) = schema {
@@ -165,25 +190,16 @@ impl DiagnosticEngine {
                         {
                             if let Some((line, col)) = self.find_attribute_position(doc, attr_name)
                             {
-                                diagnostics.push(Diagnostic {
-                                    range: Range {
-                                        start: Position {
-                                            line,
-                                            character: col,
-                                        },
-                                        end: Position {
-                                            line,
-                                            character: col + attr_name.len() as u32,
-                                        },
-                                    },
-                                    severity: Some(DiagnosticSeverity::ERROR),
-                                    source: Some("carina".to_string()),
-                                    message: format!(
+                                diagnostics.push(carina_diagnostic(
+                                    line,
+                                    col,
+                                    col + attr_name.len() as u32,
+                                    DiagnosticSeverity::ERROR,
+                                    format!(
                                         "Cannot use both '{}' and '{}' (they refer to the same attribute)",
                                         attr_name, canon
                                     ),
-                                    ..Default::default()
-                                });
+                                ));
                             }
                             continue;
                         }
@@ -201,25 +217,16 @@ impl DiagnosticEngine {
                                         String::new()
                                     };
 
-                                diagnostics.push(Diagnostic {
-                                    range: Range {
-                                        start: Position {
-                                            line,
-                                            character: col,
-                                        },
-                                        end: Position {
-                                            line,
-                                            character: col + attr_name.len() as u32,
-                                        },
-                                    },
-                                    severity: Some(DiagnosticSeverity::WARNING),
-                                    source: Some("carina".to_string()),
-                                    message: format!(
+                                diagnostics.push(carina_diagnostic(
+                                    line,
+                                    col,
+                                    col + attr_name.len() as u32,
+                                    DiagnosticSeverity::WARNING,
+                                    format!(
                                         "Unknown attribute '{}' for resource type '{}'{}",
                                         attr_name, resource.id.resource_type, suggestion
                                     ),
-                                    ..Default::default()
-                                });
+                                ));
                             }
                             continue;
                         }
@@ -239,25 +246,16 @@ impl DiagnosticEngine {
                                 let block_positions =
                                     self.find_all_block_positions(doc, search_name);
                                 for pos in &block_positions {
-                                    diagnostics.push(Diagnostic {
-                                        range: Range {
-                                            start: Position {
-                                                line: pos.0,
-                                                character: pos.1,
-                                            },
-                                            end: Position {
-                                                line: pos.0,
-                                                character: pos.1 + search_name.len() as u32,
-                                            },
-                                        },
-                                        severity: Some(DiagnosticSeverity::ERROR),
-                                        source: Some("carina".to_string()),
-                                        message: format!(
+                                    diagnostics.push(carina_diagnostic(
+                                        pos.0,
+                                        pos.1,
+                                        pos.1 + search_name.len() as u32,
+                                        DiagnosticSeverity::ERROR,
+                                        format!(
                                             "'{}' cannot use block syntax; use map assignment: {} = {{ ... }}",
                                             search_name, search_name
                                         ),
-                                        ..Default::default()
-                                    });
+                                    ));
                                 }
                             }
 
@@ -407,22 +405,13 @@ impl DiagnosticEngine {
                                 && let Some((line, col)) =
                                     self.find_attribute_position(doc, attr_name)
                             {
-                                diagnostics.push(Diagnostic {
-                                    range: Range {
-                                        start: Position {
-                                            line,
-                                            character: col,
-                                        },
-                                        end: Position {
-                                            line,
-                                            character: col + attr_name.len() as u32,
-                                        },
-                                    },
-                                    severity: Some(DiagnosticSeverity::WARNING),
-                                    source: Some("carina".to_string()),
+                                diagnostics.push(carina_diagnostic(
+                                    line,
+                                    col,
+                                    col + attr_name.len() as u32,
+                                    DiagnosticSeverity::WARNING,
                                     message,
-                                    ..Default::default()
-                                });
+                                ));
                             }
 
                             // Struct field validation
@@ -471,19 +460,17 @@ impl DiagnosticEngine {
                             if let Some((line, _col)) =
                                 self.find_resource_position(doc, &resource.id.resource_type)
                             {
-                                diagnostics.push(Diagnostic {
-                                    range: Range {
+                                diagnostics.push(carina_diagnostic_range(
+                                    Range {
                                         start: Position { line, character: 0 },
                                         end: Position {
                                             line: line + 1,
                                             character: 0,
                                         },
                                     },
-                                    severity: Some(DiagnosticSeverity::ERROR),
-                                    source: Some("carina".to_string()),
-                                    message: error.to_string(),
-                                    ..Default::default()
-                                });
+                                    DiagnosticSeverity::ERROR,
+                                    error.to_string(),
+                                ));
                             }
                         }
                     }
@@ -540,25 +527,16 @@ impl DiagnosticEngine {
                 let line_text = text.lines().nth(dup.line - 1)?;
                 let col = position::leading_whitespace_chars(line_text);
 
-                Some(Diagnostic {
-                    range: Range {
-                        start: Position {
-                            line,
-                            character: col,
-                        },
-                        end: Position {
-                            line,
-                            character: col + dup.name.len() as u32,
-                        },
-                    },
-                    severity: Some(DiagnosticSeverity::WARNING),
-                    source: Some("carina".to_string()),
-                    message: format!(
+                Some(carina_diagnostic(
+                    line,
+                    col,
+                    col + dup.name.len() as u32,
+                    DiagnosticSeverity::WARNING,
+                    format!(
                         "Duplicate attribute '{}' (first defined on line {}). The last value will be used.",
                         dup.name, dup.first_line
                     ),
-                    ..Default::default()
-                })
+                ))
             })
             .collect()
     }
@@ -577,25 +555,16 @@ impl DiagnosticEngine {
                 let byte_pos = line_text.find(&pattern)?;
                 let col = position::byte_offset_to_char_offset(line_text, byte_pos);
 
-                Some(Diagnostic {
-                    range: Range {
-                        start: Position {
-                            line,
-                            character: col,
-                        },
-                        end: Position {
-                            line,
-                            character: col + pw.name.len() as u32,
-                        },
-                    },
-                    severity: Some(DiagnosticSeverity::INFORMATION),
-                    source: Some("carina".to_string()),
-                    message: format!(
+                Some(carina_diagnostic(
+                    line,
+                    col,
+                    col + pw.name.len() as u32,
+                    DiagnosticSeverity::INFORMATION,
+                    format!(
                         "Consider using pipe form for '{}': data |> {}(...)",
                         pw.name, pw.name
                     ),
-                    ..Default::default()
-                })
+                ))
             })
             .collect()
     }
@@ -614,25 +583,16 @@ impl DiagnosticEngine {
                 let byte_pos = line_text.find(&nw.name)?;
                 let col = position::byte_offset_to_char_offset(line_text, byte_pos);
 
-                Some(Diagnostic {
-                    range: Range {
-                        start: Position {
-                            line,
-                            character: col,
-                        },
-                        end: Position {
-                            line,
-                            character: col + nw.name.len() as u32,
-                        },
-                    },
-                    severity: Some(DiagnosticSeverity::INFORMATION),
-                    source: Some("carina".to_string()),
-                    message: format!(
+                Some(carina_diagnostic(
+                    line,
+                    col,
+                    col + nw.name.len() as u32,
+                    DiagnosticSeverity::INFORMATION,
+                    format!(
                         "Binding '{}' is not snake_case. Use snake_case for binding names (e.g., 'my_resource').",
                         nw.name
                     ),
-                    ..Default::default()
-                })
+                ))
             })
             .collect()
     }
@@ -708,106 +668,63 @@ fn parse_error_to_diagnostic(error: &ParseError) -> Diagnostic {
                 pest::error::LineColLocation::Span((line, col), _) => (line, col),
             };
 
-            Diagnostic {
-                range: Range {
-                    start: Position {
-                        line: (line.saturating_sub(1)) as u32,
-                        character: (col.saturating_sub(1)) as u32,
-                    },
-                    end: Position {
-                        line: (line.saturating_sub(1)) as u32,
-                        character: col as u32,
-                    },
-                },
-                severity: Some(DiagnosticSeverity::ERROR),
-                source: Some("carina".to_string()),
-                message: format!("{}", pest_error),
-                ..Default::default()
-            }
+            carina_diagnostic(
+                (line.saturating_sub(1)) as u32,
+                (col.saturating_sub(1)) as u32,
+                col as u32,
+                DiagnosticSeverity::ERROR,
+                format!("{}", pest_error),
+            )
         }
-        ParseError::InvalidExpression { line, message } => Diagnostic {
-            range: Range {
-                start: Position {
-                    line: (*line as u32).saturating_sub(1),
-                    character: 0,
-                },
-                end: Position {
-                    line: (*line as u32).saturating_sub(1),
-                    character: 100,
-                },
-            },
-            severity: Some(DiagnosticSeverity::ERROR),
-            source: Some("carina".to_string()),
-            message: message.clone(),
-            ..Default::default()
-        },
-        ParseError::UndefinedVariable(name) => Diagnostic {
-            range: Range::default(),
-            severity: Some(DiagnosticSeverity::ERROR),
-            source: Some("carina".to_string()),
-            message: format!("Undefined variable: {}", name),
-            ..Default::default()
-        },
-        ParseError::InvalidResourceType(name) => Diagnostic {
-            range: Range::default(),
-            severity: Some(DiagnosticSeverity::ERROR),
-            source: Some("carina".to_string()),
-            message: format!("Invalid resource type: {}", name),
-            ..Default::default()
-        },
-        ParseError::DuplicateModule(name) => Diagnostic {
-            range: Range::default(),
-            severity: Some(DiagnosticSeverity::ERROR),
-            source: Some("carina".to_string()),
-            message: format!("Duplicate module definition: {}", name),
-            ..Default::default()
-        },
-        ParseError::DuplicateBinding { name, line } => Diagnostic {
-            range: Range {
-                start: Position {
-                    line: (line - 1) as u32,
-                    character: 0,
-                },
-                end: Position {
-                    line: (line - 1) as u32,
-                    character: 0,
-                },
-            },
-            severity: Some(DiagnosticSeverity::ERROR),
-            source: Some("carina".to_string()),
-            message: format!("Duplicate binding: {}", name),
-            ..Default::default()
-        },
-        ParseError::ModuleNotFound(name) => Diagnostic {
-            range: Range::default(),
-            severity: Some(DiagnosticSeverity::ERROR),
-            source: Some("carina".to_string()),
-            message: format!("Module not found: {}", name),
-            ..Default::default()
-        },
-        ParseError::InternalError { expected, context } => Diagnostic {
-            range: Range::default(),
-            severity: Some(DiagnosticSeverity::ERROR),
-            source: Some("carina".to_string()),
-            message: format!(
+        ParseError::InvalidExpression { line, message } => carina_diagnostic(
+            (*line as u32).saturating_sub(1),
+            0,
+            100,
+            DiagnosticSeverity::ERROR,
+            message.clone(),
+        ),
+        ParseError::UndefinedVariable(name) => carina_diagnostic_range(
+            Range::default(),
+            DiagnosticSeverity::ERROR,
+            format!("Undefined variable: {}", name),
+        ),
+        ParseError::InvalidResourceType(name) => carina_diagnostic_range(
+            Range::default(),
+            DiagnosticSeverity::ERROR,
+            format!("Invalid resource type: {}", name),
+        ),
+        ParseError::DuplicateModule(name) => carina_diagnostic_range(
+            Range::default(),
+            DiagnosticSeverity::ERROR,
+            format!("Duplicate module definition: {}", name),
+        ),
+        ParseError::DuplicateBinding { name, line } => carina_diagnostic(
+            (line - 1) as u32,
+            0,
+            0,
+            DiagnosticSeverity::ERROR,
+            format!("Duplicate binding: {}", name),
+        ),
+        ParseError::ModuleNotFound(name) => carina_diagnostic_range(
+            Range::default(),
+            DiagnosticSeverity::ERROR,
+            format!("Module not found: {}", name),
+        ),
+        ParseError::InternalError { expected, context } => carina_diagnostic_range(
+            Range::default(),
+            DiagnosticSeverity::ERROR,
+            format!(
                 "Internal parser error: expected {} in {}",
                 expected, context
             ),
-            ..Default::default()
-        },
-        ParseError::RecursiveFunction(name) => Diagnostic {
-            range: Range::default(),
-            severity: Some(DiagnosticSeverity::ERROR),
-            source: Some("carina".to_string()),
-            message: format!("Recursive function call detected: {}", name),
-            ..Default::default()
-        },
-        ParseError::UserFunctionError(msg) => Diagnostic {
-            range: Range::default(),
-            severity: Some(DiagnosticSeverity::ERROR),
-            source: Some("carina".to_string()),
-            message: msg.to_string(),
-            ..Default::default()
-        },
+        ),
+        ParseError::RecursiveFunction(name) => carina_diagnostic_range(
+            Range::default(),
+            DiagnosticSeverity::ERROR,
+            format!("Recursive function call detected: {}", name),
+        ),
+        ParseError::UserFunctionError(msg) => {
+            carina_diagnostic_range(Range::default(), DiagnosticSeverity::ERROR, msg.to_string())
+        }
     }
 }
