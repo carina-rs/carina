@@ -33,7 +33,7 @@ pub struct AwsccSchemaConfig {
 /// Generates a `HashMap<String, ValidatorFn>` from three categories:
 /// - `simple`: single-arg validators (`name => function`)
 /// - `prefixed`: prefixed resource ID validators (`name => prefix`)
-/// - `service_arn`: service ARN validators (`name => (service, resource_prefix)`)
+/// - `service_arn`: arbitrary closure validators (`name => closure_expr`)
 macro_rules! register_validators {
     (
         simple { $( $s_name:ident => $s_fn:expr ),* $(,)? }
