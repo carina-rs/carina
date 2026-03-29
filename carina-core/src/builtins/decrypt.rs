@@ -91,7 +91,7 @@ mod tests {
     fn mock_config(decrypt_fn: crate::parser::DecryptorFn) -> ProviderContext {
         ProviderContext {
             decryptor: Some(decrypt_fn),
-            custom_validators: HashMap::new(),
+            validators: HashMap::new(),
         }
     }
 

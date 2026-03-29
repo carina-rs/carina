@@ -1755,7 +1755,7 @@ fn validate_custom_type(
         (_, Value::Interpolation(_)) => Ok(()),   // will be resolved later
         (name, Value::String(s)) => {
             // Check custom validators from config
-            if let Some(validator) = config.custom_validators.get(name) {
+            if let Some(validator) = config.validators.get(name) {
                 validator(s)
             } else {
                 Ok(())
@@ -7753,7 +7753,7 @@ aws.s3.bucket {
             decryptor: Some(Box::new(|ciphertext, _key| {
                 Ok(format!("decrypted:{ciphertext}"))
             })),
-            custom_validators: HashMap::new(),
+            validators: HashMap::new(),
         };
 
         // decrypt() in resource attributes is resolved during resolve_resource_refs,
@@ -7810,7 +7810,7 @@ aws.s3.bucket {
         );
         let config = ProviderContext {
             decryptor: None,
-            custom_validators: validators,
+            validators,
         };
 
         let result = validate_custom_type(
@@ -7849,7 +7849,7 @@ aws.s3.bucket {
         );
         let config = ProviderContext {
             decryptor: None,
-            custom_validators: validators,
+            validators,
         };
 
         // Test validate_custom_type directly since the grammar may not accept

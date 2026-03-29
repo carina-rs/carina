@@ -25,17 +25,14 @@ pub struct ProviderContext {
     /// Optional decryptor for the `decrypt()` built-in function.
     pub decryptor: Option<DecryptorFn>,
     /// Custom type validators keyed by type name (e.g., "arn", "availability_zone").
-    pub custom_validators: HashMap<String, ValidatorFn>,
+    pub validators: HashMap<String, ValidatorFn>,
 }
 
 impl std::fmt::Debug for ProviderContext {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ProviderContext")
             .field("decryptor", &self.decryptor.as_ref().map(|_| "..."))
-            .field(
-                "custom_validators",
-                &self.custom_validators.keys().collect::<Vec<_>>(),
-            )
+            .field("validators", &self.validators.keys().collect::<Vec<_>>())
             .finish()
     }
 }
