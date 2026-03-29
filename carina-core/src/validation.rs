@@ -326,7 +326,7 @@ pub fn validate_module_arg_type(type_expr: &TypeExpr, value: &Value) -> Option<S
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parser::ParsedFile;
+    use crate::parser::{ParsedFile, ParserConfig};
     use crate::resource::Resource;
 
     fn empty_parsed() -> ParsedFile {
@@ -529,7 +529,7 @@ let route = awscc.ec2.route {
   gateway_id             = igw_attachment.internet_gateway_id
 }
 "#;
-        let parsed = crate::parser::parse(input).unwrap();
+        let parsed = crate::parser::parse(input, &ParserConfig::default()).unwrap();
 
         // Check the route resource's gateway_id is a ResourceRef to igw_attachment
         let route = parsed

@@ -30,8 +30,8 @@ pub fn load_configuration_with_config(
         // Single file mode (existing behavior)
         let content = fs::read_to_string(path)
             .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
-        let mut parsed = parser::parse_with_config(&content, config)
-            .map_err(|e| format!("Parse error: {}", e))?;
+        let mut parsed =
+            parser::parse(&content, config).map_err(|e| format!("Parse error: {}", e))?;
         let unresolved_parsed = parsed.clone();
         parser::resolve_resource_refs_with_config(&mut parsed, config)
             .map_err(|e| format!("Parse error: {}", e))?;
@@ -72,7 +72,7 @@ pub fn load_configuration_with_config(
         for file in &files {
             let content = fs::read_to_string(file)
                 .map_err(|e| format!("Failed to read {}: {}", file.display(), e))?;
-            match parser::parse_with_config(&content, config) {
+            match parser::parse(&content, config) {
                 Ok(mut parsed) => {
                     let unresolved = parsed.clone();
                     if let Err(e) = parser::resolve_resource_refs_with_config(&mut parsed, config) {
