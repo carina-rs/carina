@@ -413,56 +413,36 @@ pub fn format_destroy_plan(
     out
 }
 
-/// Format the tree body of a plan (no header, no summary).
+/// Holds shared state and configuration for recursive tree rendering.
 ///
-/// `delete_attributes` optionally provides current state attributes for Delete
-/// effects, allowing the display to show what will be deleted.
-fn format_plan_tree(
-    plan: &Plan,
+/// Groups the parameters that are threaded through every recursive call of
+/// `format_effect_tree`, reducing parameter count from 13 to 6.
+struct TreeRenderContext<'a> {
+    out: String,
+    printed: HashSet<usize>,
+    plan: &'a Plan,
+    dependents: HashMap<usize, Vec<usize>>,
     detail: DetailLevel,
-    delete_attributes: Option<&HashMap<ResourceId, HashMap<String, Value>>>,
-    schemas: Option<&HashMap<String, ResourceSchema>>,
-    moved_origins: &HashMap<ResourceId, ResourceId>,
-) -> String {
-    let mut out = String::new();
+    delete_attributes: Option<&'a HashMap<ResourceId, HashMap<String, Value>>>,
+    schemas: Option<&'a HashMap<String, ResourceSchema>>,
+    moved_origins: &'a HashMap<ResourceId, ResourceId>,
+}
 
-    // Build dependency graph from effects
-    let graph = build_dependency_graph(plan);
-
-    // Build the single-parent tree with sorted siblings
-    let (roots, dependents) = build_single_parent_tree(
-        plan,
-        &graph.binding_to_effect,
-        &graph.effect_deps,
-        &graph.effect_bindings,
-        &graph.effect_types,
-    );
-
-    // Track printed effects to avoid duplicates
-    let mut printed: HashSet<usize> = HashSet::new();
-
-    #[allow(clippy::too_many_arguments)]
+impl<'a> TreeRenderContext<'a> {
     fn format_effect_tree(
-        out: &mut String,
+        &mut self,
         idx: usize,
-        plan: &Plan,
-        dependents: &HashMap<usize, Vec<usize>>,
-        printed: &mut HashSet<usize>,
         indent: usize,
         is_last: bool,
         prefix: &str,
-        detail: DetailLevel,
         parent_binding: Option<&str>,
-        delete_attributes: Option<&HashMap<ResourceId, HashMap<String, Value>>>,
-        schemas: Option<&HashMap<String, ResourceSchema>>,
-        moved_origins: &HashMap<ResourceId, ResourceId>,
     ) -> bool {
-        if printed.contains(&idx) {
+        if self.printed.contains(&idx) {
             return false;
         }
-        printed.insert(idx);
+        self.printed.insert(idx);
 
-        let effect = &plan.effects()[idx];
+        let effect = &self.plan.effects()[idx];
         let colored_symbol = match effect {
             Effect::Create(_) => "+".green().bold(),
             Effect::Update { .. } => "~".yellow().bold(),
@@ -499,10 +479,10 @@ fn format_plan_tree(
         // --- Resource header line ---
         match effect {
             Effect::Create(r) => {
-                if detail == DetailLevel::None {
+                if self.detail == DetailLevel::None {
                     let name_part = format_compact_name(r, &r.id.name, parent_binding);
                     writeln!(
-                        out,
+                        self.out,
                         "{}{}{} {} {}",
                         base_indent,
                         connector,
@@ -513,7 +493,7 @@ fn format_plan_tree(
                     .unwrap();
                 } else {
                     writeln!(
-                        out,
+                        self.out,
                         "{}{}{} {} {}",
                         base_indent,
                         connector,
@@ -525,13 +505,14 @@ fn format_plan_tree(
                 }
             }
             Effect::Update { id, to, .. } => {
-                let moved_note = moved_origins
+                let moved_note = self
+                    .moved_origins
                     .get(id)
                     .map(|from| format!(" (moved from: {}.{})", from.display_type(), from.name));
-                if detail == DetailLevel::None {
+                if self.detail == DetailLevel::None {
                     let name_part = format_compact_name(to, &id.name, parent_binding);
                     writeln!(
-                        out,
+                        self.out,
                         "{}{}{} {} {}{}",
                         base_indent,
                         connector,
@@ -543,7 +524,7 @@ fn format_plan_tree(
                     .unwrap();
                 } else {
                     writeln!(
-                        out,
+                        self.out,
                         "{}{}{} {} {}{}",
                         base_indent,
                         connector,
@@ -563,13 +544,14 @@ fn format_plan_tree(
                 } else {
                     "(must be replaced)"
                 };
-                let moved_note = moved_origins
+                let moved_note = self
+                    .moved_origins
                     .get(id)
                     .map(|from| format!(" (moved from: {}.{})", from.display_type(), from.name));
-                if detail == DetailLevel::None {
+                if self.detail == DetailLevel::None {
                     let name_part = format_compact_name(to, &id.name, parent_binding);
                     writeln!(
-                        out,
+                        self.out,
                         "{}{}{} {} {} {}{}",
                         base_indent,
                         connector,
@@ -582,7 +564,7 @@ fn format_plan_tree(
                     .unwrap();
                 } else {
                     writeln!(
-                        out,
+                        self.out,
                         "{}{}{} {} {} {}{}",
                         base_indent,
                         connector,
@@ -598,7 +580,7 @@ fn format_plan_tree(
             Effect::Delete { id, binding, .. } => {
                 let display_name = binding.as_deref().unwrap_or(&id.name);
                 writeln!(
-                    out,
+                    self.out,
                     "{}{}{} {} {}",
                     base_indent,
                     connector,
@@ -609,11 +591,11 @@ fn format_plan_tree(
                 .unwrap();
             }
             Effect::Read { resource } => {
-                if detail == DetailLevel::None {
+                if self.detail == DetailLevel::None {
                     let name_part =
                         format_compact_name(resource, &resource.id.name, parent_binding);
                     writeln!(
-                        out,
+                        self.out,
                         "{}{}{} {} {} {}",
                         base_indent,
                         connector,
@@ -625,7 +607,7 @@ fn format_plan_tree(
                     .unwrap();
                 } else {
                     writeln!(
-                        out,
+                        self.out,
                         "{}{}{} {} {} {}",
                         base_indent,
                         connector,
@@ -639,7 +621,7 @@ fn format_plan_tree(
             }
             Effect::Import { id, identifier } => {
                 writeln!(
-                    out,
+                    self.out,
                     "{}{}{} {} {} {}",
                     base_indent,
                     connector,
@@ -652,7 +634,7 @@ fn format_plan_tree(
             }
             Effect::Remove { id } => {
                 writeln!(
-                    out,
+                    self.out,
                     "{}{}{} {} {} {}",
                     base_indent,
                     connector,
@@ -667,11 +649,11 @@ fn format_plan_tree(
                 // Skip Move line display when an Update/Replace with "(moved from: ...)"
                 // annotation already exists for this target. The Move effect stays in the
                 // plan for summary counting ("N to move").
-                if moved_origins.contains_key(to) {
+                if self.moved_origins.contains_key(to) {
                     return false;
                 }
                 writeln!(
-                    out,
+                    self.out,
                     "{}{}{} {} {} {}",
                     base_indent,
                     connector,
@@ -685,7 +667,7 @@ fn format_plan_tree(
         }
 
         // --- Detail rows (attributes) ---
-        if detail != DetailLevel::None {
+        if self.detail != DetailLevel::None {
             let attr_prefix = if indent == 0 {
                 format!("{}{}", base_indent, attr_base)
             } else {
@@ -697,15 +679,19 @@ fn format_plan_tree(
                 format!("{}{}   ", base_indent, continuation)
             };
 
-            let detail_rows =
-                build_detail_rows(effect, schemas, detail.to_core(), delete_attributes);
+            let detail_rows = build_detail_rows(
+                effect,
+                self.schemas,
+                self.detail.to_core(),
+                self.delete_attributes,
+            );
 
             if !detail_rows.is_empty() {
                 has_displayed_attrs = true;
             }
 
             for row in &detail_rows {
-                render_detail_row(out, row, effect, &attr_prefix);
+                render_detail_row(&mut self.out, row, effect, &attr_prefix);
             }
         }
 
@@ -734,10 +720,10 @@ fn format_plan_tree(
         };
 
         // Print children (dependents)
-        let children = dependents.get(&idx).cloned().unwrap_or_default();
+        let children = self.dependents.get(&idx).cloned().unwrap_or_default();
         let unprinted_children: Vec<_> = children
             .iter()
-            .filter(|c| !printed.contains(c))
+            .filter(|c| !self.printed.contains(c))
             .cloned()
             .collect();
 
@@ -755,25 +741,17 @@ fn format_plan_tree(
 
         // Insert tree continuation line between attribute block and child resources
         if has_displayed_attrs && !unprinted_children.is_empty() {
-            writeln!(out, "{}{}│", base_indent, new_prefix).unwrap();
+            writeln!(self.out, "{}{}│", base_indent, new_prefix).unwrap();
         }
 
         for (i, child_idx) in unprinted_children.iter().enumerate() {
             let child_is_last = i == unprinted_children.len() - 1;
-            let child_had_attrs = format_effect_tree(
-                out,
+            let child_had_attrs = self.format_effect_tree(
                 *child_idx,
-                plan,
-                dependents,
-                printed,
                 indent + 1,
                 child_is_last,
                 &new_prefix,
-                detail,
                 current_binding.as_deref(),
-                delete_attributes,
-                schemas,
-                moved_origins,
             );
             // Add separator line between siblings when previous sibling displayed attributes
             if child_had_attrs && !child_is_last {
@@ -787,7 +765,7 @@ fn format_plan_tree(
                 } else {
                     format!("{}   ", separator_continuation)
                 };
-                writeln!(out, "{}{}│", base_indent, separator_prefix).unwrap();
+                writeln!(self.out, "{}{}│", base_indent, separator_prefix).unwrap();
             }
             if child_had_attrs {
                 has_displayed_attrs = true;
@@ -796,50 +774,57 @@ fn format_plan_tree(
 
         has_displayed_attrs
     }
+}
+
+/// Format the tree body of a plan (no header, no summary).
+///
+/// `delete_attributes` optionally provides current state attributes for Delete
+/// effects, allowing the display to show what will be deleted.
+fn format_plan_tree(
+    plan: &Plan,
+    detail: DetailLevel,
+    delete_attributes: Option<&HashMap<ResourceId, HashMap<String, Value>>>,
+    schemas: Option<&HashMap<String, ResourceSchema>>,
+    moved_origins: &HashMap<ResourceId, ResourceId>,
+) -> String {
+    // Build dependency graph from effects
+    let graph = build_dependency_graph(plan);
+
+    // Build the single-parent tree with sorted siblings
+    let (roots, dependents) = build_single_parent_tree(
+        plan,
+        &graph.binding_to_effect,
+        &graph.effect_deps,
+        &graph.effect_bindings,
+        &graph.effect_types,
+    );
+
+    let mut ctx = TreeRenderContext {
+        out: String::new(),
+        printed: HashSet::new(),
+        plan,
+        dependents,
+        detail,
+        delete_attributes,
+        schemas,
+        moved_origins,
+    };
 
     // Print from roots
     for (i, root_idx) in roots.iter().enumerate() {
-        format_effect_tree(
-            &mut out,
-            *root_idx,
-            plan,
-            &dependents,
-            &mut printed,
-            0,
-            i == roots.len() - 1,
-            "",
-            detail,
-            None,
-            delete_attributes,
-            schemas,
-            moved_origins,
-        );
+        ctx.format_effect_tree(*root_idx, 0, i == roots.len() - 1, "", None);
     }
 
     // Print any remaining effects that weren't reachable from roots
     // (e.g., circular dependencies or isolated resources)
     let remaining: Vec<_> = (0..plan.effects().len())
-        .filter(|idx| !printed.contains(idx))
+        .filter(|idx| !ctx.printed.contains(idx))
         .collect();
     for idx in remaining {
-        format_effect_tree(
-            &mut out,
-            idx,
-            plan,
-            &dependents,
-            &mut printed,
-            0,
-            true,
-            "",
-            detail,
-            None,
-            delete_attributes,
-            schemas,
-            moved_origins,
-        );
+        ctx.format_effect_tree(idx, 0, true, "", None);
     }
 
-    out
+    ctx.out
 }
 
 /// Split a string by `, ` at the top level, respecting nested brackets, braces, and quotes.
