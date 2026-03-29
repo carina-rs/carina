@@ -1,0 +1,14 @@
+---
+source: carina-cli/src/module_info_snapshot_tests.rs
+expression: display
+---
+File: root_config
+
+=== IMPORTS ===
+
+  (none)
+
+=== CREATES ===
+
+  vpc: awscc.ec2.vpc
+    └── subnet: awscc.ec2.subnet

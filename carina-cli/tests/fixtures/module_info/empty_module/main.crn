@@ -1,0 +1,12 @@
+arguments {
+  name: string {
+    description = "Resource name prefix"
+  }
+  env: string {
+    description = "Environment label"
+    default     = "dev"
+  }
+}
+
+attributes {
+}
