@@ -247,7 +247,8 @@ impl DiagnosticEngine {
 
     /// Validate a module argument value against its expected type.
     ///
-    /// Delegates to `carina_core::validation::validate_type_expr_value`.
+    /// Thin wrapper around `carina_core::validation::validate_type_expr_value`.
+    /// Kept as a method so LSP tests can call it via `engine.validate_module_arg_type(...)`.
     pub(super) fn validate_module_arg_type(
         &self,
         type_expr: &TypeExpr,
@@ -444,8 +445,7 @@ impl DiagnosticEngine {
 
                 // Type validation (only when explicit type annotation is present)
                 if let Some(ref type_expr) = attr_param.type_expr
-                    && let Some(type_error) =
-                        self.validate_attributes_type(type_expr, value, &attr_param.name)
+                    && let Some(type_error) = self.validate_attributes_type(type_expr, value)
                     && let Some((line, col)) =
                         self.find_attributes_param_position(doc, &attr_param.name)
                 {
@@ -474,53 +474,15 @@ impl DiagnosticEngine {
 
     /// Validate an attributes value against its declared type.
     ///
-    /// Delegates to `carina_core::validation::validate_type_expr_value` for custom types
-    /// and basic type mismatches, then handles attributes-specific cross-type checks
-    /// (e.g., String vs Bool, Int vs Bool) with contextual error messages.
-    fn validate_attributes_type(
-        &self,
-        type_expr: &TypeExpr,
-        value: &Value,
-        attr_name: &str,
-    ) -> Option<String> {
+    /// Skips ResourceRef values (type is resolved at runtime), then delegates all
+    /// validation to `carina_core::validation::validate_type_expr_value`.
+    fn validate_attributes_type(&self, type_expr: &TypeExpr, value: &Value) -> Option<String> {
         // ResourceRef is always allowed (type is resolved at runtime)
         if matches!(value, Value::ResourceRef { .. }) {
             return None;
         }
 
-        // Delegate shared validation (custom types, basic mismatches)
-        if let Some(err) = carina_core::validation::validate_type_expr_value(type_expr, value) {
-            return Some(err);
-        }
-
-        // Attributes-specific cross-type checks with contextual messages
-        match (type_expr, value) {
-            (TypeExpr::String, Value::Bool(b)) => Some(format!(
-                "Type mismatch in attributes '{}': expected string, got bool ({})",
-                attr_name, b
-            )),
-            (TypeExpr::String, Value::Int(n)) => Some(format!(
-                "Type mismatch in attributes '{}': expected string, got int ({})",
-                attr_name, n
-            )),
-            (TypeExpr::String, Value::Float(f)) => Some(format!(
-                "Type mismatch in attributes '{}': expected string, got float ({})",
-                attr_name, f
-            )),
-            (TypeExpr::Bool, Value::Int(n)) => Some(format!(
-                "Type mismatch in attributes '{}': expected bool, got int ({})",
-                attr_name, n
-            )),
-            (TypeExpr::Int, Value::Bool(b)) => Some(format!(
-                "Type mismatch in attributes '{}': expected int, got bool ({})",
-                attr_name, b
-            )),
-            (TypeExpr::Float, Value::Bool(b)) => Some(format!(
-                "Type mismatch in attributes '{}': expected float, got bool ({})",
-                attr_name, b
-            )),
-            _ => None,
-        }
+        carina_core::validation::validate_type_expr_value(type_expr, value)
     }
 
     /// Find the position of an attributes parameter name in the document.

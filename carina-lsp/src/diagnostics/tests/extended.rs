@@ -539,7 +539,7 @@ attributes {
 
     let type_diag = diagnostics
         .iter()
-        .find(|d| d.message.contains("Type mismatch") && d.message.contains("string"));
+        .find(|d| d.message.contains("expected string, got bool"));
     assert!(
         type_diag.is_some(),
         "Should warn about type mismatch in attributes block (bool assigned to string). Got diagnostics: {:?}",
@@ -571,7 +571,7 @@ attributes {
 
     let type_diag = diagnostics
         .iter()
-        .find(|d| d.message.contains("Type mismatch") && d.message.contains("attributes"));
+        .find(|d| d.message.contains("expected") && d.message.contains("got"));
     assert!(
         type_diag.is_none(),
         "Should NOT warn about valid types in attributes block. Got diagnostics: {:?}",
@@ -650,7 +650,7 @@ attributes {
 
     let type_diag = diagnostics
         .iter()
-        .find(|d| d.message.contains("Type mismatch") && d.message.contains("string"));
+        .find(|d| d.message.contains("expected string, got bool"));
     assert!(
         type_diag.is_some(),
         "Output block detection should work with simplified condition. Got diagnostics: {:?}",
