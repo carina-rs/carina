@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use ropey::Rope;
 use tower_lsp::lsp_types::{Position, TextDocumentContentChangeEvent};
 
@@ -7,14 +9,16 @@ pub struct Document {
     content: Rope,
     parsed: Option<ParsedFile>,
     parse_error: Option<ParseError>,
+    provider_context: Arc<ProviderContext>,
 }
 
 impl Document {
-    pub fn new(content: String) -> Self {
+    pub fn new(content: String, provider_context: Arc<ProviderContext>) -> Self {
         let mut doc = Self {
             content: Rope::from_str(&content),
             parsed: None,
             parse_error: None,
+            provider_context,
         };
         doc.reparse();
         doc
@@ -37,7 +41,7 @@ impl Document {
 
     fn reparse(&mut self) {
         let text = self.content.to_string();
-        match parse(&text, &ProviderContext::default()) {
+        match parse(&text, &self.provider_context) {
             Ok(parsed) => {
                 self.parsed = Some(parsed);
                 self.parse_error = None;
@@ -121,7 +125,10 @@ mod tests {
 
     #[test]
     fn test_position_to_offset_beyond_last_line() {
-        let mut doc = Document::new("hello\nworld".to_string());
+        let mut doc = Document::new(
+            "hello\nworld".to_string(),
+            Arc::new(ProviderContext::default()),
+        );
         // Line 10 is beyond the document - should not panic
         let change = TextDocumentContentChangeEvent {
             range: Some(tower_lsp::lsp_types::Range {
@@ -143,7 +150,7 @@ mod tests {
 
     #[test]
     fn test_position_to_offset_empty_document() {
-        let mut doc = Document::new("".to_string());
+        let mut doc = Document::new("".to_string(), Arc::new(ProviderContext::default()));
         let change = TextDocumentContentChangeEvent {
             range: Some(tower_lsp::lsp_types::Range {
                 start: Position {
@@ -165,7 +172,10 @@ mod tests {
     fn test_word_at_with_multibyte_characters() {
         // "hello 日本語" - ASCII word, space, then multi-byte chars
         // byte length = 5 + 1 + 9 = 15, char count = 5 + 1 + 3 = 9
-        let doc = Document::new("hello 日本語".to_string());
+        let doc = Document::new(
+            "hello 日本語".to_string(),
+            Arc::new(ProviderContext::default()),
+        );
         // col=6 is char index of '日'
         let word = doc.word_at(Position {
             line: 0,
@@ -185,7 +195,7 @@ mod tests {
 
     #[test]
     fn test_word_at_col_beyond_line_chars() {
-        let doc = Document::new("hi".to_string());
+        let doc = Document::new("hi".to_string(), Arc::new(ProviderContext::default()));
         // col=10 is beyond the 2-char line
         let word = doc.word_at(Position {
             line: 0,
@@ -200,7 +210,7 @@ mod tests {
         // col=4 is beyond char_len but within byte_len
         // The bug: line.len() returns 6 (bytes), so col=4 < 6 passes the check
         // but chars vec has only 2 elements, causing index out of bounds
-        let doc = Document::new("日本".to_string());
+        let doc = Document::new("日本".to_string(), Arc::new(ProviderContext::default()));
         let word = doc.word_at(Position {
             line: 0,
             character: 4,

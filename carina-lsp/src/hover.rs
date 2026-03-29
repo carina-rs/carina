@@ -560,6 +560,7 @@ impl HoverProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use carina_core::parser::ProviderContext;
     use carina_core::schema::{AttributeSchema, AttributeType};
 
     fn create_hover_provider_with_description(
@@ -646,7 +647,10 @@ mod tests {
             desc,
         );
 
-        let doc = Document::new("secondary_allocation_ids".to_string());
+        let doc = Document::new(
+            "secondary_allocation_ids".to_string(),
+            Arc::new(ProviderContext::default()),
+        );
         let hover = provider
             .hover(&doc, Position::new(0, 5))
             .expect("Should find hover for attribute");
@@ -762,6 +766,7 @@ awscc.ec2.vpc_gateway_attachment {
 }
 "#
             .to_string(),
+            Arc::new(ProviderContext::default()),
         );
 
         // Hover over "internet_gateway_id" on line 5 (0-indexed), column 10
@@ -792,7 +797,7 @@ awscc.ec2.vpc_gateway_attachment {
     #[test]
     fn test_builtin_function_hover_join() {
         let provider = HoverProvider::new(Arc::new(HashMap::new()), vec![]);
-        let doc = Document::new("join".to_string());
+        let doc = Document::new("join".to_string(), Arc::new(ProviderContext::default()));
         let hover = provider
             .hover(&doc, Position::new(0, 1))
             .expect("Should find hover for 'join'");
@@ -821,7 +826,10 @@ awscc.ec2.vpc_gateway_attachment {
     #[test]
     fn test_builtin_function_hover_cidr_subnet() {
         let provider = HoverProvider::new(Arc::new(HashMap::new()), vec![]);
-        let doc = Document::new("cidr_subnet".to_string());
+        let doc = Document::new(
+            "cidr_subnet".to_string(),
+            Arc::new(ProviderContext::default()),
+        );
         let hover = provider
             .hover(&doc, Position::new(0, 3))
             .expect("Should find hover for 'cidr_subnet'");
@@ -841,7 +849,10 @@ awscc.ec2.vpc_gateway_attachment {
     #[test]
     fn test_builtin_function_hover_unknown_returns_none() {
         let provider = HoverProvider::new(Arc::new(HashMap::new()), vec![]);
-        let doc = Document::new("not_a_function".to_string());
+        let doc = Document::new(
+            "not_a_function".to_string(),
+            Arc::new(ProviderContext::default()),
+        );
         let hover = provider.hover(&doc, Position::new(0, 3));
         assert!(hover.is_none(), "Unknown function should not show hover");
     }
@@ -871,7 +882,7 @@ awscc.ec2.vpc_gateway_attachment {
             "values",
         ];
         for name in &names {
-            let doc = Document::new(name.to_string());
+            let doc = Document::new(name.to_string(), Arc::new(ProviderContext::default()));
             let hover = provider.hover(&doc, Position::new(0, 1));
             assert!(
                 hover.is_some(),
