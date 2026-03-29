@@ -13,8 +13,9 @@ use carina_core::schema::ResourceSchema;
 use carina_state::{BackendError, LockInfo, ResourceState, StateBackend, StateFile};
 
 use crate::commands::apply::{
-    ApplyResult, ApplyStateSave, build_state_after_apply, detect_drift, execute_effects,
-    finalize_apply, queue_state_refresh, refresh_pending_states, save_state_locked,
+    ApplyResult, ApplyStateSave, FinalizeApplyInput, build_state_after_apply, detect_drift,
+    execute_effects, finalize_apply, queue_state_refresh, refresh_pending_states,
+    save_state_locked,
 };
 use crate::commands::plan::{CurrentStateEntry, PlanFile};
 use crate::commands::state::run_state_refresh_locked;
@@ -1364,16 +1365,16 @@ async fn lock_released_on_write_state_failure() {
 
     // This mirrors the pattern used in run_apply_locked / run_apply_from_plan_locked:
     // call finalize_apply (which may fail), then always release lock in the caller.
-    let op_result = finalize_apply(
-        &result,
-        Some(StateFile::new()),
-        &[],
-        &HashMap::new(),
-        &Plan::new(),
-        &backend,
-        Some(&lock),
-        &HashMap::new(),
-    )
+    let op_result = finalize_apply(FinalizeApplyInput {
+        result: &result,
+        state_file: Some(StateFile::new()),
+        sorted_resources: &[],
+        current_states: &HashMap::new(),
+        plan: &Plan::new(),
+        backend: &backend,
+        lock: Some(&lock),
+        schemas: &HashMap::new(),
+    })
     .await;
 
     // Caller always releases the lock
@@ -1496,16 +1497,16 @@ async fn finalize_apply_uses_write_state_locked() {
         failed_refreshes: HashSet::new(),
     };
 
-    let op_result = finalize_apply(
-        &result,
-        Some(StateFile::new()),
-        &[],
-        &HashMap::new(),
-        &Plan::new(),
-        &backend,
-        Some(&lock),
-        &HashMap::new(),
-    )
+    let op_result = finalize_apply(FinalizeApplyInput {
+        result: &result,
+        state_file: Some(StateFile::new()),
+        sorted_resources: &[],
+        current_states: &HashMap::new(),
+        plan: &Plan::new(),
+        backend: &backend,
+        lock: Some(&lock),
+        schemas: &HashMap::new(),
+    })
     .await;
 
     assert!(op_result.is_ok(), "finalize_apply should succeed");
@@ -2012,16 +2013,16 @@ async fn finalize_apply_without_lock_uses_write_state() {
         failed_refreshes: HashSet::new(),
     };
 
-    let op_result = finalize_apply(
-        &result,
-        Some(StateFile::new()),
-        &[],
-        &HashMap::new(),
-        &Plan::new(),
-        &backend,
-        None, // No lock
-        &HashMap::new(),
-    )
+    let op_result = finalize_apply(FinalizeApplyInput {
+        result: &result,
+        state_file: Some(StateFile::new()),
+        sorted_resources: &[],
+        current_states: &HashMap::new(),
+        plan: &Plan::new(),
+        backend: &backend,
+        lock: None, // No lock
+        schemas: &HashMap::new(),
+    })
     .await;
 
     assert!(op_result.is_ok(), "finalize_apply should succeed");

@@ -257,6 +257,16 @@ impl TypedDependencyGraph {
 }
 
 /// ANSI color codes for terminal output
+/// Shared state for recursive dependency tree drawing.
+///
+/// Groups the output buffer, visited set, and color configuration that are
+/// threaded through every recursive call of `display_creates_tree_colored`.
+struct TreeDrawState<'a> {
+    output: &'a mut String,
+    visited: &'a mut HashSet<String>,
+    colors: &'a Colors,
+}
+
 struct Colors {
     bold: &'static str,
     reset: &'static str,
@@ -525,16 +535,13 @@ impl RootConfigSignature {
                 }
             } else {
                 let mut visited = HashSet::new();
+                let mut draw = TreeDrawState {
+                    output: &mut output,
+                    visited: &mut visited,
+                    colors: &c,
+                };
                 for root in roots {
-                    self.display_creates_tree_colored(
-                        &mut output,
-                        &root,
-                        "  ",
-                        true,
-                        &mut visited,
-                        true,
-                        &c,
-                    );
+                    self.display_creates_tree_colored(&mut draw, &root, "  ", true, true);
                 }
             }
 
@@ -576,22 +583,20 @@ impl RootConfigSignature {
         roots
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn display_creates_tree_colored(
         &self,
-        output: &mut String,
+        state: &mut TreeDrawState<'_>,
         node: &str,
         prefix: &str,
         is_last: bool,
-        visited: &mut HashSet<String>,
         is_root: bool,
-        c: &Colors,
     ) {
-        if visited.contains(node) {
+        if state.visited.contains(node) {
             return;
         }
-        visited.insert(node.to_string());
+        state.visited.insert(node.to_string());
 
+        let c = state.colors;
         let connector = if is_root {
             ""
         } else if is_last {
@@ -613,7 +618,9 @@ impl RootConfigSignature {
             })
             .unwrap_or_else(|| node.to_string());
 
-        output.push_str(&format!("{}{}{}\n", prefix, connector, node_display));
+        state
+            .output
+            .push_str(&format!("{}{}{}\n", prefix, connector, node_display));
 
         // Find children (nodes that depend on this node)
         // Filter out nodes that have a more specific path through another resource
@@ -651,15 +658,7 @@ impl RootConfigSignature {
 
         for (i, child) in children.iter().enumerate() {
             let child_is_last = i == children.len() - 1;
-            self.display_creates_tree_colored(
-                output,
-                child,
-                &new_prefix,
-                child_is_last,
-                visited,
-                false,
-                c,
-            );
+            self.display_creates_tree_colored(state, child, &new_prefix, child_is_last, false);
         }
     }
 }
@@ -995,16 +994,13 @@ impl ModuleSignature {
                 }
             } else {
                 let mut visited = HashSet::new();
+                let mut draw = TreeDrawState {
+                    output: &mut output,
+                    visited: &mut visited,
+                    colors: &c,
+                };
                 for root in roots {
-                    self.display_creates_tree_colored(
-                        &mut output,
-                        &root,
-                        "  ",
-                        true,
-                        &mut visited,
-                        true,
-                        &c,
-                    );
+                    self.display_creates_tree_colored(&mut draw, &root, "  ", true, true);
                 }
             }
         }
@@ -1056,22 +1052,20 @@ impl ModuleSignature {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn display_creates_tree_colored(
         &self,
-        output: &mut String,
+        state: &mut TreeDrawState<'_>,
         node: &str,
         prefix: &str,
         is_last: bool,
-        visited: &mut HashSet<String>,
         is_root: bool,
-        c: &Colors,
     ) {
-        if visited.contains(node) {
+        if state.visited.contains(node) {
             return;
         }
-        visited.insert(node.to_string());
+        state.visited.insert(node.to_string());
 
+        let c = state.colors;
         let connector = if is_root {
             ""
         } else if is_last {
@@ -1093,7 +1087,9 @@ impl ModuleSignature {
             node.to_string()
         };
 
-        output.push_str(&format!("{}{}{}\n", prefix, connector, node_display));
+        state
+            .output
+            .push_str(&format!("{}{}{}\n", prefix, connector, node_display));
 
         // Find children (nodes that depend on this node)
         // Filter out nodes that have a more specific path through another resource
@@ -1131,15 +1127,7 @@ impl ModuleSignature {
 
         for (i, child) in children.iter().enumerate() {
             let child_is_last = i == children.len() - 1;
-            self.display_creates_tree_colored(
-                output,
-                child,
-                &new_prefix,
-                child_is_last,
-                visited,
-                false,
-                c,
-            );
+            self.display_creates_tree_colored(state, child, &new_prefix, child_is_last, false);
         }
     }
 
