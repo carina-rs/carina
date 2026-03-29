@@ -11,7 +11,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::parser::{ImportStatement, ModuleCall, ParseError, ParsedFile, ProviderContext};
-use crate::resource::{LifecycleConfig, Resource, ResourceId, Value};
+use crate::resource::{LifecycleConfig, Resource, ResourceId, ResourceKind, Value};
 
 /// Module resolution error
 #[derive(Debug, thiserror::Error)]
@@ -389,14 +389,6 @@ impl<'cfg> ModuleResolver<'cfg> {
             && let Some(binding_name) = &call.binding_name
         {
             let mut virtual_attrs: HashMap<String, Value> = HashMap::new();
-            virtual_attrs.insert(
-                "_module".to_string(),
-                Value::String(call.module_name.clone()),
-            );
-            virtual_attrs.insert(
-                "_module_instance".to_string(),
-                Value::String(instance_prefix.to_string()),
-            );
 
             // Copy attribute values from the module definition
             for attr_param in &module.attribute_params {
@@ -412,12 +404,14 @@ impl<'cfg> ModuleResolver<'cfg> {
             let virtual_resource = Resource {
                 id: ResourceId::new("_virtual", binding_name),
                 attributes: virtual_attrs,
-                read_only: false,
+                kind: ResourceKind::Virtual {
+                    module_name: call.module_name.clone(),
+                    instance: instance_prefix.to_string(),
+                },
                 lifecycle: LifecycleConfig::default(),
                 prefixes: HashMap::new(),
                 binding: Some(binding_name.clone()),
                 dependency_bindings: Vec::new(),
-                virtual_resource: true,
             };
             expanded_resources.push(virtual_resource);
         }
@@ -740,12 +734,11 @@ mod tests {
                     );
                     attrs
                 },
-                read_only: false,
+                kind: ResourceKind::Real,
                 lifecycle: LifecycleConfig::default(),
                 prefixes: HashMap::new(),
                 binding: None,
                 dependency_bindings: Vec::new(),
-                virtual_resource: false,
             }],
             variables: HashMap::new(),
             imports: vec![],
@@ -865,12 +858,11 @@ mod tests {
                         );
                         attrs
                     },
-                    read_only: false,
+                    kind: ResourceKind::Real,
                     lifecycle: LifecycleConfig::default(),
                     prefixes: HashMap::new(),
                     binding: Some("vpc".to_string()),
                     dependency_bindings: Vec::new(),
-                    virtual_resource: false,
                 },
                 Resource {
                     id: ResourceId::new("ec2.subnet", "sub"),
@@ -886,12 +878,11 @@ mod tests {
                         );
                         attrs
                     },
-                    read_only: false,
+                    kind: ResourceKind::Real,
                     lifecycle: LifecycleConfig::default(),
                     prefixes: HashMap::new(),
                     binding: Some("subnet".to_string()),
                     dependency_bindings: Vec::new(),
-                    virtual_resource: false,
                 },
             ],
             variables: HashMap::new(),
@@ -1005,12 +996,11 @@ mod tests {
                     );
                     attrs
                 },
-                read_only: false,
+                kind: ResourceKind::Real,
                 lifecycle: LifecycleConfig::default(),
                 prefixes: HashMap::new(),
                 binding: Some("sg".to_string()),
                 dependency_bindings: Vec::new(),
-                virtual_resource: false,
             }],
             variables: HashMap::new(),
             imports: vec![],
@@ -1057,6 +1047,16 @@ mod tests {
             .expect("Virtual resource should exist");
 
         assert_eq!(virtual_res.binding, Some("web".to_string()));
+        // Module info should be in the kind, not in attributes
+        assert_eq!(
+            virtual_res.kind,
+            ResourceKind::Virtual {
+                module_name: "web_tier".to_string(),
+                instance: "web".to_string(),
+            }
+        );
+        assert!(!virtual_res.attributes.contains_key("_module"));
+        assert!(!virtual_res.attributes.contains_key("_module_instance"));
         // The security_group attribute should be a rewritten ResourceRef
         // pointing to the dot-path binding (web.sg)
         assert_eq!(
@@ -1344,12 +1344,11 @@ mod tests {
                     );
                     attrs
                 },
-                read_only: false,
+                kind: ResourceKind::Real,
                 lifecycle: LifecycleConfig::default(),
                 prefixes: HashMap::new(),
                 binding: Some("vpc".to_string()),
                 dependency_bindings: Vec::new(),
-                virtual_resource: false,
             }],
             variables: HashMap::new(),
             imports: vec![],

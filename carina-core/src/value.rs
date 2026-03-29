@@ -384,12 +384,11 @@ pub fn redact_secrets_in_resource(
     crate::resource::Resource {
         id: resource.id.clone(),
         attributes: redact_secrets_in_attributes(&resource.attributes),
-        read_only: resource.read_only,
+        kind: resource.kind.clone(),
         lifecycle: resource.lifecycle.clone(),
         prefixes: resource.prefixes.clone(),
         binding: resource.binding.clone(),
         dependency_bindings: resource.dependency_bindings.clone(),
-        virtual_resource: resource.virtual_resource,
     }
 }
 

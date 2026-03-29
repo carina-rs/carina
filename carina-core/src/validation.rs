@@ -31,7 +31,7 @@ pub fn validate_resources(
 
         match schemas.get(&schema_key) {
             Some(schema) => {
-                if schema.data_source && !resource.read_only {
+                if schema.data_source && !resource.is_data_source() {
                     all_errors.push(format!(
                         "{} is a data source and must be used with the `read` keyword:\n  let <name> = read {} {{ }}",
                         schema.resource_type, schema.resource_type

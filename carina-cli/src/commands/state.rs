@@ -357,7 +357,7 @@ fn build_plan_from_state(state: &StateFile) -> Plan {
             }
         }
 
-        resource.read_only = true;
+        resource.kind = carina_core::resource::ResourceKind::DataSource;
         plan.add(Effect::Read { resource });
     }
     plan

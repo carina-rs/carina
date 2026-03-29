@@ -739,7 +739,7 @@ fn destroy_plan_excludes_data_sources() {
     // Build current_states only for managed resources (data sources are skipped)
     let mut current_states: HashMap<ResourceId, State> = HashMap::new();
     for resource in &destroy_order {
-        if resource.read_only {
+        if resource.is_data_source() {
             continue;
         }
         current_states.insert(
@@ -752,7 +752,7 @@ fn destroy_plan_excludes_data_sources() {
     let resources_to_destroy: Vec<&Resource> = destroy_order
         .iter()
         .filter(|r| {
-            if r.read_only {
+            if r.is_data_source() {
                 return false;
             }
             if !current_states.get(&r.id).map(|s| s.exists).unwrap_or(false) {
@@ -767,7 +767,7 @@ fn destroy_plan_excludes_data_sources() {
 
     // Verify data source is NOT in the destroy list
     assert!(
-        !resources_to_destroy.iter().any(|r| r.read_only),
+        !resources_to_destroy.iter().any(|r| r.is_data_source()),
         "Data sources should not appear in destroy plan"
     );
 }

@@ -161,7 +161,7 @@ async fn run_destroy_locked(
         // Skip data sources (read-only) and virtual resources -- they won't be destroyed.
         let managed_resources: Vec<&Resource> = all_resources
             .iter()
-            .filter(|r| !r.read_only && !r.is_virtual())
+            .filter(|r| !r.is_data_source() && !r.is_virtual())
             .collect();
         let provider_ref = &provider;
         let results: Vec<Result<(ResourceId, State), AppError>> = stream::iter(&managed_resources)
@@ -221,7 +221,7 @@ async fn run_destroy_locked(
     } else if let Some(sf) = state_file.as_ref() {
         // --refresh=false: build states from state file without AWS calls
         for resource in &all_resources {
-            if resource.read_only || resource.is_virtual() {
+            if resource.is_data_source() || resource.is_virtual() {
                 continue;
             }
             let state = sf.build_state_for_resource(resource);
@@ -250,7 +250,7 @@ async fn run_destroy_locked(
         .iter()
         .filter(|r| {
             // Skip data sources (read-only) and virtual resources -- nothing to destroy
-            if r.read_only || r.is_virtual() {
+            if r.is_data_source() || r.is_virtual() {
                 return false;
             }
 
@@ -887,12 +887,11 @@ fn build_orphan_resource(sf: &carina_state::StateFile, id: &ResourceId) -> Resou
     Resource {
         id: id.clone(),
         attributes,
-        read_only: false,
+        kind: carina_core::resource::ResourceKind::Real,
         lifecycle: rs.lifecycle.clone(),
         prefixes: rs.prefixes.clone(),
         binding: rs.binding.clone(),
         dependency_bindings: rs.dependency_bindings.clone(),
-        virtual_resource: false,
     }
 }
 

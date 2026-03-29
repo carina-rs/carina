@@ -147,7 +147,7 @@ impl DiagnosticEngine {
                 if let Some(schema) = &schema {
                     // Check data source without `read` keyword
                     if schema.data_source
-                        && !resource.read_only
+                        && !resource.is_data_source()
                         && let Some((line, col)) =
                             self.find_resource_position(doc, &resource.id.resource_type)
                     {

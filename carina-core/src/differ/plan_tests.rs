@@ -1,4 +1,5 @@
 use super::*;
+use crate::resource::ResourceKind;
 
 #[test]
 fn create_before_destroy_generates_temporary_name_for_name_attribute() {
@@ -675,8 +676,10 @@ fn diff_skips_internal_attributes_in_removal_detection() {
 #[test]
 fn virtual_resources_are_skipped_in_plan() {
     // Virtual resources (module attribute containers) should not generate any effects
-    let mut virtual_resource = Resource::new("_virtual", "web");
-    virtual_resource.virtual_resource = true;
+    let mut virtual_resource = Resource::new("_virtual", "web").with_kind(ResourceKind::Virtual {
+        module_name: "web_tier".to_string(),
+        instance: "web".to_string(),
+    });
     virtual_resource.binding = Some("web".to_string());
     virtual_resource.attributes.insert(
         "security_group".to_string(),
