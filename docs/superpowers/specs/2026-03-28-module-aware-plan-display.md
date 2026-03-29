@@ -6,7 +6,7 @@ The YAPC Fukuoka 2025 talk "Why modularization of infrastructure code is difficu
 
 - **Details are the concern** — abstracting away details hurts rather than helps
 - **White-box usage** — users need to understand module internals
-- **Value definition and usage locations diverge** — makes actual configuration hard to grasp
+- **Value definition and usage locations diverge** — makes actual configuration hard to grasp. Investigating "which resource uses this CIDR?" requires mentally unwinding the module call chain from usage site back to definition site. Furthermore, the search often starts with "which directory is this even in?", adding a file-system navigation step before the value lookup.
 - **Internal structure visibility is the priority** — over abstraction and layering
 
 Carina already has `ModularPlan` infrastructure in `carina-core/src/plan.rs` (`ModuleSource`, `group_by_module()`, `display_by_module()`) and module metadata on resources (`_module`, `_module_instance`), but the CLI plan display does not use them.
@@ -53,26 +53,127 @@ No change to current behavior. All resource attributes are displayed regardless 
 
 ### 3. Value Traceability
 
-Show which resource attribute values originated from module arguments.
+#### Motivation
+
+Three use cases motivate value traceability:
+
+- **Forward (value propagation):** "This argument is passed to the module — which resource attribute does it end up in?"
+- **Reverse (value lookup):** "I see this value on a running resource — where in the .crn files was it originally defined?" When the actual value and its definition location are separate, finding "the resource that has this specific value" requires mentally unwinding the module call chain.
+- **Directory-first search:** "Which directory/file contains this module?" The search often starts with file-system navigation before the value lookup itself.
+
+#### Approach candidates
+
+Six approaches were considered. They are not mutually exclusive — combinations are possible.
+
+##### A. Module header with args + file path
+
+Always show source file path and argument values at the module boundary header.
 
 ```
   module: network (instance: net)
+    source: modules/network/main.crn
+    args: cidr_block = "10.0.0.0/16", az = "ap-northeast-1a"
 
     + awscc.ec2.vpc net.vpc
         cidr_block: "10.0.0.0/16" (← arg: cidr_block)
-
-    + awscc.ec2.subnet net.subnet
-        vpc_id: net.vpc.vpc_id
-        cidr_block: "10.0.1.0/24"
-        availability_zone: "ap-northeast-1a" (← arg: az)
 ```
 
-**Implementation:**
+- Covers directory-first search (source path visible) and value scanning (args listed)
+- Always visible — no extra command needed
+- Lightweight, self-contained in plan output
+
+##### B. Per-attribute origin chain
+
+Show the full definition→substitution→usage chain on each attribute.
+
+```
+    + awscc.ec2.vpc net.vpc
+        cidr_block: "10.0.0.0/16"
+                    └─ defined at main.crn:12 → network(cidr_block) → modules/network/main.crn:3
+```
+
+- Maximum information density per attribute
+- Can be verbose, especially with many module arguments
+- Requires tracking source locations (file + line) through the parser and module resolver
+
+##### C. `carina plan --trace <value>` filter command
+
+A dedicated CLI option that filters plan output to show only resources/attributes matching a given value, with full origin chain.
+
+```bash
+$ carina plan example.crn --trace "10.0.0.0/16"
+
+  "10.0.0.0/16" found in:
+
+    main.crn:12       import "modules/network" { cidr_block = "10.0.0.0/16" }
+      ↓ arg: cidr_block
+    modules/network/main.crn:3   awscc.ec2.vpc.cidr_block
+```
+
+- Default plan output stays clean; detailed tracing is opt-in
+- Intuitive grep-like workflow
+- Requires building an origin index but only when `--trace` is requested
+
+##### D. Grep-friendly inline comments
+
+Embed file path and origin as trailing comments on each attribute line.
+
+```
+  module: network (instance: net)  # modules/network/main.crn
+
+    + awscc.ec2.vpc net.vpc
+        cidr_block: "10.0.0.0/16"  # ← arg:cidr_block @ main.crn:12
+```
+
+- `grep "10.0.0.0/16"` hits the line and origin is on the same line
+- Works with existing Unix toolchain (grep, awk, etc.)
+- Risk of lines becoming too long or cluttered
+
+##### E. `--verbose` mode for progressive disclosure
+
+Default plan output uses approach A (header with source + args). `--verbose` adds approach B (full origin chains on each attribute).
+
+```bash
+$ carina plan example.crn             # Shows A-level detail
+$ carina plan example.crn --verbose   # Shows A + B-level detail
+```
+
+- Balances simplicity and depth
+- Avoids cluttering default output
+- Two rendering paths to maintain
+
+##### F. Module call-site summary at plan footer
+
+Append a summary section after the plan showing all module call sites with their arguments and source locations.
+
+```
+Execution Plan:
+  ...（normal plan output with (← arg: X) annotations）...
+
+Module call sites:
+  net = import "modules/network" (main.crn:12)
+    cidr_block = "10.0.0.0/16"
+    az         = "ap-northeast-1a"
+
+Plan: 3 to add, 0 to change, 0 to destroy.
+```
+
+- Plan body stays clean
+- Call-site summary provides a scannable index of all module invocations
+- Easy to find "which modules use this value" at a glance
+
+#### Chosen approach
+
+TBD — to be decided after evaluating trade-offs.
+
+#### Implementation (common to all approaches)
+
+Regardless of which approach is chosen, the following data structures support value traceability:
 
 - During `expand_module_call()` in `module_resolver.rs`, when substituting argument values into resource attributes, build a mapping: `HashMap<(resource_name, attribute_name), argument_name>`
 - For interpolated values (e.g., `"vpc-${env_name}"`), record that the attribute uses the argument (partial origin)
 - Store this mapping in `ModularPlan` (new field: `argument_origins`)
-- `format_plan()` consults the mapping to append `(← arg: X)` annotations
+- `format_plan()` consults the mapping to render traceability annotations
 
 **Data structure:**
 
@@ -98,6 +199,7 @@ pub struct ArgumentOriginKey {
 
 - Module boundary grouping in plan output
 - Value traceability annotations for module arguments
+- Value traceability in `carina module info` output (see "module info vs plan" below)
 - Snapshot tests for module-aware plan display
 - Fixture `.crn` files that use modules
 
@@ -105,9 +207,46 @@ pub struct ArgumentOriginKey {
 
 - Changes to `Value` type
 - Lint/warnings for module design quality (cohesion, nesting depth)
-- Changes to `carina module info` command
 - Compact mode module display (can be added later)
 - TUI mode module display (can be added later)
+
+## module info vs plan
+
+`module info` and `plan` serve different purposes along three axes:
+
+| Axis | `module info` | `plan` |
+|------|--------------|--------|
+| **Static vs Dynamic** | Static — no concrete values. "This module accepts `cidr_block: string`" | Dynamic — concrete values bound. "`cidr_block` is `"10.0.0.0/16"`, flows to `net.vpc.cidr_block`" |
+| **Scope** | Single module in isolation | All modules expanded into a whole-system view |
+| **Usage timing** | Design time — "how do I use this module?" | Execution time — "what will happen when I apply?" |
+
+Value traceability manifests differently in each:
+
+- **`module info`** shows **argument-to-attribute path definitions** — which arguments flow to which resource attributes, without concrete values. This helps module authors and consumers understand the module's internal wiring.
+
+  ```
+  $ carina module info modules/network
+
+  Module: network
+    Source: modules/network/main.crn
+
+  Arguments:
+    cidr_block: string (required)
+      → vpc.cidr_block
+    az: string (required)
+      → subnet.availability_zone
+
+  Resources:
+    awscc.ec2.vpc (vpc)
+    awscc.ec2.subnet (subnet)
+  ```
+
+- **`plan`** shows **concrete values with origin annotations** — the actual values that were passed and where they ended up. This helps operators verify what will be applied.
+
+  ```
+    + awscc.ec2.vpc net.vpc
+        cidr_block: "10.0.0.0/16" (← arg: cidr_block)
+  ```
 
 ## Key Files
 
