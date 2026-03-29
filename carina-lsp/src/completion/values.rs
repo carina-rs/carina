@@ -15,6 +15,19 @@ struct BindingDotContext {
     resource_type: String,
 }
 
+fn type_completion_item(label: String, detail: String, range: Range) -> CompletionItem {
+    CompletionItem {
+        label: label.clone(),
+        kind: Some(CompletionItemKind::TYPE_PARAMETER),
+        detail: Some(detail),
+        text_edit: Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(TextEdit {
+            range,
+            new_text: label,
+        })),
+        ..Default::default()
+    }
+}
+
 impl CompletionProvider {
     pub(super) fn attribute_completions_for_type(
         &self,
@@ -537,79 +550,51 @@ impl CompletionProvider {
             end: position,
         };
 
-        let mut completions = Vec::new();
-
         // Basic types
-        for (name, detail) in [
+        let basic = [
             ("string", "String type"),
             ("int", "Integer type"),
             ("bool", "Boolean type"),
             ("float", "Float type"),
-        ] {
-            completions.push(CompletionItem {
-                label: name.to_string(),
-                kind: Some(CompletionItemKind::TYPE_PARAMETER),
-                detail: Some(detail.to_string()),
-                text_edit: Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(TextEdit {
-                    range: replacement_range,
-                    new_text: name.to_string(),
-                })),
-                ..Default::default()
-            });
-        }
+        ]
+        .iter()
+        .map(|(name, detail)| {
+            type_completion_item(name.to_string(), detail.to_string(), replacement_range)
+        });
 
         // Generic type constructors
-        for (name, detail) in [
+        let generic = [
             ("list(", "List type constructor"),
             ("map(", "Map type constructor"),
-        ] {
-            completions.push(CompletionItem {
-                label: name.to_string(),
-                kind: Some(CompletionItemKind::TYPE_PARAMETER),
-                detail: Some(detail.to_string()),
-                text_edit: Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(TextEdit {
-                    range: replacement_range,
-                    new_text: name.to_string(),
-                })),
-                ..Default::default()
-            });
-        }
+        ]
+        .iter()
+        .map(|(name, detail)| {
+            type_completion_item(name.to_string(), detail.to_string(), replacement_range)
+        });
 
         // Custom types from provider validators
-        for name in &self.custom_type_names {
-            completions.push(CompletionItem {
-                label: name.clone(),
-                kind: Some(CompletionItemKind::TYPE_PARAMETER),
-                detail: Some(format!("Custom type: {}", name)),
-                text_edit: Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(TextEdit {
-                    range: replacement_range,
-                    new_text: name.clone(),
-                })),
-                ..Default::default()
-            });
-        }
+        let custom = self.custom_type_names.iter().map(move |name| {
+            type_completion_item(
+                name.clone(),
+                format!("Custom type: {}", name),
+                replacement_range,
+            )
+        });
 
         // Resource types from schemas
-        for resource_type in self.schemas.keys() {
-            let description = self
-                .schemas
-                .get(resource_type)
-                .and_then(|s| s.description.as_deref())
+        let resource = self.schemas.iter().map(move |(resource_type, schema)| {
+            let description = schema
+                .description
+                .as_deref()
                 .unwrap_or("Resource reference");
+            type_completion_item(
+                resource_type.clone(),
+                format!("{} reference", description),
+                replacement_range,
+            )
+        });
 
-            completions.push(CompletionItem {
-                label: resource_type.clone(),
-                kind: Some(CompletionItemKind::TYPE_PARAMETER),
-                detail: Some(format!("{} reference", description)),
-                text_edit: Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(TextEdit {
-                    range: replacement_range,
-                    new_text: resource_type.clone(),
-                })),
-                ..Default::default()
-            });
-        }
-
-        completions
+        basic.chain(generic).chain(custom).chain(resource).collect()
     }
 
     pub(super) fn availability_zone_completions(

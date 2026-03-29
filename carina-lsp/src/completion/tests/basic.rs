@@ -870,6 +870,24 @@ fn context_detection_type_position_in_fn_return_type() {
 }
 
 #[test]
+fn context_detection_not_type_position_inside_fn_body() {
+    let provider = test_provider();
+    let text = "fn greet(name: string) {\n  let x = ";
+    let context = provider.get_completion_context(
+        text,
+        Position {
+            line: 1,
+            character: 10,
+        },
+    );
+    assert!(
+        !matches!(context, CompletionContext::InTypePosition),
+        "Should NOT detect InTypePosition inside fn body, got: {:?}",
+        context
+    );
+}
+
+#[test]
 fn context_detection_type_position_in_attributes() {
     let provider = test_provider();
     let text = "attributes {\noutput: ";
