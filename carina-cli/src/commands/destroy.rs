@@ -285,16 +285,12 @@ async fn run_destroy_locked(
             .get(&resource.id)
             .and_then(|s| s.identifier.clone())
             .unwrap_or_default();
-        let binding = resource.attributes.get("_binding").and_then(|v| match v {
-            Value::String(s) => Some(s.clone()),
-            _ => None,
-        });
         let dependencies = get_resource_dependencies(resource);
         destroy_plan.add(Effect::Delete {
             id: resource.id.clone(),
             identifier,
             lifecycle: resource.lifecycle.clone(),
-            binding,
+            binding: resource.binding.clone(),
             dependencies,
         });
     }
@@ -410,25 +406,17 @@ async fn run_destroy_locked(
                 .get(&resource.id)
                 .and_then(|s| s.identifier.clone())
                 .unwrap_or_default();
-            let binding_for_effect = resource.attributes.get("_binding").and_then(|v| match v {
-                Value::String(s) => Some(s.clone()),
-                _ => None,
-            });
             let dependencies = get_resource_dependencies(resource);
             let effect = Effect::Delete {
                 id: resource.id.clone(),
                 identifier: identifier.clone(),
                 lifecycle: resource.lifecycle.clone(),
-                binding: binding_for_effect,
+                binding: resource.binding.clone(),
                 dependencies,
             };
             let binding = resource
-                .attributes
-                .get("_binding")
-                .and_then(|v| match v {
-                    Value::String(s) => Some(s.clone()),
-                    _ => None,
-                })
+                .binding
+                .clone()
                 .unwrap_or_else(|| format!("{}:{}", resource.id.resource_type, resource.id.name));
             (binding, identifier, effect)
         })
@@ -891,31 +879,20 @@ fn build_orphan_resource(sf: &carina_state::StateFile, id: &ResourceId) -> Resou
     let rs = sf
         .find_resource(&id.provider, &id.resource_type, &id.name)
         .expect("orphan must exist in state file");
-    let mut attributes: HashMap<String, Value> = rs
+    let attributes: HashMap<String, Value> = rs
         .attributes
         .iter()
         .filter_map(|(k, v)| carina_core::value::json_to_dsl_value(v).map(|val| (k.clone(), val)))
         .collect();
-    if let Some(ref binding) = rs.binding {
-        attributes.insert("_binding".to_string(), Value::String(binding.clone()));
-    }
-    if !rs.dependency_bindings.is_empty() {
-        attributes.insert(
-            "_dependency_bindings".to_string(),
-            Value::List(
-                rs.dependency_bindings
-                    .iter()
-                    .map(|b| Value::String(b.clone()))
-                    .collect(),
-            ),
-        );
-    }
     Resource {
         id: id.clone(),
         attributes,
         read_only: false,
         lifecycle: rs.lifecycle.clone(),
         prefixes: rs.prefixes.clone(),
+        binding: rs.binding.clone(),
+        dependency_bindings: rs.dependency_bindings.clone(),
+        virtual_resource: false,
     }
 }
 

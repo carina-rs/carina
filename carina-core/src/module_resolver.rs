@@ -336,12 +336,7 @@ impl<'cfg> ModuleResolver<'cfg> {
         let intra_module_bindings: HashSet<String> = module
             .resources
             .iter()
-            .filter_map(|r| {
-                r.attributes.get("_binding").and_then(|v| match v {
-                    Value::String(s) => Some(s.clone()),
-                    _ => None,
-                })
-            })
+            .filter_map(|r| r.binding.clone())
             .collect();
 
         // Expand resources with substituted values
@@ -357,12 +352,10 @@ impl<'cfg> ModuleResolver<'cfg> {
                 new_name.clone(),
             );
 
-            // Rewrite _binding with instance path (dot-separated)
-            if let Some(Value::String(binding)) = new_resource.attributes.get("_binding") {
+            // Rewrite binding with instance path (dot-separated)
+            if let Some(ref binding) = new_resource.binding {
                 let prefixed = format!("{}.{}", instance_prefix, binding);
-                new_resource
-                    .attributes
-                    .insert("_binding".to_string(), Value::String(prefixed));
+                new_resource.binding = Some(prefixed);
             }
 
             // Add module source info
@@ -396,8 +389,6 @@ impl<'cfg> ModuleResolver<'cfg> {
             && let Some(binding_name) = &call.binding_name
         {
             let mut virtual_attrs: HashMap<String, Value> = HashMap::new();
-            virtual_attrs.insert("_binding".to_string(), Value::String(binding_name.clone()));
-            virtual_attrs.insert("_virtual".to_string(), Value::String("true".to_string()));
             virtual_attrs.insert(
                 "_module".to_string(),
                 Value::String(call.module_name.clone()),
@@ -424,6 +415,9 @@ impl<'cfg> ModuleResolver<'cfg> {
                 read_only: false,
                 lifecycle: LifecycleConfig::default(),
                 prefixes: HashMap::new(),
+                binding: Some(binding_name.clone()),
+                dependency_bindings: Vec::new(),
+                virtual_resource: true,
             };
             expanded_resources.push(virtual_resource);
         }
@@ -749,6 +743,9 @@ mod tests {
                 read_only: false,
                 lifecycle: LifecycleConfig::default(),
                 prefixes: HashMap::new(),
+                binding: None,
+                dependency_bindings: Vec::new(),
+                virtual_resource: false,
             }],
             variables: HashMap::new(),
             imports: vec![],
@@ -858,7 +855,6 @@ mod tests {
                     id: ResourceId::new("ec2.vpc", "main_vpc"),
                     attributes: {
                         let mut attrs = HashMap::new();
-                        attrs.insert("_binding".to_string(), Value::String("vpc".to_string()));
                         attrs.insert(
                             "cidr_block".to_string(),
                             Value::ResourceRef {
@@ -872,12 +868,14 @@ mod tests {
                     read_only: false,
                     lifecycle: LifecycleConfig::default(),
                     prefixes: HashMap::new(),
+                    binding: Some("vpc".to_string()),
+                    dependency_bindings: Vec::new(),
+                    virtual_resource: false,
                 },
                 Resource {
                     id: ResourceId::new("ec2.subnet", "sub"),
                     attributes: {
                         let mut attrs = HashMap::new();
-                        attrs.insert("_binding".to_string(), Value::String("subnet".to_string()));
                         attrs.insert(
                             "vpc_id".to_string(),
                             Value::ResourceRef {
@@ -891,6 +889,9 @@ mod tests {
                     read_only: false,
                     lifecycle: LifecycleConfig::default(),
                     prefixes: HashMap::new(),
+                    binding: Some("subnet".to_string()),
+                    dependency_bindings: Vec::new(),
+                    virtual_resource: false,
                 },
             ],
             variables: HashMap::new(),
@@ -940,26 +941,26 @@ mod tests {
         let expanded_a = resolver.expand_module_call(&call_a, "prod").unwrap();
         let expanded_b = resolver.expand_module_call(&call_b, "staging").unwrap();
 
-        // _binding must be prefixed so they don't collide (using dot notation)
+        // binding must be prefixed so they don't collide (using dot notation)
         assert_eq!(
-            expanded_a[0].attributes.get("_binding"),
-            Some(&Value::String("prod.vpc".to_string())),
-            "Instance A vpc _binding should use dot path"
+            expanded_a[0].binding,
+            Some("prod.vpc".to_string()),
+            "Instance A vpc binding should use dot path"
         );
         assert_eq!(
-            expanded_a[1].attributes.get("_binding"),
-            Some(&Value::String("prod.subnet".to_string())),
-            "Instance A subnet _binding should use dot path"
+            expanded_a[1].binding,
+            Some("prod.subnet".to_string()),
+            "Instance A subnet binding should use dot path"
         );
         assert_eq!(
-            expanded_b[0].attributes.get("_binding"),
-            Some(&Value::String("staging.vpc".to_string())),
-            "Instance B vpc _binding should use dot path"
+            expanded_b[0].binding,
+            Some("staging.vpc".to_string()),
+            "Instance B vpc binding should use dot path"
         );
         assert_eq!(
-            expanded_b[1].attributes.get("_binding"),
-            Some(&Value::String("staging.subnet".to_string())),
-            "Instance B subnet _binding should use dot path"
+            expanded_b[1].binding,
+            Some("staging.subnet".to_string()),
+            "Instance B subnet binding should use dot path"
         );
 
         // Intra-module ResourceRef must point to the dot-path binding
@@ -998,7 +999,6 @@ mod tests {
                 attributes: {
                     let mut attrs = HashMap::new();
                     attrs.insert("name".to_string(), Value::String("sg".to_string()));
-                    attrs.insert("_binding".to_string(), Value::String("sg".to_string()));
                     attrs.insert(
                         "_type".to_string(),
                         Value::String("aws.security_group".to_string()),
@@ -1008,6 +1008,9 @@ mod tests {
                 read_only: false,
                 lifecycle: LifecycleConfig::default(),
                 prefixes: HashMap::new(),
+                binding: Some("sg".to_string()),
+                dependency_bindings: Vec::new(),
+                virtual_resource: false,
             }],
             variables: HashMap::new(),
             imports: vec![],
@@ -1050,17 +1053,10 @@ mod tests {
         // Find the virtual resource
         let virtual_res = expanded
             .iter()
-            .find(|r| {
-                r.attributes
-                    .get("_virtual")
-                    .is_some_and(|v| matches!(v, Value::String(s) if s == "true"))
-            })
+            .find(|r| r.is_virtual())
             .expect("Virtual resource should exist");
 
-        assert_eq!(
-            virtual_res.attributes.get("_binding"),
-            Some(&Value::String("web".to_string()))
-        );
+        assert_eq!(virtual_res.binding, Some("web".to_string()));
         // The security_group attribute should be a rewritten ResourceRef
         // pointing to the dot-path binding (web.sg)
         assert_eq!(
@@ -1091,14 +1087,7 @@ mod tests {
 
         let expanded = resolver.expand_module_call(&call, "web_tier").unwrap();
         // Only real resources, no virtual
-        let virtual_count = expanded
-            .iter()
-            .filter(|r| {
-                r.attributes
-                    .get("_virtual")
-                    .is_some_and(|v| matches!(v, Value::String(s) if s == "true"))
-            })
-            .count();
+        let virtual_count = expanded.iter().filter(|r| r.is_virtual()).count();
         assert_eq!(virtual_count, 0);
     }
 
@@ -1173,15 +1162,9 @@ mod tests {
         assert_eq!(expanded[0].id.name, "prod.main_vpc");
         assert_eq!(expanded[1].id.name, "prod.sub");
 
-        // _binding should use dot notation
-        assert_eq!(
-            expanded[0].attributes.get("_binding"),
-            Some(&Value::String("prod.vpc".to_string())),
-        );
-        assert_eq!(
-            expanded[1].attributes.get("_binding"),
-            Some(&Value::String("prod.subnet".to_string())),
-        );
+        // binding should use dot notation
+        assert_eq!(expanded[0].binding, Some("prod.vpc".to_string()));
+        assert_eq!(expanded[1].binding, Some("prod.subnet".to_string()));
 
         // Intra-module ResourceRef should use dot notation
         assert_eq!(
@@ -1213,11 +1196,7 @@ mod tests {
 
         let virtual_res = expanded
             .iter()
-            .find(|r| {
-                r.attributes
-                    .get("_virtual")
-                    .is_some_and(|v| matches!(v, Value::String(s) if s == "true"))
-            })
+            .find(|r| r.is_virtual())
             .expect("Virtual resource should exist");
 
         // The security_group attribute should reference dot-notation binding
@@ -1336,7 +1315,6 @@ mod tests {
                 id: ResourceId::new("ec2.vpc", "vpc"),
                 attributes: {
                     let mut attrs = HashMap::new();
-                    attrs.insert("_binding".to_string(), Value::String("vpc".to_string()));
                     attrs.insert(
                         "cidr_block".to_string(),
                         Value::ResourceRef {
@@ -1369,6 +1347,9 @@ mod tests {
                 read_only: false,
                 lifecycle: LifecycleConfig::default(),
                 prefixes: HashMap::new(),
+                binding: Some("vpc".to_string()),
+                dependency_bindings: Vec::new(),
+                virtual_resource: false,
             }],
             variables: HashMap::new(),
             imports: vec![],

@@ -563,14 +563,7 @@ fn build_replace_rows(
 
     // Cascading updates
     if !cascading_updates.is_empty() {
-        let replaced_binding = to
-            .attributes
-            .get("_binding")
-            .and_then(|v| match v {
-                Value::String(s) => Some(s.as_str()),
-                _ => None,
-            })
-            .unwrap_or("");
+        let replaced_binding = to.binding.as_deref().unwrap_or("");
 
         let mut updates = Vec::new();
         for cascade in cascading_updates {

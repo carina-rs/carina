@@ -352,7 +352,7 @@ impl DiagnosticEngine {
         // Collect defined binding names from parsed resources
         let mut defined_bindings: HashSet<String> = HashSet::new();
         for resource in &parsed.resources {
-            if let Some(Value::String(binding_name)) = resource.attributes.get("_binding") {
+            if let Some(ref binding_name) = resource.binding {
                 defined_bindings.insert(binding_name.clone());
             }
         }

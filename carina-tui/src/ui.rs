@@ -1045,12 +1045,12 @@ mod tests {
         let mut plan = Plan::new();
         plan.add(Effect::Create(
             Resource::new("ec2.vpc", "my-vpc")
-                .with_attribute("_binding", Value::String("vpc".to_string()))
+                .with_binding("vpc")
                 .with_attribute("cidr_block", Value::String("10.0.0.0/16".to_string())),
         ));
         plan.add(Effect::Create(
             Resource::new("ec2.subnet", "my-subnet")
-                .with_attribute("_binding", Value::String("subnet".to_string()))
+                .with_binding("subnet")
                 .with_attribute(
                     "vpc_id",
                     Value::ResourceRef {
@@ -1071,12 +1071,11 @@ mod tests {
     fn tree_connector_multiple_children() {
         let mut plan = Plan::new();
         plan.add(Effect::Create(
-            Resource::new("ec2.vpc", "my-vpc")
-                .with_attribute("_binding", Value::String("vpc".to_string())),
+            Resource::new("ec2.vpc", "my-vpc").with_binding("vpc"),
         ));
         plan.add(Effect::Create(
             Resource::new("ec2.subnet", "subnet-a")
-                .with_attribute("_binding", Value::String("subnet_a".to_string()))
+                .with_binding("subnet_a")
                 .with_attribute(
                     "vpc_id",
                     Value::ResourceRef {
@@ -1088,7 +1087,7 @@ mod tests {
         ));
         plan.add(Effect::Create(
             Resource::new("ec2.subnet", "subnet-b")
-                .with_attribute("_binding", Value::String("subnet_b".to_string()))
+                .with_binding("subnet_b")
                 .with_attribute(
                     "vpc_id",
                     Value::ResourceRef {

@@ -55,10 +55,7 @@ impl Plan {
                 ..
             } = effect
             {
-                let binding = to.attributes.get("_binding").and_then(|v| match v {
-                    Value::String(s) => Some(s.clone()),
-                    _ => None,
-                });
+                let binding = to.binding.clone();
                 if let Some(binding) = binding
                     && replaced_bindings.contains(&binding)
                     && let Some(updates) = updates_by_binding.get(&binding)

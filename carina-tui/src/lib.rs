@@ -276,23 +276,14 @@ mod tests {
     fn make_search_app() -> App {
         let mut plan = Plan::new();
         plan.add(Effect::Create(
-            Resource::new("s3.bucket", "my-bucket").with_attribute(
-                "_binding",
-                carina_core::resource::Value::String("bucket".to_string()),
-            ),
+            Resource::new("s3.bucket", "my-bucket").with_binding("bucket"),
         ));
         plan.add(Effect::Create(
-            Resource::new("ec2.vpc", "my-vpc").with_attribute(
-                "_binding",
-                carina_core::resource::Value::String("vpc".to_string()),
-            ),
+            Resource::new("ec2.vpc", "my-vpc").with_binding("vpc"),
         ));
         plan.add(Effect::Create(
             Resource::new("ec2.subnet", "my-subnet")
-                .with_attribute(
-                    "_binding",
-                    carina_core::resource::Value::String("subnet".to_string()),
-                )
+                .with_binding("subnet")
                 .with_attribute(
                     "vpc_id",
                     carina_core::resource::Value::ResourceRef {
@@ -493,22 +484,13 @@ mod tests {
     fn make_provider_prefixed_app() -> App {
         let mut plan = Plan::new();
         plan.add(Effect::Create(
-            Resource::with_provider("awscc", "ec2.vpc", "my-vpc").with_attribute(
-                "_binding",
-                carina_core::resource::Value::String("vpc".to_string()),
-            ),
+            Resource::with_provider("awscc", "ec2.vpc", "my-vpc").with_binding("vpc"),
         ));
         plan.add(Effect::Create(
-            Resource::with_provider("awscc", "ec2.subnet", "my-subnet").with_attribute(
-                "_binding",
-                carina_core::resource::Value::String("subnet".to_string()),
-            ),
+            Resource::with_provider("awscc", "ec2.subnet", "my-subnet").with_binding("subnet"),
         ));
         plan.add(Effect::Create(
-            Resource::with_provider("awscc", "s3.bucket", "my-bucket").with_attribute(
-                "_binding",
-                carina_core::resource::Value::String("bucket".to_string()),
-            ),
+            Resource::with_provider("awscc", "s3.bucket", "my-bucket").with_binding("bucket"),
         ));
         App::new(&plan, &HashMap::new())
     }

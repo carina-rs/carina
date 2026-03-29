@@ -71,7 +71,7 @@ pub fn validate_resource_ref_types(
     // Build binding_name -> resource map
     let mut binding_map: HashMap<String, &Resource> = HashMap::new();
     for resource in resources {
-        if let Some(Value::String(binding_name)) = resource.attributes.get("_binding") {
+        if let Some(ref binding_name) = resource.binding {
             binding_map.insert(binding_name.clone(), resource);
         }
     }
@@ -239,7 +239,7 @@ pub fn check_unused_bindings(parsed: &ParsedFile) -> Vec<String> {
     // Collect all defined binding names
     let mut defined_bindings: Vec<String> = Vec::new();
     for resource in &parsed.resources {
-        if let Some(Value::String(binding_name)) = resource.attributes.get("_binding") {
+        if let Some(ref binding_name) = resource.binding {
             defined_bindings.push(binding_name.clone());
         }
     }
@@ -384,7 +384,7 @@ mod tests {
 
         // Resource with a binding
         let vpc = Resource::with_provider("awscc", "ec2.vpc", "main-vpc")
-            .with_attribute("_binding", Value::String("vpc".to_string()))
+            .with_binding("vpc")
             .with_attribute("cidr_block", Value::String("10.0.0.0/16".to_string()));
         parsed.resources.push(vpc);
 
@@ -407,7 +407,7 @@ mod tests {
         let mut parsed = empty_parsed();
 
         let vpc = Resource::with_provider("awscc", "ec2.vpc", "main-vpc")
-            .with_attribute("_binding", Value::String("vpc".to_string()))
+            .with_binding("vpc")
             .with_attribute("cidr_block", Value::String("10.0.0.0/16".to_string()));
         parsed.resources.push(vpc);
 
@@ -431,8 +431,7 @@ mod tests {
     fn binding_referenced_in_nested_value() {
         let mut parsed = empty_parsed();
 
-        let vpc = Resource::with_provider("awscc", "ec2.vpc", "main-vpc")
-            .with_attribute("_binding", Value::String("vpc".to_string()));
+        let vpc = Resource::with_provider("awscc", "ec2.vpc", "main-vpc").with_binding("vpc");
         parsed.resources.push(vpc);
 
         // Reference inside a Map inside a List
@@ -456,8 +455,7 @@ mod tests {
     fn binding_referenced_in_module_call() {
         let mut parsed = empty_parsed();
 
-        let vpc = Resource::with_provider("awscc", "ec2.vpc", "main-vpc")
-            .with_attribute("_binding", Value::String("vpc".to_string()));
+        let vpc = Resource::with_provider("awscc", "ec2.vpc", "main-vpc").with_binding("vpc");
         parsed.resources.push(vpc);
 
         let mut args = HashMap::new();
@@ -482,12 +480,11 @@ mod tests {
     fn multiple_bindings_some_unused() {
         let mut parsed = empty_parsed();
 
-        let vpc = Resource::with_provider("awscc", "ec2.vpc", "main-vpc")
-            .with_attribute("_binding", Value::String("vpc".to_string()));
+        let vpc = Resource::with_provider("awscc", "ec2.vpc", "main-vpc").with_binding("vpc");
         parsed.resources.push(vpc);
 
-        let sg = Resource::with_provider("awscc", "ec2.security_group", "web-sg")
-            .with_attribute("_binding", Value::String("web_sg".to_string()));
+        let sg =
+            Resource::with_provider("awscc", "ec2.security_group", "web-sg").with_binding("web_sg");
         parsed.resources.push(sg);
 
         // Only vpc is referenced
@@ -509,8 +506,7 @@ mod tests {
     fn binding_referenced_in_attributes_not_warned() {
         let mut parsed = empty_parsed();
 
-        let vpc = Resource::with_provider("awscc", "ec2.vpc", "main-vpc")
-            .with_attribute("_binding", Value::String("vpc".to_string()));
+        let vpc = Resource::with_provider("awscc", "ec2.vpc", "main-vpc").with_binding("vpc");
         parsed.resources.push(vpc);
 
         parsed
@@ -665,7 +661,7 @@ let route = awscc.ec2.route {
 
         // VPC resource with binding
         let vpc = Resource::with_provider("awscc", "ec2.vpc", "main-vpc")
-            .with_attribute("_binding", Value::String("vpc".to_string()))
+            .with_binding("vpc")
             .with_attribute("cidr_block", Value::String("10.0.0.0/16".to_string()));
 
         // Subnet references vpc.nonexistent_attr which doesn't exist on the VPC schema
@@ -711,8 +707,8 @@ let route = awscc.ec2.route {
             ),
         );
 
-        let igw = Resource::with_provider("awscc", "ec2.internet_gateway", "igw")
-            .with_attribute("_binding", Value::String("igw".to_string()));
+        let igw =
+            Resource::with_provider("awscc", "ec2.internet_gateway", "igw").with_binding("igw");
 
         // Typo: internet_gateway_idd instead of internet_gateway_id
         let route = Resource::with_provider("awscc", "ec2.route", "main-route").with_attribute(
@@ -750,8 +746,7 @@ let route = awscc.ec2.route {
             make_schema("ec2.subnet", vec![("vpc_id", AttributeType::String)]),
         );
 
-        let vpc = Resource::with_provider("awscc", "ec2.vpc", "main-vpc")
-            .with_attribute("_binding", Value::String("vpc".to_string()));
+        let vpc = Resource::with_provider("awscc", "ec2.vpc", "main-vpc").with_binding("vpc");
 
         // Completely unrelated attribute name - no suggestion expected
         let subnet = Resource::with_provider("awscc", "ec2.subnet", "web-subnet").with_attribute(

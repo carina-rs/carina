@@ -11,11 +11,11 @@ fn cascade_dependent_updates_adds_update_for_dependent() {
 
     // Unresolved resources (before ref resolution)
     let vpc = Resource::new("ec2.vpc", "my-vpc")
-        .with_attribute("_binding", Value::String("vpc".to_string()))
+        .with_binding("vpc")
         .with_attribute("cidr_block", Value::String("10.1.0.0/16".to_string()));
 
     let subnet = Resource::new("ec2.subnet", "my-subnet")
-        .with_attribute("_binding", Value::String("subnet".to_string()))
+        .with_binding("subnet")
         .with_attribute(
             "vpc_id",
             Value::ResourceRef {
@@ -57,9 +57,7 @@ fn cascade_dependent_updates_adds_update_for_dependent() {
     plan.add(Effect::Replace {
         id: vpc_id.clone(),
         from: Box::new(current_states.get(&vpc_id).unwrap().clone()),
-        to: vpc
-            .clone()
-            .with_attribute("_binding", Value::String("vpc".to_string())),
+        to: vpc.clone().with_binding("vpc"),
         lifecycle: LifecycleConfig {
             force_delete: false,
             create_before_destroy: true,
@@ -107,11 +105,11 @@ fn cascade_skips_resources_already_in_plan() {
     let subnet_id = ResourceId::new("ec2.subnet", "my-subnet");
 
     let vpc = Resource::new("ec2.vpc", "my-vpc")
-        .with_attribute("_binding", Value::String("vpc".to_string()))
+        .with_binding("vpc")
         .with_attribute("cidr_block", Value::String("10.1.0.0/16".to_string()));
 
     let subnet = Resource::new("ec2.subnet", "my-subnet")
-        .with_attribute("_binding", Value::String("subnet".to_string()))
+        .with_binding("subnet")
         .with_attribute(
             "vpc_id",
             Value::ResourceRef {
@@ -191,11 +189,11 @@ fn cascade_no_op_without_create_before_destroy() {
     let vpc_id = ResourceId::new("ec2.vpc", "my-vpc");
 
     let vpc = Resource::new("ec2.vpc", "my-vpc")
-        .with_attribute("_binding", Value::String("vpc".to_string()))
+        .with_binding("vpc")
         .with_attribute("cidr_block", Value::String("10.1.0.0/16".to_string()));
 
     let subnet = Resource::new("ec2.subnet", "my-subnet")
-        .with_attribute("_binding", Value::String("subnet".to_string()))
+        .with_binding("subnet")
         .with_attribute(
             "vpc_id",
             Value::ResourceRef {
@@ -251,11 +249,11 @@ fn cascade_transitive_dependencies() {
     let instance_id = ResourceId::new("ec2.instance", "my-instance");
 
     let vpc = Resource::new("ec2.vpc", "my-vpc")
-        .with_attribute("_binding", Value::String("vpc".to_string()))
+        .with_binding("vpc")
         .with_attribute("cidr_block", Value::String("10.1.0.0/16".to_string()));
 
     let subnet = Resource::new("ec2.subnet", "my-subnet")
-        .with_attribute("_binding", Value::String("subnet".to_string()))
+        .with_binding("subnet")
         .with_attribute(
             "vpc_id",
             Value::ResourceRef {
@@ -266,7 +264,7 @@ fn cascade_transitive_dependencies() {
         );
 
     let instance = Resource::new("ec2.instance", "my-instance")
-        .with_attribute("_binding", Value::String("instance".to_string()))
+        .with_binding("instance")
         .with_attribute(
             "subnet_id",
             Value::ResourceRef {
@@ -349,7 +347,7 @@ fn cascade_anonymous_resource_dependent() {
     let subnet_id = ResourceId::new("ec2.subnet", "my-subnet");
 
     let vpc = Resource::new("ec2.vpc", "my-vpc")
-        .with_attribute("_binding", Value::String("vpc".to_string()))
+        .with_binding("vpc")
         .with_attribute("cidr_block", Value::String("10.1.0.0/16".to_string()));
 
     // Anonymous subnet (no _binding) with a ResourceRef to the VPC
@@ -431,11 +429,11 @@ fn cascade_generates_replace_when_dependent_attribute_is_create_only() {
 
     // Unresolved resources (before ref resolution)
     let vpc = Resource::new("ec2.vpc", "my-vpc")
-        .with_attribute("_binding", Value::String("vpc".to_string()))
+        .with_binding("vpc")
         .with_attribute("cidr_block", Value::String("10.1.0.0/16".to_string()));
 
     let subnet = Resource::new("ec2.subnet", "my-subnet")
-        .with_attribute("_binding", Value::String("subnet".to_string()))
+        .with_binding("subnet")
         .with_attribute(
             "vpc_id",
             Value::ResourceRef {
@@ -489,9 +487,7 @@ fn cascade_generates_replace_when_dependent_attribute_is_create_only() {
     plan.add(Effect::Replace {
         id: vpc_id.clone(),
         from: Box::new(current_states.get(&vpc_id).unwrap().clone()),
-        to: vpc
-            .clone()
-            .with_attribute("_binding", Value::String("vpc".to_string())),
+        to: vpc.clone().with_binding("vpc"),
         lifecycle: LifecycleConfig {
             force_delete: false,
             create_before_destroy: true,
@@ -581,11 +577,11 @@ fn cascade_merges_with_existing_replace_direct_change_plus_cascade() {
 
     // Unresolved resources (before ref resolution)
     let vpc = Resource::new("ec2.vpc", "my-vpc")
-        .with_attribute("_binding", Value::String("vpc".to_string()))
+        .with_binding("vpc")
         .with_attribute("cidr_block", Value::String("10.1.0.0/16".to_string()));
 
     let subnet = Resource::new("ec2.subnet", "my-subnet")
-        .with_attribute("_binding", Value::String("subnet".to_string()))
+        .with_binding("subnet")
         .with_attribute(
             "vpc_id",
             Value::ResourceRef {
@@ -651,9 +647,7 @@ fn cascade_merges_with_existing_replace_direct_change_plus_cascade() {
     plan.add(Effect::Replace {
         id: vpc_id.clone(),
         from: Box::new(current_states.get(&vpc_id).unwrap().clone()),
-        to: vpc
-            .clone()
-            .with_attribute("_binding", Value::String("vpc".to_string())),
+        to: vpc.clone().with_binding("vpc"),
         lifecycle: LifecycleConfig {
             force_delete: false,
             create_before_destroy: true,
@@ -666,9 +660,7 @@ fn cascade_merges_with_existing_replace_direct_change_plus_cascade() {
     plan.add(Effect::Replace {
         id: subnet_id.clone(),
         from: Box::new(current_states.get(&subnet_id).unwrap().clone()),
-        to: subnet
-            .clone()
-            .with_attribute("_binding", Value::String("subnet".to_string())),
+        to: subnet.clone().with_binding("subnet"),
         lifecycle: LifecycleConfig::default(),
         changed_create_only: vec!["availability_zone".to_string()],
         cascading_updates: vec![],
@@ -731,11 +723,11 @@ fn auto_detect_create_before_destroy_when_resource_has_dependents() {
 
     // Unresolved resources (before ref resolution)
     let vpc = Resource::new("ec2.vpc", "my-vpc")
-        .with_attribute("_binding", Value::String("vpc".to_string()))
+        .with_binding("vpc")
         .with_attribute("cidr_block", Value::String("10.1.0.0/16".to_string()));
 
     let subnet = Resource::new("ec2.subnet", "my-subnet")
-        .with_attribute("_binding", Value::String("subnet".to_string()))
+        .with_binding("subnet")
         .with_attribute(
             "vpc_id",
             Value::ResourceRef {
@@ -792,9 +784,7 @@ fn auto_detect_create_before_destroy_when_resource_has_dependents() {
     plan.add(Effect::Replace {
         id: vpc_id.clone(),
         from: Box::new(current_states.get(&vpc_id).unwrap().clone()),
-        to: vpc
-            .clone()
-            .with_attribute("_binding", Value::String("vpc".to_string())),
+        to: vpc.clone().with_binding("vpc"),
         lifecycle: LifecycleConfig::default(), // create_before_destroy = false (user didn't set it)
         changed_create_only: vec!["cidr_block".to_string()],
         cascading_updates: vec![],
@@ -842,11 +832,11 @@ fn cascade_upgrades_update_to_replace_when_ref_is_create_only() {
 
     // Unresolved resources (before ref resolution)
     let vpc = Resource::new("ec2.vpc", "my-vpc")
-        .with_attribute("_binding", Value::String("vpc".to_string()))
+        .with_binding("vpc")
         .with_attribute("cidr_block", Value::String("10.1.0.0/16".to_string()));
 
     let subnet = Resource::new("ec2.subnet", "my-subnet")
-        .with_attribute("_binding", Value::String("subnet".to_string()))
+        .with_binding("subnet")
         .with_attribute(
             "vpc_id",
             Value::ResourceRef {
@@ -905,9 +895,7 @@ fn cascade_upgrades_update_to_replace_when_ref_is_create_only() {
     plan.add(Effect::Replace {
         id: vpc_id.clone(),
         from: Box::new(current_states.get(&vpc_id).unwrap().clone()),
-        to: vpc
-            .clone()
-            .with_attribute("_binding", Value::String("vpc".to_string())),
+        to: vpc.clone().with_binding("vpc"),
         lifecycle: LifecycleConfig {
             force_delete: false,
             create_before_destroy: true,
@@ -920,9 +908,7 @@ fn cascade_upgrades_update_to_replace_when_ref_is_create_only() {
     plan.add(Effect::Update {
         id: subnet_id.clone(),
         from: Box::new(current_states.get(&subnet_id).unwrap().clone()),
-        to: subnet
-            .clone()
-            .with_attribute("_binding", Value::String("subnet".to_string())),
+        to: subnet.clone().with_binding("subnet"),
         changed_attributes: vec!["tags".to_string()],
     });
 

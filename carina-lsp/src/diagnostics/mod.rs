@@ -107,7 +107,7 @@ impl DiagnosticEngine {
             // Build binding_name -> (provider, resource_type) map for ResourceRef type checking
             let mut binding_schema_map: HashMap<String, ResourceSchema> = HashMap::new();
             for res in &parsed.resources {
-                if let Some(Value::String(binding_name)) = res.attributes.get("_binding") {
+                if let Some(ref binding_name) = res.binding {
                     let full_type = format!("{}.{}", res.id.provider, res.id.resource_type);
                     if let Some(s) = self.schemas.get(&full_type).cloned() {
                         binding_schema_map.insert(binding_name.clone(), s);

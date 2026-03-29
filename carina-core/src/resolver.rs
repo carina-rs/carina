@@ -26,10 +26,8 @@ pub fn resolve_refs_with_state(
     for resource in resources.iter_mut() {
         let deps = get_resource_dependencies(resource);
         if !deps.is_empty() {
-            let dep_list: Vec<Value> = deps.into_iter().map(Value::String).collect();
-            resource
-                .attributes
-                .insert("_dependency_bindings".to_string(), Value::List(dep_list));
+            let dep_list: Vec<String> = deps.into_iter().collect();
+            resource.dependency_bindings = dep_list;
         }
     }
 
@@ -37,7 +35,7 @@ pub fn resolve_refs_with_state(
     let mut binding_map: HashMap<String, HashMap<String, Value>> = HashMap::new();
 
     for resource in resources.iter() {
-        if let Some(Value::String(binding_name)) = resource.attributes.get("_binding") {
+        if let Some(ref binding_name) = resource.binding {
             let mut attrs = resource.attributes.clone();
 
             // Merge AWS state attributes (like `id`) if available
@@ -222,13 +220,11 @@ mod tests {
     use crate::resource::ResourceId;
 
     fn make_resource(name: &str, binding: Option<&str>, attrs: Vec<(&str, Value)>) -> Resource {
-        let mut attributes: HashMap<String, Value> =
+        let attributes: HashMap<String, Value> =
             attrs.into_iter().map(|(k, v)| (k.to_string(), v)).collect();
-        if let Some(b) = binding {
-            attributes.insert("_binding".to_string(), Value::String(b.to_string()));
-        }
         let mut r = Resource::new("test.resource", name);
         r.attributes = attributes;
+        r.binding = binding.map(|b| b.to_string());
         r
     }
 

@@ -346,25 +346,9 @@ fn build_plan_from_state(state: &StateFile) -> Plan {
     for rs in &state.resources {
         let mut resource = Resource::with_provider(&rs.provider, &rs.resource_type, &rs.name);
 
-        // Set binding as _binding attribute so TUI can display it
-        if let Some(binding) = &rs.binding {
-            resource
-                .attributes
-                .insert("_binding".to_string(), Value::String(binding.clone()));
-        }
-
-        // Set dependency bindings as _dependency_bindings so TUI tree works
-        if !rs.dependency_bindings.is_empty() {
-            resource.attributes.insert(
-                "_dependency_bindings".to_string(),
-                Value::List(
-                    rs.dependency_bindings
-                        .iter()
-                        .map(|b| Value::String(b.clone()))
-                        .collect(),
-                ),
-            );
-        }
+        // Set typed metadata fields from state
+        resource.binding = rs.binding.clone();
+        resource.dependency_bindings = rs.dependency_bindings.clone();
 
         // Convert JSON attributes to DSL values
         for (key, json_val) in &rs.attributes {
@@ -1177,14 +1161,6 @@ mod tests {
 
         // subnet depends on vpc
         let subnet_resource = plan.effects()[1].resource().unwrap();
-        let deps = subnet_resource.attributes.get("_dependency_bindings");
-        assert!(deps.is_some());
-        match deps.unwrap() {
-            Value::List(items) => {
-                assert_eq!(items.len(), 1);
-                assert_eq!(items[0], Value::String("vpc".to_string()));
-            }
-            _ => panic!("expected List"),
-        }
+        assert_eq!(subnet_resource.dependency_bindings, vec!["vpc".to_string()]);
     }
 }
