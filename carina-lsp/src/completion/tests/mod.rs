@@ -5,6 +5,7 @@ use crate::document::Document;
 use carina_core::parser::ProviderContext;
 use carina_core::provider::{self as provider_mod, ProviderFactory};
 use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
+use carina_provider_awscc::schemas::awscc_types::awscc_validators;
 
 mod basic;
 mod extended;
@@ -24,7 +25,14 @@ pub(super) fn test_provider() -> CompletionProvider {
         .iter()
         .flat_map(|f| f.region_completions())
         .collect();
-    CompletionProvider::new(schemas, provider_names, region_completions)
+    // Collect custom type names from provider validators
+    let custom_type_names: Vec<String> = awscc_validators().keys().cloned().collect();
+    CompletionProvider::new(
+        schemas,
+        provider_names,
+        region_completions,
+        custom_type_names,
+    )
 }
 
 pub(super) fn test_provider_with_block_name_nested() -> CompletionProvider {
@@ -53,7 +61,7 @@ pub(super) fn test_provider_with_block_name_nested() -> CompletionProvider {
     let mut schemas = HashMap::new();
     schemas.insert("test.block.resource".to_string(), schema);
 
-    CompletionProvider::new(Arc::new(schemas), vec!["test".to_string()], vec![])
+    CompletionProvider::new(Arc::new(schemas), vec!["test".to_string()], vec![], vec![])
 }
 
 pub(super) fn test_provider_with_nested_structs() -> CompletionProvider {
@@ -79,5 +87,5 @@ pub(super) fn test_provider_with_nested_structs() -> CompletionProvider {
     let mut schemas = HashMap::new();
     schemas.insert("test.nested.resource".to_string(), schema);
 
-    CompletionProvider::new(Arc::new(schemas), vec!["test".to_string()], vec![])
+    CompletionProvider::new(Arc::new(schemas), vec!["test".to_string()], vec![], vec![])
 }

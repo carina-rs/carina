@@ -160,7 +160,8 @@ fn list_string_enum_completions() {
     let mut schemas = HashMap::new();
     schemas.insert("test.list.resource".to_string(), schema);
 
-    let provider = CompletionProvider::new(Arc::new(schemas), vec!["test".to_string()], vec![]);
+    let provider =
+        CompletionProvider::new(Arc::new(schemas), vec!["test".to_string()], vec![], vec![]);
 
     let completions =
         provider.completions_for_type(&AttributeType::list(AttributeType::StringEnum {
@@ -313,7 +314,8 @@ fn no_completions_for_unknown_resource_type_in_block() {
     schemas.insert("test.a.resource".to_string(), schema_a);
     schemas.insert("test.b.resource".to_string(), schema_b);
 
-    let provider = CompletionProvider::new(Arc::new(schemas), vec!["test".to_string()], vec![]);
+    let provider =
+        CompletionProvider::new(Arc::new(schemas), vec!["test".to_string()], vec![], vec![]);
 
     // Simulate being inside a block where resource type detection yields empty string
     let completions = provider.attribute_completions_for_type("");

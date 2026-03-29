@@ -15,6 +15,19 @@ struct BindingDotContext {
     resource_type: String,
 }
 
+fn type_completion_item(label: String, detail: String, range: Range) -> CompletionItem {
+    CompletionItem {
+        label: label.clone(),
+        kind: Some(CompletionItemKind::TYPE_PARAMETER),
+        detail: Some(detail),
+        text_edit: Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(TextEdit {
+            range,
+            new_text: label,
+        })),
+        ..Default::default()
+    }
+}
+
 impl CompletionProvider {
     pub(super) fn attribute_completions_for_type(
         &self,
@@ -537,27 +550,51 @@ impl CompletionProvider {
             end: position,
         };
 
-        self.schemas
-            .keys()
-            .map(|resource_type| {
-                let description = self
-                    .schemas
-                    .get(resource_type)
-                    .and_then(|s| s.description.as_deref())
-                    .unwrap_or("Resource reference");
+        // Basic types
+        let basic = [
+            ("string", "String type"),
+            ("int", "Integer type"),
+            ("bool", "Boolean type"),
+            ("float", "Float type"),
+        ]
+        .iter()
+        .map(|(name, detail)| {
+            type_completion_item(name.to_string(), detail.to_string(), replacement_range)
+        });
 
-                CompletionItem {
-                    label: resource_type.clone(),
-                    kind: Some(CompletionItemKind::TYPE_PARAMETER),
-                    detail: Some(format!("{} reference", description)),
-                    text_edit: Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(TextEdit {
-                        range: replacement_range,
-                        new_text: resource_type.clone(),
-                    })),
-                    ..Default::default()
-                }
-            })
-            .collect()
+        // Generic type constructors
+        let generic = [
+            ("list(", "List type constructor"),
+            ("map(", "Map type constructor"),
+        ]
+        .iter()
+        .map(|(name, detail)| {
+            type_completion_item(name.to_string(), detail.to_string(), replacement_range)
+        });
+
+        // Custom types from provider validators
+        let custom = self.custom_type_names.iter().map(move |name| {
+            type_completion_item(
+                name.clone(),
+                format!("Custom type: {}", name),
+                replacement_range,
+            )
+        });
+
+        // Resource types from schemas
+        let resource = self.schemas.iter().map(move |(resource_type, schema)| {
+            let description = schema
+                .description
+                .as_deref()
+                .unwrap_or("Resource reference");
+            type_completion_item(
+                resource_type.clone(),
+                format!("{} reference", description),
+                replacement_range,
+            )
+        });
+
+        basic.chain(generic).chain(custom).chain(resource).collect()
     }
 
     pub(super) fn availability_zone_completions(
