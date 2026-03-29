@@ -1,4 +1,5 @@
 pub mod eip;
+pub mod flow_log;
 pub mod internet_gateway;
 pub mod nat_gateway;
 pub mod route;
@@ -9,4 +10,6 @@ pub mod security_group_ingress;
 pub mod subnet;
 pub mod subnet_route_table_association;
 pub mod vpc;
+pub mod vpc_endpoint;
 pub mod vpc_gateway_attachment;
+pub mod vpn_gateway;

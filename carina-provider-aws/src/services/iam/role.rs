@@ -304,7 +304,7 @@ impl AwsProvider {
 
 /// Convert a Carina Value (Map with snake_case keys) to a JSON string
 /// with PascalCase keys suitable for the IAM API.
-fn value_to_iam_policy_json(value: &Value) -> Result<String, String> {
+pub fn value_to_iam_policy_json(value: &Value) -> Result<String, String> {
     let json_value = value_to_json_pascal(value);
     serde_json::to_string(&json_value).map_err(|e| format!("JSON serialization failed: {}", e))
 }

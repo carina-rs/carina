@@ -486,6 +486,148 @@ impl AwsProvider {
         obj.security_group_rule_id().map(String::from)
     }
 
+    /// Extract ec2.vpc_endpoint attributes from SDK response type (generated)
+    pub(crate) fn extract_ec2_vpc_endpoint_attributes(
+        obj: &aws_sdk_ec2::types::VpcEndpoint,
+        attributes: &mut HashMap<String, Value>,
+    ) -> Option<String> {
+        if let Some(v) = obj.vpc_endpoint_id() {
+            attributes.insert("vpc_endpoint_id".to_string(), Value::String(v.to_string()));
+        }
+        if let Some(v) = obj.vpc_endpoint_type() {
+            attributes.insert(
+                "vpc_endpoint_type".to_string(),
+                Value::String(v.as_str().to_string()),
+            );
+        }
+        if let Some(v) = obj.vpc_id() {
+            attributes.insert("vpc_id".to_string(), Value::String(v.to_string()));
+        }
+        if let Some(v) = obj.service_name() {
+            attributes.insert("service_name".to_string(), Value::String(v.to_string()));
+        }
+        if let Some(v) = obj.private_dns_enabled() {
+            attributes.insert("private_dns_enabled".to_string(), Value::Bool(v));
+        }
+        if let Some(v) = obj.policy_document() {
+            // Try to parse the policy document JSON into a Value::Map
+            let policy_value = crate::services::iam::role::iam_policy_json_to_value(v)
+                .unwrap_or_else(|_| Value::String(v.to_string()));
+            attributes.insert("policy_document".to_string(), policy_value);
+        }
+        {
+            let ids = obj.route_table_ids();
+            if !ids.is_empty() {
+                let list: Vec<Value> = ids.iter().map(|s| Value::String(s.to_string())).collect();
+                attributes.insert("route_table_ids".to_string(), Value::List(list));
+            }
+        }
+        {
+            let ids = obj.subnet_ids();
+            if !ids.is_empty() {
+                let list: Vec<Value> = ids.iter().map(|s| Value::String(s.to_string())).collect();
+                attributes.insert("subnet_ids".to_string(), Value::List(list));
+            }
+        }
+        // Extract security group IDs from groups
+        {
+            let groups = obj.groups();
+            if !groups.is_empty() {
+                let list: Vec<Value> = groups
+                    .iter()
+                    .filter_map(|g| g.group_id().map(|id| Value::String(id.to_string())))
+                    .collect();
+                if !list.is_empty() {
+                    attributes.insert("security_group_ids".to_string(), Value::List(list));
+                }
+            }
+        }
+        obj.vpc_endpoint_id().map(String::from)
+    }
+
+    /// Extract ec2.flow_log attributes from SDK response type (generated)
+    pub(crate) fn extract_ec2_flow_log_attributes(
+        obj: &aws_sdk_ec2::types::FlowLog,
+        attributes: &mut HashMap<String, Value>,
+    ) -> Option<String> {
+        if let Some(v) = obj.flow_log_id() {
+            attributes.insert("flow_log_id".to_string(), Value::String(v.to_string()));
+        }
+        if let Some(v) = obj.resource_id() {
+            attributes.insert("resource_id".to_string(), Value::String(v.to_string()));
+        }
+        if let Some(v) = obj.traffic_type() {
+            attributes.insert(
+                "traffic_type".to_string(),
+                Value::String(v.as_str().to_string()),
+            );
+        }
+        if let Some(v) = obj.log_destination_type() {
+            attributes.insert(
+                "log_destination_type".to_string(),
+                Value::String(v.as_str().to_string()),
+            );
+        }
+        if let Some(v) = obj.log_destination() {
+            attributes.insert("log_destination".to_string(), Value::String(v.to_string()));
+        }
+        if let Some(v) = obj.log_group_name() {
+            attributes.insert("log_group_name".to_string(), Value::String(v.to_string()));
+        }
+        if let Some(v) = obj.deliver_logs_permission_arn() {
+            attributes.insert(
+                "deliver_logs_permission_arn".to_string(),
+                Value::String(v.to_string()),
+            );
+        }
+        if let Some(v) = obj.log_format() {
+            attributes.insert("log_format".to_string(), Value::String(v.to_string()));
+        }
+        if let Some(v) = obj.max_aggregation_interval() {
+            attributes.insert("max_aggregation_interval".to_string(), Value::Int(v as i64));
+        }
+        if let Some(v) = obj.flow_log_status()
+            && v == "ACTIVE"
+        {
+            // Only extract resource_type for active flow logs
+            if let Some(rt) = obj.resource_id() {
+                let resource_type_str = if rt.starts_with("vpc-") {
+                    "VPC"
+                } else if rt.starts_with("subnet-") {
+                    "Subnet"
+                } else if rt.starts_with("eni-") {
+                    "NetworkInterface"
+                } else {
+                    ""
+                };
+                if !resource_type_str.is_empty() {
+                    attributes.insert(
+                        "resource_type".to_string(),
+                        Value::String(resource_type_str.to_string()),
+                    );
+                }
+            }
+        }
+        obj.flow_log_id().map(String::from)
+    }
+
+    /// Extract ec2.vpn_gateway attributes from SDK response type (generated)
+    pub(crate) fn extract_ec2_vpn_gateway_attributes(
+        obj: &aws_sdk_ec2::types::VpnGateway,
+        attributes: &mut HashMap<String, Value>,
+    ) -> Option<String> {
+        if let Some(v) = obj.vpn_gateway_id() {
+            attributes.insert("vpn_gateway_id".to_string(), Value::String(v.to_string()));
+        }
+        if let Some(v) = obj.r#type() {
+            attributes.insert("type".to_string(), Value::String(v.as_str().to_string()));
+        }
+        if let Some(v) = obj.amazon_side_asn() {
+            attributes.insert("amazon_side_asn".to_string(), Value::Int(v));
+        }
+        obj.vpn_gateway_id().map(String::from)
+    }
+
     /// Extract ec2.security_group_egress attributes from SDK response type (generated)
     pub(crate) fn extract_ec2_security_group_egress_attributes(
         obj: &aws_sdk_ec2::types::SecurityGroupRule,

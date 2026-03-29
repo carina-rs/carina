@@ -1,0 +1,27 @@
+# EC2 Flow Log - Basic test
+#
+# Tests: VPC Flow Log creation with S3 destination
+
+provider aws {
+  region = aws.Region.ap_northeast_1
+}
+
+let vpc = aws.ec2.vpc {
+  cidr_block = "10.0.0.0/16"
+
+  tags = {
+    Environment = "acceptance-test"
+  }
+}
+
+let flow_log = aws.ec2.flow_log {
+  resource_id          = vpc.vpc_id
+  resource_type        = aws.ec2.flow_log.ResourceType.VPC
+  traffic_type         = aws.ec2.flow_log.TrafficType.ALL
+  log_destination_type = aws.ec2.flow_log.LogDestinationType.s3
+  log_destination      = "arn:aws:s3:::carina-acceptance-test-flow-logs"
+
+  tags = {
+    Environment = "acceptance-test"
+  }
+}

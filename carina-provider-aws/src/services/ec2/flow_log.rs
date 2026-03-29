@@ -1,0 +1,182 @@
+use std::collections::HashMap;
+
+use carina_core::provider::{ProviderError, ProviderResult};
+use carina_core::resource::{Resource, ResourceId, State, Value};
+use carina_core::utils::extract_enum_value;
+
+use crate::AwsProvider;
+
+impl AwsProvider {
+    /// Read an EC2 Flow Log
+    pub(crate) async fn read_ec2_flow_log(
+        &self,
+        id: &ResourceId,
+        identifier: Option<&str>,
+    ) -> ProviderResult<State> {
+        use aws_sdk_ec2::types::Filter;
+
+        let Some(identifier) = identifier else {
+            return Ok(State::not_found(id.clone()));
+        };
+
+        let filter = Filter::builder()
+            .name("flow-log-id")
+            .values(identifier)
+            .build();
+
+        let result = self
+            .ec2_client
+            .describe_flow_logs()
+            .filter(filter)
+            .send()
+            .await
+            .map_err(|e| {
+                ProviderError::new("Failed to describe flow logs")
+                    .with_cause(e)
+                    .for_resource(id.clone())
+            })?;
+
+        if let Some(fl) = result.flow_logs().first() {
+            let mut attributes = HashMap::new();
+
+            let identifier_value = Self::extract_ec2_flow_log_attributes(fl, &mut attributes);
+
+            // Extract user-defined tags
+            if let Some(tags_value) = Self::ec2_tags_to_value(fl.tags()) {
+                attributes.insert("tags".to_string(), tags_value);
+            }
+
+            let state = State::existing(id.clone(), attributes);
+            Ok(if let Some(id_val) = identifier_value {
+                state.with_identifier(id_val)
+            } else {
+                state
+            })
+        } else {
+            Ok(State::not_found(id.clone()))
+        }
+    }
+
+    /// Create an EC2 Flow Log
+    pub(crate) async fn create_ec2_flow_log(&self, resource: Resource) -> ProviderResult<State> {
+        let resource_id_val = match resource.attributes.get("resource_id") {
+            Some(Value::String(s)) => s.clone(),
+            _ => {
+                return Err(
+                    ProviderError::new("resource_id is required").for_resource(resource.id.clone())
+                );
+            }
+        };
+
+        let resource_type_val = match resource.attributes.get("resource_type") {
+            Some(Value::String(s)) => extract_enum_value(s).to_string(),
+            _ => {
+                return Err(ProviderError::new("resource_type is required")
+                    .for_resource(resource.id.clone()));
+            }
+        };
+
+        let mut req = self
+            .ec2_client
+            .create_flow_logs()
+            .resource_ids(&resource_id_val)
+            .resource_type(aws_sdk_ec2::types::FlowLogsResourceType::from(
+                resource_type_val.as_str(),
+            ));
+
+        if let Some(Value::String(traffic_type)) = resource.attributes.get("traffic_type") {
+            use aws_sdk_ec2::types::TrafficType;
+            let tt = TrafficType::from(extract_enum_value(traffic_type));
+            req = req.traffic_type(tt);
+        }
+
+        if let Some(Value::String(log_dest_type)) = resource.attributes.get("log_destination_type")
+        {
+            use aws_sdk_ec2::types::LogDestinationType;
+            let ldt = LogDestinationType::from(extract_enum_value(log_dest_type));
+            req = req.log_destination_type(ldt);
+        }
+
+        if let Some(Value::String(log_dest)) = resource.attributes.get("log_destination") {
+            req = req.log_destination(log_dest);
+        }
+
+        if let Some(Value::String(log_group)) = resource.attributes.get("log_group_name") {
+            req = req.log_group_name(log_group);
+        }
+
+        if let Some(Value::String(perm_arn)) =
+            resource.attributes.get("deliver_logs_permission_arn")
+        {
+            req = req.deliver_logs_permission_arn(perm_arn);
+        }
+
+        if let Some(Value::String(log_format)) = resource.attributes.get("log_format") {
+            req = req.log_format(log_format);
+        }
+
+        if let Some(Value::Int(interval)) = resource.attributes.get("max_aggregation_interval") {
+            req = req.max_aggregation_interval(*interval as i32);
+        }
+
+        // Apply tags via TagSpecifications
+        if let Some(Value::Map(tags)) = resource.attributes.get("tags") {
+            use aws_sdk_ec2::types::{Tag, TagSpecification};
+            let mut tag_spec = TagSpecification::builder()
+                .resource_type(aws_sdk_ec2::types::ResourceType::VpcFlowLog);
+            for (key, val) in tags {
+                if let Value::String(v) = val {
+                    tag_spec = tag_spec.tags(Tag::builder().key(key).value(v).build());
+                }
+            }
+            req = req.tag_specifications(tag_spec.build());
+        }
+
+        let result = req.send().await.map_err(|e| {
+            ProviderError::new("Failed to create flow logs")
+                .with_cause(e)
+                .for_resource(resource.id.clone())
+        })?;
+
+        let flow_log_id = result.flow_log_ids().first().ok_or_else(|| {
+            ProviderError::new("Flow Log created but no ID returned")
+                .for_resource(resource.id.clone())
+        })?;
+
+        // Read back
+        self.read_ec2_flow_log(&resource.id, Some(flow_log_id))
+            .await
+    }
+
+    /// Update an EC2 Flow Log (tags only - all other attributes are create_only)
+    pub(crate) async fn update_ec2_flow_log(
+        &self,
+        id: ResourceId,
+        identifier: &str,
+        from: &State,
+        to: Resource,
+    ) -> ProviderResult<State> {
+        self.apply_ec2_tags(&id, identifier, &to.attributes, Some(&from.attributes))
+            .await?;
+        self.read_ec2_flow_log(&id, Some(identifier)).await
+    }
+
+    /// Delete an EC2 Flow Log
+    pub(crate) async fn delete_ec2_flow_log(
+        &self,
+        id: ResourceId,
+        identifier: &str,
+    ) -> ProviderResult<()> {
+        self.ec2_client
+            .delete_flow_logs()
+            .flow_log_ids(identifier)
+            .send()
+            .await
+            .map_err(|e| {
+                ProviderError::new("Failed to delete flow logs")
+                    .with_cause(e)
+                    .for_resource(id.clone())
+            })?;
+        Ok(())
+    }
+}

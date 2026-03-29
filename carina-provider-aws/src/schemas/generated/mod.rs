@@ -17,6 +17,7 @@ pub mod sts;
 pub fn configs() -> Vec<AwsSchemaConfig> {
     vec![
         ec2::eip::ec2_eip_config(),
+        ec2::flow_log::ec2_flow_log_config(),
         ec2::internet_gateway::ec2_internet_gateway_config(),
         ec2::nat_gateway::ec2_nat_gateway_config(),
         ec2::route::ec2_route_config(),
@@ -27,7 +28,9 @@ pub fn configs() -> Vec<AwsSchemaConfig> {
         ec2::subnet::ec2_subnet_config(),
         ec2::subnet_route_table_association::ec2_subnet_route_table_association_config(),
         ec2::vpc::ec2_vpc_config(),
+        ec2::vpc_endpoint::ec2_vpc_endpoint_config(),
         ec2::vpc_gateway_attachment::ec2_vpc_gateway_attachment_config(),
+        ec2::vpn_gateway::ec2_vpn_gateway_config(),
         iam::role::iam_role_config(),
         logs::log_group::logs_log_group_config(),
         s3::bucket::s3_bucket_config(),
@@ -46,6 +49,7 @@ pub fn get_enum_valid_values(
 ) -> Option<&'static [&'static str]> {
     let modules: &[(&str, &[(&str, &[&str])])] = &[
         ec2::eip::enum_valid_values(),
+        ec2::flow_log::enum_valid_values(),
         ec2::internet_gateway::enum_valid_values(),
         ec2::nat_gateway::enum_valid_values(),
         ec2::route::enum_valid_values(),
@@ -56,7 +60,9 @@ pub fn get_enum_valid_values(
         ec2::subnet::enum_valid_values(),
         ec2::subnet_route_table_association::enum_valid_values(),
         ec2::vpc::enum_valid_values(),
+        ec2::vpc_endpoint::enum_valid_values(),
         ec2::vpc_gateway_attachment::enum_valid_values(),
+        ec2::vpn_gateway::enum_valid_values(),
         iam::role::enum_valid_values(),
         logs::log_group::enum_valid_values(),
         s3::bucket::enum_valid_values(),
@@ -84,6 +90,9 @@ pub fn get_enum_alias_reverse(
 ) -> Option<&'static str> {
     if resource_type == "ec2.eip" {
         return ec2::eip::enum_alias_reverse(attr_name, value);
+    }
+    if resource_type == "ec2.flow_log" {
+        return ec2::flow_log::enum_alias_reverse(attr_name, value);
     }
     if resource_type == "ec2.internet_gateway" {
         return ec2::internet_gateway::enum_alias_reverse(attr_name, value);
@@ -115,8 +124,14 @@ pub fn get_enum_alias_reverse(
     if resource_type == "ec2.vpc" {
         return ec2::vpc::enum_alias_reverse(attr_name, value);
     }
+    if resource_type == "ec2.vpc_endpoint" {
+        return ec2::vpc_endpoint::enum_alias_reverse(attr_name, value);
+    }
     if resource_type == "ec2.vpc_gateway_attachment" {
         return ec2::vpc_gateway_attachment::enum_alias_reverse(attr_name, value);
+    }
+    if resource_type == "ec2.vpn_gateway" {
+        return ec2::vpn_gateway::enum_alias_reverse(attr_name, value);
     }
     if resource_type == "iam.role" {
         return iam::role::enum_alias_reverse(attr_name, value);

@@ -47,10 +47,13 @@ impl Provider for AwsProvider {
                     self.read_ec2_subnet_route_table_association(&id, identifier.as_deref())
                         .await
                 }
+                "ec2.vpc_endpoint" => self.read_ec2_vpc_endpoint(&id, identifier.as_deref()).await,
                 "ec2.vpc_gateway_attachment" => {
                     self.read_ec2_vpc_gateway_attachment(&id, identifier.as_deref())
                         .await
                 }
+                "ec2.vpn_gateway" => self.read_ec2_vpn_gateway(&id, identifier.as_deref()).await,
+                "ec2.flow_log" => self.read_ec2_flow_log(&id, identifier.as_deref()).await,
                 "iam.role" => self.read_iam_role(&id, identifier.as_deref()).await,
                 "logs.log_group" => self.read_logs_log_group(&id, identifier.as_deref()).await,
                 "sts.caller_identity" => self.read_sts_caller_identity(&id).await,
@@ -93,9 +96,12 @@ impl Provider for AwsProvider {
                     self.create_ec2_subnet_route_table_association(resource)
                         .await
                 }
+                "ec2.vpc_endpoint" => self.create_ec2_vpc_endpoint(resource).await,
                 "ec2.vpc_gateway_attachment" => {
                     self.create_ec2_vpc_gateway_attachment(resource).await
                 }
+                "ec2.vpn_gateway" => self.create_ec2_vpn_gateway(resource).await,
+                "ec2.flow_log" => self.create_ec2_flow_log(resource).await,
                 "iam.role" => self.create_iam_role(resource).await,
                 "logs.log_group" => self.create_logs_log_group(resource).await,
                 _ => Err(ProviderError::new(format!(
@@ -153,10 +159,19 @@ impl Provider for AwsProvider {
                     self.update_ec2_subnet_route_table_association(id, &identifier, to)
                         .await
                 }
+                "ec2.vpc_endpoint" => {
+                    self.update_ec2_vpc_endpoint(id, &identifier, &from, to)
+                        .await
+                }
                 "ec2.vpc_gateway_attachment" => {
                     self.update_ec2_vpc_gateway_attachment(id, &identifier)
                         .await
                 }
+                "ec2.vpn_gateway" => {
+                    self.update_ec2_vpn_gateway(id, &identifier, &from, to)
+                        .await
+                }
+                "ec2.flow_log" => self.update_ec2_flow_log(id, &identifier, &from, to).await,
                 "iam.role" => self.update_iam_role(id, &identifier, &from, to).await,
                 "logs.log_group" => self.update_logs_log_group(id, &identifier, &from, to).await,
                 _ => Err(ProviderError::new(format!(
@@ -199,10 +214,13 @@ impl Provider for AwsProvider {
                     self.delete_ec2_subnet_route_table_association(id, &identifier)
                         .await
                 }
+                "ec2.vpc_endpoint" => self.delete_ec2_vpc_endpoint(id, &identifier).await,
                 "ec2.vpc_gateway_attachment" => {
                     self.delete_ec2_vpc_gateway_attachment(id, &identifier)
                         .await
                 }
+                "ec2.vpn_gateway" => self.delete_ec2_vpn_gateway(id, &identifier).await,
+                "ec2.flow_log" => self.delete_ec2_flow_log(id, &identifier).await,
                 "iam.role" => self.delete_iam_role(id, &identifier).await,
                 "logs.log_group" => self.delete_logs_log_group(id, &identifier).await,
                 _ => Err(ProviderError::new(format!(
