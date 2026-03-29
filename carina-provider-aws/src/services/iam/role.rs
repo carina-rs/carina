@@ -56,8 +56,9 @@ impl AwsProvider {
             }
             Err(e) => {
                 // Check if it's a NoSuchEntity error
-                let service_err = e.as_service_error();
-                if service_err.is_some() && service_err.unwrap().is_no_such_entity_exception() {
+                if let Some(service_err) = e.as_service_error()
+                    && service_err.is_no_such_entity_exception()
+                {
                     return Ok(State::not_found(id.clone()));
                 }
                 Err(ProviderError::new("Failed to get IAM role")
