@@ -82,6 +82,13 @@ impl AwsProvider {
         let assume_role_policy_document =
             match resource.attributes.get("assume_role_policy_document") {
                 Some(Value::String(s)) => s.clone(),
+                Some(value @ Value::Map(_)) => value_to_iam_policy_json(value).map_err(|e| {
+                    ProviderError::new(format!(
+                        "Failed to convert assume_role_policy_document: {}",
+                        e
+                    ))
+                    .for_resource(resource.id.clone())
+                })?,
                 _ => {
                     return Err(
                         ProviderError::new("assume_role_policy_document is required")
@@ -143,11 +150,27 @@ impl AwsProvider {
         to: Resource,
     ) -> ProviderResult<State> {
         // Update assume role policy document
-        if let Some(Value::String(policy_doc)) = to.attributes.get("assume_role_policy_document") {
+        if let Some(policy_value) = to.attributes.get("assume_role_policy_document") {
+            let policy_doc = match policy_value {
+                Value::String(s) => s.clone(),
+                Value::Map(_) => value_to_iam_policy_json(policy_value).map_err(|e| {
+                    ProviderError::new(format!(
+                        "Failed to convert assume_role_policy_document: {}",
+                        e
+                    ))
+                    .for_resource(id.clone())
+                })?,
+                _ => {
+                    return Err(ProviderError::new(
+                        "assume_role_policy_document must be a string or map",
+                    )
+                    .for_resource(id.clone()));
+                }
+            };
             self.iam_client
                 .update_assume_role_policy()
                 .role_name(identifier)
-                .policy_document(policy_doc)
+                .policy_document(&policy_doc)
                 .send()
                 .await
                 .map_err(|e| {
@@ -277,4 +300,45 @@ impl AwsProvider {
 
         Ok(())
     }
+}
+
+/// Convert a Carina Value (Map with snake_case keys) to a JSON string
+/// with PascalCase keys suitable for the IAM API.
+fn value_to_iam_policy_json(value: &Value) -> Result<String, String> {
+    let json_value = value_to_json_pascal(value);
+    serde_json::to_string(&json_value).map_err(|e| format!("JSON serialization failed: {}", e))
+}
+
+/// Recursively convert a Carina Value to serde_json::Value with PascalCase keys.
+fn value_to_json_pascal(value: &Value) -> serde_json::Value {
+    match value {
+        Value::String(s) => serde_json::Value::String(s.clone()),
+        Value::Int(n) => serde_json::Value::Number((*n).into()),
+        Value::Float(f) => serde_json::json!(*f),
+        Value::Bool(b) => serde_json::Value::Bool(*b),
+        Value::List(items) => {
+            serde_json::Value::Array(items.iter().map(value_to_json_pascal).collect())
+        }
+        Value::Map(map) => {
+            let obj: serde_json::Map<String, serde_json::Value> = map
+                .iter()
+                .map(|(k, v)| (snake_to_pascal(k), value_to_json_pascal(v)))
+                .collect();
+            serde_json::Value::Object(obj)
+        }
+        _ => serde_json::Value::Null,
+    }
+}
+
+/// Convert snake_case to PascalCase (e.g., "assume_role" -> "AssumeRole").
+fn snake_to_pascal(s: &str) -> String {
+    s.split('_')
+        .map(|part| {
+            let mut chars = part.chars();
+            match chars.next() {
+                Some(c) => c.to_uppercase().to_string() + chars.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect()
 }
