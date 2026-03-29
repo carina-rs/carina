@@ -9,7 +9,10 @@ use crate::position;
 use carina_core::builtins;
 use carina_core::parser::{ArgumentParameter, ParsedFile, TypeExpr};
 use carina_core::resource::Value;
-use carina_core::schema::{ResourceSchema, suggest_similar_name, validate_ipv4_cidr};
+use carina_core::schema::{
+    ResourceSchema, suggest_similar_name, validate_ipv4_address, validate_ipv4_cidr,
+    validate_ipv6_address, validate_ipv6_cidr,
+};
 
 use super::DiagnosticEngine;
 
@@ -252,23 +255,37 @@ impl DiagnosticEngine {
         value: &Value,
     ) -> Option<String> {
         match (type_expr, value) {
-            // CIDR type validation
-            (TypeExpr::Simple(name), Value::String(s)) if name == "cidr" => {
-                validate_ipv4_cidr(s).err()
-            }
-            // List of CIDR type validation
+            // Custom type validation (cidr, ipv4_address, ipv6_cidr, ipv6_address)
+            (TypeExpr::Simple(name), Value::String(s)) => match name.as_str() {
+                "cidr" => validate_ipv4_cidr(s).err(),
+                "ipv4_address" => validate_ipv4_address(s).err(),
+                "ipv6_cidr" => validate_ipv6_cidr(s).err(),
+                "ipv6_address" => validate_ipv6_address(s).err(),
+                _ => None,
+            },
+            // List of custom type validation
             (TypeExpr::List(inner), Value::List(items)) => {
                 if let TypeExpr::Simple(name) = inner.as_ref() {
-                    if name != "cidr" {
-                        return None;
-                    }
-                    for (i, item) in items.iter().enumerate() {
-                        if let Value::String(s) = item {
-                            if let Err(e) = validate_ipv4_cidr(s) {
-                                return Some(format!("Element {}: {}", i, e));
+                    type ValidateFn = fn(&str) -> Result<(), String>;
+                    let validator: Option<ValidateFn> = match name.as_str() {
+                        "cidr" => Some(validate_ipv4_cidr),
+                        "ipv4_address" => Some(validate_ipv4_address),
+                        "ipv6_cidr" => Some(validate_ipv6_cidr),
+                        "ipv6_address" => Some(validate_ipv6_address),
+                        _ => None,
+                    };
+                    if let Some(validate_fn) = validator {
+                        for (i, item) in items.iter().enumerate() {
+                            if let Value::String(s) = item {
+                                if let Err(e) = validate_fn(s) {
+                                    return Some(format!("Element {}: {}", i, e));
+                                }
+                            } else {
+                                return Some(format!(
+                                    "Element {}: expected string, got {:?}",
+                                    i, item
+                                ));
                             }
-                        } else {
-                            return Some(format!("Element {}: expected string, got {:?}", i, item));
                         }
                     }
                 }

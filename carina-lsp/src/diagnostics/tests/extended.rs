@@ -927,6 +927,121 @@ let name = join("-", parts)
 }
 
 #[test]
+fn validate_module_arg_type_ipv4_address_invalid() {
+    let engine = test_engine();
+    let type_expr = carina_core::parser::TypeExpr::Simple("ipv4_address".to_string());
+    let value = Value::String("not-an-ip".to_string());
+    let result = engine.validate_module_arg_type(&type_expr, &value);
+    assert!(
+        result.is_some(),
+        "Should return error for invalid ipv4_address"
+    );
+}
+
+#[test]
+fn validate_module_arg_type_ipv4_address_valid() {
+    let engine = test_engine();
+    let type_expr = carina_core::parser::TypeExpr::Simple("ipv4_address".to_string());
+    let value = Value::String("192.168.1.1".to_string());
+    let result = engine.validate_module_arg_type(&type_expr, &value);
+    assert!(
+        result.is_none(),
+        "Should not return error for valid ipv4_address. Got: {:?}",
+        result
+    );
+}
+
+#[test]
+fn validate_module_arg_type_ipv6_cidr_invalid() {
+    let engine = test_engine();
+    let type_expr = carina_core::parser::TypeExpr::Simple("ipv6_cidr".to_string());
+    let value = Value::String("not-a-cidr".to_string());
+    let result = engine.validate_module_arg_type(&type_expr, &value);
+    assert!(
+        result.is_some(),
+        "Should return error for invalid ipv6_cidr"
+    );
+}
+
+#[test]
+fn validate_module_arg_type_ipv6_cidr_valid() {
+    let engine = test_engine();
+    let type_expr = carina_core::parser::TypeExpr::Simple("ipv6_cidr".to_string());
+    let value = Value::String("2001:db8::/32".to_string());
+    let result = engine.validate_module_arg_type(&type_expr, &value);
+    assert!(
+        result.is_none(),
+        "Should not return error for valid ipv6_cidr. Got: {:?}",
+        result
+    );
+}
+
+#[test]
+fn validate_module_arg_type_ipv6_address_invalid() {
+    let engine = test_engine();
+    let type_expr = carina_core::parser::TypeExpr::Simple("ipv6_address".to_string());
+    let value = Value::String("not-an-ipv6".to_string());
+    let result = engine.validate_module_arg_type(&type_expr, &value);
+    assert!(
+        result.is_some(),
+        "Should return error for invalid ipv6_address"
+    );
+}
+
+#[test]
+fn validate_module_arg_type_ipv6_address_valid() {
+    let engine = test_engine();
+    let type_expr = carina_core::parser::TypeExpr::Simple("ipv6_address".to_string());
+    let value = Value::String("2001:db8::1".to_string());
+    let result = engine.validate_module_arg_type(&type_expr, &value);
+    assert!(
+        result.is_none(),
+        "Should not return error for valid ipv6_address. Got: {:?}",
+        result
+    );
+}
+
+#[test]
+fn validate_module_arg_type_list_ipv4_address_invalid() {
+    let engine = test_engine();
+    let type_expr = carina_core::parser::TypeExpr::List(Box::new(
+        carina_core::parser::TypeExpr::Simple("ipv4_address".to_string()),
+    ));
+    let value = Value::List(vec![
+        Value::String("192.168.1.1".to_string()),
+        Value::String("bad-ip".to_string()),
+    ]);
+    let result = engine.validate_module_arg_type(&type_expr, &value);
+    assert!(
+        result.is_some(),
+        "Should return error for invalid ipv4_address in list"
+    );
+    assert!(
+        result.as_ref().unwrap().contains("Element 1"),
+        "Error should reference element index. Got: {:?}",
+        result
+    );
+}
+
+#[test]
+fn validate_module_arg_type_list_ipv6_cidr_valid() {
+    let engine = test_engine();
+    let type_expr = carina_core::parser::TypeExpr::List(Box::new(
+        carina_core::parser::TypeExpr::Simple("ipv6_cidr".to_string()),
+    ));
+    let value = Value::List(vec![
+        Value::String("2001:db8::/32".to_string()),
+        Value::String("::/0".to_string()),
+    ]);
+    let result = engine.validate_module_arg_type(&type_expr, &value);
+    assert!(
+        result.is_none(),
+        "Should not return error for valid ipv6_cidr list. Got: {:?}",
+        result
+    );
+}
+
+#[test]
 fn pipe_preferred_pipe_form_no_diagnostic() {
     let engine = test_engine();
     let doc = create_document(
