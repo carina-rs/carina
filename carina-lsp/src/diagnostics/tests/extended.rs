@@ -1166,6 +1166,145 @@ attributes {
 }
 
 #[test]
+fn resource_ref_type_check_helper_regression() {
+    // Regression test for refactoring: all three ResourceRef type-checking paths
+    // (Union, StringEnum, Custom) must produce consistent "Type mismatch" diagnostics.
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+
+    fn dummy_validate(v: &carina_core::resource::Value) -> Result<(), String> {
+        match v {
+            carina_core::resource::Value::String(s) if s.starts_with("test.") => Ok(()),
+            _ => Err("invalid custom value".to_string()),
+        }
+    }
+
+    // Source resource: has a String attribute "name" and a Custom "my_id"
+    let source_schema = ResourceSchema::new("test.source")
+        .attribute(AttributeSchema::new("name", AttributeType::String))
+        .attribute(AttributeSchema::new(
+            "my_id",
+            AttributeType::Custom {
+                name: "MyId".to_string(),
+                base: Box::new(AttributeType::String),
+                validate: dummy_validate,
+                namespace: Some("test".to_string()),
+                to_dsl: None,
+            },
+        ));
+
+    // Target resource: has Union, StringEnum, and Custom attributes
+    let target_schema = ResourceSchema::new("test.target")
+        .attribute(AttributeSchema::new(
+            "union_attr",
+            AttributeType::Union(vec![AttributeType::Int, AttributeType::Bool]),
+        ))
+        .attribute(AttributeSchema::new(
+            "enum_attr",
+            AttributeType::StringEnum {
+                name: "Status".to_string(),
+                values: vec!["active".to_string(), "inactive".to_string()],
+                namespace: None,
+                to_dsl: None,
+            },
+        ))
+        .attribute(AttributeSchema::new(
+            "custom_attr",
+            AttributeType::Custom {
+                name: "MyId".to_string(),
+                base: Box::new(AttributeType::String),
+                validate: dummy_validate,
+                namespace: Some("test".to_string()),
+                to_dsl: None,
+            },
+        ));
+
+    let mut schemas = HashMap::new();
+    schemas.insert("test.source".to_string(), source_schema);
+    schemas.insert("test.target".to_string(), target_schema);
+    let engine = custom_engine(schemas);
+
+    // Case 1: Union attr with incompatible ResourceRef (MyId != Int|Bool) -> mismatch
+    let doc = create_document(
+        r#"let src = test.source {
+name = "hello"
+}
+
+test.target {
+union_attr = src.my_id
+}"#,
+    );
+    let diagnostics = engine.analyze(&doc, None);
+    let union_mismatch = diagnostics
+        .iter()
+        .find(|d| d.message.contains("Type mismatch") && d.message.contains("MyId"));
+    assert!(
+        union_mismatch.is_some(),
+        "Union attr should warn about type mismatch for incompatible ResourceRef. Got: {:?}",
+        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+
+    // Case 2: StringEnum attr with incompatible ResourceRef (MyId != Status) -> mismatch
+    let doc = create_document(
+        r#"let src = test.source {
+name = "hello"
+}
+
+test.target {
+enum_attr = src.my_id
+}"#,
+    );
+    let diagnostics = engine.analyze(&doc, None);
+    let enum_mismatch = diagnostics
+        .iter()
+        .find(|d| d.message.contains("Type mismatch") && d.message.contains("MyId"));
+    assert!(
+        enum_mismatch.is_some(),
+        "StringEnum attr should warn about type mismatch for incompatible ResourceRef. Got: {:?}",
+        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+
+    // Case 3: Custom attr with compatible ResourceRef (MyId == MyId) -> no mismatch
+    let doc = create_document(
+        r#"let src = test.source {
+name = "hello"
+}
+
+test.target {
+custom_attr = src.my_id
+}"#,
+    );
+    let diagnostics = engine.analyze(&doc, None);
+    let custom_mismatch = diagnostics
+        .iter()
+        .find(|d| d.message.contains("Type mismatch") && d.message.contains("custom_attr"));
+    assert!(
+        custom_mismatch.is_none(),
+        "Custom attr should NOT warn when ResourceRef type matches. Got: {:?}",
+        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+
+    // Case 4: Union attr with String ResourceRef -> no mismatch (String is always compatible)
+    let doc = create_document(
+        r#"let src = test.source {
+name = "hello"
+}
+
+test.target {
+union_attr = src.name
+}"#,
+    );
+    let diagnostics = engine.analyze(&doc, None);
+    let string_mismatch = diagnostics
+        .iter()
+        .find(|d| d.message.contains("Type mismatch") && d.message.contains("union_attr"));
+    assert!(
+        string_mismatch.is_none(),
+        "Union attr should NOT warn when ResourceRef is String type. Got: {:?}",
+        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn attributes_block_ipv6_cidr_invalid() {
     let engine = test_engine();
     let doc = create_document(

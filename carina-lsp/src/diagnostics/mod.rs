@@ -283,124 +283,22 @@ impl DiagnosticEngine {
                                         s
                                     ))
                                 }
-                                // ResourceRef type check for Union types
+                                // ResourceRef type check for Union, StringEnum, and Custom types
                                 (
-                                    carina_core::schema::AttributeType::Union(_),
+                                    carina_core::schema::AttributeType::Union(_)
+                                    | carina_core::schema::AttributeType::StringEnum { .. }
+                                    | carina_core::schema::AttributeType::Custom { .. },
                                     Value::ResourceRef {
                                         binding_name: ref_binding,
                                         attribute_name: ref_attr,
                                         ..
                                     },
-                                ) => {
-                                    if let Some(ref_schema) =
-                                        binding_schema_map.get(ref_binding.as_str())
-                                    {
-                                        if let Some(ref_attr_schema) =
-                                            ref_schema.attributes.get(ref_attr.as_str())
-                                        {
-                                            let ref_type_name =
-                                                ref_attr_schema.attr_type.type_name();
-                                            if attr_schema
-                                                .attr_type
-                                                .accepts_type_name(&ref_type_name)
-                                                || ref_type_name == "String"
-                                            {
-                                                None
-                                            } else {
-                                                Some(format!(
-                                                    "Type mismatch: expected {}, got {} (from {}.{})",
-                                                    attr_schema.attr_type.type_name(),
-                                                    ref_type_name,
-                                                    ref_binding,
-                                                    ref_attr
-                                                ))
-                                            }
-                                        } else {
-                                            None
-                                        }
-                                    } else {
-                                        None
-                                    }
-                                }
-                                // ResourceRef type check for Custom types
-                                (
-                                    carina_core::schema::AttributeType::StringEnum {
-                                        name: expected_name,
-                                        ..
-                                    },
-                                    Value::ResourceRef {
-                                        binding_name: ref_binding,
-                                        attribute_name: ref_attr,
-                                        ..
-                                    },
-                                ) => {
-                                    if let Some(ref_schema) =
-                                        binding_schema_map.get(ref_binding.as_str())
-                                    {
-                                        if let Some(ref_attr_schema) =
-                                            ref_schema.attributes.get(ref_attr.as_str())
-                                        {
-                                            let ref_type_name =
-                                                ref_attr_schema.attr_type.type_name();
-                                            if ref_type_name != *expected_name
-                                                && ref_type_name != "String"
-                                            {
-                                                Some(format!(
-                                                    "Type mismatch: expected {}, got {} (from {}.{})",
-                                                    expected_name,
-                                                    ref_type_name,
-                                                    ref_binding,
-                                                    ref_attr
-                                                ))
-                                            } else {
-                                                None
-                                            }
-                                        } else {
-                                            None
-                                        }
-                                    } else {
-                                        None
-                                    }
-                                }
-                                (
-                                    carina_core::schema::AttributeType::Custom {
-                                        name: expected_name,
-                                        ..
-                                    },
-                                    Value::ResourceRef {
-                                        binding_name: ref_binding,
-                                        attribute_name: ref_attr,
-                                        ..
-                                    },
-                                ) => {
-                                    if let Some(ref_schema) =
-                                        binding_schema_map.get(ref_binding.as_str())
-                                    {
-                                        if let Some(ref_attr_schema) =
-                                            ref_schema.attributes.get(ref_attr.as_str())
-                                        {
-                                            let ref_type_name =
-                                                ref_attr_schema.attr_type.type_name();
-                                            if ref_type_name != *expected_name
-                                                && ref_type_name != "String"
-                                            {
-                                                Some(format!(
-                                                    "Type mismatch: expected {}, got {} (from {}.{})",
-                                                    expected_name,
-                                                    ref_type_name,
-                                                    ref_binding,
-                                                    ref_attr
-                                                ))
-                                            } else {
-                                                None
-                                            }
-                                        } else {
-                                            None
-                                        }
-                                    } else {
-                                        None
-                                    }
-                                }
+                                ) => check_resource_ref_type_mismatch(
+                                    &binding_schema_map,
+                                    &attr_schema.attr_type,
+                                    ref_binding,
+                                    ref_attr,
+                                ),
                                 // Custom type validation (all Custom types use their validate fn)
                                 (carina_core::schema::AttributeType::StringEnum { .. }, value) => {
                                     attr_schema
@@ -773,6 +671,32 @@ impl DiagnosticEngine {
             return Some((line_idx as u32, position::leading_whitespace_chars(line)));
         }
         None
+    }
+}
+
+/// Check whether a ResourceRef value is type-compatible with the expected attribute type.
+/// Returns `Some(message)` on mismatch, `None` when compatible or when the binding/attribute
+/// cannot be resolved (unknown bindings are not flagged here).
+fn check_resource_ref_type_mismatch(
+    binding_schema_map: &HashMap<String, ResourceSchema>,
+    expected_type: &carina_core::schema::AttributeType,
+    ref_binding: &str,
+    ref_attr: &str,
+) -> Option<String> {
+    let ref_schema = binding_schema_map.get(ref_binding)?;
+    let ref_attr_schema = ref_schema.attributes.get(ref_attr)?;
+    let ref_type_name = ref_attr_schema.attr_type.type_name();
+
+    if expected_type.accepts_type_name(&ref_type_name) || ref_type_name == "String" {
+        None
+    } else {
+        Some(format!(
+            "Type mismatch: expected {}, got {} (from {}.{})",
+            expected_type.type_name(),
+            ref_type_name,
+            ref_binding,
+            ref_attr
+        ))
     }
 }
 
