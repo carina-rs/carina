@@ -3710,7 +3710,6 @@ mod tests {
         assert_eq!(resource.id.resource_type, "s3_bucket");
         assert_eq!(resource.id.name, "existing"); // binding name becomes the resource ID
         assert!(resource.is_data_source());
-        assert!(resource.is_data_source());
         assert_eq!(
             resource.attributes.get("_data_source"),
             Some(&Value::Bool(true))
