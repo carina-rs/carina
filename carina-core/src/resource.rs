@@ -443,13 +443,30 @@ pub struct LifecycleConfig {
     pub create_before_destroy: bool,
 }
 
+/// Classification of a resource in the IR
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub enum ResourceKind {
+    /// A real infrastructure resource managed by a provider
+    #[default]
+    Real,
+    /// A virtual resource created by the module resolver to expose module attributes.
+    /// Virtual resources are not sent to providers; they exist only in the IR.
+    Virtual {
+        module_name: String,
+        instance: String,
+    },
+    /// A data source (read-only) that is queried but not managed
+    DataSource,
+}
+
 /// Desired state declared in DSL
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Resource {
     pub id: ResourceId,
     pub attributes: HashMap<String, Value>,
-    /// If true, this is a data source (read-only) that won't be modified
-    pub read_only: bool,
+    /// Classification of this resource (real, virtual, or data source)
+    #[serde(default)]
+    pub kind: ResourceKind,
     /// Lifecycle meta-argument configuration
     #[serde(default)]
     pub lifecycle: LifecycleConfig,
@@ -463,9 +480,6 @@ pub struct Resource {
     /// Binding names of resources this resource depends on (via ResourceRef)
     #[serde(default)]
     pub dependency_bindings: Vec<String>,
-    /// If true, this is a virtual resource (module attribute container)
-    #[serde(default)]
-    pub virtual_resource: bool,
 }
 
 impl Resource {
@@ -473,12 +487,11 @@ impl Resource {
         Self {
             id: ResourceId::new(resource_type, name),
             attributes: HashMap::new(),
-            read_only: false,
+            kind: ResourceKind::Real,
             lifecycle: LifecycleConfig::default(),
             prefixes: HashMap::new(),
             binding: None,
             dependency_bindings: Vec::new(),
-            virtual_resource: false,
         }
     }
 
@@ -490,12 +503,11 @@ impl Resource {
         Self {
             id: ResourceId::with_provider(provider, resource_type, name),
             attributes: HashMap::new(),
-            read_only: false,
+            kind: ResourceKind::Real,
             lifecycle: LifecycleConfig::default(),
             prefixes: HashMap::new(),
             binding: None,
             dependency_bindings: Vec::new(),
-            virtual_resource: false,
         }
     }
 
@@ -505,7 +517,14 @@ impl Resource {
     }
 
     pub fn with_read_only(mut self, read_only: bool) -> Self {
-        self.read_only = read_only;
+        if read_only {
+            self.kind = ResourceKind::DataSource;
+        }
+        self
+    }
+
+    pub fn with_kind(mut self, kind: ResourceKind) -> Self {
+        self.kind = kind;
         self
     }
 
@@ -519,14 +538,9 @@ impl Resource {
         self
     }
 
-    pub fn with_virtual(mut self, is_virtual: bool) -> Self {
-        self.virtual_resource = is_virtual;
-        self
-    }
-
     /// Returns true if this resource is a data source (read-only)
     pub fn is_data_source(&self) -> bool {
-        self.read_only
+        matches!(self.kind, ResourceKind::DataSource)
     }
 
     /// Returns true if this resource is a virtual resource (module attribute container).
@@ -535,7 +549,7 @@ impl Resource {
     /// `attributes` values as a structured record. They should not be sent to
     /// providers for reading, creating, or updating.
     pub fn is_virtual(&self) -> bool {
-        self.virtual_resource
+        matches!(self.kind, ResourceKind::Virtual { .. })
     }
 }
 
@@ -1041,7 +1055,10 @@ mod tests {
 
     #[test]
     fn resource_typed_virtual_field() {
-        let resource = Resource::new("_virtual", "web").with_virtual(true);
+        let resource = Resource::new("_virtual", "web").with_kind(ResourceKind::Virtual {
+            module_name: "web_tier".to_string(),
+            instance: "web".to_string(),
+        });
         assert!(resource.is_virtual());
         // _virtual should NOT be in attributes
         assert!(!resource.attributes.contains_key("_virtual"));
@@ -1052,6 +1069,45 @@ mod tests {
         let resource = Resource::new("s3.bucket", "my-bucket");
         assert_eq!(resource.binding, None);
         assert!(resource.dependency_bindings.is_empty());
+        assert!(!resource.is_virtual());
+    }
+
+    #[test]
+    fn resource_kind_enum_real_by_default() {
+        let resource = Resource::new("s3.bucket", "my-bucket");
+        assert_eq!(resource.kind, ResourceKind::Real);
+        assert!(!resource.is_virtual());
+        assert!(!resource.is_data_source());
+    }
+
+    #[test]
+    fn resource_kind_enum_virtual_carries_module_info() {
+        let resource = Resource::new("_virtual", "web").with_kind(ResourceKind::Virtual {
+            module_name: "web_tier".to_string(),
+            instance: "web".to_string(),
+        });
+        assert!(resource.is_virtual());
+        assert!(!resource.is_data_source());
+        // Module info is in the kind, not in attributes
+        assert!(!resource.attributes.contains_key("_module"));
+        assert!(!resource.attributes.contains_key("_module_instance"));
+        // Can extract module info from the kind
+        match &resource.kind {
+            ResourceKind::Virtual {
+                module_name,
+                instance,
+            } => {
+                assert_eq!(module_name, "web_tier");
+                assert_eq!(instance, "web");
+            }
+            _ => panic!("Expected Virtual kind"),
+        }
+    }
+
+    #[test]
+    fn resource_kind_enum_data_source() {
+        let resource = Resource::new("s3.bucket", "my-bucket").with_kind(ResourceKind::DataSource);
+        assert!(resource.is_data_source());
         assert!(!resource.is_virtual());
     }
 }

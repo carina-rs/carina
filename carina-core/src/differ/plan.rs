@@ -6,7 +6,7 @@ use crate::deps::get_resource_dependencies;
 use crate::effect::{CascadingUpdate, Effect, TemporaryName};
 use crate::identifier::generate_random_suffix;
 use crate::plan::Plan;
-use crate::resource::{LifecycleConfig, Resource, ResourceId, State, Value};
+use crate::resource::{LifecycleConfig, Resource, ResourceId, ResourceKind, State, Value};
 use crate::schema::ResourceSchema;
 
 use super::{Diff, diff};
@@ -170,7 +170,7 @@ pub fn create_plan(
         }
 
         // Data sources (read-only resources) only generate Read effects
-        if resource.read_only {
+        if resource.is_data_source() {
             plan.add(Effect::Read {
                 resource: resource.clone(),
             });
@@ -307,12 +307,11 @@ pub fn create_plan(
                 let temp_resource = Resource {
                     id: id.clone(),
                     attributes: state.attributes.clone(),
-                    read_only: false,
+                    kind: ResourceKind::Real,
                     lifecycle: lifecycle.clone(),
                     prefixes: HashMap::new(),
                     binding: None,
                     dependency_bindings: Vec::new(),
-                    virtual_resource: false,
                 };
                 get_resource_dependencies(&temp_resource)
             };

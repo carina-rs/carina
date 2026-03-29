@@ -6,7 +6,7 @@ mod config;
 
 pub use config::{DecryptorFn, ProviderContext, ValidatorFn};
 
-use crate::resource::{LifecycleConfig, Resource, ResourceId, Value};
+use crate::resource::{LifecycleConfig, Resource, ResourceId, ResourceKind, Value};
 use crate::schema::{
     validate_ipv4_address, validate_ipv4_cidr, validate_ipv6_address, validate_ipv6_cidr,
 };
@@ -2114,12 +2114,11 @@ fn parse_anonymous_resource(
     Ok(Resource {
         id: ResourceId::with_provider(provider, resource_type, resource_name),
         attributes,
-        read_only: false,
+        kind: ResourceKind::Real,
         lifecycle,
         prefixes: HashMap::new(),
         binding: None,
         dependency_bindings: Vec::new(),
-        virtual_resource: false,
     })
 }
 
@@ -2260,12 +2259,11 @@ fn parse_resource_expr(
     Ok(Resource {
         id: ResourceId::with_provider(provider, resource_type, resource_name),
         attributes,
-        read_only: false,
+        kind: ResourceKind::Real,
         lifecycle,
         prefixes: HashMap::new(),
         binding: Some(binding_name.to_string()),
         dependency_bindings: Vec::new(),
-        virtual_resource: false,
     })
 }
 
@@ -2306,12 +2304,11 @@ fn parse_read_resource_expr(
     Ok(Resource {
         id: ResourceId::with_provider(provider, resource_type, resource_name),
         attributes,
-        read_only: true,
+        kind: ResourceKind::DataSource,
         lifecycle,
         prefixes: HashMap::new(),
         binding: Some(binding_name.to_string()),
         dependency_bindings: Vec::new(),
-        virtual_resource: false,
     })
 }
 
@@ -3799,7 +3796,6 @@ mod tests {
         let resource = &result.resources[0];
         assert_eq!(resource.id.resource_type, "s3_bucket");
         assert_eq!(resource.id.name, "existing"); // binding name becomes the resource ID
-        assert!(resource.read_only);
         assert!(resource.is_data_source());
         assert_eq!(
             resource.attributes.get("_data_source"),
@@ -3839,11 +3835,11 @@ mod tests {
         assert_eq!(result.resources.len(), 2);
 
         // First resource is read-only (data source)
-        assert!(result.resources[0].read_only);
+        assert!(result.resources[0].is_data_source());
         assert_eq!(result.resources[0].id.name, "existing_bucket"); // binding name
 
         // Second resource is a regular resource
-        assert!(!result.resources[1].read_only);
+        assert!(!result.resources[1].is_data_source());
         assert_eq!(result.resources[1].id.name, "new_bucket"); // binding name
     }
 
