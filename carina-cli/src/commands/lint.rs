@@ -8,9 +8,9 @@ use carina_core::config_loader::{
     find_crn_files_in_dir, get_base_dir, load_configuration_with_config,
 };
 use carina_core::lint::{
-    find_duplicate_attrs, find_inconsistent_tag_keys, find_list_literal_attrs,
-    find_non_snake_case_bindings, find_pipe_preferred_direct_calls, find_redundant_type_in_binding,
-    list_struct_attr_names,
+    TagKeyEntry, collect_tag_keys, find_duplicate_attrs, find_list_literal_attrs,
+    find_mixed_tag_key_styles, find_non_snake_case_bindings, find_pipe_preferred_direct_calls,
+    find_redundant_type_in_binding, list_struct_attr_names,
 };
 use carina_core::module_resolver;
 use carina_core::parser::ProviderContext;
@@ -78,6 +78,9 @@ pub fn run_lint(path: &PathBuf, provider_context: &ProviderContext) -> Result<()
 
     // Scan each source file for list literal usage of List<Struct> attributes
     let mut warnings: Vec<LintWarning> = Vec::new();
+    // Collect tag keys across all files for cross-file consistency check
+    let mut all_tag_keys: Vec<TagKeyEntry> = Vec::new();
+    let mut tag_key_files: Vec<PathBuf> = Vec::new();
 
     for (file_path, source) in &source_texts {
         // Check for list literal syntax on List<Struct> attributes
@@ -149,15 +152,62 @@ pub fn run_lint(path: &PathBuf, provider_context: &ProviderContext) -> Result<()
             });
         }
 
-        // Check for inconsistent tag key casing
-        let tag_warnings = find_inconsistent_tag_keys(source);
+        // Collect tag keys for cross-file consistency check
+        let file_tag_keys = collect_tag_keys(source);
+        for entry in &file_tag_keys {
+            all_tag_keys.push(TagKeyEntry {
+                key: entry.key.clone(),
+                style: entry.style,
+                line: entry.line,
+            });
+            tag_key_files.push(file_path.clone());
+        }
+    }
+
+    // Also collect tag keys from module directories
+    for call in &parsed.module_calls {
+        let module_dir = base_dir.join(&call.module_name);
+        if module_dir.is_dir()
+            && let Ok(module_files) = find_crn_files_in_dir(&module_dir)
+        {
+            for mf in module_files {
+                if let Ok(content) = fs::read_to_string(&mf) {
+                    let file_tag_keys = collect_tag_keys(&content);
+                    for entry in &file_tag_keys {
+                        all_tag_keys.push(TagKeyEntry {
+                            key: entry.key.clone(),
+                            style: entry.style,
+                            line: entry.line,
+                        });
+                        tag_key_files.push(mf.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    // Check for mixed tag key styles across all collected keys
+    {
+        let tag_warnings = find_mixed_tag_key_styles(&all_tag_keys);
         for tw in tag_warnings {
+            let style_name = match tw.expected_style {
+                carina_core::lint::TagKeyStyle::PascalCase => "PascalCase",
+                carina_core::lint::TagKeyStyle::SnakeCase => "snake_case",
+                carina_core::lint::TagKeyStyle::Other => "consistent",
+            };
+            // Find the file for this warning by matching line number
+            let file = all_tag_keys
+                .iter()
+                .zip(tag_key_files.iter())
+                .find(|(e, _)| e.key == tw.key && e.line == tw.line)
+                .map(|(_, f)| f.clone())
+                .unwrap_or_default();
             warnings.push(LintWarning {
-                file: file_path.clone(),
+                file,
                 line: tw.line,
                 message: format!(
-                    "Tag key '{}' is not PascalCase. Use PascalCase for tag keys (e.g., 'Environment', 'ManagedBy').",
-                    tw.key
+                    "Tag key '{}' doesn't match the dominant style ({}). Use consistent casing for tag keys.",
+                    tw.key, style_name
                 ),
             });
         }
