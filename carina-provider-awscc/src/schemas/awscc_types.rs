@@ -28,161 +28,75 @@ pub struct AwsccSchemaConfig {
     pub schema: ResourceSchema,
 }
 
+/// Register AWSCC type validators declaratively.
+///
+/// Generates a `HashMap<String, ValidatorFn>` from three categories:
+/// - `simple`: single-arg validators (`name => function`)
+/// - `prefixed`: prefixed resource ID validators (`name => prefix`)
+/// - `service_arn`: arbitrary closure validators (`name => closure_expr`)
+macro_rules! register_validators {
+    (
+        simple { $( $s_name:ident => $s_fn:expr ),* $(,)? }
+        prefixed { $( $p_name:ident => $p_prefix:expr ),* $(,)? }
+        service_arn { $( $a_name:ident => $a_expr:expr ),* $(,)? }
+    ) => {{
+        let mut m: HashMap<String, ValidatorFn> = HashMap::new();
+        $( m.insert(stringify!($s_name).to_string(), Box::new(|s: &str| ($s_fn)(s))); )*
+        $( m.insert(stringify!($p_name).to_string(), Box::new(|s: &str| validate_prefixed_resource_id(s, $p_prefix))); )*
+        $( m.insert(stringify!($a_name).to_string(), Box::new($a_expr)); )*
+        m
+    }};
+}
+
 /// Return all AWSCC type validators for registration in ProviderContext.
 ///
 /// These validators are keyed by type name (matching the names used in fn/module
 /// type annotations) and wrap the validation functions from `carina-aws-types`.
 pub fn awscc_validators() -> HashMap<String, ValidatorFn> {
-    let mut m: HashMap<String, ValidatorFn> = HashMap::new();
-
-    // Single-arg validators
-    m.insert("arn".to_string(), Box::new(|s: &str| validate_arn(s)));
-    m.insert(
-        "availability_zone".to_string(),
-        Box::new(|s: &str| validate_availability_zone(s)),
-    );
-    m.insert(
-        "aws_resource_id".to_string(),
-        Box::new(|s: &str| validate_aws_resource_id(s)),
-    );
-    m.insert(
-        "iam_role_id".to_string(),
-        Box::new(|s: &str| validate_iam_role_id(s)),
-    );
-    m.insert(
-        "aws_account_id".to_string(),
-        Box::new(|s: &str| validate_aws_account_id(s)),
-    );
-    m.insert(
-        "kms_key_id".to_string(),
-        Box::new(|s: &str| validate_kms_key_id(s)),
-    );
-    m.insert(
-        "ipam_pool_id".to_string(),
-        Box::new(|s: &str| validate_ipam_pool_id(s)),
-    );
-    m.insert(
-        "availability_zone_id".to_string(),
-        Box::new(|s: &str| validate_availability_zone_id(s)),
-    );
-
-    // Prefixed resource IDs
-    m.insert(
-        "vpc_id".to_string(),
-        Box::new(|s: &str| validate_prefixed_resource_id(s, "vpc")),
-    );
-    m.insert(
-        "subnet_id".to_string(),
-        Box::new(|s: &str| validate_prefixed_resource_id(s, "subnet")),
-    );
-    m.insert(
-        "security_group_id".to_string(),
-        Box::new(|s: &str| validate_prefixed_resource_id(s, "sg")),
-    );
-    m.insert(
-        "internet_gateway_id".to_string(),
-        Box::new(|s: &str| validate_prefixed_resource_id(s, "igw")),
-    );
-    m.insert(
-        "route_table_id".to_string(),
-        Box::new(|s: &str| validate_prefixed_resource_id(s, "rtb")),
-    );
-    m.insert(
-        "nat_gateway_id".to_string(),
-        Box::new(|s: &str| validate_prefixed_resource_id(s, "nat")),
-    );
-    m.insert(
-        "transit_gateway_id".to_string(),
-        Box::new(|s: &str| validate_prefixed_resource_id(s, "tgw")),
-    );
-    m.insert(
-        "vpn_gateway_id".to_string(),
-        Box::new(|s: &str| validate_prefixed_resource_id(s, "vgw")),
-    );
-    m.insert(
-        "network_interface_id".to_string(),
-        Box::new(|s: &str| validate_prefixed_resource_id(s, "eni")),
-    );
-    m.insert(
-        "allocation_id".to_string(),
-        Box::new(|s: &str| validate_prefixed_resource_id(s, "eipalloc")),
-    );
-    m.insert(
-        "vpc_endpoint_id".to_string(),
-        Box::new(|s: &str| validate_prefixed_resource_id(s, "vpce")),
-    );
-    m.insert(
-        "vpc_peering_connection_id".to_string(),
-        Box::new(|s: &str| validate_prefixed_resource_id(s, "pcx")),
-    );
-    m.insert(
-        "instance_id".to_string(),
-        Box::new(|s: &str| validate_prefixed_resource_id(s, "i")),
-    );
-    m.insert(
-        "prefix_list_id".to_string(),
-        Box::new(|s: &str| validate_prefixed_resource_id(s, "pl")),
-    );
-    m.insert(
-        "carrier_gateway_id".to_string(),
-        Box::new(|s: &str| validate_prefixed_resource_id(s, "cagw")),
-    );
-    m.insert(
-        "local_gateway_id".to_string(),
-        Box::new(|s: &str| validate_prefixed_resource_id(s, "lgw")),
-    );
-    m.insert(
-        "network_acl_id".to_string(),
-        Box::new(|s: &str| validate_prefixed_resource_id(s, "acl")),
-    );
-    m.insert(
-        "transit_gateway_attachment_id".to_string(),
-        Box::new(|s: &str| validate_prefixed_resource_id(s, "tgw-attach")),
-    );
-    m.insert(
-        "flow_log_id".to_string(),
-        Box::new(|s: &str| validate_prefixed_resource_id(s, "fl")),
-    );
-    m.insert(
-        "ipam_id".to_string(),
-        Box::new(|s: &str| validate_prefixed_resource_id(s, "ipam")),
-    );
-    m.insert(
-        "subnet_route_table_association_id".to_string(),
-        Box::new(|s: &str| validate_prefixed_resource_id(s, "rtbassoc")),
-    );
-    m.insert(
-        "security_group_rule_id".to_string(),
-        Box::new(|s: &str| validate_prefixed_resource_id(s, "sgr")),
-    );
-    m.insert(
-        "vpc_cidr_block_association_id".to_string(),
-        Box::new(|s: &str| validate_prefixed_resource_id(s, "vpc-cidr-assoc")),
-    );
-    m.insert(
-        "tgw_route_table_id".to_string(),
-        Box::new(|s: &str| validate_prefixed_resource_id(s, "tgw-rtb")),
-    );
-    m.insert(
-        "egress_only_internet_gateway_id".to_string(),
-        Box::new(|s: &str| validate_prefixed_resource_id(s, "eigw")),
-    );
-
-    // Service ARNs
-    m.insert(
-        "iam_role_arn".to_string(),
-        Box::new(|s: &str| validate_service_arn(s, "iam", Some("role/"))),
-    );
-    m.insert(
-        "iam_policy_arn".to_string(),
-        Box::new(|s: &str| validate_service_arn(s, "iam", Some("policy/"))),
-    );
-    m.insert(
-        "kms_key_arn".to_string(),
-        Box::new(|s: &str| validate_kms_key_id(s)),
-    );
-
-    m
+    register_validators! {
+        simple {
+            arn => validate_arn,
+            availability_zone => validate_availability_zone,
+            aws_resource_id => validate_aws_resource_id,
+            iam_role_id => validate_iam_role_id,
+            aws_account_id => validate_aws_account_id,
+            kms_key_id => validate_kms_key_id,
+            ipam_pool_id => validate_ipam_pool_id,
+            availability_zone_id => validate_availability_zone_id,
+        }
+        prefixed {
+            vpc_id => "vpc",
+            subnet_id => "subnet",
+            security_group_id => "sg",
+            internet_gateway_id => "igw",
+            route_table_id => "rtb",
+            nat_gateway_id => "nat",
+            transit_gateway_id => "tgw",
+            vpn_gateway_id => "vgw",
+            network_interface_id => "eni",
+            allocation_id => "eipalloc",
+            vpc_endpoint_id => "vpce",
+            vpc_peering_connection_id => "pcx",
+            instance_id => "i",
+            prefix_list_id => "pl",
+            carrier_gateway_id => "cagw",
+            local_gateway_id => "lgw",
+            network_acl_id => "acl",
+            transit_gateway_attachment_id => "tgw-attach",
+            flow_log_id => "fl",
+            ipam_id => "ipam",
+            subnet_route_table_association_id => "rtbassoc",
+            security_group_rule_id => "sgr",
+            vpc_cidr_block_association_id => "vpc-cidr-assoc",
+            tgw_route_table_id => "tgw-rtb",
+            egress_only_internet_gateway_id => "eigw",
+        }
+        service_arn {
+            iam_role_arn => |s: &str| validate_service_arn(s, "iam", Some("role/")),
+            iam_policy_arn => |s: &str| validate_service_arn(s, "iam", Some("policy/")),
+            kms_key_arn => |s: &str| validate_kms_key_id(s),
+        }
+    }
 }
 
 /// Validate a namespaced enum value.
@@ -356,6 +270,99 @@ mod tests {
             &["default", "dedicated", "host"],
         );
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn awscc_validators_all_registered() {
+        let validators = awscc_validators();
+
+        // Single-arg validators
+        let expected_single = [
+            "arn",
+            "availability_zone",
+            "aws_resource_id",
+            "iam_role_id",
+            "aws_account_id",
+            "kms_key_id",
+            "ipam_pool_id",
+            "availability_zone_id",
+        ];
+
+        // Prefixed resource IDs
+        let expected_prefixed = [
+            "vpc_id",
+            "subnet_id",
+            "security_group_id",
+            "internet_gateway_id",
+            "route_table_id",
+            "nat_gateway_id",
+            "transit_gateway_id",
+            "vpn_gateway_id",
+            "network_interface_id",
+            "allocation_id",
+            "vpc_endpoint_id",
+            "vpc_peering_connection_id",
+            "instance_id",
+            "prefix_list_id",
+            "carrier_gateway_id",
+            "local_gateway_id",
+            "network_acl_id",
+            "transit_gateway_attachment_id",
+            "flow_log_id",
+            "ipam_id",
+            "subnet_route_table_association_id",
+            "security_group_rule_id",
+            "vpc_cidr_block_association_id",
+            "tgw_route_table_id",
+            "egress_only_internet_gateway_id",
+        ];
+
+        // Service ARNs
+        let expected_arn = ["iam_role_arn", "iam_policy_arn", "kms_key_arn"];
+
+        let mut all_expected: Vec<&str> = Vec::new();
+        all_expected.extend_from_slice(&expected_single);
+        all_expected.extend_from_slice(&expected_prefixed);
+        all_expected.extend_from_slice(&expected_arn);
+
+        for name in &all_expected {
+            assert!(
+                validators.contains_key(*name),
+                "Missing validator: {}",
+                name
+            );
+        }
+
+        assert_eq!(
+            validators.len(),
+            all_expected.len(),
+            "Validator count mismatch: expected {}, got {}. Extra keys: {:?}",
+            all_expected.len(),
+            validators.len(),
+            validators
+                .keys()
+                .filter(|k| !all_expected.contains(&k.as_str()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn awscc_validators_produce_correct_results() {
+        let validators = awscc_validators();
+
+        // Test a prefixed resource ID validator
+        let vpc_validator = validators.get("vpc_id").unwrap();
+        assert!(vpc_validator("vpc-12345678").is_ok());
+        assert!(vpc_validator("subnet-12345678").is_err());
+
+        // Test a single-arg validator
+        let arn_validator = validators.get("arn").unwrap();
+        assert!(arn_validator("arn:aws:s3:::my-bucket").is_ok());
+        assert!(arn_validator("not-an-arn").is_err());
+
+        // Test a service ARN validator
+        let iam_role_arn_validator = validators.get("iam_role_arn").unwrap();
+        assert!(iam_role_arn_validator("arn:aws:iam::123456789012:role/my-role").is_ok());
     }
 
     #[test]
