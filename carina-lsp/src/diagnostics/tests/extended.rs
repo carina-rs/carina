@@ -1064,3 +1064,128 @@ let name = parts |> join("-")
         diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
     );
 }
+
+#[test]
+fn attributes_block_ipv4_address_invalid() {
+    let engine = test_engine();
+    let doc = create_document(
+        r#"provider awscc {
+region = awscc.Region.ap_northeast_1
+}
+
+attributes {
+    ip: ipv4_address = "not-an-ip"
+}"#,
+    );
+
+    let diagnostics = engine.analyze(&doc, None);
+
+    let type_diag = diagnostics
+        .iter()
+        .find(|d| d.message.contains("ipv4_address") || d.message.contains("IPv4"));
+    assert!(
+        type_diag.is_some(),
+        "Should warn about invalid ipv4_address in attributes block. Got diagnostics: {:?}",
+        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn attributes_block_ipv4_address_valid() {
+    let engine = test_engine();
+    let doc = create_document(
+        r#"provider awscc {
+region = awscc.Region.ap_northeast_1
+}
+
+attributes {
+    ip: ipv4_address = "192.168.1.1"
+}"#,
+    );
+
+    let diagnostics = engine.analyze(&doc, None);
+
+    let type_diag = diagnostics
+        .iter()
+        .find(|d| d.message.contains("ipv4_address") || d.message.contains("IPv4"));
+    assert!(
+        type_diag.is_none(),
+        "Should NOT warn about valid ipv4_address in attributes block. Got diagnostics: {:?}",
+        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn attributes_block_cidr_invalid() {
+    let engine = test_engine();
+    let doc = create_document(
+        r#"provider awscc {
+region = awscc.Region.ap_northeast_1
+}
+
+attributes {
+    network: cidr = "not-a-cidr"
+}"#,
+    );
+
+    let diagnostics = engine.analyze(&doc, None);
+
+    let type_diag = diagnostics
+        .iter()
+        .find(|d| d.message.contains("CIDR") || d.message.contains("cidr"));
+    assert!(
+        type_diag.is_some(),
+        "Should warn about invalid cidr in attributes block. Got diagnostics: {:?}",
+        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn attributes_block_ipv6_address_invalid() {
+    let engine = test_engine();
+    let doc = create_document(
+        r#"provider awscc {
+region = awscc.Region.ap_northeast_1
+}
+
+attributes {
+    addr: ipv6_address = "not-ipv6"
+}"#,
+    );
+
+    let diagnostics = engine.analyze(&doc, None);
+
+    let type_diag = diagnostics
+        .iter()
+        .find(|d| d.message.contains("ipv6") || d.message.contains("IPv6"));
+    assert!(
+        type_diag.is_some(),
+        "Should warn about invalid ipv6_address in attributes block. Got diagnostics: {:?}",
+        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn attributes_block_ipv6_cidr_invalid() {
+    let engine = test_engine();
+    let doc = create_document(
+        r#"provider awscc {
+region = awscc.Region.ap_northeast_1
+}
+
+attributes {
+    net6: ipv6_cidr = "not-a-cidr"
+}"#,
+    );
+
+    let diagnostics = engine.analyze(&doc, None);
+
+    let type_diag = diagnostics
+        .iter()
+        .find(|d| d.message.contains("IPv6") || d.message.contains("ipv6"));
+    assert!(
+        type_diag.is_some(),
+        "Should warn about invalid ipv6_cidr in attributes block. Got diagnostics: {:?}",
+        diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}
