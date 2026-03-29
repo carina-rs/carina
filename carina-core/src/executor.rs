@@ -362,6 +362,53 @@ fn update_binding_map(
     }
 }
 
+/// Process a `BasicEffectResult` by updating shared execution state.
+///
+/// This helper is used by both sequential and phased execution paths to avoid
+/// duplicating the result-processing logic for Create/Update/Delete effects.
+#[allow(clippy::too_many_arguments)]
+fn process_basic_result(
+    result: BasicEffectResult,
+    success_count: &mut usize,
+    failure_count: &mut usize,
+    applied_states: &mut HashMap<ResourceId, State>,
+    failed_bindings: &mut HashSet<String>,
+    successfully_deleted: &mut HashSet<ResourceId>,
+    pending_refreshes: &mut HashMap<ResourceId, String>,
+    binding_map: &mut HashMap<String, HashMap<String, Value>>,
+) {
+    match result {
+        BasicEffectResult::Success {
+            state,
+            resource_id,
+            resolved_attrs,
+        } => {
+            *success_count += 1;
+            if let Some(state) = state {
+                if let Some(attrs) = &resolved_attrs {
+                    update_binding_map(binding_map, attrs, &state);
+                }
+                applied_states.insert(resource_id, state);
+            }
+        }
+        BasicEffectResult::Failure {
+            binding, refresh, ..
+        } => {
+            *failure_count += 1;
+            if let Some(binding) = binding {
+                failed_bindings.insert(binding);
+            }
+            if let Some((id, identifier)) = &refresh {
+                queue_state_refresh(pending_refreshes, id, Some(identifier.as_str()));
+            }
+        }
+        BasicEffectResult::Deleted { resource_id, .. } => {
+            *success_count += 1;
+            successfully_deleted.insert(resource_id);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Effect execution: sequential path
 // ---------------------------------------------------------------------------
@@ -379,63 +426,15 @@ fn count_actionable_effects(effects: &[Effect]) -> usize {
 /// Groups effects into levels where all effects in a level have their
 /// dependencies satisfied by effects in earlier levels. Effects within
 /// the same level can be executed concurrently.
+///
+/// Delegates to `build_dependency_map` for the dependency computation and
+/// layers level-grouping logic on top.
 #[cfg(test)]
 fn build_dependency_levels(
     effects: &[Effect],
     unresolved_resources: &HashMap<ResourceId, Resource>,
 ) -> Vec<Vec<usize>> {
-    // Build binding -> effect index mapping
-    let mut binding_to_idx: HashMap<String, usize> = HashMap::new();
-    for (idx, effect) in effects.iter().enumerate() {
-        if let Some(binding) = effect.binding_name() {
-            binding_to_idx.insert(binding, idx);
-        }
-    }
-
-    // For each effect, compute which other effect indices it depends on.
-    // Check both the effect's resource and the unresolved resource (which may
-    // still have ResourceRef values before they were resolved to plain strings).
-    let mut deps_of: HashMap<usize, HashSet<usize>> = HashMap::new();
-    for (idx, effect) in effects.iter().enumerate() {
-        let mut dep_indices = HashSet::new();
-        if let Some(resource) = effect.resource() {
-            let dep_bindings = get_resource_dependencies(resource);
-            for dep_binding in &dep_bindings {
-                if let Some(&dep_idx) = binding_to_idx.get(dep_binding) {
-                    dep_indices.insert(dep_idx);
-                }
-            }
-            // Also check unresolved source for dependencies (ResourceRef values
-            // may have been resolved to plain strings in the effect's resource)
-            if let Some(unresolved) = unresolved_resources.get(effect.resource_id()) {
-                let unresolved_deps = get_resource_dependencies(unresolved);
-                for dep_binding in &unresolved_deps {
-                    if let Some(&dep_idx) = binding_to_idx.get(dep_binding) {
-                        dep_indices.insert(dep_idx);
-                    }
-                }
-            }
-        }
-        deps_of.insert(idx, dep_indices);
-    }
-
-    // For Delete effects, add reverse dependencies: if subnet depends on vpc,
-    // the vpc delete must wait for subnet delete (children deleted before parents).
-    // Collect all reverse edges first, then apply them.
-    let mut reverse_deps: Vec<(usize, usize)> = Vec::new();
-    for (idx, effect) in effects.iter().enumerate() {
-        if let Effect::Delete { dependencies, .. } = effect {
-            for dep_binding in dependencies {
-                if let Some(&dep_idx) = binding_to_idx.get(dep_binding) {
-                    // dep_idx (the parent) must wait for idx (the child) to be deleted
-                    reverse_deps.push((dep_idx, idx));
-                }
-            }
-        }
-    }
-    for (parent_idx, child_idx) in reverse_deps {
-        deps_of.entry(parent_idx).or_default().insert(child_idx);
-    }
+    let deps_of = build_dependency_map(effects, unresolved_resources);
 
     // Assign levels: each effect's level is max(deps' levels) + 1, or 0 if no deps
     let mut levels: HashMap<usize, usize> = HashMap::new();
@@ -486,8 +485,11 @@ fn build_dependency_levels(
     result
 }
 
-/// Result of executing a single effect.
-enum SingleEffectResult {
+/// Result of executing a basic effect (Create, Update, or Delete).
+///
+/// This is the shared result type used by `execute_basic_effect` to avoid
+/// duplicating effect dispatch logic across sequential and phased paths.
+enum BasicEffectResult {
     Success {
         state: Option<State>,
         resource_id: ResourceId,
@@ -500,6 +502,165 @@ enum SingleEffectResult {
     Deleted {
         resource_id: ResourceId,
     },
+}
+
+/// Execute a single Create, Update, or Delete effect.
+///
+/// This helper encapsulates the shared dispatch logic: increment progress counter,
+/// record start time, emit EffectStarted, resolve resource, call provider, and
+/// emit EffectSucceeded/EffectFailed. Returns a `BasicEffectResult` that callers
+/// map to their path-specific result types.
+///
+/// Panics if called with a Replace, Read, Import, Remove, or Move effect.
+async fn execute_basic_effect<'a>(
+    effect: &'a Effect,
+    provider: &'a dyn Provider,
+    binding_map: &'a HashMap<String, HashMap<String, Value>>,
+    unresolved: &'a HashMap<ResourceId, Resource>,
+    completed: &'a AtomicUsize,
+    total: usize,
+    observer: &'a dyn ExecutionObserver,
+) -> BasicEffectResult {
+    let c = completed.fetch_add(1, Ordering::Relaxed) + 1;
+    let started = Instant::now();
+    let progress = ProgressInfo {
+        completed: c,
+        total,
+    };
+    observer.on_event(&ExecutionEvent::EffectStarted { effect });
+
+    match effect {
+        Effect::Create(resource) => {
+            let resolved = match resolve_resource(resource, binding_map) {
+                Ok(r) => r,
+                Err(e) => {
+                    observer.on_event(&ExecutionEvent::EffectFailed {
+                        effect,
+                        error: &e,
+                        duration: started.elapsed(),
+                        progress,
+                    });
+                    return BasicEffectResult::Failure {
+                        binding: effect.binding_name(),
+                        refresh: None,
+                    };
+                }
+            };
+            match provider.create(&resolved).await {
+                Ok(state) => {
+                    observer.on_event(&ExecutionEvent::EffectSucceeded {
+                        effect,
+                        state: Some(&state),
+                        duration: started.elapsed(),
+                        progress,
+                    });
+                    BasicEffectResult::Success {
+                        state: Some(state),
+                        resource_id: resource.id.clone(),
+                        resolved_attrs: Some(resolved.attributes),
+                    }
+                }
+                Err(e) => {
+                    let error_str = e.to_string();
+                    observer.on_event(&ExecutionEvent::EffectFailed {
+                        effect,
+                        error: &error_str,
+                        duration: started.elapsed(),
+                        progress,
+                    });
+                    BasicEffectResult::Failure {
+                        binding: effect.binding_name(),
+                        refresh: None,
+                    }
+                }
+            }
+        }
+        Effect::Update { id, from, to, .. } => {
+            let resolve_source = unresolved.get(id).unwrap_or(to);
+            let resolved_to = match resolve_resource_with_source(to, resolve_source, binding_map) {
+                Ok(r) => r,
+                Err(e) => {
+                    observer.on_event(&ExecutionEvent::EffectFailed {
+                        effect,
+                        error: &e,
+                        duration: started.elapsed(),
+                        progress,
+                    });
+                    return BasicEffectResult::Failure {
+                        binding: effect.binding_name(),
+                        refresh: None,
+                    };
+                }
+            };
+            let identifier = from.identifier.as_deref().unwrap_or("");
+            match provider.update(id, identifier, from, &resolved_to).await {
+                Ok(state) => {
+                    observer.on_event(&ExecutionEvent::EffectSucceeded {
+                        effect,
+                        state: Some(&state),
+                        duration: started.elapsed(),
+                        progress,
+                    });
+                    BasicEffectResult::Success {
+                        state: Some(state),
+                        resource_id: id.clone(),
+                        resolved_attrs: Some(resolved_to.attributes),
+                    }
+                }
+                Err(e) => {
+                    let error_str = e.to_string();
+                    observer.on_event(&ExecutionEvent::EffectFailed {
+                        effect,
+                        error: &error_str,
+                        duration: started.elapsed(),
+                        progress,
+                    });
+                    BasicEffectResult::Failure {
+                        binding: effect.binding_name(),
+                        refresh: Some((id.clone(), identifier.to_string())),
+                    }
+                }
+            }
+        }
+        Effect::Delete {
+            id,
+            identifier,
+            lifecycle,
+            ..
+        } => match provider.delete(id, identifier, lifecycle).await {
+            Ok(()) => {
+                observer.on_event(&ExecutionEvent::EffectSucceeded {
+                    effect,
+                    state: None,
+                    duration: started.elapsed(),
+                    progress,
+                });
+                BasicEffectResult::Deleted {
+                    resource_id: id.clone(),
+                }
+            }
+            Err(e) => {
+                let error_str = e.to_string();
+                observer.on_event(&ExecutionEvent::EffectFailed {
+                    effect,
+                    error: &error_str,
+                    duration: started.elapsed(),
+                    progress,
+                });
+                BasicEffectResult::Failure {
+                    binding: None,
+                    refresh: Some((id.clone(), identifier.clone())),
+                }
+            }
+        },
+        _ => unreachable!("execute_basic_effect called with non-basic effect"),
+    }
+}
+
+/// Result of executing a single effect.
+enum SingleEffectResult {
+    /// Create/Update/Delete completed (wraps BasicEffectResult)
+    Basic(BasicEffectResult),
     Replace {
         success: bool,
         state: Option<State>,
@@ -687,171 +848,19 @@ async fn execute_effects_sequential(
 
             in_flight.push(async move {
                 let result = match effect {
-                    Effect::Create(resource) => {
-                        let c = completed_ref.fetch_add(1, Ordering::Relaxed) + 1;
-                        let started = Instant::now();
-                        observer.on_event(&ExecutionEvent::EffectStarted { effect });
-                        let resolved = match resolve_resource(resource, &binding_snapshot) {
-                            Ok(r) => r,
-                            Err(e) => {
-                                observer.on_event(&ExecutionEvent::EffectFailed {
-                                    effect,
-                                    error: &e,
-                                    duration: started.elapsed(),
-                                    progress: ProgressInfo {
-                                        completed: c,
-                                        total,
-                                    },
-                                });
-                                return (
-                                    idx,
-                                    SingleEffectResult::Failure {
-                                        binding: effect.binding_name(),
-                                        refresh: None,
-                                    },
-                                );
-                            }
-                        };
-                        match provider.create(&resolved).await {
-                            Ok(state) => {
-                                observer.on_event(&ExecutionEvent::EffectSucceeded {
-                                    effect,
-                                    state: Some(&state),
-                                    duration: started.elapsed(),
-                                    progress: ProgressInfo {
-                                        completed: c,
-                                        total,
-                                    },
-                                });
-                                SingleEffectResult::Success {
-                                    state: Some(state),
-                                    resource_id: resource.id.clone(),
-                                    resolved_attrs: Some(resolved.attributes),
-                                }
-                            }
-                            Err(e) => {
-                                let error_str = e.to_string();
-                                observer.on_event(&ExecutionEvent::EffectFailed {
-                                    effect,
-                                    error: &error_str,
-                                    duration: started.elapsed(),
-                                    progress: ProgressInfo {
-                                        completed: c,
-                                        total,
-                                    },
-                                });
-                                SingleEffectResult::Failure {
-                                    binding: effect.binding_name(),
-                                    refresh: None,
-                                }
-                            }
-                        }
-                    }
-                    Effect::Update { id, from, to, .. } => {
-                        let c = completed_ref.fetch_add(1, Ordering::Relaxed) + 1;
-                        let started = Instant::now();
-                        observer.on_event(&ExecutionEvent::EffectStarted { effect });
-                        let resolve_source = unresolved.get(id).unwrap_or(to);
-                        let resolved_to = match resolve_resource_with_source(
-                            to,
-                            resolve_source,
-                            &binding_snapshot,
-                        ) {
-                            Ok(r) => r,
-                            Err(e) => {
-                                observer.on_event(&ExecutionEvent::EffectFailed {
-                                    effect,
-                                    error: &e,
-                                    duration: started.elapsed(),
-                                    progress: ProgressInfo {
-                                        completed: c,
-                                        total,
-                                    },
-                                });
-                                return (
-                                    idx,
-                                    SingleEffectResult::Failure {
-                                        binding: effect.binding_name(),
-                                        refresh: None,
-                                    },
-                                );
-                            }
-                        };
-                        let identifier = from.identifier.as_deref().unwrap_or("");
-                        match provider.update(id, identifier, from, &resolved_to).await {
-                            Ok(state) => {
-                                observer.on_event(&ExecutionEvent::EffectSucceeded {
-                                    effect,
-                                    state: Some(&state),
-                                    duration: started.elapsed(),
-                                    progress: ProgressInfo {
-                                        completed: c,
-                                        total,
-                                    },
-                                });
-                                SingleEffectResult::Success {
-                                    state: Some(state),
-                                    resource_id: id.clone(),
-                                    resolved_attrs: Some(resolved_to.attributes),
-                                }
-                            }
-                            Err(e) => {
-                                let error_str = e.to_string();
-                                observer.on_event(&ExecutionEvent::EffectFailed {
-                                    effect,
-                                    error: &error_str,
-                                    duration: started.elapsed(),
-                                    progress: ProgressInfo {
-                                        completed: c,
-                                        total,
-                                    },
-                                });
-                                SingleEffectResult::Failure {
-                                    binding: effect.binding_name(),
-                                    refresh: Some((id.clone(), identifier.to_string())),
-                                }
-                            }
-                        }
-                    }
-                    Effect::Delete {
-                        id,
-                        identifier,
-                        lifecycle,
-                        ..
-                    } => {
-                        let c = completed_ref.fetch_add(1, Ordering::Relaxed) + 1;
-                        let started = Instant::now();
-                        let progress = ProgressInfo {
-                            completed: c,
-                            total,
-                        };
-                        observer.on_event(&ExecutionEvent::EffectStarted { effect });
-                        match provider.delete(id, identifier, lifecycle).await {
-                            Ok(()) => {
-                                observer.on_event(&ExecutionEvent::EffectSucceeded {
-                                    effect,
-                                    state: None,
-                                    duration: started.elapsed(),
-                                    progress,
-                                });
-                                SingleEffectResult::Deleted {
-                                    resource_id: id.clone(),
-                                }
-                            }
-                            Err(e) => {
-                                let error_str = e.to_string();
-                                observer.on_event(&ExecutionEvent::EffectFailed {
-                                    effect,
-                                    error: &error_str,
-                                    duration: started.elapsed(),
-                                    progress,
-                                });
-                                SingleEffectResult::Failure {
-                                    binding: None,
-                                    refresh: Some((id.clone(), identifier.clone())),
-                                }
-                            }
-                        }
+                    Effect::Create(_) | Effect::Update { .. } | Effect::Delete { .. } => {
+                        SingleEffectResult::Basic(
+                            execute_basic_effect(
+                                effect,
+                                provider,
+                                &binding_snapshot,
+                                unresolved,
+                                completed_ref,
+                                total,
+                                observer,
+                            )
+                            .await,
+                        )
                     }
                     Effect::Replace {
                         id,
@@ -923,36 +932,17 @@ async fn execute_effects_sequential(
 
         // Process the result and update shared state immediately
         match result {
-            SingleEffectResult::Success {
-                state,
-                resource_id,
-                resolved_attrs,
-                ..
-            } => {
-                success_count += 1;
-                if let Some(state) = &state {
-                    applied_states.insert(resource_id, state.clone());
-                    if let Some(attrs) = &resolved_attrs {
-                        update_binding_map(&mut input.binding_map, attrs, state);
-                    }
-                }
-            }
-            SingleEffectResult::Failure {
-                binding, refresh, ..
-            } => {
-                failure_count += 1;
-                if let Some(binding) = binding {
-                    failed_bindings.insert(binding);
-                }
-                if let Some((id, identifier)) = refresh
-                    && !identifier.is_empty()
-                {
-                    pending_refreshes.insert(id, identifier);
-                }
-            }
-            SingleEffectResult::Deleted { resource_id, .. } => {
-                success_count += 1;
-                successfully_deleted.insert(resource_id);
+            SingleEffectResult::Basic(basic) => {
+                process_basic_result(
+                    basic,
+                    &mut success_count,
+                    &mut failure_count,
+                    &mut applied_states,
+                    &mut failed_bindings,
+                    &mut successfully_deleted,
+                    &mut pending_refreshes,
+                    &mut input.binding_map,
+                );
             }
             SingleEffectResult::Replace {
                 success,
@@ -1096,10 +1086,10 @@ async fn execute_cbd_replace_parallel(
                 duration: started.elapsed(),
                 progress,
             });
-            return SingleEffectResult::Failure {
+            return SingleEffectResult::Basic(BasicEffectResult::Failure {
                 binding: effect.binding_name(),
                 refresh: None,
-            };
+            });
         }
     };
     let mut refreshes = Vec::new();
@@ -1452,19 +1442,8 @@ fn build_phase_dependency_map(
 
 /// Result of a phased effect operation within a single phase.
 enum PhaseEffectResult {
-    /// Phase 1: Non-replace effect succeeded (Create/Update)
-    Success {
-        state: Option<State>,
-        resource_id: ResourceId,
-        resolved_attrs: Option<HashMap<String, Value>>,
-    },
-    /// Phase 1: Non-replace effect failed
-    Failure {
-        binding: Option<String>,
-        refresh: Option<(ResourceId, String)>,
-    },
-    /// Phase 1: Delete succeeded
-    Deleted { resource_id: ResourceId },
+    /// Phase 1: Create/Update/Delete completed (wraps BasicEffectResult)
+    Basic(BasicEffectResult),
     /// Phase 2: CBD create succeeded
     CbdCreateSuccess {
         idx: usize,
@@ -1589,178 +1568,17 @@ async fn execute_effects_phased(
                 let completed_ref = &completed;
 
                 in_flight.push(async move {
-                    let result = match effect {
-                        Effect::Create(resource) => {
-                            let c = completed_ref.fetch_add(1, Ordering::Relaxed) + 1;
-                            let started = Instant::now();
-                            observer.on_event(&ExecutionEvent::EffectStarted { effect });
-                            let resolved = match resolve_resource(resource, &binding_snapshot) {
-                                Ok(r) => r,
-                                Err(e) => {
-                                    observer.on_event(&ExecutionEvent::EffectFailed {
-                                        effect,
-                                        error: &e,
-                                        duration: started.elapsed(),
-                                        progress: ProgressInfo {
-                                            completed: c,
-                                            total,
-                                        },
-                                    });
-                                    return (
-                                        idx,
-                                        PhaseEffectResult::Failure {
-                                            binding: effect.binding_name(),
-                                            refresh: None,
-                                        },
-                                    );
-                                }
-                            };
-                            match provider.create(&resolved).await {
-                                Ok(state) => {
-                                    observer.on_event(&ExecutionEvent::EffectSucceeded {
-                                        effect,
-                                        state: Some(&state),
-                                        duration: started.elapsed(),
-                                        progress: ProgressInfo {
-                                            completed: c,
-                                            total,
-                                        },
-                                    });
-                                    PhaseEffectResult::Success {
-                                        state: Some(state),
-                                        resource_id: resource.id.clone(),
-                                        resolved_attrs: Some(resolved.attributes),
-                                    }
-                                }
-                                Err(e) => {
-                                    let error_str = e.to_string();
-                                    observer.on_event(&ExecutionEvent::EffectFailed {
-                                        effect,
-                                        error: &error_str,
-                                        duration: started.elapsed(),
-                                        progress: ProgressInfo {
-                                            completed: c,
-                                            total,
-                                        },
-                                    });
-                                    PhaseEffectResult::Failure {
-                                        binding: effect.binding_name(),
-                                        refresh: None,
-                                    }
-                                }
-                            }
-                        }
-                        Effect::Update { id, from, to, .. } => {
-                            let c = completed_ref.fetch_add(1, Ordering::Relaxed) + 1;
-                            let started = Instant::now();
-                            observer.on_event(&ExecutionEvent::EffectStarted { effect });
-                            let resolve_source = unresolved.get(id).unwrap_or(to);
-                            let resolved_to = match resolve_resource_with_source(
-                                to,
-                                resolve_source,
-                                &binding_snapshot,
-                            ) {
-                                Ok(r) => r,
-                                Err(e) => {
-                                    observer.on_event(&ExecutionEvent::EffectFailed {
-                                        effect,
-                                        error: &e,
-                                        duration: started.elapsed(),
-                                        progress: ProgressInfo {
-                                            completed: c,
-                                            total,
-                                        },
-                                    });
-                                    return (
-                                        idx,
-                                        PhaseEffectResult::Failure {
-                                            binding: effect.binding_name(),
-                                            refresh: None,
-                                        },
-                                    );
-                                }
-                            };
-                            let identifier = from.identifier.as_deref().unwrap_or("");
-                            match provider.update(id, identifier, from, &resolved_to).await {
-                                Ok(state) => {
-                                    observer.on_event(&ExecutionEvent::EffectSucceeded {
-                                        effect,
-                                        state: Some(&state),
-                                        duration: started.elapsed(),
-                                        progress: ProgressInfo {
-                                            completed: c,
-                                            total,
-                                        },
-                                    });
-                                    PhaseEffectResult::Success {
-                                        state: Some(state),
-                                        resource_id: id.clone(),
-                                        resolved_attrs: Some(resolved_to.attributes),
-                                    }
-                                }
-                                Err(e) => {
-                                    let error_str = e.to_string();
-                                    observer.on_event(&ExecutionEvent::EffectFailed {
-                                        effect,
-                                        error: &error_str,
-                                        duration: started.elapsed(),
-                                        progress: ProgressInfo {
-                                            completed: c,
-                                            total,
-                                        },
-                                    });
-                                    PhaseEffectResult::Failure {
-                                        binding: effect.binding_name(),
-                                        refresh: Some((id.clone(), identifier.to_string())),
-                                    }
-                                }
-                            }
-                        }
-                        Effect::Delete {
-                            id,
-                            identifier,
-                            lifecycle,
-                            ..
-                        } => {
-                            let c = completed_ref.fetch_add(1, Ordering::Relaxed) + 1;
-                            let started = Instant::now();
-                            observer.on_event(&ExecutionEvent::EffectStarted { effect });
-                            match provider.delete(id, identifier, lifecycle).await {
-                                Ok(()) => {
-                                    observer.on_event(&ExecutionEvent::EffectSucceeded {
-                                        effect,
-                                        state: None,
-                                        duration: started.elapsed(),
-                                        progress: ProgressInfo {
-                                            completed: c,
-                                            total,
-                                        },
-                                    });
-                                    PhaseEffectResult::Deleted {
-                                        resource_id: id.clone(),
-                                    }
-                                }
-                                Err(e) => {
-                                    let error_str = e.to_string();
-                                    observer.on_event(&ExecutionEvent::EffectFailed {
-                                        effect,
-                                        error: &error_str,
-                                        duration: started.elapsed(),
-                                        progress: ProgressInfo {
-                                            completed: c,
-                                            total,
-                                        },
-                                    });
-                                    PhaseEffectResult::Failure {
-                                        binding: None,
-                                        refresh: Some((id.clone(), identifier.clone())),
-                                    }
-                                }
-                            }
-                        }
-                        _ => unreachable!(),
-                    };
-                    (idx, result)
+                    let basic = execute_basic_effect(
+                        effect,
+                        provider,
+                        &binding_snapshot,
+                        unresolved,
+                        completed_ref,
+                        total,
+                        observer,
+                    )
+                    .await;
+                    (idx, PhaseEffectResult::Basic(basic))
                 });
             }
 
@@ -1772,35 +1590,17 @@ async fn execute_effects_phased(
             completed_indices.insert(finished_idx);
 
             match result {
-                PhaseEffectResult::Success {
-                    state,
-                    resource_id,
-                    resolved_attrs,
-                } => {
-                    success_count += 1;
-                    if let Some(state) = &state {
-                        applied_states.insert(resource_id, state.clone());
-                        if let Some(attrs) = &resolved_attrs {
-                            update_binding_map(&mut input.binding_map, attrs, state);
-                        }
-                    }
-                }
-                PhaseEffectResult::Failure {
-                    binding, refresh, ..
-                } => {
-                    failure_count += 1;
-                    if let Some(binding) = binding {
-                        failed_bindings.insert(binding);
-                    }
-                    if let Some((id, identifier)) = refresh
-                        && !identifier.is_empty()
-                    {
-                        pending_refreshes.insert(id, identifier);
-                    }
-                }
-                PhaseEffectResult::Deleted { resource_id, .. } => {
-                    success_count += 1;
-                    successfully_deleted.insert(resource_id);
+                PhaseEffectResult::Basic(basic) => {
+                    process_basic_result(
+                        basic,
+                        &mut success_count,
+                        &mut failure_count,
+                        &mut applied_states,
+                        &mut failed_bindings,
+                        &mut successfully_deleted,
+                        &mut pending_refreshes,
+                        &mut input.binding_map,
+                    );
                 }
                 _ => unreachable!(),
             }
@@ -1910,10 +1710,10 @@ async fn execute_effects_phased(
                                 return (
                                     idx,
                                     started,
-                                    PhaseEffectResult::Failure {
+                                    PhaseEffectResult::Basic(BasicEffectResult::Failure {
                                         binding: effect.binding_name(),
                                         refresh: None,
-                                    },
+                                    }),
                                 );
                             }
                         };
@@ -2082,6 +1882,12 @@ async fn execute_effects_phased(
                     }
                     for (id, identifier) in refreshes {
                         queue_state_refresh(&mut pending_refreshes, &id, Some(&identifier));
+                    }
+                }
+                PhaseEffectResult::Basic(BasicEffectResult::Failure { binding, .. }) => {
+                    failure_count += 1;
+                    if let Some(binding) = binding {
+                        failed_bindings.insert(binding);
                     }
                 }
                 _ => unreachable!(),
@@ -2475,10 +2281,10 @@ async fn execute_effects_phased(
                                         });
                                         return (
                                             idx,
-                                            PhaseEffectResult::Failure {
+                                            PhaseEffectResult::Basic(BasicEffectResult::Failure {
                                                 binding: effect.binding_name(),
                                                 refresh: None,
-                                            },
+                                            }),
                                         );
                                     }
                                 };
@@ -2564,6 +2370,12 @@ async fn execute_effects_phased(
                     update_binding_map(&mut input.binding_map, &resolved_attrs, &state);
                 }
                 PhaseEffectResult::NonCbdCreateFailure { binding } => {
+                    failure_count += 1;
+                    if let Some(binding) = binding {
+                        failed_bindings.insert(binding);
+                    }
+                }
+                PhaseEffectResult::Basic(BasicEffectResult::Failure { binding, .. }) => {
                     failure_count += 1;
                     if let Some(binding) = binding {
                         failed_bindings.insert(binding);
@@ -3681,6 +3493,94 @@ mod tests {
             subnet_level,
             levels
         );
+    }
+
+    /// Characterization test for #1306: build_dependency_levels and build_dependency_map
+    /// must produce consistent results. This test verifies that after refactoring
+    /// build_dependency_levels to reuse build_dependency_map, the level assignments
+    /// remain the same.
+    #[test]
+    fn test_build_dependency_levels_consistent_with_dependency_map() {
+        // a (no deps), b depends on a, c depends on a, d depends on b and c
+        let a = make_resource("a", &[]);
+        let b = make_resource("b", &["a"]);
+        let c = make_resource("c", &["a"]);
+        let d = make_resource("d", &["b", "c"]);
+
+        let mut plan = Plan::new();
+        plan.add(Effect::Create(a));
+        plan.add(Effect::Create(b));
+        plan.add(Effect::Create(c));
+        plan.add(Effect::Create(d));
+
+        let levels = build_dependency_levels(plan.effects(), &HashMap::new());
+        let dep_map = build_dependency_map(plan.effects(), &HashMap::new());
+
+        // Verify levels are consistent with the dependency map:
+        // For every effect, its level must be greater than all its dependencies' levels.
+        for (idx, deps) in &dep_map {
+            let idx_level = levels.iter().position(|group| group.contains(idx)).unwrap();
+            for dep in deps {
+                let dep_level = levels.iter().position(|group| group.contains(dep)).unwrap();
+                assert!(
+                    idx_level > dep_level,
+                    "Effect {} (level {}) must be at a higher level than dependency {} (level {})",
+                    idx,
+                    idx_level,
+                    dep,
+                    dep_level
+                );
+            }
+        }
+
+        // Verify the same structure as the existing test
+        assert_eq!(levels.len(), 3);
+        assert_eq!(levels[0], vec![0]);
+        assert_eq!(levels[1], vec![1, 2]);
+        assert_eq!(levels[2], vec![3]);
+    }
+
+    /// Characterization test for #1306: both execution paths (sequential and phased)
+    /// must produce the same results for an update effect with binding map propagation.
+    #[tokio::test]
+    async fn test_update_effect_binding_map_propagation() {
+        let provider = MockProvider::new();
+        let ra_id = ResourceId::new("test", "a");
+
+        // Create initial state
+        let from_state =
+            State::existing(ra_id.clone(), HashMap::new()).with_identifier("id-original");
+        let to_resource = make_resource("a", &[]);
+
+        let mut plan = Plan::new();
+        plan.add(Effect::Update {
+            id: ra_id.clone(),
+            from: Box::new(from_state),
+            to: to_resource,
+            changed_attributes: vec!["some_attr".to_string()],
+        });
+
+        let updated_state =
+            State::existing(ra_id.clone(), HashMap::new()).with_identifier("id-updated");
+        provider.push_update(Ok(updated_state));
+
+        let input = ExecutionInput {
+            plan: &plan,
+            unresolved_resources: &HashMap::new(),
+            binding_map: HashMap::new(),
+            current_states: HashMap::new(),
+        };
+
+        let observer = MockObserver::new();
+        let result = execute_plan(&provider, input, &observer).await;
+
+        assert_eq!(result.success_count, 1);
+        assert_eq!(result.failure_count, 0);
+        assert!(result.applied_states.contains_key(&ra_id));
+
+        let events = observer.events();
+        assert!(events.iter().any(|e| e.starts_with("started:")));
+        assert!(events.iter().any(|e| e.starts_with("succeeded:")));
     }
 
     /// Regression test for #1195: build_dependency_map also respects delete dependencies.
