@@ -5,9 +5,10 @@ use std::path::PathBuf;
 use clap_complete::engine::{ArgValueCompleter, CompletionCandidate};
 use colored::Colorize;
 
-use carina_core::config_loader::{get_base_dir, load_configuration};
+use carina_core::config_loader::{get_base_dir, load_configuration_with_config};
 use carina_core::deps::sort_resources_by_dependencies;
 use carina_core::effect::Effect;
+use carina_core::parser::ParserConfig;
 use carina_core::plan::Plan;
 use carina_core::provider::{self as provider_mod, Provider, ProviderNormalizer};
 use carina_core::resource::{LifecycleConfig, Resource, ResourceId, State, Value};
@@ -17,7 +18,7 @@ use carina_state::{
     StateFile, create_backend, create_local_backend,
 };
 
-use super::validate_and_resolve;
+use super::validate_and_resolve_with_config;
 use crate::commands::apply::apply_name_overrides;
 use crate::error::AppError;
 use crate::wiring::{
@@ -160,23 +161,34 @@ pub enum StateCommands {
 }
 
 /// Run state subcommands
-pub async fn run_state_command(command: StateCommands) -> Result<(), AppError> {
+pub async fn run_state_command(
+    command: StateCommands,
+    parser_config: &ParserConfig,
+) -> Result<(), AppError> {
     match command {
         StateCommands::BucketDelete {
             bucket_name,
             force,
             path,
-        } => run_state_bucket_delete(&bucket_name, force, &path).await,
-        StateCommands::Refresh { path, lock } => run_state_refresh(&path, lock).await,
-        StateCommands::List { path } => run_state_list(&path).await,
-        StateCommands::Lookup { query, path, json } => run_state_lookup(&query, &path, json).await,
-        StateCommands::Show { path, tui } => run_state_show(&path, tui).await,
+        } => run_state_bucket_delete(&bucket_name, force, &path, parser_config).await,
+        StateCommands::Refresh { path, lock } => {
+            run_state_refresh(&path, lock, parser_config).await
+        }
+        StateCommands::List { path } => run_state_list(&path, parser_config).await,
+        StateCommands::Lookup { query, path, json } => {
+            run_state_lookup(&query, &path, json, parser_config).await
+        }
+        StateCommands::Show { path, tui } => run_state_show(&path, tui, parser_config).await,
     }
 }
 
 /// Run force-unlock command
-pub async fn run_force_unlock(lock_id: &str, path: &PathBuf) -> Result<(), AppError> {
-    let parsed = load_configuration(path)?.parsed;
+pub async fn run_force_unlock(
+    lock_id: &str,
+    path: &PathBuf,
+    parser_config: &ParserConfig,
+) -> Result<(), AppError> {
+    let parsed = load_configuration_with_config(path, parser_config)?.parsed;
 
     let backend_config = parsed
         .backend
@@ -209,8 +221,11 @@ pub async fn run_force_unlock(lock_id: &str, path: &PathBuf) -> Result<(), AppEr
 }
 
 /// Load the state file from the backend (or local file), without acquiring a lock.
-async fn load_state_file(path: &PathBuf) -> Result<StateFile, AppError> {
-    let loaded = load_configuration(path)?;
+async fn load_state_file(
+    path: &PathBuf,
+    parser_config: &ParserConfig,
+) -> Result<StateFile, AppError> {
+    let loaded = load_configuration_with_config(path, parser_config)?;
     let parsed = loaded.parsed;
 
     let backend: Box<dyn StateBackend> = if let Some(config) = parsed.backend.as_ref() {
@@ -252,8 +267,8 @@ fn format_state_list(state: &StateFile) -> Vec<String> {
 }
 
 /// Run state list command
-async fn run_state_list(path: &PathBuf) -> Result<(), AppError> {
-    let state = load_state_file(path).await?;
+async fn run_state_list(path: &PathBuf, parser_config: &ParserConfig) -> Result<(), AppError> {
+    let state = load_state_file(path, parser_config).await?;
 
     if state.resources.is_empty() {
         println!("No resources in state.");
@@ -307,8 +322,13 @@ fn format_state_lookup(
 }
 
 /// Run state lookup command
-async fn run_state_lookup(query: &str, path: &PathBuf, json_output: bool) -> Result<(), AppError> {
-    let state = load_state_file(path).await?;
+async fn run_state_lookup(
+    query: &str,
+    path: &PathBuf,
+    json_output: bool,
+    parser_config: &ParserConfig,
+) -> Result<(), AppError> {
+    let state = load_state_file(path, parser_config).await?;
     let output = format_state_lookup(&state, query, json_output)?;
     println!("{}", output);
     Ok(())
@@ -385,8 +405,12 @@ fn format_state_show(state: &StateFile) -> String {
 }
 
 /// Run state show command
-async fn run_state_show(path: &PathBuf, tui: bool) -> Result<(), AppError> {
-    let state = load_state_file(path).await?;
+async fn run_state_show(
+    path: &PathBuf,
+    tui: bool,
+    parser_config: &ParserConfig,
+) -> Result<(), AppError> {
+    let state = load_state_file(path, parser_config).await?;
 
     if state.resources.is_empty() {
         println!("No resources in state.");
@@ -422,8 +446,9 @@ async fn run_state_bucket_delete(
     bucket_name: &str,
     force: bool,
     path: &PathBuf,
+    parser_config: &ParserConfig,
 ) -> Result<(), AppError> {
-    let parsed = load_configuration(path)?.parsed;
+    let parsed = load_configuration_with_config(path, parser_config)?.parsed;
 
     let backend_config = parsed
         .backend
@@ -524,12 +549,16 @@ async fn run_state_bucket_delete(
 }
 
 /// Run state refresh command
-pub async fn run_state_refresh(path: &PathBuf, lock: bool) -> Result<(), AppError> {
-    let loaded = load_configuration(path)?;
+pub async fn run_state_refresh(
+    path: &PathBuf,
+    lock: bool,
+    parser_config: &ParserConfig,
+) -> Result<(), AppError> {
+    let loaded = load_configuration_with_config(path, parser_config)?;
     let mut parsed = loaded.parsed;
 
     let base_dir = get_base_dir(path);
-    validate_and_resolve(&mut parsed, base_dir, true)?;
+    validate_and_resolve_with_config(&mut parsed, base_dir, true, parser_config)?;
 
     // Create backend
     let backend_config = parsed.backend.as_ref();

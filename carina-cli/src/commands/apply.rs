@@ -10,7 +10,7 @@ use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 
 use futures::stream::{self, StreamExt};
 
-use carina_core::config_loader::{get_base_dir, load_configuration};
+use carina_core::config_loader::{get_base_dir, load_configuration_with_config};
 use carina_core::deps::sort_resources_by_dependencies;
 use carina_core::differ::{cascade_dependent_updates, create_plan};
 use carina_core::effect::Effect;
@@ -29,7 +29,9 @@ use carina_state::{
     create_backend, create_local_backend,
 };
 
-use super::validate_and_resolve;
+use carina_core::parser::ParserConfig;
+
+use super::validate_and_resolve_with_config;
 use crate::DetailLevel;
 use crate::commands::plan::PlanFile;
 use crate::commands::state::map_lock_error;
@@ -738,14 +740,19 @@ pub async fn detect_drift(
     }
 }
 
-pub async fn run_apply(path: &PathBuf, auto_approve: bool, lock: bool) -> Result<(), AppError> {
+pub async fn run_apply(
+    path: &PathBuf,
+    auto_approve: bool,
+    lock: bool,
+    parser_config: &ParserConfig,
+) -> Result<(), AppError> {
     let ctx = WiringContext::new();
-    let loaded = load_configuration(path)?;
+    let loaded = load_configuration_with_config(path, parser_config)?;
     let mut parsed = loaded.parsed;
     let backend_file = loaded.backend_file;
 
     let base_dir = get_base_dir(path);
-    validate_and_resolve(&mut parsed, base_dir, false)?;
+    validate_and_resolve_with_config(&mut parsed, base_dir, false, parser_config)?;
 
     // Check for backend configuration - use local backend by default
     let backend_config = parsed.backend.as_ref();
@@ -898,10 +905,12 @@ pub async fn run_apply(path: &PathBuf, auto_approve: bool, lock: bool) -> Result
                     );
 
                     // Re-parse the updated configuration to include the new resource
-                    parsed = load_configuration(path)?.parsed;
-                    if let Err(e) =
-                        module_resolver::resolve_modules(&mut parsed, get_base_dir(path))
-                    {
+                    parsed = load_configuration_with_config(path, parser_config)?.parsed;
+                    if let Err(e) = module_resolver::resolve_modules_with_config(
+                        &mut parsed,
+                        get_base_dir(path),
+                        parser_config,
+                    ) {
                         return Err(AppError::Config(format!("Module resolution error: {}", e)));
                     }
                     resolve_names_with_ctx(&ctx, &mut parsed.resources)?;

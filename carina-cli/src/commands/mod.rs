@@ -11,7 +11,7 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use carina_core::module_resolver;
-use carina_core::parser::ParsedFile;
+use carina_core::parser::{ParsedFile, ParserConfig};
 
 use crate::error::AppError;
 use crate::wiring::{
@@ -33,10 +33,25 @@ use crate::wiring::{
 ///
 /// `skip_resource_validation` is used by destroy and state refresh, which only need
 /// name resolution and identifier computation without full schema validation.
+#[allow(dead_code)] // Used by snapshot tests
 pub fn validate_and_resolve(
     parsed: &mut ParsedFile,
     base_dir: &Path,
     skip_resource_validation: bool,
+) -> Result<(), AppError> {
+    validate_and_resolve_with_config(
+        parsed,
+        base_dir,
+        skip_resource_validation,
+        &ParserConfig::default(),
+    )
+}
+
+pub fn validate_and_resolve_with_config(
+    parsed: &mut ParsedFile,
+    base_dir: &Path,
+    skip_resource_validation: bool,
+    parser_config: &ParserConfig,
 ) -> Result<(), AppError> {
     let ctx = WiringContext::new();
 
@@ -47,7 +62,7 @@ pub fn validate_and_resolve(
     validate_module_calls(parsed, base_dir)?;
 
     // Resolve module imports and expand module calls
-    module_resolver::resolve_modules(parsed, base_dir)
+    module_resolver::resolve_modules_with_config(parsed, base_dir, parser_config)
         .map_err(|e| format!("Module resolution error: {}", e))?;
 
     // Resolve names (let bindings -> resource names)

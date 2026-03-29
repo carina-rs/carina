@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::parser::{ImportStatement, ModuleCall, ParseError, ParsedFile};
+use crate::parser::{ImportStatement, ModuleCall, ParseError, ParsedFile, ParserConfig};
 use crate::resource::{LifecycleConfig, Resource, ResourceId, Value};
 
 /// Module resolution error
@@ -51,7 +51,7 @@ pub enum ModuleError {
 }
 
 /// Context for module resolution
-pub struct ModuleResolver {
+pub struct ModuleResolver<'cfg> {
     /// Base directory for resolving relative imports
     base_dir: PathBuf,
     /// Cache of loaded modules: path -> ParsedFile
@@ -60,16 +60,26 @@ pub struct ModuleResolver {
     resolving: HashSet<PathBuf>,
     /// Imported module definitions by alias
     imported_modules: HashMap<String, ParsedFile>,
+    /// Parser configuration (decryptor, custom validators)
+    config: &'cfg ParserConfig,
 }
 
-impl ModuleResolver {
-    /// Create a new resolver with the given base directory
+impl<'cfg> ModuleResolver<'cfg> {
+    /// Create a new resolver with the given base directory and default config
     pub fn new(base_dir: impl AsRef<Path>) -> Self {
+        static DEFAULT_CONFIG: std::sync::LazyLock<ParserConfig> =
+            std::sync::LazyLock::new(ParserConfig::default);
+        Self::with_config(base_dir, &DEFAULT_CONFIG)
+    }
+
+    /// Create a new resolver with the given base directory and parser configuration
+    pub fn with_config(base_dir: impl AsRef<Path>, config: &'cfg ParserConfig) -> Self {
         Self {
             base_dir: base_dir.as_ref().to_path_buf(),
             module_cache: HashMap::new(),
             resolving: HashSet::new(),
             imported_modules: HashMap::new(),
+            config,
         }
     }
 
@@ -106,7 +116,10 @@ impl ModuleResolver {
         } else {
             fs::read_to_string(&full_path)
                 .map_err(ModuleError::from)
-                .and_then(|content| crate::parser::parse(&content).map_err(ModuleError::from))
+                .and_then(|content| {
+                    crate::parser::parse_with_config(&content, self.config)
+                        .map_err(ModuleError::from)
+                })
         };
         let mut parsed = match load_result {
             Ok(parsed) => parsed,
@@ -176,7 +189,7 @@ impl ModuleResolver {
         for entry in crn_files {
             let file_path = entry.path();
             let content = fs::read_to_string(&file_path)?;
-            let parsed = crate::parser::parse(&content)?;
+            let parsed = crate::parser::parse_with_config(&content, self.config)?;
 
             // Merge all fields
             merged.providers.extend(parsed.providers);
@@ -529,7 +542,16 @@ fn rewrite_intra_module_refs(
 
 /// Resolve all modules in a parsed file
 pub fn resolve_modules(parsed: &mut ParsedFile, base_dir: &Path) -> Result<(), ModuleError> {
-    let mut resolver = ModuleResolver::new(base_dir);
+    resolve_modules_with_config(parsed, base_dir, &ParserConfig::default())
+}
+
+/// Resolve all modules in a parsed file with the given parser configuration.
+pub fn resolve_modules_with_config(
+    parsed: &mut ParsedFile,
+    base_dir: &Path,
+    config: &ParserConfig,
+) -> Result<(), ModuleError> {
+    let mut resolver = ModuleResolver::with_config(base_dir, config);
 
     // Process imports
     resolver.process_imports(&parsed.imports)?;

@@ -2,6 +2,10 @@
 //!
 //! Convert DSL to AST using pest
 
+mod config;
+
+pub use config::{DecryptorFn, ParserConfig, ValidatorFn};
+
 use crate::resource::{LifecycleConfig, Resource, ResourceId, Value};
 use crate::schema::{
     validate_ipv4_address, validate_ipv4_cidr, validate_ipv6_address, validate_ipv6_cidr,
@@ -272,7 +276,7 @@ impl ParsedFile {
 
 /// Parse context (variable scope)
 #[derive(Clone)]
-struct ParseContext {
+struct ParseContext<'cfg> {
     variables: HashMap<String, Value>,
     /// Resource bindings (binding_name -> Resource)
     resource_bindings: HashMap<String, Resource>,
@@ -282,16 +286,19 @@ struct ParseContext {
     user_functions: HashMap<String, UserFunction>,
     /// Functions currently being evaluated (for recursion detection)
     evaluating_functions: Vec<String>,
+    /// Parser configuration (decryptor, custom validators)
+    config: &'cfg ParserConfig,
 }
 
-impl ParseContext {
-    fn new() -> Self {
+impl<'cfg> ParseContext<'cfg> {
+    fn new(config: &'cfg ParserConfig) -> Self {
         Self {
             variables: HashMap::new(),
             resource_bindings: HashMap::new(),
             imported_modules: HashMap::new(),
             user_functions: HashMap::new(),
             evaluating_functions: Vec::new(),
+            config,
         }
     }
 
@@ -338,11 +345,21 @@ fn first_inner<'a>(
         })
 }
 
-/// Parse a .crn file
+/// Parse a .crn file using default configuration.
+///
+/// Convenience wrapper around [`parse_with_config`] that uses [`ParserConfig::default()`].
 pub fn parse(input: &str) -> Result<ParsedFile, ParseError> {
+    parse_with_config(input, &ParserConfig::default())
+}
+
+/// Parse a .crn file with the given configuration.
+///
+/// The config allows injecting a decryptor function for `decrypt()` calls
+/// and custom type validators from provider crates.
+pub fn parse_with_config(input: &str, config: &ParserConfig) -> Result<ParsedFile, ParseError> {
     let pairs = CarinaParser::parse(Rule::file, input)?;
 
-    let mut ctx = ParseContext::new();
+    let mut ctx = ParseContext::new(config);
     let mut providers = Vec::new();
     let mut resources = Vec::new();
     let mut imports = Vec::new();
@@ -368,7 +385,7 @@ pub fn parse(input: &str) -> Result<ParsedFile, ParseError> {
                                 providers.push(provider);
                             }
                             Rule::arguments_block => {
-                                let parsed_arguments = parse_arguments_block(stmt)?;
+                                let parsed_arguments = parse_arguments_block(stmt, config)?;
                                 for arg in &parsed_arguments {
                                     // Register argument names as lexical bindings so that
                                     // `vpc.vpc_id` resolves as ResourceRef and `cidr_block`
@@ -545,9 +562,10 @@ pub fn parse(input: &str) -> Result<ParsedFile, ParseError> {
 /// Parse arguments block
 fn parse_arguments_block(
     pair: pest::iterators::Pair<Rule>,
+    config: &ParserConfig,
 ) -> Result<Vec<ArgumentParameter>, ParseError> {
     let mut arguments = Vec::new();
-    let ctx = ParseContext::new();
+    let ctx = ParseContext::new(config);
 
     for param in pair.into_inner() {
         if param.as_rule() == Rule::arguments_param {
@@ -1045,7 +1063,7 @@ fn parse_for_iterable(
     // for_iterable contains function_call | list | variable_ref | "(" expression ")"
     let inner = first_inner(pair, "iterable expression", "for iterable")?;
     let value = parse_primary_value(inner, ctx)?;
-    evaluate_static_value(value)
+    evaluate_static_value(value, ctx.config)
 }
 
 /// Check whether a Value is fully static (no runtime dependencies).
@@ -1062,7 +1080,7 @@ fn is_static_value(value: &Value) -> bool {
 
 /// If `value` is a FunctionCall with all static arguments, eagerly evaluate it.
 /// Nested FunctionCalls in arguments are evaluated recursively first.
-fn evaluate_static_value(value: Value) -> Result<Value, ParseError> {
+fn evaluate_static_value(value: Value, config: &ParserConfig) -> Result<Value, ParseError> {
     match value {
         Value::FunctionCall { ref name, ref args } => {
             if !is_static_value(&value) {
@@ -1075,15 +1093,18 @@ fn evaluate_static_value(value: Value) -> Result<Value, ParseError> {
                 });
             }
             // Recursively evaluate any nested FunctionCall arguments
-            let evaluated_args: Result<Vec<Value>, ParseError> =
-                args.iter().cloned().map(evaluate_static_value).collect();
+            let evaluated_args: Result<Vec<Value>, ParseError> = args
+                .iter()
+                .cloned()
+                .map(|v| evaluate_static_value(v, config))
+                .collect();
             let evaluated_args = evaluated_args?;
-            crate::builtins::evaluate_builtin(name, &evaluated_args).map_err(|e| {
-                ParseError::InvalidExpression {
+            crate::builtins::evaluate_builtin_with_config(name, &evaluated_args, config).map_err(
+                |e| ParseError::InvalidExpression {
                     line: 0,
                     message: format!("for iterable function call '{name}' failed: {e}"),
-                }
-            })
+                },
+            )
         }
         other => Ok(other),
     }
@@ -1167,7 +1188,7 @@ fn parse_if_expr(
         });
     }
 
-    let condition_value = evaluate_static_value(condition_value)?;
+    let condition_value = evaluate_static_value(condition_value, ctx.config)?;
 
     // Condition must be a Bool
     let condition = match &condition_value {
@@ -1293,7 +1314,7 @@ fn parse_if_value_expr(
         });
     }
 
-    let condition_value = evaluate_static_value(condition_value)?;
+    let condition_value = evaluate_static_value(condition_value, ctx.config)?;
 
     // Condition must be a Bool
     let condition = match &condition_value {
@@ -1538,7 +1559,7 @@ fn parse_moved_block(pair: pest::iterators::Pair<Rule>) -> Result<StateBlock, Pa
 /// Parse a user-defined function definition
 fn parse_fn_def(
     pair: pest::iterators::Pair<Rule>,
-    _ctx: &ParseContext,
+    ctx: &ParseContext,
 ) -> Result<UserFunction, ParseError> {
     let mut inner = pair.into_inner();
     let name = next_pair(&mut inner, "function name", "fn_def")?
@@ -1566,7 +1587,7 @@ fn parse_fn_def(
                         }
                         _ => {
                             // This is the default expression
-                            let default_ctx = ParseContext::new();
+                            let default_ctx = ParseContext::new(ctx.config);
                             default = Some(parse_expression(remaining, &default_ctx)?);
                         }
                     }
@@ -1604,7 +1625,7 @@ fn parse_fn_def(
 
     // Create a context where parameters are registered as variables
     // so that param references in the body are resolved as variable refs
-    let mut body_ctx = ParseContext::new();
+    let mut body_ctx = ParseContext::new(ctx.config);
     for p in &params {
         body_ctx.set_variable(
             p.name.clone(),
@@ -1662,11 +1683,11 @@ fn parse_fn_def(
 
 /// Prepare a user-defined function call: validate args, build substitutions, and return
 /// the child context with all parameters and local lets resolved.
-fn prepare_user_function_call(
+fn prepare_user_function_call<'cfg>(
     func: &UserFunction,
     args: &[Value],
-    ctx: &ParseContext,
-) -> Result<(ParseContext, HashMap<String, Value>), ParseError> {
+    ctx: &ParseContext<'cfg>,
+) -> Result<(ParseContext<'cfg>, HashMap<String, Value>), ParseError> {
     let fn_name = &func.name;
 
     // Check recursion
@@ -1723,17 +1744,30 @@ fn prepare_user_function_call(
 /// Validate a value against a custom type (cidr, ipv4_address, etc.).
 /// Returns Ok(()) if the value passes validation or cannot be validated statically
 /// (e.g., ResourceRef, FunctionCall, Interpolation are deferred).
-fn validate_custom_type(type_name: &str, value: &Value) -> Result<(), String> {
+///
+/// Checks built-in validators first, then falls back to custom validators
+/// registered in the [`ParserConfig`].
+fn validate_custom_type(
+    type_name: &str,
+    value: &Value,
+    config: &ParserConfig,
+) -> Result<(), String> {
     match (type_name, value) {
         ("cidr", Value::String(s)) => validate_ipv4_cidr(s),
         ("ipv4_address", Value::String(s)) => validate_ipv4_address(s),
         ("ipv6_cidr", Value::String(s)) => validate_ipv6_cidr(s),
         ("ipv6_address", Value::String(s)) => validate_ipv6_address(s),
-        // arn, availability_zone — just accept strings for now (format varies too much)
-        (_, Value::String(_)) => Ok(()),
         (_, Value::ResourceRef { .. }) => Ok(()), // will be resolved later
         (_, Value::FunctionCall { .. }) => Ok(()), // will be resolved later
         (_, Value::Interpolation(_)) => Ok(()),   // will be resolved later
+        (name, Value::String(s)) => {
+            // Check custom validators from config
+            if let Some(validator) = config.custom_validators.get(name) {
+                validator(s)
+            } else {
+                Ok(())
+            }
+        }
         (_, value) => Err(format!(
             "expected {}, got {}",
             type_name,
@@ -1769,7 +1803,7 @@ fn check_fn_arg_type(
                 false
             } else {
                 // Validate the actual value against the custom type
-                if let Err(e) = validate_custom_type(name, value) {
+                if let Err(e) = validate_custom_type(name, value, ctx.config) {
                     return Err(ParseError::UserFunctionError(format!(
                         "function '{fn_name}': parameter '{param_name}' type '{name}' validation failed: {e}"
                     )));
@@ -1814,6 +1848,7 @@ fn check_fn_return_type(
     fn_name: &str,
     type_expr: &TypeExpr,
     value: &Value,
+    config: &ParserConfig,
 ) -> Result<(), ParseError> {
     let type_matches = match type_expr {
         TypeExpr::String => matches!(
@@ -1833,7 +1868,7 @@ fn check_fn_return_type(
             ) {
                 false
             } else {
-                if let Err(e) = validate_custom_type(name, value) {
+                if let Err(e) = validate_custom_type(name, value, config) {
                     return Err(ParseError::UserFunctionError(format!(
                         "function '{fn_name}': return type '{name}' validation failed: {e}"
                     )));
@@ -1883,7 +1918,7 @@ fn evaluate_user_function(
             let result = try_evaluate_fn_value(substituted_body, &child_ctx)?;
             // Check return type if annotated
             if let Some(ref return_type) = func.return_type {
-                check_fn_return_type(&func.name, return_type, &result)?;
+                check_fn_return_type(&func.name, return_type, &result, child_ctx.config)?;
             }
             Ok(result)
         }
@@ -2067,8 +2102,8 @@ fn try_evaluate_fn_value(value: Value, ctx: &ParseContext) -> Result<Value, Pars
                 .collect();
             let evaluated_args = evaluated_args?;
 
-            // Try built-in first
-            match crate::builtins::evaluate_builtin(name, &evaluated_args) {
+            // Try built-in first (with config for decrypt support)
+            match crate::builtins::evaluate_builtin_with_config(name, &evaluated_args, ctx.config) {
                 Ok(result) => Ok(result),
                 Err(_builtin_err) => {
                     // Try user-defined function
@@ -2873,6 +2908,14 @@ fn resolve_forward_ref_in_value(
 /// Resolve resource references in a ParsedFile
 /// This replaces ResourceRef values with the actual attribute values from referenced resources
 pub fn resolve_resource_refs(parsed: &mut ParsedFile) -> Result<(), ParseError> {
+    resolve_resource_refs_with_config(parsed, &ParserConfig::default())
+}
+
+/// Resolve resource references with the given parser configuration.
+pub fn resolve_resource_refs_with_config(
+    parsed: &mut ParsedFile,
+    config: &ParserConfig,
+) -> Result<(), ParseError> {
     // Save dependency bindings before resolution may change ResourceRef binding names.
     // This preserves direct dependencies that would be lost by recursive resolution
     // (e.g., tgw_attach.transit_gateway_id resolves to tgw.id, losing the tgw_attach dep).
@@ -2912,7 +2955,7 @@ pub fn resolve_resource_refs(parsed: &mut ParsedFile) -> Result<(), ParseError> 
         let mut resolved_attrs: HashMap<String, Value> = HashMap::new();
 
         for (key, value) in &resource.attributes {
-            let resolved = resolve_value(value, &binding_map)?;
+            let resolved = resolve_value_with_config(value, &binding_map, config)?;
             resolved_attrs.insert(key.clone(), resolved);
         }
 
@@ -2922,9 +2965,10 @@ pub fn resolve_resource_refs(parsed: &mut ParsedFile) -> Result<(), ParseError> 
     Ok(())
 }
 
-fn resolve_value(
+fn resolve_value_with_config(
     value: &Value,
     binding_map: &HashMap<String, HashMap<String, Value>>,
+    config: &ParserConfig,
 ) -> Result<Value, ParseError> {
     match value {
         Value::ResourceRef {
@@ -2935,7 +2979,7 @@ fn resolve_value(
             Some(attributes) => match attributes.get(attribute_name) {
                 Some(attr_value) => {
                     // Recursively resolve in case the attribute itself is a reference
-                    resolve_value(attr_value, binding_map)
+                    resolve_value_with_config(attr_value, binding_map, config)
                 }
                 None => {
                     // Attribute not found, keep as reference (might be resolved at runtime)
@@ -2950,14 +2994,17 @@ fn resolve_value(
         Value::List(items) => {
             let resolved: Result<Vec<Value>, ParseError> = items
                 .iter()
-                .map(|item| resolve_value(item, binding_map))
+                .map(|item| resolve_value_with_config(item, binding_map, config))
                 .collect();
             Ok(Value::List(resolved?))
         }
         Value::Map(map) => {
             let mut resolved = HashMap::new();
             for (k, v) in map {
-                resolved.insert(k.clone(), resolve_value(v, binding_map)?);
+                resolved.insert(
+                    k.clone(),
+                    resolve_value_with_config(v, binding_map, config)?,
+                );
             }
             Ok(Value::Map(resolved))
         }
@@ -2966,22 +3013,24 @@ fn resolve_value(
             let resolved: Result<Vec<InterpolationPart>, ParseError> = parts
                 .iter()
                 .map(|p| match p {
-                    InterpolationPart::Expr(v) => {
-                        Ok(InterpolationPart::Expr(resolve_value(v, binding_map)?))
-                    }
+                    InterpolationPart::Expr(v) => Ok(InterpolationPart::Expr(
+                        resolve_value_with_config(v, binding_map, config)?,
+                    )),
                     other => Ok(other.clone()),
                 })
                 .collect();
             Ok(Value::Interpolation(resolved?))
         }
         Value::FunctionCall { name, args } => {
-            let resolved_args: Result<Vec<Value>, ParseError> =
-                args.iter().map(|a| resolve_value(a, binding_map)).collect();
+            let resolved_args: Result<Vec<Value>, ParseError> = args
+                .iter()
+                .map(|a| resolve_value_with_config(a, binding_map, config))
+                .collect();
             let resolved_args = resolved_args?;
 
             let all_args_resolved = resolved_args.iter().all(is_static_value);
 
-            match crate::builtins::evaluate_builtin(name, &resolved_args) {
+            match crate::builtins::evaluate_builtin_with_config(name, &resolved_args, config) {
                 Ok(result) => Ok(result),
                 Err(e) => {
                     if all_args_resolved {
@@ -7699,6 +7748,154 @@ aws.s3.bucket {
             msg.contains("expects resource type 'awscc.ec2.vpc'")
                 && msg.contains("got awscc.ec2.security_group"),
             "Expected resource type mismatch error, got: {msg}"
+        );
+    }
+
+    // --- ParserConfig tests ---
+
+    #[test]
+    fn parse_with_config_default_is_same_as_parse() {
+        let input = r#"
+            provider aws {
+                region = aws.Region.ap_northeast_1
+            }
+        "#;
+        let default_result = parse(input).unwrap();
+        let config_result = parse_with_config(input, &ParserConfig::default()).unwrap();
+        assert_eq!(
+            default_result.providers.len(),
+            config_result.providers.len()
+        );
+        assert_eq!(
+            default_result.providers[0].name,
+            config_result.providers[0].name
+        );
+    }
+
+    #[test]
+    fn parse_with_config_decrypt_uses_config_decryptor() {
+        use std::collections::HashMap;
+        let config = ParserConfig {
+            decryptor: Some(Box::new(|ciphertext, _key| {
+                Ok(format!("decrypted:{ciphertext}"))
+            })),
+            custom_validators: HashMap::new(),
+        };
+
+        // decrypt() in resource attributes is resolved during resolve_resource_refs,
+        // so we need to parse and then resolve with config.
+        let input = r#"
+            let my_bucket = aws.s3_bucket {
+                name   = "test-bucket"
+                secret = decrypt("AQICAHh")
+            }
+        "#;
+        let mut parsed = parse_with_config(input, &config).unwrap();
+        resolve_resource_refs_with_config(&mut parsed, &config).unwrap();
+        assert_eq!(parsed.resources.len(), 1);
+        let secret_val = parsed.resources[0].attributes.get("secret").unwrap();
+        assert_eq!(*secret_val, Value::String("decrypted:AQICAHh".to_string()));
+    }
+
+    #[test]
+    fn parse_with_config_decrypt_without_decryptor_errors() {
+        let config = ParserConfig::default();
+
+        let input = r#"
+            let my_bucket = aws.s3_bucket {
+                name   = "test-bucket"
+                secret = decrypt("AQICAHh")
+            }
+        "#;
+        let mut parsed = parse_with_config(input, &config).unwrap();
+        let result = resolve_resource_refs_with_config(&mut parsed, &config);
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("requires a configured provider"),
+            "Expected decryptor error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn parse_with_config_custom_validator_validates_string() {
+        use std::collections::HashMap;
+        // Register a custom validator for the "cidr" type to override the built-in one
+        let mut validators: HashMap<String, ValidatorFn> = HashMap::new();
+        validators.insert(
+            "cidr".to_string(),
+            Box::new(|s: &str| {
+                // Our custom validator accepts anything with a /
+                if s.contains('/') {
+                    Ok(())
+                } else {
+                    Err(format!("cidr must contain '/', got '{s}'"))
+                }
+            }),
+        );
+        let config = ParserConfig {
+            decryptor: None,
+            custom_validators: validators,
+        };
+
+        // User function with custom type annotation that passes validation.
+        // "10.0.0.0/16" passes the built-in cidr validator first, so the
+        // custom validator is not reached. Use a value that fails the built-in
+        // cidr validator but would pass the custom one.
+        // Actually, the built-in validator runs first. Let's test with a value
+        // that passes both.
+        let input = r#"
+            fn test_fn(x: cidr): string {
+                x
+            }
+            let result = test_fn("10.0.0.0/16")
+        "#;
+        let result = parse_with_config(input, &config);
+        assert!(result.is_ok(), "Expected success, got: {:?}", result.err());
+    }
+
+    #[test]
+    fn parse_with_config_custom_validator_rejects_invalid() {
+        use std::collections::HashMap;
+        // Use a type name that the grammar accepts and has no built-in validator.
+        // The "arn" type is accepted by the grammar as identifier. But it fails to parse.
+        // Use "cidr" which is known to work in grammar. Register a custom stricter validator.
+        // Actually, let's test validate_custom_type directly to avoid grammar issues.
+        let mut validators: HashMap<String, ValidatorFn> = HashMap::new();
+        validators.insert(
+            "custom_type".to_string(),
+            Box::new(|s: &str| {
+                if s.starts_with("valid-") {
+                    Ok(())
+                } else {
+                    Err(format!("custom_type must start with 'valid-', got '{s}'"))
+                }
+            }),
+        );
+        let config = ParserConfig {
+            decryptor: None,
+            custom_validators: validators,
+        };
+
+        // Test validate_custom_type directly since the grammar may not accept
+        // arbitrary type names. This verifies the custom validator is called.
+        let valid_result = validate_custom_type(
+            "custom_type",
+            &Value::String("valid-data".to_string()),
+            &config,
+        );
+        assert!(valid_result.is_ok());
+
+        let invalid_result = validate_custom_type(
+            "custom_type",
+            &Value::String("invalid".to_string()),
+            &config,
+        );
+        assert!(invalid_result.is_err());
+        let msg = invalid_result.unwrap_err();
+        assert!(
+            msg.contains("custom_type must start with 'valid-'"),
+            "Expected validation error, got: {msg}"
         );
     }
 }

@@ -166,54 +166,58 @@ enum Commands {
     },
 }
 
-/// Register the AWS KMS decryptor for the `decrypt()` built-in function.
+/// Create the parser configuration with AWS KMS decryptor.
 ///
 /// Uses the tokio runtime to call KMS synchronously from within the parse-time
 /// builtin evaluation. AWS credentials are loaded from the default chain
 /// (environment variables, profiles, instance metadata, etc.).
-fn register_kms_decryptor() {
+fn create_parser_config() -> carina_core::parser::ParserConfig {
     static KMS_CLIENT: tokio::sync::OnceCell<aws_sdk_kms::Client> =
         tokio::sync::OnceCell::const_new();
 
-    carina_core::builtins::decrypt::register_decryptor(Box::new(|ciphertext, key| {
-        let ciphertext = ciphertext.to_string();
-        let key = key.map(|k| k.to_string());
+    carina_core::parser::ParserConfig {
+        decryptor: Some(Box::new(|ciphertext, key| {
+            let ciphertext = ciphertext.to_string();
+            let key = key.map(|k| k.to_string());
 
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async {
-                let client = KMS_CLIENT
-                    .get_or_init(|| async {
-                        let config =
-                            aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
-                        aws_sdk_kms::Client::new(&config)
-                    })
-                    .await;
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(async {
+                    let client = KMS_CLIENT
+                        .get_or_init(|| async {
+                            let config =
+                                aws_config::load_defaults(aws_config::BehaviorVersion::latest())
+                                    .await;
+                            aws_sdk_kms::Client::new(&config)
+                        })
+                        .await;
 
-                let blob = base64::engine::general_purpose::STANDARD
-                    .decode(&ciphertext)
-                    .map_err(|e| format!("decrypt(): invalid base64 ciphertext: {e}"))?;
+                    let blob = base64::engine::general_purpose::STANDARD
+                        .decode(&ciphertext)
+                        .map_err(|e| format!("decrypt(): invalid base64 ciphertext: {e}"))?;
 
-                let mut req = client
-                    .decrypt()
-                    .ciphertext_blob(aws_sdk_kms::primitives::Blob::new(blob));
-                if let Some(k) = key {
-                    req = req.key_id(k);
-                }
+                    let mut req = client
+                        .decrypt()
+                        .ciphertext_blob(aws_sdk_kms::primitives::Blob::new(blob));
+                    if let Some(k) = key {
+                        req = req.key_id(k);
+                    }
 
-                let resp = req
-                    .send()
-                    .await
-                    .map_err(|e| format!("decrypt(): KMS decrypt failed: {e}"))?;
+                    let resp = req
+                        .send()
+                        .await
+                        .map_err(|e| format!("decrypt(): KMS decrypt failed: {e}"))?;
 
-                let plaintext = resp
-                    .plaintext()
-                    .ok_or_else(|| "decrypt(): KMS response contained no plaintext".to_string())?;
+                    let plaintext = resp.plaintext().ok_or_else(|| {
+                        "decrypt(): KMS response contained no plaintext".to_string()
+                    })?;
 
-                String::from_utf8(plaintext.as_ref().to_vec())
-                    .map_err(|e| format!("decrypt(): decrypted value is not valid UTF-8: {e}"))
+                    String::from_utf8(plaintext.as_ref().to_vec())
+                        .map_err(|e| format!("decrypt(): decrypted value is not valid UTF-8: {e}"))
+                })
             })
-        })
-    }));
+        })),
+        custom_validators: std::collections::HashMap::new(),
+    }
 }
 
 #[tokio::main]
@@ -222,9 +226,9 @@ async fn main() {
 
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
 
-    // Register the AWS KMS decryptor for the decrypt() built-in function.
+    // Create parser configuration with AWS KMS decryptor.
     // This must happen before any .crn parsing so that decrypt() calls can be evaluated.
-    register_kms_decryptor();
+    let parser_config = create_parser_config();
 
     let cli = Cli::parse();
 
@@ -238,7 +242,7 @@ async fn main() {
         refresh,
     } = cli.command
     {
-        match run_plan(&path, out.as_ref(), detail, tui, refresh).await {
+        match run_plan(&path, out.as_ref(), detail, tui, refresh, &parser_config).await {
             Ok(has_changes) => {
                 if detailed_exitcode && has_changes {
                     std::process::exit(2);
@@ -253,7 +257,7 @@ async fn main() {
     }
 
     let result = match cli.command {
-        Commands::Validate { path } => run_validate(&path),
+        Commands::Validate { path } => run_validate(&path, &parser_config),
         Commands::Plan { .. } => unreachable!(),
         Commands::Apply {
             path,
@@ -263,7 +267,7 @@ async fn main() {
             if path.extension().is_some_and(|ext| ext == "json") {
                 run_apply_from_plan(&path, auto_approve, lock).await
             } else {
-                run_apply(&path, auto_approve, lock).await
+                run_apply(&path, auto_approve, lock, &parser_config).await
             }
         }
         Commands::Destroy {
@@ -271,17 +275,19 @@ async fn main() {
             auto_approve,
             lock,
             refresh,
-        } => run_destroy(&path, auto_approve, lock, refresh).await,
+        } => run_destroy(&path, auto_approve, lock, refresh, &parser_config).await,
         Commands::Fmt {
             path,
             check,
             diff,
             recursive,
         } => run_fmt(&path, check, diff, recursive),
-        Commands::Module { command } => run_module_command(command),
-        Commands::ForceUnlock { lock_id, path } => run_force_unlock(&lock_id, &path).await,
-        Commands::State { command } => run_state_command(command).await,
-        Commands::Lint { path } => run_lint(&path),
+        Commands::Module { command } => run_module_command(command, &parser_config),
+        Commands::ForceUnlock { lock_id, path } => {
+            run_force_unlock(&lock_id, &path, &parser_config).await
+        }
+        Commands::State { command } => run_state_command(command, &parser_config).await,
+        Commands::Lint { path } => run_lint(&path, &parser_config),
         Commands::Completions { shell } => {
             generate(shell, &mut Cli::command(), "carina", &mut std::io::stdout());
             Ok(())

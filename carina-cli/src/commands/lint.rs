@@ -4,12 +4,15 @@ use std::path::PathBuf;
 
 use colored::Colorize;
 
-use carina_core::config_loader::{find_crn_files_in_dir, get_base_dir, load_configuration};
+use carina_core::config_loader::{
+    find_crn_files_in_dir, get_base_dir, load_configuration_with_config,
+};
 use carina_core::lint::{
     find_duplicate_attrs, find_list_literal_attrs, find_non_snake_case_bindings,
     find_pipe_preferred_direct_calls, list_struct_attr_names,
 };
 use carina_core::module_resolver;
+use carina_core::parser::ParserConfig;
 use carina_core::provider::{self as provider_mod};
 
 use crate::error::AppError;
@@ -22,13 +25,13 @@ struct LintWarning {
     message: String,
 }
 
-pub fn run_lint(path: &PathBuf) -> Result<(), AppError> {
-    let mut parsed = load_configuration(path)?.parsed;
+pub fn run_lint(path: &PathBuf, parser_config: &ParserConfig) -> Result<(), AppError> {
+    let mut parsed = load_configuration_with_config(path, parser_config)?.parsed;
 
     let base_dir = get_base_dir(path);
 
     // Resolve modules
-    module_resolver::resolve_modules(&mut parsed, base_dir)
+    module_resolver::resolve_modules_with_config(&mut parsed, base_dir, parser_config)
         .map_err(|e| format!("Module resolution error: {}", e))?;
 
     let ctx = WiringContext::new();

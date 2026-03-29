@@ -5,9 +5,9 @@ use std::path::PathBuf;
 use colored::Colorize;
 use serde::{Deserialize, Serialize};
 
-use carina_core::config_loader::{get_base_dir, load_configuration};
+use carina_core::config_loader::{get_base_dir, load_configuration_with_config};
 use carina_core::effect::Effect;
-use carina_core::parser::{BackendConfig, ProviderConfig};
+use carina_core::parser::{BackendConfig, ParserConfig, ProviderConfig};
 use carina_core::plan::Plan;
 use carina_core::resource::{Resource, ResourceId, State, Value};
 use carina_core::value::{
@@ -18,7 +18,7 @@ use carina_state::{
     create_local_backend,
 };
 
-use super::validate_and_resolve;
+use super::validate_and_resolve_with_config;
 use crate::DetailLevel;
 use crate::commands::apply::apply_name_overrides;
 use crate::display::print_plan;
@@ -68,11 +68,12 @@ pub async fn run_plan(
     detail: DetailLevel,
     tui: bool,
     refresh: bool,
+    parser_config: &ParserConfig,
 ) -> Result<bool, AppError> {
-    let mut parsed = load_configuration(path)?.parsed;
+    let mut parsed = load_configuration_with_config(path, parser_config)?.parsed;
 
     let base_dir = get_base_dir(path);
-    validate_and_resolve(&mut parsed, base_dir, false)?;
+    validate_and_resolve_with_config(&mut parsed, base_dir, false, parser_config)?;
 
     // Check for backend configuration and load state
     // Use local backend by default if no backend is configured
