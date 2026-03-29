@@ -140,11 +140,19 @@ impl AwsProvider {
             if attempt > 0 {
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
             }
-            let resp = req.clone().send().await.map_err(|e| {
-                ProviderError::new("Failed to create flow logs")
-                    .with_cause(e)
-                    .for_resource(resource.id.clone())
-            })?;
+            let resp = match req.clone().send().await {
+                Ok(resp) => resp,
+                Err(e) => {
+                    let err_str = format!("{}", e);
+                    last_error = err_str.clone();
+                    if err_str.contains("Unable to assume") || err_str.contains("Not authorized") {
+                        continue;
+                    }
+                    return Err(ProviderError::new("Failed to create flow logs")
+                        .with_cause(e)
+                        .for_resource(resource.id.clone()));
+                }
+            };
 
             // Check for unsuccessful items
             if let Some(err) = resp.unsuccessful().first() {
