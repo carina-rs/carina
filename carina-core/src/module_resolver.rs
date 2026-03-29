@@ -287,7 +287,7 @@ impl<'cfg> ModuleResolver<'cfg> {
     ///
     /// If the module defines `attributes` and the call has a `binding_name`,
     /// a virtual resource is created to expose the module's attribute values.
-    /// The virtual resource has `_virtual = "true"` and is skipped by the differ.
+    /// The virtual resource has `ResourceKind::Virtual` and is skipped by the differ.
     pub fn expand_module_call(
         &self,
         call: &ModuleCall,

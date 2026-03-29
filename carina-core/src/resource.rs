@@ -538,16 +538,6 @@ impl Resource {
         self
     }
 
-    pub fn with_virtual(mut self, is_virtual: bool) -> Self {
-        if is_virtual {
-            self.kind = ResourceKind::Virtual {
-                module_name: String::new(),
-                instance: String::new(),
-            };
-        }
-        self
-    }
-
     /// Returns true if this resource is a data source (read-only)
     pub fn is_data_source(&self) -> bool {
         matches!(self.kind, ResourceKind::DataSource)
@@ -1065,7 +1055,10 @@ mod tests {
 
     #[test]
     fn resource_typed_virtual_field() {
-        let resource = Resource::new("_virtual", "web").with_virtual(true);
+        let resource = Resource::new("_virtual", "web").with_kind(ResourceKind::Virtual {
+            module_name: "web_tier".to_string(),
+            instance: "web".to_string(),
+        });
         assert!(resource.is_virtual());
         // _virtual should NOT be in attributes
         assert!(!resource.attributes.contains_key("_virtual"));
