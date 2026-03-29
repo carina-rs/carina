@@ -625,7 +625,6 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
             }).with_description("Indicates which default minimum object size behavior is applied to the lifecycle configuration. This parameter applies to general purpose buckets only. It isn't supported for directory bucket lifecycle configurations. + ``all_storage_classes_128K`` - Objects smaller than 128 KB will not transition to any storage class by default. + ``varies_by_storage_class`` - Objects smaller than 128 KB will transition to Glacier Flexible Retrieval or Glacier Deep Archive storage classes. By default, all other storage classes will prevent transitions smaller than 128 KB. To customize the minimum object size for any transition you can add a filter that specifies a custom ``ObjectSizeGreaterThan`` or ``ObjectSizeLessThan`` in the body of your transition rule. Custom filters always take precedence over the default transition behavior.").with_provider_name("TransitionDefaultMinimumObjectSize")
                     ],
                 })
-                .write_only()
                 .with_description("Specifies the lifecycle configuration for objects in an Amazon S3 bucket. For more information, see [Object Lifecycle Management](https://docs.aws.amazon.com/AmazonS3/latest/dev/object-lifecycle-mgmt.html) in the *Amazon S3 User Guide*.")
                 .with_provider_name("LifecycleConfiguration")
                 .with_block_name("lifecycle_configuration"),
@@ -736,7 +735,6 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                 }).required().with_description("The journal table configuration for a metadata configuration.").with_provider_name("JournalTableConfiguration")
                     ],
                 })
-                .write_only()
                 .with_description("The S3 Metadata configuration for a general purpose bucket.")
                 .with_provider_name("MetadataConfiguration"),
         )
@@ -1105,7 +1103,6 @@ pub fn s3_bucket_config() -> AwsccSchemaConfig {
                 })).required().with_description("A container for one or more replication rules. A replication configuration must have at least one rule and can contain a maximum of 1,000 rules.").with_provider_name("Rules").with_block_name("rule")
                     ],
                 })
-                .write_only()
                 .with_description("Configuration for replicating objects in an S3 bucket. To enable replication, you must also enable versioning by using the ``VersioningConfiguration`` property. Amazon S3 can store replicated objects in a single destination bucket or multiple destination buckets. The destination bucket or buckets must already exist.")
                 .with_provider_name("ReplicationConfiguration")
                 .with_block_name("replication_configuration"),
