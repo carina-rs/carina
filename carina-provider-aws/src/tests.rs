@@ -709,3 +709,79 @@ fn test_extract_ec2_nat_gateway_attributes_private() {
     // Private NAT gateways don't have allocation_id
     assert_eq!(attributes.get("allocation_id"), None);
 }
+
+// --- extract_iam_role_attributes tests ---
+
+#[test]
+fn test_extract_iam_role_attributes() {
+    let role = aws_sdk_iam::types::Role::builder()
+        .role_name("test-role")
+        .role_id("AROAEXAMPLE12345")
+        .arn("arn:aws:iam::123456789012:role/test-role")
+        .path("/")
+        .assume_role_policy_document(
+            "%7B%22Version%22%3A%222012-10-17%22%2C%22Statement%22%3A%5B%7B%22Effect%22%3A%22Allow%22%2C%22Principal%22%3A%7B%22Service%22%3A%22ec2.amazonaws.com%22%7D%2C%22Action%22%3A%22sts%3AAssumeRole%22%7D%5D%7D",
+        )
+        .description("Test role")
+        .max_session_duration(7200)
+        .create_date(aws_sdk_iam::primitives::DateTime::from_secs(0))
+        .build()
+        .expect("failed to build Role");
+    let mut attributes = HashMap::new();
+    let identifier = AwsProvider::extract_iam_role_attributes(&role, &mut attributes);
+    assert_eq!(identifier, Some("test-role".to_string()));
+    assert_eq!(
+        attributes.get("role_name"),
+        Some(&Value::String("test-role".to_string()))
+    );
+    assert_eq!(
+        attributes.get("role_id"),
+        Some(&Value::String("AROAEXAMPLE12345".to_string()))
+    );
+    assert_eq!(
+        attributes.get("arn"),
+        Some(&Value::String(
+            "arn:aws:iam::123456789012:role/test-role".to_string()
+        ))
+    );
+    assert_eq!(
+        attributes.get("path"),
+        Some(&Value::String("/".to_string()))
+    );
+    assert_eq!(
+        attributes.get("description"),
+        Some(&Value::String("Test role".to_string()))
+    );
+    assert_eq!(
+        attributes.get("max_session_duration"),
+        Some(&Value::Int(7200))
+    );
+    // Verify that the assume_role_policy_document is URL-decoded
+    let policy_doc = attributes
+        .get("assume_role_policy_document")
+        .expect("assume_role_policy_document should be present");
+    if let Value::String(s) = policy_doc {
+        assert!(s.contains("Version"));
+        assert!(s.contains("sts:AssumeRole"));
+        assert!(!s.contains('%')); // Should be decoded
+    } else {
+        panic!("Expected String");
+    }
+}
+
+#[test]
+fn test_extract_iam_role_attributes_minimal() {
+    let role = aws_sdk_iam::types::Role::builder()
+        .role_name("minimal-role")
+        .role_id("AROAMINIMAL")
+        .arn("arn:aws:iam::123456789012:role/minimal-role")
+        .path("/")
+        .create_date(aws_sdk_iam::primitives::DateTime::from_secs(0))
+        .build()
+        .expect("failed to build Role");
+    let mut attributes = HashMap::new();
+    let identifier = AwsProvider::extract_iam_role_attributes(&role, &mut attributes);
+    assert_eq!(identifier, Some("minimal-role".to_string()));
+    assert_eq!(attributes.get("description"), None);
+    assert_eq!(attributes.get("max_session_duration"), None);
+}

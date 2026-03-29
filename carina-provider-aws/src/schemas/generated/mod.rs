@@ -8,6 +8,8 @@
 pub use super::types::*;
 
 pub mod ec2;
+pub mod iam;
+pub mod logs;
 pub mod s3;
 pub mod sts;
 
@@ -25,6 +27,9 @@ pub fn configs() -> Vec<AwsSchemaConfig> {
         ec2::subnet::ec2_subnet_config(),
         ec2::subnet_route_table_association::ec2_subnet_route_table_association_config(),
         ec2::vpc::ec2_vpc_config(),
+        ec2::vpc_gateway_attachment::ec2_vpc_gateway_attachment_config(),
+        iam::role::iam_role_config(),
+        logs::log_group::logs_log_group_config(),
         s3::bucket::s3_bucket_config(),
         sts::caller_identity::sts_caller_identity_config(),
     ]
@@ -51,6 +56,9 @@ pub fn get_enum_valid_values(
         ec2::subnet::enum_valid_values(),
         ec2::subnet_route_table_association::enum_valid_values(),
         ec2::vpc::enum_valid_values(),
+        ec2::vpc_gateway_attachment::enum_valid_values(),
+        iam::role::enum_valid_values(),
+        logs::log_group::enum_valid_values(),
         s3::bucket::enum_valid_values(),
         sts::caller_identity::enum_valid_values(),
     ];
@@ -106,6 +114,15 @@ pub fn get_enum_alias_reverse(
     }
     if resource_type == "ec2.vpc" {
         return ec2::vpc::enum_alias_reverse(attr_name, value);
+    }
+    if resource_type == "ec2.vpc_gateway_attachment" {
+        return ec2::vpc_gateway_attachment::enum_alias_reverse(attr_name, value);
+    }
+    if resource_type == "iam.role" {
+        return iam::role::enum_alias_reverse(attr_name, value);
+    }
+    if resource_type == "logs.log_group" {
+        return logs::log_group::enum_alias_reverse(attr_name, value);
     }
     if resource_type == "s3.bucket" {
         return s3::bucket::enum_alias_reverse(attr_name, value);

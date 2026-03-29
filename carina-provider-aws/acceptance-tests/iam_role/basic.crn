@@ -1,0 +1,19 @@
+# IAM Role - Basic test
+#
+# Tests: IAM role creation with assume role policy document and tags
+
+provider aws {
+  region = aws.Region.ap_northeast_1
+}
+
+let role = aws.iam.role {
+  role_name = "carina-acceptance-test-role"
+  assume_role_policy_document = "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"Service\":\"ec2.amazonaws.com\"},\"Action\":\"sts:AssumeRole\"}]}"
+  description = "Carina acceptance test role"
+  path = "/"
+  max_session_duration = 7200
+
+  tags = {
+    Environment = "acceptance-test"
+  }
+}
