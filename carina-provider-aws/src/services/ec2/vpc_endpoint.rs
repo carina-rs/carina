@@ -334,7 +334,8 @@ impl AwsProvider {
         id: ResourceId,
         identifier: &str,
     ) -> ProviderResult<()> {
-        self.ec2_client
+        let result = self
+            .ec2_client
             .delete_vpc_endpoints()
             .vpc_endpoint_ids(identifier)
             .send()
@@ -344,6 +345,19 @@ impl AwsProvider {
                     .with_cause(e)
                     .for_resource(id.clone())
             })?;
+
+        // Check for unsuccessful items
+        if let Some(err) = result.unsuccessful().first() {
+            let msg = err
+                .error()
+                .and_then(|e| e.message())
+                .unwrap_or("unknown error");
+            return Err(
+                ProviderError::new(format!("Failed to delete VPC endpoint: {}", msg))
+                    .for_resource(id.clone()),
+            );
+        }
+
         Ok(())
     }
 }
