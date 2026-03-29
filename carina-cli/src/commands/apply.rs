@@ -448,40 +448,45 @@ fn execute_state_only_effects(plan: &Plan, result: &mut ApplyResult) {
     }
 }
 
+/// Input parameters for `finalize_apply`.
+///
+/// Groups the execution result, resource data, and backend configuration
+/// needed to save state after an apply operation.
+pub struct FinalizeApplyInput<'a> {
+    pub result: &'a ApplyResult,
+    pub state_file: Option<StateFile>,
+    pub sorted_resources: &'a [Resource],
+    pub current_states: &'a HashMap<ResourceId, State>,
+    pub plan: &'a Plan,
+    pub backend: &'a dyn StateBackend,
+    pub lock: Option<&'a LockInfo>,
+    pub schemas: &'a HashMap<String, ResourceSchema>,
+}
+
 /// Save state after apply. Does NOT release the lock -- caller is responsible.
 ///
 /// When `lock` is `None` (i.e. `--lock=false`), state is written without lock
 /// validation via `save_state_unlocked`.
-#[allow(clippy::too_many_arguments)]
-pub async fn finalize_apply(
-    result: &ApplyResult,
-    state_file: Option<StateFile>,
-    sorted_resources: &[Resource],
-    current_states: &HashMap<ResourceId, State>,
-    plan: &Plan,
-    backend: &dyn StateBackend,
-    lock: Option<&LockInfo>,
-    schemas: &HashMap<String, ResourceSchema>,
-) -> Result<(), AppError> {
+pub async fn finalize_apply(input: FinalizeApplyInput<'_>) -> Result<(), AppError> {
     println!();
     println!("{}", "Saving state...".cyan());
 
     let mut state = build_state_after_apply(ApplyStateSave {
-        state_file,
-        sorted_resources,
-        current_states,
-        applied_states: &result.applied_states,
-        permanent_name_overrides: &result.permanent_name_overrides,
-        plan,
-        successfully_deleted: &result.successfully_deleted,
-        failed_refreshes: &result.failed_refreshes,
-        schemas,
+        state_file: input.state_file,
+        sorted_resources: input.sorted_resources,
+        current_states: input.current_states,
+        applied_states: &input.result.applied_states,
+        permanent_name_overrides: &input.result.permanent_name_overrides,
+        plan: input.plan,
+        successfully_deleted: &input.result.successfully_deleted,
+        failed_refreshes: &input.result.failed_refreshes,
+        schemas: input.schemas,
     })?;
 
-    if let Some(lock) = lock {
-        save_state_locked(backend, lock, &mut state).await?;
+    if let Some(lock) = input.lock {
+        save_state_locked(input.backend, lock, &mut state).await?;
     } else {
-        save_state_unlocked(backend, &mut state).await?;
+        save_state_unlocked(input.backend, &mut state).await?;
     }
     println!("  {} State saved (serial: {})", "✓".green(), state.serial);
 
@@ -1228,16 +1233,16 @@ async fn run_apply_locked(
     // Execute remove and move effects (state-only, logged for user feedback)
     execute_state_only_effects(&plan, &mut result);
 
-    finalize_apply(
-        &result,
+    finalize_apply(FinalizeApplyInput {
+        result: &result,
         state_file,
-        &sorted_resources,
-        &current_states,
-        &plan,
+        sorted_resources: &sorted_resources,
+        current_states: &current_states,
+        plan: &plan,
         backend,
         lock,
         schemas,
-    )
+    })
     .await?;
 
     println!();
@@ -1535,16 +1540,16 @@ async fn run_apply_from_plan_locked(
     // Build schemas for write-only attribute persistence
     let ctx = WiringContext::new();
 
-    finalize_apply(
-        &result,
+    finalize_apply(FinalizeApplyInput {
+        result: &result,
         state_file,
         sorted_resources,
-        &current_states,
+        current_states: &current_states,
         plan,
         backend,
         lock,
-        ctx.schemas(),
-    )
+        schemas: ctx.schemas(),
+    })
     .await?;
 
     println!();

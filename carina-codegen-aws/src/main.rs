@@ -433,15 +433,17 @@ fn generate_resource(res: &ResourceDef, model: &SmithyModel) -> Result<String> {
         };
 
         let (type_code, enum_info) = resolve_type(
-            model,
+            &mut TypeResolutionContext {
+                model,
+                namespace: &namespace,
+                type_overrides: &type_overrides,
+                enum_alias_map: &enum_alias_map,
+                to_dsl_overrides: &to_dsl_overrides,
+                all_enums: &mut all_enums,
+                all_ranged_ints: &mut all_ranged_ints,
+            },
             &member_ref.target,
             name,
-            &namespace,
-            &type_overrides,
-            &enum_alias_map,
-            &to_dsl_overrides,
-            &mut all_enums,
-            &mut all_ranged_ints,
         );
 
         attrs.push(AttrInfo {
@@ -487,15 +489,17 @@ fn generate_resource(res: &ResourceDef, model: &SmithyModel) -> Result<String> {
         let description = SmithyModel::documentation(&member_ref.traits).map(|s| s.to_string());
 
         let (type_code, enum_info) = resolve_type(
-            model,
+            &mut TypeResolutionContext {
+                model,
+                namespace: &namespace,
+                type_overrides: &type_overrides,
+                enum_alias_map: &enum_alias_map,
+                to_dsl_overrides: &to_dsl_overrides,
+                all_enums: &mut all_enums,
+                all_ranged_ints: &mut all_ranged_ints,
+            },
             &member_ref.target,
             name,
-            &namespace,
-            &type_overrides,
-            &enum_alias_map,
-            &to_dsl_overrides,
-            &mut all_enums,
-            &mut all_ranged_ints,
         );
 
         attrs.push(AttrInfo {
@@ -824,23 +828,30 @@ fn generate_resource(res: &ResourceDef, model: &SmithyModel) -> Result<String> {
     Ok(code)
 }
 
+/// Shared context for Smithy-to-Carina type resolution.
+///
+/// Groups the Smithy model, configuration overrides, and mutable collectors
+/// that are passed to both `resolve_type` and `generate_struct_type`.
+struct TypeResolutionContext<'a> {
+    model: &'a SmithyModel,
+    namespace: &'a str,
+    type_overrides: &'a HashMap<&'a str, &'a str>,
+    enum_alias_map: &'a HashMap<&'a str, Vec<(&'a str, &'a str)>>,
+    to_dsl_overrides: &'a HashMap<&'a str, &'a str>,
+    all_enums: &'a mut BTreeMap<String, EnumInfo>,
+    all_ranged_ints: &'a mut BTreeMap<String, IntRange>,
+}
+
 /// Resolve a Smithy type to a Carina type code string.
 /// Returns (type_code, Option<EnumInfo>).
 /// Also populates collectors for enums and ranged ints discovered during resolution.
-#[allow(clippy::too_many_arguments)]
 fn resolve_type(
-    model: &SmithyModel,
+    ctx: &mut TypeResolutionContext<'_>,
     target: &str,
     field_name: &str,
-    namespace: &str,
-    type_overrides: &HashMap<&str, &str>,
-    enum_alias_map: &HashMap<&str, Vec<(&str, &str)>>,
-    to_dsl_overrides: &HashMap<&str, &str>,
-    all_enums: &mut BTreeMap<String, EnumInfo>,
-    all_ranged_ints: &mut BTreeMap<String, IntRange>,
 ) -> (String, Option<EnumInfo>) {
     // Check type overrides first
-    if let Some(&override_type) = type_overrides.get(field_name) {
+    if let Some(&override_type) = ctx.type_overrides.get(field_name) {
         return (override_type.to_string(), None);
     }
 
@@ -851,13 +862,13 @@ fn resolve_type(
             type_name,
             values: values.iter().map(|s| s.to_string()).collect(),
         };
-        all_enums
+        ctx.all_enums
             .entry(field_name.to_string())
             .or_insert_with(|| enum_info.clone());
         return ("/* enum */".to_string(), Some(enum_info));
     }
 
-    let kind = model.shape_kind(target);
+    let kind = ctx.model.shape_kind(target);
 
     match kind {
         Some(ShapeKind::String) => {
@@ -871,9 +882,11 @@ fn resolve_type(
         Some(ShapeKind::Boolean) => ("AttributeType::Bool".to_string(), None),
         Some(ShapeKind::Integer) | Some(ShapeKind::Long) => {
             // Check for range traits on the target shape
-            let range = get_int_range(model, target, field_name);
+            let range = get_int_range(ctx.model, target, field_name);
             if let Some(r) = range {
-                all_ranged_ints.entry(field_name.to_string()).or_insert(r);
+                ctx.all_ranged_ints
+                    .entry(field_name.to_string())
+                    .or_insert(r);
                 let validate_fn = format!("validate_{}_range", field_name.to_snake_case());
                 let display = range_display_string(r.min, r.max);
                 (
@@ -898,7 +911,7 @@ fn resolve_type(
         }
         Some(ShapeKind::Enum) => {
             // Get enum values from Smithy model
-            if let Some(values) = model.enum_values(target) {
+            if let Some(values) = ctx.model.enum_values(target) {
                 // Use the field name as type_name for consistency with CF codegen
                 // (e.g., "InstanceTenancy" not "Tenancy")
                 let type_name = field_name.to_string();
@@ -907,7 +920,7 @@ fn resolve_type(
                     type_name,
                     values: string_values,
                 };
-                all_enums
+                ctx.all_enums
                     .entry(field_name.to_string())
                     .or_insert_with(|| enum_info.clone());
                 return ("/* enum */".to_string(), Some(enum_info));
@@ -917,18 +930,8 @@ fn resolve_type(
         Some(ShapeKind::IntEnum) => ("AttributeType::Int".to_string(), None),
         Some(ShapeKind::List) => {
             // Get list member type
-            if let Some(carina_smithy::Shape::List(list_shape)) = model.get_shape(target) {
-                let (item_type, _) = resolve_type(
-                    model,
-                    &list_shape.member.target,
-                    field_name,
-                    namespace,
-                    type_overrides,
-                    enum_alias_map,
-                    to_dsl_overrides,
-                    all_enums,
-                    all_ranged_ints,
-                );
+            if let Some(carina_smithy::Shape::List(list_shape)) = ctx.model.get_shape(target) {
+                let (item_type, _) = resolve_type(ctx, &list_shape.member.target, field_name);
                 (format!("AttributeType::list({})", item_type), None)
             } else {
                 (
@@ -954,18 +957,8 @@ fn resolve_type(
             }
 
             // Generate struct type for nested structures
-            if let Some(structure) = model.get_structure(target) {
-                let struct_code = generate_struct_type(
-                    model,
-                    shape_name,
-                    structure,
-                    namespace,
-                    type_overrides,
-                    enum_alias_map,
-                    to_dsl_overrides,
-                    all_enums,
-                    all_ranged_ints,
-                );
+            if let Some(structure) = ctx.model.get_structure(target) {
+                let struct_code = generate_struct_type(ctx, shape_name, structure);
                 return (struct_code, None);
             }
             ("AttributeType::String".to_string(), None)
@@ -982,62 +975,45 @@ fn resolve_type(
 }
 
 /// Generate Rust code for an AttributeType::Struct.
-#[allow(clippy::too_many_arguments)]
 fn generate_struct_type(
-    model: &SmithyModel,
+    ctx: &mut TypeResolutionContext<'_>,
     struct_name: &str,
     structure: &carina_smithy::StructureShape,
-    namespace: &str,
-    type_overrides: &HashMap<&str, &str>,
-    enum_alias_map: &HashMap<&str, Vec<(&str, &str)>>,
-    to_dsl_overrides: &HashMap<&str, &str>,
-    all_enums: &mut BTreeMap<String, EnumInfo>,
-    all_ranged_ints: &mut BTreeMap<String, IntRange>,
 ) -> String {
     let mut fields: Vec<String> = Vec::new();
     for (field_name, member_ref) in &structure.members {
         let snake_name = field_name.to_snake_case();
         let is_required = SmithyModel::is_required(member_ref);
 
-        let (field_type, enum_info) = resolve_type(
-            model,
-            &member_ref.target,
-            field_name,
-            namespace,
-            type_overrides,
-            enum_alias_map,
-            to_dsl_overrides,
-            all_enums,
-            all_ranged_ints,
-        );
+        let (field_type, enum_info) = resolve_type(ctx, &member_ref.target, field_name);
 
         // If enum detected, use shared schema enum type.
         let field_type = if let Some(ei) = enum_info {
-            let to_dsl_code = if let Some(override_code) = to_dsl_overrides.get(snake_name.as_str())
-            {
-                override_code.to_string()
-            } else {
-                let has_hyphens = ei.values.iter().any(|v| v.contains('-'));
-                if let Some(aliases) = enum_alias_map.get(snake_name.as_str()) {
-                    let mut match_arms: Vec<String> = aliases
-                        .iter()
-                        .map(|(canonical, alias)| {
-                            format!("\"{}\" => \"{}\".to_string()", canonical, alias)
-                        })
-                        .collect();
-                    let fallback = if has_hyphens {
-                        "_ => s.replace('-', \"_\")"
-                    } else {
-                        "_ => s.to_string()"
-                    };
-                    match_arms.push(fallback.to_string());
-                    format!("Some(|s: &str| match s {{ {} }})", match_arms.join(", "))
-                } else if has_hyphens {
-                    "Some(|s: &str| s.replace('-', \"_\"))".to_string()
+            let to_dsl_code =
+                if let Some(override_code) = ctx.to_dsl_overrides.get(snake_name.as_str()) {
+                    override_code.to_string()
                 } else {
-                    "None".to_string()
-                }
-            };
+                    let has_hyphens = ei.values.iter().any(|v| v.contains('-'));
+                    if let Some(aliases) = ctx.enum_alias_map.get(snake_name.as_str()) {
+                        let mut match_arms: Vec<String> = aliases
+                            .iter()
+                            .map(|(canonical, alias)| {
+                                format!("\"{}\" => \"{}\".to_string()", canonical, alias)
+                            })
+                            .collect();
+                        let fallback = if has_hyphens {
+                            "_ => s.replace('-', \"_\")"
+                        } else {
+                            "_ => s.to_string()"
+                        };
+                        match_arms.push(fallback.to_string());
+                        format!("Some(|s: &str| match s {{ {} }})", match_arms.join(", "))
+                    } else if has_hyphens {
+                        "Some(|s: &str| s.replace('-', \"_\"))".to_string()
+                    } else {
+                        "None".to_string()
+                    }
+                };
             let values_str = ei
                 .values
                 .iter()
@@ -1051,7 +1027,7 @@ fn generate_struct_type(
                  \x20               namespace: Some(\"{}\".to_string()),\n\
                  \x20               to_dsl: {},\n\
                  \x20           }}",
-                ei.type_name, values_str, namespace, to_dsl_code
+                ei.type_name, values_str, ctx.namespace, to_dsl_code
             )
         } else {
             field_type

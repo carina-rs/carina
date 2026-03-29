@@ -349,50 +349,54 @@ fn update_binding_map(
     }
 }
 
+/// Mutable execution state shared across effect processing.
+///
+/// Groups the counters, result maps, and binding state that are threaded
+/// through every call to `process_basic_result`, reducing parameter count.
+struct ExecutionState<'a> {
+    success_count: &'a mut usize,
+    failure_count: &'a mut usize,
+    applied_states: &'a mut HashMap<ResourceId, State>,
+    failed_bindings: &'a mut HashSet<String>,
+    successfully_deleted: &'a mut HashSet<ResourceId>,
+    pending_refreshes: &'a mut HashMap<ResourceId, String>,
+    binding_map: &'a mut HashMap<String, HashMap<String, Value>>,
+}
+
 /// Process a `BasicEffectResult` by updating shared execution state.
 ///
 /// This helper is used by both sequential and phased execution paths to avoid
 /// duplicating the result-processing logic for Create/Update/Delete effects.
-#[allow(clippy::too_many_arguments)]
-fn process_basic_result(
-    result: BasicEffectResult,
-    success_count: &mut usize,
-    failure_count: &mut usize,
-    applied_states: &mut HashMap<ResourceId, State>,
-    failed_bindings: &mut HashSet<String>,
-    successfully_deleted: &mut HashSet<ResourceId>,
-    pending_refreshes: &mut HashMap<ResourceId, String>,
-    binding_map: &mut HashMap<String, HashMap<String, Value>>,
-) {
+fn process_basic_result(result: BasicEffectResult, exec: &mut ExecutionState<'_>) {
     match result {
         BasicEffectResult::Success {
-            state,
+            state: effect_state,
             resource_id,
             resolved_attrs,
             binding,
         } => {
-            *success_count += 1;
-            if let Some(state) = state {
+            *exec.success_count += 1;
+            if let Some(s) = effect_state {
                 if let Some(attrs) = &resolved_attrs {
-                    update_binding_map(binding_map, attrs, binding.as_deref(), &state);
+                    update_binding_map(exec.binding_map, attrs, binding.as_deref(), &s);
                 }
-                applied_states.insert(resource_id, state);
+                exec.applied_states.insert(resource_id, s);
             }
         }
         BasicEffectResult::Failure {
             binding, refresh, ..
         } => {
-            *failure_count += 1;
+            *exec.failure_count += 1;
             if let Some(binding) = binding {
-                failed_bindings.insert(binding);
+                exec.failed_bindings.insert(binding);
             }
             if let Some((id, identifier)) = &refresh {
-                queue_state_refresh(pending_refreshes, id, Some(identifier.as_str()));
+                queue_state_refresh(exec.pending_refreshes, id, Some(identifier.as_str()));
             }
         }
         BasicEffectResult::Deleted { resource_id, .. } => {
-            *success_count += 1;
-            successfully_deleted.insert(resource_id);
+            *exec.success_count += 1;
+            exec.successfully_deleted.insert(resource_id);
         }
     }
 }
@@ -872,17 +876,19 @@ async fn execute_effects_sequential(
 
                         execute_replace_parallel(
                             provider,
-                            effect,
-                            id,
-                            from,
-                            to,
-                            lifecycle,
-                            cascading_updates,
-                            temporary_name.as_ref(),
-                            &binding_snapshot,
-                            unresolved,
-                            started,
-                            progress,
+                            &ReplaceContext {
+                                effect,
+                                id,
+                                from,
+                                to,
+                                lifecycle,
+                                cascading_updates,
+                                temporary_name: temporary_name.as_ref(),
+                                binding_map: &binding_snapshot,
+                                unresolved,
+                                started,
+                                progress,
+                            },
                             observer,
                         )
                         .await
@@ -926,13 +932,15 @@ async fn execute_effects_sequential(
             SingleEffectResult::Basic(basic) => {
                 process_basic_result(
                     basic,
-                    &mut success_count,
-                    &mut failure_count,
-                    &mut applied_states,
-                    &mut failed_bindings,
-                    &mut successfully_deleted,
-                    &mut pending_refreshes,
-                    &mut input.binding_map,
+                    &mut ExecutionState {
+                        success_count: &mut success_count,
+                        failure_count: &mut failure_count,
+                        applied_states: &mut applied_states,
+                        failed_bindings: &mut failed_bindings,
+                        successfully_deleted: &mut successfully_deleted,
+                        pending_refreshes: &mut pending_refreshes,
+                        binding_map: &mut input.binding_map,
+                    },
                 );
             }
             SingleEffectResult::Replace {
@@ -1000,90 +1008,58 @@ async fn execute_effects_sequential(
 // Replace execution for parallel path
 // ---------------------------------------------------------------------------
 
+/// Context for executing a Replace effect in the parallel path.
+///
+/// Groups the resource data, lifecycle configuration, and execution metadata
+/// that are passed to both CBD and DBD replace functions.
+struct ReplaceContext<'a> {
+    effect: &'a Effect,
+    id: &'a ResourceId,
+    from: &'a State,
+    to: &'a Resource,
+    lifecycle: &'a crate::resource::LifecycleConfig,
+    cascading_updates: &'a [crate::effect::CascadingUpdate],
+    temporary_name: Option<&'a crate::effect::TemporaryName>,
+    binding_map: &'a HashMap<String, HashMap<String, Value>>,
+    unresolved: &'a HashMap<ResourceId, Resource>,
+    started: Instant,
+    progress: ProgressInfo,
+}
+
 /// Execute a Replace effect, returning a `SingleEffectResult`.
 ///
 /// This handles both CBD and DBD replace within the parallel execution path.
 /// It does not mutate shared state directly; instead returns all data needed
 /// for the caller to update shared state after the level completes.
-#[allow(clippy::too_many_arguments)]
 async fn execute_replace_parallel(
     provider: &dyn Provider,
-    effect: &Effect,
-    id: &ResourceId,
-    from: &State,
-    to: &Resource,
-    lifecycle: &crate::resource::LifecycleConfig,
-    cascading_updates: &[crate::effect::CascadingUpdate],
-    temporary_name: Option<&crate::effect::TemporaryName>,
-    binding_map: &HashMap<String, HashMap<String, Value>>,
-    unresolved: &HashMap<ResourceId, Resource>,
-    started: Instant,
-    progress: ProgressInfo,
+    ctx: &ReplaceContext<'_>,
     observer: &dyn ExecutionObserver,
 ) -> SingleEffectResult {
-    if lifecycle.create_before_destroy {
-        execute_cbd_replace_parallel(
-            provider,
-            effect,
-            id,
-            from,
-            to,
-            lifecycle,
-            cascading_updates,
-            temporary_name,
-            binding_map,
-            unresolved,
-            started,
-            progress,
-            observer,
-        )
-        .await
+    if ctx.lifecycle.create_before_destroy {
+        execute_cbd_replace_parallel(provider, ctx, observer).await
     } else {
-        execute_dbd_replace_parallel(
-            provider,
-            effect,
-            id,
-            from,
-            to,
-            lifecycle,
-            binding_map,
-            unresolved,
-            started,
-            progress,
-            observer,
-        )
-        .await
+        execute_dbd_replace_parallel(provider, ctx, observer).await
     }
 }
 
 /// CBD Replace for the parallel execution path.
-#[allow(clippy::too_many_arguments)]
 async fn execute_cbd_replace_parallel(
     provider: &dyn Provider,
-    effect: &Effect,
-    id: &ResourceId,
-    from: &State,
-    to: &Resource,
-    lifecycle: &crate::resource::LifecycleConfig,
-    cascading_updates: &[crate::effect::CascadingUpdate],
-    temporary_name: Option<&crate::effect::TemporaryName>,
-    binding_map: &HashMap<String, HashMap<String, Value>>,
-    _unresolved: &HashMap<ResourceId, Resource>,
-    started: Instant,
-    progress: ProgressInfo,
+    ctx: &ReplaceContext<'_>,
     observer: &dyn ExecutionObserver,
 ) -> SingleEffectResult {
-    let resolved = match resolve_resource(to, binding_map) {
+    let resolved = match resolve_resource(ctx.to, ctx.binding_map) {
         Ok(r) => r,
         Err(e) => {
             observer.on_event(&ExecutionEvent::EffectFailed {
-                effect,
+                effect: ctx.effect,
                 error: &e,
-                duration: started.elapsed(),
-                progress,
+                duration: ctx.started.elapsed(),
+                progress: ctx.progress,
             });
             return SingleEffectResult::Basic(BasicEffectResult::Failure {
-                binding: effect.binding_name(),
+                binding: ctx.effect.binding_name(),
                 refresh: None,
             });
         }
@@ -1093,17 +1069,17 @@ async fn execute_cbd_replace_parallel(
     match provider.create(&resolved).await {
         Ok(state) => {
             // Build a local binding map update for cascade resolution
-            let mut local_binding_map = binding_map.clone();
+            let mut local_binding_map = ctx.binding_map.clone();
             update_binding_map(
                 &mut local_binding_map,
                 &resolved.attributes,
-                to.binding.as_deref(),
+                ctx.to.binding.as_deref(),
                 &state,
             );
 
             // Execute cascading updates
             let mut cascade_failed = false;
-            for cascade in cascading_updates {
+            for cascade in ctx.cascading_updates {
                 let resolved_to = match resolve_resource(&cascade.to, &local_binding_map) {
                     Ok(r) => r,
                     Err(e) => {
@@ -1146,43 +1122,46 @@ async fn execute_cbd_replace_parallel(
             }
 
             if cascade_failed {
-                refreshes.push((to.id.clone(), state.identifier.clone().unwrap_or_default()));
+                refreshes.push((
+                    ctx.to.id.clone(),
+                    state.identifier.clone().unwrap_or_default(),
+                ));
                 return SingleEffectResult::Replace {
                     success: false,
                     state: None,
-                    resource_id: to.id.clone(),
+                    resource_id: ctx.to.id.clone(),
                     resolved_attrs: None,
-                    binding: effect.binding_name(),
+                    binding: ctx.effect.binding_name(),
                     refreshes,
                     permanent_overrides: None,
                 };
             }
 
             // Delete the old resource
-            let identifier = from.identifier.as_deref().unwrap_or("");
-            match provider.delete(id, identifier, lifecycle).await {
+            let identifier = ctx.from.identifier.as_deref().unwrap_or("");
+            match provider.delete(ctx.id, identifier, ctx.lifecycle).await {
                 Ok(()) => {
                     // Handle rename
                     let mut permanent_overrides = None;
                     let mut final_state = state.clone();
                     let mut rename_failed = false;
 
-                    if let Some(temp) = temporary_name
+                    if let Some(temp) = ctx.temporary_name
                         && temp.can_rename
                     {
                         let new_identifier = state.identifier.as_deref().unwrap_or("");
-                        let mut rename_to = to.clone();
+                        let mut rename_to = ctx.to.clone();
                         rename_to.attributes.insert(
                             temp.attribute.clone(),
                             Value::String(temp.original_value.clone()),
                         );
                         match provider
-                            .update(id, new_identifier, &state, &rename_to)
+                            .update(ctx.id, new_identifier, &state, &rename_to)
                             .await
                         {
                             Ok(renamed_state) => {
                                 observer.on_event(&ExecutionEvent::RenameSucceeded {
-                                    id,
+                                    id: ctx.id,
                                     from: &temp.temporary_value,
                                     to: &temp.original_value,
                                 });
@@ -1191,50 +1170,50 @@ async fn execute_cbd_replace_parallel(
                             Err(e) => {
                                 let error_str = e.to_string();
                                 observer.on_event(&ExecutionEvent::RenameFailed {
-                                    id,
+                                    id: ctx.id,
                                     error: &error_str,
                                 });
                                 rename_failed = true;
                             }
                         }
-                    } else if let Some(temp) = temporary_name
+                    } else if let Some(temp) = ctx.temporary_name
                         && !temp.can_rename
                     {
                         let mut overrides = HashMap::new();
                         overrides.insert(temp.attribute.clone(), temp.temporary_value.clone());
-                        permanent_overrides = Some((to.id.clone(), overrides));
+                        permanent_overrides = Some((ctx.to.id.clone(), overrides));
                     }
 
                     if rename_failed {
                         observer.on_event(&ExecutionEvent::EffectFailed {
-                            effect,
+                            effect: ctx.effect,
                             error: "rename failed",
-                            duration: started.elapsed(),
-                            progress,
+                            duration: ctx.started.elapsed(),
+                            progress: ctx.progress,
                         });
                         SingleEffectResult::Replace {
                             success: false,
                             state: Some(final_state),
-                            resource_id: to.id.clone(),
+                            resource_id: ctx.to.id.clone(),
                             resolved_attrs: Some(resolved.attributes),
-                            binding: effect.binding_name(),
+                            binding: ctx.effect.binding_name(),
                             refreshes,
 
                             permanent_overrides,
                         }
                     } else {
                         observer.on_event(&ExecutionEvent::EffectSucceeded {
-                            effect,
+                            effect: ctx.effect,
                             state: None,
-                            duration: started.elapsed(),
-                            progress,
+                            duration: ctx.started.elapsed(),
+                            progress: ctx.progress,
                         });
                         SingleEffectResult::Replace {
                             success: true,
                             state: Some(final_state),
-                            resource_id: to.id.clone(),
+                            resource_id: ctx.to.id.clone(),
                             resolved_attrs: Some(resolved.attributes),
-                            binding: to.binding.clone(),
+                            binding: ctx.to.binding.clone(),
                             refreshes,
 
                             permanent_overrides,
@@ -1244,18 +1223,21 @@ async fn execute_cbd_replace_parallel(
                 Err(e) => {
                     let error_str = e.to_string();
                     observer.on_event(&ExecutionEvent::EffectFailed {
-                        effect,
+                        effect: ctx.effect,
                         error: &error_str,
-                        duration: started.elapsed(),
-                        progress,
+                        duration: ctx.started.elapsed(),
+                        progress: ctx.progress,
                     });
-                    refreshes.push((to.id.clone(), state.identifier.clone().unwrap_or_default()));
+                    refreshes.push((
+                        ctx.to.id.clone(),
+                        state.identifier.clone().unwrap_or_default(),
+                    ));
                     SingleEffectResult::Replace {
                         success: false,
                         state: None,
-                        resource_id: to.id.clone(),
+                        resource_id: ctx.to.id.clone(),
                         resolved_attrs: None,
-                        binding: effect.binding_name(),
+                        binding: ctx.effect.binding_name(),
                         refreshes,
 
                         permanent_overrides: None,
@@ -1266,17 +1248,17 @@ async fn execute_cbd_replace_parallel(
         Err(e) => {
             let error_str = e.to_string();
             observer.on_event(&ExecutionEvent::EffectFailed {
-                effect,
+                effect: ctx.effect,
                 error: &error_str,
-                duration: started.elapsed(),
-                progress,
+                duration: ctx.started.elapsed(),
+                progress: ctx.progress,
             });
             SingleEffectResult::Replace {
                 success: false,
                 state: None,
-                resource_id: to.id.clone(),
+                resource_id: ctx.to.id.clone(),
                 resolved_attrs: None,
-                binding: effect.binding_name(),
+                binding: ctx.effect.binding_name(),
                 refreshes,
 
                 permanent_overrides: None,
@@ -1286,61 +1268,53 @@ async fn execute_cbd_replace_parallel(
 }
 
 /// DBD Replace for the parallel execution path.
-#[allow(clippy::too_many_arguments)]
 async fn execute_dbd_replace_parallel(
     provider: &dyn Provider,
-    effect: &Effect,
-    id: &ResourceId,
-    from: &State,
-    to: &Resource,
-    lifecycle: &crate::resource::LifecycleConfig,
-    binding_map: &HashMap<String, HashMap<String, Value>>,
-    unresolved: &HashMap<ResourceId, Resource>,
-    started: Instant,
-    progress: ProgressInfo,
+    ctx: &ReplaceContext<'_>,
     observer: &dyn ExecutionObserver,
 ) -> SingleEffectResult {
-    let identifier = from.identifier.as_deref().unwrap_or("");
+    let identifier = ctx.from.identifier.as_deref().unwrap_or("");
     let mut refreshes = Vec::new();
 
-    match provider.delete(id, identifier, lifecycle).await {
+    match provider.delete(ctx.id, identifier, ctx.lifecycle).await {
         Ok(()) => {
-            let resolve_source = unresolved.get(&to.id).unwrap_or(to);
-            let resolved = match resolve_resource_with_source(to, resolve_source, binding_map) {
-                Ok(r) => r,
-                Err(e) => {
-                    observer.on_event(&ExecutionEvent::EffectFailed {
-                        effect,
-                        error: &e,
-                        duration: started.elapsed(),
-                        progress,
-                    });
-                    refreshes.push((to.id.clone(), identifier.to_string()));
-                    return SingleEffectResult::Replace {
-                        success: false,
-                        state: None,
-                        resource_id: to.id.clone(),
-                        resolved_attrs: None,
-                        binding: effect.binding_name(),
-                        refreshes,
-                        permanent_overrides: None,
-                    };
-                }
-            };
+            let resolve_source = ctx.unresolved.get(&ctx.to.id).unwrap_or(ctx.to);
+            let resolved =
+                match resolve_resource_with_source(ctx.to, resolve_source, ctx.binding_map) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        observer.on_event(&ExecutionEvent::EffectFailed {
+                            effect: ctx.effect,
+                            error: &e,
+                            duration: ctx.started.elapsed(),
+                            progress: ctx.progress,
+                        });
+                        refreshes.push((ctx.to.id.clone(), identifier.to_string()));
+                        return SingleEffectResult::Replace {
+                            success: false,
+                            state: None,
+                            resource_id: ctx.to.id.clone(),
+                            resolved_attrs: None,
+                            binding: ctx.effect.binding_name(),
+                            refreshes,
+                            permanent_overrides: None,
+                        };
+                    }
+                };
             match provider.create(&resolved).await {
                 Ok(state) => {
                     observer.on_event(&ExecutionEvent::EffectSucceeded {
-                        effect,
+                        effect: ctx.effect,
                         state: Some(&state),
-                        duration: started.elapsed(),
-                        progress,
+                        duration: ctx.started.elapsed(),
+                        progress: ctx.progress,
                     });
                     SingleEffectResult::Replace {
                         success: true,
                         state: Some(state),
-                        resource_id: to.id.clone(),
+                        resource_id: ctx.to.id.clone(),
                         resolved_attrs: Some(resolved.attributes),
-                        binding: to.binding.clone(),
+                        binding: ctx.to.binding.clone(),
                         refreshes,
 
                         permanent_overrides: None,
@@ -1349,18 +1323,18 @@ async fn execute_dbd_replace_parallel(
                 Err(e) => {
                     let error_str = e.to_string();
                     observer.on_event(&ExecutionEvent::EffectFailed {
-                        effect,
+                        effect: ctx.effect,
                         error: &error_str,
-                        duration: started.elapsed(),
-                        progress,
+                        duration: ctx.started.elapsed(),
+                        progress: ctx.progress,
                     });
-                    refreshes.push((to.id.clone(), identifier.to_string()));
+                    refreshes.push((ctx.to.id.clone(), identifier.to_string()));
                     SingleEffectResult::Replace {
                         success: false,
                         state: None,
-                        resource_id: to.id.clone(),
+                        resource_id: ctx.to.id.clone(),
                         resolved_attrs: None,
-                        binding: effect.binding_name(),
+                        binding: ctx.effect.binding_name(),
                         refreshes,
 
                         permanent_overrides: None,
@@ -1371,18 +1345,18 @@ async fn execute_dbd_replace_parallel(
         Err(e) => {
             let error_str = e.to_string();
             observer.on_event(&ExecutionEvent::EffectFailed {
-                effect,
+                effect: ctx.effect,
                 error: &error_str,
-                duration: started.elapsed(),
-                progress,
+                duration: ctx.started.elapsed(),
+                progress: ctx.progress,
             });
-            refreshes.push((id.clone(), identifier.to_string()));
+            refreshes.push((ctx.id.clone(), identifier.to_string()));
             SingleEffectResult::Replace {
                 success: false,
                 state: None,
-                resource_id: to.id.clone(),
+                resource_id: ctx.to.id.clone(),
                 resolved_attrs: None,
-                binding: effect.binding_name(),
+                binding: ctx.effect.binding_name(),
                 refreshes,
 
                 permanent_overrides: None,
@@ -1597,13 +1571,15 @@ async fn execute_effects_phased(
                 PhaseEffectResult::Basic(basic) => {
                     process_basic_result(
                         basic,
-                        &mut success_count,
-                        &mut failure_count,
-                        &mut applied_states,
-                        &mut failed_bindings,
-                        &mut successfully_deleted,
-                        &mut pending_refreshes,
-                        &mut input.binding_map,
+                        &mut ExecutionState {
+                            success_count: &mut success_count,
+                            failure_count: &mut failure_count,
+                            applied_states: &mut applied_states,
+                            failed_bindings: &mut failed_bindings,
+                            successfully_deleted: &mut successfully_deleted,
+                            pending_refreshes: &mut pending_refreshes,
+                            binding_map: &mut input.binding_map,
+                        },
                     );
                 }
                 _ => unreachable!(),
