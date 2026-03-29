@@ -334,6 +334,16 @@ pub fn validate_type_expr_value(type_expr: &TypeExpr, value: &Value) -> Option<S
         (TypeExpr::Bool, Value::Int(n)) => Some(format!("expected bool, got int ({}).", n)),
         (TypeExpr::Int, Value::Bool(b)) => Some(format!("expected int, got bool ({}).", b)),
         (TypeExpr::Float, Value::Bool(b)) => Some(format!("expected float, got bool ({}).", b)),
+        // Schema types are string subtypes — reject non-string values
+        (TypeExpr::SchemaType { .. }, Value::Bool(b)) => {
+            Some(format!("expected {}, got bool ({}).", type_expr, b))
+        }
+        (TypeExpr::SchemaType { .. }, Value::Int(n)) => {
+            Some(format!("expected {}, got int ({}).", type_expr, n))
+        }
+        (TypeExpr::SchemaType { .. }, Value::Float(f)) => {
+            Some(format!("expected {}, got float ({}).", type_expr, f))
+        }
         _ => None,
     }
 }
@@ -998,5 +1008,41 @@ let route = awscc.ec2.route {
         let result = validate_type_expr_value(&TypeExpr::Float, &Value::Bool(false));
         assert!(result.is_some());
         assert!(result.unwrap().contains("expected float, got bool"));
+    }
+
+    #[test]
+    fn validate_type_expr_value_schema_type_accepts_string() {
+        let schema_type = TypeExpr::SchemaType {
+            provider: "awscc".to_string(),
+            path: "ec2".to_string(),
+            type_name: "VpcId".to_string(),
+        };
+        let result =
+            validate_type_expr_value(&schema_type, &Value::String("vpc-12345678".to_string()));
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn validate_type_expr_value_schema_type_rejects_bool() {
+        let schema_type = TypeExpr::SchemaType {
+            provider: "awscc".to_string(),
+            path: "ec2".to_string(),
+            type_name: "VpcId".to_string(),
+        };
+        let result = validate_type_expr_value(&schema_type, &Value::Bool(true));
+        assert!(result.is_some());
+        assert!(result.unwrap().contains("expected awscc.ec2.VpcId"));
+    }
+
+    #[test]
+    fn validate_type_expr_value_schema_type_rejects_int() {
+        let schema_type = TypeExpr::SchemaType {
+            provider: "awscc".to_string(),
+            path: "ec2".to_string(),
+            type_name: "VpcId".to_string(),
+        };
+        let result = validate_type_expr_value(&schema_type, &Value::Int(42));
+        assert!(result.is_some());
+        assert!(result.unwrap().contains("expected awscc.ec2.VpcId"));
     }
 }

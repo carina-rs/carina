@@ -102,6 +102,16 @@ pub enum TypeExpr {
     Map(Box<TypeExpr>),
     /// Reference to a resource type (e.g., aws.vpc)
     Ref(ResourceTypePath),
+    /// Provider-defined schema type (e.g., awscc.ec2.VpcId, awscc.ec2.SubnetId)
+    /// Distinguished from Ref by having a PascalCase final segment.
+    SchemaType {
+        /// Provider name (e.g., "awscc")
+        provider: std::string::String,
+        /// Service/namespace path (e.g., "ec2")
+        path: std::string::String,
+        /// Type name in PascalCase (e.g., "VpcId")
+        type_name: std::string::String,
+    },
 }
 
 impl std::fmt::Display for TypeExpr {
@@ -115,6 +125,11 @@ impl std::fmt::Display for TypeExpr {
             TypeExpr::List(inner) => write!(f, "list({})", inner),
             TypeExpr::Map(inner) => write!(f, "map({})", inner),
             TypeExpr::Ref(path) => write!(f, "{}", path),
+            TypeExpr::SchemaType {
+                provider,
+                path,
+                type_name,
+            } => write!(f, "{}.{}.{}", provider, path, type_name),
         }
     }
 }
@@ -663,13 +678,34 @@ fn parse_type_expr(pair: pest::iterators::Pair<Rule>) -> Result<TypeExpr, ParseE
             }
         }
         Rule::type_ref => {
-            // Parse resource_type_path directly (e.g., aws.vpc)
+            // Parse resource_type_path directly (e.g., aws.vpc or awscc.ec2.VpcId)
             let mut ref_inner = inner.into_inner();
             let path_str = next_pair(&mut ref_inner, "resource type path", "type ref")?.as_str();
-            let path = ResourceTypePath::parse(path_str).ok_or_else(|| {
-                ParseError::InvalidResourceType(format!("Invalid resource type path: {}", path_str))
-            })?;
-            Ok(TypeExpr::Ref(path))
+            let parts: Vec<&str> = path_str.split('.').collect();
+
+            // Check if the last segment starts with uppercase (PascalCase) → SchemaType
+            if parts.len() >= 3
+                && parts
+                    .last()
+                    .is_some_and(|s| s.starts_with(|c: char| c.is_uppercase()))
+            {
+                let provider = parts[0].to_string();
+                let path = parts[1..parts.len() - 1].join(".");
+                let type_name = parts.last().unwrap().to_string();
+                Ok(TypeExpr::SchemaType {
+                    provider,
+                    path,
+                    type_name,
+                })
+            } else {
+                let path = ResourceTypePath::parse(path_str).ok_or_else(|| {
+                    ParseError::InvalidResourceType(format!(
+                        "Invalid resource type path: {}",
+                        path_str
+                    ))
+                })?;
+                Ok(TypeExpr::Ref(path))
+            }
         }
         _ => Ok(TypeExpr::String),
     }
@@ -1755,6 +1791,24 @@ fn check_fn_arg_type(
             // If not found in bindings, skip validation (forward ref or dynamic)
             true
         }
+        // Schema types (awscc.ec2.VpcId, etc.) are string subtypes with provider validators
+        TypeExpr::SchemaType { type_name, .. } => {
+            if !matches!(
+                value,
+                Value::String(_) | Value::Interpolation(_) | Value::ResourceRef { .. }
+            ) {
+                false
+            } else {
+                // Convert PascalCase type_name to snake_case for validator lookup
+                let validator_key = pascal_to_snake(type_name);
+                if let Err(e) = validate_custom_type(&validator_key, value, ctx.config) {
+                    return Err(ParseError::UserFunctionError(format!(
+                        "function '{fn_name}': parameter '{param_name}' type '{type_expr}' validation failed: {e}"
+                    )));
+                }
+                true
+            }
+        }
     };
     if !type_matches {
         let actual_type = value_type_name(value);
@@ -1800,6 +1854,23 @@ fn check_fn_return_type(
         }
         // Resource type refs: not applicable for value functions
         TypeExpr::Ref(_) => true,
+        // Schema types: validate returned value against the provider validator
+        TypeExpr::SchemaType { type_name, .. } => {
+            if !matches!(
+                value,
+                Value::String(_) | Value::Interpolation(_) | Value::ResourceRef { .. }
+            ) {
+                false
+            } else {
+                let validator_key = pascal_to_snake(type_name);
+                if let Err(e) = validate_custom_type(&validator_key, value, config) {
+                    return Err(ParseError::UserFunctionError(format!(
+                        "function '{fn_name}': return type '{type_name}' validation failed: {e}"
+                    )));
+                }
+                true
+            }
+        }
     };
     if !type_matches {
         let actual_type = value_type_name(value);
@@ -1808,6 +1879,22 @@ fn check_fn_return_type(
         )));
     }
     Ok(())
+}
+
+/// Convert PascalCase to snake_case (e.g., "VpcId" → "vpc_id", "SubnetId" → "subnet_id")
+pub fn pascal_to_snake(s: &str) -> String {
+    let mut result = String::with_capacity(s.len() + 4);
+    for (i, c) in s.chars().enumerate() {
+        if c.is_uppercase() {
+            if i > 0 {
+                result.push('_');
+            }
+            result.push(c.to_lowercase().next().unwrap());
+        } else {
+            result.push(c);
+        }
+    }
+    result
 }
 
 /// Return a human-readable type name for a Value
@@ -7356,5 +7443,73 @@ aws.s3.bucket {
             msg.contains("custom_type must start with 'valid-'"),
             "Expected validation error, got: {msg}"
         );
+    }
+
+    #[test]
+    fn pascal_to_snake_conversion() {
+        assert_eq!(super::pascal_to_snake("VpcId"), "vpc_id");
+        assert_eq!(super::pascal_to_snake("SubnetId"), "subnet_id");
+        assert_eq!(
+            super::pascal_to_snake("SecurityGroupId"),
+            "security_group_id"
+        );
+        assert_eq!(super::pascal_to_snake("Arn"), "arn");
+        assert_eq!(super::pascal_to_snake("IamRoleArn"), "iam_role_arn");
+    }
+
+    #[test]
+    fn parse_schema_type_in_arguments() {
+        let input = r#"
+arguments {
+  vpc_id: awscc.ec2.VpcId
+}
+"#;
+        let parsed = parse(input, &ProviderContext::default()).unwrap();
+        assert_eq!(parsed.arguments.len(), 1);
+        let arg = &parsed.arguments[0];
+        assert_eq!(arg.name, "vpc_id");
+        match &arg.type_expr {
+            TypeExpr::SchemaType {
+                provider,
+                path,
+                type_name,
+            } => {
+                assert_eq!(provider, "awscc");
+                assert_eq!(path, "ec2");
+                assert_eq!(type_name, "VpcId");
+            }
+            other => panic!("Expected SchemaType, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_schema_type_display() {
+        let t = TypeExpr::SchemaType {
+            provider: "awscc".to_string(),
+            path: "ec2".to_string(),
+            type_name: "VpcId".to_string(),
+        };
+        assert_eq!(t.to_string(), "awscc.ec2.VpcId");
+    }
+
+    #[test]
+    fn parse_schema_type_list() {
+        let input = r#"
+arguments {
+  subnet_ids: list(awscc.ec2.SubnetId)
+}
+"#;
+        let parsed = parse(input, &ProviderContext::default()).unwrap();
+        assert_eq!(parsed.arguments.len(), 1);
+        let arg = &parsed.arguments[0];
+        match &arg.type_expr {
+            TypeExpr::List(inner) => match inner.as_ref() {
+                TypeExpr::SchemaType { type_name, .. } => {
+                    assert_eq!(type_name, "SubnetId");
+                }
+                other => panic!("Expected SchemaType inside list, got {:?}", other),
+            },
+            other => panic!("Expected List, got {:?}", other),
+        }
     }
 }
