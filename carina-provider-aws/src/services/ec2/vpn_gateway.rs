@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use carina_core::provider::{ProviderError, ProviderResult};
 use carina_core::resource::{Resource, ResourceId, State, Value};
-use carina_core::utils::extract_enum_value;
+use carina_core::utils::extract_enum_value_with_values;
 
 use crate::AwsProvider;
 
@@ -65,7 +65,7 @@ impl AwsProvider {
     /// Create an EC2 VPN Gateway
     pub(crate) async fn create_ec2_vpn_gateway(&self, resource: Resource) -> ProviderResult<State> {
         let gw_type = match resource.attributes.get("type") {
-            Some(Value::String(s)) => extract_enum_value(s).to_string(),
+            Some(Value::String(s)) => extract_enum_value_with_values(s, &["ipsec.1"]).to_string(),
             _ => {
                 return Err(
                     ProviderError::new("type is required").for_resource(resource.id.clone())

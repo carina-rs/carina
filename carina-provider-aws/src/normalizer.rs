@@ -158,11 +158,20 @@ pub(crate) fn normalize_state_enums(resource_type: &str, attributes: &mut HashMa
         if let Some(attr_schema) = config.schema.attributes.get(key.as_str()) {
             if let Some((type_name, ns, to_dsl)) = attr_schema.attr_type.namespaced_enum_parts()
                 && let Value::String(s) = value
-                && !s.contains('.')
             {
-                let dsl_val = to_dsl.map_or_else(|| s.clone(), |f| f(s));
-                let namespaced = format!("{}.{}.{}", ns, type_name, dsl_val);
-                resolved.insert(key.clone(), Value::String(namespaced));
+                // Skip values already in namespaced DSL format (e.g., "aws.ec2.vpn_gateway.Type.ipsec.1").
+                // A value that contains '.' but is not already namespaced is a raw enum value
+                // like "ipsec.1" — check if it matches a known valid enum value.
+                let already_namespaced =
+                    s.contains('.')
+                        && !attr_schema.attr_type.string_enum_parts().is_some_and(
+                            |(_, vals, _, _)| vals.iter().any(|v| v.eq_ignore_ascii_case(s)),
+                        );
+                if !already_namespaced {
+                    let dsl_val = to_dsl.map_or_else(|| s.clone(), |f| f(s));
+                    let namespaced = format!("{}.{}.{}", ns, type_name, dsl_val);
+                    resolved.insert(key.clone(), Value::String(namespaced));
+                }
             }
             // Normalize enum fields within struct (Map) values
             if let carina_core::schema::AttributeType::Struct { fields, .. } =
@@ -466,6 +475,37 @@ mod tests {
             attributes.get("ip_protocol"),
             Some(&Value::String(
                 "aws.ec2.security_group_egress.IpProtocol.tcp".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn test_normalize_state_enums_vpn_gateway_type_with_dot() {
+        // "ipsec.1" contains a dot but is a raw enum value, not a namespaced identifier.
+        // The normalizer should recognize it as a valid enum value and namespace it.
+        let mut attributes =
+            HashMap::from([("type".to_string(), Value::String("ipsec.1".to_string()))]);
+        normalize_state_enums("ec2.vpn_gateway", &mut attributes);
+        assert_eq!(
+            attributes.get("type"),
+            Some(&Value::String(
+                "aws.ec2.vpn_gateway.Type.ipsec.1".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn test_normalize_state_enums_vpn_gateway_type_already_namespaced() {
+        // Already in DSL format — should NOT be double-normalized.
+        let mut attributes = HashMap::from([(
+            "type".to_string(),
+            Value::String("aws.ec2.vpn_gateway.Type.ipsec.1".to_string()),
+        )]);
+        normalize_state_enums("ec2.vpn_gateway", &mut attributes);
+        assert_eq!(
+            attributes.get("type"),
+            Some(&Value::String(
+                "aws.ec2.vpn_gateway.Type.ipsec.1".to_string()
             ))
         );
     }
