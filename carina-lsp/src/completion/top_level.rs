@@ -314,6 +314,7 @@ impl CompletionProvider {
             parser::TypeExpr::Ref(resource_path) => {
                 format!("{}.{}", resource_path.provider, resource_path.resource_type)
             }
+            schema_type @ parser::TypeExpr::SchemaType { .. } => schema_type.to_string(),
         }
     }
 
