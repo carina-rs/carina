@@ -1127,7 +1127,7 @@ mod tests {
             Resource::new("s3.bucket", "my-bucket")
                 .with_attribute("name", Value::String("test".to_string()))
                 .with_binding("my_bucket")
-                .with_attribute("_module", Value::String("web".to_string())),
+                .with_module_source(carina_core::resource::ModuleSource::module("web", "web")),
         ));
 
         let app = App::new(&plan, &HashMap::new());

@@ -358,15 +358,11 @@ impl<'cfg> ModuleResolver<'cfg> {
                 new_resource.binding = Some(prefixed);
             }
 
-            // Add module source info
-            new_resource.attributes.insert(
-                "_module".to_string(),
-                Value::String(call.module_name.clone()),
-            );
-            new_resource.attributes.insert(
-                "_module_instance".to_string(),
-                Value::String(instance_prefix.to_string()),
-            );
+            // Set typed module source info
+            new_resource.module_source = Some(crate::resource::ModuleSource::Module {
+                name: call.module_name.clone(),
+                instance: instance_prefix.to_string(),
+            });
 
             // Rewrite intra-module ResourceRefs BEFORE substituting inputs.
             // This ensures that caller-provided ResourceRef values (which may
@@ -412,6 +408,7 @@ impl<'cfg> ModuleResolver<'cfg> {
                 prefixes: HashMap::new(),
                 binding: Some(binding_name.clone()),
                 dependency_bindings: Vec::new(),
+                module_source: None,
             };
             expanded_resources.push(virtual_resource);
         }
@@ -739,6 +736,7 @@ mod tests {
                 prefixes: HashMap::new(),
                 binding: None,
                 dependency_bindings: Vec::new(),
+                module_source: None,
             }],
             variables: HashMap::new(),
             imports: vec![],
@@ -834,9 +832,15 @@ mod tests {
             Some(&Value::String("vpc-456".to_string()))
         );
         assert_eq!(
-            sg.attributes.get("_module"),
-            Some(&Value::String("test_module".to_string()))
+            sg.module_source,
+            Some(crate::resource::ModuleSource::Module {
+                name: "test_module".to_string(),
+                instance: "my_instance".to_string(),
+            })
         );
+        // Module info should NOT be in attributes
+        assert!(!sg.attributes.contains_key("_module"));
+        assert!(!sg.attributes.contains_key("_module_instance"));
     }
 
     /// Module with two resources where one references the other via _binding / ResourceRef.
@@ -863,6 +867,7 @@ mod tests {
                     prefixes: HashMap::new(),
                     binding: Some("vpc".to_string()),
                     dependency_bindings: Vec::new(),
+                    module_source: None,
                 },
                 Resource {
                     id: ResourceId::new("ec2.subnet", "sub"),
@@ -883,6 +888,7 @@ mod tests {
                     prefixes: HashMap::new(),
                     binding: Some("subnet".to_string()),
                     dependency_bindings: Vec::new(),
+                    module_source: None,
                 },
             ],
             variables: HashMap::new(),
@@ -1001,6 +1007,7 @@ mod tests {
                 prefixes: HashMap::new(),
                 binding: Some("sg".to_string()),
                 dependency_bindings: Vec::new(),
+                module_source: None,
             }],
             variables: HashMap::new(),
             imports: vec![],
@@ -1349,6 +1356,7 @@ mod tests {
                 prefixes: HashMap::new(),
                 binding: Some("vpc".to_string()),
                 dependency_bindings: Vec::new(),
+                module_source: None,
             }],
             variables: HashMap::new(),
             imports: vec![],

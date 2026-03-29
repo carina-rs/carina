@@ -389,6 +389,7 @@ pub fn redact_secrets_in_resource(
         prefixes: resource.prefixes.clone(),
         binding: resource.binding.clone(),
         dependency_bindings: resource.dependency_bindings.clone(),
+        module_source: resource.module_source.clone(),
     }
 }
 

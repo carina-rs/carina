@@ -443,6 +443,40 @@ pub struct LifecycleConfig {
     pub create_before_destroy: bool,
 }
 
+/// Source of a resource (root or from a module)
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ModuleSource {
+    /// Resource defined at the root level
+    Root,
+    /// Resource from a module instantiation
+    Module {
+        /// Module name (e.g., "web_tier")
+        name: String,
+        /// Instance binding name (e.g., "web")
+        instance: String,
+    },
+}
+
+impl ModuleSource {
+    /// Create a Root source
+    pub fn root() -> Self {
+        Self::Root
+    }
+
+    /// Create a Module source
+    pub fn module(name: impl Into<String>, instance: impl Into<String>) -> Self {
+        Self::Module {
+            name: name.into(),
+            instance: instance.into(),
+        }
+    }
+
+    /// Check if this is the root source
+    pub fn is_root(&self) -> bool {
+        matches!(self, Self::Root)
+    }
+}
+
 /// Classification of a resource in the IR
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub enum ResourceKind {
@@ -480,6 +514,9 @@ pub struct Resource {
     /// Binding names of resources this resource depends on (via ResourceRef)
     #[serde(default)]
     pub dependency_bindings: Vec<String>,
+    /// Module source info for resources that belong to a module
+    #[serde(default)]
+    pub module_source: Option<ModuleSource>,
 }
 
 impl Resource {
@@ -492,6 +529,7 @@ impl Resource {
             prefixes: HashMap::new(),
             binding: None,
             dependency_bindings: Vec::new(),
+            module_source: None,
         }
     }
 
@@ -508,6 +546,7 @@ impl Resource {
             prefixes: HashMap::new(),
             binding: None,
             dependency_bindings: Vec::new(),
+            module_source: None,
         }
     }
 
@@ -535,6 +574,11 @@ impl Resource {
 
     pub fn with_dependency_bindings(mut self, deps: Vec<String>) -> Self {
         self.dependency_bindings = deps;
+        self
+    }
+
+    pub fn with_module_source(mut self, source: ModuleSource) -> Self {
+        self.module_source = Some(source);
         self
     }
 
@@ -1109,5 +1153,30 @@ mod tests {
         let resource = Resource::new("s3.bucket", "my-bucket").with_kind(ResourceKind::DataSource);
         assert!(resource.is_data_source());
         assert!(!resource.is_virtual());
+    }
+
+    #[test]
+    fn resource_module_source_typed_field() {
+        // Real resources that belong to modules should use the typed module_source field
+        // instead of storing _module/_module_instance as hidden attributes
+        let resource = Resource::new("ec2.security_group", "web_sg").with_module_source(
+            ModuleSource::Module {
+                name: "web_tier".to_string(),
+                instance: "web".to_string(),
+            },
+        );
+
+        // Module source info should be in the typed field
+        assert_eq!(
+            resource.module_source,
+            Some(ModuleSource::Module {
+                name: "web_tier".to_string(),
+                instance: "web".to_string(),
+            })
+        );
+
+        // Module source info should NOT be in attributes
+        assert!(!resource.attributes.contains_key("_module"));
+        assert!(!resource.attributes.contains_key("_module_instance"));
     }
 }
