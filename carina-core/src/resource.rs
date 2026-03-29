@@ -464,7 +464,7 @@ pub struct Resource {
     #[serde(default)]
     pub dependency_bindings: Vec<String>,
     /// If true, this is a virtual resource (module attribute container)
-    #[serde(default, rename = "_virtual")]
+    #[serde(default)]
     pub virtual_resource: bool,
 }
 
