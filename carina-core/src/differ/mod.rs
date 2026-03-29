@@ -71,7 +71,7 @@ pub fn diff(
     }
 
     let changed = comparison::find_changed_attributes(
-        &desired.attributes,
+        &desired.resolved_attributes(),
         &current.attributes,
         saved,
         prev_desired_keys,

@@ -1027,7 +1027,7 @@ pub fn resolve_block_names(
             .keys()
             .filter_map(|key| {
                 bn_map.get(key).and_then(|canon| {
-                    if matches!(resource.attributes.get(key), Some(Value::List(_))) {
+                    if matches!(resource.get_attr(key), Some(Value::List(_))) {
                         Some((key.clone(), canon.clone()))
                     } else {
                         None
@@ -1049,8 +1049,8 @@ pub fn resolve_block_names(
                 continue;
             }
 
-            let value = resource.attributes.remove(&block_key).unwrap();
-            resource.attributes.insert(canon_key, value);
+            let expr = resource.attributes.remove(&block_key).unwrap();
+            resource.attributes.insert(canon_key, expr);
         }
 
         // Recurse into nested struct values to resolve block names at all levels
@@ -1061,7 +1061,7 @@ pub fn resolve_block_names(
             };
             match &attr_schema.attr_type {
                 AttributeType::Struct { fields, .. } => {
-                    if let Value::Map(inner_map) = value {
+                    if let Value::Map(inner_map) = &mut value.0 {
                         resolve_block_names_in_map(
                             inner_map,
                             fields,
@@ -1072,7 +1072,7 @@ pub fn resolve_block_names(
                 }
                 AttributeType::List { inner, .. } => {
                     if let AttributeType::Struct { fields, .. } = inner.as_ref()
-                        && let Value::List(items) = value
+                        && let Value::List(items) = &mut value.0
                     {
                         for item in items.iter_mut() {
                             if let Value::Map(item_map) = item {
@@ -2364,7 +2364,7 @@ mod tests {
         let mut resources = vec![{
             let mut r = Resource::new("ec2.ipam", "my-ipam");
             // Block syntax produces Value::List
-            r.attributes.insert(
+            r.set_attr(
                 "operating_region".to_string(),
                 Value::List(vec![Value::Map({
                     let mut m = HashMap::new();
@@ -2397,8 +2397,7 @@ mod tests {
     fn resolve_block_names_noop_when_no_match() {
         let mut resources = vec![{
             let mut r = Resource::new("ec2.ipam", "my-ipam");
-            r.attributes
-                .insert("name".to_string(), Value::String("test".to_string()));
+            r.set_attr("name".to_string(), Value::String("test".to_string()));
             r
         }];
 
@@ -2419,7 +2418,7 @@ mod tests {
         let mut resources = vec![{
             let mut r = Resource::new("ec2.ipam", "my-ipam");
             // Block syntax produces Value::List
-            r.attributes.insert(
+            r.set_attr(
                 "operating_region".to_string(),
                 Value::List(vec![Value::Map({
                     let mut m = HashMap::new();
@@ -2431,7 +2430,7 @@ mod tests {
                 })]),
             );
             // User also explicitly set the canonical name
-            r.attributes.insert(
+            r.set_attr(
                 "operating_regions".to_string(),
                 Value::List(vec![Value::Map({
                     let mut m = HashMap::new();
@@ -2465,7 +2464,7 @@ mod tests {
     fn resolve_block_names_skips_unknown_schema() {
         let mut resources = vec![{
             let mut r = Resource::new("unknown.type", "test");
-            r.attributes.insert(
+            r.set_attr(
                 "operating_region".to_string(),
                 Value::String("us-east-1".to_string()),
             );
@@ -2513,8 +2512,7 @@ mod tests {
 
         let mut resources = vec![{
             let mut r = Resource::new("s3.bucket", "my-bucket");
-            r.attributes
-                .insert("lifecycle_configuration".to_string(), Value::Map(inner_map));
+            r.set_attr("lifecycle_configuration".to_string(), Value::Map(inner_map));
             r
         }];
 
@@ -2542,7 +2540,7 @@ mod tests {
         resolve_block_names(&mut resources, &schemas, |r| r.id.resource_type.clone()).unwrap();
 
         // The nested "transition" key should be renamed to "transitions"
-        let lifecycle = match resources[0].attributes.get("lifecycle_configuration") {
+        let lifecycle = match resources[0].get_attr("lifecycle_configuration") {
             Some(Value::Map(m)) => m,
             _ => panic!("expected Map"),
         };
@@ -2579,8 +2577,7 @@ mod tests {
 
         let mut resources = vec![{
             let mut r = Resource::new("s3.bucket", "my-bucket");
-            r.attributes
-                .insert("lifecycle_configuration".to_string(), Value::Map(inner_map));
+            r.set_attr("lifecycle_configuration".to_string(), Value::Map(inner_map));
             r
         }];
 
@@ -2614,7 +2611,7 @@ mod tests {
 
         resolve_block_names(&mut resources, &schemas, |r| r.id.resource_type.clone()).unwrap();
 
-        let lifecycle = match resources[0].attributes.get("lifecycle_configuration") {
+        let lifecycle = match resources[0].get_attr("lifecycle_configuration") {
             Some(Value::Map(m)) => m,
             _ => panic!("expected Map"),
         };
@@ -2649,8 +2646,7 @@ mod tests {
 
         let mut resources = vec![{
             let mut r = Resource::new("s3.bucket", "my-bucket");
-            r.attributes
-                .insert("lifecycle_configuration".to_string(), Value::Map(inner_map));
+            r.set_attr("lifecycle_configuration".to_string(), Value::Map(inner_map));
             r
         }];
 
@@ -2684,7 +2680,7 @@ mod tests {
 
         resolve_block_names(&mut resources, &schemas, |r| r.id.resource_type.clone()).unwrap();
 
-        let lifecycle = match resources[0].attributes.get("lifecycle_configuration") {
+        let lifecycle = match resources[0].get_attr("lifecycle_configuration") {
             Some(Value::Map(m)) => m,
             _ => panic!("expected Map"),
         };
@@ -2707,7 +2703,7 @@ mod tests {
         let mut resources = vec![{
             let mut r = Resource::new("ec2.security_group", "my-sg");
             // Block syntax produces Value::List
-            r.attributes.insert(
+            r.set_attr(
                 "ingress".to_string(),
                 Value::List(vec![Value::Map({
                     let mut m = HashMap::new();
@@ -2739,7 +2735,7 @@ mod tests {
         // Key should remain as "ingress"
         assert!(resources[0].attributes.contains_key("ingress"));
         // Value should be unchanged
-        match resources[0].attributes.get("ingress") {
+        match resources[0].get_attr("ingress") {
             Some(Value::List(items)) => assert_eq!(items.len(), 1),
             other => panic!("expected List, got {:?}", other),
         }
@@ -2753,7 +2749,7 @@ mod tests {
         // path handles it. This test verifies all items are preserved.
         let mut resources = vec![{
             let mut r = Resource::new("ec2.security_group", "my-sg");
-            r.attributes.insert(
+            r.set_attr(
                 "ingress".to_string(),
                 Value::List(vec![
                     Value::Map({
@@ -2790,7 +2786,7 @@ mod tests {
         resolve_block_names(&mut resources, &schemas, |r| r.id.resource_type.clone()).unwrap();
 
         assert!(resources[0].attributes.contains_key("ingress"));
-        match resources[0].attributes.get("ingress") {
+        match resources[0].get_attr("ingress") {
             Some(Value::List(items)) => assert_eq!(items.len(), 2),
             other => panic!("expected List with 2 items, got {:?}", other),
         }
@@ -2813,8 +2809,7 @@ mod tests {
 
         let mut resources = vec![{
             let mut r = Resource::new("test.resource", "my-resource");
-            r.attributes
-                .insert("config".to_string(), Value::Map(inner_map));
+            r.set_attr("config".to_string(), Value::Map(inner_map));
             r
         }];
 
@@ -2845,7 +2840,7 @@ mod tests {
         // Should succeed without errors
         resolve_block_names(&mut resources, &schemas, |r| r.id.resource_type.clone()).unwrap();
 
-        let config = match resources[0].attributes.get("config") {
+        let config = match resources[0].get_attr("config") {
             Some(Value::Map(m)) => m,
             _ => panic!("expected Map"),
         };

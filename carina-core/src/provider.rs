@@ -486,7 +486,12 @@ mod tests {
         fn create(&self, resource: &Resource) -> BoxFuture<'_, ProviderResult<State>> {
             let id = resource.id.clone();
             let attrs = resource.attributes.clone();
-            Box::pin(async move { Ok(State::existing(id, attrs).with_identifier("mock-id-123")) })
+            Box::pin(async move {
+                Ok(
+                    State::existing(id, crate::resource::Expr::resolve_map(&attrs))
+                        .with_identifier("mock-id-123"),
+                )
+            })
         }
 
         fn update(
@@ -498,7 +503,12 @@ mod tests {
         ) -> BoxFuture<'_, ProviderResult<State>> {
             let id = id.clone();
             let attrs = to.attributes.clone();
-            Box::pin(async move { Ok(State::existing(id, attrs)) })
+            Box::pin(async move {
+                Ok(State::existing(
+                    id,
+                    crate::resource::Expr::resolve_map(&attrs),
+                ))
+            })
         }
 
         fn delete(
@@ -678,7 +688,7 @@ mod tests {
                 // Prefix all string attribute values with "normalized:"
                 for resource in resources.iter_mut() {
                     for value in resource.attributes.values_mut() {
-                        if let Value::String(s) = value {
+                        if let Value::String(s) = &mut value.0 {
                             *s = format!("normalized:{}", s);
                         }
                     }
@@ -711,7 +721,7 @@ mod tests {
         ];
         ext.normalize_desired(&mut resources);
         assert_eq!(
-            resources[0].attributes.get("key"),
+            resources[0].get_attr("key"),
             Some(&Value::String("normalized:value".to_string()))
         );
 
@@ -783,7 +793,7 @@ mod tests {
                 for resource in resources.iter_mut() {
                     if resource.id.provider == "normalizing" {
                         for value in resource.attributes.values_mut() {
-                            if let Value::String(s) = value {
+                            if let Value::String(s) = &mut value.0 {
                                 *s = format!("norm:{}", s);
                             }
                         }
@@ -802,7 +812,7 @@ mod tests {
         ];
         router.normalize_desired(&mut resources);
         assert_eq!(
-            resources[0].attributes.get("key"),
+            resources[0].get_attr("key"),
             Some(&Value::String("norm:val".to_string()))
         );
     }

@@ -937,7 +937,7 @@ mod tests {
 
         let mut resource = Resource::with_provider("awscc", "ec2.subnet", "my-subnet");
         resource.binding = Some("my_subnet".to_string());
-        resource.attributes.insert(
+        resource.set_attr(
             "vpc_id".to_string(),
             Value::ResourceRef {
                 binding_name: "my_vpc".to_string(),
@@ -1124,13 +1124,11 @@ mod tests {
 
         // Simulate a VPC resource with a write-only attribute (ipv4_netmask_length)
         let mut resource = Resource::with_provider("awscc", "ec2.vpc", "my-vpc");
-        resource.attributes.insert(
+        resource.set_attr(
             "cidr_block".to_string(),
             Value::String("10.0.0.0/16".to_string()),
         );
-        resource
-            .attributes
-            .insert("ipv4_netmask_length".to_string(), Value::Int(16));
+        resource.set_attr("ipv4_netmask_length".to_string(), Value::Int(16));
 
         // Provider returns state without write-only attributes (API doesn't return them)
         let provider_state = ProviderState {
@@ -1171,7 +1169,7 @@ mod tests {
 
         // Resource without write-only attribute specified
         let mut resource = Resource::with_provider("awscc", "ec2.vpc", "my-vpc");
-        resource.attributes.insert(
+        resource.set_attr(
             "cidr_block".to_string(),
             Value::String("10.0.0.0/16".to_string()),
         );
@@ -1205,7 +1203,7 @@ mod tests {
 
         // Resource with a write-only attribute
         let mut resource = Resource::with_provider("awscc", "ec2.vpc", "my-vpc");
-        resource.attributes.insert(
+        resource.set_attr(
             "some_attr".to_string(),
             Value::String("desired".to_string()),
         );
@@ -1276,7 +1274,7 @@ mod tests {
         use carina_core::value::SECRET_PREFIX;
 
         let mut resource = Resource::with_provider("awscc", "rds.db_instance", "my-db");
-        resource.attributes.insert(
+        resource.set_attr(
             "master_password".to_string(),
             Value::Secret(Box::new(Value::String("my-password".to_string()))),
         );
@@ -1327,9 +1325,7 @@ mod tests {
             "SecretTag".to_string(),
             Value::Secret(Box::new(Value::String("super-secret-value".to_string()))),
         );
-        resource
-            .attributes
-            .insert("tags".to_string(), Value::Map(tags_map));
+        resource.set_attr("tags".to_string(), Value::Map(tags_map));
 
         let mut state_tags = StdHashMap::new();
         state_tags.insert("Name".to_string(), Value::String("test".to_string()));
@@ -1382,9 +1378,7 @@ mod tests {
             "SecretTag".to_string(),
             Value::Secret(Box::new(Value::String("super-secret-value".to_string()))),
         );
-        resource
-            .attributes
-            .insert("tags".to_string(), Value::Map(tags_map));
+        resource.set_attr("tags".to_string(), Value::Map(tags_map));
 
         // Provider returns extra keys (e.g., CloudControl adds Name automatically)
         let mut state_tags = StdHashMap::new();
@@ -1438,7 +1432,7 @@ mod tests {
         use carina_core::value::SECRET_PREFIX;
 
         let mut resource = Resource::with_provider("awscc", "test.resource", "my-res");
-        resource.attributes.insert(
+        resource.set_attr(
             "values".to_string(),
             Value::List(vec![
                 Value::String("public".to_string()),

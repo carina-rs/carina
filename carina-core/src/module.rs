@@ -362,7 +362,7 @@ impl RootConfigSignature {
             let resource_type_str = resource
                 .attributes
                 .get("_type")
-                .and_then(|v| match v {
+                .and_then(|v| match &v.0 {
                     Value::String(s) => Some(s.clone()),
                     _ => None,
                 })
@@ -761,7 +761,7 @@ impl ModuleSignature {
             let resource_type_str = resource
                 .attributes
                 .get("_type")
-                .and_then(|v| match v {
+                .and_then(|v| match &v.0 {
                     Value::String(s) => Some(s.clone()),
                     _ => None,
                 })

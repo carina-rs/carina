@@ -61,7 +61,7 @@ impl AwsProvider {
         &self,
         resource: Resource,
     ) -> ProviderResult<State> {
-        let vpc_id = match resource.attributes.get("vpc_id") {
+        let vpc_id = match resource.get_attr("vpc_id") {
             Some(Value::String(s)) => s.clone(),
             _ => {
                 return Err(
@@ -70,7 +70,7 @@ impl AwsProvider {
             }
         };
 
-        let service_name = match resource.attributes.get("service_name") {
+        let service_name = match resource.get_attr("service_name") {
             Some(Value::String(s)) => s.clone(),
             _ => {
                 return Err(ProviderError::new("service_name is required")
@@ -84,13 +84,13 @@ impl AwsProvider {
             .vpc_id(&vpc_id)
             .service_name(&service_name);
 
-        if let Some(Value::String(ep_type)) = resource.attributes.get("vpc_endpoint_type") {
+        if let Some(Value::String(ep_type)) = resource.get_attr("vpc_endpoint_type") {
             use aws_sdk_ec2::types::VpcEndpointType;
             let et = VpcEndpointType::from(extract_enum_value(ep_type));
             req = req.vpc_endpoint_type(et);
         }
 
-        if let Some(Value::List(ids)) = resource.attributes.get("route_table_ids") {
+        if let Some(Value::List(ids)) = resource.get_attr("route_table_ids") {
             for id_val in ids {
                 if let Value::String(s) = id_val {
                     req = req.route_table_ids(s);
@@ -98,7 +98,7 @@ impl AwsProvider {
             }
         }
 
-        if let Some(Value::List(ids)) = resource.attributes.get("subnet_ids") {
+        if let Some(Value::List(ids)) = resource.get_attr("subnet_ids") {
             for id_val in ids {
                 if let Value::String(s) = id_val {
                     req = req.subnet_ids(s);
@@ -106,7 +106,7 @@ impl AwsProvider {
             }
         }
 
-        if let Some(Value::List(ids)) = resource.attributes.get("security_group_ids") {
+        if let Some(Value::List(ids)) = resource.get_attr("security_group_ids") {
             for id_val in ids {
                 if let Value::String(s) = id_val {
                     req = req.security_group_ids(s);
@@ -114,13 +114,13 @@ impl AwsProvider {
             }
         }
 
-        if let Some(Value::Bool(v)) = resource.attributes.get("private_dns_enabled") {
+        if let Some(Value::Bool(v)) = resource.get_attr("private_dns_enabled") {
             req = req.private_dns_enabled(*v);
         }
 
-        if let Some(Value::String(policy)) = resource.attributes.get("policy_document") {
+        if let Some(Value::String(policy)) = resource.get_attr("policy_document") {
             req = req.policy_document(policy);
-        } else if let Some(Value::Map(map)) = resource.attributes.get("policy_document") {
+        } else if let Some(Value::Map(map)) = resource.get_attr("policy_document") {
             // Convert Value::Map to JSON string for the API
             let json_str =
                 crate::services::iam::role::value_to_iam_policy_json(&Value::Map(map.clone()))
@@ -146,8 +146,13 @@ impl AwsProvider {
             })?;
 
         // Apply tags
-        self.apply_ec2_tags(&resource.id, endpoint_id, &resource.attributes, None)
-            .await?;
+        self.apply_ec2_tags(
+            &resource.id,
+            endpoint_id,
+            &resource.resolved_attributes(),
+            None,
+        )
+        .await?;
 
         // Read back
         self.read_ec2_vpc_endpoint(&resource.id, Some(endpoint_id))
@@ -170,7 +175,7 @@ impl AwsProvider {
         let mut has_modifications = false;
 
         // Update route_table_ids
-        if let Some(Value::List(new_ids)) = to.attributes.get("route_table_ids") {
+        if let Some(Value::List(new_ids)) = to.get_attr("route_table_ids") {
             let old_ids: Vec<String> =
                 if let Some(Value::List(old)) = from.attributes.get("route_table_ids") {
                     old.iter()
@@ -211,7 +216,7 @@ impl AwsProvider {
         }
 
         // Update subnet_ids
-        if let Some(Value::List(new_ids)) = to.attributes.get("subnet_ids") {
+        if let Some(Value::List(new_ids)) = to.get_attr("subnet_ids") {
             let old_ids: Vec<String> =
                 if let Some(Value::List(old)) = from.attributes.get("subnet_ids") {
                     old.iter()
@@ -252,7 +257,7 @@ impl AwsProvider {
         }
 
         // Update security_group_ids
-        if let Some(Value::List(new_ids)) = to.attributes.get("security_group_ids") {
+        if let Some(Value::List(new_ids)) = to.get_attr("security_group_ids") {
             let old_ids: Vec<String> =
                 if let Some(Value::List(old)) = from.attributes.get("security_group_ids") {
                     old.iter()
@@ -293,16 +298,16 @@ impl AwsProvider {
         }
 
         // Update private_dns_enabled
-        if let Some(Value::Bool(v)) = to.attributes.get("private_dns_enabled") {
+        if let Some(Value::Bool(v)) = to.get_attr("private_dns_enabled") {
             req = req.private_dns_enabled(*v);
             has_modifications = true;
         }
 
         // Update policy_document
-        if let Some(Value::String(policy)) = to.attributes.get("policy_document") {
+        if let Some(Value::String(policy)) = to.get_attr("policy_document") {
             req = req.policy_document(policy);
             has_modifications = true;
-        } else if let Some(Value::Map(map)) = to.attributes.get("policy_document") {
+        } else if let Some(Value::Map(map)) = to.get_attr("policy_document") {
             let json_str =
                 crate::services::iam::role::value_to_iam_policy_json(&Value::Map(map.clone()))
                     .map_err(|e| {
@@ -322,8 +327,13 @@ impl AwsProvider {
         }
 
         // Apply tags
-        self.apply_ec2_tags(&id, identifier, &to.attributes, Some(&from.attributes))
-            .await?;
+        self.apply_ec2_tags(
+            &id,
+            identifier,
+            &to.resolved_attributes(),
+            Some(&from.attributes),
+        )
+        .await?;
 
         self.read_ec2_vpc_endpoint(&id, Some(identifier)).await
     }

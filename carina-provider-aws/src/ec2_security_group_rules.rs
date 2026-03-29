@@ -99,7 +99,7 @@ impl AwsProvider {
         resource: Resource,
         is_ingress: bool,
     ) -> ProviderResult<State> {
-        let sg_id = match resource.attributes.get("group_id") {
+        let sg_id = match resource.get_attr("group_id") {
             Some(Value::String(s)) => s.clone(),
             _ => {
                 return Err(
@@ -109,32 +109,32 @@ impl AwsProvider {
             }
         };
 
-        let protocol = match resource.attributes.get("ip_protocol") {
+        let protocol = match resource.get_attr("ip_protocol") {
             Some(Value::String(s)) => convert_protocol_value(s),
             _ => "-1".to_string(),
         };
 
-        let from_port = match resource.attributes.get("from_port") {
+        let from_port = match resource.get_attr("from_port") {
             Some(Value::Int(n)) => *n as i32,
             _ => 0,
         };
 
-        let to_port = match resource.attributes.get("to_port") {
+        let to_port = match resource.get_attr("to_port") {
             Some(Value::Int(n)) => *n as i32,
             _ => 0,
         };
 
-        let cidr_ip = match resource.attributes.get("cidr_ip") {
+        let cidr_ip = match resource.get_attr("cidr_ip") {
             Some(Value::String(s)) => Some(s.clone()),
             _ => None,
         };
 
-        let cidr_ipv6 = match resource.attributes.get("cidr_ipv6") {
+        let cidr_ipv6 = match resource.get_attr("cidr_ipv6") {
             Some(Value::String(s)) => Some(s.clone()),
             _ => None,
         };
 
-        let description = match resource.attributes.get("description") {
+        let description = match resource.get_attr("description") {
             Some(Value::String(s)) => Some(s.clone()),
             _ => None,
         };
@@ -144,7 +144,7 @@ impl AwsProvider {
         } else {
             "destination_prefix_list_id"
         };
-        let prefix_list_id = match resource.attributes.get(prefix_list_attr) {
+        let prefix_list_id = match resource.get_attr(prefix_list_attr) {
             Some(Value::String(s)) => Some(s.clone()),
             _ => None,
         };
@@ -154,7 +154,7 @@ impl AwsProvider {
         } else {
             "destination_security_group_id"
         };
-        let ref_security_group_id = match resource.attributes.get(sg_ref_attr) {
+        let ref_security_group_id = match resource.get_attr(sg_ref_attr) {
             Some(Value::String(s)) => Some(s.clone()),
             _ => None,
         };

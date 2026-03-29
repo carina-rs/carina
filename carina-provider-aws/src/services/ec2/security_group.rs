@@ -62,7 +62,7 @@ impl AwsProvider {
         &self,
         resource: Resource,
     ) -> ProviderResult<State> {
-        let vpc_id = match resource.attributes.get("vpc_id") {
+        let vpc_id = match resource.get_attr("vpc_id") {
             Some(Value::String(s)) => s.clone(),
             _ => {
                 return Err(
@@ -71,13 +71,13 @@ impl AwsProvider {
             }
         };
 
-        let description = match resource.attributes.get("description") {
+        let description = match resource.get_attr("description") {
             Some(Value::String(s)) => s.clone(),
             _ => String::new(),
         };
 
         // group_name is required for CreateSecurityGroup API
-        let group_name = match resource.attributes.get("group_name") {
+        let group_name = match resource.get_attr("group_name") {
             Some(Value::String(s)) => s.clone(),
             _ => resource.id.name.clone(),
         };
@@ -103,7 +103,7 @@ impl AwsProvider {
         })?;
 
         // Apply tags
-        self.apply_ec2_tags(&resource.id, sg_id, &resource.attributes, None)
+        self.apply_ec2_tags(&resource.id, sg_id, &resource.resolved_attributes(), None)
             .await?;
 
         // Read back using security group ID (reliable identifier)

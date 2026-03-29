@@ -62,7 +62,7 @@ impl AwsProvider {
     pub(crate) async fn create_ec2_eip(&self, resource: Resource) -> ProviderResult<State> {
         let mut req = self.ec2_client.allocate_address();
 
-        if let Some(Value::String(domain)) = resource.attributes.get("domain") {
+        if let Some(Value::String(domain)) = resource.get_attr("domain") {
             use aws_sdk_ec2::types::DomainType;
             let domain_type = DomainType::from(extract_enum_value(domain));
             req = req.domain(domain_type);
@@ -83,8 +83,13 @@ impl AwsProvider {
         })?;
 
         // Apply tags
-        self.apply_ec2_tags(&resource.id, alloc_id, &resource.attributes, None)
-            .await?;
+        self.apply_ec2_tags(
+            &resource.id,
+            alloc_id,
+            &resource.resolved_attributes(),
+            None,
+        )
+        .await?;
 
         // Read back using allocation ID
         self.read_ec2_eip(&resource.id, Some(alloc_id)).await
@@ -98,8 +103,13 @@ impl AwsProvider {
         from: &State,
         to: Resource,
     ) -> ProviderResult<State> {
-        self.apply_ec2_tags(&id, identifier, &to.attributes, Some(&from.attributes))
-            .await?;
+        self.apply_ec2_tags(
+            &id,
+            identifier,
+            &to.resolved_attributes(),
+            Some(&from.attributes),
+        )
+        .await?;
         self.read_ec2_eip(&id, Some(identifier)).await
     }
 

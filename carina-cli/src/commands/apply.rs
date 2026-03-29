@@ -305,9 +305,10 @@ pub fn apply_name_overrides(resources: &mut [Resource], state_file: &Option<Stat
     for resource in resources.iter_mut() {
         if let Some(name_overrides) = overrides.get(&resource.id) {
             for (attr, value) in name_overrides {
-                resource
-                    .attributes
-                    .insert(attr.clone(), Value::String(value.clone()));
+                resource.attributes.insert(
+                    attr.clone(),
+                    carina_core::resource::Expr(Value::String(value.clone())),
+                );
             }
         }
     }
@@ -1063,7 +1064,11 @@ async fn run_apply_locked(
     let mut binding_map: HashMap<String, HashMap<String, Value>> = HashMap::new();
     for resource in &sorted_resources {
         if let Some(ref binding_name) = resource.binding {
-            let mut attrs = resource.attributes.clone();
+            let mut attrs: HashMap<String, Value> = resource
+                .attributes
+                .iter()
+                .map(|(k, e)| (k.clone(), e.0.clone()))
+                .collect();
             // Merge existing state if available
             if let Some(state) = current_states.get(&resource.id)
                 && state.exists
@@ -1499,7 +1504,11 @@ async fn run_apply_from_plan_locked(
     let mut binding_map: HashMap<String, HashMap<String, Value>> = HashMap::new();
     for resource in sorted_resources {
         if let Some(ref binding_name) = resource.binding {
-            let mut attrs = resource.attributes.clone();
+            let mut attrs: HashMap<String, Value> = resource
+                .attributes
+                .iter()
+                .map(|(k, e)| (k.clone(), e.0.clone()))
+                .collect();
             if let Some(state) = current_states.get(&resource.id)
                 && state.exists
             {
@@ -1597,11 +1606,11 @@ mod tests {
         schemas.insert("awscc.ec2.vpc".to_string(), schema);
 
         let mut resource = Resource::with_provider("awscc", "ec2.vpc", "my-vpc");
-        resource.attributes.insert(
+        resource.set_attr(
             "cidr_block".to_string(),
             Value::String("10.0.0.0/16".to_string()),
         );
-        resource.attributes.insert(
+        resource.set_attr(
             "ipv4_netmask_length".to_string(),
             Value::String("16".to_string()),
         );

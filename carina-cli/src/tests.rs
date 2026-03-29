@@ -317,7 +317,7 @@ fn plan_file_serde_round_trip() {
 #[test]
 fn test_resolve_attr_prefixes_extracts_prefix_and_generates_name() {
     let mut resource = Resource::with_provider("awscc", "s3.bucket", "test-bucket");
-    resource.attributes.insert(
+    resource.set_attr(
         "bucket_name_prefix".to_string(),
         Value::String("my-app-".to_string()),
     );
@@ -329,7 +329,7 @@ fn test_resolve_attr_prefixes_extracts_prefix_and_generates_name() {
     assert!(!resources[0].attributes.contains_key("bucket_name_prefix"));
 
     // bucket_name should be generated with the prefix
-    let bucket_name = match resources[0].attributes.get("bucket_name").unwrap() {
+    let bucket_name = match resources[0].get_attr("bucket_name").unwrap() {
         Value::String(s) => s.clone(),
         _ => panic!("expected String"),
     };
@@ -347,7 +347,7 @@ fn test_resolve_attr_prefixes_extracts_prefix_and_generates_name() {
 fn test_resolve_attr_prefixes_leaves_non_matching_prefix_alone() {
     // If base attr doesn't exist in schema, leave _prefix as-is
     let mut resource = Resource::with_provider("awscc", "s3.bucket", "test-bucket");
-    resource.attributes.insert(
+    resource.set_attr(
         "nonexistent_attr_prefix".to_string(),
         Value::String("some-value".to_string()),
     );
@@ -367,11 +367,11 @@ fn test_resolve_attr_prefixes_leaves_non_matching_prefix_alone() {
 #[test]
 fn test_resolve_attr_prefixes_errors_when_both_prefix_and_attr_specified() {
     let mut resource = Resource::with_provider("awscc", "s3.bucket", "test-bucket");
-    resource.attributes.insert(
+    resource.set_attr(
         "bucket_name_prefix".to_string(),
         Value::String("my-app-".to_string()),
     );
-    resource.attributes.insert(
+    resource.set_attr(
         "bucket_name".to_string(),
         Value::String("my-actual-bucket".to_string()),
     );
@@ -390,7 +390,7 @@ fn test_resolve_attr_prefixes_errors_when_both_prefix_and_attr_specified() {
 #[test]
 fn test_resolve_attr_prefixes_errors_on_empty_prefix() {
     let mut resource = Resource::with_provider("awscc", "s3.bucket", "test-bucket");
-    resource.attributes.insert(
+    resource.set_attr(
         "bucket_name_prefix".to_string(),
         Value::String("".to_string()),
     );
@@ -405,7 +405,7 @@ fn test_resolve_attr_prefixes_errors_on_empty_prefix() {
 fn test_resolve_names_handles_block_name_before_prefix() {
     // resolve_names should first resolve block names, then resolve attr prefixes
     let mut resource = Resource::with_provider("awscc", "ec2.ipam", "test-ipam");
-    resource.attributes.insert(
+    resource.set_attr(
         "operating_region".to_string(),
         Value::List(vec![Value::Map(
             vec![(
@@ -431,7 +431,7 @@ fn test_reconcile_prefixed_names_reuses_state_name_when_prefix_matches() {
     resource
         .prefixes
         .insert("bucket_name".to_string(), "my-app-".to_string());
-    resource.attributes.insert(
+    resource.set_attr(
         "bucket_name".to_string(),
         Value::String("my-app-temporary".to_string()),
     );
@@ -451,7 +451,7 @@ fn test_reconcile_prefixed_names_reuses_state_name_when_prefix_matches() {
 
     // Should reuse the state name, not the temporary one
     assert_eq!(
-        resources[0].attributes.get("bucket_name"),
+        resources[0].get_attr("bucket_name"),
         Some(&Value::String("my-app-existing1".to_string()))
     );
 }
@@ -462,7 +462,7 @@ fn test_reconcile_prefixed_names_generates_new_name_when_prefix_changes() {
     resource
         .prefixes
         .insert("bucket_name".to_string(), "new-prefix-".to_string());
-    resource.attributes.insert(
+    resource.set_attr(
         "bucket_name".to_string(),
         Value::String("new-prefix-abcd1234".to_string()),
     );
@@ -482,7 +482,7 @@ fn test_reconcile_prefixed_names_generates_new_name_when_prefix_changes() {
 
     // Should keep the newly generated name since prefix changed
     assert_eq!(
-        resources[0].attributes.get("bucket_name"),
+        resources[0].get_attr("bucket_name"),
         Some(&Value::String("new-prefix-abcd1234".to_string()))
     );
 }
@@ -493,7 +493,7 @@ fn test_reconcile_prefixed_names_keeps_generated_name_when_no_state() {
     resource
         .prefixes
         .insert("bucket_name".to_string(), "my-app-".to_string());
-    resource.attributes.insert(
+    resource.set_attr(
         "bucket_name".to_string(),
         Value::String("my-app-abcd1234".to_string()),
     );
@@ -503,7 +503,7 @@ fn test_reconcile_prefixed_names_keeps_generated_name_when_no_state() {
 
     // No state, so keep the generated name
     assert_eq!(
-        resources[0].attributes.get("bucket_name"),
+        resources[0].get_attr("bucket_name"),
         Some(&Value::String("my-app-abcd1234".to_string()))
     );
 }
@@ -550,13 +550,13 @@ fn make_awscc_provider(region_dsl: &str) -> ProviderConfig {
 fn test_anonymous_id_different_regions_produce_different_identifiers() {
     // Two anonymous ec2_vpc resources with same cidr_block but different provider regions
     let mut r1 = Resource::with_provider("awscc", "ec2.vpc", "");
-    r1.attributes.insert(
+    r1.set_attr(
         "cidr_block".to_string(),
         Value::String("10.0.0.0/16".to_string()),
     );
 
     let mut r2 = Resource::with_provider("awscc", "ec2.vpc", "");
-    r2.attributes.insert(
+    r2.set_attr(
         "cidr_block".to_string(),
         Value::String("10.0.0.0/16".to_string()),
     );
@@ -583,13 +583,13 @@ fn test_anonymous_id_different_regions_produce_different_identifiers() {
 fn test_anonymous_id_same_region_same_create_only_collides() {
     // Two anonymous ec2_vpc resources with same cidr_block and same provider region -> collision
     let mut r1 = Resource::with_provider("awscc", "ec2.vpc", "");
-    r1.attributes.insert(
+    r1.set_attr(
         "cidr_block".to_string(),
         Value::String("10.0.0.0/16".to_string()),
     );
 
     let mut r2 = Resource::with_provider("awscc", "ec2.vpc", "");
-    r2.attributes.insert(
+    r2.set_attr(
         "cidr_block".to_string(),
         Value::String("10.0.0.0/16".to_string()),
     );
@@ -605,13 +605,13 @@ fn test_anonymous_id_same_region_same_create_only_collides() {
 fn test_anonymous_id_different_create_only_same_region_no_collision() {
     // Two anonymous ec2_vpc resources with different cidr_block in same provider region -> no collision
     let mut r1 = Resource::with_provider("awscc", "ec2.vpc", "");
-    r1.attributes.insert(
+    r1.set_attr(
         "cidr_block".to_string(),
         Value::String("10.0.0.0/16".to_string()),
     );
 
     let mut r2 = Resource::with_provider("awscc", "ec2.vpc", "");
-    r2.attributes.insert(
+    r2.set_attr(
         "cidr_block".to_string(),
         Value::String("10.1.0.0/16".to_string()),
     );
@@ -629,7 +629,7 @@ fn test_anonymous_id_different_create_only_same_region_no_collision() {
 fn test_anonymous_id_named_resources_are_skipped() {
     // Named resources should not be processed by compute_anonymous_identifiers
     let mut r1 = Resource::with_provider("awscc", "ec2.vpc", "my_vpc");
-    r1.attributes.insert(
+    r1.set_attr(
         "cidr_block".to_string(),
         Value::String("10.0.0.0/16".to_string()),
     );
@@ -782,7 +782,7 @@ fn test_plan_verify_idempotency_anonymous_resource_with_prefix() {
     // --- First run (apply) ---
     // 1. Parse: anonymous resource with bucket_name_prefix
     let mut resource_run1 = Resource::with_provider("awscc", "s3.bucket", "");
-    resource_run1.attributes.insert(
+    resource_run1.set_attr(
         "bucket_name_prefix".to_string(),
         Value::String("my-app-".to_string()),
     );
@@ -798,7 +798,7 @@ fn test_plan_verify_idempotency_anonymous_resource_with_prefix() {
         resources_run1[0].prefixes.contains_key("bucket_name"),
         "bucket_name should be in prefixes"
     );
-    let run1_bucket_name = match resources_run1[0].attributes.get("bucket_name") {
+    let run1_bucket_name = match resources_run1[0].get_attr("bucket_name") {
         Some(Value::String(s)) => s.clone(),
         _ => panic!("bucket_name should be a string"),
     };
@@ -836,7 +836,7 @@ fn test_plan_verify_idempotency_anonymous_resource_with_prefix() {
     // --- Second run (plan-verify) ---
     // 1. Parse again: same anonymous resource with bucket_name_prefix
     let mut resource_run2 = Resource::with_provider("awscc", "s3.bucket", "");
-    resource_run2.attributes.insert(
+    resource_run2.set_attr(
         "bucket_name_prefix".to_string(),
         Value::String("my-app-".to_string()),
     );
@@ -859,7 +859,7 @@ fn test_plan_verify_idempotency_anonymous_resource_with_prefix() {
     // 4. reconcile_prefixed_names - should restore original bucket_name from state
     reconcile_prefixed_names(&mut resources_run2, &Some(state_file.clone()));
 
-    let reconciled_bucket_name = match resources_run2[0].attributes.get("bucket_name") {
+    let reconciled_bucket_name = match resources_run2[0].get_attr("bucket_name") {
         Some(Value::String(s)) => s.clone(),
         _ => panic!("bucket_name should be a string after reconciliation"),
     };
@@ -885,15 +885,15 @@ fn test_plan_verify_idempotency_iam_role_with_prefix_and_path() {
 
     // --- First run ---
     let mut resource_run1 = Resource::with_provider("awscc", "iam.role", "");
-    resource_run1.attributes.insert(
+    resource_run1.set_attr(
         "role_name_prefix".to_string(),
         Value::String("carina-acc-test-".to_string()),
     );
-    resource_run1.attributes.insert(
+    resource_run1.set_attr(
         "path".to_string(),
         Value::String("/carina/acceptance-test/".to_string()),
     );
-    resource_run1.attributes.insert(
+    resource_run1.set_attr(
         "assume_role_policy_document".to_string(),
         Value::Map(
             vec![(
@@ -911,7 +911,7 @@ fn test_plan_verify_idempotency_iam_role_with_prefix_and_path() {
     let run1_name = resources_run1[0].id.name.clone();
 
     // Simulate state after apply
-    let run1_role_name = match resources_run1[0].attributes.get("role_name") {
+    let run1_role_name = match resources_run1[0].get_attr("role_name") {
         Some(Value::String(s)) => s.clone(),
         _ => panic!("role_name should be set after prefix resolution"),
     };
@@ -939,15 +939,15 @@ fn test_plan_verify_idempotency_iam_role_with_prefix_and_path() {
 
     // --- Second run ---
     let mut resource_run2 = Resource::with_provider("awscc", "iam.role", "");
-    resource_run2.attributes.insert(
+    resource_run2.set_attr(
         "role_name_prefix".to_string(),
         Value::String("carina-acc-test-".to_string()),
     );
-    resource_run2.attributes.insert(
+    resource_run2.set_attr(
         "path".to_string(),
         Value::String("/carina/acceptance-test/".to_string()),
     );
-    resource_run2.attributes.insert(
+    resource_run2.set_attr(
         "assume_role_policy_document".to_string(),
         Value::Map(
             vec![(
@@ -987,7 +987,7 @@ fn test_plan_verify_idempotency_anonymous_flow_log_with_resource_refs() {
 
     // --- First run ---
     let mut resource_run1 = Resource::with_provider("awscc", "ec2.flow_log", "");
-    resource_run1.attributes.insert(
+    resource_run1.set_attr(
         "resource_id".to_string(),
         Value::ResourceRef {
             binding_name: "vpc".to_string(),
@@ -995,18 +995,16 @@ fn test_plan_verify_idempotency_anonymous_flow_log_with_resource_refs() {
             field_path: vec![],
         },
     );
-    resource_run1.attributes.insert(
+    resource_run1.set_attr(
         "resource_type".to_string(),
         Value::String("VPC".to_string()),
     );
-    resource_run1
-        .attributes
-        .insert("traffic_type".to_string(), Value::String("ALL".to_string()));
-    resource_run1.attributes.insert(
+    resource_run1.set_attr("traffic_type".to_string(), Value::String("ALL".to_string()));
+    resource_run1.set_attr(
         "log_destination_type".to_string(),
         Value::String("s3".to_string()),
     );
-    resource_run1.attributes.insert(
+    resource_run1.set_attr(
         "log_destination".to_string(),
         Value::ResourceRef {
             binding_name: "bucket".to_string(),
@@ -1014,7 +1012,7 @@ fn test_plan_verify_idempotency_anonymous_flow_log_with_resource_refs() {
             field_path: vec![],
         },
     );
-    resource_run1.attributes.insert(
+    resource_run1.set_attr(
         "destination_options".to_string(),
         Value::Map(
             vec![
@@ -1045,7 +1043,7 @@ fn test_plan_verify_idempotency_anonymous_flow_log_with_resource_refs() {
 
     // --- Second run ---
     let mut resource_run2 = Resource::with_provider("awscc", "ec2.flow_log", "");
-    resource_run2.attributes.insert(
+    resource_run2.set_attr(
         "resource_id".to_string(),
         Value::ResourceRef {
             binding_name: "vpc".to_string(),
@@ -1053,18 +1051,16 @@ fn test_plan_verify_idempotency_anonymous_flow_log_with_resource_refs() {
             field_path: vec![],
         },
     );
-    resource_run2.attributes.insert(
+    resource_run2.set_attr(
         "resource_type".to_string(),
         Value::String("VPC".to_string()),
     );
-    resource_run2
-        .attributes
-        .insert("traffic_type".to_string(), Value::String("ALL".to_string()));
-    resource_run2.attributes.insert(
+    resource_run2.set_attr("traffic_type".to_string(), Value::String("ALL".to_string()));
+    resource_run2.set_attr(
         "log_destination_type".to_string(),
         Value::String("s3".to_string()),
     );
-    resource_run2.attributes.insert(
+    resource_run2.set_attr(
         "log_destination".to_string(),
         Value::ResourceRef {
             binding_name: "bucket".to_string(),
@@ -1072,7 +1068,7 @@ fn test_plan_verify_idempotency_anonymous_flow_log_with_resource_refs() {
             field_path: vec![],
         },
     );
-    resource_run2.attributes.insert(
+    resource_run2.set_attr(
         "destination_options".to_string(),
         Value::Map(
             vec![
@@ -1558,8 +1554,15 @@ impl Provider for RecordingProvider {
         // Return a state with a new identifier to simulate resource creation
         let mut attrs = resource.attributes.clone();
         // Simulate AWS returning a new ID
-        attrs.insert("vpc_id".to_string(), Value::String("vpc-NEW".to_string()));
-        let state = State::existing(resource.id.clone(), attrs).with_identifier("vpc-NEW");
+        attrs.insert(
+            "vpc_id".to_string(),
+            carina_core::resource::Expr(Value::String("vpc-NEW".to_string())),
+        );
+        let state = State::existing(
+            resource.id.clone(),
+            carina_core::resource::Expr::resolve_map(&attrs),
+        )
+        .with_identifier("vpc-NEW");
         Box::pin(async move { Ok(state) })
     }
 
@@ -1575,7 +1578,7 @@ impl Provider for RecordingProvider {
             .unwrap()
             .push((id.to_string(), to.clone()));
         let state =
-            State::existing(id.clone(), to.attributes.clone()).with_identifier("subnet-123");
+            State::existing(id.clone(), to.resolved_attributes()).with_identifier("subnet-123");
         Box::pin(async move { Ok(state) })
     }
 
@@ -1607,7 +1610,7 @@ impl Provider for RenameFailProvider {
     }
 
     fn create(&self, resource: &Resource) -> BoxFuture<'_, ProviderResult<State>> {
-        let state = State::existing(resource.id.clone(), resource.attributes.clone())
+        let state = State::existing(resource.id.clone(), resource.resolved_attributes())
             .with_identifier("temp-name-abc");
         Box::pin(async move { Ok(state) })
     }
@@ -2162,11 +2165,11 @@ fn refresh_false_uses_cached_state_from_state_file() {
     );
 
     let mut resource = Resource::with_provider("awscc", "s3.bucket", "my-bucket");
-    resource.attributes.insert(
+    resource.set_attr(
         "bucket_name".to_string(),
         Value::String("my-bucket".to_string()),
     );
-    resource.attributes.insert(
+    resource.set_attr(
         "region".to_string(),
         Value::String("ap-northeast-1".to_string()),
     );
@@ -2276,7 +2279,7 @@ fn refresh_false_without_state_file_treats_resources_as_new() {
     use carina_core::differ::create_plan;
 
     let mut resource = Resource::with_provider("awscc", "s3.bucket", "new-bucket");
-    resource.attributes.insert(
+    resource.set_attr(
         "bucket_name".to_string(),
         Value::String("new-bucket".to_string()),
     );
@@ -2398,13 +2401,11 @@ fn build_state_after_apply_persists_write_only_attributes() {
 
     // Set up a resource with a write-only attribute (ipv4_netmask_length)
     let mut resource = Resource::with_provider("awscc", "ec2.vpc", "my-vpc");
-    resource.attributes.insert(
+    resource.set_attr(
         "cidr_block".to_string(),
         Value::String("10.0.0.0/16".to_string()),
     );
-    resource
-        .attributes
-        .insert("ipv4_netmask_length".to_string(), Value::Int(16));
+    resource.set_attr("ipv4_netmask_length".to_string(), Value::Int(16));
 
     let id = resource.id.clone();
 
@@ -2474,13 +2475,11 @@ fn build_state_after_apply_write_only_detects_value_change() {
 
     // Simulate: user changed ipv4_netmask_length from 16 to 24
     let mut resource = Resource::with_provider("awscc", "ec2.vpc", "my-vpc");
-    resource.attributes.insert(
+    resource.set_attr(
         "cidr_block".to_string(),
         Value::String("10.0.0.0/24".to_string()),
     );
-    resource
-        .attributes
-        .insert("ipv4_netmask_length".to_string(), Value::Int(24));
+    resource.set_attr("ipv4_netmask_length".to_string(), Value::Int(24));
 
     let id = resource.id.clone();
 

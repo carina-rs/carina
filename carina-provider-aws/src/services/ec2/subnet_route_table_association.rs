@@ -77,7 +77,7 @@ impl AwsProvider {
         &self,
         resource: Resource,
     ) -> ProviderResult<State> {
-        let route_table_id = match resource.attributes.get("route_table_id") {
+        let route_table_id = match resource.get_attr("route_table_id") {
             Some(Value::String(s)) => s.clone(),
             _ => {
                 return Err(ProviderError::new("route_table_id is required")
@@ -85,7 +85,7 @@ impl AwsProvider {
             }
         };
 
-        let subnet_id = match resource.attributes.get("subnet_id") {
+        let subnet_id = match resource.get_attr("subnet_id") {
             Some(Value::String(s)) => s.clone(),
             _ => {
                 return Err(
@@ -134,7 +134,7 @@ impl AwsProvider {
             .for_resource(id.clone()));
         };
 
-        let route_table_id = match to.attributes.get("route_table_id") {
+        let route_table_id = match to.get_attr("route_table_id") {
             Some(Value::String(s)) => s.clone(),
             _ => {
                 return Err(

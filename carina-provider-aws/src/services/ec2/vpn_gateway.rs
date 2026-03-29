@@ -64,7 +64,7 @@ impl AwsProvider {
 
     /// Create an EC2 VPN Gateway
     pub(crate) async fn create_ec2_vpn_gateway(&self, resource: Resource) -> ProviderResult<State> {
-        let gw_type = match resource.attributes.get("type") {
+        let gw_type = match resource.get_attr("type") {
             Some(Value::String(s)) => extract_enum_value_with_values(s, &["ipsec.1"]).to_string(),
             _ => {
                 return Err(
@@ -78,7 +78,7 @@ impl AwsProvider {
             .create_vpn_gateway()
             .r#type(aws_sdk_ec2::types::GatewayType::from(gw_type.as_str()));
 
-        if let Some(Value::Int(asn)) = resource.attributes.get("amazon_side_asn") {
+        if let Some(Value::Int(asn)) = resource.get_attr("amazon_side_asn") {
             req = req.amazon_side_asn(*asn);
         }
 
@@ -97,7 +97,7 @@ impl AwsProvider {
             })?;
 
         // Apply tags
-        self.apply_ec2_tags(&resource.id, vgw_id, &resource.attributes, None)
+        self.apply_ec2_tags(&resource.id, vgw_id, &resource.resolved_attributes(), None)
             .await?;
 
         // Read back
@@ -112,8 +112,13 @@ impl AwsProvider {
         from: &State,
         to: Resource,
     ) -> ProviderResult<State> {
-        self.apply_ec2_tags(&id, identifier, &to.attributes, Some(&from.attributes))
-            .await?;
+        self.apply_ec2_tags(
+            &id,
+            identifier,
+            &to.resolved_attributes(),
+            Some(&from.attributes),
+        )
+        .await?;
         self.read_ec2_vpn_gateway(&id, Some(identifier)).await
     }
 

@@ -47,7 +47,7 @@ pub(crate) fn build_update_patches(
             continue;
         }
         if let Some(aws_name) = &attr_schema.provider_name
-            && let Some(value) = to.attributes.get(dsl_name.as_str())
+            && let Some(value) = to.get_attr(dsl_name.as_str())
             && let Some(aws_value) =
                 dsl_value_to_aws(value, &attr_schema.attr_type, resource_type, dsl_name)
         {
@@ -94,7 +94,7 @@ pub(crate) fn build_update_patches(
 
     // Handle tags
     if config.has_tags {
-        if let Some(Value::Map(user_tags)) = to.attributes.get("tags") {
+        if let Some(Value::Map(user_tags)) = to.get_attr("tags") {
             // Skip if tags are unchanged from the current state
             let tags_unchanged = matches!(from.attributes.get("tags"), Some(Value::Map(from_tags)) if from_tags == user_tags);
             if !tags_unchanged {
@@ -178,7 +178,7 @@ mod tests {
         let from = State::existing(id.clone(), from_attrs);
 
         let mut to = Resource::new("ec2.vpc", "test");
-        to.attributes.insert(
+        to.set_attr(
             "cidr_block".to_string(),
             Value::String("10.0.0.0/16".to_string()),
         );
@@ -212,7 +212,7 @@ mod tests {
         let from = State::existing(id.clone(), from_attrs);
 
         let mut to = Resource::new("ec2.vpc", "test");
-        to.attributes.insert(
+        to.set_attr(
             "cidr_block".to_string(),
             Value::String("10.0.0.0/16".to_string()),
         );
@@ -274,11 +274,11 @@ mod tests {
         let from = State::existing(id.clone(), from_attrs);
 
         let mut to = Resource::new("ec2.vpc", "test");
-        to.attributes.insert(
+        to.set_attr(
             "cidr_block".to_string(),
             Value::String("10.0.0.0/16".to_string()),
         );
-        to.attributes.insert(
+        to.set_attr(
             "instance_tenancy".to_string(),
             Value::String("awscc.ec2.vpc.InstanceTenancy.dedicated".to_string()),
         );
@@ -312,11 +312,11 @@ mod tests {
         let from = State::existing(id.clone(), from_attrs);
 
         let mut to = Resource::new("ec2.vpc", "test");
-        to.attributes.insert(
+        to.set_attr(
             "cidr_block".to_string(),
             Value::String("10.0.0.0/16".to_string()),
         );
-        to.attributes.insert(
+        to.set_attr(
             "instance_tenancy".to_string(),
             Value::String("awscc.ec2.vpc.InstanceTenancy.dedicated".to_string()),
         );
@@ -357,7 +357,7 @@ mod tests {
         let from = State::existing(id.clone(), from_attrs);
 
         let mut to = Resource::new("ec2.vpc", "test");
-        to.attributes.insert(
+        to.set_attr(
             "cidr_block".to_string(),
             Value::String("10.0.0.0/16".to_string()),
         );
@@ -387,11 +387,11 @@ mod tests {
         let from = State::existing(id.clone(), from_attrs);
 
         let mut to = Resource::new("ec2.vpc", "test");
-        to.attributes.insert(
+        to.set_attr(
             "cidr_block".to_string(),
             Value::String("10.0.0.0/16".to_string()),
         );
-        to.attributes.insert("tags".to_string(), Value::Map(tags));
+        to.set_attr("tags".to_string(), Value::Map(tags));
 
         let patches = build_update_patches(config, &from, &to);
 
@@ -422,11 +422,11 @@ mod tests {
         let from = State::existing(id.clone(), from_attrs);
 
         let mut to = Resource::new("ec2.vpc", "test");
-        to.attributes.insert(
+        to.set_attr(
             "cidr_block".to_string(),
             Value::String("10.0.0.0/16".to_string()),
         );
-        to.attributes.insert(
+        to.set_attr(
             "instance_tenancy".to_string(),
             Value::String("awscc.ec2.vpc.InstanceTenancy.dedicated".to_string()),
         );
@@ -464,9 +464,8 @@ mod tests {
         let from = State::existing(id.clone(), from_attrs);
 
         let mut to = Resource::new("logs.log_group", "test");
-        to.attributes
-            .insert("retention_in_days".to_string(), Value::Int(14));
-        to.attributes.insert(
+        to.set_attr("retention_in_days".to_string(), Value::Int(14));
+        to.set_attr(
             "log_group_name".to_string(),
             Value::String("/carina/test-group".to_string()),
         );
@@ -517,9 +516,8 @@ mod tests {
         let from = State::existing(id.clone(), from_attrs);
 
         let mut to = Resource::new("logs.log_group", "test");
-        to.attributes
-            .insert("retention_in_days".to_string(), Value::Int(14));
-        to.attributes.insert(
+        to.set_attr("retention_in_days".to_string(), Value::Int(14));
+        to.set_attr(
             "log_group_name".to_string(),
             Value::String("/carina/test-group".to_string()),
         );
@@ -577,13 +575,12 @@ mod tests {
 
         // User only specifies policy_document change, no dns_options
         let mut to = Resource::new("ec2.vpc_endpoint", "test");
-        to.attributes
-            .insert("vpc_id".to_string(), Value::String("vpc-123".to_string()));
-        to.attributes.insert(
+        to.set_attr("vpc_id".to_string(), Value::String("vpc-123".to_string()));
+        to.set_attr(
             "service_name".to_string(),
             Value::String("com.amazonaws.ap-northeast-1.s3".to_string()),
         );
-        to.attributes.insert(
+        to.set_attr(
             "policy_document".to_string(),
             Value::String("{\"Version\":\"2012-10-17\",\"Statement\":[]}".to_string()),
         );

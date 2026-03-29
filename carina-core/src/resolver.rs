@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 
 use crate::deps::get_resource_dependencies;
-use crate::resource::{InterpolationPart, Resource, ResourceId, State, Value};
+use crate::resource::{Expr, InterpolationPart, Resource, ResourceId, State, Value};
 
 /// Resolve all ResourceRef values in resources using current state.
 ///
@@ -32,11 +32,16 @@ pub fn resolve_refs_with_state(
     }
 
     // Build a map of binding_name -> attributes (merged from DSL and AWS state)
+    // Extract Value from Expr for the binding map since resolve_ref_value works with Value
     let mut binding_map: HashMap<String, HashMap<String, Value>> = HashMap::new();
 
     for resource in resources.iter() {
         if let Some(ref binding_name) = resource.binding {
-            let mut attrs = resource.attributes.clone();
+            let mut attrs: HashMap<String, Value> = resource
+                .attributes
+                .iter()
+                .map(|(k, e)| (k.clone(), e.0.clone()))
+                .collect();
 
             // Merge AWS state attributes (like `id`) if available
             if let Some(state) = current_states.get(&resource.id)
@@ -56,8 +61,8 @@ pub fn resolve_refs_with_state(
     // Resolve ResourceRef values in all resources
     for resource in resources.iter_mut() {
         let mut resolved_attrs = HashMap::new();
-        for (key, value) in &resource.attributes {
-            resolved_attrs.insert(key.clone(), resolve_ref_value(value, &binding_map)?);
+        for (key, expr) in &resource.attributes {
+            resolved_attrs.insert(key.clone(), Expr(resolve_ref_value(&expr.0, &binding_map)?));
         }
         resource.attributes = resolved_attrs;
     }
@@ -223,7 +228,10 @@ mod tests {
         let attributes: HashMap<String, Value> =
             attrs.into_iter().map(|(k, v)| (k.to_string(), v)).collect();
         let mut r = Resource::new("test.resource", name);
-        r.attributes = attributes;
+        r.attributes = attributes
+            .into_iter()
+            .map(|(k, v)| (k, crate::resource::Expr(v)))
+            .collect();
         r.binding = binding.map(|b| b.to_string());
         r
     }
@@ -412,7 +420,7 @@ mod tests {
 
         // The subnet's vpc_id should be resolved from state
         assert_eq!(
-            resources[1].attributes.get("vpc_id"),
+            resources[1].get_attr("vpc_id"),
             Some(&Value::String("vpc-abc".to_string()))
         );
     }

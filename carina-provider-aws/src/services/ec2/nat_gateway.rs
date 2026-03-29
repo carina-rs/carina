@@ -67,7 +67,7 @@ impl AwsProvider {
 
     /// Create an EC2 NAT Gateway
     pub(crate) async fn create_ec2_nat_gateway(&self, resource: Resource) -> ProviderResult<State> {
-        let subnet_id = match resource.attributes.get("subnet_id") {
+        let subnet_id = match resource.get_attr("subnet_id") {
             Some(Value::String(s)) => s.clone(),
             _ => {
                 return Err(
@@ -78,11 +78,11 @@ impl AwsProvider {
 
         let mut req = self.ec2_client.create_nat_gateway().subnet_id(&subnet_id);
 
-        if let Some(Value::String(alloc_id)) = resource.attributes.get("allocation_id") {
+        if let Some(Value::String(alloc_id)) = resource.get_attr("allocation_id") {
             req = req.allocation_id(alloc_id);
         }
 
-        if let Some(Value::String(conn_type)) = resource.attributes.get("connectivity_type") {
+        if let Some(Value::String(conn_type)) = resource.get_attr("connectivity_type") {
             use aws_sdk_ec2::types::ConnectivityType;
             let ct = ConnectivityType::from(extract_enum_value(conn_type));
             req = req.connectivity_type(ct);
@@ -103,7 +103,7 @@ impl AwsProvider {
             })?;
 
         // Apply tags
-        self.apply_ec2_tags(&resource.id, ngw_id, &resource.attributes, None)
+        self.apply_ec2_tags(&resource.id, ngw_id, &resource.resolved_attributes(), None)
             .await?;
 
         // Wait for NAT gateway to become available
@@ -122,8 +122,13 @@ impl AwsProvider {
         from: &State,
         to: Resource,
     ) -> ProviderResult<State> {
-        self.apply_ec2_tags(&id, identifier, &to.attributes, Some(&from.attributes))
-            .await?;
+        self.apply_ec2_tags(
+            &id,
+            identifier,
+            &to.resolved_attributes(),
+            Some(&from.attributes),
+        )
+        .await?;
         self.read_ec2_nat_gateway(&id, Some(identifier)).await
     }
 

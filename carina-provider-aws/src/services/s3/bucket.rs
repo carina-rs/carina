@@ -73,7 +73,7 @@ impl AwsProvider {
 
     /// Create an S3 bucket
     pub(crate) async fn create_s3_bucket(&self, resource: Resource) -> ProviderResult<State> {
-        let bucket_name = match resource.attributes.get("bucket") {
+        let bucket_name = match resource.get_attr("bucket") {
             Some(Value::String(s)) => s.clone(),
             _ => {
                 return Err(
@@ -83,7 +83,7 @@ impl AwsProvider {
         };
 
         // Get region (use Provider's region if not specified)
-        let region = match resource.attributes.get("region") {
+        let region = match resource.get_attr("region") {
             Some(Value::String(s)) => {
                 // Convert from aws.Region.ap_northeast_1 format to ap-northeast-1 format
                 convert_enum_value(s)
@@ -105,36 +105,36 @@ impl AwsProvider {
         }
 
         // Set ObjectLockEnabledForBucket on create
-        if let Some(Value::Bool(val)) = resource.attributes.get("object_lock_enabled_for_bucket") {
+        if let Some(Value::Bool(val)) = resource.get_attr("object_lock_enabled_for_bucket") {
             req = req.object_lock_enabled_for_bucket(*val);
         }
 
         // Set ObjectOwnership on create
-        if let Some(Value::String(val)) = resource.attributes.get("object_ownership") {
+        if let Some(Value::String(val)) = resource.get_attr("object_ownership") {
             use aws_sdk_s3::types::ObjectOwnership;
             let normalized = extract_enum_value(val);
             req = req.object_ownership(ObjectOwnership::from(normalized));
         }
 
         // Set ACL on create (convert_enum_value converts underscores back to hyphens)
-        if let Some(Value::String(val)) = resource.attributes.get("acl") {
+        if let Some(Value::String(val)) = resource.get_attr("acl") {
             use aws_sdk_s3::types::BucketCannedAcl;
             let normalized = convert_enum_value(val);
             req = req.acl(BucketCannedAcl::from(normalized.as_str()));
         }
-        if let Some(Value::String(val)) = resource.attributes.get("grant_full_control") {
+        if let Some(Value::String(val)) = resource.get_attr("grant_full_control") {
             req = req.grant_full_control(val);
         }
-        if let Some(Value::String(val)) = resource.attributes.get("grant_read") {
+        if let Some(Value::String(val)) = resource.get_attr("grant_read") {
             req = req.grant_read(val);
         }
-        if let Some(Value::String(val)) = resource.attributes.get("grant_read_acp") {
+        if let Some(Value::String(val)) = resource.get_attr("grant_read_acp") {
             req = req.grant_read_acp(val);
         }
-        if let Some(Value::String(val)) = resource.attributes.get("grant_write") {
+        if let Some(Value::String(val)) = resource.get_attr("grant_write") {
             req = req.grant_write(val);
         }
-        if let Some(Value::String(val)) = resource.attributes.get("grant_write_acp") {
+        if let Some(Value::String(val)) = resource.get_attr("grant_write_acp") {
             req = req.grant_write_acp(val);
         }
 
@@ -145,11 +145,15 @@ impl AwsProvider {
         })?;
 
         // Configure versioning
-        self.write_s3_bucket_versioning(&resource.id, &bucket_name, &resource.attributes)
-            .await?;
+        self.write_s3_bucket_versioning(
+            &resource.id,
+            &bucket_name,
+            &resource.resolved_attributes(),
+        )
+        .await?;
 
         // Set tags
-        self.write_s3_bucket_tags(&resource.id, &bucket_name, &resource.attributes)
+        self.write_s3_bucket_tags(&resource.id, &bucket_name, &resource.resolved_attributes())
             .await?;
 
         // Return state after creation
@@ -167,15 +171,15 @@ impl AwsProvider {
         let bucket_name = identifier.to_string();
 
         // Update versioning status
-        self.write_s3_bucket_versioning(&id, &bucket_name, &to.attributes)
+        self.write_s3_bucket_versioning(&id, &bucket_name, &to.resolved_attributes())
             .await?;
 
         // Update object ownership
-        self.write_s3_bucket_ownership_controls(&id, &bucket_name, &to.attributes)
+        self.write_s3_bucket_ownership_controls(&id, &bucket_name, &to.resolved_attributes())
             .await?;
 
         // Update ACL
-        self.write_s3_bucket_acl(&id, &bucket_name, &to.attributes)
+        self.write_s3_bucket_acl(&id, &bucket_name, &to.resolved_attributes())
             .await?;
 
         // Update tags: if tags were removed entirely, delete all tags
@@ -191,7 +195,7 @@ impl AwsProvider {
                         .for_resource(id.clone())
                 })?;
         } else {
-            self.write_s3_bucket_tags(&id, &bucket_name, &to.attributes)
+            self.write_s3_bucket_tags(&id, &bucket_name, &to.resolved_attributes())
                 .await?;
         }
 

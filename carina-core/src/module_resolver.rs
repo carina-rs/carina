@@ -11,7 +11,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::parser::{ImportStatement, ModuleCall, ParseError, ParsedFile, ProviderContext};
-use crate::resource::{LifecycleConfig, Resource, ResourceId, ResourceKind, Value};
+use crate::resource::{Expr, LifecycleConfig, Resource, ResourceId, ResourceKind, Value};
 
 /// Module resolution error
 #[derive(Debug, thiserror::Error)]
@@ -369,11 +369,11 @@ impl<'cfg> ModuleResolver<'cfg> {
             // coincidentally share a binding name with a module-internal binding)
             // are not incorrectly prefixed.
             let mut substituted_attrs = HashMap::new();
-            for (key, value) in &new_resource.attributes {
+            for (key, expr) in &new_resource.attributes {
                 let rewritten =
-                    rewrite_intra_module_refs(value, instance_prefix, &intra_module_bindings);
+                    rewrite_intra_module_refs(&expr.0, instance_prefix, &intra_module_bindings);
                 let substituted = substitute_arguments(&rewritten, &argument_values);
-                substituted_attrs.insert(key.clone(), substituted);
+                substituted_attrs.insert(key.clone(), Expr(substituted));
             }
             new_resource.attributes = substituted_attrs;
 
@@ -384,7 +384,7 @@ impl<'cfg> ModuleResolver<'cfg> {
         if !module.attribute_params.is_empty()
             && let Some(binding_name) = &call.binding_name
         {
-            let mut virtual_attrs: HashMap<String, Value> = HashMap::new();
+            let mut virtual_attrs: HashMap<String, Expr> = HashMap::new();
 
             // Copy attribute values from the module definition
             for attr_param in &module.attribute_params {
@@ -393,7 +393,7 @@ impl<'cfg> ModuleResolver<'cfg> {
                     let rewritten =
                         rewrite_intra_module_refs(value, instance_prefix, &intra_module_bindings);
                     let substituted = substitute_arguments(&rewritten, &argument_values);
-                    virtual_attrs.insert(attr_param.name.clone(), substituted);
+                    virtual_attrs.insert(attr_param.name.clone(), Expr(substituted));
                 }
             }
 
@@ -729,7 +729,7 @@ mod tests {
                         "_type".to_string(),
                         Value::String("aws.security_group".to_string()),
                     );
-                    attrs
+                    attrs.into_iter().map(|(k, v)| (k, Expr(v))).collect()
                 },
                 kind: ResourceKind::Real,
                 lifecycle: LifecycleConfig::default(),
@@ -828,7 +828,7 @@ mod tests {
         let sg = &expanded[0];
         assert_eq!(sg.id.name, "my_instance.sg");
         assert_eq!(
-            sg.attributes.get("vpc_id"),
+            sg.get_attr("vpc_id"),
             Some(&Value::String("vpc-456".to_string()))
         );
         assert_eq!(
@@ -860,7 +860,7 @@ mod tests {
                                 field_path: vec![],
                             },
                         );
-                        attrs
+                        attrs.into_iter().map(|(k, v)| (k, Expr(v))).collect()
                     },
                     kind: ResourceKind::Real,
                     lifecycle: LifecycleConfig::default(),
@@ -881,7 +881,7 @@ mod tests {
                                 field_path: vec![],
                             },
                         );
-                        attrs
+                        attrs.into_iter().map(|(k, v)| (k, Expr(v))).collect()
                     },
                     kind: ResourceKind::Real,
                     lifecycle: LifecycleConfig::default(),
@@ -962,7 +962,7 @@ mod tests {
 
         // Intra-module ResourceRef must point to the dot-path binding
         assert_eq!(
-            expanded_a[1].attributes.get("vpc_id"),
+            expanded_a[1].get_attr("vpc_id"),
             Some(&Value::ResourceRef {
                 binding_name: "prod.vpc".to_string(),
                 attribute_name: "id".to_string(),
@@ -971,7 +971,7 @@ mod tests {
             "Instance A subnet should reference prod.vpc, not bare vpc"
         );
         assert_eq!(
-            expanded_b[1].attributes.get("vpc_id"),
+            expanded_b[1].get_attr("vpc_id"),
             Some(&Value::ResourceRef {
                 binding_name: "staging.vpc".to_string(),
                 attribute_name: "id".to_string(),
@@ -1000,7 +1000,7 @@ mod tests {
                         "_type".to_string(),
                         Value::String("aws.security_group".to_string()),
                     );
-                    attrs
+                    attrs.into_iter().map(|(k, v)| (k, Expr(v))).collect()
                 },
                 kind: ResourceKind::Real,
                 lifecycle: LifecycleConfig::default(),
@@ -1067,7 +1067,7 @@ mod tests {
         // The security_group attribute should be a rewritten ResourceRef
         // pointing to the dot-path binding (web.sg)
         assert_eq!(
-            virtual_res.attributes.get("security_group"),
+            virtual_res.get_attr("security_group"),
             Some(&Value::ResourceRef {
                 binding_name: "web.sg".to_string(),
                 attribute_name: "id".to_string(),
@@ -1175,7 +1175,7 @@ mod tests {
 
         // Intra-module ResourceRef should use dot notation
         assert_eq!(
-            expanded[1].attributes.get("vpc_id"),
+            expanded[1].get_attr("vpc_id"),
             Some(&Value::ResourceRef {
                 binding_name: "prod.vpc".to_string(),
                 attribute_name: "id".to_string(),
@@ -1208,7 +1208,7 @@ mod tests {
 
         // The security_group attribute should reference dot-notation binding
         assert_eq!(
-            virtual_res.attributes.get("security_group"),
+            virtual_res.get_attr("security_group"),
             Some(&Value::ResourceRef {
                 binding_name: "web.sg".to_string(),
                 attribute_name: "id".to_string(),
@@ -1349,7 +1349,7 @@ mod tests {
                             field_path: vec![],
                         },
                     );
-                    attrs
+                    attrs.into_iter().map(|(k, v)| (k, Expr(v))).collect()
                 },
                 kind: ResourceKind::Real,
                 lifecycle: LifecycleConfig::default(),
@@ -1414,17 +1414,14 @@ mod tests {
 
         // Simple argument substitution should work
         assert_eq!(
-            vpc.attributes.get("cidr_block"),
+            vpc.get_attr("cidr_block"),
             Some(&Value::String("10.0.0.0/16".to_string()))
         );
-        assert_eq!(
-            vpc.attributes.get("env"),
-            Some(&Value::String("dev".to_string()))
-        );
+        assert_eq!(vpc.get_attr("env"), Some(&Value::String("dev".to_string())));
 
         // Interpolation with argument should have the argument value substituted
         assert_eq!(
-            vpc.attributes.get("name"),
+            vpc.get_attr("name"),
             Some(&Value::Interpolation(vec![
                 InterpolationPart::Literal("test-".to_string()),
                 InterpolationPart::Expr(Value::String("dev".to_string())),
@@ -1448,7 +1445,7 @@ mod tests {
             .resources
             .iter()
             .filter_map(|r| {
-                r.attributes.get("_type").and_then(|v| match v {
+                r.get_attr("_type").and_then(|v| match v {
                     Value::String(s) => Some(s.as_str()),
                     _ => None,
                 })
@@ -1482,7 +1479,7 @@ mod tests {
             .resources
             .iter()
             .filter_map(|r| {
-                r.attributes.get("_type").and_then(|v| match v {
+                r.get_attr("_type").and_then(|v| match v {
                     Value::String(s) => Some(s.as_str()),
                     _ => None,
                 })
@@ -1556,7 +1553,7 @@ mod tests {
 
         // FunctionCall argument should be substituted as-is (resolved at apply time)
         assert_eq!(
-            vpc.attributes.get("cidr_block"),
+            vpc.get_attr("cidr_block"),
             Some(&Value::FunctionCall {
                 name: "cidr_subnet".to_string(),
                 args: vec![

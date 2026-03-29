@@ -135,7 +135,7 @@ impl AwsProvider {
         &self,
         resource: Resource,
     ) -> ProviderResult<State> {
-        let vpc_id = match resource.attributes.get("vpc_id") {
+        let vpc_id = match resource.get_attr("vpc_id") {
             Some(Value::String(s)) => s.clone(),
             _ => {
                 return Err(
@@ -144,7 +144,7 @@ impl AwsProvider {
             }
         };
 
-        if let Some(Value::String(igw_id)) = resource.attributes.get("internet_gateway_id") {
+        if let Some(Value::String(igw_id)) = resource.get_attr("internet_gateway_id") {
             // Attach Internet Gateway
             self.ec2_client
                 .attach_internet_gateway()
@@ -161,7 +161,7 @@ impl AwsProvider {
             let composite = format!("{}|{}", vpc_id, igw_id);
             self.read_ec2_vpc_gateway_attachment(&resource.id, Some(&composite))
                 .await
-        } else if let Some(Value::String(vgw_id)) = resource.attributes.get("vpn_gateway_id") {
+        } else if let Some(Value::String(vgw_id)) = resource.get_attr("vpn_gateway_id") {
             // Attach VPN Gateway
             self.ec2_client
                 .attach_vpn_gateway()

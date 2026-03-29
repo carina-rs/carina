@@ -47,7 +47,7 @@ pub fn resolve_attr_prefixes(
             .iter()
             .filter_map(|(key, value)| {
                 if let Some(base_attr) = key.strip_suffix("_prefix")
-                    && let Value::String(prefix_value) = value
+                    && let Value::String(prefix_value) = &value.0
                     && let Some(attr_schema) = schema.attributes.get(base_attr)
                     && is_string_compatible_type(&attr_schema.attr_type)
                 {
@@ -85,9 +85,7 @@ pub fn resolve_attr_prefixes(
 
             // Generate temporary name
             let generated_name = format!("{}{}", prefix_value, generate_random_suffix());
-            resource
-                .attributes
-                .insert(base_attr, Value::String(generated_name));
+            resource.set_attr(base_attr, Value::String(generated_name));
         }
     }
 
@@ -131,19 +129,24 @@ pub fn reconcile_prefixed_names(
             None => continue,
         };
 
-        for (attr_name, prefix) in &resource.prefixes {
-            // Check if state has the same prefix for this attribute
-            if let Some(state_prefix) = state_info.prefixes.get(attr_name)
-                && state_prefix == prefix
-            {
-                // Same prefix: reuse the existing name from state
-                if let Some(name_str) = state_info.attribute_values.get(attr_name) {
-                    resource
-                        .attributes
-                        .insert(attr_name.clone(), Value::String(name_str.clone()));
+        let updates: Vec<_> = resource
+            .prefixes
+            .iter()
+            .filter_map(|(attr_name, prefix)| {
+                if let Some(state_prefix) = state_info.prefixes.get(attr_name)
+                    && state_prefix == prefix
+                {
+                    state_info
+                        .attribute_values
+                        .get(attr_name)
+                        .map(|name_str| (attr_name.clone(), Value::String(name_str.clone())))
+                } else {
+                    None
                 }
-            }
-            // If prefix changed or no state prefix exists, keep the newly generated name
+            })
+            .collect();
+        for (attr_name, value) in updates {
+            resource.set_attr(attr_name, value);
         }
     }
 }
@@ -349,7 +352,7 @@ pub fn compute_anonymous_identifiers(
             if let Some(prefix) = resource.prefixes.get(*attr_name) {
                 // Use the prefix for hashing to produce a stable identifier
                 hash_values.insert(attr_name, format!("Prefix({:?})", prefix));
-            } else if let Some(value) = resource.attributes.get(*attr_name) {
+            } else if let Some(value) = resource.get_attr(attr_name) {
                 hash_values.insert(attr_name, deterministic_value_string(value));
             }
         }
@@ -478,7 +481,7 @@ pub fn reconcile_anonymous_identifiers(
         // Collect this resource's create-only values
         let mut resource_co_values: HashMap<&str, String> = HashMap::new();
         for attr_name in &create_only_attrs {
-            if let Some(Value::String(v)) = resource.attributes.get(*attr_name) {
+            if let Some(Value::String(v)) = resource.get_attr(attr_name) {
                 resource_co_values.insert(attr_name, v.clone());
             }
         }
@@ -587,7 +590,7 @@ mod tests {
     #[test]
     fn test_resolve_attr_prefixes_extracts_prefix_and_generates_name() {
         let mut resource = Resource::with_provider("awscc", "s3.bucket", "test-bucket");
-        resource.attributes.insert(
+        resource.set_attr(
             "bucket_name_prefix".to_string(),
             Value::String("my-app-".to_string()),
         );
@@ -601,7 +604,7 @@ mod tests {
         assert!(!resources[0].attributes.contains_key("bucket_name_prefix"));
 
         // bucket_name should be generated with the prefix
-        let bucket_name = match resources[0].attributes.get("bucket_name").unwrap() {
+        let bucket_name = match resources[0].get_attr("bucket_name").unwrap() {
             Value::String(s) => s.clone(),
             _ => panic!("expected String"),
         };
@@ -618,7 +621,7 @@ mod tests {
     #[test]
     fn test_resolve_attr_prefixes_leaves_non_matching_prefix_alone() {
         let mut resource = Resource::with_provider("awscc", "s3.bucket", "test-bucket");
-        resource.attributes.insert(
+        resource.set_attr(
             "nonexistent_attr_prefix".to_string(),
             Value::String("some-value".to_string()),
         );
@@ -640,11 +643,11 @@ mod tests {
     #[test]
     fn test_resolve_attr_prefixes_errors_when_both_prefix_and_attr_specified() {
         let mut resource = Resource::with_provider("awscc", "s3.bucket", "test-bucket");
-        resource.attributes.insert(
+        resource.set_attr(
             "bucket_name_prefix".to_string(),
             Value::String("my-app-".to_string()),
         );
-        resource.attributes.insert(
+        resource.set_attr(
             "bucket_name".to_string(),
             Value::String("my-actual-bucket".to_string()),
         );
@@ -660,7 +663,7 @@ mod tests {
     #[test]
     fn test_resolve_attr_prefixes_errors_on_empty_prefix() {
         let mut resource = Resource::with_provider("awscc", "s3.bucket", "test-bucket");
-        resource.attributes.insert(
+        resource.set_attr(
             "bucket_name_prefix".to_string(),
             Value::String("".to_string()),
         );
@@ -679,7 +682,7 @@ mod tests {
         resource
             .prefixes
             .insert("bucket_name".to_string(), "my-app-".to_string());
-        resource.attributes.insert(
+        resource.set_attr(
             "bucket_name".to_string(),
             Value::String("my-app-temporary".to_string()),
         );
@@ -698,7 +701,7 @@ mod tests {
 
         // Should reuse the state name, not the temporary one
         assert_eq!(
-            resources[0].attributes.get("bucket_name"),
+            resources[0].get_attr("bucket_name"),
             Some(&Value::String("my-app-existing1".to_string()))
         );
     }
@@ -709,7 +712,7 @@ mod tests {
         resource
             .prefixes
             .insert("bucket_name".to_string(), "new-prefix-".to_string());
-        resource.attributes.insert(
+        resource.set_attr(
             "bucket_name".to_string(),
             Value::String("new-prefix-abcd1234".to_string()),
         );
@@ -731,7 +734,7 @@ mod tests {
 
         // Should keep the newly generated name since prefix changed
         assert_eq!(
-            resources[0].attributes.get("bucket_name"),
+            resources[0].get_attr("bucket_name"),
             Some(&Value::String("new-prefix-abcd1234".to_string()))
         );
     }
@@ -742,7 +745,7 @@ mod tests {
         resource
             .prefixes
             .insert("bucket_name".to_string(), "my-app-".to_string());
-        resource.attributes.insert(
+        resource.set_attr(
             "bucket_name".to_string(),
             Value::String("my-app-abcd1234".to_string()),
         );
@@ -752,7 +755,7 @@ mod tests {
 
         // No state, so keep the generated name
         assert_eq!(
-            resources[0].attributes.get("bucket_name"),
+            resources[0].get_attr("bucket_name"),
             Some(&Value::String("my-app-abcd1234".to_string()))
         );
     }
@@ -776,12 +779,11 @@ mod tests {
 
         // Step 1: compute identifier with path="/"
         let mut r1 = Resource::with_provider("awscc", "iam.role", "");
-        r1.attributes.insert(
+        r1.set_attr(
             "role_name".to_string(),
             Value::String("my-role".to_string()),
         );
-        r1.attributes
-            .insert("path".to_string(), Value::String("/".to_string()));
+        r1.set_attr("path".to_string(), Value::String("/".to_string()));
         let mut resources1 = vec![r1];
         compute_anonymous_identifiers(
             &mut resources1,
@@ -795,12 +797,11 @@ mod tests {
 
         // Step 2: compute identifier with path="/carina/" (changed create-only)
         let mut r2 = Resource::with_provider("awscc", "iam.role", "");
-        r2.attributes.insert(
+        r2.set_attr(
             "role_name".to_string(),
             Value::String("my-role".to_string()),
         );
-        r2.attributes
-            .insert("path".to_string(), Value::String("/carina/".to_string()));
+        r2.set_attr("path".to_string(), Value::String("/carina/".to_string()));
         let mut resources2 = vec![r2];
         compute_anonymous_identifiers(
             &mut resources2,
@@ -847,13 +848,11 @@ mod tests {
             .collect();
 
         let mut resource = Resource::with_provider("awscc", "iam.role", "iam_role_aabbccdd");
-        resource.attributes.insert(
+        resource.set_attr(
             "role_name".to_string(),
             Value::String("new-role".to_string()),
         );
-        resource
-            .attributes
-            .insert("path".to_string(), Value::String("/new/".to_string()));
+        resource.set_attr("path".to_string(), Value::String("/new/".to_string()));
 
         let original_id = resource.id.name.clone();
         let mut resources = vec![resource];
@@ -891,13 +890,11 @@ mod tests {
             .collect();
 
         let mut resource = Resource::with_provider("awscc", "iam.role", "iam_role_aabbccdd");
-        resource.attributes.insert(
+        resource.set_attr(
             "role_name".to_string(),
             Value::String("my-role".to_string()),
         );
-        resource
-            .attributes
-            .insert("path".to_string(), Value::String("/".to_string()));
+        resource.set_attr("path".to_string(), Value::String("/".to_string()));
 
         let original_id = resource.id.name.clone();
         let mut resources = vec![resource];
@@ -935,7 +932,7 @@ mod tests {
             .collect();
 
         let mut resource = Resource::with_provider("awscc", "ec2.vpc", "ec2_vpc_aabbccdd");
-        resource.attributes.insert(
+        resource.set_attr(
             "cidr_block".to_string(),
             Value::String("10.1.0.0/16".to_string()),
         );
@@ -985,8 +982,7 @@ mod tests {
         let identity_fn = |_: &str| -> Vec<String> { vec!["region".to_string()] };
 
         let mut r = Resource::with_provider("awscc", "ec2.eip", "");
-        r.attributes
-            .insert("domain".to_string(), Value::String("vpc".to_string()));
+        r.set_attr("domain".to_string(), Value::String("vpc".to_string()));
 
         let mut resources = vec![r];
         compute_anonymous_identifiers(
@@ -1025,8 +1021,7 @@ mod tests {
 
         let make_resource = || {
             let mut r = Resource::with_provider("awscc", "ec2.eip", "");
-            r.attributes
-                .insert("domain".to_string(), Value::String("vpc".to_string()));
+            r.set_attr("domain".to_string(), Value::String("vpc".to_string()));
             r
         };
 
@@ -1068,12 +1063,10 @@ mod tests {
         let identity_fn = |_: &str| -> Vec<String> { vec![] };
 
         let mut r1 = Resource::with_provider("awscc", "ec2.eip", "");
-        r1.attributes
-            .insert("domain".to_string(), Value::String("vpc".to_string()));
+        r1.set_attr("domain".to_string(), Value::String("vpc".to_string()));
 
         let mut r2 = Resource::with_provider("awscc", "ec2.eip", "");
-        r2.attributes
-            .insert("domain".to_string(), Value::String("vpc".to_string()));
+        r2.set_attr("domain".to_string(), Value::String("vpc".to_string()));
 
         let mut resources = vec![r1, r2];
         let result = compute_anonymous_identifiers(
@@ -1173,11 +1166,9 @@ mod tests {
 
         // Step 1: compute identifier with tag_env="production"
         let mut r1 = Resource::with_provider("awscc", "ec2.eip", "");
-        r1.attributes
-            .insert("domain".to_string(), Value::String("vpc".to_string()));
-        r1.attributes
-            .insert("tag_name".to_string(), Value::String("my-eip".to_string()));
-        r1.attributes.insert(
+        r1.set_attr("domain".to_string(), Value::String("vpc".to_string()));
+        r1.set_attr("tag_name".to_string(), Value::String("my-eip".to_string()));
+        r1.set_attr(
             "tag_env".to_string(),
             Value::String("production".to_string()),
         );
@@ -1194,12 +1185,9 @@ mod tests {
 
         // Step 2: compute identifier with tag_env="staging" (one attribute changed)
         let mut r2 = Resource::with_provider("awscc", "ec2.eip", "");
-        r2.attributes
-            .insert("domain".to_string(), Value::String("vpc".to_string()));
-        r2.attributes
-            .insert("tag_name".to_string(), Value::String("my-eip".to_string()));
-        r2.attributes
-            .insert("tag_env".to_string(), Value::String("staging".to_string()));
+        r2.set_attr("domain".to_string(), Value::String("vpc".to_string()));
+        r2.set_attr("tag_name".to_string(), Value::String("my-eip".to_string()));
+        r2.set_attr("tag_env".to_string(), Value::String("staging".to_string()));
         let mut resources2 = vec![r2];
         compute_anonymous_identifiers(
             &mut resources2,
@@ -1241,9 +1229,7 @@ mod tests {
 
         // Resource with a computed identifier
         let mut resource = Resource::with_provider("awscc", "ec2.eip", "ec2_eip_aabbccdd11223344");
-        resource
-            .attributes
-            .insert("domain".to_string(), Value::String("vpc".to_string()));
+        resource.set_attr("domain".to_string(), Value::String("vpc".to_string()));
 
         let original_id = resource.id.name.clone();
         let mut resources = vec![resource];
@@ -1285,8 +1271,7 @@ mod tests {
 
         // Compute identifier without setting the create-only property
         let mut r1 = Resource::with_provider("awscc", "ec2.eip", "");
-        r1.attributes
-            .insert("domain".to_string(), Value::String("vpc".to_string()));
+        r1.set_attr("domain".to_string(), Value::String("vpc".to_string()));
         let mut resources = vec![r1];
         compute_anonymous_identifiers(
             &mut resources,
@@ -1476,14 +1461,10 @@ mod tests {
         // Compute 3 identifiers with different attributes
         let make_resource = |env: &str, team: &str| {
             let mut r = Resource::with_provider("awscc", "ec2.eip", "");
-            r.attributes
-                .insert("domain".to_string(), Value::String("vpc".to_string()));
-            r.attributes
-                .insert("tag_name".to_string(), Value::String("my-eip".to_string()));
-            r.attributes
-                .insert("tag_env".to_string(), Value::String(env.to_string()));
-            r.attributes
-                .insert("tag_team".to_string(), Value::String(team.to_string()));
+            r.set_attr("domain".to_string(), Value::String("vpc".to_string()));
+            r.set_attr("tag_name".to_string(), Value::String("my-eip".to_string()));
+            r.set_attr("tag_env".to_string(), Value::String(env.to_string()));
+            r.set_attr("tag_team".to_string(), Value::String(team.to_string()));
             r
         };
 
@@ -1581,8 +1562,7 @@ mod tests {
         let identity_fn = |_: &str| -> Vec<String> { vec![] };
 
         let mut r = Resource::with_provider("awscc", "ec2.eip", "");
-        r.attributes
-            .insert("domain".to_string(), Value::String("vpc".to_string()));
+        r.set_attr("domain".to_string(), Value::String("vpc".to_string()));
         let mut resources = vec![r];
         compute_anonymous_identifiers(
             &mut resources,
@@ -1620,9 +1600,7 @@ mod tests {
             .collect();
 
         let mut resource = Resource::with_provider("awscc", "ec2.eip", "ec2_eip_aabbccdd11223344");
-        resource
-            .attributes
-            .insert("domain".to_string(), Value::String("vpc".to_string()));
+        resource.set_attr("domain".to_string(), Value::String("vpc".to_string()));
         let original_id = resource.id.name.clone();
         let mut resources = vec![resource];
 
@@ -1656,11 +1634,9 @@ mod tests {
 
         let make_resource = |env: &str| {
             let mut r = Resource::with_provider("awscc", "ec2.internet_gateway", "");
-            r.attributes
-                .insert("tag_name".to_string(), Value::String("my-igw".to_string()));
-            r.attributes
-                .insert("tag_env".to_string(), Value::String(env.to_string()));
-            r.attributes.insert(
+            r.set_attr("tag_name".to_string(), Value::String("my-igw".to_string()));
+            r.set_attr("tag_env".to_string(), Value::String(env.to_string()));
+            r.set_attr(
                 "tag_team".to_string(),
                 Value::String("platform".to_string()),
             );
@@ -1713,18 +1689,15 @@ mod tests {
         let identity_fn = |_: &str| -> Vec<String> { vec![] };
 
         let mut vpc = Resource::with_provider("awscc", "ec2.vpc", "");
-        vpc.attributes.insert(
+        vpc.set_attr(
             "cidr_block".to_string(),
             Value::String("10.0.0.0/16".to_string()),
         );
-        vpc.attributes
-            .insert("tag_name".to_string(), Value::String("my-vpc".to_string()));
+        vpc.set_attr("tag_name".to_string(), Value::String("my-vpc".to_string()));
 
         let mut eip = Resource::with_provider("awscc", "ec2.eip", "");
-        eip.attributes
-            .insert("domain".to_string(), Value::String("vpc".to_string()));
-        eip.attributes
-            .insert("tag_name".to_string(), Value::String("my-eip".to_string()));
+        eip.set_attr("domain".to_string(), Value::String("vpc".to_string()));
+        eip.set_attr("tag_name".to_string(), Value::String("my-eip".to_string()));
 
         let mut resources = vec![vpc, eip];
         compute_anonymous_identifiers(
@@ -1760,13 +1733,11 @@ mod tests {
 
         // Resource with both create-only props set
         let mut resource = Resource::with_provider("awscc", "iam.role", "iam_role_aabbccdd");
-        resource.attributes.insert(
+        resource.set_attr(
             "role_name".to_string(),
             Value::String("my-role".to_string()),
         );
-        resource
-            .attributes
-            .insert("path".to_string(), Value::String("/new/".to_string()));
+        resource.set_attr("path".to_string(), Value::String("/new/".to_string()));
 
         let original_id = resource.id.name.clone();
         let mut resources = vec![resource];
@@ -1815,7 +1786,7 @@ mod tests {
         // Simulate two runs with different random suffixes but same prefix
         let make_resource = |generated_name: &str| {
             let mut r = Resource::with_provider("awscc", "s3.bucket", "");
-            r.attributes.insert(
+            r.set_attr(
                 "bucket_name".to_string(),
                 Value::String(generated_name.to_string()),
             );
@@ -1856,7 +1827,7 @@ mod tests {
 
         let make_resource = |prefix: &str, generated_name: &str| {
             let mut r = Resource::with_provider("awscc", "s3.bucket", "");
-            r.attributes.insert(
+            r.set_attr(
                 "bucket_name".to_string(),
                 Value::String(generated_name.to_string()),
             );
@@ -1896,14 +1867,12 @@ mod tests {
         let mut ingress_new =
             Resource::with_provider("aws", "ec2.security_group_ingress", "ingress_new");
         ingress_new.binding = Some("ingress_new".to_string());
-        ingress_new.attributes.insert(
+        ingress_new.set_attr(
             "cidr_ip".to_string(),
             Value::String("0.0.0.0/0".to_string()),
         );
-        ingress_new
-            .attributes
-            .insert("ip_protocol".to_string(), Value::String("tcp".to_string()));
-        ingress_new.attributes.insert(
+        ingress_new.set_attr("ip_protocol".to_string(), Value::String("tcp".to_string()));
+        ingress_new.set_attr(
             "description".to_string(),
             Value::String("Allow HTTPS".to_string()),
         );
@@ -1957,14 +1926,12 @@ mod tests {
             "ec2.security_group_ingress",
             "ec2_security_group_ingress_deadbeef",
         );
-        new_rule.attributes.insert(
+        new_rule.set_attr(
             "cidr_ip".to_string(),
             Value::String("0.0.0.0/0".to_string()),
         );
-        new_rule
-            .attributes
-            .insert("ip_protocol".to_string(), Value::String("tcp".to_string()));
-        new_rule.attributes.insert(
+        new_rule.set_attr("ip_protocol".to_string(), Value::String("tcp".to_string()));
+        new_rule.set_attr(
             "description".to_string(),
             Value::String("Allow gRPC".to_string()),
         );
@@ -2048,8 +2015,7 @@ mod tests {
 
         // Step 1: Create EIP with tags Environment=acceptance-test
         let mut r1 = Resource::with_provider("awscc", "ec2.eip", "");
-        r1.attributes
-            .insert("domain".to_string(), Value::String("vpc".to_string()));
+        r1.set_attr("domain".to_string(), Value::String("vpc".to_string()));
         let mut tags1 = std::collections::HashMap::new();
         tags1.insert(
             "Environment".to_string(),
@@ -2059,7 +2025,7 @@ mod tests {
             "Purpose".to_string(),
             Value::String("simhash-test".to_string()),
         );
-        r1.attributes.insert("tags".to_string(), Value::Map(tags1));
+        r1.set_attr("tags".to_string(), Value::Map(tags1));
 
         let mut resources1 = vec![r1];
         compute_anonymous_identifiers(
@@ -2074,8 +2040,7 @@ mod tests {
 
         // Step 2: Change tag Environment=staging (only tags changed)
         let mut r2 = Resource::with_provider("awscc", "ec2.eip", "");
-        r2.attributes
-            .insert("domain".to_string(), Value::String("vpc".to_string()));
+        r2.set_attr("domain".to_string(), Value::String("vpc".to_string()));
         let mut tags2 = std::collections::HashMap::new();
         tags2.insert(
             "Environment".to_string(),
@@ -2085,7 +2050,7 @@ mod tests {
             "Purpose".to_string(),
             Value::String("simhash-test".to_string()),
         );
-        r2.attributes.insert("tags".to_string(), Value::Map(tags2));
+        r2.set_attr("tags".to_string(), Value::Map(tags2));
 
         let mut resources2 = vec![r2];
         compute_anonymous_identifiers(
@@ -2140,28 +2105,24 @@ mod tests {
         // Two named ingress resources with overlapping create-only attributes
         let mut ingress_http =
             Resource::with_provider("aws", "ec2.security_group_ingress", "ingress_http");
-        ingress_http.attributes.insert(
+        ingress_http.set_attr(
             "cidr_ip".to_string(),
             Value::String("0.0.0.0/0".to_string()),
         );
-        ingress_http
-            .attributes
-            .insert("ip_protocol".to_string(), Value::String("tcp".to_string()));
-        ingress_http.attributes.insert(
+        ingress_http.set_attr("ip_protocol".to_string(), Value::String("tcp".to_string()));
+        ingress_http.set_attr(
             "description".to_string(),
             Value::String("Allow HTTP".to_string()),
         );
 
         let mut ingress_https =
             Resource::with_provider("aws", "ec2.security_group_ingress", "ingress_https");
-        ingress_https.attributes.insert(
+        ingress_https.set_attr(
             "cidr_ip".to_string(),
             Value::String("0.0.0.0/0".to_string()),
         );
-        ingress_https
-            .attributes
-            .insert("ip_protocol".to_string(), Value::String("tcp".to_string()));
-        ingress_https.attributes.insert(
+        ingress_https.set_attr("ip_protocol".to_string(), Value::String("tcp".to_string()));
+        ingress_https.set_attr(
             "description".to_string(),
             Value::String("Allow HTTPS".to_string()),
         );

@@ -77,7 +77,7 @@ impl AwsProvider {
 
     /// Create an EC2 Route Table
     pub(crate) async fn create_ec2_route_table(&self, resource: Resource) -> ProviderResult<State> {
-        let vpc_id = match resource.attributes.get("vpc_id") {
+        let vpc_id = match resource.get_attr("vpc_id") {
             Some(Value::String(s)) => s.clone(),
             _ => {
                 return Err(
@@ -108,11 +108,11 @@ impl AwsProvider {
             })?;
 
         // Apply tags
-        self.apply_ec2_tags(&resource.id, rt_id, &resource.attributes, None)
+        self.apply_ec2_tags(&resource.id, rt_id, &resource.resolved_attributes(), None)
             .await?;
 
         // Add routes
-        if let Some(Value::List(routes)) = resource.attributes.get("routes") {
+        if let Some(Value::List(routes)) = resource.get_attr("routes") {
             for route in routes {
                 if let Value::Map(route_map) = route {
                     let destination = route_map.get("destination").and_then(|v| {
