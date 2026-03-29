@@ -246,9 +246,6 @@ impl DiagnosticEngine {
     }
 
     /// Validate a module argument value against its expected type.
-    ///
-    /// Thin wrapper around `carina_core::validation::validate_type_expr_value`.
-    /// Kept as a method so LSP tests can call it via `engine.validate_module_arg_type(...)`.
     pub(super) fn validate_module_arg_type(
         &self,
         type_expr: &TypeExpr,

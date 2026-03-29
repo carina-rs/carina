@@ -328,12 +328,12 @@ pub fn validate_type_expr_value(type_expr: &TypeExpr, value: &Value) -> Option<S
         (TypeExpr::Float, Value::String(s)) => {
             Some(format!("expected float, got string \"{}\".", s))
         }
-        (TypeExpr::String, Value::Bool(b)) => Some(format!("expected string, got bool ({})", b)),
-        (TypeExpr::String, Value::Int(n)) => Some(format!("expected string, got int ({})", n)),
-        (TypeExpr::String, Value::Float(f)) => Some(format!("expected string, got float ({})", f)),
-        (TypeExpr::Bool, Value::Int(n)) => Some(format!("expected bool, got int ({})", n)),
-        (TypeExpr::Int, Value::Bool(b)) => Some(format!("expected int, got bool ({})", b)),
-        (TypeExpr::Float, Value::Bool(b)) => Some(format!("expected float, got bool ({})", b)),
+        (TypeExpr::String, Value::Bool(b)) => Some(format!("expected string, got bool ({}).", b)),
+        (TypeExpr::String, Value::Int(n)) => Some(format!("expected string, got int ({}).", n)),
+        (TypeExpr::String, Value::Float(f)) => Some(format!("expected string, got float ({}).", f)),
+        (TypeExpr::Bool, Value::Int(n)) => Some(format!("expected bool, got int ({}).", n)),
+        (TypeExpr::Int, Value::Bool(b)) => Some(format!("expected int, got bool ({}).", b)),
+        (TypeExpr::Float, Value::Bool(b)) => Some(format!("expected float, got bool ({}).", b)),
         _ => None,
     }
 }
