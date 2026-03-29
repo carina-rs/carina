@@ -176,25 +176,10 @@ pub struct FnParam {
     pub default: Option<Value>,
 }
 
-/// The body of a user-defined function: either a value expression or a resource expression
+/// The body of a user-defined function: a value expression.
+/// Functions are pure value transformations only.
 #[derive(Debug, Clone)]
-pub enum UserFunctionBody {
-    /// The function returns a value (existing behavior)
-    Value(Value),
-    /// The function returns a resource expression (resource-generating function).
-    /// Stores the raw source text for re-parsing with substituted parameters.
-    Resource(String),
-    /// The function returns a read resource expression (data source).
-    /// Stores the raw source text for re-parsing with substituted parameters.
-    ReadResource(String),
-}
-
-impl UserFunctionBody {
-    /// Returns true if this body produces a resource (either regular or read).
-    fn is_resource(&self) -> bool {
-        matches!(self, Self::Resource(_) | Self::ReadResource(_))
-    }
-}
+pub struct UserFunctionBody(pub Value);
 
 /// User-defined pure function
 #[derive(Debug, Clone)]
@@ -489,31 +474,6 @@ pub fn parse(input: &str, config: &ProviderContext) -> Result<ParsedFile, ParseE
                             Rule::module_call => {
                                 let call = parse_module_call(stmt, &ctx)?;
                                 module_calls.push(call);
-                            }
-                            Rule::function_call => {
-                                // Top-level function call: if it's a resource-generating fn,
-                                // expand it as an anonymous resource
-                                let mut fc_inner = stmt.into_inner();
-                                let func_name = next_pair(
-                                    &mut fc_inner,
-                                    "function name",
-                                    "top-level function call",
-                                )?
-                                .as_str()
-                                .to_string();
-                                if let Some(user_fn) = ctx.user_functions.get(&func_name)
-                                    && user_fn.body.is_resource()
-                                {
-                                    let args: Result<Vec<Value>, ParseError> =
-                                        fc_inner.map(|arg| parse_expression(arg, &ctx)).collect();
-                                    let args = args?;
-                                    let user_fn = user_fn.clone();
-                                    // Use empty binding name for anonymous resource
-                                    let resource = evaluate_user_function_as_resource(
-                                        &user_fn, &args, &ctx, "",
-                                    )?;
-                                    resources.push(resource);
-                                }
                             }
                             Rule::anonymous_resource => {
                                 let resource = parse_anonymous_resource(stmt, &ctx)?;
@@ -874,27 +834,6 @@ fn parse_primary_with_resource_or_module(
             Ok((value, vec![], vec![call], None))
         }
         Rule::function_call => {
-            // Check if this is a resource-generating user function call
-            let mut fc_inner = inner.clone().into_inner();
-            let func_name = fc_inner
-                .next()
-                .map(|p| p.as_str().to_string())
-                .unwrap_or_default();
-            if let Some(user_fn) = ctx.user_functions.get(&func_name)
-                && user_fn.body.is_resource()
-            {
-                // Parse args and evaluate as resource
-                let mut fc_inner = inner.into_inner();
-                let _name = fc_inner.next(); // skip function name
-                let args: Result<Vec<Value>, ParseError> =
-                    fc_inner.map(|arg| parse_expression(arg, ctx)).collect();
-                let args = args?;
-                let user_fn = user_fn.clone();
-                let resource =
-                    evaluate_user_function_as_resource(&user_fn, &args, ctx, binding_name)?;
-                let ref_value = Value::String(format!("${{{}}}", binding_name));
-                return Ok((ref_value, vec![resource], vec![], None));
-            }
             let value = parse_primary_value(inner, ctx)?;
             Ok((value, vec![], vec![], None))
         }
@@ -1643,19 +1582,9 @@ fn parse_fn_def(
                 );
                 local_lets.push((let_name, let_expr));
             }
-            Rule::resource_expr => {
-                body = Some(UserFunctionBody::Resource(body_inner.as_str().to_string()));
-            }
-            Rule::read_resource_expr => {
-                body = Some(UserFunctionBody::ReadResource(
-                    body_inner.as_str().to_string(),
-                ));
-            }
             _ => {
                 // This should be the expression (the body)
-                body = Some(UserFunctionBody::Value(parse_expression(
-                    body_inner, &body_ctx,
-                )?));
+                body = Some(UserFunctionBody(parse_expression(body_inner, &body_ctx)?));
             }
         }
     }
@@ -1905,129 +1834,14 @@ fn evaluate_user_function(
 ) -> Result<Value, ParseError> {
     let (child_ctx, substitutions) = prepare_user_function_call(func, args, ctx)?;
 
-    match &func.body {
-        UserFunctionBody::Value(body) => {
-            let substituted_body = substitute_fn_params(body, &substitutions);
-            let result = try_evaluate_fn_value(substituted_body, &child_ctx)?;
-            // Check return type if annotated
-            if let Some(ref return_type) = func.return_type {
-                check_fn_return_type(&func.name, return_type, &result, child_ctx.config)?;
-            }
-            Ok(result)
-        }
-        UserFunctionBody::Resource(_) | UserFunctionBody::ReadResource(_) => {
-            Err(ParseError::UserFunctionError(format!(
-                "function '{}' returns a resource, not a value; use it in a let binding",
-                func.name
-            )))
-        }
-    }
-}
-
-/// Evaluate a resource-generating user-defined function call.
-/// Re-parses the resource expression source with substituted parameter values.
-fn evaluate_user_function_as_resource(
-    func: &UserFunction,
-    args: &[Value],
-    ctx: &ParseContext,
-    binding_name: &str,
-) -> Result<Resource, ParseError> {
-    let (mut child_ctx, substitutions) = prepare_user_function_call(func, args, ctx)?;
-
-    // Register substituted values in the child context so resource body can reference them.
-    // For parameters that point to resource bindings (value = "${binding_name}"),
-    // also register the param name as a resource binding so that field access works.
-    // Track the mapping from param names to original binding names for ResourceRef fixup.
-    let mut param_to_binding: HashMap<String, String> = HashMap::new();
-    for (param_name, value) in &substitutions {
-        child_ctx.set_variable(param_name.clone(), value.clone());
-        if let Value::String(s) = value
-            && let Some(ref_name) = s.strip_prefix("${").and_then(|s| s.strip_suffix('}'))
-            && let Some(resource) = ctx.resource_bindings.get(ref_name)
-        {
-            child_ctx.set_resource_binding(param_name.clone(), resource.clone());
-            param_to_binding.insert(param_name.clone(), ref_name.to_string());
-        }
-    }
-
-    let (rule, resource_source) = match &func.body {
-        UserFunctionBody::Resource(src) => (Rule::resource_expr, src.as_str()),
-        UserFunctionBody::ReadResource(src) => (Rule::read_resource_expr, src.as_str()),
-        UserFunctionBody::Value(_) => {
-            return Err(ParseError::UserFunctionError(format!(
-                "function '{}' returns a value, not a resource",
-                func.name
-            )));
-        }
-    };
-
-    // Re-parse the resource expression source with the child context
-    // that has parameter values as variables
-    let mut parsed = CarinaParser::parse(rule, resource_source).map_err(ParseError::Syntax)?;
-
-    let resource_pair = parsed.next().ok_or_else(|| ParseError::InternalError {
-        expected: "resource expression".to_string(),
-        context: "fn resource evaluation".to_string(),
-    })?;
-
-    let parse_fn = if rule == Rule::resource_expr {
-        parse_resource_expr
-    } else {
-        parse_read_resource_expr
-    };
-    let mut resource = parse_fn(resource_pair, &child_ctx, binding_name)?;
-
-    // Fix up ResourceRef binding names: replace fn parameter names with
-    // the actual outer binding names they refer to
-    if !param_to_binding.is_empty() {
-        for value in resource.attributes.values_mut() {
-            remap_resource_refs(value, &param_to_binding);
-        }
-    }
-
+    let UserFunctionBody(body) = &func.body;
+    let substituted_body = substitute_fn_params(body, &substitutions);
+    let result = try_evaluate_fn_value(substituted_body, &child_ctx)?;
     // Check return type if annotated
-    if let Some(TypeExpr::Ref(ref expected_path)) = func.return_type {
-        let actual_path = ResourceTypePath {
-            provider: resource.id.provider.clone(),
-            resource_type: resource.id.resource_type.clone(),
-        };
-        if *expected_path != actual_path {
-            return Err(ParseError::UserFunctionError(format!(
-                "function '{}': return type '{}' does not match actual resource type '{}'",
-                func.name, expected_path, actual_path
-            )));
-        }
+    if let Some(ref return_type) = func.return_type {
+        check_fn_return_type(&func.name, return_type, &result, child_ctx.config)?;
     }
-
-    Ok(resource)
-}
-
-/// Recursively remap ResourceRef binding names from fn parameter names to
-/// the actual outer binding names they refer to.
-fn remap_resource_refs(value: &mut Value, param_to_binding: &HashMap<String, String>) {
-    match value {
-        Value::ResourceRef { binding_name, .. } => {
-            if let Some(actual_name) = param_to_binding.get(binding_name) {
-                *binding_name = actual_name.clone();
-            }
-        }
-        Value::List(items) => {
-            for item in items {
-                remap_resource_refs(item, param_to_binding);
-            }
-        }
-        Value::Map(map) => {
-            for v in map.values_mut() {
-                remap_resource_refs(v, param_to_binding);
-            }
-        }
-        Value::FunctionCall { args, .. } => {
-            for arg in args {
-                remap_resource_refs(arg, param_to_binding);
-            }
-        }
-        _ => {}
-    }
+    Ok(result)
 }
 
 /// Recursively substitute function parameter placeholders with actual values
@@ -6867,219 +6681,6 @@ aws.s3.bucket {
     }
 
     #[test]
-    fn user_fn_returns_resource() {
-        let input = r#"
-            fn make_bucket(name) {
-                aws.s3_bucket {
-                    name = name
-                }
-            }
-
-            let my_bucket = make_bucket("test-bucket")
-        "#;
-
-        let result = parse(input, &ProviderContext::default()).unwrap();
-        assert_eq!(result.resources.len(), 1);
-        let resource = &result.resources[0];
-        assert_eq!(resource.id.resource_type, "s3_bucket");
-        assert_eq!(resource.id.name, "my_bucket");
-        assert_eq!(
-            resource.attributes.get("name"),
-            Some(&Value::String("test-bucket".to_string())),
-        );
-        assert_eq!(
-            resource.attributes.get("_binding"),
-            Some(&Value::String("my_bucket".to_string())),
-        );
-    }
-
-    #[test]
-    fn user_fn_returns_resource_with_local_let() {
-        let input = r#"
-            fn tagged_bucket(env) {
-                let full_name = join("-", [env, "bucket"])
-                aws.s3_bucket {
-                    name = full_name
-                }
-            }
-
-            let prod_bucket = tagged_bucket("prod")
-        "#;
-
-        let result = parse(input, &ProviderContext::default()).unwrap();
-        assert_eq!(result.resources.len(), 1);
-        let resource = &result.resources[0];
-        assert_eq!(resource.id.name, "prod_bucket");
-        assert_eq!(
-            resource.attributes.get("name"),
-            Some(&Value::String("prod-bucket".to_string())),
-        );
-    }
-
-    #[test]
-    fn user_fn_returns_resource_with_param_substitution() {
-        let input = r#"
-            fn subnet(vpc_id, cidr, az) {
-                awscc.ec2.subnet {
-                    vpc_id            = vpc_id
-                    cidr_block        = cidr
-                    availability_zone = az
-                }
-            }
-
-            let subnet_a = subnet("vpc-123", "10.0.1.0/24", "ap-northeast-1a")
-            let subnet_b = subnet("vpc-123", "10.0.2.0/24", "ap-northeast-1c")
-        "#;
-
-        let result = parse(input, &ProviderContext::default()).unwrap();
-        assert_eq!(result.resources.len(), 2);
-
-        let subnet_a = &result.resources[0];
-        assert_eq!(subnet_a.id.resource_type, "ec2.subnet");
-        assert_eq!(subnet_a.id.name, "subnet_a");
-        assert_eq!(
-            subnet_a.attributes.get("vpc_id"),
-            Some(&Value::String("vpc-123".to_string())),
-        );
-        assert_eq!(
-            subnet_a.attributes.get("availability_zone"),
-            Some(&Value::String("ap-northeast-1a".to_string())),
-        );
-
-        let subnet_b = &result.resources[1];
-        assert_eq!(subnet_b.id.name, "subnet_b");
-        assert_eq!(
-            subnet_b.attributes.get("availability_zone"),
-            Some(&Value::String("ap-northeast-1c".to_string())),
-        );
-    }
-
-    #[test]
-    fn user_fn_resource_nested_fn_call() {
-        let input = r#"
-            fn make_name(prefix) {
-                join("-", [prefix, "bucket"])
-            }
-
-            fn make_bucket(prefix) {
-                aws.s3_bucket {
-                    name = make_name(prefix)
-                }
-            }
-
-            let my_bucket = make_bucket("test")
-        "#;
-
-        let result = parse(input, &ProviderContext::default()).unwrap();
-        assert_eq!(result.resources.len(), 1);
-        let resource = &result.resources[0];
-        assert_eq!(resource.id.name, "my_bucket");
-        assert_eq!(
-            resource.attributes.get("name"),
-            Some(&Value::String("test-bucket".to_string())),
-        );
-    }
-
-    #[test]
-    fn user_fn_resource_top_level_call() {
-        let input = r#"
-            fn make_bucket(name) {
-                aws.s3_bucket {
-                    name = name
-                }
-            }
-
-            make_bucket("anon-bucket")
-        "#;
-
-        let result = parse(input, &ProviderContext::default()).unwrap();
-        assert_eq!(result.resources.len(), 1);
-        let resource = &result.resources[0];
-        assert_eq!(resource.id.resource_type, "s3_bucket");
-        assert_eq!(
-            resource.attributes.get("name"),
-            Some(&Value::String("anon-bucket".to_string())),
-        );
-    }
-
-    #[test]
-    fn user_fn_resource_with_resource_ref_param() {
-        let input = r#"
-            fn make_subnet(vpc, cidr) {
-                awscc.ec2.subnet {
-                    vpc_id     = vpc.vpc_id
-                    cidr_block = cidr
-                }
-            }
-
-            let vpc = awscc.ec2.vpc {
-                cidr_block = "10.0.0.0/16"
-            }
-
-            let subnet_a = make_subnet(vpc, "10.0.1.0/24")
-        "#;
-
-        let result = parse(input, &ProviderContext::default()).unwrap();
-        assert_eq!(result.resources.len(), 2);
-
-        let subnet = &result.resources[1];
-        assert_eq!(subnet.id.name, "subnet_a");
-        assert_eq!(subnet.id.resource_type, "ec2.subnet");
-        // vpc.vpc_id should be a ResourceRef
-        match subnet.attributes.get("vpc_id") {
-            Some(Value::ResourceRef {
-                binding_name,
-                attribute_name,
-                ..
-            }) => {
-                assert_eq!(binding_name, "vpc");
-                assert_eq!(attribute_name, "vpc_id");
-            }
-            other => panic!("Expected ResourceRef for vpc_id, got: {:?}", other),
-        }
-    }
-
-    #[test]
-    fn user_fn_resource_with_renamed_resource_ref_param() {
-        // When fn param name differs from the outer binding name,
-        // the resource ref should use the param name in the fn body
-        let input = r#"
-            fn make_subnet(v, cidr) {
-                awscc.ec2.subnet {
-                    vpc_id     = v.vpc_id
-                    cidr_block = cidr
-                }
-            }
-
-            let my_vpc = awscc.ec2.vpc {
-                cidr_block = "10.0.0.0/16"
-            }
-
-            let subnet_a = make_subnet(my_vpc, "10.0.1.0/24")
-        "#;
-
-        let result = parse(input, &ProviderContext::default()).unwrap();
-        assert_eq!(result.resources.len(), 2);
-
-        let subnet = &result.resources[1];
-        assert_eq!(subnet.id.name, "subnet_a");
-        // v.vpc_id should be resolved to my_vpc.vpc_id via forward reference resolution
-        // or kept as a resource ref pointing to my_vpc
-        match subnet.attributes.get("vpc_id") {
-            Some(Value::ResourceRef {
-                binding_name,
-                attribute_name,
-                ..
-            }) => {
-                // The reference should point to the actual resource (my_vpc)
-                assert_eq!(binding_name, "my_vpc");
-                assert_eq!(attribute_name, "vpc_id");
-            }
-            other => panic!("Expected ResourceRef for vpc_id, got: {:?}", other),
-        }
-    }
-
-    #[test]
     fn user_fn_typed_param_string() {
         let input = r#"
             fn greet(name: string) {
@@ -7175,29 +6776,6 @@ aws.s3.bucket {
             result.resources[0].attributes.get("name"),
             Some(&Value::String("prod-web".to_string())),
         );
-    }
-
-    #[test]
-    fn user_fn_resource_type_annotation_parsed() {
-        // Resource type annotations are parsed but not validated at call site
-        let input = r#"
-            fn make_subnet(vpc: awscc.ec2.vpc, cidr: string) {
-                awscc.ec2.subnet {
-                    vpc_id     = vpc.vpc_id
-                    cidr_block = cidr
-                }
-            }
-
-            let vpc = awscc.ec2.vpc {
-                cidr_block = "10.0.0.0/16"
-            }
-
-            let subnet = make_subnet(vpc, "10.0.1.0/24")
-        "#;
-
-        let result = parse(input, &ProviderContext::default()).unwrap();
-        assert_eq!(result.resources.len(), 2);
-        assert_eq!(result.resources[1].id.name, "subnet");
     }
 
     #[test]
@@ -7298,62 +6876,18 @@ aws.s3.bucket {
     }
 
     #[test]
-    fn user_fn_return_type_resource_ref() {
-        let input = r#"
-            fn make_bucket(): aws.s3_bucket {
-                aws.s3_bucket {
-                    name = "test"
-                }
-            }
-
-            let b = make_bucket()
-        "#;
-
-        let result = parse(input, &ProviderContext::default()).unwrap();
-        let func = result.user_functions.get("make_bucket").unwrap();
-        assert_eq!(
-            func.return_type,
-            Some(TypeExpr::Ref(ResourceTypePath::new("aws", "s3_bucket")))
-        );
-    }
-
-    #[test]
-    fn user_fn_return_type_resource_mismatch() {
-        let input = r#"
-            fn make_bucket(): aws.ec2_instance {
-                aws.s3_bucket {
-                    name = "test"
-                }
-            }
-
-            let b = make_bucket()
-        "#;
-
-        let err = parse(input, &ProviderContext::default()).unwrap_err();
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("return type"),
-            "Expected return type error, got: {msg}"
-        );
-    }
-
-    #[test]
     fn parse_custom_schema_type_in_fn_param() {
         // Custom schema types like cidr, ipv4_address, arn should be accepted as type annotations
         let input = r#"
-            fn subnet(vpc: awscc.ec2.vpc, cidr_block: cidr) {
-                awscc.ec2.subnet {
-                    name     = "test"
-                    vpc_id   = vpc.vpc_id
-                    cidr_block = cidr_block
-                }
+            fn format_cidr(cidr_block: cidr) {
+                cidr_block
             }
         "#;
         let result = parse(input, &ProviderContext::default()).unwrap();
-        let func = result.user_functions.get("subnet").unwrap();
-        assert_eq!(func.params[1].name, "cidr_block");
+        let func = result.user_functions.get("format_cidr").unwrap();
+        assert_eq!(func.params[0].name, "cidr_block");
         assert_eq!(
-            func.params[1].param_type,
+            func.params[0].param_type,
             Some(TypeExpr::Simple("cidr".to_string()))
         );
     }
@@ -7694,53 +7228,6 @@ aws.s3.bucket {
         assert!(
             msg.contains("return type 'ipv6_address' validation failed"),
             "Expected ipv6_address validation error, got: {msg}"
-        );
-    }
-
-    // --- Issue #1285: Validate fn call arguments for resource types ---
-
-    #[test]
-    fn user_fn_resource_type_arg_matching() {
-        let input = r#"
-            fn make_subnet(vpc: awscc.ec2.vpc, cidr: string) {
-                awscc.ec2.subnet {
-                    vpc_id     = vpc.vpc_id
-                    cidr_block = cidr
-                }
-            }
-
-            let vpc = awscc.ec2.vpc {
-                cidr_block = "10.0.0.0/16"
-            }
-
-            let subnet = make_subnet(vpc, "10.0.1.0/24")
-        "#;
-        let result = parse(input, &ProviderContext::default());
-        assert!(result.is_ok(), "Expected OK, got: {:?}", result.err());
-    }
-
-    #[test]
-    fn user_fn_resource_type_arg_mismatched() {
-        let input = r#"
-            fn make_subnet(vpc: awscc.ec2.vpc, cidr: string) {
-                awscc.ec2.subnet {
-                    vpc_id     = vpc.vpc_id
-                    cidr_block = cidr
-                }
-            }
-
-            let sg = awscc.ec2.security_group {
-                group_description = "test"
-            }
-
-            let subnet = make_subnet(sg, "10.0.1.0/24")
-        "#;
-        let err = parse(input, &ProviderContext::default()).unwrap_err();
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("expects resource type 'awscc.ec2.vpc'")
-                && msg.contains("got awscc.ec2.security_group"),
-            "Expected resource type mismatch error, got: {msg}"
         );
     }
 
