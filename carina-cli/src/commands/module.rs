@@ -2,6 +2,7 @@ use std::path::Path;
 
 use carina_core::config_loader;
 use carina_core::module_resolver;
+use carina_core::parser::ProviderContext;
 
 use crate::error::AppError;
 
@@ -20,15 +21,19 @@ pub enum ModuleCommands {
     },
 }
 
-pub fn run_module_command(command: ModuleCommands) -> Result<(), AppError> {
+pub fn run_module_command(
+    command: ModuleCommands,
+    provider_context: &ProviderContext,
+) -> Result<(), AppError> {
     match command {
         ModuleCommands::Info { file } => run_module_info(&file),
-        ModuleCommands::List { path } => run_module_list(&path),
+        ModuleCommands::List { path } => run_module_list(&path, provider_context),
     }
 }
 
-fn run_module_list(path: &Path) -> Result<(), AppError> {
-    let config = config_loader::load_configuration(&path.to_path_buf())?;
+fn run_module_list(path: &Path, provider_context: &ProviderContext) -> Result<(), AppError> {
+    let config =
+        config_loader::load_configuration_with_config(&path.to_path_buf(), provider_context)?;
     let output = format_module_list(&config.parsed.imports);
     print!("{output}");
     Ok(())

@@ -3,22 +3,25 @@ use std::path::PathBuf;
 
 use colored::Colorize;
 
-use carina_core::config_loader::{find_crn_files_in_dir, get_base_dir, load_configuration};
+use carina_core::config_loader::{
+    find_crn_files_in_dir, get_base_dir, load_configuration_with_config,
+};
 use carina_core::lint::find_duplicate_attrs;
+use carina_core::parser::ProviderContext;
 
-use super::validate_and_resolve;
+use super::validate_and_resolve_with_config;
 use crate::error::AppError;
 use crate::wiring::check_unused_bindings;
 
-pub fn run_validate(path: &PathBuf) -> Result<(), AppError> {
-    let loaded = load_configuration(path)?;
+pub fn run_validate(path: &PathBuf, provider_context: &ProviderContext) -> Result<(), AppError> {
+    let loaded = load_configuration_with_config(path, provider_context)?;
     let mut parsed = loaded.parsed;
 
     let base_dir = get_base_dir(path);
 
     println!("{}", "Validating...".cyan());
 
-    validate_and_resolve(&mut parsed, base_dir, false)?;
+    validate_and_resolve_with_config(&mut parsed, base_dir, false, provider_context)?;
 
     // Check for unused let bindings (warnings, not errors)
     // Use unresolved_parsed because resolve_resource_refs resolves intermediate

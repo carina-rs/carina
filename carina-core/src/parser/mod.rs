@@ -2,6 +2,10 @@
 //!
 //! Convert DSL to AST using pest
 
+mod config;
+
+pub use config::{DecryptorFn, ProviderContext, ValidatorFn};
+
 use crate::resource::{LifecycleConfig, Resource, ResourceId, Value};
 use crate::schema::{
     validate_ipv4_address, validate_ipv4_cidr, validate_ipv6_address, validate_ipv6_cidr,
@@ -272,7 +276,7 @@ impl ParsedFile {
 
 /// Parse context (variable scope)
 #[derive(Clone)]
-struct ParseContext {
+struct ParseContext<'cfg> {
     variables: HashMap<String, Value>,
     /// Resource bindings (binding_name -> Resource)
     resource_bindings: HashMap<String, Resource>,
@@ -282,16 +286,19 @@ struct ParseContext {
     user_functions: HashMap<String, UserFunction>,
     /// Functions currently being evaluated (for recursion detection)
     evaluating_functions: Vec<String>,
+    /// Parser configuration (decryptor, custom validators)
+    config: &'cfg ProviderContext,
 }
 
-impl ParseContext {
-    fn new() -> Self {
+impl<'cfg> ParseContext<'cfg> {
+    fn new(config: &'cfg ProviderContext) -> Self {
         Self {
             variables: HashMap::new(),
             resource_bindings: HashMap::new(),
             imported_modules: HashMap::new(),
             user_functions: HashMap::new(),
             evaluating_functions: Vec::new(),
+            config,
         }
     }
 
@@ -338,11 +345,14 @@ fn first_inner<'a>(
         })
 }
 
-/// Parse a .crn file
-pub fn parse(input: &str) -> Result<ParsedFile, ParseError> {
+/// Parse a .crn file with the given configuration.
+///
+/// The config allows injecting a decryptor function for `decrypt()` calls
+/// and custom type validators from provider crates.
+pub fn parse(input: &str, config: &ProviderContext) -> Result<ParsedFile, ParseError> {
     let pairs = CarinaParser::parse(Rule::file, input)?;
 
-    let mut ctx = ParseContext::new();
+    let mut ctx = ParseContext::new(config);
     let mut providers = Vec::new();
     let mut resources = Vec::new();
     let mut imports = Vec::new();
@@ -368,7 +378,7 @@ pub fn parse(input: &str) -> Result<ParsedFile, ParseError> {
                                 providers.push(provider);
                             }
                             Rule::arguments_block => {
-                                let parsed_arguments = parse_arguments_block(stmt)?;
+                                let parsed_arguments = parse_arguments_block(stmt, config)?;
                                 for arg in &parsed_arguments {
                                     // Register argument names as lexical bindings so that
                                     // `vpc.vpc_id` resolves as ResourceRef and `cidr_block`
@@ -545,9 +555,10 @@ pub fn parse(input: &str) -> Result<ParsedFile, ParseError> {
 /// Parse arguments block
 fn parse_arguments_block(
     pair: pest::iterators::Pair<Rule>,
+    config: &ProviderContext,
 ) -> Result<Vec<ArgumentParameter>, ParseError> {
     let mut arguments = Vec::new();
-    let ctx = ParseContext::new();
+    let ctx = ParseContext::new(config);
 
     for param in pair.into_inner() {
         if param.as_rule() == Rule::arguments_param {
@@ -1045,7 +1056,7 @@ fn parse_for_iterable(
     // for_iterable contains function_call | list | variable_ref | "(" expression ")"
     let inner = first_inner(pair, "iterable expression", "for iterable")?;
     let value = parse_primary_value(inner, ctx)?;
-    evaluate_static_value(value)
+    evaluate_static_value(value, ctx.config)
 }
 
 /// Check whether a Value is fully static (no runtime dependencies).
@@ -1062,7 +1073,7 @@ fn is_static_value(value: &Value) -> bool {
 
 /// If `value` is a FunctionCall with all static arguments, eagerly evaluate it.
 /// Nested FunctionCalls in arguments are evaluated recursively first.
-fn evaluate_static_value(value: Value) -> Result<Value, ParseError> {
+fn evaluate_static_value(value: Value, config: &ProviderContext) -> Result<Value, ParseError> {
     match value {
         Value::FunctionCall { ref name, ref args } => {
             if !is_static_value(&value) {
@@ -1075,15 +1086,18 @@ fn evaluate_static_value(value: Value) -> Result<Value, ParseError> {
                 });
             }
             // Recursively evaluate any nested FunctionCall arguments
-            let evaluated_args: Result<Vec<Value>, ParseError> =
-                args.iter().cloned().map(evaluate_static_value).collect();
+            let evaluated_args: Result<Vec<Value>, ParseError> = args
+                .iter()
+                .cloned()
+                .map(|v| evaluate_static_value(v, config))
+                .collect();
             let evaluated_args = evaluated_args?;
-            crate::builtins::evaluate_builtin(name, &evaluated_args).map_err(|e| {
-                ParseError::InvalidExpression {
+            crate::builtins::evaluate_builtin_with_config(name, &evaluated_args, config).map_err(
+                |e| ParseError::InvalidExpression {
                     line: 0,
                     message: format!("for iterable function call '{name}' failed: {e}"),
-                }
-            })
+                },
+            )
         }
         other => Ok(other),
     }
@@ -1167,7 +1181,7 @@ fn parse_if_expr(
         });
     }
 
-    let condition_value = evaluate_static_value(condition_value)?;
+    let condition_value = evaluate_static_value(condition_value, ctx.config)?;
 
     // Condition must be a Bool
     let condition = match &condition_value {
@@ -1293,7 +1307,7 @@ fn parse_if_value_expr(
         });
     }
 
-    let condition_value = evaluate_static_value(condition_value)?;
+    let condition_value = evaluate_static_value(condition_value, ctx.config)?;
 
     // Condition must be a Bool
     let condition = match &condition_value {
@@ -1538,7 +1552,7 @@ fn parse_moved_block(pair: pest::iterators::Pair<Rule>) -> Result<StateBlock, Pa
 /// Parse a user-defined function definition
 fn parse_fn_def(
     pair: pest::iterators::Pair<Rule>,
-    _ctx: &ParseContext,
+    ctx: &ParseContext,
 ) -> Result<UserFunction, ParseError> {
     let mut inner = pair.into_inner();
     let name = next_pair(&mut inner, "function name", "fn_def")?
@@ -1566,7 +1580,7 @@ fn parse_fn_def(
                         }
                         _ => {
                             // This is the default expression
-                            let default_ctx = ParseContext::new();
+                            let default_ctx = ParseContext::new(ctx.config);
                             default = Some(parse_expression(remaining, &default_ctx)?);
                         }
                     }
@@ -1604,7 +1618,7 @@ fn parse_fn_def(
 
     // Create a context where parameters are registered as variables
     // so that param references in the body are resolved as variable refs
-    let mut body_ctx = ParseContext::new();
+    let mut body_ctx = ParseContext::new(ctx.config);
     for p in &params {
         body_ctx.set_variable(
             p.name.clone(),
@@ -1662,11 +1676,11 @@ fn parse_fn_def(
 
 /// Prepare a user-defined function call: validate args, build substitutions, and return
 /// the child context with all parameters and local lets resolved.
-fn prepare_user_function_call(
+fn prepare_user_function_call<'cfg>(
     func: &UserFunction,
     args: &[Value],
-    ctx: &ParseContext,
-) -> Result<(ParseContext, HashMap<String, Value>), ParseError> {
+    ctx: &ParseContext<'cfg>,
+) -> Result<(ParseContext<'cfg>, HashMap<String, Value>), ParseError> {
     let fn_name = &func.name;
 
     // Check recursion
@@ -1723,17 +1737,30 @@ fn prepare_user_function_call(
 /// Validate a value against a custom type (cidr, ipv4_address, etc.).
 /// Returns Ok(()) if the value passes validation or cannot be validated statically
 /// (e.g., ResourceRef, FunctionCall, Interpolation are deferred).
-fn validate_custom_type(type_name: &str, value: &Value) -> Result<(), String> {
+///
+/// Checks built-in validators first, then falls back to custom validators
+/// registered in the [`ProviderContext`].
+fn validate_custom_type(
+    type_name: &str,
+    value: &Value,
+    config: &ProviderContext,
+) -> Result<(), String> {
     match (type_name, value) {
         ("cidr", Value::String(s)) => validate_ipv4_cidr(s),
         ("ipv4_address", Value::String(s)) => validate_ipv4_address(s),
         ("ipv6_cidr", Value::String(s)) => validate_ipv6_cidr(s),
         ("ipv6_address", Value::String(s)) => validate_ipv6_address(s),
-        // arn, availability_zone — just accept strings for now (format varies too much)
-        (_, Value::String(_)) => Ok(()),
         (_, Value::ResourceRef { .. }) => Ok(()), // will be resolved later
         (_, Value::FunctionCall { .. }) => Ok(()), // will be resolved later
         (_, Value::Interpolation(_)) => Ok(()),   // will be resolved later
+        (name, Value::String(s)) => {
+            // Check custom validators from config
+            if let Some(validator) = config.validators.get(name) {
+                validator(s)
+            } else {
+                Ok(())
+            }
+        }
         (_, value) => Err(format!(
             "expected {}, got {}",
             type_name,
@@ -1769,7 +1796,7 @@ fn check_fn_arg_type(
                 false
             } else {
                 // Validate the actual value against the custom type
-                if let Err(e) = validate_custom_type(name, value) {
+                if let Err(e) = validate_custom_type(name, value, ctx.config) {
                     return Err(ParseError::UserFunctionError(format!(
                         "function '{fn_name}': parameter '{param_name}' type '{name}' validation failed: {e}"
                     )));
@@ -1814,6 +1841,7 @@ fn check_fn_return_type(
     fn_name: &str,
     type_expr: &TypeExpr,
     value: &Value,
+    config: &ProviderContext,
 ) -> Result<(), ParseError> {
     let type_matches = match type_expr {
         TypeExpr::String => matches!(
@@ -1833,7 +1861,7 @@ fn check_fn_return_type(
             ) {
                 false
             } else {
-                if let Err(e) = validate_custom_type(name, value) {
+                if let Err(e) = validate_custom_type(name, value, config) {
                     return Err(ParseError::UserFunctionError(format!(
                         "function '{fn_name}': return type '{name}' validation failed: {e}"
                     )));
@@ -1883,7 +1911,7 @@ fn evaluate_user_function(
             let result = try_evaluate_fn_value(substituted_body, &child_ctx)?;
             // Check return type if annotated
             if let Some(ref return_type) = func.return_type {
-                check_fn_return_type(&func.name, return_type, &result)?;
+                check_fn_return_type(&func.name, return_type, &result, child_ctx.config)?;
             }
             Ok(result)
         }
@@ -2067,8 +2095,8 @@ fn try_evaluate_fn_value(value: Value, ctx: &ParseContext) -> Result<Value, Pars
                 .collect();
             let evaluated_args = evaluated_args?;
 
-            // Try built-in first
-            match crate::builtins::evaluate_builtin(name, &evaluated_args) {
+            // Try built-in first (with config for decrypt support)
+            match crate::builtins::evaluate_builtin_with_config(name, &evaluated_args, ctx.config) {
                 Ok(result) => Ok(result),
                 Err(_builtin_err) => {
                     // Try user-defined function
@@ -2873,6 +2901,14 @@ fn resolve_forward_ref_in_value(
 /// Resolve resource references in a ParsedFile
 /// This replaces ResourceRef values with the actual attribute values from referenced resources
 pub fn resolve_resource_refs(parsed: &mut ParsedFile) -> Result<(), ParseError> {
+    resolve_resource_refs_with_config(parsed, &ProviderContext::default())
+}
+
+/// Resolve resource references with the given parser configuration.
+pub fn resolve_resource_refs_with_config(
+    parsed: &mut ParsedFile,
+    config: &ProviderContext,
+) -> Result<(), ParseError> {
     // Save dependency bindings before resolution may change ResourceRef binding names.
     // This preserves direct dependencies that would be lost by recursive resolution
     // (e.g., tgw_attach.transit_gateway_id resolves to tgw.id, losing the tgw_attach dep).
@@ -2912,7 +2948,7 @@ pub fn resolve_resource_refs(parsed: &mut ParsedFile) -> Result<(), ParseError> 
         let mut resolved_attrs: HashMap<String, Value> = HashMap::new();
 
         for (key, value) in &resource.attributes {
-            let resolved = resolve_value(value, &binding_map)?;
+            let resolved = resolve_value_with_config(value, &binding_map, config)?;
             resolved_attrs.insert(key.clone(), resolved);
         }
 
@@ -2922,9 +2958,10 @@ pub fn resolve_resource_refs(parsed: &mut ParsedFile) -> Result<(), ParseError> 
     Ok(())
 }
 
-fn resolve_value(
+fn resolve_value_with_config(
     value: &Value,
     binding_map: &HashMap<String, HashMap<String, Value>>,
+    config: &ProviderContext,
 ) -> Result<Value, ParseError> {
     match value {
         Value::ResourceRef {
@@ -2935,7 +2972,7 @@ fn resolve_value(
             Some(attributes) => match attributes.get(attribute_name) {
                 Some(attr_value) => {
                     // Recursively resolve in case the attribute itself is a reference
-                    resolve_value(attr_value, binding_map)
+                    resolve_value_with_config(attr_value, binding_map, config)
                 }
                 None => {
                     // Attribute not found, keep as reference (might be resolved at runtime)
@@ -2950,14 +2987,17 @@ fn resolve_value(
         Value::List(items) => {
             let resolved: Result<Vec<Value>, ParseError> = items
                 .iter()
-                .map(|item| resolve_value(item, binding_map))
+                .map(|item| resolve_value_with_config(item, binding_map, config))
                 .collect();
             Ok(Value::List(resolved?))
         }
         Value::Map(map) => {
             let mut resolved = HashMap::new();
             for (k, v) in map {
-                resolved.insert(k.clone(), resolve_value(v, binding_map)?);
+                resolved.insert(
+                    k.clone(),
+                    resolve_value_with_config(v, binding_map, config)?,
+                );
             }
             Ok(Value::Map(resolved))
         }
@@ -2966,22 +3006,24 @@ fn resolve_value(
             let resolved: Result<Vec<InterpolationPart>, ParseError> = parts
                 .iter()
                 .map(|p| match p {
-                    InterpolationPart::Expr(v) => {
-                        Ok(InterpolationPart::Expr(resolve_value(v, binding_map)?))
-                    }
+                    InterpolationPart::Expr(v) => Ok(InterpolationPart::Expr(
+                        resolve_value_with_config(v, binding_map, config)?,
+                    )),
                     other => Ok(other.clone()),
                 })
                 .collect();
             Ok(Value::Interpolation(resolved?))
         }
         Value::FunctionCall { name, args } => {
-            let resolved_args: Result<Vec<Value>, ParseError> =
-                args.iter().map(|a| resolve_value(a, binding_map)).collect();
+            let resolved_args: Result<Vec<Value>, ParseError> = args
+                .iter()
+                .map(|a| resolve_value_with_config(a, binding_map, config))
+                .collect();
             let resolved_args = resolved_args?;
 
             let all_args_resolved = resolved_args.iter().all(is_static_value);
 
-            match crate::builtins::evaluate_builtin(name, &resolved_args) {
+            match crate::builtins::evaluate_builtin_with_config(name, &resolved_args, config) {
                 Ok(result) => Ok(result),
                 Err(e) => {
                     if all_args_resolved {
@@ -3006,7 +3048,7 @@ fn resolve_value(
 
 /// Parse a .crn file and resolve resource references
 pub fn parse_and_resolve(input: &str) -> Result<ParsedFile, ParseError> {
-    let mut parsed = parse(input)?;
+    let mut parsed = parse(input, &ProviderContext::default())?;
     resolve_resource_refs(&mut parsed)?;
     Ok(parsed)
 }
@@ -3024,7 +3066,7 @@ mod tests {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(result.providers.len(), 1);
         assert_eq!(result.providers[0].name, "aws");
     }
@@ -3038,7 +3080,7 @@ mod tests {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(result.resources.len(), 1);
 
         let resource = &result.resources[0];
@@ -3066,7 +3108,7 @@ mod tests {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(result.resources.len(), 2);
         assert_eq!(result.resources[0].id.name, "logs"); // binding name becomes the resource ID
         assert_eq!(result.resources[1].id.name, "data");
@@ -3083,7 +3125,7 @@ mod tests {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(result.resources.len(), 1);
         assert_eq!(
             result.resources[0].attributes.get("region"),
@@ -3116,7 +3158,7 @@ mod tests {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(result.providers.len(), 1);
         assert_eq!(result.resources.len(), 2);
         assert_eq!(
@@ -3137,7 +3179,7 @@ mod tests {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(result.resources.len(), 1);
         assert_eq!(
             result.resources[0].attributes.get("name"),
@@ -3157,7 +3199,7 @@ mod tests {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(result.resources.len(), 1);
         assert_eq!(result.resources[0].id.resource_type, "storage.bucket");
         assert_eq!(result.resources[0].id.provider, "gcp");
@@ -3174,7 +3216,7 @@ mod tests {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(result.resources.len(), 1);
 
         let resource = &result.resources[0];
@@ -3196,7 +3238,7 @@ mod tests {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(result.resources.len(), 2);
         assert_eq!(result.resources[0].id.name, ""); // anonymous gets empty name
         assert_eq!(result.resources[1].id.name, "named"); // binding name becomes the resource ID
@@ -3210,7 +3252,7 @@ mod tests {
             }
         "#;
 
-        let result = parse(input);
+        let result = parse(input, &ProviderContext::default());
         assert!(result.is_ok());
         let parsed = result.unwrap();
         assert_eq!(parsed.resources[0].id.name, ""); // empty name, computed later
@@ -3230,7 +3272,7 @@ mod tests {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(result.resources.len(), 2);
 
         // Before resolution, the attribute should be a ResourceRef
@@ -3306,7 +3348,7 @@ mod tests {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(
             result.resources[0].attributes.get("instance_tenancy"),
             Some(&Value::String("dedicated".to_string()))
@@ -3323,7 +3365,7 @@ mod tests {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(
             result.resources[0].attributes.get("region"),
             Some(&Value::String("aws.Region.ap_northeast_1".to_string()))
@@ -3340,7 +3382,7 @@ mod tests {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(
             result.resources[0].attributes.get("type"),
             Some(&Value::String(
@@ -3381,7 +3423,7 @@ mod tests {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(result.resources.len(), 1);
 
         let sg = &result.resources[0];
@@ -3429,7 +3471,7 @@ mod tests {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(result.resources.len(), 1);
 
         let rt = &result.resources[0];
@@ -3472,7 +3514,7 @@ mod tests {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
 
         // Check arguments
         assert_eq!(result.arguments.len(), 2);
@@ -3508,7 +3550,7 @@ mod tests {
             let web_tier = import "./modules/web_tier.crn"
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(result.imports.len(), 1);
         assert_eq!(result.imports[0].path, "./modules/web_tier.crn");
         assert_eq!(result.imports[0].alias, "web_tier");
@@ -3532,7 +3574,7 @@ mod tests {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
 
         assert_eq!(
             result.arguments[0].type_expr,
@@ -3571,7 +3613,7 @@ mod tests {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
 
         // Check ref type argument
         assert_eq!(result.arguments[0].name, "vpc");
@@ -3605,7 +3647,7 @@ mod tests {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
 
         // Single-level resource type
         assert_eq!(
@@ -3632,7 +3674,7 @@ mod tests {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
 
         assert_eq!(result.attribute_params.len(), 1);
         assert_eq!(result.attribute_params[0].name, "security_group");
@@ -3662,7 +3704,7 @@ mod tests {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
 
         assert_eq!(result.attribute_params.len(), 3);
 
@@ -3734,7 +3776,7 @@ mod tests {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(
             result.resources[0].attributes.get("weight"),
             Some(&Value::Float(2.5))
@@ -3750,7 +3792,7 @@ mod tests {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(
             result.resources[0].attributes.get("offset"),
             Some(&Value::Float(-0.5))
@@ -3778,7 +3820,7 @@ mod tests {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
 
         // Check backend
         assert!(result.backend.is_some());
@@ -3831,7 +3873,7 @@ mod tests {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
 
         assert!(result.backend.is_some());
         let backend = result.backend.unwrap();
@@ -3853,7 +3895,7 @@ mod tests {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(result.resources.len(), 1);
 
         let resource = &result.resources[0];
@@ -3875,7 +3917,7 @@ mod tests {
             }
         "#;
 
-        let result = parse(input);
+        let result = parse(input, &ProviderContext::default());
         assert!(result.is_ok());
         let parsed = result.unwrap();
         assert_eq!(parsed.resources[0].id.name, "existing"); // binding name
@@ -3895,7 +3937,7 @@ mod tests {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(result.resources.len(), 2);
 
         // First resource is read-only (data source)
@@ -3918,7 +3960,7 @@ mod tests {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(result.resources.len(), 1);
 
         let resource = &result.resources[0];
@@ -3936,7 +3978,7 @@ mod tests {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(result.resources.len(), 1);
         assert!(!result.resources[0].lifecycle.force_delete);
     }
@@ -3952,7 +3994,7 @@ mod tests {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(result.resources.len(), 1);
         assert!(result.resources[0].lifecycle.force_delete);
         assert!(!result.resources[0].attributes.contains_key("lifecycle"));
@@ -3968,7 +4010,7 @@ mod tests {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(result.resources.len(), 1);
 
         let resource = &result.resources[0];
@@ -3991,7 +4033,7 @@ mod tests {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(result.resources.len(), 1);
 
         let resource = &result.resources[0];
@@ -4015,7 +4057,7 @@ mod tests {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(result.resources.len(), 1);
 
         let resource = &result.resources[0];
@@ -4036,7 +4078,7 @@ mod tests {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(result.resources.len(), 1);
 
         let resource = &result.resources[0];
@@ -4060,7 +4102,7 @@ mod tests {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(result.resources.len(), 1);
 
         let role = &result.resources[0];
@@ -4112,7 +4154,7 @@ mod tests {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         let role = &result.resources[0];
         let doc = role.attributes.get("policy_document").unwrap();
         if let Value::Map(map) = doc {
@@ -4145,7 +4187,7 @@ mod tests {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         let role = &result.resources[0];
         let doc = role.attributes.get("assume_role_policy_document").unwrap();
         if let Value::Map(map) = doc {
@@ -4173,7 +4215,7 @@ mod tests {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         let r = &result.resources[0];
 
         let outer = r.attributes.get("outer").unwrap();
@@ -4216,7 +4258,7 @@ mod tests {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         let role = &result.resources[0];
 
         let doc = role.attributes.get("policy_document").unwrap();
@@ -4247,7 +4289,7 @@ mod tests {
                 bucket = "other-bucket"
             }
         "#;
-        let parsed = parse(input).unwrap();
+        let parsed = parse(input, &ProviderContext::default()).unwrap();
 
         assert!(
             parsed
@@ -4284,7 +4326,7 @@ aws.s3.bucket {
     count = 99999999999999999999
 }
 "#;
-        let result = parse(input);
+        let result = parse(input, &ProviderContext::default());
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
@@ -4298,7 +4340,7 @@ aws.s3.bucket {
         let input = r#"
             let x = "hello" |> upper()
         "#;
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         // "hello" |> upper() desugars to upper("hello")
         assert_eq!(
             result.variables.get("x"),
@@ -4316,7 +4358,7 @@ aws.s3.bucket {
                 name = "test" |> lower()
             }
         "#;
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(result.resources.len(), 1);
         assert_eq!(
             result.resources[0].attributes.get("name"),
@@ -4334,7 +4376,7 @@ aws.s3.bucket {
                 name = join("-", ["a", "b", "c"])
             }
         "#;
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(result.resources.len(), 1);
         // At parse time, function calls remain as FunctionCall values
         assert_eq!(
@@ -4360,7 +4402,7 @@ aws.s3.bucket {
                 name = ["a", "b", "c"] |> join("-")
             }
         "#;
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(result.resources.len(), 1);
         // ["a", "b", "c"] |> join("-") desugars to join("-", ["a", "b", "c"])
         assert_eq!(
@@ -4385,7 +4427,7 @@ aws.s3.bucket {
         let input = r#"
             let x = ["a", "b"] |> join("-") |> upper()
         "#;
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         // Pipe chaining: ["a", "b"] |> join("-") |> upper()
         // => upper(join("-", ["a", "b"]))
         assert_eq!(
@@ -4411,7 +4453,7 @@ aws.s3.bucket {
         let input = r#"
             let x = foo()
         "#;
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(
             result.variables.get("x"),
             Some(&Value::FunctionCall {
@@ -4428,7 +4470,7 @@ aws.s3.bucket {
                 name = join("-", ["my", "bucket", "name"])
             }
         "#;
-        let mut result = parse(input).unwrap();
+        let mut result = parse(input, &ProviderContext::default()).unwrap();
         resolve_resource_refs(&mut result).unwrap();
         assert_eq!(
             result.resources[0].attributes.get("name"),
@@ -4443,7 +4485,7 @@ aws.s3.bucket {
                 name = ["my", "bucket"] |> join("-")
             }
         "#;
-        let mut result = parse(input).unwrap();
+        let mut result = parse(input, &ProviderContext::default()).unwrap();
         resolve_resource_refs(&mut result).unwrap();
         assert_eq!(
             result.resources[0].attributes.get("name"),
@@ -4466,7 +4508,7 @@ aws.s3.bucket {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(result.resources.len(), 2);
 
         let subnet = &result.resources[0];
@@ -4520,7 +4562,7 @@ aws.s3.bucket {
             }
         "#;
 
-        let parsed = parse(input).unwrap();
+        let parsed = parse(input, &ProviderContext::default()).unwrap();
         let unused = crate::validation::check_unused_bindings(&parsed);
         // vpc is referenced by subnet, so should NOT be unused
         assert!(
@@ -4545,7 +4587,7 @@ aws.s3.bucket {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         let subnet = &result.resources[0];
         // Check nested reference in list > map
         if let Some(Value::List(items)) = subnet.attributes.get("tags") {
@@ -4582,7 +4624,7 @@ aws.s3.bucket {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         let subnet = &result.resources[0];
         assert_eq!(
             subnet.attributes.get("vpc_id"),
@@ -4610,7 +4652,7 @@ aws.s3.bucket {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         let subnet = &result.resources[0];
         assert_eq!(
             subnet.attributes.get("vpc_id"),
@@ -4637,7 +4679,7 @@ aws.s3.bucket {
             }
         "#;
 
-        let result = parse(input);
+        let result = parse(input, &ProviderContext::default());
         assert!(
             result.is_err(),
             "Duplicate let binding 'rt' should produce an error, but parsing succeeded: {:?}",
@@ -4669,7 +4711,7 @@ aws.s3.bucket {
             let region = aws.Region.us_east_1
         "#;
 
-        let result = parse(input);
+        let result = parse(input, &ProviderContext::default());
         assert!(
             result.is_err(),
             "Duplicate let binding 'region' should produce an error, but parsing succeeded: {:?}",
@@ -4706,7 +4748,7 @@ aws.s3.bucket {
             }
         "#;
 
-        let result = parse(input);
+        let result = parse(input, &ProviderContext::default());
         assert!(
             result.is_ok(),
             "Distinct let bindings should parse successfully, got: {:?}",
@@ -4738,7 +4780,7 @@ aws.s3.bucket {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(result.providers.len(), 1);
         assert_eq!(result.providers[0].name, "aws");
     }
@@ -4751,7 +4793,7 @@ aws.s3.bucket {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(result.resources.len(), 1);
         assert_eq!(
             result.resources[0].attributes.get("cidr_block"),
@@ -4770,7 +4812,7 @@ aws.s3.bucket {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(result.resources.len(), 1);
         assert_eq!(
             result.resources[0].attributes.get("cidr_block"),
@@ -4787,7 +4829,7 @@ aws.s3.bucket {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(result.providers.len(), 1);
         assert_eq!(result.providers[0].name, "aws");
     }
@@ -4804,7 +4846,7 @@ aws.s3.bucket {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(result.providers.len(), 1);
         assert_eq!(result.providers[0].name, "aws");
     }
@@ -4821,7 +4863,7 @@ aws.s3.bucket {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(result.providers.len(), 1);
         assert_eq!(result.providers[0].name, "aws");
     }
@@ -4834,7 +4876,7 @@ aws.s3.bucket {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(result.resources.len(), 1);
         assert_eq!(
             result.resources[0].attributes.get("cidr_block"),
@@ -4854,7 +4896,7 @@ aws.s3.bucket {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(result.resources.len(), 1);
     }
 
@@ -4871,7 +4913,7 @@ aws.s3.bucket {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(result.providers.len(), 1);
         assert_eq!(result.providers[0].name, "awscc");
         // default_tags should be extracted from attributes
@@ -4899,7 +4941,7 @@ aws.s3.bucket {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(result.providers.len(), 1);
         assert!(result.providers[0].default_tags.is_empty());
     }
@@ -4947,7 +4989,7 @@ aws.s3.bucket {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(result.module_calls.len(), 1);
 
         let call = &result.module_calls[0];
@@ -4976,7 +5018,7 @@ aws.s3.bucket {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         let sg = &result.resources[0];
         assert_eq!(
             sg.attributes.get("group_name"),
@@ -4997,7 +5039,7 @@ aws.s3.bucket {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         let vpc = &result.resources[0];
         assert_eq!(
             vpc.attributes.get("name"),
@@ -5018,7 +5060,7 @@ aws.s3.bucket {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         let vpc = &result.resources[0];
         assert_eq!(
             vpc.attributes.get("name"),
@@ -5042,7 +5084,7 @@ aws.s3.bucket {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         let subnet = &result.resources[1];
         assert_eq!(
             subnet.attributes.get("name"),
@@ -5066,7 +5108,7 @@ aws.s3.bucket {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         let vpc = &result.resources[0];
         assert_eq!(
             vpc.attributes.get("name"),
@@ -5083,7 +5125,7 @@ aws.s3.bucket {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         let vpc = &result.resources[0];
         assert_eq!(
             vpc.attributes.get("name"),
@@ -5100,7 +5142,7 @@ aws.s3.bucket {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         let vpc = &result.resources[0];
         assert_eq!(
             vpc.attributes.get("name"),
@@ -5116,7 +5158,7 @@ aws.s3.bucket {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         let vpc = &result.resources[0];
         assert_eq!(
             vpc.attributes.get("name"),
@@ -5135,7 +5177,7 @@ aws.s3.bucket {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         let vpc = &result.resources[0];
         assert_eq!(
             vpc.attributes.get("name"),
@@ -5156,7 +5198,7 @@ aws.s3.bucket {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         let vpc = &result.resources[0];
         assert_eq!(
             vpc.attributes.get("tag"),
@@ -5176,7 +5218,7 @@ aws.s3.bucket {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         let subnet = &result.resources[0];
 
         // Local let binding should NOT appear in attributes
@@ -5204,7 +5246,7 @@ aws.s3.bucket {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         let subnet = &result.resources[0];
 
         // Local binding should resolve outer scope variable in interpolation
@@ -5228,7 +5270,7 @@ aws.s3.bucket {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         let subnet = &result.resources[0];
 
         // Chained local bindings should resolve correctly
@@ -5255,7 +5297,7 @@ aws.s3.bucket {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         let subnet = &result.resources[0];
 
         // Local binding used inside function call
@@ -5278,7 +5320,7 @@ aws.s3.bucket {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         let subnet = &result.resources[0];
 
         // Local let binding should work in anonymous resources too
@@ -5301,7 +5343,7 @@ aws.s3.bucket {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         let subnet = &result.resources[0];
 
         // Local binding should be visible in nested blocks
@@ -5326,7 +5368,7 @@ aws.s3.bucket {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         // for expression expands to individual resources at parse time
         assert_eq!(result.resources.len(), 2);
 
@@ -5356,7 +5398,7 @@ aws.s3.bucket {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(result.resources.len(), 2);
 
         assert_eq!(result.resources[0].id.name, "subnets[0]");
@@ -5395,7 +5437,7 @@ aws.s3.bucket {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(result.resources.len(), 2);
 
         // Map iteration produces map-keyed addresses
@@ -5420,7 +5462,7 @@ aws.s3.bucket {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(result.resources.len(), 2);
 
         // Local binding should be resolved within each iteration
@@ -5449,7 +5491,7 @@ aws.s3.bucket {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
 
         // for expression with module call should produce module calls, not resources
         assert_eq!(result.module_calls.len(), 2);
@@ -5501,7 +5543,7 @@ aws.s3.bucket {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
 
         // for expression with module call over list
         assert_eq!(result.module_calls.len(), 2);
@@ -5540,7 +5582,7 @@ aws.s3.bucket {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         let subnet = &result.resources[1];
         let vpc_id = subnet.attributes.get("vpc_id").expect("vpc_id attribute");
         match vpc_id {
@@ -5571,7 +5613,7 @@ aws.s3.bucket {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         let subnet = &result.resources[1];
         let vpc_id = subnet.attributes.get("vpc_id").expect("vpc_id attribute");
         match vpc_id {
@@ -5607,7 +5649,7 @@ aws.s3.bucket {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         let rt = result.resources.last().expect("route_table resource");
         let subnet_id = rt.attributes.get("subnet_id").expect("subnet_id attribute");
         match subnet_id {
@@ -5645,7 +5687,7 @@ aws.s3.bucket {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         let subnet = result.resources.last().expect("subnet resource");
         let vpc_id = subnet.attributes.get("vpc_id").expect("vpc_id attribute");
         match vpc_id {
@@ -5683,7 +5725,7 @@ aws.s3.bucket {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         let subnet = result.resources.last().expect("subnet resource");
         let sg_id = subnet.attributes.get("sg_id").expect("sg_id attribute");
         match sg_id {
@@ -5709,7 +5751,7 @@ aws.s3.bucket {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(result.state_blocks.len(), 1);
         match &result.state_blocks[0] {
             StateBlock::Import { to, id } => {
@@ -5730,7 +5772,7 @@ aws.s3.bucket {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(result.state_blocks.len(), 1);
         match &result.state_blocks[0] {
             StateBlock::Removed { from } => {
@@ -5751,7 +5793,7 @@ aws.s3.bucket {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(result.state_blocks.len(), 1);
         match &result.state_blocks[0] {
             StateBlock::Moved { from, to } => {
@@ -5781,7 +5823,7 @@ aws.s3.bucket {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         // keys({Name = "web", Env = "prod"}) should evaluate to ["Env", "Name"] (sorted)
         assert_eq!(result.resources.len(), 2);
         assert_eq!(result.resources[0].id.name, "resources[0]");
@@ -5811,7 +5853,7 @@ aws.s3.bucket {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         // values() returns values sorted by key: prod, staging
         assert_eq!(result.resources.len(), 2);
         assert_eq!(
@@ -5834,7 +5876,7 @@ aws.s3.bucket {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(result.resources.len(), 2);
         // concat(items, base_list) => base_list ++ items
         // So concat(["10.0.0.0/16"], ["10.1.0.0/16"]) => ["10.1.0.0/16", "10.0.0.0/16"]
@@ -5863,7 +5905,7 @@ aws.s3.bucket {
             }
         "#;
 
-        let result = parse(input);
+        let result = parse(input, &ProviderContext::default());
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
@@ -5885,7 +5927,7 @@ aws.s3.bucket {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(result.resources.len(), 1);
         assert_eq!(result.resources[0].id.name, "alarm");
         assert_eq!(
@@ -5904,7 +5946,7 @@ aws.s3.bucket {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(result.resources.len(), 0);
     }
 
@@ -5922,7 +5964,7 @@ aws.s3.bucket {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(result.resources.len(), 1);
         assert_eq!(
             result.resources[0].attributes.get("cidr_block"),
@@ -5944,7 +5986,7 @@ aws.s3.bucket {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(result.resources.len(), 1);
         assert_eq!(
             result.resources[0].attributes.get("cidr_block"),
@@ -5962,7 +6004,7 @@ aws.s3.bucket {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(result.resources.len(), 0);
         // The binding should be set to the value from the true branch
         // We verify by using the variable in a resource
@@ -5978,7 +6020,7 @@ aws.s3.bucket {
             }
         "#;
 
-        let result2 = parse(input2).unwrap();
+        let result2 = parse(input2, &ProviderContext::default()).unwrap();
         assert_eq!(
             result2.resources[0].attributes.get("instance_type"),
             Some(&Value::String("m5.xlarge".to_string()))
@@ -5999,7 +6041,7 @@ aws.s3.bucket {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(
             result.resources[0].attributes.get("instance_type"),
             Some(&Value::String("t3.micro".to_string()))
@@ -6018,7 +6060,7 @@ aws.s3.bucket {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(result.resources.len(), 1);
     }
 
@@ -6032,7 +6074,7 @@ aws.s3.bucket {
             }
         "#;
 
-        let result = parse(input);
+        let result = parse(input, &ProviderContext::default());
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
@@ -6056,7 +6098,7 @@ aws.s3.bucket {
             }
         "#;
 
-        let result = parse(input);
+        let result = parse(input, &ProviderContext::default());
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
@@ -6076,7 +6118,7 @@ aws.s3.bucket {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(result.module_calls.len(), 1);
         assert_eq!(result.module_calls[0].module_name, "web");
     }
@@ -6091,7 +6133,7 @@ aws.s3.bucket {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(result.module_calls.len(), 0);
     }
 
@@ -6106,7 +6148,7 @@ aws.s3.bucket {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(result.resources.len(), 1);
         assert_eq!(
             result.resources[0].attributes.get("alarm_name"),
@@ -6124,7 +6166,7 @@ aws.s3.bucket {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(result.resources.len(), 1);
         assert_eq!(
             result.resources[0].attributes.get("cidr_block"),
@@ -6142,7 +6184,7 @@ aws.s3.bucket {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(result.resources.len(), 1);
         assert_eq!(
             result.resources[0].attributes.get("cidr_block"),
@@ -6159,7 +6201,7 @@ aws.s3.bucket {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(result.resources.len(), 1);
         assert_eq!(
             result.resources[0].attributes.get("cidr_block"),
@@ -6176,7 +6218,7 @@ aws.s3.bucket {
             }
         "#;
 
-        let result = parse(input);
+        let result = parse(input, &ProviderContext::default());
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
@@ -6196,7 +6238,7 @@ aws.s3.bucket {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(result.resources.len(), 2);
 
         // Each resource should have the loop variable substituted
@@ -6221,7 +6263,7 @@ aws.s3.bucket {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(result.resources.len(), 1);
         assert_eq!(
             result.resources[0].attributes.get("alarm_name"),
@@ -6244,7 +6286,7 @@ aws.s3.bucket {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(result.resources.len(), 4);
 
         // First for gets _for0, second gets _for1 - no collisions
@@ -6270,7 +6312,7 @@ aws.s3.bucket {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(result.resources.len(), 0);
     }
 
@@ -6284,7 +6326,7 @@ aws.s3.bucket {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(result.arguments.len(), 1);
         assert_eq!(result.arguments[0].name, "vpc");
         assert_eq!(
@@ -6309,7 +6351,7 @@ aws.s3.bucket {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(result.arguments.len(), 1);
         assert_eq!(result.arguments[0].name, "port");
         assert_eq!(result.arguments[0].type_expr, TypeExpr::Int);
@@ -6337,7 +6379,7 @@ aws.s3.bucket {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(result.arguments.len(), 3);
 
         // Simple form (unchanged)
@@ -6377,7 +6419,7 @@ aws.s3.bucket {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(result.arguments.len(), 2);
         assert!(result.arguments[0].description.is_none());
         assert!(result.arguments[1].description.is_none());
@@ -6393,7 +6435,7 @@ aws.s3.bucket {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(result.arguments.len(), 1);
         assert_eq!(result.arguments[0].name, "port");
         assert_eq!(result.arguments[0].default, Some(Value::Int(8080)));
@@ -6408,7 +6450,7 @@ aws.s3.bucket {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(result.arguments.len(), 1);
         assert_eq!(result.arguments[0].name, "port");
         assert!(result.arguments[0].default.is_none());
@@ -6426,7 +6468,7 @@ aws.s3.bucket {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(result.arguments.len(), 1);
         assert_eq!(result.arguments[0].name, "name");
         assert_eq!(result.arguments[0].type_expr, TypeExpr::String);
@@ -6501,7 +6543,7 @@ aws.s3.bucket {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(result.resources.len(), 1);
         assert_eq!(
             result.resources[0].attributes.get("name"),
@@ -6525,7 +6567,7 @@ aws.s3.bucket {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(
             result.resources[0].attributes.get("name"),
             Some(&Value::String("prod-default".to_string())),
@@ -6549,7 +6591,7 @@ aws.s3.bucket {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(
             result.resources[0].attributes.get("name"),
             Some(&Value::String("prod-subnet-a".to_string())),
@@ -6568,7 +6610,7 @@ aws.s3.bucket {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(
             result.resources[0].attributes.get("name"),
             Some(&Value::String("HELLO".to_string())),
@@ -6591,7 +6633,7 @@ aws.s3.bucket {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(
             result.resources[0].attributes.get("name"),
             Some(&Value::String("prod-app-web".to_string())),
@@ -6610,7 +6652,7 @@ aws.s3.bucket {
             }
         "#;
 
-        let result = parse(input);
+        let result = parse(input, &ProviderContext::default());
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
@@ -6631,7 +6673,7 @@ aws.s3.bucket {
             }
         "#;
 
-        let result = parse(input);
+        let result = parse(input, &ProviderContext::default());
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
@@ -6652,7 +6694,7 @@ aws.s3.bucket {
             }
         "#;
 
-        let result = parse(input);
+        let result = parse(input, &ProviderContext::default());
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
@@ -6669,7 +6711,7 @@ aws.s3.bucket {
             }
         "#;
 
-        let result = parse(input);
+        let result = parse(input, &ProviderContext::default());
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
@@ -6690,7 +6732,7 @@ aws.s3.bucket {
             }
         "#;
 
-        let result = parse(input);
+        let result = parse(input, &ProviderContext::default());
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
@@ -6707,7 +6749,7 @@ aws.s3.bucket {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         assert!(result.user_functions.contains_key("greet"));
         let func = &result.user_functions["greet"];
         assert_eq!(func.name, "greet");
@@ -6727,7 +6769,7 @@ aws.s3.bucket {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(
             result.resources[0].attributes.get("name"),
             Some(&Value::String("hello".to_string())),
@@ -6750,7 +6792,7 @@ aws.s3.bucket {
             }
         "#;
 
-        let result = parse(input);
+        let result = parse(input, &ProviderContext::default());
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
@@ -6767,7 +6809,7 @@ aws.s3.bucket {
             }
         "#;
 
-        let result = parse(input);
+        let result = parse(input, &ProviderContext::default());
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
@@ -6788,7 +6830,7 @@ aws.s3.bucket {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(
             result.resources[0].attributes.get("name"),
             Some(&Value::String("hello-world".to_string())),
@@ -6808,7 +6850,7 @@ aws.s3.bucket {
         "#;
 
         // At parse time, fn is evaluated but interpolation is not fully resolved
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         let name = result.resources[0].attributes.get("name").unwrap();
         match name {
             Value::Interpolation(parts) => {
@@ -6836,7 +6878,7 @@ aws.s3.bucket {
             let my_bucket = make_bucket("test-bucket")
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(result.resources.len(), 1);
         let resource = &result.resources[0];
         assert_eq!(resource.id.resource_type, "s3_bucket");
@@ -6864,7 +6906,7 @@ aws.s3.bucket {
             let prod_bucket = tagged_bucket("prod")
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(result.resources.len(), 1);
         let resource = &result.resources[0];
         assert_eq!(resource.id.name, "prod_bucket");
@@ -6889,7 +6931,7 @@ aws.s3.bucket {
             let subnet_b = subnet("vpc-123", "10.0.2.0/24", "ap-northeast-1c")
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(result.resources.len(), 2);
 
         let subnet_a = &result.resources[0];
@@ -6928,7 +6970,7 @@ aws.s3.bucket {
             let my_bucket = make_bucket("test")
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(result.resources.len(), 1);
         let resource = &result.resources[0];
         assert_eq!(resource.id.name, "my_bucket");
@@ -6950,7 +6992,7 @@ aws.s3.bucket {
             make_bucket("anon-bucket")
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(result.resources.len(), 1);
         let resource = &result.resources[0];
         assert_eq!(resource.id.resource_type, "s3_bucket");
@@ -6977,7 +7019,7 @@ aws.s3.bucket {
             let subnet_a = make_subnet(vpc, "10.0.1.0/24")
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(result.resources.len(), 2);
 
         let subnet = &result.resources[1];
@@ -7016,7 +7058,7 @@ aws.s3.bucket {
             let subnet_a = make_subnet(my_vpc, "10.0.1.0/24")
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(result.resources.len(), 2);
 
         let subnet = &result.resources[1];
@@ -7049,7 +7091,7 @@ aws.s3.bucket {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(result.resources.len(), 1);
         assert_eq!(
             result.resources[0].attributes.get("name"),
@@ -7069,7 +7111,7 @@ aws.s3.bucket {
             }
         "#;
 
-        let err = parse(input).unwrap_err();
+        let err = parse(input, &ProviderContext::default()).unwrap_err();
         let msg = format!("{err}");
         assert!(
             msg.contains("expects type 'string'"),
@@ -7089,7 +7131,7 @@ aws.s3.bucket {
             }
         "#;
 
-        let err = parse(input).unwrap_err();
+        let err = parse(input, &ProviderContext::default()).unwrap_err();
         let msg = format!("{err}");
         assert!(
             msg.contains("expects type 'int'"),
@@ -7109,7 +7151,7 @@ aws.s3.bucket {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(
             result.resources[0].attributes.get("name"),
             Some(&Value::String("prod-default".to_string())),
@@ -7128,7 +7170,7 @@ aws.s3.bucket {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(
             result.resources[0].attributes.get("name"),
             Some(&Value::String("prod-web".to_string())),
@@ -7153,7 +7195,7 @@ aws.s3.bucket {
             let subnet = make_subnet(vpc, "10.0.1.0/24")
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(result.resources.len(), 2);
         assert_eq!(result.resources[1].id.name, "subnet");
     }
@@ -7170,7 +7212,7 @@ aws.s3.bucket {
             }
         "#;
 
-        let err = parse(input).unwrap_err();
+        let err = parse(input, &ProviderContext::default()).unwrap_err();
         let msg = format!("{err}");
         assert!(
             msg.contains("expects type 'bool'"),
@@ -7186,7 +7228,7 @@ aws.s3.bucket {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         let func = result.user_functions.get("greet").unwrap();
         assert_eq!(func.params[0].param_type, Some(TypeExpr::String));
         assert_eq!(func.params[1].param_type, Some(TypeExpr::Int));
@@ -7200,7 +7242,7 @@ aws.s3.bucket {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         let func = result.user_functions.get("greet").unwrap();
         assert_eq!(func.params[0].param_type, None);
     }
@@ -7217,7 +7259,7 @@ aws.s3.bucket {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         let func = result.user_functions.get("greet").unwrap();
         assert_eq!(func.return_type, Some(TypeExpr::String));
     }
@@ -7230,7 +7272,7 @@ aws.s3.bucket {
             }
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         let func = result.user_functions.get("greet").unwrap();
         assert_eq!(func.return_type, None);
     }
@@ -7247,7 +7289,7 @@ aws.s3.bucket {
             }
         "#;
 
-        let err = parse(input).unwrap_err();
+        let err = parse(input, &ProviderContext::default()).unwrap_err();
         let msg = format!("{err}");
         assert!(
             msg.contains("return type"),
@@ -7267,7 +7309,7 @@ aws.s3.bucket {
             let b = make_bucket()
         "#;
 
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         let func = result.user_functions.get("make_bucket").unwrap();
         assert_eq!(
             func.return_type,
@@ -7287,7 +7329,7 @@ aws.s3.bucket {
             let b = make_bucket()
         "#;
 
-        let err = parse(input).unwrap_err();
+        let err = parse(input, &ProviderContext::default()).unwrap_err();
         let msg = format!("{err}");
         assert!(
             msg.contains("return type"),
@@ -7307,7 +7349,7 @@ aws.s3.bucket {
                 }
             }
         "#;
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         let func = result.user_functions.get("subnet").unwrap();
         assert_eq!(func.params[1].name, "cidr_block");
         assert_eq!(
@@ -7323,7 +7365,7 @@ aws.s3.bucket {
                 addr
             }
         "#;
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         let func = result.user_functions.get("f").unwrap();
         assert_eq!(
             func.params[0].param_type,
@@ -7338,7 +7380,7 @@ aws.s3.bucket {
                 role
             }
         "#;
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         let func = result.user_functions.get("f").unwrap();
         assert_eq!(
             func.params[0].param_type,
@@ -7353,7 +7395,7 @@ aws.s3.bucket {
                 cidrs
             }
         "#;
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         let func = result.user_functions.get("f").unwrap();
         assert_eq!(
             func.params[0].param_type,
@@ -7376,7 +7418,7 @@ aws.s3.bucket {
                 cidr_block = vpc_cidr
             }
         "#;
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(result.arguments[0].name, "vpc_cidr");
         assert_eq!(
             result.arguments[0].type_expr,
@@ -7401,7 +7443,7 @@ aws.s3.bucket {
                 cidr_block = "10.0.0.0/16"
             }
         "#;
-        let result = parse(input).unwrap();
+        let result = parse(input, &ProviderContext::default()).unwrap();
         assert_eq!(
             result.attribute_params[0].type_expr,
             Some(TypeExpr::Simple("cidr".to_string()))
@@ -7429,7 +7471,7 @@ aws.s3.bucket {
                 name = f("10.0.0.0/16")
             }
         "#;
-        let result = parse(input);
+        let result = parse(input, &ProviderContext::default());
         assert!(result.is_ok(), "Expected OK, got: {:?}", result.err());
     }
 
@@ -7442,7 +7484,7 @@ aws.s3.bucket {
                 name = f("invalid")
             }
         "#;
-        let err = parse(input).unwrap_err();
+        let err = parse(input, &ProviderContext::default()).unwrap_err();
         let msg = format!("{err}");
         assert!(
             msg.contains("type 'cidr' validation failed"),
@@ -7459,7 +7501,7 @@ aws.s3.bucket {
                 name = f("10.0.0.1")
             }
         "#;
-        let result = parse(input);
+        let result = parse(input, &ProviderContext::default());
         assert!(result.is_ok(), "Expected OK, got: {:?}", result.err());
     }
 
@@ -7472,7 +7514,7 @@ aws.s3.bucket {
                 name = f("invalid")
             }
         "#;
-        let err = parse(input).unwrap_err();
+        let err = parse(input, &ProviderContext::default()).unwrap_err();
         let msg = format!("{err}");
         assert!(
             msg.contains("type 'ipv4_address' validation failed"),
@@ -7489,7 +7531,7 @@ aws.s3.bucket {
                 name = f("2001:db8::/32")
             }
         "#;
-        let result = parse(input);
+        let result = parse(input, &ProviderContext::default());
         assert!(result.is_ok(), "Expected OK, got: {:?}", result.err());
     }
 
@@ -7502,7 +7544,7 @@ aws.s3.bucket {
                 name = f("invalid")
             }
         "#;
-        let err = parse(input).unwrap_err();
+        let err = parse(input, &ProviderContext::default()).unwrap_err();
         let msg = format!("{err}");
         assert!(
             msg.contains("type 'ipv6_cidr' validation failed"),
@@ -7519,7 +7561,7 @@ aws.s3.bucket {
                 name = f("2001:db8::1")
             }
         "#;
-        let result = parse(input);
+        let result = parse(input, &ProviderContext::default());
         assert!(result.is_ok(), "Expected OK, got: {:?}", result.err());
     }
 
@@ -7532,7 +7574,7 @@ aws.s3.bucket {
                 name = f("invalid")
             }
         "#;
-        let err = parse(input).unwrap_err();
+        let err = parse(input, &ProviderContext::default()).unwrap_err();
         let msg = format!("{err}");
         assert!(
             msg.contains("type 'ipv6_address' validation failed"),
@@ -7550,7 +7592,7 @@ aws.s3.bucket {
                 name = f("arn:aws:s3:::my-bucket")
             }
         "#;
-        let result = parse(input);
+        let result = parse(input, &ProviderContext::default());
         assert!(result.is_ok(), "Expected OK, got: {:?}", result.err());
     }
 
@@ -7568,7 +7610,7 @@ aws.s3.bucket {
                 name = f(vpc.cidr_block)
             }
         "#;
-        let result = parse(input);
+        let result = parse(input, &ProviderContext::default());
         assert!(result.is_ok(), "Expected OK, got: {:?}", result.err());
     }
 
@@ -7583,7 +7625,7 @@ aws.s3.bucket {
                 name = f()
             }
         "#;
-        let result = parse(input);
+        let result = parse(input, &ProviderContext::default());
         assert!(result.is_ok(), "Expected OK, got: {:?}", result.err());
     }
 
@@ -7596,7 +7638,7 @@ aws.s3.bucket {
                 name = f()
             }
         "#;
-        let err = parse(input).unwrap_err();
+        let err = parse(input, &ProviderContext::default()).unwrap_err();
         let msg = format!("{err}");
         assert!(
             msg.contains("return type 'cidr' validation failed"),
@@ -7613,7 +7655,7 @@ aws.s3.bucket {
                 name = f()
             }
         "#;
-        let err = parse(input).unwrap_err();
+        let err = parse(input, &ProviderContext::default()).unwrap_err();
         let msg = format!("{err}");
         assert!(
             msg.contains("return type 'ipv4_address' validation failed"),
@@ -7630,7 +7672,7 @@ aws.s3.bucket {
                 name = f()
             }
         "#;
-        let err = parse(input).unwrap_err();
+        let err = parse(input, &ProviderContext::default()).unwrap_err();
         let msg = format!("{err}");
         assert!(
             msg.contains("return type 'ipv6_cidr' validation failed"),
@@ -7647,7 +7689,7 @@ aws.s3.bucket {
                 name = f()
             }
         "#;
-        let err = parse(input).unwrap_err();
+        let err = parse(input, &ProviderContext::default()).unwrap_err();
         let msg = format!("{err}");
         assert!(
             msg.contains("return type 'ipv6_address' validation failed"),
@@ -7673,7 +7715,7 @@ aws.s3.bucket {
 
             let subnet = make_subnet(vpc, "10.0.1.0/24")
         "#;
-        let result = parse(input);
+        let result = parse(input, &ProviderContext::default());
         assert!(result.is_ok(), "Expected OK, got: {:?}", result.err());
     }
 
@@ -7693,12 +7735,142 @@ aws.s3.bucket {
 
             let subnet = make_subnet(sg, "10.0.1.0/24")
         "#;
-        let err = parse(input).unwrap_err();
+        let err = parse(input, &ProviderContext::default()).unwrap_err();
         let msg = format!("{err}");
         assert!(
             msg.contains("expects resource type 'awscc.ec2.vpc'")
                 && msg.contains("got awscc.ec2.security_group"),
             "Expected resource type mismatch error, got: {msg}"
+        );
+    }
+
+    // --- ProviderContext tests ---
+
+    #[test]
+    fn parse_decrypt_uses_config_decryptor() {
+        use std::collections::HashMap;
+        let config = ProviderContext {
+            decryptor: Some(Box::new(|ciphertext, _key| {
+                Ok(format!("decrypted:{ciphertext}"))
+            })),
+            validators: HashMap::new(),
+        };
+
+        // decrypt() in resource attributes is resolved during resolve_resource_refs,
+        // so we need to parse and then resolve with config.
+        let input = r#"
+            let my_bucket = aws.s3_bucket {
+                name   = "test-bucket"
+                secret = decrypt("AQICAHh")
+            }
+        "#;
+        let mut parsed = parse(input, &config).unwrap();
+        resolve_resource_refs_with_config(&mut parsed, &config).unwrap();
+        assert_eq!(parsed.resources.len(), 1);
+        let secret_val = parsed.resources[0].attributes.get("secret").unwrap();
+        assert_eq!(*secret_val, Value::String("decrypted:AQICAHh".to_string()));
+    }
+
+    #[test]
+    fn parse_decrypt_without_decryptor_errors() {
+        let config = ProviderContext::default();
+
+        let input = r#"
+            let my_bucket = aws.s3_bucket {
+                name   = "test-bucket"
+                secret = decrypt("AQICAHh")
+            }
+        "#;
+        let mut parsed = parse(input, &config).unwrap();
+        let result = resolve_resource_refs_with_config(&mut parsed, &config);
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("requires a configured provider"),
+            "Expected decryptor error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn parse_custom_validator_accepts_valid() {
+        use std::collections::HashMap;
+        // Test validate_custom_type directly with a type name that has no built-in
+        // handler. Built-in types (cidr, ipv4_address, etc.) are matched first in
+        // validate_custom_type, so custom validators only apply to other type names.
+        let mut validators: HashMap<String, ValidatorFn> = HashMap::new();
+        validators.insert(
+            "custom_type".to_string(),
+            Box::new(|s: &str| {
+                if s.starts_with("valid-") {
+                    Ok(())
+                } else {
+                    Err(format!("custom_type must start with 'valid-', got '{s}'"))
+                }
+            }),
+        );
+        let config = ProviderContext {
+            decryptor: None,
+            validators,
+        };
+
+        let result = validate_custom_type(
+            "custom_type",
+            &Value::String("valid-data".to_string()),
+            &config,
+        );
+        assert!(result.is_ok());
+
+        // Unknown type with no custom validator should also pass (permissive)
+        let result = validate_custom_type(
+            "unknown_type",
+            &Value::String("anything".to_string()),
+            &config,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn parse_custom_validator_rejects_invalid() {
+        use std::collections::HashMap;
+        // Use a type name that the grammar accepts and has no built-in validator.
+        // The "arn" type is accepted by the grammar as identifier. But it fails to parse.
+        // Use "cidr" which is known to work in grammar. Register a custom stricter validator.
+        // Actually, let's test validate_custom_type directly to avoid grammar issues.
+        let mut validators: HashMap<String, ValidatorFn> = HashMap::new();
+        validators.insert(
+            "custom_type".to_string(),
+            Box::new(|s: &str| {
+                if s.starts_with("valid-") {
+                    Ok(())
+                } else {
+                    Err(format!("custom_type must start with 'valid-', got '{s}'"))
+                }
+            }),
+        );
+        let config = ProviderContext {
+            decryptor: None,
+            validators,
+        };
+
+        // Test validate_custom_type directly since the grammar may not accept
+        // arbitrary type names. This verifies the custom validator is called.
+        let valid_result = validate_custom_type(
+            "custom_type",
+            &Value::String("valid-data".to_string()),
+            &config,
+        );
+        assert!(valid_result.is_ok());
+
+        let invalid_result = validate_custom_type(
+            "custom_type",
+            &Value::String("invalid".to_string()),
+            &config,
+        );
+        assert!(invalid_result.is_err());
+        let msg = invalid_result.unwrap_err();
+        assert!(
+            msg.contains("custom_type must start with 'valid-'"),
+            "Expected validation error, got: {msg}"
         );
     }
 }

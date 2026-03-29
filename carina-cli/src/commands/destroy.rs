@@ -8,7 +8,7 @@ use colored::Colorize;
 use futures::stream::{self, FuturesUnordered, StreamExt};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 
-use carina_core::config_loader::{get_base_dir, load_configuration};
+use carina_core::config_loader::{get_base_dir, load_configuration_with_config};
 use carina_core::deps::{
     build_dependents_map, find_failed_dependent, get_resource_dependencies,
     sort_resources_for_destroy,
@@ -22,7 +22,9 @@ use carina_state::{
     create_local_backend,
 };
 
-use super::validate_and_resolve;
+use carina_core::parser::ProviderContext;
+
+use super::validate_and_resolve_with_config;
 use crate::DetailLevel;
 use crate::commands::apply::{
     RefreshProgress, apply_name_overrides, format_duration, refresh_multi_progress, spinner_style,
@@ -40,11 +42,12 @@ pub async fn run_destroy(
     auto_approve: bool,
     lock: bool,
     refresh: bool,
+    provider_context: &ProviderContext,
 ) -> Result<(), AppError> {
-    let mut parsed = load_configuration(path)?.parsed;
+    let mut parsed = load_configuration_with_config(path, provider_context)?.parsed;
 
     let base_dir = get_base_dir(path);
-    validate_and_resolve(&mut parsed, base_dir, true)?;
+    validate_and_resolve_with_config(&mut parsed, base_dir, true, provider_context)?;
 
     // Don't exit early when resources are empty -- orphaned resources in the
     // state file may still need to be destroyed.

@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::parser::{self, ParsedFile};
+use crate::parser::{self, ParsedFile, ProviderContext};
 
 /// Result of loading configuration, includes the file path containing backend block
 pub struct LoadedConfig {
@@ -18,13 +18,23 @@ pub struct LoadedConfig {
 
 /// Load configuration from a file or directory
 pub fn load_configuration(path: &PathBuf) -> Result<LoadedConfig, String> {
+    load_configuration_with_config(path, &ProviderContext::default())
+}
+
+/// Load configuration from a file or directory with the given parser configuration.
+pub fn load_configuration_with_config(
+    path: &PathBuf,
+    config: &ProviderContext,
+) -> Result<LoadedConfig, String> {
     if path.is_file() {
         // Single file mode (existing behavior)
         let content = fs::read_to_string(path)
             .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
-        let mut parsed = parser::parse(&content).map_err(|e| format!("Parse error: {}", e))?;
+        let mut parsed =
+            parser::parse(&content, config).map_err(|e| format!("Parse error: {}", e))?;
         let unresolved_parsed = parsed.clone();
-        parser::resolve_resource_refs(&mut parsed).map_err(|e| format!("Parse error: {}", e))?;
+        parser::resolve_resource_refs_with_config(&mut parsed, config)
+            .map_err(|e| format!("Parse error: {}", e))?;
         let backend_file = if parsed.backend.is_some() {
             Some(path.clone())
         } else {
@@ -62,10 +72,10 @@ pub fn load_configuration(path: &PathBuf) -> Result<LoadedConfig, String> {
         for file in &files {
             let content = fs::read_to_string(file)
                 .map_err(|e| format!("Failed to read {}: {}", file.display(), e))?;
-            match parser::parse(&content) {
+            match parser::parse(&content, config) {
                 Ok(mut parsed) => {
                     let unresolved = parsed.clone();
-                    if let Err(e) = parser::resolve_resource_refs(&mut parsed) {
+                    if let Err(e) = parser::resolve_resource_refs_with_config(&mut parsed, config) {
                         parse_errors.push(format!("{}: {}", file.display(), e));
                         continue;
                     }

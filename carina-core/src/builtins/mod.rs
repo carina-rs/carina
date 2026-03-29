@@ -20,6 +20,7 @@ mod split;
 mod trim;
 mod upper_lower;
 
+use crate::parser::ProviderContext;
 use crate::resource::Value;
 
 /// Metadata for a built-in function, used by the LSP for completion, hover, and validation.
@@ -145,6 +146,21 @@ register_builtins! {
         signature: "values(map: map) -> list",
         description: "Returns the values of a map as a list, sorted by key.",
     },
+}
+
+/// Evaluate a built-in function with parser configuration.
+///
+/// This dispatches `decrypt` to use the decryptor from the config instead of
+/// the global Mutex. All other builtins are delegated to [`evaluate_builtin`].
+pub fn evaluate_builtin_with_config(
+    name: &str,
+    args: &[Value],
+    config: &ProviderContext,
+) -> Result<Value, String> {
+    match name {
+        "decrypt" => decrypt::builtin_decrypt_with_config(args, config),
+        _ => evaluate_builtin(name, args),
+    }
 }
 
 /// Check if a function name is a known built-in function.

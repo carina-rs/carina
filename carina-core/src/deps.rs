@@ -720,7 +720,7 @@ mod tests {
     /// The route must always come AFTER igw_attachment in creation order.
     #[test]
     fn test_apply_order_route_after_gateway_attachment() {
-        use crate::parser::parse;
+        use crate::parser::{ProviderContext, parse};
 
         let input = r#"
             provider awscc {
@@ -749,7 +749,7 @@ mod tests {
             }
         "#;
 
-        let parsed = parse(input).unwrap();
+        let parsed = parse(input, &ProviderContext::default()).unwrap();
         let sorted = sort_resources_by_dependencies(&parsed.resources).unwrap();
         let creation_order: Vec<String> = sorted
             .iter()
@@ -799,7 +799,7 @@ mod tests {
     ///   route (anonymous) -> rt, tgw_attach
     #[test]
     fn test_apply_order_route_after_tgw_attachment() {
-        use crate::parser::parse;
+        use crate::parser::{ProviderContext, parse};
 
         let input = r#"
             provider awscc {
@@ -837,7 +837,7 @@ mod tests {
             }
         "#;
 
-        let parsed = parse(input).unwrap();
+        let parsed = parse(input, &ProviderContext::default()).unwrap();
         let sorted = sort_resources_by_dependencies(&parsed.resources).unwrap();
         let creation_order: Vec<String> = sorted
             .iter()

@@ -1,7 +1,7 @@
 use ropey::Rope;
 use tower_lsp::lsp_types::{Position, TextDocumentContentChangeEvent};
 
-use carina_core::parser::{ParseError, ParsedFile, parse};
+use carina_core::parser::{ParseError, ParsedFile, ProviderContext, parse};
 
 pub struct Document {
     content: Rope,
@@ -37,7 +37,7 @@ impl Document {
 
     fn reparse(&mut self) {
         let text = self.content.to_string();
-        match parse(&text) {
+        match parse(&text, &ProviderContext::default()) {
             Ok(parsed) => {
                 self.parsed = Some(parsed);
                 self.parse_error = None;
