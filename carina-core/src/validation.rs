@@ -213,7 +213,7 @@ pub fn validate_module_calls(
         if let Some(module_args) = imported_modules.get(&call.module_name) {
             for (arg_name, arg_value) in &call.arguments {
                 if let Some(arg_param) = module_args.iter().find(|a| &a.name == arg_name)
-                    && let Some(error) = validate_module_arg_type(&arg_param.type_expr, arg_value)
+                    && let Some(error) = validate_type_expr_value(&arg_param.type_expr, arg_value)
                 {
                     errors.push(format!(
                         "module {} argument '{}': {}",
@@ -298,18 +298,12 @@ fn collect_resource_refs(value: &Value, refs: &mut HashSet<String>) {
 
 /// Validate a value against a TypeExpr, returning an error message if invalid.
 ///
-/// This is the shared validation logic used by both `validate_module_arg_type`
-/// (CLI module call validation) and the LSP diagnostics. It handles:
-/// - Custom types: cidr, ipv4_address, ipv6_cidr, ipv6_address
-/// - List of custom types
-/// - Basic type mismatches (bool/int/float vs string)
+/// Shared validation logic used by both CLI module call validation and LSP diagnostics.
 pub fn validate_type_expr_value(type_expr: &TypeExpr, value: &Value) -> Option<String> {
     match (type_expr, value) {
-        // Custom type validation
         (TypeExpr::Simple(name), Value::String(s)) => {
             simple_type_validator(name).and_then(|validate_fn| validate_fn(s).err())
         }
-        // List of custom type validation
         (TypeExpr::List(inner), Value::List(items)) => {
             if let TypeExpr::Simple(name) = inner.as_ref()
                 && let Some(validate_fn) = simple_type_validator(name)
@@ -326,14 +320,11 @@ pub fn validate_type_expr_value(type_expr: &TypeExpr, value: &Value) -> Option<S
             }
             None
         }
-        // Bool type mismatch
         (TypeExpr::Bool, Value::String(s)) => Some(format!(
             "expected bool, got string \"{}\". Use true or false.",
             s
         )),
-        // Int type mismatch
         (TypeExpr::Int, Value::String(s)) => Some(format!("expected int, got string \"{}\".", s)),
-        // Float type mismatch
         (TypeExpr::Float, Value::String(s)) => {
             Some(format!("expected float, got string \"{}\".", s))
         }
@@ -352,13 +343,6 @@ fn simple_type_validator(name: &str) -> Option<ValidateFn> {
         "ipv6_address" => Some(validate_ipv6_address),
         _ => None,
     }
-}
-
-/// Validate a module argument value against its expected type.
-///
-/// Delegates to [`validate_type_expr_value`] for the actual validation logic.
-pub fn validate_module_arg_type(type_expr: &TypeExpr, value: &Value) -> Option<String> {
-    validate_type_expr_value(type_expr, value)
 }
 
 #[cfg(test)]
