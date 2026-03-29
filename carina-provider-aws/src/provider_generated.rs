@@ -190,6 +190,49 @@ impl AwsProvider {
         Ok(())
     }
 
+    /// Extract ec2.eip attributes from SDK response type (generated)
+    pub(crate) fn extract_ec2_eip_attributes(
+        obj: &aws_sdk_ec2::types::Address,
+        attributes: &mut HashMap<String, Value>,
+    ) -> Option<String> {
+        if let Some(v) = obj.allocation_id() {
+            attributes.insert("allocation_id".to_string(), Value::String(v.to_string()));
+        }
+        if let Some(v) = obj.domain() {
+            attributes.insert("domain".to_string(), Value::String(v.as_str().to_string()));
+        }
+        if let Some(v) = obj.public_ip() {
+            attributes.insert("public_ip".to_string(), Value::String(v.to_string()));
+        }
+        obj.allocation_id().map(String::from)
+    }
+
+    /// Extract ec2.nat_gateway attributes from SDK response type (generated)
+    pub(crate) fn extract_ec2_nat_gateway_attributes(
+        obj: &aws_sdk_ec2::types::NatGateway,
+        attributes: &mut HashMap<String, Value>,
+    ) -> Option<String> {
+        // Extract allocation_id from the first NAT gateway address
+        if let Some(addr) = obj.nat_gateway_addresses().first()
+            && let Some(v) = addr.allocation_id()
+        {
+            attributes.insert("allocation_id".to_string(), Value::String(v.to_string()));
+        }
+        if let Some(v) = obj.connectivity_type() {
+            attributes.insert(
+                "connectivity_type".to_string(),
+                Value::String(v.as_str().to_string()),
+            );
+        }
+        if let Some(v) = obj.nat_gateway_id() {
+            attributes.insert("nat_gateway_id".to_string(), Value::String(v.to_string()));
+        }
+        if let Some(v) = obj.subnet_id() {
+            attributes.insert("subnet_id".to_string(), Value::String(v.to_string()));
+        }
+        obj.nat_gateway_id().map(String::from)
+    }
+
     /// Extract ec2.vpc attributes from SDK response type (generated)
     pub(crate) fn extract_ec2_vpc_attributes(
         obj: &aws_sdk_ec2::types::Vpc,
