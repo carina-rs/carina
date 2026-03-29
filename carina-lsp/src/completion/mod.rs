@@ -21,7 +21,7 @@ pub struct CompletionProvider {
     region_completions_data: Vec<CompletionValue>,
     /// Resource type patterns sorted longest-first for matching
     resource_type_patterns: Vec<String>,
-    /// Custom type names from provider validators (e.g., "cidr", "arn")
+    /// Custom type names from provider validators (e.g., "arn", "vpc_id")
     custom_type_names: Vec<String>,
 }
 
