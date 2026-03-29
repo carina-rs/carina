@@ -74,8 +74,8 @@ fn snapshot_module_info_empty_module() {
     insta::assert_snapshot!(display);
 }
 
-/// Root config file (not a module directory) with imports, resources, and module calls.
-/// Verifies the RootConfig display format with IMPORTS and module instantiations.
+/// Root config file (not a module directory) with resources and dependencies.
+/// Verifies the RootConfig display format (File: header, IMPORTS section, dependency tree).
 #[test]
 fn snapshot_module_info_root_config() {
     let display = module_info_file_output("root_config");
