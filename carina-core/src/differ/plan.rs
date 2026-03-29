@@ -277,10 +277,7 @@ pub fn create_plan(
                     .and_then(|s| s.identifier.clone())
                     .unwrap_or_default();
                 let lifecycle = resource.lifecycle.clone();
-                let binding = resource.attributes.get("_binding").and_then(|v| match v {
-                    Value::String(s) => Some(s.clone()),
-                    _ => None,
-                });
+                let binding = resource.binding.clone();
                 let dependencies = get_resource_dependencies(resource);
                 plan.add(Effect::Delete {
                     id,
@@ -313,6 +310,9 @@ pub fn create_plan(
                     read_only: false,
                     lifecycle: lifecycle.clone(),
                     prefixes: HashMap::new(),
+                    binding: None,
+                    dependency_bindings: Vec::new(),
+                    virtual_resource: false,
                 };
                 get_resource_dependencies(&temp_resource)
             };
@@ -356,12 +356,8 @@ pub fn cascade_dependent_updates(
     let mut binding_to_unresolved: HashMap<String, &Resource> = HashMap::new();
     for resource in unresolved_resources {
         let key = resource
-            .attributes
-            .get("_binding")
-            .and_then(|v| match v {
-                Value::String(s) => Some(s.clone()),
-                _ => None,
-            })
+            .binding
+            .clone()
             .unwrap_or_else(|| format!("{}:{}", resource.id.resource_type, resource.id.name));
         binding_to_unresolved.insert(key, resource);
     }
@@ -437,16 +433,9 @@ pub fn cascade_dependent_updates(
         let deps = get_resource_dependencies(resource);
         for dep in &deps {
             if replaced_bindings.contains(dep) {
-                let binding = resource
-                    .attributes
-                    .get("_binding")
-                    .and_then(|v| match v {
-                        Value::String(s) => Some(s.clone()),
-                        _ => None,
-                    })
-                    .unwrap_or_else(|| {
-                        format!("{}:{}", resource.id.resource_type, resource.id.name)
-                    });
+                let binding = resource.binding.clone().unwrap_or_else(|| {
+                    format!("{}:{}", resource.id.resource_type, resource.id.name)
+                });
                 dependents_of_replaced
                     .entry(dep.clone())
                     .or_default()

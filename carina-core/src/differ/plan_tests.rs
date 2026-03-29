@@ -676,12 +676,8 @@ fn diff_skips_internal_attributes_in_removal_detection() {
 fn virtual_resources_are_skipped_in_plan() {
     // Virtual resources (module attribute containers) should not generate any effects
     let mut virtual_resource = Resource::new("_virtual", "web");
-    virtual_resource
-        .attributes
-        .insert("_virtual".to_string(), Value::String("true".to_string()));
-    virtual_resource
-        .attributes
-        .insert("_binding".to_string(), Value::String("web".to_string()));
+    virtual_resource.virtual_resource = true;
+    virtual_resource.binding = Some("web".to_string());
     virtual_resource.attributes.insert(
         "security_group".to_string(),
         Value::String("sg-123".to_string()),

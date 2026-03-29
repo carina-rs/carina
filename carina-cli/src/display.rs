@@ -180,7 +180,7 @@ fn build_single_parent_tree(
 
 /// Check if a resource has a `let` binding (i.e., is not anonymous).
 fn has_binding(resource: &carina_core::resource::Resource) -> bool {
-    resource.attributes.contains_key("_binding")
+    resource.binding.is_some()
 }
 
 /// Extract a compact hint for anonymous resources.
@@ -724,12 +724,7 @@ fn format_plan_tree(
                     | Effect::Remove { .. }
                     | Effect::Move { .. } => None,
                 };
-                resource.and_then(|r| {
-                    r.attributes.get("_binding").and_then(|v| match v {
-                        Value::String(s) => Some(s.clone()),
-                        _ => None,
-                    })
-                })
+                resource.and_then(|r| r.binding.clone())
             }
         };
 
@@ -1453,14 +1448,7 @@ fn build_dependency_graph(plan: &Plan) -> DependencyGraph {
         };
 
         if let Some(r) = resource {
-            let binding = r
-                .attributes
-                .get("_binding")
-                .and_then(|v| match v {
-                    Value::String(s) => Some(s.clone()),
-                    _ => None,
-                })
-                .unwrap_or_else(|| r.id.to_string());
+            let binding = r.binding.clone().unwrap_or_else(|| r.id.to_string());
             binding_to_effect.insert(binding.clone(), idx);
             effect_bindings.insert(idx, binding);
             effect_types.insert(idx, r.id.resource_type.clone());
@@ -1871,8 +1859,7 @@ mod tests {
 
     fn make_resource(resource_type: &str, name: &str, binding: &str, deps: &[&str]) -> Resource {
         let mut r = Resource::new(resource_type, name);
-        r.attributes
-            .insert("_binding".to_string(), Value::String(binding.to_string()));
+        r.binding = Some(binding.to_string());
         for dep in deps {
             r.attributes.insert(
                 format!("ref_{}", dep),
@@ -1995,14 +1982,7 @@ mod tests {
             };
 
             if let Some(r) = resource {
-                let binding = r
-                    .attributes
-                    .get("_binding")
-                    .and_then(|v| match v {
-                        Value::String(s) => Some(s.clone()),
-                        _ => None,
-                    })
-                    .unwrap_or_else(|| r.id.to_string());
+                let binding = r.binding.clone().unwrap_or_else(|| r.id.to_string());
                 binding_to_effect.insert(binding.clone(), idx);
                 effect_bindings.insert(idx, binding);
                 effect_types.insert(idx, r.id.resource_type.clone());
@@ -2485,9 +2465,7 @@ mod tests {
     #[test]
     fn test_has_binding() {
         let mut bound = Resource::new("ec2.vpc", "vpc");
-        bound
-            .attributes
-            .insert("_binding".to_string(), Value::String("vpc".to_string()));
+        bound.binding = Some("vpc".to_string());
         assert!(has_binding(&bound));
 
         let anonymous = Resource::new("ec2.vpc", "hash123");
@@ -2499,8 +2477,7 @@ mod tests {
     #[test]
     fn test_format_compact_name_bound_resource() {
         let mut r = Resource::new("ec2.vpc", "vpc");
-        r.attributes
-            .insert("_binding".to_string(), Value::String("vpc".to_string()));
+        r.binding = Some("vpc".to_string());
         // For bound resources, should show name as plain identifier (no quotes)
         let result = format_compact_name(&r, "vpc", None);
         assert!(
@@ -2659,8 +2636,7 @@ mod tests {
     #[test]
     fn test_extract_compact_hint_skips_internal_attributes() {
         let mut r = Resource::new("ec2.vpc", "hash_internal");
-        r.attributes
-            .insert("_binding".to_string(), Value::String("vpc".to_string()));
+        r.binding = Some("vpc".to_string());
         r.attributes
             .insert("_hash".to_string(), Value::String("abc123".to_string()));
 
@@ -2681,7 +2657,7 @@ mod tests {
             )]),
         );
         let vpc_to = Resource::new("ec2.vpc", "vpc")
-            .with_attribute("_binding", Value::String("vpc".to_string()))
+            .with_binding("vpc")
             .with_attribute("cidr_block", Value::String("10.1.0.0/16".to_string()));
 
         let subnet_from = State::existing(
@@ -3148,8 +3124,7 @@ mod tests {
         // This is what happens after resolve_refs_with_state() runs:
         // vpc_id = vpc.vpc_id becomes vpc_id = "vpc-0123456789abcdef0"
         let mut sg = Resource::new("ec2.security_group", "sg");
-        sg.attributes
-            .insert("_binding".to_string(), Value::String("sg".to_string()));
+        sg.binding = Some("sg".to_string());
         // This is the resolved value — a plain string, NOT a ResourceRef
         sg.attributes.insert(
             "vpc_id".to_string(),
@@ -3161,10 +3136,7 @@ mod tests {
         );
         // _dependency_bindings is saved by resolve_refs_with_state() before
         // ResourceRef values are resolved to strings.
-        sg.attributes.insert(
-            "_dependency_bindings".to_string(),
-            Value::List(vec![Value::String("vpc".to_string())]),
-        );
+        sg.dependency_bindings = vec!["vpc".to_string()];
 
         let mut plan = Plan::new();
         plan.add(Effect::Update {

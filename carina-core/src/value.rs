@@ -387,6 +387,9 @@ pub fn redact_secrets_in_resource(
         read_only: resource.read_only,
         lifecycle: resource.lifecycle.clone(),
         prefixes: resource.prefixes.clone(),
+        binding: resource.binding.clone(),
+        dependency_bindings: resource.dependency_bindings.clone(),
+        virtual_resource: resource.virtual_resource,
     }
 }
 

@@ -1712,11 +1712,11 @@ async fn update_effect_resolves_refs_against_post_replacement_binding_map() {
 
     // --- Unresolved resources (before ref resolution) ---
     let vpc_unresolved = Resource::new("ec2.vpc", "my-vpc")
-        .with_attribute("_binding", Value::String("vpc".to_string()))
+        .with_binding("vpc")
         .with_attribute("cidr_block", Value::String("10.1.0.0/16".to_string()));
 
     let subnet_unresolved = Resource::new("ec2.subnet", "my-subnet")
-        .with_attribute("_binding", Value::String("subnet".to_string()))
+        .with_binding("subnet")
         .with_attribute(
             "vpc_id",
             Value::ResourceRef {
@@ -1730,7 +1730,7 @@ async fn update_effect_resolves_refs_against_post_replacement_binding_map() {
     // --- Resolved resources (after ref resolution with old state) ---
     // The subnet's vpc_id has been eagerly resolved to "vpc-OLD"
     let subnet_resolved = Resource::new("ec2.subnet", "my-subnet")
-        .with_attribute("_binding", Value::String("subnet".to_string()))
+        .with_binding("subnet")
         .with_attribute("vpc_id", Value::String("vpc-OLD".to_string()))
         .with_attribute("cidr_block", Value::String("10.1.2.0/24".to_string()));
 
@@ -1767,9 +1767,7 @@ async fn update_effect_resolves_refs_against_post_replacement_binding_map() {
     plan.add(Effect::Replace {
         id: vpc_id.clone(),
         from: Box::new(current_states.get(&vpc_id).unwrap().clone()),
-        to: vpc_unresolved
-            .clone()
-            .with_attribute("_binding", Value::String("vpc".to_string())),
+        to: vpc_unresolved.clone().with_binding("vpc"),
         lifecycle: LifecycleConfig {
             force_delete: false,
             create_before_destroy: true,
@@ -1796,7 +1794,6 @@ async fn update_effect_resolves_refs_against_post_replacement_binding_map() {
                 "cidr_block".to_string(),
                 Value::String("10.0.0.0/16".to_string()),
             ),
-            ("_binding".to_string(), Value::String("vpc".to_string())),
         ]),
     );
     binding_map.insert(
@@ -1807,7 +1804,6 @@ async fn update_effect_resolves_refs_against_post_replacement_binding_map() {
                 "cidr_block".to_string(),
                 Value::String("10.1.1.0/24".to_string()),
             ),
-            ("_binding".to_string(), Value::String("subnet".to_string())),
         ]),
     );
 
@@ -2323,7 +2319,7 @@ fn import_effect_preserves_resource_metadata_in_state() {
 
     let mut resource = Resource::with_provider("awscc", "ec2.vpc", "my-vpc")
         .with_attribute("cidr_block", Value::String("10.0.0.0/16".to_string()))
-        .with_attribute("_binding", Value::String("my_vpc_binding".to_string()));
+        .with_binding("my_vpc_binding");
     resource.lifecycle.force_delete = true;
     resource
         .prefixes

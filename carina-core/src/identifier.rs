@@ -458,7 +458,7 @@ pub fn reconcile_anonymous_identifiers(
         // Skip let-bound (named) resources entirely. Reconciliation is only
         // meaningful for anonymous hash-derived identifiers. Named resources
         // should never be rebound to a different state entry.
-        if resource.attributes.contains_key("_binding") {
+        if resource.binding.is_some() {
             continue;
         }
 
@@ -1895,10 +1895,7 @@ mod tests {
         // A let-bound resource whose name does NOT exist in state
         let mut ingress_new =
             Resource::with_provider("aws", "ec2.security_group_ingress", "ingress_new");
-        ingress_new.attributes.insert(
-            "_binding".to_string(),
-            Value::String("ingress_new".to_string()),
-        );
+        ingress_new.binding = Some("ingress_new".to_string());
         ingress_new.attributes.insert(
             "cidr_ip".to_string(),
             Value::String("0.0.0.0/0".to_string()),

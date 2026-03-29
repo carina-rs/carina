@@ -457,6 +457,15 @@ pub struct Resource {
     /// e.g., {"bucket_name": "my-app-"} from `bucket_name_prefix = "my-app-"`
     #[serde(default)]
     pub prefixes: HashMap<String, String>,
+    /// Binding name from `let` bindings in DSL (e.g., `let vpc = ...`)
+    #[serde(default)]
+    pub binding: Option<String>,
+    /// Binding names of resources this resource depends on (via ResourceRef)
+    #[serde(default)]
+    pub dependency_bindings: Vec<String>,
+    /// If true, this is a virtual resource (module attribute container)
+    #[serde(default, rename = "_virtual")]
+    pub virtual_resource: bool,
 }
 
 impl Resource {
@@ -467,6 +476,9 @@ impl Resource {
             read_only: false,
             lifecycle: LifecycleConfig::default(),
             prefixes: HashMap::new(),
+            binding: None,
+            dependency_bindings: Vec::new(),
+            virtual_resource: false,
         }
     }
 
@@ -481,6 +493,9 @@ impl Resource {
             read_only: false,
             lifecycle: LifecycleConfig::default(),
             prefixes: HashMap::new(),
+            binding: None,
+            dependency_bindings: Vec::new(),
+            virtual_resource: false,
         }
     }
 
@@ -491,6 +506,21 @@ impl Resource {
 
     pub fn with_read_only(mut self, read_only: bool) -> Self {
         self.read_only = read_only;
+        self
+    }
+
+    pub fn with_binding(mut self, binding: impl Into<String>) -> Self {
+        self.binding = Some(binding.into());
+        self
+    }
+
+    pub fn with_dependency_bindings(mut self, deps: Vec<String>) -> Self {
+        self.dependency_bindings = deps;
+        self
+    }
+
+    pub fn with_virtual(mut self, is_virtual: bool) -> Self {
+        self.virtual_resource = is_virtual;
         self
     }
 
@@ -505,9 +535,7 @@ impl Resource {
     /// `attributes` values as a structured record. They should not be sent to
     /// providers for reading, creating, or updating.
     pub fn is_virtual(&self) -> bool {
-        self.attributes
-            .get("_virtual")
-            .is_some_and(|v| matches!(v, Value::String(s) if s == "true"))
+        self.virtual_resource
     }
 }
 
@@ -992,5 +1020,38 @@ mod tests {
             ("a".to_string(), Value::Int(1)),
         ]));
         assert_eq!(m1.canonical_hash(), m2.canonical_hash());
+    }
+
+    #[test]
+    fn resource_typed_binding_field() {
+        let resource = Resource::new("s3.bucket", "my-bucket").with_binding("my_bucket");
+        assert_eq!(resource.binding, Some("my_bucket".to_string()));
+        // binding should NOT be in attributes
+        assert!(!resource.attributes.contains_key("_binding"));
+    }
+
+    #[test]
+    fn resource_typed_dependency_bindings_field() {
+        let resource = Resource::new("ec2.subnet", "my-subnet")
+            .with_dependency_bindings(vec!["vpc".to_string()]);
+        assert_eq!(resource.dependency_bindings, vec!["vpc".to_string()]);
+        // dependency_bindings should NOT be in attributes
+        assert!(!resource.attributes.contains_key("_dependency_bindings"));
+    }
+
+    #[test]
+    fn resource_typed_virtual_field() {
+        let resource = Resource::new("_virtual", "web").with_virtual(true);
+        assert!(resource.is_virtual());
+        // _virtual should NOT be in attributes
+        assert!(!resource.attributes.contains_key("_virtual"));
+    }
+
+    #[test]
+    fn resource_default_metadata_fields() {
+        let resource = Resource::new("s3.bucket", "my-bucket");
+        assert_eq!(resource.binding, None);
+        assert!(resource.dependency_bindings.is_empty());
+        assert!(!resource.is_virtual());
     }
 }

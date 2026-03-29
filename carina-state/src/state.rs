@@ -512,10 +512,7 @@ impl ResourceState {
             .collect();
         rs.desired_keys.sort();
         // Store binding name for tree structure in orphan Delete effects
-        rs.binding = resource.attributes.get("_binding").and_then(|v| match v {
-            Value::String(s) => Some(s.clone()),
-            _ => None,
-        });
+        rs.binding = resource.binding.clone();
         // Store dependency bindings for tree structure in orphan Delete effects
         let deps = get_resource_dependencies(resource);
         if !deps.is_empty() {
@@ -939,10 +936,7 @@ mod tests {
         use carina_core::resource::{Resource, State as ProviderState, Value};
 
         let mut resource = Resource::with_provider("awscc", "ec2.subnet", "my-subnet");
-        resource.attributes.insert(
-            "_binding".to_string(),
-            Value::String("my_subnet".to_string()),
-        );
+        resource.binding = Some("my_subnet".to_string());
         resource.attributes.insert(
             "vpc_id".to_string(),
             Value::ResourceRef {

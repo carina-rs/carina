@@ -1057,7 +1057,7 @@ async fn run_apply_locked(
     // Build initial binding map for reference resolution
     let mut binding_map: HashMap<String, HashMap<String, Value>> = HashMap::new();
     for resource in &sorted_resources {
-        if let Some(Value::String(binding_name)) = resource.attributes.get("_binding") {
+        if let Some(ref binding_name) = resource.binding {
             let mut attrs = resource.attributes.clone();
             // Merge existing state if available
             if let Some(state) = current_states.get(&resource.id)
@@ -1493,7 +1493,7 @@ async fn run_apply_from_plan_locked(
     // Build initial binding map for reference resolution
     let mut binding_map: HashMap<String, HashMap<String, Value>> = HashMap::new();
     for resource in sorted_resources {
-        if let Some(Value::String(binding_name)) = resource.attributes.get("_binding") {
+        if let Some(ref binding_name) = resource.binding {
             let mut attrs = resource.attributes.clone();
             if let Some(state) = current_states.get(&resource.id)
                 && state.exists

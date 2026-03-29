@@ -345,12 +345,8 @@ impl RootConfigSignature {
 
         for resource in &parsed.resources {
             let binding_name = resource
-                .attributes
-                .get("_binding")
-                .and_then(|v| match v {
-                    Value::String(s) => Some(s.clone()),
-                    _ => None,
-                })
+                .binding
+                .clone()
                 .unwrap_or_else(|| resource.id.name.clone());
 
             let resource_type_str = resource
@@ -393,12 +389,8 @@ impl RootConfigSignature {
 
         for resource in &parsed.resources {
             let binding_name = resource
-                .attributes
-                .get("_binding")
-                .and_then(|v| match v {
-                    Value::String(s) => Some(s.clone()),
-                    _ => None,
-                })
+                .binding
+                .clone()
                 .unwrap_or_else(|| resource.id.name.clone());
 
             for (attr_key, value) in &resource.attributes {
@@ -763,12 +755,8 @@ impl ModuleSignature {
 
         for resource in &parsed.resources {
             let binding_name = resource
-                .attributes
-                .get("_binding")
-                .and_then(|v| match v {
-                    Value::String(s) => Some(s.clone()),
-                    _ => None,
-                })
+                .binding
+                .clone()
                 .unwrap_or_else(|| resource.id.name.clone());
 
             let resource_type_str = resource
@@ -800,12 +788,8 @@ impl ModuleSignature {
 
         for resource in &parsed.resources {
             let binding_name = resource
-                .attributes
-                .get("_binding")
-                .and_then(|v| match v {
-                    Value::String(s) => Some(s.clone()),
-                    _ => None,
-                })
+                .binding
+                .clone()
                 .unwrap_or_else(|| resource.id.name.clone());
 
             for (attr_key, value) in &resource.attributes {

@@ -142,8 +142,7 @@ fn has_interdependent_replaces(effects: &[Effect]) -> bool {
 
     for effect in effects {
         if let Effect::Replace { to, .. } = effect {
-            let dep_bindings = extract_dependency_bindings(&to.attributes);
-            for dep in &dep_bindings {
+            for dep in &to.dependency_bindings {
                 if replace_bindings.contains(dep) {
                     return true;
                 }
@@ -158,26 +157,12 @@ fn collect_replace_bindings(effects: &[Effect]) -> HashSet<String> {
     let mut bindings = HashSet::new();
     for effect in effects {
         if let Effect::Replace { to, .. } = effect
-            && let Some(Value::String(b)) = to.attributes.get("_binding")
+            && let Some(ref b) = to.binding
         {
             bindings.insert(b.clone());
         }
     }
     bindings
-}
-
-/// Extract `_dependency_bindings` from attributes.
-fn extract_dependency_bindings(attrs: &HashMap<String, Value>) -> Vec<String> {
-    match attrs.get("_dependency_bindings") {
-        Some(Value::List(list)) => list
-            .iter()
-            .filter_map(|v| match v {
-                Value::String(s) => Some(s.clone()),
-                _ => None,
-            })
-            .collect(),
-        _ => vec![],
-    }
 }
 
 /// Topologically sort Replace effects by dependency order.
@@ -189,7 +174,7 @@ fn topological_sort_replaces(effects: &[Effect], replace_bindings: &HashSet<Stri
     for (idx, effect) in effects.iter().enumerate() {
         if let Effect::Replace { to, .. } = effect {
             replace_indices.push(idx);
-            if let Some(Value::String(b)) = to.attributes.get("_binding") {
+            if let Some(ref b) = to.binding {
                 binding_to_idx.insert(b.clone(), idx);
             }
         }
@@ -200,7 +185,8 @@ fn topological_sort_replaces(effects: &[Effect], replace_bindings: &HashSet<Stri
     for &idx in &replace_indices {
         let effect = &effects[idx];
         if let Effect::Replace { to, .. } = effect {
-            let dep_indices: Vec<usize> = extract_dependency_bindings(&to.attributes)
+            let dep_indices: Vec<usize> = to
+                .dependency_bindings
                 .iter()
                 .filter(|b| replace_bindings.contains(*b))
                 .filter_map(|b| binding_to_idx.get(b))
@@ -351,14 +337,15 @@ fn unwrap_secret(value: Value) -> Value {
 fn update_binding_map(
     binding_map: &mut HashMap<String, HashMap<String, Value>>,
     resource_attrs: &HashMap<String, Value>,
+    binding: Option<&str>,
     state: &State,
 ) {
-    if let Some(Value::String(binding_name)) = resource_attrs.get("_binding") {
+    if let Some(binding_name) = binding {
         let mut attrs = resource_attrs.clone();
         for (k, v) in &state.attributes {
             attrs.insert(k.clone(), v.clone());
         }
-        binding_map.insert(binding_name.clone(), attrs);
+        binding_map.insert(binding_name.to_string(), attrs);
     }
 }
 
@@ -382,11 +369,12 @@ fn process_basic_result(
             state,
             resource_id,
             resolved_attrs,
+            binding,
         } => {
             *success_count += 1;
             if let Some(state) = state {
                 if let Some(attrs) = &resolved_attrs {
-                    update_binding_map(binding_map, attrs, &state);
+                    update_binding_map(binding_map, attrs, binding.as_deref(), &state);
                 }
                 applied_states.insert(resource_id, state);
             }
@@ -494,6 +482,7 @@ enum BasicEffectResult {
         state: Option<State>,
         resource_id: ResourceId,
         resolved_attrs: Option<HashMap<String, Value>>,
+        binding: Option<String>,
     },
     Failure {
         binding: Option<String>,
@@ -558,6 +547,7 @@ async fn execute_basic_effect<'a>(
                         state: Some(state),
                         resource_id: resource.id.clone(),
                         resolved_attrs: Some(resolved.attributes),
+                        binding: resource.binding.clone(),
                     }
                 }
                 Err(e) => {
@@ -605,6 +595,7 @@ async fn execute_basic_effect<'a>(
                         state: Some(state),
                         resource_id: id.clone(),
                         resolved_attrs: Some(resolved_to.attributes),
+                        binding: to.binding.clone(),
                     }
                 }
                 Err(e) => {
@@ -956,7 +947,12 @@ async fn execute_effects_sequential(
                 if let Some(state) = &state {
                     applied_states.insert(resource_id, state.clone());
                     if let Some(attrs) = &resolved_attrs {
-                        update_binding_map(&mut input.binding_map, attrs, state);
+                        update_binding_map(
+                            &mut input.binding_map,
+                            attrs,
+                            binding.as_deref(),
+                            state,
+                        );
                     }
                 }
                 if success {
@@ -1098,7 +1094,12 @@ async fn execute_cbd_replace_parallel(
         Ok(state) => {
             // Build a local binding map update for cascade resolution
             let mut local_binding_map = binding_map.clone();
-            update_binding_map(&mut local_binding_map, &resolved.attributes, &state);
+            update_binding_map(
+                &mut local_binding_map,
+                &resolved.attributes,
+                to.binding.as_deref(),
+                &state,
+            );
 
             // Execute cascading updates
             let mut cascade_failed = false;
@@ -1127,6 +1128,7 @@ async fn execute_cbd_replace_parallel(
                         update_binding_map(
                             &mut local_binding_map,
                             &resolved_to.attributes,
+                            cascade.to.binding.as_deref(),
                             &cascade_state,
                         );
                     }
@@ -1232,7 +1234,7 @@ async fn execute_cbd_replace_parallel(
                             state: Some(final_state),
                             resource_id: to.id.clone(),
                             resolved_attrs: Some(resolved.attributes),
-                            binding: None,
+                            binding: to.binding.clone(),
                             refreshes,
 
                             permanent_overrides,
@@ -1338,7 +1340,7 @@ async fn execute_dbd_replace_parallel(
                         state: Some(state),
                         resource_id: to.id.clone(),
                         resolved_attrs: Some(resolved.attributes),
-                        binding: None,
+                        binding: to.binding.clone(),
                         refreshes,
 
                         permanent_overrides: None,
@@ -1441,6 +1443,7 @@ fn build_phase_dependency_map(
 }
 
 /// Result of a phased effect operation within a single phase.
+#[allow(clippy::type_complexity)]
 enum PhaseEffectResult {
     /// Phase 1: Create/Update/Delete completed (wraps BasicEffectResult)
     Basic(BasicEffectResult),
@@ -1448,7 +1451,7 @@ enum PhaseEffectResult {
     CbdCreateSuccess {
         idx: usize,
         state: State,
-        cascade_states: Vec<(ResourceId, State, HashMap<String, Value>)>,
+        cascade_states: Vec<(ResourceId, State, HashMap<String, Value>, Option<String>)>,
     },
     /// Phase 2: CBD create failed
     CbdCreateFailure {
@@ -1468,6 +1471,7 @@ enum PhaseEffectResult {
         state: State,
         resource_id: ResourceId,
         resolved_attrs: HashMap<String, Value>,
+        binding: Option<String>,
     },
     /// Phase 4: Non-CBD create failed
     NonCbdCreateFailure { binding: Option<String> },
@@ -1724,6 +1728,7 @@ async fn execute_effects_phased(
                                 update_binding_map(
                                     &mut local_binding_map,
                                     &resolved.attributes,
+                                    to.binding.as_deref(),
                                     &state,
                                 );
 
@@ -1774,12 +1779,14 @@ async fn execute_effects_phased(
                                             update_binding_map(
                                                 &mut local_binding_map,
                                                 &resolved_to.attributes,
+                                                cascade.to.binding.as_deref(),
                                                 &cascade_state,
                                             );
                                             cascade_states.push((
                                                 cascade.id.clone(),
                                                 cascade_state,
                                                 resolved_to.attributes,
+                                                cascade.to.binding.clone(),
                                             ));
                                         }
                                         Err(e) => {
@@ -1864,11 +1871,23 @@ async fn execute_effects_phased(
                 } => {
                     let effect = &effects[idx];
                     if let Effect::Replace { to, .. } = effect {
-                        update_binding_map(&mut input.binding_map, &to.attributes, &state);
+                        update_binding_map(
+                            &mut input.binding_map,
+                            &to.attributes,
+                            to.binding.as_deref(),
+                            &state,
+                        );
                     }
-                    for (cascade_id, cascade_state, cascade_attrs) in cascade_states {
+                    for (cascade_id, cascade_state, cascade_attrs, cascade_binding) in
+                        cascade_states
+                    {
                         applied_states.insert(cascade_id, cascade_state.clone());
-                        update_binding_map(&mut input.binding_map, &cascade_attrs, &cascade_state);
+                        update_binding_map(
+                            &mut input.binding_map,
+                            &cascade_attrs,
+                            cascade_binding.as_deref(),
+                            &cascade_state,
+                        );
                     }
                     replace_start_times.insert(idx, started);
                     cbd_create_states.insert(idx, state);
@@ -2303,6 +2322,7 @@ async fn execute_effects_phased(
                                                 state,
                                                 resource_id: to.id.clone(),
                                                 resolved_attrs: resolved.attributes,
+                                                binding: to.binding.clone(),
                                             },
                                         )
                                     }
@@ -2364,10 +2384,16 @@ async fn execute_effects_phased(
                     state,
                     resource_id,
                     resolved_attrs,
+                    binding,
                 } => {
                     success_count += 1;
                     applied_states.insert(resource_id, state.clone());
-                    update_binding_map(&mut input.binding_map, &resolved_attrs, &state);
+                    update_binding_map(
+                        &mut input.binding_map,
+                        &resolved_attrs,
+                        binding.as_deref(),
+                        &state,
+                    );
                 }
                 PhaseEffectResult::NonCbdCreateFailure { binding } => {
                     failure_count += 1;
@@ -2596,8 +2622,7 @@ mod tests {
 
     fn make_resource(binding: &str, deps: &[&str]) -> Resource {
         let mut r = Resource::new("test", binding);
-        r.attributes
-            .insert("_binding".to_string(), Value::String(binding.to_string()));
+        r.binding = Some(binding.to_string());
         for dep in deps {
             r.attributes.insert(
                 format!("ref_{}", dep),
@@ -2610,9 +2635,7 @@ mod tests {
         }
         // Save dependency bindings as metadata (normally done by resolver)
         if !deps.is_empty() {
-            let dep_list: Vec<Value> = deps.iter().map(|d| Value::String(d.to_string())).collect();
-            r.attributes
-                .insert("_dependency_bindings".to_string(), Value::List(dep_list));
+            r.dependency_bindings = deps.iter().map(|d| d.to_string()).collect();
         }
         r
     }
@@ -2819,20 +2842,13 @@ mod tests {
 
         let vpc_from = State::existing(vpc_id.clone(), HashMap::new()).with_identifier("vpc-old");
         let mut vpc_to = Resource::new("test", "vpc");
-        vpc_to
-            .attributes
-            .insert("_binding".to_string(), Value::String("vpc".to_string()));
+        vpc_to.binding = Some("vpc".to_string());
 
         let subnet_from =
             State::existing(subnet_id.clone(), HashMap::new()).with_identifier("subnet-old");
         let mut subnet_to = Resource::new("test", "subnet");
-        subnet_to
-            .attributes
-            .insert("_binding".to_string(), Value::String("subnet".to_string()));
-        subnet_to.attributes.insert(
-            "_dependency_bindings".to_string(),
-            Value::List(vec![Value::String("vpc".to_string())]),
-        );
+        subnet_to.binding = Some("subnet".to_string());
+        subnet_to.dependency_bindings = vec!["vpc".to_string()];
 
         let cbd_lifecycle = LifecycleConfig {
             create_before_destroy: true,
@@ -2903,20 +2919,13 @@ mod tests {
 
         let vpc_from = State::existing(vpc_id.clone(), HashMap::new()).with_identifier("vpc-old");
         let mut vpc_to = Resource::new("test", "vpc");
-        vpc_to
-            .attributes
-            .insert("_binding".to_string(), Value::String("vpc".to_string()));
+        vpc_to.binding = Some("vpc".to_string());
 
         let subnet_from =
             State::existing(subnet_id.clone(), HashMap::new()).with_identifier("subnet-old");
         let mut subnet_to = Resource::new("test", "subnet");
-        subnet_to
-            .attributes
-            .insert("_binding".to_string(), Value::String("subnet".to_string()));
-        subnet_to.attributes.insert(
-            "_dependency_bindings".to_string(),
-            Value::List(vec![Value::String("vpc".to_string())]),
-        );
+        subnet_to.binding = Some("subnet".to_string());
+        subnet_to.dependency_bindings = vec!["vpc".to_string()];
 
         let dbd_lifecycle = LifecycleConfig::default();
 
@@ -3194,18 +3203,9 @@ mod tests {
 
         // tgw_attach depends on tgw, vpc, subnet
         let mut tgw_attach = Resource::new("ec2.transit_gateway_attachment", "tgw_attach");
-        tgw_attach.attributes.insert(
-            "_binding".to_string(),
-            Value::String("tgw_attach".to_string()),
-        );
-        tgw_attach.attributes.insert(
-            "_dependency_bindings".to_string(),
-            Value::List(vec![
-                Value::String("tgw".to_string()),
-                Value::String("vpc".to_string()),
-                Value::String("subnet".to_string()),
-            ]),
-        );
+        tgw_attach.binding = Some("tgw_attach".to_string());
+        tgw_attach.dependency_bindings =
+            vec!["tgw".to_string(), "vpc".to_string(), "subnet".to_string()];
 
         // route depends on rt and tgw_attach (but after partial resolution,
         // transit_gateway_id points to ResourceRef { binding: "tgw" })
@@ -3218,39 +3218,22 @@ mod tests {
                 field_path: vec![],
             },
         );
-        route.attributes.insert(
-            "_dependency_bindings".to_string(),
-            Value::List(vec![
-                Value::String("rt".to_string()),
-                Value::String("tgw_attach".to_string()),
-            ]),
-        );
+        route.dependency_bindings = vec!["rt".to_string(), "tgw_attach".to_string()];
 
         // Other resources
         let mut vpc = Resource::new("ec2.vpc", "vpc");
-        vpc.attributes
-            .insert("_binding".to_string(), Value::String("vpc".to_string()));
+        vpc.binding = Some("vpc".to_string());
 
         let mut tgw = Resource::new("ec2.transit_gateway", "tgw");
-        tgw.attributes
-            .insert("_binding".to_string(), Value::String("tgw".to_string()));
+        tgw.binding = Some("tgw".to_string());
 
         let mut subnet = Resource::new("ec2.subnet", "subnet");
-        subnet
-            .attributes
-            .insert("_binding".to_string(), Value::String("subnet".to_string()));
-        subnet.attributes.insert(
-            "_dependency_bindings".to_string(),
-            Value::List(vec![Value::String("vpc".to_string())]),
-        );
+        subnet.binding = Some("subnet".to_string());
+        subnet.dependency_bindings = vec!["vpc".to_string()];
 
         let mut rt = Resource::new("ec2.route_table", "rt");
-        rt.attributes
-            .insert("_binding".to_string(), Value::String("rt".to_string()));
-        rt.attributes.insert(
-            "_dependency_bindings".to_string(),
-            Value::List(vec![Value::String("vpc".to_string())]),
-        );
+        rt.binding = Some("rt".to_string());
+        rt.dependency_bindings = vec!["vpc".to_string()];
 
         let mut plan = Plan::new();
         plan.add(Effect::Create(vpc)); // idx 0

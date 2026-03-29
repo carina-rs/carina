@@ -2030,6 +2030,9 @@ fn parse_anonymous_resource(
         read_only: false,
         lifecycle,
         prefixes: HashMap::new(),
+        binding: None,
+        dependency_bindings: Vec::new(),
+        virtual_resource: false,
     })
 }
 
@@ -2166,11 +2169,6 @@ fn parse_resource_expr(
     let lifecycle = extract_lifecycle_config(&mut attributes);
 
     attributes.insert("_type".to_string(), Value::String(namespaced_type.clone()));
-    // Save binding name (for reference)
-    attributes.insert(
-        "_binding".to_string(),
-        Value::String(binding_name.to_string()),
-    );
 
     Ok(Resource {
         id: ResourceId::with_provider(provider, resource_type, resource_name),
@@ -2178,6 +2176,9 @@ fn parse_resource_expr(
         read_only: false,
         lifecycle,
         prefixes: HashMap::new(),
+        binding: Some(binding_name.to_string()),
+        dependency_bindings: Vec::new(),
+        virtual_resource: false,
     })
 }
 
@@ -2212,11 +2213,6 @@ fn parse_read_resource_expr(
     let lifecycle = extract_lifecycle_config(&mut attributes);
 
     attributes.insert("_type".to_string(), Value::String(namespaced_type.clone()));
-    // Save binding name (for reference)
-    attributes.insert(
-        "_binding".to_string(),
-        Value::String(binding_name.to_string()),
-    );
     // Mark as data source
     attributes.insert("_data_source".to_string(), Value::Bool(true));
 
@@ -2226,6 +2222,9 @@ fn parse_read_resource_expr(
         read_only: true,
         lifecycle,
         prefixes: HashMap::new(),
+        binding: Some(binding_name.to_string()),
+        dependency_bindings: Vec::new(),
+        virtual_resource: false,
     })
 }
 
@@ -2729,17 +2728,15 @@ pub fn resolve_resource_refs_with_config(
     for resource in &mut parsed.resources {
         let deps = crate::deps::get_resource_dependencies(resource);
         if !deps.is_empty() {
-            let dep_list: Vec<Value> = deps.into_iter().map(Value::String).collect();
-            resource
-                .attributes
-                .insert("_dependency_bindings".to_string(), Value::List(dep_list));
+            let dep_list: Vec<String> = deps.into_iter().collect();
+            resource.dependency_bindings = dep_list;
         }
     }
 
     // Build a map of binding_name -> attributes for quick lookup
     let mut binding_map: HashMap<String, HashMap<String, Value>> = HashMap::new();
     for resource in &parsed.resources {
-        if let Some(Value::String(binding_name)) = resource.attributes.get("_binding") {
+        if let Some(ref binding_name) = resource.binding {
             binding_map.insert(binding_name.clone(), resource.attributes.clone());
         }
     }

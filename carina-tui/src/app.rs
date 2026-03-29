@@ -591,14 +591,7 @@ fn build_tree_structure(plan: &Plan, nodes: &mut [TreeNode]) {
         };
 
         if let Some(r) = resource {
-            let binding = r
-                .attributes
-                .get("_binding")
-                .and_then(|v| match v {
-                    Value::String(s) => Some(s.clone()),
-                    _ => None,
-                })
-                .unwrap_or_else(|| r.id.to_string());
+            let binding = r.binding.clone().unwrap_or_else(|| r.id.to_string());
             binding_to_effect.insert(binding.clone(), idx);
             effect_bindings.insert(idx, binding);
             effect_types.insert(idx, r.id.resource_type.clone());
@@ -795,17 +788,11 @@ fn shorten_effect_labels(plan: &Plan, nodes: &mut [TreeNode]) {
 
         if let Some(r) = resource {
             let display_type = r.id.display_type();
-            let has_binding = r.attributes.contains_key("_binding");
+            let has_binding = r.binding.is_some();
 
             let name_part = if has_binding {
                 // For bound resources, show the binding name
-                r.attributes
-                    .get("_binding")
-                    .and_then(|v| match v {
-                        Value::String(s) => Some(s.clone()),
-                        _ => None,
-                    })
-                    .unwrap_or_else(|| r.id.name.clone())
+                r.binding.clone().unwrap_or_else(|| r.id.name.clone())
             } else {
                 // For anonymous resources, try to extract a compact hint
                 let parent_binding = nodes[idx].parent.and_then(|p_idx| {
@@ -823,12 +810,7 @@ fn shorten_effect_labels(plan: &Plan, nodes: &mut [TreeNode]) {
                         | Effect::Remove { .. }
                         | Effect::Move { .. } => None,
                     };
-                    p_resource.and_then(|pr| {
-                        pr.attributes.get("_binding").and_then(|v| match v {
-                            Value::String(s) => Some(s.clone()),
-                            _ => None,
-                        })
-                    })
+                    p_resource.and_then(|pr| pr.binding.clone())
                 });
                 if let Some(hint) = extract_compact_hint(r, parent_binding.as_deref()) {
                     format!("({})", hint)
@@ -1144,7 +1126,7 @@ mod tests {
         plan.add(Effect::Create(
             Resource::new("s3.bucket", "my-bucket")
                 .with_attribute("name", Value::String("test".to_string()))
-                .with_attribute("_binding", Value::String("my_bucket".to_string()))
+                .with_binding("my_bucket")
                 .with_attribute("_module", Value::String("web".to_string())),
         ));
 
@@ -1221,12 +1203,12 @@ mod tests {
         let mut plan = Plan::new();
         plan.add(Effect::Create(
             Resource::new("ec2.vpc", "my-vpc")
-                .with_attribute("_binding", Value::String("vpc".to_string()))
+                .with_binding("vpc")
                 .with_attribute("cidr_block", Value::String("10.0.0.0/16".to_string())),
         ));
         plan.add(Effect::Create(
             Resource::new("ec2.subnet", "my-subnet")
-                .with_attribute("_binding", Value::String("subnet".to_string()))
+                .with_binding("subnet")
                 .with_attribute(
                     "vpc_id",
                     Value::ResourceRef {
@@ -1393,12 +1375,12 @@ mod tests {
         let mut plan = Plan::new();
         plan.add(Effect::Create(
             Resource::new("ec2.vpc", "my-vpc")
-                .with_attribute("_binding", Value::String("vpc".to_string()))
+                .with_binding("vpc")
                 .with_attribute("cidr_block", Value::String("10.0.0.0/16".to_string())),
         ));
         plan.add(Effect::Create(
             Resource::new("ec2.subnet", "my-subnet")
-                .with_attribute("_binding", Value::String("subnet".to_string()))
+                .with_binding("subnet")
                 .with_attribute(
                     "vpc_id",
                     Value::ResourceRef {
@@ -1409,8 +1391,7 @@ mod tests {
                 ),
         ));
         plan.add(Effect::Create(
-            Resource::new("s3.bucket", "my-bucket")
-                .with_attribute("_binding", Value::String("bucket".to_string())),
+            Resource::new("s3.bucket", "my-bucket").with_binding("bucket"),
         ));
         plan
     }
@@ -1597,12 +1578,10 @@ mod tests {
         // Resource types with provider prefix (e.g., "awscc.ec2.vpc")
         let mut plan = Plan::new();
         plan.add(Effect::Create(
-            Resource::with_provider("awscc", "ec2.vpc", "my-vpc")
-                .with_attribute("_binding", Value::String("vpc".to_string())),
+            Resource::with_provider("awscc", "ec2.vpc", "my-vpc").with_binding("vpc"),
         ));
         plan.add(Effect::Create(
-            Resource::with_provider("awscc", "ec2.subnet", "my-subnet")
-                .with_attribute("_binding", Value::String("subnet".to_string())),
+            Resource::with_provider("awscc", "ec2.subnet", "my-subnet").with_binding("subnet"),
         ));
         let mut app = App::new(&plan, &HashMap::new());
         app.search_active = true;

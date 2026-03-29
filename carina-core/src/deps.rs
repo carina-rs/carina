@@ -26,12 +26,8 @@ pub fn get_resource_dependencies(resource: &Resource) -> HashSet<String> {
     // transit_gateway_id is itself `tgw.id`. In this case, collect_dependencies
     // finds "tgw" but misses "tgw_attach". The _dependency_bindings metadata
     // (saved before resolution) correctly records the original direct dependency.
-    if let Some(Value::List(bindings)) = resource.attributes.get("_dependency_bindings") {
-        for b in bindings {
-            if let Value::String(name) = b {
-                deps.insert(name.clone());
-            }
-        }
+    for name in &resource.dependency_bindings {
+        deps.insert(name.clone());
     }
     deps
 }
@@ -108,7 +104,7 @@ fn topological_sort(resources: &[Resource], depth_presort: bool) -> Result<Vec<R
     // Build binding name to resource mapping
     let mut binding_to_resource: HashMap<String, &Resource> = HashMap::new();
     for resource in resources {
-        if let Some(Value::String(binding_name)) = resource.attributes.get("_binding") {
+        if let Some(ref binding_name) = resource.binding {
             binding_to_resource.insert(binding_name.clone(), resource);
         }
     }
@@ -150,12 +146,8 @@ fn topological_sort(resources: &[Resource], depth_presort: bool) -> Result<Vec<R
         let mut depth_visiting: HashSet<String> = HashSet::new();
         for resource in resources {
             let binding = resource
-                .attributes
-                .get("_binding")
-                .and_then(|v| match v {
-                    Value::String(s) => Some(s.clone()),
-                    _ => None,
-                })
+                .binding
+                .clone()
                 .unwrap_or_else(|| format!("{}:{}", resource.id.resource_type, resource.id.name));
             compute_depth(
                 &binding,
@@ -172,20 +164,12 @@ fn topological_sort(resources: &[Resource], depth_presort: bool) -> Result<Vec<R
         // chains (like nat_gw -> route) have been destroyed.
         presorted.sort_by(|a, b| {
             let a_binding = a
-                .attributes
-                .get("_binding")
-                .and_then(|v| match v {
-                    Value::String(s) => Some(s.clone()),
-                    _ => None,
-                })
+                .binding
+                .clone()
                 .unwrap_or_else(|| format!("{}:{}", a.id.resource_type, a.id.name));
             let b_binding = b
-                .attributes
-                .get("_binding")
-                .and_then(|v| match v {
-                    Value::String(s) => Some(s.clone()),
-                    _ => None,
-                })
+                .binding
+                .clone()
                 .unwrap_or_else(|| format!("{}:{}", b.id.resource_type, b.id.name));
             let a_depth = depth_cache.get(&a_binding).copied().unwrap_or(0);
             let b_depth = depth_cache.get(&b_binding).copied().unwrap_or(0);
@@ -206,12 +190,8 @@ fn topological_sort(resources: &[Resource], depth_presort: bool) -> Result<Vec<R
         sorted: &mut Vec<Resource>,
     ) -> Result<(), String> {
         let binding_name = resource
-            .attributes
-            .get("_binding")
-            .and_then(|v| match v {
-                Value::String(s) => Some(s.clone()),
-                _ => None,
-            })
+            .binding
+            .clone()
             .unwrap_or_else(|| format!("{}:{}", resource.id.resource_type, resource.id.name));
 
         if visited.contains(&binding_name) {
@@ -264,12 +244,8 @@ pub fn build_dependents_map(resources: &[&Resource]) -> HashMap<String, HashSet<
     let mut dependents_map: HashMap<String, HashSet<String>> = HashMap::new();
     for resource in resources {
         let binding = resource
-            .attributes
-            .get("_binding")
-            .and_then(|v| match v {
-                Value::String(s) => Some(s.clone()),
-                _ => None,
-            })
+            .binding
+            .clone()
             .unwrap_or_else(|| format!("{}:{}", resource.id.resource_type, resource.id.name));
 
         let deps = get_resource_dependencies(resource);
@@ -323,8 +299,7 @@ mod tests {
 
     fn make_resource(binding: &str, deps: &[&str]) -> Resource {
         let mut r = Resource::new("test", binding);
-        r.attributes
-            .insert("_binding".to_string(), Value::String(binding.to_string()));
+        r.binding = Some(binding.to_string());
         for dep in deps {
             r.attributes.insert(
                 format!("ref_{}", dep),
@@ -378,17 +353,11 @@ mod tests {
                 field_path: vec![],
             },
         );
-        // _dependency_bindings was saved before resolution with the CORRECT deps
-        resource.attributes.insert(
-            "_dependency_bindings".to_string(),
-            Value::List(vec![
-                Value::String("rt".to_string()),
-                Value::String("tgw_attach".to_string()),
-            ]),
-        );
+        // dependency_bindings was saved before resolution with the CORRECT deps
+        resource.dependency_bindings = vec!["rt".to_string(), "tgw_attach".to_string()];
 
         let deps = get_resource_dependencies(&resource);
-        // Must include "tgw_attach" from _dependency_bindings
+        // Must include "tgw_attach" from dependency_bindings
         assert!(
             deps.contains("tgw_attach"),
             "Expected deps to contain 'tgw_attach' but got: {:?}",
@@ -414,13 +383,7 @@ mod tests {
 
         // Even if b comes first in the input, a should come first in the output
         let sorted = sort_resources_by_dependencies(&[b, a]).unwrap();
-        let binding_order: Vec<_> = sorted
-            .iter()
-            .filter_map(|r| match r.attributes.get("_binding") {
-                Some(Value::String(s)) => Some(s.as_str()),
-                _ => None,
-            })
-            .collect();
+        let binding_order: Vec<_> = sorted.iter().filter_map(|r| r.binding.as_deref()).collect();
         assert_eq!(binding_order, vec!["a", "b"]);
     }
 
@@ -627,10 +590,7 @@ mod tests {
             let destroy_order_resources = sort_resources_for_destroy(input).unwrap();
             let destroy_order: Vec<&str> = destroy_order_resources
                 .iter()
-                .filter_map(|r| match r.attributes.get("_binding") {
-                    Some(Value::String(s)) => Some(s.as_str()),
-                    _ => None,
-                })
+                .filter_map(|r| r.binding.as_deref())
                 .collect();
 
             // IGW must come after route and nat_gw in destroy order
@@ -679,10 +639,7 @@ mod tests {
         let destroy_order_resources = sort_resources_for_destroy(&all).unwrap();
         let destroy_order: Vec<&str> = destroy_order_resources
             .iter()
-            .filter_map(|r| match r.attributes.get("_binding") {
-                Some(Value::String(s)) => Some(s.as_str()),
-                _ => None,
-            })
+            .filter_map(|r| r.binding.as_deref())
             .collect();
 
         let igw_pos = destroy_order.iter().position(|&b| b == "igw").unwrap();
@@ -754,12 +711,8 @@ mod tests {
         let creation_order: Vec<String> = sorted
             .iter()
             .map(|r| {
-                r.attributes
-                    .get("_binding")
-                    .and_then(|v| match v {
-                        Value::String(s) => Some(s.clone()),
-                        _ => None,
-                    })
+                r.binding
+                    .clone()
                     .unwrap_or_else(|| format!("{}:{}", r.id.resource_type, r.id.name))
             })
             .collect();
@@ -842,12 +795,8 @@ mod tests {
         let creation_order: Vec<String> = sorted
             .iter()
             .map(|r| {
-                r.attributes
-                    .get("_binding")
-                    .and_then(|v| match v {
-                        Value::String(s) => Some(s.clone()),
-                        _ => None,
-                    })
+                r.binding
+                    .clone()
                     .unwrap_or_else(|| format!("{}:{}", r.id.resource_type, r.id.name))
             })
             .collect();

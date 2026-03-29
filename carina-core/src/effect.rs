@@ -175,16 +175,10 @@ impl Effect {
 
     /// Returns the binding name for this effect's resource, if it has one.
     pub fn binding_name(&self) -> Option<String> {
-        use crate::resource::Value;
         if let Effect::Delete { binding, .. } = self {
             return binding.clone();
         }
-        self.resource().and_then(|r| {
-            r.attributes.get("_binding").and_then(|v| match v {
-                Value::String(s) => Some(s.clone()),
-                _ => None,
-            })
-        })
+        self.resource().and_then(|r| r.binding.clone())
     }
 }
 
@@ -236,9 +230,7 @@ mod tests {
 
     #[test]
     fn binding_name_returns_binding() {
-        use crate::resource::Value;
-        let resource = Resource::new("test", "my_binding")
-            .with_attribute("_binding", Value::String("my_binding".to_string()));
+        let resource = Resource::new("test", "my_binding").with_binding("my_binding");
         let effect = Effect::Create(resource);
         assert_eq!(effect.binding_name(), Some("my_binding".to_string()));
     }
