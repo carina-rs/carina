@@ -4,7 +4,8 @@
 
 use crate::resource::{LifecycleConfig, Resource, ResourceId, Value};
 use crate::schema::{
-    validate_ipv4_address, validate_ipv4_cidr, validate_ipv6_address, validate_ipv6_cidr,
+    validate_arn, validate_availability_zone, validate_aws_resource_id, validate_ipv4_address,
+    validate_ipv4_cidr, validate_ipv6_address, validate_ipv6_cidr,
 };
 use pest::Parser;
 use pest_derive::Parser;
@@ -1729,7 +1730,9 @@ fn validate_custom_type(type_name: &str, value: &Value) -> Result<(), String> {
         ("ipv4_address", Value::String(s)) => validate_ipv4_address(s),
         ("ipv6_cidr", Value::String(s)) => validate_ipv6_cidr(s),
         ("ipv6_address", Value::String(s)) => validate_ipv6_address(s),
-        // arn, availability_zone — just accept strings for now (format varies too much)
+        ("arn", Value::String(s)) => validate_arn(s),
+        ("availability_zone", Value::String(s)) => validate_availability_zone(s),
+        ("aws_resource_id", Value::String(s)) => validate_aws_resource_id(s),
         (_, Value::String(_)) => Ok(()),
         (_, Value::ResourceRef { .. }) => Ok(()), // will be resolved later
         (_, Value::FunctionCall { .. }) => Ok(()), // will be resolved later
@@ -7541,8 +7544,7 @@ aws.s3.bucket {
     }
 
     #[test]
-    fn user_fn_custom_type_arn_arg_accepts_string() {
-        // arn format varies too much, just accept any string
+    fn user_fn_custom_type_arn_arg_valid() {
         let input = r#"
             fn f(x: arn) { x }
 
@@ -7552,6 +7554,89 @@ aws.s3.bucket {
         "#;
         let result = parse(input);
         assert!(result.is_ok(), "Expected OK, got: {:?}", result.err());
+    }
+
+    #[test]
+    fn user_fn_custom_type_arn_arg_invalid() {
+        let input = r#"
+            fn f(x: arn) { x }
+
+            let b = aws.s3_bucket {
+                name = f("not-an-arn")
+            }
+        "#;
+        let result = parse(input);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("validation failed"),
+            "Expected validation error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn user_fn_custom_type_availability_zone_arg_valid() {
+        let input = r#"
+            fn f(x: availability_zone) { x }
+
+            let b = aws.s3_bucket {
+                name = f("ap-northeast-1a")
+            }
+        "#;
+        let result = parse(input);
+        assert!(result.is_ok(), "Expected OK, got: {:?}", result.err());
+    }
+
+    #[test]
+    fn user_fn_custom_type_availability_zone_arg_invalid() {
+        let input = r#"
+            fn f(x: availability_zone) { x }
+
+            let b = aws.s3_bucket {
+                name = f("invalid")
+            }
+        "#;
+        let result = parse(input);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("validation failed"),
+            "Expected validation error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn user_fn_custom_type_aws_resource_id_arg_valid() {
+        let input = r#"
+            fn f(x: aws_resource_id) { x }
+
+            let b = aws.s3_bucket {
+                name = f("vpc-0abc123def")
+            }
+        "#;
+        let result = parse(input);
+        assert!(result.is_ok(), "Expected OK, got: {:?}", result.err());
+    }
+
+    #[test]
+    fn user_fn_custom_type_aws_resource_id_arg_invalid() {
+        let input = r#"
+            fn f(x: aws_resource_id) { x }
+
+            let b = aws.s3_bucket {
+                name = f("invalid")
+            }
+        "#;
+        let result = parse(input);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("validation failed"),
+            "Expected validation error, got: {}",
+            err
+        );
     }
 
     #[test]

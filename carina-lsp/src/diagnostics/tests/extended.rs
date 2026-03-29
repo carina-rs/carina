@@ -1064,3 +1064,75 @@ let name = parts |> join("-")
         diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
     );
 }
+
+#[test]
+fn validate_module_arg_type_arn_invalid() {
+    let engine = test_engine();
+    let type_expr = carina_core::parser::TypeExpr::Simple("arn".to_string());
+    let value = Value::String("not-an-arn".to_string());
+    let result = engine.validate_module_arg_type(&type_expr, &value);
+    assert!(result.is_some(), "Should return error for invalid arn");
+}
+
+#[test]
+fn validate_module_arg_type_arn_valid() {
+    let engine = test_engine();
+    let type_expr = carina_core::parser::TypeExpr::Simple("arn".to_string());
+    let value = Value::String("arn:aws:iam::123456789012:role/test".to_string());
+    let result = engine.validate_module_arg_type(&type_expr, &value);
+    assert!(
+        result.is_none(),
+        "Should not return error for valid arn. Got: {:?}",
+        result
+    );
+}
+
+#[test]
+fn validate_module_arg_type_availability_zone_invalid() {
+    let engine = test_engine();
+    let type_expr = carina_core::parser::TypeExpr::Simple("availability_zone".to_string());
+    let value = Value::String("invalid".to_string());
+    let result = engine.validate_module_arg_type(&type_expr, &value);
+    assert!(
+        result.is_some(),
+        "Should return error for invalid availability_zone"
+    );
+}
+
+#[test]
+fn validate_module_arg_type_availability_zone_valid() {
+    let engine = test_engine();
+    let type_expr = carina_core::parser::TypeExpr::Simple("availability_zone".to_string());
+    let value = Value::String("ap-northeast-1a".to_string());
+    let result = engine.validate_module_arg_type(&type_expr, &value);
+    assert!(
+        result.is_none(),
+        "Should not return error for valid availability_zone. Got: {:?}",
+        result
+    );
+}
+
+#[test]
+fn validate_module_arg_type_aws_resource_id_invalid() {
+    let engine = test_engine();
+    let type_expr = carina_core::parser::TypeExpr::Simple("aws_resource_id".to_string());
+    let value = Value::String("invalid".to_string());
+    let result = engine.validate_module_arg_type(&type_expr, &value);
+    assert!(
+        result.is_some(),
+        "Should return error for invalid aws_resource_id"
+    );
+}
+
+#[test]
+fn validate_module_arg_type_aws_resource_id_valid() {
+    let engine = test_engine();
+    let type_expr = carina_core::parser::TypeExpr::Simple("aws_resource_id".to_string());
+    let value = Value::String("vpc-0abc123def".to_string());
+    let result = engine.validate_module_arg_type(&type_expr, &value);
+    assert!(
+        result.is_none(),
+        "Should not return error for valid aws_resource_id. Got: {:?}",
+        result
+    );
+}

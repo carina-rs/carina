@@ -1335,6 +1335,70 @@ pub fn validate_ipv6_address(addr: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Validate an ARN (Amazon Resource Name)
+/// Format: `arn:<partition>:<service>:<region>:<account>:<resource>`
+pub fn validate_arn(arn: &str) -> Result<(), String> {
+    if !arn.starts_with("arn:aws") {
+        return Err(format!("Invalid ARN '{}': must start with 'arn:aws'", arn));
+    }
+    let parts: Vec<&str> = arn.splitn(6, ':').collect();
+    if parts.len() < 6 {
+        return Err(format!(
+            "Invalid ARN '{}': must have at least 6 colon-separated parts",
+            arn
+        ));
+    }
+    Ok(())
+}
+
+/// Validate an availability zone name (e.g., "ap-northeast-1a", "us-east-1b")
+pub fn validate_availability_zone(az: &str) -> Result<(), String> {
+    // Pattern: region (letters-letters-digit) + az letter
+    // e.g., ap-northeast-1a, us-east-1b, eu-west-2c
+    if az.len() < 3 || !az.ends_with(|c: char| c.is_ascii_lowercase()) {
+        return Err(format!(
+            "Invalid availability zone '{}': expected format like 'ap-northeast-1a'",
+            az
+        ));
+    }
+    // Check the region part has at least one digit before the final letter
+    let region_part = &az[..az.len() - 1];
+    if !region_part.ends_with(|c: char| c.is_ascii_digit()) {
+        return Err(format!(
+            "Invalid availability zone '{}': expected format like 'ap-northeast-1a'",
+            az
+        ));
+    }
+    Ok(())
+}
+
+/// Validate an AWS resource ID (e.g., "vpc-0abc123", "subnet-0abc123def")
+pub fn validate_aws_resource_id(id: &str) -> Result<(), String> {
+    // Pattern: prefix-hexchars (e.g., vpc-0abc123, subnet-0abc123def)
+    if let Some(pos) = id.rfind('-') {
+        let prefix = &id[..pos];
+        let hex_part = &id[pos + 1..];
+        if prefix.is_empty() || hex_part.is_empty() {
+            return Err(format!(
+                "Invalid AWS resource ID '{}': expected format like 'vpc-0abc123'",
+                id
+            ));
+        }
+        if !hex_part.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(format!(
+                "Invalid AWS resource ID '{}': hex part contains non-hex characters",
+                id
+            ));
+        }
+        Ok(())
+    } else {
+        Err(format!(
+            "Invalid AWS resource ID '{}': expected format like 'vpc-0abc123'",
+            id
+        ))
+    }
+}
+
 /// Compute Levenshtein edit distance between two strings
 fn levenshtein_distance(a: &str, b: &str) -> usize {
     let a_len = a.len();
@@ -2050,27 +2114,19 @@ mod tests {
     }
 
     #[test]
-    fn types_module_has_no_aws_specific_types() {
-        // Verify that AWS-specific types are not defined in carina-core.
-        // These belong in provider crates (e.g., carina-provider-awscc).
+    fn types_module_has_no_aws_specific_type_constructors() {
+        // Verify that AWS-specific type constructors are not defined in carina-core.
+        // Type constructors belong in provider crates.
+        // Note: validation functions ARE in carina-core so they can be used
+        // by the parser and LSP.
         let source = include_str!("schema.rs");
-        let aws_keywords = [
-            "fn arn()",
-            "fn aws_resource_id()",
-            "fn availability_zone()",
-            "validate_arn",
-            "validate_aws_resource_id",
-            "validate_availability_zone",
-        ];
+        let aws_keywords = ["fn arn()", "fn aws_resource_id()", "fn availability_zone()"];
         for keyword in &aws_keywords {
-            // Exclude this test function itself from the check
             let occurrences: Vec<_> = source.match_indices(keyword).collect();
-            // Each keyword appears once in the aws_keywords array literal above
-            // If it appears more than once, it means it's also defined elsewhere
             assert!(
                 occurrences.len() <= 1,
-                "Found AWS-specific type '{}' in carina-core/src/schema.rs. \
-                 AWS-specific types belong in provider crates.",
+                "Found AWS-specific type constructor '{}' in carina-core/src/schema.rs. \
+                 Type constructors belong in provider crates.",
                 keyword
             );
         }
@@ -2858,5 +2914,50 @@ mod tests {
             Some(Value::List(items)) => assert_eq!(items.len(), 1),
             other => panic!("expected List, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn validate_arn_valid() {
+        assert!(validate_arn("arn:aws:iam::123456789012:role/test").is_ok());
+        assert!(validate_arn("arn:aws:s3:::my-bucket").is_ok());
+        assert!(validate_arn("arn:aws-cn:s3:::my-bucket").is_ok());
+        assert!(validate_arn("arn:aws:ec2:us-east-1:123456789012:vpc/vpc-1234").is_ok());
+    }
+
+    #[test]
+    fn validate_arn_invalid() {
+        assert!(validate_arn("not-an-arn").is_err());
+        assert!(validate_arn("arn:aws:s3").is_err());
+        assert!(validate_arn("arn:aws").is_err());
+        assert!(validate_arn("").is_err());
+    }
+
+    #[test]
+    fn validate_availability_zone_valid() {
+        assert!(validate_availability_zone("ap-northeast-1a").is_ok());
+        assert!(validate_availability_zone("us-east-1b").is_ok());
+        assert!(validate_availability_zone("eu-west-2c").is_ok());
+    }
+
+    #[test]
+    fn validate_availability_zone_invalid() {
+        assert!(validate_availability_zone("invalid").is_err());
+        assert!(validate_availability_zone("us-east").is_err());
+        assert!(validate_availability_zone("a").is_err());
+    }
+
+    #[test]
+    fn validate_aws_resource_id_valid() {
+        assert!(validate_aws_resource_id("vpc-0abc123def").is_ok());
+        assert!(validate_aws_resource_id("subnet-0123456789abcdef0").is_ok());
+        assert!(validate_aws_resource_id("sg-12345678").is_ok());
+    }
+
+    #[test]
+    fn validate_aws_resource_id_invalid() {
+        assert!(validate_aws_resource_id("invalid").is_err());
+        assert!(validate_aws_resource_id("vpc").is_err());
+        assert!(validate_aws_resource_id("").is_err());
+        assert!(validate_aws_resource_id("vpc-ghijk").is_err());
     }
 }
