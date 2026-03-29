@@ -2,14 +2,14 @@
 
 use std::collections::{HashMap, HashSet};
 
-use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
+use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity};
 
 use crate::document::Document;
 use crate::position;
 use carina_core::resource::Value;
 use carina_core::schema::ResourceSchema;
 
-use super::DiagnosticEngine;
+use super::{DiagnosticEngine, carina_diagnostic};
 
 impl DiagnosticEngine {
     pub(super) fn validate_struct_value(
@@ -58,22 +58,13 @@ impl DiagnosticEngine {
 
                     // Check for unknown fields
                     if !field_names.contains(canonical_key) {
-                        diagnostics.push(Diagnostic {
-                            range: Range {
-                                start: Position {
-                                    line,
-                                    character: col,
-                                },
-                                end: Position {
-                                    line,
-                                    character: col + key.len() as u32,
-                                },
-                            },
-                            severity: Some(DiagnosticSeverity::WARNING),
-                            source: Some("carina".to_string()),
-                            message: format!("Unknown field '{}' in '{}'", key, attr_name),
-                            ..Default::default()
-                        });
+                        diagnostics.push(carina_diagnostic(
+                            line,
+                            col,
+                            col + key.len() as u32,
+                            DiagnosticSeverity::WARNING,
+                            format!("Unknown field '{}' in '{}'", key, attr_name),
+                        ));
                         continue;
                     }
 
@@ -87,22 +78,13 @@ impl DiagnosticEngine {
                         };
 
                         if let Some(message) = type_error {
-                            diagnostics.push(Diagnostic {
-                                range: Range {
-                                    start: Position {
-                                        line,
-                                        character: col,
-                                    },
-                                    end: Position {
-                                        line,
-                                        character: col + key.len() as u32,
-                                    },
-                                },
-                                severity: Some(DiagnosticSeverity::WARNING),
-                                source: Some("carina".to_string()),
+                            diagnostics.push(carina_diagnostic(
+                                line,
+                                col,
+                                col + key.len() as u32,
+                                DiagnosticSeverity::WARNING,
                                 message,
-                                ..Default::default()
-                            });
+                            ));
                         }
 
                         // Recurse into nested Struct / List<Struct> fields
@@ -213,25 +195,16 @@ impl DiagnosticEngine {
             }
 
             if let Some((line, col)) = self.find_list_literal_position(doc, attr_name) {
-                diagnostics.push(Diagnostic {
-                    range: Range {
-                        start: Position {
-                            line,
-                            character: col,
-                        },
-                        end: Position {
-                            line,
-                            character: col + attr_name.len() as u32,
-                        },
-                    },
-                    severity: Some(DiagnosticSeverity::HINT),
-                    source: Some("carina".to_string()),
-                    message: format!(
+                diagnostics.push(carina_diagnostic(
+                    line,
+                    col,
+                    col + attr_name.len() as u32,
+                    DiagnosticSeverity::HINT,
+                    format!(
                         "Prefer block syntax for '{}'. Use `{} {{ ... }}` instead of `{} = [{{ ... }}]`.",
                         attr_name, attr_name, attr_name
                     ),
-                    ..Default::default()
-                });
+                ));
             }
         }
 

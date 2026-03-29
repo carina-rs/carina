@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
+use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity};
 
 use crate::document::Document;
 use crate::position;
@@ -11,7 +11,7 @@ use carina_core::parser::{ArgumentParameter, ParsedFile, TypeExpr};
 use carina_core::resource::Value;
 use carina_core::schema::{ResourceSchema, suggest_similar_name};
 
-use super::DiagnosticEngine;
+use super::{DiagnosticEngine, carina_diagnostic};
 
 impl DiagnosticEngine {
     /// Check that provider blocks are not defined inside modules.
@@ -37,22 +37,13 @@ impl DiagnosticEngine {
                     .find('{')
                     .map(|p| col + p as u32)
                     .unwrap_or(col + trimmed.len() as u32);
-                diagnostics.push(Diagnostic {
-                    range: Range {
-                        start: Position {
-                            line: line_idx as u32,
-                            character: col,
-                        },
-                        end: Position {
-                            line: line_idx as u32,
-                            character: end_col,
-                        },
-                    },
-                    severity: Some(DiagnosticSeverity::ERROR),
-                    source: Some("carina".to_string()),
-                    message: "provider blocks are not allowed inside modules. Define providers at the root configuration level.".to_string(),
-                    ..Default::default()
-                });
+                diagnostics.push(carina_diagnostic(
+                    line_idx as u32,
+                    col,
+                    end_col,
+                    DiagnosticSeverity::ERROR,
+                    "provider blocks are not allowed inside modules. Define providers at the root configuration level.".to_string(),
+                ));
             }
         }
 
@@ -73,22 +64,13 @@ impl DiagnosticEngine {
                 && let Err(e) = factory.validate_config(&provider.attributes)
                 && let Some((line, col)) = self.find_provider_region_position(doc, &provider.name)
             {
-                diagnostics.push(Diagnostic {
-                    range: Range {
-                        start: Position {
-                            line,
-                            character: col,
-                        },
-                        end: Position {
-                            line,
-                            character: col + 6, // "region"
-                        },
-                    },
-                    severity: Some(DiagnosticSeverity::WARNING),
-                    source: Some("carina".to_string()),
-                    message: format!("provider {}: {}", provider.name, e),
-                    ..Default::default()
-                });
+                diagnostics.push(carina_diagnostic(
+                    line,
+                    col,
+                    col + 6, // "region"
+                    DiagnosticSeverity::WARNING,
+                    format!("provider {}: {}", provider.name, e),
+                ));
             }
         }
         diagnostics
@@ -162,25 +144,16 @@ impl DiagnosticEngine {
                                 .map(|arg| format!(". Did you mean '{}'?", arg.name))
                                 .unwrap_or_default();
 
-                            diagnostics.push(Diagnostic {
-                                range: Range {
-                                    start: Position {
-                                        line,
-                                        character: col,
-                                    },
-                                    end: Position {
-                                        line,
-                                        character: col + arg_name.len() as u32,
-                                    },
-                                },
-                                severity: Some(DiagnosticSeverity::WARNING),
-                                source: Some("carina".to_string()),
-                                message: format!(
+                            diagnostics.push(carina_diagnostic(
+                                line,
+                                col,
+                                col + arg_name.len() as u32,
+                                DiagnosticSeverity::WARNING,
+                                format!(
                                     "Unknown parameter '{}' for module '{}'{}",
                                     arg_name, call.module_name, suggestion
                                 ),
-                                ..Default::default()
-                            });
+                            ));
                         }
                         continue;
                     }
@@ -192,22 +165,13 @@ impl DiagnosticEngine {
                         && let Some((line, col)) =
                             self.find_module_call_arg_position(doc, &call.module_name, arg_name)
                     {
-                        diagnostics.push(Diagnostic {
-                            range: Range {
-                                start: Position {
-                                    line,
-                                    character: col,
-                                },
-                                end: Position {
-                                    line,
-                                    character: col + arg_name.len() as u32,
-                                },
-                            },
-                            severity: Some(DiagnosticSeverity::WARNING),
-                            source: Some("carina".to_string()),
-                            message: type_error,
-                            ..Default::default()
-                        });
+                        diagnostics.push(carina_diagnostic(
+                            line,
+                            col,
+                            col + arg_name.len() as u32,
+                            DiagnosticSeverity::WARNING,
+                            type_error,
+                        ));
                     }
                 }
 
@@ -218,25 +182,16 @@ impl DiagnosticEngine {
                         && let Some((line, col)) =
                             self.find_module_call_position(doc, &call.module_name)
                     {
-                        diagnostics.push(Diagnostic {
-                            range: Range {
-                                start: Position {
-                                    line,
-                                    character: col,
-                                },
-                                end: Position {
-                                    line,
-                                    character: col + call.module_name.len() as u32,
-                                },
-                            },
-                            severity: Some(DiagnosticSeverity::ERROR),
-                            source: Some("carina".to_string()),
-                            message: format!(
+                        diagnostics.push(carina_diagnostic(
+                            line,
+                            col,
+                            col + call.module_name.len() as u32,
+                            DiagnosticSeverity::ERROR,
+                            format!(
                                 "Missing required parameter '{}' for module '{}'",
                                 arg.name, call.module_name
                             ),
-                            ..Default::default()
-                        });
+                        ));
                     }
                 }
             }
@@ -327,25 +282,16 @@ impl DiagnosticEngine {
 
         for binding_name in &unused_bindings {
             if let Some((line, col)) = self.find_let_binding_position(&text, binding_name) {
-                diagnostics.push(Diagnostic {
-                    range: Range {
-                        start: Position {
-                            line,
-                            character: col,
-                        },
-                        end: Position {
-                            line,
-                            character: col + binding_name.len() as u32,
-                        },
-                    },
-                    severity: Some(DiagnosticSeverity::WARNING),
-                    source: Some("carina".to_string()),
-                    message: format!(
+                diagnostics.push(carina_diagnostic(
+                    line,
+                    col,
+                    col + binding_name.len() as u32,
+                    DiagnosticSeverity::WARNING,
+                    format!(
                         "Unused let binding '{}'. Consider using an anonymous resource instead.",
                         binding_name
                     ),
-                    ..Default::default()
-                });
+                ));
             }
         }
 
@@ -421,25 +367,16 @@ impl DiagnosticEngine {
                     && let Some((line, col)) =
                         self.find_attributes_value_position(doc, &attr_param.name)
                 {
-                    diagnostics.push(Diagnostic {
-                        range: Range {
-                            start: Position {
-                                line,
-                                character: col,
-                            },
-                            end: Position {
-                                line,
-                                character: col + binding_name.len() as u32,
-                            },
-                        },
-                        severity: Some(DiagnosticSeverity::ERROR),
-                        source: Some("carina".to_string()),
-                        message: format!(
+                    diagnostics.push(carina_diagnostic(
+                        line,
+                        col,
+                        col + binding_name.len() as u32,
+                        DiagnosticSeverity::ERROR,
+                        format!(
                             "Undefined resource '{}' in attributes '{}'. Define it with 'let {} = ...'",
                             binding_name, attr_param.name, binding_name
                         ),
-                        ..Default::default()
-                    });
+                    ));
                 }
 
                 // Type validation (only when explicit type annotation is present)
@@ -449,22 +386,13 @@ impl DiagnosticEngine {
                     && let Some((line, col)) =
                         self.find_attributes_param_position(doc, &attr_param.name)
                 {
-                    diagnostics.push(Diagnostic {
-                        range: Range {
-                            start: Position {
-                                line,
-                                character: col,
-                            },
-                            end: Position {
-                                line,
-                                character: col + attr_param.name.len() as u32,
-                            },
-                        },
-                        severity: Some(DiagnosticSeverity::WARNING),
-                        source: Some("carina".to_string()),
-                        message: type_error,
-                        ..Default::default()
-                    });
+                    diagnostics.push(carina_diagnostic(
+                        line,
+                        col,
+                        col + attr_param.name.len() as u32,
+                        DiagnosticSeverity::WARNING,
+                        type_error,
+                    ));
                 }
             }
         }
@@ -659,25 +587,16 @@ impl DiagnosticEngine {
                             let col = position::byte_offset_to_char_offset(line, eq_byte_pos)
                                 + 1
                                 + whitespace_chars as u32;
-                            diagnostics.push(Diagnostic {
-                                range: Range {
-                                    start: Position {
-                                        line: line_idx as u32,
-                                        character: col,
-                                    },
-                                    end: Position {
-                                        line: line_idx as u32,
-                                        character: col + identifier.len() as u32,
-                                    },
-                                },
-                                severity: Some(DiagnosticSeverity::ERROR),
-                                source: Some("carina".to_string()),
-                                message: format!(
+                            diagnostics.push(carina_diagnostic(
+                                line_idx as u32,
+                                col,
+                                col + identifier.len() as u32,
+                                DiagnosticSeverity::ERROR,
+                                format!(
                                     "Undefined resource: '{}'. Define it with 'let {} = aws...'",
                                     identifier, identifier
                                 ),
-                                ..Default::default()
-                            });
+                            ));
                         }
                     }
                 }
@@ -716,22 +635,13 @@ impl DiagnosticEngine {
                 if !builtins::is_known_builtin(name)
                     && let Some((line, col)) = self.find_function_call_position(doc, name)
                 {
-                    diagnostics.push(Diagnostic {
-                        range: Range {
-                            start: Position {
-                                line,
-                                character: col,
-                            },
-                            end: Position {
-                                line,
-                                character: col + name.len() as u32,
-                            },
-                        },
-                        severity: Some(DiagnosticSeverity::ERROR),
-                        source: Some("carina".to_string()),
-                        message: format!("Unknown function '{}'", name),
-                        ..Default::default()
-                    });
+                    diagnostics.push(carina_diagnostic(
+                        line,
+                        col,
+                        col + name.len() as u32,
+                        DiagnosticSeverity::ERROR,
+                        format!("Unknown function '{}'", name),
+                    ));
                 }
                 // Also check nested function calls in arguments
                 for arg in args {
@@ -850,25 +760,16 @@ impl DiagnosticEngine {
                 if let Some((line, col)) = self.find_ref_value_position(doc, &ref_text) {
                     // Highlight just the attribute part (after the dot)
                     let attr_col = col + binding_name.len() as u32 + 1; // +1 for the dot
-                    diagnostics.push(Diagnostic {
-                        range: Range {
-                            start: Position {
-                                line,
-                                character: attr_col,
-                            },
-                            end: Position {
-                                line,
-                                character: attr_col + attribute_name.len() as u32,
-                            },
-                        },
-                        severity: Some(DiagnosticSeverity::WARNING),
-                        source: Some("carina".to_string()),
-                        message: format!(
+                    diagnostics.push(carina_diagnostic(
+                        line,
+                        attr_col,
+                        attr_col + attribute_name.len() as u32,
+                        DiagnosticSeverity::WARNING,
+                        format!(
                             "Unknown attribute '{}' on '{}' (type '{}'){}",
                             attribute_name, binding_name, ref_schema.resource_type, suggestion,
                         ),
-                        ..Default::default()
-                    });
+                    ));
                 }
             }
             Value::List(items) => {
