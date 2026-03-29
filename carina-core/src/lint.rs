@@ -213,6 +213,166 @@ pub fn find_non_snake_case_bindings(source: &str) -> Vec<NamingWarning> {
     warnings
 }
 
+/// Casing style for a tag key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TagKeyStyle {
+    PascalCase,
+    SnakeCase,
+    Other,
+}
+
+/// A tag key extracted from source text.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TagKeyEntry {
+    pub key: String,
+    pub style: TagKeyStyle,
+    /// 1-indexed line number
+    pub line: usize,
+}
+
+/// A warning for tag keys whose casing style is inconsistent with the majority.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TagKeyWarning {
+    pub key: String,
+    pub expected_style: TagKeyStyle,
+    /// 1-indexed line number
+    pub line: usize,
+    /// File path (set by the caller when aggregating across files)
+    pub file: Option<std::path::PathBuf>,
+}
+
+/// Classify a tag key's casing style.
+fn classify_tag_key_style(name: &str) -> TagKeyStyle {
+    if name.is_empty() {
+        return TagKeyStyle::Other;
+    }
+    // PascalCase: starts uppercase, no underscores/hyphens, all alphanumeric
+    if name.starts_with(|c: char| c.is_ascii_uppercase())
+        && !name.contains('_')
+        && !name.contains('-')
+        && name.chars().all(|c| c.is_alphanumeric())
+    {
+        return TagKeyStyle::PascalCase;
+    }
+    // snake_case: all lowercase/digits/underscores, must contain underscore or be all lowercase
+    if name
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+    {
+        return TagKeyStyle::SnakeCase;
+    }
+    TagKeyStyle::Other
+}
+
+/// Collect all tag keys from `tags = { ... }` blocks in source text.
+///
+/// Returns entries with key name, detected style, and line number.
+/// Does not judge consistency — call `find_mixed_tag_key_styles` on the aggregated entries.
+pub fn collect_tag_keys(source: &str) -> Vec<TagKeyEntry> {
+    let mut entries = Vec::new();
+    let mut in_tags_block = false;
+    let mut brace_depth: usize = 0;
+
+    for (line_idx, line) in source.lines().enumerate() {
+        let trimmed = line.trim();
+        let line_number = line_idx + 1;
+
+        // Skip comment lines
+        if trimmed.starts_with("//") || trimmed.starts_with('#') {
+            continue;
+        }
+
+        // Detect start of a tags block: `tags = {`
+        if !in_tags_block && let Some(after) = trimmed.strip_prefix("tags") {
+            let after = after.trim_start();
+            if let Some(after_eq) = after.strip_prefix('=') {
+                let after_eq = after_eq.trim_start();
+                if after_eq.starts_with('{') {
+                    in_tags_block = true;
+                    brace_depth = 1;
+                    continue;
+                }
+            }
+        }
+
+        if in_tags_block {
+            // Count braces
+            for ch in trimmed.chars() {
+                match ch {
+                    '{' => brace_depth += 1,
+                    '}' => {
+                        brace_depth = brace_depth.saturating_sub(1);
+                        if brace_depth == 0 {
+                            in_tags_block = false;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            // Check for key = value pattern
+            if !trimmed.starts_with('}')
+                && let Some(eq_pos) = trimmed.find('=')
+            {
+                let key = trimmed[..eq_pos].trim();
+                if !key.is_empty() && key.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                    entries.push(TagKeyEntry {
+                        key: key.to_string(),
+                        style: classify_tag_key_style(key),
+                        line: line_number,
+                    });
+                }
+            }
+        }
+    }
+
+    entries
+}
+
+/// Detect tag keys whose casing style is inconsistent with the majority.
+///
+/// Determines the dominant style (PascalCase or snake_case) by counting occurrences,
+/// then returns warnings for keys that don't match. If all keys use the same style
+/// (or there are fewer than 2 keys), no warnings are produced.
+pub fn find_mixed_tag_key_styles(entries: &[TagKeyEntry]) -> Vec<TagKeyWarning> {
+    if entries.len() < 2 {
+        return vec![];
+    }
+
+    let mut pascal_count = 0usize;
+    let mut snake_count = 0usize;
+    for e in entries {
+        match e.style {
+            TagKeyStyle::PascalCase => pascal_count += 1,
+            TagKeyStyle::SnakeCase => snake_count += 1,
+            TagKeyStyle::Other => {}
+        }
+    }
+
+    // No mixed styles if everything is one style (or all Other)
+    if pascal_count == 0 || snake_count == 0 {
+        return vec![];
+    }
+
+    // Dominant style is whichever has more keys
+    let dominant = if pascal_count >= snake_count {
+        TagKeyStyle::PascalCase
+    } else {
+        TagKeyStyle::SnakeCase
+    };
+
+    entries
+        .iter()
+        .filter(|e| e.style != dominant && e.style != TagKeyStyle::Other)
+        .map(|e| TagKeyWarning {
+            key: e.key.clone(),
+            expected_style: dominant,
+            line: e.line,
+            file: None,
+        })
+        .collect()
+}
+
 /// Rough heuristic to check if a byte position is inside a string literal.
 fn is_inside_string(line: &str, pos: usize) -> bool {
     let mut in_string = false;
@@ -718,5 +878,113 @@ let e = replace("old", "new", str)
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].name, "badName");
         assert_eq!(results[0].line, 2);
+    }
+
+    // --- Tag key casing consistency tests ---
+
+    #[test]
+    fn test_collect_tag_keys_extracts_keys() {
+        let source = r#"
+tags = {
+    Name = "my-vpc"
+    environment = "prod"
+}"#;
+        let keys = collect_tag_keys(source);
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys[0].key, "Name");
+        assert_eq!(keys[0].style, TagKeyStyle::PascalCase);
+        assert_eq!(keys[1].key, "environment");
+        assert_eq!(keys[1].style, TagKeyStyle::SnakeCase);
+    }
+
+    #[test]
+    fn test_tag_mixed_casing_warns() {
+        // Majority is PascalCase (2 vs 1), so snake_case key should be flagged
+        let source = r#"
+let vpc = awscc.ec2.vpc {
+    cidr_block = "10.0.0.0/16"
+    tags = {
+        Name = "my-vpc"
+        Environment = "staging"
+        environment = "prod"
+    }
+}"#;
+        let keys = collect_tag_keys(source);
+        let results = find_mixed_tag_key_styles(&keys);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].key, "environment");
+        assert_eq!(results[0].expected_style, TagKeyStyle::PascalCase);
+    }
+
+    #[test]
+    fn test_tag_all_pascal_case_no_warning() {
+        let source = r#"
+tags = {
+    Name = "my-vpc"
+    Environment = "prod"
+    ManagedBy = "carina"
+}"#;
+        let keys = collect_tag_keys(source);
+        let results = find_mixed_tag_key_styles(&keys);
+        assert!(results.is_empty(), "All PascalCase should not warn");
+    }
+
+    #[test]
+    fn test_tag_all_snake_case_no_warning() {
+        let source = r#"
+tags = {
+    managed_by = "carina"
+    env_name = "prod"
+}"#;
+        let keys = collect_tag_keys(source);
+        let results = find_mixed_tag_key_styles(&keys);
+        assert!(results.is_empty(), "All snake_case should not warn");
+    }
+
+    #[test]
+    fn test_tag_comment_line_no_warning() {
+        let source = r#"
+// tags = {
+//     bad_key = "value"
+// }"#;
+        let keys = collect_tag_keys(source);
+        assert!(keys.is_empty(), "Comment lines should not produce keys");
+    }
+
+    #[test]
+    fn test_tag_cross_file_mixed_styles() {
+        // Simulate two files: file1 uses PascalCase, file2 uses snake_case
+        let source1 = r#"
+tags = {
+    Name = "vpc"
+    Environment = "prod"
+}"#;
+        let source2 = r#"
+tags = {
+    name = "subnet"
+    managed_by = "carina"
+}"#;
+        let mut all_keys = collect_tag_keys(source1);
+        all_keys.extend(collect_tag_keys(source2));
+        let results = find_mixed_tag_key_styles(&all_keys);
+        // PascalCase (2) == snake_case (2), PascalCase wins on tie
+        // So snake_case keys are flagged
+        assert_eq!(results.len(), 2);
+        assert!(
+            results
+                .iter()
+                .all(|w| w.expected_style == TagKeyStyle::PascalCase)
+        );
+    }
+
+    #[test]
+    fn test_tag_single_key_no_warning() {
+        let source = r#"
+tags = {
+    name = "only-one"
+}"#;
+        let keys = collect_tag_keys(source);
+        let results = find_mixed_tag_key_styles(&keys);
+        assert!(results.is_empty(), "Single key should not warn");
     }
 }
