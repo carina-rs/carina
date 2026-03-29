@@ -1,0 +1,34 @@
+---
+source: carina-tui/src/module_info_tui_snapshot_tests.rs
+expression: output
+---
+┌ Module Info: web_tier ───────────────────────────────────────────────────────────────────────────┐
+│=== ARGUMENTS ===  (2 items)                                                                      │
+│  vpc: aws.vpc  (required)                                                                        │
+│  enable_https: bool = true                                                                       │
+│=== CREATES ===  (2 resources)                                                                    │
+│  web_sg: aws.security_group                                                                      │
+│  http_rule: aws.security_group.ingress_rule                                                      │
+│=== ATTRIBUTES ===  (1 items)                                                                     │
+│  security_group: aws.security_group                                                              │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘
+┌ Detail ──────────────────────────────────────────────────────────────────────────────────────────┐
+│ARGUMENTS                                                                                         │
+│2 items                                                                                           │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘
+ q quit  ↑↓/jk navigate  Tab switch panel

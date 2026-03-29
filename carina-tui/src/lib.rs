@@ -1,11 +1,16 @@
 //! TUI (Terminal User Interface) for interactive plan review
 //!
 //! Provides an interactive tree view of a Plan with color-coded effects
-//! and an attribute detail panel.
+//! and an attribute detail panel. Also provides a module info viewer
+//! for interactive exploration of module signatures.
 
 mod app;
+pub mod module_info_app;
+mod module_info_ui;
 mod ui;
 
+#[cfg(test)]
+mod module_info_tui_snapshot_tests;
 #[cfg(test)]
 mod tui_snapshot_tests;
 
@@ -17,10 +22,12 @@ use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::{ExecutableCommand, execute};
 use ratatui::prelude::*;
 
+use carina_core::module::FileSignature;
 use carina_core::plan::Plan;
 use carina_core::schema::ResourceSchema;
 
 pub use app::{App, FocusedPanel};
+pub use module_info_app::ModuleInfoApp;
 
 /// Action resulting from a key press
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -144,6 +151,61 @@ pub fn handle_key(app: &mut App, code: KeyCode) -> KeyAction {
             KeyAction::Continue
         }
         _ => KeyAction::Continue,
+    }
+}
+
+/// Handle a key code for the module info TUI.
+pub fn handle_module_info_key(app: &mut ModuleInfoApp, code: KeyCode) -> KeyAction {
+    match code {
+        KeyCode::Char('q') | KeyCode::Esc => KeyAction::Quit,
+        KeyCode::Tab => {
+            app.toggle_focus();
+            KeyAction::Continue
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            app.move_up();
+            KeyAction::Continue
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            app.move_down();
+            KeyAction::Continue
+        }
+        _ => KeyAction::Continue,
+    }
+}
+
+/// Run the module info TUI with the given file signature.
+pub fn run_module_info(signature: &FileSignature) -> io::Result<()> {
+    terminal::enable_raw_mode()?;
+    io::stdout().execute(EnterAlternateScreen)?;
+    let backend = CrosstermBackend::new(io::stdout());
+    let mut terminal = Terminal::new(backend)?;
+
+    let mut app = ModuleInfoApp::new(signature);
+    let result = run_module_info_loop(&mut terminal, &mut app);
+
+    terminal::disable_raw_mode()?;
+    execute!(io::stdout(), LeaveAlternateScreen)?;
+    terminal.show_cursor()?;
+
+    result
+}
+
+fn run_module_info_loop(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    app: &mut ModuleInfoApp,
+) -> io::Result<()> {
+    loop {
+        terminal.draw(|frame| module_info_ui::draw(frame, app))?;
+
+        if let Event::Key(key) = event::read()? {
+            if key.kind != KeyEventKind::Press {
+                continue;
+            }
+            if handle_module_info_key(app, key.code) == KeyAction::Quit {
+                return Ok(());
+            }
+        }
     }
 }
 
