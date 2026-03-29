@@ -8,7 +8,16 @@ provider aws {
 
 let role = aws.iam.role {
   role_name = "carina-acceptance-test-role"
-  assume_role_policy_document = "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"Service\":\"ec2.amazonaws.com\"},\"Action\":\"sts:AssumeRole\"}]}"
+  assume_role_policy_document = {
+    version = "2012-10-17"
+    statement {
+      effect = "Allow"
+      principal = {
+        service = "ec2.amazonaws.com"
+      }
+      action = "sts:AssumeRole"
+    }
+  }
   description = "Carina acceptance test role"
   path = "/"
   max_session_duration = 7200
