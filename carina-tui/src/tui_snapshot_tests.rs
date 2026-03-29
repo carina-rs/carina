@@ -7,7 +7,6 @@ use std::collections::{HashMap, HashSet};
 
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
-use ratatui::buffer::Buffer;
 
 use carina_core::effect::Effect;
 use carina_core::plan::Plan;
@@ -15,31 +14,8 @@ use carina_core::resource::{LifecycleConfig, Resource, ResourceId, State, Value}
 use carina_core::schema::ResourceSchema;
 
 use crate::app::App;
+use crate::test_utils::buffer_to_string;
 use crate::ui::draw;
-
-/// Convert a ratatui Buffer to a string, trimming trailing whitespace per line.
-fn buffer_to_string(buffer: &Buffer) -> String {
-    let mut output = String::new();
-    for y in 0..buffer.area.height {
-        for x in 0..buffer.area.width {
-            output.push(
-                buffer
-                    .cell((x, y))
-                    .unwrap()
-                    .symbol()
-                    .chars()
-                    .next()
-                    .unwrap_or(' '),
-            );
-        }
-        output.push('\n');
-    }
-    output
-        .lines()
-        .map(|l| l.trim_end())
-        .collect::<Vec<_>>()
-        .join("\n")
-}
 
 /// Render the TUI into a string, optionally selecting a specific node.
 fn render_tui(plan: &Plan, width: u16, height: u16, selection: usize) -> String {

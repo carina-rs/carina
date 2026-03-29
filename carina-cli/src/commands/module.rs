@@ -12,6 +12,10 @@ pub enum ModuleCommands {
     Info {
         /// Path to module .crn file
         file: std::path::PathBuf,
+
+        /// Display module info in interactive TUI mode
+        #[arg(long)]
+        tui: bool,
     },
     /// List imported modules
     List {
@@ -26,7 +30,7 @@ pub fn run_module_command(
     provider_context: &ProviderContext,
 ) -> Result<(), AppError> {
     match command {
-        ModuleCommands::Info { file } => run_module_info(&file),
+        ModuleCommands::Info { file, tui } => run_module_info(&file, tui),
         ModuleCommands::List { path } => run_module_list(&path, provider_context),
     }
 }
@@ -52,7 +56,7 @@ pub fn format_module_list(imports: &[carina_core::parser::ImportStatement]) -> S
     out
 }
 
-fn run_module_info(path: &Path) -> Result<(), AppError> {
+fn run_module_info(path: &Path, tui: bool) -> Result<(), AppError> {
     let parsed = if path.is_dir() {
         // Read all .crn files in the directory and merge them
         module_resolver::load_module_from_directory(path)?
@@ -68,7 +72,13 @@ fn run_module_info(path: &Path) -> Result<(), AppError> {
     // Build and display the file signature (module or root config)
     let signature =
         carina_core::module::FileSignature::from_parsed_file_with_name(&parsed, &module_name);
-    println!("{}", signature.display());
+
+    if tui {
+        carina_tui::run_module_info(&signature)
+            .map_err(|e| AppError::Config(format!("TUI error: {}", e)))?;
+    } else {
+        println!("{}", signature.display());
+    }
 
     Ok(())
 }

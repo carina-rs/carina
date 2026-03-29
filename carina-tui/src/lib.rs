@@ -1,11 +1,18 @@
 //! TUI (Terminal User Interface) for interactive plan review
 //!
 //! Provides an interactive tree view of a Plan with color-coded effects
-//! and an attribute detail panel.
+//! and an attribute detail panel. Also provides a module info viewer
+//! for interactive exploration of module signatures.
 
 mod app;
+pub mod module_info_app;
+mod module_info_ui;
 mod ui;
 
+#[cfg(test)]
+mod module_info_tui_snapshot_tests;
+#[cfg(test)]
+mod test_utils;
 #[cfg(test)]
 mod tui_snapshot_tests;
 
@@ -17,10 +24,12 @@ use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::{ExecutableCommand, execute};
 use ratatui::prelude::*;
 
+use carina_core::module::FileSignature;
 use carina_core::plan::Plan;
 use carina_core::schema::ResourceSchema;
 
 pub use app::{App, FocusedPanel};
+pub use module_info_app::ModuleInfoApp;
 
 /// Action resulting from a key press
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -147,46 +156,71 @@ pub fn handle_key(app: &mut App, code: KeyCode) -> KeyAction {
     }
 }
 
+/// Handle a key code for the module info TUI.
+pub fn handle_module_info_key(app: &mut ModuleInfoApp, code: KeyCode) -> KeyAction {
+    match code {
+        KeyCode::Char('q') | KeyCode::Esc => KeyAction::Quit,
+        KeyCode::Tab => {
+            app.toggle_focus();
+            KeyAction::Continue
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            app.move_up();
+            KeyAction::Continue
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            app.move_down();
+            KeyAction::Continue
+        }
+        _ => KeyAction::Continue,
+    }
+}
+
+/// Run the module info TUI with the given file signature.
+pub fn run_module_info(signature: &FileSignature) -> io::Result<()> {
+    let mut app = ModuleInfoApp::new(signature);
+    run_tui(module_info_ui::draw, handle_module_info_key, &mut app)
+}
+
 /// Run the TUI with the given plan and optional schemas.
 ///
 /// When schemas are provided, the detail panel shows read-only attributes
 /// with `(known after apply)` and default values with `# default`,
 /// matching CLI `--detail full` behavior.
-///
-/// Takes ownership of the terminal, displays the interactive plan viewer,
-/// and restores the terminal on exit.
 pub fn run(plan: &Plan, schemas: &HashMap<String, ResourceSchema>) -> io::Result<()> {
+    let mut app = App::new(plan, schemas);
+    run_tui(ui::draw, handle_key, &mut app)
+}
+
+fn run_tui<A>(
+    draw_fn: impl Fn(&mut ratatui::Frame, &mut A),
+    key_fn: impl Fn(&mut A, KeyCode) -> KeyAction,
+    app: &mut A,
+) -> io::Result<()> {
     terminal::enable_raw_mode()?;
     io::stdout().execute(EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
 
-    let mut app = App::new(plan, schemas);
-    let result = run_loop(&mut terminal, &mut app);
+    let result = (|| {
+        loop {
+            terminal.draw(|frame| draw_fn(frame, app))?;
+            if let Event::Key(key) = event::read()? {
+                if key.kind != KeyEventKind::Press {
+                    continue;
+                }
+                if key_fn(app, key.code) == KeyAction::Quit {
+                    return Ok(());
+                }
+            }
+        }
+    })();
 
     terminal::disable_raw_mode()?;
     execute!(io::stdout(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
 
     result
-}
-
-fn run_loop(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    app: &mut App,
-) -> io::Result<()> {
-    loop {
-        terminal.draw(|frame| ui::draw(frame, app))?;
-
-        if let Event::Key(key) = event::read()? {
-            if key.kind != KeyEventKind::Press {
-                continue;
-            }
-            if handle_key(app, key.code) == KeyAction::Quit {
-                return Ok(());
-            }
-        }
-    }
 }
 
 #[cfg(test)]
@@ -814,5 +848,69 @@ mod tests {
         handle_key(&mut app, KeyCode::Enter);
         assert_eq!(app.selected, prev_selected);
         assert!(app.nav_stack.is_empty());
+    }
+
+    // ---- Module info key handler tests ----
+
+    fn make_module_info_app() -> ModuleInfoApp {
+        use carina_core::parser::{ProviderContext, parse};
+        let input = r#"
+            arguments {
+                vpc: aws.vpc
+                enable_https: bool = true
+            }
+            attributes {
+                sg: aws.security_group = web_sg.id
+            }
+            let web_sg = aws.security_group {
+                name = "web-sg"
+                vpc_id = vpc
+            }
+        "#;
+        let parsed = parse(input, &ProviderContext::default()).unwrap();
+        let sig = FileSignature::from_parsed_file_with_name(&parsed, "test_module");
+        ModuleInfoApp::new(&sig)
+    }
+
+    #[test]
+    fn module_info_q_quits() {
+        let mut app = make_module_info_app();
+        assert_eq!(
+            handle_module_info_key(&mut app, KeyCode::Char('q')),
+            KeyAction::Quit
+        );
+    }
+
+    #[test]
+    fn module_info_esc_quits() {
+        let mut app = make_module_info_app();
+        assert_eq!(
+            handle_module_info_key(&mut app, KeyCode::Esc),
+            KeyAction::Quit
+        );
+    }
+
+    #[test]
+    fn module_info_navigation() {
+        let mut app = make_module_info_app();
+        assert_eq!(app.selected(), 0);
+        handle_module_info_key(&mut app, KeyCode::Down);
+        assert_eq!(app.selected(), 1);
+        handle_module_info_key(&mut app, KeyCode::Up);
+        assert_eq!(app.selected(), 0);
+        handle_module_info_key(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.selected(), 1);
+        handle_module_info_key(&mut app, KeyCode::Char('k'));
+        assert_eq!(app.selected(), 0);
+    }
+
+    #[test]
+    fn module_info_tab_toggles_focus() {
+        let mut app = make_module_info_app();
+        assert_eq!(app.focused_panel, FocusedPanel::Tree);
+        handle_module_info_key(&mut app, KeyCode::Tab);
+        assert_eq!(app.focused_panel, FocusedPanel::Detail);
+        handle_module_info_key(&mut app, KeyCode::Tab);
+        assert_eq!(app.focused_panel, FocusedPanel::Tree);
     }
 }
