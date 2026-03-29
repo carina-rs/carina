@@ -55,7 +55,7 @@ impl AwsProvider {
         &self,
         resource: Resource,
     ) -> ProviderResult<State> {
-        let vpc_id = match resource.attributes.get("vpc_id") {
+        let vpc_id = match resource.get_attr("vpc_id") {
             Some(Value::String(s)) => s.clone(),
             _ => {
                 return Err(
@@ -70,7 +70,7 @@ impl AwsProvider {
             .vpc_id(&vpc_id);
 
         // Apply tags via TagSpecifications
-        if let Some(Value::Map(tags)) = resource.attributes.get("tags") {
+        if let Some(Value::Map(tags)) = resource.get_attr("tags") {
             use aws_sdk_ec2::types::{Tag, TagSpecification};
             let mut tag_spec = TagSpecification::builder()
                 .resource_type(aws_sdk_ec2::types::ResourceType::EgressOnlyInternetGateway);
@@ -109,8 +109,13 @@ impl AwsProvider {
         from: &State,
         to: Resource,
     ) -> ProviderResult<State> {
-        self.apply_ec2_tags(&id, identifier, &to.attributes, Some(&from.attributes))
-            .await?;
+        self.apply_ec2_tags(
+            &id,
+            identifier,
+            &to.resolved_attributes(),
+            Some(&from.attributes),
+        )
+        .await?;
         self.read_ec2_egress_only_internet_gateway(&id, Some(identifier))
             .await
     }
