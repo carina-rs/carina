@@ -106,11 +106,11 @@ pub enum TypeExpr {
     /// Distinguished from Ref by having a PascalCase final segment.
     SchemaType {
         /// Provider name (e.g., "awscc")
-        provider: std::string::String,
+        provider: String,
         /// Service/namespace path (e.g., "ec2")
-        path: std::string::String,
+        path: String,
         /// Type name in PascalCase (e.g., "VpcId")
-        type_name: std::string::String,
+        type_name: String,
     },
 }
 
