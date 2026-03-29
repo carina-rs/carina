@@ -14,23 +14,15 @@ use carina_core::schema::{AttributeType, StructField};
 /// (e.g., `advanced`) or TypeName.value identifiers (e.g., `Tier.advanced`)
 /// into fully-qualified namespaced strings (e.g., `awscc.ec2.ipam.Tier.advanced`).
 pub fn resolve_enum_identifiers_impl(resources: &mut [Resource]) {
-    let awscc_configs = crate::schemas::generated::configs();
-
     for resource in resources.iter_mut() {
         // Only handle awscc resources
         if resource.id.provider != "awscc" {
             continue;
         }
 
-        // Find the matching schema config
-        let config = awscc_configs.iter().find(|c| {
-            c.schema
-                .resource_type
-                .strip_prefix("awscc.")
-                .map(|t| t == resource.id.resource_type)
-                .unwrap_or(false)
-        });
-        let config = match config {
+        // Find the matching schema config via cached O(1) lookup
+        let config = match crate::schemas::generated::get_config_by_type(&resource.id.resource_type)
+        {
             Some(c) => c,
             None => continue,
         };
@@ -143,17 +135,13 @@ fn resolve_struct_enum_values(value: &Value, fields: &[StructField]) -> Value {
 /// would see a false diff. This function normalizes state values the same way
 /// so that both sides use the same representation.
 pub fn normalize_state_enums_impl(current_states: &mut HashMap<ResourceId, State>) {
-    let awscc_configs = crate::schemas::generated::configs();
-
     for (resource_id, state) in current_states.iter_mut() {
         if !state.exists || resource_id.provider != "awscc" {
             continue;
         }
 
-        let config = awscc_configs
-            .iter()
-            .find(|c| c.resource_type_name == resource_id.resource_type);
-        let config = match config {
+        let config = match crate::schemas::generated::get_config_by_type(&resource_id.resource_type)
+        {
             Some(c) => c,
             None => continue,
         };
@@ -210,16 +198,12 @@ pub fn restore_unreturned_attrs_impl(
     current_states: &mut HashMap<ResourceId, State>,
     saved_attrs: &HashMap<ResourceId, HashMap<String, Value>>,
 ) {
-    let awscc_configs = crate::schemas::generated::configs();
-
     for (resource_id, state) in current_states.iter_mut() {
         if !state.exists || resource_id.provider != "awscc" {
             continue;
         }
-        let config = awscc_configs
-            .iter()
-            .find(|c| c.resource_type_name == resource_id.resource_type);
-        let config = match config {
+        let config = match crate::schemas::generated::get_config_by_type(&resource_id.resource_type)
+        {
             Some(c) => c,
             None => continue,
         };

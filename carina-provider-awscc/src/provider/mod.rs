@@ -73,14 +73,7 @@ impl AwsccProvider {
     }
 }
 
-/// Get the AwsccSchemaConfig for a resource type
-fn get_schema_config(resource_type: &str) -> Option<AwsccSchemaConfig> {
-    crate::schemas::generated::configs().into_iter().find(|c| {
-        // Match by schema resource_type: "awscc.ec2.vpc" -> "ec2.vpc"
-        c.schema
-            .resource_type
-            .strip_prefix("awscc.")
-            .map(|t| t == resource_type)
-            .unwrap_or(false)
-    })
+/// Get the AwsccSchemaConfig for a resource type. O(1) via cached HashMap.
+fn get_schema_config(resource_type: &str) -> Option<&'static AwsccSchemaConfig> {
+    crate::schemas::generated::get_config_by_type(resource_type)
 }
