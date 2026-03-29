@@ -132,23 +132,48 @@ impl AwsProvider {
             req = req.tag_specifications(tag_spec.build());
         }
 
-        let result = req.send().await.map_err(|e| {
-            ProviderError::new("Failed to create flow logs")
-                .with_cause(e)
-                .for_resource(resource.id.clone())
-        })?;
+        // Retry loop for IAM eventual consistency: newly created IAM roles may
+        // not be usable immediately by create_flow_logs.
+        let mut last_error = String::new();
+        let mut result = None;
+        for attempt in 0..12 {
+            if attempt > 0 {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            }
+            let resp = req.clone().send().await.map_err(|e| {
+                ProviderError::new("Failed to create flow logs")
+                    .with_cause(e)
+                    .for_resource(resource.id.clone())
+            })?;
 
-        // Check for unsuccessful items
-        if let Some(err) = result.unsuccessful().first() {
-            let msg = err
-                .error()
-                .and_then(|e| e.message())
-                .unwrap_or("unknown error");
-            return Err(
-                ProviderError::new(format!("Failed to create flow log: {}", msg))
-                    .for_resource(resource.id.clone()),
-            );
+            // Check for unsuccessful items
+            if let Some(err) = resp.unsuccessful().first() {
+                let msg = err
+                    .error()
+                    .and_then(|e| e.message())
+                    .unwrap_or("unknown error");
+                last_error = msg.to_string();
+                // Retry on IAM propagation errors
+                if msg.contains("Unable to assume IAM role") || msg.contains("Not authorized") {
+                    continue;
+                }
+                return Err(
+                    ProviderError::new(format!("Failed to create flow log: {}", msg))
+                        .for_resource(resource.id.clone()),
+                );
+            }
+
+            result = Some(resp);
+            break;
         }
+
+        let result = result.ok_or_else(|| {
+            ProviderError::new(format!(
+                "Failed to create flow log after retries: {}",
+                last_error
+            ))
+            .for_resource(resource.id.clone())
+        })?;
 
         let flow_log_id = result.flow_log_ids().first().ok_or_else(|| {
             ProviderError::new("Flow Log created but no ID returned")
