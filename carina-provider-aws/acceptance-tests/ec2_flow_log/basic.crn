@@ -1,6 +1,7 @@
 # EC2 Flow Log - Basic test
 #
-# Tests: VPC Flow Log creation with CloudWatch Logs destination
+# Tests: VPC Flow Log creation with S3 destination
+# Note: The S3 bucket is created separately and its ARN is constructed.
 
 provider aws {
   region = aws.Region.ap_northeast_1
@@ -14,27 +15,8 @@ let vpc = aws.ec2.vpc {
   }
 }
 
-let log_group = aws.logs.log_group {
-  log_group_name    = "carina-acceptance-test-flow-log"
-  retention_in_days = 1
-
-  tags = {
-    Environment = "acceptance-test"
-  }
-}
-
-let role = aws.iam.role {
-  role_name = "carina-acceptance-test-flow-log-role"
-  assume_role_policy_document = {
-    version = "2012-10-17"
-    statement {
-      effect = "Allow"
-      principal = {
-        service = "vpc-flow-logs.amazonaws.com"
-      }
-      action = "sts:AssumeRole"
-    }
-  }
+let bucket = aws.s3.bucket {
+  bucket = "carina-at-flow-log"
 
   tags = {
     Environment = "acceptance-test"
@@ -45,9 +27,8 @@ let flow_log = aws.ec2.flow_log {
   resource_id          = vpc.vpc_id
   resource_type        = aws.ec2.flow_log.ResourceType.VPC
   traffic_type         = aws.ec2.flow_log.TrafficType.ALL
-  log_destination_type = aws.ec2.flow_log.LogDestinationType.cloud_watch_logs
-  log_group_name       = log_group.log_group_name
-  deliver_logs_permission_arn = role.arn
+  log_destination_type = aws.ec2.flow_log.LogDestinationType.s3
+  log_destination      = "arn:aws:s3:::carina-at-flow-log"
 
   tags = {
     Environment = "acceptance-test"
