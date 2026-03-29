@@ -537,27 +537,79 @@ impl CompletionProvider {
             end: position,
         };
 
-        self.schemas
-            .keys()
-            .map(|resource_type| {
-                let description = self
-                    .schemas
-                    .get(resource_type)
-                    .and_then(|s| s.description.as_deref())
-                    .unwrap_or("Resource reference");
+        let mut completions = Vec::new();
 
-                CompletionItem {
-                    label: resource_type.clone(),
-                    kind: Some(CompletionItemKind::TYPE_PARAMETER),
-                    detail: Some(format!("{} reference", description)),
-                    text_edit: Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(TextEdit {
-                        range: replacement_range,
-                        new_text: resource_type.clone(),
-                    })),
-                    ..Default::default()
-                }
-            })
-            .collect()
+        // Basic types
+        for (name, detail) in [
+            ("string", "String type"),
+            ("int", "Integer type"),
+            ("bool", "Boolean type"),
+            ("float", "Float type"),
+        ] {
+            completions.push(CompletionItem {
+                label: name.to_string(),
+                kind: Some(CompletionItemKind::TYPE_PARAMETER),
+                detail: Some(detail.to_string()),
+                text_edit: Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(TextEdit {
+                    range: replacement_range,
+                    new_text: name.to_string(),
+                })),
+                ..Default::default()
+            });
+        }
+
+        // Generic type constructors
+        for (name, detail) in [
+            ("list(", "List type constructor"),
+            ("map(", "Map type constructor"),
+        ] {
+            completions.push(CompletionItem {
+                label: name.to_string(),
+                kind: Some(CompletionItemKind::TYPE_PARAMETER),
+                detail: Some(detail.to_string()),
+                text_edit: Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(TextEdit {
+                    range: replacement_range,
+                    new_text: name.to_string(),
+                })),
+                ..Default::default()
+            });
+        }
+
+        // Custom types from provider validators
+        for name in &self.custom_type_names {
+            completions.push(CompletionItem {
+                label: name.clone(),
+                kind: Some(CompletionItemKind::TYPE_PARAMETER),
+                detail: Some(format!("Custom type: {}", name)),
+                text_edit: Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(TextEdit {
+                    range: replacement_range,
+                    new_text: name.clone(),
+                })),
+                ..Default::default()
+            });
+        }
+
+        // Resource types from schemas
+        for resource_type in self.schemas.keys() {
+            let description = self
+                .schemas
+                .get(resource_type)
+                .and_then(|s| s.description.as_deref())
+                .unwrap_or("Resource reference");
+
+            completions.push(CompletionItem {
+                label: resource_type.clone(),
+                kind: Some(CompletionItemKind::TYPE_PARAMETER),
+                detail: Some(format!("{} reference", description)),
+                text_edit: Some(tower_lsp::lsp_types::CompletionTextEdit::Edit(TextEdit {
+                    range: replacement_range,
+                    new_text: resource_type.clone(),
+                })),
+                ..Default::default()
+            });
+        }
+
+        completions
     }
 
     pub(super) fn availability_zone_completions(

@@ -751,3 +751,138 @@ fn provider_block_region_completions_use_aws_namespace() {
         completions.iter().map(|c| &c.label).collect::<Vec<_>>()
     );
 }
+
+#[test]
+fn type_completion_includes_basic_types() {
+    let provider = test_provider();
+    let doc = create_document("arguments {\nvpc: ");
+    let position = Position {
+        line: 1,
+        character: 5,
+    };
+
+    let completions = provider.complete(&doc, position, None);
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+
+    for basic_type in &["string", "int", "bool", "float"] {
+        assert!(
+            labels.contains(basic_type),
+            "Type completions should include '{}'. Got: {:?}",
+            basic_type,
+            labels
+        );
+    }
+
+    // Basic types should have TYPE_PARAMETER kind
+    let string_completion = completions
+        .iter()
+        .find(|c| c.label == "string")
+        .expect("Should have 'string' completion");
+    assert_eq!(
+        string_completion.kind,
+        Some(CompletionItemKind::TYPE_PARAMETER)
+    );
+}
+
+#[test]
+fn type_completion_includes_generic_constructors() {
+    let provider = test_provider();
+    let doc = create_document("arguments {\nitems: ");
+    let position = Position {
+        line: 1,
+        character: 7,
+    };
+
+    let completions = provider.complete(&doc, position, None);
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+
+    assert!(
+        labels.contains(&"list("),
+        "Type completions should include 'list('. Got: {:?}",
+        labels
+    );
+    assert!(
+        labels.contains(&"map("),
+        "Type completions should include 'map('. Got: {:?}",
+        labels
+    );
+}
+
+#[test]
+fn type_completion_includes_custom_types() {
+    let provider = test_provider();
+    let doc = create_document("arguments {\naddr: ");
+    let position = Position {
+        line: 1,
+        character: 6,
+    };
+
+    let completions = provider.complete(&doc, position, None);
+    let labels: Vec<&str> = completions.iter().map(|c| c.label.as_str()).collect();
+
+    // Custom types from provider validators should appear
+    assert!(
+        labels.contains(&"arn"),
+        "Type completions should include 'arn'. Got: {:?}",
+        labels
+    );
+    assert!(
+        labels.contains(&"availability_zone"),
+        "Type completions should include 'availability_zone'. Got: {:?}",
+        labels
+    );
+}
+
+#[test]
+fn context_detection_type_position_in_fn_parameter() {
+    let provider = test_provider();
+    let text = "fn greet(name: ";
+    let context = provider.get_completion_context(
+        text,
+        Position {
+            line: 0,
+            character: 15,
+        },
+    );
+    assert!(
+        matches!(context, CompletionContext::InTypePosition),
+        "Should detect InTypePosition for fn parameter type annotation, got: {:?}",
+        context
+    );
+}
+
+#[test]
+fn context_detection_type_position_in_fn_return_type() {
+    let provider = test_provider();
+    let text = "fn greet(name: string): ";
+    let context = provider.get_completion_context(
+        text,
+        Position {
+            line: 0,
+            character: 24,
+        },
+    );
+    assert!(
+        matches!(context, CompletionContext::InTypePosition),
+        "Should detect InTypePosition for fn return type annotation, got: {:?}",
+        context
+    );
+}
+
+#[test]
+fn context_detection_type_position_in_attributes() {
+    let provider = test_provider();
+    let text = "attributes {\noutput: ";
+    let context = provider.get_completion_context(
+        text,
+        Position {
+            line: 1,
+            character: 8,
+        },
+    );
+    assert!(
+        matches!(context, CompletionContext::InTypePosition),
+        "Should detect InTypePosition for attributes block type annotation, got: {:?}",
+        context
+    );
+}

@@ -74,6 +74,7 @@ impl Backend {
                 Arc::clone(&schemas),
                 provider_names.clone(),
                 region_completions.clone(),
+                provider_context.validators.keys().cloned().collect(),
             ),
             semantic_tokens_provider: SemanticTokensProvider::new(&region_completions),
             hover_provider: HoverProvider::new(Arc::clone(&schemas), region_completions),

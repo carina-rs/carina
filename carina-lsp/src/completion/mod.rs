@@ -21,6 +21,8 @@ pub struct CompletionProvider {
     region_completions_data: Vec<CompletionValue>,
     /// Resource type patterns sorted longest-first for matching
     resource_type_patterns: Vec<String>,
+    /// Custom type names from provider validators (e.g., "cidr", "arn")
+    custom_type_names: Vec<String>,
 }
 
 impl CompletionProvider {
@@ -28,6 +30,7 @@ impl CompletionProvider {
         schemas: Arc<HashMap<String, ResourceSchema>>,
         provider_names: Vec<String>,
         region_completions_data: Vec<CompletionValue>,
+        custom_type_names: Vec<String>,
     ) -> Self {
         // Build sorted resource type patterns from schema keys (longest first)
         let mut resource_type_patterns: Vec<String> = schemas.keys().cloned().collect();
@@ -38,6 +41,7 @@ impl CompletionProvider {
             provider_names,
             region_completions_data,
             resource_type_patterns,
+            custom_type_names,
         }
     }
 
@@ -227,6 +231,19 @@ impl CompletionProvider {
             let has_equals_after_colon = after_colon.contains('=');
             if !has_equals_after_colon {
                 return CompletionContext::InTypePosition;
+            }
+        }
+
+        // Check if we're in a type position inside a fn definition (at top level)
+        // e.g., "fn greet(name: " or "fn greet(name: string): "
+        if brace_depth == 0 {
+            let trimmed_prefix = prefix.trim_start();
+            if trimmed_prefix.starts_with("fn ") && prefix.contains(':') {
+                let after_colon = prefix.rsplit(':').next().unwrap_or("").trim();
+                // Not after an equals sign or opening brace
+                if !after_colon.contains('=') && !after_colon.contains('{') {
+                    return CompletionContext::InTypePosition;
+                }
             }
         }
 
