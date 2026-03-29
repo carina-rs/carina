@@ -1,0 +1,19 @@
+# EC2 Egress-Only Internet Gateway - Basic test
+#
+# Tests: Egress-Only Internet Gateway creation
+
+provider aws {
+  region = aws.Region.ap_northeast_1
+}
+
+let vpc = aws.ec2.vpc {
+  cidr_block = "10.0.0.0/16"
+}
+
+aws.ec2.egress_only_internet_gateway {
+  vpc_id = vpc.vpc_id
+
+  tags = {
+    Environment = "acceptance-test"
+  }
+}

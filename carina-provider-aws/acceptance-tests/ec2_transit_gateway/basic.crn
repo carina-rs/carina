@@ -1,0 +1,15 @@
+# EC2 Transit Gateway - Basic test
+#
+# Tests: Transit Gateway creation with description, tags
+
+provider aws {
+  region = aws.Region.ap_northeast_1
+}
+
+aws.ec2.transit_gateway {
+  description = "Acceptance test Transit Gateway"
+
+  tags = {
+    Environment = "acceptance-test"
+  }
+}

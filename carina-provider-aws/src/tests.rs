@@ -999,3 +999,192 @@ fn test_extract_iam_role_attributes_minimal() {
     assert_eq!(attributes.get("description"), None);
     assert_eq!(attributes.get("max_session_duration"), None);
 }
+
+// --- extract_ec2_transit_gateway_attributes tests ---
+
+#[test]
+fn test_extract_ec2_transit_gateway_attributes() {
+    let options = aws_sdk_ec2::types::TransitGatewayOptions::builder()
+        .amazon_side_asn(64512)
+        .auto_accept_shared_attachments(
+            aws_sdk_ec2::types::AutoAcceptSharedAttachmentsValue::Enable,
+        )
+        .default_route_table_association(
+            aws_sdk_ec2::types::DefaultRouteTableAssociationValue::Enable,
+        )
+        .default_route_table_propagation(
+            aws_sdk_ec2::types::DefaultRouteTablePropagationValue::Enable,
+        )
+        .dns_support(aws_sdk_ec2::types::DnsSupportValue::Enable)
+        .vpn_ecmp_support(aws_sdk_ec2::types::VpnEcmpSupportValue::Enable)
+        .build();
+    let tgw = aws_sdk_ec2::types::TransitGateway::builder()
+        .transit_gateway_id("tgw-12345678")
+        .description("Test TGW")
+        .options(options)
+        .build();
+    let mut attributes = HashMap::new();
+    let identifier = AwsProvider::extract_ec2_transit_gateway_attributes(&tgw, &mut attributes);
+    assert_eq!(identifier, Some("tgw-12345678".to_string()));
+    assert_eq!(
+        attributes.get("transit_gateway_id"),
+        Some(&Value::String("tgw-12345678".to_string()))
+    );
+    assert_eq!(
+        attributes.get("description"),
+        Some(&Value::String("Test TGW".to_string()))
+    );
+    assert_eq!(attributes.get("amazon_side_asn"), Some(&Value::Int(64512)));
+    assert_eq!(
+        attributes.get("auto_accept_shared_attachments"),
+        Some(&Value::String("enable".to_string()))
+    );
+    assert_eq!(
+        attributes.get("dns_support"),
+        Some(&Value::String("enable".to_string()))
+    );
+    assert_eq!(
+        attributes.get("vpn_ecmp_support"),
+        Some(&Value::String("enable".to_string()))
+    );
+}
+
+#[test]
+fn test_extract_ec2_transit_gateway_attributes_minimal() {
+    let tgw = aws_sdk_ec2::types::TransitGateway::builder().build();
+    let mut attributes = HashMap::new();
+    let identifier = AwsProvider::extract_ec2_transit_gateway_attributes(&tgw, &mut attributes);
+    assert_eq!(identifier, None);
+}
+
+// --- extract_ec2_transit_gateway_attachment_attributes tests ---
+
+#[test]
+fn test_extract_ec2_transit_gateway_attachment_attributes() {
+    let att = aws_sdk_ec2::types::TransitGatewayVpcAttachment::builder()
+        .transit_gateway_attachment_id("tgw-attach-12345678")
+        .transit_gateway_id("tgw-12345678")
+        .vpc_id("vpc-12345678")
+        .subnet_ids("subnet-12345678")
+        .subnet_ids("subnet-87654321")
+        .build();
+    let mut attributes = HashMap::new();
+    let identifier =
+        AwsProvider::extract_ec2_transit_gateway_attachment_attributes(&att, &mut attributes);
+    assert_eq!(identifier, Some("tgw-attach-12345678".to_string()));
+    assert_eq!(
+        attributes.get("transit_gateway_attachment_id"),
+        Some(&Value::String("tgw-attach-12345678".to_string()))
+    );
+    assert_eq!(
+        attributes.get("transit_gateway_id"),
+        Some(&Value::String("tgw-12345678".to_string()))
+    );
+    assert_eq!(
+        attributes.get("vpc_id"),
+        Some(&Value::String("vpc-12345678".to_string()))
+    );
+    assert_eq!(
+        attributes.get("subnet_ids"),
+        Some(&Value::List(vec![
+            Value::String("subnet-12345678".to_string()),
+            Value::String("subnet-87654321".to_string()),
+        ]))
+    );
+}
+
+#[test]
+fn test_extract_ec2_transit_gateway_attachment_attributes_minimal() {
+    let att = aws_sdk_ec2::types::TransitGatewayVpcAttachment::builder().build();
+    let mut attributes = HashMap::new();
+    let identifier =
+        AwsProvider::extract_ec2_transit_gateway_attachment_attributes(&att, &mut attributes);
+    assert_eq!(identifier, None);
+}
+
+// --- extract_ec2_vpc_peering_connection_attributes tests ---
+
+#[test]
+fn test_extract_ec2_vpc_peering_connection_attributes() {
+    let requester = aws_sdk_ec2::types::VpcPeeringConnectionVpcInfo::builder()
+        .vpc_id("vpc-11111111")
+        .build();
+    let accepter = aws_sdk_ec2::types::VpcPeeringConnectionVpcInfo::builder()
+        .vpc_id("vpc-22222222")
+        .owner_id("123456789012")
+        .region("ap-northeast-1")
+        .build();
+    let pcx = aws_sdk_ec2::types::VpcPeeringConnection::builder()
+        .vpc_peering_connection_id("pcx-12345678")
+        .requester_vpc_info(requester)
+        .accepter_vpc_info(accepter)
+        .build();
+    let mut attributes = HashMap::new();
+    let identifier =
+        AwsProvider::extract_ec2_vpc_peering_connection_attributes(&pcx, &mut attributes);
+    assert_eq!(identifier, Some("pcx-12345678".to_string()));
+    assert_eq!(
+        attributes.get("vpc_peering_connection_id"),
+        Some(&Value::String("pcx-12345678".to_string()))
+    );
+    assert_eq!(
+        attributes.get("vpc_id"),
+        Some(&Value::String("vpc-11111111".to_string()))
+    );
+    assert_eq!(
+        attributes.get("peer_vpc_id"),
+        Some(&Value::String("vpc-22222222".to_string()))
+    );
+    assert_eq!(
+        attributes.get("peer_owner_id"),
+        Some(&Value::String("123456789012".to_string()))
+    );
+    assert_eq!(
+        attributes.get("peer_region"),
+        Some(&Value::String("ap-northeast-1".to_string()))
+    );
+}
+
+#[test]
+fn test_extract_ec2_vpc_peering_connection_attributes_minimal() {
+    let pcx = aws_sdk_ec2::types::VpcPeeringConnection::builder().build();
+    let mut attributes = HashMap::new();
+    let identifier =
+        AwsProvider::extract_ec2_vpc_peering_connection_attributes(&pcx, &mut attributes);
+    assert_eq!(identifier, None);
+}
+
+// --- extract_ec2_egress_only_internet_gateway_attributes tests ---
+
+#[test]
+fn test_extract_ec2_egress_only_internet_gateway_attributes() {
+    let attachment = aws_sdk_ec2::types::InternetGatewayAttachment::builder()
+        .vpc_id("vpc-12345678")
+        .state(aws_sdk_ec2::types::AttachmentStatus::from("attached"))
+        .build();
+    let eigw = aws_sdk_ec2::types::EgressOnlyInternetGateway::builder()
+        .egress_only_internet_gateway_id("eigw-12345678")
+        .attachments(attachment)
+        .build();
+    let mut attributes = HashMap::new();
+    let identifier =
+        AwsProvider::extract_ec2_egress_only_internet_gateway_attributes(&eigw, &mut attributes);
+    assert_eq!(identifier, Some("eigw-12345678".to_string()));
+    assert_eq!(
+        attributes.get("egress_only_internet_gateway_id"),
+        Some(&Value::String("eigw-12345678".to_string()))
+    );
+    assert_eq!(
+        attributes.get("vpc_id"),
+        Some(&Value::String("vpc-12345678".to_string()))
+    );
+}
+
+#[test]
+fn test_extract_ec2_egress_only_internet_gateway_attributes_minimal() {
+    let eigw = aws_sdk_ec2::types::EgressOnlyInternetGateway::builder().build();
+    let mut attributes = HashMap::new();
+    let identifier =
+        AwsProvider::extract_ec2_egress_only_internet_gateway_attributes(&eigw, &mut attributes);
+    assert_eq!(identifier, None);
+}

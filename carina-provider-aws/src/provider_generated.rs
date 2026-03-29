@@ -628,6 +628,138 @@ impl AwsProvider {
         obj.vpn_gateway_id().map(String::from)
     }
 
+    /// Extract ec2.transit_gateway attributes from SDK response type (generated)
+    pub(crate) fn extract_ec2_transit_gateway_attributes(
+        obj: &aws_sdk_ec2::types::TransitGateway,
+        attributes: &mut HashMap<String, Value>,
+    ) -> Option<String> {
+        if let Some(v) = obj.transit_gateway_id() {
+            attributes.insert(
+                "transit_gateway_id".to_string(),
+                Value::String(v.to_string()),
+            );
+        }
+        if let Some(v) = obj.description() {
+            attributes.insert("description".to_string(), Value::String(v.to_string()));
+        }
+        if let Some(opts) = obj.options() {
+            if let Some(v) = opts.amazon_side_asn() {
+                attributes.insert("amazon_side_asn".to_string(), Value::Int(v));
+            }
+            if let Some(v) = opts.auto_accept_shared_attachments() {
+                attributes.insert(
+                    "auto_accept_shared_attachments".to_string(),
+                    Value::String(v.as_str().to_string()),
+                );
+            }
+            if let Some(v) = opts.default_route_table_association() {
+                attributes.insert(
+                    "default_route_table_association".to_string(),
+                    Value::String(v.as_str().to_string()),
+                );
+            }
+            if let Some(v) = opts.default_route_table_propagation() {
+                attributes.insert(
+                    "default_route_table_propagation".to_string(),
+                    Value::String(v.as_str().to_string()),
+                );
+            }
+            if let Some(v) = opts.dns_support() {
+                attributes.insert(
+                    "dns_support".to_string(),
+                    Value::String(v.as_str().to_string()),
+                );
+            }
+            if let Some(v) = opts.vpn_ecmp_support() {
+                attributes.insert(
+                    "vpn_ecmp_support".to_string(),
+                    Value::String(v.as_str().to_string()),
+                );
+            }
+        }
+        obj.transit_gateway_id().map(String::from)
+    }
+
+    /// Extract ec2.transit_gateway_attachment attributes from SDK response type (generated)
+    pub(crate) fn extract_ec2_transit_gateway_attachment_attributes(
+        obj: &aws_sdk_ec2::types::TransitGatewayVpcAttachment,
+        attributes: &mut HashMap<String, Value>,
+    ) -> Option<String> {
+        if let Some(v) = obj.transit_gateway_attachment_id() {
+            attributes.insert(
+                "transit_gateway_attachment_id".to_string(),
+                Value::String(v.to_string()),
+            );
+        }
+        if let Some(v) = obj.transit_gateway_id() {
+            attributes.insert(
+                "transit_gateway_id".to_string(),
+                Value::String(v.to_string()),
+            );
+        }
+        if let Some(v) = obj.vpc_id() {
+            attributes.insert("vpc_id".to_string(), Value::String(v.to_string()));
+        }
+        {
+            let ids = obj.subnet_ids();
+            if !ids.is_empty() {
+                let list: Vec<Value> = ids.iter().map(|s| Value::String(s.to_string())).collect();
+                attributes.insert("subnet_ids".to_string(), Value::List(list));
+            }
+        }
+        obj.transit_gateway_attachment_id().map(String::from)
+    }
+
+    /// Extract ec2.vpc_peering_connection attributes from SDK response type (generated)
+    pub(crate) fn extract_ec2_vpc_peering_connection_attributes(
+        obj: &aws_sdk_ec2::types::VpcPeeringConnection,
+        attributes: &mut HashMap<String, Value>,
+    ) -> Option<String> {
+        if let Some(v) = obj.vpc_peering_connection_id() {
+            attributes.insert(
+                "vpc_peering_connection_id".to_string(),
+                Value::String(v.to_string()),
+            );
+        }
+        if let Some(requester) = obj.requester_vpc_info()
+            && let Some(v) = requester.vpc_id()
+        {
+            attributes.insert("vpc_id".to_string(), Value::String(v.to_string()));
+        }
+        if let Some(accepter) = obj.accepter_vpc_info() {
+            if let Some(v) = accepter.vpc_id() {
+                attributes.insert("peer_vpc_id".to_string(), Value::String(v.to_string()));
+            }
+            if let Some(v) = accepter.owner_id() {
+                attributes.insert("peer_owner_id".to_string(), Value::String(v.to_string()));
+            }
+            if let Some(v) = accepter.region() {
+                attributes.insert("peer_region".to_string(), Value::String(v.to_string()));
+            }
+        }
+        obj.vpc_peering_connection_id().map(String::from)
+    }
+
+    /// Extract ec2.egress_only_internet_gateway attributes from SDK response type (generated)
+    pub(crate) fn extract_ec2_egress_only_internet_gateway_attributes(
+        obj: &aws_sdk_ec2::types::EgressOnlyInternetGateway,
+        attributes: &mut HashMap<String, Value>,
+    ) -> Option<String> {
+        if let Some(v) = obj.egress_only_internet_gateway_id() {
+            attributes.insert(
+                "egress_only_internet_gateway_id".to_string(),
+                Value::String(v.to_string()),
+            );
+        }
+        // Extract vpc_id from attachments
+        if let Some(att) = obj.attachments().first()
+            && let Some(v) = att.vpc_id()
+        {
+            attributes.insert("vpc_id".to_string(), Value::String(v.to_string()));
+        }
+        obj.egress_only_internet_gateway_id().map(String::from)
+    }
+
     /// Extract ec2.security_group_egress attributes from SDK response type (generated)
     pub(crate) fn extract_ec2_security_group_egress_attributes(
         obj: &aws_sdk_ec2::types::SecurityGroupRule,

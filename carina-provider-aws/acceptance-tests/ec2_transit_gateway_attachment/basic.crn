@@ -1,0 +1,31 @@
+# EC2 Transit Gateway Attachment - Basic test
+#
+# Tests: Transit Gateway VPC Attachment creation
+
+provider aws {
+  region = aws.Region.ap_northeast_1
+}
+
+let vpc = aws.ec2.vpc {
+  cidr_block = "10.0.0.0/16"
+}
+
+let subnet = aws.ec2.subnet {
+  vpc_id            = vpc.vpc_id
+  cidr_block        = "10.0.1.0/24"
+  availability_zone = aws.AvailabilityZone.ap_northeast_1a
+}
+
+let tgw = aws.ec2.transit_gateway {
+  description = "Acceptance test Transit Gateway"
+}
+
+aws.ec2.transit_gateway_attachment {
+  subnet_ids         = [subnet.subnet_id]
+  transit_gateway_id = tgw.transit_gateway_id
+  vpc_id             = vpc.vpc_id
+
+  tags = {
+    Environment = "acceptance-test"
+  }
+}
