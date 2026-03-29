@@ -7818,18 +7818,19 @@ aws.s3.bucket {
     }
 
     #[test]
-    fn parse_with_config_custom_validator_validates_string() {
+    fn parse_with_config_custom_validator_accepts_valid() {
         use std::collections::HashMap;
-        // Register a custom validator for the "cidr" type to override the built-in one
+        // Test validate_custom_type directly with a type name that has no built-in
+        // handler. Built-in types (cidr, ipv4_address, etc.) are matched first in
+        // validate_custom_type, so custom validators only apply to other type names.
         let mut validators: HashMap<String, ValidatorFn> = HashMap::new();
         validators.insert(
-            "cidr".to_string(),
+            "custom_type".to_string(),
             Box::new(|s: &str| {
-                // Our custom validator accepts anything with a /
-                if s.contains('/') {
+                if s.starts_with("valid-") {
                     Ok(())
                 } else {
-                    Err(format!("cidr must contain '/', got '{s}'"))
+                    Err(format!("custom_type must start with 'valid-', got '{s}'"))
                 }
             }),
         );
@@ -7838,20 +7839,20 @@ aws.s3.bucket {
             custom_validators: validators,
         };
 
-        // User function with custom type annotation that passes validation.
-        // "10.0.0.0/16" passes the built-in cidr validator first, so the
-        // custom validator is not reached. Use a value that fails the built-in
-        // cidr validator but would pass the custom one.
-        // Actually, the built-in validator runs first. Let's test with a value
-        // that passes both.
-        let input = r#"
-            fn test_fn(x: cidr): string {
-                x
-            }
-            let result = test_fn("10.0.0.0/16")
-        "#;
-        let result = parse_with_config(input, &config);
-        assert!(result.is_ok(), "Expected success, got: {:?}", result.err());
+        let result = validate_custom_type(
+            "custom_type",
+            &Value::String("valid-data".to_string()),
+            &config,
+        );
+        assert!(result.is_ok());
+
+        // Unknown type with no custom validator should also pass (permissive)
+        let result = validate_custom_type(
+            "unknown_type",
+            &Value::String("anything".to_string()),
+            &config,
+        );
+        assert!(result.is_ok());
     }
 
     #[test]
