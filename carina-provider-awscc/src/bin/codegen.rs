@@ -1897,10 +1897,13 @@ pub fn {}() -> AwsccSchemaConfig {{
             || create_only
                 .iter()
                 .any(|p| p.starts_with(&format!("{}/", prop_name)));
-        let is_write_only = write_only.contains(prop_name)
-            || write_only
-                .iter()
-                .any(|p| p.starts_with(&format!("{}/", prop_name)));
+        // Write-only: only mark the attribute itself as write-only, NOT when
+        // only nested sub-properties are write-only. Unlike create-only (where
+        // a nested create-only property forces re-creation of the parent), a
+        // nested write-only property doesn't make the entire parent write-only.
+        // The parent is still returned by the CloudControl API read; only the
+        // specific nested sub-properties are omitted.
+        let is_write_only = write_only.contains(prop_name);
 
         let attr_type = if let Some(enum_info) = enums.get(prop_name) {
             // Use shared schema enum type for constrained strings.
@@ -9473,6 +9476,54 @@ mod tests {
                 .unwrap_or("")
                 .contains("Write-only"),
             "Name should not have write-only annotation: {md}"
+        );
+    }
+
+    #[test]
+    fn test_nested_write_only_does_not_propagate_to_parent() {
+        // Regression test for #1346: when only nested sub-properties are write-only,
+        // the parent attribute should NOT be marked write-only.
+        let mut properties = BTreeMap::new();
+        properties.insert(
+            "Config".to_string(),
+            CfnProperty {
+                prop_type: Some(TypeValue::Single("object".to_string())),
+                description: Some("A configuration object.".to_string()),
+                properties: Some(BTreeMap::from([(
+                    "SecretField".to_string(),
+                    CfnProperty {
+                        prop_type: Some(TypeValue::Single("string".to_string())),
+                        description: Some("A secret nested field.".to_string()),
+                        ..Default::default()
+                    },
+                )])),
+                ..Default::default()
+            },
+        );
+
+        let schema = CfnSchema {
+            type_name: "AWS::Test::Nested".to_string(),
+            description: None,
+            properties,
+            required: vec![],
+            read_only_properties: vec![],
+            create_only_properties: vec![],
+            // Only the nested sub-property is write-only, NOT the parent
+            write_only_properties: vec!["/properties/Config/SecretField".to_string()],
+            primary_identifier: None,
+            definitions: None,
+            tagging: None,
+            one_of: vec![],
+            any_of: vec![],
+        };
+
+        let code = generate_schema_code(&schema, "AWS::Test::Nested").unwrap();
+
+        // Config should NOT have .write_only() because only its child is write-only
+        assert!(
+            !code.contains(".write_only()"),
+            "Parent attribute should NOT be marked write-only when only nested \
+             sub-properties are write-only. Generated code:\n{code}"
         );
     }
 }

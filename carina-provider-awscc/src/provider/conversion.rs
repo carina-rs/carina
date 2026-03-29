@@ -1060,6 +1060,130 @@ mod tests {
     }
 
     #[test]
+    fn test_lifecycle_configuration_roundtrip_no_spurious_diff() {
+        // Regression test for #1346: lifecycle_configuration round-trip through
+        // CloudControl API should produce values matching the DSL parser output.
+        let config = crate::schemas::generated::s3::bucket::s3_bucket_config();
+        let attr_schema = config
+            .schema
+            .attributes
+            .get("lifecycle_configuration")
+            .unwrap();
+
+        // lifecycle_configuration must NOT be write-only — only nested sub-properties
+        // (Transition singular, ExpiredObjectDeleteMarker, etc.) are write-only in the
+        // CloudFormation schema, not the parent attribute itself.
+        assert!(
+            !attr_schema.write_only,
+            "lifecycle_configuration should NOT be marked write-only; \
+             only nested sub-properties are write-only in the CFN schema"
+        );
+
+        // Simulate AWS CloudControl API response for lifecycle rules.
+        // The API returns PascalCase keys and raw enum values.
+        let aws_json = serde_json::json!({
+            "Rules": [
+                {
+                    "ExpirationInDays": 90,
+                    "Id": "expire-old-objects",
+                    "Status": "Enabled"
+                },
+                {
+                    "Id": "transition-to-glacier",
+                    "Status": "Enabled",
+                    "Transitions": [
+                        {
+                            "StorageClass": "GLACIER",
+                            "TransitionInDays": 30
+                        }
+                    ]
+                }
+            ]
+        });
+
+        // Read path: convert AWS JSON to DSL value
+        let dsl_value = aws_value_to_dsl(
+            "lifecycle_configuration",
+            &aws_json,
+            &attr_schema.attr_type,
+            "s3.bucket",
+        )
+        .expect("aws_value_to_dsl should succeed for lifecycle_configuration");
+
+        // Verify the converted value has the expected structure
+        let Value::Map(top_map) = &dsl_value else {
+            panic!("Expected Value::Map, got: {:?}", dsl_value);
+        };
+        let Some(Value::List(rules)) = top_map.get("rules") else {
+            panic!("Expected 'rules' key with Value::List, got: {:?}", top_map);
+        };
+        assert_eq!(rules.len(), 2, "Should have 2 lifecycle rules");
+
+        // Verify enum values are converted to namespaced format
+        if let Value::Map(rule0) = &rules[0] {
+            assert_eq!(
+                rule0.get("status"),
+                Some(&Value::String(
+                    "awscc.s3.bucket.RuleStatus.Enabled".to_string()
+                )),
+                "status should be namespaced enum"
+            );
+            assert_eq!(
+                rule0.get("expiration_in_days"),
+                Some(&Value::Int(90)),
+                "expiration_in_days should be Int"
+            );
+            assert_eq!(
+                rule0.get("id"),
+                Some(&Value::String("expire-old-objects".to_string())),
+            );
+        } else {
+            panic!("Expected rule[0] to be a Map");
+        }
+
+        if let Value::Map(rule1) = &rules[1] {
+            assert_eq!(
+                rule1.get("status"),
+                Some(&Value::String(
+                    "awscc.s3.bucket.RuleStatus.Enabled".to_string()
+                )),
+            );
+            if let Some(Value::List(transitions)) = rule1.get("transitions") {
+                assert_eq!(transitions.len(), 1);
+                if let Value::Map(t) = &transitions[0] {
+                    assert_eq!(
+                        t.get("storage_class"),
+                        Some(&Value::String(
+                            "awscc.s3.bucket.TransitionStorageClass.GLACIER".to_string()
+                        )),
+                    );
+                    assert_eq!(t.get("transition_in_days"), Some(&Value::Int(30)),);
+                } else {
+                    panic!("Expected transition to be a Map");
+                }
+            } else {
+                panic!("Expected 'transitions' to be a List in rule[1]");
+            }
+        } else {
+            panic!("Expected rule[1] to be a Map");
+        }
+
+        // Write path: convert DSL value back to AWS JSON
+        let written_json = dsl_value_to_aws(
+            &dsl_value,
+            &attr_schema.attr_type,
+            "s3.bucket",
+            "lifecycle_configuration",
+        )
+        .expect("dsl_value_to_aws should succeed");
+
+        assert_eq!(
+            written_json, aws_json,
+            "Round-trip should produce original AWS JSON"
+        );
+    }
+
+    #[test]
     fn test_dsl_value_to_aws_list_with_nan_drops_nan_items() {
         let value = Value::List(vec![
             Value::Float(1.0),
