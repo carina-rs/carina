@@ -341,8 +341,9 @@ pub struct TagKeyWarning {
 
 /// Check whether a tag key follows PascalCase convention.
 ///
-/// PascalCase means: starts with an uppercase letter, no underscores,
-/// no consecutive uppercase letters (simple heuristic).
+/// PascalCase means: starts with an uppercase letter, contains no
+/// underscores or hyphens, and all characters are alphanumeric.
+/// Acronyms like "AWS" or "VPC" are accepted.
 fn is_pascal_case(name: &str) -> bool {
     if name.is_empty() {
         return false;
