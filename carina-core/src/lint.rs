@@ -228,8 +228,8 @@ pub struct RedundantTypeWarning {
 ///
 /// Detects patterns like `let security_group_sg = aws.ec2.security_group { ... }`
 /// where the binding name contains the full resource type as a word-boundary
-/// substring. Short resource types (4 chars or less, e.g., "vpc", "eip") are
-/// excluded because they are commonly used as binding names themselves.
+/// substring plus additional segments. Exact matches (binding name equals the
+/// resource type) are not flagged since they are idiomatic for single instances.
 pub fn find_redundant_type_in_binding(source: &str) -> Vec<RedundantTypeWarning> {
     let mut warnings = Vec::new();
 
@@ -260,8 +260,9 @@ pub fn find_redundant_type_in_binding(source: &str) -> Vec<RedundantTypeWarning>
                 let expr = after_eq.trim_start();
                 // Match provider.service.resource_type pattern
                 if let Some(resource_type) = extract_resource_type_from_expr(expr) {
-                    // Skip short resource types (4 chars or fewer)
-                    if resource_type.len() <= 4 {
+                    // Skip exact matches: using the resource type as binding name
+                    // is idiomatic for single instances (e.g., `let subnet = ...`)
+                    if binding == resource_type {
                         continue;
                     }
                     // Check if binding contains the resource type as word-boundary match
@@ -955,14 +956,16 @@ let e = replace("old", "new", str)
     }
 
     #[test]
-    fn test_redundant_type_full_match_warns() {
-        // Binding name is exactly the resource type
+    fn test_redundant_type_exact_match_no_warning() {
+        // Binding name exactly matches the resource type -- idiomatic for single instances
         let source = r#"let security_group = aws.ec2.security_group {
     group_name = "test"
 }"#;
         let results = find_redundant_type_in_binding(source);
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].binding, "security_group");
+        assert!(
+            results.is_empty(),
+            "Exact match of resource type as binding name should not warn"
+        );
     }
 
     #[test]
