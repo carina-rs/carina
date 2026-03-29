@@ -384,11 +384,11 @@ fn process_basic_result(
             resolved_attrs,
         } => {
             *success_count += 1;
-            if let Some(state) = &state {
-                applied_states.insert(resource_id, state.clone());
+            if let Some(state) = state {
                 if let Some(attrs) = &resolved_attrs {
-                    update_binding_map(binding_map, attrs, state);
+                    update_binding_map(binding_map, attrs, &state);
                 }
+                applied_states.insert(resource_id, state);
             }
         }
         BasicEffectResult::Failure {
@@ -398,10 +398,8 @@ fn process_basic_result(
             if let Some(binding) = binding {
                 failed_bindings.insert(binding);
             }
-            if let Some((id, identifier)) = refresh
-                && !identifier.is_empty()
-            {
-                pending_refreshes.insert(id, identifier);
+            if let Some((id, identifier)) = &refresh {
+                queue_state_refresh(pending_refreshes, id, Some(identifier.as_str()));
             }
         }
         BasicEffectResult::Deleted { resource_id, .. } => {
@@ -523,15 +521,16 @@ async fn execute_basic_effect<'a>(
     total: usize,
     observer: &'a dyn ExecutionObserver,
 ) -> BasicEffectResult {
+    let c = completed.fetch_add(1, Ordering::Relaxed) + 1;
+    let started = Instant::now();
+    let progress = ProgressInfo {
+        completed: c,
+        total,
+    };
+    observer.on_event(&ExecutionEvent::EffectStarted { effect });
+
     match effect {
         Effect::Create(resource) => {
-            let c = completed.fetch_add(1, Ordering::Relaxed) + 1;
-            let started = Instant::now();
-            let progress = ProgressInfo {
-                completed: c,
-                total,
-            };
-            observer.on_event(&ExecutionEvent::EffectStarted { effect });
             let resolved = match resolve_resource(resource, binding_map) {
                 Ok(r) => r,
                 Err(e) => {
@@ -577,13 +576,6 @@ async fn execute_basic_effect<'a>(
             }
         }
         Effect::Update { id, from, to, .. } => {
-            let c = completed.fetch_add(1, Ordering::Relaxed) + 1;
-            let started = Instant::now();
-            let progress = ProgressInfo {
-                completed: c,
-                total,
-            };
-            observer.on_event(&ExecutionEvent::EffectStarted { effect });
             let resolve_source = unresolved.get(id).unwrap_or(to);
             let resolved_to = match resolve_resource_with_source(to, resolve_source, binding_map) {
                 Ok(r) => r,
@@ -635,41 +627,32 @@ async fn execute_basic_effect<'a>(
             identifier,
             lifecycle,
             ..
-        } => {
-            let c = completed.fetch_add(1, Ordering::Relaxed) + 1;
-            let started = Instant::now();
-            let progress = ProgressInfo {
-                completed: c,
-                total,
-            };
-            observer.on_event(&ExecutionEvent::EffectStarted { effect });
-            match provider.delete(id, identifier, lifecycle).await {
-                Ok(()) => {
-                    observer.on_event(&ExecutionEvent::EffectSucceeded {
-                        effect,
-                        state: None,
-                        duration: started.elapsed(),
-                        progress,
-                    });
-                    BasicEffectResult::Deleted {
-                        resource_id: id.clone(),
-                    }
-                }
-                Err(e) => {
-                    let error_str = e.to_string();
-                    observer.on_event(&ExecutionEvent::EffectFailed {
-                        effect,
-                        error: &error_str,
-                        duration: started.elapsed(),
-                        progress,
-                    });
-                    BasicEffectResult::Failure {
-                        binding: None,
-                        refresh: Some((id.clone(), identifier.clone())),
-                    }
+        } => match provider.delete(id, identifier, lifecycle).await {
+            Ok(()) => {
+                observer.on_event(&ExecutionEvent::EffectSucceeded {
+                    effect,
+                    state: None,
+                    duration: started.elapsed(),
+                    progress,
+                });
+                BasicEffectResult::Deleted {
+                    resource_id: id.clone(),
                 }
             }
-        }
+            Err(e) => {
+                let error_str = e.to_string();
+                observer.on_event(&ExecutionEvent::EffectFailed {
+                    effect,
+                    error: &error_str,
+                    duration: started.elapsed(),
+                    progress,
+                });
+                BasicEffectResult::Failure {
+                    binding: None,
+                    refresh: Some((id.clone(), identifier.clone())),
+                }
+            }
+        },
         _ => unreachable!("execute_basic_effect called with non-basic effect"),
     }
 }
