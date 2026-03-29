@@ -3562,8 +3562,7 @@ mod tests {
     #[tokio::test]
     async fn test_update_effect_binding_map_propagation() {
         let provider = MockProvider::new();
-        let ra = make_resource("a", &[]);
-        let ra_id = ra.id.clone();
+        let ra_id = ResourceId::new("test", "a");
 
         // Create initial state
         let from_state =
